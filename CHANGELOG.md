@@ -2355,6 +2355,13 @@ them.
   slow safety scan, about five minutes later. Reconciliation now schedules
   its next attempt for the observed expiry, or re-checks after a second when
   no expiry can be read.
+- `meerkat-mob`: a stale runtime route no longer ends the mob's actor. A
+  restart could leave a runtime-retire route queued for a member whose
+  retirement had already finished; when the member's runtime refused it, the
+  machine rejected the refusal's feedback and the whole mob stopped
+  answering. A refused route that names a runtime the mob no longer runs is
+  now dropped with a warning, and a refusal for a member the mob still runs
+  stays queued while the mob is `Stopped` and is handled after it resumes.
 - A fork child of a member or session with activated host instructions no
   longer commits only to fail its first turn ("forked session must explicitly
   activate inherited instruction keys"). `fork_off`, council participants, the

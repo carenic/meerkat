@@ -12636,6 +12636,31 @@ impl MobActor {
         )
     }
 
+    /// Whether a routed effect still names the runtime the machine runs for
+    /// its member: the bound runtime for a binding or a retire, a live
+    /// runtime for an ingress.
+    fn routed_effect_targets_current_runtime(
+        state: &mob_dsl::MobMachineState,
+        effect: &super::composition::MobSeamEffect,
+    ) -> bool {
+        match effect.body() {
+            mob_dsl::MobMachineEffect::RequestRuntimeBinding {
+                agent_identity,
+                agent_runtime_id,
+                ..
+            }
+            | mob_dsl::MobMachineEffect::RequestRuntimeRetire {
+                agent_identity,
+                agent_runtime_id,
+                ..
+            } => state.identity_to_runtime.get(agent_identity) == Some(agent_runtime_id),
+            mob_dsl::MobMachineEffect::RequestRuntimeIngress {
+                agent_runtime_id, ..
+            } => state.live_runtime_ids.contains(agent_runtime_id),
+            _ => false,
+        }
+    }
+
     fn has_exact_queued_runtime_retire(
         &self,
         agent_identity: &mob_dsl::AgentIdentity,
@@ -12791,6 +12816,51 @@ impl MobActor {
                     // removed after that feedback transition commits; every
                     // tail effect remains FIFO-visible.
                     let feedback = refusal_feedback_input(&effect, &error)?;
+                    // Check the feedback against a copy of the machine first.
+                    // A guard rejection is not a machine closure, and applying
+                    // it here would end the whole actor.
+                    if let Err(rejection) = self.prepare_dsl_input_transition(
+                        feedback.clone(),
+                        "close_routed_effect_consumer_refusal",
+                    ) {
+                        let phase = self.dsl_authority.state().lifecycle_phase;
+                        if !Self::routed_effect_targets_current_runtime(
+                            self.dsl_authority.state(),
+                            &effect,
+                        ) {
+                            // The route outlived the runtime it names (its
+                            // member retired, or now runs another runtime), so
+                            // no phase of the machine takes its refusal. Drop
+                            // it rather than dispatch it again at every flush.
+                            tracing::warn!(
+                                mob_id = %self.definition.id,
+                                effect = ?effect.body(),
+                                refusal_code = %error.error_code(),
+                                rejection = %rejection,
+                                "dropping a refused routed effect that no longer names a runtime the mob machine runs (phase {phase:?})"
+                            );
+                            self.pending_routed_effects.remove(0);
+                            continue;
+                        }
+                        if phase == mob_dsl::MobPhase::Stopped {
+                            // The machine still runs this member but cannot
+                            // take the feedback while Stopped. Keep the head
+                            // queued, as the pending-detach deferral above
+                            // does: the first flush after activation
+                            // dispatches it again.
+                            tracing::warn!(
+                                mob_id = %self.definition.id,
+                                effect = ?effect.body(),
+                                refusal_code = %error.error_code(),
+                                rejection = %rejection,
+                                "deferring routed-effect refusal feedback: the mob machine cannot take it in phase {phase:?}"
+                            );
+                            return Ok(());
+                        }
+                        // In any other phase a rejection for a runtime the
+                        // machine still runs is a real disagreement between
+                        // the machine and this shell: report it as before.
+                    }
                     let transition = self.apply_dsl_input_collect_transition(
                         feedback,
                         "close_routed_effect_consumer_refusal",
@@ -28141,6 +28211,11 @@ impl MobActor {
                         let _ = release_rx.await;
                         MemberLiveMutationCompletion::AwaitedActorForTest
                     });
+                    let _ = reply_tx.send(Ok(()));
+                }
+                #[cfg(test)]
+                MobCommand::QueueRoutedEffectForTest { effect, reply_tx } => {
+                    self.pending_routed_effects.push(effect);
                     let _ = reply_tx.send(Ok(()));
                 }
                 #[cfg(test)]
@@ -61568,6 +61643,37 @@ mod routed_effect_containment_tests {
             .remove(&runtime_id);
         assert!(!MobActor::runtime_retire_blocked_on_pending_detach(
             &state, &effect
+        ));
+    }
+
+    #[test]
+    fn a_refused_route_names_a_current_runtime_only_while_its_member_runs_it() {
+        let identity = mob_dsl::AgentIdentity::from("worker");
+        let runtime_id = mob_dsl::AgentRuntimeId::from("worker:1");
+        let mut state = mob_dsl::MobMachineAuthority::new().state().clone();
+        let retire = super::super::composition::MobSeamEffect::routed(
+            mob_dsl::MobMachineEffect::RequestRuntimeRetire {
+                agent_identity: identity.clone(),
+                agent_runtime_id: runtime_id.clone(),
+                session_id: mob_dsl::SessionId::from("session-worker"),
+            },
+        )
+        .expect("runtime retire is a generated routed effect");
+
+        assert!(
+            !MobActor::routed_effect_targets_current_runtime(&state, &retire),
+            "a retired member runs no runtime"
+        );
+        state
+            .identity_to_runtime
+            .insert(identity.clone(), mob_dsl::AgentRuntimeId::from("worker:2"));
+        assert!(
+            !MobActor::routed_effect_targets_current_runtime(&state, &retire),
+            "a member that runs a later runtime does not own the route"
+        );
+        state.identity_to_runtime.insert(identity, runtime_id);
+        assert!(MobActor::routed_effect_targets_current_runtime(
+            &state, &retire
         ));
     }
 
