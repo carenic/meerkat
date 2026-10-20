@@ -23441,9 +23441,9 @@ ORDER BY runtime_id";
         }
 
         /// Commit `durable` as a new session on a fresh HeadCanonical runtime
-        /// at `path`; then append `pending`, compact the first two rows into a
-        /// summary, append `tail`, and prepare that rewrite from the runtime
-        /// authority. A rewrite that prepares commits, the store reopens, and
+        /// at `path`; then, on the committed session, append `pending`,
+        /// compact the first two rows into a summary, append `tail`, and
+        /// prepare that rewrite from the runtime authority. A rewrite that prepares commits, the store reopens, and
         /// the session reloads as the live transcript. Returns the prepare
         /// refusal's text, if any.
         async fn compact_a_live_session(
@@ -23471,6 +23471,12 @@ ORDER BY runtime_id";
                 .await
                 .boundary_head()
                 .clone();
+            // Continue from the committed rows, as a restarted runtime does.
+            let mut session = session_store
+                .load(session.id())
+                .await
+                .unwrap()
+                .expect("committed session");
             session.push_batch(pending);
             session
                 .commit_transcript_rewrite(
