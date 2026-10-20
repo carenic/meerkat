@@ -412,9 +412,10 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   delegation result held behind the user's question.
 - Fixed: a resume finishes an interrupted Stop or Complete before it hands
   the mob back (an attempt still running after 5 s, held on a member or a
-  placed completion, goes on in the background: wait for `MobStopped`); a session 0.9.2 or 0.9.3 left stuck at a compaction
-  finalizes its last turn at its next start; WebSocket and WebRTC voice keeps
-  flowing while another turn runs (rows queue off the media path).
+  placed completion, goes on in the background: wait for `MobStopped`); a
+  session 0.9.2 or 0.9.3 left stuck at a compaction finalizes its last turn
+  at its next start; WebSocket and WebRTC voice keeps flowing while another
+  turn runs (rows queue off the media path).
 - SQLite: release binaries build the bundled SQLite without its three
   process-wide locks; a build outside the repository (`cargo install rkat`,
   an embedding application) sets `LIBSQLITE3_FLAGS` itself (value in
