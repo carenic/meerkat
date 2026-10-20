@@ -12162,7 +12162,61 @@ impl SessionRuntime {
             .into())
     }
 
+    /// Register an existing session with this server's runtime before a
+    /// transcript edit asks the runtime for its admission verdict.
+    ///
+    /// The server registers a session when it creates it, runs a turn on it
+    /// or opens a live channel on it; a persisted session is recovered
+    /// lazily. After a server restart an idle persisted session therefore has
+    /// no registration, and the admission gate answers it as not ready, which
+    /// the fail-closed verdict would report as an active session.
+    /// Registration recovers the session's durable runtime state, its pending
+    /// inputs included, so the verdict then reflects what the session is
+    /// doing. As on the LLM reconfigure path, the registration stays, as a
+    /// turn's would. A session that is already registered is left as it is,
+    /// and one that is neither live nor persisted (absent or archived) is not
+    /// registered.
+    ///
+    /// This server's hosting claim is taken first, so a session another
+    /// runtime owner hosts keeps its typed refusal, which a failed
+    /// registration would only report as a failed preparation. Registration
+    /// is idempotent: concurrent edits of one unregistered session share the
+    /// one registration the machine's registration transaction admits.
+    async fn register_session_for_transcript_edit(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), RpcError> {
+        if self.runtime_adapter.contains_session(session_id).await {
+            return Ok(());
+        }
+        let live_session_exists = match self.service.has_live_session(session_id).await {
+            Ok(exists) => exists,
+            Err(SessionError::NotFound { .. }) => false,
+            Err(error) => return Err(session_error_to_rpc(error)),
+        };
+        if !live_session_exists && self.load_persisted_session(session_id).await?.is_none() {
+            return Ok(());
+        }
+        let _hosting_claim = self
+            .service
+            .grant_session_hosting(session_id)
+            .map_err(session_error_to_rpc)?;
+        self.runtime_adapter
+            .prepare_bindings(session_id.clone())
+            .await
+            .map(|_| ())
+            .map_err(|error| RpcError {
+                code: error::INTERNAL_ERROR,
+                message: format!(
+                    "failed to prepare runtime bindings for session {session_id} before a transcript edit: {error}"
+                ),
+                data: None,
+            })
+    }
+
     async fn reject_active_transcript_edit(&self, session_id: &SessionId) -> Result<(), RpcError> {
+        self.register_session_for_transcript_edit(session_id)
+            .await?;
         // The two observations are MeerkatMachine-owned facts the shell extracts:
         // the runtime lifecycle phase (`runtime_running`) and the active-input
         // ledger (`has_active_inputs`). The `SESSION_BUSY` disjunction over them
@@ -12179,23 +12233,37 @@ impl SessionRuntime {
             .list_active_inputs(session_id)
             .await
             .is_ok_and(|inputs| !inputs.is_empty());
-        let session_busy = matches!(
-            self.runtime_adapter
-                .resolve_transcript_edit_admission(session_id, runtime_running, has_active_inputs)
-                .await,
-            Ok(meerkat_runtime::meerkat_machine::dsl::TranscriptEditAdmissionKind::DeniedBusy)
-                | Err(_)
-        );
-        if session_busy {
-            return Err(RpcError {
+        match self
+            .runtime_adapter
+            .resolve_transcript_edit_admission(session_id, runtime_running, has_active_inputs)
+            .await
+        {
+            Ok(meerkat_runtime::meerkat_machine::dsl::TranscriptEditAdmissionKind::Admissible) => {
+                Ok(())
+            }
+            Ok(meerkat_runtime::meerkat_machine::dsl::TranscriptEditAdmissionKind::DeniedBusy) => {
+                Err(RpcError {
+                    code: error::SESSION_BUSY,
+                    message: format!(
+                        "session {session_id} is active; transcript fork uses running_behavior=reject"
+                    ),
+                    data: None,
+                })
+            }
+            // No registration answers: the session is neither live nor
+            // persisted here, or a concurrent archive or teardown removed its
+            // registration. The edit fails closed as busy.
+            Err(RuntimeDriverError::NotReady { .. }) => Err(RpcError {
                 code: error::SESSION_BUSY,
                 message: format!(
-                    "session {session_id} is active; transcript fork uses running_behavior=reject"
+                    "session {session_id} has no runtime registration to admit a transcript edit"
                 ),
                 data: None,
-            });
+            }),
+            // Every other refusal keeps the runtime's typed answer: a session
+            // whose durability needs a reload is refused as that, not as busy.
+            Err(error) => Err(runtime_driver_error_to_rpc(error)),
         }
-        Ok(())
     }
 
     /// Fork an idle materialized session at a transcript index.

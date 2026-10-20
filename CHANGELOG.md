@@ -1984,6 +1984,16 @@ them.
   forked by 0.9.3 or earlier that never ran a turn still fails `turn/start`
   with the error above, because it has no build state to derive one from:
   fork its source again instead.
+- RPC transcript edits (`session/fork_at`, `session/fork_replace`,
+  `session/rewrite_transcript`, `session/update_system_prompt` and
+  `session/restore_transcript_revision`) on an idle persisted session no
+  longer answer `SESSION_BUSY` ("session ... is active") after the RPC server
+  restarts (`meerkat-rpc`). The edit now registers the session with the
+  server's runtime before it asks for the busy verdict, so a session with a
+  running turn or pending input is still refused with `SESSION_BUSY`. A
+  session whose durability needs a reload now answers the runtime's typed
+  refusal ("durability reload required") instead of `SESSION_BUSY`, and a
+  session another process hosts answers its typed hosting refusal.
 - `meerkat-openai`, `meerkat-live`, `meerkat` and `meerkat-rpc`: an OpenAI
   realtime response that ends without completing is now a typed failure, not
   a finished turn (#1883). A `response.done` with status `failed`,
