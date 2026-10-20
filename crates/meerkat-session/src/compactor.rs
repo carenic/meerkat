@@ -76,6 +76,78 @@ impl DefaultCompactor {
         }
         usize::try_from(budget).unwrap_or(usize::MAX)
     }
+
+    /// Request bytes of one blob-backed image when the exact provider request
+    /// has crossed the byte trigger: the measured body beyond the serialized
+    /// rows, shared evenly by the blob images. Zero below the trigger and
+    /// without an exact witness.
+    ///
+    /// A blob image is a reference in its row and a full payload in the
+    /// hydrated request. Above the trigger the payloads dominate the body, so
+    /// the share is their size within the few kilobytes tool definitions and
+    /// framing add.
+    fn crossing_blob_image_bytes(
+        &self,
+        messages: &[Message],
+        pressure: Option<meerkat_core::ProviderRequestPressure>,
+    ) -> usize {
+        let Some(pressure) = pressure.filter(|pressure| {
+            pressure
+                .trigger_threshold(self.config.max_request_bytes)
+                .is_some_and(|threshold| pressure.encoded_bytes >= threshold)
+        }) else {
+            return 0;
+        };
+        let images = messages.iter().map(blob_images).sum::<usize>();
+        let Some(images) = u64::try_from(images).ok().filter(|images| *images > 0) else {
+            return 0;
+        };
+        let rows = messages
+            .iter()
+            .filter_map(|message| serde_json::to_vec(message).ok())
+            .fold(0u64, |total, encoded| {
+                total.saturating_add(u64::try_from(encoded.len()).unwrap_or(u64::MAX))
+            });
+        usize::try_from(pressure.encoded_bytes.saturating_sub(rows) / images).unwrap_or(usize::MAX)
+    }
+}
+
+/// Blob-backed image blocks in one message: references in the row, full
+/// payloads once the request is hydrated.
+fn blob_images(message: &Message) -> usize {
+    fn count(blocks: &[ContentBlock]) -> usize {
+        blocks
+            .iter()
+            .filter(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Image {
+                        data: meerkat_core::types::ImageData::Blob { .. },
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+    match message {
+        Message::User(user) => count(&user.content),
+        Message::ToolResults { results, .. } => {
+            results.iter().map(|result| count(&result.content)).sum()
+        }
+        Message::SystemNotice(notice) => notice
+            .blocks
+            .iter()
+            .map(|block| match block {
+                meerkat_core::types::SystemNoticeBlock::Comms { content, .. }
+                | meerkat_core::types::SystemNoticeBlock::ExternalEvent { content, .. }
+                | meerkat_core::types::SystemNoticeBlock::RuntimeNotice { content, .. } => {
+                    count(content)
+                }
+                _ => 0,
+            })
+            .sum(),
+        _ => 0,
+    }
 }
 
 /// Project media blocks to text placeholders for the summarization LLM input.
@@ -702,14 +774,21 @@ impl Compactor for DefaultCompactor {
         // can shrink, so they never count against it: counting them let a
         // System-heavy session retain no turn at all.
         let retention_budget = self.retained_history_budget_bytes(pressure);
+        // When this rewrite answers a request-byte crossing, a blob image
+        // costs its hydrated payload, as an inline one already does. Counted
+        // as a reference, every recent image turn fits the budget, the rewrite
+        // keeps the payloads that crossed, and the next turn crosses again.
+        let blob_image_bytes = self.crossing_blob_image_bytes(messages, pressure);
         let turn_bytes = |range: std::ops::Range<usize>| {
             messages[range]
                 .iter()
                 .filter(|message| !matches!(message, Message::System(_)))
                 .try_fold(0usize, |total, message| {
-                    serde_json::to_vec(message)
-                        .ok()
-                        .and_then(|encoded| total.checked_add(encoded.len()))
+                    serde_json::to_vec(message).ok().and_then(|encoded| {
+                        total
+                            .checked_add(encoded.len())?
+                            .checked_add(blob_images(message).checked_mul(blob_image_bytes)?)
+                    })
                 })
                 .unwrap_or(usize::MAX)
         };

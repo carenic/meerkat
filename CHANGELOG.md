@@ -2568,6 +2568,20 @@ them.
   head, and opening a store that an earlier build converted repairs each
   affected runtime record in place. Pre-existing in 0.9.3.
 
+- `meerkat-session`: a session whose turns each add large images, such as a
+  tool that returns camera snapshots, no longer compacts on every turn.
+  Before compacting, the agent stores inline media as blob references, and
+  the rewrite chose the turns to keep by their stored size, in which a blob
+  image is a short reference. The provider request whose size triggers
+  compaction carries every image in full. So a rewrite that answered that
+  request-size trigger kept the recent image turns, and the next turn's
+  images crossed the trigger again: every turn paid a summary and lost its
+  oldest kept turn, and with larger images every turn failed as
+  irreducible. When the exact provider request has crossed the trigger, a
+  blob image now counts its share of that request's size when the rewrite
+  chooses the turns to keep, as an inline image already counts its payload.
+  Pre-existing in 0.9.3.
+
 ### Known limitations
 
 - A store that stops answering during registration, unregister or a control
