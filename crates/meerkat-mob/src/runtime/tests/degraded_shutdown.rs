@@ -909,8 +909,9 @@ async fn a_whole_shutdown_settles_an_autonomous_member_degraded_while_idle() {
 
 /// Drive member 0 of `mob`, an AutonomousHost member, into the window
 /// between a stop's run-start hold and its cancel of the run the hold found
-/// current, and return what `stop` answered. The run is parked in its turn
-/// when the stop holds it. Before the cancel, the run's boundary commit takes
+/// current, and return what `stop` answered. That run is the member's kickoff
+/// keep-alive turn, parked until released. Before the cancel, the turn is
+/// released and the run's boundary commit takes
 /// the session's mutation gate and the store does not answer it; the cancel
 /// waits for the gate, and the registration degrades during that wait. The
 /// commit is released only once the cancel answered, so the cancel never
@@ -923,19 +924,9 @@ where
     T: Send + 'static,
 {
     let session_id = mob.session(0).clone();
-    let mut held_turns = mob.service.held_start_turn_entries();
-    let entered_before = *held_turns.borrow_and_update();
-    mob.service.hold_start_turns();
-    mob.send(0, "running when the stop holds its run starts")
+    tokio::time::timeout(STEP, mob.service.wait_keep_alive_turn_entered(&session_id))
         .await
-        .expect("the delivery to member 0 is admitted");
-    tokio::time::timeout(
-        STEP,
-        held_turns.wait_for(|entries| *entries > entered_before),
-    )
-    .await
-    .expect("member 0's run parks in its turn")
-    .expect("the turn hold counter stays open");
+        .expect("member 0's kickoff turn is current");
     let (cancel_reached, release_cancel, cancel_answered) =
         crate::runtime::provisioner::arm_stop_member_cancel_for_test(session_id.clone());
     let stopping = tokio::spawn(stop);
@@ -947,7 +938,7 @@ where
     // The run's boundary commit takes the session's mutation gate, and the
     // store does not answer it yet.
     mob.store.park_commits(&session_id);
-    mob.service.release_held_start_turns();
+    mob.service.release_keep_alive_turn(&session_id).await;
     wait_until("member 0's boundary commit to park", STEP, || async {
         mob.store.parked_commit_arrivals(&session_id) == 1
     })
