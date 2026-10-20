@@ -2635,7 +2635,12 @@ them.
   servers and the SDKs) takes that path. Before activation it stores a
   realm's legacy inline images in the realm's `blobs` directory, so such a
   realm opens on every surface. A realm with nothing to activate opens
-  exactly as before, without reading any session.
+  exactly as before, without reading any session. A realm an external
+  storage provider serves with a SQLite session store opens the same way:
+  before its store-wide activation the open stores the legacy sessions'
+  inline images in the provider's blob store
+  (`IncrementalSessionStore::stage_legacy_inline_images`) and then activates
+  with them; a store with nothing to stage activates exactly as before.
 
 ### Known limitations
 
@@ -2679,13 +2684,6 @@ them.
   identity in `Backoff` until the mob is resumed, the host process restarts
   or the host calls `MobHandle::redrive_retirement`, any of which recovers
   it.
-- A realm served by an external storage provider whose session store is
-  SQLite does not open when it holds a session that a 0.8.x build compacted
-  with images inline in its history (screenshot or browser tool results, for
-  example). The open refuses with "compact rewrite delta carries inline
-  media", and the sessions' data stays intact; earlier 0.9.x releases refuse
-  the same realm the same way. 0.9.4.1 converts these sessions at open.
-  Built-in realms (`rkat`, REST, RPC and the SDKs) open them in this release.
 
 ## [0.9.3] - 2026-10-18
 
