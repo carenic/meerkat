@@ -2580,6 +2580,8 @@ them.
   irreducible. When the exact provider request has crossed the trigger, a
   blob image now counts its share of that request's size when the rewrite
   chooses the turns to keep, as an inline image already counts its payload.
+  A turn whose own images alone exceed the kept-history budget now continues
+  with those images summarized, where before it failed as irreducible.
   Pre-existing in 0.9.3.
 
 ### Known limitations
