@@ -3878,3 +3878,105 @@ async fn a_mob_whose_member_retirement_cancelled_a_turn_at_its_boundary_restarts
     );
     let _ = handle_2.shutdown().await;
 }
+
+/// A member retired while its turn runs retires when the turn still reaches
+/// its boundary. The retirement asks the running turn to cancel at its
+/// boundary; the held provider call is then released inside the cooperative
+/// grace, so the turn's durable rows land and the run ends cancelled at the
+/// boundary, leaving the member's canonical head ahead of the runtime
+/// boundary it last committed. The rest of the retirement reads the session
+/// (its route observation first); those reads must settle the tail instead of
+/// refusing it, or the retirement stops after it durably started.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_retired_while_its_turn_reaches_the_boundary_retires() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "warn,meerkat_mob::runtime::actor::retirement_io=info,meerkat_runtime::recovery=info,\
+             meerkat_session::persistent=info,meerkat_mob::runtime::actor=info",
+        ))
+        .with_writer(std::io::stderr)
+        .try_init();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = Arc::new(
+        meerkat_runtime::store::SqliteRuntimeStore::new_head_canonical(&paths.realm_db_path)
+            .expect("open HeadCanonical runtime store"),
+    );
+    let (service, store) = persistent_head_canonical_service(&paths, runtime_store.clone());
+    let client = Arc::new(HeldTurnClient::default());
+    let storage = MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage");
+    let handle = MobBuilder::new(mob_definition(MobRuntimeMode::TurnDriven), storage)
+        .with_session_service(service.clone())
+        .with_default_llm_client(client.clone())
+        .create()
+        .await
+        .expect("create persistent mob");
+    handle
+        .spawn_spec(SpawnMemberSpec::new("lead", AgentIdentity::from("lead-1")))
+        .await
+        .expect("spawn lead");
+    handle
+        .spawn_spec(SpawnMemberSpec::new("worker", AgentIdentity::from("w-1")))
+        .await
+        .expect("spawn worker");
+    let identity = AgentIdentity::from("w-1");
+    let w1_sid = handle
+        .resolve_bridge_session_id(&identity)
+        .await
+        .expect("w1 session id");
+    send_and_wait(
+        &handle,
+        service.as_ref(),
+        "w-1",
+        "PRE_HELD_TURN token-alpha",
+        "held-turn-first",
+    )
+    .await;
+    wait_for_head_canonical_authority_convergence(
+        store.as_ref(),
+        runtime_store.as_ref(),
+        &w1_sid,
+        "PRE_HELD_TURN",
+        "held-turn-first-boundary",
+    )
+    .await;
+
+    handle
+        .member(&identity)
+        .await
+        .expect("member handle")
+        .send(HELD_TURN_PROMPT.to_string(), HandlingMode::Queue)
+        .await
+        .expect("queue the held turn");
+    tokio::time::timeout(Duration::from_secs(30), client.entered.notified())
+        .await
+        .expect("the held turn's provider call is in flight");
+    let retire = tokio::spawn({
+        let handle = handle.clone();
+        let identity = identity.clone();
+        async move { handle.retire(identity).await }
+    });
+    // The retirement reaches its runtime quiesce and asks the turn to cancel
+    // at its boundary; the turn then finishes well inside the cooperative
+    // grace and reaches that boundary.
+    sleep(Duration::from_millis(300)).await;
+    client.release.notify_one();
+    let retired = tokio::time::timeout(Duration::from_secs(60), retire)
+        .await
+        .expect("the retirement ends within its bound")
+        .expect("the retirement task completes");
+    assert!(
+        retired.is_ok(),
+        "a member retired while its turn reaches the boundary must retire: {retired:?}"
+    );
+    assert!(
+        handle
+            .get_member(&identity)
+            .await
+            .expect("read the roster")
+            .is_none(),
+        "the retired member leaves the roster"
+    );
+    let _ = handle.shutdown().await;
+}
