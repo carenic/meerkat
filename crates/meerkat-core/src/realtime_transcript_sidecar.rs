@@ -1418,8 +1418,8 @@ mod tests {
         );
     }
 
-    /// A snapshot event whose item holds all three content-index maps, each
-    /// with keys that sort differently as numbers and as strings. Replay
+    /// A snapshot event whose item holds all three content-index maps; the
+    /// text map's keys sort differently as numbers and as strings. Replay
     /// decodes the stored event's payload through the record's tagged form
     /// (serde's buffered content), and so does a decode straight from text:
     /// both keep every key and value, and serialize back to the exact
