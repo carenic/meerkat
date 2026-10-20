@@ -1962,6 +1962,7 @@ mod tests {
     }
 
     /// The comms runtime signs a message's `in_reply_to` into its envelope.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn runtime_send_signs_the_peer_message_in_reply_to_onto_the_wire() {
         let (_ctx, peer_id, sender, receiver, finalizer) =
@@ -2000,6 +2001,7 @@ mod tests {
     /// selected capability's id as `in_reply_to`, which the comms runtime
     /// signs into the envelope. `send_message` answers nothing and stamps
     /// nothing.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_runtime_less_reply_to_peer_names_the_delivery_it_answers() {
         let (ctx, peer_id, _sender, receiver, finalizer) =
@@ -2029,6 +2031,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn reply_to_peer_names_the_delivery_it_answers_and_send_message_names_none() {
         let peer_keypair = Keypair::generate();
@@ -2178,6 +2181,7 @@ mod tests {
     /// name both senders and send nothing; before 0.9.4 it routed to
     /// whichever delivery came first. The governed target resolution uses
     /// the same selector, so it cannot authorize the first match either.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn reply_to_peer_selector_matching_two_senders_is_ambiguous_and_sends_nothing() {
         let peer_keypair = Keypair::generate();
@@ -2329,6 +2333,7 @@ mod tests {
     /// authorization is prepared and nothing is sent. In the same governed
     /// context, a selector naming one sender's delivery prepares one
     /// authorization and delivers once (control).
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn governed_ambiguous_reply_is_refused_before_authorization() {
         let peer_keypair = Keypair::generate();

@@ -5776,6 +5776,7 @@ mod skill_activation_effect_tests {
     /// sees a host's external tool call refused under governed work, as that
     /// call's result, from the same fenced dispatch the loop's calls take,
     /// with the dispatch fact the model payload carries.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn an_external_tool_call_refusal_reaches_the_host_observer() {
         #[derive(Default)]

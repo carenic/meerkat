@@ -191,6 +191,7 @@ async fn gated_agent(
     gated_agent_observing(client, entered, release, ObservedReplies::default(), false).await
 }
 
+#[cfg(feature = "workspace-tests")]
 async fn gated_agent_observing(
     client: Arc<RecordingClient>,
     entered: Arc<Notify>,
@@ -505,6 +506,7 @@ async fn run_with_durable_delivery_at_post_tool_boundary(
 /// [`run_with_durable_delivery_at_post_tool_boundary`] for a turn that starts
 /// with `turn_start_replies` (the runtime's turn-start peer reply context),
 /// recording what `probe_step` can answer after the boundary.
+#[cfg(feature = "workspace-tests")]
 async fn run_with_durable_delivery_at_post_tool_boundary_observing(
     delivery: meerkat_core::lifecycle::TurnBoundaryDelivery,
     turn_start_replies: Option<Vec<meerkat_core::comms::PeerReplyCapability>>,
@@ -819,6 +821,7 @@ fn durable_peer_message(
 /// A peer message that joins the running turn is answerable like one that
 /// started it: its reply capability reaches the tool calls after the
 /// boundary that wrote its row, in the same synchronous segment.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn durable_peer_message_reply_capability_joins_the_running_turn() {
     let sender = meerkat_core::comms::PeerId::new();
@@ -848,6 +851,7 @@ async fn durable_peer_message_reply_capability_joins_the_running_turn() {
 /// in arrival order: a second sender reusing the turn-start delivery id keeps
 /// its own capability after the first, and a capability recorded again (the
 /// first sender's, and the second sender's twice) appears once.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn durable_peer_reply_capabilities_are_keyed_by_sender_and_id() {
     let first = meerkat_core::comms::PeerId::new();
