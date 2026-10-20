@@ -15429,6 +15429,120 @@ mod tests {
         assert_rejected_observation(&fixture.held_reply().await, operation_id);
     }
 
+    /// A member registration whose unregister is owed (here its final
+    /// unregister transition is staged and its store finalization's outcome
+    /// is unknown) refuses every lifecycle mutation and starts no run until an
+    /// unregister retry removes it. The host answers a supervisor's run-start
+    /// hold for it as held with no run, and the release as done, instead of
+    /// failing either as internal.
+    #[tokio::test]
+    async fn run_start_hold_and_release_answer_a_member_whose_unregister_is_owed() {
+        let supervisor_spec = current_supervisor_bridge_spec();
+        let supervisor =
+            TrustedPeerDescriptor::try_from(supervisor_spec.clone()).expect("valid supervisor");
+        let runtime_impl = bootstrap_runtime(
+            PEER_ID_RECEIVER,
+            "inproc://owed-unregister-run-start-hold",
+            Some("token"),
+        );
+        let sent_commands = Arc::clone(&runtime_impl.sent_commands);
+        let runtime: Arc<dyn CommsRuntime> = Arc::new(runtime_impl);
+        let store = Arc::new(crate::store::InMemoryRuntimeStore::new());
+        let adapter = Arc::new(
+            MeerkatMachine::persistent_without_blobs(store.clone()).expect("persistent machine"),
+        );
+        let session_id = SessionId::new();
+        adapter
+            .register_session(session_id.clone())
+            .await
+            .expect("register session");
+        adapter
+            .stage_supervisor_bind(
+                &session_id,
+                supervisor.name.to_string(),
+                supervisor.peer_id.as_str(),
+                supervisor.address.to_string(),
+                signing_public_key_for_descriptor(&supervisor),
+                1,
+            )
+            .await
+            .expect("bind supervisor");
+        store.report_next_unregister_finalization_outcome_unknown();
+        let unregistered = adapter.unregister_session(&session_id).await;
+        assert!(
+            matches!(
+                unregistered,
+                Err(crate::traits::RuntimeDriverError::UnregisterFinalizationOutcomeUnknown { .. })
+            ),
+            "{unregistered:?}"
+        );
+        assert!(adapter.unregister_owed(&session_id).await);
+
+        for command in [
+            BridgeCommand::HoldRunStarts(
+                meerkat_contracts::wire::supervisor_bridge::BridgeRunStartHoldPayload {
+                    supervisor: supervisor_spec.clone(),
+                    epoch: 1,
+                    protocol_version: SUPERVISOR_BRIDGE_PROTOCOL_VERSION,
+                    expected_member: None,
+                    cancel_current_run: true,
+                },
+            ),
+            BridgeCommand::ReleaseRunStarts(
+                meerkat_contracts::wire::supervisor_bridge::BridgeRunStartReleasePayload {
+                    supervisor: supervisor_spec.clone(),
+                    epoch: 1,
+                    protocol_version: SUPERVISOR_BRIDGE_PROTOCOL_VERSION,
+                    expected_member: None,
+                },
+            ),
+        ] {
+            let interaction_id = InteractionId(Uuid::new_v4());
+            let ingress = PeerIngressFact::peer(
+                interaction_id,
+                PeerInputClass::ActionableRequest,
+                meerkat_core::PeerIngressKind::Request,
+                Some(meerkat_core::PeerIngressAuthDecision::Required),
+                PeerIngressIdentity::new(
+                    supervisor.peer_id,
+                    supervisor.name.as_str(),
+                    meerkat_core::PeerIngressConvention::Request {
+                        request_id: interaction_id.to_string(),
+                        intent: SUPERVISOR_BRIDGE_INTENT.to_string(),
+                    },
+                )
+                .with_signing_pubkey(supervisor.pubkey),
+            );
+            let candidate =
+                bridge_candidate_with_ingress(supervisor.name.as_str(), &command, ingress);
+            assert!(
+                try_handle_supervisor_bridge_command(&adapter, &session_id, &runtime, &candidate)
+                    .await
+            );
+        }
+        let replies = recorded_bridge_replies(&sent_commands).await;
+        assert!(
+            matches!(
+                replies.as_slice(),
+                [
+                    (
+                        meerkat_core::interaction::ResponseStatus::Completed,
+                        BridgeReply::RunStartsHeld(
+                            meerkat_contracts::wire::supervisor_bridge::BridgeRunStartHoldResponse {
+                                run: meerkat_contracts::wire::supervisor_bridge::BridgeHeldRun::NoRun,
+                            }
+                        )
+                    ),
+                    (
+                        meerkat_core::interaction::ResponseStatus::Completed,
+                        BridgeReply::Ack(BridgeAck { ok: true })
+                    ),
+                ]
+            ),
+            "{replies:?}"
+        );
+    }
+
     #[tokio::test]
     async fn pending_rotation_observe_does_not_mint_temporary_supervisor_trust() {
         let previous_spec = current_supervisor_bridge_spec();
