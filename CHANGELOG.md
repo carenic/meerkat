@@ -275,7 +275,9 @@ them.
   delivery identity before) recorded the occurrence `completed` at admission
   without reading that input. The occurrence now stays `dispatching` and
   waits as for an accepted delivery; its receipt still records the admission
-  as deduplicated. After such a reclaim:
+  as deduplicated. A `ScheduleTargetDelivery` implementation's completion for
+  a deduplicated replay now decides the occurrence's terminal; it must
+  resolve from the original input's outcome. After such a reclaim:
   - the existing input is still live: the occurrence waits for it and ends
     with its outcome;
   - it failed: `delivery_failed` with its failure class;
