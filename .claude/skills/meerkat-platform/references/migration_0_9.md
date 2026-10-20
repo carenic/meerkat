@@ -414,11 +414,19 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   `estimated_history_tokens_after`.
 - Multiprocess hosting accepts a store whose file notifications cannot be
   registered (the sweep is the wake).
-- A fenced runtime-store write that meets `Backoff` while holding an async
-  lock is tried again for up to 2 s with the lock released, instead of
-  reporting the first `Backoff` at once. A fence caller in another crate that
-  holds an async lock retries `Backoff` the same way: `execute_if_current`
-  never waits beyond its own I/O.
+- Fenced runtime-store writes: the SQLite runtime store waits up to 2 s for
+  the mob database's write lock inside the identity fence (the new defaulted
+  `execute_if_current_blocking`), and a fenced write that meets `Backoff`
+  while holding an async lock is tried again for up to 2 s with the lock
+  released, so an intent-managed identity on slow disks no longer stays in
+  `Backoff`. A fence caller in another crate that holds an async lock retries
+  `Backoff` the same way (`execute_if_current` never waits beyond its own
+  I/O); a decorator that forwards fenced calls may forward
+  `execute_if_current_blocking` too.
+- Known limitation: after a restart, graceful or not, an adopted identity runs
+  again only once the previous process's identity lease expires (at most
+  30 s, `IDENTITY_LEASE_MAX_TTL_MS`); until then its convergence status reads
+  `await_lease` (condition `suspended`).
 - Work naming an original whose admission is still pending reports
   `original_admission_pending` and stays retryable.
 - Fixed: the 0.9.3 known issue "First concurrent durable delivery" (a store
