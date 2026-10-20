@@ -25,6 +25,8 @@ pub(super) mod resume_topology;
 #[cfg(feature = "runtime-adapter")]
 mod resume_topology_control;
 mod retirement_io;
+#[cfg(test)]
+pub(crate) use retirement_io::retirement_stage_test_hooks;
 mod shutdown_teardown;
 pub(in crate::runtime) use shutdown_teardown::ShutdownUnregisterOutcome;
 #[cfg(all(test, feature = "runtime-adapter"))]
@@ -25840,6 +25842,16 @@ impl MobActor {
             return Ok(IdentityReconcilePassDisposition::Outcome(false));
         }
         if decision == IdentityReconcileDecision::Backoff {
+            // A member whose durably started retirement settled stuck reads
+            // as recovering, which this pass only waits on: hand the
+            // retirement back for re-drive, paced by this identity's backoff.
+            if self.enqueue_stuck_retirement_redrive(identity) {
+                tracing::info!(
+                    mob_id = %self.definition.id,
+                    agent_identity = %identity,
+                    "identity reconciliation re-drives the member's stuck retirement"
+                );
+            }
             self.record_identity_reconcile_disposition(
                 identity,
                 &completion_authority,

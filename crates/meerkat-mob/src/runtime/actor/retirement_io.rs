@@ -2951,6 +2951,14 @@ impl MobActor {
                     {
                         return Ok(mob_dsl::MemberSessionDisposal::Archived);
                     }
+                    #[cfg(test)]
+                    if let Some(session) = member.bridge_session_id()
+                        && retirement_stage_test_hooks::take_session_archive_failure(session)
+                    {
+                        return Err(MobError::Internal(
+                            "injected session archive failure".to_string(),
+                        ));
+                    }
                     let result = if registration_refused {
                         provisioner
                             .retire_refused_member(&member, &identity, Some(deadline))
@@ -4551,6 +4559,25 @@ impl MobActor {
         }
     }
 
+    /// Hand `identity`'s stuck retirement back for re-drive, unless one is
+    /// queued or a retirement of it is in flight. Identity reconciliation
+    /// calls this on each pass that backs off: a member whose durably started
+    /// retirement settled stuck reads as recovering, which the pass only
+    /// waits on, so without a re-drive the identity would wait for a resume.
+    /// The identity's backoff paces the passes, so a stage that keeps failing
+    /// is re-driven at most once per backoff period. Returns whether one was
+    /// queued.
+    pub(super) fn enqueue_stuck_retirement_redrive(&mut self, identity: &AgentIdentity) -> bool {
+        if !self.stuck_retirements.contains_key(identity)
+            || self.retirements.contains_key(identity)
+            || self.pending_stuck_redrives.contains(identity)
+        {
+            return false;
+        }
+        self.pending_stuck_redrives.push_back(identity.clone());
+        true
+    }
+
     /// Start the next queued stuck-retirement re-drive, if the mob is running
     /// and the member's retirement is not already in flight. Returns whether
     /// one was started.
@@ -5871,6 +5898,46 @@ impl MobActor {
         rollback.compensating = false;
         self.finish_spawn_rollback_attempt(&custody, Some(continuation), Err(error))
             .await;
+    }
+}
+
+/// Test hooks for the retirement stages.
+#[cfg(test)]
+pub(crate) mod retirement_stage_test_hooks {
+    use std::sync::{Mutex, PoisonError};
+
+    use meerkat_core::types::SessionId;
+
+    static FAILING_SESSION_ARCHIVES: Mutex<Vec<SessionId>> = Mutex::new(Vec::new());
+
+    /// The next session archive stage of a retirement of `session` fails,
+    /// once.
+    pub(crate) fn fail_next_session_archive(session: &SessionId) {
+        FAILING_SESSION_ARCHIVES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(session.clone());
+    }
+
+    /// Whether the failure armed for `session` has not fired yet.
+    pub(crate) fn session_archive_failure_armed(session: &SessionId) -> bool {
+        FAILING_SESSION_ARCHIVES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(session)
+    }
+
+    pub(super) fn take_session_archive_failure(session: &SessionId) -> bool {
+        let mut armed = FAILING_SESSION_ARCHIVES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match armed.iter().position(|candidate| candidate == session) {
+            Some(index) => {
+                armed.remove(index);
+                true
+            }
+            None => false,
+        }
     }
 }
 
