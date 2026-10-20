@@ -2181,7 +2181,15 @@ impl meerkat_runtime::RuntimeStore for PowerCutRuntimeStore {
             == Some(runtime_id);
         if held {
             let mut hold = self.boundary_hold.subscribe();
-            self.boundary_hold.send_replace(BoundaryHold::Entered);
+            // A release that lands after the `held` read stays released: it
+            // is never overwritten by Entered, so this commit cannot park.
+            self.boundary_hold.send_if_modified(|state| {
+                if *state == BoundaryHold::Released {
+                    return false;
+                }
+                *state = BoundaryHold::Entered;
+                true
+            });
             let _ = hold
                 .wait_for(|state| *state == BoundaryHold::Released)
                 .await;
