@@ -1,4 +1,4 @@
-//! Stdio MCP server fixtures for process-custody tests (Linux only).
+//! Stdio MCP server fixtures for process-custody tests (Linux and macOS).
 #![allow(clippy::expect_used)]
 
 use std::path::{Path, PathBuf};
@@ -57,6 +57,11 @@ done
 pub(crate) struct PidReport {
     path: PathBuf,
     lines: BufReader<tokio::net::unix::pipe::Receiver>,
+    /// A writer this report holds open, so reads wait for the fixture's
+    /// line instead of seeing EOF (tokio opens a FIFO read-write only on
+    /// Linux and Android).
+    #[cfg(target_os = "macos")]
+    _writer: std::fs::File,
 }
 
 impl PidReport {
@@ -72,13 +77,29 @@ impl PidReport {
         nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).expect("create pid FIFO");
         // Read-write on the receiver keeps a writer open, so reads wait for
         // the fixture's line instead of seeing EOF before it opens the FIFO.
+        #[cfg(target_os = "linux")]
         let receiver = tokio::net::unix::pipe::OpenOptions::new()
             .read_write(true)
             .open_receiver(&path)
             .expect("open pid FIFO");
+        // The non-blocking read end first, then a writer of this report's
+        // own, which opens at once now that a reader exists.
+        #[cfg(target_os = "macos")]
+        let (receiver, writer) = {
+            let receiver = tokio::net::unix::pipe::OpenOptions::new()
+                .open_receiver(&path)
+                .expect("open pid FIFO");
+            let writer = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("hold the pid FIFO open for writing");
+            (receiver, writer)
+        };
         Self {
             path,
             lines: BufReader::new(receiver),
+            #[cfg(target_os = "macos")]
+            _writer: writer,
         }
     }
 
@@ -121,6 +142,7 @@ impl Drop for PidReport {
 /// `do_exit`. The last case is a SIGKILLed grandchild that has closed the
 /// stdout pipe the custody waits on but that its new parent has not reaped
 /// yet; it holds nothing and runs no more code.
+#[cfg(target_os = "linux")]
 pub(crate) fn process_exited(pid: u32) -> bool {
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
         return true;
@@ -132,6 +154,38 @@ pub(crate) fn process_exited(pid: u32) -> bool {
         return true;
     }
     std::fs::read_dir(format!("/proc/{pid}/fd")).map_or(true, |mut fds| fds.next().is_none())
+}
+
+/// Whether `pid` has exited, on macOS: reaped, or dead and awaiting reaping.
+/// `PROC_PIDTBSDINFO` describes neither (it answers `ESRCH` for both, though
+/// `kill(pid, 0)` still succeeds on a zombie), and a process it describes
+/// has exited only in the zombie state.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub(crate) fn process_exited(pid: u32) -> bool {
+    use nix::libc;
+    let pid = i32::try_from(pid).expect("pid fits i32");
+    let size =
+        i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).expect("proc_bsdinfo fits i32");
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    // SAFETY: the buffer is a live, correctly sized proc_bsdinfo; the kernel
+    // writes at most `size` bytes into it.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast::<libc::c_void>(),
+            size,
+        )
+    };
+    if written != size {
+        return std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    }
+    // SAFETY: a zero-initialised plain-integer record the kernel wrote in
+    // full (checked above).
+    let info = unsafe { info.assume_init() };
+    info.pbi_status == libc::SZOMB
 }
 
 /// Wait up to `bound` for `pid` to have exited ([`process_exited`]). For a
