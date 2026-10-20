@@ -86,7 +86,8 @@ the CHANGELOG under `## [0.9.4]`. This guide has no sections for 0.9.0 to
   - a mob store: 0.9.4 migrates each mob's SQLite store to schema version 12
     (its creation record) when it opens it, and 0.9.3 refuses that version.
     Keep a copy of the mob stores from before the upgrade to roll back;
-  - a persisted member delivery scope written at version 2 (see
+  - a persisted member delivery scope written at version 2, and a delivery
+    addressed to a member in the new `rt:mob-member:` form (see
     [Mob incarnations](#mob-incarnations)).
 - **Upgrade the SDKs with `rkat-rpc`.** The 0.9.3 Python and TypeScript SDKs
   fail on every `tool_config_changed` event a 0.9.4 `rkat-rpc` builds. An SDK
@@ -209,7 +210,10 @@ mode with leading zeros (`'0755'`; unquoted it reads as `755.0`).
   reload** report its run and run starts as `ReloadRequired` (the new
   `MemberStopRun::ReloadRequired` and `MemberRunStarts::ReloadRequired`, wire
   `reload_required`) instead of failing or waiting on it, and a Shutdown holds
-  every member's run starts and reports the first failure in roster order.
+  every member's run starts and reports the first failure in roster order. An
+  autonomous member whose registration degrades after the stop held its run
+  starts reports its run `ReloadRequired` and its starts `Held` (the cancel
+  of its current run was not dispatched).
   Known limitation: in a multi-host mob, a remote member that needs a reload
   still makes a Stop fail with `MobError::BridgeCommandRejected` (cause
   `internal`), and a Shutdown too when that member is `AutonomousHost`; a
@@ -380,8 +384,22 @@ mode with leading zeros (`'0755'`; unquoted it reads as `755.0`).
   incarnation was assigned to a store from before 0.9.4; 0.9.3 refuses a
   version-2 scope. A scoped submit with a scope from another incarnation is
   refused first, with the new `MobError::IncarnationMismatch`, where it
-  failed as `StaleDeliveryScope`, and `recover_bounded_work_at_scope` answers
+  failed as `StaleDeliveryScope`, and so is `retire_at_scope` before any
+  step; `recover_bounded_work_at_scope` answers
   `ScopedRecoveryUnresolved::IncarnationNotHosted`.
+- **Member delivery addresses name the incarnation** too
+  (`rt:mob-member:{mob}:{incarnation}:{identity}:{generation}`), so a
+  continuation or detached-job delivery owed to a member of a destroyed mob no
+  longer reaches the member of the same identity in a mob created again under
+  the same id: it strands (`Stranded`, `OwnerRetired`), and a handle kept from
+  the destroyed mob submits nothing. A 0.9.3 build does not read the new form
+  and does not deliver rows addressed to one; addresses minted before 0.9.4
+  are still read. Known limitation: with in-memory mob storage every start
+  creates each mob again as a new incarnation, so deliveries still owed to the
+  earlier incarnation strand. **Do (Rust):** `meerkat::member_delivery_address`
+  takes the mob incarnation as its second argument (`handle.incarnation()`),
+  and `MemberDeliveryAddress` gains `incarnation` (set it in struct
+  literals).
 - **Stores that disagree:** a mob store whose creation record and event log
   disagree is not resumed (`MobError::IncarnationInconsistent`), and one that
   holds a finished destroy whose files are not removed yet answers
@@ -510,8 +528,19 @@ The compaction types around it change too:
   fails them with `CompletionWaitError::BoundaryRolledBack` instead of
   `AuthorityUnavailable`. `CompletionWaitError` is now `#[non_exhaustive]`.
   **Do:** the input stays durably admitted, so read it after the reload
-  instead of resubmitting it; a reload refuses with the retryable
-  `RuntimeDriverError::RecoveryRepairBlocked` until the store answers.
+  instead of resubmitting it (the public error class is still authority
+  unavailable and the message names the case: resubmit only with an
+  idempotency key); a reload refuses with the retryable
+  `RuntimeDriverError::RecoveryRepairBlocked` until the store answers. A
+  scheduled delivery waits for the input's own outcome (see
+  [Other behaviour changes](#other-behaviour-changes)). An input admission
+  whose store write never answers is bounded by the same deadline: past it,
+  the admission refuses with the retryable `RecoveryRepairBlocked` naming the
+  input and the session needs a reload (`runtime_admission_deadline`); the
+  write may still land, so resubmit with the same idempotency key or read the
+  input after the reload. Known limitation: registration, unregister, control
+  writes, recovery and the runtime loop's other writes under the gate still
+  wait for a store that stops answering.
 - `MeerkatMachine::bind_scoped_context` refuses a destination whose
   `context_generation` does not advance with
   `RuntimeDriverError::ScopedContextGenerationNotAdvanced { bound, requested }`
@@ -606,6 +635,27 @@ mob machine inputs, effects and transition ids gain `RetireAtScope` and
   maintenance such as `rkat storage migrate --apply` waits for kept
   connections to close; `rkat storage doctor` lists the files as
   `maintenance-fence-lock` findings.
+- **Scheduled occurrences end with their input's own outcome:** a reclaim
+  whose redelivery the target deduplicated waits for the original input's
+  outcome instead of recording `completed` at admission, and a delivery whose
+  completion wait fails with `BoundaryRolledBack` or `DurableOutcomeUnknown`
+  re-reads the input's outcome for up to 5 lease periods (5 minutes at the
+  default 60 s lease) before it ends `delivery_failed` with
+  `runtime_completion_authority_unavailable`. A scheduled mob delivery whose
+  redelivery finds the delivery already failed records `delivery_failed`
+  (0.9.3: `completed`). **Do:** a custom `ScheduleTargetDelivery` resolves a
+  deduplicated replay's completion from the original input's outcome.
+- **macOS stdio MCP servers close as soon as they exit**, as on Linux; 0.9.3
+  waited about 8 s per stdio server (the EOF grace, SIGTERM, the TERM grace,
+  SIGKILL) at every close, removal, reload, session end and shutdown.
+- **RPC transcript edits after a restart:** `session/fork_at`,
+  `session/fork_replace`, `session/rewrite_transcript`,
+  `session/update_system_prompt` and `session/restore_transcript_revision` on
+  an idle persisted session no longer answer `SESSION_BUSY` after the RPC
+  server restarts. A session with a running turn or pending input still gets
+  `SESSION_BUSY`; one that needs a durability reload answers the runtime's
+  typed refusal instead, and one another process hosts answers its typed
+  hosting refusal (`SESSION_BUSY` with data kind `session_served_elsewhere`).
 - **A resume finishes an interrupted Stop or Complete** (waiting up to 5 s
   for its first attempt) before it hands the mob back, so the handle reads
   Stopped or Completed; 0.9.3 resumed it as Running and finished the Stop in

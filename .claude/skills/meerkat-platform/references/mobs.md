@@ -196,6 +196,24 @@ the same id) is refused first, with nothing admitted, as
 `MobError::IncarnationMismatch` (`require_scope_incarnation` and the scoped
 submit), and `recover_bounded_work_at_scope` answers
 `ScopedRecoveryUnresolved::IncarnationNotHosted` without reading a session.
+Member delivery addresses name the mob incarnation too
+(`rt:mob-member:{mob}:{incarnation}:{identity}:{generation}`;
+`MemberDeliveryAddress::incarnation`; `LogicalRuntimeId::for_member` refuses
+an address without one, and the pre-0.9.4 `rt:member:` form is only read).
+`meerkat::member_delivery_address` takes the live mob's incarnation
+(`handle.incarnation()`). A continuation or detached-job delivery owed to a
+member of a destroyed mob strands (`ContinuationStatus::Stranded`,
+`OwnerRetired`) instead of reaching the member of the same identity in a mob
+created again under that id, and a handle kept from the destroyed mob submits
+nothing (`submit_continuation` and `submit_retained_continuation` answer
+`OwnerRetired`). A continuation key submitted again after the mob was created
+again replays its first receipt, bound to the old member's address. Rows
+addressed before 0.9.4 name no incarnation and are served only by a mob
+created before 0.9.4. 0.9.3 neither reads nor delivers `rt:mob-member:`
+addresses. Known limitation: over in-memory mob storage every start creates
+the mob again as a new incarnation, so deliveries owed to the earlier one
+strand and its scopes get `IncarnationMismatch`; durable storage keeps the
+incarnation across restarts.
 
 Mob incarnation and provenance (since 0.9.4): a mob keeps its
 `MobIncarnationId` across resume. Its create mints it once and stores it with
@@ -262,7 +280,9 @@ incarnation a `MemberDeliveryScope` names, with `retire`'s process-tree
 semantics. MobMachine admits every step (each descendant and the member) on
 the scope in the same actor command that retires it, so a successor minted
 meanwhile (respawn, reset) is never retired through an older scope. Refusals:
-`MobError::StaleFenceToken` (another incarnation is current),
+`MobError::IncarnationMismatch` (a scope captured at another incarnation of
+the mob, one destroyed and created again under its id; answered before any
+step), `MobError::StaleFenceToken` (another incarnation is current),
 `StaleDeliveryScope` (the session is not the member's binding or the one its
 retirement is releasing), `InvalidTransition` (completed or destroyed mob); a
 refusal stops the call. `Ok(())` is `retire`'s barrier: it waits out a
