@@ -5181,6 +5181,27 @@ async fn try_handle_supervisor_bridge_command(
                     .await
                 {
                     Ok(held) => held,
+                    // A registration whose unregister is owed refuses the
+                    // hold, and its runtime loop already exited: it has no
+                    // run and starts none until the unregister removes it,
+                    // so its run starts are held, as the reply says. One
+                    // removed after the refusal has neither either.
+                    Err(_)
+                        if adapter.unregister_owed(session_id).await
+                            || !adapter.contains_session(session_id).await =>
+                    {
+                        send_bridge_response(
+                            comms_runtime,
+                            candidate,
+                            meerkat_core::interaction::ResponseStatus::Completed,
+                            BridgeReply::RunStartsHeld(BridgeRunStartHoldResponse {
+                                run: BridgeHeldRun::NoRun,
+                            }),
+                            None,
+                        )
+                        .await;
+                        return true;
+                    }
                     Err(error) => {
                         send_bridge_failure(
                             comms_runtime,
@@ -5274,6 +5295,24 @@ async fn try_handle_supervisor_bridge_command(
                     .await
                 {
                     Ok(()) => {
+                        send_bridge_response(
+                            comms_runtime,
+                            candidate,
+                            meerkat_core::interaction::ResponseStatus::Completed,
+                            BridgeReply::Ack(BridgeAck { ok: true }),
+                            None,
+                        )
+                        .await;
+                    }
+                    // A registration whose unregister is owed refuses the
+                    // release after the release unstaged the reason: what the
+                    // release is for holds. The leaving registration starts
+                    // no run, and its hold goes with it when the unregister
+                    // removes it.
+                    Err(_)
+                        if adapter.unregister_owed(session_id).await
+                            || !adapter.contains_session(session_id).await =>
+                    {
                         send_bridge_response(
                             comms_runtime,
                             candidate,

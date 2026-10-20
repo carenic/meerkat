@@ -14692,14 +14692,22 @@ impl MobProvisioner for SessionBackend {
         let Some(adapter) = &self.runtime_adapter else {
             return Ok(());
         };
-        adapter
+        let Err(error) = adapter
             .stage_registration_run_start_hold(&session_id, reason)
             .await
-            .map_err(|error| {
-                MobError::Internal(format!(
-                    "staging a run-start hold for '{session_id}' failed: {error}"
-                ))
-            })
+        else {
+            return Ok(());
+        };
+        // The reason is staged whatever the hold of the current registration
+        // answered. A registration whose unregister is owed refuses that
+        // hold, starts no run, and leaves the staged reason to hold the
+        // registration that replaces it: what the stage is for holds.
+        if registration_unregister_owed_or_gone(adapter, &session_id).await {
+            return Ok(());
+        }
+        Err(MobError::Internal(format!(
+            "staging a run-start hold for '{session_id}' failed: {error}"
+        )))
     }
 
     async fn stage_member_registration_run_start_hold_only(
