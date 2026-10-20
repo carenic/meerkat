@@ -35,38 +35,6 @@ them.
 
 ## [Unreleased]
 
-### Added
-
-- `meerkat-runtime`: `RuntimeStoreWriteFence::execute_if_current_blocking`,
-  a defaulted bounded-wait entry for a caller on a blocking thread. An
-  implementation may wait there, for a bounded time, for its authority guard
-  instead of answering `Backoff` at once; the default calls
-  `execute_if_current`. The SQLite runtime store calls it inside its blocking
-  tasks. A fence implementation or decorator outside Meerkat needs nothing
-  new; one that forwards fenced calls may forward this entry as well.
-
-### Changed
-
-- `meerkat-runtime`: a fenced write whose `RuntimeStoreWriteFence` answers
-  `Backoff` while the writer holds an async lock (the in-memory runtime
-  store's fenced writes, and `MeerkatMachine`'s publication of a registered
-  session) is tried again for up to 2 seconds before the `Backoff` is
-  reported, with the lock released between attempts and each attempt
-  re-reading what it writes. The trait's documentation now says
-  `execute_if_current` never waits beyond its own I/O, so a caller that holds
-  an async lock may call it provided it retries a `Backoff` the same way; a
-  fence caller in another crate that holds an async lock should do so too.
-
-### Fixed
-
-- An intent-managed identity on SQLite mob storage could stay in `Backoff`
-  indefinitely on a host with slow disk writes. The identity runtime write
-  fence gave up at once while a convergence status write committed, and every
-  retry met the next status write. The fence now waits up to 2 seconds for the
-  mob database's write lock when the SQLite runtime store calls it, and the
-  in-memory runtime store and the session publication retry it for up to 2
-  seconds with their locks released.
-
 ## [0.9.4] - 2026-10-20
 
 ### Breaking
@@ -1312,6 +1280,14 @@ them.
   creation record names while that record is not finalized, read without
   building a runtime.
 
+- `meerkat-runtime`: `RuntimeStoreWriteFence::execute_if_current_blocking`,
+  a defaulted bounded-wait entry for a caller on a blocking thread. An
+  implementation may wait there, for a bounded time, for its authority guard
+  instead of answering `Backoff` at once; the default calls
+  `execute_if_current`. The SQLite runtime store calls it inside its blocking
+  tasks. A fence implementation or decorator outside Meerkat needs nothing
+  new; one that forwards fenced calls may forward this entry as well.
+
 ### Changed
 
 - `meerkat`: `PersistenceBundle::require_hosting_mode(HostingMode::Multiprocess)`
@@ -1642,6 +1618,16 @@ them.
   run starts and reports the first failure in roster order instead of stopping
   at it. On the wire, `stop_report` reports such a member with `run` and
   `starts` `reload_required`.
+
+- `meerkat-runtime`: a fenced write whose `RuntimeStoreWriteFence` answers
+  `Backoff` while the writer holds an async lock (the in-memory runtime
+  store's fenced writes, and `MeerkatMachine`'s publication of a registered
+  session) is tried again for up to 2 seconds before the `Backoff` is
+  reported, with the lock released between attempts and each attempt
+  re-reading what it writes. The trait's documentation now says
+  `execute_if_current` never waits beyond its own I/O, so a caller that holds
+  an async lock may call it provided it retries a `Backoff` the same way; a
+  fence caller in another crate that holds an async lock should do so too.
 
 ### Fixed
 
@@ -2380,6 +2366,14 @@ them.
   (a non-blocking `waitid` with `WNOWAIT`; only an exit counts, not a stop).
   Other platforms without that check keep their graces as before.
   Pre-existing since 0.9.0.
+
+- An intent-managed identity on SQLite mob storage could stay in `Backoff`
+  indefinitely on a host with slow disk writes. The identity runtime write
+  fence gave up at once while a convergence status write committed, and every
+  retry met the next status write. The fence now waits up to 2 seconds for the
+  mob database's write lock when the SQLite runtime store calls it, and the
+  in-memory runtime store and the session publication retry it for up to 2
+  seconds with their locks released.
 
 ### Known limitations
 
