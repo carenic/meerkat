@@ -898,7 +898,11 @@ async fn a_scope_naming_another_members_incarnation_and_session_reads_nothing() 
 
 // Ownership: a scope belongs to the mob that bound its session. Another mob
 // over the same realm services, with a member of the same identity and
-// incarnation, never answers for it; the owning mob still does.
+// incarnation, never answers for it; the owning mob still does. The scope
+// names the owning mob's incarnation, which the other mob does not host, so
+// the other mob reads nothing. Re-stamped with the other mob's own
+// incarnation, the scope passes that check and is still refused: the other
+// mob's member history never bound the owning mob's session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn another_mob_never_answers_for_a_scope_it_did_not_bind() {
     let fixture = Fixture::new().await;
@@ -933,9 +937,20 @@ async fn another_mob_never_answers_for_a_scope_it_did_not_bind() {
 
     match Fixture::recover_with(&foreign, &scope, &delivery).await {
         ScopedWorkState::Unresolved {
-            cause: ScopedRecoveryUnresolved::ScopeBindingUnproven,
+            cause: ScopedRecoveryUnresolved::IncarnationNotHosted,
         } => {}
         other => panic!("another mob answered for this scope: {other:?}"),
+    }
+    let mut persisted = scope.to_json_value();
+    persisted["mob_incarnation"] = foreign_scope.to_json_value()["mob_incarnation"].clone();
+    let restamped =
+        MemberDeliveryScope::from_json_value(persisted).expect("a syntactically valid scope");
+    assert_eq!(restamped.session_id(), &fixture.session_id);
+    match Fixture::recover_with(&foreign, &restamped, &delivery).await {
+        ScopedWorkState::Unresolved {
+            cause: ScopedRecoveryUnresolved::ScopeBindingUnproven,
+        } => {}
+        other => panic!("another mob answered for the owning mob's session: {other:?}"),
     }
     match fixture.recover(&scope, &delivery).await {
         ScopedWorkState::Terminal { result, .. } => assert!(result.is_ok(), "{result:?}"),
