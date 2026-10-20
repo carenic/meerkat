@@ -281,6 +281,7 @@ impl MobCommand {
             | Self::LifecycleSnapshot { .. }
             | Self::LifecycleNotificationBurst { .. }
             | Self::ParkActorForObservationTest { .. }
+            | Self::QueueRoutedEffectForTest { .. }
             | Self::SpawnLiveMutationAwaitingActorForTest { .. }
             | Self::HonourCompletionForTest { .. }
             | Self::SpawnLiveMutationSendingCompletionForTest { .. }
@@ -631,6 +632,10 @@ impl MobCommand {
             }
             #[cfg(test)]
             Self::ParkActorForObservationTest { reply_tx, .. } => {
+                let _ = reply_tx.send(Err(error));
+            }
+            #[cfg(test)]
+            Self::QueueRoutedEffectForTest { reply_tx, .. } => {
                 let _ = reply_tx.send(Err(error));
             }
             #[cfg(test)]

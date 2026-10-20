@@ -3179,6 +3179,22 @@ impl MobActor {
                 let closed = (|| {
                     let feedback =
                         super::super::composition::refusal_feedback_input(&effect, &error)?;
+                    // As in flush_routed_effects: check the feedback against a
+                    // copy of the machine first. A rejection keeps the route
+                    // on the continuation for the next attempt.
+                    if let Err(rejection) = self.prepare_dsl_input_transition(
+                        feedback.clone(),
+                        "close_routed_effect_consumer_refusal",
+                    ) {
+                        tracing::warn!(
+                            mob_id = %self.definition.id,
+                            effect = ?effect.body(),
+                            phase = ?self.dsl_authority.state().lifecycle_phase,
+                            rejection = %rejection,
+                            "deferring retirement route refusal feedback: the mob machine cannot take it in this phase"
+                        );
+                        return Err(rejection);
+                    }
                     let transition = self.apply_dsl_input_collect_transition(
                         feedback,
                         "close_routed_effect_consumer_refusal",

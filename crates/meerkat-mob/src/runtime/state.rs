@@ -1284,6 +1284,13 @@ pub(super) enum MobCommand {
         release_rx: oneshot::Receiver<()>,
         reply_tx: oneshot::Sender<Result<(), MobError>>,
     },
+    /// Queue one routed effect behind the actor's pending routed effects; the
+    /// boundary flush after this command dispatches it.
+    #[cfg(test)]
+    QueueRoutedEffectForTest {
+        effect: super::composition::MobSeamEffect,
+        reply_tx: oneshot::Sender<Result<(), MobError>>,
+    },
     /// Snapshot the T2 DSL field projections (member state markers, wiring
     /// edges, identity→runtime map, tasks + task id sets) directly from the
     /// DSL authority. Test-only read seam used by the runtime-parity
@@ -2021,6 +2028,8 @@ impl MobCommand {
             #[cfg(test)]
             Self::ParkActorForObservationTest { .. } => ShutdownAnswerClass::CallerRequest,
             #[cfg(test)]
+            Self::QueueRoutedEffectForTest { .. } => ShutdownAnswerClass::CallerRequest,
+            #[cfg(test)]
             Self::DslT2Snapshot { .. } => ShutdownAnswerClass::CallerRequest,
             Self::StartupKickoffSnapshot { .. } => ShutdownAnswerClass::CallerRequest,
             Self::ProjectMemberList { .. } => ShutdownAnswerClass::CallerRequest,
@@ -2218,6 +2227,8 @@ impl MobCommand {
             Self::LifecycleNotificationBurst { .. } => "LifecycleNotificationBurst",
             #[cfg(test)]
             Self::ParkActorForObservationTest { .. } => "ParkActorForObservationTest",
+            #[cfg(test)]
+            Self::QueueRoutedEffectForTest { .. } => "QueueRoutedEffectForTest",
             #[cfg(test)]
             Self::SpawnLiveMutationAwaitingActorForTest { .. } => {
                 "SpawnLiveMutationAwaitingActorForTest"

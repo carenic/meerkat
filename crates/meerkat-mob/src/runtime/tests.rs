@@ -74665,6 +74665,86 @@ async fn assert_retire_consumer_refusal_survives_cold_restart(crash_restart: boo
     );
 }
 
+#[tokio::test]
+async fn a_refused_runtime_retire_for_a_retired_member_leaves_the_stopped_mob_running() {
+    let service = Arc::new(MockSessionService::new());
+    let _adapter = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(sample_definition(), MobStorage::in_memory())
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let mut spec = SpawnMemberSpec::new("worker", "w-1");
+    spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    handle.spawn_spec(spec).await.expect("spawn w-1");
+    let identity = AgentIdentity::from("w-1");
+    let session_id = handle
+        .resolve_bridge_session_id(&identity)
+        .await
+        .expect("session-backed");
+    let dsl_identity = crate::machines::mob_machine::AgentIdentity::from("w-1");
+    let runtime_id = handle
+        .query_machine_state()
+        .await
+        .expect("query machine state")
+        .identity_to_runtime
+        .get(&dsl_identity)
+        .cloned()
+        .expect("w-1 has a runtime");
+    handle.retire(identity.clone()).await.expect("retire w-1");
+    assert!(
+        handle
+            .get_member(&identity)
+            .await
+            .expect("read roster after retirement")
+            .is_none(),
+        "the retirement completed"
+    );
+    handle.stop().await.expect("stop the mob");
+
+    // A runtime-retire route for w-1 that outlived its retirement, as a
+    // restart can leave one queued: its consumer refuses it (the runtime is
+    // gone), and the machine has no retiring member left to take the refusal.
+    let stale = super::composition::MobSeamEffect::routed(
+        crate::machines::mob_machine::MobMachineEffect::RequestRuntimeRetire {
+            agent_identity: dsl_identity,
+            agent_runtime_id: runtime_id,
+            session_id: crate::machines::mob_machine::SessionId::from_domain(&session_id),
+        },
+    )
+    .expect("a runtime retire is a routed effect");
+    handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::QueueRoutedEffectForTest {
+            effect: stale,
+            reply_tx,
+        })
+        .await
+        .expect("queue the stale route")
+        .await
+        .expect("the actor answers the queue command")
+        .expect("the actor queues the stale route");
+
+    handle
+        .resume()
+        .await
+        .expect("the mob actor must survive the refused stale route and resume");
+    assert_eq!(
+        handle.status().await.expect("status after resume"),
+        MobState::Running
+    );
+    assert!(
+        handle
+            .query_machine_state()
+            .await
+            .expect("query machine state after resume")
+            .identity_to_runtime
+            .is_empty(),
+        "the stale route must not bring the retired member back"
+    );
+    assert!(!handle.actor_command_channel_closed_for_test());
+    handle.shutdown().await.expect("shutdown");
+}
+
 /// Lifecycle-notification failures during retirement remain best-effort.
 ///
 /// The notification may legitimately fail during concurrent teardown, but
