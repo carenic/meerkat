@@ -24496,6 +24496,532 @@ ORDER BY runtime_id";
             );
         }
 
+        /// Every retained revision of `source` (its current revision, then
+        /// each retained rewrite's parent and result), as the session the
+        /// conversion left at `path` materializes it cold and hydrates it
+        /// from `blobs`, is the source's revision, media type strings
+        /// included. None of `payloads` is inline in a converted revision
+        /// before it hydrates. Returns the media types of every image the
+        /// retained revisions hold.
+        async fn assert_retained_revisions_hydrate_from(
+            path: &Path,
+            blobs: &dyn meerkat_core::BlobStore,
+            source: &Session,
+            payloads: &[meerkat_core::InlineImagePayload],
+        ) -> std::collections::BTreeSet<String> {
+            let converted = meta_093_co_located_session_store(path)
+                .load(source.id())
+                .await
+                .unwrap()
+                .expect("converted session");
+            let state = source
+                .transcript_history_state()
+                .unwrap()
+                .expect("a compacted session has a graph");
+            let mut revisions = vec![source.transcript_revision().unwrap()];
+            for commit in state.commits().skip(state.retired_count()) {
+                revisions.push(commit.parent_revision.clone());
+                revisions.push(commit.revision.clone());
+            }
+            let mut media_types = std::collections::BTreeSet::new();
+            for revision in revisions {
+                let rows_of = |session: &Session| {
+                    session
+                        .retained_transcript_revision_rows(&revision)
+                        .unwrap()
+                        .expect("a retained revision")
+                        .messages()
+                        .to_vec()
+                };
+                let mut rows = rows_of(&converted);
+                let stored = serde_json::to_string(&rows).unwrap();
+                for payload in payloads {
+                    assert!(
+                        !stored.contains(payload.data.as_str()),
+                        "revision {revision} holds an image inline"
+                    );
+                }
+                meerkat_core::image_content::hydrate_messages_for_execution(
+                    blobs,
+                    &mut rows,
+                    meerkat_core::image_content::MissingBlobBehavior::Error,
+                )
+                .await
+                .expect("every image of the revision hydrates from the blob store");
+                let hydrated = serde_json::to_value(&rows).unwrap();
+                assert_eq!(
+                    hydrated,
+                    serde_json::to_value(rows_of(source)).unwrap(),
+                    "revision {revision}"
+                );
+                collect_image_media_types(&hydrated, &mut media_types);
+            }
+            media_types
+        }
+
+        fn collect_image_media_types(
+            value: &serde_json::Value,
+            media_types: &mut std::collections::BTreeSet<String>,
+        ) {
+            match value {
+                serde_json::Value::Object(object) => {
+                    if object.get("type").and_then(serde_json::Value::as_str) == Some("image")
+                        && let Some(media_type) =
+                            object.get("media_type").and_then(serde_json::Value::as_str)
+                    {
+                        media_types.insert(media_type.to_string());
+                    }
+                    for child in object.values() {
+                        collect_image_media_types(child, media_types);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        collect_image_media_types(item, media_types);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        /// Commit a turn, then a compaction, on the converted runtime at
+        /// `path`, each prepared as a restarted runtime prepares it, and
+        /// reopen the file.
+        async fn commit_a_turn_and_a_compaction(
+            path: &Path,
+            session_id: &meerkat_core::types::SessionId,
+        ) {
+            let store = SqliteRuntimeStore::new_head_canonical(path)
+                .expect("the converted file opens head-canonical");
+            let session_store = meta_093_co_located_session_store(path);
+            let observed_head = session_store
+                .load_head(session_id)
+                .await
+                .unwrap()
+                .expect("converted head");
+            let mut resumed = session_store
+                .load(session_id)
+                .await
+                .unwrap()
+                .expect("converted session");
+            resumed.push(Message::User(UserMessage::text(
+                "the first turn after the conversion",
+            )));
+            let mutation =
+                PreparedHeadCanonicalMutation::prepare(&resumed, Some(observed_head)).unwrap();
+            let boundary =
+                BoundSessionCommit::head_canonical_from_session(&resumed, mutation).unwrap();
+            store
+                .commit_prepared_session_boundary(
+                    &LogicalRuntimeId::for_session(session_id),
+                    PreparedRuntimeSessionCommit::snapshot_only(boundary),
+                )
+                .await
+                .expect("a turn commits on the converted runtime");
+            commit_a_rewrite_from_the_runtime_authority(&store, &session_store, session_id)
+                .await
+                .expect("the next compaction commits on the converted runtime");
+            drop(store);
+            SqliteRuntimeStore::new_head_canonical(path)
+                .expect("the converted file reopens after the compaction");
+        }
+
+        /// Base64 of a short payload distinct per `index`.
+        fn household_photo(index: usize) -> String {
+            format!("UE5H{index:08}")
+        }
+
+        fn household_image(media_type: &str, data: &str) -> meerkat_core::types::ContentBlock {
+            meerkat_core::types::ContentBlock::Image {
+                media_type: media_type.to_string(),
+                data: meerkat_core::types::ImageData::Inline {
+                    data: data.to_string(),
+                },
+            }
+        }
+
+        /// A camera tool call and its result carrying two snapshots, one
+        /// under a non-canonical media type, and an incoming comms notice
+        /// carrying a third.
+        fn household_camera_rows(turn: usize) -> Vec<Message> {
+            let call_id = format!("toolu_{turn}");
+            let comms: meerkat_core::types::SystemNoticeBlock =
+                serde_json::from_value(serde_json::json!({
+                    "type": "comms",
+                    "kind": "message",
+                    "direction": "incoming",
+                    "content": [household_image("image/jpeg", &household_photo(3 * turn + 2))],
+                }))
+                .unwrap();
+            vec![
+                Message::BlockAssistant(meerkat_core::types::BlockAssistantMessage::new(
+                    vec![meerkat_core::types::AssistantBlock::ToolUse {
+                        id: call_id.clone(),
+                        name: "camera_snapshot".to_string(),
+                        args: serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
+                        meta: None,
+                    }],
+                    meerkat_core::types::StopReason::ToolUse,
+                )),
+                Message::tool_results(vec![meerkat_core::types::ToolResult::with_blocks(
+                    call_id,
+                    vec![
+                        household_image("image/PNG", &household_photo(3 * turn)),
+                        household_image("image/png", &household_photo(3 * turn + 1)),
+                    ],
+                    false,
+                )]),
+                Message::SystemNotice(meerkat_core::types::SystemNoticeMessage::with_block(
+                    meerkat_core::types::SystemNoticeKind::Generic,
+                    None,
+                    comms,
+                )),
+            ]
+        }
+
+        /// Six rows of text, the shape each compaction of the loop leaves
+        /// behind.
+        fn household_compaction_replacement(turn: usize) -> Vec<Message> {
+            let mut rows = vec![Message::User(UserMessage::text(format!("summary {turn}")))];
+            for exchange in 0..2 {
+                rows.push(Message::User(UserMessage::text(format!(
+                    "question {turn}.{exchange}"
+                ))));
+                rows.push(Message::BlockAssistant(
+                    meerkat_core::types::BlockAssistantMessage::new(
+                        vec![meerkat_core::types::AssistantBlock::Text {
+                            text: format!("answer {turn}.{exchange}"),
+                            meta: None,
+                        }],
+                        meerkat_core::types::StopReason::EndTurn,
+                    ),
+                ));
+            }
+            rows.push(Message::User(UserMessage::text(format!("next {turn}"))));
+            rows
+        }
+
+        /// The long-lived household session a build that kept tool-result
+        /// images inline wrote: one prune edit, then thirteen compactions,
+        /// each swallowing the camera rows appended after the previous one,
+        /// one more batch of camera rows in the live tail, and the graph
+        /// retired to the default retention, so it is re-anchored.
+        fn re_anchored_household_session() -> Session {
+            let mut session = Session::new();
+            for (index, text) in ["hello", "prune me", "and me", "keep this"]
+                .into_iter()
+                .enumerate()
+            {
+                session.push(Message::User(UserMessage::text(text)));
+                session.push(Message::BlockAssistant(
+                    meerkat_core::types::BlockAssistantMessage::new(
+                        vec![meerkat_core::types::AssistantBlock::Text {
+                            text: format!("reply {index}"),
+                            meta: None,
+                        }],
+                        meerkat_core::types::StopReason::EndTurn,
+                    ),
+                ));
+            }
+            session
+                .commit_transcript_rewrite(
+                    TranscriptRewriteSelection::MessageRange { start: 2, end: 6 },
+                    vec![Message::User(UserMessage::text("pruned"))],
+                    TranscriptRewriteReason::new("prune"),
+                    Some("test".to_string()),
+                    None,
+                )
+                .unwrap();
+            session.push(Message::User(UserMessage::text("show me the cameras")));
+            for turn in 0..13 {
+                session.push_batch(household_camera_rows(turn));
+                let end = session.messages().len();
+                session
+                    .commit_transcript_rewrite(
+                        TranscriptRewriteSelection::MessageRange { start: 0, end },
+                        household_compaction_replacement(turn),
+                        TranscriptRewriteReason::new("compaction"),
+                        Some("test".to_string()),
+                        None,
+                    )
+                    .unwrap();
+            }
+            session.push_batch(household_camera_rows(13));
+            assert!(
+                session
+                    .retire_transcript_history(meerkat_core::TranscriptHistoryRetention::default())
+                    .unwrap()
+                    > 0,
+                "the fixture retires its oldest occurrences"
+            );
+            session
+        }
+
+        /// The household shape (a prune edit, then thirteen compactions
+        /// swallowing camera rows, re-anchored) converts into a filesystem
+        /// blob store. Its images carry non-canonical media type strings
+        /// ("image/PNG" in a tool result, "image/jpeg" in a comms notice).
+        /// After a cold reopen, every retained revision materializes from the
+        /// converted rows and hydrates from that store to the body's revision,
+        /// with each media type string as the body wrote it; the converted
+        /// runtime then commits a turn and a compaction and reopens.
+        #[tokio::test]
+        async fn a_re_anchored_household_session_converts_and_hydrates_from_the_blob_store() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("runtime.sqlite");
+            let session = re_anchored_household_session();
+            let state = session
+                .transcript_history_state()
+                .unwrap()
+                .expect("a compacted session has a graph");
+            assert_eq!(state.commits().count(), 14);
+            assert!(
+                state.retired_base().is_some(),
+                "the fixture's graph re-anchored"
+            );
+            let (_runtime_id, session_store) =
+                standalone_whole_blob_database(&path, &session).await;
+            drop(session_store);
+
+            let report = SqliteRuntimeStore::convert_standalone_whole_blob_in_place_with_media(
+                &path,
+                &meerkat_store::FsBlobStore::new(dir.path().join("blobs")),
+            )
+            .await
+            .expect("the household body converts");
+            assert_eq!((report.seeded_count(), report.derived_count()), (1, 0));
+
+            let blobs = meerkat_store::FsBlobStore::new(dir.path().join("blobs"));
+            let payloads = inline_image_payloads(&session);
+            for payload in &payloads {
+                assert_eq!(
+                    meerkat_core::BlobStore::get(&blobs, &payload.blob_id)
+                        .await
+                        .expect("the image is in the store")
+                        .data,
+                    payload.data
+                );
+            }
+            let media_types =
+                assert_retained_revisions_hydrate_from(&path, &blobs, &session, &payloads).await;
+            assert_eq!(
+                media_types,
+                ["image/PNG", "image/jpeg", "image/png"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+            );
+            commit_a_turn_and_a_compaction(&path, session.id()).await;
+        }
+
+        /// Rewrite every inline image under `value` into the blob reference a
+        /// 0.9.x host stored it as: the same content under other row bytes.
+        fn externalize_json_images(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(object) => {
+                    if object.get("type").and_then(serde_json::Value::as_str) == Some("image")
+                        && object.get("source").and_then(serde_json::Value::as_str)
+                            == Some("inline")
+                    {
+                        let media_type = object["media_type"].as_str().unwrap().to_string();
+                        let data = object["data"].as_str().unwrap().to_string();
+                        object.remove("data");
+                        object.insert("source".to_string(), "blob".into());
+                        object.insert(
+                            "blob_id".to_string(),
+                            serde_json::to_value(meerkat_core::content_blob_id(&media_type, &data))
+                                .unwrap(),
+                        );
+                        return;
+                    }
+                    for child in object.values_mut() {
+                        externalize_json_images(child);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        externalize_json_images(item);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        /// A rewrite whose parent advance is a content-addressed append that
+        /// carries inline images converts through the store's layout. The
+        /// host stored the first compaction's live rows as blob references
+        /// (the same content under other row bytes), then a tool result and a
+        /// comms notice with inline images arrived, and the second compaction
+        /// swallowed them. The conversion keeps the parent transitions; every
+        /// retained revision hydrates from the blob store to the body's; and
+        /// the converted runtime commits a turn and a compaction.
+        #[tokio::test]
+        async fn a_content_addressed_append_carrying_inline_images_converts() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("runtime.sqlite");
+            let blobs = meerkat_store::FsBlobStore::new(dir.path().join("blobs"));
+            let mut session = Session::new();
+            session.push(Message::User(UserMessage::text("start")));
+            session.push(tool_result_images(ROUND_IMAGES[0], ROUND_IMAGES[1]));
+            session.push(Message::User(UserMessage::text("and then")));
+            session
+                .commit_transcript_rewrite(
+                    TranscriptRewriteSelection::MessageRange { start: 0, end: 2 },
+                    vec![
+                        Message::User(UserMessage::text("summary")),
+                        Message::User(UserMessage::with_blocks(vec![inline_png(ROUND_IMAGES[2])])),
+                    ],
+                    TranscriptRewriteReason::new("compaction"),
+                    Some("test".to_string()),
+                    None,
+                )
+                .unwrap();
+            // The host stored the live rows' images as blobs.
+            meerkat_core::BlobStore::put_image(&blobs, "image/png", ROUND_IMAGES[2])
+                .await
+                .unwrap();
+            let mut document = serde_json::to_value(&session).unwrap();
+            externalize_json_images(&mut document["messages"]);
+            let mut session: Session = serde_json::from_value(document).unwrap();
+            session.push(tool_result_images(ROUND_IMAGES[3], ROUND_IMAGES[4]));
+            session.push(comms_notice_image(ROUND_IMAGES[5]));
+            session.push(Message::User(UserMessage::text("what changed?")));
+            let end = session.messages().len() - 1;
+            session
+                .commit_transcript_rewrite(
+                    TranscriptRewriteSelection::MessageRange { start: 0, end },
+                    vec![Message::User(UserMessage::text("summary of both"))],
+                    TranscriptRewriteReason::new("compaction"),
+                    Some("test".to_string()),
+                    None,
+                )
+                .unwrap();
+            let transitions = session
+                .transcript_history_state()
+                .unwrap()
+                .expect("a compacted session has a graph")
+                .parent_transitions();
+            assert_eq!(
+                transitions[1],
+                meerkat_core::TranscriptRewriteParentTransition::ContentAddressedAppend
+            );
+            let payloads = inline_image_payloads(&session);
+            assert!(
+                payloads
+                    .iter()
+                    .any(|payload| payload.data == ROUND_IMAGES[3]),
+                "the content-addressed append carries an inline image"
+            );
+            let (_runtime_id, session_store) =
+                standalone_whole_blob_database(&path, &session).await;
+
+            let report = SqliteRuntimeStore::convert_standalone_whole_blob_in_place_with_media(
+                &path, &blobs,
+            )
+            .await
+            .expect("a content-addressed append with inline images converts");
+            assert_eq!((report.seeded_count(), report.derived_count()), (1, 0));
+            let converted = session_store
+                .load(session.id())
+                .await
+                .unwrap()
+                .expect("converted session");
+            assert_eq!(
+                converted
+                    .transcript_history_state()
+                    .unwrap()
+                    .expect("the converted session has a graph")
+                    .parent_transitions(),
+                transitions
+            );
+            assert_eq!(
+                converted.transcript_revision().unwrap(),
+                session.transcript_revision().unwrap()
+            );
+            assert_retained_revisions_hydrate_from(&path, &blobs, &session, &payloads).await;
+            commit_a_turn_and_a_compaction(&path, session.id()).await;
+        }
+
+        /// A WholeBlob body that holds inline video beside inline images
+        /// converts: the images move into the blob store and the clips stay
+        /// row content (video has no blob form). Every retained revision
+        /// hydrates from the store to the body's, clips included, and the
+        /// converted runtime commits a turn and a compaction.
+        #[tokio::test]
+        async fn a_whole_blob_session_with_inline_video_and_images_converts() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("runtime.sqlite");
+            let clips = ["TVA0IGE=", "TVA0IGI=", "TVA0IGM=", "TVA0IGQ="];
+            let mut session = Session::new();
+            session.push(inline_mp4(clips[0]));
+            session.push(tool_result_images(ROUND_IMAGES[0], ROUND_IMAGES[1]));
+            session.push(Message::User(UserMessage::text("what happens in them?")));
+            session
+                .commit_transcript_rewrite(
+                    TranscriptRewriteSelection::MessageRange { start: 0, end: 2 },
+                    vec![
+                        Message::User(UserMessage::text("summary of the first clip")),
+                        inline_mp4(clips[1]),
+                        Message::User(UserMessage::with_blocks(vec![inline_png(ROUND_IMAGES[2])])),
+                    ],
+                    TranscriptRewriteReason::new("compaction"),
+                    Some("test".to_string()),
+                    None,
+                )
+                .unwrap();
+            session.push(inline_mp4(clips[2]));
+            session.push(comms_notice_image(ROUND_IMAGES[3]));
+            let end = session.messages().len() - 1;
+            session
+                .commit_transcript_rewrite(
+                    TranscriptRewriteSelection::MessageRange { start: 0, end },
+                    vec![Message::User(UserMessage::text("summary of both"))],
+                    TranscriptRewriteReason::new("compaction"),
+                    Some("test".to_string()),
+                    None,
+                )
+                .unwrap();
+            session.push(Message::User(UserMessage::with_blocks(vec![
+                inline_mp4_block(clips[3]),
+                inline_png(ROUND_IMAGES[4]),
+            ])));
+            let (_runtime_id, session_store) =
+                standalone_whole_blob_database(&path, &session).await;
+            let blobs = meerkat_store::FsBlobStore::new(dir.path().join("blobs"));
+
+            let report = SqliteRuntimeStore::convert_standalone_whole_blob_in_place_with_media(
+                &path, &blobs,
+            )
+            .await
+            .expect("a body with inline video and images converts");
+            assert_eq!((report.seeded_count(), report.derived_count()), (1, 0));
+            let payloads = inline_image_payloads(&session);
+            assert_eq!(payloads.len(), 5);
+            let converted = serde_json::to_string(
+                &session_store
+                    .load(session.id())
+                    .await
+                    .unwrap()
+                    .expect("converted session"),
+            )
+            .unwrap();
+            for clip in clips {
+                assert!(
+                    converted.contains(clip),
+                    "the clip {clip} stays row content"
+                );
+            }
+            for payload in &payloads {
+                assert!(
+                    !converted.contains(payload.data.as_str()),
+                    "the image {} is not inline",
+                    payload.data
+                );
+            }
+            assert_retained_revisions_hydrate_from(&path, &blobs, &session, &payloads).await;
+            commit_a_turn_and_a_compaction(&path, session.id()).await;
+        }
+
         /// A compacted WholeBlob body whose transcript holds inline video
         /// (in the anchor, a rewrite's replacement, a later rewrite's parent
         /// advance and the live tail, beside a blob-stored image) converts
