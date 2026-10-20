@@ -10212,9 +10212,8 @@ pub trait RuntimeStore: Send + Sync {
 pub use memory::InMemoryRuntimeStore;
 #[cfg(feature = "sqlite-store")]
 pub use sqlite::{
-    SqliteRuntimeStore, StandaloneWholeBlobConversionReport, StandaloneWholeBlobMediaRuntime,
-    StandaloneWholeBlobMediaStage, StandaloneWholeBlobRuntimeConversion,
-    StandaloneWholeBlobSessionSource,
+    SqliteRuntimeStore, StandaloneWholeBlobConversionReport, StandaloneWholeBlobRuntimeConversion,
+    StandaloneWholeBlobSessionSource, WholeBlobMediaRuntime, WholeBlobMediaStage,
 };
 
 #[cfg(test)]
