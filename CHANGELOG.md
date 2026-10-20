@@ -1272,6 +1272,15 @@ them.
   tasks. A fence implementation or decorator outside Meerkat needs nothing
   new; one that forwards fenced calls may forward this entry as well.
 
+- `meerkat-runtime`: `SqliteRuntimeStore::convert_standalone_whole_blob_in_place_with_media`
+  converts a standalone WholeBlob database whose bodies hold inline images,
+  with the realm blob store the converted runtimes hydrate from. Its two steps
+  are public for a host that makes the blob store's writes durable between
+  them: `stage_standalone_whole_blob_media` stores the images and writes
+  nothing to the database (it returns a `StandaloneWholeBlobMediaStage`), and
+  `convert_standalone_whole_blob_in_place_with_staged_media` converts with
+  them.
+
 ### Changed
 
 - `meerkat`: `PersistenceBundle::require_hosting_mode(HostingMode::Multiprocess)`
@@ -2568,6 +2577,19 @@ them.
   inline media"). Rewrites and the conversion now keep inline video as row
   content, byte for byte; inline images still move to the blob store before
   they become rows.
+
+- `meerkat-runtime`: a compacted 0.9.3 session that holds inline images
+  converts to the head-canonical profile. Its WholeBlob body keeps those
+  images inline in its transcript graph (the anchor, rewrite replacements and
+  parent advances, across user messages, tool results and comms notices), and
+  the conversion refused it ("compact rewrite delta carries inline media").
+  `SqliteRuntimeStore::convert_standalone_whole_blob_in_place_with_media` now
+  first stores every such image in the realm blob store under its content
+  address, then seeds the session with those images as blob references; the
+  transcript revision and the rewrite commits stay the body's, and the
+  WholeBlob body is kept as it was. A crash during or between the two steps
+  leaves each runtime converted or untouched, and running the conversion again
+  finishes the rest.
 
 ### Known limitations
 
