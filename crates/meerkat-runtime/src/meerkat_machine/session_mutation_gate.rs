@@ -47,7 +47,9 @@ pub(crate) struct WeakSessionMutationGate {
     durability_health: Option<DurabilityHealthHandle>,
 }
 
-/// How a helper that serves both kinds of waiter takes the gate.
+/// How a helper that serves both kinds of waiter takes the gate. Only the
+/// live lifecycle lease's gate helper serves both, so it exists with `live`.
+#[cfg(feature = "live")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SessionMutationGateWait {
     /// [`SessionMutationGate::lock_live`].
