@@ -801,6 +801,17 @@ pub(crate) mod test_support {
                 .await
         }
 
+        async fn signal_turn_failed(
+            &self,
+            _session_id: &SessionId,
+            response_id: Option<&str>,
+            _failure: &meerkat_core::live_adapter::LiveResponseFailure,
+            _accounting: meerkat_core::live_adapter::LiveResponseAccounting,
+        ) -> Result<(), LiveProjectionError> {
+            self.write("turn_failed", response_id.unwrap_or_default(), false)
+                .await
+        }
+
         async fn signal_terminal_error(
             &self,
             _session_id: &SessionId,
