@@ -268,7 +268,7 @@ them.
   `RuntimeDriverError::RecoveryRepairBlocked` until the store answers, then
   replaces the registration from durable truth. A mob member's tracked turn
   stays pending on either failure, as on `AuthorityUnavailable`, and a
-  scheduled delivery records `RuntimeCompletionAuthorityUnavailable`.
+  scheduled delivery waits for the input's own terminal outcome (below).
 - `meerkat-schedule`, `meerkat`: a scheduled occurrence's terminal now comes
   only from its delivered input's own terminal outcome. A reclaim whose
   redelivery the target deduplicated (it had admitted the same stable
@@ -295,6 +295,23 @@ them.
     yet, the occurrence ended `delivery_failed` at once; it now waits under
     the same bound. Nothing reclaims an occurrence while it waits, so the
     wait does not depend on the misfire policy.
+- `meerkat`: a runtime-backed scheduled delivery whose completion wait fails
+  with `CompletionWaitError::BoundaryRolledBack` or
+  `CompletionWaitError::DurableOutcomeUnknown` no longer ends
+  `delivery_failed` with `runtime_completion_authority_unavailable` from
+  that wait failure. Either failure leaves the input durably admitted with
+  its outcome still to come: it runs again after its session reloads, or its
+  stalled commit lands. The occurrence keeps its lease and re-reads the
+  input's own terminal outcome under the bound above (5 lease periods), then
+  ends with that outcome: `completed`, or `delivery_failed` with the input's
+  failure class. At the bound it ends `delivery_failed` with
+  `runtime_completion_authority_unavailable`, and the detail names the bound
+  and the last cause. Nothing in the wait reloads the session: a reload comes
+  from the session's own traffic (the next delivery or input through its
+  host, or a mob's `reload_member_registration`). Every other wait failure
+  still ends the occurrence at once, and so does a dispatch built with
+  `AcceptedScheduledInput::with_runtime_handle`, which names no input to
+  read.
 
 ### Fixed
 

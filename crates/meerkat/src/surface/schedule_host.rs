@@ -87,7 +87,15 @@ struct ResolvedScheduledSession {
 
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 enum AcceptedScheduledInputCompletion {
-    Handle(CompletionHandle),
+    /// The admitted input's live completion. `outcome_read` reads the
+    /// input's own terminal when the wait fails with a rolled-back boundary
+    /// or an unknown durable outcome
+    /// ([`completion_after_wait_failure`]); a handle built without its input
+    /// has none.
+    Handle {
+        wait: AdmittedCompletionWait,
+        outcome_read: Option<AdmittedInputOutcomeRead>,
+    },
     Terminal(CompletionOutcome),
     AuthorityUnavailable {
         detail: String,
@@ -125,11 +133,20 @@ pub struct AcceptedScheduledInput {
 }
 
 impl AcceptedScheduledInput {
+    /// An admission whose completion is `handle`. The handle alone names no
+    /// input to read, so a wait that fails ends the delivery with that
+    /// failure, a rolled-back boundary or an unknown durable outcome
+    /// included. The runtime-backed hosts admit through
+    /// [`runtime_delivery_dispatch_from_admission`], which reads the input's
+    /// own terminal on those two failures instead.
     pub fn with_runtime_handle(correlation_id: Option<String>, handle: CompletionHandle) -> Self {
         Self {
             correlation_id,
             admission_outcome: ScheduleAdmissionOutcome::Accepted,
-            completion: AcceptedScheduledInputCompletion::Handle(handle),
+            completion: AcceptedScheduledInputCompletion::Handle {
+                wait: Box::pin(handle.try_wait()),
+                outcome_read: None,
+            },
         }
     }
 
@@ -1966,7 +1983,7 @@ fn schedule_completion_from_runtime_completion(
 ) -> DeliveryCompletion {
     Box::pin(async move {
         let outcome = match completion {
-            AcceptedScheduledInputCompletion::Handle(handle) => match handle.try_wait().await {
+            AcceptedScheduledInputCompletion::Handle { wait, outcome_read } => match wait.await {
                 Ok(outcome) => outcome,
                 // The input's known status, from the body-free generated
                 // observation; its result or callback arguments are withheld
@@ -1989,12 +2006,7 @@ fn schedule_completion_from_runtime_completion(
                     };
                     return Ok(DeliveryTerminal::runtime_completion(outcome, None, None));
                 }
-                Err(error) => {
-                    return Err(ScheduleDomainError::DeliveryCompletionFailed {
-                        reason: completion_wait_failure_reason(&error),
-                        detail: format!("runtime completion authority unavailable: {error}"),
-                    });
-                }
+                Err(error) => completion_after_wait_failure(error, outcome_read).await?,
             },
             AcceptedScheduledInputCompletion::Terminal(terminal) => {
                 return Ok(delivery_terminal_from_completion_outcome(
@@ -2022,6 +2034,52 @@ fn authority_unavailable_completion(detail: String) -> ScheduleDomainError {
         reason: DeliveryCompletionFailureReason::RuntimeCompletionAuthorityUnavailable,
         detail,
     }
+}
+
+/// The delivery failure a failed live wait records when nothing reads past
+/// it.
+fn wait_failure_completion(error: &CompletionWaitError) -> ScheduleDomainError {
+    ScheduleDomainError::DeliveryCompletionFailed {
+        reason: completion_wait_failure_reason(error),
+        detail: format!("runtime completion authority unavailable: {error}"),
+    }
+}
+
+/// The completion of a live wait that failed.
+///
+/// A rolled-back boundary ([`CompletionWaitError::BoundaryRolledBack`]) or an
+/// unknown durable outcome ([`CompletionWaitError::DurableOutcomeUnknown`])
+/// leaves the input durably admitted with its terminal still to come: it runs
+/// again after its session reloads, or its stalled commit lands. Neither
+/// failure is the input's outcome, so when the host knows the input
+/// (`outcome_read`), the completion reads the input's own terminal through
+/// the bounded re-read loop ([`reread_admitted_input_outcome`]), under the
+/// driver's lease renewal, and resolves the occurrence from it; at the bound
+/// it ends delivery_failed with runtime_completion_authority_unavailable.
+/// Every other wait failure ends the delivery with that failure at once.
+#[cfg(not(target_arch = "wasm32"))]
+async fn completion_after_wait_failure(
+    error: CompletionWaitError,
+    outcome_read: Option<AdmittedInputOutcomeRead>,
+) -> Result<CompletionOutcome, ScheduleDomainError> {
+    match outcome_read {
+        Some(outcome_read)
+            if error.is_boundary_rolled_back() || error.is_durable_outcome_unknown() =>
+        {
+            reread_admitted_input_outcome(outcome_read.into_reread(error.to_string())).await
+        }
+        _ => Err(wait_failure_completion(&error)),
+    }
+}
+
+/// Browser builds run no schedule driver, so no lease is renewed across a
+/// re-read there: a failed wait ends the delivery with its failure.
+#[cfg(target_arch = "wasm32")]
+async fn completion_after_wait_failure(
+    error: CompletionWaitError,
+    _outcome_read: Option<AdmittedInputOutcomeRead>,
+) -> Result<CompletionOutcome, ScheduleDomainError> {
+    Err(wait_failure_completion(&error))
 }
 
 fn completion_wait_failure_reason(error: &CompletionWaitError) -> DeliveryCompletionFailureReason {
@@ -2258,6 +2316,35 @@ type AdmittedOutcomeReadFuture = Pin<Box<dyn Future<Output = AdmittedOutcomeAnsw
 /// The read the bounded re-read loop calls for each round: the runtime's
 /// read in production, a scripted one in tests.
 type AdmittedOutcomeReadFn = Box<dyn FnMut() -> AdmittedOutcomeReadFuture + Send>;
+
+/// One wait on an admitted input's live completion: the runtime handle's
+/// [`CompletionHandle::try_wait`] in production, a scripted wait in tests.
+type AdmittedCompletionWait =
+    Pin<Box<dyn Future<Output = Result<CompletionOutcome, CompletionWaitError>> + Send>>;
+
+/// How to read one admitted input's own terminal past a live wait that
+/// failed without saying it: the input, the bounds of the wait and the read.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+struct AdmittedInputOutcomeRead {
+    input_id: InputId,
+    bounds: AdmittedOutcomeRereadBounds,
+    read: AdmittedOutcomeReadFn,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl AdmittedInputOutcomeRead {
+    /// The bounded re-read loop's input for a wait that failed with
+    /// `first_cause`. The overall bound counts from now.
+    fn into_reread(self, first_cause: String) -> AdmittedOutcomeReread {
+        AdmittedOutcomeReread {
+            input_id: self.input_id,
+            started: meerkat_core::time_compat::Instant::now(),
+            first_cause,
+            bounds: self.bounds,
+            read: self.read,
+        }
+    }
+}
 
 /// The bounds of one wait for an admitted input's readable outcome.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -2509,6 +2596,12 @@ fn runtime_admitted_outcome_read(
 /// - any other typed error (the input ended without a public completion,
 ///   its receipt cannot be read, the runtime does not know it):
 ///   delivery_failed with runtime_completion_authority_unavailable at once.
+///
+/// With a live completion handle the occurrence resolves from the handle's
+/// outcome. A wait on it that fails with a rolled-back boundary or an
+/// unknown durable outcome leaves the input admitted with its terminal still
+/// to come, so the completion reads that terminal through the same bounded
+/// loop instead of recording the wait failure.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub async fn runtime_delivery_dispatch_from_admission(
     runtime_adapter: &MeerkatMachine,
@@ -2548,7 +2641,23 @@ pub async fn runtime_delivery_dispatch_from_admission(
     let correlation_id = Some(identity.correlation_id.clone());
 
     let accepted = match handle {
-        Some(handle) => AcceptedScheduledInput::with_runtime_handle(correlation_id.clone(), handle),
+        Some(handle) => {
+            // A wait that fails with a rolled-back boundary or an unknown
+            // durable outcome reads this input's own terminal.
+            let read = runtime_admitted_outcome_read(runtime_adapter, session_id, &input_id);
+            AcceptedScheduledInput {
+                correlation_id: correlation_id.clone(),
+                admission_outcome: ScheduleAdmissionOutcome::Accepted,
+                completion: AcceptedScheduledInputCompletion::Handle {
+                    wait: Box::pin(handle.try_wait()),
+                    outcome_read: Some(AdmittedInputOutcomeRead {
+                        input_id,
+                        bounds: AdmittedOutcomeRereadBounds::for_host(),
+                        read,
+                    }),
+                },
+            }
+        }
         None => {
             let read = runtime_admitted_outcome_read(runtime_adapter, session_id, &input_id);
             AcceptedScheduledInput {
@@ -6273,7 +6382,7 @@ mod tests {
                 AcceptedScheduledInputCompletion::AuthorityUnavailable { .. } => {
                     AuthorityUnavailable
                 }
-                AcceptedScheduledInputCompletion::Handle(_) => {
+                AcceptedScheduledInputCompletion::Handle { .. } => {
                     panic!("{row}: the fallback read never yields a live handle")
                 }
             };
@@ -6325,8 +6434,12 @@ mod tests {
     /// A delivery that admits each occurrence once, as the runtime does
     /// without a live completion handle. Its completion is the host's own
     /// admitted-outcome completion over the scripted read `read` builds.
+    /// With `wait_failure` it admits with a live completion instead, whose
+    /// wait fails with that error, and `read` reads the input's own terminal
+    /// past it, as [`runtime_delivery_dispatch_from_admission`] wires it.
     struct ScriptedAdmissionDelivery {
         admission_outcome: ScheduleAdmissionOutcome,
+        wait_failure: Option<CompletionWaitError>,
         read: Box<dyn Fn() -> AdmittedOutcomeReadFn + Send + Sync>,
         admissions: AtomicUsize,
     }
@@ -6349,12 +6462,24 @@ mod tests {
             identity: &ScheduleDeliveryIdentity,
         ) -> Result<DeliveryDispatch, ScheduleDomainError> {
             self.admissions.fetch_add(1, Ordering::SeqCst);
-            let completion = admitted_input_completion(
-                InputId::new(),
-                AdmittedOutcomeRereadBounds::for_host(),
-                (self.read)(),
-            )
-            .await;
+            let completion = match self.wait_failure.clone() {
+                Some(error) => AcceptedScheduledInputCompletion::Handle {
+                    wait: Box::pin(async move { Err(error) }),
+                    outcome_read: Some(AdmittedInputOutcomeRead {
+                        input_id: InputId::new(),
+                        bounds: AdmittedOutcomeRereadBounds::for_host(),
+                        read: (self.read)(),
+                    }),
+                },
+                None => {
+                    admitted_input_completion(
+                        InputId::new(),
+                        AdmittedOutcomeRereadBounds::for_host(),
+                        (self.read)(),
+                    )
+                    .await
+                }
+            };
             Ok(build_dispatch_from_accepted(
                 occurrence,
                 AcceptedScheduledInput {
@@ -6526,6 +6651,7 @@ mod tests {
     fn always_not_yet_readable() -> ScriptedAdmissionDelivery {
         ScriptedAdmissionDelivery {
             admission_outcome: ScheduleAdmissionOutcome::Deduplicated,
+            wait_failure: None,
             read: Box::new(|| {
                 scripted_outcome_read(Arc::new(AtomicUsize::new(0)), |_| Some(Ok(None)))
             }),
@@ -6576,6 +6702,7 @@ mod tests {
         let read_degraded = Arc::clone(&degraded);
         let delivery = ScriptedAdmissionDelivery {
             admission_outcome: ScheduleAdmissionOutcome::Deduplicated,
+            wait_failure: None,
             read: Box::new(move || {
                 let degraded = Arc::clone(&read_degraded);
                 scripted_outcome_read(Arc::new(AtomicUsize::new(0)), move |_| {
@@ -6643,6 +6770,7 @@ mod tests {
         let counted = Arc::clone(&reads);
         let delivery = ScriptedAdmissionDelivery {
             admission_outcome: ScheduleAdmissionOutcome::Deduplicated,
+            wait_failure: None,
             read: Box::new(move || {
                 scripted_outcome_read(Arc::clone(&counted), |_| {
                     Some(Err(RuntimeDriverError::Internal(
@@ -6674,6 +6802,7 @@ mod tests {
         let counted = Arc::clone(&reads);
         let delivery = ScriptedAdmissionDelivery {
             admission_outcome: ScheduleAdmissionOutcome::Deduplicated,
+            wait_failure: None,
             read: Box::new(move || {
                 scripted_outcome_read(Arc::clone(&counted), |call| {
                     if call < 3 {
@@ -6697,5 +6826,286 @@ mod tests {
         assert_eq!(run.occurrence.failure_class, None);
         assert_eq!(run.occurrence.attempt_count, 1);
         assert_eq!(reads.load(Ordering::SeqCst), 4);
+    }
+
+    // --- A live wait that fails without saying the input's outcome ---
+    //
+    // A run whose boundary commit rolled back (`BoundaryRolledBack`) or whose
+    // durable outcome is unknown (`DurableOutcomeUnknown`) fails its live
+    // completion waiters. The input stays admitted and reaches its own
+    // terminal after its session reloads. These tests script the failed wait
+    // and the reads of the input's terminal that follow it.
+
+    fn rolled_back_boundary() -> CompletionWaitError {
+        CompletionWaitError::BoundaryRolledBack {
+            run_id: meerkat_core::lifecycle::RunId::new(),
+            detail: "the store rejected the boundary commit".to_string(),
+        }
+    }
+
+    fn unknown_durable_outcome() -> CompletionWaitError {
+        CompletionWaitError::DurableOutcomeUnknown {
+            run_id: meerkat_core::lifecycle::RunId::new(),
+        }
+    }
+
+    /// Which wait failures read the input's own terminal: a rolled-back
+    /// boundary and an unknown durable outcome, when the host knows the
+    /// input. Every other wait failure, and a handle built without its input
+    /// (`AcceptedScheduledInput::with_runtime_handle`), ends the delivery with
+    /// the wait failure at once, with no read.
+    #[tokio::test]
+    async fn only_a_rolled_back_or_unknown_wait_reads_the_inputs_terminal() {
+        use DeliveryCompletionFailureReason::{
+            RuntimeCompletionAuthorityUnavailable, RuntimeCompletionChannelClosed,
+        };
+
+        let rows: Vec<(
+            &str,
+            CompletionWaitError,
+            bool,
+            Option<DeliveryCompletionFailureReason>,
+        )> = vec![
+            ("a rolled-back boundary", rolled_back_boundary(), true, None),
+            (
+                "an unknown durable outcome",
+                unknown_durable_outcome(),
+                true,
+                None,
+            ),
+            (
+                "a rolled-back boundary without its input",
+                rolled_back_boundary(),
+                false,
+                Some(RuntimeCompletionAuthorityUnavailable),
+            ),
+            (
+                "an unknown durable outcome without its input",
+                unknown_durable_outcome(),
+                false,
+                Some(RuntimeCompletionAuthorityUnavailable),
+            ),
+            (
+                "a closed channel",
+                CompletionWaitError::ChannelClosed,
+                true,
+                Some(RuntimeCompletionChannelClosed),
+            ),
+            (
+                "a replaced attachment",
+                CompletionWaitError::AttachmentReplaced,
+                true,
+                Some(RuntimeCompletionAuthorityUnavailable),
+            ),
+            (
+                "unavailable authority",
+                CompletionWaitError::AuthorityUnavailable("no completion authority".to_string()),
+                true,
+                Some(RuntimeCompletionAuthorityUnavailable),
+            ),
+        ];
+
+        let occurrence = sample_occurrence();
+        for (row, error, knows_input, immediate) in rows {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let outcome_read = knows_input.then(|| AdmittedInputOutcomeRead {
+                input_id: InputId::new(),
+                bounds: AdmittedOutcomeRereadBounds::for_host(),
+                read: scripted_outcome_read(Arc::clone(&calls), |_| {
+                    Some(Ok(Some(CompletionOutcome::CompletedWithoutResult)))
+                }),
+            });
+            let wait_error = error.clone();
+            let accepted = AcceptedScheduledInput {
+                correlation_id: Some("stable-correlation".to_string()),
+                admission_outcome: ScheduleAdmissionOutcome::Accepted,
+                completion: AcceptedScheduledInputCompletion::Handle {
+                    wait: Box::pin(async move { Err(wait_error) }),
+                    outcome_read,
+                },
+            };
+            let result = build_dispatch_from_accepted(&occurrence, accepted, None)
+                .completion
+                .await;
+            match immediate {
+                None => {
+                    let terminal = result.unwrap_or_else(|failure| {
+                        panic!("{row}: the input's own terminal resolves it: {failure}")
+                    });
+                    assert_eq!(
+                        terminal.runtime_completion_outcome,
+                        Some(meerkat_schedule::RuntimeCompletionOutcome::Completed),
+                        "{row}"
+                    );
+                    assert_eq!(
+                        calls.load(Ordering::SeqCst),
+                        1,
+                        "{row}: one read after the failed wait"
+                    );
+                }
+                Some(expected_reason) => {
+                    match result {
+                        Err(ScheduleDomainError::DeliveryCompletionFailed { reason, detail }) => {
+                            assert_eq!(reason, expected_reason, "{row}");
+                            assert!(
+                                detail.contains(&error.to_string()),
+                                "{row}: the detail names the wait failure: {detail}"
+                            );
+                        }
+                        other => panic!("{row}: expected the wait failure, got {other:?}"),
+                    }
+                    assert_eq!(calls.load(Ordering::SeqCst), 0, "{row}: no read");
+                }
+            }
+        }
+    }
+
+    /// A delivery admitted with a live completion whose wait fails with
+    /// `wait_failure`; the reads of the input's terminal that follow answer
+    /// `answer`, which gets the number of earlier reads.
+    fn failed_wait_delivery(
+        wait_failure: CompletionWaitError,
+        reads: Arc<AtomicUsize>,
+        answer: impl Fn(usize) -> Option<AdmittedOutcomeAnswer> + Clone + Send + Sync + 'static,
+    ) -> ScriptedAdmissionDelivery {
+        ScriptedAdmissionDelivery {
+            admission_outcome: ScheduleAdmissionOutcome::Accepted,
+            wait_failure: Some(wait_failure),
+            read: Box::new(move || scripted_outcome_read(Arc::clone(&reads), answer.clone())),
+            admissions: AtomicUsize::new(0),
+        }
+    }
+
+    /// No proven terminal on the first two reads (the session reloads and the
+    /// input runs again), then `terminal`.
+    fn terminal_after_the_reload(
+        terminal: CompletionOutcome,
+    ) -> impl Fn(usize) -> Option<AdmittedOutcomeAnswer> + Clone + Send + Sync + 'static {
+        move |read| {
+            if read < 2 {
+                Some(Ok(None))
+            } else {
+                Some(Ok(Some(terminal.clone())))
+            }
+        }
+    }
+
+    /// A scheduled delivery whose run's boundary commit was rejected.
+    /// The input stays admitted, runs again after its session reloads and
+    /// fails there. The occurrence ends with the input's own failed terminal
+    /// (runtime_rejected, with the input's detail), never with the wait
+    /// failure (internal_error, naming the rolled-back boundary).
+    #[tokio::test]
+    async fn rolled_back_boundary_ends_with_the_inputs_later_failed_terminal() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let delivery = failed_wait_delivery(
+            rolled_back_boundary(),
+            Arc::clone(&reads),
+            terminal_after_the_reload(CompletionOutcome::Abandoned {
+                reason: "the input failed after the reload".to_string(),
+                error: meerkat_core::TurnErrorMetadata::runtime_apply_failure(
+                    "the input failed after the reload",
+                ),
+            }),
+        );
+        let run = run_admitted_outcome_occurrence(
+            meerkat_schedule::MisfirePolicy::Skip,
+            chrono::Utc::now() - ChronoDuration::seconds(1),
+            delivery,
+        )
+        .await;
+        assert_eq!(run.occurrence.phase, OccurrencePhase::DeliveryFailed);
+        assert_eq!(
+            run.occurrence.failure_class,
+            Some(OccurrenceFailureClass::RuntimeRejected),
+            "the input's own failure, not the wait failure's internal_error"
+        );
+        let detail = run.occurrence.failure_detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("the input failed after the reload"),
+            "the detail is the input's own: {detail}"
+        );
+        assert!(
+            !detail.contains("rolled back"),
+            "the wait failure is not the occurrence's outcome: {detail}"
+        );
+        assert_eq!(run.occurrence.attempt_count, 1);
+        assert_eq!(run.admissions, 1);
+        assert_eq!(reads.load(Ordering::SeqCst), 3);
+    }
+
+    /// The same, and the input succeeds after the reload: the occurrence
+    /// completes.
+    #[tokio::test]
+    async fn rolled_back_boundary_ends_completed_when_the_input_later_succeeds() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let delivery = failed_wait_delivery(
+            rolled_back_boundary(),
+            Arc::clone(&reads),
+            terminal_after_the_reload(CompletionOutcome::CompletedWithoutResult),
+        );
+        let run = run_admitted_outcome_occurrence(
+            meerkat_schedule::MisfirePolicy::Skip,
+            chrono::Utc::now() - ChronoDuration::seconds(1),
+            delivery,
+        )
+        .await;
+        assert_eq!(run.occurrence.phase, OccurrencePhase::Completed);
+        assert_eq!(run.occurrence.failure_class, None);
+        assert_eq!(run.occurrence.attempt_count, 1);
+        assert_eq!(run.admissions, 1);
+        assert_eq!(reads.load(Ordering::SeqCst), 3);
+    }
+
+    /// An unknown durable outcome: the commit past its deadline still
+    /// holds the degraded session's driver, so the reads answer
+    /// InputTerminalNotYetReadable until the store answers and the reload
+    /// settles the run; then the input's terminal resolves the occurrence.
+    #[tokio::test]
+    async fn unknown_durable_outcome_ends_with_the_inputs_terminal_once_readable() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let delivery =
+            failed_wait_delivery(unknown_durable_outcome(), Arc::clone(&reads), |read| {
+                if read < 2 {
+                    Some(Err(RuntimeDriverError::InputTerminalNotYetReadable {
+                        input_id: InputId::new(),
+                        reason: "the terminal is not known yet".to_string(),
+                    }))
+                } else {
+                    Some(Ok(Some(CompletionOutcome::CompletedWithoutResult)))
+                }
+            });
+        let run = run_admitted_outcome_occurrence(
+            meerkat_schedule::MisfirePolicy::Skip,
+            chrono::Utc::now() - ChronoDuration::seconds(1),
+            delivery,
+        )
+        .await;
+        assert_eq!(run.occurrence.phase, OccurrencePhase::Completed);
+        assert_eq!(run.occurrence.failure_class, None);
+        assert_eq!(run.occurrence.attempt_count, 1);
+        assert_eq!(reads.load(Ordering::SeqCst), 3);
+    }
+
+    /// At the bound: a rolled-back boundary whose session no traffic
+    /// reloads within the bound. The input's terminal never becomes
+    /// readable, and the occurrence ends with the loop's typed end, under
+    /// the Skip policy row: never misfired, one attempt, no row fault.
+    #[tokio::test]
+    async fn rolled_back_boundary_whose_input_stays_unreadable_ends_typed_at_the_bound() {
+        let due_at_utc = chrono::Utc::now() - ChronoDuration::seconds(30)
+            + ChronoDuration::from_std(POLICY_ROW_MISFIRE_WINDOW).expect("window");
+        let delivery = failed_wait_delivery(
+            rolled_back_boundary(),
+            Arc::new(AtomicUsize::new(0)),
+            |_| Some(Ok(None)),
+        );
+        let run = run_admitted_outcome_occurrence(
+            meerkat_schedule::MisfirePolicy::Skip,
+            due_at_utc,
+            delivery,
+        )
+        .await;
+        assert_ended_at_the_bound(&run, "no finalized receipt yet");
     }
 }
