@@ -326,7 +326,7 @@ fn on_env_default_route(
             provider: selection.provider(),
             self_hosted_server_id: None,
             provider_params: None,
-            auth_binding: recorded_binding.then(|| meerkat_core::AuthBindingRef {
+            auth_binding: recorded_binding.then_some(meerkat_core::AuthBindingRef {
                 origin: meerkat_core::BindingOrigin::Configured,
                 ..env_default
             }),
