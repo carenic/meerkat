@@ -5648,11 +5648,25 @@ pub mod tests {
             McpStdioWitnessOutcome::Closed(McpStdioClosePhase::Eof)
         );
         assert_eq!((receipt.sigterm, receipt.sigkill), (None, None));
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(
             receipt.final_group_signal,
             Some(McpStdioSignalOutcome::Sent),
             "the final group signal must precede the leader's reap"
         );
+        // Darwin refuses a group signal with EPERM when the group's only
+        // member is the leader that has exited and is not reaped yet (a
+        // zombie cannot be signalled). EPERM rather than ESRCH still shows
+        // the group, and so its unreaped leader, existed when it was sent.
+        #[cfg(target_os = "macos")]
+        {
+            let zombie_group = McpStdioSignalOutcome::Failed(nix::libc::EPERM);
+            assert!(
+                receipt.final_group_signal == Some(McpStdioSignalOutcome::Sent)
+                    || receipt.final_group_signal == Some(zombie_group),
+                "the final group signal must precede the leader's reap: {receipt:?}"
+            );
+        }
         assert!(
             matches!(&receipt.leader, McpStdioLeaderOutcome::Reaped(status) if status.success()),
             "{receipt:?}"
