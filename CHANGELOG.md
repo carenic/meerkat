@@ -1272,6 +1272,16 @@ them.
   tasks. A fence implementation or decorator outside Meerkat needs nothing
   new; one that forwards fenced calls may forward this entry as well.
 
+- `meerkat-core`: `Session::with_inline_images_externalized` returns a copy
+  of a session in which every image held inline, in its live rows and in
+  every body its transcript graph retains (user content, tool results and
+  notice content), is a blob reference named by `content_blob_id` of the
+  block's own media type and data, together with the distinct payloads a
+  blob store must hold first (`InlineImageExternalization`,
+  `InlineImagePayload`). The transcript revision, the rewrite commits and
+  the rewrite prefix are unchanged; it writes nothing. The conversions below
+  use it before they lay out head-canonical rows.
+
 - `meerkat-runtime`: `SqliteRuntimeStore::convert_standalone_whole_blob_in_place_with_media`
   converts a standalone WholeBlob database whose bodies hold inline images,
   with the realm blob store the converted runtimes hydrate from. Its two steps
