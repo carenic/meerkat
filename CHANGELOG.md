@@ -2323,9 +2323,6 @@ them.
   the run-start hold. A failed Stop rolls back and the mob stays Running; a
   failed Shutdown keeps every member and can be retried. Reload that member
   on its host, then retry.
-
-### Known limitations
-
 - `meerkat-mob-mcp`: a member that created a mob with the agent mob tools and
   was then reset to its next generation, over the same session, no longer
   manages that mob after a restart: the mob's creation record names the
