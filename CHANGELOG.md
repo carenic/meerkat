@@ -2235,6 +2235,21 @@ them.
   finalized, is still removed. A transport or persistence fault, and a
   store that names no mob, still fail the restore, so the next mob verb
   tries it again. Pre-existing in 0.9.3 and earlier.
+- A session whose last turn an earlier release committed but never
+  finalized, such as a member stopped at a compaction in 0.9.2 or 0.9.3,
+  now finalizes that turn's result at its next start and accepts work
+  again (`meerkat-runtime`). Its completion receipt row still carries the
+  earlier release's `stored_input_state_version` (6), and the SQLite
+  store's exact input-state batch compare-and-swap compared those bytes
+  with this release's encoding of the same row, so every start failed with
+  "terminal completion finalization lost the exact durable CAS" and the
+  session refused all work. The same mismatch blocked the other exact
+  terminal rewrites of such rows (payload retirement, interaction terminal
+  outbox adoption, finalization and publication receipt). The store now
+  compares a row an earlier release wrote as this release encodes the
+  typed row it reads, and writes the replacement in the current encoding.
+  A row in the current encoding is still compared byte for byte, and a row
+  whose content changed is still stale.
 
 ### Known limitations
 
