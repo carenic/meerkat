@@ -105,5 +105,6 @@ mod client_service_tests;
 mod connect_attempt_tests;
 #[cfg(test)]
 mod egress_tests;
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 mod stdio_test_fixture;

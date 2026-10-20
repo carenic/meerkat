@@ -72,6 +72,18 @@ them.
   before the upgrade still reach the member of the same identity. A
   continuation key submitted again for a member after its mob was created
   again still replays its first receipt, bound to the old member's address.
+- On macOS a stdio MCP server's close now settles as soon as the server has
+  exited, as on Linux (`meerkat-mcp`). The close could not see the server's
+  exit there, so every close waited out the whole EOF grace (5 s by default),
+  sent SIGTERM, waited the TERM grace (3 s) and sent SIGKILL, even to a
+  server that had already exited. A failed connect, a removal, a reload, a
+  session end and a host shutdown each took about 8 s per stdio server; a
+  server that failed its setup stayed pending for that long, and a live add,
+  reload or restore of the same server was refused meanwhile. The close now
+  checks the server's exit on macOS without reaping it, as it does on Linux
+  (a non-blocking `waitid` with `WNOWAIT`; only an exit counts, not a stop).
+  Other platforms without that check keep their graces as before.
+  Pre-existing since 0.9.0.
 
 ### Known limitations
 
