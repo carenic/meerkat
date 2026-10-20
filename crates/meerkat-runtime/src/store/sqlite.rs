@@ -22750,8 +22750,8 @@ ORDER BY runtime_id";
         /// its physical head as the runtime authority: the authority's
         /// committed token is the physical head's, in the file the conversion
         /// leaves. A restarted runtime's next compaction, prepared from that
-        /// authority, is therefore accepted, and the session without
-        /// compactions (the append-only control) converts with matching
+        /// authority, is therefore accepted. The session without compactions
+        /// (the append-only control, checked first) converts with matching
         /// tokens as before.
         #[tokio::test]
         async fn compacted_whole_blob_session_converts_with_its_physical_head_as_authority() {
@@ -22761,7 +22761,7 @@ ORDER BY runtime_id";
             let session_store = meta_093_co_located_session_store(&path);
             SqliteRuntimeStore::convert_standalone_whole_blob_in_place(&path)
                 .expect("the WholeBlob bodies convert");
-            for session in [&re_anchored, &plain] {
+            for session in [&plain, &re_anchored] {
                 let (authority, physical) = authority_and_physical_head_tokens(&path, session.id());
                 assert_eq!(
                     authority,
@@ -22773,7 +22773,7 @@ ORDER BY runtime_id";
 
             let store = SqliteRuntimeStore::new_head_canonical(&path)
                 .expect("the converted file opens head-canonical");
-            for session in [&re_anchored, &plain] {
+            for session in [&plain, &re_anchored] {
                 let rewritten = commit_a_rewrite_from_the_runtime_authority(
                     &store,
                     &session_store,
