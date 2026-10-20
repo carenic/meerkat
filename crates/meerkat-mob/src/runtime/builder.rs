@@ -14,6 +14,15 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 const MOB_COMMAND_CHANNEL_CAPACITY: usize = 4096;
 
+/// How long a resume waits for the answer to the first attempt at a
+/// recovered Stop or Complete before it hands the mob back anyway. The
+/// attempt then finishes, or is retried, in the background: a Stop held on
+/// a member or a placed completion can take up to its own hang guards, and
+/// a host that must see the phase such a slow Stop leaves waits for it
+/// itself (its `MobStopped` in the mob's event stream).
+pub(super) const RECOVERED_PHASE_INTENT_FIRST_ATTEMPT_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 type RuntimeStartFuture = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<MobHandle, MobError>> + Send + 'static>,
@@ -393,7 +402,19 @@ impl OrchestratorResumeNotification {
 pub(super) async fn drive_recovered_placed_lifecycle_intent(
     handle: MobHandle,
     intent: mob_dsl::PlacedCompletionLifecycleIntentKind,
+    mut first_attempt_answered: Option<tokio::sync::oneshot::Sender<()>>,
 ) {
+    #[cfg(test)]
+    {
+        let hold = RECOVERED_LIFECYCLE_DRIVER_HOLDS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(handle.mob_id().as_str())
+            .cloned();
+        if let Some(hold) = hold {
+            hold.notified().await;
+        }
+    }
     let mut retry_delay = std::time::Duration::from_millis(25);
     loop {
         if handle.command_tx.is_closed() {
@@ -410,6 +431,11 @@ pub(super) async fn drive_recovered_placed_lifecycle_intent(
                 .map(|_| ())
                 .map_err(|error| MobError::Internal(error.to_string())),
         };
+        // The resume waiting on the first attempt returns once it is
+        // answered, whatever the answer; later attempts run unwatched.
+        if let Some(answered) = first_attempt_answered.take() {
+            let _ = answered.send(());
+        }
         match result {
             Ok(()) => return,
             // The actor has exited, or it refuses the intent for the rest of
@@ -438,6 +464,12 @@ pub(super) async fn drive_recovered_placed_lifecycle_intent(
 #[cfg(test)]
 static NEXT_TEST_ACTOR_RUNTIME_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
+/// Test seam: the recovery driver of a mob named here waits for the notify
+/// before its first attempt, as a Stop whose answer does not come.
+#[cfg(test)]
+pub(super) static RECOVERED_LIFECYCLE_DRIVER_HOLDS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::BTreeMap<String, Arc<tokio::sync::Notify>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
 #[cfg(test)]
 static LATEST_TEST_ACTOR_RUNTIME_BY_MOB: std::sync::LazyLock<
     std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
@@ -11158,6 +11190,10 @@ impl MobBuilder {
                 | (crate::machines::mob_machine::MobPhase::Destroyed, _) => None,
                 (_, intent) => intent,
             };
+            // The answer to the first attempt at a recovered Stop or
+            // Complete: the start waits for it before it hands the mob back
+            // (see its end).
+            let mut recovered_phase_intent_first_attempt = None;
             let recovered_retirements = if resume_destroy_cleanup {
                 Vec::new()
             } else {
@@ -11271,10 +11307,26 @@ impl MobBuilder {
             });
             } else if let Some(intent) = recovered_lifecycle_retry_intent {
                 let lifecycle_handle = handle.non_owning();
+                let first_attempt_answered = if matches!(
+                    intent,
+                    mob_dsl::PlacedCompletionLifecycleIntentKind::Stop
+                        | mob_dsl::PlacedCompletionLifecycleIntentKind::Complete
+                ) {
+                    let (answered, first_attempt) = tokio::sync::oneshot::channel();
+                    recovered_phase_intent_first_attempt = Some(first_attempt);
+                    Some(answered)
+                } else {
+                    None
+                };
                 actor.actor_io_tasks.spawn(async move {
                     #[cfg(test)]
                     let _startup_worker_guard = ActorOwnedStartupWorkerGuard::new(actor_runtime_id);
-                    drive_recovered_placed_lifecycle_intent(lifecycle_handle, intent).await;
+                    drive_recovered_placed_lifecycle_intent(
+                        lifecycle_handle,
+                        intent,
+                        first_attempt_answered,
+                    )
+                    .await;
                 });
             }
             if remote_intent_reconciler_enabled {
@@ -11384,7 +11436,25 @@ impl MobBuilder {
                 actor_task_end.returned();
             });
 
-            Ok(handle.with_root_owner())
+            let handle = handle.with_root_owner();
+            // A Stop or Complete an earlier process durably began and never
+            // finished is finished by the recovery driver above. The mob is
+            // handed back once the driver's first attempt is answered, so its
+            // phase is the one that intent leaves: a host that reads the
+            // phase right after the resume, and lifts a stopped mob, lifts it
+            // as it does after a completed Stop. Answered in the background,
+            // the Stop landed after that read, and the mob stayed Stopped
+            // with every member's work refused. The wait is short and bounded
+            // (RECOVERED_PHASE_INTENT_FIRST_ATTEMPT_WAIT): an attempt that is
+            // refused, or still running when it ends (a Stop held on a member
+            // or a placed completion), goes on in the background as before,
+            // and a host that must see the phase it leaves waits for it.
+            if let Some(first_attempt) = recovered_phase_intent_first_attempt {
+                let _ =
+                    tokio::time::timeout(RECOVERED_PHASE_INTENT_FIRST_ATTEMPT_WAIT, first_attempt)
+                        .await;
+            }
+            Ok(handle)
         })
     }
 }
