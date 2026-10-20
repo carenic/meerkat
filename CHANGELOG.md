@@ -35,6 +35,55 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- `meerkat-runtime`: `MemberDeliveryAddress` gains the field
+  `incarnation: Option<MobIncarnationId>`, the incarnation of the mob the
+  member belongs to. `LogicalRuntimeId::for_member` writes an address that
+  names one as `rt:mob-member:{mob}:{incarnation}:{identity}:{generation}`
+  and refuses an address without one. `LogicalRuntimeId::member_address`
+  reads that form as well as the `rt:member:{mob}:{identity}:{generation}`
+  form minted before 0.9.4 (as `incarnation: None`), which is now only
+  read. `meerkat::member_delivery_address` takes the mob incarnation as its
+  second argument: pass the incarnation of the live mob
+  (`handle.incarnation()`). A 0.9.3 build does not read an
+  `rt:mob-member:` address as a member address and does not deliver the
+  rows addressed to one.
+
+### Fixed
+
+- A continuation or detached-job delivery owed to a mob member is no longer
+  delivered to the member of the same identity in a mob destroyed and
+  created again under the same id (`meerkat-mob`). A member's delivery
+  address named the mob id, the identity and the generation only, and the
+  new mob's generations start over, so the new member served the rows owed
+  to the old one. The address now names the mob incarnation too
+  (`rt:mob-member:{mob}:{incarnation}:{identity}:{generation}`): the
+  address of a destroyed mob's member resolves as retired, and its rows
+  strand (`ContinuationStatus::Stranded` with `OwnerRetired`). A handle
+  kept from the destroyed mob, such as the one a fork_off or council
+  completion that ends after the destroy submits through, submits nothing:
+  `MobHandle::submit_continuation` and `submit_retained_continuation` answer
+  `OwnerRetired` (a destroy and a create again that both complete between
+  that check and the commit are not caught). An address minted before 0.9.4
+  names no mob incarnation, and only a mob created before 0.9.4, whose
+  incarnation was assigned at its first 0.9.4 resume, serves it; so rows
+  owed before the upgrade to a mob that was destroyed and created again
+  before the upgrade still reach the member of the same identity. A
+  continuation key submitted again for a member after its mob was created
+  again still replays its first receipt, bound to the old member's address.
+
+### Known limitations
+
+- When a host declares in-memory mob storage, every mob is created again at
+  each start, and each create is a new mob incarnation (`meerkat-mob`). A
+  continuation or detached-job delivery still owed to a member of the
+  earlier incarnation is not delivered to the new member: it strands, and
+  its status reads `Stranded` with `OwnerRetired`. A delivery scope
+  captured at the earlier incarnation is refused the same way
+  (`MobError::IncarnationMismatch`). A mob on durable storage is resumed at
+  a restart and keeps its incarnation.
+
 ## [0.9.4] - 2026-10-20
 
 ### Breaking

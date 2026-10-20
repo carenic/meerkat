@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use meerkat_core::service::MobIncarnationId;
 use meerkat_core::types::SessionId;
 
 /// Unique identifier for a runtime event.
@@ -37,12 +38,19 @@ pub struct LogicalRuntimeId(pub String);
 /// The stable delivery address of one mob member incarnation.
 ///
 /// A member's sessions change when it is repointed, but its incarnation
-/// (`identity` at `generation`) does not, so durable deliveries addressed to a
-/// member follow it across repoints and never reach a later respawn under a
-/// new generation.
+/// (`identity` at `generation`, in one incarnation of its mob) does not, so
+/// durable deliveries addressed to a member follow it across repoints and
+/// never reach a later respawn under a new generation, nor the same identity
+/// in a mob destroyed and created again under the same id.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MemberDeliveryAddress {
     pub mob_id: String,
+    /// The incarnation of the mob the member belongs to. Every address
+    /// minted since 0.9.4 names it. `None` is an address minted before:
+    /// only the incarnation a mob created before 0.9.4 got at its first
+    /// resume serves it. Only [`LogicalRuntimeId::member_address`] reads
+    /// `None`; [`LogicalRuntimeId::for_member`] refuses it.
+    pub incarnation: Option<MobIncarnationId>,
     pub identity: String,
     pub generation: u64,
 }
@@ -81,12 +89,28 @@ fn valid_address_component(component: &str) -> bool {
 
 impl LogicalRuntimeId {
     const SESSION_RUNTIME_PREFIX: &'static str = "rt:session:";
+    const MOB_MEMBER_RUNTIME_PREFIX: &'static str = "rt:mob-member:";
     const MEMBER_RUNTIME_PREFIX: &'static str = "rt:member:";
 
     /// The delivery address of one member incarnation:
-    /// `rt:member:{mob}:{identity}:{generation}`, with `%` and `:` escaped
-    /// inside each component. Its own namespace, never read as a session.
+    /// `rt:mob-member:{mob}:{incarnation}:{identity}:{generation}`, with `%`
+    /// and `:` escaped inside the mob and identity components. Its own
+    /// namespace, never read as a session. An address without a mob
+    /// incarnation is refused: that form
+    /// (`rt:member:{mob}:{identity}:{generation}`) is only read, from rows
+    /// minted before 0.9.4, and a mob created since never serves it.
     pub fn for_member(address: &MemberDeliveryAddress) -> Result<Self, LogicalRuntimeIdError> {
+        if address.incarnation.is_none() {
+            return Err(LogicalRuntimeIdError {
+                id: format!("{address:?}"),
+                reason: "a member address without a mob incarnation is read-only (minted before 0.9.4)",
+            });
+        }
+        Self::member_spelling(address).map(Self)
+    }
+
+    /// The canonical spelling of a member address in either form.
+    fn member_spelling(address: &MemberDeliveryAddress) -> Result<String, LogicalRuntimeIdError> {
         if !valid_address_component(&address.mob_id) || !valid_address_component(&address.identity)
         {
             return Err(LogicalRuntimeIdError {
@@ -94,33 +118,56 @@ impl LogicalRuntimeId {
                 reason: "member address components must be non-empty and free of control characters",
             });
         }
-        Ok(Self(format!(
-            "{}{}:{}:{}",
-            Self::MEMBER_RUNTIME_PREFIX,
-            encode_address_component(&address.mob_id),
-            encode_address_component(&address.identity),
-            address.generation
-        )))
+        let mob_id = encode_address_component(&address.mob_id);
+        let identity = encode_address_component(&address.identity);
+        let generation = address.generation;
+        Ok(match address.incarnation {
+            Some(incarnation) => format!(
+                "{}{mob_id}:{incarnation}:{identity}:{generation}",
+                Self::MOB_MEMBER_RUNTIME_PREFIX
+            ),
+            None => format!(
+                "{}{mob_id}:{identity}:{generation}",
+                Self::MEMBER_RUNTIME_PREFIX
+            ),
+        })
     }
 
     /// The member address this id names. `Ok(None)` for any id outside the
-    /// `rt:member:` namespace; an id inside it that does not parse is an
-    /// error, never a different kind of runtime.
+    /// `rt:mob-member:` and `rt:member:` namespaces; an id inside one that
+    /// does not parse is an error, never a different kind of runtime.
     pub fn member_address(&self) -> Result<Option<MemberDeliveryAddress>, LogicalRuntimeIdError> {
-        let Some(rest) = self.0.strip_prefix(Self::MEMBER_RUNTIME_PREFIX) else {
-            return Ok(None);
-        };
+        let (rest, names_incarnation) =
+            if let Some(rest) = self.0.strip_prefix(Self::MOB_MEMBER_RUNTIME_PREFIX) {
+                (rest, true)
+            } else if let Some(rest) = self.0.strip_prefix(Self::MEMBER_RUNTIME_PREFIX) {
+                (rest, false)
+            } else {
+                return Ok(None);
+            };
         let malformed = |reason| LogicalRuntimeIdError {
             id: self.0.clone(),
             reason,
         };
         let mut parts = rest.split(':');
-        let (Some(mob_id), Some(identity), Some(generation), None) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            return Err(malformed(
-                "expected rt:member:{mob}:{identity}:{generation}",
-            ));
+        let mob_id = parts.next();
+        let incarnation = if names_incarnation {
+            parts.next().map(Some)
+        } else {
+            Some(None)
+        };
+        let (Some(mob_id), Some(incarnation), Some(identity), Some(generation), None) = (
+            mob_id,
+            incarnation,
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) else {
+            return Err(malformed(if names_incarnation {
+                "expected rt:mob-member:{mob}:{incarnation}:{identity}:{generation}"
+            } else {
+                "expected rt:member:{mob}:{identity}:{generation}"
+            }));
         };
         let mob_id = decode_address_component(mob_id)
             .ok_or_else(|| malformed("invalid escape in the mob component"))?;
@@ -129,16 +176,21 @@ impl LogicalRuntimeId {
         if !valid_address_component(&mob_id) || !valid_address_component(&identity) {
             return Err(malformed("empty or control-character component"));
         }
+        let incarnation = incarnation
+            .map(str::parse::<MobIncarnationId>)
+            .transpose()
+            .map_err(|_| malformed("the incarnation is not a mob incarnation id"))?;
         let generation = generation
             .parse::<u64>()
             .map_err(|_| malformed("the generation is not a u64"))?;
         let address = MemberDeliveryAddress {
             mob_id,
+            incarnation,
             identity,
             generation,
         };
         // Round-trip: only the canonical spelling is a member address.
-        if Self::for_member(&address)?.0 != self.0 {
+        if Self::member_spelling(&address)? != self.0 {
             return Err(malformed("not the canonical member address spelling"));
         }
         Ok(Some(address))
@@ -419,17 +471,42 @@ impl std::fmt::Display for EventCodeId {
 mod tests {
     use super::*;
 
+    const INCARNATION: &str = "0f6a3c2e-1b7d-4e59-8a10-2c4b6d8e9f01";
+
     #[test]
     fn member_addresses_round_trip_with_escaped_components() {
         let address = MemberDeliveryAddress {
             mob_id: "team:a%b".into(),
+            incarnation: Some(INCARNATION.parse().unwrap()),
             identity: "lead:1".into(),
             generation: 7,
         };
         let id = LogicalRuntimeId::for_member(&address).unwrap();
-        assert_eq!(id.0, "rt:member:team%3Aa%25b:lead%3A1:7");
+        assert_eq!(
+            id.0,
+            format!("rt:mob-member:team%3Aa%25b:{INCARNATION}:lead%3A1:7")
+        );
         assert_eq!(id.member_address().unwrap(), Some(address));
         assert_eq!(id.session_id(), None, "a member address is never a session");
+    }
+
+    /// An address minted before 0.9.4 names no mob incarnation. It still
+    /// reads as the member address it was, and nothing mints that form.
+    #[test]
+    fn a_member_address_without_an_incarnation_is_read_only() {
+        let address = MemberDeliveryAddress {
+            mob_id: "team:a%b".into(),
+            incarnation: None,
+            identity: "lead:1".into(),
+            generation: 7,
+        };
+        let id = LogicalRuntimeId::new("rt:member:team%3Aa%25b:lead%3A1:7");
+        assert_eq!(id.member_address().unwrap(), Some(address.clone()));
+        assert_eq!(id.session_id(), None, "a member address is never a session");
+        assert!(
+            LogicalRuntimeId::for_member(&address).is_err(),
+            "the form without a mob incarnation is never minted"
+        );
     }
 
     #[test]
@@ -450,20 +527,41 @@ mod tests {
             "rt:member::lead:7",
             "rt:member:team%3:lead:7",
             "rt:member:team:lead:007",
+            "rt:mob-member:",
+            "rt:mob-member:team:lead:7",
+            "rt:mob-member:team:not-an-incarnation:lead:7",
         ] {
             assert!(
                 LogicalRuntimeId::new(raw).member_address().is_err(),
                 "{raw} must not parse as a member address"
             );
         }
-        assert!(
-            LogicalRuntimeId::for_member(&MemberDeliveryAddress {
-                mob_id: String::new(),
-                identity: "lead".into(),
-                generation: 1,
-            })
-            .is_err()
-        );
+        for raw in [
+            format!("rt:mob-member:team:{INCARNATION}:lead"),
+            format!("rt:mob-member:team:{INCARNATION}:lead:7:extra"),
+            format!("rt:mob-member::{INCARNATION}:lead:7"),
+            format!("rt:mob-member:team:{INCARNATION}::7"),
+            format!("rt:mob-member:team:{INCARNATION}:lead:seven"),
+            format!("rt:mob-member:team:{INCARNATION}:lead:007"),
+            format!("rt:mob-member:team:{}:lead:7", INCARNATION.to_uppercase()),
+            format!("rt:mob-member:team:{}:lead:7", INCARNATION.replace('-', "")),
+        ] {
+            assert!(
+                LogicalRuntimeId::new(raw.clone()).member_address().is_err(),
+                "{raw} must not parse as a member address"
+            );
+        }
+        for incarnation in [None, Some(INCARNATION.parse().unwrap())] {
+            assert!(
+                LogicalRuntimeId::for_member(&MemberDeliveryAddress {
+                    mob_id: String::new(),
+                    incarnation,
+                    identity: "lead".into(),
+                    generation: 1,
+                })
+                .is_err()
+            );
+        }
     }
 
     #[test]

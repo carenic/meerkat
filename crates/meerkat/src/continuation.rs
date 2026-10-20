@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use meerkat_core::SessionId;
 use meerkat_core::lifecycle::InputId;
+use meerkat_core::service::MobIncarnationId;
 use meerkat_runtime::{
     ContinuationAdmission, ContinuationAdmissionOutcome, ContinuationAdmissionTransition,
     ContinuationKeyClaim, KeyedSubmitOutcome, LogicalRuntimeId, MemberDeliveryAddress,
@@ -1738,14 +1739,20 @@ async fn admit_continuation(
     Ok(())
 }
 
-/// The address a member owner's current incarnation binds to.
+/// The address a member owner's current incarnation binds to: `identity`
+/// at `generation` in the incarnation `mob_incarnation` of mob `mob_id`
+/// (`rt:mob-member:{mob}:{incarnation}:{identity}:{generation}`). A mob
+/// destroyed and created again under the same id is a new incarnation, so
+/// its members never serve the rows owed to the members of the old one.
 pub fn member_delivery_address(
     mob_id: &str,
+    mob_incarnation: MobIncarnationId,
     identity: &str,
     generation: u64,
 ) -> Result<LogicalRuntimeId, ContinuationSubmitError> {
     LogicalRuntimeId::for_member(&MemberDeliveryAddress {
         mob_id: mob_id.to_string(),
+        incarnation: Some(mob_incarnation),
         identity: identity.to_string(),
         generation,
     })
