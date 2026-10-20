@@ -1287,20 +1287,20 @@ them.
   still refuses such a session typed.
 - A governed realm no longer refuses every input of a host whose model key
   comes from the environment (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY` and the
-  other provider and `RKAT_*` keys, with no realm binding configured)
-  (`meerkat-runtime`, `meerkat-core`). Stock `rkat` in a governed realm, and
-  any host that installs native work authorization, answered such input
-  `controller credential is not currently usable` before any model request:
-  governed admission required an authorized credential lease, and the
-  env-var default route never has one, by design, since it is the host
-  process's own key and not a durable identity. Admission now holds no lease
-  for that route, as for an explicitly authless one, and publishes or
+  other provider and `RKAT_*` keys, with no realm binding configured, or none
+  that resolves) (`meerkat-runtime`, `meerkat-core`). Stock `rkat` in a
+  governed realm, and any host that installs native work authorization,
+  answered such input `controller credential is not currently usable` before
+  any model request: governed admission required an authorized credential
+  lease, and the env-var default route never has one, by design, since it is
+  the host process's own key and not a durable identity. Admission now holds
+  no lease for that route, as for an explicitly authless one, and publishes or
   synthesizes none. The route is recognized from the selection the provider
   factory pins (no recorded auth binding, the `env_default` credential,
-  `ControllerModelSelection::uses_synthetic_env_default_credential`), and,
-  as for an authless route, the live selected client must still report
-  exactly that selection. Every other governed check still applies, and
-  ungoverned hosts, which never held a lease, are unchanged.
+  `ControllerModelSelection::uses_synthetic_env_default_credential`), and, as
+  for an authless route, the live selected client must still report exactly
+  that selection. Every other governed check still applies, and ungoverned
+  hosts, which never held a lease, are unchanged.
 - A command sent to a mob while its actor is exiting after a shutdown now
   settles instead of going unanswered (`meerkat-mob`). The actor dropped its
   command channel without waiting for a send that had already reserved
