@@ -288,10 +288,12 @@ them.
   and the `MobStop` a Stop staged first holds the reloaded registration until
   Resume. An autonomous member's stop skips its comms-drain abort and its run
   settlement for such a registration (the discard aborts and joins the drain
-  itself). Resume releases such a member. A Shutdown now holds every member's
-  run starts and reports the first failure in roster order instead of stopping
-  at it. On the wire, `stop_report` reports such a member with `run` and
-  `starts` `reload_required`.
+  itself). A Resume refuses typed (`MemberReloadRequired`, naming the member)
+  while such a member is not reloaded; reloading it while Stopped publishes a
+  successor that stays held until the Resume. A Shutdown now holds every
+  member's run starts and reports the first failure in roster order instead of
+  stopping at it. On the wire, `stop_report` reports such a member with `run`
+  and `starts` `reload_required`.
 
 - `meerkat-mob`: a Stop now stages `MobStop` for every local member before it
   holds the member, so a member reloaded while the mob is Stopped stays held
