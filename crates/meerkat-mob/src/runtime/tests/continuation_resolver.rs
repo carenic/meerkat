@@ -290,6 +290,53 @@ async fn member_continuations_never_reach_a_mob_created_again_under_its_id() {
     );
 }
 
+/// A fork_off or council completion that ends after its mob was destroyed
+/// submits through a handle kept from that mob. The continuation names the
+/// mob by id, so it must not bind the member of a mob created again under
+/// the id: the handle of a destroyed mob submits nothing.
+#[tokio::test]
+async fn a_handle_of_a_destroyed_mob_submits_nothing_to_the_mob_created_again() {
+    let (first, _first_service) = create_test_mob(sample_definition()).await;
+    let identity = AgentIdentity::from("w-cont");
+    first
+        .spawn_spec(SpawnMemberSpec::new("worker", identity.as_str()))
+        .await
+        .expect("spawn");
+    first.destroy().await.expect("destroy the first mob");
+    let (second, _second_service) = create_test_mob(sample_definition()).await;
+    second
+        .spawn_spec(SpawnMemberSpec::new("worker", identity.as_str()))
+        .await
+        .expect("spawn under the same identity");
+    let continuations = ContinuationOwnerService::new(
+        RuntimeDeliveryInbox::new(Arc::new(InMemoryRuntimeStore::new())),
+        Arc::new(MobContinuationResolver::new(Arc::new(OneMob(
+            second.clone(),
+        )))),
+        Arc::new(meerkat_runtime::MeerkatMachine::ephemeral()),
+    );
+
+    assert_eq!(
+        first
+            .submit_continuation(&continuations, &identity, delivery("late"), 1)
+            .await
+            .expect_err("the first mob is destroyed"),
+        ContinuationSubmitError::OwnerRetired
+    );
+    let owner = ContinuationOwner::Member {
+        mob_id: second.mob_id().as_str().to_string(),
+        identity: identity.as_str().to_string(),
+    };
+    assert_eq!(
+        continuations
+            .continuation_status(&owner, &ContinuationKey::new("late").expect("key"))
+            .await
+            .expect("status"),
+        ContinuationStatus::NotCommitted,
+        "nothing was committed for the new mob's member"
+    );
+}
+
 /// An address minted before 0.9.4 names no mob incarnation, and a mob
 /// created since is a later incarnation under its id: it never serves the
 /// rows owed to the members of an older mob.
@@ -309,13 +356,21 @@ async fn an_address_without_a_mob_incarnation_is_retired_in_a_mob_created_since(
         .generation
         .get();
     let resolver = MobContinuationResolver::new(Arc::new(OneMob(handle.clone())));
-    let legacy = LogicalRuntimeId::for_member(&meerkat_runtime::MemberDeliveryAddress {
-        mob_id: handle.mob_id().as_str().to_string(),
-        incarnation: None,
-        identity: identity.as_str().to_string(),
-        generation,
-    })
-    .expect("an address from before 0.9.4");
+    // Nothing mints the old form any more: spell it as a 0.9.3 store holds it.
+    let escape = |component: &str| component.replace('%', "%25").replace(':', "%3A");
+    let legacy = LogicalRuntimeId::new(format!(
+        "rt:member:{}:{}:{generation}",
+        escape(handle.mob_id().as_str()),
+        escape(identity.as_str()),
+    ));
+    assert_eq!(
+        legacy
+            .member_address()
+            .expect("an address from before 0.9.4")
+            .map(|member| member.incarnation),
+        Some(None),
+        "it names no mob incarnation"
+    );
     assert_eq!(
         resolver.resolve_address(&legacy).await.expect("resolve"),
         AddressResolution::Retired

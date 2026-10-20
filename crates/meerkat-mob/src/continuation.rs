@@ -216,6 +216,21 @@ impl ContinuationAddressResolver for MobContinuationResolver {
 }
 
 impl MobHandle {
+    /// A member continuation submitted through this handle names its mob by
+    /// id, and the service binds whichever mob holds the id when it
+    /// submits. A handle kept from a destroyed mob (a fork_off or council
+    /// completion that ends after the destroy) must not reach a mob created
+    /// again under the id, so it submits nothing. The phase is published
+    /// before the destroy returns, to every clone.
+    fn require_undestroyed_continuation_owner(
+        &self,
+    ) -> Result<(), meerkat::ContinuationSubmitError> {
+        if self.status_observation_snapshot() == crate::MobState::Destroyed {
+            return Err(meerkat::ContinuationSubmitError::OwnerRetired);
+        }
+        Ok(())
+    }
+
     /// Whether this mob serves the members of a delivery address that names
     /// mob incarnation `incarnation`: only the one it runs at. An address
     /// minted before 0.9.4 names none (`None`), and only the incarnation a
@@ -235,7 +250,10 @@ impl MobHandle {
     ///
     /// The member's incarnation current at the key's first submission is
     /// bound by the key ledger; `continuations` must resolve members through
-    /// this host's mobs (for example with [`MobContinuationResolver`]).
+    /// this host's mobs (for example with [`MobContinuationResolver`]). A
+    /// handle of a destroyed mob submits nothing and answers
+    /// [`meerkat::ContinuationSubmitError::OwnerRetired`], even once a mob is
+    /// created again under its id.
     pub async fn submit_continuation(
         &self,
         continuations: &meerkat::ContinuationOwnerService,
@@ -243,6 +261,7 @@ impl MobHandle {
         delivery: meerkat::ContinuationDelivery,
         committed_at_ms: u64,
     ) -> Result<meerkat::ContinuationReceipt, meerkat::ContinuationSubmitError> {
+        self.require_undestroyed_continuation_owner()?;
         continuations
             .submit(
                 &ContinuationOwner::Member {
@@ -257,7 +276,9 @@ impl MobHandle {
 
     /// Submit a Meerkat producer job's outcome for one of this mob's members,
     /// carrying the job's retained work (see
-    /// [`meerkat::ContinuationOwnerService::submit_retained_completion`]).
+    /// [`meerkat::ContinuationOwnerService::submit_retained_completion`]). A
+    /// handle of a destroyed mob submits nothing, as for
+    /// [`Self::submit_continuation`].
     pub async fn submit_retained_continuation(
         &self,
         continuations: &meerkat::ContinuationOwnerService,
@@ -266,6 +287,7 @@ impl MobHandle {
         job: &meerkat::RetainedJobRecord,
         committed_at_ms: u64,
     ) -> Result<meerkat::ContinuationReceipt, meerkat::ContinuationSubmitError> {
+        self.require_undestroyed_continuation_owner()?;
         continuations
             .submit_retained_completion(
                 &ContinuationOwner::Member {

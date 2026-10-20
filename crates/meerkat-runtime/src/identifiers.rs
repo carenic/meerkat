@@ -48,7 +48,8 @@ pub struct MemberDeliveryAddress {
     /// The incarnation of the mob the member belongs to. Every address
     /// minted since 0.9.4 names it. `None` is an address minted before:
     /// only the incarnation a mob created before 0.9.4 got at its first
-    /// resume serves it.
+    /// resume serves it. Only [`LogicalRuntimeId::member_address`] reads
+    /// `None`; [`LogicalRuntimeId::for_member`] refuses it.
     pub incarnation: Option<MobIncarnationId>,
     pub identity: String,
     pub generation: u64,
@@ -92,12 +93,24 @@ impl LogicalRuntimeId {
     const MEMBER_RUNTIME_PREFIX: &'static str = "rt:member:";
 
     /// The delivery address of one member incarnation:
-    /// `rt:mob-member:{mob}:{incarnation}:{identity}:{generation}`, or
-    /// `rt:member:{mob}:{identity}:{generation}` for an address that names
-    /// no mob incarnation (the form minted before 0.9.4), with `%` and `:`
-    /// escaped inside the mob and identity components. Its own namespace,
-    /// never read as a session.
+    /// `rt:mob-member:{mob}:{incarnation}:{identity}:{generation}`, with `%`
+    /// and `:` escaped inside the mob and identity components. Its own
+    /// namespace, never read as a session. An address without a mob
+    /// incarnation is refused: that form
+    /// (`rt:member:{mob}:{identity}:{generation}`) is only read, from rows
+    /// minted before 0.9.4, and a mob created since never serves it.
     pub fn for_member(address: &MemberDeliveryAddress) -> Result<Self, LogicalRuntimeIdError> {
+        if address.incarnation.is_none() {
+            return Err(LogicalRuntimeIdError {
+                id: format!("{address:?}"),
+                reason: "a member address without a mob incarnation is read-only (minted before 0.9.4)",
+            });
+        }
+        Self::member_spelling(address).map(Self)
+    }
+
+    /// The canonical spelling of a member address in either form.
+    fn member_spelling(address: &MemberDeliveryAddress) -> Result<String, LogicalRuntimeIdError> {
         if !valid_address_component(&address.mob_id) || !valid_address_component(&address.identity)
         {
             return Err(LogicalRuntimeIdError {
@@ -108,7 +121,7 @@ impl LogicalRuntimeId {
         let mob_id = encode_address_component(&address.mob_id);
         let identity = encode_address_component(&address.identity);
         let generation = address.generation;
-        Ok(Self(match address.incarnation {
+        Ok(match address.incarnation {
             Some(incarnation) => format!(
                 "{}{mob_id}:{incarnation}:{identity}:{generation}",
                 Self::MOB_MEMBER_RUNTIME_PREFIX
@@ -117,7 +130,7 @@ impl LogicalRuntimeId {
                 "{}{mob_id}:{identity}:{generation}",
                 Self::MEMBER_RUNTIME_PREFIX
             ),
-        }))
+        })
     }
 
     /// The member address this id names. `Ok(None)` for any id outside the
@@ -177,7 +190,7 @@ impl LogicalRuntimeId {
             generation,
         };
         // Round-trip: only the canonical spelling is a member address.
-        if Self::for_member(&address)?.0 != self.0 {
+        if Self::member_spelling(&address)? != self.0 {
             return Err(malformed("not the canonical member address spelling"));
         }
         Ok(Some(address))
@@ -477,20 +490,23 @@ mod tests {
         assert_eq!(id.session_id(), None, "a member address is never a session");
     }
 
-    /// An address minted before 0.9.4 names no mob incarnation, and still
-    /// reads as the member address it was.
+    /// An address minted before 0.9.4 names no mob incarnation. It still
+    /// reads as the member address it was, and nothing mints that form.
     #[test]
-    fn a_member_address_without_an_incarnation_keeps_its_old_spelling() {
+    fn a_member_address_without_an_incarnation_is_read_only() {
         let address = MemberDeliveryAddress {
             mob_id: "team:a%b".into(),
             incarnation: None,
             identity: "lead:1".into(),
             generation: 7,
         };
-        let id = LogicalRuntimeId::for_member(&address).unwrap();
-        assert_eq!(id.0, "rt:member:team%3Aa%25b:lead%3A1:7");
-        assert_eq!(id.member_address().unwrap(), Some(address));
+        let id = LogicalRuntimeId::new("rt:member:team%3Aa%25b:lead%3A1:7");
+        assert_eq!(id.member_address().unwrap(), Some(address.clone()));
         assert_eq!(id.session_id(), None, "a member address is never a session");
+        assert!(
+            LogicalRuntimeId::for_member(&address).is_err(),
+            "the form without a mob incarnation is never minted"
+        );
     }
 
     #[test]
