@@ -431,6 +431,24 @@ enum IdentitySessionLoadErrorClass {
     Unavailable,
 }
 
+/// Whether a session read failed because the committed runtime boundary no
+/// longer names the session's physical head: its store refused the read as a
+/// transcript revision conflict.
+fn is_transcript_revision_conflict(error: &meerkat_core::service::SessionError) -> bool {
+    matches!(
+        error,
+        meerkat_core::service::SessionError::Store(error)
+            if error
+                .downcast_ref::<meerkat_core::SessionStoreError>()
+                .is_some_and(|error| {
+                    matches!(
+                        error,
+                        meerkat_core::SessionStoreError::TranscriptRevisionConflict { .. }
+                    )
+                })
+    )
+}
+
 /// Classify a session read failure by its typed cause. Durable corruption and
 /// unsupported persistence are permanent observations; transport, I/O, and
 /// unknown failures remain retryable. Display text is diagnostic only.
@@ -30789,9 +30807,7 @@ impl MobActor {
                 ));
             }
             if !io.session_service.has_live_session(session).await?
-                && io
-                    .session_service
-                    .load_persisted_session(session)
+                && Self::load_cleanup_session_settling_durable_tail(&io, session)
                     .await?
                     .is_none()
                 && !io
@@ -30844,6 +30860,39 @@ impl MobActor {
     #[cfg(not(feature = "runtime-adapter"))]
     async fn restore_local_cleanup_composition_delivery(&self) -> Result<(), MobError> {
         Ok(())
+    }
+
+    /// The persisted session a local cleanup delivery restores, read once its
+    /// durable tail is settled.
+    ///
+    /// A member whose last turn's durable rows landed after the runtime
+    /// boundary it committed (a mid-turn retirement's boundary cancel, or a
+    /// process death between the two commit points) reads as a transcript
+    /// revision conflict at that boundary. This read runs before the actor
+    /// admits any command, so the conflict would fail-stop the whole mob at
+    /// every start. The tail is settled first, through the store-owned
+    /// recovery the resume path runs (a proven continuation is adopted, an
+    /// unprovable one is kept intact), and the session is read once more; a
+    /// tail the recovery keeps still refuses, typed, as before.
+    #[cfg(feature = "runtime-adapter")]
+    async fn load_cleanup_session_settling_durable_tail(
+        io: &ResumeOperationBindingIo,
+        session: &SessionId,
+    ) -> Result<Option<meerkat_core::Session>, MobError> {
+        match io.session_service.load_persisted_session(session).await {
+            Err(error) if is_transcript_revision_conflict(&error) => {
+                tracing::info!(
+                    session_id = %session,
+                    "settling a durable tail ahead of its runtime boundary before restoring \
+                     local cleanup delivery"
+                );
+                io.session_service
+                    .materialize_session_resume_verdict(session)
+                    .await?;
+                Ok(io.session_service.load_persisted_session(session).await?)
+            }
+            loaded => Ok(loaded?),
+        }
     }
 
     #[cfg(feature = "runtime-adapter")]

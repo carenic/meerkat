@@ -1622,6 +1622,17 @@ them.
 
 ### Fixed
 
+- `meerkat-mob`: a mob restarts when one of its members has a durable tail
+  ahead of the runtime boundary it last committed. A turn's durable rows can
+  land after that boundary when a retirement cancels the turn mid-way, or when
+  the process dies between the two commits. If that member's retirement was
+  still pending, the next start restored the member's cleanup delivery by
+  reading its session at the committed boundary; the
+  store refused the read as a transcript revision conflict, and the whole mob
+  stopped before admitting any command. The restore now settles the tail
+  first, through the store-owned recovery the resume path runs (a proven
+  continuation is adopted), and then reads the session.
+
 - `meerkat-mob-mcp`: after a restart, the session that created a mob with
   the agent mob tools manages it again. A session's persisted mob operator
   authority binds no mob, so the manage grant its create returned was gone
