@@ -411,6 +411,9 @@ effects. A retry that the target deduplicates waits for the original input's
 outcome and records it. While that outcome cannot be read yet, the occurrence
 keeps its lease and re-reads it for up to five lease periods; then it ends
 delivery_failed with runtime_completion_authority_unavailable.
+A reclaim after a lapsed lease is still subject to the misfire
+policy: with `skip`, a lapse past the grace window ends `misfired`; keeping
+crash recovery needs `catch_up_within` with a window longer than the lease.
 
 Poisoned schedule and occurrence rows are isolated as typed per-row faults so
 healthy rows can continue. Hosts should surface the driver fault report rather
