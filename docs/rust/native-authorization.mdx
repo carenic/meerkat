@@ -601,7 +601,8 @@ Since 0.9.4 a controller on the environment's default key (no recorded auth
 binding, the `env_default` credential;
 `ControllerModelSelection::uses_synthetic_env_default_credential`) holds no
 credential lease under governed admission, as for an authless route. Its live
-client must still report exactly the pinned selection.
+client must still report exactly the pinned selection, and your controller
+policy still decides whether that route runs.
 
 ## Remove a permission without removing the controller
 
