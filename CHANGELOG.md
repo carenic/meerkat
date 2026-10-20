@@ -1508,11 +1508,16 @@ them.
   predecessor's session recorded only when its own spec names none and its
   profile resolves to the provider that binding was recorded for; a successor
   re-profiled to another provider (or to one that cannot be told) selects its
-  own binding, as a fresh spawn does. The successor's profile and provider are
-  resolved before anything is retired. A respawn whose predecessor's
-  restrictions cannot be established, whose successor profile cannot be
-  resolved, or whose member changes while they are read, is refused before
-  anything is retired, and the member is kept. A peer-only member whose generation was
+  own binding, as a fresh spawn does. For a member with a local session, the
+  successor's profile and provider are resolved before anything is retired. A
+  respawn whose predecessor's restrictions cannot be established, whose
+  successor profile cannot be resolved, or whose member changes while they are
+  read, is refused before anything is retired, and the member is kept. A
+  recorded binding that has since been removed from the realm configuration,
+  or re-pointed to another provider, is not validated before retirement: the
+  successor's build then fails after the predecessor is retired
+  (`MobRespawnError::SpawnAfterRetireWithCause`). Name a binding in a spawn
+  customizer, or retire and spawn. A peer-only member whose generation was
   never bound to a local session carries no session restrictions; its
   successor keeps the launch policy and ceiling its own spec inherits. Placed
   members are unchanged.
