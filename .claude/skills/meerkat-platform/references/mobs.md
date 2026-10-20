@@ -234,9 +234,10 @@ one that holds a finished destroy whose files remain answers
 `IncarnationDestroyed` (was `Internal`). Failure classes: `IncarnationDestroyed`
 and `IncarnationMismatch` are `TargetMissing`, `IncarnationInconsistent` is
 `Internal`, `ProvenanceUnavailable` is `RuntimeRejected`. `MobProvenance`
-(`Member`, `Host`, `Session`, `Ambiguous` or `Unrecorded`) is recorded once at
-create: `MobHandle::provenance`, `MobStorage::creation_provenance` and
-`creation_incarnation` (no runtime needed), `MobBuilder::with_provenance`
+(`Member`, `Host`, `Session`, `Ambiguous`, `Unrecorded`, `OperatorSession` or
+`OperatorMember`) is recorded once at create: `MobHandle::provenance`,
+`MobStorage::creation_provenance` and `creation_incarnation` (no runtime
+needed), `MobBuilder::with_provenance`
 (default `Host`). A `MobMcpState` create for a caller session (the agent mob
 tools, council seating) records that session's provenance from every hosted
 roster and is refused with `ProvenanceUnavailable`, creating nothing, while
@@ -251,12 +252,15 @@ Creator grant after a restart (since 0.9.4): a session's persisted mob
 operator authority binds no mob, so the manage grant a create returned was
 gone after a restart. The agent mob tools now re-derive it from the mob's
 creation record, for the incarnation the mob runs at, while the session may
-still create mobs: for `MobProvenance::Session` naming that session (a session
-a host passes as the owner session of a create counts), and for `Member` only
-while the session is still the recorded member's bridge session at the
-recorded generation in the recorded parent incarnation. `Host`, `Ambiguous`
-and `Unrecorded` records, other sessions, later generations and a session
-whose operator removed its create capability get no grant. Known limitation: a
+still create mobs, and only for a create the session made itself with its
+`mob_create`: for `MobProvenance::OperatorSession` naming that session, and
+for `OperatorMember` only while the session is still the recorded member's
+bridge session at the recorded generation in the recorded parent incarnation.
+A mob a host created for the session
+(`mob_create_definition_with_owner_bridge_session`, recorded as `Session` or
+`Member`) is owned by the session but gets no grant. `Host`, `Ambiguous` and
+`Unrecorded` records, other sessions, later generations and a session whose
+operator removed its create capability get no grant either. Known limitation: a
 creating member that was reset to its next generation over the same session no
 longer manages the mob after a restart, because the record names its earlier
 generation; before the restart the session keeps the grant its create

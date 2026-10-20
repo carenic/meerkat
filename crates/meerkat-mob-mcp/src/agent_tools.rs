@@ -125,6 +125,7 @@ fn mob_create_with_owner_bridge_boxed(
                     owner_bridge_session_id,
                     true,
                     false,
+                    crate::SessionCreateCaller::Session,
                 )
                 .await
         },
@@ -457,17 +458,20 @@ impl AgentMobToolSurface {
     /// The operator authority this surface's session holds over the mob
     /// `handle` serves: the effective authority as the turn owner committed
     /// it, or, when that holds no manage scope over the mob's incarnation and
-    /// the mob's creation record proves this session is its creator
+    /// the mob's creation record at that incarnation proves this session
+    /// created the mob with its own `mob_create`
     /// ([`MobMcpState::session_is_recorded_creator`]), the effective
     /// authority with the creator's manage grant re-derived for that
     /// incarnation through the generated authority. A session's persisted
     /// authority binds no mob, so after a restart this is how a creator
-    /// manages the mob it created. The re-derived grant serves this
-    /// admission only and is derived again for the next one; nothing is
-    /// written to the session. The creator's grant follows from its create
-    /// capability, so it is re-derived only while the session may still
-    /// create mobs: once its operator removes that capability, a restart
-    /// leaves it no manage scope over the mobs it created.
+    /// manages the mob it created. A mob a host created for the session is
+    /// owned by it, not created by it, and gets no grant here. The
+    /// re-derived grant serves this admission only and is derived again for
+    /// the next one; nothing is written to the session. The creator's grant
+    /// follows from its create capability, so it is re-derived only while
+    /// the session may still create mobs: once its operator removes that
+    /// capability, a restart leaves it no manage scope over the mobs it
+    /// created.
     async fn authority_over(&self, mob_id: &MobId, handle: &MobHandle) -> MobToolAuthorityContext {
         let authority = self.authority_context_snapshot();
         if !authority.is_generated_authority_context()
@@ -6506,8 +6510,8 @@ mod tests {
     /// fresh create-only one, so the grant its `mob_create` returned is gone.
     /// A fresh create-only surface for the creating session stands for that
     /// restarted session here. The creator's manage grant is re-derived from
-    /// the mob's creation record (`MobProvenance::Session` naming the
-    /// session): the creator lists and manages the mob it created, while
+    /// the mob's creation record (`MobProvenance::OperatorSession` naming
+    /// the session): the creator lists and manages the mob it created, while
     /// another session gets nothing, and neither does the creator over a mob
     /// the host created, nor the creator once its operator removed its create
     /// capability.
@@ -6582,7 +6586,7 @@ mod tests {
                 .provenance()
                 .await
                 .expect("provenance"),
-            meerkat_mob::MobProvenance::Session {
+            meerkat_mob::MobProvenance::OperatorSession {
                 session_id: creator.clone()
             },
             "the record names the creating session"
@@ -6638,6 +6642,174 @@ mod tests {
             Err(ToolError::AccessDenied { .. })
         ));
         assert!(listed(surface_for(SessionId::new())).await.is_empty());
+    }
+
+    /// The rebuild after a restart (`build_mob_tools` with the fresh
+    /// create-only authority) gives a session back the manage grant of the
+    /// mob it created with its own `mob_create`, whose creation record at the
+    /// mob's current incarnation names it (`MobProvenance::OperatorSession`),
+    /// and nothing else: a mob the host created for the session
+    /// (`MobProvenance::Session`, owned but not created by it) stays out of
+    /// its scope, and so does a mob the session created whose id the host
+    /// re-created after a destroy, since the record of the earlier
+    /// incarnation proves nothing for the current one.
+    #[tokio::test]
+    async fn a_rebuilt_session_regains_manage_only_over_the_mob_its_own_create_made() {
+        let state = MobMcpState::new_in_memory();
+        let factory = AgentMobToolSurfaceFactory::new(Arc::clone(&state));
+        let session_id = SessionId::new();
+        let before_restart = AgentMobToolSurface::new(
+            Arc::clone(&state),
+            None,
+            create_only_authority(),
+            "claude-sonnet-4-5".to_string(),
+            session_id.clone(),
+            None,
+            None,
+            None,
+        );
+        let create = |mob_id: &'static str| {
+            let surface = &before_restart;
+            async move {
+                let args = serde_json::value::RawValue::from_string(
+                    json!({
+                        "definition": {
+                            "id": mob_id,
+                            "profiles": {
+                                "worker": {
+                                    "model": "claude-sonnet-4-5",
+                                    "tools": { "comms": true },
+                                    "peer_description": "worker",
+                                    "runtime_mode": "turn_driven"
+                                }
+                            }
+                        }
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+                let created = surface
+                    .dispatch(ToolCallView {
+                        id: "create-own",
+                        name: "mob_create",
+                        args: &args,
+                    })
+                    .await
+                    .expect("create-only authority allows mob_create");
+                let created: serde_json::Value =
+                    serde_json::from_str(&created.result.text_content()).unwrap();
+                MobId::from(created["mob_id"].as_str().expect("mob_id"))
+            }
+        };
+        let created = create("created-by-session").await;
+        let owned = state
+            .mob_create_definition_with_owner_bridge_session(
+                sample_definition("owned-by-session"),
+                session_id.clone(),
+                true,
+                false,
+            )
+            .await
+            .expect("the host creates a mob for the session");
+        assert_eq!(
+            state
+                .handle_for(&owned)
+                .await
+                .expect("owned mob handle")
+                .provenance()
+                .await
+                .expect("provenance"),
+            meerkat_mob::MobProvenance::Session {
+                session_id: session_id.clone()
+            },
+            "the host's create names the session as its caller, not as its creator"
+        );
+        let recreated = create("recreated-by-host").await;
+        let earlier = state
+            .handle_for(&recreated)
+            .await
+            .expect("handle of the session's create");
+        assert!(
+            state
+                .session_is_recorded_creator(&earlier, &session_id)
+                .await
+        );
+        state
+            .mob_destroy_unchecked(&recreated)
+            .await
+            .expect("destroy the session's mob");
+        state
+            .mob_create_definition(sample_definition("recreated-by-host"))
+            .await
+            .expect("the host re-creates the id");
+        let current = state
+            .handle_for(&recreated)
+            .await
+            .expect("handle of the host's create");
+        assert_ne!(current.incarnation(), earlier.incarnation());
+        assert!(
+            !state
+                .session_is_recorded_creator(&current, &session_id)
+                .await,
+            "the session's record of the earlier incarnation proves nothing for the current one"
+        );
+
+        let rebuilt = factory
+            .build_mob_tools(meerkat_core::service::MobToolsBuildArgs {
+                session_id,
+                model: "claude-sonnet-4-5".to_string(),
+                authority_context: Some(create_only_authority()),
+                effective_authority: None,
+                comms_name: None,
+                comms_runtime: None,
+                snapshot_context: meerkat_core::service::MobToolSnapshotContext::Standalone,
+            })
+            .await
+            .expect("build_mob_tools");
+        let list_args = serde_json::value::RawValue::from_string("{}".to_string()).unwrap();
+        let listed = rebuilt
+            .dispatch(ToolCallView {
+                id: "list-after-restart",
+                name: "mob_list",
+                args: &list_args,
+            })
+            .await
+            .expect("mob_list");
+        let listed: serde_json::Value =
+            serde_json::from_str(&listed.result.text_content()).unwrap();
+        let listed = listed["mobs"]
+            .as_array()
+            .expect("mobs")
+            .iter()
+            .map(|mob| mob["mob_id"].as_str().expect("mob_id").to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(listed, vec![created.to_string()]);
+        let members_of = |mob_id: &MobId| {
+            let rebuilt = &rebuilt;
+            let args =
+                serde_json::value::RawValue::from_string(json!({ "mob_id": mob_id }).to_string())
+                    .unwrap();
+            async move {
+                rebuilt
+                    .dispatch(ToolCallView {
+                        id: "members-after-restart",
+                        name: "mob_list_members",
+                        args: &args,
+                    })
+                    .await
+            }
+        };
+        members_of(&created)
+            .await
+            .expect("the creator manages the mob its own create made");
+        assert!(matches!(
+            members_of(&owned).await,
+            Err(ToolError::AccessDenied { .. })
+        ));
+        assert!(matches!(
+            members_of(&recreated).await,
+            Err(ToolError::AccessDenied { .. })
+        ));
     }
 
     /// An agent's `mob_create` names the calling session to the host's create

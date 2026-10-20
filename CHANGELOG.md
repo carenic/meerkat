@@ -1268,11 +1268,16 @@ them.
 - `meerkat_core::service::MobIncarnationId` implements `Display`,
   `FromStr` (error: `MobIncarnationIdParseError`), `PartialOrd` and `Ord`.
 - `meerkat_mob::MobProvenance`: who created a mob (`Member`, `Host`,
-  `Session`, `Ambiguous` or `Unrecorded`), recorded once with its creation and
-  never rewritten. `MobHandle::provenance` reads it for a running mob, and
-  `MobStorage::creation_provenance` and `MobStorage::creation_incarnation`
-  read a stored mob's record without building a runtime.
-  `MobBuilder::with_provenance` sets it for a create (default `Host`).
+  `Session`, `Ambiguous`, `Unrecorded`, `OperatorSession` or
+  `OperatorMember`), recorded once with its creation and never rewritten. A
+  session's own create with its create capability (the agent mob tools'
+  `mob_create`) records `OperatorSession`, or `OperatorMember` for a
+  member's session; a create a host makes for a caller session records
+  `Session` or `Member`. `MobHandle::provenance` reads it for a running mob,
+  and `MobStorage::creation_provenance` and
+  `MobStorage::creation_incarnation` read a stored mob's record without
+  building a runtime. `MobBuilder::with_provenance` sets it for a create
+  (default `Host`).
 - `meerkat_mob::IncarnationInconsistency`: how a mob store's creation record
   and its event log disagree.
 - `meerkat_mob::MobHandle::member_of_session` and
@@ -1712,16 +1717,17 @@ them.
   authority binds no mob, so the manage grant its create returned was gone
   after a restart; the agent mob tools now re-derive it, for the incarnation
   the mob runs at, from the mob's creation record, while the session may
-  still create mobs. The record proves it for
-  `MobProvenance::Session` naming the session, and for
-  `MobProvenance::Member` only while the session is still the bridge session
-  of the recorded member at the recorded generation in the recorded parent
-  incarnation. Nothing else is granted: `Host`, `Ambiguous` and `Unrecorded`
-  records, another session, a later generation of the creating member, and a
-  session whose operator removed its create capability get no grant. A
-  session that a host passes as the owner session of a create
-  (`MobMcpState::mob_create_definition_with_owner_bridge_session`) is that
-  mob's recorded creator too.
+  still create mobs. The record proves it only for the session's own create:
+  `MobProvenance::OperatorSession` naming the session, and
+  `MobProvenance::OperatorMember` only while the session is still the bridge
+  session of the recorded member at the recorded generation in the recorded
+  parent incarnation. A mob a host created for a session
+  (`MobMcpState::mob_create_definition_with_owner_bridge_session`, recorded
+  as `Session` or `Member`) is owned by that session, but that create
+  granted the session nothing, so it gets no grant. Nothing else is granted
+  either: `Host`, `Ambiguous` and `Unrecorded` records, another session, a
+  later generation of the creating member, and a session whose operator
+  removed its create capability get no grant.
 - `meerkat-store`: the SQLite session store lays out a whole-blob session
   whose transcript graph retired its oldest occurrences, which every session
   compacted more often than `history_retained_rewrites` (default 4) has. It
