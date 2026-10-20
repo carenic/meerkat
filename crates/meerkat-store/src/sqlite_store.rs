@@ -10645,10 +10645,11 @@ mod tests {
             .activate_head_canonical_store_with_staged_images(&staged)
             .await
             .expect("the staged activation crosses the legacy session");
-        let HeadCanonicalStoreActivation::Activated(crossings) = activation else {
-            panic!("the store activates");
+        let crossings = match activation {
+            HeadCanonicalStoreActivation::Activated(crossings) => crossings,
+            HeadCanonicalStoreActivation::NotApplicable => Vec::new(),
         };
-        assert_eq!(crossings.len(), 1);
+        assert_eq!(crossings.len(), 1, "the store activates its one session");
         assert!(matches!(
             crossings[0],
             HeadCanonicalAuthorityCrossing::Converted(_)
@@ -10674,15 +10675,17 @@ mod tests {
                 .is_empty(),
             "an activated store has nothing to stage"
         );
-        let HeadCanonicalStoreActivation::Activated(again) =
-            store.activate_head_canonical_store().await.unwrap()
-        else {
-            panic!("the store activates again");
+        let again = match store.activate_head_canonical_store().await.unwrap() {
+            HeadCanonicalStoreActivation::Activated(crossings) => crossings,
+            HeadCanonicalStoreActivation::NotApplicable => Vec::new(),
         };
-        assert!(matches!(
-            again[0],
-            HeadCanonicalAuthorityCrossing::AlreadyCurrent(_)
-        ));
+        assert!(
+            matches!(
+                again.first(),
+                Some(HeadCanonicalAuthorityCrossing::AlreadyCurrent(_))
+            ),
+            "the store activates again with the session already current"
+        );
     }
 
     /// The head fields the transcript and its rewrite graph determine, which a
