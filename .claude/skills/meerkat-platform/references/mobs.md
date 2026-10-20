@@ -316,6 +316,33 @@ delivery records `runtime_rejected` instead of `mob_rejected`; the restored
 member keeps its registration, and a re-selection must advance
 `context_generation` (else the cause is `scoped_context_generation_not_advanced`).
 
+Respawn restrictions (since 0.9.4): `MobHandle::respawn` and the `mob_respawn`
+tool give a local member's successor the predecessor's launch tool access
+policy and inherited visibility ceiling, as its session recorded them,
+intersected with the successor's own and never widened. The successor keeps
+the auth binding the predecessor's session recorded only when its own spec
+names none and its profile resolves to the provider that binding was recorded
+for; otherwise it selects its own, as a fresh spawn does. The successor's
+profile and provider are resolved before anything is retired. A respawn whose
+predecessor's restrictions cannot be established, whose successor profile
+cannot be resolved, or whose member changes while they are read is refused
+before anything is retired with
+`MobError::RespawnPredecessorRestrictionsUnavailable`, and the member is kept.
+It has no dedicated wire code: the message is
+`respawn of member <id> refused: <reason>`. That includes a Broken member
+whose session was lost, which respawn no longer repairs: retire it and spawn a
+fresh member, which recovers nothing of the lost restrictions. A custom
+`MobSessionService` that wraps a stock one must delegate
+`predecessor_tool_restrictions` (default `Unsupported`), or its members'
+respawns are refused. Not checked before retirement: a recorded binding since
+removed from the realm configuration or re-pointed to another provider, so the
+successor's build fails after the predecessor is retired
+(`MobRespawnError::SpawnAfterRetireWithCause`); name a binding in a spawn
+customizer, or retire and spawn. A peer-only member never bound to a local
+session keeps its own spec's policy and ceiling; placed members are
+unchanged. The authorization integration guide covers the security side
+("Preserve restrictions across respawn").
+
 Reload-required members (since 0.9.4): `force_cancel_member` and
 `cancel_all_work` on a member whose runtime needs a durability reload answer
 `MobError::MemberReloadRequired` at once (wire `MEMBER_RELOAD_REQUIRED`:
