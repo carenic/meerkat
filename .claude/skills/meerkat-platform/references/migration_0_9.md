@@ -342,7 +342,11 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   input after the reload instead of resubmitting it (resubmit only with an
   idempotency key); a scheduled delivery waits for the input's own outcome
   for up to 5 lease periods. A custom `ScheduleTargetDelivery` resolves a
-  deduplicated replay's completion from the original input's outcome.
+  deduplicated replay's completion from the original input's outcome. An
+  input admission whose write never answers is bounded by the same deadline
+  (then `RecoveryRepairBlocked`, `runtime_admission_deadline`; resubmit with
+  the same idempotency key); registration, unregister, control writes and
+  recovery still wait for the store (known limitation).
 - Realtime: a response the provider ends without completing it arrives as the
   non-terminal `turn_failed` live observation (route on `failure.status`;
   nothing of it is committed, the transcript records `assistant_turn_failed`,

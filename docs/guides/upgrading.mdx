@@ -533,7 +533,14 @@ The compaction types around it change too:
   idempotency key); a reload refuses with the retryable
   `RuntimeDriverError::RecoveryRepairBlocked` until the store answers. A
   scheduled delivery waits for the input's own outcome (see
-  [Other behaviour changes](#other-behaviour-changes)).
+  [Other behaviour changes](#other-behaviour-changes)). An input admission
+  whose store write never answers is bounded by the same deadline: past it,
+  the admission refuses with the retryable `RecoveryRepairBlocked` naming the
+  input and the session needs a reload (`runtime_admission_deadline`); the
+  write may still land, so resubmit with the same idempotency key or read the
+  input after the reload. Known limitation: registration, unregister, control
+  writes, recovery and the runtime loop's other writes under the gate still
+  wait for a store that stops answering.
 - `MeerkatMachine::bind_scoped_context` refuses a destination whose
   `context_generation` does not advance with
   `RuntimeDriverError::ScopedContextGenerationNotAdvanced { bound, requested }`
@@ -634,9 +641,10 @@ mob machine inputs, effects and transition ids gain `RetireAtScope` and
   completion wait fails with `BoundaryRolledBack` or `DurableOutcomeUnknown`
   re-reads the input's outcome for up to 5 lease periods (5 minutes at the
   default 60 s lease) before it ends `delivery_failed` with
-  `runtime_completion_authority_unavailable`. **Do:** a custom
-  `ScheduleTargetDelivery` resolves a deduplicated replay's completion from
-  the original input's outcome.
+  `runtime_completion_authority_unavailable`. A scheduled mob delivery whose
+  redelivery finds the delivery already failed records `delivery_failed`
+  (0.9.3: `completed`). **Do:** a custom `ScheduleTargetDelivery` resolves a
+  deduplicated replay's completion from the original input's outcome.
 - **macOS stdio MCP servers close as soon as they exit**, as on Linux; 0.9.3
   waited about 8 s per stdio server (the EOF grace, SIGTERM, the TERM grace,
   SIGKILL) at every close, removal, reload, session end and shutdown.
