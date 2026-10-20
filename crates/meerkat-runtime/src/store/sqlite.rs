@@ -7243,8 +7243,9 @@ ORDER BY runtime_id";
     /// Activation before this release derived such a boundary with a flat
     /// message-row prefix. For a session whose transcript was rewritten that
     /// names a head the store never wrote, so the first mutation checked
-    /// against the authority was refused. Only an authority whose token
-    /// differs from its stored physical head token is read further; each one
+    /// against the authority was refused. A read-only scan first keeps only
+    /// the authorities whose token differs from their stored physical head
+    /// token, so an open with none takes no write lock here; each one kept
     /// is rewritten in its own transaction, as a compare-and-set on the token
     /// it holds, once the store proves its boundary is that head
     /// ([`meerkat_store::sqlite_store::runtime_boundary_in_physical_row_lineage_in_txn`]).
@@ -7273,11 +7274,34 @@ ORDER BY runtime_id";
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?
         };
-        for (runtime_id, session_id, committed_head_token) in authorities {
-            let runtime_id = LogicalRuntimeId::new(runtime_id);
-            let Ok(session_id) = meerkat_core::types::SessionId::parse(&session_id) else {
-                continue;
-            };
+        let candidates = {
+            let tx = conn
+                .transaction()
+                .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+            let mut candidates = Vec::new();
+            for (runtime_id, session_id, committed_head_token) in authorities {
+                let Ok(session_id) = meerkat_core::types::SessionId::parse(&session_id) else {
+                    continue;
+                };
+                let stored_head_token =
+                    meerkat_store::sqlite_store::stored_head_token_for_runtime_in_txn(
+                        &tx,
+                        &session_id,
+                    )
+                    .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+                if stored_head_token.is_some_and(|token| token != committed_head_token) {
+                    candidates.push((
+                        LogicalRuntimeId::new(runtime_id),
+                        session_id,
+                        committed_head_token,
+                    ));
+                }
+            }
+            tx.commit()
+                .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+            candidates
+        };
+        for (runtime_id, session_id, committed_head_token) in candidates {
             let tx = begin_runtime_transaction(conn)?;
             match repair_flat_physical_head_boundary_in_txn(
                 &tx,
@@ -22793,6 +22817,63 @@ ORDER BY runtime_id";
                         .boundary_head(),
                     &rewritten
                 );
+            }
+        }
+
+        /// A SQLite realm (a WholeBlob v1 runtime database beside the session
+        /// store, in one file) whose co-tenant store keeps a compacted session
+        /// as a released blob row activates on open with the physical head as
+        /// the runtime authority, and the next compaction is accepted. The
+        /// session without compactions (the append-only control, checked
+        /// first) activates with matching tokens as before.
+        #[tokio::test]
+        async fn realm_activation_of_a_compacted_blob_row_takes_its_physical_head_as_authority() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("realm.sqlite3");
+            let (re_anchored, plain) = re_anchored_whole_blob_database(&path).await;
+            let session_store = meta_093_co_located_session_store(&path);
+            let millis = |at: std::time::SystemTime| {
+                i64::try_from(at.duration_since(UNIX_EPOCH).unwrap().as_millis()).unwrap()
+            };
+            for session in [&plain, &re_anchored] {
+                Connection::open(&path)
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO sessions (
+                             session_id, created_at_ms, updated_at_ms, message_count,
+                             total_tokens, metadata_json, session_json
+                         ) VALUES (?1, ?2, ?3, ?4, 0, '{}', ?5)",
+                        params![
+                            session.id().to_string(),
+                            millis(session.created_at()),
+                            millis(session.updated_at()),
+                            i64::try_from(session.messages().len()).unwrap(),
+                            serde_json::to_vec(session).unwrap(),
+                        ],
+                    )
+                    .unwrap();
+            }
+
+            let store = SqliteRuntimeStore::new_head_canonical(&path)
+                .expect("the realm activates its WholeBlob runtimes on open");
+            for session in [&plain, &re_anchored] {
+                let (authority, physical) = authority_and_physical_head_tokens(&path, session.id());
+                assert_eq!(
+                    authority,
+                    physical,
+                    "{}: the activated runtime authority does not name the physical head",
+                    session.id()
+                );
+            }
+            for session in [&plain, &re_anchored] {
+                commit_a_rewrite_from_the_runtime_authority(&store, &session_store, session.id())
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{}: the next compaction after the realm activation is refused: {error}",
+                            session.id()
+                        )
+                    });
             }
         }
 
