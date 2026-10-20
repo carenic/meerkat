@@ -520,3 +520,187 @@ async fn a_resume_refuses_typed_while_a_member_needs_a_reload() {
         .expect("the send answers")
         .expect("the reloaded member accepts the request");
 }
+
+/// A member whose runtime unregister is finalizing (its final unregister
+/// transition is committed and the store transaction that ends it is still
+/// in flight) refuses every lifecycle mutation, the Stop's hold among them.
+/// The Stop reports the member with no run and its run starts held instead
+/// of failing, and the unregister then finishes and removes the registration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_holds_a_member_whose_unregister_is_finalizing() {
+    let mob = persistent_single_member_mob("unregister-finalizing").await;
+    let session = mob.session(0).clone();
+    mob.store.park_unregister_finalizations(&session);
+    let unregister = tokio::spawn({
+        let adapter = Arc::clone(&mob.adapter);
+        let session = session.clone();
+        async move {
+            adapter
+                .unregister_current_session_registration_until_terminal(&session)
+                .await
+        }
+    });
+    wait_until(
+        "the member's unregister finalization parks",
+        STEP,
+        || async { mob.store.parked_unregister_finalization_arrivals(&session) == 1 },
+    )
+    .await;
+    assert!(
+        mob.adapter.unregister_owed(&session).await,
+        "the finalizing registration refuses lifecycle mutations"
+    );
+
+    let report = tokio::time::timeout(STEP, mob.handle.stop())
+        .await
+        .expect("the stop answers")
+        .expect("the stop succeeds");
+    assert_eq!(
+        report.members.get(mob.member(0)),
+        Some(&crate::runtime::stop_report::MemberStopOutcome {
+            run: MemberStopRun::NoRun,
+            starts: MemberRunStarts::Held,
+        }),
+        "{report:?}"
+    );
+
+    mob.store.release_unregister_finalizations();
+    let removed = tokio::time::timeout(STEP, unregister)
+        .await
+        .expect("the unregister finishes")
+        .expect("the unregister task")
+        .expect("the unregister succeeds");
+    assert!(removed, "the unregister removed the registration");
+    assert!(!mob.adapter.contains_session(&session).await);
+}
+
+/// A member whose runtime unregister ended with its finalization's outcome
+/// unknown keeps a registration that refuses every lifecycle mutation until
+/// an unregister is retried. A Shutdown reports the member's run starts held
+/// instead of failing at its hold, and its teardown retries the unregister,
+/// which removes the registration once the store answers again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shutdown_retries_the_owed_unregister_of_a_member() {
+    use crate::runtime::{MemberShutdownOutcome, ShutdownOptions};
+
+    let mob = persistent_single_member_mob("unregister-owed-shutdown").await;
+    let session = mob.session(0).clone();
+    mob.store
+        .fail_unregister_finalizations(&session, Some(UnregisterFinalizationFault::OutcomeUnknown));
+    let unregistered = tokio::time::timeout(
+        STEP,
+        mob.adapter
+            .unregister_current_session_registration_until_terminal(&session),
+    )
+    .await
+    .expect("the unregister answers");
+    assert!(
+        matches!(
+            unregistered,
+            Err(meerkat_runtime::RuntimeDriverError::UnregisterFinalizationOutcomeUnknown { .. })
+        ),
+        "{unregistered:?}"
+    );
+    assert!(
+        mob.adapter.unregister_owed(&session).await,
+        "the registration waits for a retried unregister"
+    );
+    // The store answers again; nothing retries the unregister on its own.
+    mob.store.fail_unregister_finalizations(&session, None);
+
+    let report = tokio::time::timeout(
+        STEP,
+        mob.handle.shutdown_with_report(
+            ShutdownOptions::default().with_deadline(Instant::now() + Duration::from_secs(5)),
+        ),
+    )
+    .await
+    .expect("the shutdown answers")
+    .expect("the shutdown succeeds");
+    assert_eq!(
+        report.run_starts.get(mob.member(0)),
+        Some(&MemberRunStarts::Held),
+        "{report:?}"
+    );
+    assert!(
+        matches!(
+            report.runs.get(mob.member(0)),
+            None | Some(MemberStopRun::NoRun)
+        ),
+        "{report:?}"
+    );
+    assert!(
+        matches!(
+            report.members.get(mob.member(0)),
+            Some(MemberShutdownOutcome::Unregistered)
+        ),
+        "{report:?}"
+    );
+    assert!(
+        !mob.adapter.contains_session(&session).await,
+        "the teardown's retried unregister removed the registration"
+    );
+}
+
+/// A member whose runtime unregister failed definitely at its finalization is
+/// the teardown-only anchor the next unregister retries from, and it refuses
+/// every lifecycle mutation until then. A Stop reports the member with no run
+/// and its run starts held instead of failing, and a Shutdown's teardown
+/// retries the unregister, which removes the registration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_and_a_shutdown_settle_a_member_left_as_an_unregister_anchor() {
+    use crate::runtime::{MemberShutdownOutcome, ShutdownOptions};
+
+    let mob = persistent_single_member_mob("unregister-anchor").await;
+    let session = mob.session(0).clone();
+    mob.store
+        .fail_unregister_finalizations(&session, Some(UnregisterFinalizationFault::WriteFailed));
+    let unregistered = tokio::time::timeout(
+        STEP,
+        mob.adapter
+            .unregister_current_session_registration_until_terminal(&session),
+    )
+    .await
+    .expect("the unregister answers");
+    assert!(unregistered.is_err(), "{unregistered:?}");
+    assert!(
+        mob.adapter.unregister_owed(&session).await,
+        "the anchor waits for the next unregister"
+    );
+
+    let report = tokio::time::timeout(STEP, mob.handle.stop())
+        .await
+        .expect("the stop answers")
+        .expect("the stop succeeds");
+    assert_eq!(
+        report.members.get(mob.member(0)),
+        Some(&crate::runtime::stop_report::MemberStopOutcome {
+            run: MemberStopRun::NoRun,
+            starts: MemberRunStarts::Held,
+        }),
+        "{report:?}"
+    );
+
+    // The store answers again; the Shutdown's teardown retries the unregister.
+    mob.store.fail_unregister_finalizations(&session, None);
+    let report = tokio::time::timeout(
+        STEP,
+        mob.handle.shutdown_with_report(
+            ShutdownOptions::default().with_deadline(Instant::now() + Duration::from_secs(5)),
+        ),
+    )
+    .await
+    .expect("the shutdown answers")
+    .expect("the shutdown succeeds");
+    assert!(
+        matches!(
+            report.members.get(mob.member(0)),
+            Some(MemberShutdownOutcome::Unregistered)
+        ),
+        "{report:?}"
+    );
+    assert!(
+        !mob.adapter.contains_session(&session).await,
+        "the teardown's retried unregister removed the registration"
+    );
+}

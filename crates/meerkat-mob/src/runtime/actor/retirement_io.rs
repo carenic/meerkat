@@ -63,6 +63,11 @@ pub(in crate::runtime) struct StuckRetirement {
     pub(in crate::runtime) entry: RosterEntry,
     pub(in crate::runtime) stage: super::super::RetirementStage,
     pub(in crate::runtime) cause: Arc<MobError>,
+    /// Whether the retirement started for a member whose host refused its
+    /// registration. The member's Retire transition cleared MobMachine's
+    /// record of the refusal, so a re-drive starts on the refused path
+    /// from this.
+    pub(in crate::runtime) registration_refused: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1751,12 +1756,13 @@ impl MobActor {
             }
         }
         .await;
-        if result.is_err() && matches!(&batch.after, RetirementAfter::Reset { .. }) {
-            if self.state() == MobState::Stopped {
-                self.provisioner.cancel_all_checkpointers().await;
-            } else {
-                self.fail_reset_to_stopped().await;
-            }
+        // A failed Reset leaves the mob Stopped, the pause a Stop leaves:
+        // its checkpointer gates stay armed.
+        if result.is_err()
+            && matches!(&batch.after, RetirementAfter::Reset { .. })
+            && self.state() != MobState::Stopped
+        {
+            self.fail_reset_to_stopped().await;
         }
         if !self.respawn_topology_reply_withheld && !self.durable_uncertainty_fail_stop {
             Self::answer_retirement_after(batch.after, result);
@@ -2951,6 +2957,14 @@ impl MobActor {
                     {
                         return Ok(mob_dsl::MemberSessionDisposal::Archived);
                     }
+                    #[cfg(test)]
+                    if let Some(session) = member.bridge_session_id()
+                        && retirement_stage_test_hooks::take_session_archive_failure(session)
+                    {
+                        return Err(MobError::Internal(
+                            "injected session archive failure".to_string(),
+                        ));
+                    }
                     let result = if registration_refused {
                         provisioner
                             .retire_refused_member(&member, &identity, Some(deadline))
@@ -3795,6 +3809,7 @@ impl MobActor {
             }
             return;
         }
+        let mut redriven_refused = false;
         if let Some(stuck) = self.stuck_retirements.get(&identity) {
             if redrive || matches!(reply, RetirementReply::Owned) {
                 tracing::info!(
@@ -3804,6 +3819,7 @@ impl MobActor {
                     cause = %stuck.cause,
                     "re-driving stuck member retirement"
                 );
+                redriven_refused = stuck.registration_refused;
                 self.stuck_retirements.remove(&identity);
             } else {
                 let error = MobError::MemberRetirementStuck {
@@ -3869,7 +3885,9 @@ impl MobActor {
         let placed =
             super::super::member_runtime_is_host_owned(self.dsl_authority.state(), &identity);
         let placement = self.retirement_placement_fence(&identity);
-        let registration_refused = self.member_registration_refused(&identity);
+        // A re-drive keeps the refusal its retirement started with: the
+        // member's Retire transition cleared MobMachine's record of it.
+        let registration_refused = redriven_refused || self.member_registration_refused(&identity);
         let mut continuation = Box::new(RetirementState {
             ticket: 0,
             entry,
@@ -4551,6 +4569,25 @@ impl MobActor {
         }
     }
 
+    /// Hand `identity`'s stuck retirement back for re-drive, unless one is
+    /// queued or a retirement of it is in flight. Identity reconciliation
+    /// calls this on each pass that backs off: a member whose durably started
+    /// retirement settled stuck reads as recovering, which the pass only
+    /// waits on, so without a re-drive the identity would wait for a resume.
+    /// The identity's backoff paces the passes, so a stage that keeps failing
+    /// is re-driven at most once per backoff period. Returns whether one was
+    /// queued.
+    pub(super) fn enqueue_stuck_retirement_redrive(&mut self, identity: &AgentIdentity) -> bool {
+        if !self.stuck_retirements.contains_key(identity)
+            || self.retirements.contains_key(identity)
+            || self.pending_stuck_redrives.contains(identity)
+        {
+            return false;
+        }
+        self.pending_stuck_redrives.push_back(identity.clone());
+        true
+    }
+
     /// Start the next queued stuck-retirement re-drive, if the mob is running
     /// and the member's retirement is not already in flight. Returns whether
     /// one was started.
@@ -4645,6 +4682,7 @@ impl MobActor {
                         entry: continuation.entry.clone(),
                         stage,
                         cause: Arc::clone(&cause),
+                        registration_refused: continuation.registration_refused,
                     },
                 );
                 self.lifecycle_observations.publish(
@@ -5871,6 +5909,46 @@ impl MobActor {
         rollback.compensating = false;
         self.finish_spawn_rollback_attempt(&custody, Some(continuation), Err(error))
             .await;
+    }
+}
+
+/// Test hooks for the retirement stages.
+#[cfg(test)]
+pub(crate) mod retirement_stage_test_hooks {
+    use std::sync::{Mutex, PoisonError};
+
+    use meerkat_core::types::SessionId;
+
+    static FAILING_SESSION_ARCHIVES: Mutex<Vec<SessionId>> = Mutex::new(Vec::new());
+
+    /// The next session archive stage of a retirement of `session` fails,
+    /// once.
+    pub(crate) fn fail_next_session_archive(session: &SessionId) {
+        FAILING_SESSION_ARCHIVES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(session.clone());
+    }
+
+    /// Whether the failure armed for `session` has not fired yet.
+    pub(crate) fn session_archive_failure_armed(session: &SessionId) -> bool {
+        FAILING_SESSION_ARCHIVES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(session)
+    }
+
+    pub(super) fn take_session_archive_failure(session: &SessionId) -> bool {
+        let mut armed = FAILING_SESSION_ARCHIVES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match armed.iter().position(|candidate| candidate == session) {
+            Some(index) => {
+                armed.remove(index);
+                true
+            }
+            None => false,
+        }
     }
 }
 

@@ -27,6 +27,7 @@ mod live_pipeline {
     };
     use meerkat::session_runtime::live_orchestration::{
         LiveOrchestrator, LiveSessionIngressReconciler, LiveTransportContext,
+        RealtimeSessionOpenProjectionError,
     };
     use meerkat::session_runtime::runtime_state::ArchiveRuntimeCleanup;
     use meerkat::surface::{
@@ -1128,6 +1129,14 @@ mod live_pipeline {
         assert!(matches!(
             member_live_error_from_open(LiveOpenError::WebrtcNotCompiled),
             MemberLiveError::TransportUnsupported { .. }
+        ));
+        // Another open on the host still holds the open-projection admission:
+        // transient, so the member degrades typed instead of failing internal.
+        assert!(matches!(
+            member_live_error_from_open(LiveOpenError::OpenConfig(
+                RealtimeSessionOpenProjectionError::Backpressured
+            )),
+            MemberLiveError::Unavailable { .. }
         ));
         assert!(matches!(
             member_live_error_from_verb(LiveChannelVerbError::SessionPinMismatch {

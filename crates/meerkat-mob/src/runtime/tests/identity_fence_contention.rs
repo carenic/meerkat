@@ -408,9 +408,11 @@ impl fmt::Display for ContentionReport {
     }
 }
 
-/// RED-2: an adopted identity whose every convergence-status commit holds
-/// mob.db's write lock for 300 ms converges: its runtime registration waits
-/// for the lock instead of losing to the status write on every pass.
+/// C3: an adopted identity whose every convergence-status commit holds
+/// mob.db's write lock for 300 ms converges. A control: with one identity,
+/// a registration that finds the fence held is retried on a later pass, so
+/// it converges with or without the bounded wait. RED-1 and RED-5 prove the
+/// wait itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_adopted_identity_converges_while_status_commits_hold_the_mob_database() {
     let mob = sqlite_mob("fence-contention-one").await;
@@ -563,6 +565,36 @@ async fn identities_whose_retirement_outruns_its_budget_converge_once_the_load_e
         converged.iter().all(Option::is_some),
         "every identity converges within {BOUND:?} of the adoptions, the hold ending at \
          {HOLD_FOR:?}:\n{unconverged}"
+    );
+    mob.handle.shutdown().await.expect("shut the mob down");
+}
+
+/// An adopted identity whose member retirement settles stuck after its
+/// durable start (its session archive stage fails once) converges without
+/// a resume: identity reconciliation re-drives the stuck retirement on its
+/// backoff passes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_identity_whose_member_retirement_settles_stuck_converges_on_a_redrive() {
+    use crate::runtime::actor::retirement_stage_test_hooks as stages;
+
+    const BOUND: Duration = Duration::from_secs(20);
+    let mob = sqlite_mob("stuck-retirement-redrive").await;
+    let member = AgentIdentity::from("worker-1");
+    let session_id = spawn_member(&mob, &member).await;
+    stages::fail_next_session_archive(&session_id);
+
+    let started = Instant::now();
+    adopt(&mob, &member, &session_id).await;
+    let converged = wait_converged(&mob, std::slice::from_ref(&member), started, BOUND).await;
+    let latest = convergence(&mob, &member).await;
+    assert!(
+        !stages::session_archive_failure_armed(&session_id),
+        "the adoption's member retirement reached its session archive stage, which failed once"
+    );
+    assert!(
+        converged[0].is_some(),
+        "the identity converges within {BOUND:?} once its stuck retirement is re-driven; latest \
+         status: {latest:?}"
     );
     mob.handle.shutdown().await.expect("shut the mob down");
 }

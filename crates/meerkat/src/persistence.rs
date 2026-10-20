@@ -115,10 +115,16 @@ pub enum PersistenceError {
 /// physical store reissues `AlreadyCurrent` and the runtime consumer accepts
 /// either the exact installed token or the same semantic pre-activation
 /// boundary.
+///
+/// Legacy sessions whose compacted history holds images inline (as a
+/// 0.8.x-era build wrote them) have those images stored in `blob_store`, the
+/// realm's blob store, before the bulk activation crosses them as blob
+/// references.
 #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
 async fn activate_external_head_canonical_store(
     session_store: &Arc<dyn SessionStore>,
     runtime_store: &Arc<dyn RuntimeStore>,
+    blob_store: &Arc<dyn BlobStore>,
     profile: RuntimeSessionPersistenceProfile,
 ) -> Result<(), PersistenceError> {
     if profile != RuntimeSessionPersistenceProfile::HeadCanonicalV1 {
@@ -130,7 +136,28 @@ async fn activate_external_head_canonical_store(
             detail: "HeadCanonical requires an IncrementalSessionStore pairing".to_string(),
         }
     })?;
-    let crossings = match incremental.activate_head_canonical_store().await? {
+    // A legacy session whose compacted history holds images inline crosses
+    // with them as blob references, so they go into the realm blob store
+    // first. Only a persistent blob store may take them: once a session has
+    // crossed, its rows name the images only by blob id, so images staged in
+    // a store that forgets them would be lost at the next restart. A
+    // non-persistent store keeps the plain activation and its refusal, and a
+    // store with nothing to stage activates exactly as before.
+    let staged = if blob_store.is_persistent() {
+        incremental
+            .stage_legacy_inline_images(blob_store.as_ref())
+            .await?
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let activation = if staged.is_empty() {
+        incremental.activate_head_canonical_store().await?
+    } else {
+        incremental
+            .activate_head_canonical_store_with_staged_images(&staged)
+            .await?
+    };
+    let crossings = match activation {
         meerkat_core::HeadCanonicalStoreActivation::NotApplicable => {
             return Err(PersistenceError::SessionPersistenceProfileMismatch {
                 profile,
@@ -1554,8 +1581,13 @@ pub(crate) async fn stage_realm_persistence_stores(
     let set = provider.open(&ctx).await?;
     let profile = admit_store_set(&set, &manifest)?;
     if manifest.provider_name().is_some() {
-        activate_external_head_canonical_store(&set.session_store, &set.runtime_store, profile)
-            .await?;
+        activate_external_head_canonical_store(
+            &set.session_store,
+            &set.runtime_store,
+            &set.blob_store,
+            profile,
+        )
+        .await?;
     }
     Ok(StagedRealmStores {
         manifest,
@@ -1665,11 +1697,38 @@ fn session_hosting_paths(paths: &meerkat_store::RealmPaths) -> meerkat_runtime::
     }
 }
 
+/// Open a SQLite realm's head-canonical runtime store over `database`.
+///
+/// When the activation has legacy runtimes to take up whose WholeBlob bodies
+/// or session blob rows hold images inline (sessions a 0.8.x-era host
+/// compacted with images in their transcripts), those images go into the
+/// realm blob store first, so the activation lays them out as blob
+/// references
+/// ([`meerkat_runtime::store::SqliteRuntimeStore::stage_realm_whole_blob_media`]).
+/// A realm with nothing to activate decodes no session and opens exactly as
+/// before, and so does one whose legacy sessions hold no inline image.
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+async fn open_sqlite_realm_runtime_store(
+    database: &Path,
+    blob_store: &FsBlobStore,
+) -> Result<meerkat_runtime::store::SqliteRuntimeStore, PersistenceError> {
+    use meerkat_runtime::store::SqliteRuntimeStore;
+    let media = SqliteRuntimeStore::stage_realm_whole_blob_media(database, blob_store).await?;
+    let store = if media.stored().is_empty() {
+        SqliteRuntimeStore::new_head_canonical(database)?
+    } else {
+        SqliteRuntimeStore::new_head_canonical_with_staged_media(database, &media)?
+    };
+    Ok(store)
+}
+
 /// The built-in disk composition (sqlite / jsonl / memory), unchanged in
-/// behavior from before the provider seam existed. Crate-visible so the
+/// behavior from before the provider seam existed, except that a SQLite
+/// realm's legacy inline images move into its blob store before activation
+/// ([`open_sqlite_realm_runtime_store`]). Crate-visible so the
 /// `DiskStorageProvider` stays a thin adapter.
 #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
-pub(crate) fn open_disk_store_set(
+pub(crate) async fn open_disk_store_set(
     ctx: &crate::storage_provider::RealmOpenContext,
 ) -> Result<crate::storage_provider::RealmStoreSet, PersistenceError> {
     use crate::storage_provider::RealmStoreSet;
@@ -1798,17 +1857,16 @@ pub(crate) fn open_disk_store_set(
             let workgraph_store = Arc::new(SqliteWorkGraphStore::open(
                 paths.root.join("workgraph.sqlite3"),
             )?) as Arc<dyn WorkGraphStore>;
+            let fs_blob_store = Arc::new(FsBlobStore::new(paths.root.join("blobs")));
             let runtime_store = Arc::new(
-                meerkat_runtime::store::SqliteRuntimeStore::new_head_canonical(
-                    sqlite_store.path().to_path_buf(),
-                )?
-                .with_hosting_paths(session_hosting_paths(paths)),
+                open_sqlite_realm_runtime_store(sqlite_store.path(), &fs_blob_store)
+                    .await?
+                    .with_hosting_paths(session_hosting_paths(paths)),
             ) as Arc<dyn RuntimeStore>;
             let job_store = Arc::new(meerkat_jobs::SqliteDetachedJobStore::open(
                 paths.jobs_sqlite_path.clone(),
             )?) as Arc<dyn meerkat_jobs::DetachedJobStore>;
-            let blob_store: Arc<dyn BlobStore> =
-                Arc::new(FsBlobStore::new(paths.root.join("blobs")));
+            let blob_store: Arc<dyn BlobStore> = fs_blob_store;
             let artifact_store: Arc<dyn ArtifactStore> =
                 Arc::new(FsArtifactStore::new(paths.root.join("artifacts")));
             Ok(RealmStoreSet {
@@ -3359,6 +3417,312 @@ mod tests {
         Ok(())
     }
 
+    /// A session a 0.8.x-era host compacted with images inline: each
+    /// compaction swallowed a tool result carrying an "image/PNG" snapshot
+    /// and a comms notice carrying an "image/jpeg" one, and the live tail
+    /// holds one more image.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn session_with_compacted_inline_images() -> Session {
+        use meerkat_core::types::{
+            ContentBlock, ImageData, Message, SystemNoticeBlock, SystemNoticeKind,
+            SystemNoticeMessage, ToolResult, UserMessage,
+        };
+        let image = |media_type: &str, data: String| ContentBlock::Image {
+            media_type: media_type.to_string(),
+            data: ImageData::Inline { data },
+        };
+        let mut session = Session::new();
+        session.push(Message::User(UserMessage::text("check the cameras")));
+        for round in 0..3 {
+            session.push(Message::tool_results(vec![ToolResult::with_blocks(
+                format!("call-{round}"),
+                vec![image("image/PNG", format!("UE5H{:08}", 2 * round))],
+                false,
+            )]));
+            let comms: SystemNoticeBlock = serde_json::from_value(serde_json::json!({
+                "type": "comms",
+                "kind": "message",
+                "direction": "incoming",
+                "content": [image("image/jpeg", format!("UE5H{:08}", 2 * round + 1))],
+            }))
+            .expect("a comms notice");
+            session.push(Message::SystemNotice(SystemNoticeMessage::with_block(
+                SystemNoticeKind::Generic,
+                None,
+                comms,
+            )));
+            let end = session.messages().len() - 1;
+            session
+                .commit_transcript_rewrite(
+                    meerkat_core::TranscriptRewriteSelection::MessageRange { start: 0, end },
+                    vec![Message::User(UserMessage::text(format!("summary {round}")))],
+                    meerkat_core::TranscriptRewriteReason::new("compaction"),
+                    Some("test".to_string()),
+                    None,
+                )
+                .expect("a compaction");
+        }
+        session.push(Message::User(UserMessage::with_blocks(vec![image(
+            "image/PNG",
+            "UE5H99999999".to_string(),
+        )])));
+        session
+    }
+
+    /// A SQLite realm as a 0.8.x-era build left it for its first 0.9.x open:
+    /// `session`'s runtime committed as a WholeBlob body, which queues it for
+    /// activation, and its session store keeping the same document as a
+    /// legacy blob row.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn stage_inline_image_realm(
+        root: &Path,
+        realm_id: &str,
+        session: &Session,
+    ) -> Result<meerkat_store::RealmPaths, Box<dyn std::error::Error>> {
+        let paths = realm_paths_in(root, realm_id);
+        write_builtin_manifest(&paths, realm_id, RealmBackend::Sqlite)?;
+        drop(SqliteSessionStore::open(
+            paths.sessions_sqlite_path.clone(),
+        )?);
+        let whole_blob = meerkat_runtime::store::SqliteRuntimeStore::new_whole_blob(
+            &paths.sessions_sqlite_path,
+        )?;
+        whole_blob
+            .commit_session_snapshot(
+                &meerkat_runtime::LogicalRuntimeId::for_session(session.id()),
+                meerkat_runtime::SerializedSessionSnapshot {
+                    session_snapshot: serde_json::to_vec(session)?.into(),
+                },
+            )
+            .await?;
+        drop(whole_blob);
+        let mut conn = meerkat_sqlite::open(
+            &paths.sessions_sqlite_path,
+            meerkat_sqlite::ConnectionProfile::Primary { create: false },
+        )?;
+        let tx = conn.transaction()?;
+        meerkat_store::sqlite_store::write_session_snapshot_in_txn(&tx, session)?;
+        tx.commit()?;
+        Ok(paths)
+    }
+
+    /// Whether the realm database at `database` holds a head row for
+    /// `session`.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn realm_has_head_row(
+        database: &Path,
+        session: &SessionId,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let conn = meerkat_sqlite::open(database, meerkat_sqlite::ConnectionProfile::ReadOnly)?;
+        let heads: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM session_heads WHERE session_id = ?1",
+            [session.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(heads > 0)
+    }
+
+    /// The realm's legacy session opens through the built-in provider with
+    /// its images in the realm blob store: each stored under its content
+    /// address, none inline in the activated session, and its live rows and
+    /// every compaction's parent revision hydrating from the bundle's blob
+    /// store to the legacy document, media type strings included. Before
+    /// this, the activation refused the whole realm ("compact rewrite delta
+    /// carries inline media").
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn a_sqlite_realm_whose_legacy_session_holds_inline_images_opens()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let realm_id = "inline-image-realm";
+        let session = session_with_compacted_inline_images();
+        let paths = stage_inline_image_realm(temp.path(), realm_id, &session).await?;
+
+        let (_manifest, bundle) =
+            open_realm_persistence_in(temp.path(), realm_id, None, None).await?;
+        let payloads = session
+            .with_inline_images_externalized()?
+            .expect("the legacy session holds inline images")
+            .payloads;
+        assert_eq!(payloads.len(), 7);
+        let realm_blobs = FsBlobStore::new(paths.root.join("blobs"));
+        for payload in &payloads {
+            assert_eq!(realm_blobs.get(&payload.blob_id).await?.data, payload.data);
+        }
+        let activated = bundle
+            .session_store()
+            .load(session.id())
+            .await?
+            .expect("the activated session");
+        let document = serde_json::to_string(&activated)?;
+        for payload in &payloads {
+            assert!(
+                !document.contains(payload.data.as_str()),
+                "the activated session holds an image inline"
+            );
+        }
+        assert_eq!(
+            activated.transcript_revision()?,
+            session.transcript_revision()?
+        );
+        let blobs = bundle.blob_store();
+        let mut rows = activated.messages().to_vec();
+        meerkat_core::image_content::hydrate_messages_for_execution(
+            blobs.as_ref(),
+            &mut rows,
+            meerkat_core::image_content::MissingBlobBehavior::Error,
+        )
+        .await?;
+        assert_eq!(
+            serde_json::to_value(&rows)?,
+            serde_json::to_value(session.messages())?
+        );
+        let history = session
+            .transcript_history_state()?
+            .expect("a compacted session has a graph");
+        for commit in history.commits() {
+            let rows_of = |session: &Session| {
+                session
+                    .retained_transcript_revision_rows(&commit.parent_revision)
+                    .map(|rows| rows.map(|rows| rows.messages().to_vec()))
+            };
+            let mut rows = rows_of(&activated)?.expect("a retained revision");
+            meerkat_core::image_content::hydrate_messages_for_execution(
+                blobs.as_ref(),
+                &mut rows,
+                meerkat_core::image_content::MissingBlobBehavior::Error,
+            )
+            .await?;
+            assert_eq!(
+                serde_json::to_value(&rows)?,
+                serde_json::to_value(rows_of(&session)?.expect("a retained revision"))?,
+                "revision {}",
+                commit.parent_revision
+            );
+        }
+        Ok(())
+    }
+
+    /// An open with nothing to activate decodes no session. The first open
+    /// of the realm above reads its legacy session (the control); the next
+    /// open, with the realm activated, reads it no more and stores nothing.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn a_sqlite_realm_with_nothing_to_activate_opens_without_decoding_a_session()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let realm_id = "activated-realm";
+        let session = session_with_compacted_inline_images();
+        let paths = stage_inline_image_realm(temp.path(), realm_id, &session).await?;
+
+        let before = meerkat_core::whole_blob_decodes_of_session(session.id());
+        drop(open_realm_persistence_in(temp.path(), realm_id, None, None).await?);
+        let after_activation = meerkat_core::whole_blob_decodes_of_session(session.id());
+        assert!(
+            after_activation > before,
+            "the activating open reads the legacy session"
+        );
+        let blob_files = |root: &Path| -> std::io::Result<usize> {
+            let mut count = 0;
+            for shard in std::fs::read_dir(root)? {
+                count += std::fs::read_dir(shard?.path())?.count();
+            }
+            Ok(count)
+        };
+        let stored = blob_files(&paths.root.join("blobs"))?;
+
+        drop(open_realm_persistence_in(temp.path(), realm_id, None, None).await?);
+        assert_eq!(
+            meerkat_core::whole_blob_decodes_of_session(session.id()),
+            after_activation,
+            "an open with nothing to activate decodes no session"
+        );
+        assert_eq!(blob_files(&paths.root.join("blobs"))?, stored);
+        Ok(())
+    }
+
+    /// An open stopped after its media stage (the images stored, nothing in
+    /// the database changed) opens on the next try.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn a_sqlite_realm_open_stopped_after_its_media_stage_opens_next_time()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let realm_id = "staged-realm";
+        let session = session_with_compacted_inline_images();
+        let paths = stage_inline_image_realm(temp.path(), realm_id, &session).await?;
+
+        let stage = meerkat_runtime::store::SqliteRuntimeStore::stage_realm_whole_blob_media(
+            &paths.sessions_sqlite_path,
+            &FsBlobStore::new(paths.root.join("blobs")),
+        )
+        .await?;
+        assert_eq!(stage.stored().len(), 7);
+        assert!(!realm_has_head_row(
+            &paths.sessions_sqlite_path,
+            session.id()
+        )?);
+        drop(meerkat_runtime::store::SqliteRuntimeStore::new_whole_blob(
+            &paths.sessions_sqlite_path,
+        )?);
+
+        let (_manifest, bundle) =
+            open_realm_persistence_in(temp.path(), realm_id, None, None).await?;
+        assert!(realm_has_head_row(
+            &paths.sessions_sqlite_path,
+            session.id()
+        )?);
+        assert_eq!(
+            bundle
+                .session_store()
+                .load(session.id())
+                .await?
+                .expect("the activated session")
+                .transcript_revision()?,
+            session.transcript_revision()?
+        );
+        Ok(())
+    }
+
+    /// When the realm blob store cannot take the images, the open refuses
+    /// typed and writes nothing the media path owns: the database stays
+    /// unpinned (it still opens as a WholeBlob database) and the session
+    /// has no head row. Once the store works, the realm opens.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn a_sqlite_realm_whose_blob_store_refuses_the_images_stays_unactivated()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let realm_id = "refused-realm";
+        let session = session_with_compacted_inline_images();
+        let paths = stage_inline_image_realm(temp.path(), realm_id, &session).await?;
+        std::fs::write(paths.root.join("blobs"), b"not a directory")?;
+
+        let refused = open_realm_persistence_in(temp.path(), realm_id, None, None).await;
+        assert!(
+            matches!(
+                &refused,
+                Err(PersistenceError::Runtime(RuntimeStoreError::WriteFailed(_)))
+            ),
+            "the open refuses typed: {:?}",
+            refused.as_ref().err()
+        );
+        drop(refused);
+        assert!(!realm_has_head_row(
+            &paths.sessions_sqlite_path,
+            session.id()
+        )?);
+        drop(meerkat_runtime::store::SqliteRuntimeStore::new_whole_blob(
+            &paths.sessions_sqlite_path,
+        )?);
+
+        std::fs::remove_file(paths.root.join("blobs"))?;
+        let (_manifest, bundle) =
+            open_realm_persistence_in(temp.path(), realm_id, None, None).await?;
+        assert!(bundle.session_store().load(session.id()).await?.is_some());
+        Ok(())
+    }
+
     #[cfg(feature = "jsonl-store")]
     #[tokio::test]
     async fn open_realm_persistence_jsonl_builds_durable_runtime_companion()
@@ -3652,6 +4016,141 @@ mod tests {
         assert!(matches!(err, PersistenceError::Runtime(_)));
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    fn memory_blob_store() -> Arc<dyn BlobStore> {
+        Arc::new(MemoryBlobStore::new())
+    }
+
+    /// An externally provided realm whose SQLite session store holds a legacy
+    /// session with images inline in its compacted history activates at
+    /// open: the images go into the realm blob store first, and the session
+    /// crosses with them as blob references, its rows hydrating from that
+    /// store to the legacy document. Before this, the store-wide activation
+    /// refused ("compact rewrite delta carries inline media").
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn external_head_canonical_activation_stages_legacy_inline_images()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let store = Arc::new(SqliteSessionStore::open(
+            temp.path().join("sessions.sqlite3"),
+        )?);
+        let runtime_store = Arc::new(
+            meerkat_runtime::store::SqliteRuntimeStore::new_head_canonical(
+                temp.path().join("runtime.sqlite3"),
+            )?,
+        );
+        let blobs = Arc::new(FsBlobStore::new(temp.path().join("blobs")));
+        let session = session_with_compacted_inline_images();
+        // A legacy blob row, as an earlier build left it.
+        let mut conn = meerkat_sqlite::open(
+            &temp.path().join("sessions.sqlite3"),
+            meerkat_sqlite::ConnectionProfile::Primary { create: false },
+        )?;
+        let tx = conn.transaction()?;
+        meerkat_store::sqlite_store::write_session_snapshot_in_txn(&tx, &session)?;
+        tx.commit()?;
+        drop(conn);
+        let erased: Arc<dyn SessionStore> = store.clone();
+        let erased_runtime: Arc<dyn RuntimeStore> = runtime_store.clone();
+        let erased_blobs: Arc<dyn BlobStore> = blobs.clone();
+
+        activate_external_head_canonical_store(
+            &erased,
+            &erased_runtime,
+            &erased_blobs,
+            RuntimeSessionPersistenceProfile::HeadCanonicalV1,
+        )
+        .await?;
+
+        let payloads = session
+            .with_inline_images_externalized()?
+            .expect("the legacy session holds inline images")
+            .payloads;
+        for payload in &payloads {
+            assert_eq!(blobs.get(&payload.blob_id).await?.data, payload.data);
+        }
+        assert!(
+            Arc::clone(&erased)
+                .as_incremental()
+                .expect("SQLite exposes HeadCanonical capability")
+                .load_head(session.id())
+                .await?
+                .is_some(),
+            "the legacy session crossed into a head"
+        );
+        let activated = erased
+            .load(session.id())
+            .await?
+            .expect("the activated session");
+        let document = serde_json::to_string(&activated)?;
+        for payload in &payloads {
+            assert!(
+                !document.contains(payload.data.as_str()),
+                "the activated session holds an image inline"
+            );
+        }
+        assert_eq!(
+            activated.transcript_revision()?,
+            session.transcript_revision()?
+        );
+        let mut rows = activated.messages().to_vec();
+        meerkat_core::image_content::hydrate_messages_for_execution(
+            erased_blobs.as_ref(),
+            &mut rows,
+            meerkat_core::image_content::MissingBlobBehavior::Error,
+        )
+        .await?;
+        assert_eq!(
+            serde_json::to_value(&rows)?,
+            serde_json::to_value(session.messages())?
+        );
+        Ok(())
+    }
+
+    /// A provider realm whose blob store is not persistent keeps the refusal
+    /// for a legacy session that holds images inline: staging them there
+    /// would lose them at the next restart, because the crossed session names
+    /// them only by blob id. The activation refuses typed and the session
+    /// keeps no head.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn external_head_canonical_activation_does_not_stage_into_a_non_persistent_blob_store()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let sessions_path = temp.path().join("sessions.sqlite3");
+        let store = Arc::new(SqliteSessionStore::open(sessions_path.clone())?);
+        let runtime_store = Arc::new(
+            meerkat_runtime::store::SqliteRuntimeStore::new_head_canonical(
+                temp.path().join("runtime.sqlite3"),
+            )?,
+        );
+        let session = session_with_compacted_inline_images();
+        // A legacy blob row, as an earlier build left it.
+        let mut conn = meerkat_sqlite::open(
+            &sessions_path,
+            meerkat_sqlite::ConnectionProfile::Primary { create: false },
+        )?;
+        let tx = conn.transaction()?;
+        meerkat_store::sqlite_store::write_session_snapshot_in_txn(&tx, &session)?;
+        tx.commit()?;
+        drop(conn);
+        let erased: Arc<dyn SessionStore> = store.clone();
+        let erased_runtime: Arc<dyn RuntimeStore> = runtime_store.clone();
+
+        let refused = activate_external_head_canonical_store(
+            &erased,
+            &erased_runtime,
+            &memory_blob_store(),
+            RuntimeSessionPersistenceProfile::HeadCanonicalV1,
+        )
+        .await;
+        let error = format!("{:?}", refused.expect_err("the activation refuses"));
+        assert!(error.contains("carries inline media"), "{error}");
+        assert!(!realm_has_head_row(&sessions_path, session.id())?);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn external_head_canonical_activation_consumes_current_store_authority()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -3688,6 +4187,7 @@ mod tests {
         activate_external_head_canonical_store(
             &erased,
             &erased_runtime,
+            &memory_blob_store(),
             RuntimeSessionPersistenceProfile::HeadCanonicalV1,
         )
         .await?;
@@ -3716,6 +4216,7 @@ mod tests {
         activate_external_head_canonical_store(
             &erased,
             &erased_runtime,
+            &memory_blob_store(),
             RuntimeSessionPersistenceProfile::HeadCanonicalV1,
         )
         .await?;
@@ -3755,6 +4256,7 @@ mod tests {
         activate_external_head_canonical_store(
             &first_erased,
             &runtime_erased,
+            &memory_blob_store(),
             RuntimeSessionPersistenceProfile::HeadCanonicalV1,
         )
         .await?;
@@ -3777,6 +4279,7 @@ mod tests {
         let error = activate_external_head_canonical_store(
             &second_erased,
             &runtime_erased,
+            &memory_blob_store(),
             RuntimeSessionPersistenceProfile::HeadCanonicalV1,
         )
         .await
@@ -3794,6 +4297,7 @@ mod tests {
         let error = activate_external_head_canonical_store(
             &store,
             &runtime_store,
+            &memory_blob_store(),
             RuntimeSessionPersistenceProfile::HeadCanonicalV1,
         )
         .await

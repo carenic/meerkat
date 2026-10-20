@@ -175,7 +175,7 @@ impl RealmStorageProvider for DiskStorageProvider {
     }
 
     async fn open(&self, ctx: &RealmOpenContext) -> Result<RealmStoreSet, PersistenceError> {
-        crate::persistence::open_disk_store_set(ctx)
+        crate::persistence::open_disk_store_set(ctx).await
     }
 
     fn migrator(&self) -> Option<&dyn meerkat_core::StorageMigrator> {

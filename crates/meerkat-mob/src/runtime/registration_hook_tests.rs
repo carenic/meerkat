@@ -2083,6 +2083,70 @@ async fn a_member_refused_at_a_restart_can_be_retired() {
     let _ = rebooted.resumed.stop().await;
 }
 
+/// `error` is a retirement stuck at its session archive stage, which a
+/// refused member's retirement reaches without a runtime to route to.
+#[track_caller]
+fn assert_stuck_at_archive(error: &MobError) {
+    let cause = match error {
+        MobError::SharedLifecycleFailure(inner) => inner.as_ref(),
+        other => other,
+    };
+    assert!(
+        matches!(cause, MobError::MemberRetirementStuck { stage, .. } if stage.contains("archive")),
+        "stuck at the session archive stage, as the refused path is: {error:?}"
+    );
+}
+
+/// A refused member's retirement whose archive fails after the retirement
+/// durably started settles stuck, and every re-drive of it takes the refused
+/// path again. The member's Retire transition cleared MobMachine's record of
+/// the refusal, so a re-drive keeps the refusal its retirement started with,
+/// also through a re-drive that fails again: the first re-drive still
+/// reaches the archive stage, and the second retires the member.
+#[tokio::test]
+async fn a_refused_members_stuck_retirement_is_redriven_on_the_refused_path() {
+    let rebooted = rebooted_mob(SelectingHost::new(false, true), false).await;
+    rebooted.assert_broken_with_the_refusal().await;
+    rebooted
+        .service
+        .set_archive_failure(&rebooted.session)
+        .await;
+
+    let first = rebooted
+        .resumed
+        .retire(rebooted.member.clone())
+        .await
+        .expect_err("the failing archive leaves the retirement stuck");
+    assert_stuck_at_archive(&first);
+    let again = rebooted
+        .resumed
+        .redrive_retirement(rebooted.member.clone())
+        .await
+        .expect_err("the archive still fails");
+    assert_stuck_at_archive(&again);
+
+    rebooted
+        .service
+        .clear_archive_failure(&rebooted.session)
+        .await;
+    rebooted
+        .resumed
+        .redrive_retirement(rebooted.member.clone())
+        .await
+        .expect("the next re-drive retires the refused member");
+    assert!(
+        rebooted
+            .resumed
+            .list_members()
+            .await
+            .iter()
+            .all(|entry| entry.agent_identity != rebooted.member),
+        "the retired member leaves the roster"
+    );
+    rebooted.assert_no_runtime_residue().await;
+    let _ = rebooted.resumed.stop().await;
+}
+
 /// Respawn is the repair a refused member's diagnostics name: once its host
 /// accepts, the respawned member runs on exactly one current registration,
 /// the one the host was asked about.

@@ -486,27 +486,60 @@ pub struct SessionMemberMatch {
     pub generation: meerkat_mob::Generation,
 }
 
+/// Who makes a create for a caller session, which decides whether the
+/// mob's creation record names that session as the creator whose manage
+/// grant the agent mob tools re-derive after a restart
+/// ([`MobMcpState::session_is_recorded_creator`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionCreateCaller {
+    /// A host creates the mob for the session
+    /// ([`MobMcpState::mob_create_definition_with_owner_bridge_session`]):
+    /// the session owns the mob but holds no grant from the create, so the
+    /// record names it `Session` or `Member`.
+    Host,
+    /// The session creates the mob with its own create capability (the
+    /// agent mob tools' `mob_create`), whose answer grants it manage over
+    /// the mob: the record names it `OperatorSession` or `OperatorMember`.
+    Session,
+}
+
 /// The provenance a create by `session_id` records, from the complete
 /// lookup of the hosted rosters that name that session
 /// ([`MobMcpState::session_member_matches`]): the member when exactly one
 /// roster names it, the bare session when none does, and `Ambiguous` when
-/// several do, without picking one.
+/// several do, without picking one. `caller` decides whether the member or
+/// session is recorded as the creator of its own create.
 fn session_creation_provenance(
     session_id: &SessionId,
     matches: Vec<SessionMemberMatch>,
+    caller: SessionCreateCaller,
 ) -> meerkat_mob::MobProvenance {
-    match <[SessionMemberMatch; 1]>::try_from(matches) {
-        Ok([found]) => meerkat_mob::MobProvenance::Member {
+    match (<[SessionMemberMatch; 1]>::try_from(matches), caller) {
+        (Ok([found]), SessionCreateCaller::Host) => meerkat_mob::MobProvenance::Member {
             parent_mob_id: found.mob_id,
             parent_incarnation: found.incarnation,
             creator_identity: found.identity,
             creator_generation: found.generation,
             owner_session: session_id.clone(),
         },
-        Err(matches) if matches.is_empty() => meerkat_mob::MobProvenance::Session {
-            session_id: session_id.clone(),
+        (Ok([found]), SessionCreateCaller::Session) => meerkat_mob::MobProvenance::OperatorMember {
+            parent_mob_id: found.mob_id,
+            parent_incarnation: found.incarnation,
+            creator_identity: found.identity,
+            creator_generation: found.generation,
+            owner_session: session_id.clone(),
         },
-        Err(matches) => meerkat_mob::MobProvenance::Ambiguous {
+        (Err(matches), SessionCreateCaller::Host) if matches.is_empty() => {
+            meerkat_mob::MobProvenance::Session {
+                session_id: session_id.clone(),
+            }
+        }
+        (Err(matches), SessionCreateCaller::Session) if matches.is_empty() => {
+            meerkat_mob::MobProvenance::OperatorSession {
+                session_id: session_id.clone(),
+            }
+        }
+        (Err(matches), _) => meerkat_mob::MobProvenance::Ambiguous {
             matching_rosters: u32::try_from(matches.len()).unwrap_or(u32::MAX),
         },
     }
@@ -2160,17 +2193,20 @@ impl MobMcpState {
     }
 
     /// Whether the creation record of the mob `handle` serves proves that
-    /// `session_id` is that mob's creator, as the session is bound now. A
-    /// session's persisted operator authority binds no mob, so after a
-    /// restart the agent mob tools re-derive the creator's manage grant from
-    /// this record instead.
+    /// `session_id` created that mob with its own create capability, as the
+    /// session is bound now. A session's persisted operator authority binds
+    /// no mob, so after a restart the agent mob tools re-derive the manage
+    /// grant that create returned from this record instead. The record is
+    /// read at the incarnation `handle` serves: a record of an earlier
+    /// incarnation proves nothing.
     ///
-    /// The record proves it for:
-    /// - `MobProvenance::Session { session_id }`: the session created the mob
-    ///   while no hosted roster named it;
-    /// - `MobProvenance::Member`: the session created the mob as the member
-    ///   `creator_identity` at `creator_generation` of the parent mob at
-    ///   `parent_incarnation`. The generation rule: the record proves only
+    /// The record proves it only for a create the session made itself (the
+    /// agent mob tools' `mob_create`):
+    /// - `MobProvenance::OperatorSession { session_id }`: the session created
+    ///   the mob while no hosted roster named it;
+    /// - `MobProvenance::OperatorMember`: the session created the mob as the
+    ///   member `creator_identity` at `creator_generation` of the parent mob
+    ///   at `parent_incarnation`. The generation rule: the record proves only
     ///   that member incarnation, so the parent must be hosted at that
     ///   incarnation and the session must still be the bridge session of
     ///   exactly that member at exactly that generation. A later generation
@@ -2178,14 +2214,12 @@ impl MobMcpState {
     ///   parent that is not hosted proves nothing, even over the same
     ///   session.
     ///
-    /// `Host`, `Ambiguous` and `Unrecorded` name no creator session, and a
-    /// record that cannot be read proves nothing: every one answers `false`.
-    ///
-    /// Every create with an owner session records that session as the
-    /// creator, including a host's own call of
-    /// [`Self::mob_create_definition_with_owner_bridge_session`] for a
-    /// session that never held a grant over the mob: after a restart that
-    /// session manages the mob too.
+    /// A create a host made for the session
+    /// ([`Self::mob_create_definition_with_owner_bridge_session`], recorded
+    /// as `Session` or `Member`) granted the session nothing, so a mob the
+    /// session merely owns is never widened into its scope. `Host`,
+    /// `Ambiguous` and `Unrecorded` name no creator session, and a record
+    /// that cannot be read proves nothing: every one answers `false`.
     pub(crate) async fn session_is_recorded_creator(
         &self,
         handle: &MobHandle,
@@ -2203,10 +2237,10 @@ impl MobMcpState {
             }
         };
         match provenance {
-            meerkat_mob::MobProvenance::Session {
+            meerkat_mob::MobProvenance::OperatorSession {
                 session_id: creator,
             } => creator == *session_id,
-            meerkat_mob::MobProvenance::Member {
+            meerkat_mob::MobProvenance::OperatorMember {
                 parent_mob_id,
                 parent_incarnation,
                 creator_identity,
@@ -4808,13 +4842,14 @@ impl MobMcpState {
         }
     }
 
-    /// Create `definition` for the caller session `owner_bridge_session_id`.
-    /// The create makes that session the mob's recorded creator (its
-    /// creation record names it as `MobProvenance::Session`, or as the
-    /// creating member's `owner_session` in `MobProvenance::Member`), and
-    /// after a restart the agent mob tools re-derive the creator's manage
-    /// grant for that session from the record
-    /// (`MobMcpState::session_is_recorded_creator`), whoever called this.
+    /// Create `definition` for the caller session `owner_bridge_session_id`,
+    /// as the host. The session owns the mob, and its creation record names
+    /// it as `MobProvenance::Session`, or as the member's `owner_session` in
+    /// `MobProvenance::Member`, but the create grants the session nothing:
+    /// after a restart the agent mob tools do not re-derive a manage grant
+    /// for it (`MobMcpState::session_is_recorded_creator`). Only a session's
+    /// own create with its create capability (the agent mob tools'
+    /// `mob_create`) makes it the creator whose grant is re-derived.
     #[doc(hidden)]
     pub async fn mob_create_definition_with_owner_bridge_session(
         &self,
@@ -4828,20 +4863,22 @@ impl MobMcpState {
             owner_bridge_session_id,
             destroy_on_owner_archive,
             implicit_delegation_mob,
+            SessionCreateCaller::Host,
         )
         .await
         .map(|created| created.mob_id)
     }
 
-    /// [`Self::mob_create_definition_with_owner_bridge_session`], answering
-    /// the incarnation of the mob this create built: the only incarnation a
-    /// mob operator grant for the create may name.
+    /// [`Self::mob_create_definition_with_owner_bridge_session`] made by
+    /// `caller`, answering the incarnation of the mob this create built: the
+    /// only incarnation a mob operator grant for the create may name.
     pub(crate) async fn create_mob_for_owner_bridge_session(
         &self,
         definition: MobDefinition,
         owner_bridge_session_id: SessionId,
         destroy_on_owner_archive: bool,
         implicit_delegation_mob: bool,
+        caller: SessionCreateCaller,
     ) -> Result<CreatedMob, MobError> {
         self.mob_create_definition_inner(
             definition,
@@ -4849,6 +4886,7 @@ impl MobMcpState {
                 owner_bridge_session_id,
                 destroy_on_owner_archive,
                 implicit_delegation_mob,
+                caller,
             )),
             None,
             None,
@@ -4859,7 +4897,7 @@ impl MobMcpState {
     async fn mob_create_definition_inner(
         &self,
         definition: MobDefinition,
-        owner_bridge_session_authority: Option<(SessionId, bool, bool)>,
+        owner_bridge_session_authority: Option<(SessionId, bool, bool, SessionCreateCaller)>,
         member_external_tools: Option<meerkat_mob::ExternalToolsProvider>,
         claim_verifier: Option<meerkat_mob::MobClaimVerifier>,
     ) -> Result<CreatedMob, MobError> {
@@ -4869,7 +4907,7 @@ impl MobMcpState {
         // Before anything of the mob exists: an opt-in names only what this
         // create offers.
         let child = owner_bridge_session_authority.as_ref().is_some_and(
-            |(_, destroy_on_owner_archive, _)| {
+            |(_, destroy_on_owner_archive, _, _)| {
                 child_tool_policy::is_child_mob(*destroy_on_owner_archive)
             },
         );
@@ -4926,7 +4964,7 @@ impl MobMcpState {
     async fn mob_create_definition_admitted(
         &self,
         mut definition: MobDefinition,
-        owner_bridge_session_authority: Option<(SessionId, bool, bool)>,
+        owner_bridge_session_authority: Option<(SessionId, bool, bool, SessionCreateCaller)>,
         member_external_tools: Option<meerkat_mob::ExternalToolsProvider>,
         claim_verifier: Option<meerkat_mob::MobClaimVerifier>,
     ) -> Result<CreatedMob, MobError> {
@@ -4946,13 +4984,16 @@ impl MobMcpState {
         }
         // Who creates the mob, recorded with its creation: the host when no
         // session calls, otherwise what the complete lookup of the hosted
-        // rosters finds for the caller session. A lookup that cannot be
-        // complete refuses the create before anything of the mob exists.
+        // rosters finds for the caller session, and whether that session
+        // makes the create with its own create capability. A lookup that
+        // cannot be complete refuses the create before anything of the mob
+        // exists.
         let provenance = match owner_bridge_session_authority.as_ref() {
             None => meerkat_mob::MobProvenance::Host,
-            Some((owner_bridge_session_id, _, _)) => session_creation_provenance(
+            Some((owner_bridge_session_id, _, _, caller)) => session_creation_provenance(
                 owner_bridge_session_id,
                 self.session_member_matches(owner_bridge_session_id).await?,
+                *caller,
             ),
         };
         // The host admits or refuses the create before anything of the mob
@@ -4964,9 +5005,9 @@ impl MobMcpState {
             mob_id: mob_id.clone(),
             owner_bridge_session_id: owner_bridge_session_authority
                 .as_ref()
-                .map(|(owner_bridge_session_id, _, _)| owner_bridge_session_id.clone()),
+                .map(|(owner_bridge_session_id, _, _, _)| owner_bridge_session_id.clone()),
             implicit_delegation_mob: owner_bridge_session_authority.as_ref().is_some_and(
-                |(owner_bridge_session_id, _, implicit_delegation_mob)| {
+                |(owner_bridge_session_id, _, implicit_delegation_mob, _)| {
                     *implicit_delegation_mob
                         && MobDefinition::implicit(&owner_bridge_session_id.to_string(), "").id
                             == mob_id
@@ -4976,7 +5017,7 @@ impl MobMcpState {
         .await?;
         let (storage, storage_path) = self.storage_for_new_mob(&mob_id).await?;
         let child = owner_bridge_session_authority.as_ref().is_some_and(
-            |(_, destroy_on_owner_archive, _)| {
+            |(_, destroy_on_owner_archive, _, _)| {
                 child_tool_policy::is_child_mob(*destroy_on_owner_archive)
             },
         );
@@ -4999,8 +5040,12 @@ impl MobMcpState {
             scope,
             member_external_tools,
         );
-        if let Some((owner_bridge_session_id, destroy_on_owner_archive, implicit_delegation_mob)) =
-            owner_bridge_session_authority
+        if let Some((
+            owner_bridge_session_id,
+            destroy_on_owner_archive,
+            implicit_delegation_mob,
+            _,
+        )) = owner_bridge_session_authority
         {
             builder = builder.with_owner_bridge_session_create_authority(
                 owner_bridge_session_id,
@@ -16811,16 +16856,32 @@ mod tests {
             identity: AgentIdentity::from("worker-1"),
             generation: meerkat_mob::Generation::INITIAL,
         };
-        assert_eq!(
-            session_creation_provenance(&session_id, vec![matched("a"), matched("b")]),
-            meerkat_mob::MobProvenance::Ambiguous {
-                matching_rosters: 2
-            }
-        );
+        for caller in [SessionCreateCaller::Host, SessionCreateCaller::Session] {
+            assert_eq!(
+                session_creation_provenance(&session_id, vec![matched("a"), matched("b")], caller),
+                meerkat_mob::MobProvenance::Ambiguous {
+                    matching_rosters: 2
+                }
+            );
+        }
         let one = matched("a");
         assert_eq!(
-            session_creation_provenance(&session_id, vec![one.clone()]),
+            session_creation_provenance(&session_id, vec![one.clone()], SessionCreateCaller::Host),
             meerkat_mob::MobProvenance::Member {
+                parent_mob_id: one.mob_id.clone(),
+                parent_incarnation: one.incarnation,
+                creator_identity: one.identity.clone(),
+                creator_generation: one.generation,
+                owner_session: session_id.clone(),
+            }
+        );
+        assert_eq!(
+            session_creation_provenance(
+                &session_id,
+                vec![one.clone()],
+                SessionCreateCaller::Session
+            ),
+            meerkat_mob::MobProvenance::OperatorMember {
                 parent_mob_id: one.mob_id,
                 parent_incarnation: one.incarnation,
                 creator_identity: one.identity,
@@ -16829,8 +16890,14 @@ mod tests {
             }
         );
         assert_eq!(
-            session_creation_provenance(&session_id, Vec::new()),
+            session_creation_provenance(&session_id, Vec::new(), SessionCreateCaller::Host),
             meerkat_mob::MobProvenance::Session {
+                session_id: session_id.clone()
+            }
+        );
+        assert_eq!(
+            session_creation_provenance(&session_id, Vec::new(), SessionCreateCaller::Session),
+            meerkat_mob::MobProvenance::OperatorSession {
                 session_id: session_id.clone()
             }
         );
@@ -16975,13 +17042,16 @@ mod tests {
     }
 
     /// The creator a mob's creation record proves, whose manage grant the
-    /// agent mob tools re-derive after a restart. A Session record proves the
-    /// creating session. A Member record proves the creating member's session
-    /// only while that session still serves the recorded member at the
-    /// recorded generation in the recorded parent incarnation: once the
-    /// member is respawned at its next generation, neither its old session
-    /// nor its new one proves anything. A host create, and any other session,
-    /// prove nothing.
+    /// agent mob tools re-derive after a restart: only a session's own create
+    /// with its create capability. An OperatorSession record proves the
+    /// creating session. An OperatorMember record proves the creating
+    /// member's session only while that session still serves the recorded
+    /// member at the recorded generation in the recorded parent incarnation:
+    /// once the member is respawned at its next generation, neither its old
+    /// session nor its new one proves anything. A create the host made for
+    /// the same session or member (`Session`, `Member`) proves nothing: the
+    /// session owns that mob but did not create it. A host create, and any
+    /// other session, prove nothing.
     #[tokio::test]
     async fn a_creation_record_proves_its_creator_session_at_the_recorded_generation() {
         let svc = Arc::new(MockSessionSvc::new());
@@ -17009,21 +17079,23 @@ mod tests {
             .expect("resolve bridge session")
             .expect("creator bridge session");
         let member_child = state
-            .mob_create_definition_with_owner_bridge_session(
+            .create_mob_for_owner_bridge_session(
                 explicit_definition("creator-member-child"),
                 creator_session.clone(),
                 false,
                 false,
+                SessionCreateCaller::Session,
             )
             .await
-            .expect("the member's session creates a mob");
+            .expect("the member's session creates a mob")
+            .mob_id;
         let member_child = state
             .handle_for(&member_child)
             .await
             .expect("member child handle");
         assert!(matches!(
             member_child.provenance().await.expect("provenance"),
-            meerkat_mob::MobProvenance::Member { .. }
+            meerkat_mob::MobProvenance::OperatorMember { .. }
         ));
         assert!(
             state
@@ -17035,23 +17107,54 @@ mod tests {
                 .session_is_recorded_creator(&member_child, &SessionId::new())
                 .await
         );
+        let member_owned = state
+            .mob_create_definition_with_owner_bridge_session(
+                explicit_definition("creator-member-owned"),
+                creator_session.clone(),
+                false,
+                false,
+            )
+            .await
+            .expect("the host creates a mob for the member's session");
+        let member_owned = state
+            .handle_for(&member_owned)
+            .await
+            .expect("member owned handle");
+        assert!(matches!(
+            member_owned.provenance().await.expect("provenance"),
+            meerkat_mob::MobProvenance::Member { .. }
+        ));
+        assert!(
+            !state
+                .session_is_recorded_creator(&member_owned, &creator_session)
+                .await,
+            "a mob the host created for the member's session is not the member's create"
+        );
 
         let caller = SessionId::new();
         svc.insert_persisted_session(Session::with_id(caller.clone()))
             .await;
         let session_child = state
-            .mob_create_definition_with_owner_bridge_session(
+            .create_mob_for_owner_bridge_session(
                 explicit_definition("creator-session-child"),
                 caller.clone(),
                 false,
                 false,
+                SessionCreateCaller::Session,
             )
             .await
-            .expect("a session creates a mob");
+            .expect("a session creates a mob")
+            .mob_id;
         let session_child = state
             .handle_for(&session_child)
             .await
             .expect("session child handle");
+        assert_eq!(
+            session_child.provenance().await.expect("provenance"),
+            meerkat_mob::MobProvenance::OperatorSession {
+                session_id: caller.clone()
+            }
+        );
         assert!(
             state
                 .session_is_recorded_creator(&session_child, &caller)
@@ -17061,6 +17164,25 @@ mod tests {
             !state
                 .session_is_recorded_creator(&session_child, &creator_session)
                 .await
+        );
+        let session_owned = state
+            .mob_create_definition_with_owner_bridge_session(
+                explicit_definition("creator-session-owned"),
+                caller.clone(),
+                true,
+                false,
+            )
+            .await
+            .expect("the host creates a mob for the session");
+        let session_owned = state
+            .handle_for(&session_owned)
+            .await
+            .expect("session owned handle");
+        assert!(
+            !state
+                .session_is_recorded_creator(&session_owned, &caller)
+                .await,
+            "a mob the host created for the session is not the session's create"
         );
 
         let host = state

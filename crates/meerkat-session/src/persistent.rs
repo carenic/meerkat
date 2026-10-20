@@ -14525,9 +14525,9 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             // Acquire the checkpointer gate (if any) and hold it across the
             // archival save. This prevents a concurrent checkpoint() from saving
             // a live snapshot over the archived one. Setting cancelled under the
-            // lock ensures future checkpoints cannot write: WholeBlob calls are
-            // no-ops, while a HeadCanonical call terminates the stale live actor
-            // rather than silently omitting its required projection.
+            // lock ensures future checkpoints cannot write: a later WholeBlob or
+            // HeadCanonical checkpoint fails its run and terminates the stale
+            // live actor rather than silently omitting its projection.
             let gate = self.existing_gate_for_session(id).await;
             let mut gate_guard = if let Some(ref gate) = gate {
                 let mut guard = gate.cancelled.lock().await;
@@ -16262,11 +16262,12 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// Cancel all active checkpointer gates.
     ///
     /// After this call, in-flight checkpoints that are past the gate check
-    /// will complete their current save. Subsequent WholeBlob checkpoints are
-    /// no-ops; a HeadCanonical checkpoint instead fails the live actor because
-    /// its required physical projection cannot be silently omitted. Use this
-    /// during `stop()` to prevent checkpoint writes from racing with external
-    /// cleanup operations.
+    /// will complete their current save. Every later checkpoint, WholeBlob or
+    /// HeadCanonical, fails its run: the run's provisional tail is not
+    /// attempted, so the live actor is retired and its next registration
+    /// cold-loads the session. A mob Stop does not use this: it pauses the
+    /// mob, and a run it leaves running must still commit. Archive closes one
+    /// session's gate itself.
     ///
     /// A save holds its session's gate across the store write, so each cancel
     /// waits for that session's in-flight save. The gates are cancelled
@@ -16282,9 +16283,8 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
 
     /// Re-enable checkpointer gates for all tracked sessions.
     ///
-    /// Call this during `resume()` after `cancel_all_checkpointers()` was
-    /// used during stop. Gates that were removed by `archive()` are not
-    /// affected.
+    /// Call this to restore persistence after `cancel_all_checkpointers()`.
+    /// Gates that were removed by `archive()` are not affected.
     pub async fn rearm_all_checkpointers(&self) {
         let gates = self.checkpointer_gates.lock().await;
         for gate in gates.values() {
@@ -16865,6 +16865,73 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 )))
             })?
             .is_some())
+    }
+
+    /// The tool restrictions a session inherited from its spawner, read from
+    /// its committed record without materializing its transcript.
+    ///
+    /// HeadCanonical reads the metadata of whichever boundary is current under
+    /// one store snapshot, as the metadata view does: a durable tail ahead of
+    /// that boundary, or a turn between its checkpoint and its boundary
+    /// commit, never refuses the read. WholeBlob reads the store-verified
+    /// committed body. `NotFound` when the store holds no authority for the
+    /// session; evidence the record lacks is `Unsupported`, never
+    /// "unrestricted".
+    pub async fn predecessor_tool_restrictions(
+        &self,
+        id: &SessionId,
+    ) -> Result<meerkat_core::PredecessorToolRestrictions, SessionError> {
+        let unavailable = |error: meerkat_core::PredecessorRestrictionsError| {
+            SessionError::Unsupported(format!(
+                "inherited tool restriction evidence for session {id}: {error}"
+            ))
+        };
+        if self.runtime_store.session_persistence_profile()
+            == RuntimeSessionPersistenceProfile::HeadCanonicalV1
+        {
+            let role = "inherited tool restriction read";
+            let runtime_id = Self::runtime_id_for_session(id);
+            let Some(authority) = self
+                .runtime_store
+                .load_session_boundary_authority(&runtime_id)
+                .await
+                .map_err(|error| {
+                    SessionError::Agent(AgentError::InternalError(format!(
+                        "failed to load {role} HeadCanonical authority for session {id}: {error}"
+                    )))
+                })?
+            else {
+                return Err(SessionError::NotFound { id: id.clone() });
+            };
+            let head_authority = authority.head_canonical().ok_or_else(|| {
+                SessionError::Agent(AgentError::InternalError(format!(
+                    "{role} loaded non-HeadCanonical authority for session {id}"
+                )))
+            })?;
+            if head_authority.session_id() != id {
+                return Err(SessionError::Agent(AgentError::InternalError(format!(
+                    "{role} HeadCanonical authority identifies session {}, not {id}",
+                    head_authority.session_id()
+                ))));
+            }
+            let metadata = self
+                .runtime_store
+                .load_current_head_canonical_metadata(&runtime_id)
+                .await
+                .map_err(|error| {
+                    SessionError::Agent(AgentError::InternalError(format!(
+                        "failed to materialize committed HeadCanonical metadata for session {id}: {error}"
+                    )))
+                })?
+                .ok_or_else(|| SessionError::NotFound { id: id.clone() })?;
+            return meerkat_core::PredecessorToolRestrictions::from_metadata_map(&metadata)
+                .map_err(unavailable);
+        }
+        let Some(session) = self.observe_authoritative_session_body(id).await? else {
+            return Err(SessionError::NotFound { id: id.clone() });
+        };
+        meerkat_core::PredecessorToolRestrictions::from_committed_session(&session)
+            .map_err(unavailable)
     }
 
     /// Load the authoritative durable session metadata view.

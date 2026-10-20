@@ -153,13 +153,16 @@ impl super::RuntimeStoreControllerCustody for MemoryControllerCustody<'_> {
                 .map_or(MachineLifecycleObservation::Missing, |bytes| {
                     classify_machine_lifecycle_record(bytes)
                 });
+            // A session runtime's binding names the mob runtime it serves,
+            // which has its own id; any other runtime must name itself.
+            let session_runtime = LogicalRuntimeId::new(id.clone()).session_id().is_some();
             let run =
                 match &lifecycle {
                     MachineLifecycleObservation::Decoded { record, .. }
                         if record
                             .binding()
                             .agent_runtime_id()
-                            .is_none_or(|bound| bound == id) =>
+                            .is_none_or(|bound| session_runtime || bound == id) =>
                     {
                         record.run().current_run_id()
                     }
@@ -580,6 +583,8 @@ pub struct InMemoryRuntimeStore {
     #[cfg(test)]
     atomic_input_persist_ack_loss: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
+    unregister_finalization_outcome_unknown: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
     input_state_batch_cas_before: Arc<StdMutex<Option<InputStateBatchCasTestBlock>>>,
     #[cfg(test)]
     input_state_batch_cas_after_commit: Arc<StdMutex<Option<InputStateBatchCasTestBlock>>>,
@@ -653,6 +658,15 @@ impl InMemoryRuntimeStore {
             .store(true, Ordering::Release);
     }
 
+    /// Answer the next unregister finalization with an unknown outcome,
+    /// committing nothing: its unregister keeps the final transition for a
+    /// retry, and the registration refuses lifecycle mutations until then.
+    #[cfg(test)]
+    pub(crate) fn report_next_unregister_finalization_outcome_unknown(&self) {
+        self.unregister_finalization_outcome_unknown
+            .store(true, Ordering::Release);
+    }
+
     /// Hold the store's shared state lock, as any store operation does while
     /// it runs. Test support for the persistence-wait deadlock shape (#1654).
     #[cfg(test)]
@@ -721,6 +735,10 @@ impl InMemoryRuntimeStore {
             atomic_input_persist_before: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             atomic_input_persist_ack_loss: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            unregister_finalization_outcome_unknown: Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
             #[cfg(test)]
             input_state_batch_cas_before: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
@@ -3968,6 +3986,15 @@ impl RuntimeStore for InMemoryRuntimeStore {
         runtime_id: &LogicalRuntimeId,
         finalization: crate::store::UnregisterFinalizationCommit,
     ) -> Result<(), RuntimeStoreError> {
+        #[cfg(test)]
+        if self
+            .unregister_finalization_outcome_unknown
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(RuntimeStoreError::UnregisterFinalizationOutcomeUnknown(
+                "injected unknown unregister finalization outcome".to_string(),
+            ));
+        }
         let (snapshot, input_states, retired_ops_epoch) = finalization.into_parts();
         let runtime_state = snapshot.runtime_state();
         let lifecycle_record = MachineLifecycleStoreRecord::from_snapshot(&snapshot).encode()?;
@@ -4273,6 +4300,72 @@ mod tests {
         assert_eq!(visited, 1);
         drop(guard);
         assert!(store.inner.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn controller_admin_memory_inventory_admits_a_session_runtime_bound_to_its_mob_runtime() {
+        let store = InMemoryRuntimeStore::new();
+        // A mob member runs on its session's runtime, whose lifecycle binding
+        // names the mob runtime it serves: a different id by design.
+        let session_runtime = LogicalRuntimeId::for_session(&meerkat_core::SessionId::new());
+        let bound = MachineLifecycleCommit::new_with_binding(
+            RuntimeState::Idle,
+            MachineLifecycleBindingFacts::new(
+                Some("mob-member-runtime:1".to_string()),
+                Some(1),
+                Some(1),
+                Some("epoch-1".to_string()),
+            ),
+            crate::store::SupervisorAuthoritySnapshot::UnboundNoReceipt,
+        );
+        store
+            .commit_machine_lifecycle(&session_runtime, bound, &[])
+            .await
+            .unwrap();
+        let claim = store.execution_custody.try_acquire_governed().unwrap();
+        let guard = store.try_controller_mutation_custody(&claim).unwrap();
+        let mut visited = 0;
+        assert!(
+            !guard
+                .visit_runtimes(&mut |owner| {
+                    assert_eq!(owner.runtime_id(), &session_runtime);
+                    assert!(matches!(
+                        owner.lifecycle(),
+                        MachineLifecycleObservation::Decoded { record, .. }
+                            if record.binding().agent_runtime_id() == Some("mob-member-runtime:1")
+                    ));
+                    visited += 1;
+                    false
+                })
+                .expect("a session runtime bound to its mob runtime is not misbound")
+        );
+        assert_eq!(visited, 1);
+        drop(guard);
+
+        // Any other runtime must still name itself.
+        let placed_runtime = LogicalRuntimeId::new("placed-member-runtime:1");
+        store
+            .commit_machine_lifecycle(
+                &placed_runtime,
+                MachineLifecycleCommit::new_with_binding(
+                    RuntimeState::Idle,
+                    MachineLifecycleBindingFacts::new(
+                        Some("placed-member-runtime:2".to_string()),
+                        Some(1),
+                        Some(1),
+                        Some("epoch-1".to_string()),
+                    ),
+                    crate::store::SupervisorAuthoritySnapshot::UnboundNoReceipt,
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        let guard = store.try_controller_mutation_custody(&claim).unwrap();
+        assert!(
+            guard.visit_runtimes(&mut |_| false).is_err(),
+            "a non-session runtime bound to another runtime stays misbound"
+        );
     }
 
     #[tokio::test]

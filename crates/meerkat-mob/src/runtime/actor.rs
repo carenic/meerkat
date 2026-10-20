@@ -25,6 +25,8 @@ pub(super) mod resume_topology;
 #[cfg(feature = "runtime-adapter")]
 mod resume_topology_control;
 mod retirement_io;
+#[cfg(test)]
+pub(crate) use retirement_io::retirement_stage_test_hooks;
 mod shutdown_teardown;
 pub(in crate::runtime) use shutdown_teardown::ShutdownUnregisterOutcome;
 #[cfg(all(test, feature = "runtime-adapter"))]
@@ -3224,8 +3226,6 @@ pub(super) enum StopInlineStage {
     PendingSpawns,
     /// Pending peer deliveries cancelled.
     PeerDeliveries,
-    /// Every member session's checkpoint gate cancelled.
-    CheckpointerCancel,
     /// Every member's run starts held (#1500).
     RunStartHolds,
     /// Autonomous members' kickoff stops and interrupt dispatch.
@@ -3240,7 +3240,6 @@ impl StopInlineStage {
             Self::PlacedCompletionCleanup => "stop_placed_completion_cleanup",
             Self::PendingSpawns => "stop_pending_spawns",
             Self::PeerDeliveries => "stop_peer_deliveries",
-            Self::CheckpointerCancel => "stop_checkpointer_cancel",
             Self::RunStartHolds => "stop_run_start_holds",
             Self::AutonomousStops => "stop_autonomous_stops",
             Self::StoppedCommit => "stop_stopped_commit",
@@ -18125,11 +18124,27 @@ impl DetachedMemberReadinessContext {
         // cold registration it publishes reads the run's outcome from durable
         // truth. Until then the drain may keep re-arming, but it admits no
         // input: admission waits for a durability-ready registration.
+        // The stop's outcome says so when the hold or the cancel met the
+        // degraded registration. A registration can also degrade just after
+        // the cancel took the gate (its boundary commit failed right then),
+        // so the registration itself is read as well.
         #[cfg(feature = "runtime-adapter")]
-        let reload_required = matches!(
+        let mut reload_required = matches!(
             target.outcome.run,
             super::stop_report::MemberStopRun::ReloadRequired
         );
+        #[cfg(feature = "runtime-adapter")]
+        if !reload_required
+            && expected_member.is_none()
+            && let (Some(adapter), Some(session_id)) =
+                (&self.runtime_adapter, member_ref.bridge_session_id())
+            && adapter
+                .durability_reload_required(session_id)
+                .await
+                .is_some()
+        {
+            reload_required = true;
+        }
         // Abort the comms drain but keep the session registered. A placed
         // member's session and drain belong to the member host; its exact
         // remote interrupt is the stop boundary.
@@ -18149,14 +18164,26 @@ impl DetachedMemberReadinessContext {
             // below already degrades on exactly this condition, for exactly
             // this reason; this is the same reasoning on the autonomous-stop
             // path. Every other driver fault keeps its existing meaning.
-            converge_autonomous_stop_drain_abort_result(
-                adapter.abort_comms_drain(session_id).await,
-            )
-            .map_err(|err| {
-                MobError::Internal(format!(
-                    "failed to abort comms drain for stopped member session {session_id}: {err}"
-                ))
-            })?;
+            match adapter.abort_comms_drain(session_id).await {
+                // The registration degraded while the abort waited for its
+                // mutation gate: the discard aborts and joins the drain, as
+                // for a registration that was degraded before.
+                Err(meerkat_runtime::RuntimeDriverError::RecoveryRepairBlocked { .. })
+                    if adapter
+                        .durability_reload_required(session_id)
+                        .await
+                        .is_some() =>
+                {
+                    reload_required = true;
+                }
+                result => {
+                    converge_autonomous_stop_drain_abort_result(result).map_err(|err| {
+                        MobError::Internal(format!(
+                            "failed to abort comms drain for stopped member session {session_id}: {err}"
+                        ))
+                    })?;
+                }
+            }
         }
 
         // Local sessions must be visibly idle before Stop can admit Resume.
@@ -20811,7 +20838,8 @@ impl MobActor {
             let _ = reply_tx.send(Err(error));
             return;
         }
-        // Re-enable checkpointers cancelled during stop.
+        // Re-enable checkpointer gates a host may have cancelled. The mob
+        // itself leaves them armed while it is Stopped.
         self.provisioner.rearm_all_checkpointers().await;
         // Resume is what releases the run starts its Stop held (#1500). The
         // member rebuild below needs each member's runtime to make progress,
@@ -20827,7 +20855,6 @@ impl MobActor {
         let candidates = match self.explicit_resume_candidates().await {
             Ok(candidates) => candidates,
             Err(error) => {
-                self.provisioner.cancel_all_checkpointers().await;
                 let settled = self.apply_explicit_resume_input(
                     |attempt| mob_dsl::MobMachineInput::SettleExplicitResumePreparation { attempt },
                     "settle_undispatched_resume_preparation",
@@ -20909,7 +20936,6 @@ impl MobActor {
             return;
         }
         if self.dsl_authority.state().explicit_resume_cancel_requested {
-            self.provisioner.cancel_all_checkpointers().await;
             let result =
                 self.finish_explicit_resume_attempt(Err(MobError::LifecycleOperationPending {
                     intent: "explicit_resume superseded by lifecycle control".to_string(),
@@ -20921,7 +20947,6 @@ impl MobActor {
         let rebuild = match result {
             Ok(rebuild) => rebuild,
             Err(error) => {
-                self.provisioner.cancel_all_checkpointers().await;
                 let result = self.finish_explicit_resume_attempt(Err(error));
                 self.hold_member_run_starts_while_stopped().await;
                 let _ = reply_tx.send(result);
@@ -21180,7 +21205,6 @@ impl MobActor {
                     .await;
                 return;
             }
-            self.provisioner.cancel_all_checkpointers().await;
             let result = self.finish_explicit_resume_attempt(Err(error));
             self.hold_member_run_starts_while_stopped().await;
             let _ = reply_tx.send(result);
@@ -25812,6 +25836,16 @@ impl MobActor {
             return Ok(IdentityReconcilePassDisposition::Outcome(false));
         }
         if decision == IdentityReconcileDecision::Backoff {
+            // A member whose durably started retirement settled stuck reads
+            // as recovering, which this pass only waits on: hand the
+            // retirement back for re-drive, paced by this identity's backoff.
+            if self.enqueue_stuck_retirement_redrive(identity) {
+                tracing::info!(
+                    mob_id = %self.definition.id,
+                    agent_identity = %identity,
+                    "identity reconciliation re-drives the member's stuck retirement"
+                );
+            }
             self.record_identity_reconcile_disposition(
                 identity,
                 &completion_authority,
@@ -28588,14 +28622,11 @@ impl MobActor {
                                     // held, so it could only read the notice
                                     // after Resume, when it is stale. Resume
                                     // tells it the pause happened instead.
-                                    // Cancel checkpointer gates before stopping host loops so
-                                    // in-flight saves that complete after the loop stops don't
-                                    // race with subsequent external cleanup (e.g. DML deletes).
-                                    if stop_result.is_ok() {
-                                        self.inline_step_watchdog
-                                            .set_stop_stage(StopInlineStage::CheckpointerCancel);
-                                        self.provisioner.cancel_all_checkpointers().await;
-                                    }
+                                    // The checkpointer gates stay armed: a
+                                    // turn-driven member's run that the Stop
+                                    // leaves running must still commit. A host
+                                    // that deletes storage Destroys the mob,
+                                    // and archive closes each session's gate.
                                 }
                                 // Hold every member's run starts before any
                                 // interrupt (#1500): input admitted before the
@@ -54551,10 +54582,11 @@ impl MobActor {
         }
     }
 
-    /// Cancel checkpointers and transition to Stopped. Used by `handle_reset`
-    /// error paths after destructive steps have already been taken.
+    /// Transition to Stopped. Used by `handle_reset` error paths after
+    /// destructive steps have already been taken. The checkpointer gates stay
+    /// armed, as after a Stop: each retired member's archive closed its own
+    /// session's gate, and a run still in flight on another member commits.
     async fn fail_reset_to_stopped(&mut self) {
-        self.provisioner.cancel_all_checkpointers().await;
         let result = self
             .drive_placed_completion_lifecycle_cleanup(
                 None,
@@ -54580,7 +54612,8 @@ impl MobActor {
         let was_stopped = prior_state == MobState::Stopped;
         self.cancel_all_flow_tasks().await?;
 
-        // Rearm checkpointers temporarily so retire can checkpoint if needed.
+        // Rearm checkpointer gates a host may have cancelled while the mob
+        // was Stopped.
         if was_stopped {
             self.provisioner.rearm_all_checkpointers().await;
         }
@@ -54591,7 +54624,9 @@ impl MobActor {
         // ResetToRunning owns active/pending run counters and coordinator
         // binding. The durable epoch marker is appended only after the
         // generated authority has accepted the prepared transition.
-        let prepared = match self
+        // A Reset refused here leaves a Stopped mob Stopped with its
+        // checkpointer gates armed, the pause a Stop leaves.
+        let prepared = self
             .prepare_dsl_input_transition(mob_dsl::MobMachineInput::Reset, "reset_to_running")
             .map_err(|error| {
                 tracing::debug!(
@@ -54600,37 +54635,19 @@ impl MobActor {
                     "MobMachine command admission rejected input"
                 );
                 self.invalid_transition_to(MobState::Running)
-            }) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                if was_stopped {
-                    self.provisioner.cancel_all_checkpointers().await;
-                }
-                return Err(error);
-            }
-        };
-        if let Err(error) = Self::require_lifecycle_journal_effect(
+            })?;
+        Self::require_lifecycle_journal_effect(
             &prepared.transition,
             mob_dsl::MobLifecycleJournalKind::Reset,
             "reset_to_running",
-        ) {
-            if was_stopped {
-                self.provisioner.cancel_all_checkpointers().await;
-            }
-            return Err(error);
-        }
+        )?;
         // Reset releases the run starts a Stop held (#1500), realized after
         // the commit below.
-        if let Err(error) = Self::require_member_run_start_effect(
+        Self::require_member_run_start_effect(
             &prepared.transition,
             Some(false),
             "reset_to_running",
-        ) {
-            if was_stopped {
-                self.provisioner.cancel_all_checkpointers().await;
-            }
-            return Err(error);
-        }
+        )?;
 
         // --- Event rewrite phase: append the new epoch marker. ---
         // Append-only epoch model: projections clear on MobReset; the original

@@ -732,18 +732,18 @@ pub async fn externalize_messages_from(
         .map(|_| ())
 }
 
-fn content_blocks_have_inline_media(blocks: &[ContentBlock]) -> bool {
+fn content_blocks_have_inline_images(blocks: &[ContentBlock]) -> bool {
     blocks
         .iter()
-        .any(|block| block.image_inline_data().is_some() || block.video_inline_data().is_some())
+        .any(|block| block.image_inline_data().is_some())
 }
 
-fn system_notice_block_has_inline_media(block: &crate::types::SystemNoticeBlock) -> bool {
+fn system_notice_block_has_inline_images(block: &crate::types::SystemNoticeBlock) -> bool {
     match block {
         crate::types::SystemNoticeBlock::Comms { content, .. }
         | crate::types::SystemNoticeBlock::ExternalEvent { content, .. }
         | crate::types::SystemNoticeBlock::RuntimeNotice { content, .. } => {
-            content_blocks_have_inline_media(content)
+            content_blocks_have_inline_images(content)
         }
         crate::types::SystemNoticeBlock::ToolConfig { .. }
         | crate::types::SystemNoticeBlock::Mcp { .. }
@@ -754,24 +754,116 @@ fn system_notice_block_has_inline_media(block: &crate::types::SystemNoticeBlock)
     }
 }
 
-/// Whether a row delta still contains media bytes that must cross the blob
+/// Whether a row delta still contains image bytes that must cross the blob
 /// boundary before it can become a HeadCanonical durable row.
+///
+/// Only images have a blob form. Video does not (its bytes are inline or it
+/// is a provider URI), so the persistence paths keep inline video as row
+/// content, as ordinary appends always did, and this classifier does not
+/// count it.
 ///
 /// This is intentionally a pure classifier. A rewrite carrier cannot mutate
 /// retained graph bodies without invalidating their content-addressed
 /// revisions, so it must reject rather than silently externalize such a body.
-pub(crate) fn messages_have_inline_media(messages: &[Message]) -> bool {
+pub(crate) fn messages_have_inline_images(messages: &[Message]) -> bool {
     messages.iter().any(|message| match message {
-        Message::User(user) => content_blocks_have_inline_media(&user.content),
+        Message::User(user) => content_blocks_have_inline_images(&user.content),
         Message::ToolResults { results, .. } => results
             .iter()
-            .any(|result| content_blocks_have_inline_media(&result.content)),
+            .any(|result| content_blocks_have_inline_images(&result.content)),
         Message::SystemNotice(notice) => notice
             .blocks
             .iter()
-            .any(system_notice_block_has_inline_media),
+            .any(system_notice_block_has_inline_images),
         Message::System(_) | Message::BlockAssistant(_) => false,
     })
+}
+
+/// Rewrites inline images to the blob references a blob store would name
+/// them by, without writing any blob, and collects each distinct payload
+/// once, in first-seen order.
+///
+/// The reference is [`crate::blob::content_blob_id`] of the block's own
+/// media type and data, and the block keeps its own media type: that is the
+/// form transcript digests already canonicalize an inline image to, so a
+/// rewritten row has the digest its inline form had.
+#[derive(Debug, Default)]
+pub(crate) struct InlineImageCollector {
+    seen: BTreeSet<BlobId>,
+    payloads: Vec<crate::session::InlineImagePayload>,
+}
+
+impl InlineImageCollector {
+    /// Rewrite every inline image `message` carries (user content, tool
+    /// results, and comms, external-event and runtime notice content).
+    /// Returns whether the message changed.
+    pub(crate) fn externalize(&mut self, message: &mut Message) -> bool {
+        match message {
+            Message::User(user) => self.externalize_blocks(&mut user.content),
+            Message::ToolResults { results, .. } => {
+                let mut changed = false;
+                for result in results.iter_mut() {
+                    changed |= self.externalize_blocks(&mut result.content);
+                }
+                changed
+            }
+            Message::SystemNotice(notice) => {
+                let mut changed = false;
+                for block in &mut notice.blocks {
+                    match block {
+                        SystemNoticeBlock::Comms { content, .. }
+                        | SystemNoticeBlock::ExternalEvent { content, .. }
+                        | SystemNoticeBlock::RuntimeNotice { content, .. } => {
+                            changed |= self.externalize_blocks(content);
+                        }
+                        SystemNoticeBlock::ToolConfig { .. }
+                        | SystemNoticeBlock::Mcp { .. }
+                        | SystemNoticeBlock::BackgroundJob { .. }
+                        | SystemNoticeBlock::Auth { .. }
+                        | SystemNoticeBlock::ToolProcessInterrupted { .. }
+                        | SystemNoticeBlock::Unknown { .. } => {}
+                    }
+                }
+                changed
+            }
+            Message::System(_) | Message::BlockAssistant(_) => false,
+        }
+    }
+
+    fn externalize_blocks(&mut self, blocks: &mut [ContentBlock]) -> bool {
+        let mut changed = false;
+        for block in blocks.iter_mut() {
+            let ContentBlock::Image {
+                media_type,
+                data: ImageData::Inline { data },
+            } = block
+            else {
+                continue;
+            };
+            let media_type = media_type.clone();
+            let data = std::mem::take(data);
+            let blob_id = crate::blob::content_blob_id(&media_type, &data);
+            *block = ContentBlock::Image {
+                media_type: media_type.clone(),
+                data: ImageData::Blob {
+                    blob_id: blob_id.clone(),
+                },
+            };
+            if self.seen.insert(blob_id.clone()) {
+                self.payloads.push(crate::session::InlineImagePayload {
+                    blob_id,
+                    media_type,
+                    data,
+                });
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    pub(crate) fn into_payloads(self) -> Vec<crate::session::InlineImagePayload> {
+        self.payloads
+    }
 }
 
 /// [`externalize_messages_from`] that reports the lowest message index it
@@ -1127,11 +1219,11 @@ mod tests {
                 content: vec![inline.clone()],
             },
         ))];
-        assert!(messages_have_inline_media(&messages));
+        assert!(messages_have_inline_images(&messages));
 
         externalize_messages_from(&store, &mut messages, 0).await?;
         assert!(
-            !messages_have_inline_media(&messages),
+            !messages_have_inline_images(&messages),
             "the notice image is stored once, by reference"
         );
         assert_eq!(collect_blob_ids_from_messages(&messages).len(), 1);

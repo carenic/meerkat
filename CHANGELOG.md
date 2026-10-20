@@ -39,6 +39,10 @@ them.
 
 ### Breaking
 
+- `meerkat`: `session_runtime::live_orchestration::RealtimeSessionOpenProjectionError`
+  gains the variant `Backpressured`: a live open refused because another
+  live open on the host still holds the process's open-projection admission
+  (see Fixed). Code that matches the enum exhaustively adds an arm for it.
 - `meerkat-mob`: `SqliteMobObserverDrainReport` gains the field
   `retained_registrations: usize`: notification registrations of the
   drained observer's change watches that were still running when the drain
@@ -49,6 +53,11 @@ them.
   `RuntimeSessionRegistrationWitness` (see `registration()` under Added),
   which is neither. A host that moves an identity into `catch_unwind` wraps
   it in `std::panic::AssertUnwindSafe`.
+- Not measured by the gate (a behaviour change): `meerkat-mob`:
+  `MobHandle::stop` no longer cancels its members' checkpoint saves, and
+  neither does a failed `MobHandle::reset`: a run in flight at the Stop can
+  still commit. A host that deletes a mob's storage after a Stop must
+  Destroy the mob instead (see Fixed).
 - Not measured by the gate (a parameter type change): `meerkat-runtime`:
   `ConfiguredMcpAttachmentProvider::configured` and
   `NativeWorkAuthorizationHost::configured_mcp_attachment_for_agent` take the
@@ -777,6 +786,15 @@ them.
 
 ### Added
 
+- `meerkat-core`: `PredecessorToolRestrictions::from_metadata_map` reads the
+  tool restrictions a session inherited from its spawner out of its committed
+  metadata map, with the same keys, checks and refusals as
+  `from_committed_session`, which now delegates to it.
+  `try_tool_visibility_state_from_map` is the canonical decoder of a session's
+  tool-visibility record from a metadata map.
+- `meerkat-session`: `PersistentSessionService::predecessor_tool_restrictions`
+  reads those restrictions from a session's committed record without
+  materializing its transcript.
 - `LocalGrantAuthority::resolve_lineage_observed`,
   `resolve_controller_lineage_observed` and
   `resolve_lineage_ceiling_observed` resolve a lineage for a caller inside
@@ -1255,11 +1273,16 @@ them.
 - `meerkat_core::service::MobIncarnationId` implements `Display`,
   `FromStr` (error: `MobIncarnationIdParseError`), `PartialOrd` and `Ord`.
 - `meerkat_mob::MobProvenance`: who created a mob (`Member`, `Host`,
-  `Session`, `Ambiguous` or `Unrecorded`), recorded once with its creation and
-  never rewritten. `MobHandle::provenance` reads it for a running mob, and
-  `MobStorage::creation_provenance` and `MobStorage::creation_incarnation`
-  read a stored mob's record without building a runtime.
-  `MobBuilder::with_provenance` sets it for a create (default `Host`).
+  `Session`, `Ambiguous`, `Unrecorded`, `OperatorSession` or
+  `OperatorMember`), recorded once with its creation and never rewritten. A
+  session's own create with its create capability (the agent mob tools'
+  `mob_create`) records `OperatorSession`, or `OperatorMember` for a
+  member's session; a create a host makes for a caller session records
+  `Session` or `Member`. `MobHandle::provenance` reads it for a running mob,
+  and `MobStorage::creation_provenance` and
+  `MobStorage::creation_incarnation` read a stored mob's record without
+  building a runtime. `MobBuilder::with_provenance` sets it for a create
+  (default `Host`).
 - `meerkat_mob::IncarnationInconsistency`: how a mob store's creation record
   and its event log disagree.
 - `meerkat_mob::MobHandle::member_of_session` and
@@ -1284,6 +1307,43 @@ them.
   `execute_if_current`. The SQLite runtime store calls it inside its blocking
   tasks. A fence implementation or decorator outside Meerkat needs nothing
   new; one that forwards fenced calls may forward this entry as well.
+
+- `meerkat-core`: `Session::with_inline_images_externalized` returns a copy
+  of a session in which every image held inline, in its live rows and in
+  every body its transcript graph retains (user content, tool results and
+  notice content), is a blob reference named by `content_blob_id` of the
+  block's own media type and data, together with the distinct payloads a
+  blob store must hold first (`InlineImageExternalization`,
+  `InlineImagePayload`). The transcript revision, the rewrite commits and
+  the rewrite prefix are unchanged; it writes nothing. The conversions below
+  use it before they lay out head-canonical rows.
+
+- `meerkat-runtime`: `SqliteRuntimeStore::convert_standalone_whole_blob_in_place_with_media`
+  converts a standalone WholeBlob database whose bodies hold inline images,
+  with the realm blob store the converted runtimes hydrate from. Its two steps
+  are public for a host that makes the blob store's writes durable between
+  them: `stage_standalone_whole_blob_media` stores the images and writes
+  nothing to the database's sessions, bodies or authorities (it returns a
+  `WholeBlobMediaStage`), and
+  `convert_standalone_whole_blob_in_place_with_staged_media` converts with
+  them.
+
+- `meerkat-runtime`: `SqliteRuntimeStore::new_head_canonical_with_media` opens
+  a realm whose runtimes or legacy session blob rows hold inline images, with
+  the realm blob store. Its two steps are public as well:
+  `stage_realm_whole_blob_media` stores the images and writes nothing to the
+  database's sessions, bodies or authorities (it returns the same
+  `WholeBlobMediaStage`), and `new_head_canonical_with_staged_media` opens with
+  them.
+
+- `meerkat-core`: `IncrementalSessionStore` gains
+  `stage_legacy_inline_images` and
+  `activate_head_canonical_store_with_staged_images`, both with defaults
+  (stage nothing; activate as `activate_head_canonical_store`), so existing
+  backends are unchanged. The SQLite session store implements them: the first
+  stores the images its not yet activated legacy sessions hold inline in a
+  blob store, and the second activates the store with those images as blob
+  references.
 
 ### Changed
 
@@ -1620,6 +1680,45 @@ them.
 
 ### Fixed
 
+- `meerkat-mob`: a member whose session's canonical head has moved past its
+  committed runtime boundary respawns. A respawn reads the tool restrictions
+  the member was spawned under before it retires anything; the persistent read
+  materialized the session's transcript at the committed boundary, and the
+  store refused it as a transcript revision conflict while a durable tail was
+  ahead of that boundary or a turn was between its checkpoint and its
+  boundary commit. The respawn, and the reset built on it, was refused and the
+  member kept its old incarnation. HeadCanonical sessions now read the
+  restrictions from the current boundary's metadata under one store snapshot,
+  without the transcript.
+
+- A live open refused because another live open on the same host was still
+  being set up is now the typed, retryable
+  `RealtimeSessionOpenProjectionError::Backpressured`, not an internal session
+  error. A host admits live opens one at a time per process and queues none,
+  and an open keeps that admission until its provider has acknowledged its
+  seed: for a provider-brokered WebRTC channel (the provider answers the
+  client's offer), through that offer and answer. A second open during that
+  setup (two people starting voice, or a voice call and another live
+  channel) was refused, and surfaces reported it as an internal failure the
+  caller could not tell from a broken host.
+  `rkat-rpc` `live/open` now answers it with the retryable `SessionBusy` code
+  (-32002) and a member live host with `MemberLiveError::Unavailable`.
+  Clients retry with backoff; the open succeeds once the other open's setup
+  has finished.
+- `meerkat-mob`: a Stop during a member's run no longer abandons that run's
+  turn. A Stop leaves a turn-driven member's running turn to finish
+  (`MemberStopRun::LeftRunning`), but it also cancelled every member
+  session's checkpoint gate, so the run failed at its final checkpoint, on
+  WholeBlob and HeadCanonical realms alike. The turn ended with an error
+  ("turn abandoned"), the member's runtime was torn down, and the session
+  kept nothing of the run although its tool calls had already run; Resume
+  did not run the input again. The Stop now leaves the gates armed, and so
+  does a failed Reset, which returns the mob to the same pause: the run
+  finishes and commits while the mob is Stopped, and the member stays
+  registered. A host that deletes a mob's storage after a Stop must Destroy
+  the mob instead, since a run in flight at the Stop can still commit. The
+  Stop watchdog no longer reports a `stop_checkpointer_cancel` stage.
+
 - `meerkat-mob`: a mob restarts when one of its members has a durable tail
   ahead of the runtime boundary it last committed. A turn's durable rows can
   land after that boundary when a retirement cancels the turn mid-way, or when
@@ -1642,21 +1741,42 @@ them.
   through the store-owned recovery a restart runs (a proven continuation is
   adopted; a held or refused tail is left intact), and then reads again.
 
+- `meerkat-mob`: a mob Stop or Shutdown no longer fails with an internal error
+  when a member's runtime unregister is past its final transition, for
+  example when the member's own runtime loop unregisters it as the Stop
+  reaches it: its store finalization still in flight, its outcome unknown, or
+  a failed finalization left the registration for the next unregister. Such a
+  registration refuses every lifecycle mutation, and its runtime loop has
+  already exited. The stop now reports the member's run `NoRun` and its run
+  starts `Held`: the registration starts no run until the unregister removes
+  it, and the `MobStop` a Stop staged first holds any registration that
+  replaces it until Resume. A Resume's release of that member is answered the
+  same way, and a Shutdown's teardown joins or retries the unregister as for
+  any member. For a placed member, the member's host answers a supervisor's
+  bridged hold the same way (`RunStartsHeld` with no run) and its release
+  with `Ack`, and a restore of a Stopped mob in the same process stages the
+  member's hold without failing. `MeerkatMachine::hold_run_starts` and
+  `release_run_starts` refuse such a registration typed
+  (`UnregisterFinalizationOutcomeUnknown` while the final transition is
+  staged, `ValidationFailed` as the teardown-only anchor) instead of
+  `Internal`, and `MeerkatMachine::unregister_owed` reports the state.
+
 - `meerkat-mob-mcp`: after a restart, the session that created a mob with
   the agent mob tools manages it again. A session's persisted mob operator
   authority binds no mob, so the manage grant its create returned was gone
   after a restart; the agent mob tools now re-derive it, for the incarnation
   the mob runs at, from the mob's creation record, while the session may
-  still create mobs. The record proves it for
-  `MobProvenance::Session` naming the session, and for
-  `MobProvenance::Member` only while the session is still the bridge session
-  of the recorded member at the recorded generation in the recorded parent
-  incarnation. Nothing else is granted: `Host`, `Ambiguous` and `Unrecorded`
-  records, another session, a later generation of the creating member, and a
-  session whose operator removed its create capability get no grant. A
-  session that a host passes as the owner session of a create
-  (`MobMcpState::mob_create_definition_with_owner_bridge_session`) is that
-  mob's recorded creator too.
+  still create mobs. The record proves it only for the session's own create:
+  `MobProvenance::OperatorSession` naming the session, and
+  `MobProvenance::OperatorMember` only while the session is still the bridge
+  session of the recorded member at the recorded generation in the recorded
+  parent incarnation. A mob a host created for a session
+  (`MobMcpState::mob_create_definition_with_owner_bridge_session`, recorded
+  as `Session` or `Member`) is owned by that session, but that create
+  granted the session nothing, so it gets no grant. Nothing else is granted
+  either: `Host`, `Ambiguous` and `Unrecorded` records, another session, a
+  later generation of the creating member, and a session whose operator
+  removed its create capability get no grant.
 - `meerkat-store`: the SQLite session store lays out a whole-blob session
   whose transcript graph retired its oldest occurrences, which every session
   compacted more often than `history_retained_rewrites` (default 4) has. It
@@ -2354,13 +2474,20 @@ them.
   seconds with their locks released.
 - An intent-managed identity could stay in `Backoff` for good after its
   member retirement ran past the budget its reconcile pass gave it (30
-  seconds), as on slow storage with many identities adopting at once. Once
-  the retirement had durably started the member read as recovering, which
-  identity reconciliation only waits on, and nothing finished the
+  seconds), as on slow storage with many identities adopting at once, or
+  failed at a stage after it had durably started (a storage or host error).
+  Once the retirement had durably started the member read as recovering,
+  which identity reconciliation only waits on, and nothing finished the
   retirement. Identity reconciliation now owns a retirement it started until
-  it settles, as an operator retirement does: it runs under the lifecycle
-  hang guard, a failure after the durable start settles as stuck and is
-  re-driven on resume, and a shutdown interrupts it instead of waiting.
+  it settles: it runs under the lifecycle hang guard, a shutdown interrupts
+  it instead of waiting, and a failure after the durable start settles as
+  stuck and is re-driven on the identity's next backoff pass (250 ms
+  doubling, at most 60 s apart), so the identity converges once the error
+  clears. A stopped mob re-drives it when it is resumed. Every re-drive of a
+  stuck retirement (this one, a mob resume or
+  `MobHandle::redrive_retirement`) now keeps a host's refusal of the
+  member's registration, so a member its host refused at a restart is
+  retired on the refused member's path again, as its first attempt was.
 - An intent-managed identity (`meerkat-mob`) whose lease the previous process
   still held when the mob restarted converges once that lease expires, at
   most 30 s after the previous process last renewed it. Nothing woke the
@@ -2567,6 +2694,78 @@ them.
   compacted member failed to start. A conversion now records the stored
   head, and opening a store that an earlier build converted repairs each
   affected runtime record in place. Pre-existing in 0.9.3.
+- `meerkat-runtime`: revoking a controller grant no longer answers
+  `Unavailable` once the runtime store holds a mob member's runtime with its
+  mob binding, as it does after a restart recovers the members. The custody
+  scan took that binding, which names the mob runtime the member's session
+  runtime serves, for a lifecycle stored under another runtime's id. A
+  session runtime may now name its mob runtime; any other runtime must still
+  name itself. Pre-existing since 0.8.52.
+
+- `meerkat-core`: a session that holds inline video compacts, and a
+  compacted 0.9.3 session that holds inline video converts to the
+  head-canonical profile. Video has no blob form, so ordinary appends always
+  kept its bytes in the session's rows, but a transcript rewrite refused
+  rows with inline video as if they were images that had to move to the blob
+  store first. A live head-canonical session that had received an inline
+  video could never compact again ("post-rewrite live tail carries inline
+  media"), and the conversion of a compacted 0.9.3 session with inline video
+  (`SqliteRuntimeStore::convert_standalone_whole_blob_in_place`, and the Meta
+  storage migration that runs it) was refused ("compact rewrite delta carries
+  inline media"). Rewrites and the conversion now keep inline video as row
+  content, byte for byte; inline images still move to the blob store before
+  they become rows.
+
+- `meerkat-runtime`: a compacted 0.9.3 session that holds inline images
+  converts to the head-canonical profile. Its WholeBlob body keeps those
+  images inline in its transcript graph (the anchor, rewrite replacements and
+  parent advances, across user messages, tool results and comms notices), and
+  the conversion refused it ("compact rewrite delta carries inline media").
+  `SqliteRuntimeStore::convert_standalone_whole_blob_in_place_with_media` now
+  first stores every such image in the realm blob store under its content
+  address, then seeds the session with those images as blob references; the
+  transcript revision and the rewrite commits stay the body's, and the
+  WholeBlob body is kept as it was. A crash during or between the two steps
+  leaves each runtime converted or untouched, and running the conversion again
+  finishes the rest.
+
+- `meerkat-runtime`: a SQLite realm that holds such a session, in a runtime's
+  WholeBlob body or as the session store's legacy blob row, opens on the
+  head-canonical profile. Its activation refused the session the same way,
+  so the realm did not open. `SqliteRuntimeStore::new_head_canonical_with_media`
+  first stores the images in the realm blob store, then lays the session out
+  with them as blob references; the body and the blob row are kept as they
+  were, and an open stopped after storing the images finishes on the next one.
+  The SQLite session store's own activation of such a legacy session
+  (`IncrementalSessionStore::activate_head_canonical_store_with_staged_images`,
+  after `stage_legacy_inline_images`) crosses it the same way, and one whose
+  images were not staged refuses the whole activation, writing nothing.
+- `meerkat-session`: a session whose turns each add large images, such as a
+  tool that returns camera snapshots, no longer compacts on every turn.
+  Before compacting, the agent stores inline media as blob references, and
+  the rewrite chose the turns to keep by their stored size, in which a blob
+  image is a short reference. The provider request whose size triggers
+  compaction carries every image in full. So a rewrite that answered that
+  request-size trigger kept the recent image turns, and the next turn's
+  images crossed the trigger again: every turn paid a summary and lost its
+  oldest kept turn, and with larger images every turn failed as
+  irreducible. When the exact provider request has crossed the trigger, a
+  blob image now counts its share of that request's size when the rewrite
+  chooses the turns to keep, as an inline image already counts its payload.
+  A turn whose own images alone exceed the kept-history budget now continues
+  with those images summarized, where before it failed as irreducible.
+  Pre-existing in 0.9.3.
+
+- `meerkat`: the built-in SQLite realm open (used by `rkat`, the REST and RPC
+  servers and the SDKs) takes that path. Before activation it stores a
+  realm's legacy inline images in the realm's `blobs` directory, so such a
+  realm opens on every surface. A realm with nothing to activate opens
+  exactly as before, without reading any session. A realm an external
+  storage provider serves with a SQLite session store opens the same way:
+  before its store-wide activation the open stores the legacy sessions'
+  inline images in the provider's blob store
+  (`IncrementalSessionStore::stage_legacy_inline_images`) and then activates
+  with them; a store with nothing to stage activates exactly as before.
 
 ### Known limitations
 
@@ -2605,11 +2804,6 @@ them.
   `misfired` although its admitted input ran; nothing runs twice. Use
   `catch_up_within` with a window longer than the lease to keep crash
   recovery.
-- Identity reconciliation (`meerkat-mob`): a genuine storage or host error
-  after an identity's member retirement has durably started leaves the
-  identity in `Backoff` until the mob is resumed, the host process restarts
-  or the host calls `MobHandle::redrive_retirement`, any of which recovers
-  it.
 
 ## [0.9.3] - 2026-10-18
 

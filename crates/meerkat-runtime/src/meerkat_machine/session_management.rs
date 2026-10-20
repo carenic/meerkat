@@ -12168,6 +12168,39 @@ Ok::<(), RuntimeDriverError>(())
         self.sessions.read().await.contains_key(session_id)
     }
 
+    /// Report whether `session_id`'s registration is leaving through its
+    /// unregister: the unregister staged its final transition, and the
+    /// finalization is in flight or its outcome is unknown and a retry owes
+    /// it, or the registration is the teardown-only anchor that a failed
+    /// finalization (or a reload-required discard) leaves to the next
+    /// unregister. Such a registration refuses every other lifecycle
+    /// mutation, run-start holds and releases included, and its runtime loop
+    /// already exited, so it starts no run; only an unregister, joined or
+    /// retried, removes it. The state lasts until then. `false` when the
+    /// session is not registered here.
+    pub async fn unregister_owed(&self, session_id: &SessionId) -> bool {
+        self.lifecycle_mutation_refused_by_unregister(session_id)
+            .await
+            .is_some()
+    }
+
+    /// The refusal a registration whose unregister is owed
+    /// ([`Self::unregister_owed`]) answers every other lifecycle mutation
+    /// with, typed: `UnregisterFinalizationOutcomeUnknown` while the
+    /// unregister's final transition is staged, `ValidationFailed` as the
+    /// teardown-only anchor. `None` for any other registration, and when the
+    /// session is not registered here.
+    async fn lifecycle_mutation_refused_by_unregister(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<RuntimeDriverError> {
+        self.sessions
+            .read()
+            .await
+            .get(session_id)
+            .and_then(|entry| entry.dsl_mutation_blocked_by_unregister(session_id))
+    }
+
     /// The owner-loss proof whose settlement `session_id`'s registration
     /// completed when it published: present only when its hosting claim's
     /// lineage began with a cross-process fresh acquisition or takeover, the
@@ -12804,7 +12837,11 @@ Ok::<(), RuntimeDriverError>(())
     /// establishes a new run, so admitted input stays queued. The current run,
     /// if any, is unaffected and reported, so the caller can cancel exactly
     /// that run. Idempotent per reason; a stopped runtime records the hold, a
-    /// destroyed one ignores it.
+    /// destroyed one ignores it. A registration whose unregister is owed
+    /// ([`Self::unregister_owed`]) refuses the hold with that refusal's own
+    /// type: `UnregisterFinalizationOutcomeUnknown` while the unregister's
+    /// final transition is staged, `ValidationFailed` as the teardown-only
+    /// anchor.
     pub async fn hold_run_starts(
         &self,
         session_id: &SessionId,
@@ -12815,6 +12852,12 @@ Ok::<(), RuntimeDriverError>(())
         let _gate = self
             .lock_current_durability_ready_session_mutation_gate(session_id)
             .await?;
+        if let Some(refusal) = self
+            .lifecycle_mutation_refused_by_unregister(session_id)
+            .await
+        {
+            return Err(refusal);
+        }
         let (_, effects) = self
             .apply_session_dsl_input(
                 session_id,
@@ -12860,7 +12903,10 @@ Ok::<(), RuntimeDriverError>(())
     /// once no reason holds the runtime: a runtime loop that parked on the
     /// hold is woken when input is queued. Releasing a reason that does not
     /// hold is a no-op, and so is releasing on a session not registered yet:
-    /// its registration then applies no hold for `reason`.
+    /// its registration then applies no hold for `reason`. A registration
+    /// whose unregister is owed ([`Self::unregister_owed`]) refuses the
+    /// release, after the reason is unstaged, with that refusal's own type,
+    /// as [`Self::hold_run_starts`] does.
     pub async fn release_run_starts(
         &self,
         session_id: &SessionId,
@@ -12876,6 +12922,12 @@ Ok::<(), RuntimeDriverError>(())
         let gate = self
             .lock_current_durability_ready_session_mutation_gate(session_id)
             .await?;
+        if let Some(refusal) = self
+            .lifecycle_mutation_refused_by_unregister(session_id)
+            .await
+        {
+            return Err(refusal);
+        }
         let (_, effects) = self
             .apply_session_dsl_input(
                 session_id,

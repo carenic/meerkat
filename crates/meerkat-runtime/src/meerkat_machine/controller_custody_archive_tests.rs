@@ -568,6 +568,31 @@ async fn actual_cold_registration_settles_old_run_before_omitting_closed_termina
 ))]
 #[tokio::test]
 async fn sqlite_detached_terminal_original_vetoes_controller_mutation_until_cold_convergence() {
+    detached_terminal_original_custody_scenario(None).await;
+}
+
+/// The same killed producer and governed successor, with the member's durable
+/// lifecycle bound to the mob runtime its session runtime serves, as a
+/// successor's recovery leaves a mob member. The successor's controller
+/// custody still classifies that row: the live original vetoes its own grant
+/// lineage, an unrelated grant mutates, and the lineage mutates once the old
+/// run converges.
+#[cfg(all(
+    feature = "sqlite-store",
+    feature = "local-authorization",
+    any(target_os = "macos", target_os = "linux", windows)
+))]
+#[tokio::test]
+async fn sqlite_mob_bound_member_row_keeps_controller_custody_classifying() {
+    detached_terminal_original_custody_scenario(Some("mob-member-runtime:1")).await;
+}
+
+#[cfg(all(
+    feature = "sqlite-store",
+    feature = "local-authorization",
+    any(target_os = "macos", target_os = "linux", windows)
+))]
+async fn detached_terminal_original_custody_scenario(mob_runtime: Option<&str>) {
     use meerkat_authorization::publication::LocalAuthorizationPublication;
     use std::cell::Cell;
 
@@ -638,7 +663,17 @@ async fn sqlite_detached_terminal_original_vetoes_controller_mutation_until_cold
                 &staged.runtime_id,
                 crate::store::MachineLifecycleCommit::new_with_binding_run_and_unregister_progress(
                     driver.runtime_state(),
-                    driver.machine_lifecycle_binding_facts(),
+                    match mob_runtime {
+                        // A mob member's lifecycle names the mob runtime its
+                        // session runtime serves, a different id.
+                        Some(mob_runtime) => crate::store::MachineLifecycleBindingFacts::new(
+                            Some(mob_runtime.to_string()),
+                            Some(1),
+                            Some(1),
+                            Some("epoch-1".to_string()),
+                        ),
+                        None => driver.machine_lifecycle_binding_facts(),
+                    },
                     crate::store::MachineLifecycleRunFacts::new(
                         driver.current_run_id(),
                         driver.pre_run_phase().map(|phase| match phase {

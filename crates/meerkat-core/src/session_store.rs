@@ -4584,7 +4584,7 @@ impl PreparedHeadCanonicalRewriteMutation {
                     return Err(SessionStoreError::Corrupted(session.id().clone()));
                 }
                 let missing_anchor_suffix = &anchor_messages[current_len..base_count];
-                if crate::image_content::messages_have_inline_media(missing_anchor_suffix) {
+                if crate::image_content::messages_have_inline_images(missing_anchor_suffix) {
                     return Err(SessionStoreError::InvalidTranscriptRewrite {
                         id: session.id().clone(),
                         reason: "compact rewrite anchor bridge carries inline media".to_string(),
@@ -4694,13 +4694,13 @@ impl PreparedHeadCanonicalRewriteMutation {
                 .iter()
                 .map(|message| serde_json::to_vec(message).map_err(SessionStoreError::from))
                 .collect::<Result<Vec<_>, _>>()?;
-            if crate::image_content::messages_have_inline_media(&appended[already_appended..])
-                || crate::image_content::messages_have_inline_media(edge.rewrite().replacement())
+            if crate::image_content::messages_have_inline_images(&appended[already_appended..])
+                || crate::image_content::messages_have_inline_images(edge.rewrite().replacement())
                 || edge
                     .parent_advance()
                     .exact_splice()
                     .is_some_and(|(_, replacement)| {
-                        crate::image_content::messages_have_inline_media(replacement)
+                        crate::image_content::messages_have_inline_images(replacement)
                     })
             {
                 return Err(SessionStoreError::InvalidTranscriptRewrite {
@@ -4759,7 +4759,7 @@ impl PreparedHeadCanonicalRewriteMutation {
             });
         }
         let tail = &session.messages()[current_len..];
-        if crate::image_content::messages_have_inline_media(tail) {
+        if crate::image_content::messages_have_inline_images(tail) {
             return Err(SessionStoreError::InvalidTranscriptRewrite {
                 id: session.id().clone(),
                 reason: "post-rewrite live tail carries inline media".to_string(),
@@ -5277,6 +5277,38 @@ pub trait IncrementalSessionStore: SessionStore {
     async fn activate_head_canonical_store(
         &self,
     ) -> Result<HeadCanonicalStoreActivation, SessionStoreError>;
+
+    /// Put every image this store's not yet activated sessions hold inline
+    /// (a legacy representation that a host compacted with images in its
+    /// transcript) into `blob_store` under its content address, for
+    /// [`Self::activate_head_canonical_store_with_staged_images`], and return
+    /// the address of every image stored. It writes nothing to the store.
+    ///
+    /// The default stores nothing: a backend without such a legacy
+    /// representation has nothing to stage.
+    async fn stage_legacy_inline_images(
+        &self,
+        blob_store: &dyn crate::BlobStore,
+    ) -> Result<std::collections::BTreeSet<crate::BlobId>, SessionStoreError> {
+        let _ = blob_store;
+        Ok(std::collections::BTreeSet::new())
+    }
+
+    /// [`Self::activate_head_canonical_store`] for a store whose legacy
+    /// sessions hold images inline: each such session crosses with those
+    /// images as the blob references `staged` holds, and one holding an
+    /// image `staged` does not hold refuses the whole activation, which then
+    /// writes nothing.
+    ///
+    /// The default ignores `staged` and activates as
+    /// [`Self::activate_head_canonical_store`] does.
+    async fn activate_head_canonical_store_with_staged_images(
+        &self,
+        staged: &std::collections::BTreeSet<crate::BlobId>,
+    ) -> Result<HeadCanonicalStoreActivation, SessionStoreError> {
+        let _ = staged;
+        self.activate_head_canonical_store().await
+    }
 
     /// Cross one physical HeadCanonical session into current store authority.
     ///
@@ -6206,13 +6238,13 @@ fn lay_out_retained_history(
             .iter()
             .map(|message| serde_json::to_vec(message).map_err(SessionStoreError::from))
             .collect::<Result<Vec<_>, _>>()?;
-        if crate::image_content::messages_have_inline_media(edge.parent_advance().appended())
-            || crate::image_content::messages_have_inline_media(edge.rewrite().replacement())
+        if crate::image_content::messages_have_inline_images(edge.parent_advance().appended())
+            || crate::image_content::messages_have_inline_images(edge.rewrite().replacement())
             || edge
                 .parent_advance()
                 .exact_splice()
                 .is_some_and(|(_, replacement)| {
-                    crate::image_content::messages_have_inline_media(replacement)
+                    crate::image_content::messages_have_inline_images(replacement)
                 })
         {
             return Err(SessionStoreError::InvalidTranscriptRewrite {

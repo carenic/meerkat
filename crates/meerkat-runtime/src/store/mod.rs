@@ -10213,7 +10213,7 @@ pub use memory::InMemoryRuntimeStore;
 #[cfg(feature = "sqlite-store")]
 pub use sqlite::{
     SqliteRuntimeStore, StandaloneWholeBlobConversionReport, StandaloneWholeBlobRuntimeConversion,
-    StandaloneWholeBlobSessionSource,
+    StandaloneWholeBlobSessionSource, WholeBlobMediaRuntime, WholeBlobMediaStage,
 };
 
 #[cfg(test)]

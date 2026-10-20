@@ -406,7 +406,7 @@ fn migration_0004_head_canonical_v2_authority(tx: &Transaction<'_>) -> Result<()
                 ),
             )))
         })?;
-        let crossing = cross_head_canonical_authority_in_txn(tx, &id).map_err(|error| {
+        let crossing = cross_head_canonical_authority_in_txn(tx, &id, None).map_err(|error| {
             rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("head-canonical v1-to-v2 conversion failed for session '{id}': {error}"),
@@ -2018,7 +2018,7 @@ mod schema_floor_tests {
         let (mut conn, id, _source_head_bytes, source_token) = pre_exact_head_canonical_v3();
 
         let tx = conn.transaction().expect("typed conversion transaction");
-        let converted = cross_head_canonical_authority_in_txn(&tx, &id)
+        let converted = cross_head_canonical_authority_in_txn(&tx, &id, None)
             .expect("typed crossing converts pre-exact authority");
         assert!(matches!(
             &converted,
@@ -2033,7 +2033,7 @@ mod schema_floor_tests {
         tx.commit().expect("commit typed conversion");
 
         let tx = conn.transaction().expect("typed retry transaction");
-        let current = cross_head_canonical_authority_in_txn(&tx, &id)
+        let current = cross_head_canonical_authority_in_txn(&tx, &id, None)
             .expect("typed crossing reverifies current authority");
         assert!(matches!(
             &current,
@@ -2061,7 +2061,7 @@ mod schema_floor_tests {
         tx.commit()?;
 
         let tx = conn.transaction()?;
-        let activation = activate_head_canonical_store_in_txn(&tx)?;
+        let activation = activate_head_canonical_store_in_txn(&tx, None)?;
         let HeadCanonicalStoreActivation::Activated(crossings) = activation else {
             return Err("SQLite HeadCanonical activation must be applicable".into());
         };
@@ -2115,7 +2115,7 @@ mod schema_floor_tests {
             .expect("commit invalid physical identity fixture");
 
         let tx = conn.transaction().expect("bulk activation transaction");
-        activate_head_canonical_store_in_txn(&tx)
+        activate_head_canonical_store_in_txn(&tx, None)
             .expect_err("invalid later census identity must abort the full activation");
         drop(tx);
 
@@ -2144,7 +2144,7 @@ mod schema_floor_tests {
         let tx = conn
             .transaction()
             .expect("prepare current authority transaction");
-        let converted = cross_head_canonical_authority_in_txn(&tx, &id)
+        let converted = cross_head_canonical_authority_in_txn(&tx, &id, None)
             .expect("prepare current authority before schema crossing");
         let referenced_token = converted
             .authority()
@@ -5693,15 +5693,60 @@ fn activate_realtime_component_in_txn(
 /// One-time migration: lay out the legacy blob's strands and head inside the
 /// caller's transaction. The blob row is left untouched as a frozen archive
 /// and is never read again once the head row exists.
+///
+/// With `staged_images` (an activation whose media stage stored the legacy
+/// blob's inline images), the blob's session is laid out with every image it
+/// holds inline rewritten to the blob reference that stage stored it under
+/// ([`Session::with_inline_images_externalized`]), and an image the stage
+/// did not store refuses typed before anything is written. The blob row
+/// itself is not rewritten.
 fn migrate_legacy_blob_in_txn(
     tx: &Transaction<'_>,
     id: &SessionId,
+    staged_images: Option<&BTreeSet<meerkat_core::BlobId>>,
 ) -> Result<Option<(SessionHead, String)>, SessionStoreError> {
     let Some(session) = load_session_snapshot_in_txn(tx, id).map_err(into_session_store_error)?
     else {
         return Ok(None);
     };
+    let session = match staged_images {
+        Some(stored) => with_staged_inline_images(id, session, stored)?,
+        None => session,
+    };
     lay_out_blob_session_in_txn(tx, id, &session).map(Some)
+}
+
+/// `session` with the images it holds inline rewritten to the blob
+/// references `stored` holds, refusing typed when it holds one `stored`
+/// does not.
+fn with_staged_inline_images(
+    id: &SessionId,
+    session: Session,
+    stored: &BTreeSet<meerkat_core::BlobId>,
+) -> Result<Session, SessionStoreError> {
+    let externalized = session.with_inline_images_externalized().map_err(|error| {
+        SessionStoreError::InvalidTranscriptRewrite {
+            id: id.clone(),
+            reason: format!("failed to move the legacy blob session's inline images out: {error}"),
+        }
+    })?;
+    let Some(externalized) = externalized else {
+        return Ok(session);
+    };
+    if let Some(unstored) = externalized
+        .payloads
+        .iter()
+        .find(|payload| !stored.contains(&payload.blob_id))
+    {
+        return Err(SessionStoreError::InvalidTranscriptRewrite {
+            id: id.clone(),
+            reason: format!(
+                "the legacy blob session holds inline image {} that the media stage did not store; stage the media again",
+                unstored.blob_id.as_str()
+            ),
+        });
+    }
+    Ok(externalized.session)
 }
 
 /// Lay out one whole-blob session document as this store's physical session:
@@ -5740,6 +5785,14 @@ fn lay_out_blob_session_in_txn(
 fn ensure_head_canonical_for_write_in_txn(
     tx: &Transaction<'_>,
     id: &SessionId,
+) -> Result<Option<(SessionHead, String)>, SessionStoreError> {
+    ensure_head_canonical_for_write_with_staged_images_in_txn(tx, id, None)
+}
+
+fn ensure_head_canonical_for_write_with_staged_images_in_txn(
+    tx: &Transaction<'_>,
+    id: &SessionId,
+    staged_images: Option<&BTreeSet<meerkat_core::BlobId>>,
 ) -> Result<Option<(SessionHead, String)>, SessionStoreError> {
     if let Some((head, stored_token)) = head_row_in_txn(tx, id)? {
         if session_head_cas_token(&head)? != stored_token {
@@ -5817,7 +5870,7 @@ fn ensure_head_canonical_for_write_in_txn(
         let upgraded_token = write_head_row_only_in_txn(tx, &upgraded)?;
         return Ok(Some((upgraded, upgraded_token)));
     }
-    migrate_legacy_blob_in_txn(tx, id)
+    migrate_legacy_blob_in_txn(tx, id, staged_images)
 }
 
 /// Read the exact physical canonical head and stored token in a co-tenant
@@ -6991,6 +7044,22 @@ pub fn runtime_boundary_in_physical_row_lineage_in_txn(
     Ok(lineage_form)
 }
 
+/// The session a legacy blob row holds for `id` while this store has no
+/// head row for it: the session the next head-canonical write (a runtime
+/// activation's included) migrates. `None` once it is migrated, or when
+/// there is no blob row. It borrows the caller's transaction and writes
+/// nothing.
+#[doc(hidden)]
+pub fn unmigrated_legacy_blob_session_in_txn(
+    tx: &Transaction<'_>,
+    id: &SessionId,
+) -> Result<Option<Session>, SessionStoreError> {
+    if head_row_in_txn(tx, id)?.is_some() {
+        return Ok(None);
+    }
+    load_session_snapshot_in_txn(tx, id).map_err(into_session_store_error)
+}
+
 /// One-time blob-to-head conversion seam for the co-tenant runtime store.
 ///
 /// This is intentionally hidden from generated documentation: ordinary
@@ -7006,7 +7075,23 @@ pub fn ensure_head_canonical_for_runtime_in_txn(
     tx: &Transaction<'_>,
     id: &SessionId,
 ) -> Result<Option<(SessionHead, String)>, SessionStoreError> {
-    let Some((head, token)) = ensure_head_canonical_for_write_in_txn(tx, id)? else {
+    ensure_head_canonical_for_runtime_with_staged_images_in_txn(tx, id, None)
+}
+
+/// [`ensure_head_canonical_for_runtime_in_txn`] for an activation whose
+/// media stage stored the images a legacy blob row holds inline: a legacy
+/// blob migrated here lays out its session with those images as the blob
+/// references in `staged_images`, and refuses typed, writing nothing, when it
+/// holds an image the stage did not store. `None` is the plain seam.
+#[doc(hidden)]
+pub fn ensure_head_canonical_for_runtime_with_staged_images_in_txn(
+    tx: &Transaction<'_>,
+    id: &SessionId,
+    staged_images: Option<&BTreeSet<meerkat_core::BlobId>>,
+) -> Result<Option<(SessionHead, String)>, SessionStoreError> {
+    let Some((head, token)) =
+        ensure_head_canonical_for_write_with_staged_images_in_txn(tx, id, staged_images)?
+    else {
         return Ok(None);
     };
     if head.realtime_event_prefix.is_some() {
@@ -7126,6 +7211,7 @@ pub fn held_session_ids_in_txn(
 fn cross_head_canonical_authority_in_txn(
     tx: &Transaction<'_>,
     id: &SessionId,
+    staged_images: Option<&BTreeSet<meerkat_core::BlobId>>,
 ) -> Result<HeadCanonicalAuthorityCrossing, SessionStoreError> {
     let source_was_current = match head_row_in_txn(tx, id)? {
         Some((source_head, source_token)) => {
@@ -7155,7 +7241,9 @@ fn cross_head_canonical_authority_in_txn(
         None => false,
     };
 
-    let Some((head, stored_token)) = ensure_head_canonical_for_runtime_in_txn(tx, id)? else {
+    let Some((head, stored_token)) =
+        ensure_head_canonical_for_runtime_with_staged_images_in_txn(tx, id, staged_images)?
+    else {
         return Ok(HeadCanonicalAuthorityCrossing::NotApplicable);
     };
     let (published_head, published_token) =
@@ -7176,8 +7264,43 @@ fn cross_head_canonical_authority_in_txn(
     }
 }
 
+/// Every session this store holds only as a legacy blob row (no head row
+/// yet), as its blob row holds it, in session id order. Reads only.
+fn unmigrated_legacy_blob_sessions_in_txn(
+    tx: &Transaction<'_>,
+) -> Result<Vec<Session>, SessionStoreError> {
+    let raw_ids = {
+        let mut statement = tx
+            .prepare(
+                r"
+                SELECT session_id FROM sessions
+                WHERE session_id NOT IN (SELECT session_id FROM session_heads)
+                ORDER BY session_id ASC
+                ",
+            )
+            .map_err(StoreError::from)
+            .map_err(into_session_store_error)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(StoreError::from)
+            .map_err(into_session_store_error)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+            .map_err(into_session_store_error)?
+    };
+    let mut sessions = Vec::with_capacity(raw_ids.len());
+    for raw_id in raw_ids {
+        let id = parse_session_id(raw_id).map_err(into_session_store_error)?;
+        if let Some(session) = unmigrated_legacy_blob_session_in_txn(tx, &id)? {
+            sessions.push(session);
+        }
+    }
+    Ok(sessions)
+}
+
 fn activate_head_canonical_store_in_txn(
     tx: &Transaction<'_>,
+    staged_images: Option<&BTreeSet<meerkat_core::BlobId>>,
 ) -> Result<HeadCanonicalStoreActivation, SessionStoreError> {
     let raw_ids = {
         let mut statement = tx
@@ -7202,7 +7325,7 @@ fn activate_head_canonical_store_in_txn(
     let mut crossings = Vec::with_capacity(raw_ids.len());
     for raw_id in raw_ids {
         let id = parse_session_id(raw_id).map_err(into_session_store_error)?;
-        let crossing = cross_head_canonical_authority_in_txn(tx, &id)?;
+        let crossing = cross_head_canonical_authority_in_txn(tx, &id, staged_images)?;
         if matches!(crossing, HeadCanonicalAuthorityCrossing::NotApplicable) {
             return Err(SessionStoreError::InvalidTranscriptRewrite {
                 id,
@@ -9806,7 +9929,66 @@ impl IncrementalSessionStore for SqliteSessionStore {
     async fn activate_head_canonical_store(
         &self,
     ) -> Result<HeadCanonicalStoreActivation, SessionStoreError> {
-        self.in_write_txn(activate_head_canonical_store_in_txn)
+        self.in_write_txn(|tx| activate_head_canonical_store_in_txn(tx, None))
+            .await
+    }
+
+    async fn stage_legacy_inline_images(
+        &self,
+        blob_store: &dyn meerkat_core::BlobStore,
+    ) -> Result<BTreeSet<meerkat_core::BlobId>, SessionStoreError> {
+        // Read every legacy session, and release the database, before the
+        // first blob store write.
+        let legacy = self
+            .in_read_txn(unmigrated_legacy_blob_sessions_in_txn)
+            .await?;
+        let mut stored = BTreeSet::new();
+        for session in &legacy {
+            let externalized = session.with_inline_images_externalized().map_err(|error| {
+                SessionStoreError::InvalidTranscriptRewrite {
+                    id: session.id().clone(),
+                    reason: format!(
+                        "failed to move the legacy blob session's inline images out: {error}"
+                    ),
+                }
+            })?;
+            let Some(externalized) = externalized else {
+                continue;
+            };
+            for payload in externalized.payloads {
+                if stored.contains(&payload.blob_id) {
+                    continue;
+                }
+                let blob = blob_store
+                    .put_image(&payload.media_type, &payload.data)
+                    .await
+                    .map_err(|error| {
+                        SessionStoreError::Internal(format!(
+                            "storing inline image {} of session {} failed: {error}",
+                            payload.blob_id.as_str(),
+                            session.id()
+                        ))
+                    })?;
+                if blob.blob_id != payload.blob_id {
+                    return Err(SessionStoreError::Internal(format!(
+                        "the blob store addressed inline image {} of session {} as {}; staging needs the image's content address",
+                        payload.blob_id.as_str(),
+                        session.id(),
+                        blob.blob_id.as_str()
+                    )));
+                }
+                stored.insert(payload.blob_id);
+            }
+        }
+        Ok(stored)
+    }
+
+    async fn activate_head_canonical_store_with_staged_images(
+        &self,
+        staged: &BTreeSet<meerkat_core::BlobId>,
+    ) -> Result<HeadCanonicalStoreActivation, SessionStoreError> {
+        let staged = staged.clone();
+        self.in_write_txn(move |tx| activate_head_canonical_store_in_txn(tx, Some(&staged)))
             .await
     }
 
@@ -9815,7 +9997,7 @@ impl IncrementalSessionStore for SqliteSessionStore {
         id: &SessionId,
     ) -> Result<HeadCanonicalAuthorityCrossing, SessionStoreError> {
         let id = id.clone();
-        self.in_write_txn(move |tx| cross_head_canonical_authority_in_txn(tx, &id))
+        self.in_write_txn(move |tx| cross_head_canonical_authority_in_txn(tx, &id, None))
             .await
     }
 
@@ -10370,6 +10552,142 @@ mod tests {
             .unwrap();
     }
 
+    /// A session whose compacted history holds images inline, as a
+    /// 0.8.x-era host wrote them: each round's tool result carries two
+    /// snapshots and is swallowed by the next compaction, which keeps the
+    /// newest row.
+    fn legacy_session_with_inline_images() -> Session {
+        let image = |data: &str| meerkat_core::types::ContentBlock::Image {
+            media_type: "image/jpeg".to_string(),
+            data: meerkat_core::types::ImageData::Inline {
+                data: data.to_string(),
+            },
+        };
+        let mut session = Session::new();
+        session.push(Message::User(UserMessage::text("start")));
+        for (round, pair) in [["SlBFRyBh", "SlBFRyBi"], ["SlBFRyBj", "SlBFRyBk"]]
+            .into_iter()
+            .enumerate()
+        {
+            session.push(Message::tool_results(vec![
+                meerkat_core::types::ToolResult::with_blocks(
+                    format!("call-{round}"),
+                    vec![image(pair[0]), image(pair[1])],
+                    false,
+                ),
+            ]));
+            session.push(Message::User(UserMessage::text(format!("round {round}"))));
+            let end = session.messages().len() - 1;
+            session
+                .commit_transcript_rewrite(
+                    TranscriptRewriteSelection::MessageRange { start: 0, end },
+                    vec![Message::User(UserMessage::text("summary so far"))],
+                    TranscriptRewriteReason::new("compaction"),
+                    Some("test".to_string()),
+                    None,
+                )
+                .unwrap();
+        }
+        session
+    }
+
+    fn head_row_count(path: &Path) -> i64 {
+        Connection::open(path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM session_heads", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// A store whose legacy blob row holds images inline in its compacted
+    /// history refuses the store-wide activation, writing nothing. With its
+    /// images staged into a blob store, the activation crosses it with them
+    /// as blob references: the session keeps its transcript revision and
+    /// holds no image inline. An activation whose stage misses an image
+    /// refuses and writes nothing; once activated, the store stages nothing.
+    #[tokio::test]
+    async fn a_store_activation_crosses_a_legacy_session_with_its_staged_inline_images() {
+        let (_dir, store) = temp_store();
+        let session = legacy_session_with_inline_images();
+        insert_whole_blob_row(store.path(), &session);
+
+        let refused = store.activate_head_canonical_store().await;
+        assert!(
+            matches!(
+                &refused,
+                Err(SessionStoreError::InvalidTranscriptRewrite { reason, .. })
+                    if reason.contains("carries inline media")
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(head_row_count(store.path()), 0);
+        let refused = store
+            .activate_head_canonical_store_with_staged_images(&BTreeSet::new())
+            .await;
+        assert!(
+            matches!(
+                &refused,
+                Err(SessionStoreError::InvalidTranscriptRewrite { reason, .. })
+                    if reason.contains("did not store")
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(head_row_count(store.path()), 0);
+
+        let blobs = crate::MemoryBlobStore::new();
+        let staged = store.stage_legacy_inline_images(&blobs).await.unwrap();
+        assert_eq!(staged.len(), 4, "every distinct image is staged once");
+        for blob_id in &staged {
+            meerkat_core::BlobStore::get(&blobs, blob_id)
+                .await
+                .expect("the staged image is in the blob store");
+        }
+        let activation = store
+            .activate_head_canonical_store_with_staged_images(&staged)
+            .await
+            .expect("the staged activation crosses the legacy session");
+        let crossings = match activation {
+            HeadCanonicalStoreActivation::Activated(crossings) => crossings,
+            HeadCanonicalStoreActivation::NotApplicable => Vec::new(),
+        };
+        assert_eq!(crossings.len(), 1, "the store activates its one session");
+        assert!(matches!(
+            crossings[0],
+            HeadCanonicalAuthorityCrossing::Converted(_)
+        ));
+        let activated = store
+            .load(session.id())
+            .await
+            .unwrap()
+            .expect("the activated session");
+        let document = serde_json::to_string(&activated).unwrap();
+        for data in ["SlBFRyBh", "SlBFRyBi", "SlBFRyBj", "SlBFRyBk"] {
+            assert!(!document.contains(data), "{data} is still inline");
+        }
+        assert_eq!(
+            activated.transcript_revision().unwrap(),
+            session.transcript_revision().unwrap()
+        );
+        assert!(
+            store
+                .stage_legacy_inline_images(&blobs)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an activated store has nothing to stage"
+        );
+        let again = match store.activate_head_canonical_store().await.unwrap() {
+            HeadCanonicalStoreActivation::Activated(crossings) => crossings,
+            HeadCanonicalStoreActivation::NotApplicable => Vec::new(),
+        };
+        assert!(
+            matches!(
+                again.first(),
+                Some(HeadCanonicalAuthorityCrossing::AlreadyCurrent(_))
+            ),
+            "the store activates again with the session already current"
+        );
+    }
+
     /// The head fields the transcript and its rewrite graph determine, which a
     /// converted head and an incrementally written head share.
     fn transcript_head_fields(head: &SessionHead) -> serde_json::Value {
@@ -10469,7 +10787,7 @@ mod tests {
         let migrate_id = id.clone();
         let (migrated, migrated_token) = blob_store
             .in_write_txn(move |tx| {
-                migrate_legacy_blob_in_txn(tx, &migrate_id)?
+                migrate_legacy_blob_in_txn(tx, &migrate_id, None)?
                     .ok_or(SessionStoreError::NotFound(migrate_id))
             })
             .await
