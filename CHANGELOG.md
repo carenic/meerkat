@@ -2574,6 +2574,10 @@ them.
   `misfired` although its admitted input ran; nothing runs twice. Use
   `catch_up_within` with a window longer than the lease to keep crash
   recovery.
+- Identity reconciliation (`meerkat-mob`): a genuine storage or host error
+  after an identity's member retirement has durably started leaves the
+  identity in `Backoff` until the mob is resumed or the host process
+  restarts, either of which recovers it.
 
 ## [0.9.3] - 2026-10-18
 
