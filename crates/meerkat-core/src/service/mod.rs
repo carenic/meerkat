@@ -1249,49 +1249,117 @@ impl std::fmt::Display for OpaquePrincipalToken {
     }
 }
 
-/// One incarnation of a mob: a mob runtime from the moment it starts (a
-/// create, or a resume by a later process) until it stops for good. A mob
-/// destroyed and created again under the same id, or resumed by a later
-/// process, is a new incarnation.
+/// One incarnation of a mob: the mob one create started, from that create
+/// until its destroy. The create mints it with [`Self::mint`] (UUID v4, 122
+/// random bits) and records it with the mob's creation, and every resume,
+/// in this process or a later one, reads it back, so a restart keeps it. A
+/// mob destroyed and created again under the same id is a new incarnation.
 ///
 /// Mob operator grants name the incarnation they were minted for, so a grant
-/// never reaches a later mob under the same id. The mob runtime mints one
-/// with [`Self::mint`] when it starts (UUID v4, 122 random bits) and hands it
-/// out through its handles; a value minted anywhere else names no running
-/// mob, so a grant naming it reaches nothing. The value is opaque and is
-/// never decoded: deserialization always refuses, and `Debug` and
-/// `Serialize` render it redacted. It is not a credential; the authority is
-/// the sealed [`MobToolAuthorityContext`] that names it.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+/// never reaches a later mob under the same id. The mob runtime hands its
+/// incarnation out through its handles.
+///
+/// The value is an identity, not a credential: it renders and serializes as
+/// its canonical form, a lowercase hyphenated UUID, and [`FromStr`] and
+/// `Deserialize` accept only that form. Holding one grants nothing. The
+/// grant functions take a [`LiveMobIncarnation`], which only the mob
+/// runtime's own handle hands out, so no grant binds a value decoded from
+/// input; the authority is the sealed [`MobToolAuthorityContext`] that names
+/// it, whose bindings are never serialized.
+///
+/// [`FromStr`]: std::str::FromStr
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MobIncarnationId(uuid::Uuid);
 
 impl MobIncarnationId {
     /// A fresh incarnation, never handed out before. The mob runtime calls
-    /// this when a mob starts; any other caller gets a value no mob runs at.
+    /// this when it creates a mob, and once for a mob created before
+    /// incarnations were recorded, at its first resume; any other caller
+    /// gets a value no mob runs at.
     pub fn mint() -> Self {
         Self(uuid::Uuid::new_v4())
     }
 }
 
-const REDACTED_MOB_INCARNATION: &str = "[redacted mob incarnation]";
+/// A string that is not the canonical form of a [`MobIncarnationId`]: a
+/// lowercase hyphenated UUID, as its `Display` writes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("a mob incarnation id is a lowercase hyphenated UUID")]
+#[non_exhaustive]
+pub struct MobIncarnationIdParseError;
+
+impl std::fmt::Display for MobIncarnationId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.as_hyphenated().fmt(f)
+    }
+}
 
 impl std::fmt::Debug for MobIncarnationId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(REDACTED_MOB_INCARNATION)
+        write!(f, "MobIncarnationId({})", self.0.as_hyphenated())
+    }
+}
+
+/// Parses the canonical form only: braced, `urn:uuid:`, simple and
+/// upper-case UUIDs are refused, so a stored id has one spelling.
+impl std::str::FromStr for MobIncarnationId {
+    type Err = MobIncarnationIdParseError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let uuid = uuid::Uuid::try_parse(text).map_err(|_| MobIncarnationIdParseError)?;
+        let mut buffer = uuid::Uuid::encode_buffer();
+        if *uuid.as_hyphenated().encode_lower(&mut buffer) != *text {
+            return Err(MobIncarnationIdParseError);
+        }
+        Ok(Self(uuid))
     }
 }
 
 impl Serialize for MobIncarnationId {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(REDACTED_MOB_INCARNATION)
+        serializer.collect_str(self)
     }
 }
 
 impl<'de> Deserialize<'de> for MobIncarnationId {
-    fn deserialize<D: serde::Deserializer<'de>>(_deserializer: D) -> Result<Self, D::Error> {
-        Err(serde::de::Error::custom(
-            "a mob incarnation is minted by the mob runtime and never decoded",
-        ))
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// A [`MobIncarnationId`] read from the mob runtime that runs at it:
+/// `meerkat_mob::MobHandle::live_incarnation` hands it out. The mob operator
+/// grant functions (`meerkat_runtime::mob_operator_authority::grant_manage_mob`
+/// and the spawn-profile grants) take this witness instead of a bare id, so a
+/// grant binds only an incarnation a mob runtime of this process runs or ran
+/// at, never a value decoded from input. It has no serde.
+///
+/// Rust cannot keep another crate from calling a public constructor, so
+/// `LiveMobIncarnation::witnessed` is public but hidden from the docs, and
+/// fenced twice in this workspace: `clippy.toml` disallows it
+/// (`disallowed-methods`), and `crates/meerkat/tests/host_launch_sites.rs`
+/// lists every call. A downstream workspace fences it with the same
+/// `clippy.toml` entry; a Rust embedder without one is held only by the
+/// hidden doc and the name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LiveMobIncarnation(MobIncarnationId);
+
+impl LiveMobIncarnation {
+    /// The witness that a mob runtime runs at `incarnation`. Its one shipped
+    /// caller is `meerkat_mob::MobHandle::live_incarnation`; `clippy.toml`
+    /// disallows every other call (`disallowed-methods`), and
+    /// `crates/meerkat/tests/host_launch_sites.rs` lists that caller and the
+    /// test helpers that call it.
+    #[doc(hidden)]
+    pub fn witnessed(incarnation: MobIncarnationId) -> Self {
+        Self(incarnation)
+    }
+
+    /// The incarnation this witness names.
+    pub fn incarnation(self) -> MobIncarnationId {
+        self.0
     }
 }
 
@@ -1550,18 +1618,21 @@ impl MobToolAuthorityContext {
 
     /// Raw, atomic observation: whether the operator holds manage scope over
     /// the mob `mob_id` at `incarnation`, the incarnation of the live mob the
-    /// caller resolved. A grant for a destroyed mob never matches a later
-    /// mob under the same id.
+    /// caller resolved, never a value decoded from input. A grant for a
+    /// destroyed mob never matches a later mob under the same id, but a
+    /// decoded stale id would match a grant bound to that destroyed mob.
     pub fn can_manage_mob(&self, mob_id: &str, incarnation: MobIncarnationId) -> bool {
         self.managed_mob_scope().contains(mob_id) && self.scope_bound_to(mob_id, incarnation)
     }
 
     /// Raw, atomic observation: whether the operator holds a non-empty
-    /// spawn-profile scope for the mob `mob_id` at `incarnation`. This is one
-    /// of the two pure facts the spawn-tool shell feeds to MobMachine's
-    /// `ResolveSpawnToolAdmission` (alongside [`Self::can_manage_mob`]); the
-    /// machine - not the shell - composes the disjunction into the
-    /// Allow/Deny verdict. This is NOT a pre-reduced admission conclusion.
+    /// spawn-profile scope for the mob `mob_id` at `incarnation`, the
+    /// incarnation of the live mob the caller resolved, never a value decoded
+    /// from input. This is one of the two pure facts the spawn-tool shell
+    /// feeds to MobMachine's `ResolveSpawnToolAdmission` (alongside
+    /// [`Self::can_manage_mob`]); the machine - not the shell - composes the
+    /// disjunction into the Allow/Deny verdict. This is NOT a pre-reduced
+    /// admission conclusion.
     pub fn spawn_profile_scope_present(&self, mob_id: &str, incarnation: MobIncarnationId) -> bool {
         self.scope_bound_to(mob_id, incarnation)
             && self
@@ -1579,7 +1650,9 @@ impl MobToolAuthorityContext {
     /// `manage_scope_present || profile_scope_contains` disjunction into the
     /// Allow/Deny verdict. This is a RAW per-profile set-membership fact, NOT a
     /// pre-reduced admission conclusion (it does not OR in manage scope). Like
-    /// the other scope observations it holds only at the bound `incarnation`.
+    /// the other scope observations it holds only at the bound `incarnation`:
+    /// the incarnation of the live mob the caller resolved, never a value
+    /// decoded from input.
     pub fn spawn_profile_scope_contains(
         &self,
         mob_id: &str,
@@ -4303,23 +4376,54 @@ mod tests {
         assert!(error.contains("mob-2"), "{error}");
     }
 
-    /// A mob incarnation is opaque: it never decodes from any input, and
-    /// neither `Debug` nor `Serialize` renders its value.
+    /// A mob incarnation is an identity with one spelling: it renders and
+    /// serializes as a lowercase hyphenated UUID, and decodes from exactly
+    /// that form.
     #[test]
-    fn mob_incarnation_is_never_decoded_and_renders_redacted() {
+    fn mob_incarnation_round_trips_its_canonical_form_only() {
         let incarnation = MobIncarnationId::mint();
         assert_ne!(incarnation, MobIncarnationId::mint());
-        let rendered = format!("{incarnation:?}");
+        let rendered = incarnation.to_string();
+        assert_eq!(rendered.parse::<MobIncarnationId>(), Ok(incarnation));
+        assert_eq!(
+            format!("{incarnation:?}"),
+            format!("MobIncarnationId({rendered})")
+        );
         let serialized = serde_json::to_value(incarnation).expect("serialize incarnation");
-        assert_eq!(rendered, "[redacted mob incarnation]");
-        assert_eq!(serialized, serde_json::json!("[redacted mob incarnation]"));
+        assert_eq!(serialized, serde_json::json!(rendered));
+        assert_eq!(
+            serde_json::from_value::<MobIncarnationId>(serialized).expect("decode incarnation"),
+            incarnation
+        );
+
+        let canonical = "6f7f0d5c-3c2d-4c4e-9a54-0e8b0f1d2c3b";
+        let parsed: MobIncarnationId = canonical.parse().expect("the canonical form parses");
+        assert_eq!(parsed.to_string(), canonical);
         for input in [
-            serialized,
-            serde_json::json!("6f7f0d5c-3c2d-4c4e-9a54-0e8b0f1d2c3b"),
+            canonical.to_uppercase(),
+            format!("{{{canonical}}}"),
+            format!("urn:uuid:{canonical}"),
+            canonical.replace('-', ""),
+            format!(" {canonical}"),
+            format!("{canonical}\n"),
+            String::new(),
+            "[redacted mob incarnation]".to_string(),
+        ] {
+            assert_eq!(
+                input.parse::<MobIncarnationId>(),
+                Err(MobIncarnationIdParseError),
+                "{input:?}"
+            );
+            serde_json::from_value::<MobIncarnationId>(serde_json::json!(input))
+                .expect_err("only the canonical form decodes");
+        }
+        for input in [
             serde_json::json!({}),
+            serde_json::json!(7),
+            serde_json::Value::Null,
         ] {
             serde_json::from_value::<MobIncarnationId>(input)
-                .expect_err("a mob incarnation never decodes");
+                .expect_err("a mob incarnation decodes only from a string");
         }
     }
 

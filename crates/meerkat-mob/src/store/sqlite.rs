@@ -42,12 +42,18 @@ use super::{
     validate_identity_member_commit_authority, validate_identity_wiring_commit_authority,
     validate_initial_mob_created_events, validate_mob_event_write_authority,
 };
+use super::{
+    MobCreationOrigin, MobCreationRecord, creation_finalized_at_ms, encode_mob_provenance,
+    refuse_raw_creation_over_record, validate_creation_event,
+};
 #[cfg(feature = "runtime-adapter")]
 use super::{
     identity_runtime_fence_error, validate_identity_runtime_target_binding,
     validate_identity_runtime_write_authority,
 };
+use crate::MobProvenance;
 use crate::definition::MobDefinition;
+use crate::error::IncarnationInconsistency;
 use crate::error::MobError;
 use crate::event::{
     MobEvent, MobEventKind, NewMobEvent, decode_stored_mob_event, encode_stored_mob_event,
@@ -86,6 +92,7 @@ use crate::temporary_council::TemporaryCouncilId;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use meerkat_core::SessionId;
+use meerkat_core::service::MobIncarnationId;
 use meerkat_sqlite::watch::{
     SqliteChangeWatch, SqliteWatchControl, SqliteWatchJoin, SqliteWatchRegistration,
     SqliteWatchStopHandle, SqliteWatchTick,
@@ -318,6 +325,13 @@ CREATE TABLE IF NOT EXISTS mob_temporary_councils (
 CREATE TABLE IF NOT EXISTS mob_runtime_callback_claim_verifiers (
     mob_id TEXT PRIMARY KEY,
     verifier BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mob_runtime_incarnations (
+    mob_id TEXT PRIMARY KEY,
+    incarnation TEXT NOT NULL,
+    origin TEXT NOT NULL CHECK (origin IN ('created', 'migrated')),
+    provenance TEXT NOT NULL,
+    finalized_at_ms INTEGER
 )";
 
 // Literal released 0.8.10 base DDL. This is intentionally independent of
@@ -1244,6 +1258,18 @@ fn migration_0011_callback_claim_verifiers(tx: &Transaction<'_>) -> Result<(), r
     )
 }
 
+fn migration_0012_mob_runtime_incarnations(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
+    tx.execute_batch(
+        "CREATE TABLE mob_runtime_incarnations (
+             mob_id TEXT PRIMARY KEY,
+             incarnation TEXT NOT NULL,
+             origin TEXT NOT NULL CHECK (origin IN ('created', 'migrated')),
+             provenance TEXT NOT NULL,
+             finalized_at_ms INTEGER
+         );",
+    )
+}
+
 fn migration_0001_mob_schema(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
     tx.execute_batch(CREATE_SCHEMA_SQL)
 }
@@ -2102,6 +2128,164 @@ fn verify_released_0_9_2_mob_schema(conn: &Connection) -> Result<(), String> {
     )
 }
 
+// Frozen v11 catalog: the shape 0.9.3 shipped, immediately before the mob
+// creation records. Built from the frozen v10 catalog plus the released
+// migration 11, never from the current initializer, so a v11 database is
+// proven against the exact released shape before the one supported
+// v11 -> v12 transition runs.
+fn build_released_0_9_3_mob_schema(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
+    build_released_0_9_2_mob_schema(tx)?;
+    migration_0011_callback_claim_verifiers(tx)
+}
+
+const RELEASED_0_9_3_MOB_OBJECTS: &[meerkat_sqlite::SchemaObject] = &[
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_events",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_event_meta",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_external_deliveries",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_runs",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_run_remote_turn_intents",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_run_remote_turn_receipts",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_specs",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_runtime_supervisors",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_runtime_host_authorities",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_runtime_host_binding_generation_highwaters",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_runtime_member_operator_requests",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_runtime_placed_spawns",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_runtime_operator_grants",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_runtime_member_event_cursors",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_runtime_member_live_cleanups",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_runtime_binding_overlays",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_identity_store_meta",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_identity_intents",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_identity_leases",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_identity_operation_receipts",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_identity_statuses",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "realm_profiles",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_identity_intent_mutation_receipts",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_identity_convergence_resolution_receipts",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_identity_adoption_receipts",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_forked_participants",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_forked_participant_member_associations",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_temporary_councils",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_runtime_callback_claim_verifiers",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "mob_forked_participants_fork_session",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "mob_events_mob_cursor",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "mob_identity_intents_session",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "mob_identity_intents_lineage",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "mob_identity_receipts_identity",
+    },
+];
+
+fn verify_released_0_9_3_mob_schema(conn: &Connection) -> Result<(), String> {
+    meerkat_sqlite::verify_released_schema_fingerprint(
+        conn,
+        &MOB_DOMAIN,
+        RELEASED_0_9_3_MOB_OBJECTS,
+        build_released_0_9_3_mob_schema,
+    )
+}
+
 /// The mob store bundle's schema domain in the per-file migration ledger.
 ///
 /// The oldest historical transition admitted by this binary is the exact
@@ -2192,9 +2376,14 @@ pub const MOB_DOMAIN: meerkat_sqlite::SchemaDomain = meerkat_sqlite::SchemaDomai
             name: "callback-claim-verifiers",
             apply: migration_0011_callback_claim_verifiers,
         },
+        meerkat_sqlite::Migration {
+            version: 12,
+            name: "mob-incarnation",
+            apply: migration_0012_mob_runtime_incarnations,
+        },
     ],
     initialize_current: initialize_current_mob_schema,
-    allowed_existing_versions: &[3, 4, 7, 8, 9, 10, 11],
+    allowed_existing_versions: &[3, 4, 7, 8, 9, 10, 11, 12],
     bridge_recoverable_versions: &[],
     released_predecessors: &[
         meerkat_sqlite::SchemaPredecessor {
@@ -2221,8 +2410,16 @@ pub const MOB_DOMAIN: meerkat_sqlite::SchemaDomain = meerkat_sqlite::SchemaDomai
             version: 10,
             verify: verify_released_0_9_2_mob_schema,
         },
+        meerkat_sqlite::SchemaPredecessor {
+            version: 11,
+            verify: verify_released_0_9_3_mob_schema,
+        },
     ],
     owned_objects: &[
+        meerkat_sqlite::SchemaObject {
+            kind: meerkat_sqlite::SchemaObjectKind::Table,
+            name: "mob_runtime_incarnations",
+        },
         meerkat_sqlite::SchemaObject {
             kind: meerkat_sqlite::SchemaObjectKind::Table,
             name: "mob_runtime_callback_claim_verifiers",
@@ -2404,7 +2601,7 @@ mod schema_floor_tests {
         let report =
             meerkat_sqlite::apply_domain_migrations(&mut conn, &MOB_DOMAIN).expect("upgrade");
         assert_eq!(report.from_version, 3);
-        assert_eq!(report.to_version, 11);
+        assert_eq!(report.to_version, 12);
     }
 
     #[test]
@@ -7927,6 +8124,85 @@ fn validate_initial_mob_created_sqlite(
     validate_initial_mob_created_events(&[], proposed)
 }
 
+/// A raw append of `proposed`, refused when it holds a `MobCreated` and the
+/// store holds a creation record (see `refuse_raw_creation_over_record`).
+fn validate_raw_mob_created_sqlite(
+    tx: &Transaction<'_>,
+    proposed: &[NewMobEvent],
+) -> Result<(), MobStoreError> {
+    validate_initial_mob_created_sqlite(tx, proposed)?;
+    if !proposed
+        .iter()
+        .any(|event| matches!(&event.kind, MobEventKind::MobCreated { .. }))
+    {
+        return Ok(());
+    }
+    refuse_raw_creation_over_record(read_creation_record(tx)?.as_ref(), proposed)
+}
+
+/// The store's creation record ([`MobCreationRecord`]).
+fn read_creation_record(conn: &Connection) -> Result<Option<MobCreationRecord>, MobStoreError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT mob_id, incarnation, origin, provenance, finalized_at_ms
+             FROM mob_runtime_incarnations",
+        )
+        .map_err(se)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+            ))
+        })
+        .map_err(se)?;
+    let mut records = Vec::new();
+    for row in rows {
+        let (mob_id, incarnation, origin, provenance, finalized_at_ms) = row.map_err(se)?;
+        let incarnation = incarnation.parse().map_err(|error| {
+            MobStoreError::Serialization(format!("creation record of mob '{mob_id}': {error}"))
+        })?;
+        records.push(MobCreationRecord {
+            mob_id: MobId::from(mob_id),
+            incarnation,
+            origin: MobCreationOrigin::parse(&origin)?,
+            provenance,
+            finalized_at_ms,
+        });
+    }
+    match records.len() {
+        0 | 1 => Ok(records.pop()),
+        count => Err(MobStoreError::IncarnationInconsistent {
+            mob_id: records[0].mob_id.clone(),
+            inconsistency: IncarnationInconsistency::MultipleRecords {
+                count: u64::try_from(count).unwrap_or(u64::MAX),
+            },
+        }),
+    }
+}
+
+fn insert_creation_record(
+    tx: &Transaction<'_>,
+    record: &MobCreationRecord,
+) -> Result<(), MobStoreError> {
+    tx.execute(
+        "INSERT INTO mob_runtime_incarnations
+             (mob_id, incarnation, origin, provenance, finalized_at_ms)
+         VALUES (?1, ?2, ?3, ?4, NULL)",
+        params![
+            record.mob_id.as_str(),
+            record.incarnation.to_string(),
+            record.origin.as_str(),
+            record.provenance,
+        ],
+    )
+    .map_err(se)?;
+    Ok(())
+}
+
 #[async_trait]
 impl private::MobEventStoreSealed for SqliteMobEventStore {
     fn definition_resume_gate(&self) -> Arc<tokio::sync::RwLock<()>> {
@@ -8192,6 +8468,118 @@ impl private::MobEventStoreSealed for SqliteMobEventStore {
             }
         }
         Ok(outcome)
+    }
+
+    async fn creation_record(&self) -> Result<Option<MobCreationRecord>, MobStoreError> {
+        let path = self.path.clone();
+        run_sqlite_task(move || {
+            let conn = open_connection(&path)?;
+            read_creation_record(&conn)
+        })
+        .await
+    }
+
+    async fn append_creation(
+        &self,
+        event: NewMobEvent,
+        incarnation: MobIncarnationId,
+        provenance: &MobProvenance,
+    ) -> Result<MobEvent, MobStoreError> {
+        validate_mob_event_write_authority(&event.kind)?;
+        let record = MobCreationRecord {
+            mob_id: validate_creation_event(&event)?.clone(),
+            incarnation,
+            origin: MobCreationOrigin::Created,
+            provenance: encode_mob_provenance(provenance)?,
+            finalized_at_ms: None,
+        };
+        let path = self.path.clone();
+        let stored = run_sqlite_task(move || {
+            let mut conn = open_connection(&path)?;
+            let tx = begin_immediate(&mut conn)?;
+            validate_initial_mob_created_sqlite(&tx, std::slice::from_ref(&event))?;
+            // A finalized record is the finished destroy of an earlier mob
+            // in a store kept for reuse: this creation replaces it. A live
+            // record next to an empty log is a store that disagrees with
+            // itself, and nothing is written over it.
+            match read_creation_record(&tx)? {
+                Some(existing) if !existing.is_finalized() => {
+                    return Err(MobStoreError::IncarnationInconsistent {
+                        mob_id: existing.mob_id,
+                        inconsistency: IncarnationInconsistency::RecordWithoutCreation,
+                    });
+                }
+                Some(_) => {
+                    tx.execute(
+                        "DELETE FROM mob_runtime_incarnations WHERE finalized_at_ms IS NOT NULL",
+                        [],
+                    )
+                    .map_err(se)?;
+                }
+                None => {}
+            }
+            let cursor = next_event_cursor(&tx)?;
+            let stored = MobEvent {
+                cursor,
+                timestamp: event.timestamp.unwrap_or_else(Utc::now),
+                mob_id: event.mob_id,
+                kind: event.kind,
+            };
+            let encoded = encode_stored_mob_event(&stored)
+                .map_err(|e| MobStoreError::Serialization(e.to_string()))?;
+            tx.execute(
+                "INSERT INTO mob_events (cursor, mob_id, event_json) VALUES (?1, ?2, ?3)",
+                params![cursor_to_i64(cursor)?, stored.mob_id.as_str(), encoded],
+            )
+            .map_err(se)?;
+            insert_creation_record(&tx, &record)?;
+            set_next_cursor(&tx, checked_event_cursor_successor(cursor)?)?;
+            tx.commit().map_err(se)?;
+            Ok(stored)
+        })
+        .await?;
+        self.event_bus.publish_committed(stored.clone());
+        Ok(stored)
+    }
+
+    async fn assign_legacy_incarnation(
+        &self,
+        mob_id: &MobId,
+        incarnation: MobIncarnationId,
+    ) -> Result<MobCreationRecord, MobStoreError> {
+        let record = MobCreationRecord {
+            mob_id: mob_id.clone(),
+            incarnation,
+            origin: MobCreationOrigin::Migrated,
+            provenance: encode_mob_provenance(&MobProvenance::Unrecorded)?,
+            finalized_at_ms: None,
+        };
+        let path = self.path.clone();
+        run_sqlite_task(move || {
+            let mut conn = open_connection(&path)?;
+            let tx = begin_immediate(&mut conn)?;
+            if let Some(existing) = read_creation_record(&tx)? {
+                tx.commit().map_err(se)?;
+                return Ok(existing);
+            }
+            let has_events = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM mob_events WHERE mob_id = ?1 LIMIT 1)",
+                    params![record.mob_id.as_str()],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(se)?;
+            if !has_events {
+                return Err(MobStoreError::Internal(format!(
+                    "the store holds no events of mob '{}' to assign an incarnation to",
+                    record.mob_id
+                )));
+            }
+            insert_creation_record(&tx, &record)?;
+            tx.commit().map_err(se)?;
+            Ok(record)
+        })
+        .await
     }
 }
 
@@ -8839,7 +9227,7 @@ impl MobEventStore for SqliteMobEventStore {
         let stored = run_sqlite_task(move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
-            validate_initial_mob_created_sqlite(&tx, std::slice::from_ref(&event))?;
+            validate_raw_mob_created_sqlite(&tx, std::slice::from_ref(&event))?;
             let cursor = next_event_cursor(&tx)?;
             let stored = MobEvent {
                 cursor,
@@ -9067,7 +9455,7 @@ impl MobEventStore for SqliteMobEventStore {
         let stored = run_sqlite_task(move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
-            validate_initial_mob_created_sqlite(&tx, &batch)?;
+            validate_raw_mob_created_sqlite(&tx, &batch)?;
             let mut cursor = next_event_cursor(&tx)?;
             let mut results = Vec::with_capacity(batch.len());
             for event in batch {
@@ -9139,6 +9527,14 @@ impl MobEventStore for SqliteMobEventStore {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             tx.execute("DELETE FROM mob_events", []).map_err(se)?;
+            // The cleared log is a finished destroy: its creation record
+            // stays, finalized, until the store's files are removed.
+            tx.execute(
+                "UPDATE mob_runtime_incarnations SET finalized_at_ms = ?1
+                 WHERE finalized_at_ms IS NULL",
+                params![creation_finalized_at_ms()],
+            )
+            .map_err(se)?;
             tx.execute(
                 "INSERT OR REPLACE INTO mob_event_meta (key, value) VALUES (?1, ?2)",
                 params![EVENT_CURSOR_KEY, 1i64],
@@ -11566,7 +11962,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .unwrap(),
-            11
+            12
         );
         for retired in [
             "mob_identity_declaration_scopes",
@@ -11657,7 +12053,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .unwrap(),
-            11
+            12
         );
         for table in [
             "mob_identity_intent_mutation_receipts",
@@ -11735,7 +12131,7 @@ mod tests {
 
         drop(SqliteMobStores::open(&path).unwrap());
 
-        assert_eq!(ledger_version(&path), 11);
+        assert_eq!(ledger_version(&path), 12);
         for table in [
             "mob_forked_participants",
             "mob_forked_participant_member_associations",
@@ -11772,7 +12168,7 @@ mod tests {
 
         drop(SqliteMobStores::open(&path).unwrap());
 
-        assert_eq!(ledger_version(&path), 11);
+        assert_eq!(ledger_version(&path), 12);
         assert!(
             table_exists(&path, "mob_forked_participant_member_associations"),
             "migration 9 must run when a released-v8 file is opened"
@@ -11790,7 +12186,7 @@ mod tests {
 
         drop(SqliteMobStores::open(&path).unwrap());
 
-        assert_eq!(ledger_version(&path), 11);
+        assert_eq!(ledger_version(&path), 12);
         assert!(
             table_exists(&path, "mob_temporary_councils"),
             "migration 10 must run when a released-v9 file is opened"
@@ -11808,7 +12204,7 @@ mod tests {
 
         drop(SqliteMobStores::open(&path).unwrap());
 
-        assert_eq!(ledger_version(&path), 11);
+        assert_eq!(ledger_version(&path), 12);
         assert!(
             table_exists(&path, "mob_runtime_callback_claim_verifiers"),
             "migration 11 must run when a released-v10 file is opened"
@@ -11871,12 +12267,98 @@ mod tests {
         );
     }
 
-    /// A binary whose mob domain ends at v10 (0.9.2) refuses a store this
-    /// one migrated to v11, with the ledger's typed future-schema error and
-    /// without touching the file: downgrading after the migration is not
-    /// supported, and is never a misread.
+    /// No store method rewrites a creation record: the create's transaction
+    /// and the legacy assignment insert it, the destroy's event clear sets
+    /// its `finalized_at_ms` and nothing else, and a create in a kept store
+    /// deletes only a finalized one. Every SQL statement that names the table
+    /// is one of those (plus its reads and its schema), and the in-memory
+    /// stores write it only through the shared helpers.
     #[test]
-    fn a_v10_binary_refuses_a_v11_store_typed_and_unmutated() {
+    fn no_store_method_rewrites_a_creation_record() {
+        // The code before each file's `mod tests`, which this test is in.
+        fn shipped(source: &str) -> &str {
+            source
+                .split("\nmod tests {")
+                .next()
+                .expect("the source has code before its tests")
+        }
+        let sqlite = shipped(include_str!("sqlite.rs"));
+        let mut writes = Vec::new();
+        for (at, _) in sqlite.match_indices("mob_runtime_incarnations") {
+            // A Rust identifier that contains the name (the migration
+            // function) is not SQL.
+            if sqlite[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            {
+                continue;
+            }
+            let start = sqlite[..at].rfind('"').map_or(0, |quote| quote + 1);
+            let end = sqlite[at..]
+                .find('"')
+                .map_or(sqlite.len(), |quote| at + quote);
+            let literal = &sqlite[start..end];
+            let statement = literal
+                .split(';')
+                .find(|statement| statement.contains("mob_runtime_incarnations"))
+                .expect("the literal names the table");
+            let statement = statement.split_whitespace().collect::<Vec<_>>().join(" ");
+            let read_or_schema = statement == "mob_runtime_incarnations"
+                || statement.starts_with("CREATE TABLE")
+                || statement.starts_with("SELECT ");
+            if !read_or_schema {
+                writes.push(statement);
+            }
+        }
+        writes.sort();
+        assert_eq!(
+            writes,
+            [
+                "DELETE FROM mob_runtime_incarnations WHERE finalized_at_ms IS NOT NULL",
+                "INSERT INTO mob_runtime_incarnations (mob_id, incarnation, origin, provenance, \
+                 finalized_at_ms) VALUES (?1, ?2, ?3, ?4, NULL)",
+                "UPDATE mob_runtime_incarnations SET finalized_at_ms = ?1 WHERE \
+                 finalized_at_ms IS NULL",
+            ],
+            "the only SQL writes of a creation record"
+        );
+
+        let in_memory = shipped(include_str!("in_memory.rs"));
+        assert_eq!(
+            in_memory.matches("&mut aggregate.creation").count(),
+            3,
+            "the in-memory store hands its record to the three shared writers only"
+        );
+        let helpers = shipped(include_str!("mod.rs"));
+        assert_eq!(helpers.matches("*creation = Some(").count(), 2);
+        assert_eq!(helpers.matches(".finalized_at_ms = Some(").count(), 1);
+    }
+
+    #[test]
+    fn released_v11_migrates_to_canonical_current_schema() {
+        // v11 (the 0.9.3 head) became a frozen predecessor when migration 12
+        // landed. This proves the v11 verifier matches what migration 11
+        // actually produces, which is the only thing that keeps 12 legal as
+        // ledger head without a v12 verifier of its own.
+        let (_dir, path) = temp_db_path();
+        seed_released_predecessor(&path, 11, build_released_0_9_3_mob_schema);
+
+        drop(SqliteMobStores::open(&path).unwrap());
+
+        assert_eq!(ledger_version(&path), 12);
+        assert!(
+            table_exists(&path, "mob_runtime_incarnations"),
+            "migration 12 must run when a released-v11 file is opened"
+        );
+    }
+
+    /// A binary whose mob domain ends at v10 (0.9.2) refuses a store this
+    /// one migrated, with the ledger's typed future-schema error and without
+    /// touching the file: downgrading after the migration is not supported,
+    /// and is never a misread.
+    #[test]
+    fn a_v10_binary_refuses_a_current_store_typed_and_unmutated() {
         const RELEASED_0_9_2_MOB_DOMAIN: meerkat_sqlite::SchemaDomain =
             meerkat_sqlite::SchemaDomain {
                 migrations: MOB_DOMAIN.migrations.split_at(10).0,
@@ -11886,11 +12368,11 @@ mod tests {
             };
         let (_dir, path) = temp_db_path();
         drop(SqliteMobStores::open(&path).unwrap());
-        assert_eq!(ledger_version(&path), 11);
+        assert_eq!(ledger_version(&path), 12);
 
         let mut conn = Connection::open(&path).unwrap();
         let err = meerkat_sqlite::apply_domain_migrations(&mut conn, &RELEASED_0_9_2_MOB_DOMAIN)
-            .expect_err("a v10 binary must refuse a v11 store");
+            .expect_err("a v10 binary must refuse a v12 store");
         assert!(
             matches!(
                 err,
@@ -11898,8 +12380,44 @@ mod tests {
             ),
             "{err}"
         );
-        assert_eq!(ledger_version(&path), 11);
+        assert_eq!(ledger_version(&path), 12);
         assert!(table_exists(&path, "mob_runtime_callback_claim_verifiers"));
+    }
+
+    /// The mob creation records take ledger head 12, and a binary whose mob
+    /// domain ends at v11 (0.9.3) refuses a store at it, typed and without
+    /// touching the file: after a 0.9.4 binary opened a store, 0.9.3 cannot.
+    #[test]
+    fn a_v11_binary_refuses_a_v12_store_typed_and_unmutated() {
+        const RELEASED_0_9_3_MOB_DOMAIN: meerkat_sqlite::SchemaDomain =
+            meerkat_sqlite::SchemaDomain {
+                migrations: MOB_DOMAIN.migrations.split_at(11).0,
+                allowed_existing_versions: &[3, 4, 7, 8, 9, 10, 11],
+                released_predecessors: MOB_DOMAIN.released_predecessors.split_at(6).0,
+                ..MOB_DOMAIN
+            };
+        assert!(
+            !RELEASED_0_9_3_MOB_DOMAIN
+                .allowed_existing_versions
+                .contains(&12)
+        );
+        let (_dir, path) = temp_db_path();
+        drop(SqliteMobStores::open(&path).unwrap());
+        assert_eq!(ledger_version(&path), 12);
+        assert!(table_exists(&path, "mob_runtime_incarnations"));
+
+        let mut conn = Connection::open(&path).unwrap();
+        let err = meerkat_sqlite::apply_domain_migrations(&mut conn, &RELEASED_0_9_3_MOB_DOMAIN)
+            .expect_err("a v11 binary must refuse a v12 store");
+        assert!(
+            matches!(
+                err,
+                meerkat_sqlite::SqliteStoreError::SchemaFromTheFuture { .. }
+            ),
+            "{err}"
+        );
+        assert_eq!(ledger_version(&path), 12);
+        assert!(table_exists(&path, "mob_runtime_incarnations"));
     }
 
     #[test]
@@ -11984,16 +12502,21 @@ mod tests {
                     version: 10,
                     verify: verify_released_0_9_2_mob_schema,
                 },
-                // The requested "exact frozen v11 predecessor verifier".
                 meerkat_sqlite::SchemaPredecessor {
                     version: 11,
-                    verify: verify_released_0_9_2_mob_schema,
+                    verify: verify_released_0_9_3_mob_schema,
+                },
+                // The requested "exact frozen predecessor verifier" for the
+                // head version itself.
+                meerkat_sqlite::SchemaPredecessor {
+                    version: 12,
+                    verify: verify_released_0_9_3_mob_schema,
                 },
             ],
             ..MOB_DOMAIN
         };
         const WITHOUT_HEAD_FLOOR: meerkat_sqlite::SchemaDomain = meerkat_sqlite::SchemaDomain {
-            allowed_existing_versions: &[3, 4, 7, 8, 9, 10],
+            allowed_existing_versions: &[3, 4, 7, 8, 9, 10, 11],
             ..MOB_DOMAIN
         };
 

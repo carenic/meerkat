@@ -1025,7 +1025,7 @@ impl AgentMobToolSurface {
         let authority_context = meerkat_runtime::mob_operator_authority::grant_manage_mob(
             &authority_context,
             mob_id.as_str(),
-            incarnation,
+            handle.live_incarnation(),
         )
         .map_err(|error| {
             ToolError::execution_failed(format!(
@@ -1297,7 +1297,7 @@ impl AgentMobToolSurface {
         // registered under the id since then is another incarnation and
         // gets none.
         if let Ok(handle) = self.bound_handle(&mob_id).await
-            && handle.incarnation() == created.incarnation
+            && handle.incarnation() == created.incarnation.incarnation()
         {
             self.record_successful_operator_action_boxed(&handle, call.name)
                 .await;
@@ -5700,22 +5700,22 @@ mod tests {
             .expect("generated create-only mob authority should be accepted")
     }
 
-    /// The incarnation the live mob `mob_id` runs at: the binding a grant
-    /// over that mob names.
+    /// The incarnation the live mob `mob_id` runs at, as its handle's
+    /// witness: the binding a grant over that mob names.
     async fn live_incarnation(
         state: &MobMcpState,
         mob_id: &MobId,
-    ) -> meerkat_core::service::MobIncarnationId {
+    ) -> meerkat_core::service::LiveMobIncarnation {
         state
             .handle_for(mob_id)
             .await
             .expect("live mob handle")
-            .incarnation()
+            .live_incarnation()
     }
 
     fn scope_only_authority(
         mob_id: &str,
-        incarnation: meerkat_core::service::MobIncarnationId,
+        incarnation: meerkat_core::service::LiveMobIncarnation,
     ) -> MobToolAuthorityContext {
         let authority = meerkat_runtime::mob_operator_authority::set_create_authority(
             &create_only_authority(),
@@ -5728,7 +5728,7 @@ mod tests {
 
     fn spawn_profile_authority(
         mob_id: &str,
-        incarnation: meerkat_core::service::MobIncarnationId,
+        incarnation: meerkat_core::service::LiveMobIncarnation,
         profile: &str,
     ) -> MobToolAuthorityContext {
         let authority = meerkat_runtime::mob_operator_authority::set_create_authority(
@@ -6595,7 +6595,9 @@ mod tests {
                 assert!(
                     authority_context.can_manage_mob(
                         intended_id,
-                        live_incarnation(&state, &MobId::from(intended_id)).await
+                        live_incarnation(&state, &MobId::from(intended_id))
+                            .await
+                            .incarnation()
                     ),
                     "the atomic grant must manage the same mob that was created"
                 );
@@ -6835,7 +6837,9 @@ mod tests {
                 "only the first delegate creates the implicit mob: {parsed}"
             );
             let mob_id = parsed["mob_id"].as_str().expect("mob id");
-            let incarnation = live_incarnation(&state, &MobId::from(mob_id)).await;
+            let incarnation = live_incarnation(&state, &MobId::from(mob_id))
+                .await
+                .incarnation();
             match outcome.session_effects.as_slice() {
                 [
                     meerkat_core::SessionEffect::ReplaceMobToolAuthorityContext {

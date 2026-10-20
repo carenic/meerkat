@@ -3821,8 +3821,9 @@ macro_rules! meerkat_catalog_machine_dsl {
             mob_operator_managed_mob_scope: Set<String>,
             mob_operator_spawn_profile_scope: Map<String, Set<String>>,
             // The mob incarnation each scoped mob id is bound to. A grant
-            // names the incarnation the mob runtime minted when it started,
-            // so it never reaches a later mob created under the same id.
+            // names the incarnation the mob was created at, which its
+            // restarts keep, so it never reaches a later mob created under
+            // the same id.
             #[redacted]
             mob_operator_mob_incarnations: Map<String, MobIncarnationId>,
             mob_operator_caller_provenance: Option<MobToolCallerProvenance>,
@@ -11340,9 +11341,9 @@ macro_rules! meerkat_catalog_machine_dsl {
             to Initializing
         }
 
-        // A grant names one incarnation of the mob: the one the mob runtime
-        // minted when it started. Scope held for an earlier incarnation of
-        // the same id never reaches a later one.
+        // A grant names one incarnation of the mob: the one the mob was
+        // created at, which its restarts keep. Scope held for an earlier
+        // incarnation of the same id never reaches a later one.
         transition GrantMobOperatorManageMob {
             on input GrantMobOperatorManageMob { mob_id, mob_incarnation }
             guard { self.lifecycle_phase == Phase::Initializing }
@@ -11358,9 +11359,10 @@ macro_rules! meerkat_catalog_machine_dsl {
             to Initializing
         }
 
-        // A manage grant for a new incarnation of a mob id replaces the old
-        // binding. Spawn-profile scope held for the old incarnation is
-        // dropped: it never carries over to the new mob.
+        // A manage grant for a new incarnation of a mob id (the mob was
+        // destroyed and created again) replaces the old binding.
+        // Spawn-profile scope held for the old incarnation is dropped: it
+        // never carries over to the new mob.
         transition RebindMobOperatorManageMob {
             on input GrantMobOperatorManageMob { mob_id, mob_incarnation }
             guard { self.lifecycle_phase == Phase::Initializing }
@@ -11392,9 +11394,10 @@ macro_rules! meerkat_catalog_machine_dsl {
             to Initializing
         }
 
-        // A spawn-profile grant for a new incarnation of a mob id replaces
-        // the old binding. Manage scope held for the old incarnation is
-        // dropped: a spawn grant for the new mob never revives it.
+        // A spawn-profile grant for a new incarnation of a mob id (the mob
+        // was destroyed and created again) replaces the old binding. Manage
+        // scope held for the old incarnation is dropped: a spawn grant for
+        // the new mob never revives it.
         transition RebindMobOperatorSpawnProfilesInMob {
             on input SetMobOperatorSpawnProfilesInMob { mob_id, mob_incarnation, profiles }
             guard { self.lifecycle_phase == Phase::Initializing }

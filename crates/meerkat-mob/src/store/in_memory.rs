@@ -12,30 +12,32 @@ use super::{
     BeginPlacedSpawnResult, CommitPlacedSpawnResult, DeletePlacedSpawnResult,
     ExternalBindingOverlayRecord, IdentityMemberEventCommitOutcome,
     IdentityMemberTargetObservation, IdentityWiringEventCommitOutcome,
-    IdentityWiringTargetObservation, MobEventStore, MobExternalDeliveryAbandonOutcome,
-    MobExternalDeliveryBeginOutcome, MobExternalDeliveryClaimOutcome,
-    MobExternalDeliveryCompleteOutcome, MobExternalDeliveryFencedResolutionCommit,
-    MobExternalDeliveryIntent, MobExternalDeliveryPhase, MobExternalDeliveryRealizationCommit,
-    MobExternalDeliveryRealizerCompletionCommit, MobExternalDeliveryRecord,
-    MobExternalDeliveryRepairOutcome, MobExternalDeliveryRepairState, MobExternalDeliveryTerminal,
-    MobForkedParticipantMemberAssociation, MobHostAuthorityDeletionAuthority,
-    MobHostAuthorityPersistenceAuthority, MobHostAuthorityRecord, MobIdentityMemberStore,
-    MobIdentityStatusStore, MobIdentityStore, MobIdentityStoreClock, MobMemberEventCursorRecord,
-    MobMemberLiveCleanupRecord, MobMemberOperatorPruneAuthority, MobMemberOperatorRequestBegin,
-    MobMemberOperatorRequestKey, MobMemberOperatorRequestRecord, MobOperatorGrantDeletionAuthority,
+    IdentityWiringTargetObservation, MobCreationRecord, MobEventStore,
+    MobExternalDeliveryAbandonOutcome, MobExternalDeliveryBeginOutcome,
+    MobExternalDeliveryClaimOutcome, MobExternalDeliveryCompleteOutcome,
+    MobExternalDeliveryFencedResolutionCommit, MobExternalDeliveryIntent, MobExternalDeliveryPhase,
+    MobExternalDeliveryRealizationCommit, MobExternalDeliveryRealizerCompletionCommit,
+    MobExternalDeliveryRecord, MobExternalDeliveryRepairOutcome, MobExternalDeliveryRepairState,
+    MobExternalDeliveryTerminal, MobForkedParticipantMemberAssociation,
+    MobHostAuthorityDeletionAuthority, MobHostAuthorityPersistenceAuthority,
+    MobHostAuthorityRecord, MobIdentityMemberStore, MobIdentityStatusStore, MobIdentityStore,
+    MobIdentityStoreClock, MobMemberEventCursorRecord, MobMemberLiveCleanupRecord,
+    MobMemberOperatorPruneAuthority, MobMemberOperatorRequestBegin, MobMemberOperatorRequestKey,
+    MobMemberOperatorRequestRecord, MobOperatorGrantDeletionAuthority,
     MobOperatorGrantPersistenceAuthority, MobOperatorGrantRecord,
     MobPlacedSpawnBindingPromotionAuthority, MobPlacedSpawnCarrierRecord,
     MobPlacedSpawnCleanupAuthority, MobPlacedSpawnCommitPersistenceAuthority,
     MobPlacedSpawnPendingPersistenceAuthority, MobRunStore, MobRuntimeMetadataStore, MobSpecStore,
     MobStoreError, PlacedSpawnCarrierPhase, PromotePlacedSpawnBindingResult,
     SupervisorAuthorityDeletionAuthority, SupervisorAuthorityPersistenceAuthority,
-    SupervisorAuthorityRecord, SystemMobIdentityStoreClock, current_definition_authority,
-    external_delivery_repair_now_ms, identity_member_target_state,
+    SupervisorAuthorityRecord, SystemMobIdentityStoreClock, append_creation_in_memory,
+    assign_legacy_incarnation_in_memory, current_definition_authority,
+    external_delivery_repair_now_ms, finalize_creation_in_memory, identity_member_target_state,
     identity_structural_projection_is_anchor, identity_wiring_target_state,
-    next_external_delivery_repair_state, step_failed_event_identity, terminal_event_identity,
-    validate_external_delivery_terminal, validate_identity_member_commit_authority,
-    validate_identity_wiring_commit_authority, validate_initial_mob_created_events,
-    validate_mob_event_write_authority,
+    next_external_delivery_repair_state, refuse_raw_creation_over_record,
+    step_failed_event_identity, terminal_event_identity, validate_external_delivery_terminal,
+    validate_identity_member_commit_authority, validate_identity_wiring_commit_authority,
+    validate_initial_mob_created_events, validate_mob_event_write_authority,
 };
 #[cfg(feature = "runtime-adapter")]
 use super::{
@@ -392,6 +394,46 @@ impl private::MobEventStoreSealed for InMemoryMobEventStore {
         drop(aggregate);
         Ok(MobDefinitionEpochAppendOutcome::Appended(stored))
     }
+
+    async fn creation_record(&self) -> Result<Option<MobCreationRecord>, MobStoreError> {
+        Ok(self.aggregate.read().await.creation.clone())
+    }
+
+    async fn append_creation(
+        &self,
+        event: NewMobEvent,
+        incarnation: meerkat_core::service::MobIncarnationId,
+        provenance: &crate::MobProvenance,
+    ) -> Result<MobEvent, MobStoreError> {
+        let mut aggregate = self.aggregate.write().await;
+        let aggregate = &mut *aggregate;
+        let stored = append_creation_in_memory(
+            &mut aggregate.events,
+            &mut aggregate.creation,
+            event,
+            incarnation,
+            provenance,
+        )?;
+        // Broadcast under the write lock so live subscribers see appends in
+        // cursor order; `send` never blocks.
+        let _ = self.event_tx.send(stored.clone());
+        Ok(stored)
+    }
+
+    async fn assign_legacy_incarnation(
+        &self,
+        mob_id: &MobId,
+        incarnation: meerkat_core::service::MobIncarnationId,
+    ) -> Result<MobCreationRecord, MobStoreError> {
+        let mut aggregate = self.aggregate.write().await;
+        let aggregate = &mut *aggregate;
+        assign_legacy_incarnation_in_memory(
+            &aggregate.events,
+            &mut aggregate.creation,
+            mob_id,
+            incarnation,
+        )
+    }
 }
 
 type ExternalBindingOverlayMap = BTreeMap<
@@ -424,6 +466,9 @@ pub(super) struct IdentityAuthorityState {
 #[derive(Debug, Default)]
 struct InMemoryMobAggregateState {
     events: Vec<MobEvent>,
+    /// The store's creation record, written with its `MobCreated` under this
+    /// one lock.
+    creation: Option<MobCreationRecord>,
     external_deliveries: BTreeMap<(MobId, String), MobExternalDeliveryRecord>,
     identity: IdentityAuthorityState,
 }
@@ -3032,6 +3077,7 @@ impl MobEventStore for InMemoryMobEventStore {
 
         let mut aggregate = self.aggregate.write().await;
         validate_initial_mob_created_events(&aggregate.events, std::slice::from_ref(&event))?;
+        refuse_raw_creation_over_record(aggregate.creation.as_ref(), std::slice::from_ref(&event))?;
         let events = &mut aggregate.events;
         let cursor = events.last().map_or(1, |existing| existing.cursor + 1);
         let stored = MobEvent {
@@ -3200,6 +3246,7 @@ impl MobEventStore for InMemoryMobEventStore {
 
         let mut aggregate = self.aggregate.write().await;
         validate_initial_mob_created_events(&aggregate.events, &batch)?;
+        refuse_raw_creation_over_record(aggregate.creation.as_ref(), &batch)?;
         let events = &mut aggregate.events;
         let mut results = Vec::with_capacity(batch.len());
         for event in batch {
@@ -3271,7 +3318,9 @@ impl MobEventStore for InMemoryMobEventStore {
             ));
         }
 
-        self.aggregate.write().await.events.clear();
+        let mut aggregate = self.aggregate.write().await;
+        aggregate.events.clear();
+        finalize_creation_in_memory(&mut aggregate.creation);
         Ok(())
     }
 

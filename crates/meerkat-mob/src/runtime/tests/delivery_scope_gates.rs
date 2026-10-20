@@ -1233,3 +1233,133 @@ async fn a_history_reader_recovers_a_genuine_scope_after_its_member_retired() {
     );
     fixture.finish().await;
 }
+
+// A scope belongs to the incarnation of the mob it was captured at. The mob is
+// destroyed and created again under the same id on the same store and realm,
+// and the member is spawned again at the same generation: the old scope is
+// refused typed before anything is admitted (never StaleDeliveryScope, whose
+// recovery is a re-capture that would address the new mob's member), scoped
+// recovery with it reads no session, and the same submit with a scope
+// captured at the new incarnation is admitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scope_from_a_destroyed_incarnation_never_reaches_the_mob_created_again() {
+    let fixture = Fixture::new().await;
+    let old_scope = fixture.capture().await;
+    let destroyed = fixture.handle().incarnation();
+    let definition = fixture.handle().definition().clone();
+    let Fixture {
+        root,
+        owner,
+        identity,
+        session_id: old_session,
+        client,
+    } = fixture;
+    tokio::time::timeout(WAIT, owner.handle.destroy())
+        .await
+        .expect("mob destroy finishes")
+        .expect("destroy the mob");
+    let Owner {
+        handle,
+        store,
+        service,
+    } = owner;
+    drop(handle);
+    await_supervisor_route_release(&definition.id).await;
+
+    let root_path = root.path().canonicalize().expect("absolute fixture root");
+    let again = MobBuilder::new(definition, mob_storage(&root_path))
+        .with_session_service(service.clone())
+        .with_default_llm_client(Arc::new(client.clone()))
+        .create()
+        .await
+        .expect("create the mob again under its id on the same store");
+    let current = again.incarnation();
+    assert_ne!(current, destroyed, "a create mints a new incarnation");
+    let new_session = spawn_member(&again, &identity).await;
+    assert_ne!(new_session, old_session);
+    let new_scope = again
+        .capture_member_delivery_scope(&identity)
+        .await
+        .expect("capture the member's scope at the new incarnation");
+    assert_eq!(
+        new_scope.runtime_id(),
+        old_scope.runtime_id(),
+        "the member runs at the same generation in both incarnations"
+    );
+
+    let inputs = |session: SessionId| {
+        let store = store.clone();
+        async move {
+            store
+                .load_input_states(&LogicalRuntimeId::for_session(&session))
+                .await
+                .expect("store read")
+                .len()
+        }
+    };
+    let inputs_before = inputs(new_session.clone()).await;
+    let delivery = delivery("scope-of-a-destroyed-incarnation");
+    let text = "one scoped delivery";
+    let refused = again
+        .submit_work_with_mode_and_delivery_identity_bounded(
+            &old_scope,
+            work(text),
+            HandlingMode::Queue,
+            delivery.clone(),
+            deadline(),
+        )
+        .await
+        .expect_err("a scope from the destroyed incarnation is refused");
+    match refused {
+        MobError::IncarnationMismatch {
+            mob_id,
+            expected,
+            current: running,
+        } => {
+            assert_eq!(&mob_id, again.mob_id());
+            assert_eq!(expected, Some(destroyed));
+            assert_eq!(running, Some(current));
+        }
+        other => panic!("expected IncarnationMismatch, got {other:?}"),
+    }
+    assert_eq!(
+        inputs(new_session.clone()).await,
+        inputs_before,
+        "the refused submit admitted nothing in the new member's session"
+    );
+    for session in [&old_session, &new_session] {
+        let row = store
+            .load_input_state_by_idempotency_key(
+                &LogicalRuntimeId::for_session(session),
+                &meerkat_runtime::IdempotencyKey::new(delivery.idempotency_key.clone()),
+            )
+            .await
+            .expect("store read");
+        assert!(
+            row.is_none(),
+            "the refused submit claimed nothing in {session:?}"
+        );
+    }
+    match Fixture::recover_with(&again, &old_scope, &delivery).await {
+        ScopedWorkState::Unresolved {
+            cause: ScopedRecoveryUnresolved::IncarnationNotHosted,
+        } => {}
+        other => panic!("expected IncarnationNotHosted, got {other:?}"),
+    }
+
+    // Control: the same submit with the scope captured at the new incarnation.
+    let receipt = again
+        .submit_work_with_mode_and_delivery_identity_bounded(
+            &new_scope,
+            work(text),
+            HandlingMode::Queue,
+            delivery.clone(),
+            deadline(),
+        )
+        .await
+        .expect("a scope captured at the new incarnation is admitted");
+    assert_eq!(receipt.stage, crate::WorkAdmissionStage::IngressAccepted);
+    assert_eq!(receipt.session_id.as_ref(), Some(&new_session));
+    client.release();
+    let _ = tokio::time::timeout(WAIT, again.shutdown()).await;
+}

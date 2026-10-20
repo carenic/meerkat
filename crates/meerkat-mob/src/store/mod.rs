@@ -71,6 +71,8 @@ use tokio::sync::broadcast;
 /// Receiver for append-driven structural mob events.
 pub type MobEventReceiver = broadcast::Receiver<MobEvent>;
 
+pub(crate) use private::{MobCreationOrigin, MobCreationRecord};
+
 pub(crate) mod private {
     use super::MobStoreError;
     use crate::event::{MobEvent, MobEventKind, NewMobEvent};
@@ -79,6 +81,71 @@ pub(crate) mod private {
     #[cfg(target_arch = "wasm32")]
     use crate::tokio;
     use std::sync::Arc;
+
+    /// How a store's creation record came to be.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum MobCreationOrigin {
+        /// Written with the mob's `MobCreated`, by its create.
+        Created,
+        /// Assigned by the first resume of a mob created before creation
+        /// records existed (a store from before 0.9.4).
+        Migrated,
+    }
+
+    impl MobCreationOrigin {
+        pub(crate) fn as_str(self) -> &'static str {
+            match self {
+                Self::Created => "created",
+                Self::Migrated => "migrated",
+            }
+        }
+
+        pub(crate) fn parse(text: &str) -> Result<Self, MobStoreError> {
+            match text {
+                "created" => Ok(Self::Created),
+                "migrated" => Ok(Self::Migrated),
+                other => Err(MobStoreError::Serialization(format!(
+                    "unknown mob creation record origin '{other}'"
+                ))),
+            }
+        }
+    }
+
+    /// A store's creation record: the incarnation its mob was created at, and
+    /// the provenance of that creation. A store holds at most one, because
+    /// `MobCreated` is a store's first event. Only the create writes one
+    /// (`append_creation`, in the transaction of its `MobCreated`), and the
+    /// first resume of an older store assigns one (`assign_legacy_incarnation`).
+    /// Its one later write is the destroy's event clear, which finalizes it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct MobCreationRecord {
+        pub(crate) mob_id: MobId,
+        pub(crate) incarnation: meerkat_core::service::MobIncarnationId,
+        pub(crate) origin: MobCreationOrigin,
+        /// The provenance as stored. Only a provenance read decodes it, so a
+        /// provenance this binary cannot decode never blocks a resume.
+        pub(crate) provenance: String,
+        /// When the destroy's event clear finalized the record: the store then
+        /// holds a finished destroy whose files are not removed yet.
+        pub(crate) finalized_at_ms: Option<i64>,
+    }
+
+    impl MobCreationRecord {
+        pub(crate) fn is_finalized(&self) -> bool {
+            self.finalized_at_ms.is_some()
+        }
+
+        /// Whether this incarnation was assigned to a store from before
+        /// 0.9.4 at its first resume, rather than minted by a create.
+        pub(crate) fn is_migrated(&self) -> bool {
+            matches!(self.origin, MobCreationOrigin::Migrated)
+        }
+
+        pub(crate) fn provenance(&self) -> Result<crate::MobProvenance, MobStoreError> {
+            serde_json::from_str(&self.provenance)
+                .map_err(|error| MobStoreError::Serialization(error.to_string()))
+        }
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct MobDefinitionEpochPersistenceAuthority {
@@ -187,6 +254,34 @@ pub(crate) mod private {
         ) -> Result<MobDefinitionEpochAppendOutcome, MobStoreError> {
             Err(MobStoreError::DefinitionEpochPersistenceUnavailable)
         }
+
+        /// This store's creation record, if it has one
+        /// ([`MobCreationRecord`]).
+        async fn creation_record(&self) -> Result<Option<MobCreationRecord>, MobStoreError>;
+
+        /// Append `event`, the store's `MobCreated`, and insert its creation
+        /// record for `incarnation` and `provenance` in the same transaction.
+        /// A finalized record, the finished destroy of an earlier mob in a
+        /// store kept for reuse, is replaced; any other record refuses.
+        async fn append_creation(
+            &self,
+            event: NewMobEvent,
+            incarnation: meerkat_core::service::MobIncarnationId,
+            provenance: &crate::MobProvenance,
+        ) -> Result<MobEvent, MobStoreError>;
+
+        /// The one assignment for a mob created before creation records
+        /// existed: record `incarnation` for `mob_id` as migrated, with an
+        /// `Unrecorded` provenance, unless the store already holds a record,
+        /// and answer the record the store then holds. Every store refuses
+        /// the assignment with [`MobStoreError::Internal`] when it holds no
+        /// record and no event of `mob_id`; resume calls it only after it
+        /// read the mob's `MobCreated`.
+        async fn assign_legacy_incarnation(
+            &self,
+            mob_id: &MobId,
+            incarnation: meerkat_core::service::MobIncarnationId,
+        ) -> Result<MobCreationRecord, MobStoreError>;
     }
 
     /// Proof that a run store is the MobMachine flow-authority validation
@@ -482,6 +577,141 @@ pub enum MobStoreError {
     /// Internal error.
     #[error("Internal error: {0}")]
     Internal(String),
+
+    /// The store's creation record and its event log disagree, or the write
+    /// would make them disagree; nothing was written.
+    #[error("mob {mob_id} has an inconsistent creation record: {inconsistency}")]
+    IncarnationInconsistent {
+        mob_id: MobId,
+        inconsistency: crate::error::IncarnationInconsistency,
+    },
+}
+
+/// The stored form of `provenance` in a creation record.
+pub(crate) fn encode_mob_provenance(
+    provenance: &crate::MobProvenance,
+) -> Result<String, MobStoreError> {
+    serde_json::to_string(provenance)
+        .map_err(|error| MobStoreError::Serialization(error.to_string()))
+}
+
+/// The time the destroy's event clear records as a creation record's
+/// finalization, in milliseconds since the Unix epoch.
+pub(crate) fn creation_finalized_at_ms() -> i64 {
+    Utc::now().timestamp_millis()
+}
+
+/// Refuse `proposed` when it holds a raw `MobCreated` and the store already
+/// holds a creation record: only the create writes `MobCreated`, with its
+/// record, so a raw one would leave the record naming another creation.
+pub(crate) fn refuse_raw_creation_over_record(
+    record: Option<&MobCreationRecord>,
+    proposed: &[NewMobEvent],
+) -> Result<(), MobStoreError> {
+    let Some(record) = record else {
+        return Ok(());
+    };
+    match proposed
+        .iter()
+        .find(|event| matches!(event.kind, MobEventKind::MobCreated { .. }))
+    {
+        Some(_) => Err(MobStoreError::IncarnationInconsistent {
+            mob_id: record.mob_id.clone(),
+            inconsistency: crate::error::IncarnationInconsistency::RawCreationOverRecord,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Check that `event` is a `MobCreated` for the mob it is appended under, as
+/// `append_creation` requires.
+pub(crate) fn validate_creation_event(event: &NewMobEvent) -> Result<&MobId, MobStoreError> {
+    match &event.kind {
+        MobEventKind::MobCreated { definition } if definition.id == event.mob_id => {
+            Ok(&event.mob_id)
+        }
+        _ => Err(MobStoreError::Internal(format!(
+            "the creation of mob '{}' appends exactly its own MobCreated",
+            event.mob_id
+        ))),
+    }
+}
+
+/// `append_creation` over an in-memory log and creation record, both held
+/// under the caller's one lock.
+pub(crate) fn append_creation_in_memory(
+    events: &mut Vec<MobEvent>,
+    creation: &mut Option<MobCreationRecord>,
+    event: NewMobEvent,
+    incarnation: meerkat_core::service::MobIncarnationId,
+    provenance: &crate::MobProvenance,
+) -> Result<MobEvent, MobStoreError> {
+    validate_mob_event_write_authority(&event.kind)?;
+    let mob_id = validate_creation_event(&event)?.clone();
+    validate_initial_mob_created_events(events, std::slice::from_ref(&event))?;
+    if let Some(record) = creation.as_ref()
+        && !record.is_finalized()
+    {
+        return Err(MobStoreError::IncarnationInconsistent {
+            mob_id: record.mob_id.clone(),
+            inconsistency: crate::error::IncarnationInconsistency::RecordWithoutCreation,
+        });
+    }
+    let record = MobCreationRecord {
+        mob_id,
+        incarnation,
+        origin: MobCreationOrigin::Created,
+        provenance: encode_mob_provenance(provenance)?,
+        finalized_at_ms: None,
+    };
+    let cursor = events.last().map_or(1, |existing| existing.cursor + 1);
+    let stored = MobEvent {
+        cursor,
+        timestamp: event.timestamp.unwrap_or_else(Utc::now),
+        mob_id: event.mob_id,
+        kind: event.kind,
+    };
+    events.push(stored.clone());
+    *creation = Some(record);
+    Ok(stored)
+}
+
+/// `assign_legacy_incarnation` over an in-memory log and creation record,
+/// both held under the caller's one lock.
+pub(crate) fn assign_legacy_incarnation_in_memory(
+    events: &[MobEvent],
+    creation: &mut Option<MobCreationRecord>,
+    mob_id: &MobId,
+    incarnation: meerkat_core::service::MobIncarnationId,
+) -> Result<MobCreationRecord, MobStoreError> {
+    if let Some(record) = creation.as_ref() {
+        return Ok(record.clone());
+    }
+    // The same precondition as every other store (see the trait method).
+    if !events.iter().any(|event| &event.mob_id == mob_id) {
+        return Err(MobStoreError::Internal(format!(
+            "the store holds no events of mob '{mob_id}' to assign an incarnation to"
+        )));
+    }
+    let record = MobCreationRecord {
+        mob_id: mob_id.clone(),
+        incarnation,
+        origin: MobCreationOrigin::Migrated,
+        provenance: encode_mob_provenance(&crate::MobProvenance::Unrecorded)?,
+        finalized_at_ms: None,
+    };
+    *creation = Some(record.clone());
+    Ok(record)
+}
+
+/// The destroy's event clear over an in-memory creation record: finalize it
+/// (once), under the lock that clears the log.
+pub(crate) fn finalize_creation_in_memory(creation: &mut Option<MobCreationRecord>) {
+    if let Some(record) = creation.as_mut()
+        && record.finalized_at_ms.is_none()
+    {
+        record.finalized_at_ms = Some(creation_finalized_at_ms());
+    }
 }
 
 pub const MOB_EXTERNAL_DELIVERY_SCHEMA_VERSION: u32 = 1;
@@ -4221,7 +4451,9 @@ pub trait MobEventStore: private::MobEventStoreSealed + Send + Sync {
         ))
     }
 
-    /// Delete all persisted events.
+    /// Delete all persisted events, and finalize the store's creation record
+    /// in the same write: a cleared log is a finished destroy, and the
+    /// finalized record keeps its incarnation until the store's files go.
     async fn clear(&self) -> Result<(), MobStoreError>;
 
     /// Prune events older than a timestamp. Returns count of deleted events.

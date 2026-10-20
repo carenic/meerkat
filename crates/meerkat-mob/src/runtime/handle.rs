@@ -68,6 +68,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::store::MobMemberOperatorRequestKey;
+use crate::store::private::MobEventStoreSealed as _;
 
 /// Type a member session subscription failure. `NotFound` means the member's
 /// authorized session has no live actor; a rejected cursor keeps its typed
@@ -2640,6 +2641,13 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         // variant; spawn-many provisions with no revival intent, so a host
         // refusal there keeps the host's own error.
         | MobError::MemberRegistrationRefused { .. }
+        // A mob's creation record is read by its create and resume, never by
+        // a spawn-many row.
+        | MobError::IncarnationInconsistent { .. }
+        | MobError::IncarnationDestroyed { .. }
+        | MobError::ProvenanceUnavailable { .. }
+        // A scope's incarnation is checked by the scoped verbs only.
+        | MobError::IncarnationMismatch { .. }
         | MobError::PlacedCompletionDeliveryRejected
         | MobError::PlacedCompletionHostNoEffect
         | MobError::PlacedCompletionHostCancelled
@@ -5803,7 +5811,7 @@ pub struct MobHandle {
     /// actor is the sole writer.
     pub(super) admission_closed_rx:
         tokio::sync::watch::Receiver<Option<super::admission_close::MobAdmissionCloseReason>>,
-    /// The incarnation this mob's runtime minted when it started; see
+    /// The incarnation this mob was created at, which its resumes keep; see
     /// [`MobHandle::incarnation`].
     pub(super) incarnation: meerkat_core::service::MobIncarnationId,
     /// The tool bundle names this incarnation's builder registered: the
@@ -8641,14 +8649,76 @@ impl MobHandle {
         &self.definition.id
     }
 
-    /// The incarnation of this mob: minted once when its runtime started
-    /// (create, or resume in a new process) and shared by every clone. A mob
-    /// destroyed and created again under the same id is a new incarnation,
-    /// so mob operator scope granted for this mob
+    /// The incarnation of this mob, shared by every clone: minted once by its
+    /// create, kept in its creation record, and read back by every resume,
+    /// so a restart keeps it (a mob created before 0.9.4 gets one at its
+    /// first 0.9.4 resume). Only a destroy and a create under the same id
+    /// start a new incarnation, so mob operator scope granted for this mob
     /// (`meerkat_runtime::mob_operator_authority::grant_manage_mob`) never
     /// reaches a later one.
     pub fn incarnation(&self) -> meerkat_core::service::MobIncarnationId {
         self.incarnation
+    }
+
+    /// The witness that this mob's runtime runs at [`Self::incarnation`], for
+    /// the mob operator grants
+    /// (`meerkat_runtime::mob_operator_authority::grant_manage_mob` and the
+    /// spawn-profile grants), which take nothing else. The only way to get
+    /// one: a grant therefore binds an incarnation a mob runtime of this
+    /// process runs or ran at, never a value decoded from input. A handle
+    /// kept after its mob's destroy still hands it out; a grant naming it
+    /// reaches nothing, since no mob runs at it again.
+    // The one shipped witness site: the facade's host_launch_sites test
+    // lists it (`WITNESS_SITES`).
+    #[allow(clippy::disallowed_methods)]
+    pub fn live_incarnation(&self) -> meerkat_core::service::LiveMobIncarnation {
+        meerkat_core::service::LiveMobIncarnation::witnessed(self.incarnation)
+    }
+
+    /// Who created this mob ([`crate::MobProvenance`]): the fact its create
+    /// recorded with its first event, read from its store. It never changes;
+    /// a mob created before 0.9.4 reads `Unrecorded`. A handle kept past its
+    /// mob's destroy, over a store a later create reused, never reads the
+    /// later mob's record: it is [`MobError::IncarnationDestroyed`] for this
+    /// handle's incarnation.
+    pub async fn provenance(&self) -> Result<crate::MobProvenance, MobError> {
+        let record = self.events.creation_record().await?.ok_or_else(|| {
+            MobError::Internal(format!(
+                "mob '{}' runs without a creation record",
+                self.definition.id
+            ))
+        })?;
+        if record.incarnation != self.incarnation {
+            return Err(MobError::IncarnationDestroyed {
+                mob_id: self.definition.id.clone(),
+                incarnation: self.incarnation,
+            });
+        }
+        Ok(record.provenance()?)
+    }
+
+    /// Whether this mob's incarnation was assigned to a store from before
+    /// 0.9.4 at its first resume, rather than minted by its create.
+    pub(crate) async fn incarnation_is_migrated(&self) -> Result<bool, MobError> {
+        Ok(self
+            .events
+            .creation_record()
+            .await?
+            .is_some_and(|record| record.is_migrated()))
+    }
+
+    /// The member of this mob's current roster whose bridge session is
+    /// `session_id`: its identity and generation. Read from this handle's
+    /// own roster state, with no round trip to the actor, so the answer
+    /// never depends on the actor running.
+    pub async fn member_of_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<(AgentIdentity, crate::Generation)> {
+        let roster = self.project_roster_snapshot_from_machine_state().await;
+        roster
+            .find_by_bridge_session_id(session_id)
+            .map(|entry| (entry.agent_identity.clone(), entry.generation))
     }
 
     /// Change-notification seam over the actor-published machine state.
@@ -14163,6 +14233,12 @@ impl MobHandle {
     /// retargeted to today's session, or resubmitted. The work reference is
     /// derived from the delivery's stable idempotency key.
     ///
+    /// A scope captured at another incarnation of this mob (one destroyed and
+    /// created again under the same id) is refused first, before any other
+    /// check, as the typed [`MobError::IncarnationMismatch`] and never as
+    /// [`MobError::StaleDeliveryScope`]: re-capturing would address the new
+    /// mob's member. Nothing is admitted.
+    ///
     /// The receipt proves [`WorkAdmissionStage::IngressAccepted`] and names
     /// the admitted session; it is not a durable runtime-input claim. Recover
     /// a lost reply with [`Self::recover_bounded_work_at_scope`] and the same
@@ -14175,6 +14251,7 @@ impl MobHandle {
         delivery_identity: crate::store::MobDeliveryIdentity,
         deadline: Instant,
     ) -> Result<WorkDeliveryReceipt, MobError> {
+        self.require_scope_incarnation(scope).await?;
         delivery_identity.validate()?;
         let runtime_id = scope.runtime_id().clone();
         let work_ref = WorkRef::for_delivery(

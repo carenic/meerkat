@@ -5749,7 +5749,7 @@ enum SpawnProvisionInput {
 struct DeferredResumeProvision {
     definition: Arc<MobDefinition>,
     /// The incarnation of the mob the member is rebuilt in.
-    mob_incarnation: meerkat_core::service::MobIncarnationId,
+    mob_incarnation: meerkat_core::service::LiveMobIncarnation,
     realm_profile_store: Option<Arc<dyn crate::store::RealmProfileStore>>,
     profile_name: ProfileName,
     agent_identity: AgentIdentity,
@@ -7530,10 +7530,10 @@ pub(super) enum ResumePostCommitMemberOutcome {
 
 pub(super) struct MobActor {
     pub(super) definition: Arc<MobDefinition>,
-    /// The incarnation this runtime start minted (see
-    /// [`super::MobHandle::incarnation`]). Mob operator scope minted for
-    /// members of this mob is bound to it.
-    pub(super) incarnation: meerkat_core::service::MobIncarnationId,
+    /// The incarnation this runtime start minted, as the witness its
+    /// launched handle hands out (see [`super::MobHandle::live_incarnation`]).
+    /// Mob operator scope minted for members of this mob is bound to it.
+    pub(super) incarnation: meerkat_core::service::LiveMobIncarnation,
     pub(super) roster: Arc<RwLock<RosterAuthority>>,
     pub(super) events: Arc<dyn MobEventStore>,
     pub(super) placed_completion_durable_index: Arc<std::sync::Mutex<PlacedCompletionDurableIndex>>,
@@ -14363,7 +14363,7 @@ impl MobActor {
             public_owner: None,
             ownership: Arc::clone(&self.ownership),
             admission_closed_rx: self.admission_closed_tx.subscribe(),
-            incarnation: self.incarnation,
+            incarnation: self.incarnation.incarnation(),
             registered_tool_bundles: Arc::new(self.tool_bundles.keys().cloned().collect()),
             realm_profile_store: self.realm_profile_store.clone(),
         }

@@ -10,6 +10,12 @@
 # constructor. Test code, the developer tooling crate and examples allow the
 # lint for themselves. `allow-invalid` keeps an entry for a crate or platform
 # a package does not build with from failing that package's lint.
+#
+# The mob incarnation witness constructor
+# (`meerkat_core::service::LiveMobIncarnation::witnessed`) is disallowed the
+# same way: shipped code calls it only in `MobHandle::live_incarnation`, under
+# its own `#[allow(clippy::disallowed_methods)]`, and the same test lists
+# that call and every test helper that calls it.
 disallowed-methods = [
     { path = "std::process::Command::new", reason = "a process launch: route it through the launch kind's confinement or a HostLaunchExemption constructor, and list a new launch site in crates/meerkat/tests/host_launch_sites.rs" },
     { path = "std::os::unix::process::CommandExt::exec", reason = "replaces the process with another program: a process launch", allow-invalid = true },
@@ -39,4 +45,5 @@ disallowed-methods = [
     { path = "webbrowser::open", reason = "launches a browser from the host's PATH: use the HostLaunchExemption::browser_opener constructor", allow-invalid = true },
     { path = "webbrowser::open_browser", reason = "launches a browser from the host's PATH: use the HostLaunchExemption::browser_opener constructor", allow-invalid = true },
     { path = "webbrowser::open_browser_with_options", reason = "launches a browser from the host's PATH: use the HostLaunchExemption::browser_opener constructor", allow-invalid = true },
+    { path = "meerkat_core::service::LiveMobIncarnation::witnessed", reason = "witnesses a running mob incarnation: take one from MobHandle::live_incarnation, and list a new call in crates/meerkat/tests/host_launch_sites.rs", allow-invalid = true },
 ]

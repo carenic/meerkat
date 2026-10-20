@@ -144,7 +144,7 @@ impl SpawnPreparations {
 /// Shared, immutable actor services a preparation reads through.
 pub(super) struct LocalSpawnPreparationContext {
     pub(super) definition: Arc<MobDefinition>,
-    pub(super) incarnation: meerkat_core::service::MobIncarnationId,
+    pub(super) incarnation: meerkat_core::service::LiveMobIncarnation,
     pub(super) realm_profile_store: Option<Arc<dyn crate::store::RealmProfileStore>>,
     pub(super) session_service: Arc<dyn MobSessionService>,
     pub(super) provisioner: Arc<dyn MobProvisioner>,

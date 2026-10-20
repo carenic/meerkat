@@ -172,17 +172,17 @@ fn routed_script(
 // Surfaces and calls
 // ===========================================================================
 
-/// The incarnation the live mob `mob_id` runs at in `state`: the binding a
-/// grant over that mob names.
+/// The incarnation the live mob `mob_id` runs at in `state`, as its handle's
+/// witness: the binding a grant over that mob names.
 async fn live_incarnation(
     state: &MobMcpState,
     mob_id: &str,
-) -> meerkat_core::service::MobIncarnationId {
+) -> meerkat_core::service::LiveMobIncarnation {
     state
         .handle_for(&meerkat_mob::MobId::from(mob_id))
         .await
         .expect("live mob handle")
-        .incarnation()
+        .live_incarnation()
 }
 
 /// A member's fork authority: it may spawn its own role, nothing else. No
@@ -190,7 +190,7 @@ async fn live_incarnation(
 /// ownership admission.
 fn forker_authority(
     mob_id: &str,
-    incarnation: meerkat_core::service::MobIncarnationId,
+    incarnation: meerkat_core::service::LiveMobIncarnation,
 ) -> meerkat_core::service::MobToolAuthorityContext {
     let authority = meerkat_runtime::mob_operator_authority::create_only_mob_operator_authority()
         .expect("generated authority");
@@ -210,7 +210,7 @@ fn forker_authority(
 /// source mob whose members participate.
 fn convener_authority(
     mob_id: &str,
-    incarnation: meerkat_core::service::MobIncarnationId,
+    incarnation: meerkat_core::service::LiveMobIncarnation,
 ) -> meerkat_core::service::MobToolAuthorityContext {
     let authority = meerkat_runtime::mob_operator_authority::create_only_mob_operator_authority()
         .expect("generated authority");
@@ -2179,7 +2179,7 @@ async fn spawned_by_survives_resume_restart_and_successor_respawn() {
     let forker_after_restart = bind_surface(
         &restarted,
         forker.session.clone(),
-        forker_authority(mob_id.as_str(), restored.incarnation()),
+        forker_authority(mob_id.as_str(), restored.live_incarnation()),
     );
     // The restored mob's fork re-link pass reads its children's status
     // concurrently; the forker's check neither waits on it nor is refused.
