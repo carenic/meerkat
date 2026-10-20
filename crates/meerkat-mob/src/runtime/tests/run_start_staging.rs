@@ -424,13 +424,15 @@ async fn a_stop_reports_a_degraded_member_reload_required_and_holds_its_reload()
     .await;
 }
 
-/// Resume releases a member whose registration is still durability-degraded,
-/// as it is. Resume leaves the degraded registration to its reload: the
-/// member stays non-serving, and a request to it is refused typed
-/// (`MemberReloadRequired`) instead of waiting. The reload after Resume
-/// registers unheld, because Resume left no staged `MobStop`.
+/// A member whose registration needs a durability reload: while the mob is
+/// Running its status names the reload and a request to it is refused typed
+/// (`MemberReloadRequired`) instead of waiting. After a Stop, a Resume
+/// refuses typed while the member still needs the reload, before anything
+/// moves: the mob stays Stopped. The member's reload, admitted while Stopped,
+/// publishes a successor the staged `MobStop` holds, and the Resume then
+/// releases it and the member serves again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_resume_releases_a_member_still_degraded() {
+async fn a_resume_refuses_typed_while_a_member_needs_a_reload() {
     let mob = persistent_single_member_mob("resume-degraded").await;
     assert!(
         mob.adapter
@@ -438,33 +440,8 @@ async fn a_resume_releases_a_member_still_degraded() {
             .await,
         "the member's registration degrades"
     );
-    let report = tokio::time::timeout(STEP, mob.handle.stop())
-        .await
-        .expect("the stop answers")
-        .expect("the stop succeeds");
-    assert_eq!(
-        report
-            .members
-            .get(mob.member(0))
-            .map(|outcome| outcome.starts.clone()),
-        Some(MemberRunStarts::ReloadRequired),
-        "{report:?}"
-    );
-    tokio::time::timeout(STEP, mob.handle.resume())
-        .await
-        .expect("the resume answers")
-        .expect("the resume releases the degraded member");
-    assert_eq!(mob.handle.status().await.expect("phase"), MobState::Running);
 
-    // Resume left the degraded registration to its reload, and a request to
-    // the member is refused typed instead of waiting.
-    assert!(
-        mob.adapter
-            .durability_reload_required(mob.session(0))
-            .await
-            .is_some(),
-        "the degraded registration stays until its reload"
-    );
+    // Running: the status names the reload, and a request is refused typed.
     let status = tokio::time::timeout(STEP, mob.handle.member_status(mob.member(0)))
         .await
         .expect("the member status answers")
@@ -487,14 +464,71 @@ async fn a_resume_releases_a_member_still_degraded() {
         "a request to the degraded member is refused typed: {refused:?}"
     );
 
-    // The reload's successor registers unheld: Resume left no staged MobStop.
-    tokio::time::timeout(STEP, mob.handle.reload_member_registration(mob.member(0)))
+    let report = tokio::time::timeout(STEP, mob.handle.stop())
         .await
-        .expect("the reload answers")
-        .expect("the reload succeeds while the mob is Running");
+        .expect("the stop answers")
+        .expect("the stop succeeds");
+    assert_eq!(
+        report
+            .members
+            .get(mob.member(0))
+            .map(|outcome| outcome.starts.clone()),
+        Some(MemberRunStarts::ReloadRequired),
+        "{report:?}"
+    );
+
+    // The Resume refuses typed, naming the member, and nothing moves.
+    let refused = tokio::time::timeout(STEP, mob.handle.resume())
+        .await
+        .expect("the resume answers")
+        .expect_err("a member that needs a reload blocks the resume");
+    let refused = match &refused {
+        MobError::SharedLifecycleFailure(inner) => inner.as_ref(),
+        other => other,
+    };
+    assert!(
+        matches!(
+            refused,
+            MobError::MemberReloadRequired { member_id, .. } if member_id == mob.member(0)
+        ),
+        "the resume names the member to reload: {refused:?}"
+    );
+    assert_eq!(mob.handle.status().await.expect("phase"), MobState::Stopped);
+
+    // The reload while Stopped publishes a successor that applies the staged
+    // MobStop; its revival waits for Running.
+    let reload = tokio::time::timeout(STEP, mob.handle.reload_member_registration(mob.member(0)))
+        .await
+        .expect("the reload answers");
+    assert!(
+        matches!(
+            reload,
+            Err(MobError::InvalidTransition {
+                from: MobState::Stopped,
+                to: MobState::Running,
+            })
+        ),
+        "the reload's revival waits for Running: {reload:?}"
+    );
+    assert_eq!(
+        mob.adapter.run_starts_held_for_test(mob.session(0)).await,
+        Some(true),
+        "the reloaded registration stays held while Stopped"
+    );
+
+    // The Resume now releases the reloaded member, which serves again.
+    tokio::time::timeout(STEP, mob.handle.resume())
+        .await
+        .expect("the resume answers")
+        .expect("the resume releases the reloaded member");
+    assert_eq!(mob.handle.status().await.expect("phase"), MobState::Running);
     assert_eq!(
         mob.adapter.run_starts_held_for_test(mob.session(0)).await,
         Some(false),
         "the reloaded member is not held after Resume"
     );
+    tokio::time::timeout(STEP, mob.send(0, "sent after the reload"))
+        .await
+        .expect("the send answers")
+        .expect("the reloaded member accepts the request");
 }
