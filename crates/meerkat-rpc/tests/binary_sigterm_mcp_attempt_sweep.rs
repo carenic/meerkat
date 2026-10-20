@@ -219,6 +219,18 @@ impl Server {
     }
 }
 
+/// Where the binary's default token store keeps credentials under the
+/// test's `HOME` and `XDG_CONFIG_HOME`: the platform config directory, which
+/// on macOS is `$HOME/Library/Application Support` whatever XDG says.
+fn credentials_root(temp: &Path) -> PathBuf {
+    let config = if cfg!(target_os = "macos") {
+        temp.join("home/Library/Application Support")
+    } else {
+        temp.join("xdg")
+    };
+    config.join("meerkat/credentials")
+}
+
 /// The single credential file the store wrote for the MCP target.
 fn credential_file(credentials: &Path) -> PathBuf {
     let mut found = Vec::new();
@@ -344,7 +356,7 @@ async fn sigterm_with_a_held_credential_save_reports_the_attempt_unresolved() {
         server.call(3, "auth/login/complete", complete_params(&first));
         server
     });
-    let credential = credential_file(&temp.path().join("xdg/meerkat/credentials"));
+    let credential = credential_file(&credentials_root(temp.path()));
     let fifo = credential.with_extension("json.tmp");
     mkfifo(&fifo);
 

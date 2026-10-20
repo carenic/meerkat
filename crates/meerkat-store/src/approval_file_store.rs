@@ -1160,7 +1160,9 @@ mod tests {
         let ancestor = temp.path().join("new-ancestor");
         let parent = ancestor.join("store-parent");
         let path = parent.join("approvals.json");
-        let required_barrier = temp.path().to_path_buf();
+        // The store syncs each entry in its real parent: on macOS the
+        // tempdir is reached through the /var -> /private/var symlink.
+        let required_barrier = std::fs::canonicalize(temp.path()).expect("real temp root");
         let sync = Arc::new(CountedSync::default());
         // Only the barrier publishing new-ancestor fails. The different
         // store-parent barrier may succeed and must not substitute for it.
