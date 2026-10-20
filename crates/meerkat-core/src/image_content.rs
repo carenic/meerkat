@@ -779,6 +779,93 @@ pub(crate) fn messages_have_inline_images(messages: &[Message]) -> bool {
     })
 }
 
+/// Rewrites inline images to the blob references a blob store would name
+/// them by, without writing any blob, and collects each distinct payload
+/// once, in first-seen order.
+///
+/// The reference is [`crate::blob::content_blob_id`] of the block's own
+/// media type and data, and the block keeps its own media type: that is the
+/// form transcript digests already canonicalize an inline image to, so a
+/// rewritten row has the digest its inline form had.
+#[derive(Debug, Default)]
+pub(crate) struct InlineImageCollector {
+    seen: BTreeSet<BlobId>,
+    payloads: Vec<crate::session::InlineImagePayload>,
+}
+
+impl InlineImageCollector {
+    /// Rewrite every inline image `message` carries (user content, tool
+    /// results, and comms, external-event and runtime notice content).
+    /// Returns whether the message changed.
+    pub(crate) fn externalize(&mut self, message: &mut Message) -> bool {
+        match message {
+            Message::User(user) => self.externalize_blocks(&mut user.content),
+            Message::ToolResults { results, .. } => {
+                let mut changed = false;
+                for result in results.iter_mut() {
+                    changed |= self.externalize_blocks(&mut result.content);
+                }
+                changed
+            }
+            Message::SystemNotice(notice) => {
+                let mut changed = false;
+                for block in &mut notice.blocks {
+                    match block {
+                        SystemNoticeBlock::Comms { content, .. }
+                        | SystemNoticeBlock::ExternalEvent { content, .. }
+                        | SystemNoticeBlock::RuntimeNotice { content, .. } => {
+                            changed |= self.externalize_blocks(content);
+                        }
+                        SystemNoticeBlock::ToolConfig { .. }
+                        | SystemNoticeBlock::Mcp { .. }
+                        | SystemNoticeBlock::BackgroundJob { .. }
+                        | SystemNoticeBlock::Auth { .. }
+                        | SystemNoticeBlock::ToolProcessInterrupted { .. }
+                        | SystemNoticeBlock::Unknown { .. } => {}
+                    }
+                }
+                changed
+            }
+            Message::System(_) | Message::BlockAssistant(_) => false,
+        }
+    }
+
+    fn externalize_blocks(&mut self, blocks: &mut [ContentBlock]) -> bool {
+        let mut changed = false;
+        for block in blocks.iter_mut() {
+            let ContentBlock::Image {
+                media_type,
+                data: ImageData::Inline { data },
+            } = block
+            else {
+                continue;
+            };
+            let media_type = media_type.clone();
+            let data = std::mem::take(data);
+            let blob_id = crate::blob::content_blob_id(&media_type, &data);
+            *block = ContentBlock::Image {
+                media_type: media_type.clone(),
+                data: ImageData::Blob {
+                    blob_id: blob_id.clone(),
+                },
+            };
+            if self.seen.insert(blob_id.clone()) {
+                self.payloads.push(crate::session::InlineImagePayload {
+                    blob_id,
+                    media_type,
+                    data,
+                });
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    pub(crate) fn into_payloads(self) -> Vec<crate::session::InlineImagePayload> {
+        self.payloads
+    }
+}
+
 /// [`externalize_messages_from`] that reports the lowest message index it
 /// actually rewrote (`None` = the buffer is unchanged).
 ///
