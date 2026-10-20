@@ -168,7 +168,16 @@ then retry.
 Stop hold: Stop holds run starts for every local member until Resume. Since
 0.9.4 that includes a member reloaded while the mob is stopped, one spawned
 into a stopped mob and one held again after a failed Resume; retire, Shutdown
-and destroy release the hold for the members they dispose of.
+and destroy release the hold for the members they dispose of. Since 0.9.4
+`MobBuilder::resume` finishes a Stop (or Complete) that an earlier process
+durably began and never finished before it returns the handle: it waits up to
+5 s for the first attempt, so the handle reads Stopped (or Completed) and a
+host lifts it as after a completed Stop. Before, the mob resumed as Running
+and the background recovery stopped it a moment later, so a host that read
+the phase right after resume never lifted it and every send failed with
+`invalid state transition: Stopped -> Running`. An attempt refused or still
+running after 5 s (held on a member or a placed completion) goes on in the
+background; wait for its `MobStopped` if you need the phase.
 
 Delivery scope: a host that persists effect-bearing deliveries captures the
 member's `MemberDeliveryScope` (runtime incarnation, fence and session; it

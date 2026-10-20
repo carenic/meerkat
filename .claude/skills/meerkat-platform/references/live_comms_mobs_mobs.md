@@ -40,7 +40,8 @@ live_comms_mobs_live.md and comms in live_comms_mobs_comms.md.
   retire, Shutdown and destroy release the hold for the members they dispose
   of, so a later registration of the same session is not held, and a mob
   reopened in the same process holds its members only if it is restored
-  stopped.
+  stopped. A resume finishes a Stop an earlier process left half done
+  before it returns the mob (waiting up to 5 s), so the mob reads Stopped.
 - Rust `MobHandle::stop()` returns a `MobStopReport`.
   `shutdown_with_report(ShutdownOptions)` cancels in-flight runs immediately
   and reports each member. Since 0.9.4 an admitted Shutdown closes admission
