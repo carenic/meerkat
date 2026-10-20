@@ -1655,15 +1655,19 @@ them.
   without the transcript.
 
 - A live open refused because another live open on the same host was still
-  being prepared is now the typed, retryable
+  being set up is now the typed, retryable
   `RealtimeSessionOpenProjectionError::Backpressured`, not an internal session
-  error. The host admits one live open projection at a time and queues none,
-  so two opens at the same moment (two people starting voice, or a voice call
-  and another live channel) refused the second, and surfaces reported it as
-  an internal failure the caller could not tell from a broken host. `rkat-rpc`
-  `live/open` now answers it with the `SessionBusy` code (-32002) and a
-  member live host with `MemberLiveError::Unavailable`; the same open
-  succeeds when retried once the other open has been prepared.
+  error. A host admits live opens one at a time per process and queues none,
+  and an open keeps that admission until its provider has acknowledged its
+  seed: for a provider-brokered WebRTC channel (the provider answers the
+  client's offer), through that offer and answer. A second open during that
+  setup (two people starting voice, or a voice call and another live
+  channel) was refused, and surfaces reported it as an internal failure the
+  caller could not tell from a broken host.
+  `rkat-rpc` `live/open` now answers it with the retryable `SessionBusy` code
+  (-32002) and a member live host with `MemberLiveError::Unavailable`.
+  Clients retry with backoff; the open succeeds once the other open's setup
+  has finished.
 - `meerkat-mob`: a mob restarts when one of its members has a durable tail
   ahead of the runtime boundary it last committed. A turn's durable rows can
   land after that boundary when a retirement cancels the turn mid-way, or when
