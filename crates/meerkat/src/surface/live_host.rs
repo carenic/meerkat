@@ -3165,6 +3165,13 @@ pub fn member_live_error_from_open(error: LiveOpenError) -> MemberLiveError {
         LiveOpenError::UnsupportedTransport => MemberLiveError::TransportUnsupported {
             requested: "unknown".to_string(),
         },
+        // Another open on the host still holds the open-projection admission:
+        // transient, and the same open succeeds on a later retry.
+        LiveOpenError::OpenConfig(RealtimeSessionOpenProjectionError::Backpressured) => {
+            MemberLiveError::Unavailable {
+                reason: error.to_string(),
+            }
+        }
         error @ (LiveOpenError::SessionStateFault(_)
         | LiveOpenError::OpenConfig(_)
         | LiveOpenError::AdmissionAuthority(_)

@@ -2718,3 +2718,45 @@ async fn the_production_bind_advances_a_retained_seed_over_a_row_committed_befor
         .await
         .expect("close active channel");
 }
+
+/// A live open projected while another open on the host still holds the
+/// open-projection admission is refused with the typed, retryable
+/// `Backpressured`, not an internal session error, so a surface can answer
+/// "busy, retry" instead of a host failure. Once the holder lets go, the same
+/// open projects.
+#[tokio::test]
+async fn an_open_projected_while_another_holds_the_admission_is_refused_as_backpressured() {
+    use crate::session_runtime::live_orchestration::RealtimeSessionOpenProjectionError;
+
+    let env = build_environment_without_summary_policy().await;
+    let orchestrator = env.member_host.orchestrator();
+    let holder = orchestrator
+        .live_open_projection_for_session(
+            &env.session_id,
+            meerkat_contracts::RealtimeTurningMode::ProviderManaged,
+            None,
+        )
+        .await
+        .expect("the first open projects and holds the admission");
+    match orchestrator
+        .live_open_projection_for_session(
+            &env.session_id,
+            meerkat_contracts::RealtimeTurningMode::ProviderManaged,
+            None,
+        )
+        .await
+    {
+        Err(RealtimeSessionOpenProjectionError::Backpressured) => {}
+        Err(other) => panic!("a held admission must refuse typed and retryable, got: {other:?}"),
+        Ok(_) => panic!("a second open projected while the first held the admission"),
+    }
+    drop(holder);
+    orchestrator
+        .live_open_projection_for_session(
+            &env.session_id,
+            meerkat_contracts::RealtimeTurningMode::ProviderManaged,
+            None,
+        )
+        .await
+        .expect("the open projects once the holder lets go");
+}

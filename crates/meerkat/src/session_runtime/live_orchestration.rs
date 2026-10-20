@@ -530,6 +530,13 @@ pub enum RealtimeSessionOpenProjectionError {
         requested_session_id: SessionId,
         projection_session_id: SessionId,
     },
+    /// Another live open on this host still holds the process's
+    /// open-projection admission, which admits one worst-case projection at
+    /// a time and queues no waiter. The holder keeps it until its provider
+    /// has acknowledged its seed. Nothing was projected or opened; the same
+    /// open succeeds when retried after the holder lets go.
+    #[error("live open refused: another live open is being prepared on this host; retry shortly")]
+    Backpressured,
 }
 
 /// Test hook: the next ready summary's seeded projection reports
@@ -1808,6 +1815,25 @@ mod orchestrator {
             .clone()
     }
 
+    /// Take `service`'s open-projection admission for one live open. An
+    /// admission another open still holds is the typed, retryable
+    /// [`RealtimeSessionOpenProjectionError::Backpressured`]; invalid limits
+    /// stay an internal fault.
+    fn admit_open_projection<B: SessionAgentBuilder + 'static>(
+        service: &Arc<PersistentSessionService<B>>,
+    ) -> Result<meerkat_core::RealtimeOpenProjectionLease, RealtimeSessionOpenProjectionError> {
+        realtime_open_projection_admission(service)
+            .try_acquire()
+            .map_err(|error| match error {
+                meerkat_core::RealtimeOpenProjectionAdmissionError::Backpressured { .. } => {
+                    RealtimeSessionOpenProjectionError::Backpressured
+                }
+                meerkat_core::RealtimeOpenProjectionAdmissionError::InvalidLimits { .. } => {
+                    SessionError::Agent(AgentError::InternalError(error.to_string())).into()
+                }
+            })
+    }
+
     /// Forget the retained summaries of up to `limit` sessions other than
     /// `except`, least recently retained first, whose durable source is
     /// archived (archived, retired or destroyed) or absent. Returns how many
@@ -2094,11 +2120,7 @@ mod orchestrator {
             // hydrate blob-backed image history. The take-once slot carried on
             // the returned config transfers this same lease through provider
             // seed acknowledgement; no payload-bearing waiter is queued.
-            let open_projection_lease = realtime_open_projection_admission(self.service)
-                .try_acquire()
-                .map_err(|error| {
-                    SessionError::Agent(AgentError::InternalError(error.to_string()))
-                })?;
+            let open_projection_lease = admit_open_projection(self.service)?;
             Box::pin(self.recover_live_session_for_realtime_open(session_id)).await?;
             let (session, canonical_user_image_decoded_bytes) = match self
                 .service
@@ -2157,11 +2179,7 @@ mod orchestrator {
             turning_mode: meerkat_contracts::RealtimeTurningMode,
             seed_window: Option<LiveSeedWindow>,
         ) -> Result<RealtimeSessionOpenProjection, RealtimeSessionOpenProjectionError> {
-            let open_projection_lease = realtime_open_projection_admission(self.service)
-                .try_acquire()
-                .map_err(|error| {
-                    SessionError::Agent(AgentError::InternalError(error.to_string()))
-                })?;
+            let open_projection_lease = admit_open_projection(self.service)?;
             Box::pin(self.recover_live_session_for_realtime_open(session_id)).await?;
             let snapshot = match self
                 .service
@@ -2371,11 +2389,7 @@ mod orchestrator {
             turning_mode: meerkat_contracts::RealtimeTurningMode,
             policy: &super::live_summary::LiveContextSummaryPolicy,
         ) -> Result<RealtimeSessionOpenProjection, RealtimeSessionOpenProjectionError> {
-            let lease = realtime_open_projection_admission(self.service)
-                .try_acquire()
-                .map_err(|error| {
-                    SessionError::Agent(AgentError::InternalError(error.to_string()))
-                })?;
+            let lease = admit_open_projection(self.service)?;
             Box::pin(self.recover_live_session_for_realtime_open(session_id)).await?;
             let session = self
                 .service
@@ -2452,11 +2466,7 @@ mod orchestrator {
                     Arc::clone(self.service),
                 )),
             );
-            let lease = realtime_open_projection_admission(self.service)
-                .try_acquire()
-                .map_err(|error| {
-                    SessionError::Agent(AgentError::InternalError(error.to_string()))
-                })?;
+            let lease = admit_open_projection(self.service)?;
             let config =
                 RealtimeSessionOpenConfig::new(turning_mode, identity, Vec::new(), Vec::new())?
                     .with_open_projection_lease(lease)
