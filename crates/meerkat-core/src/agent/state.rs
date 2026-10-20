@@ -12259,6 +12259,7 @@ mod tests {
     /// A staged compaction reports its completion only when the runtime
     /// commits it, and that deferred completion carries the summary source
     /// the staged intent recorded.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn runtime_committed_compaction_completion_carries_the_staged_summary_source() {
         let memory_store = Arc::new(AbortRetryMemoryStore::new());
@@ -15004,6 +15005,7 @@ mod tests {
     /// The completion event says who wrote the summary and, for a provider
     /// call, how much of the history its source carried, as the compactor
     /// reported it.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn compaction_completed_reports_the_summary_source_bound() {
         let bound = crate::compact::SummarizationSourceBound::RequestsOnly { kept: 1, of: 2 };
@@ -15041,6 +15043,7 @@ mod tests {
     /// A committed rewrite records the history estimate it left as the
     /// session's cadence evidence, persisted with the cadence, and the
     /// completion reports the same number.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn compaction_records_and_reports_the_history_its_rewrite_left() {
         let client = Arc::new(CompactionAwareLlmClient::new());
@@ -15099,6 +15102,7 @@ mod tests {
 
     /// A rewrite rejected as a no-op left the transcript as it was, so the
     /// evidence is the estimate the attempt started from.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn rejected_noop_rewrite_records_the_unchanged_history() {
         let client = Arc::new(CompactionAwareLlmClient::new());
@@ -15148,6 +15152,7 @@ mod tests {
 
     /// A summary call that fails proves nothing about what a rewrite would
     /// leave: the evidence of the last rewrite stays.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn failed_summary_call_keeps_the_previous_rewrite_evidence() {
         let client = Arc::new(FailingCompactionLlmClient::new());
@@ -17630,6 +17635,7 @@ mod tests {
     /// its source is sized for that model: after the session switches to a
     /// model with a smaller window (a model fallback replaces the active
     /// profile the same way), the next compaction gets that model's budget.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn compaction_summary_budget_follows_the_active_model() {
         let registry = summary_window_test_registry(&[("primary", 128_000), ("backup", 16_000)]);
@@ -17796,6 +17802,7 @@ mod tests {
     /// another model or provider, or a request policy for another model, is
     /// refused with a typed error that names the hot swap, and the live
     /// client, request model and active profile stay as they were.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn direct_client_replacement_refuses_a_model_change() {
         let registry = fallback_activation_test_registry();
@@ -33250,6 +33257,7 @@ mod tests {
 
         /// Run one prompt with `client` as both the session's model and the
         /// work's retained controller, under `policy`.
+        #[cfg(feature = "workspace-tests")]
         async fn run_churn(
             policy: &Arc<ChurnPolicy>,
             client: &Arc<ChurnClient>,
@@ -33260,6 +33268,7 @@ mod tests {
 
         /// [`run_churn`] with `observer` installed as the host's operation
         /// refusal observer.
+        #[cfg(feature = "workspace-tests")]
         async fn run_churn_observed(
             policy: &Arc<ChurnPolicy>,
             client: &Arc<ChurnClient>,
@@ -33362,6 +33371,7 @@ mod tests {
         /// immediate rebuild. The model request waits for it to complete,
         /// then rebuilds under the same operation, with no refusal notice and
         /// no controller-feedback request.
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test(start_paused = true)]
         async fn an_owner_change_in_progress_is_waited_out_before_the_rebuild() {
             let policy = ChurnPolicy::new([
@@ -33397,6 +33407,7 @@ mod tests {
         /// three free rebuilds per model call; then the call takes its own
         /// rebuild, the controller feedback attempt and the refusal, as
         /// without waiting.
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test(start_paused = true)]
         async fn a_flip_storm_spends_at_most_three_free_rebuilds() {
             let policy = ChurnPolicy::new([ChurnStep::Begin {
@@ -33428,6 +33439,7 @@ mod tests {
         /// The wait bound is wall-clock from the first wait, so the time the
         /// rebuilds themselves take counts against it: slow rebuilds end
         /// the free rebuilds before the cap does.
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test(start_paused = true)]
         async fn the_wait_bound_counts_rebuild_time() {
             let policy = ChurnPolicy::new([ChurnStep::Begin {
@@ -33452,6 +33464,7 @@ mod tests {
         /// With less run budget left than the wait bound, the wait ends at
         /// the run deadline and the turn ends with the budget error, not a
         /// refusal.
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test(start_paused = true)]
         async fn a_run_budget_under_the_wait_bound_ends_the_turn_on_time() {
             const TURN_BUDGET: std::time::Duration = std::time::Duration::from_millis(300);
@@ -33491,6 +33504,7 @@ mod tests {
 
         /// The wait belongs to the call's own future: dropping the run stops
         /// it, and nothing keeps preparing afterwards.
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test(start_paused = true)]
         async fn dropping_a_waiting_model_call_stops_the_wait() {
             let policy = ChurnPolicy::new([ChurnStep::Begin { settle: None }]);
@@ -33532,6 +33546,7 @@ mod tests {
 
         /// A `ReprepareRequired` refusal with no change in progress takes its
         /// ordinary path at once: one rebuild, then the controller feedback.
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test(start_paused = true)]
         async fn a_refusal_without_a_change_in_progress_rebuilds_at_once() {
             let policy = ChurnPolicy::new([ChurnStep::Stale, ChurnStep::Stale, ChurnStep::Allow]);
@@ -33553,6 +33568,7 @@ mod tests {
         /// Only `ReprepareRequired` waits: a denial with a change in progress
         /// returns to the controller at once, and that new operation then
         /// waits for the change like any other.
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test(start_paused = true)]
         async fn other_refusals_never_wait_for_a_change_in_progress() {
             let policy = ChurnPolicy::new([
@@ -33581,6 +33597,7 @@ mod tests {
         /// on the work's own publication waits for it and asks again under
         /// the same operation: the compaction completes, and the controller
         /// sees no refusal.
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test(start_paused = true)]
         async fn a_compaction_summary_waits_out_an_owner_change_in_progress() {
             // The first run answers; the second compacts first, and its
@@ -33673,6 +33690,7 @@ mod tests {
         /// wait for an owner change, with the refused operation, its run and
         /// session, and how long it waited; the rebuild that follows was
         /// authorized, so nothing else is observed.
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test(start_paused = true)]
         async fn the_host_observes_the_model_request_waiting_out_an_owner_change() {
             let policy = ChurnPolicy::new([
@@ -33714,6 +33732,7 @@ mod tests {
         /// goes to the controller: the host sees both decisions, for the
         /// refused operation, and nothing for the feedback request that was
         /// authorized.
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test(start_paused = true)]
         async fn the_host_observes_the_rebuild_and_the_controller_feedback() {
             let policy = ChurnPolicy::new([ChurnStep::Stale, ChurnStep::Stale, ChurnStep::Allow]);
@@ -33758,6 +33777,7 @@ mod tests {
         /// no longer may, the call's own rebuild, the controller feedback
         /// request and, when that one is refused too, the failed run, on the
         /// feedback request's own operation.
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test(start_paused = true)]
         async fn the_host_observes_every_disposition_of_a_flip_storm() {
             use crate::authorization::OperationRefusalDisposition as Disposition;
@@ -33818,6 +33838,7 @@ mod tests {
         /// exactly the events and keeps exactly the transcript of the same
         /// run without one, and each agent reports its own session to an
         /// observer two agents share.
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test(start_paused = true)]
         async fn an_observation_reaches_only_the_host_that_installed_the_observer() {
             fn shape(mut run: ChurnRun) -> (Vec<String>, usize) {
@@ -33877,6 +33898,7 @@ mod tests {
         /// A compaction summary the owners refuse is skipped with the history
         /// kept, and the host observes it on the compaction surface with the
         /// summary request's own operation.
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn the_host_observes_a_refused_compaction_summary_as_skipped() {
             let client = Arc::new(FixtureClient {
@@ -35155,6 +35177,7 @@ mod tests {
         /// The retained controller client writes the summary of the admitted
         /// controller's context, so the source is sized for the controller's
         /// model, not for the session's active model.
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn controller_compaction_summary_budget_is_sized_for_the_controller_model() {
             let registry =
@@ -35417,6 +35440,7 @@ mod tests {
         /// retained attempt of the call is refused at its staging. The host
         /// observes it once, as the original call's result, with the closed
         /// kind and the dispatch fact the model's notice carries; no body ran.
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn the_host_observes_a_refused_in_run_consent_attempt() {
             let client = Arc::new(FixtureClient {
@@ -35526,6 +35550,7 @@ mod tests {
             assert_completed_without_failure(&mut rx);
         }
 
+        #[cfg(feature = "workspace-tests")]
         mod observation_infrastructure_tool_siblings {
             use super::*;
             use crate::authorization::{OperationObservation, OperationObservationError};

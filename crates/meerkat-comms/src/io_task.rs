@@ -698,6 +698,7 @@ mod tests {
         assert_eq!(candidate.interaction.id.0, expected_id);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_io_task_refuses_a_signed_field_altered_after_signing() {
         use crate::transport::codec::test_frames::{frame_bytes, message_kind, signed_map, text};
@@ -724,6 +725,7 @@ mod tests {
         assert!(matches!(result, Err(IoTaskError::InvalidSignature { .. })));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_io_task_accepts_invalid_signature_when_auth_disabled() {
         let sender_keypair = make_keypair();
