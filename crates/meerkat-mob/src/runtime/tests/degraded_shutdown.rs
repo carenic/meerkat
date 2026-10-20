@@ -879,7 +879,7 @@ async fn a_whole_shutdown_settles_a_member_degraded_while_idle() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_whole_shutdown_settles_an_autonomous_member_degraded_by_a_failed_boundary_commit() {
     let mob = create_isolation_mob_with_definition(2, autonomous_isolation_definition()).await;
-    mob.degrade_member(0).await;
+    mob.degrade_autonomous_member(0).await;
     mob.store.fail_commit(mob.session(0), false);
     let report = whole_shutdown_settles_the_degraded_member(&mob).await;
     assert_eq!(

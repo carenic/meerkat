@@ -5596,6 +5596,19 @@ impl SessionBackend {
             let observed_ops_binding = self.ops_adapter.capture_session_binding_witness(session_id);
 
             let Some(witness) = witness else {
+                // A registration that needs a durability reload is left to
+                // that reload, which discards it and publishes the cold
+                // successor. Its exact unregister refuses until that repair,
+                // so releasing it here would fail the whole Resume, and the
+                // member starts no run on it meanwhile. Nothing is discarded
+                // or rebuilt for it here.
+                if adapter
+                    .durability_reload_required(session_id)
+                    .await
+                    .is_some()
+                {
+                    return Ok(false);
+                }
                 // Captured under B: the exact registration any discarded
                 // unattached actor was built against. Discarding the actor
                 // alone leaves that registration's materialization claim

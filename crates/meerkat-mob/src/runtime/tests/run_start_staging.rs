@@ -455,6 +455,30 @@ async fn a_resume_releases_a_member_still_degraded() {
         .expect("the resume releases the degraded member");
     assert_eq!(mob.handle.status().await.expect("phase"), MobState::Running);
 
+    // Resume left the degraded registration to its reload: it is still the
+    // member's registration, and it admits no input until the reload.
+    assert!(
+        mob.adapter
+            .durability_reload_required(mob.session(0))
+            .await
+            .is_some(),
+        "the degraded registration stays until its reload"
+    );
+    let refused = mob
+        .adapter
+        .accept_input_with_completion(
+            mob.session(0),
+            meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::new(
+                "offered to the degraded member after Resume",
+                None,
+            )),
+        )
+        .await;
+    assert!(
+        !matches!(&refused, Ok((accepted, _)) if accepted.is_accepted()),
+        "the degraded registration admits no input after Resume"
+    );
+
     // The reload's successor registers unheld: Resume left no staged MobStop.
     tokio::time::timeout(STEP, mob.handle.reload_member_registration(mob.member(0)))
         .await
