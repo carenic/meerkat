@@ -789,6 +789,31 @@ them.
   the rosters of the mobs hosted when it runs: a host inserts a mob's handle
   before its members can run turns, because a member of a mob not inserted
   yet is in no hosted roster and its session's create records `Session`.
+- A local `tools.mob` member's own mob operator tools (`spawn_member`,
+  `spawn_many_members` and the rest, which the mob runtime composes for the
+  member's session) admit against the session's final mob operator
+  authority, the context `AgentFactory` settles after a host session hook
+  has edited the build. They admitted against a default the runtime
+  composed itself (create-only, with spawn rights over every profile of the
+  mob), so a hook that narrowed a member's spawn profiles, for example with
+  `restrict_spawn_profiles_in_mob`, narrowed the session's other mob tool
+  surfaces while the member could still spawn every profile through these.
+  The factory binds the authority through the new defaulted method
+  `AgentToolDispatcher::bind_session_mob_tool_authority`, on the session's
+  external tools before it composes them, with or without a
+  `MobToolsFactory`. Behaviour changes for hosts:
+  - A hook that grants manage scope over the member's own mob now reaches
+    these tools too: such a member can retire, force-cancel and read the
+    status of members it did not spawn, and lists every member.
+  - A hook that removes the authority (`mob_tool_authority_context` set to
+    `None`, or mob tools disabled) now hides these tools and refuses their
+    spawn and management calls, where they still admitted every profile.
+  - They follow the authority updates the agent applies during the session
+    (`apply_session_effects`), as a `MobToolsFactory` surface does.
+  - A host that wraps a member's external tools in its own
+    `AgentToolDispatcher` must forward `bind_session_mob_tool_authority` to
+    the wrapped dispatcher: tools the factory never binds deny every call.
+    `DynamicToolComposite` and `ToolGateway` forward it.
 
 ### Added
 

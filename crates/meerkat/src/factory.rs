@@ -6980,6 +6980,29 @@ impl AgentFactory {
                 .apply_generated_create_only_mob_operator_access(ToolCategoryOverride::Enable);
         }
 
+        // The session's final mob operator authority, settled above and only
+        // read from here on. One handle carries it to every mob operator
+        // surface of the session: the agent writes its in-session updates to
+        // it, the mob tools below read it, and so do the mob operator
+        // dispatchers in the caller's external tools (a mob runtime's own
+        // tools for a member), bound here before anything composes them. A
+        // session with no generated authority, or with mob tools disabled,
+        // binds none, and those dispatchers then hide their tools and deny
+        // every call.
+        let session_mob_authority = build_config
+            .mob_tool_authority_context
+            .as_ref()
+            .filter(|authority| authority.is_generated_authority_context())
+            .map(|authority| Arc::new(std::sync::RwLock::new(authority.clone())));
+        if let Some(external_tools) = build_config.external_tools.as_ref() {
+            let bound = if matches!(build_config.override_mob, ToolCategoryOverride::Disable) {
+                None
+            } else {
+                session_mob_authority.clone()
+            };
+            external_tools.bind_session_mob_tool_authority(bound);
+        }
+
         if let Some(value) = build_config.max_inline_peer_notifications
             && value < -1
         {
@@ -8389,11 +8412,8 @@ impl AgentFactory {
             .mob_tools
             .take()
             .or_else(|| self.mob_tools.clone());
-        // Shared mob authority handle — created inside the mob block, hoisted
-        // out so the agent builder can reference it after the block.
-        let mut hoisted_mob_authority_handle: Option<
-            Arc<std::sync::RwLock<meerkat_core::service::MobToolAuthorityContext>>,
-        > = None;
+        // The session's shared mob authority handle, for the agent builder.
+        let hoisted_mob_authority_handle = session_mob_authority.clone();
         // Hoisted so the final built ToolScope can become the parent
         // composition authority's live generated visibility source.
         let mut hoisted_parent_tool_authority: Option<
@@ -8415,13 +8435,10 @@ impl AgentFactory {
             #[cfg(not(feature = "comms"))]
             let mob_comms_name = build_config.comms_name.clone();
 
-            // Create the shared effective-authority handle. The agent owns the
-            // write side (via apply_session_effects); mob tools get a read view.
-            let mob_authority_handle = build_config
-                .mob_tool_authority_context
-                .as_ref()
-                .map(|ctx| Arc::new(std::sync::RwLock::new(ctx.clone())));
-            hoisted_mob_authority_handle = mob_authority_handle.clone();
+            // The session's shared effective-authority handle. The agent owns
+            // the write side (via apply_session_effects); mob tools get a read
+            // view.
+            let mob_authority_handle = session_mob_authority.clone();
 
             // Use an AgentFactory-minted parent composition authority: created
             // before mob composition so it can be passed into MobToolsBuildArgs.
