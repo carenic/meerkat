@@ -4818,6 +4818,12 @@ struct ClockAlignment {
     pairs: usize,
 }
 
+/// How far a sideband frame read just after the disconnect marker may sit
+/// from the median offset of the pairs before it and still pair with the
+/// browser's surplus: the late read itself is a few tens of milliseconds, and
+/// one 200 ms model frame plus scheduling stays well inside it.
+const LATE_READ_PAIR_TOLERANCE_MS: i64 = 1000;
+
 /// Align the sideband with the browser clock through the commentary.appended
 /// events both saw: the provider sends each on both channels, in the same
 /// order, and the k-th on one is the k-th on the other. The browser sees
@@ -4847,21 +4853,43 @@ fn sideband_clock_alignment(
         sideband_server_frames(lines, channel, "session.commentary.appended")
             .map(|(elapsed_ms, _)| elapsed_ms)
             .partition(|elapsed_ms| disconnected.is_none_or(|at| *elapsed_ms < at));
-    let sideband: Vec<i64> = match browser.len().checked_sub(before.len()) {
-        Some(surplus) if !browser.is_empty() && surplus <= after.len() => before
-            .iter()
-            .chain(after.iter().take(surplus))
-            .map(|elapsed_ms| *elapsed_ms as i64)
-            .collect(),
-        _ => {
-            return Err(format!(
-                "cannot pair commentary.appended events to align the clocks: the browser saw {} and the sideband {} before the disconnect marker and {} after it",
-                browser.len(),
-                before.len(),
-                after.len()
-            ));
-        }
+    let mismatch = || {
+        format!(
+            "cannot pair commentary.appended events to align the clocks: the browser saw {} and the sideband {} before the disconnect marker and {} after it",
+            browser.len(),
+            before.len(),
+            after.len()
+        )
     };
+    let surplus = browser
+        .len()
+        .checked_sub(before.len())
+        .filter(|surplus| !browser.is_empty() && *surplus <= after.len())
+        .ok_or_else(mismatch)?;
+    let mut sideband: Vec<i64> = before.iter().map(|elapsed_ms| *elapsed_ms as i64).collect();
+    if surplus > 0 {
+        // A frame read after the marker pairs only when its offset agrees
+        // with the pairs both channels saw before it, so a browser
+        // duplicate cannot hide behind an ack the browser never saw.
+        let mut settled: Vec<i64> = sideband.iter().zip(&browser).map(|(s, b)| s - b).collect();
+        settled.sort_unstable();
+        let median = settled
+            .get(settled.len() / 2)
+            .copied()
+            .ok_or_else(mismatch)?;
+        for (elapsed_ms, browser_ms) in after.iter().take(surplus).zip(&browser[before.len()..]) {
+            let offset = *elapsed_ms as i64 - browser_ms;
+            if (offset - median).abs() > LATE_READ_PAIR_TOLERANCE_MS {
+                return Err(format!(
+                    "{}: a frame read after it is {} ms off the median offset of {} ms",
+                    mismatch(),
+                    offset - median,
+                    median
+                ));
+            }
+            sideband.push(*elapsed_ms as i64);
+        }
+    }
     let mut offsets: Vec<i64> = sideband.iter().zip(&browser).map(|(s, b)| s - b).collect();
     offsets.sort_unstable();
     Ok(ClockAlignment {
@@ -14348,6 +14376,19 @@ mod config_tests {
         assert_eq!(
             super::sideband_clock_alignment(&entries, &lines, 1).unwrap_err(),
             "cannot pair commentary.appended events to align the clocks: the browser saw 4 and the sideband 3 before the disconnect marker and 0 after it"
+        );
+    }
+
+    /// A browser duplicate in the middle cannot hide behind a sideband ack
+    /// the browser never saw after it disconnected: the late frame's offset
+    /// disagrees with the pairs before it.
+    #[test]
+    fn a_browser_duplicate_cannot_hide_behind_a_trailing_sideband_ack() {
+        let entries = commentary_timeline(&[1000, 1010, 9000, 13_000]);
+        let lines = commentary_lines(&[1500, 9500, 13_520, 14_000], Some(13_600));
+        assert_eq!(
+            super::sideband_clock_alignment(&entries, &lines, 1).unwrap_err(),
+            "cannot pair commentary.appended events to align the clocks: the browser saw 4 and the sideband 3 before the disconnect marker and 1 after it: a frame read after it is -3520 ms off the median offset of 4520 ms"
         );
     }
 
