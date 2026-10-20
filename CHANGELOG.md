@@ -1319,7 +1319,7 @@ them.
   are public for a host that makes the blob store's writes durable between
   them: `stage_standalone_whole_blob_media` stores the images and writes
   nothing to the database's sessions, bodies or authorities (it returns a
-  `StandaloneWholeBlobMediaStage`), and
+  `WholeBlobMediaStage`), and
   `convert_standalone_whole_blob_in_place_with_staged_media` converts with
   them.
 
@@ -1327,8 +1327,9 @@ them.
   a realm whose runtimes or legacy session blob rows hold inline images, with
   the realm blob store. Its two steps are public as well:
   `stage_realm_whole_blob_media` stores the images and writes nothing to the
-  database's sessions, bodies or authorities, and
-  `new_head_canonical_with_staged_media` opens with them.
+  database's sessions, bodies or authorities (it returns the same
+  `WholeBlobMediaStage`), and `new_head_canonical_with_staged_media` opens with
+  them.
 
 ### Changed
 
@@ -2703,6 +2704,12 @@ them.
   with those images summarized, where before it failed as irreducible.
   Pre-existing in 0.9.3.
 
+- `meerkat`: the built-in SQLite realm open (used by `rkat`, the REST and RPC
+  servers and the SDKs) takes that path. Before activation it stores a
+  realm's legacy inline images in the realm's `blobs` directory, so such a
+  realm opens on every surface. A realm with nothing to activate opens
+  exactly as before, without reading any session.
+
 ### Known limitations
 
 - A store that stops answering during registration, unregister or a control
@@ -2740,6 +2747,13 @@ them.
   `misfired` although its admitted input ran; nothing runs twice. Use
   `catch_up_within` with a window longer than the lease to keep crash
   recovery.
+- A realm served by an external storage provider whose session store is
+  SQLite does not open when it holds a session that a 0.8.x build compacted
+  with images inline in its history (screenshot or browser tool results, for
+  example). The open refuses with "compact rewrite delta carries inline
+  media", and the sessions' data stays intact; earlier 0.9.x releases refuse
+  the same realm the same way. 0.9.4.1 converts these sessions at open.
+  Built-in realms (`rkat`, REST, RPC and the SDKs) open them in this release.
 
 ## [0.9.3] - 2026-10-18
 

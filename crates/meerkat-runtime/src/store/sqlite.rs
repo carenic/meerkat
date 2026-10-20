@@ -7063,7 +7063,7 @@ ORDER BY runtime_id";
         conn: &mut Connection,
         runtime_id: &LogicalRuntimeId,
         source: HeadCanonicalActivationSource,
-        media: Option<&StandaloneWholeBlobMediaStage>,
+        media: Option<&WholeBlobMediaStage>,
     ) -> Result<HeadCanonicalActivationOutcome, RuntimeStoreError> {
         let session_label = runtime_id
             .session_id()
@@ -7530,7 +7530,7 @@ ORDER BY runtime_id";
     fn session_with_staged_media(
         runtime_id: &LogicalRuntimeId,
         session: meerkat_core::Session,
-        media: Option<&StandaloneWholeBlobMediaStage>,
+        media: Option<&WholeBlobMediaStage>,
     ) -> Result<meerkat_core::Session, RuntimeStoreError> {
         let Some(media) = media else {
             return Ok(session);
@@ -7555,7 +7555,7 @@ ORDER BY runtime_id";
     }
 
     /// One runtime's inline images, read for a media stage.
-    struct PendingStandaloneMedia {
+    struct PendingWholeBlobMedia {
         runtime_id: LogicalRuntimeId,
         session_id: meerkat_core::types::SessionId,
         payloads: Vec<meerkat_core::InlineImagePayload>,
@@ -7568,7 +7568,7 @@ ORDER BY runtime_id";
     /// holds, has nothing to stage.
     fn collect_standalone_whole_blob_media(
         conn: &mut Connection,
-    ) -> Result<Vec<PendingStandaloneMedia>, RuntimeStoreError> {
+    ) -> Result<Vec<PendingWholeBlobMedia>, RuntimeStoreError> {
         let order = head_canonical_activation_order(
             conn,
             HeadCanonicalActivationSource::StandaloneWholeBlob,
@@ -7595,7 +7595,7 @@ ORDER BY runtime_id";
                 continue;
             }
             if let Some(externalized) = externalize_inline_images(runtime_id, &source.session)? {
-                pending.push(PendingStandaloneMedia {
+                pending.push(PendingWholeBlobMedia {
                     runtime_id: runtime_id.clone(),
                     session_id: source.session_id,
                     payloads: externalized.payloads,
@@ -7612,7 +7612,7 @@ ORDER BY runtime_id";
     /// nothing to stage.
     fn collect_realm_whole_blob_media(
         conn: &mut Connection,
-    ) -> Result<Vec<PendingStandaloneMedia>, RuntimeStoreError> {
+    ) -> Result<Vec<PendingWholeBlobMedia>, RuntimeStoreError> {
         let order =
             head_canonical_activation_order(conn, HeadCanonicalActivationSource::CoTenantSession)?;
         // Rolled back when it drops: this reads one snapshot and writes
@@ -7648,7 +7648,7 @@ ORDER BY runtime_id";
                 }
             }
             if !payloads.is_empty() {
-                pending.push(PendingStandaloneMedia {
+                pending.push(PendingWholeBlobMedia {
                     runtime_id: runtime_id.clone(),
                     session_id: source.session_id,
                     payloads,
@@ -7667,7 +7667,7 @@ ORDER BY runtime_id";
     /// activation transactions repeat every check and stay authoritative.
     fn check_realm_activation_with_media(
         conn: &mut Connection,
-        media: &StandaloneWholeBlobMediaStage,
+        media: &WholeBlobMediaStage,
     ) -> Result<(), RuntimeStoreError> {
         let order =
             head_canonical_activation_order(conn, HeadCanonicalActivationSource::CoTenantSession)?;
@@ -7705,9 +7705,9 @@ ORDER BY runtime_id";
     /// refusing typed when the store answers any other address.
     async fn put_pending_media(
         blob_store: &dyn meerkat_core::BlobStore,
-        pending: Vec<PendingStandaloneMedia>,
-    ) -> Result<StandaloneWholeBlobMediaStage, RuntimeStoreError> {
-        let mut stage = StandaloneWholeBlobMediaStage::default();
+        pending: Vec<PendingWholeBlobMedia>,
+    ) -> Result<WholeBlobMediaStage, RuntimeStoreError> {
+        let mut stage = WholeBlobMediaStage::default();
         for runtime in pending {
             for payload in &runtime.payloads {
                 let stored = blob_store
@@ -7730,7 +7730,7 @@ ORDER BY runtime_id";
                 }
                 stage.stored.insert(payload.blob_id.clone());
             }
-            stage.runtimes.push(StandaloneWholeBlobMediaRuntime {
+            stage.runtimes.push(WholeBlobMediaRuntime {
                 runtime_id: runtime.runtime_id,
                 session_id: runtime.session_id,
                 images: runtime.payloads.len(),
@@ -7750,7 +7750,7 @@ ORDER BY runtime_id";
     /// transactions repeat every check and stay authoritative.
     fn check_standalone_whole_blob_conversion(
         conn: &mut Connection,
-        media: Option<&StandaloneWholeBlobMediaStage>,
+        media: Option<&WholeBlobMediaStage>,
     ) -> Result<(), RuntimeStoreError> {
         let order = head_canonical_activation_order(
             conn,
@@ -7793,7 +7793,7 @@ ORDER BY runtime_id";
     fn activate_head_canonical_profiles(
         conn: &mut Connection,
         source: HeadCanonicalActivationSource,
-        media: Option<&StandaloneWholeBlobMediaStage>,
+        media: Option<&WholeBlobMediaStage>,
     ) -> Result<Vec<HeadCanonicalActivationOutcome>, RuntimeStoreError> {
         let candidates = head_canonical_activation_order(conn, source)?;
         let mut outcomes = Vec::new();
@@ -11477,22 +11477,25 @@ ORDER BY runtime_id";
         CoLocatedSessionStore,
     }
 
-    /// The inline images a standalone conversion stored before it converts
-    /// ([`SqliteRuntimeStore::stage_standalone_whole_blob_media`]): every
-    /// image the WholeBlob bodies it would seed hold inline, put into the
-    /// realm blob store under its content address.
+    /// The inline images a media stage stored before a standalone conversion
+    /// or a realm open lays its sessions out
+    /// ([`SqliteRuntimeStore::stage_standalone_whole_blob_media`],
+    /// [`SqliteRuntimeStore::stage_realm_whole_blob_media`]): every image the
+    /// sources it would lay out hold inline, put into the realm blob store
+    /// under its content address.
     ///
-    /// Only the stage step fills one, so a conversion never takes an image
-    /// id the step did not store. The default stage is empty, and a
-    /// conversion given it refuses every body that holds inline images.
+    /// Only a stage step fills one, so a conversion or an open never takes an
+    /// image id the step did not store. The default stage is empty, and a
+    /// conversion or an open given it refuses every source that holds inline
+    /// images.
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     #[non_exhaustive]
-    pub struct StandaloneWholeBlobMediaStage {
+    pub struct WholeBlobMediaStage {
         stored: std::collections::BTreeSet<meerkat_core::BlobId>,
-        runtimes: Vec<StandaloneWholeBlobMediaRuntime>,
+        runtimes: Vec<WholeBlobMediaRuntime>,
     }
 
-    impl StandaloneWholeBlobMediaStage {
+    impl WholeBlobMediaStage {
         /// The content address of every image this stage stored.
         pub fn stored(&self) -> &std::collections::BTreeSet<meerkat_core::BlobId> {
             &self.stored
@@ -11500,32 +11503,33 @@ ORDER BY runtime_id";
 
         /// The runtimes whose bodies hold inline images, in the order the
         /// conversion takes them up.
-        pub fn runtimes(&self) -> &[StandaloneWholeBlobMediaRuntime] {
+        pub fn runtimes(&self) -> &[WholeBlobMediaRuntime] {
             &self.runtimes
         }
     }
 
-    /// One runtime whose WholeBlob body holds inline images.
+    /// One runtime whose sources hold inline images: its WholeBlob body and,
+    /// in a realm, its session's legacy blob row.
     #[derive(Debug, Clone, PartialEq, Eq)]
     #[non_exhaustive]
-    pub struct StandaloneWholeBlobMediaRuntime {
+    pub struct WholeBlobMediaRuntime {
         runtime_id: LogicalRuntimeId,
         session_id: meerkat_core::types::SessionId,
         images: usize,
     }
 
-    impl StandaloneWholeBlobMediaRuntime {
-        /// The runtime whose body holds the images.
+    impl WholeBlobMediaRuntime {
+        /// The runtime whose sources hold the images.
         pub fn runtime_id(&self) -> &LogicalRuntimeId {
             &self.runtime_id
         }
 
-        /// The session the runtime's body holds.
+        /// The runtime's session.
         pub fn session_id(&self) -> &meerkat_core::types::SessionId {
             &self.session_id
         }
 
-        /// Distinct images the body holds inline.
+        /// Distinct images its sources hold inline.
         pub fn images(&self) -> usize {
             self.images
         }
@@ -11847,11 +11851,11 @@ ORDER BY runtime_id";
         pub async fn stage_realm_whole_blob_media(
             path: impl Into<PathBuf>,
             blob_store: &dyn meerkat_core::BlobStore,
-        ) -> Result<StandaloneWholeBlobMediaStage, RuntimeStoreError> {
+        ) -> Result<WholeBlobMediaStage, RuntimeStoreError> {
             let path = path.into();
             validate_runtime_database_file(&path)?;
             if !path.is_file() {
-                return Ok(StandaloneWholeBlobMediaStage::default());
+                return Ok(WholeBlobMediaStage::default());
             }
             // Read every payload, and close the database, before the first
             // store write.
@@ -11875,14 +11879,14 @@ ORDER BY runtime_id";
         /// were, with their inline images, beside the activated rows.
         pub fn new_head_canonical_with_staged_media(
             path: impl Into<PathBuf>,
-            stage: &StandaloneWholeBlobMediaStage,
+            stage: &WholeBlobMediaStage,
         ) -> Result<Self, RuntimeStoreError> {
             Self::open_head_canonical(path.into(), Some(stage))
         }
 
         fn open_head_canonical(
             path: PathBuf,
-            media: Option<&StandaloneWholeBlobMediaStage>,
+            media: Option<&WholeBlobMediaStage>,
         ) -> Result<Self, RuntimeStoreError> {
             validate_runtime_database_file(&path)?;
             let mut conn = open_head_canonical_runtime_connection(&path)?;
@@ -12018,7 +12022,7 @@ ORDER BY runtime_id";
         pub async fn stage_standalone_whole_blob_media(
             path: impl Into<PathBuf>,
             blob_store: &dyn meerkat_core::BlobStore,
-        ) -> Result<StandaloneWholeBlobMediaStage, RuntimeStoreError> {
+        ) -> Result<WholeBlobMediaStage, RuntimeStoreError> {
             let path = path.into();
             validate_runtime_database_file(&path)?;
             if !path.is_file() {
@@ -12052,14 +12056,14 @@ ORDER BY runtime_id";
         /// the two steps again finishes the rest.
         pub fn convert_standalone_whole_blob_in_place_with_staged_media(
             path: impl Into<PathBuf>,
-            stage: &StandaloneWholeBlobMediaStage,
+            stage: &WholeBlobMediaStage,
         ) -> Result<StandaloneWholeBlobConversionReport, RuntimeStoreError> {
             Self::convert_standalone_whole_blob(path.into(), Some(stage))
         }
 
         fn convert_standalone_whole_blob(
             path: PathBuf,
-            media: Option<&StandaloneWholeBlobMediaStage>,
+            media: Option<&WholeBlobMediaStage>,
         ) -> Result<StandaloneWholeBlobConversionReport, RuntimeStoreError> {
             validate_runtime_database_file(&path)?;
             if !path.is_file() {
@@ -24209,7 +24213,7 @@ ORDER BY runtime_id";
             let refused =
                 SqliteRuntimeStore::convert_standalone_whole_blob_in_place_with_staged_media(
                     &path,
-                    &StandaloneWholeBlobMediaStage::default(),
+                    &WholeBlobMediaStage::default(),
                 );
             assert!(
                 matches!(
@@ -24416,7 +24420,7 @@ ORDER BY runtime_id";
 
             let refused = SqliteRuntimeStore::new_head_canonical_with_staged_media(
                 &path,
-                &StandaloneWholeBlobMediaStage::default(),
+                &WholeBlobMediaStage::default(),
             );
             assert!(
                 matches!(
@@ -31772,7 +31776,6 @@ pub use inner::delivery_generation_test_hooks;
 #[cfg(feature = "sqlite-store")]
 pub use inner::{
     RUNTIME_STORE_DOMAIN, SqliteRuntimeStore, StandaloneWholeBlobConversionReport,
-    StandaloneWholeBlobMediaRuntime, StandaloneWholeBlobMediaStage,
-    StandaloneWholeBlobRuntimeConversion, StandaloneWholeBlobSessionSource,
-    prepare_pre_0_8_10_runtime_input_states,
+    StandaloneWholeBlobRuntimeConversion, StandaloneWholeBlobSessionSource, WholeBlobMediaRuntime,
+    WholeBlobMediaStage, prepare_pre_0_8_10_runtime_input_states,
 };
