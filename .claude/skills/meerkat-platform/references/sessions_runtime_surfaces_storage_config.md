@@ -161,6 +161,10 @@ written any input row there is no downgrade to 0.9.3. Upgrade every process
 that shares a runtime store together. Likewise a HeadCanonical session that
 records a failed realtime response writes realtime sidecar event schema 4,
 which 0.9.3 and earlier refuse ("unsupported realtime event schema 4").
+A session whose last turn 0.9.2 or 0.9.3 committed but never finalized (for
+example a mob member stopped at a compaction) finalizes that turn at its first
+0.9.4 start and accepts work again: the store compares a row an earlier
+release wrote by its typed content rather than its bytes.
 
 A database whose ledger is newer than the binary is refused as
 `SchemaFromTheFuture` before any write. SQLite files must be regular files with
