@@ -2349,11 +2349,8 @@ pub trait MobProvisioner: Send + Sync {
         ))
     }
 
-    /// Cancel all active checkpointer gates so in-flight saves complete but
-    /// subsequent checkpoints are no-ops. Call during mob stop.
-    async fn cancel_all_checkpointers(&self) {}
-
-    /// Re-enable checkpointer gates after a prior cancel. Call during mob resume.
+    /// Re-enable checkpointer gates a host cancelled. Resume and Reset call
+    /// this; the mob itself never cancels them.
     async fn rearm_all_checkpointers(&self) {}
 }
 
@@ -15549,10 +15546,6 @@ impl MobProvisioner for SessionBackend {
         Ok(())
     }
 
-    async fn cancel_all_checkpointers(&self) {
-        self.session_service.cancel_all_checkpointers().await;
-    }
-
     async fn rearm_all_checkpointers(&self) {
         self.session_service.rearm_all_checkpointers().await;
     }
@@ -19844,10 +19837,6 @@ impl MobProvisioner for MultiBackendProvisioner {
                 &provision_operation_id,
             )
             .await
-    }
-
-    async fn cancel_all_checkpointers(&self) {
-        self.session.cancel_all_checkpointers().await;
     }
 
     async fn rearm_all_checkpointers(&self) {

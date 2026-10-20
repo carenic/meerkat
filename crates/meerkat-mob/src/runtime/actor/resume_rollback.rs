@@ -146,7 +146,6 @@ impl MobActor {
                 .into_iter()
                 .map(ResumeRollbackMemberOutcome::from_member_stop)
                 .collect::<Vec<_>>();
-            context.provisioner.cancel_all_checkpointers().await;
             if command_tx
                 .send(RoutedMobCommand::internal(
                     MobCommand::ResumeLifecycleRollbackFinalized { attempt, outcomes },
