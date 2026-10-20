@@ -44,6 +44,8 @@ live_comms_mobs_live.md and comms in live_comms_mobs_comms.md.
   reopened in the same process holds its members only if it is restored
   stopped. A resume finishes a Stop an earlier process left half done
   before it returns the mob (waiting up to 5 s), so the mob reads Stopped.
+  An attempt still running after 5 s (held on a member or a placed
+  completion) goes on in the background; wait for `MobStopped`.
 - Rust `MobHandle::stop()` returns a `MobStopReport`.
   `shutdown_with_report(ShutdownOptions)` cancels in-flight runs immediately
   and reports each member. Since 0.9.4 an admitted Shutdown closes admission
@@ -128,7 +130,11 @@ succeeds after it. `MobError` is `#[non_exhaustive]`. Details in
   (`session/archive`, REST `DELETE /sessions/{id}`, MCP `meerkat_archive`)
   re-drives it once per request.
 - `rkat mob respawn <MOB_ID> <AGENT_IDENTITY> [--initial-message <MSG>]`
-  (RPC `mob/respawn`) replaces the member under a new runtime binding.
+  (RPC `mob/respawn`) replaces the member under a new runtime binding. Since
+  0.9.4 the successor keeps its predecessor's spawn-time tool restrictions
+  (never widened) and, while the provider matches, its auth binding; a
+  respawn whose restrictions cannot be established (a lost-session Broken
+  member too) is refused before anything is retired, and the member is kept.
 - Since 0.9.4 a mob that was reset and then re-spawned a member under an
   identity it had before the reset resumes after a restart (0.9.3 and earlier
   failed that resume with an internal error), and the re-spawned member always
@@ -151,11 +157,10 @@ succeeds after it. `MobError` is `#[non_exhaustive]`. Details in
   `runtime_rejected`, was `mob_rejected`). Rust
   `MobHandle::retire_at_scope(&scope)` retires exactly the incarnation a
   delivery scope names, never a successor.
-- Since 0.9.4 a respawned member starts its own execution-health record, an
-  idle close no longer counts a retired member's last observed work, a placed
-  member no longer shows its predecessor's kickoff after a restart, and a
-  destroy reloads a member whose boundary commit failed and retries its
-  retirement once (`reloaded_members`).
+- Since 0.9.4 a respawned member gets a fresh health record, idle close
+  ignores retired members' work, a restarted placed member shows no
+  predecessor kickoff, and destroy reloads a member whose boundary commit
+  failed, then retries it once (`reloaded_members`).
 - `mob/spawn` also takes `labels`, `additional_instructions` (sections
   appended to the member's system prompt after its skills) and `context`: an
   opaque JSON application context for host build callbacks (a custom
