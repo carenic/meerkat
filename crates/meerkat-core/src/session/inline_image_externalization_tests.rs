@@ -3,6 +3,7 @@
 //! with: camera snapshots in tool results, an image in a runtime notice and
 //! in a user message, held in the anchor, in rewrite replacements, in the
 //! parent advance a later compaction swallowed, and in the live tail.
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use super::*;
 use crate::session_store::strand_layout_for_retained_history;
@@ -358,4 +359,278 @@ fn a_content_addressed_append_is_re_derived_from_its_preceding_endpoint() {
         parent.contains("\"blob_id\""),
         "the parent names its images by blob id"
     );
+}
+
+/// A blob store that keeps each payload under the id it is put by.
+#[derive(Default)]
+struct PayloadStore(std::sync::Mutex<std::collections::BTreeMap<crate::BlobId, (String, String)>>);
+
+#[async_trait::async_trait]
+impl crate::BlobStore for PayloadStore {
+    async fn put_image(
+        &self,
+        media_type: &str,
+        data: &str,
+    ) -> Result<crate::BlobRef, crate::BlobStoreError> {
+        let blob_id = crate::content_blob_id(media_type, data);
+        self.0
+            .lock()
+            .unwrap()
+            .insert(blob_id.clone(), (media_type.to_string(), data.to_string()));
+        Ok(crate::BlobRef {
+            blob_id,
+            media_type: media_type.to_string(),
+        })
+    }
+
+    async fn get(
+        &self,
+        blob_id: &crate::BlobId,
+    ) -> Result<crate::BlobPayload, crate::BlobStoreError> {
+        let (media_type, data) = self
+            .0
+            .lock()
+            .unwrap()
+            .get(blob_id)
+            .cloned()
+            .ok_or_else(|| crate::BlobStoreError::NotFound(blob_id.clone()))?;
+        Ok(crate::BlobPayload {
+            blob_id: blob_id.clone(),
+            media_type,
+            data,
+        })
+    }
+
+    async fn delete(&self, blob_id: &crate::BlobId) -> Result<(), crate::BlobStoreError> {
+        self.0.lock().unwrap().remove(blob_id);
+        Ok(())
+    }
+
+    fn is_persistent(&self) -> bool {
+        false
+    }
+}
+
+fn image(media_type: &str, data: &str) -> ContentBlock {
+    ContentBlock::Image {
+        media_type: media_type.to_string(),
+        data: ImageData::Inline {
+            data: data.to_string(),
+        },
+    }
+}
+
+/// A camera tool call and its result carrying two snapshots, one under a
+/// non-canonical media type, and an incoming comms notice carrying a third.
+fn camera_rows(turn: usize) -> Vec<Message> {
+    let call_id = format!("toolu_{turn}");
+    let comms: SystemNoticeBlock = serde_json::from_value(serde_json::json!({
+        "type": "comms",
+        "kind": "message",
+        "direction": "incoming",
+        "content": [image("image/jpeg", &photo(3 * turn + 2))],
+    }))
+    .unwrap();
+    vec![
+        Message::BlockAssistant(BlockAssistantMessage::new(
+            vec![AssistantBlock::ToolUse {
+                id: call_id.clone(),
+                name: "camera_snapshot".to_string(),
+                args: serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
+                meta: None,
+            }],
+            StopReason::ToolUse,
+        )),
+        Message::tool_results(vec![ToolResult::with_blocks(
+            call_id,
+            vec![
+                image("image/PNG", &photo(3 * turn)),
+                image("image/png", &photo(3 * turn + 1)),
+            ],
+            false,
+        )]),
+        Message::SystemNotice(SystemNoticeMessage::with_block(
+            SystemNoticeKind::Generic,
+            None,
+            comms,
+        )),
+    ]
+}
+
+/// Six rows of text, the shape each compaction of the loop leaves behind.
+fn compaction_replacement(turn: usize) -> Vec<Message> {
+    let mut rows = vec![Message::User(UserMessage::text(format!("summary {turn}")))];
+    for exchange in 0..2 {
+        rows.push(Message::User(UserMessage::text(format!(
+            "question {turn}.{exchange}"
+        ))));
+        rows.push(Message::BlockAssistant(BlockAssistantMessage::new(
+            vec![AssistantBlock::Text {
+                text: format!("answer {turn}.{exchange}"),
+                meta: None,
+            }],
+            StopReason::EndTurn,
+        )));
+    }
+    rows.push(Message::User(UserMessage::text(format!("next {turn}"))));
+    rows
+}
+
+/// The shape of a long-lived household session written by a build that
+/// kept tool-result images inline: one prune edit, then compactions, each
+/// swallowing the camera rows appended after the previous one, ten of them
+/// in a loop that takes the transcript from nine rows back to six, and the
+/// graph retired to the default retention, so it is re-anchored. Every image
+/// is in a parent advance or the live tail, none in a replacement. The
+/// externalized copy keeps the transcript revision, every commit, the
+/// rewrite prefix and each image's own media type string; it lays out with
+/// no inline bytes; and every retained revision, hydrated from the
+/// payloads, is the source's revision byte for byte.
+#[tokio::test]
+async fn a_re_anchored_household_history_with_tool_result_images_converts() {
+    let mut session = Session::new();
+    for (index, text) in ["hello", "prune me", "and me", "keep this"]
+        .into_iter()
+        .enumerate()
+    {
+        session.push(Message::User(UserMessage::text(text)));
+        session.push(Message::BlockAssistant(BlockAssistantMessage::new(
+            vec![AssistantBlock::Text {
+                text: format!("reply {index}"),
+                meta: None,
+            }],
+            StopReason::EndTurn,
+        )));
+    }
+    session
+        .commit_transcript_rewrite(
+            TranscriptRewriteSelection::MessageRange { start: 2, end: 6 },
+            vec![Message::User(UserMessage::text("pruned"))],
+            TranscriptRewriteReason::new("prune"),
+            Some("test".to_string()),
+            None,
+        )
+        .unwrap();
+    session.push(Message::User(UserMessage::text("show me the cameras")));
+    for turn in 0..13 {
+        session.push_batch(camera_rows(turn));
+        let end = session.messages().len();
+        session
+            .commit_transcript_rewrite(
+                TranscriptRewriteSelection::MessageRange { start: 0, end },
+                compaction_replacement(turn),
+                TranscriptRewriteReason::new("compaction"),
+                Some("test".to_string()),
+                None,
+            )
+            .unwrap();
+    }
+    session.push_batch(camera_rows(13));
+    assert_eq!(commits(&session).len(), 14);
+    assert!(
+        session
+            .retire_transcript_history(crate::TranscriptHistoryRetention::default())
+            .unwrap()
+            > 0
+    );
+    let source = Session::decode_whole_blob_document(&serde_json::to_vec(&session).unwrap())
+        .unwrap()
+        .into_session();
+    let refusal = laid_out_bytes(&source).expect_err("inline images refuse the layout");
+    assert!(
+        refusal
+            .to_string()
+            .contains("compact rewrite delta carries inline media"),
+        "{refusal}"
+    );
+
+    let externalized = source
+        .with_inline_images_externalized()
+        .unwrap()
+        .expect("the session holds inline images");
+    let media_types = externalized
+        .payloads
+        .iter()
+        .map(|payload| payload.media_type.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        media_types,
+        ["image/PNG", "image/jpeg", "image/png"]
+            .into_iter()
+            .collect()
+    );
+    for payload in &externalized.payloads {
+        assert_eq!(
+            payload.blob_id,
+            crate::content_blob_id(&payload.media_type, &payload.data)
+        );
+    }
+    let converted = &externalized.session;
+    assert_eq!(
+        converted.transcript_revision().unwrap(),
+        source.transcript_revision().unwrap()
+    );
+    assert_eq!(commits(converted), commits(&source));
+    assert_eq!(
+        converted
+            .transcript_history_state()
+            .unwrap()
+            .unwrap()
+            .rewrite_prefix(),
+        source
+            .transcript_history_state()
+            .unwrap()
+            .unwrap()
+            .rewrite_prefix()
+    );
+    for bytes in laid_out_bytes(converted).expect("the converted session lays out") {
+        let row = String::from_utf8(bytes).unwrap();
+        for payload in &externalized.payloads {
+            assert!(!row.contains(payload.data.as_str()));
+        }
+    }
+
+    let store = PayloadStore::default();
+    for payload in &externalized.payloads {
+        crate::BlobStore::put_image(&store, &payload.media_type, &payload.data)
+            .await
+            .unwrap();
+    }
+    let retired = source
+        .transcript_history_state()
+        .unwrap()
+        .unwrap()
+        .retired_count();
+    let mut revisions = vec![source.transcript_revision().unwrap()];
+    for commit in commits(&source).into_iter().skip(retired) {
+        revisions.push(commit.parent_revision);
+        revisions.push(commit.revision);
+    }
+    for revision in revisions {
+        let mut rows = converted
+            .retained_transcript_revision_rows(&revision)
+            .unwrap()
+            .expect("a retained revision")
+            .messages()
+            .to_vec();
+        crate::image_content::hydrate_messages_for_execution(
+            &store,
+            &mut rows,
+            crate::image_content::MissingBlobBehavior::Error,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&rows).unwrap(),
+            serde_json::to_value(
+                source
+                    .retained_transcript_revision_rows(&revision)
+                    .unwrap()
+                    .expect("a retained revision")
+                    .messages()
+            )
+            .unwrap(),
+            "revision {revision}"
+        );
+    }
 }
