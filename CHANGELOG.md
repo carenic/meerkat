@@ -2576,8 +2576,9 @@ them.
   recovery.
 - Identity reconciliation (`meerkat-mob`): a genuine storage or host error
   after an identity's member retirement has durably started leaves the
-  identity in `Backoff` until the mob is resumed or the host process
-  restarts, either of which recovers it.
+  identity in `Backoff` until the mob is resumed, the host process restarts
+  or the host calls `MobHandle::redrive_retirement`, any of which recovers
+  it.
 
 ## [0.9.3] - 2026-10-18
 
