@@ -135,10 +135,16 @@ while IFS=$'\t' read -r name lib_name features; do
     fi
     echo "semver-rustdoc: ${name} features=[${features}]"
     doc_args+=(-p "$name")
+    # Bare feature names. Cargo reads `name/feature` as a feature of the
+    # dependency called `name` whenever the crate has one, so for a crate with
+    # a same-named dev-dependency on itself the feature went to that
+    # dev-dependency, which `cargo doc --lib` never builds. A bare name reaches
+    # every selected crate that has the feature; the lists above filter by
+    # name alone, so each crate still gets exactly its own list.
     IFS=',' read -r -a feature_list <<<"$features"
     for feature in "${feature_list[@]}"; do
         [[ -n "$feature" ]] || continue
-        doc_args+=(--features "${name}/${feature}")
+        doc_args+=(--features "$feature")
     done
     generated+=("${name}=${features}")
     lib_names+=("${name}=${lib_name}")
