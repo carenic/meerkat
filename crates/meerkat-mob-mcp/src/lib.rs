@@ -16890,8 +16890,9 @@ mod tests {
         let mut host_origins = Vec::new();
         for (path, source) in &sources {
             for (at, _) in source.match_indices("ManagedMob {") {
-                // The struct's own definition is not an entry.
-                if !source[..at].ends_with("struct ") {
+                // Neither the struct's own definition nor a function's return
+                // type is an entry.
+                if !source[..at].ends_with("struct ") && !source[..at].ends_with("-> ") {
                     literals.push((path.clone(), at));
                 }
             }
