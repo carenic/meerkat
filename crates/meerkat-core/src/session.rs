@@ -122,6 +122,8 @@ pub mod context_control;
 mod digest_accumulator;
 mod head_metadata;
 mod import_0810;
+#[cfg(test)]
+mod inline_image_externalization_tests;
 mod instruction_activation;
 pub mod model_routing_control;
 pub mod model_routing_handoff_staging;
@@ -471,6 +473,29 @@ impl RetainedTranscriptRevisionRows {
     ) -> Result<(), crate::blob::BlobStoreError> {
         crate::image_content::externalize_messages_from(blob_store, &mut self.messages, 0).await
     }
+}
+
+/// One inline image that [`Session::with_inline_images_externalized`] moved
+/// out of a transcript: the bytes a blob store must hold under `blob_id`
+/// before the rewritten transcript is persisted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineImagePayload {
+    /// [`crate::content_blob_id`] of `media_type` and `data`.
+    pub blob_id: crate::BlobId,
+    /// The image block's own media type.
+    pub media_type: String,
+    /// The base64 image bytes.
+    pub data: String,
+}
+
+/// A session whose transcript names every image it held inline by its
+/// content address, and the payloads those addresses name.
+#[derive(Debug, Clone)]
+pub struct InlineImageExternalization {
+    /// The rewritten session.
+    pub session: Session,
+    /// Each distinct image the rewrite moved out, in first-seen order.
+    pub payloads: Vec<InlineImagePayload>,
 }
 
 fn canonicalize_digest_image_blocks(blocks: &mut [crate::types::ContentBlock]) {
@@ -8085,6 +8110,88 @@ impl Session {
             session_id: self.id.clone(),
             revision: revision.to_string(),
             messages,
+        }))
+    }
+
+    /// This session with every image it holds inline rewritten to a blob
+    /// reference, in its live rows and in every body its transcript graph
+    /// retains, together with the payloads a blob store must hold before the
+    /// result is persisted; `None` when it holds no inline image.
+    ///
+    /// Each image becomes a reference named by [`crate::content_blob_id`] of
+    /// its media type and data, which is the form transcript digests already
+    /// canonicalize an inline image to. The transcript revision, every
+    /// rewrite commit and the rewrite prefix are therefore unchanged; the row
+    /// lineage and graph prefix the bodies' bytes bind are re-derived, and
+    /// the result is decoded as a persisted WholeBlob document, so it passes
+    /// the same validation. Pure and deterministic: no blob is written.
+    /// Inline video has no blob form and stays as row content.
+    pub fn with_inline_images_externalized(
+        &self,
+    ) -> Result<Option<InlineImageExternalization>, TranscriptEditError> {
+        let malformed = |error: &dyn std::fmt::Display| {
+            TranscriptEditError::HistoryStateMalformed(error.to_string())
+        };
+        let mut collector = crate::image_content::InlineImageCollector::default();
+        let history = match self
+            .transcript_history_state()
+            .map_err(|error| malformed(&error))?
+        {
+            Some(state) => {
+                state.with_bodies_rewritten(&mut |message| collector.externalize(message))?
+            }
+            None => None,
+        };
+        let mut messages = self.messages().to_vec();
+        let mut live_changed = false;
+        for message in &mut messages {
+            live_changed |= collector.externalize(message);
+        }
+        if history.is_none() && !live_changed {
+            return Ok(None);
+        }
+        let mut document = serde_json::to_value(self).map_err(|error| malformed(&error))?;
+        let fields = document.as_object_mut().ok_or_else(|| {
+            TranscriptEditError::HistoryStateMalformed(
+                "a WholeBlob session document is not an object".to_string(),
+            )
+        })?;
+        fields.insert(
+            "messages".to_string(),
+            serde_json::to_value(&messages).map_err(|error| malformed(&error))?,
+        );
+        if let Some(history) = history {
+            let metadata = fields
+                .get_mut("metadata")
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or_else(|| {
+                    TranscriptEditError::HistoryStateMalformed(
+                        "a WholeBlob session document with a transcript graph has no metadata"
+                            .to_string(),
+                    )
+                })?;
+            metadata.insert(
+                SESSION_TRANSCRIPT_HISTORY_STATE_KEY.to_string(),
+                serde_json::to_value(&history).map_err(|error| malformed(&error))?,
+            );
+        }
+        let bytes = serde_json::to_vec(&document).map_err(|error| malformed(&error))?;
+        let session = Self::decode_whole_blob_document(&bytes)
+            .map_err(|error| malformed(&error))?
+            .into_session();
+        let revision = |session: &Self| {
+            session
+                .transcript_revision()
+                .map_err(|error| malformed(&error))
+        };
+        if revision(&session)? != revision(self)? {
+            return Err(TranscriptEditError::HistoryStateMalformed(
+                "externalizing inline images changed the transcript revision".to_string(),
+            ));
+        }
+        Ok(Some(InlineImageExternalization {
+            session,
+            payloads: collector.into_payloads(),
         }))
     }
 

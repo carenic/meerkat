@@ -2803,6 +2803,180 @@ impl TranscriptHistoryState {
 
     pub(crate) fn prune_mechanical_revision_bodies(&mut self) {}
 
+    /// This graph with every retained body message (the anchor rows, each
+    /// occurrence's parent advance and its rewrite replacement) passed
+    /// through `rewrite`, or `None` when `rewrite` changed none of them.
+    ///
+    /// `rewrite` may change only the bytes of a row, never its meaning:
+    /// commits, revisions, digests and the rewrite prefix are kept as they
+    /// are, so a rewrite that changes a row's semantic content fails the
+    /// validation the result must pass. What the bodies' bytes bind is
+    /// re-derived in occurrence order, exactly as validation derives it: a
+    /// whole graph's anchor row prefix, every parent row prefix (a
+    /// content-addressed append's included, which the layout requires to
+    /// extend the preceding endpoint), every result witness and the graph
+    /// prefix. A re-anchored graph keeps the anchor row prefix and graph
+    /// prefix its retired prefix carries; they bind bodies it no longer holds.
+    pub(crate) fn with_bodies_rewritten(
+        &self,
+        rewrite: &mut dyn FnMut(&mut Message) -> bool,
+    ) -> Result<Option<Self>, TranscriptEditError> {
+        fn rewritten(
+            messages: &[Message],
+            rewrite: &mut dyn FnMut(&mut Message) -> bool,
+            changed: &mut bool,
+        ) -> Vec<Message> {
+            let mut messages = messages.to_vec();
+            for message in &mut messages {
+                *changed |= rewrite(message);
+            }
+            messages
+        }
+        fn rows(messages: &[Message]) -> Result<Vec<Vec<u8>>, TranscriptEditError> {
+            messages
+                .iter()
+                .map(serde_json::to_vec)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| TranscriptEditError::HistoryStateMalformed(error.to_string()))
+        }
+        fn coordinate(value: usize) -> Result<u64, TranscriptEditError> {
+            u64::try_from(value).map_err(|_| {
+                TranscriptEditError::HistoryStateMalformed(
+                    "rewritten transcript body exceeds durable row coordinates".to_string(),
+                )
+            })
+        }
+        let malformed = |error: &dyn std::fmt::Display| {
+            TranscriptEditError::HistoryStateMalformed(error.to_string())
+        };
+
+        let mut changed = false;
+        let anchor_messages = rewritten(self.anchor.messages(), rewrite, &mut changed);
+        let edges = self.edges.ordered();
+        let mut bodies = Vec::with_capacity(edges.len());
+        for edge in edges {
+            let parent_advance = match &edge.parent_advance {
+                TranscriptParentAdvance::ExactAppend { appended } => {
+                    TranscriptParentAdvance::ExactAppend {
+                        appended: rewritten(appended, rewrite, &mut changed),
+                    }
+                }
+                TranscriptParentAdvance::ContentAddressedAppend { appended } => {
+                    TranscriptParentAdvance::ContentAddressedAppend {
+                        appended: rewritten(appended, rewrite, &mut changed),
+                    }
+                }
+                TranscriptParentAdvance::ExactSplice {
+                    at,
+                    replacement,
+                    appended,
+                } => TranscriptParentAdvance::ExactSplice {
+                    at: *at,
+                    replacement: rewritten(replacement, rewrite, &mut changed),
+                    appended: rewritten(appended, rewrite, &mut changed),
+                },
+            };
+            let replacement = rewritten(edge.rewrite.replacement(), rewrite, &mut changed);
+            bodies.push((parent_advance, replacement));
+        }
+        if !changed {
+            return Ok(None);
+        }
+
+        let anchor_row_prefix = if self.retired.is_some() {
+            self.anchor.row_prefix.clone()
+        } else {
+            SessionMessageRowPrefixAccumulator::from_messages(&anchor_messages)
+                .map_err(|error| malformed(&error))?
+        };
+        let mut base_witness = TranscriptEndpointWitness {
+            message_count: anchor_messages.len(),
+            row_prefix: anchor_row_prefix.clone(),
+        };
+        let anchor = TranscriptRevisionAnchor {
+            revision: self.anchor.revision.clone(),
+            messages: anchor_messages,
+            row_prefix: anchor_row_prefix,
+            created_at: self.anchor.created_at,
+        };
+        let mut rebuilt = Vec::with_capacity(edges.len());
+        for (edge, (parent_advance, replacement)) in edges.iter().zip(bodies) {
+            let base_prefix = match &parent_advance {
+                TranscriptParentAdvance::ExactSplice {
+                    at, replacement, ..
+                } => {
+                    let start = coordinate(*at)?;
+                    let end = coordinate(at.checked_add(replacement.len()).ok_or_else(|| {
+                        TranscriptEditError::HistoryStateMalformed(
+                            "rewritten parent splice end overflowed".to_string(),
+                        )
+                    })?)?;
+                    base_witness
+                        .row_prefix
+                        .replace_serialized_range(start, end, &rows(replacement)?)
+                        .map_err(|error| malformed(&error))?
+                }
+                TranscriptParentAdvance::ExactAppend { .. }
+                | TranscriptParentAdvance::ContentAddressedAppend { .. } => {
+                    base_witness.row_prefix.clone()
+                }
+            };
+            let parent_row_prefix = base_prefix
+                .extend_serialized_rows(&rows(parent_advance.appended())?)
+                .map_err(|error| malformed(&error))?;
+            let (start, end) = edge.commit.selection.bounds();
+            let result_witness = TranscriptEndpointWitness {
+                message_count: edge.result_witness.message_count,
+                row_prefix: parent_row_prefix
+                    .replace_serialized_range(
+                        coordinate(start)?,
+                        coordinate(end)?,
+                        &rows(&replacement)?,
+                    )
+                    .map_err(|error| malformed(&error))?,
+            };
+            rebuilt.push(TranscriptRevisionEdge {
+                commit: edge.commit.clone(),
+                rewrite_prefix: edge.rewrite_prefix.clone(),
+                base_revision: edge.base_revision.clone(),
+                messages_before_base: edge.messages_before_base,
+                parent_advance,
+                parent_row_prefix,
+                rewrite: TranscriptRewritePatch {
+                    at: edge.rewrite.at,
+                    replacement,
+                },
+                result_witness: result_witness.clone(),
+                parent_created_at: edge.parent_created_at,
+                revision_created_at: edge.revision_created_at,
+            });
+            base_witness = result_witness;
+        }
+        let graph_base = match self.retired.as_deref() {
+            Some(retired) => retired.graph_prefix.clone(),
+            None => TranscriptGraphPrefixAccumulator::from_anchor(&anchor)
+                .map_err(|error| malformed(&error))?,
+        };
+        let edge_count = rebuilt.len();
+        let edges = PersistentTranscriptEdges::from_vec_after(graph_base.clone(), rebuilt)
+            .map_err(|error| malformed(&error))?;
+        let graph_prefix = edges
+            .graph_prefix_at(edge_count)
+            .cloned()
+            .unwrap_or(graph_base);
+        let state = Self {
+            format: self.format,
+            retired: self.retired.clone(),
+            anchor: Arc::new(anchor),
+            edges,
+            rewrite_prefix: self.rewrite_prefix.clone(),
+            graph_prefix,
+            digest_format: self.digest_format,
+        };
+        validate_transcript_history_state(&state)?;
+        Ok(Some(state))
+    }
+
     pub(super) fn proved_prefix(&self, edge_count: usize) -> Result<Self, TranscriptEditError> {
         if edge_count == 0 || edge_count > self.commit_count() {
             return Err(TranscriptEditError::HistoryStateMalformed(format!(
