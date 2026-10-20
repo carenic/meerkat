@@ -1642,6 +1642,17 @@ them.
   first, through the store-owned recovery the resume path runs (a proven
   continuation is adopted), and then reads the session.
 
+- `meerkat-session`: a member retires, respawns or resets when its retirement
+  cancels a turn at the turn's boundary. A turn cancelled after its durable
+  rows landed commits no boundary, so the session's canonical head stayed
+  ahead of the runtime boundary while this process still hosted the member's
+  live session. Every read of the session was refused as a transcript
+  revision conflict, and the retirement, or the respawn or destructive reset
+  built on it, stopped after it had durably started. A read of a hosted live
+  session that still conflicts after its retries now settles that tail
+  through the store-owned recovery a restart runs (a proven continuation is
+  adopted; a held or refused tail is left intact), and then reads again.
+
 - `meerkat-mob-mcp`: after a restart, the session that created a mob with
   the agent mob tools manages it again. A session's persisted mob operator
   authority binds no mob, so the manage grant its create returned was gone
