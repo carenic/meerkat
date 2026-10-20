@@ -332,27 +332,34 @@ where
 /// `profiles` is held, the context keeps the binding with no spawn profiles,
 /// so it can spawn nothing there.
 ///
-/// A host session hook can use this on the context a member is built with,
-/// for example the default scope over every profile of its own mob that a
-/// `tools.mob` member gets when it has no persisted authority, including a
-/// member the mob restores before the host holds its handle. It refuses a
-/// mob the context holds no spawn-profile scope for.
+/// A host session hook can use this on the context a member's session is
+/// built with, for example the default scope over every profile of its own
+/// mob that a `tools.mob` member gets when it has no persisted authority,
+/// including a member the mob restores before the host holds its handle.
+/// Every mob operator surface of that session admits against the narrowed
+/// context: a `MobToolsFactory` surface, and the mob runtime's own mob
+/// operator tools for the member (`spawn_member`, `spawn_many_members` and
+/// the rest).
+///
+/// It refuses a mob the context holds no spawn-profile scope for, and a
+/// context that generated authority did not mint.
 ///
 /// ```
-/// use meerkat_core::service::{LiveMobIncarnation, MobIncarnationId};
-/// use meerkat_runtime::mob_operator_authority::{
-///     create_only_mob_operator_authority, grant_spawn_profiles_in_mob,
-///     restrict_spawn_profiles_in_mob,
-/// };
+/// # use meerkat_core::service::{LiveMobIncarnation, MobIncarnationId};
+/// # use meerkat_runtime::mob_operator_authority::{
+/// #     create_only_mob_operator_authority, grant_spawn_profiles_in_mob,
+/// # };
+/// use meerkat_runtime::mob_operator_authority::restrict_spawn_profiles_in_mob;
 ///
 /// # fn main() -> Result<(), String> {
-/// let incarnation = MobIncarnationId::mint();
-/// let granted = grant_spawn_profiles_in_mob(
-///     &create_only_mob_operator_authority()?,
-///     "mob-1",
-///     LiveMobIncarnation::witnessed(incarnation),
-///     ["lead", "worker"],
-/// )?;
+/// # let incarnation = MobIncarnationId::mint();
+/// # let granted = grant_spawn_profiles_in_mob(
+/// #     &create_only_mob_operator_authority()?,
+/// #     "mob-1",
+/// #     LiveMobIncarnation::witnessed(incarnation),
+/// #     ["lead", "worker"],
+/// # )?;
+/// // `granted` holds spawn scope over "lead" and "worker" in mob-1.
 /// // Keep only "worker"; "auditor" is not held, so it is not added.
 /// let narrowed = restrict_spawn_profiles_in_mob(&granted, "mob-1", ["worker", "auditor"])?;
 /// assert!(narrowed.spawn_profile_scope_contains("mob-1", incarnation, "worker"));
@@ -865,6 +872,19 @@ mod tests {
         let error = restrict_spawn_profiles_in_mob(&manage_only, "mob-3", ["worker"])
             .expect_err("a mob with manage scope only holds no spawn scope to restrict");
         assert!(error.contains("mob-3"), "{error}");
+    }
+
+    /// A persisted projection of a context that held spawn scope in the mob
+    /// is not generated authority, and is refused.
+    #[test]
+    fn restricting_spawn_profiles_in_a_projection_context_is_refused() {
+        let (context, _, _) = spawn_and_manage_context();
+        let projected = persisted_projection(context);
+        assert!(!projected.is_generated_authority_context());
+        assert!(
+            restrict_spawn_profiles_in_mob(&projected, "mob-1", ["worker"]).is_err(),
+            "a projection is refused"
+        );
     }
 
     /// Keeping none of the held profiles leaves the mob bound with no spawn

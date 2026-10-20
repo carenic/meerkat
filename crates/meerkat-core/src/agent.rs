@@ -2641,6 +2641,24 @@ pub trait AgentToolDispatcher: Send + Sync {
         _handle: Arc<dyn crate::handles::ExternalToolSurfaceHandle>,
     ) {
     }
+
+    /// Bind the session's mob operator authority.
+    ///
+    /// The agent factory calls this on a session's external tools once the
+    /// session's final mob operator authority is settled, before it composes
+    /// them. `Some` is the session's effective-authority handle, which the
+    /// agent updates through `apply_session_effects`; `None` means the
+    /// session holds no mob operator authority. A dispatcher that admits mob
+    /// operator calls for the session (a mob runtime's own tools for a
+    /// member) admits against it, and a composite forwards it to every
+    /// child. A host that wraps a session's external tools in its own
+    /// dispatcher forwards it to the wrapped one. The default implementation
+    /// is a no-op for dispatchers that admit no mob operator calls.
+    fn bind_session_mob_tool_authority(
+        &self,
+        _authority: Option<Arc<std::sync::RwLock<crate::service::MobToolAuthorityContext>>>,
+    ) {
+    }
 }
 
 /// Resolve a plan against the exact live root dispatcher allocation.
