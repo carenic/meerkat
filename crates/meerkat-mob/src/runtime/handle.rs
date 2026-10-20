@@ -12334,6 +12334,9 @@ impl MobHandle {
     /// the scope in the same actor command that retires it, so a successor
     /// minted while the call runs (respawn, reset) is never retired through
     /// an older scope. Refusals:
+    /// - [`MobError::IncarnationMismatch`] when the scope was captured at
+    ///   another incarnation of this mob (one destroyed and created again
+    ///   under its id), checked before any step;
     /// - [`MobError::StaleFenceToken`] when another incarnation of the
     ///   identity is current (its runtime id or fence moved);
     /// - [`MobError::StaleDeliveryScope`] when the scope's incarnation is
@@ -12364,6 +12367,10 @@ impl MobHandle {
         &self,
         scope: &super::MemberDeliveryScope,
     ) -> Result<(), MobError> {
+        // A scope from another incarnation of this mob reaches no step: the
+        // member it names is gone for good, and a member of the new
+        // incarnation can carry its runtime id and fence.
+        self.require_scope_incarnation(scope).await?;
         let handle = self.clone();
         let scope = scope.clone();
         // Like `retire`, run the cascade off the caller's stack.

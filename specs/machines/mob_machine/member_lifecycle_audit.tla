@@ -521,7 +521,8 @@ AuditMintClearsExecutionHealth ==
 
 \* A step that mints an incarnation leaves the identity no failure record:
 \* either its recorded generation is unchanged, or none of the three
-\* failure maps holds it after the step.
+\* failure maps holds it after the step. It guards arms to come: the bounded
+\* run reaches no failure record before a mint, so it has no mutant.
 AuditMintClearsFailureRecords ==
     [][\A id \in DOMAIN identity_runtime_generations' :
          \/ /\ id \in DOMAIN identity_runtime_generations
