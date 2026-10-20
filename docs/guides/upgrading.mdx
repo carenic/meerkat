@@ -597,6 +597,13 @@ mob machine inputs, effects and transition ids gain `RetireAtScope` and
   never waits beyond its own I/O; a fence decorator that forwards fenced
   calls may forward `execute_if_current_blocking` as well. A fence
   implementation needs nothing new.
+- **Known limitation, adopted identities after a restart:** an adopted
+  identity runs again only once the previous process's identity lease
+  expires, at most 30 seconds after that process last renewed it
+  (`IDENTITY_LEASE_MAX_TTL_MS`), whether that process stopped gracefully or
+  not: no runtime path releases the lease at shutdown. Until then the
+  identity's convergence status reads decision `await_lease` (condition
+  `suspended`).
 - **Work that names an original its source owner has not settled yet** is
   reported not ready (`ControllerReadinessUnavailable` with
   `original_admission_pending`) and stays retryable, instead of being refused
