@@ -291,7 +291,12 @@ async fn a_retired_member_keeps_its_last_binding_and_resuming_it_restores_the_tr
             .contains(&live)
     );
 
-    handle.retire(member.clone()).await.expect("retire");
+    // `retire` answers a slow but healthy retirement with a typed
+    // in-progress error once its budget elapses, which a loaded run reaches
+    // in the session-archive stage; join the saga to its terminal reply.
+    retire_to_terminal(handle, &member)
+        .await
+        .expect("retire the member to its terminal");
 
     let retired = handle
         .last_member_binding(&member)
@@ -522,7 +527,9 @@ async fn the_history_survives_a_prune_of_everything_else() {
     let handle = &fixture.handle;
     let member = unique_identity("pruned-member");
     let session = wake(handle, &member).await;
-    handle.retire(member.clone()).await.expect("retire");
+    retire_to_terminal(handle, &member)
+        .await
+        .expect("retire the member to its terminal");
     let mob_id = handle.mob_id().clone();
     let mob_db = fixture.mob_db();
     let _root = fixture.stop().await;
