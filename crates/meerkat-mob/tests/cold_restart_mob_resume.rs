@@ -3719,13 +3719,13 @@ impl meerkat_client::LlmClient for HeldTurnClient {
 }
 
 /// A mob restarts after a member's retirement cancelled a turn at its
-/// boundary and the process died before the retirement finished. The held
-/// provider call is released once the retirement has asked the turn to cancel
-/// at its boundary, so the turn's durable rows land and the run ends cancelled
-/// without committing that boundary: the member's canonical head is left ahead
-/// of the runtime boundary it last committed. The next start restores the
-/// member's cleanup delivery before it admits any command and must settle that
-/// tail instead of fail-stopping the whole mob.
+/// boundary. The held provider call is released once the retirement has asked
+/// the turn to cancel at its boundary, so the turn's durable rows land and the
+/// run ends cancelled without committing that boundary. The retirement settles
+/// that tail in process (the runtime authority names the physical head again)
+/// and retires the member; the process then dies, and the next start must
+/// admit commands. A crash inside the window before the settle leaves the tail
+/// for the next start, whose cleanup restore settles it the same way.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_mob_whose_member_retirement_cancelled_a_turn_at_its_boundary_restarts() {
@@ -3811,8 +3811,14 @@ async fn a_mob_whose_member_retirement_cancelled_a_turn_at_its_boundary_restarts
     });
     sleep(Duration::from_millis(300)).await;
     client.release.notify_one();
-    let retired = tokio::time::timeout(Duration::from_secs(60), retire).await;
-    eprintln!("[cancelled-tail] retire => {retired:?}");
+    let retired = tokio::time::timeout(Duration::from_secs(60), retire)
+        .await
+        .expect("the retirement ends within its bound")
+        .expect("the retirement task completes");
+    assert!(
+        retired.is_ok(),
+        "the member's retirement settles the cancelled turn's tail and retires: {retired:?}"
+    );
     let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&w1_sid);
     let authority = runtime_store
         .load_session_boundary_authority(&runtime_id)
@@ -3822,20 +3828,16 @@ async fn a_mob_whose_member_retirement_cancelled_a_turn_at_its_boundary_restarts
     let authority = authority
         .head_canonical()
         .expect("head-canonical boundary authority");
-    let ahead_head = store_1
+    let physical_head = store_1
         .load_head(&w1_sid)
         .await
         .expect("load physical head")
         .expect("physical head exists");
-    assert_ne!(
-        meerkat_core::session_store::session_head_cas_token(&ahead_head)
+    assert_eq!(
+        meerkat_core::session_store::session_head_cas_token(&physical_head)
             .expect("physical head has a canonical token"),
         authority.committed_head_token(),
-        "the physical head must be ahead of the runtime authority"
-    );
-    assert!(
-        ahead_head.message_count > authority.boundary_head().message_count,
-        "the physical head must carry the cancelled turn's rows past the boundary"
+        "the retirement settles the cancelled turn's tail: the runtime authority names the physical head"
     );
     handle_1
         .crash_stop_preserving_durable_work_for_test()
@@ -3877,4 +3879,106 @@ async fn a_mob_whose_member_retirement_cancelled_a_turn_at_its_boundary_restarts
         "the restarted mob must admit commands, not fail-stop before admission: {status:?}"
     );
     let _ = handle_2.shutdown().await;
+}
+
+/// A member retired while its turn runs retires when the turn still reaches
+/// its boundary. The retirement asks the running turn to cancel at its
+/// boundary; the held provider call is then released inside the cooperative
+/// grace, so the turn's durable rows land and the run ends cancelled at the
+/// boundary, leaving the member's canonical head ahead of the runtime
+/// boundary it last committed. The rest of the retirement reads the session
+/// (its route observation first); those reads must settle the tail instead of
+/// refusing it, or the retirement stops after it durably started.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_retired_while_its_turn_reaches_the_boundary_retires() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "warn,meerkat_mob::runtime::actor::retirement_io=info,meerkat_runtime::recovery=info,\
+             meerkat_session::persistent=info,meerkat_mob::runtime::actor=info",
+        ))
+        .with_writer(std::io::stderr)
+        .try_init();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = Arc::new(
+        meerkat_runtime::store::SqliteRuntimeStore::new_head_canonical(&paths.realm_db_path)
+            .expect("open HeadCanonical runtime store"),
+    );
+    let (service, store) = persistent_head_canonical_service(&paths, runtime_store.clone());
+    let client = Arc::new(HeldTurnClient::default());
+    let storage = MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage");
+    let handle = MobBuilder::new(mob_definition(MobRuntimeMode::TurnDriven), storage)
+        .with_session_service(service.clone())
+        .with_default_llm_client(client.clone())
+        .create()
+        .await
+        .expect("create persistent mob");
+    handle
+        .spawn_spec(SpawnMemberSpec::new("lead", AgentIdentity::from("lead-1")))
+        .await
+        .expect("spawn lead");
+    handle
+        .spawn_spec(SpawnMemberSpec::new("worker", AgentIdentity::from("w-1")))
+        .await
+        .expect("spawn worker");
+    let identity = AgentIdentity::from("w-1");
+    let w1_sid = handle
+        .resolve_bridge_session_id(&identity)
+        .await
+        .expect("w1 session id");
+    send_and_wait(
+        &handle,
+        service.as_ref(),
+        "w-1",
+        "PRE_HELD_TURN token-alpha",
+        "held-turn-first",
+    )
+    .await;
+    wait_for_head_canonical_authority_convergence(
+        store.as_ref(),
+        runtime_store.as_ref(),
+        &w1_sid,
+        "PRE_HELD_TURN",
+        "held-turn-first-boundary",
+    )
+    .await;
+
+    handle
+        .member(&identity)
+        .await
+        .expect("member handle")
+        .send(HELD_TURN_PROMPT.to_string(), HandlingMode::Queue)
+        .await
+        .expect("queue the held turn");
+    tokio::time::timeout(Duration::from_secs(30), client.entered.notified())
+        .await
+        .expect("the held turn's provider call is in flight");
+    let retire = tokio::spawn({
+        let handle = handle.clone();
+        let identity = identity.clone();
+        async move { handle.retire(identity).await }
+    });
+    // The retirement reaches its runtime quiesce and asks the turn to cancel
+    // at its boundary; the turn then finishes well inside the cooperative
+    // grace and reaches that boundary.
+    sleep(Duration::from_millis(300)).await;
+    client.release.notify_one();
+    let retired = tokio::time::timeout(Duration::from_secs(60), retire)
+        .await
+        .expect("the retirement ends within its bound")
+        .expect("the retirement task completes");
+    assert!(
+        retired.is_ok(),
+        "a member retired while its turn reaches the boundary must retire: {retired:?}"
+    );
+    assert!(
+        handle
+            .get_member(&identity)
+            .await
+            .expect("read the roster")
+            .is_none(),
+        "the retired member leaves the roster"
+    );
+    let _ = handle.shutdown().await;
 }

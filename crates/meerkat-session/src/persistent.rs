@@ -5436,7 +5436,104 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 .live_session_authority_with(id, LiveAuthorityObservation::Published)
                 .await;
         }
+        if Self::is_transcript_revision_conflict(&result)
+            && self.settle_ended_live_turn_durable_tail(id).await
+        {
+            result = self
+                .live_session_authority_with(id, LiveAuthorityObservation::Published)
+                .await;
+        }
         result
+    }
+
+    /// Settle the durable tail of a hosted live session whose runtime turn
+    /// ended without its boundary commit.
+    ///
+    /// A turn that ends after its end-of-run checkpoint applied the
+    /// HeadCanonical provisional tail, but without the boundary commit (a
+    /// retirement's boundary cancel lands between the two), leaves the
+    /// physical head ahead of the RuntimeStore authority while this service
+    /// still hosts the session's live actor. Nothing in this process commits
+    /// that tail any more: every committed read of the session fails closed
+    /// with the typed `TranscriptRevisionConflict`, and resume recovery
+    /// answers `Busy` for the live actor, so only a restart would settle it.
+    /// An observation that still conflicts after its retries runs the same
+    /// store-owned, machine-authorized durable-tail recovery a restart runs,
+    /// and only when all of these hold:
+    /// - the profile is HeadCanonical;
+    /// - this service hosts the session's live actor, so no other process
+    ///   commits it;
+    /// - the store records a provisional tail for the session;
+    /// - the per-session recovery gate is free (a holder owns the tail).
+    ///
+    /// The recovery machine refuses a runtime that is not quiescent, and a
+    /// held or refused tail is left intact. Returns whether the store now
+    /// names a settled boundary, so the caller observes once more.
+    async fn settle_ended_live_turn_durable_tail(&self, id: &SessionId) -> bool {
+        if self.runtime_store.session_persistence_profile()
+            != RuntimeSessionPersistenceProfile::HeadCanonicalV1
+        {
+            return false;
+        }
+        if !matches!(self.inner.has_live_session(id).await, Ok(true)) {
+            return false;
+        }
+        match self
+            .runtime_store
+            .load_head_canonical_provisional_tail(&Self::runtime_id_for_session(id))
+            .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %id,
+                    %error,
+                    "could not observe the provisional tail of a live session whose read conflicts"
+                );
+                return false;
+            }
+        }
+        let recovery_gate = self.recovery_gate_for_session(id).await;
+        let Ok(_recovery_guard) = recovery_gate.try_lock_owned() else {
+            return false;
+        };
+        match self.store_owned_durable_tail_recovery_outcome(id).await {
+            Ok((meerkat_runtime::recovery::DurableTailRecoveryOutcome::Committed { .. }, _)) => {
+                tracing::info!(
+                    session_id = %id,
+                    "settled the durable tail a live session's ended turn left ahead of its runtime boundary"
+                );
+                self.note_live_authority_advanced(id);
+                true
+            }
+            Ok((
+                meerkat_runtime::recovery::DurableTailRecoveryOutcome::AlreadyAligned { .. },
+                _,
+            )) => true,
+            Ok((meerkat_runtime::recovery::DurableTailRecoveryOutcome::Held, _)) => {
+                tracing::warn!(
+                    session_id = %id,
+                    "durable-tail recovery held the tail of a live session whose turn ended without its boundary commit"
+                );
+                false
+            }
+            Ok((meerkat_runtime::recovery::DurableTailRecoveryOutcome::Refused, _)) => {
+                tracing::warn!(
+                    session_id = %id,
+                    "durable-tail recovery refused the tail of a live session whose turn ended without its boundary commit"
+                );
+                false
+            }
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %id,
+                    %error,
+                    "durable-tail recovery failed for a live session whose turn ended without its boundary commit"
+                );
+                false
+            }
+        }
     }
 
     /// Ask the generated document machine to classify pure live-vs-store
