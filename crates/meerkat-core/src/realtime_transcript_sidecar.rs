@@ -1418,6 +1418,47 @@ mod tests {
         );
     }
 
+    /// A snapshot event whose item holds all three content-index maps, each
+    /// with keys that sort differently as numbers and as strings. Replay
+    /// decodes the stored event's payload through the record's tagged form
+    /// (serde's buffered content), and so does a decode straight from text:
+    /// both keep every key and value, and serialize back to the exact
+    /// canonical event bytes that were stored.
+    #[test]
+    fn a_snapshot_event_keeps_every_content_index_map_through_its_tagged_decode() {
+        const PAYLOAD: &str = concat!(
+            r#"{"base_event_count":0,"reason":"transcript_rewrite","state":{"#,
+            r#""assistant_completions":{},"first_seen_order":["held"],"items":{"held":{"#,
+            r#""content_segments":{"12":"twelfth","2":"second"},"lane":"display","#,
+            r#""materialized":false,"previous_item_id":"earlier","ready":false,"#,
+            r#""response_id":null,"role":"user","skipped":false,"#,
+            r#""user_content_segment_fingerprints":{"0":"fingerprint-0","10":"fingerprint-10"},"#,
+            r#""user_content_segments":{"0":[{"blob_id":"#,
+            r#""sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","#,
+            r#""media_type":"image/png","source":"blob","type":"image"}]}}},"#,
+            r#""seen_delta_ids":[]},"type":"snapshot_v1"}"#
+        );
+        let stored = format!(r#"{{"payload":{PAYLOAD},"schema_version":1}}"#);
+        let event = SerializedComponentEvent::from_canonical_bytes(stored.clone().into_bytes())
+            .expect("the stored bytes are a canonical event");
+        let replayed: RealtimeTranscriptSidecarRecord = event
+            .decode_payload(REALTIME_TRANSCRIPT_SIDECAR_EVENT_SCHEMA_V1)
+            .expect("the replay decode keeps every content-index key");
+        let from_text: RealtimeTranscriptSidecarRecord =
+            serde_json::from_str(PAYLOAD).expect("a decode from text keeps them too");
+        for decoded in [&replayed, &from_text] {
+            let rewritten = SerializedComponentEvent::canonical_json(
+                REALTIME_TRANSCRIPT_SIDECAR_EVENT_SCHEMA_V1,
+                decoded,
+            )
+            .expect("serialize the decoded record");
+            assert_eq!(
+                std::str::from_utf8(rewritten.bytes()).expect("utf-8 event"),
+                stored
+            );
+        }
+    }
+
     #[test]
     fn activation_snapshot_moved_from_sequence_zero_is_rejected() {
         let session_id = SessionId::new();
