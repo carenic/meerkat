@@ -53,6 +53,11 @@ them.
   `RuntimeSessionRegistrationWitness` (see `registration()` under Added),
   which is neither. A host that moves an identity into `catch_unwind` wraps
   it in `std::panic::AssertUnwindSafe`.
+- Not measured by the gate (a behaviour change): `meerkat-mob`:
+  `MobHandle::stop` no longer cancels its members' checkpoint saves, and
+  neither does a failed `MobHandle::reset`: a run in flight at the Stop can
+  still commit. A host that deletes a mob's storage after a Stop must
+  Destroy the mob instead (see Fixed).
 - Not measured by the gate (a parameter type change): `meerkat-runtime`:
   `ConfiguredMcpAttachmentProvider::configured` and
   `NativeWorkAuthorizationHost::configured_mcp_attachment_for_agent` take the
@@ -1700,6 +1705,20 @@ them.
   (-32002) and a member live host with `MemberLiveError::Unavailable`.
   Clients retry with backoff; the open succeeds once the other open's setup
   has finished.
+- `meerkat-mob`: a Stop during a member's run no longer abandons that run's
+  turn. A Stop leaves a turn-driven member's running turn to finish
+  (`MemberStopRun::LeftRunning`), but it also cancelled every member
+  session's checkpoint gate, so the run failed at its final checkpoint, on
+  WholeBlob and HeadCanonical realms alike. The turn ended with an error
+  ("turn abandoned"), the member's runtime was torn down, and the session
+  kept nothing of the run although its tool calls had already run; Resume
+  did not run the input again. The Stop now leaves the gates armed, and so
+  does a failed Reset, which returns the mob to the same pause: the run
+  finishes and commits while the mob is Stopped, and the member stays
+  registered. A host that deletes a mob's storage after a Stop must Destroy
+  the mob instead, since a run in flight at the Stop can still commit. The
+  Stop watchdog no longer reports a `stop_checkpointer_cancel` stage.
+
 - `meerkat-mob`: a mob restarts when one of its members has a durable tail
   ahead of the runtime boundary it last committed. A turn's durable rows can
   land after that boundary when a retirement cancels the turn mid-way, or when

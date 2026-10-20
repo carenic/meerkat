@@ -2256,14 +2256,16 @@ pub trait MobSessionService:
 
     /// Cancel all active checkpointer gates.
     ///
-    /// After this call in-flight saves complete but subsequent checkpoint
-    /// calls on any session are no-ops. Call during `stop()` to prevent
-    /// checkpoint writes from racing with external cleanup.
+    /// After this call in-flight saves complete, and every later checkpoint
+    /// on any session fails its run. The mob never calls this: a Stop, or a
+    /// failed Reset, pauses the mob, and a run it leaves running must still
+    /// commit. A host that deletes a mob's storage destroys the mob, and each
+    /// member's archive closes its own session's gate.
     async fn cancel_all_checkpointers(&self) {}
 
     /// Re-enable checkpointer gates cancelled by [`cancel_all_checkpointers`].
     ///
-    /// Call during `resume()` to restore periodic persistence.
+    /// The mob's Resume and Reset call this to restore persistence.
     async fn rearm_all_checkpointers(&self) {}
 }
 

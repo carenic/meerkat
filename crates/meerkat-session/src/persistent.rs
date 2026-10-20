@@ -14525,9 +14525,9 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             // Acquire the checkpointer gate (if any) and hold it across the
             // archival save. This prevents a concurrent checkpoint() from saving
             // a live snapshot over the archived one. Setting cancelled under the
-            // lock ensures future checkpoints cannot write: WholeBlob calls are
-            // no-ops, while a HeadCanonical call terminates the stale live actor
-            // rather than silently omitting its required projection.
+            // lock ensures future checkpoints cannot write: a later WholeBlob or
+            // HeadCanonical checkpoint fails its run and terminates the stale
+            // live actor rather than silently omitting its projection.
             let gate = self.existing_gate_for_session(id).await;
             let mut gate_guard = if let Some(ref gate) = gate {
                 let mut guard = gate.cancelled.lock().await;
@@ -16262,11 +16262,12 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// Cancel all active checkpointer gates.
     ///
     /// After this call, in-flight checkpoints that are past the gate check
-    /// will complete their current save. Subsequent WholeBlob checkpoints are
-    /// no-ops; a HeadCanonical checkpoint instead fails the live actor because
-    /// its required physical projection cannot be silently omitted. Use this
-    /// during `stop()` to prevent checkpoint writes from racing with external
-    /// cleanup operations.
+    /// will complete their current save. Every later checkpoint, WholeBlob or
+    /// HeadCanonical, fails its run: the run's provisional tail is not
+    /// attempted, so the live actor is retired and its next registration
+    /// cold-loads the session. A mob Stop does not use this: it pauses the
+    /// mob, and a run it leaves running must still commit. Archive closes one
+    /// session's gate itself.
     ///
     /// A save holds its session's gate across the store write, so each cancel
     /// waits for that session's in-flight save. The gates are cancelled
@@ -16282,9 +16283,8 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
 
     /// Re-enable checkpointer gates for all tracked sessions.
     ///
-    /// Call this during `resume()` after `cancel_all_checkpointers()` was
-    /// used during stop. Gates that were removed by `archive()` are not
-    /// affected.
+    /// Call this to restore persistence after `cancel_all_checkpointers()`.
+    /// Gates that were removed by `archive()` are not affected.
     pub async fn rearm_all_checkpointers(&self) {
         let gates = self.checkpointer_gates.lock().await;
         for gate in gates.values() {

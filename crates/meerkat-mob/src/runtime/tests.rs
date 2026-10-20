@@ -60928,7 +60928,10 @@ async fn test_admitted_explicit_resume_outlives_initial_caller_deadline() {
         .expect("autonomous member is session-backed");
     handle.stop().await.expect("stop before explicit Resume");
     assert_eq!(handle.status().await.unwrap(), MobState::Stopped);
-    assert!(!service.checkpointers_armed());
+    assert!(
+        service.checkpointers_armed(),
+        "Stop leaves the checkpointer gates armed"
+    );
 
     service.pause_next_interaction_event_injector();
     let resume_handle = handle.clone();
@@ -73711,7 +73714,7 @@ async fn test_mob_event_router_stays_alive_across_machine_routed_spawn_tracking(
 #[tokio::test]
 async fn test_reset_append_failure_transitions_to_stopped() {
     let events = Arc::new(FaultInjectedMobEventStore::new());
-    let (handle, _service) = create_test_mob_with_events(sample_definition(), events.clone()).await;
+    let (handle, service) = create_test_mob_with_events(sample_definition(), events.clone()).await;
     handle
         .spawn(
             ProfileName::from("worker"),
@@ -73736,6 +73739,10 @@ async fn test_reset_append_failure_transitions_to_stopped() {
         MobState::Stopped,
         "failed reset after destructive steps must transition to Stopped"
     );
+    assert!(
+        service.checkpointers_armed(),
+        "the Stopped a failed reset leaves is the pause a Stop leaves: checkpointer gates armed"
+    );
 
     // The original creation event should still remain available for resume.
     let all_events = events.replay_all().await.expect("replay");
@@ -73750,7 +73757,7 @@ async fn test_reset_append_failure_transitions_to_stopped() {
 #[tokio::test]
 async fn test_reset_failure_from_stopped_stays_stopped() {
     let events = Arc::new(FaultInjectedMobEventStore::new());
-    let (handle, _service) = create_test_mob_with_events(sample_definition(), events.clone()).await;
+    let (handle, service) = create_test_mob_with_events(sample_definition(), events.clone()).await;
 
     handle.stop().await.expect("stop");
     assert_eq!(handle.status().await.unwrap(), MobState::Stopped);
@@ -73764,6 +73771,10 @@ async fn test_reset_failure_from_stopped_stays_stopped() {
         handle.status().await.unwrap(),
         MobState::Stopped,
         "failed reset from Stopped must remain Stopped"
+    );
+    assert!(
+        service.checkpointers_armed(),
+        "a failed reset from Stopped keeps the checkpointer gates armed, as the Stop left them"
     );
 }
 

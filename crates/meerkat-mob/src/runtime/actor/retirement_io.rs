@@ -1756,12 +1756,13 @@ impl MobActor {
             }
         }
         .await;
-        if result.is_err() && matches!(&batch.after, RetirementAfter::Reset { .. }) {
-            if self.state() == MobState::Stopped {
-                self.provisioner.cancel_all_checkpointers().await;
-            } else {
-                self.fail_reset_to_stopped().await;
-            }
+        // A failed Reset leaves the mob Stopped, the pause a Stop leaves:
+        // its checkpointer gates stay armed.
+        if result.is_err()
+            && matches!(&batch.after, RetirementAfter::Reset { .. })
+            && self.state() != MobState::Stopped
+        {
+            self.fail_reset_to_stopped().await;
         }
         if !self.respawn_topology_reply_withheld && !self.durable_uncertainty_fail_stop {
             Self::answer_retirement_after(batch.after, result);
