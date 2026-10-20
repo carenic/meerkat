@@ -1047,3 +1047,12 @@ reason = "needs meerkat, which depends on this crate"
 modules = [
     "runtime::oauth::ce_native_progress",
 ]
+
+[crates.meerkat-sqlite]
+excluded = [
+    { path = "tests/lock_profile.rs", reason = "checks the repository's build configuration, which sets the bundled SQLite's flags" },
+    { path = "tests/lock_profile_sources.rs", reason = "reads the repository's SQLite flag sites and the host binaries' sources" },
+    { path = "tests/process_wide_mutexes.rs", reason = "needs the bundled SQLite built with the repository's flags" },
+    { path = "tests/statistics_switch_first.rs", reason = "needs the bundled SQLite built with the repository's flags" },
+    { path = "tests/statistics_switch_late.rs", reason = "needs the bundled SQLite built with the repository's flags" },
+]
