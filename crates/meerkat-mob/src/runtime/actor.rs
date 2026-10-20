@@ -19876,13 +19876,27 @@ impl MobActor {
                                 .await
                         }
                         _ => {
-                            context
+                            match context
                                 .provisioner
                                 .ensure_runtime_session_state(&member_ref)
-                                .await?;
-                            context
-                                .ensure_mob_comms_drain(&agent_identity, &member_ref)
                                 .await
+                            {
+                                // A registration that needs a durability
+                                // reload has nothing to make ready: it starts
+                                // no run and admits no input until its reload
+                                // replaces it. Resume releases the member as
+                                // it is, and the reload readies it.
+                                Err(MobError::MemberRuntimeDetached {
+                                    detachment: crate::MemberRuntimeDetachment::ReloadRequired,
+                                    ..
+                                }) => Ok(()),
+                                result => {
+                                    result?;
+                                    context
+                                        .ensure_mob_comms_drain(&agent_identity, &member_ref)
+                                        .await
+                                }
+                            }
                         }
                     }
                 };
