@@ -74,11 +74,13 @@ pub enum MemberStopRun {
     /// A remote member that cannot report its run (it lacks the run-start
     /// hold capability); the stop sent it the ambient interrupt.
     Interrupted,
-    /// The member's runtime registration is durability-degraded and refused
-    /// the hold. No outcome for its run is recorded on that registration:
-    /// durable truth decides it, at the reload that replaces the registration
-    /// or at the discard a mob Shutdown performs. This does not say the run
-    /// was cancelled.
+    /// The member's runtime registration is durability-degraded: it refused
+    /// the hold, or it degraded after the hold was placed and refused the
+    /// cancel of the run the hold found current (the run starts then report
+    /// `Held`, and nothing was dispatched). No outcome for its run is recorded
+    /// on that registration: durable truth decides it, at the reload that
+    /// replaces the registration or at the discard a mob Shutdown performs.
+    /// This does not say the run was cancelled.
     ReloadRequired,
 }
 

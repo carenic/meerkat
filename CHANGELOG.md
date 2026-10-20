@@ -173,6 +173,12 @@ them.
   verdict before the host is asked, as it already refused the operator.
   0.9.3 asked the host about a caller equal to that principal, and could
   admit it.
+- `meerkat-runtime`: `CompletionWaitError` is `#[non_exhaustive]` and gains
+  `BoundaryRolledBack { run_id, detail }` and `DurableOutcomeUnknown { run_id }`
+  (see Changed). A match on it outside the crate needs a wildcard arm.
+  `wait_failure_observation()` maps both new variants to
+  `AuthorityUnavailable`, as it maps `AuthorityUnavailable(_)`, and
+  `is_boundary_rolled_back()` and `is_durable_outcome_unknown()` name them.
 - `meerkat-mob`: `MobError` is now `#[non_exhaustive]`, and gains the variant
   `MobError::ShutdownInProgress { mob_id }`, appended last (see the next
   entry). A downstream exhaustive `match` on `MobError` needs a wildcard arm.
@@ -940,6 +946,16 @@ them.
   working unchanged. `RuntimeTurnStateHandle` reads all three from the
   borrowed machine state under the authority lock, and samples the phase
   after an input in the same critical section as the transition.
+- `RuntimeStore::commit_outcome_deadline` declares the longest a boundary
+  commit or run terminalization through the store may legitimately take
+  before it reports its durable outcome (see Changed). The backend declares
+  it through the new `RuntimeSessionAuthorityOps::commit_outcome_deadline`,
+  so a pure decorator forwards it. A composed store whose commit runs
+  lock-acquiring transactions of its own declares its inner store's
+  declaration plus the busy timeout of each such transaction. The default is
+  `DEFAULT_COMMIT_OUTCOME_DEADLINE`, two `COMMIT_BUSY_WINDOW`s of 60 s.
+  `SqliteRuntimeStore` declares the same from the shared SQLite busy timeout,
+  and `InMemoryRuntimeStore` declares none.
 - `meerkat-core`: `ControllerReadinessFailure::OriginalAdmissionPending`: an
   original that an input or operation relies on is still its source owner's
   submission candidate, whose admission the owner has not settled yet.
@@ -1513,6 +1529,20 @@ them.
   commit is rejected fails them with `CompletionWaitError::BoundaryRolledBack`
   where they got `AuthorityUnavailable` with a message. In both cases the
   input stays durably admitted: read it after the reload instead of
+  resubmitting it. A reload refuses with the retryable
+  `RuntimeDriverError::RecoveryRepairBlocked` until the store answers, then
+  replaces the registration from durable truth. A mob member's tracked turn
+  stays pending on either failure, as on `AuthorityUnavailable`, and a
+  scheduled delivery records `RuntimeCompletionAuthorityUnavailable`.
+- A persistent session's boundary commit or run terminalization that reports
+  no durable outcome within its store's declared deadline (120 s for the
+  SQLite store) now marks the session reload-required. The runtime loop
+  stops waiting and leaves the commit running; it keeps the session's
+  mutation gate until the store answers. The run's completion waiters fail
+  with `CompletionWaitError::DurableOutcomeUnknown`, and a run whose boundary
+  commit is rejected fails them with `CompletionWaitError::BoundaryRolledBack`
+  where they got `AuthorityUnavailable` with a message. In both cases the
+  input stays durably admitted: read it after the reload instead of
   resubmitting it. The public error class is unchanged (authority
   unavailable); the message names the case, so resubmit only with an
   idempotency key. A reload refuses with the retryable
@@ -1612,17 +1642,20 @@ them.
   wait for a kept connection: run maintenance with the same release as the
   hosts.
 - `meerkat-mob`: a mob Shutdown or Stop of a local member whose runtime
-  registration is durability-degraded reports the member's run and run
-  starts as `ReloadRequired`, where it failed or waited on the degraded
-  registration. That registration starts no run until a reload replaces it;
-  a Shutdown's teardown discards it and unregisters the cold successor, and
-  the `MobStop` a Stop staged first holds the reloaded registration until
+  registration is durability-degraded reports the member's run and run starts
+  as `ReloadRequired`, where it failed or waited on the degraded registration.
+  An autonomous member whose registration degrades after the stop held its run
+  starts, so that the stop's cancel of its current run is refused, reports its
+  run `ReloadRequired` and its run starts `Held`: that cancel was not
+  dispatched. A degraded registration starts no run until a reload replaces
+  it; a Shutdown's teardown discards it and unregisters the cold successor,
+  and the `MobStop` a Stop staged first holds the reloaded registration until
   Resume. An autonomous member's stop skips its comms-drain abort and its run
   settlement for such a registration (the discard aborts and joins the drain
-  itself). Resume releases such a member. A Shutdown now holds every
-  member's run starts and reports the first failure in roster order instead
-  of stopping at it. On the wire, `stop_report` reports such a member with
-  `run` and `starts` `reload_required`.
+  itself). Resume releases such a member. A Shutdown now holds every member's
+  run starts and reports the first failure in roster order instead of stopping
+  at it. On the wire, `stop_report` reports such a member with `run` and
+  `starts` `reload_required`.
 
 ### Fixed
 
@@ -2221,6 +2254,39 @@ them.
   unregister that waits for the gate before it stages its final unregister
   also ends typed and releases its teardown coordinator, so the
   reload-required discard can run.
+- The other waits for a session's mutation gate that serve live work now end
+  the same way instead of waiting for a holder of the gate once the session's
+  durability degrades: an exact-run interrupt and its reconciliation, the
+  recover and destroy control commands (`RuntimeControlPlaneError::StoreError`
+  carrying the refusal, as their durability-ready wait answers), a comms abort
+  (an abort of every session aborts the others, then answers the typed
+  refusal naming the sessions it skipped),
+  unregistering or retiring an executor attachment, an explicit stop and its
+  post-stop fence, installing an unregister coordinator, closing an idle
+  registration, input admission, the return to the gate after a boundary
+  callback, a member effect, the admitted-original read
+  (`AdmittedOriginalRefusal::Unavailable`), registering an executor over an
+  existing entry, and the runless terminal publication task. A session that
+  has already degraded refuses such a wait whenever another holder keeps the
+  gate. Waits that run only once the degraded holder has released the gate
+  (the reload-required discard) or before any runtime loop exists keep
+  waiting.
+- Reads of a session's runtime state that take no mutation gate (whether it
+  has active inputs, which a mob's close-if-idle and last-owner release ask;
+  a runtime wake; whether a run input awaits its boundary; a stopped run's
+  contributor terminal; an input's terminal completion) and a member's
+  tracked-input cancel waited behind a boundary commit or run
+  terminalization that holds the session's driver. Past its deadline such a
+  commit holds the driver until the store answers, so once the session
+  degrades they answer without it: the active-input read answers busy, the
+  contributor terminal is unknown, and the others refuse with the typed,
+  retryable `RecoveryRepairBlocked`.
+- A boundary commit whose store never answered (a stalled disk or a hung
+  network filesystem, for example) kept the session's mutation gate for
+  good, so every later wait for the gate waited for it, a mob destroy's
+  retirement of the member and a force cancel of it included. The commit's
+  declared deadline now degrades the session (see Changed), those waits end
+  typed, and a reload replaces the registration once the store has answered.
 - The other waits for a session's mutation gate that serve live work now end
   the same way instead of waiting for a holder of the gate once the session's
   durability degrades: an exact-run interrupt and its reconciliation, the

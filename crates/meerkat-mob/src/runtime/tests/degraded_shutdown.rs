@@ -906,3 +906,147 @@ async fn a_whole_shutdown_settles_an_autonomous_member_degraded_while_idle() {
         "the degraded member's run: {report:?}"
     );
 }
+
+/// Drive member 0 of `mob`, an AutonomousHost member, into the window
+/// between a stop's run-start hold and its cancel of the run the hold found
+/// current, and return what `stop` answered. The run is parked in its turn
+/// when the stop holds it. Before the cancel, the run's boundary commit takes
+/// the session's mutation gate and the store does not answer it; the cancel
+/// waits for the gate, and the registration degrades during that wait. The
+/// commit is released only once the cancel answered, so the cancel never
+/// finds the gate free.
+async fn degrade_between_hold_and_cancel<T>(
+    mob: &IsolationMob,
+    stop: impl std::future::Future<Output = T> + Send + 'static,
+) -> T
+where
+    T: Send + 'static,
+{
+    let session_id = mob.session(0).clone();
+    let mut held_turns = mob.service.held_start_turn_entries();
+    let entered_before = *held_turns.borrow_and_update();
+    mob.service.hold_start_turns();
+    mob.send(0, "running when the stop holds its run starts")
+        .await
+        .expect("the delivery to member 0 is admitted");
+    tokio::time::timeout(
+        STEP,
+        held_turns.wait_for(|entries| *entries > entered_before),
+    )
+    .await
+    .expect("member 0's run parks in its turn")
+    .expect("the turn hold counter stays open");
+    let (cancel_reached, release_cancel, cancel_answered) =
+        crate::runtime::provisioner::arm_stop_member_cancel_for_test(session_id.clone());
+    let stopping = tokio::spawn(stop);
+    tokio::time::timeout(STEP, cancel_reached)
+        .await
+        .expect("the stop holds member 0 and reaches its cancel")
+        .expect("the cancel hook stays armed");
+
+    // The run's boundary commit takes the session's mutation gate, and the
+    // store does not answer it yet.
+    mob.store.park_commits(&session_id);
+    mob.service.release_held_start_turns();
+    wait_until("member 0's boundary commit to park", STEP, || async {
+        mob.store.parked_commit_arrivals(&session_id) == 1
+    })
+    .await;
+
+    // The cancel waits for the gate behind the commit, and the registration
+    // degrades during that wait.
+    let parked = mob
+        .adapter
+        .arm_mutation_gate_wait_observer_for_test(session_id.clone());
+    release_cancel
+        .send(())
+        .expect("the stop waits at its cancel");
+    tokio::time::timeout(STEP, parked)
+        .await
+        .expect("the cancel waits for the gate behind the commit")
+        .expect("the wait observer stays armed until the wait");
+    assert!(
+        mob.adapter
+            .force_session_durability_reload_required_for_test(&session_id)
+            .await,
+        "member 0's registration degrades during the cancel's wait"
+    );
+    let _ = tokio::time::timeout(STEP, cancel_answered)
+        .await
+        .expect("the cancel answers once the registration degrades");
+    mob.store.release_commits();
+    tokio::time::timeout(STEP, stopping)
+        .await
+        .expect("the stop returns")
+        .expect("the stop task completes")
+}
+
+/// A Stop of an AutonomousHost member whose registration degrades between
+/// the Stop's run-start hold and its boundary cancel: the cancel is refused
+/// typed, and the member reports its run `ReloadRequired` with its run starts
+/// `Held` instead of failing the Stop. Without that mapping the refusal
+/// failed the Stop as an internal error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_reports_reload_required_for_a_member_degraded_between_its_hold_and_its_cancel() {
+    let mob = create_isolation_mob_with_definition(1, autonomous_isolation_definition()).await;
+    let handle = mob.handle.clone();
+    let report = degrade_between_hold_and_cancel(&mob, async move { handle.stop().await })
+        .await
+        .expect("the stop succeeds");
+    let outcome = report
+        .members
+        .get(mob.member(0))
+        .expect("member 0's stop outcome");
+    assert_eq!(outcome.run, MemberStopRun::ReloadRequired, "{report:?}");
+    assert_eq!(outcome.starts, MemberRunStarts::Held, "{report:?}");
+    assert_eq!(
+        report.not_holdable().count(),
+        0,
+        "the held member is not reported as able to start a turn: {report:?}"
+    );
+}
+
+/// The same window under a whole Shutdown, whose cancel is the immediate
+/// exact hard cancel: the member reports its run `ReloadRequired` with its
+/// run starts `Held`, and the teardown still discards the degraded
+/// registration and unregisters the cold successor. Without that mapping the
+/// refusal failed the Shutdown as an internal error; before the hard cancel's
+/// gate wait ended on a degradation, it waited behind the commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_whole_shutdown_settles_a_member_degraded_between_its_hold_and_its_cancel() {
+    let mob = create_isolation_mob_with_definition(1, autonomous_isolation_definition()).await;
+    let handle = mob.handle.clone();
+    let report = degrade_between_hold_and_cancel(&mob, async move {
+        handle
+            .shutdown_with_report(
+                ShutdownOptions::default().with_deadline(Instant::now() + Duration::from_secs(20)),
+            )
+            .await
+    })
+    .await
+    .expect("the shutdown succeeds");
+    assert_eq!(
+        report.runs.get(mob.member(0)),
+        Some(&MemberStopRun::ReloadRequired),
+        "member 0's run: {report:?}"
+    );
+    assert_eq!(
+        report.run_starts.get(mob.member(0)),
+        Some(&MemberRunStarts::Held),
+        "member 0's run starts: {report:?}"
+    );
+    assert!(
+        matches!(
+            report.members.get(mob.member(0)),
+            Some(MemberShutdownOutcome::Unregistered)
+        ),
+        "member 0: {report:?}"
+    );
+    assert!(
+        mob.adapter
+            .current_session_registration_witness(mob.session(0))
+            .await
+            .is_none(),
+        "member 0's session has no registration left"
+    );
+}
