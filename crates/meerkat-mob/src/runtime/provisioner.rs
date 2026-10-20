@@ -5225,6 +5225,18 @@ fn member_runtime_detachment(
     }
 }
 
+/// Whether `session_id`'s registration refused a run-start hold or release
+/// because it is leaving through its unregister
+/// ([`meerkat_runtime::MeerkatMachine::unregister_owed`]), or was removed
+/// after the refusal. Either way it has no run and starts none.
+#[cfg(feature = "runtime-adapter")]
+async fn registration_unregister_owed_or_gone(
+    adapter: &meerkat_runtime::MeerkatMachine,
+    session_id: &SessionId,
+) -> bool {
+    adapter.unregister_owed(session_id).await || !adapter.contains_session(session_id).await
+}
+
 #[cfg(feature = "runtime-adapter")]
 impl SessionBackend {
     /// Hold the member's run starts (#1500) and treat the run the hold found
@@ -5287,6 +5299,31 @@ impl SessionBackend {
                         )));
                     }
                     retried = true;
+                }
+                // A registration whose unregister is owed refuses every
+                // lifecycle mutation, this hold included: typed
+                // `UnregisterFinalizationOutcomeUnknown` while the
+                // unregister's final transition is staged (its store
+                // finalization in flight, or its outcome unknown), and
+                // `ValidationFailed` as the teardown-only anchor a failed
+                // finalization leaves. Its runtime loop already exited, which
+                // ended its last run, so the refusal is the member's typed
+                // outcome too: it has no run, and it starts none until the
+                // unregister removes it (a Shutdown's teardown joins or
+                // retries that unregister); the `MobStop` a Stop staged before
+                // the hold holds any registration that replaces it until
+                // Resume. `unregister_owed` confirms the state, which lasts
+                // until the registration is removed; one removed after the
+                // refusal is answered as one absent before the hold.
+                Err(_) if registration_unregister_owed_or_gone(adapter, &session_id).await => {
+                    tracing::info!(
+                        %session_id,
+                        "member stop met a registration whose unregister is owed: no run, run starts held"
+                    );
+                    return Ok(MemberStopOutcome {
+                        run: MemberStopRun::NoRun,
+                        starts: MemberRunStarts::Held,
+                    });
                 }
                 Err(error) => {
                     return Err(MobError::Internal(format!(
@@ -14632,6 +14669,13 @@ impl MobProvisioner for SessionBackend {
             .await
             .is_some()
         {
+            return Ok(());
+        }
+        // A registration whose unregister is owed refuses the release the
+        // same way, after the release unstaged the reason. What the release
+        // is for holds here too: the leaving registration starts no run, and
+        // its hold goes with it when the unregister removes it.
+        if registration_unregister_owed_or_gone(adapter, &session_id).await {
             return Ok(());
         }
         Err(MobError::Internal(format!(

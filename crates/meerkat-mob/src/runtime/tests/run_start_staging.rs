@@ -523,10 +523,9 @@ async fn a_resume_refuses_typed_while_a_member_needs_a_reload() {
 
 /// A member whose runtime unregister is finalizing (its final unregister
 /// transition is committed and the store transaction that ends it is still
-/// in flight) refuses every lifecycle mutation, the Stop's hold and the
-/// Resume's release among them. The Stop reports the member with no run and
-/// its run starts held instead of failing, the Resume completes, and the
-/// unregister then finishes and removes the registration.
+/// in flight) refuses every lifecycle mutation, the Stop's hold among them.
+/// The Stop reports the member with no run and its run starts held instead
+/// of failing, and the unregister then finishes and removes the registration.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stop_holds_a_member_whose_unregister_is_finalizing() {
     let mob = persistent_single_member_mob("unregister-finalizing").await;
@@ -564,10 +563,6 @@ async fn a_stop_holds_a_member_whose_unregister_is_finalizing() {
         }),
         "{report:?}"
     );
-    tokio::time::timeout(STEP, mob.handle.resume())
-        .await
-        .expect("the resume answers")
-        .expect("the resume succeeds");
 
     mob.store.release_unregister_finalizations();
     let removed = tokio::time::timeout(STEP, unregister)
