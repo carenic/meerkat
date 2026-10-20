@@ -606,6 +606,13 @@ mob machine inputs, effects and transition ids gain `RetireAtScope` and
   maintenance such as `rkat storage migrate --apply` waits for kept
   connections to close; `rkat storage doctor` lists the files as
   `maintenance-fence-lock` findings.
+- **RPC transcript edits after a restart:** `session/fork_at`,
+  `session/fork_replace`, `session/rewrite_transcript`,
+  `session/update_system_prompt` and `session/restore_transcript_revision` on
+  an idle persisted session no longer answer `SESSION_BUSY` after the RPC
+  server restarts. A session that needs a durability reload answers the
+  runtime's typed refusal instead, and one another process hosts its typed
+  hosting refusal.
 - **A resume finishes an interrupted Stop or Complete** (waiting up to 5 s
   for its first attempt) before it hands the mob back, so the handle reads
   Stopped or Completed; 0.9.3 resumed it as Running and finished the Stop in
