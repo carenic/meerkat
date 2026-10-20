@@ -617,7 +617,10 @@ history; inputs it still held end `Stopped`) and releases its owner context.
 The member stays Broken with `MobError::MemberRegistrationRefused`, shown as
 `registration_refusal` in its status, until an explicit repair, and
 `ensure_member_live` returns that refusal without asking the hook again. The
-member can still be retired, respawned or destroyed. A destination the hook
+member can still be retired, respawned or destroyed. A member that
+`MobBuilder::resume` recreates on a fresh session (for example when the session
+service keeps no durable sessions) is isolated the same way when its hook
+refuses it, and the other members resume. A destination the hook
 selected that the runtime did not install is
 `MobError::MemberDestinationNotInstalled` instead (the runtime's verdict, not
 a refusal): the member keeps its registration, and the repair must select
@@ -1206,7 +1209,10 @@ the registration) took it over; the settlement then touches nothing. A member
 whose registration is durability-degraded is now unregistered after the
 runtime's reload-required discard (reported at stage
 `durability_reload_discard` while the runtime refuses the unregister until
-then); 0.9.3 and earlier left it registered until the process exited.
+then); 0.9.3 and earlier left it registered until the process exited. Stop and
+Shutdown report such a member's run and run starts as `ReloadRequired` instead
+of failing on it, and a Shutdown holds every member's run starts, reporting the
+first failure in roster order.
 
 A mob restored with an unfinished destroy starts with admission closed before
 `MobBuilder::resume` returns its handle, so nothing is spawned into it while the

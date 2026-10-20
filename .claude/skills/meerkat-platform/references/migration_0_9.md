@@ -218,7 +218,9 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
 - Mixed versions: a 0.9.3 peer that checks signatures drops a 0.9.4
   `reply_to_peer` reply (the sender sees an ambiguous outcome; other message
   kinds still reach it), and mob member hosts must be upgraded before their
-  controller (fork instruction policy). A temporary council record holding a
+  controller (fork instruction policy; a controller set to
+  `reactivate_inherited` gets `member_host_unsupported` from a 0.9.3 member
+  host). A temporary council record holding a
   participant refused by that policy cannot be read by 0.9.3.
 - Upgrade the Python and TypeScript SDKs with `rkat-rpc`: a 0.9.3 SDK fails on
   every `tool_config_changed` event a 0.9.4 `rkat-rpc` builds, and does not
@@ -291,9 +293,11 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   `in_reply_to` fields on the comms notice block, `PeerContentIngested`,
   `CommsCommand::PeerMessage`, `InteractionContent::Message`,
   `MessageKind::Message` and `PeerInput`.
-- Mobs: a host's refusal of a restored member's registration removes the
-  registration and leaves the member Broken with
-  `MobError::MemberRegistrationRefused` until a repair; an uninstalled
+- Mobs: a host's refusal of a restored member's registration (also one the
+  boot recreates on a fresh session) removes the registration and leaves only
+  that member Broken with `MobError::MemberRegistrationRefused` until a
+  repair; Stop and Shutdown report a member needing a durability reload as
+  `ReloadRequired` (`MemberStopRun` / `MemberRunStarts`) instead of failing; an uninstalled
   destination is `MobError::MemberDestinationNotInstalled` (was
   `WiringError`; schedule delivery records `runtime_rejected`);
   `force_cancel_member` / `cancel_all_work` on a member needing a durability
@@ -380,6 +384,15 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   keeps Node alive for 5 seconds, and both SDK clients settle on the
   `rkat-rpc` child's exit; public GPT Live sends a finished notice for a
   delegation result held behind the user's question.
+- SQLite: release binaries build the bundled SQLite without its three
+  process-wide locks; a build outside the repository (`cargo install rkat`,
+  an embedding application) sets `LIBSQLITE3_FLAGS` itself (value in
+  `docs/guides/deploying.mdx`, "SQLite Lock Profile"), and an embedding
+  application calls the `unsafe fn`
+  `meerkat_sqlite::disable_memory_statistics_at_process_start()` first in
+  `main`, before any other thread or SQLite connection exists. `rkat storage doctor` reports `sqlite-lock-profile`. Kept
+  store connections hold `<file>.mpresence` presence locks, which maintenance
+  waits for.
 - Fixed: a child of `session/fork_at` or `session/fork_replace` can run a turn:
   it gets a build state derived from its source's, with the source's session
   configuration but without its `shell_env`, MCP attachments or mob operator

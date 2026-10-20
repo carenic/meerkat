@@ -195,6 +195,16 @@ delta. `stop_reason` is optional: observation-only rows omit it. Rows
 committed from a live channel carry `realtime_origin` (its channel and
 `provider_item_ids`).
 
+Rows wait behind a running turn of the member, so the persisted transcript
+can lag the conversation by up to that turn's length. Since 0.9.4 a GPT Live
+channel commits all the rows it already holds when a member turn ends at that
+boundary (up to 64 rows or about a second at a time), before a member turn
+queued behind them starts; before, they drained one row per turn, so speech
+said before a typed message could land after its answer. A WebSocket or
+WebRTC channel still takes the boundary once per row and forwards nothing
+behind a waiting row, so its voice and events stop while a member turn runs
+and arrive in a burst when it ends.
+
 ### SDK calls
 
 - Python: `client.live_open(session_id, turning_mode=None, transport=None,

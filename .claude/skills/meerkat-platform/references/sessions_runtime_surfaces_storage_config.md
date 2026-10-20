@@ -59,8 +59,10 @@ Typical realm directory (`<state-root>/<realm>/`):
 | `mobs/` | Per-mob databases |
 
 Every SQLite file has a `meerkat_schema` ledger table and a sibling
-`<file>.mfence` fence-lock file. The `global` realm's config is
-`~/.rkat/config.toml`.
+`<file>.mfence` fence-lock file; since 0.9.4 also a `<file>.mpresence`
+presence-lock file, which maintenance creates next to every database it fences
+and a kept connection holds shared while it is open. The `global` realm's
+config is `~/.rkat/config.toml`.
 
 Backends (pinned at first creation; `--realm-backend` is only a creation
 hint):
@@ -194,6 +196,20 @@ rkat storage prune [--apply] [--older-than-days 30] [--json] [--root PATH]...
 - `storage doctor` also reports read-only census findings such as
   `transcript-history-oversized`, `strand-duplication-reclaimable`,
   `frozen-blob-archive-reclaimable` and `storage-census-unmeasured` (0.8.10).
+  Since 0.9.4 it also reports the SQLite lock profile of its own binary (the
+  `sqlite_lock_profile` object of `--json` and a text line, with the warning
+  finding `sqlite-lock-profile` when a process-wide lock is on), and lists
+  `*.mpresence` files with the `*.mfence` files as `maintenance-fence-lock`
+  inventory findings.
+- Since 0.9.4 `storage migrate --apply` also waits, within its fence wait, for
+  kept connections to close. The only kept connection is a runtime delivery
+  owner's reader of a shared store's delivery generation, which closes at its
+  next read or after `KEPT_DELIVERY_READER_IDLE` (1 second) idle, well inside
+  the default 10-second `--fence-wait-secs`; a fence wait under a second can
+  meet an idle reader and refuse. Maintenance from a binary older than 0.9.4
+  takes only the fence lock and does not wait for kept connections: run
+  maintenance with the same release as the hosts. Windows keeps a fresh,
+  verified open per store tick instead of a kept reader.
 - `storage prune` deletes only registered `*.pre-<version>-<timestamp>` and
   `*.corrupt-<timestamp>` artifacts; deleting realms is `rkat realm delete` /
   `rkat realm prune`.
@@ -278,6 +294,25 @@ rkat storage prune [--apply] [--older-than-days 30] [--json] [--root PATH]...
   `RecoveryRepairBlocked`; afterwards the reload replaces the registration
   from durable truth. A mob member's tracked turn stays pending, and a
   scheduled delivery records `RuntimeCompletionAuthorityUnavailable`.
+- SQLite lock profile (0.9.4): the bundled SQLite is built without its three
+  process-wide locks (allocator statistics, one page cache shared by every
+  connection, page-cache overflow statistics), which made concurrent sessions
+  in one host queue on each other. Release binaries carry the setting. A
+  build outside the repository (`cargo install rkat`, an application that
+  embeds Meerkat) sets `LIBSQLITE3_FLAGS="-DSQLITE_DEFAULT_MEMSTATUS=0
+  -USQLITE_ENABLE_MEMORY_MANAGEMENT -DSQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS"`
+  (`meerkat_sqlite::REQUIRED_LIBSQLITE3_FLAGS`) itself. Without it every host
+  binary still turns allocator statistics off as the first statement of
+  `main`, but the shared page cache and overflow statistics stay on; the first
+  store connection then logs a warning naming the variable, and
+  `rkat storage doctor` warns `sqlite-lock-profile`. Nothing Meerkat calls
+  reads what the locks provided (SQLite memory statistics, heap limits,
+  `sqlite3_release_memory`).
+- Since 0.9.4 a runtime delivery owner on a store other processes share reads
+  the delivery generation through one kept connection (about 19 microseconds
+  per read instead of about 500 for a verified open, measured on a shared
+  192-core host; store ticks come up to one per 10 ms). It still takes the shared fence guard for each read and opens
+  again, verified, when the file, schema or delivery ledger row changed.
 - Since 0.9.4 creating a persistent runtime over one store no longer waits for
   another store's OAuth flow rehydration: each store has its own slot in the
   process-wide provider-auth cache, and runtimes over one store still share
