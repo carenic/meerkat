@@ -560,7 +560,8 @@ pub use session::{
     session_metadata_schema_version, session_version,
     transcript_history_full_body_materializations, transcript_messages_digest,
     transcript_rewrite_prefix_digest, try_lifecycle_terminal_from_map,
-    try_session_metadata_from_map, validate_current_persisted_transcript_history_slice,
+    try_session_metadata_from_map, try_tool_visibility_state_from_map,
+    validate_current_persisted_transcript_history_slice,
 };
 pub use session_component_sidecar::{
     ComponentEventDigest, ComponentEventPrefixAuthority, ComponentEventPrefixDigest,
