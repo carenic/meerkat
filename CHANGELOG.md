@@ -213,6 +213,13 @@ them.
   `load_delivery_generation`), `RuntimeDeliveryInbox::delivery_generation_reader`,
   and `KEPT_DELIVERY_READER_IDLE`. A store decorator forwards the method to
   the store it wraps or keeps the default.
+- `meerkat-runtime`: `RuntimeStoreWriteFence::execute_if_current_blocking`,
+  a defaulted bounded-wait entry for a caller on a blocking thread. An
+  implementation may wait there, for a bounded time, for its authority guard
+  instead of answering `Backoff` at once; the default calls
+  `execute_if_current`. The SQLite runtime store calls it inside its blocking
+  tasks. A fence implementation or decorator outside Meerkat needs nothing
+  new; one that forwards fenced calls may forward this entry as well.
 
 ### Changed
 
@@ -414,6 +421,13 @@ them.
   crate now embeds its own byte-identical copy, pinned to the original's
   SHA-256. The mobpack help test still reads `docs/`, so it stays out of the
   rkat package and runs in the repository only.
+- An intent-managed identity on SQLite mob storage could stay in `Backoff`
+  indefinitely on a host with slow disk writes. The identity runtime write
+  fence gave up at once while a convergence status write committed, and every
+  retry met the next status write. The fence now waits up to 2 seconds for the
+  mob database's write lock when the SQLite runtime store calls it, and the
+  in-memory runtime store and the session publication retry it for up to 2
+  seconds with their locks released.
 
 ## [0.9.3] - 2026-10-18
 

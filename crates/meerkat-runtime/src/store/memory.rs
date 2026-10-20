@@ -1820,7 +1820,7 @@ fn deserialize_persisted_session(bytes: &[u8]) -> Result<meerkat_core::Session, 
 /// not commit it.
 fn prepared_snapshot_taken(runtime_id: &LogicalRuntimeId) -> RuntimeStoreError {
     RuntimeStoreError::Internal(format!(
-        "the prepared snapshot of runtime {runtime_id} was taken by an attempt that did not          commit it"
+        "the prepared snapshot of runtime {runtime_id} was taken by an attempt that did not commit it"
     ))
 }
 

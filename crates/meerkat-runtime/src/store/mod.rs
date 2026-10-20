@@ -6177,15 +6177,63 @@ pub enum RuntimeStoreWriteFenceOutcome {
 /// an async lock other tasks need, provided it retries a Backoff the way the
 /// built-in callers do: release the lock, pause, re-observe and try again,
 /// within a bound.
+///
+/// [`Self::execute_if_current_blocking`] is the bounded-wait entry, for a
+/// caller that is already on a blocking thread, such as the SQLite runtime
+/// store inside its blocking tasks. There an implementation may wait, for a
+/// bounded time, for an authority guard that `execute_if_current` would
+/// answer Backoff for at once. An async caller never calls it.
 pub trait RuntimeStoreWriteFence: Send + Sync {
     fn execute_if_current(
         &self,
         operation: Box<dyn FnOnce() -> Result<(), RuntimeStoreError> + '_>,
     ) -> Result<RuntimeStoreWriteFenceOutcome, RuntimeStoreError>;
+
+    /// [`Self::execute_if_current`] for a caller on a blocking thread: the
+    /// same contract, except that the implementation may block the thread
+    /// for a bounded time waiting for its authority guard before it answers
+    /// Backoff. The default waits no longer than `execute_if_current`.
+    fn execute_if_current_blocking(
+        &self,
+        operation: Box<dyn FnOnce() -> Result<(), RuntimeStoreError> + '_>,
+    ) -> Result<RuntimeStoreWriteFenceOutcome, RuntimeStoreError> {
+        self.execute_if_current(operation)
+    }
+}
+
+/// Which entry of a [`RuntimeStoreWriteFence`] a fenced write goes through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FenceEntry {
+    /// [`RuntimeStoreWriteFence::execute_if_current`]: no wait for the
+    /// authority's guard.
+    Immediate,
+    /// [`RuntimeStoreWriteFence::execute_if_current_blocking`]: a bounded
+    /// wait, on a blocking thread only.
+    Blocking,
 }
 
 pub(crate) fn execute_runtime_store_write_fence(
     write_fence: &dyn RuntimeStoreWriteFence,
+    operation: impl FnOnce() -> Result<(), RuntimeStoreError>,
+) -> Result<RuntimeStoreWriteFenceOutcome, RuntimeStoreError> {
+    execute_write_fence_through(write_fence, FenceEntry::Immediate, operation)
+}
+
+/// [`execute_runtime_store_write_fence`] through the fence's bounded-wait
+/// entry. It can block the calling thread for the fence's bound, so only a
+/// caller on a blocking thread calls it: the SQLite store, inside its
+/// blocking tasks.
+#[cfg_attr(not(feature = "sqlite-store"), allow(dead_code))]
+pub(crate) fn execute_runtime_store_write_fence_blocking(
+    write_fence: &dyn RuntimeStoreWriteFence,
+    operation: impl FnOnce() -> Result<(), RuntimeStoreError>,
+) -> Result<RuntimeStoreWriteFenceOutcome, RuntimeStoreError> {
+    execute_write_fence_through(write_fence, FenceEntry::Blocking, operation)
+}
+
+fn execute_write_fence_through(
+    write_fence: &dyn RuntimeStoreWriteFence,
+    entry: FenceEntry,
     operation: impl FnOnce() -> Result<(), RuntimeStoreError>,
 ) -> Result<RuntimeStoreWriteFenceOutcome, RuntimeStoreError> {
     let invoked = std::cell::Cell::new(false);
@@ -6196,7 +6244,12 @@ pub(crate) fn execute_runtime_store_write_fence(
         *operation_result.borrow_mut() = Some(result.clone());
         result
     };
-    let fence_result = write_fence.execute_if_current(Box::new(checked_operation));
+    let fence_result = match entry {
+        FenceEntry::Immediate => write_fence.execute_if_current(Box::new(checked_operation)),
+        FenceEntry::Blocking => {
+            write_fence.execute_if_current_blocking(Box::new(checked_operation))
+        }
+    };
     let operation_result = operation_result.borrow_mut().take();
     if invoked.get() {
         return match operation_result {
@@ -6245,11 +6298,30 @@ pub(crate) fn execute_optional_runtime_store_target_write<T>(
     write_fence: Option<&dyn RuntimeStoreWriteFence>,
     operation: impl FnOnce() -> Result<T, RuntimeStoreError>,
 ) -> Result<T, RuntimeStoreError> {
+    execute_optional_target_write_through(write_fence, FenceEntry::Immediate, operation)
+}
+
+/// [`execute_optional_runtime_store_target_write`] through the fence's
+/// bounded-wait entry: on a blocking thread only, as
+/// [`execute_runtime_store_write_fence_blocking`].
+#[cfg_attr(not(feature = "sqlite-store"), allow(dead_code))]
+pub(crate) fn execute_optional_runtime_store_target_write_blocking<T>(
+    write_fence: Option<&dyn RuntimeStoreWriteFence>,
+    operation: impl FnOnce() -> Result<T, RuntimeStoreError>,
+) -> Result<T, RuntimeStoreError> {
+    execute_optional_target_write_through(write_fence, FenceEntry::Blocking, operation)
+}
+
+fn execute_optional_target_write_through<T>(
+    write_fence: Option<&dyn RuntimeStoreWriteFence>,
+    entry: FenceEntry,
+    operation: impl FnOnce() -> Result<T, RuntimeStoreError>,
+) -> Result<T, RuntimeStoreError> {
     let Some(write_fence) = write_fence else {
         return operation();
     };
     let result = std::cell::RefCell::new(None);
-    let outcome = execute_runtime_store_write_fence(write_fence, || {
+    let outcome = execute_write_fence_through(write_fence, entry, || {
         let value = operation()?;
         *result.borrow_mut() = Some(value);
         Ok(())
@@ -6287,9 +6359,9 @@ pub(crate) const FENCE_BACKOFF_RETRY_BOUND: std::time::Duration = std::time::Dur
 const FENCE_BACKOFF_FIRST_PAUSE: std::time::Duration = std::time::Duration::from_millis(5);
 const FENCE_BACKOFF_MAX_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// The retry policy of a fenced write whose caller holds an async lock
-///. Each attempt takes the caller's lock, re-observes what it writes
-/// and runs one fence attempt. After an attempt the fence answered with
+/// The retry policy of a fenced write whose caller holds an async lock.
+/// Each attempt takes the caller's lock, re-observes what it writes and
+/// runs one fence attempt. After an attempt the fence answered with
 /// Backoff, the caller releases the lock and calls [`Self::pause`].
 #[derive(Debug, Default)]
 pub(crate) struct FenceBackoffRetry {

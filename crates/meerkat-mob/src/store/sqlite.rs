@@ -3388,6 +3388,15 @@ pub struct SqliteMobIdentityStore {
     event_bus: Option<Arc<SqliteMobEventBus>>,
 }
 
+/// The identity store's runtime write fence: one IMMEDIATE transaction on
+/// mob.db that checks the identity's intent and lease and runs the runtime
+/// write inside it.
+///
+/// It opens mob.db with `ConnectionProfile::Maintenance { write: true }`:
+/// read-write access to the existing file without pragma mutation (no
+/// journal-mode change, no schema work), with the busy wait named per entry:
+/// none for `execute_if_current`, [`IDENTITY_RUNTIME_WRITE_FENCE_WAIT`] for
+/// `execute_if_current_blocking`.
 #[cfg(feature = "runtime-adapter")]
 struct SqliteIdentityRuntimeWriteFence {
     path: PathBuf,
@@ -3397,10 +3406,65 @@ struct SqliteIdentityRuntimeWriteFence {
     expected_session: DesiredSessionTarget,
 }
 
+/// How long the identity runtime write fence's bounded-wait entry
+/// (`execute_if_current_blocking`) waits for mob.db's write lock before it
+/// answers Backoff. Only a caller on a blocking thread takes that entry: the
+/// SQLite runtime store, inside its blocking tasks. `execute_if_current`
+/// still waits for nothing; an async caller that holds a lock retries its
+/// Backoff with the lock released instead.
+///
+/// Convergence statuses are written to mob.db right before each actuation,
+/// and a status commit holds the write lock across its fsync. Without a wait
+/// the fence lost to that commit on a host with slow disk writes, wrote
+/// another status and lost again on the next pass. Basis for 2 seconds: a
+/// convergence-status write took 4.4 ms at the median, 6.8 ms at the 99th
+/// percentile and 7.9 ms at most over 200 writes on a development host (the
+/// ignored `bench_convergence_status_write` test), so the bound covers
+/// commits through fsyncs some 250 times slower than that. A status commit
+/// slower than the bound still loses the fence, and the identity retries
+/// with backoff, as before.
+///
+/// While the fence waits it holds runtime.sqlite3's write lock (the runtime
+/// store's IMMEDIATE transaction). Under contention only:
+/// - other runtime writers wait on their 60-second busy timeout;
+/// - writers with a zero busy timeout are refused busy for up to the bound
+///   (controller custody, `try_controller_mutation_custody`);
+/// - WAL readers, the kept delivery-generation reader included, are not
+///   affected.
+///
+/// A status commit can therefore delay an actuation by at most the bound.
+/// The lock order is always runtime.sqlite3, then mob.db: no mob.db writer
+/// takes runtime.sqlite3. A holder in the other order would still meet a
+/// bounded wait and a Backoff, not a deadlock.
+#[cfg(feature = "runtime-adapter")]
+pub(crate) const IDENTITY_RUNTIME_WRITE_FENCE_WAIT: Duration = Duration::from_secs(2);
+
 #[cfg(feature = "runtime-adapter")]
 impl meerkat_runtime::RuntimeStoreWriteFence for SqliteIdentityRuntimeWriteFence {
     fn execute_if_current(
         &self,
+        operation: Box<dyn FnOnce() -> Result<(), meerkat_runtime::RuntimeStoreError> + '_>,
+    ) -> Result<meerkat_runtime::RuntimeStoreWriteFenceOutcome, meerkat_runtime::RuntimeStoreError>
+    {
+        self.execute_waiting(Duration::ZERO, operation)
+    }
+
+    fn execute_if_current_blocking(
+        &self,
+        operation: Box<dyn FnOnce() -> Result<(), meerkat_runtime::RuntimeStoreError> + '_>,
+    ) -> Result<meerkat_runtime::RuntimeStoreWriteFenceOutcome, meerkat_runtime::RuntimeStoreError>
+    {
+        self.execute_waiting(IDENTITY_RUNTIME_WRITE_FENCE_WAIT, operation)
+    }
+}
+
+#[cfg(feature = "runtime-adapter")]
+impl SqliteIdentityRuntimeWriteFence {
+    /// One fence attempt whose IMMEDIATE transaction on mob.db waits up to
+    /// `wait` for the write lock.
+    fn execute_waiting(
+        &self,
+        wait: Duration,
         operation: Box<dyn FnOnce() -> Result<(), meerkat_runtime::RuntimeStoreError> + '_>,
     ) -> Result<meerkat_runtime::RuntimeStoreWriteFenceOutcome, meerkat_runtime::RuntimeStoreError>
     {
@@ -3416,14 +3480,19 @@ impl meerkat_runtime::RuntimeStoreWriteFence for SqliteIdentityRuntimeWriteFence
                 });
             }
         };
-        // Maintenance profile: read-write on the existing file, zero busy
-        // timeout for nonblocking admission, no pragma mutation. No schema
-        // preflight: a preflight refusal here would surface as an endlessly
-        // retried Backoff instead of a typed error, and the fence probe's
-        // SQL fails typed on a restructured file anyway.
-        let mut conn = match meerkat_sqlite::open(
+        // The Maintenance profile with this entry's wait (see the type). No
+        // schema preflight: a preflight refusal here would surface as an
+        // endlessly retried Backoff instead of a typed error, and the fence
+        // probe's SQL fails typed on a restructured file anyway.
+        #[cfg(test)]
+        let started = std::time::Instant::now();
+        let mut conn = match meerkat_sqlite::open_with(
             &self.path,
             meerkat_sqlite::ConnectionProfile::Maintenance { write: true },
+            meerkat_sqlite::OpenOptions {
+                busy_timeout: Some(wait),
+                ..meerkat_sqlite::OpenOptions::default()
+            },
         ) {
             Ok(conn) => conn,
             Err(error) => {
@@ -3434,7 +3503,18 @@ impl meerkat_runtime::RuntimeStoreWriteFence for SqliteIdentityRuntimeWriteFence
                 });
             }
         };
-        let tx = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate);
+        #[cfg(test)]
+        identity_fence_test_hooks::fence_attempt(&self.path, || {
+            identity_fence_test_hooks::FenceAttempt {
+                identity: self.permit.identity.clone(),
+                blocking: !wait.is_zero(),
+                started,
+                waited: started.elapsed(),
+                took_lock: tx.is_ok(),
+            }
+        });
+        let tx = match tx {
             Ok(tx) => tx,
             Err(error) if meerkat_sqlite::is_busy_or_locked(&error) => {
                 return Ok(meerkat_runtime::RuntimeStoreWriteFenceOutcome::Backoff {
@@ -3482,6 +3562,111 @@ impl meerkat_runtime::RuntimeStoreWriteFence for SqliteIdentityRuntimeWriteFence
         }
         operation()?;
         Ok(meerkat_runtime::RuntimeStoreWriteFenceOutcome::Applied)
+    }
+}
+
+/// Test hooks of the identity runtime write fence, keyed by mob database
+/// path: a fault-injection hold of convergence-status commits (a commit
+/// through a slow fsync) and a record of fence attempts. Unit tests only.
+#[cfg(all(test, feature = "runtime-adapter"))]
+pub(crate) mod identity_fence_test_hooks {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+    use std::time::{Duration, Instant};
+
+    use crate::identity::IdentityReconcileDecision;
+    use crate::ids::AgentIdentity;
+
+    /// One identity runtime write fence attempt on a recorded database.
+    #[derive(Debug, Clone)]
+    pub(crate) struct FenceAttempt {
+        pub(crate) identity: AgentIdentity,
+        /// Whether the attempt came through the bounded-wait entry.
+        pub(crate) blocking: bool,
+        pub(crate) started: Instant,
+        /// From the attempt's start until mob.db's write lock was taken or
+        /// refused.
+        pub(crate) waited: Duration,
+        pub(crate) took_lock: bool,
+    }
+
+    #[derive(Default)]
+    struct Hooks {
+        status_commit_holds: HashMap<PathBuf, StatusCommitHold>,
+        fence_attempts: HashMap<PathBuf, Vec<FenceAttempt>>,
+    }
+
+    /// How long a convergence-status commit holds its write transaction
+    /// open, and for which decision only (`None`: every status).
+    #[derive(Clone, Copy)]
+    struct StatusCommitHold {
+        hold: Duration,
+        only: Option<IdentityReconcileDecision>,
+    }
+
+    fn hooks() -> MutexGuard<'static, Hooks> {
+        static HOOKS: OnceLock<Mutex<Hooks>> = OnceLock::new();
+        HOOKS
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The stores key their database by its canonical path.
+    fn key(path: &Path) -> PathBuf {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    /// Every convergence-status commit to the database at `path` (with
+    /// `only`, every one whose decision is `only`) holds its write
+    /// transaction open for `hold` before it commits.
+    pub(crate) fn hold_status_commits(
+        path: &Path,
+        hold: Duration,
+        only: Option<IdentityReconcileDecision>,
+    ) {
+        hooks()
+            .status_commit_holds
+            .insert(key(path), StatusCommitHold { hold, only });
+    }
+
+    /// Records every identity runtime write fence attempt on the database
+    /// at `path` from now on.
+    pub(crate) fn record_fence_attempts(path: &Path) {
+        hooks().fence_attempts.entry(key(path)).or_default();
+    }
+
+    /// The fence attempts recorded on the database at `path`.
+    pub(crate) fn fence_attempts(path: &Path) -> Vec<FenceAttempt> {
+        hooks()
+            .fence_attempts
+            .get(&key(path))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Drops every hook of the database at `path`.
+    pub(crate) fn release(path: &Path) {
+        let key = key(path);
+        let mut hooks = hooks();
+        hooks.status_commit_holds.remove(&key);
+        hooks.fence_attempts.remove(&key);
+    }
+
+    pub(super) fn before_status_commit(path: &Path, decision: Option<IdentityReconcileDecision>) {
+        let hold = hooks().status_commit_holds.get(path).copied();
+        if let Some(StatusCommitHold { hold, only }) = hold
+            && (only.is_none() || only == decision)
+        {
+            std::thread::sleep(hold);
+        }
+    }
+
+    pub(super) fn fence_attempt(path: &Path, attempt: impl FnOnce() -> FenceAttempt) {
+        if let Some(attempts) = hooks().fence_attempts.get_mut(path) {
+            attempts.push(attempt());
+        }
     }
 }
 
@@ -5859,6 +6044,8 @@ impl MobIdentityStatusStore for SqliteMobIdentityStatusStore {
             .map_err(|error| {
                 sqlite_identity_write_error(error, "replace identity convergence status")
             })?;
+            #[cfg(all(test, feature = "runtime-adapter"))]
+            identity_fence_test_hooks::before_status_commit(&path, status.decision);
             tx.commit().map_err(se)?;
             Ok(())
         })
@@ -14902,7 +15089,7 @@ mod identity_fence_contention_tests {
         MeerkatMachine, RuntimeSessionLifecycleObservation, RuntimeSessionRegistrationOutcome,
         RuntimeStoreError, RuntimeStoreWriteFenceOutcome,
     };
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     /// How long the holder keeps mob.db's write lock: a slow status commit.
@@ -15107,6 +15294,18 @@ mod identity_fence_contention_tests {
             self.after_call();
             outcome
         }
+
+        fn execute_if_current_blocking(
+            &self,
+            operation: Box<dyn FnOnce() -> Result<(), RuntimeStoreError> + '_>,
+        ) -> Result<RuntimeStoreWriteFenceOutcome, RuntimeStoreError> {
+            self.before_call();
+            let outcome = self
+                .inner
+                .execute_if_current_blocking(self.recorded(operation));
+            self.after_call();
+            outcome
+        }
     }
 
     /// Counts ticks of a task on the test's runtime until it is aborted.
@@ -15287,5 +15486,170 @@ mod identity_fence_contention_tests {
         );
         assert_read_ran_during_the_pause(read_at, starts[READ_AFTER_CALLS]);
         assert!(machine.contains_session(&session_id).await);
+    }
+
+    /// A fence call through the bounded-wait entry on a blocking thread, as
+    /// the SQLite runtime store makes it: the outcome, whether the operation
+    /// ran, and how long the call took.
+    async fn blocking_fence_call(
+        fence: Arc<dyn RuntimeStoreWriteFence>,
+    ) -> (
+        Result<RuntimeStoreWriteFenceOutcome, RuntimeStoreError>,
+        bool,
+        Duration,
+    ) {
+        tokio::task::spawn_blocking(move || {
+            let ran = AtomicBool::new(false);
+            let started = Instant::now();
+            let outcome = fence.execute_if_current_blocking(Box::new(|| {
+                ran.store(true, Ordering::SeqCst);
+                Ok(())
+            }));
+            (outcome, ran.into_inner(), started.elapsed())
+        })
+        .await
+        .unwrap()
+    }
+
+    /// The cold lifecycle observation of `session_id` in a fresh store.
+    async fn cold_observation(
+        session_id: &meerkat_core::SessionId,
+    ) -> RuntimeSessionLifecycleObservation {
+        MeerkatMachine::persistent(
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
+            Arc::new(meerkat_store::MemoryBlobStore::new()),
+        )
+        .unwrap()
+        .observe_cold_runtime_lifecycle(session_id)
+        .await
+        .unwrap()
+    }
+
+    /// RED-1: the SQLite runtime store's fenced lifecycle CAS runs in a
+    /// blocking task and takes the bounded-wait entry, so it waits inside its
+    /// one fence call for mob.db held by a status commit, and writes once the
+    /// holder releases.
+    #[tokio::test]
+    async fn a_sqlite_runtime_store_cas_waits_inside_the_fence_for_a_held_mob_database() {
+        let adopted = adopted_identity().await;
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            meerkat_runtime::SqliteRuntimeStore::new(runtime_dir.path().join("runtime.sqlite3"))
+                .unwrap(),
+        );
+        let machine =
+            MeerkatMachine::persistent(store, Arc::new(meerkat_store::MemoryBlobStore::new()))
+                .unwrap();
+        let session_id = adopted.session.session_id.clone();
+        let observed = machine
+            .observe_cold_runtime_lifecycle(&session_id)
+            .await
+            .unwrap();
+        let fence = HoldMobDbAt::new(adopted.runtime_fence(&observed), &adopted.path, 1);
+
+        let outcome = machine
+            .register_session_if_runtime_lifecycle_current(observed, fence.clone())
+            .await;
+        assert!(
+            matches!(outcome, RuntimeSessionRegistrationOutcome::Applied { .. }),
+            "the fenced registration rides out the held lock: {outcome:?}"
+        );
+        assert_eq!(
+            fence.call_starts().len(),
+            2,
+            "the CAS waited inside its one fence call, then the publication ran"
+        );
+        let released_at = fence.released_at();
+        let operations = fence.operations();
+        assert_eq!(operations.len(), 2);
+        assert!(
+            operations[0] >= released_at,
+            "the CAS wrote once the holder released mob.db"
+        );
+        assert!(machine.contains_session(&session_id).await);
+    }
+
+    /// C1: with nothing holding mob.db, the bounded-wait entry admits at once.
+    #[tokio::test]
+    async fn an_uncontended_bounded_fence_admits_without_waiting() {
+        let adopted = adopted_identity().await;
+        let fence = adopted.runtime_fence(&cold_observation(&adopted.session.session_id).await);
+        let (outcome, ran, took) = blocking_fence_call(fence).await;
+        assert_eq!(outcome.unwrap(), RuntimeStoreWriteFenceOutcome::Applied);
+        assert!(ran);
+        assert!(
+            took < Duration::from_millis(500),
+            "no wait without contention: {took:?}"
+        );
+    }
+
+    /// C2: with mob.db held well past the documented 2 s bound, the
+    /// bounded-wait entry answers the contended Backoff once its wait is
+    /// spent, without running the operation, and waits about the bound. The
+    /// 3.5 s hold is fixed: a longer bound, or no bound, admits the operation
+    /// once the holder releases and fails the Backoff check.
+    #[tokio::test]
+    async fn a_bounded_fence_answers_backoff_once_its_wait_is_spent() {
+        let bound = IDENTITY_RUNTIME_WRITE_FENCE_WAIT;
+        let adopted = adopted_identity().await;
+        let fence = adopted.runtime_fence(&cold_observation(&adopted.session.session_id).await);
+        let holder = hold_mob_db(&adopted.path, Duration::from_millis(3500));
+        let (outcome, ran, took) = blocking_fence_call(fence).await;
+        holder.join().unwrap();
+        assert_eq!(
+            outcome.unwrap(),
+            RuntimeStoreWriteFenceOutcome::Backoff {
+                reason: "identity runtime write fence authority guard is contended".to_string(),
+            }
+        );
+        assert!(!ran, "a refused fence runs nothing");
+        assert!(
+            took >= bound && took < bound + Duration::from_secs(1),
+            "the fence waited the bound, no more: {took:?}"
+        );
+    }
+
+    /// The basis of [`IDENTITY_RUNTIME_WRITE_FENCE_WAIT`]: how long a
+    /// convergence-status write takes on this host, from its call to its
+    /// commit (the write lock is held from its BEGIN IMMEDIATE through the
+    /// commit's fsync). Prints numbers, asserts nothing about them:
+    ///
+    /// ```text
+    /// ./scripts/repo-cargo test -p meerkat-mob --lib -- --ignored --nocapture \
+    ///     bench_convergence_status_write
+    /// ```
+    #[tokio::test]
+    #[ignore = "measurement: prints convergence-status write latencies"]
+    async fn bench_convergence_status_write() {
+        const WRITES: usize = 200;
+        let adopted = adopted_identity().await;
+        let statuses = SqliteMobStores::open(&adopted.path)
+            .unwrap()
+            .identity_status_store();
+        let mut took = Vec::with_capacity(WRITES);
+        for write in 0..WRITES {
+            let status = crate::identity::IdentityConvergenceStatus {
+                identity: adopted.identity.clone(),
+                intent_revision: Some(1),
+                active_intent_revision: Some(1),
+                lease_epoch: Some(adopted.lease.epoch),
+                decision: Some(crate::identity::IdentityReconcileDecision::Backoff),
+                observed_at_ms: write as u64,
+                detail: Some("convergence-status write measurement".to_string()),
+            };
+            let started = Instant::now();
+            statuses
+                .replace_identity_convergence_status(&adopted.mob_id, &status)
+                .await
+                .unwrap();
+            took.push(started.elapsed());
+        }
+        took.sort();
+        println!(
+            "convergence-status writes: p50 {:?}, p99 {:?}, max {:?} over {WRITES}",
+            took[WRITES / 2],
+            took[WRITES * 99 / 100],
+            took[WRITES - 1]
+        );
     }
 }

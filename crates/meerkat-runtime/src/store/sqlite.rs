@@ -42,7 +42,7 @@ mod inner {
         RuntimeStoreWriteFenceOutcome, SerializedSessionSnapshot,
         WholeBlobProvisionalTailAuthority, WholeBlobSnapshotCasOutcome, WholeBlobStoreAuthority,
         classify_machine_lifecycle_record, complete_compaction_projection_intent,
-        decoded_prepared_machine_lifecycle_replacement, execute_runtime_store_write_fence,
+        decoded_prepared_machine_lifecycle_replacement, execute_runtime_store_write_fence_blocking,
         head_canonical_activation_predecessor_matches, parsed_whole_blob_snapshot,
         prepare_input_state_batch_cas, prepare_machine_lifecycle_replacement,
         prepare_recovery_input_state_mutations, validate_input_state_batch_read_ids,
@@ -5186,11 +5186,13 @@ END";
             .map_err(|error| map_runtime_connection_error(&path, "BEGIN IMMEDIATE", caller, error))
     }
 
+    /// Commits `tx` under `write_fence`'s bounded-wait entry: every caller
+    /// runs inside a blocking task.
     fn commit_runtime_transaction(
         tx: Transaction<'_>,
         write_fence: Option<&dyn RuntimeStoreWriteFence>,
     ) -> Result<(), RuntimeStoreError> {
-        crate::store::execute_optional_runtime_store_target_write(write_fence, || {
+        crate::store::execute_optional_runtime_store_target_write_blocking(write_fence, || {
             tx.commit()
                 .map_err(|error| RuntimeStoreError::WriteFailed(error.to_string()))
         })
@@ -11473,7 +11475,7 @@ ORDER BY runtime_id";
                     insert_receipt(&tx, &runtime_id, receipt)?;
                 }
                 upsert_input_states(&tx, &runtime_id, &input_updates)?;
-                crate::store::execute_optional_runtime_store_target_write(
+                crate::store::execute_optional_runtime_store_target_write_blocking(
                     write_fence.as_deref(),
                     || {
                         tx.commit().map_err(|error| {
@@ -16142,7 +16144,7 @@ ORDER BY runtime_id";
 
                 let mut tx_slot = Some(tx);
                 let fence_outcome =
-                    execute_runtime_store_write_fence(write_fence.as_ref(), || {
+                    execute_runtime_store_write_fence_blocking(write_fence.as_ref(), || {
                         let tx = tx_slot.as_ref().ok_or_else(|| {
                             RuntimeStoreError::Internal(
                                 "SQLite input recovery fence lost its transaction".to_string(),
@@ -16261,7 +16263,7 @@ ORDER BY runtime_id";
 
                 let mut tx_slot = Some(tx);
                 let fence_outcome =
-                    execute_runtime_store_write_fence(write_fence.as_ref(), || {
+                    execute_runtime_store_write_fence_blocking(write_fence.as_ref(), || {
                         let tx = tx_slot.as_ref().ok_or_else(|| {
                             RuntimeStoreError::Internal(
                                 "SQLite recovery input fence lost its transaction".to_string(),
@@ -16797,7 +16799,7 @@ ORDER BY runtime_id";
                 let replacement_bytes = replacement.bytes;
                 let mut tx_slot = Some(tx);
                 let fence_outcome =
-                    execute_runtime_store_write_fence(write_fence.as_ref(), || {
+                    execute_runtime_store_write_fence_blocking(write_fence.as_ref(), || {
                         let tx = tx_slot.as_ref().ok_or_else(|| {
                             RuntimeStoreError::Internal(
                                 "SQLite lifecycle fence lost its transaction".to_string(),
@@ -17529,6 +17531,247 @@ ORDER BY runtime_id";
             })
             .await
             .map_err(|err| RuntimeStoreError::Internal(format!("Task join failed: {err}")))?
+        }
+    }
+
+    /// The bounded fence wait blocks its thread, so this store calls it only
+    /// on a blocking thread: inside a `spawn_blocking_holding_claim` closure,
+    /// or in `commit_runtime_transaction`, which only such closures call. The
+    /// in-memory store and the session publication take the fence's
+    /// immediate entry and retry a Backoff with their lock released.
+    #[cfg(test)]
+    #[allow(clippy::expect_used)]
+    mod fence_wait_site_tests {
+        use std::ops::Range;
+
+        /// The store's fence helpers that take the bounded-wait entry.
+        const WAITING_HELPERS: [&str; 2] = [
+            "execute_runtime_store_write_fence_blocking",
+            "execute_optional_runtime_store_target_write_blocking",
+        ];
+
+        /// Where the comment or the string or character literal starting at
+        /// `at` ends (exclusive), or `None` when none starts there.
+        fn skipped_end(bytes: &[u8], at: usize) -> Option<usize> {
+            let rest = &bytes[at..];
+            if rest.starts_with(b"//") {
+                return Some(
+                    rest.iter()
+                        .position(|&byte| byte == b'\n')
+                        .map_or(bytes.len(), |offset| at + offset),
+                );
+            }
+            if rest.starts_with(b"/*") {
+                let (mut depth, mut end) = (0_usize, at);
+                while end < bytes.len() {
+                    if bytes[end..].starts_with(b"/*") {
+                        depth += 1;
+                        end += 2;
+                    } else if bytes[end..].starts_with(b"*/") {
+                        depth -= 1;
+                        end += 2;
+                        if depth == 0 {
+                            return Some(end);
+                        }
+                    } else {
+                        end += 1;
+                    }
+                }
+                return Some(end);
+            }
+            let after_identifier =
+                at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_');
+            if !after_identifier {
+                // Raw strings: r"..", r#".."#, br"..", br#".."#.
+                let prefix = if rest.starts_with(b"br") {
+                    2
+                } else {
+                    usize::from(rest.starts_with(b"r"))
+                };
+                if prefix > 0 {
+                    let hashes = rest[prefix..]
+                        .iter()
+                        .take_while(|&&byte| byte == b'#')
+                        .count();
+                    if rest.get(prefix + hashes) == Some(&b'"') {
+                        let mut closing = vec![b'"'];
+                        closing.extend(std::iter::repeat_n(b'#', hashes));
+                        let body = at + prefix + hashes + 1;
+                        return Some(
+                            bytes[body..]
+                                .windows(closing.len())
+                                .position(|window| window == closing.as_slice())
+                                .map_or(bytes.len(), |offset| body + offset + closing.len()),
+                        );
+                    }
+                }
+            }
+            match rest.first() {
+                Some(b'"') => {
+                    let mut end = at + 1;
+                    while end < bytes.len() && bytes[end] != b'"' {
+                        end += if bytes[end] == b'\\' { 2 } else { 1 };
+                    }
+                    Some((end + 1).min(bytes.len()))
+                }
+                // A character literal; a lifetime or a label stays code.
+                Some(b'\'') => {
+                    if rest.get(1) == Some(&b'\\') {
+                        let close = rest.get(3..)?.iter().position(|&byte| byte == b'\'')?;
+                        return Some(at + 3 + close + 1);
+                    }
+                    let width = match *rest.get(1)? {
+                        byte if byte < 0x80 => 1,
+                        byte if byte >= 0xF0 => 4,
+                        byte if byte >= 0xE0 => 3,
+                        _ => 2,
+                    };
+                    (rest.get(1 + width) == Some(&b'\'')).then_some(at + 2 + width)
+                }
+                _ => None,
+            }
+        }
+
+        /// `source` with comments and string and character literals blanked
+        /// byte for byte, so names and brackets are matched in code only.
+        fn code_only(source: &str) -> Vec<u8> {
+            let bytes = source.as_bytes();
+            let mut code = bytes.to_vec();
+            let mut at = 0;
+            while at < bytes.len() {
+                if let Some(end) = skipped_end(bytes, at) {
+                    for byte in &mut code[at..end] {
+                        if *byte != b'\n' {
+                            *byte = b' ';
+                        }
+                    }
+                    at = end;
+                } else {
+                    at += 1;
+                }
+            }
+            code
+        }
+
+        /// The offset of the `(` of every call of `name` in `code`; a
+        /// definition (`fn name(`) is not a call.
+        fn calls<'a>(code: &'a [u8], name: &'a str) -> impl Iterator<Item = usize> + 'a {
+            let name = name.as_bytes();
+            (0..code.len())
+                .filter(move |&at| {
+                    code[at..].starts_with(name)
+                        && code.get(at + name.len()) == Some(&b'(')
+                        && (at == 0
+                            || !(code[at - 1].is_ascii_alphanumeric() || code[at - 1] == b'_'))
+                        && !code[..at].ends_with(b"fn ")
+                })
+                .map(move |at| at + name.len())
+        }
+
+        /// Just past the bracket that closes the one at `open`.
+        fn closing(code: &[u8], open: usize) -> usize {
+            let opening = code[open];
+            let closing = if opening == b'(' { b')' } else { b'}' };
+            let mut depth = 0_usize;
+            for (offset, &byte) in code[open..].iter().enumerate() {
+                if byte == opening {
+                    depth += 1;
+                } else if byte == closing {
+                    depth -= 1;
+                    if depth == 0 {
+                        return open + offset + 1;
+                    }
+                }
+            }
+            code.len()
+        }
+
+        /// The body of `fn name`.
+        fn fn_body(code: &[u8], name: &str) -> Range<usize> {
+            let needle = format!("fn {name}(");
+            let at = code
+                .windows(needle.len())
+                .position(|window| window == needle.as_bytes())
+                .expect("the function exists");
+            let open = at
+                + code[at..]
+                    .iter()
+                    .position(|&byte| byte == b'{')
+                    .expect("the function has a body");
+            open..closing(code, open)
+        }
+
+        fn line(code: &[u8], at: usize) -> usize {
+            code[..at].split(|&byte| byte == b'\n').count()
+        }
+
+        #[test]
+        fn the_bounded_fence_wait_is_called_only_on_blocking_threads() {
+            let code = code_only(include_str!("sqlite.rs"));
+            let blocking: Vec<Range<usize>> = calls(&code, "spawn_blocking_holding_claim")
+                .map(|open| open..closing(&code, open))
+                .collect();
+            let on_blocking_thread = |at: usize| blocking.iter().any(|span| span.contains(&at));
+            let commit = fn_body(&code, "commit_runtime_transaction");
+            let mut waiting_calls = 0;
+            for name in WAITING_HELPERS {
+                for at in calls(&code, name) {
+                    waiting_calls += 1;
+                    assert!(
+                        on_blocking_thread(at) || commit.contains(&at),
+                        "sqlite.rs:{}: {name} outside a spawn_blocking_holding_claim closure",
+                        line(&code, at)
+                    );
+                }
+            }
+            assert!(
+                waiting_calls > 0,
+                "the store's fenced writes take the bounded wait"
+            );
+            let mut commits = 0;
+            for at in calls(&code, "commit_runtime_transaction") {
+                commits += 1;
+                assert!(
+                    on_blocking_thread(at),
+                    "sqlite.rs:{}: commit_runtime_transaction outside a \
+                     spawn_blocking_holding_claim closure",
+                    line(&code, at)
+                );
+            }
+            assert!(commits > 0, "the store commits fenced transactions");
+
+            for (file, source) in [
+                ("memory.rs", include_str!("memory.rs")),
+                (
+                    "session_management.rs",
+                    include_str!("../meerkat_machine/session_management.rs"),
+                ),
+            ] {
+                let code = code_only(source);
+                for name in WAITING_HELPERS
+                    .into_iter()
+                    .chain(["execute_if_current_blocking"])
+                {
+                    assert!(
+                        calls(&code, name).next().is_none(),
+                        "{file} calls {name}: an async site retries the immediate entry instead"
+                    );
+                }
+            }
+
+            // The trait's bounded entry is reached only through the helpers.
+            let code = code_only(include_str!("mod.rs"));
+            let entry_calls: Vec<usize> = calls(&code, "execute_if_current_blocking").collect();
+            let through = fn_body(&code, "execute_write_fence_through");
+            assert!(
+                entry_calls.len() == 1 && through.contains(&entry_calls[0]),
+                "mod.rs calls execute_if_current_blocking only in execute_write_fence_through: \
+                 lines {:?}",
+                entry_calls
+                    .iter()
+                    .map(|&at| line(&code, at))
+                    .collect::<Vec<_>>()
+            );
         }
     }
 
