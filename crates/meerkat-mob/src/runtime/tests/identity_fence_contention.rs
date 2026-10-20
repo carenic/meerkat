@@ -408,9 +408,11 @@ impl fmt::Display for ContentionReport {
     }
 }
 
-/// RED-2: an adopted identity whose every convergence-status commit holds
-/// mob.db's write lock for 300 ms converges: its runtime registration waits
-/// for the lock instead of losing to the status write on every pass.
+/// C3: an adopted identity whose every convergence-status commit holds
+/// mob.db's write lock for 300 ms converges. A control: with one identity,
+/// a registration that finds the fence held is retried on a later pass, so
+/// it converges with or without the bounded wait. RED-1 and RED-5 prove the
+/// wait itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_adopted_identity_converges_while_status_commits_hold_the_mob_database() {
     let mob = sqlite_mob("fence-contention-one").await;
