@@ -3127,7 +3127,16 @@ impl SessionHead {
             {
                 session
                     .install_verified_realtime_component_sequence(realtime_sequence)
-                    .map_err(|_| SessionStoreError::Corrupted(id.clone()))?;
+                    .map_err(|error| {
+                        // The error keeps its shape; the reason a stored
+                        // sequence does not replay goes to the log.
+                        tracing::warn!(
+                            session_id = %id,
+                            error = %error,
+                            "a stored realtime component sequence does not replay"
+                        );
+                        SessionStoreError::Corrupted(id.clone())
+                    })?;
             }
             _ => return Err(SessionStoreError::Corrupted(id)),
         }
