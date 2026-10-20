@@ -4,7 +4,7 @@ description: "Optional ABAC for the console: control which users can see which a
 icon: "lock"
 ---
 
-*Mirrored from MobKit main at [2c56f4c82669](https://github.com/lukacf/meerkat-meta/commit/2c56f4c826694f65124df7a111e33497f08e2bf9) on 2026-10-19; MobKit workspace version 0.9.3 at that commit.*
+*Mirrored from MobKit main at [703f86615ceb](https://github.com/lukacf/meerkat-meta/commit/703f86615ceb7ec6f7d85870d01720f54114cd8c) on 2026-10-20; MobKit workspace version 0.9.3 at that commit.*
 
 Meta ships an optional attribute-based access control (ABAC) layer for everything that flows through the console and observation surfaces. When it is off — the default — nothing changes. When it is on, every console caller only sees and operates exactly what their attributes grant: the agent sidebar, roster, topology, timeline, event streams, sends, and lifecycle actions are all filtered or gated per principal, invisibly. A restricted user doesn't see denied agents or disabled buttons explained; they just get a console shaped to what they're allowed.
 
@@ -215,7 +215,12 @@ request.
    review step binds the intended edit to the current configuration; it does not
    itself write. Refreshing alone never silently rebases or retries the draft.
 
-A loading or failed protected read disables edits until a current read succeeds.
+The first read after opening Access or changing connection or subject, a Refresh,
+and the read after a save disable edits until they succeed; so does a failed read.
+Reads the console starts in the background do not disable edits while they run:
+the panel keeps the last read until one lands and then applies it at once, a
+refusal included. They never rebase a draft; the owner still checks the draft's
+edit token when you save.
 Missing or unknown checked-save capability also disables edits while permitted
 reads remain available. Losing administrator access or switching connection or
 subject must not expose the previous scope's draft. Server-side read-only mode

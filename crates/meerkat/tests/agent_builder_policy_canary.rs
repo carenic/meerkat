@@ -665,9 +665,12 @@ fn core_agent_builder_does_not_expose_public_build_bypass() {
 fn core_test_turn_state_handle_is_not_public_authority() {
     let agent_mod = repo_file("crates/meerkat-core/src/agent.rs");
     assert!(
-        agent_mod.contains("#[cfg(test)]\n#[doc(hidden)]\npub(crate) mod test_turn_state_handle;"),
-        "core test turn-state handle must be cfg(test) and crate-private so downstream \
-         crates cannot substitute a handwritten lifecycle reducer for runtime machine authority"
+        agent_mod.contains(
+            "#[cfg(all(test, feature = \"workspace-tests\"))]\n#[doc(hidden)]\npub(crate) mod test_turn_state_handle;"
+        ),
+        "core test turn-state handle must be test-only (cfg(test), narrowed to the \
+         workspace-tests feature) and crate-private so downstream crates cannot substitute \
+         a handwritten lifecycle reducer for runtime machine authority"
     );
 
     let test_handle = repo_file("crates/meerkat-core/src/agent/test_turn_state_handle.rs");
