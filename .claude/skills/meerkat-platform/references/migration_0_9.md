@@ -414,6 +414,11 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   `estimated_history_tokens_after`.
 - Multiprocess hosting accepts a store whose file notifications cannot be
   registered (the sweep is the wake).
+- A fenced runtime-store write that meets `Backoff` while holding an async
+  lock is tried again for up to 2 s with the lock released, instead of
+  reporting the first `Backoff` at once. A fence caller in another crate that
+  holds an async lock retries `Backoff` the same way: `execute_if_current`
+  never waits beyond its own I/O.
 - Work naming an original whose admission is still pending reports
   `original_admission_pending` and stays retryable.
 - Fixed: the 0.9.3 known issue "First concurrent durable delivery" (a store
