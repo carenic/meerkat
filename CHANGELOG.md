@@ -1299,6 +1299,15 @@ them.
   database's sessions, bodies or authorities, and
   `new_head_canonical_with_staged_media` opens with them.
 
+- `meerkat-core`: `IncrementalSessionStore` gains
+  `stage_legacy_inline_images` and
+  `activate_head_canonical_store_with_staged_images`, both with defaults
+  (stage nothing; activate as `activate_head_canonical_store`), so existing
+  backends are unchanged. The SQLite session store implements them: the first
+  stores the images its not yet activated legacy sessions hold inline in a
+  blob store, and the second activates the store with those images as blob
+  references.
+
 ### Changed
 
 - `meerkat`: `PersistenceBundle::require_hosting_mode(HostingMode::Multiprocess)`
@@ -2616,6 +2625,10 @@ them.
   first stores the images in the realm blob store, then lays the session out
   with them as blob references; the body and the blob row are kept as they
   were, and an open stopped after storing the images finishes on the next one.
+  The SQLite session store's own activation of such a legacy session
+  (`IncrementalSessionStore::activate_head_canonical_store_with_staged_images`,
+  after `stage_legacy_inline_images`) crosses it the same way, and one whose
+  images were not staged refuses the whole activation, writing nothing.
 
 ### Known limitations
 
