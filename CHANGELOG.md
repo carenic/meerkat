@@ -1288,7 +1288,7 @@ them.
   are public for a host that makes the blob store's writes durable between
   them: `stage_standalone_whole_blob_media` stores the images and writes
   nothing to the database's sessions, bodies or authorities (it returns a
-  `StandaloneWholeBlobMediaStage`), and
+  `WholeBlobMediaStage`), and
   `convert_standalone_whole_blob_in_place_with_staged_media` converts with
   them.
 
@@ -1296,8 +1296,9 @@ them.
   a realm whose runtimes or legacy session blob rows hold inline images, with
   the realm blob store. Its two steps are public as well:
   `stage_realm_whole_blob_media` stores the images and writes nothing to the
-  database's sessions, bodies or authorities, and
-  `new_head_canonical_with_staged_media` opens with them.
+  database's sessions, bodies or authorities (it returns the same
+  `WholeBlobMediaStage`), and `new_head_canonical_with_staged_media` opens with
+  them.
 
 ### Changed
 
