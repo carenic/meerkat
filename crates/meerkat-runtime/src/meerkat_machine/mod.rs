@@ -2229,7 +2229,7 @@ impl RuntimeSessionRegistrationWitness {
         // lifetime, and a rebuilt entry gets a gate of its own, so no strong
         // reference left means this incarnation's entry exists nowhere. A
         // dropped allocation can never gain a strong reference again.
-        self.registration_gate.strong_count() == 0
+        self.registration_gate.upgrade().is_none()
     }
 
     fn belongs_to(&self, machine: &MeerkatMachine) -> bool {
