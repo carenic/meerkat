@@ -5859,6 +5859,27 @@ pub fn load_head_canonical_for_runtime_in_txn(
     Ok(current)
 }
 
+/// The CAS token stored with `id`'s physical head row, read without decoding
+/// the head; `None` when the store holds no head for `id`.
+///
+/// RuntimeStore compares it with each runtime authority's committed token at
+/// open, so only an authority that disagrees with its physical head is read
+/// further.
+#[doc(hidden)]
+pub fn stored_head_token_for_runtime_in_txn(
+    tx: &Transaction<'_>,
+    id: &SessionId,
+) -> Result<Option<String>, SessionStoreError> {
+    tx.query_row(
+        "SELECT cas_token FROM session_heads WHERE session_id = ?1",
+        params![id.to_string()],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(StoreError::from)
+    .map_err(into_session_store_error)
+}
+
 /// Attach the authenticated metadata projection to one exact current physical
 /// head without materializing transcript rows.
 ///
@@ -6898,12 +6919,76 @@ pub fn derive_runtime_boundary_head_for_activation_in_txn(
     }
     let exact_prefix =
         SessionMessageRowPrefixAccumulator::from_serialized_rows(&serialized_prefix)?;
-    SessionHead::from_session_with_proved_storage_authority(
+    let derived = SessionHead::from_session_with_proved_storage_authority(
         session,
         boundary_strand,
         boundary_rewrite_prefix.clone(),
         exact_prefix,
-    )
+    )?;
+    runtime_boundary_in_physical_row_lineage_in_txn(tx, derived, physical_head)
+}
+
+/// A runtime boundary that is the physical head itself, in the head's own
+/// row-lineage form.
+///
+/// Activation derives the boundary's message-row prefix flat, from the rows
+/// it retains. The physical head commits to the same rows by operation
+/// lineage instead: a splice is framed differently from an append, so once
+/// the transcript was rewritten the two commitments differ for the same
+/// rows, and with them the two heads' CAS tokens. A runtime authority holding
+/// the flat form then names a head the store never wrote, and the first
+/// mutation checked against it is refused.
+///
+/// When `boundary` covers the physical head's whole live strand and differs
+/// from it only in that row commitment (every other field and, after the
+/// swap, the CAS token equal), this returns the physical head's form, once
+/// both commitments are proved over the head's rows: `boundary`'s flat
+/// prefix is the flat commitment of those rows, and the store's own replay
+/// verifies the head (its anchor's rows reproduce the anchor's flat
+/// commitment, and the transitions after it reproduce the head's lineage).
+/// Any other boundary is returned unchanged, so a boundary older than the
+/// physical head (a tail of appends or rewrites) never takes the head's
+/// token.
+#[doc(hidden)]
+pub fn runtime_boundary_in_physical_row_lineage_in_txn(
+    tx: &Transaction<'_>,
+    boundary: SessionHead,
+    physical_head: &SessionHead,
+) -> Result<SessionHead, SessionStoreError> {
+    if physical_head.row_lineage_anchor.is_none()
+        || boundary.message_row_prefix == physical_head.message_row_prefix
+        || boundary.strand != physical_head.strand
+        || boundary.message_count != physical_head.message_count
+    {
+        return Ok(boundary);
+    }
+    let mut lineage_form = boundary.clone();
+    lineage_form
+        .message_row_prefix
+        .clone_from(&physical_head.message_row_prefix);
+    lineage_form
+        .row_lineage_anchor
+        .clone_from(&physical_head.row_lineage_anchor);
+    if lineage_form != *physical_head
+        || session_head_cas_token(&lineage_form)? != session_head_cas_token(physical_head)?
+    {
+        return Ok(boundary);
+    }
+    let links = strand_links_in_txn(tx, &physical_head.id)?;
+    validate_strand_links_acyclic(&physical_head.id, &links)?;
+    let rows = resolve_strand_bytes_in_txn(
+        tx,
+        &physical_head.id,
+        &physical_head.strand,
+        0..physical_head.message_count,
+        &links,
+    )?;
+    let flat_prefix = SessionMessageRowPrefixAccumulator::from_serialized_rows(&rows)?;
+    if boundary.message_row_prefix.as_ref() != Some(&flat_prefix) {
+        return Ok(boundary);
+    }
+    verify_physical_head_canonical_in_txn(tx, physical_head)?;
+    Ok(lineage_form)
 }
 
 /// One-time blob-to-head conversion seam for the co-tenant runtime store.

@@ -7593,6 +7593,180 @@ ORDER BY runtime_id";
         Ok(outcomes)
     }
 
+    /// Rewrite each runtime authority whose boundary is its physical head,
+    /// held in the flat row form, into the head's own row-lineage form.
+    ///
+    /// Activation before this release derived such a boundary with a flat
+    /// message-row prefix. For a session whose transcript was rewritten that
+    /// names a head the store never wrote, so the first mutation checked
+    /// against the authority was refused. A read-only scan first keeps only
+    /// the authorities whose token differs from their stored physical head
+    /// token, so an open with none takes no write lock here; each one kept
+    /// is rewritten in its own transaction, as a compare-and-set on the token
+    /// it holds, once the store proves its boundary is that head
+    /// ([`meerkat_store::sqlite_store::runtime_boundary_in_physical_row_lineage_in_txn`]).
+    /// An authority with a provisional tail, a boundary older than its
+    /// physical head, or one the proof refuses stays as it is, and its reads
+    /// refuse typed as before.
+    fn repair_flat_physical_head_boundaries(
+        conn: &mut Connection,
+    ) -> Result<(), RuntimeStoreError> {
+        let authorities = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT runtime_id, session_id, committed_head_token \
+                     FROM runtime_session_authority ORDER BY runtime_id",
+                )
+                .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?
+        };
+        let candidates = {
+            let tx = conn
+                .transaction()
+                .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+            let mut candidates = Vec::new();
+            for (runtime_id, session_id, committed_head_token) in authorities {
+                let Ok(session_id) = meerkat_core::types::SessionId::parse(&session_id) else {
+                    continue;
+                };
+                let stored_head_token =
+                    meerkat_store::sqlite_store::stored_head_token_for_runtime_in_txn(
+                        &tx,
+                        &session_id,
+                    )
+                    .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+                if stored_head_token.is_some_and(|token| token != committed_head_token) {
+                    candidates.push((
+                        LogicalRuntimeId::new(runtime_id),
+                        session_id,
+                        committed_head_token,
+                    ));
+                }
+            }
+            tx.commit()
+                .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+            candidates
+        };
+        for (runtime_id, session_id, committed_head_token) in candidates {
+            let tx = begin_runtime_transaction(conn)?;
+            match repair_flat_physical_head_boundary_in_txn(
+                &tx,
+                &runtime_id,
+                &session_id,
+                &committed_head_token,
+            ) {
+                Ok(true) => {
+                    tx.commit()
+                        .map_err(|error| RuntimeStoreError::WriteFailed(error.to_string()))?;
+                    tracing::info!(
+                        runtime_id = %runtime_id,
+                        session_id = %session_id,
+                        "rewrote a flat runtime boundary into its physical head's row-lineage form"
+                    );
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        runtime_id = %runtime_id,
+                        session_id = %session_id,
+                        error = %error,
+                        "left a runtime authority that disagrees with its physical head unchanged"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn repair_flat_physical_head_boundary_in_txn(
+        tx: &Transaction<'_>,
+        runtime_id: &LogicalRuntimeId,
+        session_id: &meerkat_core::types::SessionId,
+        listed_head_token: &str,
+    ) -> Result<bool, RuntimeStoreError> {
+        let stored_head_token =
+            meerkat_store::sqlite_store::stored_head_token_for_runtime_in_txn(tx, session_id)
+                .map_err(|error| map_head_canonical_session_store_error(runtime_id, error))?;
+        if stored_head_token
+            .as_deref()
+            .is_none_or(|token| token == listed_head_token)
+            || load_head_canonical_provisional_tail_authority(tx, runtime_id)?.is_some()
+        {
+            return Ok(false);
+        }
+        let Some(RuntimeSessionAuthority::HeadCanonical(committed)) =
+            load_head_canonical_authority(tx, runtime_id)?
+        else {
+            return Ok(false);
+        };
+        if committed.session_id() != session_id
+            || committed.committed_head_token() != listed_head_token
+        {
+            return Ok(false);
+        }
+        let Some((physical_head, physical_head_token)) =
+            meerkat_store::sqlite_store::load_head_canonical_for_runtime_in_txn(tx, session_id)
+                .map_err(|error| map_head_canonical_session_store_error(runtime_id, error))?
+        else {
+            return Ok(false);
+        };
+        let boundary =
+            meerkat_store::sqlite_store::runtime_boundary_in_physical_row_lineage_in_txn(
+                tx,
+                committed.boundary_head().clone(),
+                &physical_head,
+            )
+            .map_err(|error| map_head_canonical_session_store_error(runtime_id, error))?;
+        if &boundary == committed.boundary_head() {
+            return Ok(false);
+        }
+        let repaired = HeadCanonicalStoreAuthority::issued(
+            session_id.clone(),
+            committed.store_revision(),
+            boundary,
+            physical_head_token,
+        )?;
+        let boundary_head_json = serde_json::to_vec(repaired.boundary_head())
+            .map_err(|error| RuntimeStoreError::WriteFailed(error.to_string()))?;
+        let store_revision = i64::try_from(repaired.store_revision()).map_err(|_| {
+            session_authority_conflict(
+                runtime_id,
+                "HeadCanonical store revision exceeds SQLite INTEGER",
+            )
+        })?;
+        let changed = tx
+            .execute(
+                "UPDATE runtime_session_authority \
+                 SET boundary_head_json = ?2, committed_head_token = ?3 \
+                 WHERE runtime_id = ?1 AND store_revision = ?4 AND committed_head_token = ?5",
+                params![
+                    runtime_id_text(runtime_id),
+                    boundary_head_json,
+                    repaired.committed_head_token(),
+                    store_revision,
+                    listed_head_token,
+                ],
+            )
+            .map_err(|error| RuntimeStoreError::WriteFailed(error.to_string()))?;
+        if changed != 1 {
+            return Err(session_authority_conflict(
+                runtime_id,
+                "runtime authority changed while its flat boundary was being rewritten",
+            ));
+        }
+        Ok(true)
+    }
+
     fn load_boundary_receipt(
         conn: &Connection,
         runtime_id: &LogicalRuntimeId,
@@ -11331,6 +11505,7 @@ ORDER BY runtime_id";
                 &mut conn,
                 HeadCanonicalActivationSource::CoTenantSession,
             )?;
+            repair_flat_physical_head_boundaries(&mut conn)?;
             drop(conn);
             let (path, execution_custody) = bind_runtime_execution_custody(path)?;
             Ok(Self {
@@ -23132,6 +23307,306 @@ ORDER BY runtime_id";
                     .messages(),
                 resumed.messages()
             );
+        }
+
+        /// The committed token of `session_id`'s runtime authority and the
+        /// stored token of its physical head, read straight from the file.
+        fn authority_and_physical_head_tokens(
+            path: &Path,
+            session_id: &meerkat_core::types::SessionId,
+        ) -> (String, String) {
+            let conn =
+                Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .unwrap();
+            let authority = conn
+                .query_row(
+                    "SELECT committed_head_token FROM runtime_session_authority
+                     WHERE session_id = ?1",
+                    params![session_id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap();
+            let physical = conn
+                .query_row(
+                    "SELECT cas_token FROM session_heads WHERE session_id = ?1",
+                    params![session_id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap();
+            (authority, physical)
+        }
+
+        async fn head_canonical_authority(
+            store: &SqliteRuntimeStore,
+            runtime_id: &LogicalRuntimeId,
+        ) -> HeadCanonicalStoreAuthority {
+            let Some(RuntimeSessionAuthority::HeadCanonical(authority)) = store
+                .load_session_boundary_authority(runtime_id)
+                .await
+                .unwrap()
+            else {
+                panic!("{runtime_id}: no HeadCanonical authority");
+            };
+            authority
+        }
+
+        /// Compact `session_id` once more, prepare that rewrite from the
+        /// runtime authority's boundary as a restarted runtime does, and commit
+        /// it on `store`. Returns the rewritten head.
+        async fn commit_a_rewrite_from_the_runtime_authority(
+            store: &SqliteRuntimeStore,
+            session_store: &SqliteSessionStore,
+            session_id: &meerkat_core::types::SessionId,
+        ) -> Result<meerkat_core::session_store::SessionHead, RuntimeStoreError> {
+            let runtime_id = LogicalRuntimeId::for_session(session_id);
+            let authority = head_canonical_authority(store, &runtime_id).await;
+            let mut session = session_store
+                .load(session_id)
+                .await
+                .unwrap()
+                .expect("converted session");
+            let end = session.messages().len() - 1;
+            session
+                .commit_transcript_rewrite(
+                    TranscriptRewriteSelection::MessageRange { start: 0, end },
+                    vec![Message::User(UserMessage::text(
+                        "the first compaction after the conversion",
+                    ))],
+                    TranscriptRewriteReason::new("compaction"),
+                    Some("test".to_string()),
+                    None,
+                )
+                .unwrap();
+            let rewrite =
+                meerkat_core::session_store::PreparedHeadCanonicalRewriteMutation::prepare(
+                    &session,
+                    authority.boundary_head().clone(),
+                )
+                .expect("the next rewrite prepares from the runtime authority");
+            let rewritten_head = rewrite.successor_head().clone();
+            let boundary =
+                BoundSessionCommit::head_canonical_rewrite_from_session(&session, rewrite).unwrap();
+            store
+                .commit_prepared_session_boundary(
+                    &runtime_id,
+                    PreparedRuntimeSessionCommit::snapshot_only(boundary),
+                )
+                .await?;
+            Ok(rewritten_head)
+        }
+
+        /// A WholeBlob session whose transcript was compacted converts with
+        /// its physical head as the runtime authority: the authority's
+        /// committed token is the physical head's, in the file the conversion
+        /// leaves. A restarted runtime's next compaction, prepared from that
+        /// authority, is therefore accepted. The session without compactions
+        /// (the append-only control, checked first) converts with matching
+        /// tokens as before.
+        #[tokio::test]
+        async fn compacted_whole_blob_session_converts_with_its_physical_head_as_authority() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("runtime.sqlite");
+            let (re_anchored, plain) = re_anchored_whole_blob_database(&path).await;
+            let session_store = meta_093_co_located_session_store(&path);
+            SqliteRuntimeStore::convert_standalone_whole_blob_in_place(&path)
+                .expect("the WholeBlob bodies convert");
+            for session in [&plain, &re_anchored] {
+                let (authority, physical) = authority_and_physical_head_tokens(&path, session.id());
+                assert_eq!(
+                    authority,
+                    physical,
+                    "{}: the converted runtime authority does not name the physical head",
+                    session.id()
+                );
+            }
+
+            let store = SqliteRuntimeStore::new_head_canonical(&path)
+                .expect("the converted file opens head-canonical");
+            for session in [&plain, &re_anchored] {
+                let rewritten = commit_a_rewrite_from_the_runtime_authority(
+                    &store,
+                    &session_store,
+                    session.id(),
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{}: the next compaction after the conversion is refused: {error}",
+                        session.id()
+                    )
+                });
+                let runtime_id = LogicalRuntimeId::for_session(session.id());
+                assert_eq!(
+                    head_canonical_authority(&store, &runtime_id)
+                        .await
+                        .boundary_head(),
+                    &rewritten
+                );
+            }
+        }
+
+        /// A SQLite realm (a WholeBlob v1 runtime database beside the session
+        /// store, in one file) whose co-tenant store keeps a compacted session
+        /// as a released blob row activates on open with the physical head as
+        /// the runtime authority, and the next compaction is accepted. The
+        /// session without compactions (the append-only control, checked
+        /// first) activates with matching tokens as before.
+        #[tokio::test]
+        async fn realm_activation_of_a_compacted_blob_row_takes_its_physical_head_as_authority() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("realm.sqlite3");
+            let (re_anchored, plain) = re_anchored_whole_blob_database(&path).await;
+            let session_store = meta_093_co_located_session_store(&path);
+            let millis = |at: std::time::SystemTime| {
+                i64::try_from(at.duration_since(UNIX_EPOCH).unwrap().as_millis()).unwrap()
+            };
+            for session in [&plain, &re_anchored] {
+                Connection::open(&path)
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO sessions (
+                             session_id, created_at_ms, updated_at_ms, message_count,
+                             total_tokens, metadata_json, session_json
+                         ) VALUES (?1, ?2, ?3, ?4, 0, '{}', ?5)",
+                        params![
+                            session.id().to_string(),
+                            millis(session.created_at()),
+                            millis(session.updated_at()),
+                            i64::try_from(session.messages().len()).unwrap(),
+                            serde_json::to_vec(session).unwrap(),
+                        ],
+                    )
+                    .unwrap();
+            }
+
+            let store = SqliteRuntimeStore::new_head_canonical(&path)
+                .expect("the realm activates its WholeBlob runtimes on open");
+            for session in [&plain, &re_anchored] {
+                let (authority, physical) = authority_and_physical_head_tokens(&path, session.id());
+                assert_eq!(
+                    authority,
+                    physical,
+                    "{}: the activated runtime authority does not name the physical head",
+                    session.id()
+                );
+            }
+            for session in [&plain, &re_anchored] {
+                commit_a_rewrite_from_the_runtime_authority(&store, &session_store, session.id())
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{}: the next compaction after the realm activation is refused: {error}",
+                            session.id()
+                        )
+                    });
+            }
+        }
+
+        /// A file whose activation wrote a compacted session's boundary in
+        /// the flat row form (every build before this fix: a 0.9.3 realm, or
+        /// a standalone conversion) is repaired when the head-canonical store
+        /// opens it. The authority row is rewritten to the physical head
+        /// exactly, so the next compaction is accepted. An authority that
+        /// differs from its physical head in any other field is left as it
+        /// was written.
+        #[tokio::test]
+        async fn a_flat_activation_boundary_is_rewritten_to_its_physical_head_on_open() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("runtime.sqlite");
+            let (re_anchored, _plain) = re_anchored_whole_blob_database(&path).await;
+            let session_store = meta_093_co_located_session_store(&path);
+            SqliteRuntimeStore::convert_standalone_whole_blob_in_place(&path)
+                .expect("the WholeBlob bodies convert");
+            let runtime_id = LogicalRuntimeId::for_session(re_anchored.id());
+            let physical = session_store
+                .load_head(re_anchored.id())
+                .await
+                .unwrap()
+                .expect("converted head");
+            let physical_token = meerkat_core::session_head_cas_token(&physical).unwrap();
+
+            // The boundary the activation derived before this fix: the frozen
+            // WholeBlob body's head with a flat message-row prefix.
+            let frozen =
+                deserialize_persisted_session(&serde_json::to_vec(&re_anchored).unwrap()).unwrap();
+            let rows = frozen
+                .messages()
+                .iter()
+                .map(|message| serde_json::to_vec(message).unwrap())
+                .collect::<Vec<_>>();
+            let flat = meerkat_core::session_store::SessionHead::from_session_with_proved_storage_authority(
+                &frozen,
+                physical.strand.clone(),
+                physical.rewrite_prefix.clone(),
+                meerkat_core::session_store::SessionMessageRowPrefixAccumulator::from_serialized_rows(&rows)
+                    .unwrap(),
+            )
+            .unwrap();
+            let flat_token = meerkat_core::session_head_cas_token(&flat).unwrap();
+            assert_ne!(
+                flat_token, physical_token,
+                "the compacted session has two forms"
+            );
+            let mut lineage = flat.clone();
+            lineage
+                .message_row_prefix
+                .clone_from(&physical.message_row_prefix);
+            lineage
+                .row_lineage_anchor
+                .clone_from(&physical.row_lineage_anchor);
+            assert_eq!(
+                lineage, physical,
+                "the flat form differs from the physical head only in its row commitment"
+            );
+            let write_authority = |head: &meerkat_core::session_store::SessionHead| {
+                let conn = Connection::open(&path).unwrap();
+                let changed = conn
+                    .execute(
+                        "UPDATE runtime_session_authority
+                         SET boundary_head_json = ?2, committed_head_token = ?3
+                         WHERE runtime_id = ?1",
+                        params![
+                            runtime_id_text(&runtime_id),
+                            serde_json::to_vec(head).unwrap(),
+                            meerkat_core::session_head_cas_token(head).unwrap(),
+                        ],
+                    )
+                    .unwrap();
+                assert_eq!(changed, 1);
+            };
+
+            // Not the physical head in another field: never rewritten.
+            let mut other = flat.clone();
+            other.updated_at += Duration::from_secs(1);
+            write_authority(&other);
+            drop(SqliteRuntimeStore::new_head_canonical(&path).expect("the file opens"));
+            assert_eq!(
+                authority_and_physical_head_tokens(&path, re_anchored.id()),
+                (
+                    meerkat_core::session_head_cas_token(&other).unwrap(),
+                    physical_token.clone()
+                ),
+                "an authority that is not the physical head must stay as written"
+            );
+
+            // The flat form of the physical head: rewritten on open.
+            write_authority(&flat);
+            let store = SqliteRuntimeStore::new_head_canonical(&path)
+                .expect("the file with a flat boundary opens");
+            assert_eq!(
+                authority_and_physical_head_tokens(&path, re_anchored.id()),
+                (physical_token.clone(), physical_token.clone()),
+                "the flat boundary was not rewritten to the physical head"
+            );
+            assert_eq!(
+                head_canonical_authority(&store, &runtime_id)
+                    .await
+                    .boundary_head(),
+                &physical
+            );
+            commit_a_rewrite_from_the_runtime_authority(&store, &session_store, re_anchored.id())
+                .await
+                .expect("the next compaction after the repair is accepted");
         }
 
         /// The 0.9.3 sessions carrying every tool-config and MCP notice shape,
