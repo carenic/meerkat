@@ -5693,15 +5693,60 @@ fn activate_realtime_component_in_txn(
 /// One-time migration: lay out the legacy blob's strands and head inside the
 /// caller's transaction. The blob row is left untouched as a frozen archive
 /// and is never read again once the head row exists.
+///
+/// With `staged_images` (an activation whose media stage stored the legacy
+/// blob's inline images), the blob's session is laid out with every image it
+/// holds inline rewritten to the blob reference that stage stored it under
+/// ([`Session::with_inline_images_externalized`]), and an image the stage
+/// did not store refuses typed before anything is written. The blob row
+/// itself is not rewritten.
 fn migrate_legacy_blob_in_txn(
     tx: &Transaction<'_>,
     id: &SessionId,
+    staged_images: Option<&BTreeSet<meerkat_core::BlobId>>,
 ) -> Result<Option<(SessionHead, String)>, SessionStoreError> {
     let Some(session) = load_session_snapshot_in_txn(tx, id).map_err(into_session_store_error)?
     else {
         return Ok(None);
     };
+    let session = match staged_images {
+        Some(stored) => with_staged_inline_images(id, session, stored)?,
+        None => session,
+    };
     lay_out_blob_session_in_txn(tx, id, &session).map(Some)
+}
+
+/// `session` with the images it holds inline rewritten to the blob
+/// references `stored` holds, refusing typed when it holds one `stored`
+/// does not.
+fn with_staged_inline_images(
+    id: &SessionId,
+    session: Session,
+    stored: &BTreeSet<meerkat_core::BlobId>,
+) -> Result<Session, SessionStoreError> {
+    let externalized = session.with_inline_images_externalized().map_err(|error| {
+        SessionStoreError::InvalidTranscriptRewrite {
+            id: id.clone(),
+            reason: format!("failed to move the legacy blob session's inline images out: {error}"),
+        }
+    })?;
+    let Some(externalized) = externalized else {
+        return Ok(session);
+    };
+    if let Some(unstored) = externalized
+        .payloads
+        .iter()
+        .find(|payload| !stored.contains(&payload.blob_id))
+    {
+        return Err(SessionStoreError::InvalidTranscriptRewrite {
+            id: id.clone(),
+            reason: format!(
+                "the legacy blob session holds inline image {} that the media stage did not store; stage the media again",
+                unstored.blob_id.as_str()
+            ),
+        });
+    }
+    Ok(externalized.session)
 }
 
 /// Lay out one whole-blob session document as this store's physical session:
@@ -5740,6 +5785,14 @@ fn lay_out_blob_session_in_txn(
 fn ensure_head_canonical_for_write_in_txn(
     tx: &Transaction<'_>,
     id: &SessionId,
+) -> Result<Option<(SessionHead, String)>, SessionStoreError> {
+    ensure_head_canonical_for_write_with_staged_images_in_txn(tx, id, None)
+}
+
+fn ensure_head_canonical_for_write_with_staged_images_in_txn(
+    tx: &Transaction<'_>,
+    id: &SessionId,
+    staged_images: Option<&BTreeSet<meerkat_core::BlobId>>,
 ) -> Result<Option<(SessionHead, String)>, SessionStoreError> {
     if let Some((head, stored_token)) = head_row_in_txn(tx, id)? {
         if session_head_cas_token(&head)? != stored_token {
@@ -5817,7 +5870,7 @@ fn ensure_head_canonical_for_write_in_txn(
         let upgraded_token = write_head_row_only_in_txn(tx, &upgraded)?;
         return Ok(Some((upgraded, upgraded_token)));
     }
-    migrate_legacy_blob_in_txn(tx, id)
+    migrate_legacy_blob_in_txn(tx, id, staged_images)
 }
 
 /// Read the exact physical canonical head and stored token in a co-tenant
@@ -6991,6 +7044,22 @@ pub fn runtime_boundary_in_physical_row_lineage_in_txn(
     Ok(lineage_form)
 }
 
+/// The session a legacy blob row holds for `id` while this store has no
+/// head row for it: the session the next head-canonical write (a runtime
+/// activation's included) migrates. `None` once it is migrated, or when
+/// there is no blob row. It borrows the caller's transaction and writes
+/// nothing.
+#[doc(hidden)]
+pub fn unmigrated_legacy_blob_session_in_txn(
+    tx: &Transaction<'_>,
+    id: &SessionId,
+) -> Result<Option<Session>, SessionStoreError> {
+    if head_row_in_txn(tx, id)?.is_some() {
+        return Ok(None);
+    }
+    load_session_snapshot_in_txn(tx, id).map_err(into_session_store_error)
+}
+
 /// One-time blob-to-head conversion seam for the co-tenant runtime store.
 ///
 /// This is intentionally hidden from generated documentation: ordinary
@@ -7006,7 +7075,23 @@ pub fn ensure_head_canonical_for_runtime_in_txn(
     tx: &Transaction<'_>,
     id: &SessionId,
 ) -> Result<Option<(SessionHead, String)>, SessionStoreError> {
-    let Some((head, token)) = ensure_head_canonical_for_write_in_txn(tx, id)? else {
+    ensure_head_canonical_for_runtime_with_staged_images_in_txn(tx, id, None)
+}
+
+/// [`ensure_head_canonical_for_runtime_in_txn`] for an activation whose
+/// media stage stored the images a legacy blob row holds inline: a legacy
+/// blob migrated here lays out its session with those images as the blob
+/// references in `staged_images`, and refuses typed, writing nothing, when it
+/// holds an image the stage did not store. `None` is the plain seam.
+#[doc(hidden)]
+pub fn ensure_head_canonical_for_runtime_with_staged_images_in_txn(
+    tx: &Transaction<'_>,
+    id: &SessionId,
+    staged_images: Option<&BTreeSet<meerkat_core::BlobId>>,
+) -> Result<Option<(SessionHead, String)>, SessionStoreError> {
+    let Some((head, token)) =
+        ensure_head_canonical_for_write_with_staged_images_in_txn(tx, id, staged_images)?
+    else {
         return Ok(None);
     };
     if head.realtime_event_prefix.is_some() {
@@ -10469,7 +10554,7 @@ mod tests {
         let migrate_id = id.clone();
         let (migrated, migrated_token) = blob_store
             .in_write_txn(move |tx| {
-                migrate_legacy_blob_in_txn(tx, &migrate_id)?
+                migrate_legacy_blob_in_txn(tx, &migrate_id, None)?
                     .ok_or(SessionStoreError::NotFound(migrate_id))
             })
             .await

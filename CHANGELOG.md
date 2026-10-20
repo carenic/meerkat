@@ -1281,6 +1281,12 @@ them.
   `convert_standalone_whole_blob_in_place_with_staged_media` converts with
   them.
 
+- `meerkat-runtime`: `SqliteRuntimeStore::new_head_canonical_with_media` opens
+  a realm whose runtimes or legacy session blob rows hold inline images, with
+  the realm blob store. Its two steps are public as well:
+  `stage_realm_whole_blob_media` stores the images and writes nothing to the
+  database, and `new_head_canonical_with_staged_media` opens with them.
+
 ### Changed
 
 - `meerkat`: `PersistenceBundle::require_hosting_mode(HostingMode::Multiprocess)`
@@ -2590,6 +2596,14 @@ them.
   WholeBlob body is kept as it was. A crash during or between the two steps
   leaves each runtime converted or untouched, and running the conversion again
   finishes the rest.
+
+- `meerkat-runtime`: a SQLite realm that holds such a session, in a runtime's
+  WholeBlob body or as the session store's legacy blob row, opens on the
+  head-canonical profile. Its activation refused the session the same way,
+  so the realm did not open. `SqliteRuntimeStore::new_head_canonical_with_media`
+  first stores the images in the realm blob store, then lays the session out
+  with them as blob references; the body and the blob row are kept as they
+  were, and an open stopped after storing the images finishes on the next one.
 
 ### Known limitations
 
