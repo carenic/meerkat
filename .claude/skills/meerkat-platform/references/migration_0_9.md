@@ -263,9 +263,9 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   `SystemNoticeBlock::lifecycle_settled()`. The `persisted` result of
   `mcp/add`, `mcp/remove` and `mcp/reload` is unchanged.
 - Child tool bundle opt-in (Rust hosts): a child mob's inline profile mounts
-  a bundle the host offers with the new `ChildToolBundleAvailability::ChildOffered`
-  by naming it in `tools.bundles` (an unoffered name is refused with
-  `MobError::ToolBundleNotOffered`). `ToolConfig` and `MobToolConfigInput`
+  a bundle the host offers with the new
+  `ChildToolBundleAvailability::ChildOffered` by naming it in `tools.bundles`
+  (an unoffered name is refused with `MobError::ToolBundleNotOffered`). `ToolConfig` and `MobToolConfigInput`
   gain `bundles`; `ChildToolBundleAvailability` and
   `ChildMcpServerRegistrationError` are non-exhaustive.
 - Mob Shutdown: `MemberShutdownOutcome::UnregisterPending` carries a
@@ -279,7 +279,8 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   council participants) and the RPC forks `session/fork_at` /
   `session/fork_replace` are refused before commit with
   `FORK_INSTRUCTION_REFUSED` (-32037, HTTP 422, exit 57); set
-  `reactivate_inherited` (`MobBuilder` / `MobMcpState::with_fork_instruction_policy`),
+  `reactivate_inherited`
+  (`MobBuilder` / `MobMcpState::with_fork_instruction_policy`),
   or pass `inherited_instructions: "reactivate_inherited"` on the RPC fork, to
   carry the activations. Rust:
   `SessionError::ForkInstructionRefused`, `MobError::ForkInstructionRefused`,
@@ -297,8 +298,8 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   boot recreates on a fresh session) removes the registration and leaves only
   that member Broken with `MobError::MemberRegistrationRefused` until a
   repair; Stop and Shutdown report a member needing a durability reload as
-  `ReloadRequired` (`MemberStopRun` / `MemberRunStarts`) instead of failing; an uninstalled
-  destination is `MobError::MemberDestinationNotInstalled` (was
+  `ReloadRequired` (`MemberStopRun` / `MemberRunStarts`) instead of failing;
+  an uninstalled destination is `MobError::MemberDestinationNotInstalled` (was
   `WiringError`; schedule delivery records `runtime_rejected`);
   `force_cancel_member` / `cancel_all_work` on a member needing a durability
   reload answer `MemberReloadRequired` (-32029, HTTP 409, exit 49): reload it
@@ -390,9 +391,9 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   `docs/guides/deploying.mdx`, "SQLite Lock Profile"), and an embedding
   application calls the `unsafe fn`
   `meerkat_sqlite::disable_memory_statistics_at_process_start()` first in
-  `main`, before any other thread or SQLite connection exists. `rkat storage doctor` reports `sqlite-lock-profile`. Kept
-  store connections hold `<file>.mpresence` presence locks, which maintenance
-  waits for.
+  `main`, before any other thread or SQLite connection exists.
+  `rkat storage doctor` reports `sqlite-lock-profile`. Kept store connections
+  hold `<file>.mpresence` presence locks, which maintenance waits for.
 - Fixed: a child of `session/fork_at` or `session/fork_replace` can run a turn:
   it gets a build state derived from its source's, with the source's session
   configuration but without its `shell_env`, MCP attachments or mob operator

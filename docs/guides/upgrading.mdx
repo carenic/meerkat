@@ -332,8 +332,9 @@ mode with leading zeros (`'0755'`; unquoted it reads as `755.0`).
   sender sees an ambiguous delivery outcome. `send_message` and every other
   message kind still reach a 0.9.3 peer. Upgrade peers together.
 - **Do (Rust):** `SystemNoticeBlock::Comms` and
-  `AgentEvent::PeerContentIngested` gain `delivery_id`; `CommsCommand::PeerMessage`,
-  `InteractionContent::Message` and `SystemNoticeBlock::Comms` gain
+  `AgentEvent::PeerContentIngested` gain `delivery_id`;
+  `CommsCommand::PeerMessage`, `InteractionContent::Message` and
+  `SystemNoticeBlock::Comms` gain
   `in_reply_to`, as do `meerkat-comms`'s `MessageKind::Message` and
   `meerkat-runtime`'s `PeerInput`. Struct literals and exhaustive patterns
   name them.
@@ -469,10 +470,10 @@ mob machine inputs, effects and transition ids gain `RetireAtScope` and
 - **Compaction is sized for the model that writes the summary.** The summary
   source may take two bytes per token of that model's context window left
   after `max_summary_tokens` (capped by a declared input ceiling, at least
-  4 KiB), instead of a quarter of the compaction threshold. With the default threshold that is about ten times
-  more, so a summary call can cost more input tokens on a large window; it
-  never costs more than the history being compacted plus the compaction
-  prompt.
+  4 KiB), instead of a quarter of the compaction threshold. With the default
+  threshold that is about ten times more, so a summary call can cost more
+  input tokens on a large window; it never costs more than the history being
+  compacted plus the compaction prompt.
 - **Compaction no longer pays for a summary at every boundary** when no
   rewrite can get the history under the threshold (for example when the
   System rows alone exceed an explicit `auto_compact_threshold`). It waits for
@@ -529,8 +530,8 @@ mob machine inputs, effects and transition ids gain `RetireAtScope` and
   build, and in an embedding application call
   `meerkat_sqlite::disable_memory_statistics_at_process_start()` (an
   `unsafe fn`) in an `unsafe` block as the first statement of `main`, before
-  any other thread or SQLite connection exists. `rkat storage doctor` reports the profile and warns
-  with `sqlite-lock-profile` when a lock is on.
+  any other thread or SQLite connection exists. `rkat storage doctor` reports
+  the profile and warns with `sqlite-lock-profile` when a lock is on.
 - **Presence locks:** a connection a store keeps open between operations
   holds a presence lock (`<file>.mpresence` next to the database), and
   maintenance such as `rkat storage migrate --apply` waits for kept
