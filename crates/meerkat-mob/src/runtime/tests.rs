@@ -26587,10 +26587,9 @@ async fn test_visible_mob_operator_reads_still_require_exact_scope() {
     .expect("compose dispatcher")
     .expect("operator dispatcher should be visible when authority is injected");
 
-    // The injected authority holds scope only in another mob, so the member's
-    // own mob operator tools have nothing to offer here: they are not listed,
-    // and a read that still reaches them is admitted like any other, which
-    // denies it.
+    // The injected authority binds only another mob, so the member's own mob
+    // operator tools are not listed, and a read that still reaches them is
+    // admitted like any other, which denies it.
     let tools = dispatcher.tools();
     let tool_names = tools
         .iter()
@@ -26598,7 +26597,7 @@ async fn test_visible_mob_operator_reads_still_require_exact_scope() {
         .collect::<Vec<_>>();
     assert!(
         !tool_names.contains(&"list_members"),
-        "operator tools with no scope in this mob are not listed: {tool_names:?}"
+        "operator tools with no binding to this mob instance are not listed: {tool_names:?}"
     );
 
     let args = RawValue::from_string("{}".to_string()).expect("raw args");

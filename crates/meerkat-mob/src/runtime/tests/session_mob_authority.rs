@@ -96,10 +96,11 @@ async fn mob_with_restored_worker() -> (MobHandle, Arc<MockSessionService>, Sess
     (resumed, service, session_id)
 }
 
-/// The worker's build config as the mob runtime produces it for a member
-/// with no persisted authority, carrying the given member tools.
+/// A worker's build config as the mob runtime produces it for a member with
+/// no persisted authority, carrying the given member tools.
 async fn worker_build_config(
     handle: &MobHandle,
+    member: &str,
     tools: Arc<dyn AgentToolDispatcher>,
 ) -> meerkat::AgentBuildConfig {
     let definition = handle.definition();
@@ -112,7 +113,7 @@ async fn worker_build_config(
     let mut config = crate::build::build_agent_config(crate::build::BuildAgentConfigParams {
         mob_id: &definition.id,
         profile_name: &profile_name,
-        agent_identity: &AgentIdentity::from(MEMBER),
+        agent_identity: &AgentIdentity::from(member),
         profile,
         definition,
         realm_profile_store: None,
@@ -251,7 +252,7 @@ async fn assert_no_hook_equality(
 ) {
     let tools = recorded_member_tools(&service, &session_id).await;
     let listed_before = tool_names(&tools);
-    let config = worker_build_config(&handle, Arc::clone(&tools)).await;
+    let config = worker_build_config(&handle, MEMBER, Arc::clone(&tools)).await;
     let (_dir, _agent) = build_through_factory(config, None).await;
 
     assert_eq!(
@@ -304,7 +305,7 @@ async fn assert_narrowed_spawn_follows_the_hook(
     session_id: SessionId,
 ) {
     let tools = recorded_member_tools(&service, &session_id).await;
-    let mut config = worker_build_config(&handle, Arc::clone(&tools)).await;
+    let mut config = worker_build_config(&handle, MEMBER, Arc::clone(&tools)).await;
     let default_authority = config
         .mob_tool_authority_context
         .clone()
@@ -358,7 +359,7 @@ async fn a_restored_member_runtime_spawn_follows_the_hook_narrowed_authority() {
 async fn a_member_built_without_a_mob_tools_factory_follows_the_final_authority() {
     let (handle, service, session_id) = mob_with_spawned_worker().await;
     let tools = recorded_member_tools(&service, &session_id).await;
-    let mut config = worker_build_config(&handle, Arc::clone(&tools)).await;
+    let mut config = worker_build_config(&handle, MEMBER, Arc::clone(&tools)).await;
     narrow_to_worker(&mut config, handle.definition().id.as_str());
     let (_dir, _agent) = build_through_factory(config, None).await;
 
@@ -374,7 +375,7 @@ async fn a_member_built_without_a_mob_tools_factory_follows_the_final_authority(
 async fn assert_removed_authority_hides_and_denies(edit: fn(&mut meerkat::AgentBuildConfig)) {
     let (handle, service, session_id) = mob_with_spawned_worker().await;
     let tools = recorded_member_tools(&service, &session_id).await;
-    let mut config = worker_build_config(&handle, Arc::clone(&tools)).await;
+    let mut config = worker_build_config(&handle, MEMBER, Arc::clone(&tools)).await;
     edit(&mut config);
     let (_dir, _agent) = build_through_factory(config, None).await;
 
@@ -443,5 +444,205 @@ async fn a_fixed_context_operator_dispatcher_ignores_session_bindings() {
     assert_denied(
         spawn(&tools, "lead", "lead-fixed").await,
         "spawning a profile the fixed context does not hold",
+    );
+}
+
+/// A hook that narrows the member's spawn profiles to none keeps the
+/// member's binding to its mob: the tools stay listed, the member still
+/// lists and retires the members it spawned, and spawning is denied.
+#[tokio::test]
+async fn a_member_narrowed_to_no_spawn_profiles_keeps_its_own_children() {
+    let (handle, service) = create_test_mob(sample_definition_with_mob_tools()).await;
+    service.set_return_exact_run_result(true);
+    let forker = AgentIdentity::from("owner-forker");
+    spawn_bounded_fork_source(&handle, &forker).await;
+    let forker_session = handle
+        .resolve_bridge_session_id(&forker)
+        .await
+        .expect("forker session");
+    let child = AgentIdentity::from("owned-fork-child");
+    let (_fork, run) = handle
+        .fork_member_then_run_detached(
+            &forker,
+            bounded_fork_child_spec(&child),
+            None,
+            "fork_child_result",
+            256,
+            meerkat_core::DurableForkSourceAdmission::CallerTurn,
+            None,
+            None,
+        )
+        .await
+        .expect("caller-turn fork");
+    run.outcome().await.expect("child outcome");
+
+    let tools = recorded_member_tools(&service, &forker_session).await;
+    let mut config = worker_build_config(&handle, forker.as_str(), Arc::clone(&tools)).await;
+    let authority = config
+        .mob_tool_authority_context
+        .as_ref()
+        .expect("a tools.mob member gets a default authority");
+    let narrowed = meerkat_runtime::mob_operator_authority::restrict_spawn_profiles_in_mob(
+        authority,
+        handle.definition().id.as_str(),
+        std::iter::empty::<&str>(),
+    )
+    .expect("narrow the default spawn scope to no profile");
+    config.mob_tool_authority_context = Some(narrowed);
+    let (_dir, _agent) = build_through_factory(config, None).await;
+
+    let listed = tool_names(&tools);
+    for name in ["spawn_member", "list_members", "retire_member"] {
+        assert!(
+            listed.iter().any(|listed| listed == name),
+            "{name} stays listed while the member is bound to its mob: {listed:?}"
+        );
+    }
+    let owner_bound = dispatched_from_session(Arc::clone(&tools), forker_session);
+    let members = call(&owner_bound, "list_members", serde_json::json!({}))
+        .await
+        .expect("the member lists its own children");
+    let payload: serde_json::Value =
+        serde_json::from_str(&members.result.text_content()).expect("list payload");
+    let names: Vec<_> = payload["members"]
+        .as_array()
+        .expect("members")
+        .iter()
+        .filter_map(|member| {
+            member["member_id"]
+                .as_str()
+                .or(member["agent_identity"].as_str())
+        })
+        .collect();
+    assert_eq!(names, vec!["owned-fork-child"], "the owner view is kept");
+    assert_denied(
+        spawn(&owner_bound, "worker", "w-2").await,
+        "spawning with no spawn profile",
+    );
+    call(
+        &owner_bound,
+        "retire_member",
+        serde_json::json!({ "member_id": "owned-fork-child" }),
+    )
+    .await
+    .expect("the member retires its own child");
+    assert!(
+        handle
+            .get_member(&child)
+            .await
+            .expect("roster read")
+            .is_none()
+    );
+}
+
+/// Member tools no agent factory bound (a session built without one, or
+/// behind a wrapper that does not forward the binding) stay listed as
+/// composed and deny every call: nothing is admitted against the default
+/// the runtime composed for them.
+#[tokio::test]
+async fn member_tools_that_were_never_bound_deny_every_call() {
+    let (handle, _service) = create_test_mob(sample_definition_with_mob_tools()).await;
+    let profile = handle
+        .definition()
+        .profiles
+        .get(&ProfileName::from("worker"))
+        .and_then(|profile| profile.as_inline())
+        .expect("inline worker profile");
+    let tools = super::super::tools::compose_external_tools_for_profile(
+        profile,
+        &BTreeMap::new(),
+        handle.clone(),
+        None,
+        None,
+        None,
+    )
+    .expect("compose the member tools")
+    .expect("a tools.mob member gets its operator tools");
+
+    assert!(tool_names(&tools).iter().any(|name| name == "spawn_member"));
+    assert_denied(
+        spawn(&tools, "worker", "w-unbound").await,
+        "spawning through tools no factory bound",
+    );
+    assert_denied(
+        call(&tools, "list_members", serde_json::json!({})).await,
+        "listing through tools no factory bound",
+    );
+    assert!(
+        handle
+            .get_member(&AgentIdentity::from("w-unbound"))
+            .await
+            .expect("roster read")
+            .is_none()
+    );
+}
+
+/// The binding reaches a member's tools through the composites that can
+/// wrap them before the agent factory builds the session: a surface's
+/// `ToolGateway` over the runtime's `DynamicToolComposite`.
+#[tokio::test]
+async fn the_binding_reaches_member_tools_through_a_gateway_and_a_composite() {
+    let (handle, _service) = create_test_mob(sample_definition_with_mob_tools()).await;
+    let mob_id = handle.definition().id.to_string();
+    let profile = handle
+        .definition()
+        .profiles
+        .get(&ProfileName::from("worker"))
+        .and_then(|profile| profile.as_inline())
+        .expect("inline worker profile");
+    let member_tools = super::super::tools::compose_external_tools_for_profile(
+        profile,
+        &BTreeMap::new(),
+        handle.clone(),
+        None,
+        None,
+        None,
+    )
+    .expect("compose the member tools")
+    .expect("a tools.mob member gets its operator tools");
+    let composite: Arc<dyn AgentToolDispatcher> = Arc::new(
+        meerkat_core::DynamicToolComposite::new(vec![Arc::clone(&member_tools)]),
+    );
+    let gateway: Arc<dyn AgentToolDispatcher> = Arc::new(
+        meerkat_core::ToolGateway::new(composite, None).expect("gateway over the member tools"),
+    );
+    assert_denied(
+        spawn(&gateway, "worker", "w-before-bind").await,
+        "spawning before the binding",
+    );
+
+    gateway.bind_session_mob_tool_authority(Some(Arc::new(std::sync::RwLock::new(
+        generated_mob_operator_authority_with_spawn_profile(
+            &mob_id,
+            handle.live_incarnation(),
+            "worker",
+        ),
+    ))));
+    assert!(
+        tool_names(&gateway)
+            .iter()
+            .any(|name| name == "spawn_member")
+    );
+    assert_spawned(spawn(&gateway, "worker", "w-2").await, "w-2");
+    assert_denied(
+        spawn(&gateway, "lead", "lead-2").await,
+        "spawning a profile the bound authority does not hold",
+    );
+
+    gateway.bind_session_mob_tool_authority(None);
+    assert!(
+        !tool_names(&gateway)
+            .iter()
+            .any(|name| name == "spawn_member")
+    );
+    let routed = spawn(&gateway, "worker", "w-3").await;
+    assert!(
+        matches!(routed, Err(ToolError::NotFound { .. })),
+        "the gateway no longer routes a hidden tool: {:?}",
+        routed.map(|outcome| outcome.result.text_content())
+    );
+    assert_denied(
+        spawn(&member_tools, "worker", "w-3").await,
+        "spawning after the authority was removed",
     );
 }
