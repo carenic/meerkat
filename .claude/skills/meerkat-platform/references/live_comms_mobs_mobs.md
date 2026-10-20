@@ -124,7 +124,11 @@ succeeds after it. `MobError` is `#[non_exhaustive]`. Details in
   (`session/archive`, REST `DELETE /sessions/{id}`, MCP `meerkat_archive`)
   re-drives it once per request.
 - `rkat mob respawn <MOB_ID> <AGENT_IDENTITY> [--initial-message <MSG>]`
-  (RPC `mob/respawn`) replaces the member under a new runtime binding.
+  (RPC `mob/respawn`) replaces the member under a new runtime binding. Since
+  0.9.4 the successor keeps its predecessor's spawn-time tool restrictions
+  (never widened) and, while the provider matches, its auth binding; a
+  respawn whose restrictions cannot be established (a lost-session Broken
+  member too) is refused before anything is retired, and the member is kept.
 - Since 0.9.4 a mob that was reset and then re-spawned a member under an
   identity it had before the reset resumes after a restart (0.9.3 and earlier
   failed that resume with an internal error), and the re-spawned member always
