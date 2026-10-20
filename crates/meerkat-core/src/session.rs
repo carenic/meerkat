@@ -14379,6 +14379,74 @@ mod tests {
         );
     }
 
+    /// A native session that took a live image and then compacted writes a
+    /// rewrite snapshot whose rebuilt image item keys its fingerprint by
+    /// content index. Its whole realtime component sequence, replayed from
+    /// the start as a cold load replays it, installs, and the live image's
+    /// identity survives.
+    #[test]
+    fn a_compacted_session_with_a_live_image_replays_its_realtime_component() {
+        let mut session = Session::new();
+        session.append_system_message("system prompt");
+        session.push(Message::User(UserMessage::text("question 0")));
+        session.push(Message::User(UserMessage::text("question 1")));
+        let image = RealtimeTranscriptEvent::UserContentFinal {
+            idempotency_key: "image-request-1".to_string(),
+            item_id: "item_image".to_string(),
+            previous_item_id: None,
+            content_index: 0,
+            content: vec![ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: crate::types::ImageData::Inline {
+                    data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB".to_string(),
+                },
+            }],
+        };
+        assert!(!append_staged_user_image(&mut session, &image).is_inert());
+        session.push(Message::User(UserMessage::text("and then")));
+        let live = session.messages().to_vec();
+        assert_eq!(live.len(), 5);
+        let identities = session.realtime_user_content_identities();
+        assert_eq!(identities.len(), 1);
+
+        // The compaction keeps the image row, so the rebuilt projection keeps
+        // the image's identity.
+        session
+            .stage_validated_compaction_for_test(
+                vec![
+                    live[0].clone(),
+                    Message::User(UserMessage::compaction_summary(
+                        "[Compaction summary] two questions",
+                    )),
+                    live[3].clone(),
+                    live[4].clone(),
+                ],
+                12,
+            )
+            .expect("the compaction commits");
+        assert_eq!(session.realtime_user_content_identities(), identities);
+
+        let suffix = session
+            .prepare_realtime_component_event_suffix()
+            .expect("prepare the component events")
+            .expect("the session has component events");
+        let rows = suffix
+            .events()
+            .iter()
+            .enumerate()
+            .map(|(offset, event)| {
+                crate::StoredComponentEventRow::new(offset as u64, event.bytes().to_vec())
+            })
+            .collect();
+        let verified =
+            crate::VerifiedComponentEventSequence::verify_full(suffix.successor().clone(), rows)
+                .expect("verify the full sequence");
+        let mut cold = session.clone();
+        cold.install_verified_realtime_component_sequence(&verified)
+            .expect("the component sequence replays");
+        assert_eq!(cold.realtime_user_content_identities(), identities);
+    }
+
     #[test]
     fn realtime_user_image_materializes_once_and_unblocks_causal_assistant() {
         let mut session = Session::new();

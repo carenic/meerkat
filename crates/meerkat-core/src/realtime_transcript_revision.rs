@@ -407,19 +407,27 @@ struct RealtimeTranscriptItemState {
     previous_item_id: Option<String>,
     #[serde(default)]
     response_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "u32_map_keys::deserialize")]
     content_segments: BTreeMap<u32, String>,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     final_content_indices: BTreeSet<u32>,
     /// Typed non-text user content staged until canonical materialization.
     /// Cleared as soon as the user message materializes so inline image bytes
     /// never remain duplicated in durable transcript metadata.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "u32_map_keys::deserialize"
+    )]
     user_content_segments: BTreeMap<u32, Vec<ContentBlock>>,
     /// Stable replay identities retained after typed blocks move into the
     /// canonical message. This preserves idempotency without retaining a
     /// second copy of media bytes.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "u32_map_keys::deserialize"
+    )]
     user_content_segment_fingerprints: BTreeMap<u32, String>,
     #[serde(default)]
     skipped: bool,
@@ -429,6 +437,64 @@ struct RealtimeTranscriptItemState {
     materialized: bool,
     #[serde(default)]
     lane: TranscriptLane,
+}
+
+/// The `u32`-keyed maps of a realtime item. A JSON object key is a string.
+/// Read straight from JSON, serde_json parses it as the `u32`; but a snapshot
+/// record is an internally tagged enum, which serde decodes through its
+/// buffered content, and there the key stays a string that a plain `u32`
+/// refuses. These maps take the key as an integer, or as a string in the exact
+/// decimal form serde_json writes, so a decoded item serializes back to the
+/// same bytes.
+mod u32_map_keys {
+    use std::collections::BTreeMap;
+    use std::fmt;
+
+    use serde::de::{Deserialize, Deserializer, Error, Unexpected, Visitor};
+
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    struct Key(u32);
+
+    struct KeyVisitor;
+
+    impl Visitor<'_> for KeyVisitor {
+        type Value = Key;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a u32 map key")
+        }
+
+        fn visit_u64<E: Error>(self, value: u64) -> Result<Key, E> {
+            u32::try_from(value)
+                .map(Key)
+                .map_err(|_| E::invalid_value(Unexpected::Unsigned(value), &self))
+        }
+
+        fn visit_str<E: Error>(self, value: &str) -> Result<Key, E> {
+            match value.parse::<u32>() {
+                Ok(key) if key.to_string() == value => Ok(Key(key)),
+                _ => Err(E::invalid_value(Unexpected::Str(value), &self)),
+            }
+        }
+    }
+
+    impl<'de> Deserialize<'de> for Key {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            deserializer.deserialize_any(KeyVisitor)
+        }
+    }
+
+    pub(super) fn deserialize<'de, D, V>(deserializer: D) -> Result<BTreeMap<u32, V>, D::Error>
+    where
+        D: Deserializer<'de>,
+        V: Deserialize<'de>,
+    {
+        let keyed = BTreeMap::<Key, V>::deserialize(deserializer)?;
+        Ok(keyed
+            .into_iter()
+            .map(|(Key(key), value)| (key, value))
+            .collect())
+    }
 }
 
 impl RealtimeTranscriptItemState {

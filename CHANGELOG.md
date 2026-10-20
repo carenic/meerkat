@@ -2740,6 +2740,21 @@ them.
   (`IncrementalSessionStore::activate_head_canonical_store_with_staged_images`,
   after `stage_legacy_inline_images`) crosses it the same way, and one whose
   images were not staged refuses the whole activation, writing nothing.
+
+- `meerkat-core`: a session whose realtime projection holds a transcript
+  segment converts to the head-canonical profile, and a session that took a
+  live image reopens after a compaction or another transcript rewrite. The
+  conversion of a 0.9.3 session (the session store's crossing, the store-wide
+  activation, the realm open and the standalone conversion, and the Meta
+  storage migration that runs them) and every transcript rewrite or recovery
+  rebase write the realtime projection as one snapshot event, whose items key
+  their text, staged content and image fingerprints by content index. Reading
+  that event back refused every such key ("invalid type: string \"0\",
+  expected u32"), so the conversion refused the session as `Corrupted`, the
+  store-wide activation and the realm open with it, and a rewritten session
+  with a live image could not be loaded again. The items now read those keys;
+  the stored bytes are unchanged, and the reason a stored realtime sequence
+  does not replay is now logged.
 - `meerkat-session`: a session whose turns each add large images, such as a
   tool that returns camera snapshots, no longer compacts on every turn.
   Before compacting, the agent stores inline media as blob references, and

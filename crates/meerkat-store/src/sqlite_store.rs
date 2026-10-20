@@ -10688,6 +10688,196 @@ mod tests {
         );
     }
 
+    /// A legacy blob session whose realtime projection holds staged text
+    /// crosses into head-canonical authority. The crossing replays the
+    /// projection's activation snapshot, whose items key their text by content
+    /// index, and the text survives.
+    #[tokio::test]
+    async fn a_legacy_session_with_staged_realtime_text_crosses() {
+        let (_dir, store) = temp_store();
+        let session = session_with_realtime_text("before the call");
+        assert_eq!(
+            session
+                .staged_realtime_assistant_segment_text("resp", "assistant", 0)
+                .as_deref(),
+            Some("partial answer")
+        );
+        insert_whole_blob_row(store.path(), &session);
+
+        let crossing = store
+            .cross_head_canonical_authority(session.id())
+            .await
+            .expect("the legacy session crosses");
+        assert!(
+            matches!(crossing, HeadCanonicalAuthorityCrossing::Converted(_)),
+            "{crossing:?}"
+        );
+        let crossed = store
+            .load(session.id())
+            .await
+            .unwrap()
+            .expect("the crossed session");
+        assert_eq!(
+            crossed
+                .staged_realtime_assistant_segment_text("resp", "assistant", 0)
+                .as_deref(),
+            Some("partial answer")
+        );
+        assert_eq!(
+            crossed.transcript_revision().unwrap(),
+            session.transcript_revision().unwrap()
+        );
+    }
+
+    /// The realtime projection a session's WholeBlob document carries.
+    fn whole_blob_realtime_state(session: &Session) -> serde_json::Value {
+        serde_json::to_value(session).unwrap()["metadata"]["realtime_transcript_state"].clone()
+    }
+
+    /// A session whose realtime projection holds a spoken user transcript and
+    /// a staged spoken assistant transcript.
+    fn session_with_realtime_text(first: &str) -> Session {
+        let mut session = Session::new();
+        session.push(user(first));
+        let _ = session.append_realtime_transcript_event(
+            meerkat_core::RealtimeTranscriptEvent::UserTranscriptFinal {
+                item_id: "user".to_string(),
+                previous_item_id: None,
+                content_index: 0,
+                text: "hello".to_string(),
+            },
+        );
+        let _ = session.append_realtime_transcript_event(
+            meerkat_core::RealtimeTranscriptEvent::AssistantTranscriptDelta {
+                response_id: "resp".to_string(),
+                delta_id: "delta-1".to_string(),
+                item_id: "assistant".to_string(),
+                previous_item_id: Some("user".to_string()),
+                content_index: 0,
+                delta: "partial answer".to_string(),
+            },
+        );
+        session
+    }
+
+    /// A session document Meerkat 0.9.3 wrote for one voice turn (a spoken
+    /// user transcript and a spoken assistant reply, both kept in its realtime
+    /// projection) crosses into head-canonical authority from 0.9.3's own
+    /// bytes. After a cold reopen, its realtime projection equals the one
+    /// 0.9.3 wrote, by value.
+    #[tokio::test]
+    async fn a_0_9_3_voice_session_crosses_with_its_realtime_projection() {
+        const DOCUMENT: &[u8] =
+            include_bytes!("../tests/fixtures/v0_9_3_realtime_voice_session/session.json");
+        let written: serde_json::Value = serde_json::from_slice(DOCUMENT).unwrap();
+        let session: Session = serde_json::from_slice(DOCUMENT).unwrap();
+        let (dir, store) = temp_store();
+        Connection::open(store.path())
+            .unwrap()
+            .execute(
+                "INSERT INTO sessions (
+                     session_id, created_at_ms, updated_at_ms, message_count,
+                     total_tokens, metadata_json, session_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    session.id().to_string(),
+                    system_time_millis(session.created_at()),
+                    system_time_millis(session.updated_at()),
+                    i64::try_from(session.messages().len()).unwrap(),
+                    0_i64,
+                    "{}",
+                    DOCUMENT,
+                ],
+            )
+            .unwrap();
+
+        let crossing = store
+            .cross_head_canonical_authority(session.id())
+            .await
+            .expect("the 0.9.3 voice session crosses");
+        assert!(
+            matches!(crossing, HeadCanonicalAuthorityCrossing::Converted(_)),
+            "{crossing:?}"
+        );
+        drop(store);
+        let reopened = SqliteSessionStore::open(dir.path().join("sessions.sqlite3")).unwrap();
+        let crossed = reopened
+            .load(session.id())
+            .await
+            .unwrap()
+            .expect("the crossed session");
+        assert_eq!(crossed.messages(), session.messages());
+        assert!(!written["metadata"]["realtime_transcript_state"].is_null());
+        assert_eq!(
+            whole_blob_realtime_state(&crossed),
+            written["metadata"]["realtime_transcript_state"]
+        );
+    }
+
+    /// The store-wide activation crosses every legacy session, those whose
+    /// realtime projection holds text included, in one transaction.
+    #[tokio::test]
+    async fn a_store_activation_crosses_legacy_sessions_with_realtime_text() {
+        let (_dir, store) = temp_store();
+        let plain = {
+            let mut session = Session::new();
+            session.push(user("no realtime here"));
+            session
+        };
+        let voice = session_with_realtime_text("before the call");
+        insert_whole_blob_row(store.path(), &plain);
+        insert_whole_blob_row(store.path(), &voice);
+
+        let crossings = match store
+            .activate_head_canonical_store()
+            .await
+            .expect("the store activates")
+        {
+            HeadCanonicalStoreActivation::Activated(crossings) => crossings,
+            HeadCanonicalStoreActivation::NotApplicable => Vec::new(),
+        };
+        assert_eq!(crossings.len(), 2);
+        assert!(
+            crossings
+                .iter()
+                .all(|crossing| matches!(crossing, HeadCanonicalAuthorityCrossing::Converted(_))),
+            "{crossings:?}"
+        );
+        assert_eq!(head_row_count(store.path()), 2);
+        let crossed = store
+            .load(voice.id())
+            .await
+            .unwrap()
+            .expect("the voice session");
+        assert_eq!(
+            whole_blob_realtime_state(&crossed),
+            whole_blob_realtime_state(&voice)
+        );
+    }
+
+    /// The standalone conversion's seeding seam lays out a session whose
+    /// realtime projection holds text and activates its realtime component.
+    #[tokio::test]
+    async fn runtime_seed_lays_out_a_session_with_realtime_text() {
+        let (_dir, store) = temp_store();
+        let session = session_with_realtime_text("seeded from a runtime body");
+        let seed = session.clone();
+        store
+            .in_write_txn(move |tx| seed_head_canonical_for_runtime_in_txn(tx, &seed))
+            .await
+            .expect("seed a session with realtime text");
+        let loaded = store
+            .load(session.id())
+            .await
+            .unwrap()
+            .expect("the seeded session loads");
+        assert_eq!(loaded.messages(), session.messages());
+        assert_eq!(
+            whole_blob_realtime_state(&loaded),
+            whole_blob_realtime_state(&session)
+        );
+    }
+
     /// The head fields the transcript and its rewrite graph determine, which a
     /// converted head and an incrementally written head share.
     fn transcript_head_fields(head: &SessionHead) -> serde_json::Value {
