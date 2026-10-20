@@ -310,6 +310,12 @@ CARGO_BUILD_JOBS=2 CARGO_PROFILE_RELEASE_OPT_LEVEL=1 cargo install rkat --locked
   `--config 'profile.release.package.meerkat-mob.opt-level=0'` lowers that
   one (to about 6 GiB). Under 8 GiB, prefer a prebuilt binary.
 - Builds need a C compiler and libc headers (bundled SQLite), no OpenSSL.
+  Since 0.9.4 set `LIBSQLITE3_FLAGS="-DSQLITE_DEFAULT_MEMSTATUS=0
+  -USQLITE_ENABLE_MEMORY_MANAGEMENT -DSQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS"`
+  for a build outside the repository (`cargo install`, an embedding
+  application): it turns off SQLite's three process-wide locks, which the
+  repository's own builds and the release binaries already do; otherwise
+  `rkat storage doctor` warns `sqlite-lock-profile`.
 - Reduced builds are source-only. The repository keeps `rkat
   --no-default-features --features session-store`, `session-store,mcp` and
   `session-store,comms,mcp,workgraph` compiling; leaving out the mob graph
@@ -424,6 +430,25 @@ Rust host API changes in 0.9.4 (hosts that embed the crates):
   digest-verified body; open `SqliteSessionStore` on the file first, write no
   session row before it returns, and never use it on a realm database. Report:
   `StandaloneWholeBlobConversionReport`.
+- SQLite lock profile: `meerkat_sqlite::lock_profile` with
+  `REQUIRED_LIBSQLITE3_FLAGS`, `SqliteLockProfile::compiled()` / `effective()`,
+  `check_lock_profile()` (`SqliteLockProfileMismatch` names the setting) and
+  `unsafe fn disable_memory_statistics_at_process_start()` (call it as the
+  first statement of `main`; `MemoryStatisticsOutcome` `Applied`, `AlreadyOff`
+  or `TooLate`, read back with `memory_statistics_outcome()`).
+  `StorageDiagnosis::sqlite_lock_profile` (`SqliteLockProfileReport`,
+  `SqliteMemoryStatisticsSwitch` in `meerkat-core`) is filled by the disk
+  diagnosis only.
+- Presence locks: `meerkat_sqlite::KeptConnectionPresence` (`<file>.mpresence`,
+  `presence_lock_path`), held shared by a kept connection for its whole life.
+  `ExclusiveFence` now also holds the presence lock: `try_acquire` takes both
+  or neither, and `acquire` waits for the presence lock within the same
+  deadline.
+- `RuntimeStore::delivery_generation_reader` (defaulted, `None` reads through
+  `load_delivery_generation`) returns an optional `DeliveryGenerationReader`
+  for a delivery owner's store ticks; `RuntimeDeliveryInbox::delivery_generation_reader`
+  and `KEPT_DELIVERY_READER_IDLE` (1 s). A store decorator forwards the method
+  to the store it wraps or keeps the default.
 - `meerkat_core::strand_layout_for_retained_history` lays out the retained part
   of a transcript graph, including one that retired its oldest occurrences,
   and returns `RetainedStrandLayout`; `strand_layout_for_history` still refuses
