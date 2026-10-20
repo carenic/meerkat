@@ -16,6 +16,8 @@ pub use in_memory::{
     InMemoryMobSpecStore, InMemoryRealmProfileStore, InMemoryTemporaryCouncilStore,
 };
 pub use realm_profile::{RealmProfileStore, StoredRealmProfile};
+#[cfg(all(test, feature = "runtime-adapter", not(target_arch = "wasm32")))]
+pub(crate) use sqlite::{IDENTITY_RUNTIME_WRITE_FENCE_WAIT, identity_fence_test_hooks};
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use sqlite::{MemberBindingStoreRead, read_member_binding_store_at};
 #[cfg(not(target_arch = "wasm32"))]

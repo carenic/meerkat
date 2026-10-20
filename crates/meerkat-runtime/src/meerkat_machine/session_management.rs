@@ -1825,8 +1825,10 @@ impl MeerkatMachine {
     /// The external fence is generic and never participates in lifecycle-row
     /// content. The RuntimeStore retains it across the exact target CAS/commit;
     /// this method obtains a fresh guarded admission around the later live-map
-    /// publication. Conflict never spins internally: callers re-observe and
-    /// requeue one level-triggered pass.
+    /// publication. A fence that answers Backoff there is tried again for a
+    /// bounded time, with the session map released between attempts.
+    /// Conflict never spins internally: callers re-observe and requeue one
+    /// level-triggered pass.
     pub async fn register_session_if_runtime_lifecycle_current(
         &self,
         observed: RuntimeSessionLifecycleObservation,
@@ -2108,22 +2110,43 @@ impl MeerkatMachine {
                 };
             }
         };
-        let mut sessions = self.sessions.write().await;
-        if sessions.contains_key(&session_id) {
-            return RuntimeSessionRegistrationOutcome::Conflict {
-                current: committed_lifecycle,
-                reason: "a live runtime registration appeared before publication".to_string(),
-            };
-        }
-        let publication =
-            crate::store::execute_runtime_store_write_fence(write_fence.as_ref(), || {
-                let mut session_entry = session_entry;
-                session_entry.complete_owner_loss(owner_loss);
-                if let Some(displaced) = sessions.insert(session_id, session_entry) {
-                    displaced.agent_binding.retire();
+        // A fence that answers Backoff is tried again with the session map
+        // released between attempts. The entry and its owner-loss
+        // reservation stay here until an attempt publishes them, and a
+        // registration dropped at an await has published nothing.
+        let mut pending = Some((session_entry, owner_loss));
+        let mut retry = crate::store::FenceBackoffRetry::default();
+        let publication = loop {
+            let mut sessions = self.sessions.write().await;
+            if sessions.contains_key(&session_id) {
+                return RuntimeSessionRegistrationOutcome::Conflict {
+                    current: committed_lifecycle,
+                    reason: "a live runtime registration appeared before publication".to_string(),
+                };
+            }
+            let attempt =
+                crate::store::execute_runtime_store_write_fence(write_fence.as_ref(), || {
+                    let (mut session_entry, owner_loss) = pending.take().ok_or_else(|| {
+                        crate::store::RuntimeStoreError::Internal(
+                            "a runtime registration was published twice".to_string(),
+                        )
+                    })?;
+                    session_entry.complete_owner_loss(owner_loss);
+                    if let Some(displaced) = sessions.insert(session_id.clone(), session_entry) {
+                        displaced.agent_binding.retire();
+                    }
+                    Ok(())
+                });
+            match attempt {
+                Ok(crate::store::RuntimeStoreWriteFenceOutcome::Backoff { reason }) => {
+                    drop(sessions);
+                    if !retry.pause().await {
+                        break Ok(crate::store::RuntimeStoreWriteFenceOutcome::Backoff { reason });
+                    }
                 }
-                Ok(())
-            });
+                attempt => break attempt,
+            }
+        };
         match publication {
             Ok(crate::store::RuntimeStoreWriteFenceOutcome::Applied) => match durable_write {
                 DurableWrite::Applied => RuntimeSessionRegistrationOutcome::Applied {

@@ -91394,6 +91394,10 @@ mod fork_job_terminal;
 mod held_spawn;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod host_outage_recovery;
+/// SQLite-backed intent-managed identities converge while convergence-status
+/// commits hold the mob database's write lock across a slow fsync.
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+mod identity_fence_contention;
 /// Member binding history reads over real persistent stores, on the running
 /// mob and on its stopped store.
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]

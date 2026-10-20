@@ -265,6 +265,7 @@ rust_test(
     ],
     size = "large",
     data = [
+        "//:repo_governance_files",
         "//crates/meerkat-machine-schema:cargo_manifest",
         "//crates/meerkat-machine-schema:package_runfiles",
         "//crates/meerkat-mob:cargo_manifest",

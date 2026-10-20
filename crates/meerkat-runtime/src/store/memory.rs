@@ -1816,6 +1816,14 @@ fn deserialize_persisted_session(bytes: &[u8]) -> Result<meerkat_core::Session, 
     serde_json::from_slice(bytes).map_err(|err| RuntimeStoreError::ReadFailed(err.to_string()))
 }
 
+/// The prepared snapshot of a fenced commit was taken by an attempt that did
+/// not commit it.
+fn prepared_snapshot_taken(runtime_id: &LogicalRuntimeId) -> RuntimeStoreError {
+    RuntimeStoreError::Internal(format!(
+        "the prepared snapshot of runtime {runtime_id} was taken by an attempt that did not commit it"
+    ))
+}
+
 fn ensure_compaction_intents_already_outboxed(
     inner: &Inner,
     runtime_id: &LogicalRuntimeId,
@@ -1966,12 +1974,41 @@ impl super::RuntimeSessionAuthorityOps for InMemoryRuntimeStore {
                         ),
                     });
                 }
-                let mut inner = self.inner.lock().await;
-                ensure_compaction_intents_already_outboxed(&inner, runtime_id, prepared.session())?;
-                Some(super::execute_optional_runtime_store_target_write(
-                    write_fence.as_deref(),
-                    || commit_prepared_whole_blob_snapshot_locked(&mut inner, runtime_id, prepared),
-                )?)
+                // A fence that answers Backoff is tried again with the
+                // store lock released between attempts; the prepared
+                // snapshot stays here until an attempt commits it.
+                let mut pending = Some(prepared);
+                let mut retry = super::FenceBackoffRetry::default();
+                loop {
+                    let mut inner = self.inner.lock().await;
+                    let session = pending
+                        .as_ref()
+                        .map(|prepared| prepared.session())
+                        .ok_or_else(|| prepared_snapshot_taken(runtime_id))?;
+                    ensure_compaction_intents_already_outboxed(&inner, runtime_id, session)?;
+                    let committed = super::execute_optional_runtime_store_target_write(
+                        write_fence.as_deref(),
+                        || {
+                            let prepared = pending
+                                .take()
+                                .ok_or_else(|| prepared_snapshot_taken(runtime_id))?;
+                            commit_prepared_whole_blob_snapshot_locked(
+                                &mut inner, runtime_id, prepared,
+                            )
+                        },
+                    );
+                    match committed {
+                        Err(RuntimeStoreError::WriteFenceBackoff { reason })
+                            if pending.is_some() =>
+                        {
+                            drop(inner);
+                            if !retry.pause().await {
+                                return Err(RuntimeStoreError::WriteFenceBackoff { reason });
+                            }
+                        }
+                        committed => break Some(committed?),
+                    }
+                }
             }
             PreparedRuntimeSessionCommitPayload::Success {
                 session,
@@ -3366,58 +3403,68 @@ impl RuntimeStore for InMemoryRuntimeStore {
         replacements: &[InputStatePersistenceRecord],
         write_fence: Arc<dyn RuntimeStoreWriteFence>,
     ) -> Result<FencedInputStateBatchCasOutcome, RuntimeStoreError> {
-        let prepared = prepare_input_state_batch_cas(expected, replacements)?;
-        if prepared.is_empty() {
-            return Ok(FencedInputStateBatchCasOutcome::Swapped);
-        }
+        // A fence that answers Backoff is tried again with the store lock
+        // released between attempts; each attempt re-reads the rows.
+        let mut retry = super::FenceBackoffRetry::default();
+        loop {
+            let prepared = prepare_input_state_batch_cas(expected, replacements)?;
+            if prepared.is_empty() {
+                return Ok(FencedInputStateBatchCasOutcome::Swapped);
+            }
 
-        let mut inner = self.inner.lock().await;
-        let Some(states) = inner.input_states.get_mut(&runtime_id.0) else {
-            return Ok(FencedInputStateBatchCasOutcome::Stale);
-        };
-        let mut all_expected = true;
-        let mut all_replacements = true;
-        for row in &prepared {
-            let Some(current) = states.get(&row.input_id) else {
+            let mut inner = self.inner.lock().await;
+            let Some(states) = inner.input_states.get_mut(&runtime_id.0) else {
                 return Ok(FencedInputStateBatchCasOutcome::Stale);
             };
-            let current_json = serde_json::to_vec(current)
-                .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
-            if current_json != row.expected_json {
-                all_expected = false;
+            let mut all_expected = true;
+            let mut all_replacements = true;
+            for row in &prepared {
+                let Some(current) = states.get(&row.input_id) else {
+                    return Ok(FencedInputStateBatchCasOutcome::Stale);
+                };
+                let current_json = serde_json::to_vec(current)
+                    .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+                if current_json != row.expected_json {
+                    all_expected = false;
+                }
+                if current_json != row.replacement_json {
+                    all_replacements = false;
+                }
             }
-            if current_json != row.replacement_json {
-                all_replacements = false;
+            if !all_replacements && !all_expected {
+                return Ok(FencedInputStateBatchCasOutcome::Stale);
             }
-        }
-        if !all_replacements && !all_expected {
-            return Ok(FencedInputStateBatchCasOutcome::Stale);
-        }
 
-        let _ = states;
-        let prepared = if all_replacements {
-            Vec::new()
-        } else {
-            prepare_memory_input_state_mutations(
-                &inner,
-                &runtime_id.0,
-                prepared
-                    .into_iter()
-                    .map(|row| MemoryInputStateMutation::Upsert(row.replacement))
-                    .collect(),
-            )?
-        };
-        let fence_outcome = execute_runtime_store_write_fence(write_fence.as_ref(), || {
-            apply_prepared_memory_input_state_mutations(&mut inner, &runtime_id.0, prepared);
-            Ok(())
-        })?;
-        match fence_outcome {
-            RuntimeStoreWriteFenceOutcome::Applied => Ok(FencedInputStateBatchCasOutcome::Swapped),
-            RuntimeStoreWriteFenceOutcome::Conflict { reason } => {
-                Ok(FencedInputStateBatchCasOutcome::FenceConflict { reason })
-            }
-            RuntimeStoreWriteFenceOutcome::Backoff { reason } => {
-                Ok(FencedInputStateBatchCasOutcome::FenceBackoff { reason })
+            let _ = states;
+            let prepared = if all_replacements {
+                Vec::new()
+            } else {
+                prepare_memory_input_state_mutations(
+                    &inner,
+                    &runtime_id.0,
+                    prepared
+                        .into_iter()
+                        .map(|row| MemoryInputStateMutation::Upsert(row.replacement))
+                        .collect(),
+                )?
+            };
+            let fence_outcome = execute_runtime_store_write_fence(write_fence.as_ref(), || {
+                apply_prepared_memory_input_state_mutations(&mut inner, &runtime_id.0, prepared);
+                Ok(())
+            })?;
+            match fence_outcome {
+                RuntimeStoreWriteFenceOutcome::Applied => {
+                    return Ok(FencedInputStateBatchCasOutcome::Swapped);
+                }
+                RuntimeStoreWriteFenceOutcome::Conflict { reason } => {
+                    return Ok(FencedInputStateBatchCasOutcome::FenceConflict { reason });
+                }
+                RuntimeStoreWriteFenceOutcome::Backoff { reason } => {
+                    drop(inner);
+                    if !retry.pause().await {
+                        return Ok(FencedInputStateBatchCasOutcome::FenceBackoff { reason });
+                    }
+                }
             }
         }
     }
@@ -3487,66 +3534,77 @@ impl RuntimeStore for InMemoryRuntimeStore {
         mutations: &[RecoveryInputStateMutation],
         write_fence: Arc<dyn RuntimeStoreWriteFence>,
     ) -> Result<FencedInputStateBatchCasOutcome, RuntimeStoreError> {
-        let prepared = prepare_recovery_input_state_mutations(mutations)?;
-        let mut inner = self.inner.lock().await;
-        let current_revision = inner
-            .recovery_input_set_revisions
-            .get(&runtime_id.0)
-            .copied()
-            .unwrap_or(0);
-        if current_revision != expected_revision.store_generation() {
-            return Ok(FencedInputStateBatchCasOutcome::Stale);
-        }
-
-        let states = inner.input_states.get(&runtime_id.0);
-        let mut changed = Vec::new();
-        for mutation in prepared {
-            let Some(current) = states.and_then(|states| states.get(mutation.input_id())) else {
-                return Ok(FencedInputStateBatchCasOutcome::Stale);
-            };
-            if memory_input_row_version_digest(current)? != mutation.expected_row_digest() {
+        // A fence that answers Backoff is tried again with the store lock
+        // released between attempts; each attempt re-reads the rows.
+        let mut retry = super::FenceBackoffRetry::default();
+        loop {
+            let prepared = prepare_recovery_input_state_mutations(mutations)?;
+            let mut inner = self.inner.lock().await;
+            let current_revision = inner
+                .recovery_input_set_revisions
+                .get(&runtime_id.0)
+                .copied()
+                .unwrap_or(0);
+            if current_revision != expected_revision.store_generation() {
                 return Ok(FencedInputStateBatchCasOutcome::Stale);
             }
-            match &mutation {
-                PreparedRecoveryInputStateMutation::Upsert { replacement, .. } => {
-                    let current_bytes = serde_json::to_vec(current)
-                        .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
-                    let replacement_bytes = serde_json::to_vec(replacement)
-                        .map_err(|error| RuntimeStoreError::WriteFailed(error.to_string()))?;
-                    if current_bytes != replacement_bytes {
-                        changed.push(mutation);
+
+            let states = inner.input_states.get(&runtime_id.0);
+            let mut changed = Vec::new();
+            for mutation in prepared {
+                let Some(current) = states.and_then(|states| states.get(mutation.input_id()))
+                else {
+                    return Ok(FencedInputStateBatchCasOutcome::Stale);
+                };
+                if memory_input_row_version_digest(current)? != mutation.expected_row_digest() {
+                    return Ok(FencedInputStateBatchCasOutcome::Stale);
+                }
+                match &mutation {
+                    PreparedRecoveryInputStateMutation::Upsert { replacement, .. } => {
+                        let current_bytes = serde_json::to_vec(current)
+                            .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+                        let replacement_bytes = serde_json::to_vec(replacement)
+                            .map_err(|error| RuntimeStoreError::WriteFailed(error.to_string()))?;
+                        if current_bytes != replacement_bytes {
+                            changed.push(mutation);
+                        }
+                    }
+                    PreparedRecoveryInputStateMutation::Delete { .. } => changed.push(mutation),
+                }
+            }
+            let prepared = prepare_memory_input_state_mutations(
+                &inner,
+                &runtime_id.0,
+                changed
+                    .into_iter()
+                    .map(|mutation| match mutation {
+                        PreparedRecoveryInputStateMutation::Upsert { replacement, .. } => {
+                            MemoryInputStateMutation::Upsert(replacement)
+                        }
+                        PreparedRecoveryInputStateMutation::Delete { input_id, .. } => {
+                            MemoryInputStateMutation::Delete(input_id)
+                        }
+                    })
+                    .collect(),
+            )?;
+
+            let fence_outcome = execute_runtime_store_write_fence(write_fence.as_ref(), || {
+                apply_prepared_memory_input_state_mutations(&mut inner, &runtime_id.0, prepared);
+                Ok(())
+            })?;
+            match fence_outcome {
+                RuntimeStoreWriteFenceOutcome::Applied => {
+                    return Ok(FencedInputStateBatchCasOutcome::Swapped);
+                }
+                RuntimeStoreWriteFenceOutcome::Conflict { reason } => {
+                    return Ok(FencedInputStateBatchCasOutcome::FenceConflict { reason });
+                }
+                RuntimeStoreWriteFenceOutcome::Backoff { reason } => {
+                    drop(inner);
+                    if !retry.pause().await {
+                        return Ok(FencedInputStateBatchCasOutcome::FenceBackoff { reason });
                     }
                 }
-                PreparedRecoveryInputStateMutation::Delete { .. } => changed.push(mutation),
-            }
-        }
-        let prepared = prepare_memory_input_state_mutations(
-            &inner,
-            &runtime_id.0,
-            changed
-                .into_iter()
-                .map(|mutation| match mutation {
-                    PreparedRecoveryInputStateMutation::Upsert { replacement, .. } => {
-                        MemoryInputStateMutation::Upsert(replacement)
-                    }
-                    PreparedRecoveryInputStateMutation::Delete { input_id, .. } => {
-                        MemoryInputStateMutation::Delete(input_id)
-                    }
-                })
-                .collect(),
-        )?;
-
-        let fence_outcome = execute_runtime_store_write_fence(write_fence.as_ref(), || {
-            apply_prepared_memory_input_state_mutations(&mut inner, &runtime_id.0, prepared);
-            Ok(())
-        })?;
-        match fence_outcome {
-            RuntimeStoreWriteFenceOutcome::Applied => Ok(FencedInputStateBatchCasOutcome::Swapped),
-            RuntimeStoreWriteFenceOutcome::Conflict { reason } => {
-                Ok(FencedInputStateBatchCasOutcome::FenceConflict { reason })
-            }
-            RuntimeStoreWriteFenceOutcome::Backoff { reason } => {
-                Ok(FencedInputStateBatchCasOutcome::FenceBackoff { reason })
             }
         }
     }
@@ -3756,56 +3814,65 @@ impl RuntimeStore for InMemoryRuntimeStore {
         #[cfg(test)]
         self.machine_lifecycle_fenced_cas_calls
             .fetch_add(1, Ordering::AcqRel);
-        let replacement = prepare_machine_lifecycle_replacement(replacement)?;
-        let mut inner = self.inner.lock().await;
-        let current_raw = inner.runtime_lifecycle.get(&runtime_id.0).cloned();
-        let current = current_raw.as_deref().map_or(
-            MachineLifecycleObservation::Missing,
-            classify_machine_lifecycle_record,
-        );
-        let matches = match (&expected, &current) {
-            (MachineLifecycleExpectedVersion::Missing, MachineLifecycleObservation::Missing) => {
-                true
+        // A fence that answers Backoff is tried again with the store lock
+        // released between attempts; each attempt re-reads the row.
+        let mut retry = super::FenceBackoffRetry::default();
+        loop {
+            let replacement = prepare_machine_lifecycle_replacement(replacement.clone())?;
+            let mut inner = self.inner.lock().await;
+            let current_raw = inner.runtime_lifecycle.get(&runtime_id.0).cloned();
+            let current = current_raw.as_deref().map_or(
+                MachineLifecycleObservation::Missing,
+                classify_machine_lifecycle_record,
+            );
+            let matches = match (&expected, &current) {
+                (
+                    MachineLifecycleExpectedVersion::Missing,
+                    MachineLifecycleObservation::Missing,
+                ) => true,
+                (MachineLifecycleExpectedVersion::Version(expected), current) => {
+                    current.version().is_some_and(|actual| actual == expected)
+                }
+                _ => false,
+            };
+            if !matches {
+                return Ok(FencedMachineLifecycleCasOutcome::Conflict { current });
             }
-            (MachineLifecycleExpectedVersion::Version(expected), current) => {
-                current.version().is_some_and(|actual| actual == expected)
-            }
-            _ => false,
-        };
-        if !matches {
-            return Ok(FencedMachineLifecycleCasOutcome::Conflict { current });
-        }
-        let replacement = replacement.preserve_observed_custody(&current)?;
-        validate_machine_lifecycle_replacement(
-            &current,
-            current_raw.as_deref(),
-            &replacement.snapshot,
-        )?;
-        let already_exact = current_raw.as_deref() == Some(replacement.bytes.as_slice());
-        let record = decoded_prepared_machine_lifecycle_replacement(&replacement)?;
-        let version = replacement.version.clone();
-        let runtime_state = replacement.snapshot.runtime_state();
-        let fence_outcome = execute_runtime_store_write_fence(write_fence.as_ref(), || {
-            if !already_exact {
-                inner
-                    .runtime_lifecycle
-                    .insert(runtime_id.0.clone(), replacement.bytes.clone());
-            }
-            sync_runtime_session_catalog_lifecycle(&mut inner, &runtime_id.0, runtime_state);
-            Ok(())
-        })?;
-        match fence_outcome {
-            RuntimeStoreWriteFenceOutcome::Applied if already_exact => {
-                Ok(FencedMachineLifecycleCasOutcome::AlreadyExact { record, version })
-            }
-            RuntimeStoreWriteFenceOutcome::Applied => {
-                Ok(FencedMachineLifecycleCasOutcome::Applied { record, version })
-            }
-            RuntimeStoreWriteFenceOutcome::Conflict { reason } => {
-                Ok(FencedMachineLifecycleCasOutcome::FenceConflict { reason })
-            }
-            RuntimeStoreWriteFenceOutcome::Backoff { reason } => {
-                Ok(FencedMachineLifecycleCasOutcome::FenceBackoff { reason })
+            let replacement = replacement.preserve_observed_custody(&current)?;
+            validate_machine_lifecycle_replacement(
+                &current,
+                current_raw.as_deref(),
+                &replacement.snapshot,
+            )?;
+            let already_exact = current_raw.as_deref() == Some(replacement.bytes.as_slice());
+            let record = decoded_prepared_machine_lifecycle_replacement(&replacement)?;
+            let version = replacement.version.clone();
+            let runtime_state = replacement.snapshot.runtime_state();
+            let fence_outcome = execute_runtime_store_write_fence(write_fence.as_ref(), || {
+                if !already_exact {
+                    inner
+                        .runtime_lifecycle
+                        .insert(runtime_id.0.clone(), replacement.bytes.clone());
+                }
+                sync_runtime_session_catalog_lifecycle(&mut inner, &runtime_id.0, runtime_state);
+                Ok(())
+            })?;
+            match fence_outcome {
+                RuntimeStoreWriteFenceOutcome::Applied if already_exact => {
+                    return Ok(FencedMachineLifecycleCasOutcome::AlreadyExact { record, version });
+                }
+                RuntimeStoreWriteFenceOutcome::Applied => {
+                    return Ok(FencedMachineLifecycleCasOutcome::Applied { record, version });
+                }
+                RuntimeStoreWriteFenceOutcome::Conflict { reason } => {
+                    return Ok(FencedMachineLifecycleCasOutcome::FenceConflict { reason });
+                }
+                RuntimeStoreWriteFenceOutcome::Backoff { reason } => {
+                    drop(inner);
+                    if !retry.pause().await {
+                        return Ok(FencedMachineLifecycleCasOutcome::FenceBackoff { reason });
+                    }
+                }
             }
         }
     }
@@ -4335,6 +4402,257 @@ mod tests {
             .insert(wrong_id, input);
         let guard = store.try_controller_mutation_custody(&claim).unwrap();
         assert!(guard.visit_runtimes(&mut |_| false).is_err());
+    }
+
+    /// Answers Backoff to its first `backoffs` calls and admits the next, as
+    /// an identity fence does while a status commit holds its database's write
+    /// lock. Records when each call started and counts the calls that
+    /// returned.
+    struct BackoffThenAdmit {
+        backoffs: usize,
+        call_starts: std::sync::Mutex<Vec<std::time::Instant>>,
+        returned: tokio::sync::watch::Sender<usize>,
+    }
+
+    impl BackoffThenAdmit {
+        fn new(backoffs: usize) -> Arc<Self> {
+            Arc::new(Self {
+                backoffs,
+                call_starts: std::sync::Mutex::new(Vec::new()),
+                returned: tokio::sync::watch::Sender::new(0),
+            })
+        }
+
+        /// Runs `read` on a task of its own once `after` calls have returned,
+        /// and resolves to when the read finished.
+        fn read_after(
+            &self,
+            after: usize,
+            read: impl std::future::Future<Output = ()> + Send + 'static,
+        ) -> tokio::task::JoinHandle<std::time::Instant> {
+            let mut returned = self.returned.subscribe();
+            tokio::spawn(async move {
+                returned
+                    .wait_for(|returned| *returned >= after)
+                    .await
+                    .unwrap();
+                read.await;
+                std::time::Instant::now()
+            })
+        }
+
+        /// The read finished well before the writer's next attempt: the
+        /// writer released the store lock for its pause.
+        fn assert_read_ran_in_the_pause(&self, read_at: std::time::Instant) {
+            let starts = self.call_starts.lock().unwrap().clone();
+            assert_eq!(
+                starts.len(),
+                self.backoffs + 1,
+                "every refused attempt was retried, then admitted"
+            );
+            let margin = starts[READ_AFTER_BACKOFFS].saturating_duration_since(read_at);
+            assert!(
+                margin >= std::time::Duration::from_millis(10),
+                "the read finished {margin:?} before the next attempt; a writer that keeps \
+                 its lock across the pause lets it run only just before that attempt"
+            );
+        }
+    }
+
+    impl RuntimeStoreWriteFence for BackoffThenAdmit {
+        fn execute_if_current(
+            &self,
+            operation: Box<dyn FnOnce() -> Result<(), RuntimeStoreError> + '_>,
+        ) -> Result<RuntimeStoreWriteFenceOutcome, RuntimeStoreError> {
+            let call = {
+                let mut starts = self.call_starts.lock().unwrap();
+                starts.push(std::time::Instant::now());
+                starts.len()
+            };
+            let outcome = if call <= self.backoffs {
+                Ok(RuntimeStoreWriteFenceOutcome::Backoff {
+                    reason: "identity authority busy".to_string(),
+                })
+            } else {
+                operation().map(|()| RuntimeStoreWriteFenceOutcome::Applied)
+            };
+            self.returned.send_modify(|returned| *returned += 1);
+            outcome
+        }
+    }
+
+    /// Five Backoffs before the admitted attempt: the writer pauses 5, 10, 20,
+    /// 40 and 50 ms between them.
+    const BACKOFFS: usize = 5;
+    /// A read issued after the fourth Backoff runs in the 40 ms pause.
+    const READ_AFTER_BACKOFFS: usize = 4;
+
+    #[tokio::test]
+    async fn a_fenced_lifecycle_cas_retries_a_backoff_with_the_store_lock_released() {
+        let store = InMemoryRuntimeStore::new();
+        let runtime_id = LogicalRuntimeId::new("fenced-lifecycle-retry");
+        let fence = BackoffThenAdmit::new(BACKOFFS);
+        let reader = fence.read_after(READ_AFTER_BACKOFFS, {
+            let store = store.clone();
+            let runtime_id = runtime_id.clone();
+            async move {
+                store
+                    .load_machine_lifecycle_record(&runtime_id)
+                    .await
+                    .unwrap();
+            }
+        });
+        let outcome = store
+            .compare_and_swap_machine_lifecycle_with_fence(
+                &runtime_id,
+                MachineLifecycleExpectedVersion::Missing,
+                lifecycle_commit(&runtime_id, RuntimeState::Idle, 1, 1),
+                fence.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, FencedMachineLifecycleCasOutcome::Applied { .. }),
+            "{outcome:?}"
+        );
+        fence.assert_read_ran_in_the_pause(reader.await.unwrap());
+        assert!(
+            store
+                .load_machine_lifecycle_record(&runtime_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fenced_input_state_cas_retries_a_backoff_with_the_store_lock_released() {
+        let store = InMemoryRuntimeStore::new();
+        let rid = LogicalRuntimeId::new("fenced-input-cas-retry");
+        let expected: Vec<_> = (0..2)
+            .map(|_| StoredInputState::new_accepted(InputId::new()))
+            .collect();
+        let initial: Vec<_> = expected.iter().cloned().map(persistable).collect();
+        store
+            .persist_input_states_atomically(&rid, &initial)
+            .await
+            .unwrap();
+        let fence = BackoffThenAdmit::new(BACKOFFS);
+        let reader = fence.read_after(READ_AFTER_BACKOFFS, {
+            let store = store.clone();
+            let rid = rid.clone();
+            async move {
+                store.load_input_states_strict(&rid).await.unwrap();
+            }
+        });
+        let outcome = store
+            .compare_and_swap_input_states_atomically_with_fence(
+                &rid,
+                &expected,
+                &replacement_records(&expected, 1),
+                fence.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, FencedInputStateBatchCasOutcome::Swapped);
+        fence.assert_read_ran_in_the_pause(reader.await.unwrap());
+        let rows = store.load_input_states_strict(&rid).await.unwrap();
+        assert!(rows.iter().all(|row| row.state.recovery_count == 1));
+    }
+
+    #[tokio::test]
+    async fn a_fenced_recovery_cas_retries_a_backoff_with_the_store_lock_released() {
+        let store = InMemoryRuntimeStore::new();
+        let rid = LogicalRuntimeId::new("fenced-recovery-cas-retry");
+        let input = StoredInputState::new_accepted(InputId::new());
+        let input_id = input.state.input_id.clone();
+        store
+            .persist_input_states_atomically(&rid, &[persistable(input)])
+            .await
+            .unwrap();
+        let (revision, digest) = {
+            let inner = store.inner.lock().await;
+            let revision = RecoveryInputSetRevision::from_store_generation(
+                inner
+                    .recovery_input_set_revisions
+                    .get(&rid.0)
+                    .copied()
+                    .unwrap_or(0),
+            );
+            let current = &inner.input_states[&rid.0][&input_id];
+            (revision, memory_input_row_version_digest(current).unwrap())
+        };
+        let mutations = [RecoveryInputStateMutation::delete(input_id.clone(), digest).unwrap()];
+        let fence = BackoffThenAdmit::new(BACKOFFS);
+        let reader = fence.read_after(READ_AFTER_BACKOFFS, {
+            let store = store.clone();
+            let rid = rid.clone();
+            async move {
+                store.load_input_states_strict(&rid).await.unwrap();
+            }
+        });
+        let outcome = store
+            .compare_and_swap_recovery_input_states_atomically_with_fence(
+                &rid,
+                revision,
+                &mutations,
+                fence.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, FencedInputStateBatchCasOutcome::Swapped);
+        fence.assert_read_ran_in_the_pause(reader.await.unwrap());
+        assert!(
+            store
+                .load_input_state(&rid, &input_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fenced_session_boundary_retries_a_backoff_with_the_store_lock_released() {
+        let store = InMemoryRuntimeStore::new();
+        let session = session_with_user("fenced boundary retry");
+        let runtime_id = LogicalRuntimeId::for_session(session.id());
+        let request = crate::store::PreparedRuntimeSessionCommit::snapshot_only(
+            meerkat_core::lifecycle::core_executor::BoundSessionCommit::sealed(Arc::new(
+                session.clone(),
+            ))
+            .unwrap(),
+        );
+        let fence = BackoffThenAdmit::new(BACKOFFS);
+        let reader = fence.read_after(READ_AFTER_BACKOFFS, {
+            let store = store.clone();
+            let runtime_id = runtime_id.clone();
+            async move {
+                store.load_session_snapshot(&runtime_id).await.unwrap();
+            }
+        });
+        let outcome = RuntimeStore::commit_prepared_session_boundary_with_fence(
+            &store,
+            &runtime_id,
+            request,
+            fence.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                crate::store::FencedPreparedRuntimeSessionCommitOutcome::Applied(_)
+            ),
+            "{outcome:?}"
+        );
+        fence.assert_read_ran_in_the_pause(reader.await.unwrap());
+        assert!(
+            store
+                .load_session_snapshot(&runtime_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     struct AppliedWriteFence;

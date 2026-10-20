@@ -6171,15 +6171,69 @@ pub enum RuntimeStoreWriteFenceOutcome {
 /// boundary. The caller defensively treats a successful target operation as
 /// Applied even if a fence implementation then returns a contradictory result.
 /// Implementations must not re-enter the same RuntimeStore from this callback.
+///
+/// `execute_if_current` never waits beyond its own I/O: an authority that is
+/// busy answers Backoff at once. A caller may therefore call it while holding
+/// an async lock other tasks need, provided it retries a Backoff the way the
+/// built-in callers do: release the lock, pause, re-observe and try again,
+/// within a bound.
+///
+/// [`Self::execute_if_current_blocking`] is the bounded-wait entry, for a
+/// caller that is already on a blocking thread, such as the SQLite runtime
+/// store inside its blocking tasks. There an implementation may wait, for a
+/// bounded time, for an authority guard that `execute_if_current` would
+/// answer Backoff for at once. An async caller never calls it.
 pub trait RuntimeStoreWriteFence: Send + Sync {
     fn execute_if_current(
         &self,
         operation: Box<dyn FnOnce() -> Result<(), RuntimeStoreError> + '_>,
     ) -> Result<RuntimeStoreWriteFenceOutcome, RuntimeStoreError>;
+
+    /// [`Self::execute_if_current`] for a caller on a blocking thread: the
+    /// same contract, except that the implementation may block the thread
+    /// for a bounded time waiting for its authority guard before it answers
+    /// Backoff. The default waits no longer than `execute_if_current`.
+    fn execute_if_current_blocking(
+        &self,
+        operation: Box<dyn FnOnce() -> Result<(), RuntimeStoreError> + '_>,
+    ) -> Result<RuntimeStoreWriteFenceOutcome, RuntimeStoreError> {
+        self.execute_if_current(operation)
+    }
+}
+
+/// Which entry of a [`RuntimeStoreWriteFence`] a fenced write goes through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FenceEntry {
+    /// [`RuntimeStoreWriteFence::execute_if_current`]: no wait for the
+    /// authority's guard.
+    Immediate,
+    /// [`RuntimeStoreWriteFence::execute_if_current_blocking`]: a bounded
+    /// wait, on a blocking thread only.
+    Blocking,
 }
 
 pub(crate) fn execute_runtime_store_write_fence(
     write_fence: &dyn RuntimeStoreWriteFence,
+    operation: impl FnOnce() -> Result<(), RuntimeStoreError>,
+) -> Result<RuntimeStoreWriteFenceOutcome, RuntimeStoreError> {
+    execute_write_fence_through(write_fence, FenceEntry::Immediate, operation)
+}
+
+/// [`execute_runtime_store_write_fence`] through the fence's bounded-wait
+/// entry. It can block the calling thread for the fence's bound, so only a
+/// caller on a blocking thread calls it: the SQLite store, inside its
+/// blocking tasks.
+#[cfg_attr(not(feature = "sqlite-store"), allow(dead_code))]
+pub(crate) fn execute_runtime_store_write_fence_blocking(
+    write_fence: &dyn RuntimeStoreWriteFence,
+    operation: impl FnOnce() -> Result<(), RuntimeStoreError>,
+) -> Result<RuntimeStoreWriteFenceOutcome, RuntimeStoreError> {
+    execute_write_fence_through(write_fence, FenceEntry::Blocking, operation)
+}
+
+fn execute_write_fence_through(
+    write_fence: &dyn RuntimeStoreWriteFence,
+    entry: FenceEntry,
     operation: impl FnOnce() -> Result<(), RuntimeStoreError>,
 ) -> Result<RuntimeStoreWriteFenceOutcome, RuntimeStoreError> {
     let invoked = std::cell::Cell::new(false);
@@ -6190,7 +6244,12 @@ pub(crate) fn execute_runtime_store_write_fence(
         *operation_result.borrow_mut() = Some(result.clone());
         result
     };
-    let fence_result = write_fence.execute_if_current(Box::new(checked_operation));
+    let fence_result = match entry {
+        FenceEntry::Immediate => write_fence.execute_if_current(Box::new(checked_operation)),
+        FenceEntry::Blocking => {
+            write_fence.execute_if_current_blocking(Box::new(checked_operation))
+        }
+    };
     let operation_result = operation_result.borrow_mut().take();
     if invoked.get() {
         return match operation_result {
@@ -6239,11 +6298,30 @@ pub(crate) fn execute_optional_runtime_store_target_write<T>(
     write_fence: Option<&dyn RuntimeStoreWriteFence>,
     operation: impl FnOnce() -> Result<T, RuntimeStoreError>,
 ) -> Result<T, RuntimeStoreError> {
+    execute_optional_target_write_through(write_fence, FenceEntry::Immediate, operation)
+}
+
+/// [`execute_optional_runtime_store_target_write`] through the fence's
+/// bounded-wait entry: on a blocking thread only, as
+/// [`execute_runtime_store_write_fence_blocking`].
+#[cfg_attr(not(feature = "sqlite-store"), allow(dead_code))]
+pub(crate) fn execute_optional_runtime_store_target_write_blocking<T>(
+    write_fence: Option<&dyn RuntimeStoreWriteFence>,
+    operation: impl FnOnce() -> Result<T, RuntimeStoreError>,
+) -> Result<T, RuntimeStoreError> {
+    execute_optional_target_write_through(write_fence, FenceEntry::Blocking, operation)
+}
+
+fn execute_optional_target_write_through<T>(
+    write_fence: Option<&dyn RuntimeStoreWriteFence>,
+    entry: FenceEntry,
+    operation: impl FnOnce() -> Result<T, RuntimeStoreError>,
+) -> Result<T, RuntimeStoreError> {
     let Some(write_fence) = write_fence else {
         return operation();
     };
     let result = std::cell::RefCell::new(None);
-    let outcome = execute_runtime_store_write_fence(write_fence, || {
+    let outcome = execute_write_fence_through(write_fence, entry, || {
         let value = operation()?;
         *result.borrow_mut() = Some(value);
         Ok(())
@@ -6260,6 +6338,57 @@ pub(crate) fn execute_optional_runtime_store_target_write<T>(
         RuntimeStoreWriteFenceOutcome::Backoff { reason } => {
             Err(RuntimeStoreError::WriteFenceBackoff { reason })
         }
+    }
+}
+
+/// How long a fenced write whose caller holds an async lock retries a fence
+/// that answers [`RuntimeStoreWriteFenceOutcome::Backoff`].
+///
+/// Such a caller cannot wait inside the fence: the wait would block its
+/// thread while it holds a lock other tasks need. Between attempts it
+/// releases the lock and pauses, and each attempt re-observes what it
+/// writes. Past this bound it reports the Backoff, as it did at once before.
+/// The SQLite identity fence answers Backoff while a convergence-status
+/// commit holds the mob database's write lock across its fsync; a bound of a
+/// few such commits lets an actuation through instead of losing to the next
+/// status write every time.
+pub(crate) const FENCE_BACKOFF_RETRY_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The first pause between two fence attempts; each pause doubles, up to
+/// [`FENCE_BACKOFF_MAX_PAUSE`].
+const FENCE_BACKOFF_FIRST_PAUSE: std::time::Duration = std::time::Duration::from_millis(5);
+const FENCE_BACKOFF_MAX_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The retry policy of a fenced write whose caller holds an async lock.
+/// Each attempt takes the caller's lock, re-observes what it writes and
+/// runs one fence attempt. After an attempt the fence answered with
+/// Backoff, the caller releases the lock and calls [`Self::pause`].
+#[derive(Debug, Default)]
+pub(crate) struct FenceBackoffRetry {
+    /// Set at the first pause, so a write the fence admits at once reads no
+    /// clock.
+    deadline: Option<crate::tokio::time::Instant>,
+    pause: std::time::Duration,
+}
+
+impl FenceBackoffRetry {
+    /// Wait before the next attempt and return `true`, or return `false`
+    /// once the bound has passed: the caller then reports the Backoff.
+    pub(crate) async fn pause(&mut self) -> bool {
+        let now = crate::tokio::time::Instant::now();
+        let deadline = *self
+            .deadline
+            .get_or_insert_with(|| now + FENCE_BACKOFF_RETRY_BOUND);
+        if now >= deadline {
+            return false;
+        }
+        self.pause = if self.pause.is_zero() {
+            FENCE_BACKOFF_FIRST_PAUSE
+        } else {
+            (self.pause * 2).min(FENCE_BACKOFF_MAX_PAUSE)
+        };
+        crate::tokio::time::sleep(self.pause.min(deadline - now)).await;
+        true
     }
 }
 
