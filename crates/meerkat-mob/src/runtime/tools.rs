@@ -968,9 +968,10 @@ enum SessionAuthorityBinding {
     /// call is denied.
     Unbound,
     /// The session's effective-authority handle. `listed` records whether
-    /// the context held operator scope in this mob instance when it was
-    /// bound; without it the tools are hidden, and a call that still reaches
-    /// them is admitted against the bound context like any other.
+    /// the context bound this mob instance when it was bound, whatever scope
+    /// it holds there; without that binding the tools are hidden, and a call
+    /// that still reaches them is admitted against the bound context like any
+    /// other.
     Bound {
         authority: Arc<std::sync::RwLock<MobToolAuthorityContext>>,
         listed: bool,
@@ -1118,7 +1119,7 @@ impl MobOperatorToolDispatcher {
     }
 
     /// Whether the tools are listed: a session authority bound as removed,
-    /// or without operator scope in this mob instance, hides them.
+    /// or with no binding to this mob instance, hides them.
     fn listed(&self) -> bool {
         match &self.authority {
             OperatorAuthority::Fixed(_) => true,
@@ -1773,8 +1774,8 @@ impl AgentToolDispatcher for MobOperatorToolDispatcher {
     }
 
     /// A local member's tools admit against the session authority bound
-    /// here, and are hidden when it is `None` or holds no operator scope in
-    /// this mob instance. A fixed-context dispatcher ignores it.
+    /// here, and are hidden when it is `None` or binds no incarnation of this
+    /// mob instance. A fixed-context dispatcher ignores it.
     fn bind_session_mob_tool_authority(
         &self,
         authority: Option<Arc<std::sync::RwLock<MobToolAuthorityContext>>>,
@@ -1791,8 +1792,7 @@ impl AgentToolDispatcher for MobOperatorToolDispatcher {
                     let mob_id = self.handle.definition().id.as_str();
                     let incarnation = self.handle.incarnation();
                     context.is_generated_authority_context()
-                        && (context.can_manage_mob(mob_id, incarnation)
-                            || context.spawn_profile_scope_present(mob_id, incarnation))
+                        && context.mob_incarnations().get(mob_id) == Some(&incarnation)
                 };
                 SessionAuthorityBinding::Bound { authority, listed }
             }

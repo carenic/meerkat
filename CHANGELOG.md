@@ -799,8 +799,8 @@ them.
   `restrict_spawn_profiles_in_mob`, narrowed the session's other mob tool
   surfaces while the member could still spawn every profile through these.
   The factory binds the authority through the new defaulted method
-  `AgentToolDispatcher::bind_session_mob_tool_authority`, on the session's
-  external tools before it composes them, with or without a
+  `AgentToolDispatcher::bind_session_mob_tool_authority` (see Added), on the
+  session's external tools before it composes them, with or without a
   `MobToolsFactory`. Behaviour changes for hosts:
   - A hook that grants manage scope over the member's own mob now reaches
     these tools too: such a member can retire, force-cancel and read the
@@ -808,8 +808,9 @@ them.
   - A hook that removes the authority (`mob_tool_authority_context` set to
     `None`, or mob tools disabled) now hides these tools and refuses their
     spawn and management calls, where they still admitted every profile.
-  - They follow the authority updates the agent applies during the session
-    (`apply_session_effects`), as a `MobToolsFactory` surface does.
+  - Their admission follows the authority updates the agent applies during
+    the session (`apply_session_effects`), as a `MobToolsFactory` surface's
+    does. Which of them are listed is settled when the session is built.
   - A host that wraps a member's external tools in its own
     `AgentToolDispatcher` must forward `bind_session_mob_tool_authority` to
     the wrapped dispatcher: tools the factory never binds deny every call.
@@ -1313,6 +1314,14 @@ them.
   before the host holds their handle and so before it can call the grant
   functions. Before this, such a restored member kept spawn rights over every
   profile of its mob after each restart.
+- `meerkat_core::AgentToolDispatcher::bind_session_mob_tool_authority`, a
+  defaulted method (a no-op by default). The agent factory calls it on a
+  session's external tools once the session's mob operator authority is
+  settled, before it composes them, with the session's effective-authority
+  handle or `None`. A dispatcher that admits mob operator calls for the
+  session admits against it. A composite, or a host's wrapper around a
+  session's external tools, forwards it to every dispatcher it wraps, as
+  `DynamicToolComposite` and `ToolGateway` do (see Security).
 - `meerkat_core::service::MobIncarnationId` implements `Display`,
   `FromStr` (error: `MobIncarnationIdParseError`), `PartialOrd` and `Ord`.
 - `meerkat_mob::MobProvenance`: who created a mob (`Member`, `Host`,
