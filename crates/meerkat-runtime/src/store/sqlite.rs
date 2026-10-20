@@ -4344,12 +4344,14 @@ END";
             {
                 let bytes = controller_custody_bytes(row, 0)?;
                 let observation = MachineLifecycleObservation::from_raw_record(bytes);
+                // A session runtime's binding names the mob runtime it serves,
+                // which has its own id; any other runtime must name itself.
                 match &observation {
                     MachineLifecycleObservation::Decoded { record, .. }
-                        if record
-                            .binding()
-                            .agent_runtime_id()
-                            .is_none_or(|bound| bound == runtime_id_text(&runtime_id)) => {}
+                        if record.binding().agent_runtime_id().is_none_or(|bound| {
+                            runtime_id.session_id().is_some()
+                                || bound == runtime_id_text(&runtime_id)
+                        }) => {}
                     _ => return Err(RuntimeStoreError::ReadFailed(
                         "controller custody lifecycle is undecodable or bound to another runtime"
                             .to_string(),
@@ -19066,6 +19068,48 @@ ORDER BY runtime_id";
             drop(maintenance);
             RuntimeStore::try_controller_mutation_custody(&store, &claim)
                 .expect("ordinary administration resumes after actual fence release");
+        }
+
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        #[tokio::test]
+        async fn persistent_admin_custody_admits_a_session_runtime_bound_to_its_mob_runtime() {
+            let (_directory, store) = temp_store();
+            // A mob member runs on its session's runtime, whose lifecycle
+            // binding names the mob runtime it serves: a different id by design.
+            let session_runtime = LogicalRuntimeId::for_session(&meerkat_core::SessionId::new());
+            store
+                .commit_machine_lifecycle(
+                    &session_runtime,
+                    MachineLifecycleCommit::new_with_binding(
+                        RuntimeState::Idle,
+                        crate::store::MachineLifecycleBindingFacts::new(
+                            Some("mob-member-runtime:1".to_string()),
+                            Some(1),
+                            Some(1),
+                            Some("epoch-1".to_string()),
+                        ),
+                        crate::store::SupervisorAuthoritySnapshot::UnboundNoReceipt,
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap();
+            let claim = sqlite_execution_owner(&store)
+                .try_acquire_governed()
+                .unwrap();
+            let custody = RuntimeStore::try_controller_mutation_custody(&store, &claim)
+                .expect("actual backend administration custody");
+            let mut visited = 0;
+            assert!(
+                !custody
+                    .visit_runtimes(&mut |owner| {
+                        assert_eq!(owner.runtime_id(), &session_runtime);
+                        visited += 1;
+                        false
+                    })
+                    .expect("a session runtime bound to its mob runtime is not misbound")
+            );
+            assert_eq!(visited, 1);
         }
 
         #[test]

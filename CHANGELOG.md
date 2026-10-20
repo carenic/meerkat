@@ -2567,6 +2567,13 @@ them.
   compacted member failed to start. A conversion now records the stored
   head, and opening a store that an earlier build converted repairs each
   affected runtime record in place. Pre-existing in 0.9.3.
+- `meerkat-runtime`: revoking a controller grant no longer answers
+  `Unavailable` once the runtime store holds a mob member's runtime with its
+  mob binding, as it does after a restart recovers the members. The custody
+  scan took that binding, which names the mob runtime the member's session
+  runtime serves, for a lifecycle stored under another runtime's id. A
+  session runtime may now name its mob runtime; any other runtime must still
+  name itself. Pre-existing since 0.8.52.
 
 ### Known limitations
 
