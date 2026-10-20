@@ -24370,6 +24370,54 @@ ORDER BY runtime_id";
             );
         }
 
+        /// A realm whose session store holds a legacy blob row with realtime
+        /// text opens on the head-canonical profile. Its activation crosses the
+        /// session, replaying the realtime projection's activation snapshot,
+        /// and the session keeps that projection.
+        #[tokio::test]
+        async fn a_realm_whose_blob_row_holds_realtime_text_opens() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("realm.sqlite3");
+            let mut session = Session::new();
+            session.push(Message::User(UserMessage::text("before the call")));
+            let _ = session.append_realtime_transcript_event(
+                meerkat_core::RealtimeTranscriptEvent::UserTranscriptFinal {
+                    item_id: "user".to_string(),
+                    previous_item_id: None,
+                    content_index: 0,
+                    text: "hello".to_string(),
+                },
+            );
+            let _ = session.append_realtime_transcript_event(
+                meerkat_core::RealtimeTranscriptEvent::AssistantTranscriptDelta {
+                    response_id: "resp".to_string(),
+                    delta_id: "delta-1".to_string(),
+                    item_id: "assistant".to_string(),
+                    previous_item_id: Some("user".to_string()),
+                    content_index: 0,
+                    delta: "partial answer".to_string(),
+                },
+            );
+            let (_runtime_id, session_store) = realm_with_blob_row(&path, &session).await;
+
+            let blobs = CountingBlobStore::new();
+            SqliteRuntimeStore::new_head_canonical_with_media(&path, &blobs)
+                .await
+                .expect("the realm opens");
+            assert!(has_head_row(&path, session.id()));
+            let opened = session_store
+                .load(session.id())
+                .await
+                .unwrap()
+                .expect("the opened session");
+            let realtime = |session: &Session| {
+                serde_json::to_value(session).unwrap()["metadata"]["realtime_transcript_state"]
+                    .clone()
+            };
+            assert!(!realtime(&session).is_null());
+            assert_eq!(realtime(&opened), realtime(&session));
+        }
+
         /// A realm open that stopped after its media stage (the images are
         /// stored, nothing in the file changed) finishes on the next open.
         #[tokio::test]
