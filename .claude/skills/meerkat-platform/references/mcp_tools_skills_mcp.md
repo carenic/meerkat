@@ -114,7 +114,12 @@ Behavior:
   and waits until the process has exited and every holder of its stdout has
   closed it: SIGTERM to the group after 5 s, SIGKILL after 3 s more, then a
   10 s backstop (Rust hosts: `McpRouter::with_stdio_close_bounds`, each grace
-  at most 60 s). A remote server's close that does not finish within 18 s
+  at most 60 s). Since 0.9.4 a macOS close also settles as soon as the server
+  has exited and its stdout is closed, as on Linux; in 0.9.0-0.9.3 every
+  macOS stdio close waited out both graces and sent SIGKILL, even to a server
+  that had already exited (by default about 8 s per server; a server that
+  failed setup stayed pending that long, and a live add, reload or restore of
+  it was refused). A remote server's close that does not finish within 18 s
   (the default stdio bound) fails `CloseTimedOut` (`MCP server '<name>' close
   did not finish within ...`). (Rust host) `McpRouter::shutdown_with_report()`
   returns an `McpRouterShutdownReport` (`servers()`, `is_settled()`);
