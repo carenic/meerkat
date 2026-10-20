@@ -1941,6 +1941,172 @@ mod tests {
         assert_eq!(result.discarded.len(), messages.len());
     }
 
+    const CAMERA_PROVIDER_CAP: u64 = 9_000_000; // approximate_request_byte_cap(Anthropic)
+
+    /// A conversational turn whose tool result carries two images, inline or
+    /// blob-backed (the form compaction sees: the agent externalizes inline
+    /// media before it compacts).
+    fn camera_turn(round: usize, inline_base64_bytes: Option<usize>) -> Vec<Message> {
+        let image = |camera: &str| match inline_base64_bytes {
+            Some(bytes) => inline_image_block("image/jpeg", &"A".repeat(bytes)),
+            None => blob_image_block("image/jpeg", &format!("{camera}-{round}")),
+        };
+        vec![
+            Message::User(UserMessage::text(format!(
+                "check the cameras, round {round}"
+            ))),
+            Message::tool_results(vec![meerkat_core::types::ToolResult::with_blocks(
+                format!("tc_{round}"),
+                vec![image("cam-a"), image("cam-b")],
+                false,
+            )]),
+        ]
+    }
+
+    fn camera_blob_images(messages: &[Message]) -> u64 {
+        messages
+            .iter()
+            .map(|message| match message {
+                Message::ToolResults { results, .. } => results
+                    .iter()
+                    .flat_map(|result| result.content.iter())
+                    .filter(|block| {
+                        matches!(
+                            block,
+                            ContentBlock::Image {
+                                data: ImageData::Blob { .. },
+                                ..
+                            }
+                        )
+                    })
+                    .count() as u64,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// The provider-lowered request: the canonical rows plus every blob
+    /// payload the execution hydration pass inlines.
+    fn camera_request_bytes(messages: &[Message], blob_payload_bytes: u64) -> u64 {
+        let rows: u64 = messages
+            .iter()
+            .map(|message| serde_json::to_vec(message).unwrap().len() as u64)
+            .sum();
+        rows + camera_blob_images(messages) * blob_payload_bytes
+    }
+
+    fn camera_context(request_bytes: u64, boundary: u64) -> CompactionContext {
+        CompactionContext {
+            last_input_tokens: 20_000,
+            message_count: 12,
+            estimated_history_tokens: 20_000,
+            estimated_request_bytes: 4_096,
+            request_context_budget: None,
+            provider_request_pressure: Some(meerkat_core::ProviderRequestPressure::new(
+                request_bytes,
+                Some(CAMERA_PROVIDER_CAP),
+            )),
+            last_compaction_boundary_index: Some(boundary - 1),
+            session_boundary_index: boundary,
+            last_rewrite_history_tokens: Some(10_000),
+        }
+    }
+
+    fn camera_compactor() -> DefaultCompactor {
+        DefaultCompactor::new(CompactionConfig {
+            auto_compact_threshold: 160_000,
+            recent_turn_budget: 4,
+            ..make_config()
+        })
+    }
+
+    /// Every turn adds a tool result with two large camera images. A rewrite
+    /// that answers the request-byte crossing must shed the image turns whose
+    /// payloads crossed, as it does for inline media. It used to count a blob
+    /// image as its reference, keep the four newest image turns, and let the
+    /// next turn cross again: the session compacted on every turn.
+    #[test]
+    fn a_byte_triggered_rewrite_sheds_blob_backed_image_turns() {
+        const IMAGE_BASE64_BYTES: u64 = 800_000; // a ~600 KB JPEG per snapshot
+        let c = camera_compactor();
+        let mut messages = vec![Message::System(SystemMessage::new("You watch the house."))];
+        for round in 1..=5 {
+            messages.extend(camera_turn(round, None));
+        }
+        let before = camera_request_bytes(&messages, IMAGE_BASE64_BYTES);
+        assert!(
+            c.should_compact(&camera_context(before, 10)),
+            "ten images cross 4/5 of the cap one boundary after the last compaction"
+        );
+        let pressure =
+            meerkat_core::ProviderRequestPressure::new(before, Some(CAMERA_PROVIDER_CAP));
+        let rewrite = c.rebuild_history_under_pressure(&messages, "summary", Some(pressure));
+        let mut next = rewrite.messages.clone();
+        next.extend(camera_turn(6, None));
+        let next_bytes = camera_request_bytes(&next, IMAGE_BASE64_BYTES);
+        assert!(
+            !c.should_compact(&camera_context(next_bytes, 12)),
+            "the next turn compacts again: the rewrite kept {} blob images, and the next \
+             request carries {next_bytes} bytes",
+            camera_blob_images(&rewrite.messages)
+        );
+
+        // Control: the same images inline are shed the same way.
+        let mut inline = vec![Message::System(SystemMessage::new("You watch the house."))];
+        for round in 1..=5 {
+            inline.extend(camera_turn(round, Some(IMAGE_BASE64_BYTES as usize)));
+        }
+        let inline_bytes = camera_request_bytes(&inline, IMAGE_BASE64_BYTES);
+        let inline_pressure =
+            meerkat_core::ProviderRequestPressure::new(inline_bytes, Some(CAMERA_PROVIDER_CAP));
+        let mut inline_next = c
+            .rebuild_history_under_pressure(&inline, "summary", Some(inline_pressure))
+            .messages;
+        inline_next.extend(camera_turn(6, Some(IMAGE_BASE64_BYTES as usize)));
+        assert!(!c.should_compact(&camera_context(
+            camera_request_bytes(&inline_next, IMAGE_BASE64_BYTES),
+            12
+        )));
+
+        // Control: below the byte trigger (a token-triggered rewrite) a blob
+        // image keeps costing its reference, and the recent turns stay.
+        let calm = meerkat_core::ProviderRequestPressure::new(1_000_000, Some(CAMERA_PROVIDER_CAP));
+        let calm_rewrite = c.rebuild_history_under_pressure(&messages, "summary", Some(calm));
+        assert_eq!(camera_blob_images(&calm_rewrite.messages), 8);
+    }
+
+    /// One turn whose two images alone cross the byte trigger still compacts,
+    /// once: the rewrite sheds that turn's payloads, so the next boundary is
+    /// under the trigger instead of crossing again.
+    #[test]
+    fn an_oversized_image_turn_compacts_once() {
+        const IMAGE_BASE64_BYTES: u64 = 4_000_000;
+        let c = camera_compactor();
+        let mut messages = vec![
+            Message::System(SystemMessage::new("You watch the house.")),
+            Message::User(UserMessage::text("is anyone home?")),
+        ];
+        messages.extend(camera_turn(1, None));
+        let before = camera_request_bytes(&messages, IMAGE_BASE64_BYTES);
+        assert!(
+            c.should_compact(&camera_context(before, 10)),
+            "a single turn's images over 4/5 of the cap compact"
+        );
+        let pressure =
+            meerkat_core::ProviderRequestPressure::new(before, Some(CAMERA_PROVIDER_CAP));
+        let rewrite = c.rebuild_history_under_pressure(&messages, "summary", Some(pressure));
+        let after = camera_request_bytes(&rewrite.messages, IMAGE_BASE64_BYTES);
+        assert!(
+            after < before,
+            "the rewrite shrinks the request ({before} -> {after})"
+        );
+        assert!(
+            !c.should_compact(&camera_context(after, 11)),
+            "the next boundary compacts again: the rewrite kept {} blob images ({after} bytes)",
+            camera_blob_images(&rewrite.messages)
+        );
+    }
+
     #[test]
     fn test_rebuild_with_block_assistant_and_tool_results() {
         use meerkat_core::types::{AssistantBlock, BlockAssistantMessage, StopReason, ToolResult};
