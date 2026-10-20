@@ -87,6 +87,14 @@ rkat run --as-agent <AGENT> "..."
   and wire model) and has no expiry. Changing the model or endpoint changes the
   key and needs a new grant. Controller grants from before 0.9 name no route
   and admit nothing.
+- Since 0.9.4 a controller route may use the host's environment key
+  (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, the other provider and `RKAT_*` keys)
+  with no realm binding: governed admission holds no credential lease for it,
+  and every other governed check still applies. The environment key is also
+  the fallback when no binding is named and the configured one does not
+  resolve at build time (for example a logged-out OAuth binding). That route
+  has its own route key, so a controller grant that lists only the configured
+  binding's route keys refuses it.
 - `--expires-in-secs` sets a lifetime for catalog and MCP grants.
 - `revoke-grant` exits successfully only when revoked. Otherwise it reports
   why: unfinished work holds the controller, cleanup deferred because work
