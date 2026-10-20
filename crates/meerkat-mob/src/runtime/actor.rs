@@ -18125,11 +18125,27 @@ impl DetachedMemberReadinessContext {
         // cold registration it publishes reads the run's outcome from durable
         // truth. Until then the drain may keep re-arming, but it admits no
         // input: admission waits for a durability-ready registration.
+        // The stop's outcome says so when the hold or the cancel met the
+        // degraded registration. A registration can also degrade just after
+        // the cancel took the gate (its boundary commit failed right then),
+        // so the registration itself is read as well.
         #[cfg(feature = "runtime-adapter")]
-        let reload_required = matches!(
+        let mut reload_required = matches!(
             target.outcome.run,
             super::stop_report::MemberStopRun::ReloadRequired
         );
+        #[cfg(feature = "runtime-adapter")]
+        if !reload_required
+            && expected_member.is_none()
+            && let (Some(adapter), Some(session_id)) =
+                (&self.runtime_adapter, member_ref.bridge_session_id())
+            && adapter
+                .durability_reload_required(session_id)
+                .await
+                .is_some()
+        {
+            reload_required = true;
+        }
         // Abort the comms drain but keep the session registered. A placed
         // member's session and drain belong to the member host; its exact
         // remote interrupt is the stop boundary.
@@ -18149,14 +18165,26 @@ impl DetachedMemberReadinessContext {
             // below already degrades on exactly this condition, for exactly
             // this reason; this is the same reasoning on the autonomous-stop
             // path. Every other driver fault keeps its existing meaning.
-            converge_autonomous_stop_drain_abort_result(
-                adapter.abort_comms_drain(session_id).await,
-            )
-            .map_err(|err| {
-                MobError::Internal(format!(
-                    "failed to abort comms drain for stopped member session {session_id}: {err}"
-                ))
-            })?;
+            match adapter.abort_comms_drain(session_id).await {
+                // The registration degraded while the abort waited for its
+                // mutation gate: the discard aborts and joins the drain, as
+                // for a registration that was degraded before.
+                Err(meerkat_runtime::RuntimeDriverError::RecoveryRepairBlocked { .. })
+                    if adapter
+                        .durability_reload_required(session_id)
+                        .await
+                        .is_some() =>
+                {
+                    reload_required = true;
+                }
+                result => {
+                    converge_autonomous_stop_drain_abort_result(result).map_err(|err| {
+                        MobError::Internal(format!(
+                            "failed to abort comms drain for stopped member session {session_id}: {err}"
+                        ))
+                    })?;
+                }
+            }
         }
 
         // Local sessions must be visibly idle before Stop can admit Resume.

@@ -912,11 +912,17 @@ async fn a_whole_shutdown_settles_an_autonomous_member_degraded_while_idle() {
 /// current, and return what `stop` answered. That run is the member's kickoff
 /// keep-alive turn, parked until released. Before the cancel, the turn is
 /// released and the run's boundary commit takes the session's mutation gate
-/// while the store holds it; the cancel waits for the gate, and the store then
-/// fails the commit, which degrades the registration during that wait. The
-/// failed commit's fence keeps the gate, so the cancel never finds it free.
+/// while the store holds it, and the cancel waits for the gate.
+/// - `mark_during_wait`: the registration is marked degraded during that wait,
+///   while the parked commit still holds the gate, so the cancel always ends
+///   on the degradation; the store then fails the commit.
+/// - otherwise the store fails the commit during the wait, which degrades
+///   the registration. The failed commit gives the gate back before its
+///   runtime loop retains it again, so the cancel may take it in between:
+///   which of the two happens first is up to the scheduler.
 async fn degrade_between_hold_and_cancel<T>(
     mob: &IsolationMob,
+    mark_during_wait: bool,
     stop: impl std::future::Future<Output = T> + Send + 'static,
 ) -> T
 where
@@ -944,8 +950,8 @@ where
     })
     .await;
 
-    // The cancel waits for the gate behind the commit; the commit then fails,
-    // and the registration degrades during that wait.
+    // The cancel waits for the gate behind the commit, and the registration
+    // degrades during that wait.
     let parked = mob
         .adapter
         .arm_mutation_gate_wait_observer_for_test(session_id.clone());
@@ -956,10 +962,23 @@ where
         .await
         .expect("the cancel waits for the gate behind the commit")
         .expect("the wait observer stays armed until the wait");
-    mob.store.release_commits();
-    let _ = tokio::time::timeout(STEP, cancel_answered)
-        .await
-        .expect("the cancel answers once the registration degrades");
+    if mark_during_wait {
+        assert!(
+            mob.adapter
+                .force_session_durability_reload_required_for_test(&session_id)
+                .await,
+            "member 0's registration degrades during the cancel's wait"
+        );
+        let _ = tokio::time::timeout(STEP, cancel_answered)
+            .await
+            .expect("the cancel answers once the registration degrades");
+        mob.store.release_commits();
+    } else {
+        mob.store.release_commits();
+        let _ = tokio::time::timeout(STEP, cancel_answered)
+            .await
+            .expect("the cancel answers once the registration degrades");
+    }
     assert!(
         mob.adapter
             .durability_reload_required(&session_id)
@@ -984,7 +1003,7 @@ where
 async fn a_stop_reports_reload_required_for_a_member_degraded_between_its_hold_and_its_cancel() {
     let mob = create_isolation_mob_with_definition(1, autonomous_isolation_definition()).await;
     let handle = mob.handle.clone();
-    let report = degrade_between_hold_and_cancel(&mob, async move { handle.stop().await })
+    let report = degrade_between_hold_and_cancel(&mob, true, async move { handle.stop().await })
         .await
         .expect("the stop succeeds");
     let outcome = report
@@ -1010,7 +1029,7 @@ async fn a_stop_reports_reload_required_for_a_member_degraded_between_its_hold_a
 async fn a_whole_shutdown_settles_a_member_degraded_between_its_hold_and_its_cancel() {
     let mob = create_isolation_mob_with_definition(1, autonomous_isolation_definition()).await;
     let handle = mob.handle.clone();
-    let report = degrade_between_hold_and_cancel(&mob, async move {
+    let report = degrade_between_hold_and_cancel(&mob, true, async move {
         handle
             .shutdown_with_report(
                 ShutdownOptions::default().with_deadline(Instant::now() + Duration::from_secs(20)),
@@ -1022,6 +1041,54 @@ async fn a_whole_shutdown_settles_a_member_degraded_between_its_hold_and_its_can
     assert_eq!(
         report.runs.get(mob.member(0)),
         Some(&MemberStopRun::ReloadRequired),
+        "member 0's run: {report:?}"
+    );
+    assert_eq!(
+        report.run_starts.get(mob.member(0)),
+        Some(&MemberRunStarts::Held),
+        "member 0's run starts: {report:?}"
+    );
+    assert!(
+        matches!(
+            report.members.get(mob.member(0)),
+            Some(MemberShutdownOutcome::Unregistered)
+        ),
+        "member 0: {report:?}"
+    );
+    assert!(
+        mob.adapter
+            .current_session_registration_witness(mob.session(0))
+            .await
+            .is_none(),
+        "member 0's session has no registration left"
+    );
+}
+
+/// The same window when the store fails the parked boundary commit during
+/// the cancel's wait, so the registration degrades by the failed commit
+/// alone. The cancel either ends on the degradation or takes the gate the
+/// failed commit gave back, and then finds the run ended. Either way the
+/// member's stop leaves the degraded registration to the teardown: its drain
+/// abort must not fail the Shutdown when the registration degraded after the
+/// cancel answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_whole_shutdown_settles_a_member_whose_boundary_commit_fails_around_its_cancel() {
+    let mob = create_isolation_mob_with_definition(1, autonomous_isolation_definition()).await;
+    let handle = mob.handle.clone();
+    let report = degrade_between_hold_and_cancel(&mob, false, async move {
+        handle
+            .shutdown_with_report(
+                ShutdownOptions::default().with_deadline(Instant::now() + Duration::from_secs(20)),
+            )
+            .await
+    })
+    .await
+    .expect("the shutdown succeeds");
+    assert!(
+        matches!(
+            report.runs.get(mob.member(0)),
+            Some(MemberStopRun::ReloadRequired | MemberStopRun::RunEndedBeforeCancel { .. })
+        ),
         "member 0's run: {report:?}"
     );
     assert_eq!(
