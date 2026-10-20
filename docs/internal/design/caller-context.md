@@ -96,7 +96,7 @@ These choices define implementation order and the supported first profile. They 
 ## Open decision: where attribute-based access control lives
 
 This design currently assumes Meerkat carries typed caller facts and asks a
-host-owned decision point at each protected use, while MobKit and Elephant keep
+host-owned decision point at each protected use, while MobKit and the knowledge service keep
 their existing attribute-based access control (ABAC) as the policy owners. That
 assumption is not settled. Before any implementation starts, decide between:
 
@@ -104,12 +104,12 @@ assumption is not settled. Before any implementation starts, decide between:
   and the policy enforcement point at every internal use (history load, model
   attempt, tool dispatch, output release, replay, delegation). One general host
   decision interface (operation, subject attributes, resource attributes,
-  context) is answered by MobKit's or Elephant's ABAC. Meerkat owns no policy
+  context) is answered by MobKit's or the knowledge service's ABAC. Meerkat owns no policy
   language.
 - **ABAC generalized into Meerkat.** MobKit's ABAC moves down into Meerkat as a
   general capability, so containment of information between agents, sessions
   and peers is expressed as attribute policy inside the runtime rather than
-  through coarse peering controls. MobKit and Elephant become policy authors and
+  through coarse peering controls. MobKit and the knowledge service become policy authors and
   hosts instead of separate engines.
 
 Either way the caller facts become a set of typed attributes rather than a fixed

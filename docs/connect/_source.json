@@ -11,6 +11,9 @@
   "namespaced_links": 161,
   "existing_products_unchanged": true,
   "static_validation": "pass",
+  "mirror_adjustments": [
+    "Prose that named a downstream host product describes it neutrally; package identifiers are unchanged. rendered_sha256 covers the adjusted pages."
+  ],
   "files": [
     {
       "path": "acquisition/local-install.mdx",
@@ -45,7 +48,7 @@
     {
       "path": "concepts/ownership.mdx",
       "source_sha256": "4a52e1d9db8cb1894d9d6c1c55ac37c5783c7b8f5bc323305bbcf34ced57a6e4",
-      "rendered_sha256": "3b2628b8b51a0d9fcd5f1f9b024cab5b8dc3ca276fd4131236b651e545320c86"
+      "rendered_sha256": "7cea66fc3758ba2e50d8aaf30d9d53c8adf30fa165d2b85da5353dc4ea82a83e"
     },
     {
       "path": "concepts/readiness.mdx",
@@ -55,7 +58,7 @@
     {
       "path": "concepts/roles.mdx",
       "source_sha256": "bf9b6b25fbad2e4bde4d97fc480cb07e33e20526e93d4f503df6b79013bbcf42",
-      "rendered_sha256": "d9d0f35c2480258206b185d56824a1ff5429ab43a054003fb812aff4dda7bac3"
+      "rendered_sha256": "c001a99560548ab701e2301e0307f5b9fb08b529588986d7060d095523920eea"
     },
     {
       "path": "contributing/validation.mdx",
@@ -110,7 +113,7 @@
     {
       "path": "guides/request-an-integration.mdx",
       "source_sha256": "0b63a35ef1eb9f51402fc84b546fb3a22a6e890ffa6be6b9db1112e82e70ad0e",
-      "rendered_sha256": "4eed8ebef74131de89af112b4ad173d3c2394e89ebef2c10a0b194949de2b9b5"
+      "rendered_sha256": "878c55d322f9f629595c6e130e1a78b1b584dd60d167ae94fa3030c0bbefc20a"
     },
     {
       "path": "guides/service-connectors.mdx",
@@ -200,7 +203,7 @@
     {
       "path": "reference/deployment.mdx",
       "source_sha256": "caa371b73b430c7dfec762d1705b8070e4937413bdc18c105fed697eb54cc81f",
-      "rendered_sha256": "37156051056a5276f09039af84b20a9b09d61e15f0f8c719bfdda353d41204ae"
+      "rendered_sha256": "4fabc2775d070737fb7511b16c67cf582f21a462e89de8d41aba5bc3b30f5ea7"
     },
     {
       "path": "reference/packages.mdx",
@@ -230,17 +233,17 @@
     {
       "path": "sdks/python-frontends.mdx",
       "source_sha256": "10641beb93a7fae407771a495b878a43c12cb06d6d9345932893d452a939696f",
-      "rendered_sha256": "1c578d395054aa35b23bc9dc5d0e139a7b5551431f3f3a4226f29a0f135519b5"
+      "rendered_sha256": "1b5a6e326d7964da500b367db4b057afe9d5c4383a74cc18d1a44e66caeb1c06"
     },
     {
       "path": "sdks/python.mdx",
       "source_sha256": "f6e808d7b39c79a14937373e0f2173f8f80be9ddf5f63748b2348ad8c20b5c0f",
-      "rendered_sha256": "ccc5a1382af922b61e702c2826c9d63eb8375d8162cc9fd9f6b9d3fb9e9ed94a"
+      "rendered_sha256": "fa3db7621cbe00a820069385b9009f6a3ba52c99c006d947631709e077a08adc"
     },
     {
       "path": "sdks/rust.mdx",
       "source_sha256": "5391ba8f06ca8268bf3002a624689c3c67c0c1d3149289d55dc0ccc983f03159",
-      "rendered_sha256": "bf7a1f889c0873924274d521c3c8f1c389199aa04e30295b0d18e9de202c5a7b"
+      "rendered_sha256": "7126068761990bd2f26aa0ef6ba5cbea4e6682203345f9c6af4c9e254648c871"
     },
     {
       "path": "sdks/service-profiles.mdx",
