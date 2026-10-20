@@ -694,6 +694,12 @@ them.
 
 ### Security
 
+- `rustls-webpki` is updated to 0.103.16 and `webpki-roots` to 1.0.10, in
+  Cargo.lock and in the example workspaces' lockfiles. RUSTSEC-2026-0382:
+  `rustls-webpki` 0.103.15 could accept a certificate path through a
+  distrusted emSign intermediate whose private key is now public.
+  RUSTSEC-2026-0381: `webpki-roots` before 1.0.10 bundles the distrusted
+  "emSign ECC Root CA - G3".
 - No crate in the workspace builds unsafe-libyaml any more: serde_yaml 0.9
   (deprecated) and the archived unsafe-libyaml it brought in
   (RUSTSEC-2024-0449, unmaintained) are gone with the move to serde-saphyr,
