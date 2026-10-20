@@ -13278,6 +13278,14 @@ mod tests {
     /// `session/restore_transcript_revision` and
     /// `session/update_system_prompt` apply. The session then runs its next
     /// turn. A session archived before the restart is still not found.
+    ///
+    /// Not pinned here: an edit refused as busy over a durable input still
+    /// pending after the restart. A clean shutdown abandons a queued input
+    /// (`Abandoned { reason: Stopped }`), so only a crash leaves one pending,
+    /// and a test cannot restore the row because its persistence record is
+    /// crate-private to the runtime. That needs a child-process harness like
+    /// `tests/lazy_resume_uncommitted_terminal.rs`. The edit's registration
+    /// recovers the input ledger before the busy verdict reads it.
     #[tokio::test]
     async fn transcript_edits_on_an_idle_session_are_admitted_after_a_server_restart() {
         let temp = tempfile::tempdir().unwrap();
@@ -13694,6 +13702,86 @@ mod tests {
             ("session/fork_at", &fork_resp),
             ("session/update_system_prompt", &update_resp),
         ] {
+            let error = response.error.as_ref().unwrap_or_else(|| {
+                panic!("{method} is refused on a session that needs a reload: {response:?}")
+            });
+            assert_ne!(
+                error.code,
+                error::SESSION_BUSY,
+                "{method} is not refused as busy: {error:?}"
+            );
+            assert!(
+                error
+                    .message
+                    .contains("durability reload required after `test_reload_required_discard`"),
+                "{method} carries the typed reload-required refusal: {error:?}"
+            );
+        }
+    }
+
+    /// A transcript edit on a session whose durability gate requires a
+    /// reload while its runtime loop is still attached (the session ran its
+    /// first turn in this server) answers the typed reload-required refusal
+    /// in bounded time: neither edit waits on the degraded session.
+    #[tokio::test]
+    async fn transcript_edit_on_a_reload_required_session_with_an_attached_runtime_loop_answers() {
+        // Bounds a failure only; the passing path never waits for it.
+        const STEP_BOUND: Duration = Duration::from_secs(45);
+        let (router, _notif_rx) = test_router().await;
+        let create_resp = tokio::time::timeout(
+            STEP_BOUND,
+            router.dispatch(make_request(
+                "session/create",
+                serde_json::json!({
+                    "prompt": "Hello",
+                    "system_prompt": "You are a test assistant.",
+                }),
+            )),
+        )
+        .await
+        .expect("session/create answers in bounded time")
+        .unwrap();
+        let session_id = result_value(&create_resp)["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let parsed_session_id = SessionId::parse(&session_id).expect("session id");
+        assert!(
+            router
+                .runtime_adapter
+                .force_session_durability_reload_required_for_test(&parsed_session_id)
+                .await,
+            "the created session owns a real persistent durability gate"
+        );
+
+        for (method, params) in [
+            (
+                "session/fork_at",
+                serde_json::json!({
+                    "session_id": &session_id,
+                    "message_index": 1,
+                    "running_behavior": "reject"
+                }),
+            ),
+            (
+                "session/update_system_prompt",
+                serde_json::json!({
+                    "session_id": &session_id,
+                    "key": "persona",
+                    "target_message_index": 0,
+                    "content": "You are an edited test assistant."
+                }),
+            ),
+        ] {
+            let response = tokio::time::timeout(
+                STEP_BOUND,
+                router.dispatch(make_request(method, params)),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!("{method} on a reload-required session did not answer within {STEP_BOUND:?}")
+            })
+            .unwrap();
             let error = response.error.as_ref().unwrap_or_else(|| {
                 panic!("{method} is refused on a session that needs a reload: {response:?}")
             });
