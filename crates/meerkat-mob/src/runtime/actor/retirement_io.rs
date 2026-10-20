@@ -33,10 +33,15 @@ pub(super) enum RetirementReply {
 impl RetirementReply {
     /// Whether a durably started retirement with this reply is owned until it
     /// settles: it is never dropped on a stage failure and publishes its
-    /// settlement. Respawn, identity reconciliation and spawn rollback keep
-    /// their own failure handling.
+    /// settlement. Identity reconciliation owns the retirement it started
+    /// too: once the start is durable the member is observed as recovering,
+    /// which the reconcile only waits on, so nothing but the owner finishes
+    /// it. Respawn and spawn rollback keep their own failure handling.
     fn owns_started_retirement(&self) -> bool {
-        matches!(self, Self::Retire(_) | Self::BatchRetire(_) | Self::Owned)
+        matches!(
+            self,
+            Self::Retire(_) | Self::BatchRetire(_) | Self::Owned | Self::IdentityReconcile(_)
+        )
     }
 }
 
@@ -4411,7 +4416,13 @@ impl MobActor {
                     .insert(continuation.entry.agent_identity.clone(), continuation);
                 return;
             }
-            let result = if continuation.reply.owns_started_retirement() {
+            // An identity reconciliation that failed before its durable start
+            // keeps its own failure handling: its disposition reads the stage
+            // error itself.
+            let settles_owned = continuation.reply.owns_started_retirement()
+                && (continuation.retirement_started
+                    || !matches!(continuation.reply, RetirementReply::IdentityReconcile(_)));
+            let result = if settles_owned {
                 self.retirement_settle_owned(&continuation, result)
             } else {
                 result

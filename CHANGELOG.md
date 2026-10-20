@@ -428,6 +428,15 @@ them.
   mob database's write lock when the SQLite runtime store calls it, and the
   in-memory runtime store and the session publication retry it for up to 2
   seconds with their locks released.
+- An intent-managed identity could stay in `Backoff` for good after its
+  member retirement ran past the budget its reconcile pass gave it (30
+  seconds), as on slow storage with many identities adopting at once. Once
+  the retirement had durably started the member read as recovering, which
+  identity reconciliation only waits on, and nothing finished the
+  retirement. Identity reconciliation now owns a retirement it started until
+  it settles, as an operator retirement does: it runs under the lifecycle
+  hang guard, a failure after the durable start settles as stuck and is
+  re-driven on resume, and a shutdown interrupts it instead of waiting.
 
 ## [0.9.3] - 2026-10-18
 

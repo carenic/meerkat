@@ -162,6 +162,22 @@ fn is_converged(
     )
 }
 
+/// The latest convergence status of every member that did not converge,
+/// one per line.
+async fn unconverged_statuses(
+    mob: &SqliteMob,
+    members: &[AgentIdentity],
+    converged: &[Option<Duration>],
+) -> String {
+    let mut lines = Vec::new();
+    for (member, converged_after) in members.iter().zip(converged) {
+        if converged_after.is_none() {
+            lines.push(format!("{member}: {:?}", convergence(mob, member).await));
+        }
+    }
+    lines.join("\n")
+}
+
 /// Polls every member's convergence until all converged or `bound` passed
 /// since `started`; returns when each converged, measured from `started`.
 async fn wait_converged(
@@ -424,18 +440,15 @@ async fn an_adopted_identity_converges_while_status_commits_hold_the_mob_databas
 /// RED-5: eight adopted identities on one mob reconcile at once while every
 /// convergence-status commit of the runtime-registration step (the status
 /// written right before the fenced registration) holds mob.db's write lock
-/// for 200 ms. Every identity that reaches the fence gets its fenced
-/// registration admitted, no fence attempt waits out the whole bound, no
-/// refused retry runs out its own, a probe's plain reads of the runtime
-/// store keep completing while fences wait, and every identity converges
-/// within 30 s unless member retirement's owner deadline holds it. Prints
-/// the per-identity numbers.
+/// for 200 ms. Every identity converges within 30 s, every identity that
+/// reaches the fence gets its fenced registration admitted, no fence attempt
+/// waits out the whole bound, no refused retry runs out its own, and a
+/// probe's plain reads of the runtime store keep completing while fences
+/// wait. Prints the per-identity numbers.
 ///
-/// The statuses of the other steps commit at full speed. Adopting a member
-/// retires its materialization, and that retirement has its own owner
-/// deadline (2 s in test builds); under this load it is sometimes reached,
-/// with or without the fence's wait, and identity reconcile then leaves the
-/// identity in Backoff (a known limitation of 0.9.4, outside the fence).
+/// The statuses of the other steps commit at full speed: adopting a member
+/// retires its materialization first, and the load of every status held
+/// belongs to the retirement test below.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn eight_adopted_identities_converge_together_while_status_commits_hold_the_mob_database() {
     const IDENTITIES: usize = 8;
@@ -473,42 +486,10 @@ async fn eight_adopted_identities_converge_together_while_status_commits_hold_th
 
     let report = ContentionReport::new(&members, &attempts, &converged, &reads);
     println!("{report}");
-    // An identity that did not converge must be held by member retirement's
-    // owner deadline (2 s in test builds), a known limitation of identity
-    // reconcile under slow storage that the fence does not cause; anything
-    // else fails.
-    let mut held_by_retirement = Vec::new();
-    let mut otherwise_unconverged = Vec::new();
-    for (member, converged_after) in members.iter().zip(&converged) {
-        if converged_after.is_some() {
-            continue;
-        }
-        let latest = convergence(&mob, member).await;
-        let retirement_deadline = matches!(
-            &latest,
-            crate::identity::IdentityStoredObservation::Valid(status)
-                if status.decision == Some(crate::identity::IdentityReconcileDecision::Backoff)
-                    && status.detail.as_deref().is_some_and(|detail| {
-                        detail.starts_with("member retirement remains in progress")
-                            && detail.ends_with("the owner deadline was reached")
-                    })
-        );
-        if retirement_deadline {
-            held_by_retirement.push(member.to_string());
-        } else {
-            otherwise_unconverged.push(format!("{member}: {latest:?}"));
-        }
-    }
-    println!(
-        "held by member retirement's owner deadline: {} ({})",
-        held_by_retirement.len(),
-        held_by_retirement.join(", ")
-    );
+    let unconverged = unconverged_statuses(&mob, &members, &converged).await;
     assert!(
-        otherwise_unconverged.is_empty(),
-        "every identity converges within {BOUND:?} or is held by member retirement's owner \
-         deadline:\n{report}\nthe others:\n{}",
-        otherwise_unconverged.join("\n")
+        converged.iter().all(Option::is_some),
+        "every identity converges within {BOUND:?}:\n{report}\nthe others:\n{unconverged}"
     );
     assert!(
         report
@@ -539,6 +520,49 @@ async fn eight_adopted_identities_converge_together_while_status_commits_hold_th
     assert!(
         report.probe_max_read < Duration::from_secs(1),
         "no plain runtime-store read waits behind a fence:\n{report}"
+    );
+    mob.handle.shutdown().await.expect("shut the mob down");
+}
+
+/// Eight adopted identities reconcile at once while every convergence-status
+/// commit holds mob.db's write lock for 300 ms, for 15 s; then the hold
+/// ends. Under that load a member retirement runs past the 2 s budget its
+/// reconcile pass gave it (test builds) after the retirement durably
+/// started. Identity reconciliation owns such a retirement until it
+/// settles, so every identity converges once the load ends, within 60 s of
+/// the adoptions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn identities_whose_retirement_outruns_its_budget_converge_once_the_load_ends() {
+    const IDENTITIES: usize = 8;
+    const HOLD_FOR: Duration = Duration::from_secs(15);
+    const BOUND: Duration = Duration::from_secs(60);
+    let mob = sqlite_mob("retirement-outruns-budget").await;
+    let members: Vec<AgentIdentity> = (1..=IDENTITIES)
+        .map(|index| AgentIdentity::from(format!("worker-{index}")))
+        .collect();
+    let mut sessions = Vec::with_capacity(IDENTITIES);
+    for member in &members {
+        sessions.push(spawn_member(&mob, member).await);
+    }
+    hooks::hold_status_commits(&mob.mob_db, STATUS_COMMIT_HOLD, None);
+
+    let started = Instant::now();
+    futures::future::join_all(
+        members
+            .iter()
+            .zip(&sessions)
+            .map(|(member, session_id)| adopt(&mob, member, session_id)),
+    )
+    .await;
+    tokio::time::sleep(HOLD_FOR.saturating_sub(started.elapsed())).await;
+    hooks::release(&mob.mob_db);
+    let converged = wait_converged(&mob, &members, started, BOUND).await;
+    let unconverged = unconverged_statuses(&mob, &members, &converged).await;
+    println!("converged after (from the adoptions): {converged:?}");
+    assert!(
+        converged.iter().all(Option::is_some),
+        "every identity converges within {BOUND:?} of the adoptions, the hold ending at \
+         {HOLD_FOR:?}:\n{unconverged}"
     );
     mob.handle.shutdown().await.expect("shut the mob down");
 }
