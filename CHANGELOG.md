@@ -1217,6 +1217,12 @@ them.
 - `meerkat_mob_mcp::MobMcpState::session_member_matches` (with
   `meerkat_mob_mcp::SessionMemberMatch`): every hosted roster, managed or
   held, that names a session, read as one complete lookup.
+- `meerkat_mob_mcp::MobMcpState::unrestored_mobs`: the persisted mobs whose
+  resume failed at restore, each with the typed error a lookup of its id
+  answers. They are not in `mob_list`.
+- `meerkat_mob::MobStorage::unfinalized_creation_mob`: the mob a store's
+  creation record names while that record is not finalized, read without
+  building a runtime.
 
 ### Changed
 
@@ -2189,6 +2195,28 @@ them.
   its transport forwards nothing behind a row that waits, so its voice goes
   silent while a member turn runs and arrives in a burst when the turn ends
   (see `docs/guides/realtime.mdx`). (#1821)
+- A persisted mob whose resume is refused at restore no longer fails the
+  whole restore of `MobMcpState` (`meerkat-mob-mcp`). One such store, for
+  example one whose creation record disagrees with its log
+  (`MobError::IncarnationInconsistent`), made every mob verb fail after a
+  restart, and no mob of the host came back. That mob is now left
+  unrestored, its store kept as found, and the other mobs restore. A lookup
+  of its id, and a create of that id, answer its refusal:
+  `IncarnationInconsistent` and `IncarnationDestroyed` keep their variants,
+  and any other refusal answers `MobError::Internal` with its message. Its
+  stored roster still counts for the provenance a session's create
+  records: a create by a session that roster names, or while it cannot be
+  read, is refused with `MobError::ProvenanceUnavailable` naming that mob.
+  A child mob that a member of that mob created still resumes while its
+  owner session is live, although its parent mob does not run. The sweep
+  of empty stores at restore keeps a store whose log is empty while its
+  creation record is not finalized (the log lost the `MobCreated` that
+  record names): it is left unrestored the same way, under the record's
+  mob, answering `IncarnationInconsistent` (`RecordWithoutCreation`). An
+  empty store with no creation record, or one a finished destroy
+  finalized, is still removed. A transport or persistence fault, and a
+  store that names no mob, still fail the restore, so the next mob verb
+  tries it again. Pre-existing in 0.9.3 and earlier.
 
 ### Known limitations
 

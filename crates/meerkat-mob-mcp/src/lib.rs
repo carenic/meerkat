@@ -239,6 +239,59 @@ struct HeldChildRosterRead {
     incarnation: Option<meerkat_core::service::MobIncarnationId>,
 }
 
+/// Why a persisted mob was not restored: its resume failed at restore. The
+/// mob has no actor, its store is kept exactly as found, and a lookup of its
+/// id answers this cause, as the same typed error each time (`MobError` is
+/// not `Clone`). One store that does not resume leaves the rest of the
+/// restore alone.
+#[derive(Clone)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+enum UnrestoredMobCause {
+    IncarnationInconsistent(meerkat_mob::IncarnationInconsistency),
+    IncarnationDestroyed(meerkat_core::service::MobIncarnationId),
+    /// Any other refusal of the resume, as its message.
+    Refused(String),
+}
+
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+impl UnrestoredMobCause {
+    fn of(error: &MobError) -> Self {
+        match error {
+            MobError::IncarnationInconsistent { inconsistency, .. } => {
+                Self::IncarnationInconsistent(inconsistency.clone())
+            }
+            MobError::IncarnationDestroyed { incarnation, .. } => {
+                Self::IncarnationDestroyed(*incarnation)
+            }
+            other => Self::Refused(other.to_string()),
+        }
+    }
+
+    fn error(&self, mob_id: &MobId) -> MobError {
+        match self {
+            Self::IncarnationInconsistent(inconsistency) => MobError::IncarnationInconsistent {
+                mob_id: mob_id.clone(),
+                inconsistency: inconsistency.clone(),
+            },
+            Self::IncarnationDestroyed(incarnation) => MobError::IncarnationDestroyed {
+                mob_id: mob_id.clone(),
+                incarnation: *incarnation,
+            },
+            Self::Refused(reason) => {
+                MobError::Internal(format!("mob {mob_id} was not restored: {reason}"))
+            }
+        }
+    }
+}
+
+/// A persisted mob whose resume failed at restore: the id its store names,
+/// and why.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+struct UnrestoredMob {
+    mob_id: MobId,
+    cause: UnrestoredMobCause,
+}
+
 /// A parked child-teardown preflight (test seam).
 #[cfg(test)]
 #[derive(Default)]
@@ -1062,6 +1115,10 @@ pub struct MobMcpState {
     /// resumed, so no actor or producer exists for them and nothing in their
     /// durable state is changed by the hold.
     held_child_mobs: RwLock<BTreeMap<MobId, HeldChildMob>>,
+    /// Persisted mobs whose resume failed at the last restore pass, by store
+    /// path, with why: never registered, their stores kept as found. Each
+    /// pass rebuilds it.
+    unrestored_mobs: RwLock<BTreeMap<PathBuf, UnrestoredMob>>,
     /// Serializes moving a held child out of the hold. Its held row stays
     /// until the child is registered as managed (or confirmed gone), so a
     /// cancelled or failed transfer leaves it held, never unaccounted for.
@@ -1123,6 +1180,10 @@ pub struct MobMcpState {
     /// and before the managed-set registration.
     #[cfg(test)]
     resume_insert_hold: std::sync::Mutex<Option<Arc<InsertHold>>>,
+    /// Test seam: the store at this path is refused at its resume as one
+    /// whose creation record disagrees with its log.
+    #[cfg(test)]
+    refused_resume_store: std::sync::Mutex<Option<PathBuf>>,
     /// Test seam: when set, the next agent mob tool call parks once between
     /// its admission and its action (see [`Self::pause_agent_call`]).
     #[cfg(test)]
@@ -1272,6 +1333,7 @@ impl MobMcpState {
             mobs: Arc::new(RwLock::new(BTreeMap::new())),
             retired_mobs: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             held_child_mobs: RwLock::new(BTreeMap::new()),
+            unrestored_mobs: RwLock::new(BTreeMap::new()),
             #[cfg(not(target_arch = "wasm32"))]
             held_child_transfer: Mutex::new(()),
             #[cfg(test)]
@@ -1299,6 +1361,8 @@ impl MobMcpState {
             create_insert_hold: std::sync::Mutex::new(None),
             #[cfg(test)]
             resume_insert_hold: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            refused_resume_store: std::sync::Mutex::new(None),
             #[cfg(test)]
             agent_call_hold: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -1992,7 +2056,11 @@ impl MobMcpState {
 
     /// Every hosted roster that names `session_id` as a member's session: each
     /// managed mob's, read from its handle's own roster state, and each held
-    /// child mob's, read from its store without activation. It is one
+    /// child mob's, read from its store without activation. The roster of a
+    /// persisted mob left unrestored ([`Self::unrestored_mobs`]) is read from
+    /// its store too, but never yields a match, since that mob's incarnation
+    /// is in doubt: when it names the session, or cannot be read, the lookup
+    /// refuses [`MobError::ProvenanceUnavailable`] naming that mob. It is one
     /// complete lookup and never answers from part of the hosted set. It
     /// refuses [`MobError::ProvenanceUnavailable`] naming no mob while the
     /// hosted set may be incomplete: the mob set is not restored, and this
@@ -2046,6 +2114,21 @@ impl MobMcpState {
                 if let Some(found) = Self::held_child_member_of_session(&held, session_id).await? {
                     matches.insert(held.mob_id.clone(), found);
                 }
+            }
+        }
+        // A persisted mob left unrestored is hosted too: its stored roster
+        // refuses the lookup when it names the session or cannot be read.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let unrestored = self
+                .unrestored_mobs
+                .read()
+                .await
+                .iter()
+                .map(|(path, unrestored)| (path.clone(), unrestored.mob_id.clone()))
+                .collect::<Vec<_>>();
+            for (path, mob_id) in unrestored {
+                Self::unrestored_member_lookup(&path, &mob_id, session_id).await?;
             }
         }
         let managed = self
@@ -3438,6 +3521,10 @@ impl MobMcpState {
             let Some(root) = &self.persistent_storage_root else {
                 return Ok(());
             };
+            // Each pass finds the stores whose resume fails afresh: a store
+            // an earlier pass left unrestored and that resumes now is
+            // managed, never still listed as unrestored.
+            self.unrestored_mobs.write().await.clear();
             tokio::fs::create_dir_all(root).await.map_err(|error| {
                 MobError::Internal(format!(
                     "failed to create persistent mob root '{}': {error}",
@@ -3494,6 +3581,45 @@ impl MobMcpState {
 
                 let storage = self.bind_realm_profile_store(MobStorage::persistent(&path)?);
                 if storage.is_event_log_empty().await? {
+                    // A creation record that is not finalized names a mob
+                    // whose log lost its MobCreated: the store disagrees with
+                    // itself, so it is left unrestored as found, never
+                    // swept. So is a store whose records disagree among
+                    // themselves. With no record, or one a finished destroy
+                    // finalized, the store is empty. Any other read fault
+                    // fails the restore.
+                    match storage.unfinalized_creation_mob().await {
+                        Ok(Some(mob_id)) => {
+                            self.keep_unrestored_mob(
+                                Some(mob_id.clone()),
+                                &path,
+                                MobError::IncarnationInconsistent {
+                                    mob_id,
+                                    inconsistency:
+                                        meerkat_mob::IncarnationInconsistency::RecordWithoutCreation,
+                                },
+                            )
+                            .await?;
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(MobError::IncarnationInconsistent {
+                            mob_id,
+                            inconsistency,
+                        }) => {
+                            self.keep_unrestored_mob(
+                                Some(mob_id.clone()),
+                                &path,
+                                MobError::IncarnationInconsistent {
+                                    mob_id,
+                                    inconsistency,
+                                },
+                            )
+                            .await?;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
                     if let Err(error) = Self::remove_storage_files(Some(path.as_path())).await {
                         tracing::error!(error = %error, "empty mob store sweep failed");
                     }
@@ -3508,10 +3634,22 @@ impl MobMcpState {
                 // its size in this poll frame, beneath every mob it restores.
                 match self.child_mob_restore_gate(&storage, &path).await? {
                     ChildMobRestoreGate::Resume => {
-                        meerkat_runtime::stack_relief::box_in_own_frame(|| {
+                        // A failed resume is kept under the id the store
+                        // names, read only then.
+                        let kept = storage.clone();
+                        let resumed = meerkat_runtime::stack_relief::box_in_own_frame(|| {
                             self.resume_persisted_mob(storage, &path)
                         })
-                        .await?;
+                        .await;
+                        if let Err(error) = resumed {
+                            let mob_id = kept
+                                .created_definition()
+                                .await
+                                .ok()
+                                .flatten()
+                                .map(|definition| definition.id);
+                            self.keep_unrestored_mob(mob_id, &path, error).await?;
+                        }
                     }
                     ChildMobRestoreGate::Teardown { mob_id, owner } => {
                         if let Err(error) = meerkat_runtime::stack_relief::box_in_own_frame(|| {
@@ -3736,6 +3874,24 @@ impl MobMcpState {
         let created =
             meerkat_runtime::stack_relief::box_in_own_frame(|| storage.created_definition())
                 .await?;
+        #[cfg(test)]
+        {
+            let refused = self
+                .refused_resume_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if refused.as_deref() == Some(path)
+                && let Some(definition) = created.as_ref()
+            {
+                return Err(MobError::IncarnationInconsistent {
+                    mob_id: definition.id.clone(),
+                    inconsistency: meerkat_mob::IncarnationInconsistency::MultipleRecords {
+                        count: 2,
+                    },
+                });
+            }
+        }
         let (member_external_tools, on_managed) = match created {
             Some(definition) => self.member_external_tools_for(&definition.id, None),
             None => (None, None),
@@ -3900,6 +4056,86 @@ impl MobMcpState {
             .insert(held.mob_id.clone(), held);
     }
 
+    /// Keep a persisted mob whose resume failed unrestored, under the id its
+    /// store names, so the rest of the restore goes on: it gets no actor, its
+    /// store stays as found, and a lookup of the id answers the failure. A
+    /// transport or persistence fault, which a later restore may get past,
+    /// and a store that names no mob still fail the restore.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn keep_unrestored_mob(
+        &self,
+        mob_id: Option<MobId>,
+        path: &Path,
+        error: MobError,
+    ) -> Result<(), MobError> {
+        let Some(mob_id) = mob_id else {
+            return Err(error);
+        };
+        if error.failure_class() == meerkat_mob::MobFailureClass::Transport {
+            return Err(error);
+        }
+        tracing::warn!(
+            mob_id = %mob_id,
+            error = %error,
+            "leaving a persisted mob unrestored: its resume failed"
+        );
+        self.unrestored_mobs.write().await.insert(
+            path.to_path_buf(),
+            UnrestoredMob {
+                mob_id,
+                cause: UnrestoredMobCause::of(&error),
+            },
+        );
+        Ok(())
+    }
+
+    /// The persisted mob `mob_id` that was not restored, as its lookup
+    /// answer.
+    async fn unrestored_mob_error(&self, mob_id: &MobId) -> Option<MobError> {
+        self.unrestored_mobs
+            .read()
+            .await
+            .values()
+            .find(|unrestored| &unrestored.mob_id == mob_id)
+            .map(|unrestored| unrestored.cause.error(mob_id))
+    }
+
+    /// A member lookup of `session_id` over the persisted mob `mob_id` left
+    /// unrestored with its store at `path`. That mob's incarnation is in
+    /// doubt, so it is never a match: when its stored roster names the
+    /// session, or cannot be read, the lookup refuses with
+    /// [`MobError::ProvenanceUnavailable`] naming it. A roster that does not
+    /// name the session leaves the lookup to the other mobs.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn unrestored_member_lookup(
+        path: &Path,
+        mob_id: &MobId,
+        session_id: &SessionId,
+    ) -> Result<(), MobError> {
+        let unavailable = |error: Option<&dyn std::fmt::Display>| {
+            match error {
+                Some(error) => tracing::warn!(
+                    mob_id = %mob_id,
+                    %error,
+                    "unrestored mob roster could not be read for a provenance lookup"
+                ),
+                None => tracing::warn!(
+                    mob_id = %mob_id,
+                    "unrestored mob roster names the session of a provenance lookup"
+                ),
+            }
+            MobError::ProvenanceUnavailable {
+                mob_id: Some(mob_id.clone()),
+            }
+        };
+        let storage = MobStorage::persistent(path).map_err(|error| unavailable(Some(&error)))?;
+        match storage.stored_member_of_session(session_id).await {
+            Ok(None) => Ok(()),
+            Ok(Some(_)) => Err(unavailable(None)),
+            Err(error) => Err(unavailable(Some(&error))),
+        }
+    }
+
     /// Tear down a persisted child mob without activating it: the actor
     /// admits the destroy (as the console principal) before any restored work
     /// starts, then the ordinary destroy envelope runs. A refused admission
@@ -4043,8 +4279,12 @@ impl MobMcpState {
         Ok(custody)
     }
 
-    /// The held child mob `mob_id`, as its operational lookup answer.
-    async fn held_child_mob_error(&self, mob_id: &MobId) -> Option<MobError> {
+    /// The held child mob `mob_id`, or the persisted mob `mob_id` that was not
+    /// restored, as its operational lookup answer.
+    async fn unmanaged_mob_error(&self, mob_id: &MobId) -> Option<MobError> {
+        if let Some(error) = self.unrestored_mob_error(mob_id).await {
+            return Some(error);
+        }
         self.held_child_mobs.read().await.get(mob_id).map(|held| {
             MobError::held_before_activation(&held.mob_id, &held.owner, held.reason.token())
         })
@@ -4060,6 +4300,26 @@ impl MobMcpState {
             .await
             .values()
             .map(|held| (held.mob_id.clone(), held.owner.clone()))
+            .collect()
+    }
+
+    /// The persisted mobs whose resume failed at restore, each with the typed
+    /// error a lookup of its id answers. They are not in [`Self::mob_list`];
+    /// their stores are kept as found.
+    pub async fn unrestored_mobs(&self) -> Vec<(MobId, MobError)> {
+        if !self.ensure_restored_best_effort("unrestored_mobs").await {
+            return Vec::new();
+        }
+        self.unrestored_mobs
+            .read()
+            .await
+            .values()
+            .map(|unrestored| {
+                (
+                    unrestored.mob_id.clone(),
+                    unrestored.cause.error(&unrestored.mob_id),
+                )
+            })
             .collect()
     }
 
@@ -4375,7 +4635,7 @@ impl MobMcpState {
         let Some(managed) = mobs.get(mob_id) else {
             drop(mobs);
             return Err(self
-                .held_child_mob_error(mob_id)
+                .unmanaged_mob_error(mob_id)
                 .await
                 .unwrap_or_else(|| MobError::MobNotFound(mob_id.clone())));
         };
@@ -4415,7 +4675,7 @@ impl MobMcpState {
         let Some(managed) = mobs.get(mob_id) else {
             drop(mobs);
             return Err(self
-                .held_child_mob_error(mob_id)
+                .unmanaged_mob_error(mob_id)
                 .await
                 .unwrap_or_else(|| MobError::MobNotFound(mob_id.clone())));
         };
@@ -4676,6 +4936,10 @@ impl MobMcpState {
         self.ensure_restored().await?;
         if self.mobs.read().await.contains_key(&mob_id) {
             return Err(MobError::Internal(format!("mob already exists: {mob_id}")));
+        }
+        // A store left unrestored is kept as found: no create takes its id.
+        if let Some(error) = self.unrestored_mob_error(&mob_id).await {
+            return Err(error);
         }
         if self.destroy_cleanup_owed(&mob_id) {
             return Err(Self::owed_destroy_cleanup_error(&mob_id));
@@ -6862,7 +7126,7 @@ impl MobMcpState {
         match handle {
             Some(handle) => Ok(handle),
             None => Err(self
-                .held_child_mob_error(mob_id)
+                .unmanaged_mob_error(mob_id)
                 .await
                 .unwrap_or_else(|| MobError::MobNotFound(mob_id.clone()))),
         }
@@ -17875,6 +18139,281 @@ mod tests {
         assert!(
             err.to_string().contains("broken.db") || err.to_string().contains("database"),
             "restore failure should preserve the typed storage error, got {err}"
+        );
+    }
+
+    /// A persisted mob whose resume is refused at restore no longer fails the
+    /// whole restore: the other mob is restored and serves, and the refused
+    /// one is left unrestored with its store as found. A lookup of its id, a
+    /// create of that id included, answers the typed refusal. A later pass
+    /// whose resume of that store succeeds no longer lists it.
+    #[tokio::test]
+    async fn a_store_whose_resume_is_refused_is_left_unrestored_and_the_rest_restores() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = Arc::new(
+            MobMcpState::new(svc.clone(), meerkat_mob::MobControlPrincipal::Owner)
+                .expect("construct runtime authority")
+                .with_persistent_storage_root(Some(root.path().to_path_buf())),
+        );
+        let serving = state
+            .mob_create_definition(explicit_definition("restore-serving"))
+            .await
+            .expect("create the mob that restores");
+        let refused = state
+            .mob_create_definition(explicit_definition("restore-refused"))
+            .await
+            .expect("create the mob whose resume is refused");
+        let refused_store = MobMcpState::persistent_storage_path(
+            &MobMcpState::persistent_mob_root(root.path()),
+            &refused,
+        );
+        // A restart: the predecessors give up their supervisor routes.
+        for mob_id in [&serving, &refused] {
+            state
+                .handle_for(mob_id)
+                .await
+                .expect("predecessor mob handle")
+                .shutdown()
+                .await
+                .expect("retire the predecessor supervisor route");
+        }
+
+        let restored = Arc::new(
+            MobMcpState::new(svc, meerkat_mob::MobControlPrincipal::Owner)
+                .expect("construct runtime authority")
+                .with_persistent_storage_root(Some(root.path().to_path_buf())),
+        );
+        *restored
+            .refused_resume_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(refused_store.clone());
+
+        let listed = restored
+            .mob_list()
+            .await
+            .expect("the restore goes on past the store whose resume is refused");
+        assert!(
+            listed.iter().any(|(mob_id, _)| mob_id == &serving),
+            "the other mob is restored"
+        );
+        assert!(
+            listed.iter().all(|(mob_id, _)| mob_id != &refused),
+            "the refused mob is not managed"
+        );
+        restored
+            .mob_status(&serving)
+            .await
+            .expect("the restored mob serves");
+
+        let is_refusal = |error: &MobError| {
+            matches!(
+                error,
+                MobError::IncarnationInconsistent {
+                    mob_id,
+                    inconsistency: meerkat_mob::IncarnationInconsistency::MultipleRecords {
+                        count: 2
+                    },
+                } if mob_id == &refused
+            )
+        };
+        let lookup = restored
+            .mob_status(&refused)
+            .await
+            .expect_err("the refused mob was not restored");
+        assert!(is_refusal(&lookup), "{lookup:?}");
+        let unrestored = restored.unrestored_mobs().await;
+        assert_eq!(unrestored.len(), 1, "{unrestored:?}");
+        assert_eq!(unrestored[0].0, refused);
+        assert!(is_refusal(&unrestored[0].1), "{:?}", unrestored[0].1);
+        let create = restored
+            .mob_create_definition(explicit_definition("restore-refused"))
+            .await
+            .expect_err("a create does not take the unrestored mob's id");
+        assert!(is_refusal(&create), "{create:?}");
+        assert!(
+            tokio::fs::metadata(&refused_store).await.is_ok(),
+            "the unrestored mob's store is kept"
+        );
+
+        // A later restore pass rebuilds the unrestored set: the store whose
+        // resume succeeds now is managed and no longer listed.
+        *restored
+            .refused_resume_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        restored
+            .restore_from_persistent_storage()
+            .await
+            .expect("a later restore pass");
+        let unrestored = restored.unrestored_mobs().await;
+        assert!(unrestored.is_empty(), "{unrestored:?}");
+        restored
+            .mob_status(&refused)
+            .await
+            .expect("the mob the later pass resumed serves");
+    }
+
+    /// A persisted mob left unrestored is still read for member lookups,
+    /// and never matched: a session its stored roster names is refused,
+    /// naming that mob, and so is a create by that session, before any store
+    /// exists for the new id. A session no roster names still gets a
+    /// complete, empty lookup, and its create records that session.
+    #[tokio::test]
+    async fn an_unrestored_mobs_roster_refuses_the_lookup_of_its_member_sessions() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = restored_state(&svc, root.path());
+        let refused = state
+            .mob_create_definition(explicit_definition("unrestored-parent"))
+            .await
+            .expect("create the mob whose resume is refused");
+        let worker = AgentIdentity::from("worker-1");
+        state
+            .mob_spawn(
+                &refused,
+                ProfileName::from("worker"),
+                worker.clone(),
+                Some(MobRuntimeMode::TurnDriven),
+                None,
+                None,
+            )
+            .await
+            .expect("spawn a member of that mob");
+        let member_session = state
+            .mob_resolve_bridge_session_id(&refused, &worker)
+            .await
+            .expect("resolve bridge session")
+            .expect("member bridge session");
+        // A restart: the predecessor gives up its supervisor route.
+        state
+            .handle_for(&refused)
+            .await
+            .expect("predecessor mob handle")
+            .shutdown()
+            .await
+            .expect("retire the predecessor supervisor route");
+
+        let mob_root = MobMcpState::persistent_mob_root(root.path());
+        let restored = restored_state(&svc, root.path());
+        *restored
+            .refused_resume_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(MobMcpState::persistent_storage_path(&mob_root, &refused));
+        let names_refused = |error: &MobError| {
+            matches!(
+                error,
+                MobError::ProvenanceUnavailable { mob_id: Some(blocking) } if blocking == &refused
+            )
+        };
+        let lookup = restored
+            .session_member_matches(&member_session)
+            .await
+            .expect_err("the unrestored roster names the member's session");
+        assert!(names_refused(&lookup), "{lookup:?}");
+        let blocked = MobId::from("unrestored-member-create");
+        let create = restored
+            .mob_create_definition_with_owner_bridge_session(
+                explicit_definition("unrestored-member-create"),
+                member_session,
+                false,
+                false,
+            )
+            .await
+            .expect_err("a create by that session is refused");
+        assert!(names_refused(&create), "{create:?}");
+        assert!(
+            tokio::fs::metadata(MobMcpState::persistent_storage_path(&mob_root, &blocked))
+                .await
+                .is_err(),
+            "no store exists for the refused create's id"
+        );
+
+        let caller = SessionId::new();
+        svc.insert_persisted_session(Session::with_id(caller.clone()))
+            .await;
+        assert!(
+            restored
+                .session_member_matches(&caller)
+                .await
+                .expect("a session no roster names gets a complete lookup")
+                .is_empty()
+        );
+        let created = restored
+            .mob_create_definition_with_owner_bridge_session(
+                explicit_definition("unrestored-other-create"),
+                caller.clone(),
+                false,
+                false,
+            )
+            .await
+            .expect("a create by a session no roster names");
+        assert_eq!(
+            restored
+                .handle_for(&created)
+                .await
+                .expect("handle")
+                .provenance()
+                .await
+                .expect("provenance"),
+            meerkat_mob::MobProvenance::Session { session_id: caller }
+        );
+    }
+
+    /// The restore's empty-store sweep keeps a store whose log is empty but
+    /// whose creation record is not finalized: its log lost the `MobCreated`
+    /// that record names, so the store is left unrestored under that mob,
+    /// typed, and never deleted. An empty store with no record is still
+    /// swept.
+    #[tokio::test]
+    async fn the_restore_sweep_keeps_an_empty_log_whose_creation_record_is_live() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = restored_state(&svc, root.path());
+        let damaged = state
+            .mob_create_definition(explicit_definition("sweep-live-record"))
+            .await
+            .expect("create the mob whose log is lost");
+        // A restart: the predecessor gives up its supervisor route.
+        state
+            .handle_for(&damaged)
+            .await
+            .expect("predecessor mob handle")
+            .shutdown()
+            .await
+            .expect("retire the predecessor supervisor route");
+        drop(state);
+        let mob_root = MobMcpState::persistent_mob_root(root.path());
+        let damaged_store = MobMcpState::persistent_storage_path(&mob_root, &damaged);
+        MobStorage::drop_event_log_for_test(&damaged_store)
+            .expect("drop the log, not through the destroy's clear");
+        let empty_store =
+            MobMcpState::persistent_storage_path(&mob_root, &MobId::from("sweep-empty"));
+        drop(MobStorage::persistent(&empty_store).expect("an empty store with no record"));
+
+        let restored = restored_state(&svc, root.path());
+        let unrestored = restored.unrestored_mobs().await;
+        assert_eq!(unrestored.len(), 1, "{unrestored:?}");
+        assert_eq!(unrestored[0].0, damaged);
+        assert!(
+            matches!(
+                &unrestored[0].1,
+                MobError::IncarnationInconsistent {
+                    mob_id,
+                    inconsistency: meerkat_mob::IncarnationInconsistency::RecordWithoutCreation,
+                } if mob_id == &damaged
+            ),
+            "{:?}",
+            unrestored[0].1
+        );
+        assert!(
+            tokio::fs::metadata(&damaged_store).await.is_ok(),
+            "the store whose record is not finalized is kept"
+        );
+        assert!(
+            tokio::fs::metadata(&empty_store).await.is_err(),
+            "the empty store with no record is swept"
         );
     }
 

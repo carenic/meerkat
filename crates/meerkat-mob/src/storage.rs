@@ -355,6 +355,32 @@ impl MobStorage {
             .map(|record| record.incarnation))
     }
 
+    /// The mob this store's creation record names while that record is not
+    /// finalized, read without building a runtime. `None` for a store with
+    /// no creation record, and for one whose record a finished destroy
+    /// finalized. A store whose log is empty but answers `Some` is not an
+    /// empty store: its log lost the `MobCreated` its record names
+    /// ([`crate::IncarnationInconsistency::RecordWithoutCreation`]).
+    pub async fn unfinalized_creation_mob(&self) -> Result<Option<crate::MobId>, MobError> {
+        Ok(self
+            .events
+            .creation_record()
+            .await?
+            .filter(|record| !record.is_finalized())
+            .map(|record| record.mob_id))
+    }
+
+    /// Test support: delete the event log of the persistent store at `path`
+    /// without the destroy's clear, so its creation record stays as it was.
+    #[cfg(all(any(test, feature = "test-support"), not(target_arch = "wasm32")))]
+    #[doc(hidden)]
+    pub fn drop_event_log_for_test(path: &Path) -> Result<(), MobError> {
+        rusqlite::Connection::open(path)
+            .and_then(|connection| connection.execute("DELETE FROM mob_events", []))
+            .map(|_| ())
+            .map_err(|error| MobError::Internal(format!("drop the event log: {error}")))
+    }
+
     /// The provenance this store's mob was created with
     /// ([`crate::MobProvenance`]), read without building a runtime, as
     /// [`crate::MobHandle::provenance`] reads it for a running mob. A mob
