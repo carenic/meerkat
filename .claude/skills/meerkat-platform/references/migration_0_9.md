@@ -303,8 +303,8 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   that member Broken with `MobError::MemberRegistrationRefused` until a
   repair; Stop and Shutdown report a member needing a durability reload as
   `ReloadRequired` (`MemberStopRun` / `MemberRunStarts`) instead of failing,
-  and a Resume refuses with `MemberReloadRequired` while a member needs a
-  durability reload (reload it, then Resume; a reload while Stopped answers
+  and a Resume refuses with `MemberReloadRequired` while a local member needs
+  a durability reload (reload it, then Resume; a reload while Stopped answers
   `Discarded` and the Resume revives the member);
   an uninstalled destination is `MobError::MemberDestinationNotInstalled` (was
   `WiringError`; schedule delivery records `runtime_rejected`);
