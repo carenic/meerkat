@@ -122,8 +122,8 @@ impl MeerkatMachine {
                 .accept_resolved_input_with_credential(input, resolved, credential_custody)
                 .await;
             return Ok(AnsweredAdmissionWrite {
-                held_mutation_gate,
                 driver,
+                held_mutation_gate,
                 result,
             });
         };
@@ -142,8 +142,8 @@ impl MeerkatMachine {
             // deadline, are released).
             drop(answered);
             AnsweredAdmissionWrite {
-                held_mutation_gate,
                 driver,
+                held_mutation_gate,
                 result,
             }
         });
@@ -168,22 +168,21 @@ impl MeerkatMachine {
         let joined = match joined {
             Some(joined) => joined,
             None => {
-                if !write.mark_past_deadline(
+                if write.mark_past_deadline(
                     RUNTIME_ADMISSION_DEADLINE,
                     format!(
                         "input {input_id}: the store reported no durable outcome for its admission within {deadline:?}; the admission may still land"
                     ),
                 ) {
-                    // The store answered as the deadline passed: the write
-                    // is about to hand M and the driver back.
-                    task.as_mut().await
-                } else {
                     self.hand_off_degraded_gate_settlement(session_id, gate.clone());
                     // Returning drops the join handle, which detaches the
                     // write: it keeps M and the driver until the store
                     // answers.
                     return Err(admission_outcome_unknown_refusal(&input_id));
                 }
+                // The store answered as the deadline passed: the write is
+                // about to hand M and the driver back.
+                task.as_mut().await
             }
         };
         joined.map_err(|error| {
