@@ -29965,6 +29965,63 @@ mod tests {
         );
     }
 
+    /// The shape after a restart: the session is materialized from the
+    /// store's committed head. A long run on it compacts more often than the
+    /// retention keeps and its run-end commit still proves every compaction;
+    /// after a second restart the next long run's intra-turn checkpoint
+    /// proves its suffix from the reloaded head.
+    #[tokio::test]
+    async fn a_session_reloaded_from_the_store_keeps_what_its_head_lacks() {
+        let (_directory, service, checkpointer, committed) = retention_checkpoint_fixture().await;
+        let id = committed.id().clone();
+        drop(committed);
+        let retention = meerkat_core::TranscriptHistoryRetention::from_count(4).unwrap();
+
+        let mut session = service
+            .load_committed_runtime_session_for_body(&id, "reload after restart")
+            .await
+            .unwrap()
+            .expect("the committed head");
+        for compaction in 0..6 {
+            compact_and_retire(&mut session, compaction, retention);
+        }
+        let session = service
+            .persist_detached_head_canonical_session(session, "run boundary")
+            .await
+            .expect("the run-end commit proves every compaction of the run");
+        assert_eq!(physical_rewrite_count(&service, &id).await, 6);
+        assert_eq!(
+            retired_rewrites(&session),
+            0,
+            "nothing the reloaded head lacked was retired"
+        );
+        drop(session);
+
+        let mut session = service
+            .load_committed_runtime_session_for_body(&id, "reload after the second restart")
+            .await
+            .unwrap()
+            .expect("the committed head");
+        for compaction in 6..12 {
+            compact_and_retire(&mut session, compaction, retention);
+        }
+        assert_eq!(
+            retired_rewrites(&session),
+            6,
+            "the reloaded session retires up to its head and no further"
+        );
+        meerkat_core::SessionCheckpointer::checkpoint_run(
+            &checkpointer,
+            &mut session,
+            &RunId::new(),
+            None,
+        )
+        .await
+        .expect("the intra-turn checkpoint proves its suffix from the reloaded head")
+        .expect("a provisional successor");
+        assert_eq!(physical_rewrite_count(&service, &id).await, 12);
+    }
+
     /// The cap belongs to the session a durable head describes. A fork and a
     /// copy decoded from the persisted document have no durable head of
     /// their own and retire to the retention bound as before.
