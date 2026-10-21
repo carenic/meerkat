@@ -29727,9 +29727,10 @@ mod tests {
         (directory, service, checkpointer, committed)
     }
 
-    /// One compaction of a long turn: a few rows, a rewrite of everything
-    /// after the first row down to a summary, then the retirement the agent
-    /// applies after every compaction rewrite.
+    /// One compaction of a long turn: a few rows, then, as the agent does on
+    /// a clone of its session it installs afterwards, a rewrite of everything
+    /// after the first row down to a summary and the retirement it applies
+    /// after every compaction rewrite.
     fn compact_and_retire(
         session: &mut Session,
         compaction: usize,
@@ -29738,9 +29739,10 @@ mod tests {
         for row in 0..3 {
             session.push(user_message(&format!("compaction {compaction} row {row}")));
         }
-        let end = session.messages().len();
-        let parent_revision = session.transcript_revision().unwrap();
-        session
+        let mut compacted = session.clone();
+        let end = compacted.messages().len();
+        let parent_revision = compacted.transcript_revision().unwrap();
+        compacted
             .commit_transcript_rewrite(
                 TranscriptRewriteSelection::MessageRange { start: 1, end },
                 vec![Message::BlockAssistant(
@@ -29757,7 +29759,8 @@ mod tests {
                 Some(parent_revision),
             )
             .unwrap();
-        session.retire_transcript_history(retention).unwrap();
+        compacted.retire_transcript_history(retention).unwrap();
+        *session = compacted;
     }
 
     fn retired_rewrites(session: &Session) -> usize {
@@ -29864,6 +29867,128 @@ mod tests {
         }
         assert_eq!(physical_rewrite_count(&service, &id).await, 6);
         assert_eq!(retired_rewrites(&session), 2);
+    }
+
+    /// Retirement goes exactly as far as the durable head and no further:
+    /// with the head at four rewrites, the eighth compaction retires the
+    /// first four, and the ninth, which the retention alone would let retire
+    /// a fifth, keeps it until a checkpoint covers it.
+    #[tokio::test]
+    async fn retirement_reaches_the_durable_head_and_stops_there() {
+        let (_directory, service, checkpointer, committed) = retention_checkpoint_fixture().await;
+        let id = committed.id().clone();
+        let retention = meerkat_core::TranscriptHistoryRetention::from_count(4).unwrap();
+        let mut session = committed;
+        for compaction in 0..4 {
+            compact_and_retire(&mut session, compaction, retention);
+        }
+        let run_id = RunId::new();
+        let receipt = meerkat_core::SessionCheckpointer::checkpoint_run(
+            &checkpointer,
+            &mut session,
+            &run_id,
+            None,
+        )
+        .await
+        .expect("the checkpoint after four compactions")
+        .expect("a provisional successor");
+        assert_eq!(physical_rewrite_count(&service, &id).await, 4);
+
+        for compaction in 4..8 {
+            compact_and_retire(&mut session, compaction, retention);
+        }
+        assert_eq!(
+            retired_rewrites(&session),
+            4,
+            "the eighth compaction retires up to the durable head"
+        );
+        compact_and_retire(&mut session, 8, retention);
+        assert_eq!(
+            retired_rewrites(&session),
+            4,
+            "the ninth compaction keeps what the durable head does not cover"
+        );
+        meerkat_core::SessionCheckpointer::checkpoint_run(
+            &checkpointer,
+            &mut session,
+            &run_id,
+            Some(&receipt),
+        )
+        .await
+        .expect("the checkpoint proves its suffix from the durable head")
+        .expect("the next provisional successor");
+        assert_eq!(physical_rewrite_count(&service, &id).await, 9);
+    }
+
+    /// A committed run boundary advances the cap on the session the next run
+    /// continues with: a second long run retires back toward the retention
+    /// within that boundary, and its checkpoint still proves the suffix.
+    #[tokio::test]
+    async fn a_second_run_retires_within_the_committed_boundary_and_checkpoints() {
+        let (_directory, service, checkpointer, committed) = retention_checkpoint_fixture().await;
+        let id = committed.id().clone();
+        let retention = meerkat_core::TranscriptHistoryRetention::from_count(4).unwrap();
+        let mut session = committed;
+        for compaction in 0..6 {
+            compact_and_retire(&mut session, compaction, retention);
+        }
+        let mut session = service
+            .persist_detached_head_canonical_session(session, "first run boundary")
+            .await
+            .expect("the first run's boundary commits every compaction of the run");
+        assert_eq!(physical_rewrite_count(&service, &id).await, 6);
+        assert_eq!(retired_rewrites(&session), 0);
+
+        for compaction in 6..12 {
+            compact_and_retire(&mut session, compaction, retention);
+        }
+        assert_eq!(
+            retired_rewrites(&session),
+            6,
+            "the second run retires up to the committed boundary"
+        );
+        meerkat_core::SessionCheckpointer::checkpoint_run(
+            &checkpointer,
+            &mut session,
+            &RunId::new(),
+            None,
+        )
+        .await
+        .expect("the second run's checkpoint proves its suffix from the boundary")
+        .expect("a provisional successor");
+        assert_eq!(physical_rewrite_count(&service, &id).await, 12);
+        compact_and_retire(&mut session, 12, retention);
+        assert_eq!(
+            retired_rewrites(&session),
+            9,
+            "after the checkpoint the graph is back at the retention bound"
+        );
+    }
+
+    /// The cap belongs to the session a durable head describes. A fork and a
+    /// copy decoded from the persisted document have no durable head of
+    /// their own and retire to the retention bound as before.
+    #[tokio::test]
+    async fn forks_and_decoded_copies_retire_without_the_durable_cap() {
+        let (_directory, _service, _checkpointer, committed) = retention_checkpoint_fixture().await;
+        let retention = meerkat_core::TranscriptHistoryRetention::from_count(4).unwrap();
+        let mut session = committed;
+        for compaction in 0..6 {
+            compact_and_retire(&mut session, compaction, retention);
+        }
+        assert_eq!(retired_rewrites(&session), 0);
+
+        // A fork starts its own rewrite graph.
+        let mut fork = session.fork();
+        for compaction in 6..12 {
+            compact_and_retire(&mut fork, compaction, retention);
+        }
+        assert_eq!(retired_rewrites(&fork), 2);
+
+        let mut decoded: Session =
+            serde_json::from_slice(&session.to_persisted_bytes().unwrap()).unwrap();
+        compact_and_retire(&mut decoded, 6, retention);
+        assert_eq!(retired_rewrites(&decoded), 3);
     }
 
     #[tokio::test]
