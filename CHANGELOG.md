@@ -789,6 +789,32 @@ them.
   the rosters of the mobs hosted when it runs: a host inserts a mob's handle
   before its members can run turns, because a member of a mob not inserted
   yet is in no hosted roster and its session's create records `Session`.
+- A local `tools.mob` member's own mob operator tools (`spawn_member`,
+  `spawn_many_members` and the rest, which the mob runtime composes for the
+  member's session) admit against the session's final mob operator
+  authority, the context `AgentFactory` settles after a host session hook
+  has edited the build. They admitted against a default the runtime
+  composed itself (create-only, with spawn rights over every profile of the
+  mob), so a hook that narrowed a member's spawn profiles, for example with
+  `restrict_spawn_profiles_in_mob`, narrowed the session's other mob tool
+  surfaces while the member could still spawn every profile through these.
+  The factory binds the authority through the new defaulted method
+  `AgentToolDispatcher::bind_session_mob_tool_authority` (see Added), on the
+  session's external tools before it composes them, with or without a
+  `MobToolsFactory`. Behaviour changes for hosts:
+  - A hook that grants manage scope over the member's own mob now reaches
+    these tools too: such a member can retire, force-cancel and read the
+    status of members it did not spawn, and lists every member.
+  - A hook that removes the authority (`mob_tool_authority_context` set to
+    `None`, or mob tools disabled) now hides these tools and refuses their
+    spawn and management calls, where they still admitted every profile.
+  - Their admission follows the authority updates the agent applies during
+    the session (`apply_session_effects`), as a `MobToolsFactory` surface's
+    does. Which of them are listed is settled when the session is built.
+  - A host that wraps a member's external tools in its own
+    `AgentToolDispatcher` must forward `bind_session_mob_tool_authority` to
+    the wrapped dispatcher: tools the factory never binds deny every call.
+    `DynamicToolComposite` and `ToolGateway` forward it.
 
 ### Added
 
@@ -1276,6 +1302,26 @@ them.
 - `meerkat_core::service::LiveMobIncarnation` (with `incarnation()`) and
   `meerkat_mob::MobHandle::live_incarnation`: the witness the mob operator
   grant functions take (see Breaking).
+- `meerkat_runtime::mob_operator_authority::restrict_spawn_profiles_in_mob`
+  narrows the spawn-profile scope a mob operator authority context holds in
+  one mob to the profiles given that it already holds there. It takes no
+  `LiveMobIncarnation`, because it can only take rights away: it keeps the
+  incarnation the context binds for that mob and every other fact, never adds
+  a profile, and refuses a mob the context holds no spawn-profile scope for.
+  A host session hook uses it to narrow the default scope over every profile
+  of its own mob that a `tools.mob` member built without persisted authority
+  gets, which includes the members a mob restores while it is being built,
+  before the host holds their handle and so before it can call the grant
+  functions. Before this, such a restored member kept spawn rights over every
+  profile of its mob after each restart.
+- `meerkat_core::AgentToolDispatcher::bind_session_mob_tool_authority`, a
+  defaulted method (a no-op by default). The agent factory calls it on a
+  session's external tools once the session's mob operator authority is
+  settled, before it composes them, with the session's effective-authority
+  handle or `None`. A dispatcher that admits mob operator calls for the
+  session admits against it. A composite, or a host's wrapper around a
+  session's external tools, forwards it to every dispatcher it wraps, as
+  `DynamicToolComposite` and `ToolGateway` do (see Security).
 - `meerkat_core::service::MobIncarnationId` implements `Display`,
   `FromStr` (error: `MobIncarnationIdParseError`), `PartialOrd` and `Ord`.
 - `meerkat_mob::MobProvenance`: who created a mob (`Member`, `Host`,

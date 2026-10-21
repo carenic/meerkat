@@ -727,6 +727,17 @@ impl AgentToolDispatcher for ToolGateway {
         }
     }
 
+    fn bind_session_mob_tool_authority(
+        &self,
+        authority: Option<Arc<std::sync::RwLock<crate::service::MobToolAuthorityContext>>>,
+    ) {
+        for entry in &self.entries {
+            entry
+                .dispatcher
+                .bind_session_mob_tool_authority(authority.clone());
+        }
+    }
+
     /// Aggregate external updates across all dispatcher entries.
     ///
     /// Deduplicates by server name for pending, by `(server, operation, status)`
@@ -1181,6 +1192,15 @@ impl AgentToolDispatcher for DynamicToolComposite {
     ) {
         for dispatcher in &self.dispatchers {
             dispatcher.bind_external_tool_surface_handle(Arc::clone(&handle));
+        }
+    }
+
+    fn bind_session_mob_tool_authority(
+        &self,
+        authority: Option<Arc<std::sync::RwLock<crate::service::MobToolAuthorityContext>>>,
+    ) {
+        for dispatcher in &self.dispatchers {
+            dispatcher.bind_session_mob_tool_authority(authority.clone());
         }
     }
 

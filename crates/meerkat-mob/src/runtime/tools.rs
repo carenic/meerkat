@@ -777,6 +777,7 @@ pub(super) fn compose_external_tools_for_profile(
     // The resolver is the single source of truth shared with build_agent_config.
     let should_grant_default_spawn_profiles =
         profile.tools.mob && persisted_mob_tool_authority_context.is_none();
+    let bind_persisted_context = persisted_mob_tool_authority_context.is_some();
     let (_, effective_authority) = crate::build::resolve_profile_mob_operator_access(
         profile,
         persisted_mob_tool_authority_context,
@@ -803,11 +804,22 @@ pub(super) fn compose_external_tools_for_profile(
                     ))
                 })?;
         }
-        dispatchers.push(Arc::new(MobOperatorToolDispatcher::new(
+        // The member's own session builds these tools, so they admit against
+        // the authority the agent factory binds for that session once a host
+        // hook has edited the build, never against this composed context,
+        // which only decides the tools listed before that binding. A
+        // persisted context given here is bound until then.
+        let dispatcher = MobOperatorToolDispatcher::for_member_session(
             mob_handle,
             profile.tools.mob,
-            authority_context,
-        )));
+            authority_context.clone(),
+        );
+        if bind_persisted_context {
+            dispatcher.bind_session_mob_tool_authority(Some(Arc::new(std::sync::RwLock::new(
+                authority_context,
+            ))));
+        }
+        dispatchers.push(Arc::new(dispatcher));
     }
 
     for name in &profile.tools.rust_bundles {
@@ -934,8 +946,39 @@ pub(super) fn compose_external_tools_for_profile(
 
 pub(crate) struct MobOperatorToolDispatcher {
     handle: MobHandle,
-    authority_context: MobToolAuthorityContext,
+    authority: OperatorAuthority,
     tools: Arc<[Arc<ToolDef>]>,
+}
+
+/// The mob operator authority a dispatcher admits its calls against.
+enum OperatorAuthority {
+    /// A context fixed at construction: the controlling side's upcall
+    /// executor mints one for each request of a placed member, which has no
+    /// local session.
+    Fixed(MobToolAuthorityContext),
+    /// A local member's own session authority, which the agent factory binds
+    /// once the session's final context is settled.
+    Session(std::sync::RwLock<SessionAuthorityBinding>),
+}
+
+/// What the agent factory bound for a local member's session.
+enum SessionAuthorityBinding {
+    /// Nothing yet, or the session was built without the agent factory: the
+    /// tools stay listed as composed, so composition sees them, and every
+    /// call is denied.
+    Unbound,
+    /// The session's effective-authority handle. `listed` records whether
+    /// the context bound this mob instance when it was bound, whatever scope
+    /// it holds there; without that binding the tools are hidden, and a call
+    /// that still reaches them is admitted against the bound context like any
+    /// other.
+    Bound {
+        authority: Arc<std::sync::RwLock<MobToolAuthorityContext>>,
+        listed: bool,
+    },
+    /// The session holds no mob operator authority: the tools are hidden and
+    /// every call is denied.
+    Removed,
 }
 
 impl MobOperatorToolDispatcher {
@@ -994,7 +1037,26 @@ impl MobOperatorToolDispatcher {
             crate::control_policy::CommandAuthorityKind::AgentLane
         ));
         let enable_mob = enable_mob && authority_context.is_generated_authority_context();
-        Self::build(handle, enable_mob, authority_context)
+        Self::build(
+            handle,
+            enable_mob,
+            OperatorAuthority::Fixed(authority_context),
+        )
+    }
+
+    /// The dispatcher for a local member's own session. It lists its tools as
+    /// `composed` allows until the agent factory binds the session's final
+    /// authority (`bind_session_mob_tool_authority`), and admits calls only
+    /// against that bound authority, never against `composed`.
+    pub(crate) fn for_member_session(
+        handle: MobHandle,
+        enable_mob: bool,
+        composed: MobToolAuthorityContext,
+    ) -> Self {
+        let mut dispatcher = Self::new(handle, enable_mob, composed);
+        dispatcher.authority =
+            OperatorAuthority::Session(std::sync::RwLock::new(SessionAuthorityBinding::Unbound));
+        dispatcher
     }
 
     /// T-LS4 introspection: the lane this dispatcher's commands travel on.
@@ -1011,11 +1073,7 @@ impl MobOperatorToolDispatcher {
             .is_some()
     }
 
-    fn build(
-        handle: MobHandle,
-        enable_mob: bool,
-        authority_context: MobToolAuthorityContext,
-    ) -> Self {
+    fn build(handle: MobHandle, enable_mob: bool, authority: OperatorAuthority) -> Self {
         let defs: Vec<Arc<ToolDef>> = if enable_mob {
             local_operator_tool_defs()
         } else {
@@ -1023,19 +1081,69 @@ impl MobOperatorToolDispatcher {
         };
         Self {
             handle,
-            authority_context,
+            authority,
             tools: defs.into(),
         }
     }
 
-    async fn ensure_current_mob_scope(&self, tool_name: &str) -> Result<(), ToolError> {
+    /// The authority this call is admitted against: the fixed context, or one
+    /// snapshot of the session authority the agent factory bound. A session
+    /// authority that is unbound or removed admits nothing.
+    fn admission_authority(
+        &self,
+        tool_name: &str,
+    ) -> Result<std::borrow::Cow<'_, MobToolAuthorityContext>, ToolError> {
+        let binding = match &self.authority {
+            OperatorAuthority::Fixed(context) => return Ok(std::borrow::Cow::Borrowed(context)),
+            OperatorAuthority::Session(binding) => binding
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        };
+        match &*binding {
+            SessionAuthorityBinding::Bound { authority, .. } => Ok(std::borrow::Cow::Owned(
+                authority
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            )),
+            SessionAuthorityBinding::Unbound => {
+                tracing::warn!(
+                    tool_name,
+                    mob_id = %self.handle.definition().id,
+                    "mob operator call denied: no session authority is bound to the member's tools"
+                );
+                Err(ToolError::access_denied(tool_name))
+            }
+            SessionAuthorityBinding::Removed => Err(ToolError::access_denied(tool_name)),
+        }
+    }
+
+    /// Whether the tools are listed: a session authority bound as removed,
+    /// or with no binding to this mob instance, hides them.
+    fn listed(&self) -> bool {
+        match &self.authority {
+            OperatorAuthority::Fixed(_) => true,
+            OperatorAuthority::Session(binding) => match &*binding
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            {
+                SessionAuthorityBinding::Unbound => true,
+                SessionAuthorityBinding::Bound { listed, .. } => *listed,
+                SessionAuthorityBinding::Removed => false,
+            },
+        }
+    }
+
+    async fn ensure_current_mob_scope(
+        &self,
+        tool_name: &str,
+        authority: &MobToolAuthorityContext,
+    ) -> Result<(), ToolError> {
         // Pure observation extracted from the machine-owned operator-scope
         // projection. MobMachine — not this shell — decides the Allow/Deny
         // verdict; we mirror it (Denied -> access_denied). Fails closed.
         let mob_id = self.handle.definition().id.as_str();
-        let can_manage_mob = self
-            .authority_context
-            .can_manage_mob(mob_id, self.handle.incarnation());
+        let can_manage_mob = authority.can_manage_mob(mob_id, self.handle.incarnation());
         let admission = self
             .handle
             .resolve_current_mob_admission(can_manage_mob)
@@ -1085,9 +1193,10 @@ impl MobOperatorToolDispatcher {
         owner: Option<&SessionId>,
         tool_name: &str,
         target: &AgentIdentity,
+        authority: &MobToolAuthorityContext,
     ) -> Result<(), ToolError> {
         let validated = self.validated_caller(owner, tool_name).await?;
-        let can_manage_mob = self.can_manage_current_mob();
+        let can_manage_mob = self.can_manage_current_mob(authority);
         let caller = if can_manage_mob { None } else { validated };
         // An invalid supplied origin (a session that is not a current
         // member's: stale, retired, rebound away or foreign) is denied above,
@@ -1109,16 +1218,16 @@ impl MobOperatorToolDispatcher {
         }
     }
 
-    fn can_manage_current_mob(&self) -> bool {
+    fn can_manage_current_mob(&self, authority: &MobToolAuthorityContext) -> bool {
         let mob_id = self.handle.definition().id.as_str();
-        self.authority_context
-            .can_manage_mob(mob_id, self.handle.incarnation())
+        authority.can_manage_mob(mob_id, self.handle.incarnation())
     }
 
     async fn ensure_spawn_member_scope(
         &self,
         tool_name: &str,
         args: &SpawnMemberArgs,
+        authority: &MobToolAuthorityContext,
     ) -> Result<(), ToolError> {
         // RAW, atomic observations extracted from the machine-owned
         // operator-scope projection and the typed spawn args, fed WITHOUT
@@ -1131,8 +1240,8 @@ impl MobOperatorToolDispatcher {
         let mob_id = self.handle.definition().id.as_str();
         let incarnation = self.handle.incarnation();
         let observations = SpawnMemberAdmissionObservations {
-            manage_scope_present: self.authority_context.can_manage_mob(mob_id, incarnation),
-            profile_scope_contains: self.authority_context.spawn_profile_scope_contains(
+            manage_scope_present: authority.can_manage_mob(mob_id, incarnation),
+            profile_scope_contains: authority.spawn_profile_scope_contains(
                 mob_id,
                 incarnation,
                 &args.profile,
@@ -1174,13 +1283,16 @@ impl MobOperatorToolDispatcher {
     /// `spawn_many_members` case (where the per-member loop runs zero iterations
     /// and fires no per-member admission), so the deny must be machine-routed
     /// here rather than reduced in the shell. Fails closed.
-    async fn ensure_spawn_tool_scope(&self, tool_name: &str) -> Result<(), ToolError> {
+    async fn ensure_spawn_tool_scope(
+        &self,
+        tool_name: &str,
+        authority: &MobToolAuthorityContext,
+    ) -> Result<(), ToolError> {
         let mob_id = self.handle.definition().id.as_str();
         let incarnation = self.handle.incarnation();
-        let can_manage_mob = self.authority_context.can_manage_mob(mob_id, incarnation);
-        let spawn_profile_scope_present = self
-            .authority_context
-            .spawn_profile_scope_present(mob_id, incarnation);
+        let can_manage_mob = authority.can_manage_mob(mob_id, incarnation);
+        let spawn_profile_scope_present =
+            authority.spawn_profile_scope_present(mob_id, incarnation);
         let admission = self
             .handle
             .resolve_spawn_tool_admission(can_manage_mob, spawn_profile_scope_present)
@@ -1284,10 +1396,14 @@ impl MobOperatorToolDispatcher {
         ))
     }
 
-    async fn record_successful_operator_action(&self, tool_name: &str) {
+    async fn record_successful_operator_action(
+        &self,
+        tool_name: &str,
+        authority: &MobToolAuthorityContext,
+    ) {
         if let Err(error) = self
             .handle
-            .record_operator_action_provenance(tool_name, &self.authority_context)
+            .record_operator_action_provenance(tool_name, authority)
             .await
         {
             tracing::warn!(
@@ -1650,7 +1766,41 @@ struct FlowStatusArgs {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl AgentToolDispatcher for MobOperatorToolDispatcher {
     fn tools(&self) -> Arc<[Arc<ToolDef>]> {
-        Arc::clone(&self.tools)
+        if self.listed() {
+            Arc::clone(&self.tools)
+        } else {
+            Arc::from(Vec::<Arc<ToolDef>>::new())
+        }
+    }
+
+    /// A local member's tools admit against the session authority bound
+    /// here, and are hidden when it is `None` or binds no incarnation of this
+    /// mob instance. A fixed-context dispatcher ignores it.
+    fn bind_session_mob_tool_authority(
+        &self,
+        authority: Option<Arc<std::sync::RwLock<MobToolAuthorityContext>>>,
+    ) {
+        let OperatorAuthority::Session(binding) = &self.authority else {
+            return;
+        };
+        let bound = match authority {
+            Some(authority) => {
+                let listed = {
+                    let context = authority
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mob_id = self.handle.definition().id.as_str();
+                    let incarnation = self.handle.incarnation();
+                    context.is_generated_authority_context()
+                        && context.mob_incarnations().get(mob_id) == Some(&incarnation)
+                };
+                SessionAuthorityBinding::Bound { authority, listed }
+            }
+            None => SessionAuthorityBinding::Removed,
+        };
+        *binding
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = bound;
     }
 
     fn live_bridge_effect_kind(&self, tool_name: &str) -> meerkat_core::LiveBridgeEffectKind {
@@ -1690,6 +1840,8 @@ impl MobOperatorToolDispatcher {
         call: ToolCallView<'_>,
         owner: Option<&SessionId>,
     ) -> Result<meerkat_core::ToolDispatchOutcome, ToolError> {
+        // Every check of this call reads one snapshot of the authority.
+        let authority = self.admission_authority(call.name)?;
         let mut owner_list_view = None;
         if matches!(
             call.name,
@@ -1700,13 +1852,18 @@ impl MobOperatorToolDispatcher {
             let args: OwnedMemberTargetArgs = call
                 .parse_args()
                 .map_err(|error| ToolError::invalid_arguments(call.name, error.to_string()))?;
-            self.ensure_owned_member_scope(owner, call.name, &AgentIdentity::from(args.member_id))
-                .await?;
+            self.ensure_owned_member_scope(
+                owner,
+                call.name,
+                &AgentIdentity::from(args.member_id),
+                &authority,
+            )
+            .await?;
         } else if call.name == TOOL_LIST_MEMBERS
             && self.tools.iter().any(|tool| tool.name == call.name)
         {
             let validated = self.validated_caller(owner, call.name).await?;
-            if let Err(denied) = self.ensure_current_mob_scope(call.name).await {
+            if let Err(denied) = self.ensure_current_mob_scope(call.name, &authority).await {
                 // Without manage scope a member sees only the members it
                 // spawned (its fork_off children).
                 owner_list_view = Some(validated.ok_or(denied)?);
@@ -1714,9 +1871,9 @@ impl MobOperatorToolDispatcher {
         } else if self.tools.iter().any(|tool| tool.name == call.name)
             && !matches!(call.name, TOOL_SPAWN_MEMBER | TOOL_SPAWN_MANY_MEMBERS)
         {
-            self.ensure_current_mob_scope(call.name).await?;
+            self.ensure_current_mob_scope(call.name, &authority).await?;
         } else if matches!(call.name, TOOL_SPAWN_MEMBER | TOOL_SPAWN_MANY_MEMBERS) {
-            self.ensure_spawn_tool_scope(call.name).await?;
+            self.ensure_spawn_tool_scope(call.name, &authority).await?;
         }
         match call.name {
             TOOL_SPAWN_MEMBER => {
@@ -1729,7 +1886,8 @@ impl MobOperatorToolDispatcher {
                     owner_bound = owner.is_some(),
                     "MobOperatorToolDispatcher::spawn_member dispatch start"
                 );
-                self.ensure_spawn_member_scope(call.name, &args).await?;
+                self.ensure_spawn_member_scope(call.name, &args, &authority)
+                    .await?;
                 let agent_identity = AgentIdentity::from(args.member_id.as_str());
                 let mut spec = SpawnMemberSpec::from_wire(
                     args.profile,
@@ -1785,7 +1943,8 @@ impl MobOperatorToolDispatcher {
                         Self::spawn_result_payload(&self.handle.definition().id, &spawn_result);
                     (result, Vec::new())
                 };
-                self.record_successful_operator_action(call.name).await;
+                self.record_successful_operator_action(call.name, &authority)
+                    .await;
                 Self::encode_result_with_async_ops(call, result, async_ops)
             }
             TOOL_SPAWN_MANY_MEMBERS => {
@@ -1793,7 +1952,8 @@ impl MobOperatorToolDispatcher {
                     .parse_args()
                     .map_err(|error| ToolError::invalid_arguments(call.name, error.to_string()))?;
                 for spec in &args.specs {
-                    self.ensure_spawn_member_scope(call.name, spec).await?;
+                    self.ensure_spawn_member_scope(call.name, spec, &authority)
+                        .await?;
                 }
                 let identities = args
                     .specs
@@ -1889,7 +2049,8 @@ impl MobOperatorToolDispatcher {
                         .collect::<Vec<_>>();
                     (results, Vec::new())
                 };
-                self.record_successful_operator_action(call.name).await;
+                self.record_successful_operator_action(call.name, &authority)
+                    .await;
                 Self::encode_result_with_async_ops(call, json!({ "results": results }), async_ops)
             }
             TOOL_RETIRE_MEMBER => {
@@ -1900,7 +2061,8 @@ impl MobOperatorToolDispatcher {
                     .retire_with_descendants(AgentIdentity::from(args.member_id))
                     .await
                     .map_err(|error| Self::map_mob_error(call, error))?;
-                self.record_successful_operator_action(call.name).await;
+                self.record_successful_operator_action(call.name, &authority)
+                    .await;
                 Self::encode_result(call, json!({"ok": true}))
             }
             TOOL_WIRE_MEMBERS => {
@@ -1914,7 +2076,8 @@ impl MobOperatorToolDispatcher {
                     )
                     .await
                     .map_err(|error| Self::map_mob_error(call, error))?;
-                self.record_successful_operator_action(call.name).await;
+                self.record_successful_operator_action(call.name, &authority)
+                    .await;
                 Self::encode_result(call, json!({"ok": true}))
             }
             TOOL_UNWIRE_MEMBERS => {
@@ -1928,7 +2091,8 @@ impl MobOperatorToolDispatcher {
                     )
                     .await
                     .map_err(|error| Self::map_mob_error(call, error))?;
-                self.record_successful_operator_action(call.name).await;
+                self.record_successful_operator_action(call.name, &authority)
+                    .await;
                 Self::encode_result(call, json!({"ok": true}))
             }
             TOOL_LIST_MEMBERS => {
@@ -1973,7 +2137,8 @@ impl MobOperatorToolDispatcher {
                     .run_flow(FlowId::from(args.flow_id), args.params)
                     .await
                     .map_err(|error| Self::map_mob_error(call, error))?;
-                self.record_successful_operator_action(call.name).await;
+                self.record_successful_operator_action(call.name, &authority)
+                    .await;
                 Self::encode_result(call, json!({ "run_id": run_id }))
             }
             TOOL_MOB_FLOW_STATUS => {
@@ -2001,7 +2166,8 @@ impl MobOperatorToolDispatcher {
                     .cancel_flow(run_id)
                     .await
                     .map_err(|error| Self::map_mob_error(call, error))?;
-                self.record_successful_operator_action(call.name).await;
+                self.record_successful_operator_action(call.name, &authority)
+                    .await;
                 Self::encode_result(call, json!({"ok": true}))
             }
             TOOL_FORCE_CANCEL_MEMBER => {
@@ -2012,7 +2178,8 @@ impl MobOperatorToolDispatcher {
                     .force_cancel_member(AgentIdentity::from(args.member_id))
                     .await
                     .map_err(|error| Self::map_mob_error(call, error))?;
-                self.record_successful_operator_action(call.name).await;
+                self.record_successful_operator_action(call.name, &authority)
+                    .await;
                 Self::encode_result(call, json!({"ok": true}))
             }
             TOOL_MEMBER_STATUS => {

@@ -319,6 +319,94 @@ where
     context_from_authority_state(authority.state())
 }
 
+/// Narrow the spawn-profile scope `authority_context` holds in the mob
+/// `mob_id` to the profiles in `profiles` it already holds there.
+///
+/// This needs no [`LiveMobIncarnation`] witness, because it can only take
+/// rights away. The scope stays bound to the incarnation the context already
+/// binds for `mob_id`, so it never reaches another mob under the same id. A
+/// profile the context does not already hold there is ignored, never added.
+/// Every other fact is kept as it was: create and profile-mutation authority,
+/// manage scope (which carries its own rights over the mob), the scope held
+/// in other mobs, caller provenance and the audit invocation id. When none of
+/// `profiles` is held, the context keeps the binding with no spawn profiles,
+/// so it can spawn nothing there.
+///
+/// A host session hook can use this on the context a member's session is
+/// built with, for example the default scope over every profile of its own
+/// mob that a `tools.mob` member gets when it has no persisted authority,
+/// including a member the mob restores before the host holds its handle.
+/// Every mob operator surface of that session admits against the narrowed
+/// context: a `MobToolsFactory` surface, and the mob runtime's own mob
+/// operator tools for the member (`spawn_member`, `spawn_many_members` and
+/// the rest).
+///
+/// It refuses a mob the context holds no spawn-profile scope for, and a
+/// context that generated authority did not mint.
+///
+/// ```
+/// # use meerkat_core::service::{LiveMobIncarnation, MobIncarnationId};
+/// # use meerkat_runtime::mob_operator_authority::{
+/// #     create_only_mob_operator_authority, grant_spawn_profiles_in_mob,
+/// # };
+/// use meerkat_runtime::mob_operator_authority::restrict_spawn_profiles_in_mob;
+///
+/// # fn main() -> Result<(), String> {
+/// # let incarnation = MobIncarnationId::mint();
+/// # let granted = grant_spawn_profiles_in_mob(
+/// #     &create_only_mob_operator_authority()?,
+/// #     "mob-1",
+/// #     LiveMobIncarnation::witnessed(incarnation),
+/// #     ["lead", "worker"],
+/// # )?;
+/// // `granted` holds spawn scope over "lead" and "worker" in mob-1.
+/// // Keep only "worker"; "auditor" is not held, so it is not added.
+/// let narrowed = restrict_spawn_profiles_in_mob(&granted, "mob-1", ["worker", "auditor"])?;
+/// assert!(narrowed.spawn_profile_scope_contains("mob-1", incarnation, "worker"));
+/// assert!(!narrowed.spawn_profile_scope_contains("mob-1", incarnation, "lead"));
+/// assert!(!narrowed.spawn_profile_scope_contains("mob-1", incarnation, "auditor"));
+/// assert!(restrict_spawn_profiles_in_mob(&granted, "mob-2", ["worker"]).is_err());
+/// # Ok(())
+/// # }
+/// ```
+pub fn restrict_spawn_profiles_in_mob<I, S>(
+    authority_context: &MobToolAuthorityContext,
+    mob_id: &str,
+    profiles: I,
+) -> Result<MobToolAuthorityContext, String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let Some(held) = authority_context.spawn_profile_scope().get(mob_id) else {
+        return Err(format!(
+            "mob operator authority holds no spawn-profile scope in mob '{mob_id}' to restrict"
+        ));
+    };
+    let Some(mob_incarnation) = authority_context.mob_incarnations().get(mob_id).copied() else {
+        return Err(format!(
+            "mob operator authority binds no incarnation for mob '{mob_id}'"
+        ));
+    };
+    let kept: BTreeSet<String> = profiles
+        .into_iter()
+        .map(Into::into)
+        .filter(|profile| held.contains(profile))
+        .collect();
+    let mut authority = authority_from_context(authority_context)?;
+    // The context's own binding: the machine sets the narrowed scope in
+    // place, and never takes its rebind path that drops manage scope.
+    apply(
+        &mut authority,
+        dsl::MeerkatMachineInput::SetMobOperatorSpawnProfilesInMob {
+            mob_id: mob_id.to_string(),
+            mob_incarnation,
+            profiles: kept,
+        },
+    )?;
+    context_from_authority_state(authority.state())
+}
+
 pub fn with_caller_provenance(
     authority_context: &MobToolAuthorityContext,
     caller_provenance: MobToolCallerProvenance,
@@ -690,5 +778,128 @@ mod tests {
             .expect_err("facts scoping another mob must be refused");
             assert!(error.contains("other-mob"), "{error}");
         }
+    }
+
+    /// A context with spawn scope over three profiles of mob-1, and manage
+    /// plus spawn scope over mob-2, each bound to its own incarnation, with
+    /// caller provenance and an audit invocation id.
+    fn spawn_and_manage_context() -> (MobToolAuthorityContext, MobIncarnationId, MobIncarnationId) {
+        let first = MobIncarnationId::mint();
+        let second = MobIncarnationId::mint();
+        let context = create_only_mob_operator_authority().expect("create-only authority");
+        let context = grant_spawn_profiles_in_mob(
+            &context,
+            "mob-1",
+            live(first),
+            ["lead", "worker", "auditor"],
+        )
+        .expect("spawn scope in mob-1");
+        let context = grant_manage_mob(&context, "mob-2", live(second)).expect("manage mob-2");
+        let context = grant_spawn_profile_in_mob(&context, "mob-2", live(second), "scout")
+            .expect("spawn scope in mob-2");
+        let context = with_caller_provenance(
+            &context,
+            MobToolCallerProvenance::default().with_mob_id("mob-1"),
+        )
+        .expect("caller provenance");
+        let context = with_audit_invocation_id(&context, "audit-7").expect("audit invocation id");
+        (context, first, second)
+    }
+
+    /// Restricting keeps the incarnation binding and every other fact, and
+    /// drops the profiles left out.
+    #[test]
+    fn restricting_spawn_profiles_keeps_the_binding_and_drops_the_rest() {
+        let (context, first, second) = spawn_and_manage_context();
+        let narrowed = restrict_spawn_profiles_in_mob(&context, "mob-1", ["worker", "auditor"])
+            .expect("narrow mob-1");
+
+        assert!(narrowed.is_generated_authority_context());
+        assert_eq!(
+            narrowed.spawn_profile_scope()["mob-1"],
+            BTreeSet::from(["worker".to_string(), "auditor".to_string()])
+        );
+        assert!(narrowed.spawn_profile_scope_contains("mob-1", first, "worker"));
+        assert!(!narrowed.spawn_profile_scope_contains("mob-1", first, "lead"));
+        assert!(!narrowed.spawn_profile_scope_present("mob-1", MobIncarnationId::mint()));
+        assert_eq!(narrowed.mob_incarnations(), context.mob_incarnations());
+        assert_eq!(
+            narrowed.spawn_profile_scope()["mob-2"],
+            context.spawn_profile_scope()["mob-2"]
+        );
+        assert!(narrowed.can_manage_mob("mob-2", second));
+        assert_eq!(narrowed.managed_mob_scope(), context.managed_mob_scope());
+        assert_eq!(narrowed.can_create_mobs(), context.can_create_mobs());
+        assert_eq!(
+            narrowed.can_mutate_profiles(),
+            context.can_mutate_profiles()
+        );
+        assert_eq!(narrowed.caller_provenance(), context.caller_provenance());
+        assert_eq!(narrowed.audit_invocation_id(), Some("audit-7"));
+    }
+
+    /// A profile the context does not hold in the mob is never added.
+    #[test]
+    fn restricting_spawn_profiles_never_adds_a_profile() {
+        let (context, first, _) = spawn_and_manage_context();
+        let narrowed = restrict_spawn_profiles_in_mob(&context, "mob-1", ["worker", "admin"])
+            .expect("narrow mob-1");
+        assert_eq!(
+            narrowed.spawn_profile_scope()["mob-1"],
+            BTreeSet::from(["worker".to_string()])
+        );
+        assert!(!narrowed.spawn_profile_scope_contains("mob-1", first, "admin"));
+        // Narrowing what is already narrow changes nothing.
+        let again = restrict_spawn_profiles_in_mob(&narrowed, "mob-1", ["lead", "worker"])
+            .expect("narrow mob-1 again");
+        assert_eq!(again.spawn_profile_scope(), narrowed.spawn_profile_scope());
+    }
+
+    /// A mob the context holds no spawn-profile scope for is refused, and the
+    /// context is left as it was.
+    #[test]
+    fn restricting_spawn_profiles_in_an_unscoped_mob_is_refused() {
+        let (context, _, _) = spawn_and_manage_context();
+        let error = restrict_spawn_profiles_in_mob(&context, "mob-9", ["worker"])
+            .expect_err("an unbound mob is refused");
+        assert!(error.contains("mob-9"), "{error}");
+        let manage_only = grant_manage_mob(
+            &create_only_mob_operator_authority().expect("create-only authority"),
+            "mob-3",
+            live(MobIncarnationId::mint()),
+        )
+        .expect("manage mob-3");
+        let error = restrict_spawn_profiles_in_mob(&manage_only, "mob-3", ["worker"])
+            .expect_err("a mob with manage scope only holds no spawn scope to restrict");
+        assert!(error.contains("mob-3"), "{error}");
+    }
+
+    /// A persisted projection of a context that held spawn scope in the mob
+    /// is not generated authority, and is refused.
+    #[test]
+    fn restricting_spawn_profiles_in_a_projection_context_is_refused() {
+        let (context, _, _) = spawn_and_manage_context();
+        let projected = persisted_projection(context);
+        assert!(!projected.is_generated_authority_context());
+        assert!(
+            restrict_spawn_profiles_in_mob(&projected, "mob-1", ["worker"]).is_err(),
+            "a projection is refused"
+        );
+    }
+
+    /// Keeping none of the held profiles leaves the mob bound with no spawn
+    /// rights, and manage scope over a mob keeps its own rights.
+    #[test]
+    fn restricting_to_no_held_profile_leaves_no_spawn_rights() {
+        let (context, first, second) = spawn_and_manage_context();
+        let narrowed = restrict_spawn_profiles_in_mob(&context, "mob-1", Vec::<String>::new())
+            .expect("narrow mob-1 to nothing");
+        assert!(!narrowed.spawn_profile_scope_present("mob-1", first));
+        assert_eq!(narrowed.mob_incarnations()["mob-1"], first);
+
+        let narrowed = restrict_spawn_profiles_in_mob(&narrowed, "mob-2", ["other"])
+            .expect("narrow mob-2 to nothing");
+        assert!(!narrowed.spawn_profile_scope_present("mob-2", second));
+        assert!(narrowed.can_manage_mob("mob-2", second));
     }
 }

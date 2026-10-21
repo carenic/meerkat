@@ -4126,6 +4126,19 @@ impl MockSessionService {
                 .cloned(),
         );
         if let Some(dispatcher) = external_tools {
+            // A session service that builds its agent through the agent
+            // factory binds the member's tools to the session's mob operator
+            // authority; this mock builds no agent, so it binds the request's.
+            let authority = req
+                .build
+                .as_ref()
+                .filter(|build| !matches!(build.override_mob, ToolCategoryOverride::Disable))
+                .and_then(|build| build.mob_tool_authority_context.clone())
+                .filter(
+                    meerkat_core::service::MobToolAuthorityContext::is_generated_authority_context,
+                )
+                .map(|authority| Arc::new(std::sync::RwLock::new(authority)));
+            dispatcher.bind_session_mob_tool_authority(authority);
             self.external_tools_by_session
                 .write()
                 .await
@@ -26574,14 +26587,17 @@ async fn test_visible_mob_operator_reads_still_require_exact_scope() {
     .expect("compose dispatcher")
     .expect("operator dispatcher should be visible when authority is injected");
 
+    // The injected authority binds only another mob, so the member's own mob
+    // operator tools are not listed, and a read that still reaches them is
+    // admitted like any other, which denies it.
     let tools = dispatcher.tools();
     let tool_names = tools
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
     assert!(
-        tool_names.contains(&"list_members"),
-        "tool visibility should depend on injected authority presence, not scope success"
+        !tool_names.contains(&"list_members"),
+        "operator tools with no binding to this mob instance are not listed: {tool_names:?}"
     );
 
     let args = RawValue::from_string("{}".to_string()).expect("raw args");
@@ -91794,6 +91810,10 @@ mod retirement_isolation;
 /// take the lease a concurrent raw unregister holds into its cleanup.
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod rollback_boundary_order;
+/// A local member's runtime mob operator tools admit against the session's
+/// final sealed authority, which the agent factory binds.
+#[cfg(not(target_arch = "wasm32"))]
+mod session_mob_authority;
 /// #1105 spawn-activation isolation: a parked activation must not stall the
 /// loop, a failed one must compensate exactly, and a stale one must be
 /// declined instead of touching its successor.
