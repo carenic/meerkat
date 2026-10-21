@@ -8458,21 +8458,17 @@ mod tests {
             .into_session(session.messages().to_vec())
             .expect("materialize the head");
         assert_eq!(
-            materialized.durable_transcript_rewrite_count_for_test(),
-            Some(2)
-        );
-        assert_eq!(
-            materialized
-                .clone()
-                .durable_transcript_rewrite_count_for_test(),
-            Some(2)
-        );
-        assert_eq!(
             materialized
                 .fork()
                 .durable_transcript_rewrite_count_for_test(),
             None
         );
+        let cloned = materialized.clone();
+        assert_eq!(
+            materialized.durable_transcript_rewrite_count_for_test(),
+            Some(2)
+        );
+        assert_eq!(cloned.durable_transcript_rewrite_count_for_test(), Some(2));
     }
 
     /// Every durable successor acknowledged on the live session records the
