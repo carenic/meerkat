@@ -6693,6 +6693,11 @@ impl Session {
             Some(usize::try_from(rewrite_count).unwrap_or(usize::MAX));
     }
 
+    #[cfg(test)]
+    pub(crate) fn durable_transcript_rewrite_count_for_test(&self) -> Option<usize> {
+        self.history_caches.durable_rewrite_count
+    }
+
     fn set_metadata_unchecked(&mut self, key: &str, value: serde_json::Value) {
         // Reapplying an identical durable projection is not a session-content
         // mutation. In particular, cold materialization restores
