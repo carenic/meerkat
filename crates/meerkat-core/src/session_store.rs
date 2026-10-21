@@ -3072,6 +3072,7 @@ impl SessionHead {
         // EVERY row-assembled materialization. Process-global substitution or
         // verification memos must not replace this durable-byte proof.
         let component_root = self.realtime_event_prefix.clone();
+        let durable_rewrite_count = self.rewrite_count;
         let SessionHead {
             id,
             version,
@@ -3120,6 +3121,7 @@ impl SessionHead {
                 "failed to restore session from head row: {err}"
             ))
         })?;
+        session.note_durable_transcript_rewrites(durable_rewrite_count);
         match (component_root, component_sequence) {
             (None, None) => {}
             (Some(realtime_root), Some(realtime_sequence))
@@ -4043,6 +4045,7 @@ impl PreparedHeadCanonicalMutation {
                     session.id()
                 ))
             })?;
+        session.note_durable_transcript_rewrites(self.successor_head.rewrite_count);
         Ok(())
     }
 }
