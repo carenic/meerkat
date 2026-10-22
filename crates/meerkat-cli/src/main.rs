@@ -16148,6 +16148,12 @@ fn cli_scheduled_session_build(
 #[cfg(feature = "session-store")]
 #[async_trait::async_trait]
 impl SurfaceScheduleSessionHost for CliScheduleSessionHost {
+    /// Its prompt and event deliveries admit through
+    /// `accept_schedule_runtime_input_with_reconciliation` on the calling task.
+    fn decides_existing_admission(&self) -> bool {
+        true
+    }
+
     async fn probe_session_target(
         &self,
         binding: &meerkat::SessionTargetBinding,

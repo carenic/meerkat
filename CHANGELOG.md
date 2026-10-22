@@ -35,6 +35,89 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- `meerkat-schedule`: the occurrence lifecycle carries the admission evidence
+  of an occurrence's receipt history (see Fixed, scheduled delivery after a
+  lost executor). `OccurrenceLifecycleInput::ClassifyDue` and `Claim` gain the
+  field `admission_evidence: AdmissionEvidence`, `ResolveTargetProbe` gains
+  the field `redelivery: Option<ExistingDelivery>` (the redelivery the claim
+  named, `None` for an ordinary claim), and the input gains the variants
+  `ResolveReclaimExhausted` and `ResolveUnprovenLateNotAdmitted`.
+  `OccurrenceLifecycleEffect` gains `DueReclaimExhausted`,
+  `ReclaimedAfterAdmission` and `ReclaimedAfterUnprovenDispatch`.
+  `OccurrenceDueAction` gains `ReclaimExhausted` and is now
+  `#[non_exhaustive]`. `Occurrence::classify_due_action` takes the evidence
+  as a second argument. The gate's findings: added enum variants, struct
+  variant fields added, a method parameter count change, and an enum marked
+  non-exhaustive. Code outside the crate that builds these inputs passes
+  `AdmissionEvidence::None` and `redelivery: None`, the earlier behaviour,
+  unless it derives the evidence with `AdmissionEvidence::from_receipt_stages`
+  and the redelivery from the claim's effects. The variants after the new
+  ones change their implicit discriminants (`OccurrenceLifecycleEffect::*`
+  and `OccurrenceLifecycleInput::*`); match them by variant name, not by
+  numeric cast. The persisted occurrence is unchanged (schema version 9).
+- `meerkat-machine-kernels`: the generated occurrence machine
+  (`generated::occurrence_lifecycle`) gains the same inputs and effects:
+  `Input`, `InputKind` and `OccurrenceLifecycleInputVariant` gain
+  `ResolveReclaimExhausted` and `ResolveUnprovenLateNotAdmitted`; `Effect`
+  and `EffectKind` gain `DueReclaimExhausted`, `ReclaimedAfterAdmission` and
+  `ReclaimedAfterUnprovenDispatch`; `TransitionId` gains
+  `ClassifyDuePendingReclaimExhausted`, `ClaimPendingAfterAdmission`,
+  `ClaimPendingAfterUnprovenDispatch`, `TargetProbeBusyExistingRedelivery`,
+  `ReclaimExhaustedAfterAdmission`, `ReclaimExhaustedAfterUnprovenDispatch`,
+  `UnprovenLateNotAdmittedFromClaimed` and
+  `UnprovenLateNotAdmittedFromDispatching`. So their implicit discriminants
+  change (`EffectKind::*`, `InputKind::*`,
+  `OccurrenceLifecycleInputVariant::*` and `TransitionId::*`), and so does
+  the `PartialOrd` order of `OccurrenceLifecycleInputVariant::*`; match them
+  by variant name, not by numeric cast or position. The input structs
+  `ClassifyDue` and `Claim` gain the public field `admission_evidence`, and
+  `ResolveTargetProbe` gains `redelivery` (struct literals need them).
+- `meerkat-machine-schema` (`catalog::dsl::occurrence_lifecycle`): the
+  occurrence machine's DSL enums gain the same variants and input fields
+  (`OccurrenceLifecycleEffectVariant` and `OccurrenceLifecycleInputVariant`
+  included), so their implicit discriminants change
+  (`OccurrenceLifecycleEffect::*`, `OccurrenceLifecycleEffectVariant::*`,
+  `OccurrenceLifecycleInput::*` and `OccurrenceLifecycleInputVariant::*`)
+  and so does the `PartialOrd` order of `OccurrenceLifecycleEffectVariant::*`
+  and `OccurrenceLifecycleInputVariant::*`; match them by variant name, not
+  by numeric cast or position.
+
+### Added
+
+- `meerkat-schedule`: `ScheduleTargetDelivery::deliver_existing_occurrence`,
+  a defaulted method the driver calls to redeliver a reclaimed occurrence
+  whose earlier attempt recorded its dispatch, with `ExistingDelivery`
+  (`Admitted`, `UnprovenLate`) and the answer `ExistingDeliveryAnswer`
+  (`Dispatch`, `NotAdmittedPastDeadline`), both `#[non_exhaustive]`. The
+  default delivers an admitted occurrence through `deliver_occurrence` and
+  answers `NotAdmittedPastDeadline` for an unproven late one, so an
+  implementation that cannot tell never delivers a late occurrence fresh.
+  `AdmissionEvidence`, `ADMITTED_RECLAIM_ATTEMPT_CAP` (5) and
+  `Occurrence::reclaim_exhausted_detail` come with it. `meerkat` re-exports
+  the two delivery types, and `SurfaceScheduleMobHost` gains the defaulted
+  `deliver_existing_mob_target` and `deliver_existing_identity_target`.
+  `SurfaceScheduleSessionHost` gains the defaulted
+  `decides_existing_admission` (default `false`): a host that returns `true`
+  admits its prompt and event deliveries through
+  `accept_schedule_runtime_input_with_reconciliation` on the calling task, so
+  a redelivery through it only replays the earlier input, and a host that
+  declares it but admits another way is logged as an incident. With the
+  default the adapter answers an unproven late redelivery not admitted
+  without asking the host, and delivers an admitted one through the host's
+  ordinary delivery. The built-in hosts return `true`.
+- `meerkat-runtime`: `SessionServiceRuntimeExt::accept_existing_input_with_completion`,
+  a deduplicate-only admission. It answers as `accept_input_with_completion`
+  does for a replay of an input admitted earlier under the same idempotency
+  key, and otherwise refuses with the new
+  `RuntimeDriverError::NoExistingAdmission { key }`, admitting nothing. Each
+  driver decides it where it decides deduplication, under its lock and after
+  registration's recovery, so a binding that recovery or an archive released
+  is seen as gone, never admitted again. The trait default refuses.
+  `MeerkatMachine::accept_existing_input_with_completion_for_attachment_and_member_residency`
+  is the same for a mob member's attachment.
+
 ### Fixed
 
 - A turn that compacts its history more often than
@@ -50,6 +133,44 @@ them.
   occurrence that head does not cover yet, even past the retention bound, and
   retires down to the bound at its first compaction after a checkpoint covers
   them.
+- `meerkat-schedule`, `meerkat`, `meerkat-store`, `meerkat-mob-mcp`: a
+  scheduled delivery whose executor died after the target admitted it ended
+  `misfired` under `skip` once its lease lapsed: the reclaim past the misfire
+  deadline was refused, although the input had been admitted and could still
+  complete. This lifts the 0.9.4 known limitation that such a delivery was
+  reclaimed only inside its misfire window: keeping its crash recovery no
+  longer needs a `catch_up_within` window longer than the lease. A reclaim
+  now follows the misfire policy only when no earlier attempt recorded its
+  dispatch:
+  - an earlier attempt's admission is recorded (a `dispatch_accepted`
+    receipt): the occurrence is reclaimed, also past its misfire deadline, for
+    up to five attempts. The redelivery uses the runtime's deduplicate-only
+    admission, so it finds the admitted input and never admits it again, and
+    the occurrence records that input's outcome. A target still busy with
+    that input does not end the redelivery under `skip_if_running`, since a
+    redelivery starts no new run. After five lost executors it ends
+    `delivery_failed` with `lease_lost`; an input the runtime no longer knows
+    (a row that recovery discarded, a store-less runtime's archived input)
+    ends it `delivery_failed` (failure class `runtime_rejected`) with nothing
+    admitted. A host runnable keeps no admission record and runs again, so
+    for host runnables the guarantee is at-least-once and relies on the
+    runnable deduplicating on `delivery_idempotency_key`. A target delivery
+    that keeps the default `deliver_existing_occurrence` redelivers through
+    its ordinary delivery and relies on that delivery's durable
+    deduplication;
+  - only an earlier dispatch start is recorded: a reclaim past the deadline
+    asks the target, a busy one too, whether it admitted the delivery. It
+    records that input's outcome when the target did, and ends `misfired`
+    with nothing delivered when it did not. A mob target answers from its
+    durable external-delivery record and begins none;
+  - no dispatch was recorded (a crash before the dispatch start was
+    recorded): the misfire policy decides, as before.
+  The evidence is read from the occurrence's receipt history in both stores
+  (SQLite decodes `receipt_json` of a reclaimed row only), so no column and no
+  schema step is added.
+  The scheduling guide also names the failure class that the 0.9.4
+  `runtime_completion_authority_unavailable` end is recorded with:
+  `internal_error`.
 
 - `SqliteSessionStore::list` and `load_meta` no longer fail now and then
   with `SessionStoreError::Corrupted` for an intact HeadCanonical session
