@@ -58,6 +58,14 @@ them.
   commit between the two paired the old head with the new metadata. Both
   reads now take the head and its metadata from one read transaction.
 
+- `meerkat-mob`: an identity whose lease claim meets a live holder retries
+  as soon as that holder's lease expires. Reconciliation claims a lease it
+  reads as expired, and the claim can still find it held: another
+  incarnation claimed it in between, or the identity store's clock runs
+  behind the actor's. Such an identity stayed unreconciled until the slow
+  safety scan, about five minutes later; it now waits for the holder's
+  expiry, at least one second, the same way as `AwaitLease`.
+
 ## [0.9.4] - 2026-10-20
 
 ### Breaking

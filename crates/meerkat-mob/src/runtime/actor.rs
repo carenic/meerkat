@@ -25490,6 +25490,18 @@ impl MobActor {
                     super::IdentityRecoveryFailStopPoint::LeaseAcquired,
                 );
             }
+            if let IdentityLeaseClaimOutcome::HeldByOther(active) = &outcome {
+                // The claim met a live holder although the lease read showed
+                // it expired: another incarnation claimed it in between, or
+                // the store's clock is behind this actor's. Wait for that
+                // holder's expiry, at least one re-check interval.
+                self.schedule_identity_reconcile_wait(
+                    identity,
+                    IdentityReconcileAuthorityKey::from_observation(&intent_observation),
+                    identity_lease_wait_delay(Some(active.expires_at_ms), now_ms)
+                        .max(IDENTITY_RECONCILE_LEASE_RECHECK),
+                );
+            }
             return Ok(IdentityReconcilePassDisposition::Outcome(matches!(
                 outcome,
                 IdentityLeaseClaimOutcome::Acquired(_) | IdentityLeaseClaimOutcome::Renewed(_)

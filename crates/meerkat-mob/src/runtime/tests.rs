@@ -16947,6 +16947,287 @@ async fn an_adopted_identity_converges_once_the_previous_incarnations_lease_expi
     resumed.shutdown().await.expect("shutdown resumed mob");
 }
 
+/// An identity store clock that runs `lag_ms` behind this process's clock.
+struct LaggingIdentityStoreClock {
+    lag_ms: u64,
+}
+
+impl crate::store::MobIdentityStoreClock for LaggingIdentityStoreClock {
+    fn now_ms(&self) -> Result<u64, MobStoreError> {
+        crate::store::MobIdentityStoreClock::now_ms(&crate::store::SystemMobIdentityStoreClock)
+            .map(|now_ms| now_ms.saturating_sub(self.lag_ms))
+    }
+}
+
+#[tokio::test]
+async fn a_lost_identity_lease_claim_is_retried_once_the_holders_lease_expires() {
+    // The store's clock runs behind the actor's, so the resumed actor reads
+    // the previous incarnation's lease as expired while the store still holds
+    // it: the actor's claim meets a live holder.
+    const STORE_CLOCK_LAG_MS: u64 = 5_000;
+    const PREVIOUS_LEASE_TTL_MS: u64 = 4_000;
+
+    let definition = with_unique_mob_id(sample_definition(), "identity-lost-lease-claim");
+    let mob_id = definition.id.clone();
+    let event_store = InMemoryMobEventStore::new();
+    let runs = Arc::new(InMemoryMobRunStore::new());
+    let specs = Arc::new(InMemoryMobSpecStore::new());
+    let runtime_metadata = Arc::new(InMemoryMobRuntimeMetadataStore::new());
+    let identity_store = Arc::new(InMemoryMobIdentityStore::paired_with_event_store(
+        &event_store,
+        Arc::new(LaggingIdentityStoreClock {
+            lag_ms: STORE_CLOCK_LAG_MS,
+        }),
+    ));
+    let events: Arc<dyn MobEventStore> = Arc::new(event_store);
+    let identity_status = Arc::new(InMemoryMobIdentityStatusStore::new());
+    let session_store_dyn: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let blob_store: Arc<dyn meerkat_core::BlobStore> =
+        Arc::new(meerkat_store::MemoryBlobStore::new());
+    let service = Arc::new(meerkat_session::PersistentSessionService::new(
+        PersistentMockBuilder,
+        16,
+        session_store_dyn,
+        runtime_store,
+        blob_store,
+    ));
+    let storage = || MobStorage {
+        events: events.clone(),
+        runs: runs.clone(),
+        specs: specs.clone(),
+        definition_projection_composition:
+            crate::storage::DefinitionProjectionComposition::Independent,
+        runtime_metadata: runtime_metadata.clone(),
+        identity: identity_store.clone(),
+        identity_member: Some(identity_store.clone()),
+        identity_status: identity_status.clone(),
+        identity_status_projection_order: Default::default(),
+        realm_profiles: None,
+        forked_participants: None,
+    };
+    let base_prompt = || {
+        Arc::new(crate::StaticSpawnBasePromptSource(
+            "lost lease claim test base prompt".to_string(),
+        ))
+    };
+    let handle = MobBuilder::new(definition, storage())
+        .with_session_service(service.clone())
+        .with_spawn_base_prompt_source(base_prompt())
+        .create()
+        .await
+        .expect("create lost-lease-claim test mob");
+    let member = AgentIdentity::from("worker-1");
+    let mut spawn = SpawnMemberSpec::new(ProfileName::from("worker"), member.clone());
+    spawn.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    handle
+        .spawn_spec(spawn)
+        .await
+        .expect("spawn pre-existing member");
+    let session_id = handle
+        .resolve_bridge_session_id(&member)
+        .await
+        .expect("session-backed member");
+    let adoption = crate::identity::AdoptMemberIdentityDeclaration {
+        mob_id: mob_id.clone(),
+        agent_identity: member.clone(),
+        request_id: crate::identity::IdentityAdoptionId::new("adopt-worker-1")
+            .expect("valid adoption id"),
+        precondition: crate::identity::IdentityAdoptionPrecondition::ExpectedAbsent,
+        declaration_scope: crate::identity::IdentityDeclarationScopeId::new("example-policy")
+            .expect("valid declaration scope"),
+        declaration_revision: 1,
+        session: crate::identity::DesiredSessionTarget {
+            session_id: session_id.clone(),
+            lineage_id: meerkat_core::SessionLineageId::for_session(&session_id),
+            lineage_generation: meerkat_core::SessionGeneration::INITIAL,
+            authority_policy: crate::identity::DesiredSessionAuthorityPolicy::RequireExisting,
+        },
+        member: crate::identity::IdentityProfileMemberDeclaration {
+            profile_name: ProfileName::from("worker"),
+            profile_override: None,
+            model_override: None,
+            external_addressable_override: None,
+            context: None,
+            labels: None,
+            additional_instructions: None,
+            system_prompt_override: None,
+            tool_access_policy: None,
+            auth_binding: None,
+            budget_limits: None,
+            runtime_mode: Some(meerkat_contracts::wire::WireMobRuntimeMode::TurnDriven),
+            required_env_keys: Vec::new(),
+            required_local_callback_tools: Vec::new(),
+            execution: crate::identity::DesiredExecution::ControllingSession,
+        },
+        wiring_custody: crate::identity::IdentityWiringCustody::ExternalManaged,
+        owned_wiring: BTreeSet::new(),
+        convergence: crate::identity::IdentityConvergenceMode::Drain { max_wait_ms: 5_000 },
+    };
+    assert!(matches!(
+        handle
+            .adopt_member_identity_declaration(adoption)
+            .await
+            .expect("adopt existing member")
+            .adoption,
+        crate::identity::IdentityAdoptionOutcome::Adopted {
+            desired_revision: 1
+        }
+    ));
+    let converged = |status: &crate::identity::IdentityStoredObservation<
+        crate::identity::IdentityConvergenceStatus,
+    >,
+                     after_epoch: u64| {
+        matches!(
+            status,
+            crate::identity::IdentityStoredObservation::Valid(
+                crate::identity::IdentityConvergenceStatus {
+                    intent_revision: Some(1),
+                    decision: Some(crate::identity::IdentityReconcileDecision::Converged),
+                    lease_epoch: Some(epoch),
+                    ..
+                }
+            ) if *epoch > after_epoch
+        )
+    };
+    let adoption_convergence = tokio::time::timeout(Duration::from_secs(20), async {
+        while !converged(
+            &handle
+                .identity_convergence_status(&member)
+                .await
+                .expect("read adoption convergence"),
+            0,
+        ) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        adoption_convergence.is_ok(),
+        "adoption must converge before the restart; latest status: {:?}",
+        handle
+            .identity_convergence_status(&member)
+            .await
+            .expect("read final adoption convergence")
+    );
+    let previous = match identity_store
+        .observe_identity_lease(&mob_id, &member)
+        .await
+        .expect("read the converged identity lease")
+    {
+        crate::identity::IdentityStoredObservation::Valid(
+            crate::identity::IdentityLeaseRecord {
+                active: Some(claim),
+                ..
+            },
+        ) => claim,
+        other => panic!("a converged identity holds a live lease, got {other:?}"),
+    };
+
+    // The process ends without releasing the lease, after a last renewal
+    // that the store stamps with its own, lagging clock: the resumed actor
+    // reads that lease as expired, but the store holds it for the renewal's
+    // lifetime.
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown lost-lease-claim test mob");
+    let previous = match identity_store
+        .claim_or_renew_identity_lease(
+            &mob_id,
+            &member,
+            &previous.holder_id,
+            &previous.incarnation_id,
+            PREVIOUS_LEASE_TTL_MS,
+        )
+        .await
+        .expect("renew the previous incarnation's lease")
+    {
+        crate::identity::IdentityLeaseClaimOutcome::Renewed(claim)
+        | crate::identity::IdentityLeaseClaimOutcome::Acquired(claim) => claim,
+        crate::identity::IdentityLeaseClaimOutcome::HeldByOther(other) => {
+            panic!("no other incarnation may hold the lease yet: {other:?}")
+        }
+    };
+    let resumed = MobBuilder::for_resume(storage())
+        .with_session_service(service.clone())
+        .with_spawn_base_prompt_source(base_prompt())
+        .notify_orchestrator_on_resume(false)
+        .resume()
+        .await
+        .expect("resume while the store still holds the previous lease");
+
+    let mut lost_claim = false;
+    let resumed_convergence = tokio::time::timeout(
+        Duration::from_millis(PREVIOUS_LEASE_TTL_MS) + Duration::from_secs(5),
+        async {
+            loop {
+                let status = resumed
+                    .identity_convergence_status(&member)
+                    .await
+                    .expect("read resumed convergence");
+                if converged(&status, previous.epoch) {
+                    break;
+                }
+                if matches!(
+                    status,
+                    crate::identity::IdentityStoredObservation::Valid(
+                        crate::identity::IdentityConvergenceStatus {
+                            decision: Some(
+                                crate::identity::IdentityReconcileDecision::AcquireLease
+                            ),
+                            ..
+                        }
+                    )
+                ) {
+                    lost_claim |= matches!(
+                        identity_store
+                            .observe_identity_lease(&mob_id, &member)
+                            .await
+                            .expect("read the identity lease while claiming"),
+                        crate::identity::IdentityStoredObservation::Valid(
+                            crate::identity::IdentityLeaseRecord {
+                                active: Some(claim),
+                                ..
+                            }
+                        ) if claim.incarnation_id == previous.incarnation_id
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
+    .await;
+    let lease = identity_store
+        .observe_identity_lease(&mob_id, &member)
+        .await
+        .expect("read the identity lease after resume");
+    assert!(
+        resumed_convergence.is_ok(),
+        "a lost lease claim must be retried once the holder's lease expires, not at the slow safety scan; latest status: {:?}; lease: {lease:?}",
+        resumed
+            .identity_convergence_status(&member)
+            .await
+            .expect("read final resumed convergence")
+    );
+    assert!(
+        lost_claim,
+        "the resumed incarnation's claim must first meet the lease the store still holds"
+    );
+    assert!(
+        matches!(
+            &lease,
+            crate::identity::IdentityStoredObservation::Valid(crate::identity::IdentityLeaseRecord {
+                active: Some(claim),
+                ..
+            }) if claim.incarnation_id != previous.incarnation_id && claim.epoch > previous.epoch
+        ),
+        "the resumed incarnation must hold the lease: {lease:?}"
+    );
+    resumed.shutdown().await.expect("shutdown resumed mob");
+}
+
 #[tokio::test]
 async fn test_existing_member_adoption_preserves_prompt_sequence_without_spawn_prompt_source() {
     let definition = with_unique_mob_id(sample_definition(), "persisted-prompt-adoption");
