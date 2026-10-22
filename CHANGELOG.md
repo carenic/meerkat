@@ -98,6 +98,15 @@ them.
   `Occurrence::reclaim_exhausted_detail` come with it. `meerkat` re-exports
   the two delivery types, and `SurfaceScheduleMobHost` gains the defaulted
   `deliver_existing_mob_target` and `deliver_existing_identity_target`.
+  `SurfaceScheduleSessionHost` gains the defaulted
+  `decides_existing_admission` (default `false`): a host that returns `true`
+  admits its prompt and event deliveries through
+  `accept_schedule_runtime_input_with_reconciliation` on the calling task, so
+  a redelivery through it only replays the earlier input, and a host that
+  declares it but admits another way is logged as an incident. With the
+  default the adapter answers an unproven late redelivery not admitted
+  without asking the host, and delivers an admitted one through the host's
+  ordinary delivery. The built-in hosts return `true`.
 - `meerkat-runtime`: `SessionServiceRuntimeExt::accept_existing_input_with_completion`,
   a deduplicate-only admission. It answers as `accept_input_with_completion`
   does for a replay of an input admitted earlier under the same idempotency

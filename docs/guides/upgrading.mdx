@@ -102,6 +102,18 @@ when an unproven late delivery was never admitted. A custom
 `SessionServiceRuntimeExt` inherits `accept_existing_input_with_completion`,
 whose default refuses with `RuntimeDriverError::NoExistingAdmission`.
 
+A custom `SurfaceScheduleSessionHost` inherits the new defaulted
+`decides_existing_admission`, which answers `false`: the shared adapter then
+never asks the host to redeliver an unproven late occurrence (it ends
+`misfired`), and redelivers an admitted one through the host's ordinary
+`deliver_prompt` or `deliver_event`, relying on their stable-key
+deduplication.
+
+**Do:** return `true` only when the host's `deliver_prompt` and
+`deliver_event` admit through
+`accept_schedule_runtime_input_with_reconciliation` on the task that calls
+them; a redelivery through such a host only replays the earlier input.
+
 ### Other behaviour changes
 
 - **Crash recovery of scheduled deliveries:** a delivery whose executor died
@@ -126,6 +138,9 @@ whose default refuses with `RuntimeDriverError::NoExistingAdmission`.
 2. Custom `ScheduleTargetDelivery` implementations: override
    `deliver_existing_occurrence` if the target can find an earlier admission
    without admitting anew.
+3. Custom `SurfaceScheduleSessionHost` implementations: return `true` from
+   `decides_existing_admission` only if they admit through
+   `accept_schedule_runtime_input_with_reconciliation` on the calling task.
 
 ## Upgrading to 0.9.4
 

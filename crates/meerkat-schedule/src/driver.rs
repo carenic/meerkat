@@ -223,7 +223,8 @@ pub enum ExistingDelivery {
     /// A host runnable keeps no admission record and runs again, so for host
     /// runnables the guarantee is at-least-once and relies on the runnable
     /// deduplicating on its `delivery_idempotency_key`. The trait's default
-    /// (and the surface mob host's defaults) redeliver an admitted occurrence
+    /// and the surface hosts' defaults (a mob host, a session host that does
+    /// not decide existing-only admission) redeliver an admitted occurrence
     /// through the ordinary delivery and rely on its durable deduplication:
     /// a target that lost the admission admits the delivery again.
     Admitted,

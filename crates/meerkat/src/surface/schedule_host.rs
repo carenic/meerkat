@@ -355,10 +355,32 @@ pub trait SurfaceScheduleSessionHost: Send + Sync {
         create: &SessionMaterializationSpec,
     ) -> Result<SessionId, ScheduleDomainError>;
 
+    /// Whether this host decides a redelivery's existing-only admission
+    /// ([`ExistingDelivery`]): its [`Self::deliver_prompt`] and
+    /// [`Self::deliver_event`] admit through
+    /// [`accept_schedule_runtime_input_with_reconciliation`], on the task
+    /// that calls them, with the runtime they admit through. The adapter then
+    /// runs a redelivery inside a redelivery scope that helper reads, so the
+    /// runtime only finds the earlier admission and never admits the
+    /// delivery fresh; a host that declares this and admits any other way is
+    /// reported as an incident.
+    ///
+    /// The default `false` fails closed: the adapter never asks the host for
+    /// an [`ExistingDelivery::UnprovenLate`] redelivery (the occurrence ends
+    /// misfired, as before), and delivers an [`ExistingDelivery::Admitted`]
+    /// one through the ordinary [`Self::deliver_prompt`] or
+    /// [`Self::deliver_event`], whose stable-key deduplication finds the
+    /// earlier admission (a host that lost it admits the delivery again).
+    fn decides_existing_admission(&self) -> bool {
+        false
+    }
+
     /// Admit the prompt under `identity.idempotency_key` before returning.
     /// An exact replay must return the original admission result without a
     /// second input. Ordinary errors certify that admission did not occur;
-    /// an unknown post-admission outcome uses `DeliveryRepairDeferred`.
+    /// an unknown post-admission outcome uses `DeliveryRepairDeferred`. A
+    /// host that declares [`Self::decides_existing_admission`] admits through
+    /// [`accept_schedule_runtime_input_with_reconciliation`] on this task.
     async fn deliver_prompt(
         &self,
         session_id: &SessionId,
@@ -1327,12 +1349,14 @@ fn existing_delivery_unknown(
 /// [`accept_schedule_runtime_input_with_reconciliation`], which every
 /// runtime-backed host's delivery reaches, admits through the runtime's
 /// deduplicate-only admission while it is set. `not_admitted` records that
-/// an unproven late redelivery found no earlier admission.
+/// an unproven late redelivery found no earlier admission; `consumed` that
+/// the helper read the scope, the witness that the host admitted through it.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone)]
 struct ExistingAdmissionScope {
     existing: ExistingDelivery,
     not_admitted: Arc<std::sync::atomic::AtomicBool>,
+    consumed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1349,6 +1373,14 @@ fn existing_admission_scope() -> Option<ExistingAdmissionScope> {
 impl SharedScheduleTargetAdapter {
     /// Deliver a session action as a redelivery that may only find the
     /// earlier admission.
+    ///
+    /// A session host that does not decide an existing-only admission
+    /// ([`SurfaceScheduleSessionHost::decides_existing_admission`]) is never
+    /// asked for an unproven late redelivery, and gets an admitted one
+    /// through its ordinary delivery, like the other defaults. A host that
+    /// does runs it inside the redelivery scope; if it reports an admission
+    /// without its helper having read the scope, it admitted some other way,
+    /// possibly fresh: an incident.
     #[cfg(not(target_arch = "wasm32"))]
     async fn deliver_existing_session_action(
         &self,
@@ -1358,10 +1390,21 @@ impl SharedScheduleTargetAdapter {
         action: &ScheduledSessionAction,
         existing: ExistingDelivery,
     ) -> Result<ExistingDeliveryAnswer, ScheduleDomainError> {
+        if !self.session_host.decides_existing_admission() {
+            return match existing {
+                ExistingDelivery::Admitted => self
+                    .deliver_session_action(occurrence, identity, resolved, action)
+                    .await
+                    .map(ExistingDeliveryAnswer::Dispatch),
+                _ => Ok(ExistingDeliveryAnswer::NotAdmittedPastDeadline),
+            };
+        }
         let not_admitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let consumed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let scope = ExistingAdmissionScope {
             existing,
             not_admitted: Arc::clone(&not_admitted),
+            consumed: Arc::clone(&consumed),
         };
         let delivered = EXISTING_ADMISSION
             .scope(
@@ -1372,6 +1415,22 @@ impl SharedScheduleTargetAdapter {
         if not_admitted.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(ExistingDeliveryAnswer::NotAdmittedPastDeadline);
         }
+        let bypassed = !consumed.load(std::sync::atomic::Ordering::SeqCst)
+            && matches!(
+                &delivered,
+                Ok(dispatch) if dispatch.receipt.stage == DeliveryReceiptStage::DispatchAccepted
+            );
+        if bypassed {
+            tracing::error!(
+                occurrence_id = %occurrence.occurrence_id,
+                ?existing,
+                "a session host that decides existing-only admission admitted a redelivery without consulting the redelivery scope; it may have admitted the delivery fresh"
+            );
+        }
+        debug_assert!(
+            !bypassed,
+            "redelivery admitted without consulting the redelivery scope ({existing:?})"
+        );
         delivered.map(ExistingDeliveryAnswer::Dispatch)
     }
 }
@@ -2943,6 +3002,10 @@ where
     #[cfg(target_arch = "wasm32")]
     let existing: Option<std::convert::Infallible> = None;
     if let Some(existing) = existing {
+        #[cfg(not(target_arch = "wasm32"))]
+        existing
+            .consumed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         return accept_existing_schedule_runtime_input(
             runtime_adapter,
             session_id,
@@ -4826,6 +4889,288 @@ mod tests {
             0,
             "a redelivery materializes nothing"
         );
+    }
+
+    /// A session host that admits a scheduled prompt through its own runtime
+    /// call instead of [`accept_schedule_runtime_input_with_reconciliation`],
+    /// so it never reads a redelivery's scope.
+    struct OwnAdmissionHost {
+        runtime: Arc<MeerkatMachine>,
+        deliveries: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl SurfaceScheduleSessionHost for OwnAdmissionHost {
+        async fn probe_session_target(
+            &self,
+            _binding: &SessionTargetBinding,
+        ) -> Result<TargetProbeOutcome, ScheduleDomainError> {
+            Ok(TargetProbeOutcome::Ready)
+        }
+
+        async fn materialize_session(
+            &self,
+            _occurrence: &Occurrence,
+            _create: &SessionMaterializationSpec,
+        ) -> Result<SessionId, ScheduleDomainError> {
+            Err(ScheduleDomainError::Internal(
+                "this host targets an exact session".to_string(),
+            ))
+        }
+
+        async fn deliver_prompt(
+            &self,
+            session_id: &SessionId,
+            occurrence: &Occurrence,
+            identity: &ScheduleDeliveryIdentity,
+            dispatch: ScheduledPromptDispatch,
+        ) -> Result<DeliveryDispatch, ScheduleDomainError> {
+            self.deliveries.fetch_add(1, Ordering::SeqCst);
+            let mut prompt =
+                meerkat_runtime::PromptInput::from_content_input(dispatch.prompt, None);
+            prompt.header.idempotency_key = Some(meerkat_runtime::IdempotencyKey::new(
+                identity.idempotency_key.clone(),
+            ));
+            prompt.header.correlation_id = Some(schedule_runtime_correlation_id(identity)?);
+            let (outcome, handle) = self
+                .runtime
+                .accept_input_with_completion(session_id, meerkat_runtime::Input::Prompt(prompt))
+                .await
+                .map_err(|error| ScheduleDomainError::Internal(error.to_string()))?;
+            runtime_delivery_dispatch_from_admission(
+                &self.runtime,
+                session_id,
+                occurrence,
+                identity,
+                outcome,
+                handle,
+                dispatch.materialized_session_id,
+            )
+            .await
+        }
+
+        async fn deliver_event(
+            &self,
+            _session_id: &SessionId,
+            _occurrence: &Occurrence,
+            _identity: &ScheduleDeliveryIdentity,
+            _dispatch: ScheduledEventDispatch,
+        ) -> Result<DeliveryDispatch, ScheduleDomainError> {
+            Err(ScheduleDomainError::Internal(
+                "this host delivers prompts only".to_string(),
+            ))
+        }
+    }
+
+    /// A planned occurrence (ordinal `ordinal`) whose target is the exact
+    /// session `session_id`, as its first attempt.
+    fn exact_session_occurrence(session_id: &SessionId, ordinal: u64) -> Occurrence {
+        let schedule = meerkat_schedule::Schedule::new(meerkat_schedule::CreateScheduleRequest {
+            name: Some("existing-admission".to_string()),
+            description: None,
+            trigger: meerkat_schedule::TriggerSpec::Interval(
+                meerkat_schedule::IntervalTriggerSpec {
+                    start_at_utc: chrono::Utc::now(),
+                    every_seconds: 60,
+                    end_at_utc: None,
+                },
+            ),
+            target: TargetBinding::session(SessionTargetBinding::ExactSession {
+                session_id: session_id.clone(),
+                action: ScheduledSessionAction::Prompt {
+                    prompt: ContentInput::Text("scheduled prompt".to_string()),
+                    system_prompt: None,
+                    render_metadata: None,
+                    skill_refs: Vec::new(),
+                    additional_instructions: Vec::new(),
+                },
+            }),
+            misfire_policy: meerkat_schedule::MisfirePolicy::Skip,
+            overlap_policy: meerkat_schedule::OverlapPolicy::SkipIfRunning,
+            missing_target_policy: meerkat_schedule::MissingTargetPolicy::MarkMisfired,
+            labels: BTreeMap::new(),
+            planning_horizon_days: None,
+            planning_horizon_occurrences: None,
+        })
+        .expect("schedule creation should pass generated authority");
+        let mut occurrence = Occurrence::planned_from_schedule(
+            &schedule,
+            meerkat_schedule::OccurrenceOrdinal(ordinal),
+            chrono::Utc::now(),
+        )
+        .expect("occurrence planning should pass generated authority");
+        occurrence.attempt_count = 1;
+        occurrence
+    }
+
+    async fn admitted_input_count(runtime: &MeerkatMachine, session_id: &SessionId) -> usize {
+        runtime
+            .meerkat_machine_spine_snapshot(session_id)
+            .await
+            .expect("the session is registered")
+            .inputs
+            .admission_order
+            .len()
+    }
+
+    /// A session host that keeps the trait's default does not decide an
+    /// existing-only admission, so the adapter never asks it to redeliver an
+    /// unproven late occurrence: the answer is not admitted, and nothing
+    /// reaches the runtime. An admitted redelivery goes through its ordinary
+    /// delivery, like the other defaults. Before the capability, the adapter
+    /// asked every host, and one that admits through its own runtime call
+    /// admitted the late delivery fresh.
+    #[tokio::test]
+    async fn a_host_that_does_not_decide_existing_admission_never_redelivers_late() {
+        let runtime = Arc::new(MeerkatMachine::ephemeral());
+        let session_id = SessionId::new();
+        runtime
+            .register_session(session_id.clone())
+            .await
+            .expect("register the target session");
+        let deliveries = Arc::new(AtomicUsize::new(0));
+        let session_host: Arc<dyn SurfaceScheduleSessionHost> = Arc::new(OwnAdmissionHost {
+            runtime: Arc::clone(&runtime),
+            deliveries: Arc::clone(&deliveries),
+        });
+        let mob_host: Arc<dyn SurfaceScheduleMobHost> =
+            Arc::new(NoopScheduleMobHost::new("mob targets unused here"));
+        let service = ScheduleService::new(
+            Arc::new(meerkat_schedule::MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>
+        );
+        let adapter = SharedScheduleTargetAdapter::new(service, session_host, mob_host);
+
+        let late = exact_session_occurrence(&session_id, 0);
+        let answer = adapter
+            .deliver_existing_occurrence(
+                &late,
+                &ScheduleDeliveryIdentity::for_occurrence(&late),
+                ExistingDelivery::UnprovenLate,
+            )
+            .await
+            .expect("the unproven late redelivery answers");
+        assert!(
+            matches!(answer, ExistingDeliveryAnswer::NotAdmittedPastDeadline),
+            "an unproven late redelivery is never asked of this host: {answer:?}"
+        );
+        assert_eq!(
+            deliveries.load(Ordering::SeqCst),
+            0,
+            "the host is not asked"
+        );
+        assert_eq!(
+            admitted_input_count(&runtime, &session_id).await,
+            0,
+            "nothing reaches the runtime"
+        );
+
+        let admitted = exact_session_occurrence(&session_id, 1);
+        let answer = adapter
+            .deliver_existing_occurrence(
+                &admitted,
+                &ScheduleDeliveryIdentity::for_occurrence(&admitted),
+                ExistingDelivery::Admitted,
+            )
+            .await
+            .expect("the admitted redelivery answers");
+        let ExistingDeliveryAnswer::Dispatch(dispatch) = answer else {
+            panic!("an admitted redelivery answers with a dispatch: {answer:?}");
+        };
+        assert_eq!(
+            dispatch.receipt.stage,
+            DeliveryReceiptStage::DispatchAccepted
+        );
+        assert_eq!(
+            deliveries.load(Ordering::SeqCst),
+            1,
+            "an admitted redelivery goes through the host's ordinary delivery"
+        );
+    }
+
+    /// [`OwnAdmissionHost`] declaring that it decides existing-only admission
+    /// while it still admits through its own runtime call.
+    struct DeclaringOwnAdmissionHost(OwnAdmissionHost);
+
+    #[async_trait]
+    impl SurfaceScheduleSessionHost for DeclaringOwnAdmissionHost {
+        fn decides_existing_admission(&self) -> bool {
+            true
+        }
+
+        async fn probe_session_target(
+            &self,
+            binding: &SessionTargetBinding,
+        ) -> Result<TargetProbeOutcome, ScheduleDomainError> {
+            self.0.probe_session_target(binding).await
+        }
+
+        async fn materialize_session(
+            &self,
+            occurrence: &Occurrence,
+            create: &SessionMaterializationSpec,
+        ) -> Result<SessionId, ScheduleDomainError> {
+            self.0.materialize_session(occurrence, create).await
+        }
+
+        async fn deliver_prompt(
+            &self,
+            session_id: &SessionId,
+            occurrence: &Occurrence,
+            identity: &ScheduleDeliveryIdentity,
+            dispatch: ScheduledPromptDispatch,
+        ) -> Result<DeliveryDispatch, ScheduleDomainError> {
+            self.0
+                .deliver_prompt(session_id, occurrence, identity, dispatch)
+                .await
+        }
+
+        async fn deliver_event(
+            &self,
+            session_id: &SessionId,
+            occurrence: &Occurrence,
+            identity: &ScheduleDeliveryIdentity,
+            dispatch: ScheduledEventDispatch,
+        ) -> Result<DeliveryDispatch, ScheduleDomainError> {
+            self.0
+                .deliver_event(session_id, occurrence, identity, dispatch)
+                .await
+        }
+    }
+
+    /// A host that declares it decides existing-only admission but admits
+    /// through its own runtime call never reads the redelivery scope: the
+    /// adapter reports the incident, and a debug build stops on it, so a
+    /// host that stops consulting the scope fails its rows instead of
+    /// passing silently.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "redelivery admitted without consulting the redelivery scope")]
+    async fn a_declaring_host_that_bypasses_the_redelivery_scope_is_an_incident() {
+        let runtime = Arc::new(MeerkatMachine::ephemeral());
+        let session_id = SessionId::new();
+        runtime
+            .register_session(session_id.clone())
+            .await
+            .expect("register the target session");
+        let session_host: Arc<dyn SurfaceScheduleSessionHost> =
+            Arc::new(DeclaringOwnAdmissionHost(OwnAdmissionHost {
+                runtime: Arc::clone(&runtime),
+                deliveries: Arc::new(AtomicUsize::new(0)),
+            }));
+        let mob_host: Arc<dyn SurfaceScheduleMobHost> =
+            Arc::new(NoopScheduleMobHost::new("mob targets unused here"));
+        let service = ScheduleService::new(
+            Arc::new(meerkat_schedule::MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>
+        );
+        let adapter = SharedScheduleTargetAdapter::new(service, session_host, mob_host);
+        let late = exact_session_occurrence(&session_id, 0);
+        let _answer = adapter
+            .deliver_existing_occurrence(
+                &late,
+                &ScheduleDeliveryIdentity::for_occurrence(&late),
+                ExistingDelivery::UnprovenLate,
+            )
+            .await;
     }
 
     /// A service with a probe attached, and the adapter that owns the probe:
