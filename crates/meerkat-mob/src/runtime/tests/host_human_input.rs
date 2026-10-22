@@ -2032,6 +2032,8 @@ struct StopRow {
     digest: String,
     has_outbox: bool,
     pending_terminal_owner: bool,
+    /// The row's wire image, for facts a typed read cannot name yet.
+    image: serde_json::Value,
 }
 
 async fn stop_row(
@@ -2075,6 +2077,7 @@ async fn stop_row(
     }
     StopRow {
         has_outbox: !image["interaction_terminal_outbox"].is_null(),
+        image: image.clone(),
         digest: exact.exact_row_digest().to_owned(),
         stored,
         pending_terminal_owner,
@@ -2175,6 +2178,8 @@ enum StopAnswer {
     Other(String),
     Refused(String),
     Unresolved,
+    RequeuedAcrossStop(meerkat_core::lifecycle::InputId),
+    Abandoned(String),
 }
 
 async fn stop_answer(turn: WorkTurnHandle, session_id: &SessionId) -> StopAnswer {
@@ -2202,6 +2207,15 @@ async fn stop_answer(turn: WorkTurnHandle, session_id: &SessionId) -> StopAnswer
             kind: error.kind,
             detail: error.detail.clone(),
         },
+        BoundedTurnFailure::RequeuedAcrossStop {
+            session_id: failed,
+            input_id,
+        } if failed == session_id => StopAnswer::RequeuedAcrossStop(input_id.clone()),
+        BoundedTurnFailure::Abandoned {
+            session_id: failed,
+            reason,
+            ..
+        } if failed == session_id => StopAnswer::Abandoned(reason.clone()),
         other => StopAnswer::Other(format!("{other:?}")),
     }
 }
@@ -2587,4 +2601,539 @@ async fn queued_human_behind_a_running_turn_at_graceful_stop_is_terminated_once_
         .await
         .expect("mob shutdown finishes")
         .expect("mob shutdown");
+}
+
+const QUEUED_SECOND: &str = "A third question, queued behind the second.";
+const AFTER_RESTART: &str = "A question sent after the restart.";
+
+fn requeue_options(max_age: Duration) -> crate::ShutdownOptions {
+    crate::ShutdownOptions::default().with_queued_inputs(crate::QueuedInputsOnShutdown::Requeue(
+        crate::RequeueMaxAge::new(max_age).expect("an accepted requeue bound"),
+    ))
+}
+
+/// Start a Queue- or Steer-mode host human input on the stop fixture's member.
+async fn start_stop_input(
+    host: &StopHost,
+    entry: &RosterEntry,
+    spec: WorkSpec,
+    mode: HandlingMode,
+    key: &MobDeliveryIdentity,
+) -> Result<WorkTurnHandle, MobError> {
+    host.handle
+        .start_host_human_input_bounded(
+            entry.agent_runtime_id.clone(),
+            entry.fence_token,
+            spec,
+            mode,
+            key.clone(),
+            deadline(),
+        )
+        .await
+}
+
+/// A requeued input as the stopping process leaves it.
+#[derive(Debug, PartialEq)]
+struct RequeuedAtStop {
+    waiter: StopAnswer,
+    phase: meerkat_runtime::input_state::InputLifecycleState,
+    outcome: serde_json::Value,
+    payload_kept: bool,
+    replay_identity_kept: bool,
+    requeue_mark: bool,
+    outbox: bool,
+    pending_terminal_owner: bool,
+    runs_started: usize,
+}
+
+fn observe_requeued_at_stop(
+    waiter: StopAnswer,
+    row: &StopRow,
+    events: &[AgentEvent],
+    interaction_id: InteractionId,
+) -> RequeuedAtStop {
+    RequeuedAtStop {
+        waiter,
+        phase: row.stored.seed.phase,
+        outcome: serde_json::to_value(&row.stored.seed.terminal_outcome)
+            .expect("terminal outcome wire image"),
+        payload_kept: row.stored.state.persisted_input.is_some(),
+        replay_identity_kept: row.stored.state.prompt_replay_identity.is_some(),
+        requeue_mark: !row.image["stop_requeue"].is_null(),
+        outbox: row.has_outbox,
+        pending_terminal_owner: row.pending_terminal_owner,
+        runs_started: runs_started_for(events, interaction_id).len(),
+    }
+}
+
+/// The restarted process's handling of a requeued input: a same-key replay,
+/// then the row, the model requests and the log.
+#[derive(Debug, PartialEq)]
+struct RequeuedAfterRestart {
+    replay: StopAnswer,
+    phase: meerkat_runtime::input_state::InputLifecycleState,
+    outcome: serde_json::Value,
+    payload_kept: bool,
+    requests_carrying: usize,
+    runs_started: usize,
+}
+
+async fn observe_requeued_after_restart(
+    root: &std::path::Path,
+    host: &StopHost,
+    client: &ScriptedClient,
+    input: (
+        &MobDeliveryIdentity,
+        &meerkat_core::lifecycle::InputId,
+        WorkSpec,
+    ),
+    identity: &AgentIdentity,
+    session_id: &SessionId,
+    text: &str,
+) -> RequeuedAfterRestart {
+    let (key, input_id, spec) = input;
+    let entry = host
+        .handle
+        .get_member(identity)
+        .await
+        .expect("roster read")
+        .expect("the member survives the restart");
+    let replay = match start_stop_input(host, &entry, spec, HandlingMode::Queue, key).await {
+        Ok(replay) => stop_answer(replay, session_id).await,
+        Err(error) => StopAnswer::Refused(error.to_string()),
+    };
+    let row = stop_row(&host.runtime_store, session_id, key, input_id).await;
+    let events = stop_events(root, session_id).await;
+    RequeuedAfterRestart {
+        replay,
+        phase: row.stored.seed.phase,
+        outcome: serde_json::to_value(&row.stored.seed.terminal_outcome)
+            .expect("terminal outcome wire image"),
+        payload_kept: row.stored.state.persisted_input.is_some(),
+        requests_carrying: requests_carrying(&client.requests(), text),
+        runs_started: runs_started_for(&events, interaction(key)).len(),
+    }
+}
+
+/// Under a requeue Shutdown, a Queue-mode host human input still queued
+/// behind a running turn stays durably queued: its waiter is told it was
+/// requeued, its row keeps its payload, its replay identity and a requeue
+/// mark, and nothing ran it. The running input is still cancelled and is not
+/// run again. After the restart the requeued input runs exactly once and a
+/// same-key replay re-attaches to its result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requeue_shutdown_keeps_a_queued_human_input_and_runs_it_once_after_restart() {
+    use meerkat_runtime::input_state::InputLifecycleState;
+
+    let (_root, root_path) = stop_root();
+    let client = ScriptedClient::new(true);
+    let host = open_stop_host(&root_path, &client, Some("host-human-requeue")).await;
+    let mob_id = host.handle.mob_id().clone();
+    let (identity, session_id, entry) = spawn_stop_member(&host).await;
+
+    client.block();
+    let requests_before = client.requests().len();
+    let running_key = delivery("requeue-running");
+    let running = start_stop_input(
+        &host,
+        &entry,
+        WorkSpec::new(HUMAN, WorkOrigin::External),
+        HandlingMode::Queue,
+        &running_key,
+    )
+    .await
+    .expect("running human admission");
+    client.wait_for_requests(requests_before + 1).await;
+    let key = delivery("requeue-queued-behind");
+    let interaction_id = interaction(&key);
+    let spec = WorkSpec::new(QUEUED_HUMAN, WorkOrigin::External);
+    let queued = start_stop_input(&host, &entry, spec.clone(), HandlingMode::Queue, &key)
+        .await
+        .expect("queued human admission");
+    let input_id = admitted_input_id(&host.runtime_store, &session_id, &key).await;
+    let before_stop = stop_row(&host.runtime_store, &session_id, &key, &input_id).await;
+    assert_eq!(before_stop.stored.seed.phase, InputLifecycleState::Queued);
+
+    tokio::time::timeout(
+        WAIT,
+        host.handle
+            .shutdown_with_report(requeue_options(crate::RequeueMaxAge::DEFAULT)),
+    )
+    .await
+    .expect("the requeue stop finishes")
+    .expect("requeue stop");
+    let waiter = stop_answer(queued, &session_id).await;
+    let running_answer = stop_answer(running, &session_id).await;
+    let at_exit = stop_row(&host.runtime_store, &session_id, &key, &input_id).await;
+    let events = stop_events(&root_path, &session_id).await;
+    let at_stop = observe_requeued_at_stop(waiter, &at_exit, &events, interaction_id);
+    drop(host);
+    await_supervisor_route_release(&mob_id).await;
+
+    let restarted_client = ScriptedClient::new(true);
+    let restarted = open_stop_host(&root_path, &restarted_client, None).await;
+    let after_restart = observe_requeued_after_restart(
+        &root_path,
+        &restarted,
+        &restarted_client,
+        (&key, &input_id, spec),
+        &identity,
+        &session_id,
+        QUEUED_HUMAN,
+    )
+    .await;
+    let running_runs = runs_started_for(
+        &stop_events(&root_path, &session_id).await,
+        interaction(&running_key),
+    )
+    .len();
+    assert_eq!(
+        (running_answer, at_stop, after_restart, running_runs),
+        (
+            StopAnswer::Cancelled,
+            RequeuedAtStop {
+                waiter: StopAnswer::RequeuedAcrossStop(input_id.clone()),
+                phase: InputLifecycleState::Queued,
+                outcome: serde_json::Value::Null,
+                payload_kept: true,
+                replay_identity_kept: true,
+                requeue_mark: true,
+                outbox: false,
+                pending_terminal_owner: false,
+                runs_started: 0,
+            },
+            RequeuedAfterRestart {
+                replay: StopAnswer::Succeeded,
+                phase: InputLifecycleState::Consumed,
+                outcome: serde_json::json!({"outcome_type": "consumed"}),
+                payload_kept: false,
+                requests_carrying: 1,
+                runs_started: 1,
+            },
+            1,
+        ),
+        "the requeued input stays queued across the stop and runs once after the restart; \
+         the cancelled running input is not run again"
+    );
+    tokio::time::timeout(WAIT, restarted.handle.shutdown())
+        .await
+        .expect("mob shutdown finishes")
+        .expect("mob shutdown");
+}
+
+/// A requeued input older than the requeue bound when the next start
+/// recovers it ends as expired instead of running: payload retired, no run,
+/// no model request, and a same-key replay answers the expiry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requeue_shutdown_expires_a_queued_human_input_older_than_the_bound_at_restart() {
+    use meerkat_runtime::input_state::InputLifecycleState;
+
+    let (_root, root_path) = stop_root();
+    let client = ScriptedClient::new(true);
+    let host = open_stop_host(&root_path, &client, Some("host-human-requeue-expiry")).await;
+    let mob_id = host.handle.mob_id().clone();
+    let (identity, session_id, entry) = spawn_stop_member(&host).await;
+
+    client.block();
+    let requests_before = client.requests().len();
+    let running = start_stop_input(
+        &host,
+        &entry,
+        WorkSpec::new(HUMAN, WorkOrigin::External),
+        HandlingMode::Queue,
+        &delivery("requeue-expiry-running"),
+    )
+    .await
+    .expect("running human admission");
+    client.wait_for_requests(requests_before + 1).await;
+    let key = delivery("requeue-expiry-queued");
+    let interaction_id = interaction(&key);
+    let spec = WorkSpec::new(QUEUED_HUMAN, WorkOrigin::External);
+    let queued = start_stop_input(&host, &entry, spec.clone(), HandlingMode::Queue, &key)
+        .await
+        .expect("queued human admission");
+    let input_id = admitted_input_id(&host.runtime_store, &session_id, &key).await;
+
+    tokio::time::timeout(
+        WAIT,
+        host.handle
+            .shutdown_with_report(requeue_options(Duration::from_millis(1))),
+    )
+    .await
+    .expect("the requeue stop finishes")
+    .expect("requeue stop");
+    let waiter = stop_answer(queued, &session_id).await;
+    let _ = stop_answer(running, &session_id).await;
+    let at_exit = stop_row(&host.runtime_store, &session_id, &key, &input_id).await;
+    let events = stop_events(&root_path, &session_id).await;
+    let at_stop = observe_requeued_at_stop(waiter, &at_exit, &events, interaction_id);
+    drop(host);
+    await_supervisor_route_release(&mob_id).await;
+
+    let restarted_client = ScriptedClient::new(true);
+    let restarted = open_stop_host(&root_path, &restarted_client, None).await;
+    let after_restart = observe_requeued_after_restart(
+        &root_path,
+        &restarted,
+        &restarted_client,
+        (&key, &input_id, spec),
+        &identity,
+        &session_id,
+        QUEUED_HUMAN,
+    )
+    .await;
+    assert_eq!(
+        (at_stop.waiter.clone(), at_stop.requeue_mark, after_restart),
+        (
+            StopAnswer::RequeuedAcrossStop(input_id.clone()),
+            true,
+            RequeuedAfterRestart {
+                replay: StopAnswer::Abandoned("requeue expired".to_owned()),
+                phase: InputLifecycleState::Abandoned,
+                outcome: serde_json::json!({
+                    "outcome_type": "abandoned",
+                    "reason": "requeue_expired",
+                }),
+                payload_kept: false,
+                requests_carrying: 0,
+                runs_started: 0,
+            },
+        ),
+        "a requeued input past its bound at restart ends as expired and never runs"
+    );
+    tokio::time::timeout(WAIT, restarted.handle.shutdown())
+        .await
+        .expect("mob shutdown finishes")
+        .expect("mob shutdown");
+}
+
+/// Two inputs requeued in admission order, then one admitted right after the
+/// restart: the restarted member runs them in that order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requeue_shutdown_runs_requeued_inputs_in_admission_order_before_new_work() {
+    let (_root, root_path) = stop_root();
+    let client = ScriptedClient::new(true);
+    let host = open_stop_host(&root_path, &client, Some("host-human-requeue-order")).await;
+    let mob_id = host.handle.mob_id().clone();
+    let (identity, session_id, entry) = spawn_stop_member(&host).await;
+
+    client.block();
+    let requests_before = client.requests().len();
+    let running = start_stop_input(
+        &host,
+        &entry,
+        WorkSpec::new(HUMAN, WorkOrigin::External),
+        HandlingMode::Queue,
+        &delivery("requeue-order-running"),
+    )
+    .await
+    .expect("running human admission");
+    client.wait_for_requests(requests_before + 1).await;
+    let first_key = delivery("requeue-order-first");
+    let first_spec = WorkSpec::new(QUEUED_HUMAN, WorkOrigin::External);
+    let first = start_stop_input(
+        &host,
+        &entry,
+        first_spec.clone(),
+        HandlingMode::Queue,
+        &first_key,
+    )
+    .await
+    .expect("first queued admission");
+    let second_key = delivery("requeue-order-second");
+    let second_spec = WorkSpec::new(QUEUED_SECOND, WorkOrigin::External);
+    let second = start_stop_input(
+        &host,
+        &entry,
+        second_spec.clone(),
+        HandlingMode::Queue,
+        &second_key,
+    )
+    .await
+    .expect("second queued admission");
+
+    tokio::time::timeout(
+        WAIT,
+        host.handle
+            .shutdown_with_report(requeue_options(crate::RequeueMaxAge::DEFAULT)),
+    )
+    .await
+    .expect("the requeue stop finishes")
+    .expect("requeue stop");
+    let _ = stop_answer(first, &session_id).await;
+    let _ = stop_answer(second, &session_id).await;
+    let _ = stop_answer(running, &session_id).await;
+    drop(host);
+    await_supervisor_route_release(&mob_id).await;
+
+    let restarted_client = ScriptedClient::new(true);
+    let restarted = open_stop_host(&root_path, &restarted_client, None).await;
+    let restarted_entry = restarted
+        .handle
+        .get_member(&identity)
+        .await
+        .expect("roster read")
+        .expect("the member survives the restart");
+    let later = start_stop_input(
+        &restarted,
+        &restarted_entry,
+        WorkSpec::new(AFTER_RESTART, WorkOrigin::External),
+        HandlingMode::Queue,
+        &delivery("requeue-order-after-restart"),
+    )
+    .await
+    .expect("post-restart admission");
+    let later_answer = stop_answer(later, &session_id).await;
+    let first_replay = match start_stop_input(
+        &restarted,
+        &restarted_entry,
+        first_spec,
+        HandlingMode::Queue,
+        &first_key,
+    )
+    .await
+    {
+        Ok(replay) => stop_answer(replay, &session_id).await,
+        Err(error) => StopAnswer::Refused(error.to_string()),
+    };
+    let second_replay = match start_stop_input(
+        &restarted,
+        &restarted_entry,
+        second_spec,
+        HandlingMode::Queue,
+        &second_key,
+    )
+    .await
+    {
+        Ok(replay) => stop_answer(replay, &session_id).await,
+        Err(error) => StopAnswer::Refused(error.to_string()),
+    };
+    // The last request carries the whole transcript; read the order of the
+    // three user messages from it.
+    let requests = restarted_client.requests();
+    let order = requests.last().map(|request| {
+        [QUEUED_HUMAN, QUEUED_SECOND, AFTER_RESTART].map(|text| {
+            request.messages.iter().position(|message| {
+                matches!(message, Message::User(user) if user.text_content().contains(text))
+            })
+        })
+    });
+    let in_order = matches!(
+        order,
+        Some([Some(first), Some(second), Some(later)]) if first < second && second < later
+    );
+    assert_eq!(
+        (first_replay, second_replay, later_answer, in_order),
+        (
+            StopAnswer::Succeeded,
+            StopAnswer::Succeeded,
+            StopAnswer::Succeeded,
+            true
+        ),
+        "requeued inputs run in admission order, before work admitted after the restart: \
+         {order:?}"
+    );
+    tokio::time::timeout(WAIT, restarted.handle.shutdown())
+        .await
+        .expect("mob shutdown finishes")
+        .expect("mob shutdown");
+}
+
+/// Requeue keeps only eligible inputs: a Steer-mode input queued behind the
+/// running turn targets the cancelled run, so it is not requeued and never
+/// runs after the restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requeue_shutdown_does_not_keep_a_steer_input_queued_behind_the_running_turn() {
+    use meerkat_runtime::input_state::InputLifecycleState;
+
+    let (_root, root_path) = stop_root();
+    let client = ScriptedClient::new(true);
+    let host = open_stop_host(&root_path, &client, Some("host-human-requeue-steer")).await;
+    let mob_id = host.handle.mob_id().clone();
+    let (_identity, session_id, entry) = spawn_stop_member(&host).await;
+
+    client.block();
+    let requests_before = client.requests().len();
+    let running = start_stop_input(
+        &host,
+        &entry,
+        WorkSpec::new(HUMAN, WorkOrigin::External),
+        HandlingMode::Queue,
+        &delivery("requeue-steer-running"),
+    )
+    .await
+    .expect("running human admission");
+    client.wait_for_requests(requests_before + 1).await;
+    let key = delivery("requeue-steer-queued");
+    let interaction_id = interaction(&key);
+    let steer = start_stop_input(
+        &host,
+        &entry,
+        WorkSpec::new(QUEUED_HUMAN, WorkOrigin::External),
+        HandlingMode::Steer,
+        &key,
+    )
+    .await
+    .expect("steer human admission");
+    let input_id = admitted_input_id(&host.runtime_store, &session_id, &key).await;
+
+    tokio::time::timeout(
+        WAIT,
+        host.handle
+            .shutdown_with_report(requeue_options(crate::RequeueMaxAge::DEFAULT)),
+    )
+    .await
+    .expect("the requeue stop finishes")
+    .expect("requeue stop");
+    let _ = stop_answer(steer, &session_id).await;
+    let _ = stop_answer(running, &session_id).await;
+    let at_exit = stop_row(&host.runtime_store, &session_id, &key, &input_id).await;
+    drop(host);
+    await_supervisor_route_release(&mob_id).await;
+
+    let restarted_client = ScriptedClient::new(true);
+    let restarted = open_stop_host(&root_path, &restarted_client, None).await;
+    let after_restart = stop_row(&restarted.runtime_store, &session_id, &key, &input_id).await;
+    let events = stop_events(&root_path, &session_id).await;
+    assert_eq!(
+        (
+            at_exit.stored.seed.phase,
+            !at_exit.image["stop_requeue"].is_null(),
+            after_restart.digest == at_exit.digest,
+            requests_carrying(&restarted_client.requests(), QUEUED_HUMAN),
+            runs_started_for(&events, interaction_id).len(),
+        ),
+        (InputLifecycleState::Abandoned, false, true, 0, 0),
+        "a steer input is not requeued: terminal at the stop, never run after the restart"
+    );
+    tokio::time::timeout(WAIT, restarted.handle.shutdown())
+        .await
+        .expect("mob shutdown finishes")
+        .expect("mob shutdown");
+}
+
+#[test]
+fn requeue_max_age_refuses_zero_and_over_the_cap() {
+    use crate::{RequeueMaxAge, ShutdownOptionsError};
+
+    let over = RequeueMaxAge::CAP + Duration::from_millis(1);
+    assert_eq!(
+        (
+            RequeueMaxAge::new(Duration::ZERO),
+            RequeueMaxAge::new(over),
+            RequeueMaxAge::new(RequeueMaxAge::CAP).map(RequeueMaxAge::get),
+            RequeueMaxAge::new(Duration::from_millis(1)).map(RequeueMaxAge::get),
+            RequeueMaxAge::default().get(),
+        ),
+        (
+            Err(ShutdownOptionsError::RequeueMaxAgeZero),
+            Err(ShutdownOptionsError::RequeueMaxAgeOverCap {
+                max_age: over,
+                cap: RequeueMaxAge::CAP,
+            }),
+            Ok(Duration::from_hours(24)),
+            Ok(Duration::from_millis(1)),
+            Duration::from_mins(15),
+        )
+    );
 }
