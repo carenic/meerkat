@@ -39146,9 +39146,9 @@ mod governed_host_original_tests {
             .await;
             match outcome {
                 Ok(status) => status,
-                Err(_) => panic!(
-                    "the host original was neither applied nor settled; last pass {:?}; \
-                     binds {}, without a live actor {}",
+                Err(elapsed) => panic!(
+                    "the host original was neither applied nor settled ({elapsed}); last pass \
+                     {:?}; binds {}, without a live actor {}",
                     self.passes.borrow().clone(),
                     self.binder.binds.load(Ordering::SeqCst),
                     self.binder.not_live.load(Ordering::SeqCst),
