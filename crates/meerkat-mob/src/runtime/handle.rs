@@ -2525,6 +2525,11 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         MobError::MemberRestoreFailed { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::MemberRestoreFailed
         }
+        // Never a spawn outcome today (a spawn on a stopped actor gets
+        // ActorCommandChannelClosed); were it one, it classifies as its cause.
+        MobError::MemberStartupRecoveryFailed { cause, .. } => {
+            spawn_many_failure_observation(cause.as_ref())
+        }
         // A degraded or detached runtime registration is a session fault of
         // the existing member; the spawn row records it as its session cause.
         MobError::MemberReloadRequired { .. } | MobError::MemberRuntimeDetached { .. } => {
@@ -7261,9 +7266,15 @@ impl MobHandle {
                 }
             }
         };
+        // An actor that stopped in its startup recovery answers with that
+        // failure, so every joined observer gets it, typed.
+        let terminal = terminal.map_err(|error| {
+            self.fail_stop_cause_behind(&error)
+                .unwrap_or_else(|| Arc::new(error))
+        });
         self.explicit_resume_operations.publish_if_current(
             &operation,
-            ResumeOperationState::Terminal(Arc::new(terminal.map_err(Arc::new))),
+            ResumeOperationState::Terminal(Arc::new(terminal)),
         );
     }
 
@@ -8444,14 +8455,6 @@ impl MobHandle {
         }
     }
 
-    /// Current mob lifecycle state, read directly from the DSL authority
-    /// via the actor command channel. There is no atomic shadow — the DSL
-    /// authority is the single source of truth (dogma #1, #13, #17).
-    ///
-    /// After generated Shutdown/Complete/Destroy authority has moved the mob
-    /// out of a live phase and the actor exits, this may read the actor's
-    /// terminal phase watch. A closed actor while the last published phase is
-    /// still live is an actor failure, not lifecycle truth.
     /// Release a host's run-start hold on a member (#1500), placed with
     /// [`MobBuilder::hold_restored_member_run_starts`](crate::MobBuilder::hold_restored_member_run_starts).
     /// The member starts runs again once nothing else holds it (a mob Stop
@@ -8479,6 +8482,20 @@ impl MobHandle {
         .await?
     }
 
+    /// Current mob lifecycle state, read directly from the DSL authority
+    /// via the actor command channel. There is no atomic shadow: the DSL
+    /// authority is the single source of truth (dogma #1, #13, #17).
+    ///
+    /// After generated Shutdown/Complete/Destroy authority has moved the mob
+    /// out of a live phase and the actor exits, this may read the actor's
+    /// terminal phase watch. A closed actor while the last published phase is
+    /// still live is an actor failure, not lifecycle truth. When the actor
+    /// fail-stopped, this returns why, typed, as
+    /// [`MobError::SharedLifecycleFailure`]: for a failed startup recovery of
+    /// a member's session, a [`MobError::MemberStartupRecoveryFailed`] naming
+    /// the member, its session and the cause; for an uncertain durable
+    /// mutation, [`MobError::AdmissionClosed`] with
+    /// `MobAdmissionCloseReason::DurabilityFailStop`.
     pub async fn status(&self) -> Result<MobState, MobError> {
         match self
             .send_actor_command(|reply_tx| MobCommand::QueryPhase { reply_tx })
@@ -8490,8 +8507,24 @@ impl MobHandle {
             Ok(reply) => reply,
             Err(
                 error @ (MobError::ActorCommandChannelClosed | MobError::ActorReplyChannelClosed),
-            ) => Self::status_from_closed_actor(error, *self.phase_watch_rx.borrow()),
+            ) => match self.fail_stop_cause_behind(&error) {
+                // The actor stopped in its startup recovery, before it
+                // admitted any command: report why, typed.
+                Some(failure) => Err(MobError::SharedLifecycleFailure(failure)),
+                None => Self::status_from_closed_actor(error, *self.phase_watch_rx.borrow()),
+            },
             Err(other) => Err(other),
+        }
+    }
+
+    /// Why the actor fail-stopped, for a command that found it closed: such
+    /// a command reports it, typed, instead of the closed channel.
+    fn fail_stop_cause_behind(&self, error: &MobError) -> Option<Arc<MobError>> {
+        match error {
+            MobError::ActorCommandChannelClosed | MobError::ActorReplyChannelClosed => {
+                self.lifecycle_observations.fail_stop_cause()
+            }
+            _ => None,
         }
     }
 
@@ -14776,6 +14809,9 @@ impl MobHandle {
     }
 
     /// Transition Stopped -> Running.
+    ///
+    /// When the actor fail-stopped, this returns why, typed, as
+    /// [`Self::status`] does.
     pub async fn resume(&self) -> Result<(), MobError> {
         let deadline = Instant::now() + super::provisioner::EXPLICIT_RESUME_RETIRE_TOTAL_TIMEOUT;
         match self

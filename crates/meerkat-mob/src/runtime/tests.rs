@@ -57910,6 +57910,56 @@ async fn test_spawn_rejects_reserved_flow_member_prefix() {
     );
 }
 
+/// A mob actor that fail-stops on an uncertain durable mutation (here a
+/// failed run's terminal event append) reports why, typed, to a status read
+/// and to an explicit resume, as a startup recovery failure does, instead of
+/// a closed reply channel.
+#[tokio::test]
+async fn an_in_loop_durability_fail_stop_reports_why_to_status_and_resume() {
+    let events = Arc::new(FaultInjectedMobEventStore::new());
+    events.fail_appends_for("FlowFailed").await;
+    let (handle, service, runs, _specs, _runtime_metadata, _identity, _identity_status) =
+        create_test_mob_with_recoverable_fault_events(
+            sample_definition_with_single_step_flow(500, 8),
+            events.clone(),
+        )
+        .await;
+    handle
+        .spawn(
+            ProfileName::from("worker"),
+            AgentIdentity::from("w-1"),
+            None,
+        )
+        .await
+        .expect("spawn worker");
+    service.set_flow_turn_fail(true);
+    let run_id = handle
+        .run_flow(FlowId::from("demo"), serde_json::json!({}))
+        .await
+        .expect("run flow");
+    wait_for_run_terminal_in_store(runs.as_ref(), &run_id, Duration::from_secs(3)).await;
+    wait_for_actor_fail_stop(&handle).await;
+
+    let status = handle.status().await.map(|_| ());
+    let resumed = handle.resume().await;
+    for (call, result) in [("status", status), ("resume", resumed)] {
+        let error = result.expect_err("a fail-stopped mob must report why");
+        let MobError::SharedLifecycleFailure(failure) = &error else {
+            panic!("{call} must report the fail-stop, typed: {error:?}");
+        };
+        assert!(
+            matches!(
+                failure.as_ref(),
+                MobError::AdmissionClosed {
+                    reason: crate::runtime::MobAdmissionCloseReason::DurabilityFailStop,
+                    ..
+                }
+            ),
+            "{call} must name the durability fail-stop: {failure:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_flow_failed_append_failure_does_not_write_raw_failure_ledger_entry() {
     let events = Arc::new(FaultInjectedMobEventStore::new());
@@ -84792,6 +84842,9 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
             "bounded_helper_retirement_failed".to_string()
         }
         MobError::MemberRestoreFailed { .. } => "member_restore_failed".to_string(),
+        MobError::MemberStartupRecoveryFailed { .. } => {
+            "member_startup_recovery_failed".to_string()
+        }
         MobError::SpawnMemberAdmissionDenied { .. } => "spawn_member_admission_denied".to_string(),
         MobError::BridgeRequestTimedOut { .. } => "bridge_request_timed_out".to_string(),
         MobError::ForkSourceUnavailable { .. } => "fork_source_unavailable".to_string(),

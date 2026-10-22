@@ -371,6 +371,24 @@ them.
   static standalone guard now also follows a `CARGO_MANIFEST_DIR` join
   through a same-file string constant.
 
+- `meerkat-mob`: a mob whose startup recovery fails now tells its caller
+  why. When the actor's durable recovery failed before it admitted a
+  command, for example on a retiring member's session that another runtime
+  owner hosts, `MobHandle::status` reported only "mob actor reply channel
+  closed" and `MobHandle::resume` only `ActorCommandChannelClosed`: the
+  member, its session and the cause reached only the host's error log. Both
+  now return the failure, typed, as `MobError::SharedLifecycleFailure`. A
+  member's failure is the new `MobError::MemberStartupRecoveryFailed`, which
+  names the member, its session and the typed cause (such as
+  `SessionError::ServedElsewhere`); its wire code and failure class are the
+  cause's. Other commands on that handle still fail with
+  `ActorCommandChannelClosed`, and `MobBuilder::resume` still returns the
+  handle before startup recovery runs: read `MobHandle::status` for the
+  reason. An actor that stops later because a durable mutation's outcome
+  stayed uncertain reports that the same way, as `MobError::AdmissionClosed`
+  with `MobAdmissionCloseReason::DurabilityFailStop`; the mutation itself is
+  still named only in the error log where it failed.
+
 ## [0.9.4] - 2026-10-20
 
 ### Breaking

@@ -3767,15 +3767,52 @@ async fn a_mob_whose_retiring_member_has_a_durable_tail_restarts() {
     let _ = handle_2.shutdown().await;
 }
 
+/// A refused mob start names the member whose session another runtime owner
+/// hosts, that session, and the typed hosting refusal as its cause.
+#[cfg(feature = "test-support")]
+fn assert_startup_refusal_names_the_hosted_member(
+    error: &meerkat_mob::MobError,
+    member: &AgentIdentity,
+    session: &meerkat_core::types::SessionId,
+) {
+    let failure = match error {
+        meerkat_mob::MobError::SharedLifecycleFailure(failure) => failure.as_ref(),
+        other => other,
+    };
+    let meerkat_mob::MobError::MemberStartupRecoveryFailed {
+        member_id,
+        session_id,
+        cause,
+    } = failure
+    else {
+        panic!("a refused start must report the member's startup recovery failure: {error:?}");
+    };
+    assert_eq!(member_id, member, "the refusal names the member");
+    assert_eq!(
+        session_id, session,
+        "the refusal names the member's session"
+    );
+    assert!(
+        matches!(
+            cause.as_ref(),
+            meerkat_mob::MobError::SessionError(
+                meerkat_core::service::SessionError::ServedElsewhere { id }
+            ) if id == session
+        ),
+        "the refusal's cause is the typed hosting refusal for that session: {cause:?}"
+    );
+}
+
 /// #1813: a mob start never settles a durable tail on a member session that
 /// another runtime owner hosts. The retiring member's last turn leaves a
 /// durable tail (a power cut between its rows and its runtime boundary), and
 /// before the next start another runtime owner on the realm (another process,
 /// here a second owner in this one) takes the member session's hosting
 /// claim. That owner may still commit the tail itself, so the start must not
-/// adopt it: it refuses, typed, naming the member's session, and leaves the
-/// tail as it was. Once that owner lets go, the next start settles the tail
-/// under its own claim and runs, the healthy lead included.
+/// adopt it: it refuses and leaves the tail as it was, and its caller gets the
+/// refusal typed, naming the member, its session and the hosting refusal.
+/// Once that owner lets go, the next start settles the tail under its own
+/// claim and runs, the healthy lead included.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_mob_start_refuses_a_durable_tail_another_runtime_owner_hosts() {
@@ -3985,6 +4022,38 @@ async fn a_mob_start_refuses_a_durable_tail_another_runtime_owner_hosts() {
         "a mob start that could not restore a retiring member's cleanup delivery must not run: \
          {refused_status:?}"
     );
+    // The caller learns why, typed: the member, its session and the refusal.
+    // A handle the builder already handed back reports it from a status read,
+    // from an explicit resume and from every status read after that.
+    match &refused {
+        Err(error) => assert_startup_refusal_names_the_hosted_member(error, &identity, &w1_sid),
+        Ok(handle) => {
+            match &refused_status {
+                Some(Err(error)) => {
+                    assert_startup_refusal_names_the_hosted_member(error, &identity, &w1_sid);
+                }
+                other => {
+                    panic!("status after the refused start must report the refusal: {other:?}")
+                }
+            }
+            match handle.resume().await {
+                Err(error) => {
+                    assert_startup_refusal_names_the_hosted_member(&error, &identity, &w1_sid);
+                }
+                Ok(()) => {
+                    panic!("an explicit resume after the refused start must report the refusal")
+                }
+            }
+            match handle.status().await {
+                Err(error) => {
+                    assert_startup_refusal_names_the_hosted_member(&error, &identity, &w1_sid);
+                }
+                Ok(state) => {
+                    panic!("status after the refused resume must report the refusal, not {state:?}")
+                }
+            }
+        }
+    }
     if let Ok(handle) = refused {
         let _ = handle.shutdown().await;
     }

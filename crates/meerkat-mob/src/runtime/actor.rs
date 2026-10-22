@@ -29655,7 +29655,10 @@ impl MobActor {
     /// and command dispatch can never execute concurrently. Erasing this
     /// phase drops the recovery frame before a deeply nested command handler
     /// is polled, without moving actor authority out of the serialized task.
-    async fn prepare_actor_run(&mut self) -> bool {
+    ///
+    /// An error is the durable recovery failure that stops the actor before
+    /// it admits any command; `run` records it for the mob's handles.
+    async fn prepare_actor_run(&mut self) -> Result<(), MobError> {
         #[cfg(test)]
         if take_mob_seam_for_test(&FAIL_STOP_ACTOR_START_FOR_MOB, &self.definition.id) {
             tracing::error!(
@@ -29663,7 +29666,9 @@ impl MobActor {
                 "test seam: durable recovery fail-stops before command admission"
             );
             self.quiesce_volatile_producers_after_fail_stop().await;
-            return false;
+            return Err(MobError::Internal(
+                "test seam: durable recovery fail-stops before command admission".into(),
+            ));
         }
         if let Err(error) = self.restore_local_cleanup_composition_delivery().await {
             tracing::error!(
@@ -29672,7 +29677,7 @@ impl MobActor {
                 "local cleanup delivery recovery failed before command admission"
             );
             self.quiesce_volatile_producers_after_fail_stop().await;
-            return false;
+            return Err(error);
         }
         if matches!(self.dsl_state(), MobState::Running) {
             if let Err(error) = self.restore_generated_member_operation_bindings().await {
@@ -29692,7 +29697,7 @@ impl MobActor {
                 "durable member-live Open cleanup recovery failed; fail-stopping before command admission"
             );
             self.quiesce_volatile_producers_after_fail_stop().await;
-            return false;
+            return Err(error);
         }
         // Durable capability associations are rehydrated before command
         // admission so an orphaned lease cannot survive a restart unnoticed,
@@ -29708,7 +29713,7 @@ impl MobActor {
                 "durable forked-participant association recovery failed; fail-stopping before command admission"
             );
             self.quiesce_volatile_producers_after_fail_stop().await;
-            return false;
+            return Err(error);
         }
         // Prune only after generated member bindings have recovered: before
         // that point the machine snapshot may not yet contain every current
@@ -29745,7 +29750,18 @@ impl MobActor {
                     .await;
             }
         }
-        true
+        Ok(())
+    }
+
+    /// Write-before-close for the fail-stop on an uncertain durable
+    /// mutation: a status read or a resume after this exit reports it,
+    /// typed. The uncertain mutation itself is logged where it failed.
+    fn record_durability_fail_stop(&self) {
+        self.lifecycle_observations
+            .record_fail_stop_cause(Arc::new(MobError::AdmissionClosed {
+                mob_id: self.definition.id.clone(),
+                reason: MobAdmissionCloseReason::DurabilityFailStop,
+            }));
     }
 
     /// Close the command channel, then receive until it is empty.
@@ -29775,8 +29791,13 @@ impl MobActor {
         // next lifecycle transition gets the run-start posture it implies.
         self.supervisor_bridge
             .set_member_run_start_posture(self.member_run_start_posture());
-        if !boxed_arm_future(|| self.prepare_actor_run()).await {
+        if let Err(error) = boxed_arm_future(|| self.prepare_actor_run()).await {
             // Durable recovery fail-stopped before command admission.
+            // Write-before-close: the cause is recorded before admission
+            // closes and before any reply channel drops, so every command
+            // this exit drops, and every status read after it, reports it.
+            self.lifecycle_observations
+                .record_fail_stop_cause(Arc::new(error));
             self.close_admission_for_exit(MobAdmissionCloseReason::DurabilityFailStop);
             self.inline_step_watchdog.stop();
             drop(self);
@@ -29821,6 +29842,7 @@ impl MobActor {
             // Honor fail-stop before polling any new work so a confirmed
             // durable panic quarantine transfers ownership to cold recovery.
             if self.durable_uncertainty_fail_stop {
+                self.record_durability_fail_stop();
                 self.close_admission_for_exit(MobAdmissionCloseReason::DurabilityFailStop);
                 tracing::error!(
                     mob_id = %self.definition.id,
@@ -30087,6 +30109,7 @@ impl MobActor {
                 ActorLoopControl::BreakActor => break,
             }
             if self.durable_uncertainty_fail_stop {
+                self.record_durability_fail_stop();
                 self.close_admission_for_exit(MobAdmissionCloseReason::DurabilityFailStop);
                 tracing::error!(
                     mob_id = %self.definition.id,
@@ -30968,59 +30991,76 @@ impl MobActor {
                     "local cleanup delivery tuple diverges from generated authority".into(),
                 ));
             }
-            if !io.session_service.has_live_session(session).await?
-                && Self::load_member_session_settling_durable_tail(
-                    &io,
-                    &entry.agent_identity,
-                    session,
-                )
-                .await?
-                .is_none()
-                && !io
-                    .adapter
-                    .archive_runtime_residue_present(session)
-                    .await
-                    .map_err(|error| MobError::Internal(error.to_string()))?
-            {
-                continue;
-            }
-            let bindings = io
-                .adapter
-                .prepare_local_session_bindings(session.clone())
+            // The start fails before admission on the first member that
+            // fails, in roster (identity) order; name that member and its
+            // session for the caller.
+            self.restore_member_local_cleanup_delivery(&io, &entry, session)
                 .await
-                .map_err(|error| {
-                    MobError::Internal(format!("prepare local cleanup delivery: {error}"))
+                .map_err(|cause| MobError::MemberStartupRecoveryFailed {
+                    member_id: entry.agent_identity.clone(),
+                    session_id: session.clone(),
+                    cause: Arc::new(cause),
                 })?;
-            // A cold start can re-register a session whose runtime already
-            // stopped, which clears its member binding; the unbound endpoint
-            // is then refused, typed and pre-effect, while the previous
-            // attachment's retained cleanup tail still owns the registration.
-            // That owner keeps delivery custody until the lifecycle operation
-            // that retires or reloads this member takes it over; failing the
-            // actor here would refuse every command for a condition that
-            // needs no startup action.
-            if Self::restore_composition_delivery(&io, &entry, &bindings).await?
-                == CompositionDeliveryRestore::HeldByRegistrationOwner
-            {
-                tracing::debug!(
-                    mob_id = %self.definition.id,
-                    member = %entry.agent_identity,
-                    session_id = %session,
-                    "local cleanup delivery custody stays with the registration's current owner"
-                );
-            }
-            // The generated member or pending retirement tuple identifies the
-            // same operation registry for a later archive's final transition.
-            // This creates no serving/runtime binding.
-            io.provisioner
-                .bind_member_owner_context(
-                    &entry.member_ref,
-                    session.clone(),
-                    Arc::clone(bindings.ops_lifecycle()),
-                )
-                .await?;
         }
         Ok(())
+    }
+
+    /// Restore one member's local cleanup delivery for `session`, the member
+    /// session its generated cleanup tuple names.
+    #[cfg(feature = "runtime-adapter")]
+    async fn restore_member_local_cleanup_delivery(
+        &self,
+        io: &ResumeOperationBindingIo,
+        entry: &RosterEntry,
+        session: &SessionId,
+    ) -> Result<(), MobError> {
+        if !io.session_service.has_live_session(session).await?
+            && Self::load_member_session_settling_durable_tail(io, &entry.agent_identity, session)
+                .await?
+                .is_none()
+            && !io
+                .adapter
+                .archive_runtime_residue_present(session)
+                .await
+                .map_err(|error| MobError::Internal(error.to_string()))?
+        {
+            return Ok(());
+        }
+        let bindings = io
+            .adapter
+            .prepare_local_session_bindings(session.clone())
+            .await
+            .map_err(|error| {
+                MobError::Internal(format!("prepare local cleanup delivery: {error}"))
+            })?;
+        // A cold start can re-register a session whose runtime already
+        // stopped, which clears its member binding; the unbound endpoint
+        // is then refused, typed and pre-effect, while the previous
+        // attachment's retained cleanup tail still owns the registration.
+        // That owner keeps delivery custody until the lifecycle operation
+        // that retires or reloads this member takes it over; failing the
+        // actor here would refuse every command for a condition that
+        // needs no startup action.
+        if Self::restore_composition_delivery(io, entry, &bindings).await?
+            == CompositionDeliveryRestore::HeldByRegistrationOwner
+        {
+            tracing::debug!(
+                mob_id = %self.definition.id,
+                member = %entry.agent_identity,
+                session_id = %session,
+                "local cleanup delivery custody stays with the registration's current owner"
+            );
+        }
+        // The generated member or pending retirement tuple identifies the
+        // same operation registry for a later archive's final transition.
+        // This creates no serving/runtime binding.
+        io.provisioner
+            .bind_member_owner_context(
+                &entry.member_ref,
+                session.clone(),
+                Arc::clone(bindings.ops_lifecycle()),
+            )
+            .await
     }
 
     #[cfg(not(feature = "runtime-adapter"))]
