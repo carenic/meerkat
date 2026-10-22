@@ -181,6 +181,17 @@ them.
 
 ### Fixed
 
+- `meerkat-runtime`: a browser OAuth completion on another redirect than the
+  one its attempt was started on is refused as the caller's mismatched
+  attempt (`OAuthFlowError::RedirectUriMismatch`: wire reason
+  `attempt_mismatch`, RPC `INVALID_PARAMS`, REST 400), not as a flow-owner
+  lifecycle failure (wire reason `infrastructure`, RPC `INTERNAL_ERROR`, REST
+  500) that a host would retry. The runtime's flow owner checks a completion
+  against the attempt its AuthMachine admitted, which refused another
+  redirect only as a rejected transition; the machine's own record of the
+  attempt now tells that case apart. This covers a loopback MCP login and a
+  provider browser login; a completion for another provider keeps its
+  lifecycle rejection.
 - A turn that compacts its history more often than
   `[compaction] history_retained_rewrites` keeps (five or more compactions at
   the default of 4) no longer ends at its intra-turn checkpoint on a

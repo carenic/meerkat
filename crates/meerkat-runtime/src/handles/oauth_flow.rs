@@ -496,6 +496,34 @@ impl RuntimeOAuthFlowHandle {
         )
     }
 
+    /// The AuthMachine refuses a completion on another redirect than the
+    /// one it admitted only as a rejected transition. Its own record of the
+    /// flow tells that case apart: the caller's mismatched attempt,
+    /// refused typed ([`OAuthFlowError::RedirectUriMismatch`]) as the
+    /// in-memory registry refuses it, not a flow-owner fault. Every other
+    /// rejection is returned as it is.
+    fn classify_browser_rejection(
+        &self,
+        rejected: OAuthFlowError,
+        target: &AuthCredentialIdentity,
+        flow_id: &str,
+        provider: &OAuthBrowserFlowIdentity,
+        redirect_uri: &str,
+    ) -> OAuthFlowError {
+        let other_redirect = matches!(rejected, OAuthFlowError::LifecycleRejected { .. })
+            && self.lifecycle.oauth_browser_flow_admits_other_redirect(
+                target,
+                flow_id,
+                &provider.binding_key(),
+                redirect_uri,
+            );
+        if other_redirect {
+            OAuthFlowError::RedirectUriMismatch
+        } else {
+            rejected
+        }
+    }
+
     fn consume_browser(
         &self,
         target: &AuthCredentialIdentity,
@@ -1758,7 +1786,10 @@ impl OAuthFlowAuthority for RuntimeOAuthFlowHandle {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.sync_persisted_payloads("verify_oauth_browser_flow")?;
         self.require_admitted_browser_flow(target, state)?;
-        self.verify_browser(target, state, &provider, redirect_uri)?;
+        self.verify_browser(target, state, &provider, redirect_uri)
+            .map_err(|rejected| {
+                self.classify_browser_rejection(rejected, target, state, &provider, redirect_uri)
+            })?;
         match self.registry.verify(state, target, provider, redirect_uri) {
             Ok(record) => Ok(record),
             Err(OAuthFlowError::Missing) => Err(OAuthFlowError::RegistryProjectionMissing {
@@ -1783,7 +1814,10 @@ impl OAuthFlowAuthority for RuntimeOAuthFlowHandle {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.sync_persisted_payloads("consume_oauth_browser_flow")?;
         self.require_admitted_browser_flow(target, state)?;
-        self.verify_browser(target, state, &provider, redirect_uri)?;
+        self.verify_browser(target, state, &provider, redirect_uri)
+            .map_err(|rejected| {
+                self.classify_browser_rejection(rejected, target, state, &provider, redirect_uri)
+            })?;
         let record = match self
             .registry
             .verify(state, target, provider.clone(), redirect_uri)
