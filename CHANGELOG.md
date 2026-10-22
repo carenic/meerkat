@@ -118,6 +118,15 @@ them.
   `MeerkatMachine::accept_existing_input_with_completion_for_attachment_and_member_residency`
   is the same for a mob member's attachment.
 
+### Changed
+
+- `meerkat-core`: the `FORK_INSTRUCTION_REFUSED` message for a fork the
+  policy refuses (cause `policy_refuses`) names the setting that changes it:
+  "to carry them into the child, set the host's fork_instruction_policy
+  (inherited_instructions on a session fork call) to reactivate_inherited".
+  It said only that `reactivate_inherited` carries them into the child. The
+  cause, the keys and the error code are unchanged.
+
 ### Fixed
 
 - A turn that compacts its history more often than
@@ -190,8 +199,41 @@ them.
   session another runtime owner hosts refuses the start, and the error log
   names the member, its session and the remedy (stop that runtime owner, or
   wait until it releases the session, then start again); the tail stays as
-  it was. The method's default keeps the previous settle, without a claim, so
-  a session-service wrapper around a persistent service must forward it.
+  it was. The method's default settles through the resume verdict, which
+  takes the claim as well (see the next entry) but materializes the whole
+  resume, so a session-service wrapper around a persistent service should
+  forward it.
+- `meerkat-session`, `meerkat-mob`: resuming a session no longer settles a
+  durable tail on a session that another runtime owner on the realm hosts.
+  `PersistentSessionService::prepare_committed_boundary_resume` and
+  `recover_committed_boundary`, which every persistent resume runs (a mob
+  start's member restore, a resume spawn or respawn, a host
+  materialization, an attached actor's recovery), recovered the tail
+  without the session's hosting claim: a mob start adopted another
+  process's in-flight tail on an active member's session, then stopped the
+  mob when it bound the member. Both now take this runtime owner's claim
+  first and refuse with `SessionError::ServedElsewhere`, or
+  `HostingUnavailable` when the claim cannot be taken, before any recovery;
+  the tail stays as it was. `MobBuilder::resume` returns that error, and the
+  error log names the member, its session and the remedy (stop that runtime
+  owner, or wait until it releases the session, then start again). A
+  resume spawn of such a session returns it too, where it failed with an
+  internal error before.
+- `meerkat-mob`: a mob start no longer stops when a member whose restore
+  failed at that start (its spawn customizer refused it, say) holds a
+  durable tail. The start read that member's session to restore its
+  operation binding, met the tail as a transcript revision conflict, and
+  stopped the whole mob, at every start. It now settles the tail under this
+  runtime owner's hosting claim, as it does for a retiring member's, and
+  reads the session again. A session another runtime owner on the realm
+  hosts refuses the start, and the error log names the member, its session
+  and the remedy; the tail stays as it was.
+- `meerkat-mob`: a resume spawn onto a session whose durable tail runs past
+  its committed runtime boundary, and which no start of the mob restores
+  (another mob's member session, say), now refuses with that typed
+  transcript revision conflict (`SessionError::Store`) instead of an
+  internal "resume bridge session check failed" error. The spawn does not
+  settle the tail; it stays as it was.
 
 ## [0.9.4] - 2026-10-20
 
