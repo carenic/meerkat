@@ -3332,6 +3332,301 @@ async fn mob_cold_restart_resume_after_kill_between_commit_points() {
     assert_member_active(&member_entry(&handle_2, "w-1").await, "kill-window-final");
 }
 
+/// A run compacts, and the host dies between that run's final checkpoint and
+/// its runtime boundary commit. The compaction rewrote the transcript, so the
+/// physical head is not a message-prefix extension of the retained boundary:
+/// the store proves the descent through its rewrite rows, and the cold
+/// restart recovers the tail. The worker then runs a new turn.
+///
+/// Needs the test-support feature for the crash-stop command, like
+/// `mob_cold_restart_resume_after_kill_between_commit_points`.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn mob_cold_restart_resume_after_kill_between_commit_points_of_a_compacting_run() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+
+    let power_store = Arc::new(PowerCutRuntimeStore::new(&paths.realm_db_path));
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = power_store.clone();
+
+    // The worker compacts as soon as the compactor allows: never at its
+    // session's first LLM boundary, then at the second.
+    let mut definition = mob_definition(MobRuntimeMode::TurnDriven);
+    match definition.profiles.get_mut(&ProfileName::from("worker")) {
+        Some(ProfileBinding::Inline(profile)) => {
+            profile.auto_compact_threshold = std::num::NonZeroU64::new(1);
+        }
+        other => panic!("the worker profile must be inline: {other:?}"),
+    }
+
+    // ---------------- Lifetime 1 ----------------
+    let (service_1, store_1) = persistent_head_canonical_service(&paths, runtime_store.clone());
+    let storage_1 = MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage");
+    let handle_1 = MobBuilder::new(definition, storage_1)
+        .with_session_service(service_1.clone())
+        .with_default_llm_client(openai_test_client())
+        .create()
+        .await
+        .expect("create persistent mob");
+
+    handle_1
+        .spawn_spec(SpawnMemberSpec::new("lead", AgentIdentity::from("lead-1")))
+        .await
+        .expect("spawn lead");
+    handle_1
+        .spawn_spec(SpawnMemberSpec::new("worker", AgentIdentity::from("w-1")))
+        .await
+        .expect("spawn worker");
+
+    let w1_sid = handle_1
+        .resolve_bridge_session_id(&AgentIdentity::from("w-1"))
+        .await
+        .expect("w1 session id");
+    let lead_sid = handle_1
+        .resolve_bridge_session_id(&AgentIdentity::from("lead-1"))
+        .await
+        .expect("lead session id");
+    let mut runtime_release_witnesses = Vec::new();
+    for session_id in [&lead_sid, &w1_sid] {
+        let runtime = service_1
+            .comms_runtime(session_id)
+            .await
+            .unwrap_or_else(|| panic!("comms runtime missing for {session_id}"));
+        runtime_release_witnesses.push(Arc::downgrade(&runtime));
+    }
+
+    // Turn A: the worker session's first LLM boundary, which never compacts,
+    // commits cleanly.
+    send_and_wait(
+        &handle_1,
+        service_1.as_ref(),
+        "w-1",
+        "PRE_CUT_COMPACTING_W1_TURN token-alpha",
+        "compacting-kill-window-lifetime1",
+    )
+    .await;
+    wait_for_head_canonical_authority_convergence(
+        store_1.as_ref(),
+        runtime_store.as_ref(),
+        &w1_sid,
+        "PRE_CUT_COMPACTING_W1_TURN",
+        "compacting-pre-cut-boundary",
+    )
+    .await;
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&w1_sid);
+    let pre_cut_boundary_authority = runtime_store
+        .load_session_boundary_authority(&runtime_id)
+        .await
+        .expect("load pre-cut runtime session authority")
+        .expect("pre-cut runtime session authority present");
+
+    // Power cut: admission still lands, the prepared boundary commit does not.
+    power_store.set_cut(true);
+
+    // Turn B: the second boundary compacts, the run completes and its final
+    // checkpoint writes the rewritten head; its boundary commit is lost.
+    let identity = AgentIdentity::from("w-1");
+    let send_result = tokio::time::timeout(Duration::from_secs(30), async {
+        handle_1
+            .member(&identity)
+            .await
+            .expect("member handle")
+            .send(
+                "POST_CUT_COMPACTING_W1_TURN token-omega".to_string(),
+                HandlingMode::Queue,
+            )
+            .await
+    })
+    .await;
+    eprintln!("[compacting-kill-window] send during cut => {send_result:?}");
+
+    wait_for_row_contains(
+        store_1.as_ref(),
+        &w1_sid,
+        "POST_CUT_COMPACTING_W1_TURN",
+        "compacting-kill-window-row",
+    )
+    .await;
+    {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while power_store.prepared_boundary_commit_rejections() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "[compacting-kill-window] prepared boundary commit was never rejected under the cut"
+            );
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+    let committed_boundary_authority = runtime_store
+        .load_session_boundary_authority(&runtime_id)
+        .await
+        .expect("load runtime session authority")
+        .expect("runtime session authority present");
+    assert_eq!(
+        committed_boundary_authority, pre_cut_boundary_authority,
+        "the rejected boundary commit must leave the pre-cut RuntimeStore authority current"
+    );
+    let committed_boundary_authority = committed_boundary_authority
+        .head_canonical()
+        .expect("head-canonical boundary authority");
+    let boundary_head = committed_boundary_authority.boundary_head().clone();
+    let ahead_head = store_1
+        .load_head(&w1_sid)
+        .await
+        .expect("load ahead physical head")
+        .expect("ahead physical head exists");
+    eprintln!(
+        "[compacting-kill-window] boundary rewrites={} messages={}; physical rewrites={} messages={}",
+        boundary_head.rewrite_count,
+        boundary_head.message_count,
+        ahead_head.rewrite_count,
+        ahead_head.message_count
+    );
+    // Without a compaction in the cut run this row would only repeat the
+    // plain kill-window row.
+    assert!(
+        ahead_head.rewrite_count > boundary_head.rewrite_count,
+        "the run cut before its boundary commit must have compacted: boundary rewrites={}, \
+         physical rewrites={}",
+        boundary_head.rewrite_count,
+        ahead_head.rewrite_count
+    );
+    assert_ne!(
+        meerkat_core::session_store::session_head_cas_token(&ahead_head)
+            .expect("ahead physical head has a canonical token"),
+        committed_boundary_authority.committed_head_token(),
+        "the physical head must remain ahead of the retained runtime authority"
+    );
+
+    handle_1
+        .crash_stop_preserving_durable_work_for_test()
+        .await
+        .expect("crash-stop lifetime-1 actor before restoring power");
+    assert_eq!(
+        power_store.legacy_boundary_commit_rejections(),
+        0,
+        "HeadCanonical lifetime must reach only the prepared boundary seam"
+    );
+    service_1
+        .try_shutdown()
+        .await
+        .expect("shutdown first session service");
+    drop(handle_1);
+    drop(service_1);
+    drop(store_1);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while runtime_release_witnesses
+            .iter()
+            .any(|runtime| runtime.upgrade().is_some())
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("process-loss fixture waits for every old session runtime to be released");
+
+    // ---------------- Lifetime 2 (power restored) ----------------
+    power_store.set_cut(false);
+    let (service_2, store_2) = persistent_head_canonical_service(&paths, runtime_store.clone());
+    let persistent_owner: Arc<dyn MobSessionService> = service_2.clone();
+    let forwarding_decorator =
+        FailingOnceSessionService::new(persistent_owner, None, None, 0, false);
+    let storage_2 = MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage");
+    let handle_2 = MobBuilder::for_resume(storage_2)
+        .with_session_service(forwarding_decorator)
+        .with_default_llm_client(openai_test_client())
+        .notify_orchestrator_on_resume(false)
+        .resume()
+        .await
+        .unwrap_or_else(|error| panic!("[compacting-kill-window] mob resume failed: {error}"));
+
+    assert_member_active(
+        &member_entry(&handle_2, "lead-1").await,
+        "compacting-kill-window-post-resume-orchestrator",
+    );
+    assert_member_active(
+        &member_entry(&handle_2, "w-1").await,
+        "compacting-kill-window-post-resume",
+    );
+    // Recovery promotes the rewritten physical head as the boundary.
+    wait_for_head_canonical_authority_convergence(
+        store_2.as_ref(),
+        runtime_store.as_ref(),
+        &w1_sid,
+        "POST_CUT_COMPACTING_W1_TURN",
+        "compacting-kill-window-recovered-boundary",
+    )
+    .await;
+    let recovered_authority = runtime_store
+        .load_session_boundary_authority(&runtime_id)
+        .await
+        .expect("load recovered runtime session authority")
+        .expect("recovered runtime session authority present");
+    let recovered_boundary_head = recovered_authority
+        .head_canonical()
+        .expect("head-canonical recovered authority")
+        .boundary_head()
+        .clone();
+    assert_eq!(
+        recovered_boundary_head.rewrite_count, ahead_head.rewrite_count,
+        "the recovered boundary must carry the cut run's rewrite"
+    );
+
+    // A new turn runs on the recovered session and commits its boundary.
+    send_and_wait(
+        &handle_2,
+        service_2.as_ref(),
+        "w-1",
+        "POST_RESTART_COMPACTING_W1_TURN token-sigma",
+        "compacting-kill-window-lifetime2",
+    )
+    .await;
+    wait_for_head_canonical_authority_convergence(
+        store_2.as_ref(),
+        runtime_store.as_ref(),
+        &w1_sid,
+        "POST_RESTART_COMPACTING_W1_TURN",
+        "compacting-kill-window-post-recovery-boundary",
+    )
+    .await;
+
+    // The recovered turn is adopted once and stays before the new turn.
+    let w1_final = wait_for_history_contains_all(
+        service_2.as_ref(),
+        &w1_sid,
+        &[
+            "POST_CUT_COMPACTING_W1_TURN",
+            "POST_RESTART_COMPACTING_W1_TURN",
+        ],
+        "compacting-kill-window-final-history",
+    )
+    .await;
+    for needle in [
+        "POST_CUT_COMPACTING_W1_TURN",
+        "POST_RESTART_COMPACTING_W1_TURN",
+    ] {
+        assert_eq!(
+            w1_final.matches(needle).count(),
+            1,
+            "'{needle}' must appear exactly once in committed history: {w1_final}"
+        );
+    }
+    let post_cut_at = w1_final
+        .find("POST_CUT_COMPACTING_W1_TURN")
+        .expect("post-cut present");
+    let post_restart_at = w1_final
+        .find("POST_RESTART_COMPACTING_W1_TURN")
+        .expect("post-restart present");
+    assert!(
+        post_cut_at < post_restart_at,
+        "the recovered tail must stay before the new turn: {w1_final}"
+    );
+    assert_member_active(
+        &member_entry(&handle_2, "w-1").await,
+        "compacting-kill-window-final",
+    );
+}
+
 /// A completed-boundary store failure leaves the live runtime shell in
 /// ReloadRequired with its exact run still bound. Ordinary Mob retirement must
 /// dispose only that degraded shell, cold-register durable authority, and then
