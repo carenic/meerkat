@@ -4254,11 +4254,11 @@ static FAIL_SESSION_INGRESS_DETACH_FOR_SESSION: std::sync::Mutex<Option<SessionI
 /// The mobs a one-shot per-mob test seam is armed for. A set, so arming the
 /// seam for one mob never disarms another's arm: tests in one process
 /// (in-process `cargo test`) can arm the same seam concurrently.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 type MobSeamForTest = std::sync::Mutex<std::collections::BTreeSet<MobId>>;
 
 /// Arm a one-shot per-mob test seam: it fires once, for this mob only.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn arm_mob_seam_for_test(seam: &MobSeamForTest, mob_id: &MobId) {
     if let Ok(mut armed) = seam.lock() {
         armed.insert(mob_id.clone());
@@ -4266,7 +4266,7 @@ fn arm_mob_seam_for_test(seam: &MobSeamForTest, mob_id: &MobId) {
 }
 
 /// Whether the seam is armed for this mob, disarming it if so.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn take_mob_seam_for_test(seam: &MobSeamForTest, mob_id: &MobId) -> bool {
     seam.lock().is_ok_and(|mut armed| armed.remove(mob_id))
 }
@@ -4408,12 +4408,16 @@ pub(super) fn fail_next_shutdown_drain_for_test(mob_id: &MobId) {
 
 /// Test seam: this mob's next actor start fail-stops in its durable recovery,
 /// before command admission.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static FAIL_STOP_ACTOR_START_FOR_MOB: MobSeamForTest =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
-#[cfg(test)]
-pub(super) fn fail_stop_next_actor_start_for_test(mob_id: &MobId) {
+/// Test-support seam: the next actor start of the mob `mob_id` fail-stops in
+/// its durable recovery, before it admits a command, as a real startup
+/// recovery failure does. The seam fires once, for that mob only.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn fail_stop_next_actor_start_for_test(mob_id: &MobId) {
     arm_mob_seam_for_test(&FAIL_STOP_ACTOR_START_FOR_MOB, mob_id);
 }
 #[cfg(test)]
@@ -29608,7 +29612,7 @@ impl MobActor {
     /// An error is the durable recovery failure that stops the actor before
     /// it admits any command; `run` records it for the mob's handles.
     async fn prepare_actor_run(&mut self) -> Result<(), MobError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if take_mob_seam_for_test(&FAIL_STOP_ACTOR_START_FOR_MOB, &self.definition.id) {
             tracing::error!(
                 mob_id = %self.definition.id,

@@ -8543,6 +8543,13 @@ impl MobHandle {
         *self.phase_watch_rx.borrow()
     }
 
+    /// The mob's lifecycle as observed without asking its actor: the last
+    /// phase the actor published and, once the actor has stopped, why. See
+    /// [`MobLifecycleObservation`](super::MobLifecycleObservation).
+    pub fn lifecycle_observation(&self) -> super::MobLifecycleObservation {
+        super::MobLifecycleObservation::new(self.status_observation_snapshot(), None)
+    }
+
     /// Access the mob definition.
     pub fn definition(&self) -> &MobDefinition {
         &self.definition

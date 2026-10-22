@@ -692,9 +692,9 @@ pub async fn handle_public_tools_call(
                 .await
                 .map_err(|err| McpToolError::from_mob(&err))?
                 .into_iter()
-                .map(|(mob_id, status)| meerkat_contracts::MobStatusResult {
+                .map(|(mob_id, observation)| meerkat_contracts::MobStatusResult {
                     mob_id: mob_id.to_string(),
-                    status: crate::wire_mob_lifecycle_status(status),
+                    status: crate::wire_mob_lifecycle_status(observation.phase),
                 })
                 .collect::<Vec<_>>();
             Ok(json!(meerkat_contracts::MobListResult { mobs }))

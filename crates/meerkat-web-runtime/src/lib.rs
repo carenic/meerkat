@@ -2245,9 +2245,9 @@ pub async fn mob_list() -> Result<JsValue, JsValue> {
     let mobs = mob_state.mob_list().await.map_err(err_mob)?;
     let rows: Vec<meerkat_contracts::MobStatusResult> = mobs
         .into_iter()
-        .map(|(id, state)| meerkat_contracts::MobStatusResult {
+        .map(|(id, observation)| meerkat_contracts::MobStatusResult {
             mob_id: id.to_string(),
-            status: meerkat_mob_mcp::wire_mob_lifecycle_status(state),
+            status: meerkat_mob_mcp::wire_mob_lifecycle_status(observation.phase),
         })
         .collect();
     let result = meerkat_contracts::MobListResult { mobs: rows };

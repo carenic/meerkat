@@ -451,9 +451,9 @@ pub async fn handle_list(id: Option<RpcId>, state: &Arc<MobMcpState>) -> RpcResp
     };
     let mobs = mobs
         .into_iter()
-        .map(|(mob_id, status)| MobStatusResult {
+        .map(|(mob_id, observation)| MobStatusResult {
             mob_id: mob_id.to_string(),
-            status: meerkat_mob_mcp::wire_mob_lifecycle_status(status),
+            status: meerkat_mob_mcp::wire_mob_lifecycle_status(observation.phase),
         })
         .collect::<Vec<_>>();
     RpcResponse::success(id, MobListResult { mobs })

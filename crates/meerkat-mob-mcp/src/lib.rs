@@ -5275,7 +5275,11 @@ impl MobMcpState {
             .collect())
     }
 
-    pub async fn mob_list(&self) -> Result<Vec<(MobId, MobState)>, MobError> {
+    /// Every managed mob, with its lifecycle as observed without asking its
+    /// actor (see [`meerkat_mob::MobLifecycleObservation`]).
+    pub async fn mob_list(
+        &self,
+    ) -> Result<Vec<(MobId, meerkat_mob::MobLifecycleObservation)>, MobError> {
         // The gate of `mob_handles_snapshot` (cross-mob enumeration is
         // Owner-only), but every managed mob is listed: a destroyed mob still
         // managed, such as the retry anchor of a destroy whose native part
@@ -5288,7 +5292,7 @@ impl MobMcpState {
             .read()
             .await
             .iter()
-            .map(|(id, managed)| (id.clone(), managed.handle.status_observation_snapshot()))
+            .map(|(id, managed)| (id.clone(), managed.handle.lifecycle_observation()))
             .collect())
     }
 
@@ -9744,7 +9748,7 @@ impl AgentToolDispatcher for MobMcpDispatcher {
                         .map_err(|e| map_mob_err(call, e))?;
                     encode(
                         call,
-                        json!({"mobs": mobs.into_iter().map(|(id, status)| json!({"mob_id": id, "status": wire_mob_lifecycle_status(status)})).collect::<Vec<_>>() }),
+                        json!({"mobs": mobs.into_iter().map(|(id, observation)| json!({"mob_id": id, "status": wire_mob_lifecycle_status(observation.phase)})).collect::<Vec<_>>() }),
                     )
                 }
             }
@@ -19297,6 +19301,7 @@ mod tests {
             .await
             .expect("owner list")
             .into_iter()
+            .map(|(mob_id, observation)| (mob_id, observation.phase))
             .collect();
         assert_eq!(
             listed.keys().cloned().collect::<Vec<_>>(),

@@ -2228,7 +2228,7 @@ impl AgentMobToolSurface {
         // ruling. Fails closed: a mob whose handle cannot resolve, or whose
         // admission errors or is Denied, is omitted.
         let mut mob_list: Vec<serde_json::Value> = Vec::new();
-        for (id, status) in mobs {
+        for (id, observation) in mobs {
             let Ok(handle) = self.bound_handle(&id).await else {
                 continue;
             };
@@ -2240,7 +2240,7 @@ impl AgentMobToolSurface {
                 Ok(meerkat_mob::CurrentMobAdmission::Allowed) => {
                     mob_list.push(json!({
                         "mob_id": id,
-                        "status": status.as_str(),
+                        "status": observation.phase.as_str(),
                     }));
                 }
                 Ok(meerkat_mob::CurrentMobAdmission::Denied) | Err(_) => {}
