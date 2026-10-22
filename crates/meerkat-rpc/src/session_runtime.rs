@@ -1612,6 +1612,16 @@ impl meerkat_mob::MobSessionService for RpcMobSessionService {
         <PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::discard_live_session_under_runtime_turn_boundary(&self.service, session_id).await
     }
 
+    /// The wrapped persistent service owns the session actors, so the exit
+    /// of a removed one is awaited there.
+    async fn await_removed_actor_exit(&self, session_id: &SessionId) {
+        <PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::await_removed_actor_exit(
+            self.service.as_ref(),
+            session_id,
+        )
+        .await;
+    }
+
     fn supports_persistent_sessions(&self) -> bool {
         true
     }
