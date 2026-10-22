@@ -2505,6 +2505,11 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         MobError::MemberDestinationNotInstalled { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::WiringError
         }
+        // A refused ceiling is a refused spawn request, like any other spec
+        // the spawn cannot wire.
+        MobError::OperatorAuthorityCeilingRefused { .. } => {
+            mob_dsl::MobSpawnManyFailureObservationKind::WiringError
+        }
         MobError::SupervisorRotationIncomplete { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::SupervisorRotationIncomplete
         }
@@ -6551,6 +6556,11 @@ pub struct SpawnMemberSpec {
     /// by the capability-attached spawn after it proves the inheritance names
     /// the capability's own source.
     pub(crate) fork_build_inheritance: Option<super::ForkBuildInheritance>,
+    /// The most operator authority this placed member may hold, set through
+    /// [`SpawnMemberSpec::with_operator_authority_ceiling`]. `None` keeps the
+    /// default authority, except on a respawn, which keeps the authority its
+    /// predecessor recorded.
+    pub(crate) operator_authority_ceiling: Option<super::MemberOperatorAuthorityCeiling>,
 }
 
 impl std::fmt::Debug for SpawnMemberSpec {
@@ -6599,6 +6609,10 @@ impl std::fmt::Debug for SpawnMemberSpec {
             .field("fork_source", &self.fork_source)
             .field("fork_overlay", &self.fork_overlay)
             .field("fork_build_inheritance", &self.fork_build_inheritance)
+            .field(
+                "operator_authority_ceiling",
+                &self.operator_authority_ceiling,
+            )
             .finish()
     }
 }
@@ -6659,6 +6673,7 @@ impl SpawnMemberSpec {
             fork_source: None,
             fork_overlay: super::ForkOverlayOrigin::default(),
             fork_build_inheritance: None,
+            operator_authority_ceiling: None,
         }
     }
 
@@ -6690,6 +6705,41 @@ impl SpawnMemberSpec {
     pub fn with_placement(mut self, host: crate::machines::mob_machine::HostId) -> Self {
         self.placement = Some(host);
         self
+    }
+
+    /// Bound the operator authority this placed member is compiled with (see
+    /// [`super::MemberOperatorAuthorityCeiling`]).
+    ///
+    /// The controlling host records the lowered authority with the member and
+    /// admits the member's operator upcalls against it, across restarts. A
+    /// spawn without a placement refuses a ceiling
+    /// ([`crate::OperatorAuthorityCeilingRefusal::UnplacedMember`]).
+    ///
+    /// A respawn of a placed member keeps the authority its predecessor
+    /// recorded. A ceiling set on the respawn request, here or by a spawn
+    /// customizer, replaces it, wider or narrower.
+    #[must_use]
+    pub fn with_operator_authority_ceiling(
+        mut self,
+        ceiling: super::MemberOperatorAuthorityCeiling,
+    ) -> Self {
+        self.operator_authority_ceiling = Some(ceiling);
+        self
+    }
+
+    /// [`Self::with_operator_authority_ceiling`] for a spawn customizer, which
+    /// edits the request in place.
+    pub fn set_operator_authority_ceiling(
+        &mut self,
+        ceiling: super::MemberOperatorAuthorityCeiling,
+    ) {
+        self.operator_authority_ceiling = Some(ceiling);
+    }
+
+    /// The operator authority ceiling this request carries. On a respawn of a
+    /// placed member, a customizer sees the one the predecessor recorded.
+    pub fn operator_authority_ceiling(&self) -> Option<&super::MemberOperatorAuthorityCeiling> {
+        self.operator_authority_ceiling.as_ref()
     }
 
     /// Set the per-member auth binding (deferral §1).

@@ -179,6 +179,27 @@ them.
   `MeerkatMachine::accept_existing_input_with_completion_for_attachment_and_member_residency`
   is the same for a mob member's attachment.
 
+- `meerkat-mob`: a controlling host can narrow the operator authority it
+  records for a placed member. `SpawnMemberSpec::with_operator_authority_ceiling`
+  (and `set_operator_authority_ceiling`, for a `SpawnMemberCustomizer`) sets a
+  `MemberOperatorAuthorityCeiling` on a placed spawn. `without_manage()` drops
+  manage scope: the member then spawns only the profiles it holds
+  (`with_spawn_profiles`), never with a privileged spawn argument (a runtime
+  mode, a launch mode or a requested tool access policy), and is refused
+  `list_members`, `retire_member` and the other operator tools that need
+  manage scope. `without_create()` and `without_mutate()` drop create and
+  profile-mutation authority. The lowered facts are recorded with the member,
+  so they hold across controlling restarts, and a respawn keeps them unless
+  its request (or the spawn customizer) sets a ceiling of its own; a respawn
+  whose recorded facts cannot be read is refused before anything is retired.
+  With no ceiling nothing changes: a placed member keeps manage scope over its
+  mob, including the privileged spawn arguments, and records the same facts as
+  before. A ceiling that narrows the spawn profiles but keeps manage scope, or
+  one on a spawn without a placement, is refused with the new
+  `MobError::OperatorAuthorityCeilingRefused` (`OperatorAuthorityCeilingRefusal`).
+  This is Rust host API only; the JSON-RPC, REST and SDK spawn surfaces are
+  unchanged.
+
 ### Changed
 
 - `meerkat-core`: the `FORK_INSTRUCTION_REFUSED` message for a fork the
