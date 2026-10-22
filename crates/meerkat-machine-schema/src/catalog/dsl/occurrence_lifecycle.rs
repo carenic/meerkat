@@ -226,8 +226,13 @@ machine! {
                 detail: Option<String>,
                 at_utc_ms: u64
             },
+            // `redelivery` is the redelivery the claim named in its effects:
+            // AfterAdmission (ReclaimedAfterAdmission), AfterUnprovenDispatch
+            // (ReclaimedAfterUnprovenDispatch), or Ordinary. A redelivery
+            // starts no new run.
             ResolveTargetProbe {
                 outcome: Enum<OccurrenceTargetProbeOutcome>,
+                redelivery: Enum<ClaimRedelivery>,
                 detail: Option<String>,
                 at_utc_ms: u64
             },
@@ -1932,25 +1937,39 @@ machine! {
         // skipped terminality, or misfired terminality.
 
         transition TargetProbeReadyClaimed {
-            on input ResolveTargetProbe { outcome, detail, at_utc_ms }
+            on input ResolveTargetProbe { outcome, redelivery, detail, at_utc_ms }
             guard { self.lifecycle_phase == Phase::Claimed }
             guard "ready" { outcome == OccurrenceTargetProbeOutcome::Ready }
             to Claimed
         }
 
         transition TargetProbeBusyAllowedByPolicy {
-            on input ResolveTargetProbe { outcome, detail, at_utc_ms }
+            on input ResolveTargetProbe { outcome, redelivery, detail, at_utc_ms }
             guard { self.lifecycle_phase == Phase::Claimed }
             guard "busy" { outcome == OccurrenceTargetProbeOutcome::Busy }
             guard "allow_concurrent" { self.overlap_policy == OverlapPolicy::AllowConcurrent }
             to Claimed
         }
 
-        transition TargetProbeBusySkipByPolicy {
-            on input ResolveTargetProbe { outcome, detail, at_utc_ms }
+        // A redelivery the claim named (a recorded admission, or a recorded
+        // dispatch start past the misfire deadline) starts no new run: it may
+        // only find the earlier admission, whose input can be what keeps the
+        // target busy. The overlap policy does not end it.
+        transition TargetProbeBusyExistingRedelivery {
+            on input ResolveTargetProbe { outcome, redelivery, detail, at_utc_ms }
             guard { self.lifecycle_phase == Phase::Claimed }
             guard "busy" { outcome == OccurrenceTargetProbeOutcome::Busy }
             guard "skip_if_running" { self.overlap_policy == OverlapPolicy::SkipIfRunning }
+            guard "existing_redelivery" { redelivery != ClaimRedelivery::Ordinary }
+            to Claimed
+        }
+
+        transition TargetProbeBusySkipByPolicy {
+            on input ResolveTargetProbe { outcome, redelivery, detail, at_utc_ms }
+            guard { self.lifecycle_phase == Phase::Claimed }
+            guard "busy" { outcome == OccurrenceTargetProbeOutcome::Busy }
+            guard "skip_if_running" { self.overlap_policy == OverlapPolicy::SkipIfRunning }
+            guard "ordinary_claim" { redelivery == ClaimRedelivery::Ordinary }
             update {
                 self.failure_detail = detail;
                 self.failure_class = Some(OccurrenceFailureClass::TargetBusy);
@@ -1969,7 +1988,7 @@ machine! {
         }
 
         transition TargetProbeMissingSkipByPolicy {
-            on input ResolveTargetProbe { outcome, detail, at_utc_ms }
+            on input ResolveTargetProbe { outcome, redelivery, detail, at_utc_ms }
             guard { self.lifecycle_phase == Phase::Claimed }
             guard "missing" { outcome == OccurrenceTargetProbeOutcome::Missing }
             guard "skip_missing_target" { self.missing_target_policy == MissingTargetPolicy::Skip }
@@ -1991,7 +2010,7 @@ machine! {
         }
 
         transition TargetProbeMissingMisfireByPolicy {
-            on input ResolveTargetProbe { outcome, detail, at_utc_ms }
+            on input ResolveTargetProbe { outcome, redelivery, detail, at_utc_ms }
             guard { self.lifecycle_phase == Phase::Claimed }
             guard "missing" { outcome == OccurrenceTargetProbeOutcome::Missing }
             guard "mark_misfired_missing_target" { self.missing_target_policy == MissingTargetPolicy::MarkMisfired }
@@ -2656,6 +2675,18 @@ pub enum OccurrenceTargetProbeOutcome {
     Ready,
     Busy,
     Missing,
+}
+
+/// The redelivery a claim named in its effects, reported with that claim's
+/// target probe. No state field carries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimRedelivery {
+    /// No redelivery: a first claim, or a reclaim that delivers as before.
+    Ordinary,
+    /// The claim emitted ReclaimedAfterAdmission.
+    AfterAdmission,
+    /// The claim emitted ReclaimedAfterUnprovenDispatch.
+    AfterUnprovenDispatch,
 }
 
 /// Pure observation of the owning schedule's lifecycle phase, extracted by the

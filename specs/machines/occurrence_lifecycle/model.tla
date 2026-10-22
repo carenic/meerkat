@@ -3,7 +3,7 @@ EXTENDS TLC, Naturals, Sequences, FiniteSets
 
 \* Generated semantic machine model for OccurrenceLifecycleMachine.
 
-CONSTANTS AdmissionEvidenceValues, BooleanValues, ClaimOwnerValues, ClaimTokenValues, ClaimedDispatchDispositionValues, ClaimedDispatchSchedulePhaseValues, CompletionSupersessionDispositionValues, CorrelationIdValues, DeliveryAdmissionOutcomeValues, DeliveryCompletionFailureReasonValues, DeliveryFailureReasonValues, DeliveryReceiptStageValues, LateCompletionResolutionClassValues, MisfirePolicyValues, MissingTargetPolicyValues, NatValues, OccurrenceFailureClassValues, OccurrenceIdValues, OccurrenceLifecycleInputVariantValues, OccurrenceLifecycleStateValues, OccurrenceTargetProbeOutcomeValues, OccurrenceTransitionFailureClassKindValues, OccurrenceTransitionFailureRefusalKindValues, OverlapPolicyValues, RuntimeCompletionOutcomeValues, RuntimeOutcomeKeyValues, ScheduleIdValues, SessionIdValues, StringValues, TargetBindingIdValues, TriggerKeyValues
+CONSTANTS AdmissionEvidenceValues, BooleanValues, ClaimOwnerValues, ClaimRedeliveryValues, ClaimTokenValues, ClaimedDispatchDispositionValues, ClaimedDispatchSchedulePhaseValues, CompletionSupersessionDispositionValues, CorrelationIdValues, DeliveryAdmissionOutcomeValues, DeliveryCompletionFailureReasonValues, DeliveryFailureReasonValues, DeliveryReceiptStageValues, LateCompletionResolutionClassValues, MisfirePolicyValues, MissingTargetPolicyValues, NatValues, OccurrenceFailureClassValues, OccurrenceIdValues, OccurrenceLifecycleInputVariantValues, OccurrenceLifecycleStateValues, OccurrenceTargetProbeOutcomeValues, OccurrenceTransitionFailureClassKindValues, OccurrenceTransitionFailureRefusalKindValues, OverlapPolicyValues, RuntimeCompletionOutcomeValues, RuntimeOutcomeKeyValues, ScheduleIdValues, SessionIdValues, StringValues, TargetBindingIdValues, TriggerKeyValues
 
 None == [tag |-> "none", value |-> "none"]
 Some(v) == [tag |-> "some", value |-> v]
@@ -1886,7 +1886,7 @@ DeliveryFailureScheduleMandateUnavailable(reason, detail, at_utc_ms) ==
     /\ UnchangedFrame_baba76eb08ae0995
 
 
-TargetProbeReadyClaimed(outcome, detail, at_utc_ms) ==
+TargetProbeReadyClaimed(outcome, redelivery, detail, at_utc_ms) ==
     /\ phase = "Claimed"
     /\ (outcome = "Ready")
     /\ phase' = "Claimed"
@@ -1894,7 +1894,7 @@ TargetProbeReadyClaimed(outcome, detail, at_utc_ms) ==
     /\ UnchangedFrame_dac7ac5b0d5b99b3
 
 
-TargetProbeBusyAllowedByPolicy(outcome, detail, at_utc_ms) ==
+TargetProbeBusyAllowedByPolicy(outcome, redelivery, detail, at_utc_ms) ==
     /\ phase = "Claimed"
     /\ (outcome = "Busy")
     /\ (overlap_policy = "AllowConcurrent")
@@ -1903,10 +1903,21 @@ TargetProbeBusyAllowedByPolicy(outcome, detail, at_utc_ms) ==
     /\ UnchangedFrame_dac7ac5b0d5b99b3
 
 
-TargetProbeBusySkipByPolicy(outcome, detail, at_utc_ms) ==
+TargetProbeBusyExistingRedelivery(outcome, redelivery, detail, at_utc_ms) ==
     /\ phase = "Claimed"
     /\ (outcome = "Busy")
     /\ (overlap_policy = "SkipIfRunning")
+    /\ (redelivery # "Ordinary")
+    /\ phase' = "Claimed"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_dac7ac5b0d5b99b3
+
+
+TargetProbeBusySkipByPolicy(outcome, redelivery, detail, at_utc_ms) ==
+    /\ phase = "Claimed"
+    /\ (outcome = "Busy")
+    /\ (overlap_policy = "SkipIfRunning")
+    /\ (redelivery = "Ordinary")
     /\ phase' = "Skipped"
     /\ model_step_count' = model_step_count + 1
     /\ claimed_by' = None
@@ -1923,7 +1934,7 @@ TargetProbeBusySkipByPolicy(outcome, detail, at_utc_ms) ==
     /\ UnchangedFrame_1f2faaf9e88439a0
 
 
-TargetProbeMissingSkipByPolicy(outcome, detail, at_utc_ms) ==
+TargetProbeMissingSkipByPolicy(outcome, redelivery, detail, at_utc_ms) ==
     /\ phase = "Claimed"
     /\ (outcome = "Missing")
     /\ (missing_target_policy = "Skip")
@@ -1943,7 +1954,7 @@ TargetProbeMissingSkipByPolicy(outcome, detail, at_utc_ms) ==
     /\ UnchangedFrame_1f2faaf9e88439a0
 
 
-TargetProbeMissingMisfireByPolicy(outcome, detail, at_utc_ms) ==
+TargetProbeMissingMisfireByPolicy(outcome, redelivery, detail, at_utc_ms) ==
     /\ phase = "Claimed"
     /\ (outcome = "Missing")
     /\ (missing_target_policy = "MarkMisfired")
@@ -2468,11 +2479,12 @@ Next ==
     \/ (phase = "Claimed" \/ phase = "Dispatching" \/ phase = "AwaitingCompletion") /\ \E reason \in DeliveryFailureReasonValues : \E detail \in OptionStringValues : \E at_utc_ms \in 0..2 : DeliveryFailureTransportError(reason, detail, at_utc_ms)
     \/ (phase = "Claimed" \/ phase = "Dispatching" \/ phase = "AwaitingCompletion") /\ \E reason \in DeliveryFailureReasonValues : \E detail \in OptionStringValues : \E at_utc_ms \in 0..2 : DeliveryFailureInternalError(reason, detail, at_utc_ms)
     \/ (phase = "Claimed" \/ phase = "Dispatching" \/ phase = "AwaitingCompletion") /\ \E reason \in DeliveryFailureReasonValues : \E detail \in OptionStringValues : \E at_utc_ms \in 0..2 : DeliveryFailureScheduleMandateUnavailable(reason, detail, at_utc_ms)
-    \/ (phase = "Claimed") /\ \E outcome \in OccurrenceTargetProbeOutcomeValues : \E detail \in OptionStringValues : \E at_utc_ms \in 0..2 : TargetProbeReadyClaimed(outcome, detail, at_utc_ms)
-    \/ (phase = "Claimed") /\ \E outcome \in OccurrenceTargetProbeOutcomeValues : \E detail \in OptionStringValues : \E at_utc_ms \in 0..2 : TargetProbeBusyAllowedByPolicy(outcome, detail, at_utc_ms)
-    \/ (phase = "Claimed") /\ \E outcome \in OccurrenceTargetProbeOutcomeValues : \E detail \in OptionStringValues : \E at_utc_ms \in 0..2 : TargetProbeBusySkipByPolicy(outcome, detail, at_utc_ms)
-    \/ (phase = "Claimed") /\ \E outcome \in OccurrenceTargetProbeOutcomeValues : \E detail \in OptionStringValues : \E at_utc_ms \in 0..2 : TargetProbeMissingSkipByPolicy(outcome, detail, at_utc_ms)
-    \/ (phase = "Claimed") /\ \E outcome \in OccurrenceTargetProbeOutcomeValues : \E detail \in OptionStringValues : \E at_utc_ms \in 0..2 : TargetProbeMissingMisfireByPolicy(outcome, detail, at_utc_ms)
+    \/ (phase = "Claimed") /\ \E outcome \in OccurrenceTargetProbeOutcomeValues : \E redelivery \in ClaimRedeliveryValues : \E detail \in OptionStringValues : \E at_utc_ms \in 0..2 : TargetProbeReadyClaimed(outcome, redelivery, detail, at_utc_ms)
+    \/ (phase = "Claimed") /\ \E outcome \in OccurrenceTargetProbeOutcomeValues : \E redelivery \in ClaimRedeliveryValues : \E detail \in OptionStringValues : \E at_utc_ms \in 0..2 : TargetProbeBusyAllowedByPolicy(outcome, redelivery, detail, at_utc_ms)
+    \/ (phase = "Claimed") /\ \E outcome \in OccurrenceTargetProbeOutcomeValues : \E redelivery \in ClaimRedeliveryValues : \E detail \in OptionStringValues : \E at_utc_ms \in 0..2 : TargetProbeBusyExistingRedelivery(outcome, redelivery, detail, at_utc_ms)
+    \/ (phase = "Claimed") /\ \E outcome \in OccurrenceTargetProbeOutcomeValues : \E redelivery \in ClaimRedeliveryValues : \E detail \in OptionStringValues : \E at_utc_ms \in 0..2 : TargetProbeBusySkipByPolicy(outcome, redelivery, detail, at_utc_ms)
+    \/ (phase = "Claimed") /\ \E outcome \in OccurrenceTargetProbeOutcomeValues : \E redelivery \in ClaimRedeliveryValues : \E detail \in OptionStringValues : \E at_utc_ms \in 0..2 : TargetProbeMissingSkipByPolicy(outcome, redelivery, detail, at_utc_ms)
+    \/ (phase = "Claimed") /\ \E outcome \in OccurrenceTargetProbeOutcomeValues : \E redelivery \in ClaimRedeliveryValues : \E detail \in OptionStringValues : \E at_utc_ms \in 0..2 : TargetProbeMissingMisfireByPolicy(outcome, redelivery, detail, at_utc_ms)
     \/ (phase = "Pending") /\ \E detail \in OptionStringValues : \E at_utc_ms \in 0..2 : DueMisfirePending(detail, at_utc_ms)
     \/ (phase = "Pending") /\ \E admission_evidence \in AdmissionEvidenceValues : \E detail \in OptionStringValues : \E at_utc_ms \in 0..2 : ReclaimExhaustedAfterAdmission(admission_evidence, detail, at_utc_ms)
     \/ (phase = "Pending") /\ \E admission_evidence \in AdmissionEvidenceValues : \E detail \in OptionStringValues : \E at_utc_ms \in 0..2 : ReclaimExhaustedAfterUnprovenDispatch(admission_evidence, detail, at_utc_ms)

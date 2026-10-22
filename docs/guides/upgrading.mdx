@@ -68,19 +68,20 @@ the CHANGELOG under `## [0.9.5]`.
 an occurrence's receipt history:
 
 - `OccurrenceLifecycleInput::ClassifyDue` and `Claim` gain the field
-  `admission_evidence: AdmissionEvidence`, and the input gains the variants
-  `ResolveReclaimExhausted` and `ResolveUnprovenLateNotAdmitted`;
+  `admission_evidence: AdmissionEvidence`, `ResolveTargetProbe` gains the
+  field `redelivery: Option<ExistingDelivery>`, and the input gains the
+  variants `ResolveReclaimExhausted` and `ResolveUnprovenLateNotAdmitted`;
 - `OccurrenceLifecycleEffect` gains `DueReclaimExhausted`,
   `ReclaimedAfterAdmission` and `ReclaimedAfterUnprovenDispatch`;
 - `OccurrenceDueAction` gains `ReclaimExhausted` and is now
   `#[non_exhaustive]`;
 - `Occurrence::classify_due_action` takes the evidence as a second argument.
 
-**Do:** where you build these inputs, pass `AdmissionEvidence::None` (the
-0.9.4 behaviour) or derive the evidence with
-`AdmissionEvidence::from_receipt_stages`, and add a wildcard arm where you
-match `OccurrenceDueAction`. The persisted occurrence is unchanged (schema
-version 9).
+**Do:** where you build these inputs, pass `AdmissionEvidence::None` and
+`redelivery: None` (the 0.9.4 behaviour) or derive the evidence with
+`AdmissionEvidence::from_receipt_stages` and the redelivery from the claim's
+effects, and add a wildcard arm where you match `OccurrenceDueAction`. The
+persisted occurrence is unchanged (schema version 9).
 
 A custom `ScheduleTargetDelivery` inherits the new defaulted
 `deliver_existing_occurrence`, which the driver calls to redeliver a
@@ -108,10 +109,13 @@ whose default refuses with `RuntimeDriverError::NoExistingAdmission`.
   misfire deadline (up to five attempts), and redelivered without a fresh
   admission: it ends with the admitted input's outcome, or `misfired` when
   only the dispatch start was recorded and the target never admitted it. A
-  reclaim with no recorded dispatch still follows the misfire policy. This
-  lifts the 0.9.4 known limitation (see "Upgrading to 0.9.4" below): a
-  `catch_up_within` window longer than the lease is no longer needed to keep
-  that recovery. See
+  reclaim with no recorded dispatch still follows the misfire policy, and a
+  target still busy with the admitted input does not end the redelivery
+  under `skip_if_running`. This lifts the 0.9.4 known limitation (see
+  "Upgrading to 0.9.4" below): a `catch_up_within` window longer than the
+  lease is no longer needed to keep that recovery. A host runnable keeps no
+  admission record and runs again, so for host runnables the guarantee is
+  at-least-once: deduplicate on `delivery_idempotency_key`. See
   [Executor Lease And Crash Recovery](/guides/scheduling#executor-lease-and-crash-recovery).
 
 ### Upgrade checklist

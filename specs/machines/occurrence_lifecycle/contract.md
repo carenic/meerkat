@@ -66,7 +66,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `ResolveRuntimeCompletion`(outcome: RuntimeCompletionOutcome, detail: Option<String>, at_utc_ms: u64)
 - `ResolveDeliveryCompletionFailure`(reason: DeliveryCompletionFailureReason, detail: Option<String>, at_utc_ms: u64)
 - `ResolveDeliveryFailure`(reason: DeliveryFailureReason, detail: Option<String>, at_utc_ms: u64)
-- `ResolveTargetProbe`(outcome: OccurrenceTargetProbeOutcome, detail: Option<String>, at_utc_ms: u64)
+- `ResolveTargetProbe`(outcome: OccurrenceTargetProbeOutcome, redelivery: ClaimRedelivery, detail: Option<String>, at_utc_ms: u64)
 - `ResolveDueMisfire`(detail: Option<String>, at_utc_ms: u64)
 - `ResolveReclaimExhausted`(admission_evidence: AdmissionEvidence, detail: Option<String>, at_utc_ms: u64)
 - `ResolveUnprovenLateNotAdmitted`(admission_evidence: AdmissionEvidence, detail: Option<String>, at_utc_ms: u64)
@@ -1557,31 +1557,41 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `TargetProbeReadyClaimed`
 - From: `Claimed`
-- On: `ResolveTargetProbe`(outcome, detail, at_utc_ms)
+- On: `ResolveTargetProbe`(outcome, redelivery, detail, at_utc_ms)
 - Guards:
   - `ready`
 - To: `Claimed`
 
 ### `TargetProbeBusyAllowedByPolicy`
 - From: `Claimed`
-- On: `ResolveTargetProbe`(outcome, detail, at_utc_ms)
+- On: `ResolveTargetProbe`(outcome, redelivery, detail, at_utc_ms)
 - Guards:
   - `busy`
   - `allow_concurrent`
 - To: `Claimed`
 
-### `TargetProbeBusySkipByPolicy`
+### `TargetProbeBusyExistingRedelivery`
 - From: `Claimed`
-- On: `ResolveTargetProbe`(outcome, detail, at_utc_ms)
+- On: `ResolveTargetProbe`(outcome, redelivery, detail, at_utc_ms)
 - Guards:
   - `busy`
   - `skip_if_running`
+  - `existing_redelivery`
+- To: `Claimed`
+
+### `TargetProbeBusySkipByPolicy`
+- From: `Claimed`
+- On: `ResolveTargetProbe`(outcome, redelivery, detail, at_utc_ms)
+- Guards:
+  - `busy`
+  - `skip_if_running`
+  - `ordinary_claim`
 - Emits: `Skipped`
 - To: `Skipped`
 
 ### `TargetProbeMissingSkipByPolicy`
 - From: `Claimed`
-- On: `ResolveTargetProbe`(outcome, detail, at_utc_ms)
+- On: `ResolveTargetProbe`(outcome, redelivery, detail, at_utc_ms)
 - Guards:
   - `missing`
   - `skip_missing_target`
@@ -1590,7 +1600,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `TargetProbeMissingMisfireByPolicy`
 - From: `Claimed`
-- On: `ResolveTargetProbe`(outcome, detail, at_utc_ms)
+- On: `ResolveTargetProbe`(outcome, redelivery, detail, at_utc_ms)
 - Guards:
   - `missing`
   - `mark_misfired_missing_target`
@@ -1765,5 +1775,5 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `occurrence_start_complete_fail` — occurrence transitions through pending, running, and terminal lifecycle states
 - `occurrence_claim_dispatch_completion` — plan occurrence from pending, sync target snapshot from pending or claimed materialized bindings, record receipt from pending, claimed, dispatching, awaiting completion, completed, skipped, misfired, superseded, or delivery failed result projection, claim pending occurrence, persist dispatch intent from claimed, record target admission without rewriting its correlation, await completion, complete from dispatching or awaiting, resolve runtime completion outcome, and record claimed/dispatch/accept/await/completed effects
 - `occurrence_terminal_classification` — skip/skipped, misfire/misfired, supersede/superseded, delivery failed, occurrences superseded, records revision and explicit failure class for terminal occurrence outcomes
-- `occurrence_recorded_dispatch_reclaim` — classify a pending occurrence whose earlier attempt recorded its dispatch as claim eligible past its misfire deadline up to five attempts and as reclaim exhausted after them, reclaim it after a recorded admission or an unproven dispatch start, end an exhausted admitted occurrence delivery failed lease lost and an exhausted or never-admitted unproven one misfired
+- `occurrence_recorded_dispatch_reclaim` — classify a pending occurrence whose earlier attempt recorded its dispatch as claim eligible past its misfire deadline up to five attempts and as reclaim exhausted after them, reclaim it after a recorded admission or an unproven dispatch start, keep such a redelivery claimed when its target is busy under skip if running, end an exhausted admitted occurrence delivery failed lease lost and an exhausted or never-admitted unproven one misfired
 - `occurrence_lease_recovery` — classify due no action, due claim eligible, due misfire required, due lease expired, lease renewal by the live claim-token holder from dispatching or awaiting completion, and lease expired from claimed, dispatching, or awaiting completion returns live claimed work to owner-aware recovery

@@ -95,6 +95,60 @@ impl std::fmt::Display for ClaimOwner {
         f.write_str(&self.0)
     }
 }
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum ClaimRedelivery {
+    #[default]
+    #[serde(rename = "Ordinary")]
+    Ordinary,
+    #[serde(rename = "AfterAdmission")]
+    AfterAdmission,
+    #[serde(rename = "AfterUnprovenDispatch")]
+    AfterUnprovenDispatch,
+}
+impl ClaimRedelivery {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ordinary => "Ordinary",
+            Self::AfterAdmission => "AfterAdmission",
+            Self::AfterUnprovenDispatch => "AfterUnprovenDispatch",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for ClaimRedelivery {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "Ordinary" => Ok(Self::Ordinary),
+            "AfterAdmission" => Ok(Self::AfterAdmission),
+            "AfterUnprovenDispatch" => Ok(Self::AfterUnprovenDispatch),
+            other => Err(format!("invalid ClaimRedelivery value `{other}`")),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for ClaimRedelivery {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for ClaimRedelivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 #[derive(
     Debug,
     Clone,
@@ -1733,6 +1787,7 @@ pub mod inputs {
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct ResolveTargetProbe {
         pub outcome: OccurrenceTargetProbeOutcome,
+        pub redelivery: ClaimRedelivery,
         pub detail: Option<String>,
         pub at_utc_ms: u64,
     }
@@ -2199,6 +2254,7 @@ pub enum TransitionId {
     DeliveryFailureScheduleMandateUnavailable,
     TargetProbeReadyClaimed,
     TargetProbeBusyAllowedByPolicy,
+    TargetProbeBusyExistingRedelivery,
     TargetProbeBusySkipByPolicy,
     TargetProbeMissingSkipByPolicy,
     TargetProbeMissingMisfireByPolicy,

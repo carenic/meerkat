@@ -535,8 +535,15 @@ pub enum OccurrenceLifecycleInput {
         detail: Option<String>,
         at_utc: DateTime<Utc>,
     },
+    /// `redelivery` is the redelivery the claim named in its effects
+    /// ([`OccurrenceLifecycleEffect::ReclaimedAfterAdmission`]: `Admitted`,
+    /// [`OccurrenceLifecycleEffect::ReclaimedAfterUnprovenDispatch`]:
+    /// `UnprovenLate`), `None` for an ordinary claim. A busy target ends an
+    /// ordinary claim under `SkipIfRunning`, never a redelivery: it starts
+    /// no new run.
     ResolveTargetProbe {
         outcome: OccurrenceTargetProbeOutcome,
+        redelivery: Option<crate::driver::ExistingDelivery>,
         detail: Option<String>,
         at_utc: DateTime<Utc>,
     },
@@ -1667,10 +1674,12 @@ fn convert_occurrence_input(
         },
         OccurrenceLifecycleInput::ResolveTargetProbe {
             outcome,
+            redelivery,
             detail,
             at_utc,
         } => occ_dsl::OccurrenceLifecycleInput::ResolveTargetProbe {
             outcome: to_dsl_occurrence_target_probe_outcome(*outcome),
+            redelivery: to_dsl_claim_redelivery(*redelivery),
             detail: detail.clone(),
             at_utc_ms: occurrence_datetime_to_millis(*at_utc, "at_utc")?,
         },
@@ -2158,6 +2167,18 @@ fn to_dsl_occurrence_target_probe_outcome(
         OccurrenceTargetProbeOutcome::Ready => occ_dsl::OccurrenceTargetProbeOutcome::Ready,
         OccurrenceTargetProbeOutcome::Busy => occ_dsl::OccurrenceTargetProbeOutcome::Busy,
         OccurrenceTargetProbeOutcome::Missing => occ_dsl::OccurrenceTargetProbeOutcome::Missing,
+    }
+}
+
+fn to_dsl_claim_redelivery(
+    redelivery: Option<crate::driver::ExistingDelivery>,
+) -> occ_dsl::ClaimRedelivery {
+    match redelivery {
+        None => occ_dsl::ClaimRedelivery::Ordinary,
+        Some(crate::driver::ExistingDelivery::Admitted) => occ_dsl::ClaimRedelivery::AfterAdmission,
+        Some(crate::driver::ExistingDelivery::UnprovenLate) => {
+            occ_dsl::ClaimRedelivery::AfterUnprovenDispatch
+        }
     }
 }
 
@@ -3754,6 +3775,7 @@ mod tests {
                 &completed,
                 OccurrenceLifecycleInput::ResolveTargetProbe {
                     outcome: OccurrenceTargetProbeOutcome::Busy,
+                    redelivery: None,
                     detail: None,
                     at_utc: now,
                 },
@@ -5407,6 +5429,75 @@ mod tests {
                     AdmissionEvidence::Started
                 )
                 .is_err()
+            );
+        }
+    }
+
+    /// A busy target ends an ordinary claim under skip_if_running, never a
+    /// redelivery its claim named: the redelivery starts no new run and goes
+    /// on to find the earlier admission, inside the window and past it. A
+    /// missing target keeps the missing-target policy for a redelivery too.
+    #[test]
+    fn a_busy_target_skips_an_ordinary_claim_but_not_a_redelivery() {
+        use crate::ExistingDelivery::{Admitted, UnprovenLate};
+        let (occurrence, due) = pending_after_attempts(1);
+        let inside = due + Duration::seconds(10);
+        let past = due + Duration::seconds(45);
+        let probe = |claimed: &Occurrence, at, outcome, redelivery| {
+            claimed
+                .clone()
+                .apply(OccurrenceLifecycleInput::ResolveTargetProbe {
+                    outcome,
+                    redelivery,
+                    detail: Some("target busy".to_string()),
+                    at_utc: at,
+                })
+                .expect("the probe resolution should pass")
+        };
+        for (at, evidence, existing) in [
+            (inside, AdmissionEvidence::Accepted, Admitted),
+            (past, AdmissionEvidence::Accepted, Admitted),
+            (past, AdmissionEvidence::Started, UnprovenLate),
+        ] {
+            let claimed = reclaim(&occurrence, at, evidence)
+                .expect("the reclaim should pass")
+                .into_occurrence();
+
+            let continued = probe(
+                &claimed,
+                at,
+                OccurrenceTargetProbeOutcome::Busy,
+                Some(existing),
+            );
+            assert!(continued.effects().is_empty(), "{existing:?}");
+            assert_eq!(
+                continued.into_occurrence().phase,
+                OccurrencePhase::Claimed,
+                "a busy target keeps the {existing:?} redelivery claimed"
+            );
+
+            let skipped =
+                probe(&claimed, at, OccurrenceTargetProbeOutcome::Busy, None).into_occurrence();
+            assert_eq!(skipped.phase, OccurrencePhase::Skipped);
+            assert_eq!(
+                skipped.failure_class,
+                Some(OccurrenceFailureClass::TargetBusy)
+            );
+
+            let missing = probe(
+                &claimed,
+                at,
+                OccurrenceTargetProbeOutcome::Missing,
+                Some(existing),
+            )
+            .into_occurrence();
+            assert_eq!(
+                (missing.phase, missing.failure_class),
+                (
+                    OccurrencePhase::Misfired,
+                    Some(OccurrenceFailureClass::TargetMissing)
+                ),
+                "a missing target keeps the missing-target policy for {existing:?}"
             );
         }
     }

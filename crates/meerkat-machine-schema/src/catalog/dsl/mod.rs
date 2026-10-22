@@ -4722,6 +4722,10 @@ pub fn occurrence_lifecycle_schema_metadata() -> MachineSchemaMetadata {
                 &["Ready", "Busy", "Missing"],
             ),
             NamedTypeBinding::string_enum(
+                "ClaimRedelivery",
+                &["Ordinary", "AfterAdmission", "AfterUnprovenDispatch"],
+            ),
+            NamedTypeBinding::string_enum(
                 "ClaimedDispatchSchedulePhase",
                 &["Active", "Paused", "Deleted"],
             ),

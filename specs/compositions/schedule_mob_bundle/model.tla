@@ -3,7 +3,7 @@ EXTENDS TLC, Naturals, Sequences, FiniteSets
 
 \* Generated composition model for schedule_mob_bundle.
 
-CONSTANTS AdmissionEvidenceValues, BooleanValues, ClaimOwnerValues, ClaimTokenValues, ClaimedDispatchDispositionValues, ClaimedDispatchSchedulePhaseValues, CompletionSupersessionDispositionValues, CorrelationIdValues, DeliveryAdmissionOutcomeValues, DeliveryCompletionFailureReasonValues, DeliveryFailureReasonValues, DeliveryReceiptStageValues, LateCompletionResolutionClassValues, MisfirePolicyValues, MissingTargetPolicyValues, NatValues, OccurrenceFailureClassValues, OccurrenceIdValues, OccurrenceLifecycleInputVariantValues, OccurrenceLifecycleStateValues, OccurrenceTargetProbeOutcomeValues, OccurrenceTransitionFailureClassKindValues, OccurrenceTransitionFailureRefusalKindValues, OverlapPolicyValues, RuntimeCompletionOutcomeValues, RuntimeOutcomeKeyValues, ScheduleIdValues, ScheduleLifecycleStateValues, SessionIdValues, SetOfOccurrenceIdValues, StringValues, TargetBindingIdValues, TriggerKeyValues
+CONSTANTS AdmissionEvidenceValues, BooleanValues, ClaimOwnerValues, ClaimRedeliveryValues, ClaimTokenValues, ClaimedDispatchDispositionValues, ClaimedDispatchSchedulePhaseValues, CompletionSupersessionDispositionValues, CorrelationIdValues, DeliveryAdmissionOutcomeValues, DeliveryCompletionFailureReasonValues, DeliveryFailureReasonValues, DeliveryReceiptStageValues, LateCompletionResolutionClassValues, MisfirePolicyValues, MissingTargetPolicyValues, NatValues, OccurrenceFailureClassValues, OccurrenceIdValues, OccurrenceLifecycleInputVariantValues, OccurrenceLifecycleStateValues, OccurrenceTargetProbeOutcomeValues, OccurrenceTransitionFailureClassKindValues, OccurrenceTransitionFailureRefusalKindValues, OverlapPolicyValues, RuntimeCompletionOutcomeValues, RuntimeOutcomeKeyValues, ScheduleIdValues, ScheduleLifecycleStateValues, SessionIdValues, SetOfOccurrenceIdValues, StringValues, TargetBindingIdValues, TriggerKeyValues
 
 None == [tag |-> "none", value |-> "none"]
 Some(v) == [tag |-> "some", value |-> v]
@@ -4243,11 +4243,12 @@ occurrence_DeliveryFailureScheduleMandateUnavailable(arg_reason, arg_detail, arg
        /\ model_step_count' = model_step_count + 1
 
 
-occurrence_TargetProbeReadyClaimed(arg_outcome, arg_detail, arg_at_utc_ms) ==
+occurrence_TargetProbeReadyClaimed(arg_outcome, arg_redelivery, arg_detail, arg_at_utc_ms) ==
     /\ \E packet \in SeqElements(pending_inputs) :
        /\ packet.machine = "occurrence"
        /\ packet.variant = "ResolveTargetProbe"
        /\ packet.payload.outcome = arg_outcome
+       /\ packet.payload.redelivery = arg_redelivery
        /\ packet.payload.detail = arg_detail
        /\ packet.payload.at_utc_ms = arg_at_utc_ms
        /\ ~HigherPriorityReady("occurrence_authority")
@@ -4264,11 +4265,12 @@ occurrence_TargetProbeReadyClaimed(arg_outcome, arg_detail, arg_at_utc_ms) ==
        /\ model_step_count' = model_step_count + 1
 
 
-occurrence_TargetProbeBusyAllowedByPolicy(arg_outcome, arg_detail, arg_at_utc_ms) ==
+occurrence_TargetProbeBusyAllowedByPolicy(arg_outcome, arg_redelivery, arg_detail, arg_at_utc_ms) ==
     /\ \E packet \in SeqElements(pending_inputs) :
        /\ packet.machine = "occurrence"
        /\ packet.variant = "ResolveTargetProbe"
        /\ packet.payload.outcome = arg_outcome
+       /\ packet.payload.redelivery = arg_redelivery
        /\ packet.payload.detail = arg_detail
        /\ packet.payload.at_utc_ms = arg_at_utc_ms
        /\ ~HigherPriorityReady("occurrence_authority")
@@ -4286,17 +4288,43 @@ occurrence_TargetProbeBusyAllowedByPolicy(arg_outcome, arg_detail, arg_at_utc_ms
        /\ model_step_count' = model_step_count + 1
 
 
-occurrence_TargetProbeBusySkipByPolicy(arg_outcome, arg_detail, arg_at_utc_ms) ==
+occurrence_TargetProbeBusyExistingRedelivery(arg_outcome, arg_redelivery, arg_detail, arg_at_utc_ms) ==
     /\ \E packet \in SeqElements(pending_inputs) :
        /\ packet.machine = "occurrence"
        /\ packet.variant = "ResolveTargetProbe"
        /\ packet.payload.outcome = arg_outcome
+       /\ packet.payload.redelivery = arg_redelivery
        /\ packet.payload.detail = arg_detail
        /\ packet.payload.at_utc_ms = arg_at_utc_ms
        /\ ~HigherPriorityReady("occurrence_authority")
        /\ occurrence_phase = "Claimed"
        /\ (packet.payload.outcome = "Busy")
        /\ (occurrence_overlap_policy = "SkipIfRunning")
+       /\ (packet.payload.redelivery # "Ordinary")
+       /\ occurrence_phase' = "Claimed"
+       /\ UnchangedFrame_f0a226b84dec6595
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "occurrence", transition |-> "TargetProbeBusyExistingRedelivery", actor |-> "occurrence_authority", step |-> (model_step_count + 1), from_phase |-> occurrence_phase, to_phase |-> "Claimed"]}
+       /\ model_step_count' = model_step_count + 1
+
+
+occurrence_TargetProbeBusySkipByPolicy(arg_outcome, arg_redelivery, arg_detail, arg_at_utc_ms) ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "occurrence"
+       /\ packet.variant = "ResolveTargetProbe"
+       /\ packet.payload.outcome = arg_outcome
+       /\ packet.payload.redelivery = arg_redelivery
+       /\ packet.payload.detail = arg_detail
+       /\ packet.payload.at_utc_ms = arg_at_utc_ms
+       /\ ~HigherPriorityReady("occurrence_authority")
+       /\ occurrence_phase = "Claimed"
+       /\ (packet.payload.outcome = "Busy")
+       /\ (occurrence_overlap_policy = "SkipIfRunning")
+       /\ (packet.payload.redelivery = "Ordinary")
        /\ occurrence_phase' = "Skipped"
        /\ occurrence_claimed_by' = None
        /\ occurrence_lease_expires_at_utc_ms' = None
@@ -4319,11 +4347,12 @@ occurrence_TargetProbeBusySkipByPolicy(arg_outcome, arg_detail, arg_at_utc_ms) =
        /\ model_step_count' = model_step_count + 1
 
 
-occurrence_TargetProbeMissingSkipByPolicy(arg_outcome, arg_detail, arg_at_utc_ms) ==
+occurrence_TargetProbeMissingSkipByPolicy(arg_outcome, arg_redelivery, arg_detail, arg_at_utc_ms) ==
     /\ \E packet \in SeqElements(pending_inputs) :
        /\ packet.machine = "occurrence"
        /\ packet.variant = "ResolveTargetProbe"
        /\ packet.payload.outcome = arg_outcome
+       /\ packet.payload.redelivery = arg_redelivery
        /\ packet.payload.detail = arg_detail
        /\ packet.payload.at_utc_ms = arg_at_utc_ms
        /\ ~HigherPriorityReady("occurrence_authority")
@@ -4352,11 +4381,12 @@ occurrence_TargetProbeMissingSkipByPolicy(arg_outcome, arg_detail, arg_at_utc_ms
        /\ model_step_count' = model_step_count + 1
 
 
-occurrence_TargetProbeMissingMisfireByPolicy(arg_outcome, arg_detail, arg_at_utc_ms) ==
+occurrence_TargetProbeMissingMisfireByPolicy(arg_outcome, arg_redelivery, arg_detail, arg_at_utc_ms) ==
     /\ \E packet \in SeqElements(pending_inputs) :
        /\ packet.machine = "occurrence"
        /\ packet.variant = "ResolveTargetProbe"
        /\ packet.payload.outcome = arg_outcome
+       /\ packet.payload.redelivery = arg_redelivery
        /\ packet.payload.detail = arg_detail
        /\ packet.payload.at_utc_ms = arg_at_utc_ms
        /\ ~HigherPriorityReady("occurrence_authority")
@@ -5545,7 +5575,8 @@ EntryPacketAdmissible_occurrence(packet) ==
     \/ /\ (packet.variant = "ResolveDeliveryFailure") /\ (occurrence_phase = "Claimed" \/ occurrence_phase = "Dispatching" \/ occurrence_phase = "AwaitingCompletion") /\ ((packet.payload.reason = "ScheduleMandateUnavailable"))
     \/ /\ (packet.variant = "ResolveTargetProbe") /\ (occurrence_phase = "Claimed") /\ ((packet.payload.outcome = "Ready"))
     \/ /\ (packet.variant = "ResolveTargetProbe") /\ (occurrence_phase = "Claimed") /\ ((packet.payload.outcome = "Busy")) /\ ((occurrence_overlap_policy = "AllowConcurrent"))
-    \/ /\ (packet.variant = "ResolveTargetProbe") /\ (occurrence_phase = "Claimed") /\ ((packet.payload.outcome = "Busy")) /\ ((occurrence_overlap_policy = "SkipIfRunning"))
+    \/ /\ (packet.variant = "ResolveTargetProbe") /\ (occurrence_phase = "Claimed") /\ ((packet.payload.outcome = "Busy")) /\ ((occurrence_overlap_policy = "SkipIfRunning")) /\ ((packet.payload.redelivery # "Ordinary"))
+    \/ /\ (packet.variant = "ResolveTargetProbe") /\ (occurrence_phase = "Claimed") /\ ((packet.payload.outcome = "Busy")) /\ ((occurrence_overlap_policy = "SkipIfRunning")) /\ ((packet.payload.redelivery = "Ordinary"))
     \/ /\ (packet.variant = "ResolveTargetProbe") /\ (occurrence_phase = "Claimed") /\ ((packet.payload.outcome = "Missing")) /\ ((occurrence_missing_target_policy = "Skip"))
     \/ /\ (packet.variant = "ResolveTargetProbe") /\ (occurrence_phase = "Claimed") /\ ((packet.payload.outcome = "Missing")) /\ ((occurrence_missing_target_policy = "MarkMisfired"))
     \/ /\ (packet.variant = "ResolveDueMisfire") /\ (occurrence_phase = "Pending") /\ (((occurrence_due_at_utc_ms <= packet.payload.at_utc_ms) /\ (occurrence_misfire_deadline_utc_ms < packet.payload.at_utc_ms)))
@@ -5839,11 +5870,12 @@ CoreNext ==
     \/ \E arg_reason \in DeliveryFailureReasonValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_DeliveryFailureTransportError(arg_reason, arg_detail, arg_at_utc_ms)
     \/ \E arg_reason \in DeliveryFailureReasonValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_DeliveryFailureInternalError(arg_reason, arg_detail, arg_at_utc_ms)
     \/ \E arg_reason \in DeliveryFailureReasonValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_DeliveryFailureScheduleMandateUnavailable(arg_reason, arg_detail, arg_at_utc_ms)
-    \/ \E arg_outcome \in OccurrenceTargetProbeOutcomeValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_TargetProbeReadyClaimed(arg_outcome, arg_detail, arg_at_utc_ms)
-    \/ \E arg_outcome \in OccurrenceTargetProbeOutcomeValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_TargetProbeBusyAllowedByPolicy(arg_outcome, arg_detail, arg_at_utc_ms)
-    \/ \E arg_outcome \in OccurrenceTargetProbeOutcomeValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_TargetProbeBusySkipByPolicy(arg_outcome, arg_detail, arg_at_utc_ms)
-    \/ \E arg_outcome \in OccurrenceTargetProbeOutcomeValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_TargetProbeMissingSkipByPolicy(arg_outcome, arg_detail, arg_at_utc_ms)
-    \/ \E arg_outcome \in OccurrenceTargetProbeOutcomeValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_TargetProbeMissingMisfireByPolicy(arg_outcome, arg_detail, arg_at_utc_ms)
+    \/ \E arg_outcome \in OccurrenceTargetProbeOutcomeValues : \E arg_redelivery \in ClaimRedeliveryValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_TargetProbeReadyClaimed(arg_outcome, arg_redelivery, arg_detail, arg_at_utc_ms)
+    \/ \E arg_outcome \in OccurrenceTargetProbeOutcomeValues : \E arg_redelivery \in ClaimRedeliveryValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_TargetProbeBusyAllowedByPolicy(arg_outcome, arg_redelivery, arg_detail, arg_at_utc_ms)
+    \/ \E arg_outcome \in OccurrenceTargetProbeOutcomeValues : \E arg_redelivery \in ClaimRedeliveryValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_TargetProbeBusyExistingRedelivery(arg_outcome, arg_redelivery, arg_detail, arg_at_utc_ms)
+    \/ \E arg_outcome \in OccurrenceTargetProbeOutcomeValues : \E arg_redelivery \in ClaimRedeliveryValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_TargetProbeBusySkipByPolicy(arg_outcome, arg_redelivery, arg_detail, arg_at_utc_ms)
+    \/ \E arg_outcome \in OccurrenceTargetProbeOutcomeValues : \E arg_redelivery \in ClaimRedeliveryValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_TargetProbeMissingSkipByPolicy(arg_outcome, arg_redelivery, arg_detail, arg_at_utc_ms)
+    \/ \E arg_outcome \in OccurrenceTargetProbeOutcomeValues : \E arg_redelivery \in ClaimRedeliveryValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_TargetProbeMissingMisfireByPolicy(arg_outcome, arg_redelivery, arg_detail, arg_at_utc_ms)
     \/ \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_DueMisfirePending(arg_detail, arg_at_utc_ms)
     \/ \E arg_admission_evidence \in AdmissionEvidenceValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_ReclaimExhaustedAfterAdmission(arg_admission_evidence, arg_detail, arg_at_utc_ms)
     \/ \E arg_admission_evidence \in AdmissionEvidenceValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_ReclaimExhaustedAfterUnprovenDispatch(arg_admission_evidence, arg_detail, arg_at_utc_ms)

@@ -40,8 +40,10 @@ them.
 - `meerkat-schedule`: the occurrence lifecycle carries the admission evidence
   of an occurrence's receipt history (see Fixed, scheduled delivery after a
   lost executor). `OccurrenceLifecycleInput::ClassifyDue` and `Claim` gain the
-  field `admission_evidence: AdmissionEvidence`, and the input gains the
-  variants `ResolveReclaimExhausted` and `ResolveUnprovenLateNotAdmitted`.
+  field `admission_evidence: AdmissionEvidence`, `ResolveTargetProbe` gains
+  the field `redelivery: Option<ExistingDelivery>` (the redelivery the claim
+  named, `None` for an ordinary claim), and the input gains the variants
+  `ResolveReclaimExhausted` and `ResolveUnprovenLateNotAdmitted`.
   `OccurrenceLifecycleEffect` gains `DueReclaimExhausted`,
   `ReclaimedAfterAdmission` and `ReclaimedAfterUnprovenDispatch`.
   `OccurrenceDueAction` gains `ReclaimExhausted` and is now
@@ -49,8 +51,9 @@ them.
   as a second argument. The gate's findings: added enum variants, struct
   variant fields added, a method parameter count change, and an enum marked
   non-exhaustive. Code outside the crate that builds these inputs passes
-  `AdmissionEvidence::None`, the earlier behaviour, unless it derives the
-  evidence with `AdmissionEvidence::from_receipt_stages`. The persisted
+  `AdmissionEvidence::None` and `redelivery: None`, the earlier behaviour,
+  unless it derives the evidence with `AdmissionEvidence::from_receipt_stages`
+  and the redelivery from the claim's effects. The persisted
   occurrence is unchanged (schema version 9).
 
 ### Added
@@ -106,15 +109,23 @@ them.
     receipt): the occurrence is reclaimed, also past its misfire deadline, for
     up to five attempts. The redelivery uses the runtime's deduplicate-only
     admission, so it finds the admitted input and never admits it again, and
-    the occurrence records that input's outcome. After five lost executors it
-    ends `delivery_failed` with `lease_lost`; an input the runtime no longer
-    knows (a row that recovery discarded, a store-less runtime's archived
-    input) ends it `delivery_failed` with nothing admitted;
+    the occurrence records that input's outcome. A target still busy with
+    that input does not end the redelivery under `skip_if_running`, since a
+    redelivery starts no new run. After five lost executors it ends
+    `delivery_failed` with `lease_lost`; an input the runtime no longer knows
+    (a row that recovery discarded, a store-less runtime's archived input)
+    ends it `delivery_failed` (failure class `runtime_rejected`) with nothing
+    admitted. A host runnable keeps no admission record and runs again, so
+    for host runnables the guarantee is at-least-once and relies on the
+    runnable deduplicating on `delivery_idempotency_key`. A target delivery
+    that keeps the default `deliver_existing_occurrence` redelivers through
+    its ordinary delivery and relies on that delivery's durable
+    deduplication;
   - only an earlier dispatch start is recorded: a reclaim past the deadline
-    asks the target whether it admitted the delivery. It records that input's
-    outcome when the target did, and ends `misfired` with nothing delivered
-    when it did not. A mob target answers from its durable external-delivery
-    record and begins none;
+    asks the target, a busy one too, whether it admitted the delivery. It
+    records that input's outcome when the target did, and ends `misfired`
+    with nothing delivered when it did not. A mob target answers from its
+    durable external-delivery record and begins none;
   - no dispatch was recorded (a crash before the dispatch start was
     recorded): the misfire policy decides, as before.
   The evidence is read from the occurrence's receipt history in both stores
