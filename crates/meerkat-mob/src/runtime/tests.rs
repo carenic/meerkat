@@ -48585,8 +48585,12 @@ async fn test_retire_member_waits_for_active_runtime_turn_before_unregister() {
             meerkat_core::lifecycle::core_executor::CoreApplyOutput,
             meerkat_core::lifecycle::core_executor::CoreExecutorError,
         > {
+            // apply runs on the runtime's serving thread, and the test may
+            // release it as soon as it sees the start. notify_waiters keeps
+            // no permit, so register for the release before announcing.
+            let allow_finish = self.allow_finish.notified();
             self.apply_started.notify_waiters();
-            self.allow_finish.notified().await;
+            allow_finish.await;
 
             Ok(
                 meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_untyped_snapshot(
@@ -48787,8 +48791,12 @@ async fn test_retire_member_cancels_visible_retired_drain_run_before_archive() {
             meerkat_core::lifecycle::core_executor::CoreApplyOutput,
             meerkat_core::lifecycle::core_executor::CoreExecutorError,
         > {
+            // apply runs on the runtime's serving thread, and the test may
+            // release it as soon as it sees the start. notify_waiters keeps
+            // no permit, so register for the release before announcing.
+            let allow_finish = self.allow_finish.notified();
             self.apply_started.notify_waiters();
-            self.allow_finish.notified().await;
+            allow_finish.await;
             Ok(
                 meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_untyped_snapshot(
                     meerkat_core::lifecycle::run_receipt::RunBoundaryReceiptDraft {
@@ -49280,8 +49288,12 @@ async fn test_retire_member_bounds_wedged_exact_control_and_retry_converges() {
             meerkat_core::lifecycle::core_executor::CoreApplyOutput,
             meerkat_core::lifecycle::core_executor::CoreExecutorError,
         > {
+            // apply runs on the runtime's serving thread, and the test may
+            // release it as soon as it sees the start. notify_waiters keeps
+            // no permit, so register for the release before announcing.
+            let allow_finish = self.allow_finish.notified();
             self.apply_started.notify_waiters();
-            self.allow_finish.notified().await;
+            allow_finish.await;
             Ok(
                 meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_untyped_snapshot(
                     meerkat_core::lifecycle::run_receipt::RunBoundaryReceiptDraft {
