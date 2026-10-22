@@ -131,6 +131,66 @@ async fn a_session_continuation_replays_after_reopening_a_sqlite_store() {
     );
 }
 
+/// A member continuation committed before a restart replays its first
+/// receipt from the reopened store: the restart path of a keyed member send,
+/// whose key this ledger keeps for the member identity.
+#[cfg(feature = "sqlite-store")]
+#[tokio::test]
+async fn a_member_continuation_replays_after_reopening_a_sqlite_store() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("runtime.sqlite3");
+    let owner = ContinuationOwner::Member {
+        mob_id: "team".into(),
+        identity: "lead".into(),
+    };
+    let receipt = {
+        let store: Arc<dyn RuntimeStore> =
+            Arc::new(meerkat_runtime::SqliteRuntimeStore::new(&path).expect("open"));
+        let (continuations, _) = service(store, MemberResolver::at(1));
+        continuations
+            .submit(&owner, delivery("member_send:item-16", "result"), 10)
+            .await
+            .expect("commit")
+    };
+    let store: Arc<dyn RuntimeStore> =
+        Arc::new(meerkat_runtime::SqliteRuntimeStore::new(&path).expect("reopen"));
+    let (continuations, _) = service(store, MemberResolver::at(1));
+    assert_eq!(
+        continuations
+            .submit(&owner, delivery("member_send:item-16", "result"), 99)
+            .await
+            .expect("replay after reopen"),
+        receipt,
+        "the first receipt, delivery id and commit time included"
+    );
+    assert!(
+        matches!(
+            continuations
+                .continuation_status(
+                    &owner,
+                    &ContinuationKey::new("member_send:item-16").expect("key")
+                )
+                .await
+                .expect("status"),
+            ContinuationStatus::Pending { admitted: None, .. }
+        ),
+        "committed and not drained yet"
+    );
+    assert_eq!(
+        continuations
+            .submit(
+                &owner,
+                delivery("member_send:item-16", "other content"),
+                100
+            )
+            .await
+            .expect_err("other content under the key"),
+        ContinuationSubmitError::Conflict {
+            existing: Box::new(receipt)
+        }
+    );
+}
+
 /// A mob resolver test double: the member's current generation, which the
 /// test moves to model a respawn or a retirement.
 struct MemberResolver {

@@ -18584,5 +18584,55 @@ provider_params = { provider_tag = { provider = "anthropic", cache_control = "di
                 );
             }
         }
+
+        /// A first keyed send to a member the mob does not hold is refused,
+        /// typed, before anything commits: the key binds nothing for that
+        /// identity.
+        #[cfg(feature = "mob")]
+        #[tokio::test]
+        async fn member_send_key_to_an_unknown_member_is_refused_before_commit() {
+            let (router, _runtime, _temp) = keyed_router(true).await;
+            let mob_id = create_mob_with_worker(&router, "mob-keyed-unknown").await;
+            let refused = router
+                .dispatch(make_request(
+                    "mob/member_send",
+                    serde_json::json!({
+                        "mob_id": mob_id,
+                        "agent_identity": "ghost-1",
+                        "content": "never committed",
+                        "idempotency_key": "item-17",
+                    }),
+                ))
+                .await
+                .unwrap();
+            let error = refused
+                .error
+                .as_ref()
+                .expect("an unknown member is refused");
+            assert_ne!(error.code, crate::error::INTERNAL_ERROR, "typed: {error:?}");
+            let service = router
+                .mob_state
+                .continuation_service()
+                .expect("the RPC mob state binds its continuation service");
+            let status = service
+                .continuation_status(
+                    &meerkat::ContinuationOwner::Member {
+                        mob_id: mob_id.clone(),
+                        identity: "ghost-1".to_string(),
+                    },
+                    &meerkat::ContinuationKey::new(format!(
+                        "{}item-17",
+                        meerkat_mob_mcp::MEMBER_SEND_CONTINUATION_KEY_PREFIX
+                    ))
+                    .expect("key"),
+                )
+                .await
+                .expect("status");
+            assert_eq!(
+                status,
+                meerkat::ContinuationStatus::NotCommitted,
+                "nothing was committed"
+            );
+        }
     }
 }

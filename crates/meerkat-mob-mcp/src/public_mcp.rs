@@ -2483,4 +2483,112 @@ mod tests {
         let data = err.data.clone().unwrap_or_default();
         assert_eq!(data["kind"], "idempotency_unavailable", "{err:?}");
     }
+
+    /// A native work authorization host that admits nothing: these rows only
+    /// need one installed.
+    struct RefuseAllWork;
+
+    impl meerkat_runtime::input_authority::NativeWorkAuthorizationHost for RefuseAllWork {
+        fn authenticate_association(
+            &self,
+            _runtime_id: &meerkat_runtime::LogicalRuntimeId,
+            _input: &meerkat_runtime::input::Input,
+            _ingress: &meerkat_runtime::input_authority::NativeIngressContext,
+            _association: &meerkat_authorization_contracts::work_association::InputAuthorityAssociation,
+        ) -> Result<(), meerkat_runtime::input_authority::NativeAdmissionError> {
+            Err(
+                meerkat_core::OperationRefused::new(meerkat_core::OperationRefusalKind::Denied)
+                    .into(),
+            )
+        }
+
+        fn work_context(
+            &self,
+            _batch: &meerkat_runtime::input_authority::NativeWorkBatch,
+        ) -> Result<
+            meerkat_core::authorization::WorkAuthorizationContext,
+            meerkat_runtime::input_authority::NativeWorkContextError,
+        > {
+            Err(meerkat_runtime::input_authority::NativeWorkContextError::MalformedAcceptedWork)
+        }
+    }
+
+    /// A keyed member send on a governed runtime is refused, typed, before
+    /// anything commits: a continuation carries no native work binding it
+    /// could be admitted under there.
+    #[tokio::test]
+    async fn mcp_member_send_key_on_a_governed_runtime_is_refused_before_commit() {
+        let runtime = Arc::new(
+            meerkat_runtime::MeerkatMachine::ephemeral()
+                .with_native_work_authorization_host(Arc::new(RefuseAllWork))
+                .expect("install the host"),
+        );
+        let state = MobMcpState::from_acquired_runtime_adapter(
+            Arc::new(crate::LocalSessionService::new_over_runtime_for_tests(
+                Arc::clone(&runtime),
+            )),
+            Some(runtime),
+            meerkat_mob::MobControlPrincipal::Owner,
+        )
+        .into_shared();
+        let bindings = meerkat::ContinuationHostBindings::default();
+        state
+            .bind_continuations(
+                meerkat_runtime::RuntimeDeliveryInbox::new(Arc::new(
+                    meerkat_runtime::InMemoryRuntimeStore::new(),
+                )),
+                &bindings,
+            )
+            .expect("bind the state's continuations");
+        handle_public_tools_call(
+            &state,
+            "meerkat_mob_create",
+            &json!({
+                "definition": {
+                    "id": "keyed-governed-mob",
+                    "profiles": {
+                        "lead": { "model": "gpt-5.4", "tools": {"comms": true} }
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("typed public create");
+        let err = handle_public_tools_call(
+            &state,
+            "meerkat_mob_member_send",
+            &json!({
+                "mob_id": "keyed-governed-mob",
+                "agent_identity": "worker-1",
+                "content": "keyed",
+                "idempotency_key": "item-18",
+            }),
+        )
+        .await
+        .expect_err("a governed runtime refuses a keyed send");
+        let data = err.data.clone().unwrap_or_default();
+        assert_eq!(data["kind"], "idempotency_unavailable", "{err:?}");
+        assert_eq!(data["cause"], "governed_runtime", "{err:?}");
+        let status = state
+            .continuation_service()
+            .expect("bound")
+            .continuation_status(
+                &meerkat::ContinuationOwner::Member {
+                    mob_id: "keyed-governed-mob".to_string(),
+                    identity: "worker-1".to_string(),
+                },
+                &meerkat::ContinuationKey::new(format!(
+                    "{}item-18",
+                    crate::MEMBER_SEND_CONTINUATION_KEY_PREFIX
+                ))
+                .expect("key"),
+            )
+            .await
+            .expect("status");
+        assert_eq!(
+            status,
+            meerkat::ContinuationStatus::NotCommitted,
+            "nothing was committed"
+        );
+    }
 }

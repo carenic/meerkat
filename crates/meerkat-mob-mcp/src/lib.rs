@@ -8284,6 +8284,16 @@ impl LocalSessionService {
         Self::new_with_archive_failures(Arc::new(InMemoryArchiveFailureControl::default()))
     }
 
+    /// [`Self::new`] over a runtime the test configured first (a governed
+    /// one). Tests only.
+    #[cfg(test)]
+    fn new_over_runtime_for_tests(runtime_adapter: Arc<meerkat_runtime::MeerkatMachine>) -> Self {
+        Self {
+            runtime_adapter,
+            ..Self::new()
+        }
+    }
+
     fn new_with_archive_failures(archive_failures: Arc<InMemoryArchiveFailureControl>) -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
