@@ -77,24 +77,51 @@ pub(super) fn drain_target(
     }
 }
 
-/// Settle every member of `snapshot` within `until`.
+/// Settle every member of `snapshot` within `until`, waiting for all
+/// captured runs together.
 pub(super) async fn drain(snapshot: DrainSnapshot, until: Instant) -> MobRunDrainReport {
     let DrainSnapshot { members, machine } = snapshot;
-    let _ = until;
-    let mut report = MobRunDrainReport::default();
-    for member in members {
+    let machine = machine.as_deref();
+    let outcomes = futures::future::join_all(members.into_iter().map(|member| async move {
         let run = match member.target {
             DrainTarget::Report(run) => run,
-            DrainTarget::Wait { run_id, .. } => MemberRunDrain::StillRunning { run_id },
+            DrainTarget::Wait { session_id, run_id } => match machine {
+                Some(machine) => settle(machine, &session_id, run_id, until).await,
+                None => MemberRunDrain::StillRunning { run_id },
+            },
         };
-        report.members.insert(
+        (
             member.identity,
             MemberRunDrainOutcome {
                 run,
                 starts: member.starts,
             },
-        );
+        )
+    }))
+    .await;
+    MobRunDrainReport {
+        members: outcomes.into_iter().collect(),
     }
-    drop(machine);
-    report
+}
+
+/// Wait until `run_id` is no longer `session_id`'s current run, or until
+/// `until`. A run that ended reports the terminal the machine retains for it,
+/// or none when its registration ended with it.
+async fn settle(
+    machine: &meerkat_runtime::MeerkatMachine,
+    session_id: &SessionId,
+    run_id: RunId,
+    until: Instant,
+) -> MemberRunDrain {
+    let settled = crate::tokio::time::timeout(
+        until.saturating_duration_since(Instant::now()),
+        machine.wait_run_settled(session_id, &run_id),
+    )
+    .await
+    .is_ok();
+    if !settled {
+        return MemberRunDrain::StillRunning { run_id };
+    }
+    let terminal = machine.run_turn_terminal(session_id, &run_id).await;
+    MemberRunDrain::Ended { run_id, terminal }
 }

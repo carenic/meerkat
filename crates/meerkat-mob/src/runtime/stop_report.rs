@@ -53,7 +53,12 @@ impl StopOptions {
     /// Leave every member's current run running: an autonomous member's run
     /// is not cancelled at its next boundary, as a plain Stop does. Its run
     /// starts are held and its kickoff stop intent is recorded as usual, and
-    /// the Stop reports the run `LeftRunning`.
+    /// the Stop reports the run `LeftRunning` and returns without waiting
+    /// for any turn. A Stop that arrives while a plain Stop still waits for
+    /// the turns it cancelled joins that Stop and returns its report, and a
+    /// Stop with this option does not recall the cancels an earlier plain
+    /// Stop that failed already dispatched: those runs still end at their
+    /// next boundary.
     ///
     /// Meant for Stop, then
     /// [`MobHandle::drain_stopped_runs`](super::MobHandle::drain_stopped_runs),
@@ -96,8 +101,9 @@ pub enum MemberStopRun {
     CancelDispatched { run_id: RunId },
     /// The run ended on its own between the hold and the cancel.
     RunEndedBeforeCancel { run_id: RunId },
-    /// A turn-driven member's run: Stop does not cancel it, and it finishes
-    /// normally. No new run starts after it until Resume.
+    /// A run the Stop left running: a turn-driven member's, or any member's
+    /// under [`StopOptions::leave_runs_running`]. It finishes normally, and
+    /// no new run starts after it until Resume.
     LeftRunning { run_id: RunId },
     /// A remote member that cannot report its run (it lacks the run-start
     /// hold capability); the stop sent it the ambient interrupt.

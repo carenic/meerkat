@@ -178,6 +178,23 @@ them.
   is seen as gone, never admitted again. The trait default refuses.
   `MeerkatMachine::accept_existing_input_with_completion_for_attachment_and_member_residency`
   is the same for a mob member's attachment.
+- `MobHandle::drain_stopped_runs(until)` waits, up to `until`, for the run
+  each member of a Stopped mob had when it was called, and reports for each
+  member whether that run ended (with the terminal it recorded), was still
+  running at the bound, or was not waited for: no run, an open live channel,
+  a placed or remote member, or a runtime registration that needs a
+  durability reload. It cancels and writes nothing, so a graceful shutdown
+  that lets in-flight turns finish runs Stop, the drain, then Shutdown, which
+  cancels what is still running as before. On a mob that is not Stopped it
+  is refused with `MobError::DrainRequiresStoppedMob`.
+- `MobHandle::stop_with_options(StopOptions::default().leave_runs_running())`
+  leaves every member's current run running, an autonomous member's
+  included, and returns without waiting for any turn: run starts are held
+  and autonomous kickoffs are closed as by a plain Stop, and each such run is
+  reported `LeftRunning`. `MobHandle::stop` is unchanged and still cancels
+  an autonomous member's run at its next boundary.
+- `MeerkatMachine::session_live_channel_active` reports whether a session
+  has an active live channel at that instant.
 
 ### Changed
 
