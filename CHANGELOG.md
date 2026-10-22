@@ -53,8 +53,36 @@ them.
   non-exhaustive. Code outside the crate that builds these inputs passes
   `AdmissionEvidence::None` and `redelivery: None`, the earlier behaviour,
   unless it derives the evidence with `AdmissionEvidence::from_receipt_stages`
-  and the redelivery from the claim's effects. The persisted
-  occurrence is unchanged (schema version 9).
+  and the redelivery from the claim's effects. The variants after the new
+  ones change their implicit discriminants (`OccurrenceLifecycleEffect::*`
+  and `OccurrenceLifecycleInput::*`); match them by variant name, not by
+  numeric cast. The persisted occurrence is unchanged (schema version 9).
+- `meerkat-machine-kernels`: the generated occurrence machine
+  (`generated::occurrence_lifecycle`) gains the same inputs and effects:
+  `Input`, `InputKind` and `OccurrenceLifecycleInputVariant` gain
+  `ResolveReclaimExhausted` and `ResolveUnprovenLateNotAdmitted`; `Effect`
+  and `EffectKind` gain `DueReclaimExhausted`, `ReclaimedAfterAdmission` and
+  `ReclaimedAfterUnprovenDispatch`; `TransitionId` gains
+  `ClassifyDuePendingReclaimExhausted`, `ClaimPendingAfterAdmission`,
+  `ClaimPendingAfterUnprovenDispatch`, `TargetProbeBusyExistingRedelivery`,
+  `ReclaimExhaustedAfterAdmission`, `ReclaimExhaustedAfterUnprovenDispatch`,
+  `UnprovenLateNotAdmittedFromClaimed` and
+  `UnprovenLateNotAdmittedFromDispatching`. So their implicit discriminants
+  change (`EffectKind::*`, `InputKind::*`,
+  `OccurrenceLifecycleInputVariant::*` and `TransitionId::*`), and so does
+  the `PartialOrd` order of `OccurrenceLifecycleInputVariant::*`; match them
+  by variant name, not by numeric cast or position. The input structs
+  `ClassifyDue` and `Claim` gain the public field `admission_evidence`, and
+  `ResolveTargetProbe` gains `redelivery` (struct literals need them).
+- `meerkat-machine-schema` (`catalog::dsl::occurrence_lifecycle`): the
+  occurrence machine's DSL enums gain the same variants and input fields
+  (`OccurrenceLifecycleEffectVariant` and `OccurrenceLifecycleInputVariant`
+  included), so their implicit discriminants change
+  (`OccurrenceLifecycleEffect::*`, `OccurrenceLifecycleEffectVariant::*`,
+  `OccurrenceLifecycleInput::*` and `OccurrenceLifecycleInputVariant::*`)
+  and so does the `PartialOrd` order of `OccurrenceLifecycleEffectVariant::*`
+  and `OccurrenceLifecycleInputVariant::*`; match them by variant name, not
+  by numeric cast or position.
 
 ### Added
 
