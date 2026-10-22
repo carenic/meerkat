@@ -1067,14 +1067,28 @@ if (not gcp_block or "exec_properties" in gcp_body or "parents" in gcp_body
     fail(f"linux_x86_64_gcp_ci must set no exec_properties and no parent, with the parent's constraints: {gcp_body!r}")
 else:
     ok("linux_x86_64_gcp_ci sets no exec_properties and no parent, with the former parent's constraints")
-# Its properties are the .bazelrc defaults of its config (buildbuddy-linux-rbe, then
-# buildbuddy-linux-gcp-ci-rbe); the wrapper adds only the container image.
-gcp_defaults = {}
+# Its properties are the .bazelrc defaults that reach its config: the unscoped build and
+# common lines, and every config that buildbuddy-linux-gcp-ci-rbe pulls in through
+# --config= (buildbuddy-linux-rbe, buildbuddy). The wrapper adds only the container image.
 with open(os.path.join(REPO, ".bazelrc"), encoding="utf-8") as handle:
-    for line in handle:
-        found = re.match(r"build:(buildbuddy-linux-rbe|buildbuddy-linux-gcp-ci-rbe) --remote_default_exec_properties=([^=\s]+)=(\S*)$", line.strip())
-        if found:
-            gcp_defaults[found.group(2)] = found.group(3)
+    rc_lines = [line.split() for line in handle if line.strip() and not line.lstrip().startswith("#")]
+gcp_chain, pending = set(), ["buildbuddy-linux-gcp-ci-rbe"]
+while pending:
+    config = pending.pop()
+    if config in gcp_chain:
+        continue
+    gcp_chain.add(config)
+    for tokens in rc_lines:
+        if tokens[0] in (f"build:{config}", f"common:{config}"):
+            pending += [token.split("=", 1)[1] for token in tokens[1:] if token.startswith("--config=")]
+applies = {"build", "common"} | {f"{command}:{config}" for config in gcp_chain for command in ("build", "common")}
+gcp_defaults = {}
+for tokens in rc_lines:
+    if tokens[0] in applies:
+        for token in tokens[1:]:
+            if token.startswith("--remote_default_exec_properties="):
+                key, _, value = token.split("=", 1)[1].partition("=")
+                gcp_defaults[key] = value
 want_defaults = {"Arch": "amd64", "OSFamily": "linux", "Pool": "meerkat-ci", "dockerNetwork": "off", "network": "external"}
 if gcp_defaults != want_defaults:
     fail(f"the gcp platform's .bazelrc defaults changed: {gcp_defaults} (want {want_defaults})")
@@ -1087,7 +1101,12 @@ for directory, _, names in os.walk(os.path.join(REPO, "tools", "bazel")):
                 if name in ("BUILD", "BUILD.bazel") or name.endswith(".bzl")]
 scripts_dir = os.path.join(REPO, "scripts")
 scanned += [os.path.join(scripts_dir, name) for name in sorted(os.listdir(scripts_dir))
-            if name.startswith(("ci-action-pins", "gcp-buildbuddy-"))]
+            if name.startswith(("ci-action-pins", "gcp-buildbuddy-", "buildbuddy-"))]
+# The BuildBuddy workflow and the actions it runs pass the CI image at run time too.
+scanned.append(os.path.join(REPO, ".github", "workflows", "buildbuddy.yml"))
+actions_dir = os.path.join(REPO, ".github", "actions")
+scanned += [os.path.join(actions_dir, name, "action.yml") for name in sorted(os.listdir(actions_dir))
+            if "buildbuddy" in name and os.path.isfile(os.path.join(actions_dir, name, "action.yml"))]
 written = []
 for path in scanned:
     with open(path, encoding="utf-8") as handle:
@@ -1096,7 +1115,8 @@ for path in scanned:
 if written:
     fail(f"a project-scoped registry path is written out: {written}")
 else:
-    ok("no project-scoped registry path is written out in the Bazel platforms, the pin check or the GCP scripts")
+    ok("no project-scoped registry path is written out in the Bazel platforms, the pin check, the GCP and "
+       "BuildBuddy scripts, or the BuildBuddy workflow and its actions")
 
 sys.exit(1 if FAILURES else 0)
 PY
