@@ -351,8 +351,14 @@ pub struct ForkInstructionRefusal {
     /// source whose arguments name no skill. Their results count as
     /// loaded skills, so the fork fails closed on them. Empty for every
     /// other refusal, and then not serialized.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub unreadable_skill_loads: Vec<String>,
+    // A boxed slice, not a `Vec`: `SessionError` carries this refusal
+    // inline, and a third `Vec` here makes every `SessionError` larger.
+    #[serde(default, skip_serializing_if = "no_unreadable_skill_loads")]
+    pub unreadable_skill_loads: Box<[String]>,
+}
+
+fn no_unreadable_skill_loads(calls: &[String]) -> bool {
+    calls.is_empty()
 }
 
 impl ForkInstructionRefusal {
@@ -365,7 +371,7 @@ impl ForkInstructionRefusal {
             cause,
             keys,
             skills: Vec::new(),
-            unreadable_skill_loads: Vec::new(),
+            unreadable_skill_loads: Box::default(),
         }
     }
 
@@ -380,7 +386,7 @@ impl ForkInstructionRefusal {
     /// name no skill, by tool call id.
     #[must_use]
     pub fn with_unreadable_skill_loads(mut self, calls: Vec<String>) -> Self {
-        self.unreadable_skill_loads = calls;
+        self.unreadable_skill_loads = calls.into_boxed_slice();
         self
     }
 }

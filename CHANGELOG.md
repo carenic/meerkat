@@ -56,7 +56,7 @@ them.
 - Not measured by the gate (a wire change): `meerkat-core`:
   `ForkInstructionRefusal` gains `skills: Vec<SkillKey>`, the skills a
   prompt-context fork's source loaded with the built-in `load_skill` tool
-  (see the next entry), and `unreadable_skill_loads: Vec<String>`, the
+  (see the next entry), and `unreadable_skill_loads: Box<[String]>`, the
   tool call ids of `load_skill` calls whose arguments name no skill. Each
   is serialized only when not empty, and only a prompt-context fork
   refusal sets them; its message names only what the child would
