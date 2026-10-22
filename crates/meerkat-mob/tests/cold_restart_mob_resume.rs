@@ -4028,7 +4028,7 @@ async fn a_mob_start_refuses_a_durable_tail_another_runtime_owner_hosts() {
         Ok(handle) => {
             match &refused_status {
                 Some(Err(error)) => {
-                    assert_startup_refusal_names_the_hosted_member(error, &identity, &w1_sid)
+                    assert_startup_refusal_names_the_hosted_member(error, &identity, &w1_sid);
                 }
                 other => {
                     panic!("status after the refused start must report the refusal: {other:?}")
@@ -4036,7 +4036,7 @@ async fn a_mob_start_refuses_a_durable_tail_another_runtime_owner_hosts() {
             }
             match handle.resume().await {
                 Err(error) => {
-                    assert_startup_refusal_names_the_hosted_member(&error, &identity, &w1_sid)
+                    assert_startup_refusal_names_the_hosted_member(&error, &identity, &w1_sid);
                 }
                 Ok(()) => {
                     panic!("an explicit resume after the refused start must report the refusal")
@@ -4044,7 +4044,7 @@ async fn a_mob_start_refuses_a_durable_tail_another_runtime_owner_hosts() {
             }
             match handle.status().await {
                 Err(error) => {
-                    assert_startup_refusal_names_the_hosted_member(&error, &identity, &w1_sid)
+                    assert_startup_refusal_names_the_hosted_member(&error, &identity, &w1_sid);
                 }
                 Ok(state) => {
                     panic!("status after the refused resume must report the refusal, not {state:?}")
