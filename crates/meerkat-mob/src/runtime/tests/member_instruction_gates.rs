@@ -1708,6 +1708,365 @@ async fn an_unknown_member_is_refused_not_materialized() {
     fixture.finish().await;
 }
 
+// Prompt-context forks (`MemberLaunchMode::Fork`): the source's history is
+// rendered as text into the child's first prompt. Under the default policy
+// and under `refuse` the source's System rows (its system prompt and its
+// activated instruction rows) are not carried, and `refuse` refuses a fork
+// whose rows hold an activation; `reactivate_inherited` carries them. The
+// block ends with a notice line naming what happened.
+
+const FORK_HEADER: &str = "[Forked conversation context from member";
+const FORK_END: &str = "[End of forked context]";
+
+/// The rendered fork-context block in `request`'s user rows, if any.
+fn fork_block(request: &meerkat_client::LlmRequest) -> Option<String> {
+    request.messages.iter().find_map(|message| {
+        let Message::User(user) = message else {
+            return None;
+        };
+        let text = user.text_content();
+        let start = text.find(FORK_HEADER)?;
+        let block = &text[start..];
+        let end = block
+            .find(FORK_END)
+            .map_or(block.len(), |end| end + FORK_END.len());
+        Some(block[..end].to_string())
+    })
+}
+
+/// Whether any row of `request` carries the standing activation body.
+fn carries_body(request: &meerkat_client::LlmRequest) -> bool {
+    format!("{:?}", request.messages).contains(BODY)
+}
+
+fn context_fork_spec(
+    identity: &str,
+    source: &AgentIdentity,
+    fork_context: crate::launch::ForkContext,
+) -> SpawnMemberSpec {
+    SpawnMemberSpec::new(ProfileName::from("lead"), AgentIdentity::from(identity)).with_launch_mode(
+        crate::launch::MemberLaunchMode::Fork {
+            source_member_id: source.clone(),
+            fork_context,
+        },
+    )
+}
+
+impl Fixture {
+    /// The standing activation and one completed turn, so the source's
+    /// transcript is its system prompt, the activation row, a user row and
+    /// an assistant row.
+    async fn activated_source_with_a_turn(&self) {
+        self.activate_standing().await;
+        self.run_turn("source turn after the activation").await;
+    }
+
+    /// The first model request started after `before` requests.
+    async fn first_request_after(&self, before: usize) -> meerkat_client::LlmRequest {
+        self.client.wait_started(before + 1).await;
+        self.client
+            .requests()
+            .get(before)
+            .cloned()
+            .expect("the child's first model request")
+    }
+}
+
+/// A context fork delivered with an initial message used to render the
+/// activation row, body included, and the source's system prompt into the
+/// child's first prompt. Under the default policy neither is carried, the
+/// conversation rows are, and the notice names the key that was not carried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_context_fork_of_an_activated_member_carries_no_instruction_body_by_default() {
+    let fixture = Fixture::restored_member().await;
+    fixture.activated_source_with_a_turn().await;
+    let before = fixture.client.requests().len();
+    fixture
+        .handle
+        .spawn_spec(
+            context_fork_spec(
+                "context-child",
+                &fixture.identity,
+                crate::launch::ForkContext::FullHistory,
+            )
+            .with_initial_message("the forked task")
+            .with_runtime_mode(crate::MobRuntimeMode::TurnDriven),
+        )
+        .await
+        .expect("the context fork spawns");
+
+    let request = fixture.first_request_after(before).await;
+    assert!(
+        !carries_body(&request),
+        "no row of the child's first request carries the activation body"
+    );
+    let block = fork_block(&request).expect("the first request carries the fork context");
+    assert!(
+        block.contains("[user]: source turn after the activation"),
+        "the conversation rows are carried: {block}"
+    );
+    assert!(
+        !block.contains("[system]:"),
+        "no System row of the source is rendered: {block}"
+    );
+    assert!(
+        block.contains("[fork_notice]:")
+            && block.contains("host.standing/member")
+            && block.contains("system prompt was not carried"),
+        "the notice names what was not carried: {block}"
+    );
+    fixture.finish().await;
+}
+
+/// An autonomous context fork delivers the rendered context in its kickoff.
+/// Under the default policy the kickoff carries no activation body either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_autonomous_context_fork_carries_no_instruction_body_by_default() {
+    let fixture = Fixture::restored_member().await;
+    fixture.activated_source_with_a_turn().await;
+    let before = fixture.client.requests().len();
+    fixture
+        .handle
+        .spawn_spec(
+            context_fork_spec(
+                "autonomous-child",
+                &fixture.identity,
+                crate::launch::ForkContext::FullHistory,
+            )
+            .with_runtime_mode(crate::MobRuntimeMode::AutonomousHost),
+        )
+        .await
+        .expect("the autonomous context fork spawns");
+
+    let request = fixture.first_request_after(before).await;
+    assert!(
+        !carries_body(&request),
+        "the kickoff carries no activation body"
+    );
+    let block = fork_block(&request).expect("the kickoff carries the fork context");
+    assert!(
+        !block.contains("[system]:") && block.contains("host.standing/member"),
+        "no System row is rendered and the notice names the key: {block}"
+    );
+    fixture.finish().await;
+}
+
+/// Under `refuse`, a context fork whose rows hold an activation row is
+/// refused, typed, before any spawn effect: no member, no session, no model
+/// request. fork_helper surfaces the same refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_refuse_policy_refuses_a_context_fork_of_an_activated_member_before_any_effect() {
+    let fixture =
+        Fixture::restored_member_with_policy(meerkat_core::ForkInstructionPolicy::Refuse).await;
+    fixture.activated_source_with_a_turn().await;
+    let sessions_before = fixture.session_count().await;
+    let requests_before = fixture.client.requests().len();
+
+    let refused = tokio::time::timeout(
+        WAIT,
+        fixture.handle.spawn_spec(
+            context_fork_spec(
+                "refused-child",
+                &fixture.identity,
+                crate::launch::ForkContext::FullHistory,
+            )
+            .with_initial_message("the forked task"),
+        ),
+    )
+    .await
+    .expect("the spawn answers");
+    match refused {
+        Err(MobError::ForkInstructionRefused {
+            source_member_id,
+            refusal,
+        }) => {
+            assert_eq!(source_member_id, fixture.identity);
+            assert_policy_refusal(&refusal);
+        }
+        other => panic!("expected a typed fork instruction refusal, got {other:?}"),
+    }
+
+    let helper = tokio::time::timeout(
+        WAIT,
+        fixture.handle.fork_helper(
+            &fixture.identity,
+            AgentIdentity::from("refused-helper"),
+            "helper task text",
+            crate::launch::ForkContext::FullHistory,
+            HelperOptions {
+                role_name: Some(ProfileName::from("lead")),
+                ..HelperOptions::default()
+            },
+            "refused-helper-result",
+            256,
+        ),
+    )
+    .await
+    .expect("fork_helper answers");
+    match helper {
+        Err(BoundedMemberRunError::Admission(MobError::ForkInstructionRefused {
+            refusal, ..
+        })) => assert_policy_refusal(&refusal),
+        other => panic!("expected fork_helper's typed refusal, got {other:?}"),
+    }
+
+    for child in ["refused-child", "refused-helper"] {
+        assert!(
+            fixture
+                .handle
+                .get_member(&AgentIdentity::from(child))
+                .await
+                .expect("roster read")
+                .is_none(),
+            "{child} is not seated"
+        );
+    }
+    assert_eq!(
+        fixture.session_count().await,
+        sessions_before,
+        "no child session is created"
+    );
+    assert_eq!(
+        fixture.client.requests().len(),
+        requests_before,
+        "no model request is made"
+    );
+    fixture.finish().await;
+}
+
+/// `reactivate_inherited` carries the source's System rows, activation body
+/// included, and the notice says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reactivate_inherited_keeps_instruction_bodies_in_a_context_fork() {
+    let fixture = Fixture::restored_member_with_policy(
+        meerkat_core::ForkInstructionPolicy::ReactivateInherited,
+    )
+    .await;
+    fixture.activated_source_with_a_turn().await;
+    let before = fixture.client.requests().len();
+    fixture
+        .handle
+        .spawn_spec(
+            context_fork_spec(
+                "carrying-child",
+                &fixture.identity,
+                crate::launch::ForkContext::FullHistory,
+            )
+            .with_initial_message("the forked task")
+            .with_runtime_mode(crate::MobRuntimeMode::TurnDriven),
+        )
+        .await
+        .expect("the context fork spawns");
+
+    let request = fixture.first_request_after(before).await;
+    assert!(carries_body(&request), "the activation body is carried");
+    let block = fork_block(&request).expect("the first request carries the fork context");
+    assert!(
+        block.contains("[system]:"),
+        "the source's System rows are carried: {block}"
+    );
+    assert!(
+        block.contains("[fork_notice]:")
+            && block.contains("host.standing/member")
+            && block.contains("were carried"),
+        "the notice says what was carried: {block}"
+    );
+    fixture.finish().await;
+}
+
+/// `refuse` decides on the rows the fork would render: a `LastMessages` tail
+/// without an activation row carries no body and forks; a tail that reaches
+/// the activation row is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_last_messages_context_fork_is_refused_only_when_its_tail_holds_an_activation_row() {
+    let fixture =
+        Fixture::restored_member_with_policy(meerkat_core::ForkInstructionPolicy::Refuse).await;
+    fixture.activated_source_with_a_turn().await;
+
+    fixture
+        .handle
+        .spawn_spec(
+            context_fork_spec(
+                "tail-of-two",
+                &fixture.identity,
+                crate::launch::ForkContext::LastMessages { count: 2 },
+            )
+            .with_initial_message("the forked task"),
+        )
+        .await
+        .expect("a tail of the user and assistant rows forks");
+
+    let refused = fixture
+        .handle
+        .spawn_spec(
+            context_fork_spec(
+                "tail-of-three",
+                &fixture.identity,
+                crate::launch::ForkContext::LastMessages { count: 3 },
+            )
+            .with_initial_message("the forked task"),
+        )
+        .await;
+    match refused {
+        Err(MobError::ForkInstructionRefused { refusal, .. }) => {
+            assert_policy_refusal(&refusal);
+        }
+        other => panic!("a tail holding the activation row is refused, got {other:?}"),
+    }
+    fixture.finish().await;
+}
+
+/// A turn-driven fork_helper is created with no initial message. Its fork
+/// context used to go into a create request that discards its prompt, so the
+/// helper saw only its task. The planned context now reaches the helper's
+/// task turn, without the activation body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_turn_driven_fork_helper_sees_its_planned_context() {
+    let fixture = Fixture::restored_member().await;
+    fixture.activated_source_with_a_turn().await;
+    let before = fixture.client.requests().len();
+    tokio::time::timeout(
+        WAIT,
+        fixture.handle.fork_helper(
+            &fixture.identity,
+            AgentIdentity::from("context-helper"),
+            "helper task text",
+            crate::launch::ForkContext::FullHistory,
+            HelperOptions {
+                role_name: Some(ProfileName::from("lead")),
+                runtime_mode: Some(crate::MobRuntimeMode::TurnDriven),
+                ..HelperOptions::default()
+            },
+            "context-helper-result",
+            256,
+        ),
+    )
+    .await
+    .expect("fork_helper answers")
+    .expect("fork_helper succeeds");
+
+    let request = fixture
+        .client
+        .requests()
+        .get(before)
+        .cloned()
+        .expect("the helper's model request");
+    let block = fork_block(&request).expect("the helper's task turn carries the fork context");
+    assert!(
+        format!("{:?}", request.messages).contains("helper task text"),
+        "the task follows the context"
+    );
+    assert!(
+        !carries_body(&request) && !block.contains("[system]:"),
+        "the context carries no System row of the source: {block}"
+    );
+    assert!(
+        block.contains("host.standing/member"),
+        "the notice names the key: {block}"
+    );
+    fixture.finish().await;
+}
+
 /// Forwards every session-service method to the real persistent service
 /// except `activate_instruction_under_runtime_turn_boundary`, which keeps the
 /// trait default. Generated mechanically from the trait signatures.
