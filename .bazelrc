@@ -43,6 +43,10 @@ build:buildbuddy-linux-gcp-ci-rbe --config=buildbuddy-linux-rbe
 build:buildbuddy-linux-gcp-ci-rbe --platforms=//tools/bazel/platforms:linux_x86_64_gcp_ci
 build:buildbuddy-linux-gcp-ci-rbe --extra_execution_platforms=//tools/bazel/platforms:linux_x86_64_gcp_ci
 build:buildbuddy-linux-gcp-ci-rbe --remote_default_exec_properties=Pool=meerkat-ci
+# linux_x86_64_gcp_ci sets no exec_properties, so these defaults are its
+# properties (dockerNetwork=off is what its former parent set); the wrapper
+# adds the digest-pinned container image at run time.
+build:buildbuddy-linux-gcp-ci-rbe --remote_default_exec_properties=dockerNetwork=off
 
 build:buildbuddy-linux-arm64-rbe --config=buildbuddy
 build:buildbuddy-linux-arm64-rbe --remote_executor=grpcs://remote.buildbuddy.io

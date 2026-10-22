@@ -1006,7 +1006,10 @@ if [[ "${meerkat_bazel_backend}" != "gcp-local" && -n "${buildbuddy_remote_url}"
       exit 1
     fi
     # Actions run in the action image pinned by digest, on executors of the
-    # caller's own org (user-owned executors on the control plane).
+    # caller's own org (user-owned executors on the control plane). The image
+    # is a default platform property: linux_x86_64_gcp_ci sets none of its own,
+    # so Bazel applies these defaults, and the image digest is part of every
+    # action key (results cached under another CI image are never reused).
     gcp_action_image="${MEERKAT_BUILDBUDDY_CI_IMAGE:-}"
     gcp_action_image="${gcp_action_image#docker://}"
     if ! [[ "${gcp_action_image}" =~ ^[A-Za-z0-9._/:-]+@sha256:[0-9a-f]{64}$ ]]; then
@@ -1015,7 +1018,7 @@ if [[ "${meerkat_bazel_backend}" != "gcp-local" && -n "${buildbuddy_remote_url}"
     fi
     bb_args+=(
       --tls_certificate="${BUILDBUDDY_TLS_CERTIFICATE}"
-      "--remote_exec_header=x-buildbuddy-platform.container-image=docker://${gcp_action_image}"
+      "--remote_default_exec_properties=container-image=docker://${gcp_action_image}"
       --remote_exec_header=x-buildbuddy-platform.use-self-hosted-executors=true
     )
   fi

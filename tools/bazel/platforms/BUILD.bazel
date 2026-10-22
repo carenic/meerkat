@@ -76,20 +76,24 @@ platform(
     parents = ["@toolchains_buildbuddy//platforms:linux_x86_64"],
 )
 
+# The self-hosted GCP CI lane's platform sets no exec_properties and has no
+# parent, on purpose. Bazel applies --remote_default_exec_properties only to an
+# execution platform without exec_properties, and those defaults carry all of
+# this platform's properties: the static ones from .bazelrc (config
+# buildbuddy-linux-gcp-ci-rbe) and the container image, which
+# scripts/buildbuddy-bazel-poc reads from the digest-pinned
+# MEERKAT_BUILDBUDDY_CI_IMAGE at run time. The image digest is therefore part
+# of every action key on this platform: results cached under one CI image are
+# never reused under another. The constraint values are those of the former
+# parent (@toolchains_buildbuddy//platforms:linux_x86_64), so toolchain
+# resolution is unchanged.
 platform(
     name = "linux_x86_64_gcp_ci",
     constraint_values = [
+        "@bazel_tools//tools/cpp:gcc",
         "@platforms//cpu:x86_64",
         "@platforms//os:linux",
     ],
-    exec_properties = {
-        "Arch": "amd64",
-        "OSFamily": "linux",
-        "Pool": "meerkat-ci",
-        "container-image": "docker://europe-west1-docker.pkg.dev/king-dnn-training-dev/meerkat-ci/meerkat-ci-rust:1.94.0",
-        "network": "external",
-    },
-    parents = ["@toolchains_buildbuddy//platforms:linux_x86_64"],
 )
 
 platform(
