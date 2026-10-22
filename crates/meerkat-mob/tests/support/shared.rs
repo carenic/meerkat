@@ -407,6 +407,9 @@ pub struct HostFixtureOptions {
     /// Phase 3: wrap the member session service so the FIRST `create_session`
     /// fails typed (H T12 build-failure rollback row).
     pub failing_first_create_session: bool,
+    /// Wrap the member session service so every member create's build
+    /// facts are recorded ([`FailingOnceSessionService::recorded_creates`]).
+    pub record_member_creates: bool,
     /// Fail one selected one-based `create_session` invocation. This extends
     /// the first-call shorthand with a deterministic superseding-build fault.
     pub failing_create_session_call: Option<u64>,
@@ -473,6 +476,7 @@ impl HostFixtureOptions {
             forked_participant_realm: None,
             forked_participant_sweep_interval: None,
             failing_first_create_session: false,
+            record_member_creates: false,
             failing_create_session_call: None,
             corrupt_first_create_session_result_identity: false,
             corrupt_create_session_result_identity_call: None,
@@ -672,6 +676,17 @@ pub struct FailingOnceSessionService {
     archive_failures_fired: AtomicU64,
     fail_projection_drain: bool,
     projection_drain_failed_once: AtomicBool,
+    recorded_creates: std::sync::Mutex<Vec<RecordedMemberCreate>>,
+}
+
+/// The build facts of one member create a fixture host's session service
+/// received.
+#[derive(Debug, Clone)]
+pub struct RecordedMemberCreate {
+    pub mob_member_binding: Option<meerkat_core::MobMemberBinding>,
+    pub prompt_context_fork_source: Option<meerkat_core::PromptContextForkSource>,
+    /// The fork seed the create records on the child's session, as JSON.
+    pub fork_seed: Option<serde_json::Value>,
 }
 
 impl FailingOnceSessionService {
@@ -695,7 +710,34 @@ impl FailingOnceSessionService {
             archive_failures_fired: AtomicU64::new(0),
             fail_projection_drain,
             projection_drain_failed_once: AtomicBool::new(false),
+            recorded_creates: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    /// Every member create received, in order.
+    pub fn recorded_creates(&self) -> Vec<RecordedMemberCreate> {
+        self.recorded_creates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn record_create(&self, req: &meerkat_core::service::CreateSessionRequest) {
+        let build = req.build.as_ref();
+        self.recorded_creates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(RecordedMemberCreate {
+                mob_member_binding: build.and_then(|build| build.mob_member_binding.clone()),
+                prompt_context_fork_source: build
+                    .and_then(|build| build.prompt_context_fork_source.clone()),
+                fork_seed: build.and_then(|build| {
+                    build
+                        .initial_metadata_entries
+                        .get(meerkat_core::fork_notice::SESSION_FORK_SEED_KEY)
+                        .cloned()
+                }),
+            });
     }
 
     /// True once the injected failure has fired.
@@ -766,6 +808,7 @@ impl meerkat_core::service::SessionService for FailingOnceSessionService {
         &self,
         req: meerkat_core::service::CreateSessionRequest,
     ) -> Result<meerkat_core::RunResult, meerkat_core::service::SessionError> {
+        self.record_create(&req);
         let call = self.begin_create_call()?;
         let result = self.inner.create_session(req).await?;
         Ok(self.finish_create_call(call, result))
@@ -980,6 +1023,7 @@ impl meerkat_mob::MobSessionService for FailingOnceSessionService {
         &self,
         req: meerkat_core::service::CreateSessionRequest,
     ) -> Result<meerkat_core::RunResult, meerkat_core::service::SessionError> {
+        self.record_create(&req);
         let call = self.begin_create_call()?;
         let result = self
             .inner
@@ -994,6 +1038,7 @@ impl meerkat_mob::MobSessionService for FailingOnceSessionService {
         resume_preparation: Option<meerkat_mob::SessionResumePreparationReceipt>,
         actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
     ) -> Result<meerkat_core::RunResult, meerkat_core::service::SessionError> {
+        self.record_create(&req);
         let call = self.begin_create_call()?;
         let result = self
             .inner
@@ -1011,6 +1056,7 @@ impl meerkat_mob::MobSessionService for FailingOnceSessionService {
         req: meerkat_core::service::CreateSessionRequest,
         authorization: meerkat_runtime::ArchivedSessionActorMaterializationAuthorization,
     ) -> Result<meerkat_core::RunResult, meerkat_core::service::SessionError> {
+        self.record_create(&req);
         let call = self.begin_create_call()?;
         let result = self
             .inner
@@ -1024,6 +1070,7 @@ impl meerkat_mob::MobSessionService for FailingOnceSessionService {
         req: meerkat_core::service::CreateSessionRequest,
         authorization: meerkat_runtime::ArchivedSessionActorMaterializationAuthorization,
     ) -> Result<meerkat_core::RunResult, meerkat_core::service::SessionError> {
+        self.record_create(&req);
         let call = self.begin_create_call()?;
         let result = self
             .inner
@@ -1042,6 +1089,7 @@ impl meerkat_mob::MobSessionService for FailingOnceSessionService {
         resume_preparation: meerkat_mob::SessionResumePreparationReceipt,
         actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
     ) -> Result<meerkat_core::RunResult, meerkat_core::service::SessionError> {
+        self.record_create(&req);
         let call = self.begin_create_call()?;
         let result = self
             .inner
@@ -2156,6 +2204,7 @@ pub async fn spawn_host_daemon_fixture(
                 || corrupt_create_result_call.is_some()
                 || opts.failing_archive_with_mob_lifecycle_authority_calls > 0
                 || opts.failing_first_projection_drain
+                || opts.record_member_creates
             {
                 let failing = FailingOnceSessionService::new(
                     mob_service,
@@ -2357,6 +2406,8 @@ pub struct ScriptedHostPeer {
     trust: Arc<std::sync::Mutex<ScriptedPeerTrustState>>,
     /// V6 source-owned forked-participant capability scripting (issue #159).
     forked_participants: Arc<std::sync::Mutex<ScriptedForkedParticipantState>>,
+    /// What this scripted host answers to commands stamped protocol V7.
+    v7: Arc<std::sync::Mutex<ScriptedV7State>>,
     /// Protocol versions this scripted host advertises at bind AND status.
     /// Both replies read the same value so a status refresh can never
     /// contradict the negotiated bind-time capability contract.
@@ -2415,6 +2466,69 @@ pub enum ScriptedForkedParticipantTamper {
     ForeignOwnerHost,
     /// Name a different source member than the command's source incarnation.
     ForeignSourceIdentity,
+}
+
+/// What a scripted host does with a command stamped above protocol V6:
+/// the `HostFeatures` probe and a `MaterializeMember` that carries a
+/// prompt-context fork.
+#[derive(Default)]
+pub struct ScriptedV7State {
+    mode: ScriptedV7Mode,
+    /// Refuse the next V7 `MaterializeMember` with
+    /// `UnsupportedProtocolVersion`: a host downgraded after it answered
+    /// the probe.
+    refuse_next_v7_materialize: bool,
+    /// The `command` name of every request received, in order.
+    command_kinds: Vec<String>,
+}
+
+/// How a scripted host answers commands stamped above protocol V6.
+#[derive(Debug, Clone, Default)]
+pub enum ScriptedV7Mode {
+    /// A 0.9.4 host: such a command is refused with
+    /// `UnsupportedProtocolVersion` before its payload is read.
+    #[default]
+    BeforeV7,
+    /// Answers the `HostFeatures` probe with these features and serves
+    /// the other V7 commands.
+    Features(Vec<String>),
+    /// Never answers the `HostFeatures` probe.
+    HoldFeatures,
+}
+
+/// The scripted answer to one request stamped `stamped`: `None` serves it
+/// as usual, `Some(None)` holds it, `Some(Some(reply))` answers `reply`.
+fn scripted_v7_answer(
+    state: &mut ScriptedV7State,
+    stamped: u64,
+    kind: &str,
+) -> Option<Option<serde_json::Value>> {
+    if stamped <= 6 {
+        return None;
+    }
+    let refused = || {
+        serde_json::to_value(BridgeReply::Rejected {
+            cause: BridgeRejectionCause::UnsupportedProtocolVersion,
+            reason: format!(
+                "invalid bridge command: unsupported supervisor bridge protocol version \
+                 {stamped} (supported [2, 3, 4, 5, 6]; default 6)"
+            ),
+        })
+        .expect("scripted version refusal")
+    };
+    match &state.mode {
+        ScriptedV7Mode::BeforeV7 => Some(Some(refused())),
+        ScriptedV7Mode::HoldFeatures if kind == "host_features" => Some(None),
+        ScriptedV7Mode::Features(features) if kind == "host_features" => Some(Some(
+            serde_json::json!({ "result": "host_features", "features": features }),
+        )),
+        _ if kind == "materialize_member"
+            && std::mem::take(&mut state.refuse_next_v7_materialize) =>
+        {
+            Some(Some(refused()))
+        }
+        _ => None,
+    }
 }
 
 /// Scripted materialize-responder state (fault injectors in the
@@ -2543,6 +2657,29 @@ impl ScriptedHostPeer {
 
     pub fn materialize_count(&self) -> u64 {
         self.materialize_state().count
+    }
+
+    /// How this host answers commands stamped above protocol V6.
+    pub fn serve_v7(&self, mode: ScriptedV7Mode) {
+        self.v7_state().mode = mode;
+    }
+
+    /// Refuse the next V7 `MaterializeMember` with
+    /// `UnsupportedProtocolVersion`, as a host downgraded after it
+    /// answered the `HostFeatures` probe would.
+    pub fn refuse_next_v7_materialize(&self) {
+        self.v7_state().refuse_next_v7_materialize = true;
+    }
+
+    /// The `command` name of every request this host received, in order.
+    pub fn received_command_kinds(&self) -> Vec<String> {
+        self.v7_state().command_kinds.clone()
+    }
+
+    fn v7_state(&self) -> std::sync::MutexGuard<'_, ScriptedV7State> {
+        self.v7
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Every `BridgeMaterializePayload` received, in order — the captured-
@@ -3001,6 +3138,7 @@ pub async fn spawn_scripted_host_peer(name: &str) -> ScriptedHostPeer {
     let protocol_versions = Arc::new(std::sync::Mutex::new(
         BridgeProtocolVersion::supported().to_vec(),
     ));
+    let v7 = Arc::new(std::sync::Mutex::new(ScriptedV7State::default()));
     let member_endpoints = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::<
         String,
         Arc<PeerCommsEndpoint>,
@@ -3018,6 +3156,7 @@ pub async fn spawn_scripted_host_peer(name: &str) -> ScriptedHostPeer {
     let responder_trust = Arc::clone(&trust);
     let responder_forked_participants = Arc::clone(&forked_participants);
     let responder_protocol_versions = Arc::clone(&protocol_versions);
+    let responder_v7 = Arc::clone(&v7);
     let responder_member_endpoints = Arc::clone(&member_endpoints);
     let responder_address = endpoint.runtime.advertised_address();
     let responder_token = token;
@@ -3049,8 +3188,27 @@ pub async fn spawn_scripted_host_peer(name: &str) -> ScriptedHostPeer {
                     .request_received_from_ingress(&candidate)
                     .expect("record inbound peer request before response");
 
+                // A command stamped above V6 gets the scripted V7
+                // answer before its payload is read.
+                let mut v7_answer = {
+                    let stamped = params
+                        .get("protocol_version")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or_default();
+                    let kind = params
+                        .get("command")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let mut v7 = responder_v7
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    v7.command_kinds.push(kind.clone());
+                    scripted_v7_answer(&mut v7, stamped, &kind)
+                };
                 let command: Result<BridgeCommand, _> = serde_json::from_value(params.clone());
                 let reply_value: Option<serde_json::Value> = match command {
+                    _ if v7_answer.is_some() => v7_answer.take().flatten(),
                     // --- phase-3 scripted V4 serving arms ---
                     Ok(BridgeCommand::MaterializeMember(payload)) => {
                         let supervisor_spec =
@@ -3480,6 +3638,7 @@ pub async fn spawn_scripted_host_peer(name: &str) -> ScriptedHostPeer {
         release,
         trust,
         forked_participants,
+        v7,
         protocol_versions,
         member_endpoints,
         task,
