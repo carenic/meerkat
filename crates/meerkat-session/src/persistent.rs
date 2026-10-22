@@ -16545,9 +16545,12 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// the store-owned recovery seam proves and atomically consumes the exact
     /// runtime authority plus physical-head evidence.
     ///
+    /// It runs under this runtime owner's hosting claim for the session
+    /// (#1813), joining the claim when this owner's lineage already holds it.
     /// A session another runtime owner hosts is refused with
-    /// [`SessionError::ServedElsewhere`] before any recovery (#1813): that
-    /// owner may still commit the session's durable tail itself.
+    /// [`SessionError::ServedElsewhere`], and one whose claim cannot be taken
+    /// with [`SessionError::HostingUnavailable`], before any recovery: the
+    /// other owner may still commit the session's durable tail itself.
     pub async fn recover_committed_boundary(
         &self,
         id: &SessionId,
@@ -16653,9 +16656,12 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// capability that the same service/store owner must later consume during
     /// actor creation; callers never reduce that proof to a boolean.
     ///
+    /// It runs under this runtime owner's hosting claim for the session
+    /// (#1813), joining the claim when this owner's lineage already holds it.
     /// A session another runtime owner hosts is refused with
-    /// [`SessionError::ServedElsewhere`] before any recovery (#1813): that
-    /// owner may still commit the session's durable tail itself.
+    /// [`SessionError::ServedElsewhere`], and one whose claim cannot be taken
+    /// with [`SessionError::HostingUnavailable`], before any recovery: the
+    /// other owner may still commit the session's durable tail itself.
     pub async fn prepare_committed_boundary_resume(
         &self,
         id: &SessionId,
@@ -43556,6 +43562,293 @@ mod tests {
             token,
             "NotFound classification must not mutate the physical row"
         );
+    }
+
+    /// A HeadCanonical session hosted with OS-locked claims whose last turn
+    /// left a durable tail: the runtime authority committed one turn, and a
+    /// store-issued provisional tail plus the physical head carry the next
+    /// (a process that died between its rows and its runtime boundary).
+    struct HostedDurableTail {
+        _dir: tempfile::TempDir,
+        runtime_store: Arc<meerkat_runtime::SqliteRuntimeStore>,
+        session_store: Arc<meerkat_store::SqliteSessionStore>,
+        session_id: SessionId,
+    }
+
+    impl HostedDurableTail {
+        async fn new() -> Self {
+            use meerkat_core::lifecycle::core_executor::BoundSessionCommit;
+            use meerkat_core::session_store::PreparedHeadCanonicalMutation;
+            use meerkat_core::types::{
+                AssistantBlock, BlockAssistantMessage, TranscriptMessageIdentity,
+            };
+            use meerkat_runtime::store::{
+                PreparedHeadCanonicalProvisionalTail, PreparedRuntimeSessionCommit,
+            };
+
+            let dir = tempfile::tempdir().expect("hosted durable tail directory");
+            let database = dir.path().join("runtime.sqlite3");
+            let runtime_store = Arc::new(
+                meerkat_runtime::SqliteRuntimeStore::new_head_canonical(&database)
+                    .expect("head-canonical runtime store")
+                    .with_hosting_paths(meerkat_runtime::HostingPaths {
+                        hosting_lock_dir: dir.path().join("hosting"),
+                        cold_delivery_lock: dir.path().join("cold-delivery.lock"),
+                        database: None,
+                    }),
+            );
+            assert!(
+                runtime_store.hosting_capability().is_cross_process(),
+                "the store must host sessions with OS-locked claims"
+            );
+            let session_store = Arc::new(
+                meerkat_store::SqliteSessionStore::open(&database)
+                    .expect("co-located head-canonical session store"),
+            );
+
+            let mut committed = Session::new();
+            committed.push(Message::User(UserMessage::text("committed turn")));
+            let session_id = committed.id().clone();
+            let runtime_id = LogicalRuntimeId::for_session(&session_id);
+            let root = PreparedHeadCanonicalMutation::prepare(&committed, None)
+                .expect("prepare the committed head");
+            let document = BoundSessionCommit::sealed(Arc::new(committed))
+                .expect("seal the committed document")
+                .with_head_canonical_mutation(root)
+                .expect("bind the committed head");
+            let committed_authority = runtime_store
+                .commit_prepared_session_boundary(
+                    &runtime_id,
+                    PreparedRuntimeSessionCommit::snapshot_only(document),
+                )
+                .await
+                .expect("commit the first boundary")
+                .authority()
+                .and_then(|authority| authority.head_canonical())
+                .cloned()
+                .expect("the boundary returns HeadCanonical authority");
+
+            let run_id = RunId::new();
+            let mut candidate = session_store
+                .load(&session_id)
+                .await
+                .expect("load the committed session")
+                .expect("the committed session exists");
+            candidate.push(Message::BlockAssistant(BlockAssistantMessage {
+                blocks: vec![AssistantBlock::Text {
+                    text: "durable tail reply".to_string(),
+                    meta: None,
+                }],
+                stop_reason: Some(StopReason::EndTurn),
+                identity: TranscriptMessageIdentity::default().with_run_id(run_id.clone()),
+                created_at: meerkat_core::types::message_timestamp_now(),
+                assistant_message_id: None,
+            }));
+            let observed = session_store
+                .load_head(&session_id)
+                .await
+                .expect("load the committed head")
+                .expect("the committed head exists");
+            let tail = PreparedHeadCanonicalMutation::prepare(&candidate, Some(observed))
+                .expect("prepare the tail");
+            runtime_store
+                .write_prepared_head_canonical_provisional_tail(
+                    &runtime_id,
+                    PreparedHeadCanonicalProvisionalTail::prepare(
+                        committed_authority,
+                        run_id,
+                        tail.successor_head(),
+                        tail.successor_head_token(),
+                        &candidate,
+                    )
+                    .expect("prepare the provisional tail"),
+                )
+                .await
+                .expect("write the provisional tail");
+            session_store
+                .apply_prepared_head_canonical_mutation(&tail)
+                .await
+                .expect("advance the physical head past the boundary");
+            Self {
+                _dir: dir,
+                runtime_store,
+                session_store,
+                session_id,
+            }
+        }
+
+        fn service(&self) -> PersistentSessionService<DummyBuilder> {
+            PersistentSessionService::new(
+                DummyBuilder,
+                4,
+                Arc::clone(&self.session_store) as Arc<dyn SessionStore>,
+                Arc::clone(&self.runtime_store) as Arc<dyn RuntimeStore>,
+                memory_blob_store(),
+            )
+        }
+
+        /// The committed head token, the physical head token, and whether the
+        /// provisional tail is still recorded.
+        async fn durable_state(&self) -> (String, String, bool) {
+            let runtime_id = LogicalRuntimeId::for_session(&self.session_id);
+            let committed = self
+                .runtime_store
+                .load_session_boundary_authority(&runtime_id)
+                .await
+                .expect("load the runtime authority")
+                .expect("the runtime authority exists")
+                .head_canonical()
+                .expect("HeadCanonical authority")
+                .committed_head_token()
+                .to_string();
+            let head = self
+                .session_store
+                .load_head(&self.session_id)
+                .await
+                .expect("load the physical head")
+                .expect("the physical head exists");
+            let physical = session_head_cas_token(&head).expect("the physical head has a token");
+            let provisional = self
+                .runtime_store
+                .load_head_canonical_provisional_tail(&runtime_id)
+                .await
+                .expect("load the provisional tail")
+                .is_some();
+            (committed, physical, provisional)
+        }
+
+        /// Another runtime owner on the realm (another process, or another
+        /// runtime of this one) takes the session's hosting claim.
+        fn another_owner_hosts_the_session(&self) -> meerkat_runtime::HostingClaim {
+            meerkat_runtime::SessionHostingAuthority::new(
+                self.runtime_store.hosting_capability(),
+                meerkat_runtime::HostingOwner::mint(),
+            )
+            .grant(&self.session_id)
+            .expect("another runtime owner takes the session's claim")
+        }
+    }
+
+    /// #1813: recovery may settle a session's durable tail, so it never runs
+    /// for a session another runtime owner on the realm hosts: that owner may
+    /// still commit the tail itself. The heal seam refuses, typed, before any
+    /// recovery, and the runtime authority, the provisional tail and the
+    /// physical head stay as they were.
+    #[tokio::test]
+    async fn recover_committed_boundary_refuses_a_session_another_owner_hosts() {
+        let tail = HostedDurableTail::new().await;
+        let service = tail.service();
+        let _other_owner_claim = tail.another_owner_hosts_the_session();
+        let before = tail.durable_state().await;
+        assert_ne!(
+            before.0, before.1,
+            "instrument: the physical head is ahead of the committed boundary"
+        );
+        assert!(before.2, "instrument: the provisional tail is recorded");
+
+        let refused = service.recover_committed_boundary(&tail.session_id).await;
+        assert!(
+            matches!(&refused, Err(SessionError::ServedElsewhere { id }) if *id == tail.session_id),
+            "recovery must refuse a session another runtime owner hosts: {refused:?}"
+        );
+        assert_eq!(
+            tail.durable_state().await,
+            before,
+            "the refused recovery must leave the durable tail as it was"
+        );
+    }
+
+    /// #1813: the resume preparation refuses a session another runtime owner
+    /// hosts the same way, before its recovery and before any body read.
+    #[tokio::test]
+    async fn prepare_committed_boundary_resume_refuses_a_session_another_owner_hosts() {
+        let tail = HostedDurableTail::new().await;
+        let service = tail.service();
+        let _other_owner_claim = tail.another_owner_hosts_the_session();
+        let before = tail.durable_state().await;
+
+        match service
+            .prepare_committed_boundary_resume(&tail.session_id)
+            .await
+        {
+            Err(SessionError::ServedElsewhere { id }) => {
+                assert_eq!(id, tail.session_id, "the refusal names the session");
+            }
+            other => panic!(
+                "the resume preparation must refuse a session another runtime owner hosts: \
+                 {other:?}"
+            ),
+        }
+        assert_eq!(
+            tail.durable_state().await,
+            before,
+            "the refused preparation must leave the durable tail as it was"
+        );
+    }
+
+    /// #1813: a caller whose own runtime owner already holds the session's
+    /// claim (a registration, or a create that granted it before its
+    /// recovery) joins that claim: the recovery proceeds and settles the
+    /// durable tail.
+    #[tokio::test]
+    async fn recover_committed_boundary_joins_its_own_runtime_owners_claim() {
+        let tail = HostedDurableTail::new().await;
+        let service = tail.service();
+        let held = service
+            .grant_session_hosting(&tail.session_id)
+            .expect("this runtime owner takes the session's claim");
+        assert!(
+            held.is_cross_process(),
+            "instrument: the held claim is an OS lock"
+        );
+
+        let recovery = service
+            .recover_committed_boundary(&tail.session_id)
+            .await
+            .expect("recovery joins its own runtime owner's claim");
+        assert!(
+            matches!(recovery, CommittedBoundaryRecovery::Recovered { .. }),
+            "recovery must settle the durable tail: {recovery:?}"
+        );
+        let (committed, physical, provisional) = tail.durable_state().await;
+        assert_eq!(
+            committed, physical,
+            "the settled boundary is the physical head"
+        );
+        assert!(!provisional, "settling consumes the provisional tail");
+        drop(held);
+    }
+
+    /// #1813: the resume preparation joins its own runtime owner's claim as
+    /// well: it settles the durable tail and materializes the settled body.
+    #[tokio::test]
+    async fn prepare_committed_boundary_resume_joins_its_own_runtime_owners_claim() {
+        let tail = HostedDurableTail::new().await;
+        let service = tail.service();
+        let held = service
+            .grant_session_hosting(&tail.session_id)
+            .expect("this runtime owner takes the session's claim");
+
+        let prepared = service
+            .prepare_committed_boundary_resume(&tail.session_id)
+            .await
+            .expect("the preparation joins its own runtime owner's claim");
+        let session = match prepared {
+            PreparedCommittedBoundaryResume::Materializable { session, .. } => session,
+            other => panic!("a settled session is materializable: {other:?}"),
+        };
+        assert_eq!(
+            session.messages().len(),
+            2,
+            "the materialized body carries the settled tail turn"
+        );
+        let (committed, physical, provisional) = tail.durable_state().await;
+        assert_eq!(
+            committed, physical,
+            "the settled boundary is the physical head"
+        );
+        assert!(!provisional, "settling consumes the provisional tail");
+        drop(held);
     }
 
     /// A committed WholeBlob document the current decoder refuses (its live

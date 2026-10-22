@@ -1881,6 +1881,13 @@ pub trait MobSessionService:
     /// retain the exact observations available from each authority owner.
     /// Downstream heal/resume consumers must use this owner-issued verdict
     /// rather than probing session and runtime stores independently.
+    ///
+    /// The persistent service's verdict is claim-scoped (#1813): its
+    /// preparation (`PersistentSessionService::prepare_committed_boundary_resume`)
+    /// takes this runtime owner's hosting claim for the session before it
+    /// converges the durable tail, and refuses with
+    /// [`SessionError::ServedElsewhere`] or [`SessionError::HostingUnavailable`]
+    /// before any recovery. A wrapper that forwards this method inherits that.
     async fn materialize_session_resume_verdict(
         &self,
         session_id: &SessionId,
