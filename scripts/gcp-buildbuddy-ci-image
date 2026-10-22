@@ -11,8 +11,9 @@ cache fetched from the checked-in manifests and Cargo.lock. It intentionally
 does not keep the latest source tree in the final image.
 
 Environment:
-  MEERKAT_GCP_PROJECT_ID       GCP project (required by build, and by image
-                               unless MEERKAT_CI_IMAGE is set)
+  MEERKAT_GCP_PROJECT_ID       GCP project (required by build; by image unless
+                               MEERKAT_CI_IMAGE is set; by context unless
+                               MEERKAT_CI_BASE_IMAGE or MEERKAT_CI_IMAGE is set)
   MEERKAT_GCP_REGION           Artifact Registry region (default: europe-west1)
   MEERKAT_CI_IMAGE_REPOSITORY  Artifact Registry repo (default: meerkat-ci)
   MEERKAT_CI_IMAGE_NAME        Image name (default: meerkat-ci-rust)
@@ -143,6 +144,11 @@ case "${command}" in
       echo "error: context requires an output directory" >&2
       usage >&2
       exit 2
+    fi
+    # The Dockerfile starts FROM the base image, which defaults to the
+    # image derived from the project.
+    if [[ -z "${MEERKAT_CI_BASE_IMAGE:-}" && -z "${MEERKAT_CI_IMAGE:-}" ]]; then
+      require_project
     fi
     make_context "${out}"
     ;;

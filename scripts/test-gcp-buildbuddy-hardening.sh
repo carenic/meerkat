@@ -390,7 +390,7 @@ def ok(message):
     print(f"ok: {message}")
 
 
-def run(script, args, state, **extra):
+def run(script, args, state, cwd=None, **extra):
     COUNTER[0] += 1
     directory = os.path.join(ROOT, f"scenario-{COUNTER[0]}")
     os.makedirs(directory)
@@ -402,7 +402,7 @@ def run(script, args, state, **extra):
     env.update(FAKE_GCLOUD_STATE=directory, MEERKAT_GCP_PROJECT_ID=PROJECT,
                MEERKAT_GCP_ZONE="europe-west1-b", TMPDIR=directory)
     env.update({key: str(value) for key, value in extra.items()})
-    proc = subprocess.run([script] + args, env=env, capture_output=True, text=True, timeout=120)
+    proc = subprocess.run([script] + args, env=env, cwd=cwd, capture_output=True, text=True, timeout=120)
     with open(os.path.join(directory, "calls.jsonl"), encoding="utf-8") as handle:
         calls = [json.loads(line) for line in handle]
     ALL_CALLS.extend(calls)
@@ -1001,6 +1001,45 @@ for script, label in ((CONTROL, "control plane"), (POOL, "executor pool")):
         fail(f"{label} does not fall back to GCP_PROJECT_ID: rc={proc.returncode} {projects} {proc.stderr[-200:]}")
     else:
         ok(f"{label} reads GCP_PROJECT_ID when MEERKAT_GCP_PROJECT_ID is unset")
+
+# --- the CI image script needs the project wherever it derives an image ------------------
+
+CI_IMAGE_SCRIPT = os.path.join(REPO, "scripts", "gcp-buildbuddy-ci-image")
+refused_context = os.path.join(ROOT, "ci-image-context-refused")
+for label, args in (("image", ["image"]), ("build", ["build"]), ("context", ["context", refused_context])):
+    proc, calls = run(CI_IMAGE_SCRIPT, args, {}, cwd=REPO, MEERKAT_GCP_PROJECT_ID="")
+    if proc.returncode != 2 or calls or "MEERKAT_GCP_PROJECT_ID must name the GCP project" not in proc.stderr:
+        fail(f"ci-image {label} ran without a GCP project: rc={proc.returncode} {[c['argv'] for c in calls]} {proc.stderr[-200:]}")
+    else:
+        ok(f"ci-image {label} refuses to run without MEERKAT_GCP_PROJECT_ID and calls nothing")
+if os.path.exists(refused_context):
+    fail("ci-image context wrote a build context without a GCP project")
+base_context = os.path.join(ROOT, "ci-image-context-base")
+base_image = "registry.example.invalid/meerkat-ci-base:1"
+proc, calls = run(CI_IMAGE_SCRIPT, ["context", base_context], {}, cwd=REPO, MEERKAT_GCP_PROJECT_ID="",
+                  MEERKAT_CI_BASE_IMAGE=base_image)
+dockerfile = os.path.join(base_context, "Dockerfile")
+first_line = open(dockerfile, encoding="utf-8").readline().strip() if os.path.exists(dockerfile) else ""
+if proc.returncode != 0 or calls or first_line != f"FROM {base_image}":
+    fail(f"ci-image context with MEERKAT_CI_BASE_IMAGE: rc={proc.returncode} {first_line!r} {proc.stderr[-200:]}")
+else:
+    ok("ci-image context builds FROM MEERKAT_CI_BASE_IMAGE without a project")
+pinned_image = "registry.example.invalid/meerkat-ci:1"
+proc, calls = run(CI_IMAGE_SCRIPT, ["image"], {}, cwd=REPO, MEERKAT_GCP_PROJECT_ID="", MEERKAT_CI_IMAGE=pinned_image)
+if proc.returncode != 0 or calls or proc.stdout.strip() != pinned_image:
+    fail(f"ci-image image with MEERKAT_CI_IMAGE: rc={proc.returncode} {proc.stdout.strip()!r} {proc.stderr[-200:]}")
+else:
+    ok("ci-image image prints MEERKAT_CI_IMAGE without a project")
+proc, calls = run(CI_IMAGE_SCRIPT, ["--help"], {}, cwd=REPO, MEERKAT_GCP_PROJECT_ID="")
+if proc.returncode != 0 or calls or not proc.stdout.startswith("usage: gcp-buildbuddy-ci-image"):
+    fail(f"ci-image --help without a project: rc={proc.returncode} {proc.stderr[-200:]}")
+else:
+    ok("ci-image --help needs no project")
+proc, calls = run(CI_IMAGE_SCRIPT, ["image"], {}, cwd=REPO)
+if proc.returncode != 0 or calls or f"-docker.pkg.dev/{PROJECT}/meerkat-ci/meerkat-ci-rust:" not in proc.stdout:
+    fail(f"ci-image image does not derive its reference from MEERKAT_GCP_PROJECT_ID: {proc.stdout.strip()!r}")
+else:
+    ok("ci-image image derives its reference from MEERKAT_GCP_PROJECT_ID")
 
 sys.exit(1 if FAILURES else 0)
 PY
