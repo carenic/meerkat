@@ -2418,4 +2418,41 @@ mod tests {
         assert_eq!(second["wired"].as_array().expect("wired array").len(), 0);
         assert_eq!(second["already_wired"], json!([{ "a": "w-a", "b": "w-b" }]));
     }
+
+    /// the public MCP member-send tool routes a caller key to the
+    /// keyed door instead of dropping or refusing it at parse. A state with no
+    /// bound continuation service answers the typed idempotency_unavailable,
+    /// before any member lookup.
+    #[tokio::test]
+    async fn mcp_member_send_tool_routes_the_key() {
+        let state = MobMcpState::new_in_memory();
+        handle_public_tools_call(
+            &state,
+            "meerkat_mob_create",
+            &json!({
+                "definition": {
+                    "id": "keyed-mcp-mob",
+                    "profiles": {
+                        "lead": { "model": "gpt-5.4", "tools": {"comms": true} }
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("typed public create");
+        let err = handle_public_tools_call(
+            &state,
+            "meerkat_mob_member_send",
+            &json!({
+                "mob_id": "keyed-mcp-mob",
+                "agent_identity": "worker-1",
+                "content": "keyed",
+                "idempotency_key": "item-1",
+            }),
+        )
+        .await
+        .expect_err("no continuation service is bound on an in-memory state");
+        let data = err.data.clone().unwrap_or_default();
+        assert_eq!(data["kind"], "idempotency_unavailable", "{err:?}");
+    }
 }

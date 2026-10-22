@@ -3307,8 +3307,8 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     use super::{Credentials, build_bootstrap_config, extract_verify_and_parse_mobpack};
     use super::{
-        MobForkHelperOptions, MobSpawnHelperOptions, StreamRef, SubscriptionInner,
-        close_subscription, parse_js_tool_result, parse_mob_event_cursor,
+        MobForkHelperOptions, MobMemberSendOptions, MobSpawnHelperOptions, StreamRef,
+        SubscriptionInner, close_subscription, parse_js_tool_result, parse_mob_event_cursor,
         parse_mob_lifecycle_action_arg, parse_mobpack, parse_prompt_content_input,
         parse_session_config, poll_subscription, serialize_subscription_item,
         session_error_envelope, stream_lagged_envelope,
@@ -5342,5 +5342,22 @@ capabilities = [{capability_values}]
         );
 
         clear_tool_callbacks();
+    }
+
+    /// the in-browser runtime binds no continuation service, so a
+    /// caller idempotency key on member send is refused at parse, never
+    /// silently dropped.
+    #[test]
+    fn wasm_member_send_refuses_a_key() {
+        let keyed = serde_json::from_value::<MobMemberSendOptions>(json!({
+            "content": "keyed",
+            "idempotency_key": "item-1",
+        }));
+        assert!(
+            keyed.is_err(),
+            "a key the browser runtime cannot honour is refused, never dropped"
+        );
+        let plain = serde_json::from_value::<MobMemberSendOptions>(json!({ "content": "plain" }));
+        assert!(plain.is_ok(), "an unkeyed send still parses: {plain:?}");
     }
 }

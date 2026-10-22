@@ -38276,6 +38276,169 @@ mod tests {
         assert!(!public_error.contains(PRIVATE_DETAIL));
         assert!(!public_error.contains(PRIVATE_CONTEXT));
     }
+
+    /// Caller idempotency key rows on the runtime-backed `session/external_event` handler,
+    /// driven through its JSON params so they compile without the new field.
+    mod caller_idempotency_key {
+        use super::*;
+
+        async fn keyed_external_event(
+            runtime: &Arc<SessionRuntime>,
+            session_id: &SessionId,
+            key: Option<&str>,
+            payload: serde_json::Value,
+        ) -> crate::protocol::RpcResponse {
+            let mut params = serde_json::json!({
+                "session_id": session_id.to_string(),
+                "kind": "generic_json",
+                "event_type": "inbox.item",
+                "payload": payload,
+            });
+            if let Some(key) = key {
+                params["idempotency_key"] = serde_json::json!(key);
+            }
+            let raw =
+                serde_json::value::RawValue::from_string(params.to_string()).expect("raw params");
+            crate::handlers::event::handle_external_event(
+                Some(crate::protocol::RpcId::Num(1)),
+                Some(&raw),
+                Arc::clone(runtime),
+            )
+            .await
+        }
+
+        fn result_json(resp: &crate::protocol::RpcResponse) -> serde_json::Value {
+            assert!(
+                resp.error.is_none(),
+                "expected a result, got {:?}",
+                resp.error
+            );
+            serde_json::from_str(resp.result.as_ref().expect("result").get()).expect("result json")
+        }
+
+        /// Restart: the admission commits the key in the store's
+        /// index with its input row, so after the process goes away between
+        /// that commit and the response, the reopened runtime's retry names
+        /// the first admission and admits nothing new.
+        #[tokio::test]
+        async fn external_event_key_replays_after_restart_between_commit_and_response() {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let seed_runtime = no_turn_disk_runtime(temp.path()).await;
+            let session_id = seed_runtime
+                .create_or_resume_session_without_turn(
+                    mock_build_config(),
+                    None,
+                    None,
+                    Default::default(),
+                )
+                .await
+                .expect("create session");
+            let (event_tx, _event_rx) = mpsc::channel(100);
+            seed_runtime
+                .start_turn_via_runtime(
+                    &session_id,
+                    "persist this session".into(),
+                    Vec::new(),
+                    event_tx,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("a turn persists the session");
+            let payload = serde_json::json!({ "item": "msg-restart", "body": "keyed" });
+            let first = result_json(
+                &keyed_external_event(
+                    &seed_runtime,
+                    &session_id,
+                    Some("inbox:msg-restart"),
+                    payload.clone(),
+                )
+                .await,
+            );
+            assert_eq!(first["outcome_type"], "accepted", "{first}");
+            let first_id = first["input_id"].as_str().expect("input id").to_string();
+            seed_runtime.try_shutdown().await.expect("shutdown");
+            drop(seed_runtime);
+
+            let runtime = no_turn_disk_runtime(temp.path()).await;
+            let replay = result_json(
+                &keyed_external_event(&runtime, &session_id, Some("inbox:msg-restart"), payload)
+                    .await,
+            );
+            assert_eq!(
+                replay["outcome_type"], "deduplicated",
+                "the reopened store index names the first admission: {replay}"
+            );
+            assert_eq!(replay["existing_id"].as_str(), Some(first_id.as_str()));
+        }
+
+        /// Guard (caller keys stored without their namespace would fail it): a
+        /// caller key equal to a Core job delivery key never meets it; the
+        /// job's own event is still admitted under its key.
+        #[tokio::test]
+        async fn external_event_caller_key_never_meets_a_job_delivery_key() {
+            use meerkat::JobDeliverySink as _;
+            use meerkat_runtime::SessionServiceRuntimeExt as _;
+
+            let temp = tempfile::tempdir().expect("tempdir");
+            let runtime = make_runtime_with_runtime_store(temp_factory(&temp), 10);
+            runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
+            let session_id = runtime
+                .create_session(mock_build_config(), None, None, Vec::new())
+                .await
+                .expect("create_session");
+            let job_id = meerkat::JobId::new("job-caller-collision").expect("job id");
+            let job_key = format!("job:{job_id}:1:watcher");
+
+            let caller = result_json(
+                &keyed_external_event(
+                    &runtime,
+                    &session_id,
+                    Some(&job_key),
+                    serde_json::json!({ "body": "a caller event under a Core-shaped key" }),
+                )
+                .await,
+            );
+            assert_eq!(caller["outcome_type"], "accepted", "{caller}");
+            let caller_input = caller["input_id"].as_str().expect("input id").to_string();
+
+            let subscription = meerkat::JobSubscription::new(
+                meerkat::JobSubscriptionId::new("watcher").expect("subscription id"),
+                session_id.clone(),
+                meerkat::JobDeliveryKind::Event {
+                    handling_mode: meerkat_core::types::HandlingMode::Queue,
+                },
+            );
+            let sink = SessionRuntimeJobDeliverySink {
+                runtime: Arc::clone(&runtime),
+            };
+            sink.apply(meerkat::JobDeliveryApplication::Event {
+                job_id: job_id.clone(),
+                delivery_sequence: 1,
+                subscription,
+                interaction_lineage_id: meerkat::InteractionLineageId::new(),
+                handling_mode: meerkat_core::types::HandlingMode::Queue,
+                content: meerkat::JobDeliveryContent::Terminal(
+                    meerkat::JobTerminalResult::Succeeded { result_ref: None },
+                ),
+            })
+            .await
+            .expect("the job event is admitted, never refused as the caller's conflict");
+            let job_row = runtime
+                .runtime_adapter()
+                .input_state_by_idempotency_key(&session_id, &job_key)
+                .await
+                .expect("idempotency lookup")
+                .expect("the job event holds its own key");
+            assert_ne!(
+                job_row.state.input_id.to_string(),
+                caller_input,
+                "the job's key names the job's row, not the caller's"
+            );
+        }
+    }
 }
 
 #[cfg(feature = "mcp")]
