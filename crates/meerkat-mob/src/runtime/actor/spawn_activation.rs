@@ -2719,8 +2719,10 @@ impl MobActor {
 
         pending.phase = SpawnActivationPhase::Commit;
         if pending.state.suppress_autonomous_initial_prompt {
-            // Identity reconciliation resumed an authoritative transcript:
-            // the runtime is up and must not receive a manufactured kickoff.
+            // Identity reconciliation, or a plain resume of a session whose
+            // first turn already started, resumed an authoritative
+            // transcript: the runtime is up and must not receive a
+            // manufactured kickoff.
             tracing::debug!(
                 agent_identity = %agent_identity,
                 "autonomous member runtime resumed without a fresh kickoff"
@@ -3041,6 +3043,7 @@ impl MobActor {
                 rollback_authority: None,
                 materialized_ack: None,
                 failed_restore_peer_ids: Vec::new(),
+                adopted_first_turn: None,
             },
             failed_restore_peer_ids: std::mem::take(&mut state.failed_restore_peer_ids),
         })

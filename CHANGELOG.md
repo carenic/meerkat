@@ -83,6 +83,10 @@ them.
   and so does the `PartialOrd` order of `OccurrenceLifecycleEffectVariant::*`
   and `OccurrenceLifecycleInputVariant::*`; match them by variant name, not
   by numeric cast or position.
+- Behaviour-only (not measured by the gate): `meerkat-mob`: a resume spawn of
+  an existing session whose first turn already started no longer delivers the
+  spawn's `initial_message` (see Fixed). A caller that sent a message with a
+  resume to give the member new work sends it after the resume.
 
 ### Added
 
@@ -234,6 +238,22 @@ them.
   transcript revision conflict (`SessionError::Store`) instead of an
   internal "resume bridge session check failed" error. The spawn does not
   settle the tail; it stays as it was.
+- `meerkat-mob`: a resume spawn of an existing session (a `Resume` launch,
+  such as a host re-materializing a retired member, or a spawn with
+  `resume_session_id`) no longer runs the member's first turn again. An
+  autonomous member got a fresh kickoff turn (its initial message, or the
+  fallback role prompt) and a turn-driven member re-ran its initial message
+  on every resume, each appending a manufactured turn and a model request to
+  the existing transcript. A resume now delivers the first turn only while
+  the session's first turn never started (its deferred first-turn phase is
+  still pending, or it is a deferred template), and then once; otherwise it
+  runs no kickoff and does not deliver `initial_message`, and it logs the
+  undelivered message at info. A first turn that started and was interrupted
+  is not re-run. Fresh spawns, fork seatings and identity reconciliation are
+  unchanged. Placed members (`placement` set) get the same rule in a
+  separate fix in this release. `meerkat-core` adds
+  `Session::is_deferred_template`, the one predicate the session service and
+  the mob read for a deferred template.
 - `meerkat-session`: a session resumed while its first turn was still pending
   now records that first turn's start durably. A run checkpoint persisted the
   deferred-turn state the resumed agent was built from, so after the first

@@ -5718,7 +5718,10 @@ pub(super) struct PendingSpawn {
     pub(super) initial_turn_prompt: Option<ContentInput>,
     /// Identity reconciliation resumes an already authoritative transcript.
     /// Starting its autonomous runtime must not manufacture a fresh kickoff
-    /// prompt when the sealed intent has no pending initial delivery.
+    /// prompt when the sealed intent has no pending initial delivery. A
+    /// plain resume gets the same suppression when its provision shows the
+    /// adopted session's first turn already started
+    /// (`MobActor::adopted_session_first_turn_delivery`).
     pub(super) suppress_autonomous_initial_prompt: bool,
     /// Target-local identity authority for the final structural member CAS.
     /// The built-in member store revalidates this after provisioning; it is
@@ -16627,6 +16630,37 @@ impl MobActor {
             "You have been spawned as '{}' (role: {}) in mob '{}'.",
             agent_identity, profile_name, self.definition.id
         )
+    }
+
+    /// The first-turn delivery of a spawn, given what a plain resume found in
+    /// the session it adopted ([`super::handle::AdoptedFirstTurn`]).
+    ///
+    /// A resume of a session whose first turn already started adopts an
+    /// authoritative transcript: it runs no autonomous kickoff and no
+    /// turn-driven initial turn, with or without an initial message. A
+    /// resume that owes the first turn, and every other spawn, keeps its
+    /// delivery.
+    fn adopted_session_first_turn_delivery(
+        &self,
+        agent_identity: &AgentIdentity,
+        adopted_first_turn: Option<super::handle::AdoptedFirstTurn>,
+        suppress_autonomous_initial_prompt: bool,
+        initial_turn_prompt: Option<ContentInput>,
+    ) -> (bool, Option<ContentInput>) {
+        if adopted_first_turn != Some(super::handle::AdoptedFirstTurn::Started) {
+            return (suppress_autonomous_initial_prompt, initial_turn_prompt);
+        }
+        // `initial_turn_prompt` is present exactly when the spawn carried an
+        // initial message.
+        if initial_turn_prompt.is_some() {
+            tracing::info!(
+                mob_id = %self.definition.id,
+                agent_identity = %agent_identity,
+                first_turn = "started",
+                "resume adopts a session whose first turn already started; its initial message is not delivered"
+            );
+        }
+        (true, None)
     }
 
     async fn ensure_autonomous_runtime_ready(
@@ -32550,6 +32584,16 @@ impl MobActor {
                 Some(rollback_authority),
                 super::provisioner::RollbackOrigin::SpawnRollback,
             );
+            // This lane adopts a session whose turn is active, so its first
+            // turn has started and a plain resume owes none.
+            let (suppress_autonomous_initial_prompt, initial_turn_prompt) = self
+                .adopted_session_first_turn_delivery(
+                    &agent_identity,
+                    matches!(spawn_source, super::handle::SpawnSource::Resume)
+                        .then_some(super::handle::AdoptedFirstTurn::Started),
+                    suppress_autonomous_initial_prompt,
+                    initial_turn_prompt,
+                );
             // Resume fast-path: admission still commits inline, but the
             // activation stages are routed. The caller's reply rides the
             // typed continuation, so a slow member runtime start cannot hold
@@ -32896,7 +32940,18 @@ impl MobActor {
                         )
                         .await?;
                         drop(preparation_permit);
-                        let spawn_receipt = match held {
+                        // A plain resume adopts an existing transcript: read
+                        // whether it still owes the member's first turn from
+                        // the session the resume already loaded.
+                        let adopted_first_turn =
+                            if matches!(spawn_source, super::handle::SpawnSource::Resume) {
+                                provision_request.authorized_resume.as_ref().map(|resume| {
+                                    super::handle::AdoptedFirstTurn::of(&resume.session)
+                                })
+                            } else {
+                                None
+                            };
+                        let mut spawn_receipt = match held {
                             #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
                             Some(held) => {
                                 meerkat_runtime::stack_relief::box_in_own_frame(|| {
@@ -32926,6 +32981,7 @@ impl MobActor {
                                 .await?
                             }
                         };
+                        spawn_receipt.adopted_first_turn = adopted_first_turn;
                         if let Some(bridge_session_id) =
                             spawn_receipt.member_ref.bridge_session_id().cloned()
                         {
@@ -35116,6 +35172,13 @@ impl MobActor {
                                 }
                             },
                         };
+                        let (suppress_autonomous_initial_prompt, initial_turn_prompt) = self
+                            .adopted_session_first_turn_delivery(
+                                &agent_identity,
+                                spawn_receipt.adopted_first_turn,
+                                suppress_autonomous_initial_prompt,
+                                initial_turn_prompt,
+                            );
                         Ok((
                             Box::new(SpawnFinalizeCtx {
                                 profile_name: profile_name.clone(),

@@ -37734,6 +37734,55 @@ async fn test_resume_of_a_deferred_template_session_delivers_the_first_turn() {
     );
 }
 
+/// The resume witness owes the first turn exactly when the session service
+/// leaves it pending: a stored pending first turn, or a deferred template.
+#[test]
+fn adopted_first_turn_is_owed_only_while_the_first_turn_never_started() {
+    use super::handle::AdoptedFirstTurn;
+
+    assert_eq!(
+        AdoptedFirstTurn::of(&Session::new()),
+        AdoptedFirstTurn::Owed,
+        "a deferred template owes its first turn"
+    );
+
+    let mut pending = Session::new();
+    pending.push(Message::System(meerkat_core::types::SystemMessage::new(
+        "member prompt",
+    )));
+    let mut state = meerkat_core::SessionDeferredTurnState::default();
+    state.mark_initial_turn_pending();
+    pending
+        .set_deferred_turn_state(state.clone())
+        .expect("pending deferred-turn state");
+    assert_eq!(
+        AdoptedFirstTurn::of(&pending),
+        AdoptedFirstTurn::Owed,
+        "a stored pending first turn is owed"
+    );
+
+    let mut started = pending.clone();
+    assert!(state.mark_initial_turn_started(), "pending to consumed");
+    started
+        .set_deferred_turn_state(state)
+        .expect("consumed deferred-turn state");
+    assert_eq!(
+        AdoptedFirstTurn::of(&started),
+        AdoptedFirstTurn::Started,
+        "a consumed first turn is not owed"
+    );
+
+    let mut immediate = Session::new();
+    immediate.push(Message::User(meerkat_core::types::UserMessage::text(
+        "first turn of a session created without a deferred first turn",
+    )));
+    assert_eq!(
+        AdoptedFirstTurn::of(&immediate),
+        AdoptedFirstTurn::Started,
+        "a session that was not created deferred owes nothing"
+    );
+}
+
 #[tokio::test]
 async fn test_resume_recreates_missing_external_bridge_preserving_backend_identity() {
     let _serial = lock_real_comms_tests();

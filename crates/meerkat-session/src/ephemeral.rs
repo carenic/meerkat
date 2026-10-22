@@ -8269,9 +8269,8 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
             })?
             .flatten();
         let mut deferred_turn_state = resumed_deferred_turn_state.clone().unwrap_or_default();
-        let resumed_session_is_deferred_template = resumed_session.is_some_and(|session| {
-            session.messages().is_empty() && resumed_deferred_turn_state.is_none()
-        });
+        let resumed_session_is_deferred_template =
+            resumed_session.is_some_and(meerkat_core::Session::is_deferred_template);
         if let Some(blob_store) = req
             .build
             .as_ref()

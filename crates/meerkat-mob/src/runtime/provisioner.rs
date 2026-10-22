@@ -13967,6 +13967,7 @@ impl ProvisionFinish {
             rollback_authority,
             materialized_ack: None,
             failed_restore_peer_ids: Vec::new(),
+            adopted_first_turn: None,
         })
         }
         .await;
@@ -17323,6 +17324,7 @@ impl MultiBackendProvisioner {
             rollback_authority: None,
             materialized_ack: None,
             failed_restore_peer_ids: Vec::new(),
+            adopted_first_turn: None,
         })
     }
 }
@@ -17654,6 +17656,7 @@ impl MobProvisioner for MultiBackendProvisioner {
                     }),
                 })),
                 failed_restore_peer_ids: Vec::new(),
+                adopted_first_turn: None,
             },
         })
     }

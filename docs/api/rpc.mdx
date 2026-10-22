@@ -1972,6 +1972,12 @@ from the stored predecessor role while keeping mob ID, member identity,
 session, and transcript fixed; live sessions and mismatched declarations fail
 closed.
 
+A `mob/spawn` or `mob/spawn_many` item whose `launch_mode` resumes an existing
+session delivers the member's first turn (its kickoff or `initial_message`) only
+while that session's first turn has never started, and then once. Otherwise the
+resume runs no kickoff and does not deliver `initial_message`; a first turn that
+started and was interrupted is not re-run.
+
 ### workgraph/get
 
 Read one WorkGraph item by id. Requires the `workgraph` feature and a

@@ -588,6 +588,18 @@ Spawn defaults matter:
 Autonomous members run as long-lived peers. `turn_driven` members are useful
 when a host wants explicit dispatch control.
 
+A fresh `autonomous_host` member runs exactly one kickoff turn (one model
+request) when it is spawned: on its `initial_message`, or without one on a
+fallback role prompt. A member that must start idle should be `turn_driven`; it
+runs `initial_message` as its first turn, and nothing without one.
+
+A resume of an existing session (a `resume` launch mode) delivers that first
+turn only while the session's first turn has never started, and then once.
+Otherwise the resume runs no kickoff and does not deliver `initial_message`: the
+transcript already holds the member's start, and a first turn that started and
+was interrupted is not re-run. Placed members (`placement` set) are not covered
+yet; their resume still runs the kickoff.
+
 ### Trusted Rust member build overrides
 
 An in-process Rust host can attach a per-member

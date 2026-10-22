@@ -6959,6 +6959,13 @@ impl Session {
             .transpose()
     }
 
+    /// Whether this session is a deferred template: it carries no messages
+    /// and no deferred-turn state. A deferred create that resumes a template
+    /// marks its first turn pending, as it does for a new session.
+    pub fn is_deferred_template(&self) -> bool {
+        self.messages().is_empty() && !self.metadata.contains_key(SESSION_DEFERRED_TURN_STATE_KEY)
+    }
+
     /// Load durable deferred-turn control state from the session metadata map.
     ///
     /// Rejected durable facts fail closed through the generated restore
@@ -16169,6 +16176,21 @@ mod tests {
         Session::new()
             .set_build_state(child)
             .expect("the persist gate admits a fork child's build state");
+    }
+
+    #[test]
+    fn a_deferred_template_has_no_messages_and_no_deferred_turn_state() {
+        assert!(Session::new().is_deferred_template());
+
+        let mut with_message = Session::new();
+        with_message.push(Message::User(UserMessage::text("hello")));
+        assert!(!with_message.is_deferred_template());
+
+        let mut with_state = Session::new();
+        with_state
+            .set_deferred_turn_state(SessionDeferredTurnState::default())
+            .expect("deferred-turn state should serialize");
+        assert!(!with_state.is_deferred_template());
     }
 
     #[test]

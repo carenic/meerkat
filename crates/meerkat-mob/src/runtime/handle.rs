@@ -2316,6 +2316,41 @@ pub struct PreviousMemberCleanupReport {
     pub destroy_error: Option<String>,
 }
 
+/// Whether the existing session a plain resume adopted still owes the
+/// member's first turn.
+///
+/// The session service owns the answer: a deferred create that resumes a
+/// session keeps its stored first-turn phase, and marks a deferred template
+/// ([`meerkat_core::Session::is_deferred_template`]) pending. The first turn
+/// is owed exactly when one of those leaves it pending, and the turn that
+/// delivers it moves the phase to consumed, so it is delivered once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdoptedFirstTurn {
+    /// The session's first turn never started.
+    Owed,
+    /// The session's first turn started, or the session was not created
+    /// with a deferred first turn.
+    Started,
+}
+
+impl AdoptedFirstTurn {
+    /// Read the stored session a resume loaded. A deferred-turn state the
+    /// session service would refuse reads as `Started`: it never
+    /// manufactures a first turn.
+    pub(crate) fn of(session: &meerkat_core::Session) -> Self {
+        let stored_pending = matches!(
+            session.try_deferred_turn_state(),
+            Ok(Some(state))
+                if state.first_turn_phase() == meerkat_core::DeferredFirstTurnPhase::Pending
+        );
+        if stored_pending || session.is_deferred_template() {
+            Self::Owed
+        } else {
+            Self::Started
+        }
+    }
+}
+
 /// Receipt returned by a successful member spawn.
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
@@ -2345,6 +2380,11 @@ pub(crate) struct MemberSpawnReceipt {
     /// deferred placed-spawn reply. Empty for ordinary spawns.
     #[serde(skip)]
     pub(crate) failed_restore_peer_ids: Vec<crate::ids::RespawnTopologyPeerId>,
+    /// For a plain resume ([`SpawnSource::Resume`]), whether the existing
+    /// session it adopted still owes the member's first turn, read from the
+    /// session the resume loaded. `None` for every other spawn.
+    #[serde(skip)]
+    pub(crate) adopted_first_turn: Option<AdoptedFirstTurn>,
 }
 
 /// Public result from a successful member spawn.
@@ -6406,6 +6446,23 @@ pub struct SpawnMemberSpec {
     /// `role_name` remains a roster/topology label.
     pub role_name: ProfileName,
     pub identity: AgentIdentity,
+    /// The member's first turn.
+    ///
+    /// A fresh `AutonomousHost` member runs exactly one kickoff turn (one
+    /// model request) when it is spawned: on this message, or without one on
+    /// a fallback role prompt (`You have been spawned as '<identity>' (role:
+    /// <role>) in mob '<mob>'.`). A member that must start idle should be
+    /// `TurnDriven`. A fresh `TurnDriven` member runs this message as its
+    /// first turn, and nothing without one.
+    ///
+    /// A resume of an existing session
+    /// ([`crate::launch::MemberLaunchMode::Resume`]) delivers that first
+    /// turn only while the session's first turn has never started, and then
+    /// once. Otherwise the resume runs no kickoff and does not deliver this
+    /// message: the session's transcript already holds the member's start,
+    /// and a first turn that started and was interrupted is not re-run.
+    /// Placed members (`placement` set) are not covered yet: their resume
+    /// still runs the kickoff.
     pub initial_message: Option<ContentInput>,
     pub runtime_mode: Option<crate::MobRuntimeMode>,
     pub backend: Option<MobBackendKind>,
