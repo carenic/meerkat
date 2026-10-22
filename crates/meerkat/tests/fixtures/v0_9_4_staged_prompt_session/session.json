@@ -1,0 +1,68 @@
+{
+  "version": 4,
+  "id": "01a16405-9db1-7a53-89a9-f75519af39eb",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are an autonomous agent. Your task is to accomplish the user's goal by systematically using the tools available to you.\n\n# Core Behavior\n- Break complex tasks into steps and execute them one by one.\n- Use tools to gather information, take actions, and verify results.\n- When multiple tool calls are independent, execute them in parallel.\n- If a tool call fails, analyze the error and try alternative approaches.\n- Continue working until the task is complete or you determine it cannot be completed.\n\n# Decision Making\n- Act on the information you have. Make reasonable assumptions when necessary.\n- If critical information is missing and no tool can provide it, state what you need and why.\n- Prioritize correctness over speed. Verify your work when possible.\n\n# Output\n- When the task is complete, provide a clear summary of what was accomplished.\n- If the task cannot be completed, explain what blocked progress and what was attempted.",
+      "created_at": "2026-10-22T14:30:52.089658926Z"
+    }
+  ],
+  "created_at": {
+    "secs_since_epoch": 1792679452,
+    "nanos_since_epoch": 81233368
+  },
+  "updated_at": {
+    "secs_since_epoch": 1792679452,
+    "nanos_since_epoch": 90768721
+  },
+  "metadata": {
+    "session_build_state": {},
+    "session_compaction_cadence": {
+      "session_boundary_index": 0
+    },
+    "session_deferred_turn_state": {
+      "first_turn_phase": "pending",
+      "pending_initial_prompt": {
+        "accepted_at": {
+          "nanos_since_epoch": 85519938,
+          "secs_since_epoch": 1792679452
+        },
+        "prompt": "Remember the codeword ORBIT-7 for later."
+      }
+    },
+    "session_metadata": {
+      "comms_name": null,
+      "keep_alive": false,
+      "max_tokens": 64000,
+      "model": "claude-sonnet-4-5",
+      "provider": "anthropic",
+      "schema_version": 2,
+      "structured_output_retries": 2,
+      "tooling": {
+        "application_tool_policy": {
+          "kind": "unmanaged"
+        },
+        "builtins": "inherit",
+        "comms": "inherit",
+        "image_generation": "inherit",
+        "memory": "inherit",
+        "mob": "inherit",
+        "schedule": "inherit",
+        "shell": "inherit",
+        "spawn_tool_access_policy": {
+          "kind": "unrestricted"
+        },
+        "web_search": "inherit",
+        "workgraph": "inherit"
+      }
+    },
+    "session_tool_visibility_state_v1": {}
+  },
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cache_creation_tokens": null,
+    "cache_read_tokens": null
+  }
+}

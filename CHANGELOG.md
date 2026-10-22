@@ -198,6 +198,23 @@ them.
   actor still lives, at the Shutdown's deadline keeps its lease, as do a
   retiring member and every member of a process that ends without a
   Shutdown.
+
+- `meerkat-session`, `meerkat-core`, `meerkat-contracts`: a deferred
+  `session/create` prompt that `live/open` staged
+  (`DeferredPromptPolicy::Stage`) no longer disappears on the session's first
+  runtime-authored turn, such as the next `turn/start`. That turn commits only
+  its typed appends, so the prompt reached the run-start hooks and
+  `RunStarted` but neither the transcript nor the model request. The prompt
+  now joins the turn's committed rows: folded into its first user row (staged
+  content first), or as a user row ahead of the turn's other appends when it
+  has none, and the run-start hooks and `RunStarted` see exactly those rows. A
+  turn that commits no user row (a pending continuation, a run-start veto, a
+  refusal before the run) leaves the prompt pending, so it lands exactly once,
+  also for a session persisted with a staged prompt by an earlier release. A
+  turn whose input carries directed interaction custody is refused with the new
+  `AgentError::StagedPromptDirectedTurnRefused` while a prompt is staged. The
+  realtime seed still carries no staged prompt: in a voice-first session it
+  lands with the first later text turn.
 - A turn that compacts its history more often than
   `[compaction] history_retained_rewrites` keeps (five or more compactions at
   the default of 4) no longer ends at its intra-turn checkpoint on a
