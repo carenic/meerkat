@@ -3724,15 +3724,20 @@ mod tests {
     async fn helpers_with_an_autonomous_runtime_mode_are_refused_before_spawning() {
         let mob_id = MobId::from("rpc-autonomous-helper");
         let state = MobMcpState::new_in_memory();
-        let handle = MobBuilder::new(
-            rpc_destroy_test_definition(&mob_id),
-            MobStorage::in_memory(),
-        )
-        .with_session_service(state.session_service())
-        .allow_ephemeral_sessions(true)
-        .create()
-        .await
-        .expect("create the mob");
+        // Mob members need comms; the shared fixture profile leaves it off.
+        let mut definition = rpc_destroy_test_definition(&mob_id);
+        if let Some(meerkat_mob::ProfileBinding::Inline(profile)) = definition
+            .profiles
+            .get_mut(&meerkat_mob::ProfileName::from("worker"))
+        {
+            profile.tools.comms = true;
+        }
+        let handle = MobBuilder::new(definition, MobStorage::in_memory())
+            .with_session_service(state.session_service())
+            .allow_ephemeral_sessions(true)
+            .create()
+            .await
+            .expect("create the mob");
         state
             .mob_insert_handle(mob_id.clone(), handle.clone())
             .await;
