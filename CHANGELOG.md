@@ -116,21 +116,22 @@ them.
   was lost, or it failed after the consume and could not restore the
   previous credential and lifecycle; whether the credential landed is
   unknown until the commit settles, and a later read of the stored
-  credential reports it. It is never a success and never a clean failure. The semver gate reports each as an
-  enum variant added to an exhaustive enum (`McpOAuthError` stays
-  exhaustive, as above); a match outside the crate needs the arms. Surfaces
-  map `NetworkTimedOut` to the reason `upstream_failure` with the detail
-  `upstream_timeout` (the code had not been sent) or
-  `upstream_timeout_after_code`, and `CommitUnsettled` to the new reason
-  `commit_unsettled`.
+  credential reports it. It is never a success and never a clean failure.
+  The semver gate reports each as an enum variant added to an exhaustive
+  enum (`McpOAuthError` stays exhaustive, as above); a match outside the
+  crate needs the arms. Surfaces map `NetworkTimedOut` to the reason
+  `upstream_failure` with the detail `upstream_timeout` (the code had not
+  been sent) or `upstream_timeout_after_code`, and `CommitUnsettled` to the
+  new reason `commit_unsettled`.
 - `meerkat-contracts` (bounded MCP OAuth network stages):
-  `WireAuthErrorDetail` gains the variants `UpstreamTimeout` and
-  `UpstreamTimeoutAfterCode`, and `WireAuthErrorReason` gains
-  `CommitUnsettled`, each appended last. The semver gate reports each as an
-  enum variant added to an exhaustive enum. On the wire they are new values
+  `WireAuthErrorReason` gains `CommitUnsettled`, appended last; the semver
+  gate reports it as an enum variant added to an exhaustive enum.
+  `WireAuthErrorDetail`, new in this release (hosted MCP OAuth above), gains
+  `UpstreamTimeout` and `UpstreamTimeoutAfterCode`, appended last: not a
+  finding against 0.9.4, but a match written against an earlier build of
+  this release needs the arms. On the wire they are new values
   (`upstream_timeout`, `upstream_timeout_after_code`, `commit_unsettled`);
-  the SDK helpers of earlier releases read an unknown reason or detail as
-  absent.
+  SDK helpers built before them read them as absent.
 - `meerkat-core` (bounded MCP OAuth network stages):
   `CredentialMutationError` gains the variant `RollbackFailed(String)`,
   appended last: a publication failed after it acquired the credential
