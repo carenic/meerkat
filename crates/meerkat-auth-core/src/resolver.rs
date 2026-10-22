@@ -2455,6 +2455,7 @@ mod tests {
         .expect("runtime AuthLeaseHandle is certified by generated AuthMachine authority")
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     fn fixture_refresh_observation_time(expires_at: u64) -> u64 {
         if expires_at == u64::MAX {
@@ -2464,6 +2465,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     fn mark_tokens_lifecycle_published_for_transition_for_test(
         tokens: &PersistedTokens,
@@ -2487,6 +2489,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     fn mark_lease_tokens_lifecycle_published_for_test(
         lease_key: &LeaseKey,

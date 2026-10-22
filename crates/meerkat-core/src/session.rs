@@ -4394,6 +4394,21 @@ impl ConsumedDeferredTurnInputs {
     pub fn pending_tool_results(&self) -> &[PendingToolResultsMessage] {
         &self.pending_tool_results
     }
+
+    /// Move the staged initial prompt out into a restore set of its own.
+    ///
+    /// A turn that consumed the prompt but commits no row carrying it (a
+    /// pending continuation, or a run that committed nothing) restores the
+    /// returned set, so the prompt stays pending for the next content turn.
+    /// The first-turn phase and staged tool results stay with `self`.
+    #[must_use]
+    pub fn take_initial_prompt(&mut self) -> Self {
+        Self {
+            restore_first_turn_pending: false,
+            pending_initial_prompt: self.pending_initial_prompt.take(),
+            pending_tool_results: Vec::new(),
+        }
+    }
 }
 
 /// Per-session registry key for the first-turn region of the

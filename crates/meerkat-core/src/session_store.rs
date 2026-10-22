@@ -8593,7 +8593,7 @@ mod tests {
                 lifecycle_bit: crate::event::ToolConfigLifecycleBit::Settled(false),
                 detail: Some(body.to_string()),
                 confinement_refusal: None,
-                pending_sources: vec!["king-search".to_string()],
+                pending_sources: vec!["slow-search".to_string()],
             },
         ))
     }
@@ -8619,7 +8619,7 @@ mod tests {
         let mut session = Session::new();
         session.push(Message::User(UserMessage::text("Hello".to_string())));
         session.push(mcp_pending_synthetic_notice(
-            "Servers connecting: king-search. Tools will appear when ready.",
+            "Servers connecting: slow-search. Tools will appear when ready.",
         ));
         session.push(assistant_reply("reply"));
         let mutation = PreparedHeadCanonicalMutation::prepare_root(&session).expect("prepare root");
@@ -8642,7 +8642,7 @@ mod tests {
         let refresh_shapes: [Vec<Message>; 2] = [
             Vec::new(),
             vec![mcp_pending_synthetic_notice(
-                "Servers connecting: king-search (retrying).",
+                "Servers connecting: slow-search (retrying).",
             )],
         ];
         for replacements in refresh_shapes {
@@ -8778,7 +8778,7 @@ mod tests {
             .replace_synthetic_notices(
                 SystemNoticeKind::McpPending,
                 vec![mcp_pending_synthetic_notice(
-                    "Servers connecting: king-search (retrying).",
+                    "Servers connecting: slow-search (retrying).",
                 )],
             )
             .expect("audited-prefix synthetic refresh must complete");

@@ -235,14 +235,14 @@ env:
   # toolchain wrapper path is identical across runs and lanes.
   RUST_LANE_ID: ci
   # Compiled objects live in the GCS bucket named by the repository variable
-  # MEERKAT_SCCACHE_GCS_BUCKET (default: the project bucket below), selected
-  # per job by .github/actions/setup-sccache-ci; with the GCP identity
-  # unavailable (fork pull requests) a lane runs with a local disk cache
-  # only. The GitHub Actions cache is 10 GB per repository and one
+  # MEERKAT_SCCACHE_GCS_BUCKET, selected per job by
+  # .github/actions/setup-sccache-ci; with the variable unset or the GCP
+  # identity unavailable (fork pull requests) a lane runs with a local disk
+  # cache only. The GitHub Actions cache is 10 GB per repository and one
   # workspace-mode run exceeds it, so writes failed at the quota and every run
   # stayed cold; it now keeps only the cargo registry. Debuginfo is off
   # (above) so the objects stay small.
-  SCCACHE_GCS_BUCKET_NAME: ${{ vars.MEERKAT_SCCACHE_GCS_BUCKET || 'meerkat-sccache-king-dnn-training-dev' }}
+  SCCACHE_GCS_BUCKET_NAME: ${{ vars.MEERKAT_SCCACHE_GCS_BUCKET }}
   # Pull-request wall-clock budget, split by who controls the time. It exists
   # to catch runaway CI (a lane that grows, aggregate drift), not to police a
   # single lane; every lane's own timeout-minutes does that.

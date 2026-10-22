@@ -131,12 +131,13 @@ pub(crate) enum ActorTaskEnd {
 
 /// Member lifecycle observations written only by the mob actor (and its
 /// task's spawn wrapper) and shared read-only with its handles: per-member
-/// retirement settlements, the report of the most recent Shutdown, and how
-/// the actor task ended.
+/// retirement settlements, the report of the most recent Shutdown, why the
+/// actor fail-stopped, and how the actor task ended.
 #[derive(Debug, Default)]
 pub(crate) struct MemberLifecycleObservations {
     members: std::sync::Mutex<BTreeMap<AgentIdentity, SettlementChannel>>,
     last_shutdown_report: std::sync::Mutex<Option<MobShutdownReport>>,
+    fail_stop_cause: std::sync::Mutex<Option<Arc<MobError>>>,
     actor_task: crate::tokio::sync::watch::Sender<ActorTaskEnd>,
     /// Test probe: set once a Shutdown parks on its off-actor teardown.
     #[cfg(test)]
@@ -217,6 +218,25 @@ impl MemberLifecycleObservations {
     /// The report of the most recent completed Shutdown.
     pub(crate) fn last_shutdown_report(&self) -> Option<MobShutdownReport> {
         self.last_shutdown_report
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Record why the actor fail-stopped (its startup recovery failed, or a
+    /// durable mutation's outcome stayed uncertain), before the actor closes
+    /// its admission and drops the commands it has not answered. The first
+    /// record stands.
+    pub(crate) fn record_fail_stop_cause(&self, cause: Arc<MobError>) {
+        self.fail_stop_cause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert(cause);
+    }
+
+    /// Why the actor fail-stopped, if it did.
+    pub(crate) fn fail_stop_cause(&self) -> Option<Arc<MobError>> {
+        self.fail_stop_cause
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()

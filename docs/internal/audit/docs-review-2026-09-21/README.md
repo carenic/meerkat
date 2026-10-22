@@ -23,7 +23,7 @@ At audit handoff, the Meerkat correction and ledger commits were local: the norm
 
 ## Imported MobKit publication boundary
 
-The 27 confirmed imported-documentation errors are corrected in the canonical source commit [`01435e7ccda5e925fc2cf9f462327bdae9584d07`](https://github.com/lukacf/meerkat-mobkit/commit/01435e7ccda5e925fc2cf9f462327bdae9584d07) on the [pushed correction branch](https://github.com/lukacf/meerkat-mobkit/compare/main...luka-crnkovicfriis-abk-mobkit-documentation-corrections). Native PR creation is blocked by the application's GitHub identity (HTTP 403, Enterprise Managed User); no PR number is claimed. The published `docs/mobkit` snapshot remains pinned to its existing released source. Publishing the corrections here requires the normal upstream release and subsequent verified documentation sync; this audit does not authorize a release or bypass provenance gates.
+The 27 confirmed imported-documentation errors are corrected in the canonical source commit [`01435e7ccda5e925fc2cf9f462327bdae9584d07`](https://github.com/lukacf/meerkat-mobkit/commit/01435e7ccda5e925fc2cf9f462327bdae9584d07) on a pushed correction branch. Native PR creation is blocked by the application's GitHub identity (HTTP 403, Enterprise Managed User); no PR number is claimed. The published `docs/mobkit` snapshot remains pinned to its existing released source. Publishing the corrections here requires the normal upstream release and subsequent verified documentation sync; this audit does not authorize a release or bypass provenance gates.
 
 ## Coverage and limitations
 

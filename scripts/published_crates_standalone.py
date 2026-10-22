@@ -30,7 +30,8 @@ scripts/release-rust-crates.sh lists.
         - its [package] exclude and the manifest's `excluded` list agree;
         - no packaged Rust file reads outside the package: no include_* or
           #[path] that leaves the package root, no CARGO_MANIFEST_DIR walked
-          up with parent() or "..", no workspace_root/repo_root helper;
+          up with parent() or ".." (inline, or through a same-file string
+          constant), no workspace_root/repo_root helper;
         - no packaged test skips itself when a binary or artifact is missing;
         - code under a cfg that needs `workspace-tests` is not scanned: the
           package leaves that feature off, so the code never builds there;
@@ -225,6 +226,9 @@ INCLUDE_FROM_MANIFEST = re.compile(
 )
 PATH_ATTR = re.compile(r'#\[\s*path\s*=\s*"([^"]+)"\s*\]')
 MANIFEST_DIR = re.compile(r'CARGO_MANIFEST_DIR')
+# A same-file string constant: a statement that joins CARGO_MANIFEST_DIR with
+# the constant's name walks wherever the constant's literal does.
+STR_CONST = re.compile(r'\b(?:const|static)\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*&\s*(?:\'static\s+)?str\s*=\s*"([^"\\]*)"\s*;')
 ROOT_HELPER = re.compile(r'\bfn\s+(workspace_root|repo_root|repository_root)\s*\(')
 SKIP_MISSING = re.compile(r'"Skipping[^"]*\b(missing|not found|not built)\b', re.IGNORECASE)
 STATEMENT_WINDOW = 400
@@ -484,6 +488,7 @@ def scan_source(packaged: set[str], relative: str, text: str) -> list[tuple[str,
     text = blank_compiled_out(text)
     findings: list[tuple[str, int, str]] = []
     base = os.path.dirname(relative)
+    consts = {match.group(1): match.group(2) for match in STR_CONST.finditer(text)}
 
     def line_of(offset: int) -> int:
         return text.count("\n", 0, offset) + 1
@@ -500,7 +505,9 @@ def scan_source(packaged: set[str], relative: str, text: str) -> list[tuple[str,
     for match in MANIFEST_DIR.finditer(text):
         window = text[match.start() : match.start() + STATEMENT_WINDOW]
         statement = window.split(";", 1)[0]
-        if ".parent()" in statement or '".."' in statement or '"../' in statement:
+        named = [literal for name, literal in consts.items() if re.search(rf"\b{re.escape(name)}\b", statement)]
+        if (".parent()" in statement or '".."' in statement or '"../' in statement
+                or any(literal == ".." or literal.startswith("../") or "/../" in literal for literal in named)):
             findings.append(("manifest-dir-walk", line_of(match.start()), statement.strip()[:120]))
     for match in ROOT_HELPER.finditer(text):
         findings.append(("root-helper", line_of(match.start()), match.group(0)))

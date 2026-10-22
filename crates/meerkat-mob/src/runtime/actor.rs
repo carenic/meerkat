@@ -12635,9 +12635,11 @@ impl MobActor {
         )
     }
 
-    /// Whether a routed effect still names the runtime the machine runs for
-    /// its member: the bound runtime for a binding or a retire, a live
-    /// runtime for an ingress.
+    /// Whether a refused routed effect still names a runtime the machine runs
+    /// for its member: the bound and live runtime for a binding, the bound and
+    /// retiring runtime for a retire, a live runtime for an ingress. Any other
+    /// kind is never presumed stale (only these three carry refusal feedback
+    /// today): it waits while Stopped and keeps the error in any other phase.
     fn routed_effect_targets_current_runtime(
         state: &mob_dsl::MobMachineState,
         effect: &super::composition::MobSeamEffect,
@@ -12647,16 +12649,23 @@ impl MobActor {
                 agent_identity,
                 agent_runtime_id,
                 ..
+            } => {
+                state.identity_to_runtime.get(agent_identity) == Some(agent_runtime_id)
+                    && state.live_runtime_ids.contains(agent_runtime_id)
             }
-            | mob_dsl::MobMachineEffect::RequestRuntimeRetire {
+            mob_dsl::MobMachineEffect::RequestRuntimeRetire {
                 agent_identity,
                 agent_runtime_id,
                 ..
-            } => state.identity_to_runtime.get(agent_identity) == Some(agent_runtime_id),
+            } => {
+                state.identity_to_runtime.get(agent_identity) == Some(agent_runtime_id)
+                    && state.member_state_markers.get(agent_runtime_id)
+                        == Some(&mob_dsl::MobMemberState::Retiring)
+            }
             mob_dsl::MobMachineEffect::RequestRuntimeIngress {
                 agent_runtime_id, ..
             } => state.live_runtime_ids.contains(agent_runtime_id),
-            _ => false,
+            _ => true,
         }
     }
 
@@ -12828,9 +12837,10 @@ impl MobActor {
                             &effect,
                         ) {
                             // The route outlived the runtime it names (its
-                            // member retired, or now runs another runtime), so
-                            // no phase of the machine takes its refusal. Drop
-                            // it rather than dispatch it again at every flush.
+                            // member retired, runs another runtime, or for a
+                            // retire is no longer retiring), so no phase of
+                            // the machine takes its refusal. Drop it rather
+                            // than dispatch it again at every flush.
                             tracing::warn!(
                                 mob_id = %self.definition.id,
                                 effect = ?effect.body(),
@@ -12843,10 +12853,11 @@ impl MobActor {
                         }
                         if phase == mob_dsl::MobPhase::Stopped {
                             // The machine still runs this member but cannot
-                            // take the feedback while Stopped. Keep the head
-                            // queued, as the pending-detach deferral above
-                            // does: the first flush after activation
-                            // dispatches it again.
+                            // take the feedback while Stopped (binding and
+                            // ingress refusals have Running transitions only).
+                            // Keep the head queued, as the pending-detach
+                            // deferral above does: the first flush after
+                            // activation dispatches it again.
                             tracing::warn!(
                                 mob_id = %self.definition.id,
                                 effect = ?effect.body(),
@@ -12911,6 +12922,27 @@ impl MobActor {
             }
             Err(error) => ActorBoundaryFlushDisposition::Fatal(error),
         }
+    }
+
+    /// Whether a destroy supersedes a queued routed effect: it retires every
+    /// member and the mob never runs again once its admission closes, so a
+    /// queued binding or ingress for a member can only be refused or be moot.
+    /// Retire and destroy routes stay: the destroy dispatches them.
+    fn routed_effect_superseded_by_destroy(effect: &super::composition::MobSeamEffect) -> bool {
+        matches!(
+            effect.body(),
+            mob_dsl::MobMachineEffect::RequestRuntimeBinding { .. }
+                | mob_dsl::MobMachineEffect::RequestRuntimeIngress { .. }
+        )
+    }
+
+    /// Drop the queued routes a destroy supersedes (see
+    /// [`Self::routed_effect_superseded_by_destroy`]). A refused one, held
+    /// while the mob was Stopped, would otherwise stop every destroy attempt
+    /// at its first routed flush.
+    fn discard_routed_effects_superseded_by_destroy(&mut self) {
+        self.pending_routed_effects
+            .retain(|effect| !Self::routed_effect_superseded_by_destroy(effect));
     }
 
     fn discard_pending_routed_effects_for_session(&mut self, session_id: &SessionId) {
@@ -25490,6 +25522,18 @@ impl MobActor {
                     super::IdentityRecoveryFailStopPoint::LeaseAcquired,
                 );
             }
+            if let IdentityLeaseClaimOutcome::HeldByOther(active) = &outcome {
+                // The claim met a live holder although the lease read showed
+                // it expired: another incarnation claimed it in between, or
+                // the store's clock is behind this actor's. Wait for that
+                // holder's expiry, at least one re-check interval.
+                self.schedule_identity_reconcile_wait(
+                    identity,
+                    IdentityReconcileAuthorityKey::from_observation(&intent_observation),
+                    identity_lease_wait_delay(Some(active.expires_at_ms), now_ms)
+                        .max(IDENTITY_RECONCILE_LEASE_RECHECK),
+                );
+            }
             return Ok(IdentityReconcilePassDisposition::Outcome(matches!(
                 outcome,
                 IdentityLeaseClaimOutcome::Acquired(_) | IdentityLeaseClaimOutcome::Renewed(_)
@@ -25526,9 +25570,12 @@ impl MobActor {
                 .await;
                 if preliminary == IdentityReconcileDecision::AwaitLease {
                     // Another incarnation holds the lease. A holder that
-                    // crashed or stopped never releases it, and nothing else
-                    // wakes this identity when it expires (only the slow
-                    // safety scan would), so wait for that expiry.
+                    // crashed never releases it, nor does a Shutdown that
+                    // kept it (a member still unregistering, or whose
+                    // session actor had not exited, at its deadline; a
+                    // retiring member). Neither that expiry nor a release
+                    // wakes this identity (only the slow safety scan
+                    // would), so wait for the observed expiry.
                     let expires_at_ms = match &lease_observation {
                         IdentityStoredObservation::Valid(record) => {
                             record.active.as_ref().map(|active| active.expires_at_ms)
@@ -29450,6 +29497,10 @@ impl MobActor {
         #[cfg(feature = "runtime-adapter")]
         let identity_reconcile_pending =
             identity_reconcile_pending && !self.resume_topology_mutation_pending();
+        // A Shutdown parked on its runtime teardown releases members' identity
+        // leases from there: no reconcile pass claims one again meanwhile.
+        let identity_reconcile_pending =
+            identity_reconcile_pending && self.pending_shutdown_teardown.is_none();
         let identity_reconcile_backoff_wait = self.identity_reconcile_next_backoff_wait();
         let ready_deferred = deferred_commands
             .iter()
@@ -29604,7 +29655,10 @@ impl MobActor {
     /// and command dispatch can never execute concurrently. Erasing this
     /// phase drops the recovery frame before a deeply nested command handler
     /// is polled, without moving actor authority out of the serialized task.
-    async fn prepare_actor_run(&mut self) -> bool {
+    ///
+    /// An error is the durable recovery failure that stops the actor before
+    /// it admits any command; `run` records it for the mob's handles.
+    async fn prepare_actor_run(&mut self) -> Result<(), MobError> {
         #[cfg(test)]
         if take_mob_seam_for_test(&FAIL_STOP_ACTOR_START_FOR_MOB, &self.definition.id) {
             tracing::error!(
@@ -29612,7 +29666,9 @@ impl MobActor {
                 "test seam: durable recovery fail-stops before command admission"
             );
             self.quiesce_volatile_producers_after_fail_stop().await;
-            return false;
+            return Err(MobError::Internal(
+                "test seam: durable recovery fail-stops before command admission".into(),
+            ));
         }
         if let Err(error) = self.restore_local_cleanup_composition_delivery().await {
             tracing::error!(
@@ -29621,7 +29677,7 @@ impl MobActor {
                 "local cleanup delivery recovery failed before command admission"
             );
             self.quiesce_volatile_producers_after_fail_stop().await;
-            return false;
+            return Err(error);
         }
         if matches!(self.dsl_state(), MobState::Running) {
             if let Err(error) = self.restore_generated_member_operation_bindings().await {
@@ -29641,7 +29697,7 @@ impl MobActor {
                 "durable member-live Open cleanup recovery failed; fail-stopping before command admission"
             );
             self.quiesce_volatile_producers_after_fail_stop().await;
-            return false;
+            return Err(error);
         }
         // Durable capability associations are rehydrated before command
         // admission so an orphaned lease cannot survive a restart unnoticed,
@@ -29657,7 +29713,7 @@ impl MobActor {
                 "durable forked-participant association recovery failed; fail-stopping before command admission"
             );
             self.quiesce_volatile_producers_after_fail_stop().await;
-            return false;
+            return Err(error);
         }
         // Prune only after generated member bindings have recovered: before
         // that point the machine snapshot may not yet contain every current
@@ -29694,7 +29750,18 @@ impl MobActor {
                     .await;
             }
         }
-        true
+        Ok(())
+    }
+
+    /// Write-before-close for the fail-stop on an uncertain durable
+    /// mutation: a status read or a resume after this exit reports it,
+    /// typed. The uncertain mutation itself is logged where it failed.
+    fn record_durability_fail_stop(&self) {
+        self.lifecycle_observations
+            .record_fail_stop_cause(Arc::new(MobError::AdmissionClosed {
+                mob_id: self.definition.id.clone(),
+                reason: MobAdmissionCloseReason::DurabilityFailStop,
+            }));
     }
 
     /// Close the command channel, then receive until it is empty.
@@ -29724,8 +29791,13 @@ impl MobActor {
         // next lifecycle transition gets the run-start posture it implies.
         self.supervisor_bridge
             .set_member_run_start_posture(self.member_run_start_posture());
-        if !boxed_arm_future(|| self.prepare_actor_run()).await {
+        if let Err(error) = boxed_arm_future(|| self.prepare_actor_run()).await {
             // Durable recovery fail-stopped before command admission.
+            // Write-before-close: the cause is recorded before admission
+            // closes and before any reply channel drops, so every command
+            // this exit drops, and every status read after it, reports it.
+            self.lifecycle_observations
+                .record_fail_stop_cause(Arc::new(error));
             self.close_admission_for_exit(MobAdmissionCloseReason::DurabilityFailStop);
             self.inline_step_watchdog.stop();
             drop(self);
@@ -29770,6 +29842,7 @@ impl MobActor {
             // Honor fail-stop before polling any new work so a confirmed
             // durable panic quarantine transfers ownership to cold recovery.
             if self.durable_uncertainty_fail_stop {
+                self.record_durability_fail_stop();
                 self.close_admission_for_exit(MobAdmissionCloseReason::DurabilityFailStop);
                 tracing::error!(
                     mob_id = %self.definition.id,
@@ -30036,6 +30109,7 @@ impl MobActor {
                 ActorLoopControl::BreakActor => break,
             }
             if self.durable_uncertainty_fail_stop {
+                self.record_durability_fail_stop();
                 self.close_admission_for_exit(MobAdmissionCloseReason::DurabilityFailStop);
                 tracing::error!(
                     mob_id = %self.definition.id,
@@ -30917,59 +30991,76 @@ impl MobActor {
                     "local cleanup delivery tuple diverges from generated authority".into(),
                 ));
             }
-            if !io.session_service.has_live_session(session).await?
-                && Self::load_member_session_settling_durable_tail(
-                    &io,
-                    &entry.agent_identity,
-                    session,
-                )
-                .await?
-                .is_none()
-                && !io
-                    .adapter
-                    .archive_runtime_residue_present(session)
-                    .await
-                    .map_err(|error| MobError::Internal(error.to_string()))?
-            {
-                continue;
-            }
-            let bindings = io
-                .adapter
-                .prepare_local_session_bindings(session.clone())
+            // The start fails before admission on the first member that
+            // fails, in roster (identity) order; name that member and its
+            // session for the caller.
+            self.restore_member_local_cleanup_delivery(&io, &entry, session)
                 .await
-                .map_err(|error| {
-                    MobError::Internal(format!("prepare local cleanup delivery: {error}"))
+                .map_err(|cause| MobError::MemberStartupRecoveryFailed {
+                    member_id: entry.agent_identity.clone(),
+                    session_id: session.clone(),
+                    cause: Arc::new(cause),
                 })?;
-            // A cold start can re-register a session whose runtime already
-            // stopped, which clears its member binding; the unbound endpoint
-            // is then refused, typed and pre-effect, while the previous
-            // attachment's retained cleanup tail still owns the registration.
-            // That owner keeps delivery custody until the lifecycle operation
-            // that retires or reloads this member takes it over; failing the
-            // actor here would refuse every command for a condition that
-            // needs no startup action.
-            if Self::restore_composition_delivery(&io, &entry, &bindings).await?
-                == CompositionDeliveryRestore::HeldByRegistrationOwner
-            {
-                tracing::debug!(
-                    mob_id = %self.definition.id,
-                    member = %entry.agent_identity,
-                    session_id = %session,
-                    "local cleanup delivery custody stays with the registration's current owner"
-                );
-            }
-            // The generated member or pending retirement tuple identifies the
-            // same operation registry for a later archive's final transition.
-            // This creates no serving/runtime binding.
-            io.provisioner
-                .bind_member_owner_context(
-                    &entry.member_ref,
-                    session.clone(),
-                    Arc::clone(bindings.ops_lifecycle()),
-                )
-                .await?;
         }
         Ok(())
+    }
+
+    /// Restore one member's local cleanup delivery for `session`, the member
+    /// session its generated cleanup tuple names.
+    #[cfg(feature = "runtime-adapter")]
+    async fn restore_member_local_cleanup_delivery(
+        &self,
+        io: &ResumeOperationBindingIo,
+        entry: &RosterEntry,
+        session: &SessionId,
+    ) -> Result<(), MobError> {
+        if !io.session_service.has_live_session(session).await?
+            && Self::load_member_session_settling_durable_tail(io, &entry.agent_identity, session)
+                .await?
+                .is_none()
+            && !io
+                .adapter
+                .archive_runtime_residue_present(session)
+                .await
+                .map_err(|error| MobError::Internal(error.to_string()))?
+        {
+            return Ok(());
+        }
+        let bindings = io
+            .adapter
+            .prepare_local_session_bindings(session.clone())
+            .await
+            .map_err(|error| {
+                MobError::Internal(format!("prepare local cleanup delivery: {error}"))
+            })?;
+        // A cold start can re-register a session whose runtime already
+        // stopped, which clears its member binding; the unbound endpoint
+        // is then refused, typed and pre-effect, while the previous
+        // attachment's retained cleanup tail still owns the registration.
+        // That owner keeps delivery custody until the lifecycle operation
+        // that retires or reloads this member takes it over; failing the
+        // actor here would refuse every command for a condition that
+        // needs no startup action.
+        if Self::restore_composition_delivery(io, entry, &bindings).await?
+            == CompositionDeliveryRestore::HeldByRegistrationOwner
+        {
+            tracing::debug!(
+                mob_id = %self.definition.id,
+                member = %entry.agent_identity,
+                session_id = %session,
+                "local cleanup delivery custody stays with the registration's current owner"
+            );
+        }
+        // The generated member or pending retirement tuple identifies the
+        // same operation registry for a later archive's final transition.
+        // This creates no serving/runtime binding.
+        io.provisioner
+            .bind_member_owner_context(
+                &entry.member_ref,
+                session.clone(),
+                Arc::clone(bindings.ops_lifecycle()),
+            )
+            .await
     }
 
     #[cfg(not(feature = "runtime-adapter"))]
@@ -49774,6 +49865,9 @@ impl MobActor {
             entries,
             mut trust_cleanup_plan_by_member,
         } = boxed_arm_future(|| self.admit_destroy_cleanup()).await?;
+        // Before anything below flushes the routed queue (each member's
+        // retire admission does, in cleanup mode), on every attempt.
+        self.discard_routed_effects_superseded_by_destroy();
         boxed_arm_future(|| self.fail_all_pending_spawns("mob is destroying"))
             .await
             .map_err(|error| {
@@ -61717,34 +61811,139 @@ mod routed_effect_containment_tests {
     }
 
     #[test]
+    fn a_destroy_supersedes_queued_binding_and_ingress_routes_only() {
+        let identity = mob_dsl::AgentIdentity::from("worker");
+        let runtime_id = mob_dsl::AgentRuntimeId::from("worker:1");
+        let session = mob_dsl::SessionId::from("session-worker");
+        let routed = |body| {
+            super::super::composition::MobSeamEffect::routed(body)
+                .expect("a generated routed effect")
+        };
+        let binding = routed(mob_dsl::MobMachineEffect::RequestRuntimeBinding {
+            session_id: session.clone(),
+            agent_identity: identity.clone(),
+            agent_runtime_id: runtime_id.clone(),
+            fence_token: mob_dsl::FenceToken(1),
+            generation: None,
+        });
+        let ingress = routed(mob_dsl::MobMachineEffect::RequestRuntimeIngress {
+            session_id: session.clone(),
+            agent_runtime_id: runtime_id.clone(),
+            fence_token: mob_dsl::FenceToken(1),
+            generation: None,
+            work_id: mob_dsl::WorkId::from("work-1"),
+            origin: mob_dsl::WorkOrigin::External,
+            content_attribution: mob_dsl::WorkContentAttribution::Conversational,
+        });
+        let retire = routed(mob_dsl::MobMachineEffect::RequestRuntimeRetire {
+            agent_identity: identity,
+            agent_runtime_id: runtime_id,
+            session_id: session.clone(),
+        });
+        let destroy = routed(mob_dsl::MobMachineEffect::RequestRuntimeDestroy {
+            session_id: session,
+        });
+        assert!(MobActor::routed_effect_superseded_by_destroy(&binding));
+        assert!(MobActor::routed_effect_superseded_by_destroy(&ingress));
+        assert!(
+            !MobActor::routed_effect_superseded_by_destroy(&retire),
+            "the destroy dispatches its members' retire routes"
+        );
+        assert!(
+            !MobActor::routed_effect_superseded_by_destroy(&destroy),
+            "a destroy route is the destroy's own"
+        );
+    }
+
+    #[test]
     fn a_refused_route_names_a_current_runtime_only_while_its_member_runs_it() {
         let identity = mob_dsl::AgentIdentity::from("worker");
         let runtime_id = mob_dsl::AgentRuntimeId::from("worker:1");
+        let session = mob_dsl::SessionId::from("session-worker");
+        let routed = |body| {
+            super::super::composition::MobSeamEffect::routed(body)
+                .expect("a generated routed effect")
+        };
+        let retire = routed(mob_dsl::MobMachineEffect::RequestRuntimeRetire {
+            agent_identity: identity.clone(),
+            agent_runtime_id: runtime_id.clone(),
+            session_id: session.clone(),
+        });
+        let binding = routed(mob_dsl::MobMachineEffect::RequestRuntimeBinding {
+            session_id: session.clone(),
+            agent_identity: identity.clone(),
+            agent_runtime_id: runtime_id.clone(),
+            fence_token: mob_dsl::FenceToken(1),
+            generation: None,
+        });
+        let ingress = routed(mob_dsl::MobMachineEffect::RequestRuntimeIngress {
+            session_id: session.clone(),
+            agent_runtime_id: runtime_id.clone(),
+            fence_token: mob_dsl::FenceToken(1),
+            generation: None,
+            work_id: mob_dsl::WorkId::from("work-1"),
+            origin: mob_dsl::WorkOrigin::External,
+            content_attribution: mob_dsl::WorkContentAttribution::Conversational,
+        });
+        let destroy = routed(mob_dsl::MobMachineEffect::RequestRuntimeDestroy {
+            session_id: session,
+        });
+        let current = |state: &mob_dsl::MobMachineState, effect| {
+            MobActor::routed_effect_targets_current_runtime(state, effect)
+        };
         let mut state = mob_dsl::MobMachineAuthority::new().state().clone();
-        let retire = super::super::composition::MobSeamEffect::routed(
-            mob_dsl::MobMachineEffect::RequestRuntimeRetire {
-                agent_identity: identity.clone(),
-                agent_runtime_id: runtime_id.clone(),
-                session_id: mob_dsl::SessionId::from("session-worker"),
-            },
-        )
-        .expect("runtime retire is a generated routed effect");
 
         assert!(
-            !MobActor::routed_effect_targets_current_runtime(&state, &retire),
+            !current(&state, &retire),
             "a retired member runs no runtime"
         );
+        assert!(
+            !current(&state, &binding),
+            "an unbound member owns no binding"
+        );
+        assert!(
+            !current(&state, &ingress),
+            "a runtime that is not live takes no input"
+        );
+        assert!(
+            current(&state, &destroy),
+            "a kind without a rule is never presumed stale"
+        );
+
         state
             .identity_to_runtime
             .insert(identity.clone(), mob_dsl::AgentRuntimeId::from("worker:2"));
         assert!(
-            !MobActor::routed_effect_targets_current_runtime(&state, &retire),
+            !current(&state, &retire),
             "a member that runs a later runtime does not own the route"
         );
-        state.identity_to_runtime.insert(identity, runtime_id);
-        assert!(MobActor::routed_effect_targets_current_runtime(
-            &state, &retire
-        ));
+        assert!(!current(&state, &binding));
+
+        state
+            .identity_to_runtime
+            .insert(identity, runtime_id.clone());
+        assert!(
+            !current(&state, &binding),
+            "a bound runtime that is no longer live owns no binding"
+        );
+        assert!(
+            !current(&state, &retire),
+            "a bound member that is not retiring takes no retire refusal"
+        );
+        state
+            .member_state_markers
+            .insert(runtime_id.clone(), mob_dsl::MobMemberState::Retiring);
+        assert!(
+            current(&state, &retire),
+            "the retiring runtime owns its retire"
+        );
+
+        state.live_runtime_ids.insert(runtime_id);
+        assert!(
+            current(&state, &binding),
+            "the bound live runtime owns its binding"
+        );
+        assert!(current(&state, &ingress), "a live runtime takes its input");
     }
 
     #[test]

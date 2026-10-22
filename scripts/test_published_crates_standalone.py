@@ -90,6 +90,15 @@ class ScanSource(unittest.TestCase):
         text = 'let own = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");\nlet up = own.parent();'
         self.assertEqual(self.scan("tests/a.rs", text), [])
 
+    def test_manifest_dir_joined_with_a_constant_walks_where_the_constant_does(self):
+        use = 'fn t() { let f = Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE); }\n'
+        up = 'const FIXTURE: &str =\n    "../../crates/other/tests/fixtures/x.json";\n' + use
+        own = 'const FIXTURE: &str = "tests/fixtures/x.json";\n' + use
+        unused = 'const OTHER: &str = "../../x.json";\n' + use
+        self.assertEqual(kinds(self.scan("src/lib.rs", up)), ["manifest-dir-walk"])
+        self.assertEqual(self.scan("src/lib.rs", own), [])
+        self.assertEqual(self.scan("src/lib.rs", unused), [])
+
     def test_root_helper_and_skip_when_missing(self):
         self.assertEqual(kinds(self.scan("tests/a.rs", "fn workspace_root() -> PathBuf { todo!() }")), ["root-helper"])
         self.assertEqual(

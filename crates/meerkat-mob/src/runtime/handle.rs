@@ -2525,6 +2525,11 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         MobError::MemberRestoreFailed { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::MemberRestoreFailed
         }
+        // Never a spawn outcome today (a spawn on a stopped actor gets
+        // ActorCommandChannelClosed); were it one, it classifies as its cause.
+        MobError::MemberStartupRecoveryFailed { cause, .. } => {
+            spawn_many_failure_observation(cause.as_ref())
+        }
         // A degraded or detached runtime registration is a session fault of
         // the existing member; the spawn row records it as its session cause.
         MobError::MemberReloadRequired { .. } | MobError::MemberRuntimeDetached { .. } => {
@@ -4808,7 +4813,10 @@ pub(crate) fn legacy_direct_session_error(
 pub struct HelperOptions {
     /// Role name (profile key) to use. If None, requires a default profile in the definition.
     pub role_name: Option<ProfileName>,
-    /// Runtime mode override.
+    /// Runtime mode override. A helper runs one tracked turn, so
+    /// `AutonomousHost` is refused before any spawn with
+    /// `MobError::UnsupportedForMode`: autonomous inbox delivery has no
+    /// tracked turn completion.
     pub runtime_mode: Option<crate::MobRuntimeMode>,
     /// Backend override.
     pub backend: Option<MobBackendKind>,
@@ -7258,9 +7266,15 @@ impl MobHandle {
                 }
             }
         };
+        // An actor that stopped in its startup recovery answers with that
+        // failure, so every joined observer gets it, typed.
+        let terminal = terminal.map_err(|error| {
+            self.fail_stop_cause_behind(&error)
+                .unwrap_or_else(|| Arc::new(error))
+        });
         self.explicit_resume_operations.publish_if_current(
             &operation,
-            ResumeOperationState::Terminal(Arc::new(terminal.map_err(Arc::new))),
+            ResumeOperationState::Terminal(Arc::new(terminal)),
         );
     }
 
@@ -8441,14 +8455,6 @@ impl MobHandle {
         }
     }
 
-    /// Current mob lifecycle state, read directly from the DSL authority
-    /// via the actor command channel. There is no atomic shadow — the DSL
-    /// authority is the single source of truth (dogma #1, #13, #17).
-    ///
-    /// After generated Shutdown/Complete/Destroy authority has moved the mob
-    /// out of a live phase and the actor exits, this may read the actor's
-    /// terminal phase watch. A closed actor while the last published phase is
-    /// still live is an actor failure, not lifecycle truth.
     /// Release a host's run-start hold on a member (#1500), placed with
     /// [`MobBuilder::hold_restored_member_run_starts`](crate::MobBuilder::hold_restored_member_run_starts).
     /// The member starts runs again once nothing else holds it (a mob Stop
@@ -8476,6 +8482,20 @@ impl MobHandle {
         .await?
     }
 
+    /// Current mob lifecycle state, read directly from the DSL authority
+    /// via the actor command channel. There is no atomic shadow: the DSL
+    /// authority is the single source of truth (dogma #1, #13, #17).
+    ///
+    /// After generated Shutdown/Complete/Destroy authority has moved the mob
+    /// out of a live phase and the actor exits, this may read the actor's
+    /// terminal phase watch. A closed actor while the last published phase is
+    /// still live is an actor failure, not lifecycle truth. When the actor
+    /// fail-stopped, this returns why, typed, as
+    /// [`MobError::SharedLifecycleFailure`]: for a failed startup recovery of
+    /// a member's session, a [`MobError::MemberStartupRecoveryFailed`] naming
+    /// the member, its session and the cause; for an uncertain durable
+    /// mutation, [`MobError::AdmissionClosed`] with
+    /// `MobAdmissionCloseReason::DurabilityFailStop`.
     pub async fn status(&self) -> Result<MobState, MobError> {
         match self
             .send_actor_command(|reply_tx| MobCommand::QueryPhase { reply_tx })
@@ -8487,8 +8507,24 @@ impl MobHandle {
             Ok(reply) => reply,
             Err(
                 error @ (MobError::ActorCommandChannelClosed | MobError::ActorReplyChannelClosed),
-            ) => Self::status_from_closed_actor(error, *self.phase_watch_rx.borrow()),
+            ) => match self.fail_stop_cause_behind(&error) {
+                // The actor stopped in its startup recovery, before it
+                // admitted any command: report why, typed.
+                Some(failure) => Err(MobError::SharedLifecycleFailure(failure)),
+                None => Self::status_from_closed_actor(error, *self.phase_watch_rx.borrow()),
+            },
             Err(other) => Err(other),
+        }
+    }
+
+    /// Why the actor fail-stopped, for a command that found it closed: such
+    /// a command reports it, typed, instead of the closed channel.
+    fn fail_stop_cause_behind(&self, error: &MobError) -> Option<Arc<MobError>> {
+        match error {
+            MobError::ActorCommandChannelClosed | MobError::ActorReplyChannelClosed => {
+                self.lifecycle_observations.fail_stop_cause()
+            }
+            _ => None,
         }
     }
 
@@ -14773,6 +14809,9 @@ impl MobHandle {
     }
 
     /// Transition Stopped -> Running.
+    ///
+    /// When the actor fail-stopped, this returns why, typed, as
+    /// [`Self::status`] does.
     pub async fn resume(&self) -> Result<(), MobError> {
         let deadline = Instant::now() + super::provisioner::EXPLICIT_RESUME_RETIRE_TOTAL_TIMEOUT;
         match self
@@ -16430,8 +16469,11 @@ impl MobHandle {
     /// request before [`Self::fork_member`] runs. That prevents the resume path
     /// from dispatching an untracked initial turn; this composition admits the
     /// same message exactly once through the internal exact work carrier instead.
-    /// The bounded-result request is validated before any fork or member
-    /// admission occurs.
+    /// The bounded-result request and the child's runtime mode are validated
+    /// before any fork or member admission occurs: an `AutonomousHost` child
+    /// is refused with `MobError::UnsupportedForMode`, and a child spec that
+    /// names no runtime mode runs turn-driven, whatever its profile's default,
+    /// as a bounded helper does.
     ///
     /// `source_admission` states where the request comes from. The agent-facing
     /// `fork_off` tool runs inside the source member's own turn and passes
@@ -16449,6 +16491,12 @@ impl MobHandle {
         source_admission: meerkat_core::DurableForkSourceAdmission,
     ) -> Result<ForkMemberBoundedRunOutcome, BoundedMemberRunError> {
         let result_spec = BoundedResultSpec::new(result_label, max_text_bytes)?;
+        Self::refuse_autonomous_bounded_run(member.runtime_mode)?;
+        member.runtime_mode = Some(
+            member
+                .runtime_mode
+                .unwrap_or(crate::MobRuntimeMode::TurnDriven),
+        );
         let task = member.initial_message.take().ok_or_else(|| {
             MobError::InvalidBoundedHelperResult {
                 reason: "fork_member_then_run_bounded requires member.initial_message so the exact turn has one caller-authored input"
@@ -16510,6 +16558,10 @@ impl MobHandle {
     /// A child whose own turn fails is retired. A child whose turn completes
     /// stays seated, exactly like [`Self::fork_member_then_run_bounded`].
     ///
+    /// A child spec with an `AutonomousHost` runtime mode is refused with
+    /// `MobError::UnsupportedForMode` before anything is forked; one that
+    /// names no runtime mode runs turn-driven, whatever its profile's default.
+    ///
     /// Validation, fork, seat and turn admission all happen before this
     /// returns, so every admission failure is reported synchronously and a
     /// child whose turn could not be admitted is retired first. A call
@@ -16533,6 +16585,12 @@ impl MobHandle {
         max_run: Option<Duration>,
         job: Option<ForkJobBinding>,
     ) -> Result<(ForkMemberResult, ForkChildRun), BoundedMemberRunError> {
+        Self::refuse_autonomous_bounded_run(member.runtime_mode)?;
+        member.runtime_mode = Some(
+            member
+                .runtime_mode
+                .unwrap_or(crate::MobRuntimeMode::TurnDriven),
+        );
         let result_label: String = result_label.into();
         // A fork in its source's own turn is its source's: the re-link after
         // a restart relies on that owner (a job bound elsewhere would be
@@ -16971,6 +17029,25 @@ impl MobHandle {
         Ok(snapshot)
     }
 
+    /// A bounded run (a helper, or a fork child run through
+    /// `fork_member_then_run_bounded`/`_detached`) executes one tracked turn,
+    /// and an autonomous host member's inbox delivery has no tracked turn
+    /// completion. That runtime mode is refused before any admission, fork or
+    /// spawn, so no member is seated and no kickoff turn runs.
+    fn refuse_autonomous_bounded_run(
+        runtime_mode: Option<crate::MobRuntimeMode>,
+    ) -> Result<(), MobError> {
+        if runtime_mode == Some(crate::MobRuntimeMode::AutonomousHost) {
+            return Err(MobError::UnsupportedForMode {
+                mode: crate::MobRuntimeMode::AutonomousHost,
+                reason: "a bounded run executes one tracked turn, and autonomous inbox delivery \
+                         has no tracked turn completion"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
     fn bounded_helper_spawn_spec(
         &self,
         identity: AgentIdentity,
@@ -17108,9 +17185,11 @@ impl MobHandle {
     /// Spawn a helper with `HelperSpawn` provenance, run one explicit exact
     /// turn, capture its receiver-bounded result, then attempt retirement.
     ///
-    /// Label and byte-bound validation occurs before control or spawn
-    /// admission. The result is captured before retirement begins, so cleanup
-    /// failure is returned as debt without erasing the certified turn result.
+    /// Label, byte-bound and runtime-mode validation occur before control or
+    /// spawn admission; an `AutonomousHost` runtime mode is refused there with
+    /// `MobError::UnsupportedForMode`. The result is captured before
+    /// retirement begins, so cleanup failure is returned as debt without
+    /// erasing the certified turn result.
     pub async fn spawn_helper(
         &self,
         identity: AgentIdentity,
@@ -17120,6 +17199,7 @@ impl MobHandle {
         max_text_bytes: usize,
     ) -> Result<BoundedHelperRunOutcome, BoundedMemberRunError> {
         let result_spec = BoundedResultSpec::new(result_label, max_text_bytes)?;
+        Self::refuse_autonomous_bounded_run(options.runtime_mode)?;
         self.admit_control_scope(mob_dsl::ControlScope::SendCommand)
             .await?;
         let (spec, turn_options) = self.bounded_helper_spawn_spec(
@@ -17137,8 +17217,10 @@ impl MobHandle {
     /// turn, capture its receiver-bounded result, then attempt retirement.
     ///
     /// The fork context is installed during provisioning, while the task
-    /// itself is admitted once through the exact internal work carrier. Label
-    /// and byte-bound validation occurs before control or spawn admission.
+    /// itself is admitted once through the exact internal work carrier. Label,
+    /// byte-bound and runtime-mode validation occur before control or spawn
+    /// admission; an `AutonomousHost` runtime mode is refused there with
+    /// `MobError::UnsupportedForMode`, before any fork child is seated.
     #[allow(clippy::too_many_arguments)]
     pub async fn fork_helper(
         &self,
@@ -17151,6 +17233,7 @@ impl MobHandle {
         max_text_bytes: usize,
     ) -> Result<BoundedHelperRunOutcome, BoundedMemberRunError> {
         let result_spec = BoundedResultSpec::new(result_label, max_text_bytes)?;
+        Self::refuse_autonomous_bounded_run(options.runtime_mode)?;
         self.admit_control_scope(mob_dsl::ControlScope::SendCommand)
             .await?;
         let (spec, turn_options) = self.bounded_helper_spawn_spec(

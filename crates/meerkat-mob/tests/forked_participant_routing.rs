@@ -902,6 +902,7 @@ async fn placed_revoke_routes_by_capability_owner_host_after_the_source_is_absen
 /// revocation `ShutdownInProgress` without running it. Revocation with
 /// recovery then revokes through the recovery transport, as it does once the
 /// source has exited.
+#[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread")]
 async fn recovered_revoke_uses_the_transport_while_the_source_shuts_down() {
     let _guard = REAL_COMMS_TEST_LOCK.lock().await;

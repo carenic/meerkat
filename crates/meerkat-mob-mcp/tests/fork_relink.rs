@@ -2572,12 +2572,53 @@ async fn fork_child_whose_boundary_commit_hangs(child: &str) -> GatedChild {
     gated
 }
 
+/// Destroy `held`'s mob once the member's released boundary commit has
+/// reported its outcome to the member's runtime.
+///
+/// Releasing the store lets the commit answer, but the commit's own task
+/// reports that answer to the runtime only when it runs next. A reload
+/// before then refuses, typed and retryable, so the destroy answers
+/// incomplete with exactly that refusal for the member and reloads nothing.
+/// Only that answer is retried, within the caller's bound; any other is
+/// returned as it is.
+async fn destroy_once_the_released_commit_reports(
+    held: &GatedChild,
+) -> Result<meerkat_mob::MobDestroyReport, meerkat_mob_mcp::MobMcpDestroyError> {
+    let run_id = held
+        .store
+        .held_run()
+        .expect("the held boundary commit carries its run's receipt");
+    let outcome_pending = meerkat_runtime::RuntimeDriverError::RecoveryRepairBlocked {
+        evidence_digest: None,
+        reason: format!(
+            "runtime commit of run {run_id} has not reported its durable outcome; retry the reload after it does"
+        ),
+    }
+    .to_string();
+    let member = format!("{}: ", held.child.as_str());
+    let mob_id = held.fixture.source_mob_id();
+    loop {
+        match held.fixture.state.mob_destroy(&mob_id).await {
+            Err(meerkat_mob_mcp::MobMcpDestroyError::Incomplete { report })
+                if report.reloaded_members.is_empty()
+                    && matches!(
+                        report.errors.as_slice(),
+                        [error] if error.starts_with(&member) && error.ends_with(&outcome_pending)
+                    ) =>
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// A member whose boundary commit the store never answers no longer keeps a
 /// destroy waiting. At the store's declared deadline the member's session
 /// degrades, so the destroy's retirement of it ends typed, and the destroy
 /// answers incomplete, naming the member, while the store still has not
-/// answered. Once the store answers, the same destroy reloads the member and
-/// completes.
+/// answered. Once the store answers and the commit reports that to the
+/// member's runtime, the same destroy reloads the member and completes.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_destroy_behind_a_commit_the_store_never_answers_is_incomplete_until_it_answers() {
     let held = fork_child_whose_boundary_commit_hangs("hung-commit-child").await;
@@ -2607,7 +2648,7 @@ async fn a_destroy_behind_a_commit_the_store_never_answers_is_incomplete_until_i
     held.store.release();
     let report = tokio::time::timeout(
         DEGRADED_DESTROY_BOUND,
-        held.fixture.state.mob_destroy(&mob_id),
+        destroy_once_the_released_commit_reports(&held),
     )
     .await
     .expect("the retried destroy finishes")

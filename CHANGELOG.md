@@ -83,9 +83,70 @@ them.
   and so does the `PartialOrd` order of `OccurrenceLifecycleEffectVariant::*`
   and `OccurrenceLifecycleInputVariant::*`; match them by variant name, not
   by numeric cast or position.
+- `meerkat-auth-core` (hosted MCP OAuth, #1808): `McpOAuthError` gains the
+  variant `RemoteCustodyRequired { server_name }`, a refusal: an attempt
+  started on a registered `https` redirect was completed without the host's
+  retained attempt handle. The semver gate reports it as an enum variant
+  added to an exhaustive enum; a match outside the crate needs the arm
+  (surfaces map it to the reason `invalid_target` with the detail
+  `remote_custody_required`). The enum stays exhaustive on purpose (the
+  facade maps every variant to a reason with no wildcard arm), so every
+  future variant is a declared break too. The text of `DisconnectRequired`
+  now names its remedy: "disconnect it first: log it out, then log in
+  again".
+- `meerkat-contracts` (hosted MCP OAuth, #1808): `WireLoginStart` gains
+  `host_attempt_handle: Option<String>`, `WireMcpLoginStart` gains
+  `attempt_ref: Option<String>`, `LoginCompleteParams` gains
+  `host_attempt_handle: Option<String>` and `iss: Option<String>`, and
+  `WireAuthErrorData` and `WireAuthErrorBody` gain
+  `detail: Option<WireAuthErrorDetail>`. The semver gate reports each as a
+  field added to a constructible struct; struct literals pass `None` for the
+  earlier behaviour. On the wire every new field is optional and omitted when
+  absent, so loopback starts and completions and every existing error keep
+  their exact JSON.
 
 ### Added
 
+- Hosted MCP OAuth through the host's own `https` callback (#1808), for a
+  host whose users' browsers cannot reach its loopback address. The host
+  configures one registered redirect base (`rkat-rpc
+  --mcp-oauth-redirect-base <https-url>`, or
+  `HostAuthService::with_mcp_registered_redirect_base` /
+  `SessionRuntime::set_mcp_registered_redirect_base` for an embedding host);
+  agents, MCP server definitions and mob profiles cannot set it. Each MCP
+  server's exact redirect is the base followed by one path segment, its
+  credential binding (`McpOAuthAuthority::registered_redirect_uri`), so every
+  server, realm and account selection has its own redirect.
+  `auth/login/start` with an MCP target and `redirect_uri` naming the base
+  (or the server's derived redirect) admits the attempt on that redirect:
+  dynamic client registration as a public PKCE `web` client for exactly that
+  URI, then the same PKCE, one-time state, account selection, window and
+  start-or-join as a loopback login, through the same AuthMachine-owned flow
+  owner. The result adds `host_attempt_handle`, a secret the host keeps
+  server-side with its ceremony (never in the browser, a URL, a model or a
+  log), and the public `attempt_ref` that `auth/status/get` reports, which
+  authorizes nothing. The host's callback endpoint authenticates the user's
+  session, then `auth/login/complete` passes `code`, `state`, the exact
+  `redirect_uri` from the start result, `host_attempt_handle` and, when the
+  authorization server sent one, `iss`. Without the handle, with another one
+  or through the loopback completion, the attempt is refused
+  (`invalid_target`, detail `remote_custody_required`) and left pending; a
+  forged callback cannot cancel it. `iss` (RFC 9207) must equal the
+  attempt's issuer byte for byte, and is required when the server advertises
+  `authorization_response_iss_parameter_supported`. A confidential client
+  answer from dynamic registration is refused with its remedy before any
+  attempt exists, and a credential whose client was registered for the other
+  redirect kind needs a logout first. The credential lands in the same slot
+  as a loopback login's, with the same refresh, status, cancel by reference
+  and logout. Rust: `McpOAuthAuthority::login_start_registered` and
+  `login_complete_registered` (`McpRegisteredRedirectBase`,
+  `McpOAuthRegisteredCallback`), `HostAuthService::mcp_login_start_registered`,
+  `mcp_login_complete_registered` and `mcp_registered_redirect_uri`, and
+  `HostAuthError::detail`. Limits: the handle's key lives in the process, so
+  after a runtime restart a completion is refused with
+  `remote_custody_required` (cancel the attempt by its reference and start
+  again); the login window stays the shared 300 s browser window of the flow
+  owner; REST and `rkat mcp login` stay loopback-only.
 - `meerkat-schedule`: `ScheduleTargetDelivery::deliver_existing_occurrence`,
   a defaulted method the driver calls to redeliver a reclaimed occurrence
   whose earlier attempt recorded its dispatch, with `ExistingDelivery`
@@ -129,6 +190,31 @@ them.
 
 ### Fixed
 
+- A graceful mob Shutdown releases a member's identity reconcile lease once
+  it has unregistered the member's runtime and the member's session actor has
+  exited, so the next incarnation takes that identity at once. Before, every
+  lease stayed until it expired (up to 30 seconds), and the next start waited
+  on each one. A member whose unregister is still running, or whose session
+  actor still lives, at the Shutdown's deadline keeps its lease, as do a
+  retiring member and every member of a process that ends without a
+  Shutdown.
+
+- `meerkat-session`, `meerkat-core`, `meerkat-contracts`: a deferred
+  `session/create` prompt that `live/open` staged
+  (`DeferredPromptPolicy::Stage`) no longer disappears on the session's first
+  runtime-authored turn, such as the next `turn/start`. That turn commits only
+  its typed appends, so the prompt reached the run-start hooks and
+  `RunStarted` but neither the transcript nor the model request. The prompt
+  now joins the turn's committed rows: folded into its first user row (staged
+  content first), or as a user row ahead of the turn's other appends when it
+  has none, and the run-start hooks and `RunStarted` see exactly those rows. A
+  turn that commits no user row (a pending continuation, a run-start veto, a
+  refusal before the run) leaves the prompt pending, so it lands exactly once,
+  also for a session persisted with a staged prompt by an earlier release. A
+  turn whose input carries directed interaction custody is refused with the new
+  `AgentError::StagedPromptDirectedTurnRefused` while a prompt is staged. The
+  realtime seed still carries no staged prompt: in a voice-first session it
+  lands with the first later text turn.
 - A turn that compacts its history more often than
   `[compaction] history_retained_rewrites` keeps (five or more compactions at
   the default of 4) no longer ends at its intra-turn checkpoint on a
@@ -234,6 +320,74 @@ them.
   transcript revision conflict (`SessionError::Store`) instead of an
   internal "resume bridge session check failed" error. The spawn does not
   settle the tail; it stays as it was.
+- `meerkat-mob`, `meerkat-schedule`, `meerkat-mob-mcp`: a bounded helper or
+  bounded fork child with runtime mode `autonomous_host` is now refused with
+  `UnsupportedForMode` before anything is spawned. This covers `spawn_helper`
+  and `fork_helper`, `fork_member_then_run_bounded` and
+  `fork_member_then_run_detached`, RPC `mob/spawn_helper` and
+  `mob/fork_helper`, and scheduled helper targets.
+  Before, the helper was spawned and its autonomous kickoff turn ran (one
+  model request) before the bounded task failed, because autonomous inbox
+  delivery has no tracked turn completion. Schedules now refuse such a helper
+  target at create and update, and a schedule stored with one fails each
+  occurrence before any spawn. A bounded fork child whose spec names no
+  runtime mode now runs turn-driven, as a bounded helper does, instead of
+  inheriting an autonomous profile default and failing the same way.
+
+- `meerkat-mob`: an identity whose lease claim meets a live holder retries
+  as soon as that holder's lease expires. Reconciliation claims a lease it
+  reads as expired, and the claim can still find it held: another
+  incarnation claimed it in between, or the identity store's clock runs
+  behind the actor's. Such an identity stayed unreconciled until the slow
+  safety scan, about five minutes later; it now waits for the holder's
+  expiry, at least one second, the same way as `AwaitLease`.
+
+- `meerkat-mob`: a Destroy of a Stopped mob no longer fails with
+  `MobDestroyError::Incomplete` at every attempt when the mob's routed queue
+  still holds a member route that the member's runtime refused. While the
+  mob is Stopped the mob machine cannot take that refusal, so the route
+  waited for a resume, and each destroy attempt dispatched it again and
+  stopped on the refusal until a resume or a restart emptied the queue. A
+  destroy now drops its members' queued runtime-binding and input routes
+  before it dispatches anything; it still sends their retire routes.
+
+- The first restore after a process exit that cut a member's runtime
+  unregister no longer leaves the member Broken. That restore concludes the
+  cut teardown and then registers the session again, but the teardown fenced
+  the restoring caller's materialization claim: the fresh registration was
+  refused as owned elsewhere, and only a second restore brought the member
+  back. The recovered drain now carries a claim of its own, so the caller's
+  claim reaches the fresh registration untouched.
+
+- `meerkat-auth-core`, `meerkat-runtime`, `meerkat-mob`: the published
+  packages' own tests now build and pass standalone, with no library change.
+  In 0.9.4, plain `cargo test` in the unpacked package did not compile
+  auth-core's lib tests (a test helper used `meerkat-runtime`, a
+  dev-dependency the package does not carry), nor runtime's and mob's
+  default-feature test targets (one test file needed `sqlite-store` and
+  `test-support`, one test needed `test-support`). With the command its
+  README prints, one runtime lib test failed, because it read a meerkat-core
+  fixture the runtime package did not ship; the package now ships it. The
+  static standalone guard now also follows a `CARGO_MANIFEST_DIR` join
+  through a same-file string constant.
+
+- `meerkat-mob`: a mob whose startup recovery fails now tells its caller
+  why. When the actor's durable recovery failed before it admitted a
+  command, for example on a retiring member's session that another runtime
+  owner hosts, `MobHandle::status` reported only "mob actor reply channel
+  closed" and `MobHandle::resume` only `ActorCommandChannelClosed`: the
+  member, its session and the cause reached only the host's error log. Both
+  now return the failure, typed, as `MobError::SharedLifecycleFailure`. A
+  member's failure is the new `MobError::MemberStartupRecoveryFailed`, which
+  names the member, its session and the typed cause (such as
+  `SessionError::ServedElsewhere`); its wire code and failure class are the
+  cause's. Other commands on that handle still fail with
+  `ActorCommandChannelClosed`, and `MobBuilder::resume` still returns the
+  handle before startup recovery runs: read `MobHandle::status` for the
+  reason. An actor that stops later because a durable mutation's outcome
+  stayed uncertain reports that the same way, as `MobError::AdmissionClosed`
+  with `MobAdmissionCloseReason::DurabilityFailStop`; the mutation itself is
+  still named only in the error log where it failed.
 
 ## [0.9.4] - 2026-10-20
 
@@ -29914,7 +30068,7 @@ BuildBuddy-backed Windows release assets.
   behavior with the tool bridge path so peer-to-peer wake and delivery semantics
   stay consistent across mob surfaces.
 - **Windows BuildBuddy release endpoint** (#726) — Windows release binary builds
-  now route directly to the hosted King BuildBuddy endpoint instead of a mutable
+  now route directly to the hosted BuildBuddy endpoint instead of a mutable
   secret-backed endpoint, preventing stale private endpoint routing from
   breaking release asset publication.
 
