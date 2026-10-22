@@ -2794,6 +2794,98 @@ async fn closing_a_mob_if_idle_behind_a_commit_the_store_never_answers_answers_b
     held.store.release();
 }
 
+/// Redrive `held`'s stuck retirement of its member once the member's released
+/// boundary commit has reported its outcome to the member's runtime.
+///
+/// Until the commit's own task reports the store's answer, the redriven
+/// retirement's reload refuses, typed and retryable, and the retirement stays
+/// stuck on exactly that cause. Only that answer is retried, within the
+/// caller's bound; any other is returned as it is.
+async fn redrive_once_the_released_commit_reports(
+    held: &GatedChild,
+    handle: &meerkat_mob::MobHandle,
+) -> Result<(), meerkat_mob::MobError> {
+    loop {
+        match handle.redrive_retirement(held.child.clone()).await {
+            Err(meerkat_mob::MobError::MemberRetirementStuck { cause, .. })
+                if cause
+                    .structured_data()
+                    .and_then(|data| data.get("kind").cloned())
+                    == Some(serde_json::json!("mob_member_reload_repair_blocked")) =>
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// A retire of a member whose session degraded behind a boundary commit the
+/// store has not answered cannot reload the member: the runtime refuses the
+/// reload, repair-blocked, until the commit reports its durable outcome. The
+/// retirement sticks with that refusal as its typed cause, retryable and
+/// carrying the runtime's reason, instead of an internal error that only says
+/// it in text. Once the commit reports, redriving the retirement completes it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retire_whose_member_reload_the_runtime_refuses_sticks_with_the_refusal_typed() {
+    let held = fork_child_whose_boundary_commit_hangs("retire-refused-child").await;
+    let mob_id = held.fixture.source_mob_id();
+    let handle = held.fixture.state.handle_for(&mob_id).await.unwrap();
+    tokio::time::timeout(DEGRADED_DESTROY_BOUND, handle.close_if_idle())
+        .await
+        .expect("closing if idle answers once the member's session degrades")
+        .expect("the mob answers the close");
+    let run_id = held
+        .store
+        .held_run()
+        .expect("the held boundary commit carries its run's receipt");
+
+    let refused = tokio::time::timeout(DEGRADED_DESTROY_BOUND, handle.retire(held.child.clone()))
+        .await
+        .expect("the retire answers while the store has not");
+    let (stage, cause) = match refused {
+        Err(meerkat_mob::MobError::MemberRetirementStuck { stage, cause, .. }) => (stage, cause),
+        other => panic!("a retire whose reload the runtime refuses sticks: {other:?}"),
+    };
+    assert_eq!(stage, "retire-runtime-quiesce");
+    assert_eq!(
+        cause.structured_data(),
+        Some(serde_json::json!({
+            "kind": "mob_member_reload_repair_blocked",
+            "session_id": held.child_session.to_string(),
+            "reason": format!(
+                "runtime commit of run {run_id} has not reported its durable outcome; retry the reload after it does"
+            ),
+            "retryable": true,
+            "authority_retained": true,
+            "live_shell_discarded": false,
+        })),
+        "the stuck retirement keeps the runtime's refusal typed: {cause:?}"
+    );
+    assert_eq!(
+        cause.wire_error_code(),
+        Some(meerkat_contracts::ErrorCode::SessionBusy),
+        "{cause:?}"
+    );
+
+    held.store.release();
+    tokio::time::timeout(
+        DEGRADED_DESTROY_BOUND,
+        redrive_once_the_released_commit_reports(&held, &handle),
+    )
+    .await
+    .expect("the redriven retirement finishes")
+    .expect("the redriven retirement reloads the member and retires it");
+    assert!(
+        handle
+            .get_member(&held.child)
+            .await
+            .expect("the roster answers")
+            .is_none(),
+        "the retired member left the roster"
+    );
+}
+
 /// Force-cancelling a member whose runtime needs a durability reload answers
 /// the typed `MemberReloadRequired`, naming the member, at once: it neither
 /// waits on the member session's gates nor fails untyped behind them. A
