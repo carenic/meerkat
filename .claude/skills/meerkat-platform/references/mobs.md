@@ -611,7 +611,14 @@ mob under that id is refused until the cleanup is done. An admitted destroy
 closes the mob's admission first (`MobAdmissionCloseReason::Destroyed`).
 Since 0.9.4 a member whose boundary commit fails while the destroy waits on its
 ingress detach is reloaded and its retirement retried once;
-`MobDestroyReport::reloaded_members` names it (0.9.3 answered `Incomplete`). A
+`MobDestroyReport::reloaded_members` names it (0.9.3 answered `Incomplete`).
+Since 0.9.5 a member reload the runtime refuses as repair-blocked (for example
+while a boundary commit past its deadline has not reported its outcome)
+answers `Incomplete` with the member in
+`MobDestroyReport::member_reload_refusals` (`kind: "repair_blocked"` and the
+runtime's `reason`): retry the destroy later. A refusal in the reload pass
+before the destroy starts leaves the mob unchanged; a later one comes after
+the destroy's cleanup has begun. A
 host that drains observers itself reads a `SqliteMobObserverDrainReport`;
 since 0.9.4 its `retained_registrations` counts change-watch notification
 registrations still running when the drain stopped them (a struct literal
