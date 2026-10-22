@@ -501,25 +501,37 @@ async fn only_a_migrated_mob_serves_addresses_without_a_mob_incarnation() {
     migrated.shutdown().await.expect("stop the resume");
 }
 
-/// A mob whose actor stopped, and the mob the host then holds again under
-/// its id, each with the member `w-cont`. The lookup holds the first until
-/// the test replaces it.
-async fn stopped_mob_and_the_mob_created_again() -> (MobHandle, MobHandle, Arc<CurrentMob>) {
-    let (first, _first_service) = create_test_mob(sample_definition()).await;
-    let identity = AgentIdentity::from("w-cont");
+/// A mob with the member `w-cont`, which the host's lookup holds.
+async fn mob_with_a_member() -> (MobHandle, Arc<MockSessionService>, Arc<CurrentMob>) {
+    let (first, first_service) = create_test_mob(sample_definition()).await;
     first
-        .spawn_spec(SpawnMemberSpec::new("worker", identity.as_str()))
+        .spawn_spec(SpawnMemberSpec::new("worker", "w-cont"))
         .await
         .expect("spawn");
     let mobs = Arc::new(CurrentMob(std::sync::Mutex::new(first.clone())));
-    let (second, _second_service) = create_test_mob(sample_definition()).await;
+    (first, first_service, mobs)
+}
+
+/// Stop `first`'s actor (a crash stop, so its phase stays live), then create
+/// the mob again under its id, with the same member, and let the host's
+/// lookup hold the new one.
+async fn stop_and_create_again(
+    first: &MobHandle,
+    mobs: &CurrentMob,
+) -> (MobHandle, Arc<MockSessionService>) {
+    first
+        .crash_stop_preserving_durable_work_for_test()
+        .await
+        .expect("stop the first mob's actor");
+    let (second, second_service) = create_test_mob(sample_definition()).await;
     assert_eq!(second.mob_id(), first.mob_id());
     assert_ne!(second.incarnation(), first.incarnation());
     second
-        .spawn_spec(SpawnMemberSpec::new("worker", identity.as_str()))
+        .spawn_spec(SpawnMemberSpec::new("worker", "w-cont"))
         .await
         .expect("spawn under the same identity");
-    (first, second, mobs)
+    mobs.replace(second.clone());
+    (second, second_service)
 }
 
 fn continuation_service(mobs: Arc<CurrentMob>) -> ContinuationOwnerService {
@@ -535,18 +547,14 @@ fn continuation_service(mobs: Arc<CurrentMob>) -> ContinuationOwnerService {
 /// today's replay of the first receipt, never `OwnerRetired`.
 #[tokio::test]
 async fn a_live_mob_reusing_a_key_an_earlier_incarnation_bound_replays_it() {
-    let (first, second, mobs) = stopped_mob_and_the_mob_created_again().await;
+    let (first, _first_service, mobs) = mob_with_a_member().await;
     let identity = AgentIdentity::from("w-cont");
     let continuations = continuation_service(mobs.clone());
     let earlier = first
         .submit_continuation(&continuations, &identity, delivery("task-1"), 1)
         .await
         .expect("the first mob binds the key");
-    first
-        .crash_stop_preserving_durable_work_for_test()
-        .await
-        .expect("stop the first mob's actor");
-    mobs.replace(second.clone());
+    let (second, _second_service) = stop_and_create_again(&first, &mobs).await;
 
     assert_eq!(
         second
@@ -561,13 +569,9 @@ async fn a_live_mob_reusing_a_key_an_earlier_incarnation_bound_replays_it() {
 /// the id bound: it would answer with the live incarnation's receipt.
 #[tokio::test]
 async fn a_stopped_mobs_handle_replays_nothing_the_mob_created_again_bound() {
-    let (first, second, mobs) = stopped_mob_and_the_mob_created_again().await;
+    let (first, _first_service, mobs) = mob_with_a_member().await;
     let identity = AgentIdentity::from("w-cont");
-    first
-        .crash_stop_preserving_durable_work_for_test()
-        .await
-        .expect("stop the first mob's actor");
-    mobs.replace(second.clone());
+    let (second, _second_service) = stop_and_create_again(&first, &mobs).await;
     let continuations = continuation_service(mobs);
     second
         .submit_continuation(&continuations, &identity, delivery("task-2"), 1)
@@ -604,13 +608,9 @@ impl meerkat::RetainedJobSource for OneForkJob {
 /// host holds again under its id, as for a plain continuation.
 #[tokio::test]
 async fn a_stopped_mobs_handle_commits_no_retained_outcome_for_the_mob_created_again() {
-    let (first, second, mobs) = stopped_mob_and_the_mob_created_again().await;
+    let (first, _first_service, mobs) = mob_with_a_member().await;
     let identity = AgentIdentity::from("w-cont");
-    first
-        .crash_stop_preserving_durable_work_for_test()
-        .await
-        .expect("stop the first mob's actor");
-    mobs.replace(second.clone());
+    let (second, _second_service) = stop_and_create_again(&first, &mobs).await;
     let continuations = continuation_service(mobs);
     let jobs = OneForkJob(meerkat::RetainedJobFacts {
         owner_session_id: second
