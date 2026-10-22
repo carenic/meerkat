@@ -4750,6 +4750,14 @@ async fn a_resume_spawn_onto_a_foreign_session_tail_refuses_typed() {
 /// its committed record before it retires anything; that read must not need
 /// the transcript at the boundary the head has moved past, or the respawn is
 /// refused and the member keeps its stale incarnation.
+///
+/// The member's actor has ended with its failed boundary, and a read of its
+/// session refuses as a transcript revision conflict while the tail stands.
+/// The retirement's runtime quiesce reloads the degraded registration, which
+/// commits the tail, before the retirement's route and archive reads; so the
+/// respawn succeeds and the retired session keeps the tail turn exactly once.
+/// Were those reads ordered before the reload, they would refuse, and so would
+/// the respawn.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_member_whose_session_has_a_durable_tail_respawns() {
@@ -4861,6 +4869,38 @@ async fn a_member_whose_session_has_a_durable_tail_respawns() {
 
     // Power is back; the member respawns with the tail in place.
     power_store.set_cut(false);
+    // The member's actor has ended with its failed boundary, and a read of its
+    // session refuses while the tail stands: only the retirement's reload can
+    // settle it.
+    let sessions: &dyn MobSessionService = service.as_ref();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while sessions
+            .has_live_session(&w1_sid)
+            .await
+            .expect("read whether the member's session is live")
+        {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the member's actor ends with its failed boundary");
+    match sessions.load_persisted_session(&w1_sid).await {
+        Err(meerkat_core::service::SessionError::Store(error))
+            if error
+                .downcast_ref::<meerkat_core::SessionStoreError>()
+                .is_some_and(|error| {
+                    matches!(
+                        error,
+                        meerkat_core::SessionStoreError::TranscriptRevisionConflict { id, .. }
+                            if *id == w1_sid
+                    )
+                }) => {}
+        other => panic!(
+            "a read of the session must refuse as its transcript revision conflict while \
+             the tail stands: {:?}",
+            other.map(|session| session.is_some())
+        ),
+    }
     let respawned = tokio::time::timeout(
         Duration::from_secs(60),
         handle.respawn(identity.clone(), None),
@@ -4881,6 +4921,20 @@ async fn a_member_whose_session_has_a_durable_tail_respawns() {
         incarnation_after, incarnation_before,
         "the respawn installs a new incarnation"
     );
+    let retired = service
+        .load_revivable_retired_session(&w1_sid)
+        .await
+        .expect("read the member's retired session")
+        .expect("the respawn archives the member's previous session");
+    let history = to_string(retired.messages()).expect("serialize the retired transcript");
+    for token in ["PRE_CUT_TAIL_TURN", "POST_CUT_TAIL_TURN"] {
+        assert_eq!(
+            history.matches(token).count(),
+            1,
+            "the retirement's reload commits the tail, so the retired session keeps \
+             '{token}' exactly once: {history}"
+        );
+    }
     let _ = handle.shutdown().await;
 }
 
