@@ -646,6 +646,9 @@ pub struct ShutdownOptions {
     /// every member still being waited on is reported and Shutdown returns.
     /// `None` uses the member lifecycle hang guard as the failure bound.
     pub deadline: Option<meerkat_core::time_compat::Instant>,
+    /// What the Shutdown does with inputs still queued behind a member's
+    /// running turn. The default is [`QueuedInputsOnShutdown::Stop`].
+    pub queued_inputs: QueuedInputsOnShutdown,
 }
 
 impl ShutdownOptions {
@@ -655,6 +658,67 @@ impl ShutdownOptions {
         self.deadline = Some(deadline);
         self
     }
+
+    /// Choose what the Shutdown does with inputs still queued behind a
+    /// member's running turn.
+    #[must_use]
+    pub fn with_queued_inputs(mut self, queued_inputs: QueuedInputsOnShutdown) -> Self {
+        self.queued_inputs = queued_inputs;
+        self
+    }
+}
+
+/// What a graceful mob Shutdown does with inputs still queued behind a
+/// member's running turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum QueuedInputsOnShutdown {
+    /// End them as stopped.
+    #[default]
+    Stop,
+    /// Keep eligible queued inputs durably queued, so the mob's next start
+    /// runs them, unless they are older than the bound by then.
+    Requeue(RequeueMaxAge),
+}
+
+/// The age bound of a requeued input, measured from its admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequeueMaxAge(Duration);
+
+impl RequeueMaxAge {
+    /// The longest accepted bound.
+    pub const CAP: Duration = Duration::from_hours(24);
+    /// The bound a requeue uses when the caller names none.
+    pub const DEFAULT: Duration = Duration::from_mins(15);
+
+    /// A bound of `max_age`.
+    pub fn new(max_age: Duration) -> Result<Self, ShutdownOptionsError> {
+        Ok(Self(max_age))
+    }
+
+    /// The bound.
+    #[must_use]
+    pub fn get(self) -> Duration {
+        self.0
+    }
+}
+
+impl Default for RequeueMaxAge {
+    fn default() -> Self {
+        Self(Self::DEFAULT)
+    }
+}
+
+/// A refused [`ShutdownOptions`] value.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ShutdownOptionsError {
+    /// A requeue bound of zero.
+    #[error("the requeue max age must be greater than zero")]
+    RequeueMaxAgeZero,
+    /// A requeue bound over [`RequeueMaxAge::CAP`].
+    #[error("the requeue max age {max_age:?} is over the cap of {cap:?}")]
+    RequeueMaxAgeOverCap { max_age: Duration, cap: Duration },
 }
 
 /// Per-member account of a completed mob Shutdown.

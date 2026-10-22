@@ -4073,6 +4073,13 @@ pub enum BoundedTurnFailure {
         admitted_session_id: SessionId,
         error: MobError,
     },
+    /// A graceful Shutdown kept this queued input durably queued: it runs on
+    /// the mob's next start. Do not resubmit it; a same-key replay after the
+    /// restart re-attaches to it.
+    RequeuedAcrossStop {
+        session_id: SessionId,
+        input_id: meerkat_core::lifecycle::InputId,
+    },
 }
 
 impl std::fmt::Display for BoundedTurnFailure {
@@ -4172,6 +4179,13 @@ impl std::fmt::Display for BoundedTurnFailure {
                     "exact turn completion plumbing for admitted session '{admitted_session_id}' failed: {error}"
                 )
             }
+            Self::RequeuedAcrossStop {
+                session_id,
+                input_id,
+            } => write!(
+                f,
+                "input '{input_id}' for session '{session_id}' stays queued across the stop and runs on the next start; re-attach with the same delivery key, do not resubmit"
+            ),
         }
     }
 }
