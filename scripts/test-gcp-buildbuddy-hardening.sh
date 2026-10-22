@@ -861,6 +861,14 @@ for label, env, message in (
     else:
         ok(f"executor pool ensure refuses {label}")
 
+unpinned = "registry.example.invalid/meerkat-ci:1"
+proc, calls = run(POOL, ["ensure"], {"secrets": SECRETS_OK}, **dict(POOL_ENV, MEERKAT_BUILDBUDDY_CI_IMAGE=unpinned))
+hint = proc.stderr.replace(unpinned, "")
+if proc.returncode == 0 or "scripts/gcp-buildbuddy-ci-image image" not in hint or "docker.pkg.dev/" in hint:
+    fail(f"the unpinned action image error must point at the image script and name no registry path: {proc.stderr[-300:]}")
+else:
+    ok("the unpinned action image error points at the image script and names no registry path")
+
 policy = {"bindings": [{"role": "roles/secretmanager.secretAccessor", "members": [f"serviceAccount:{EXECUTOR_SA}"]}]}
 proc, calls = run(POOL, ["ensure"], {"secrets": SECRETS_OK, "project_iam_policy": policy}, MEERKAT_GCP_BUILDBUDDY_MANAGE_IAM="1", **POOL_ENV)
 problems = []
@@ -880,6 +888,7 @@ if not re.fullmatch(r"meerkat-bb-exec-template-[0-9a-f]{12}", template_name):
     problems.append(f"template name {template_name!r} is not derived from its rendering")
 for needle in ('API_KEY_SECRET="meerkat-bb-executor-api-key"', 'ENDPOINT_SECRET="meerkat-bb-control-endpoint"',
                'CA_SECRET="meerkat-bb-control-ca"', f'EXECUTOR_IMAGE="{EXECUTOR_IMAGE}"', f'CI_IMAGE="{CI_IMAGE}"',
+               'default_isolation_type: "oci"', 'default_image: "${CI_IMAGE}"',
                'case "${app_target}" in\n  grpcs://*) ;;\n  *)\n    echo "Refusing a non-TLS BuildBuddy app target',
                "SSL_CERT_FILE=/etc/buildbuddy/ca-bundle.pem", "umask 077",
                "Refusing a BuildBuddy app target outside the private network"):
@@ -1040,6 +1049,33 @@ if proc.returncode != 0 or calls or f"-docker.pkg.dev/{PROJECT}/meerkat-ci/meerk
     fail(f"ci-image image does not derive its reference from MEERKAT_GCP_PROJECT_ID: {proc.stdout.strip()!r}")
 else:
     ok("ci-image image derives its reference from MEERKAT_GCP_PROJECT_ID")
+
+# --- the self-hosted RBE platform names no image ---------------------------------------------
+
+platforms_build = open(os.path.join(REPO, "tools", "bazel", "platforms", "BUILD.bazel"), encoding="utf-8").read()
+gcp_block = re.search(r'platform\(\n    name = "linux_x86_64_gcp_ci",\n(.*?)\n\)\n', platforms_build, re.S)
+gcp_images = re.findall(r'"container-image":\s*"([^"]*)"', gcp_block.group(1)) if gcp_block else None
+if gcp_images != [""]:
+    fail(f"linux_x86_64_gcp_ci must unset container-image with an empty string, not name an image: {gcp_images}")
+else:
+    ok("linux_x86_64_gcp_ci unsets the container-image it would inherit")
+registry_path = re.compile(r"[a-z0-9-]+-docker\.pkg\.dev/[a-z][a-z0-9-]{4,28}[a-z0-9]/")
+scanned = [os.path.join(REPO, ".bazelrc")]
+for directory, _, names in os.walk(os.path.join(REPO, "tools", "bazel")):
+    scanned += [os.path.join(directory, name) for name in names
+                if name in ("BUILD", "BUILD.bazel") or name.endswith(".bzl")]
+scripts_dir = os.path.join(REPO, "scripts")
+scanned += [os.path.join(scripts_dir, name) for name in sorted(os.listdir(scripts_dir))
+            if name.startswith(("ci-action-pins", "gcp-buildbuddy-"))]
+written = []
+for path in scanned:
+    with open(path, encoding="utf-8") as handle:
+        written += [f"{os.path.relpath(path, REPO)}:{number}" for number, line in enumerate(handle, 1)
+                    if registry_path.search(line)]
+if written:
+    fail(f"a project-scoped registry path is written out: {written}")
+else:
+    ok("no project-scoped registry path is written out in the Bazel platforms, the pin check or the GCP scripts")
 
 sys.exit(1 if FAILURES else 0)
 PY

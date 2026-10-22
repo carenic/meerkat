@@ -86,7 +86,12 @@ platform(
         "Arch": "amd64",
         "OSFamily": "linux",
         "Pool": "meerkat-ci",
-        "container-image": "docker://europe-west1-docker.pkg.dev/king-dnn-training-dev/meerkat-ci/meerkat-ci-rust:1.94.0",
+        # Empty on purpose: it unsets the image this platform would otherwise
+        # inherit from its parent (a public BuildBuddy image). The GCP lane's
+        # actions run in the digest-pinned MEERKAT_BUILDBUDDY_CI_IMAGE, which
+        # scripts/buildbuddy-bazel-poc sends as the container-image header and
+        # scripts/gcp-buildbuddy-executor-pool makes the executors' default image.
+        "container-image": "",
         "network": "external",
     },
     parents = ["@toolchains_buildbuddy//platforms:linux_x86_64"],
