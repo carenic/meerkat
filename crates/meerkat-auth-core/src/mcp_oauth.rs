@@ -4448,14 +4448,18 @@ mod tests {
 
     #[test]
     fn server_identity_key_is_typed_and_stable() {
-        let a =
-            McpServerIdentity::from_server_config("glean", "https://king-be.glean.com/mcp/default")
-                .token_key()
-                .unwrap();
-        let b =
-            McpServerIdentity::from_server_config("glean", "https://king-be.glean.com/mcp/default")
-                .token_key()
-                .unwrap();
+        let a = McpServerIdentity::from_server_config(
+            "glean",
+            "https://tenant.glean.example/mcp/default",
+        )
+        .token_key()
+        .unwrap();
+        let b = McpServerIdentity::from_server_config(
+            "glean",
+            "https://tenant.glean.example/mcp/default",
+        )
+        .token_key()
+        .unwrap();
         let c = McpServerIdentity::from_server_config("glean", "https://other.example/mcp/default")
             .token_key()
             .unwrap();
@@ -4469,8 +4473,10 @@ mod tests {
         // Row #349 gate (1): realm-key derivation flows through the typed
         // `McpServerIdentity`, and the token key and the AuthMachine lease key
         // share one identity derivation (structurally identical binding).
-        let identity =
-            McpServerIdentity::from_server_config("glean", "https://king-be.glean.com/mcp/default");
+        let identity = McpServerIdentity::from_server_config(
+            "glean",
+            "https://tenant.glean.example/mcp/default",
+        );
         let token_key = identity.token_key().unwrap();
         let lease_key = identity.lease_key().unwrap();
         assert_eq!(token_key.realm().as_str(), MCP_TOKEN_REALM);
