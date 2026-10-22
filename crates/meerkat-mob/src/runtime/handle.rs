@@ -7266,7 +7266,7 @@ impl MobHandle {
         // An actor that stopped in its startup recovery answers with that
         // failure, so every joined observer gets it, typed.
         let terminal = terminal.map_err(|error| {
-            self.startup_failure_behind(&error)
+            self.fail_stop_cause_behind(&error)
                 .unwrap_or_else(|| Arc::new(error))
         });
         self.explicit_resume_operations.publish_if_current(
@@ -8487,11 +8487,12 @@ impl MobHandle {
     /// out of a live phase and the actor exits, this may read the actor's
     /// terminal phase watch. A closed actor while the last published phase is
     /// still live is an actor failure, not lifecycle truth. When the actor
-    /// stopped in its startup recovery, before it admitted any command, this
-    /// returns that failure, typed, as
-    /// [`MobError::SharedLifecycleFailure`]: for a member's session, a
-    /// [`MobError::MemberStartupRecoveryFailed`] naming the member, its
-    /// session and the cause.
+    /// fail-stopped, this returns why, typed, as
+    /// [`MobError::SharedLifecycleFailure`]: for a failed startup recovery of
+    /// a member's session, a [`MobError::MemberStartupRecoveryFailed`] naming
+    /// the member, its session and the cause; for an uncertain durable
+    /// mutation, [`MobError::AdmissionClosed`] with
+    /// `MobAdmissionCloseReason::DurabilityFailStop`.
     pub async fn status(&self) -> Result<MobState, MobError> {
         match self
             .send_actor_command(|reply_tx| MobCommand::QueryPhase { reply_tx })
@@ -8503,7 +8504,7 @@ impl MobHandle {
             Ok(reply) => reply,
             Err(
                 error @ (MobError::ActorCommandChannelClosed | MobError::ActorReplyChannelClosed),
-            ) => match self.startup_failure_behind(&error) {
+            ) => match self.fail_stop_cause_behind(&error) {
                 // The actor stopped in its startup recovery, before it
                 // admitted any command: report why, typed.
                 Some(failure) => Err(MobError::SharedLifecycleFailure(failure)),
@@ -8513,13 +8514,12 @@ impl MobHandle {
         }
     }
 
-    /// The failure that stopped the actor's startup recovery, for a command
-    /// that found the actor closed: such a command reports it, typed,
-    /// instead of the closed channel.
-    fn startup_failure_behind(&self, error: &MobError) -> Option<Arc<MobError>> {
+    /// Why the actor fail-stopped, for a command that found it closed: such
+    /// a command reports it, typed, instead of the closed channel.
+    fn fail_stop_cause_behind(&self, error: &MobError) -> Option<Arc<MobError>> {
         match error {
             MobError::ActorCommandChannelClosed | MobError::ActorReplyChannelClosed => {
-                self.lifecycle_observations.startup_failure()
+                self.lifecycle_observations.fail_stop_cause()
             }
             _ => None,
         }
@@ -14807,9 +14807,8 @@ impl MobHandle {
 
     /// Transition Stopped -> Running.
     ///
-    /// When the actor stopped in its startup recovery, before it admitted
-    /// any command, this returns that failure, typed, as [`Self::status`]
-    /// does.
+    /// When the actor fail-stopped, this returns why, typed, as
+    /// [`Self::status`] does.
     pub async fn resume(&self) -> Result<(), MobError> {
         let deadline = Instant::now() + super::provisioner::EXPLICIT_RESUME_RETIRE_TOTAL_TIMEOUT;
         match self

@@ -29702,6 +29702,17 @@ impl MobActor {
         Ok(())
     }
 
+    /// Write-before-close for the fail-stop on an uncertain durable
+    /// mutation: a status read or a resume after this exit reports it,
+    /// typed. The uncertain mutation itself is logged where it failed.
+    fn record_durability_fail_stop(&self) {
+        self.lifecycle_observations
+            .record_fail_stop_cause(Arc::new(MobError::AdmissionClosed {
+                mob_id: self.definition.id.clone(),
+                reason: MobAdmissionCloseReason::DurabilityFailStop,
+            }));
+    }
+
     /// Close the command channel, then receive until it is empty.
     ///
     /// A sender that reserved capacity before the close still writes its
@@ -29730,11 +29741,12 @@ impl MobActor {
         self.supervisor_bridge
             .set_member_run_start_posture(self.member_run_start_posture());
         if let Err(error) = boxed_arm_future(|| self.prepare_actor_run()).await {
-            // Durable recovery fail-stopped before command admission. Record
-            // why before the close: every command this exit drops, and every
-            // status read after it, can then report it, typed.
+            // Durable recovery fail-stopped before command admission.
+            // Write-before-close: the cause is recorded before admission
+            // closes and before any reply channel drops, so every command
+            // this exit drops, and every status read after it, reports it.
             self.lifecycle_observations
-                .record_startup_failure(Arc::new(error));
+                .record_fail_stop_cause(Arc::new(error));
             self.close_admission_for_exit(MobAdmissionCloseReason::DurabilityFailStop);
             self.inline_step_watchdog.stop();
             drop(self);
@@ -29779,6 +29791,7 @@ impl MobActor {
             // Honor fail-stop before polling any new work so a confirmed
             // durable panic quarantine transfers ownership to cold recovery.
             if self.durable_uncertainty_fail_stop {
+                self.record_durability_fail_stop();
                 self.close_admission_for_exit(MobAdmissionCloseReason::DurabilityFailStop);
                 tracing::error!(
                     mob_id = %self.definition.id,
@@ -30045,6 +30058,7 @@ impl MobActor {
                 ActorLoopControl::BreakActor => break,
             }
             if self.durable_uncertainty_fail_stop {
+                self.record_durability_fail_stop();
                 self.close_admission_for_exit(MobAdmissionCloseReason::DurabilityFailStop);
                 tracing::error!(
                     mob_id = %self.definition.id,
@@ -30921,8 +30935,9 @@ impl MobActor {
                     "local cleanup delivery tuple diverges from generated authority".into(),
                 ));
             }
-            // The start fails before admission on any member's failure, so
-            // name the member and its session for the caller.
+            // The start fails before admission on the first member that
+            // fails, in roster (identity) order; name that member and its
+            // session for the caller.
             self.restore_member_local_cleanup_delivery(&io, &entry, session)
                 .await
                 .map_err(|cause| MobError::MemberStartupRecoveryFailed {

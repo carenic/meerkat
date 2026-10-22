@@ -1189,8 +1189,11 @@ failure, typed, as `MobError::SharedLifecycleFailure`. For a member's session
 it is `MobError::MemberStartupRecoveryFailed`, which names the member, its
 session and the cause, for example `SessionError::ServedElsewhere` while
 another runtime owner on the realm hosts the session. Other commands fail with
-`ActorCommandChannelClosed`. Before 0.9.5, `status` reported only "mob actor
-reply channel closed", and the cause reached only the host's error log.
+`ActorCommandChannelClosed`. An actor that fail-stops later, on a durable
+mutation whose outcome stayed uncertain, reports `MobError::AdmissionClosed`
+with `DurabilityFailStop` the same way. Before 0.9.5, `status` reported only
+"mob actor reply channel closed", and the cause reached only the host's error
+log.
 
 While a Shutdown drains, a command the close refuses (spawn, respawn, work, a
 flow run, wiring, a host bind, a live commit, resume, reset or reload) fails

@@ -206,7 +206,10 @@ them.
   cause's. Other commands on that handle still fail with
   `ActorCommandChannelClosed`, and `MobBuilder::resume` still returns the
   handle before startup recovery runs: read `MobHandle::status` for the
-  reason.
+  reason. An actor that stops later because a durable mutation's outcome
+  stayed uncertain reports that the same way, as `MobError::AdmissionClosed`
+  with `MobAdmissionCloseReason::DurabilityFailStop`; the mutation itself is
+  still named only in the error log where it failed.
 
 ## [0.9.4] - 2026-10-20
 
