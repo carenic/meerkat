@@ -181,6 +181,14 @@ them.
 
 ### Fixed
 
+- A connector OAuth login on one of its client profile's
+  `registered_redirect_uris` can complete over RPC: `auth/login/start`
+  returns its `host_attempt_handle`, and `auth/login/complete` passes the
+  one the host sends (before, RPC dropped it both ways, so such a login was
+  always refused as needing the host's custody). Without the handle the
+  refusal carries `error.data.detail` `remote_custody_required` and leaves
+  the attempt pending. `iss` stays MCP-only.
+
 - A turn that compacts its history more often than
   `[compaction] history_retained_rewrites` keeps (five or more compactions at
   the default of 4) no longer ends at its intra-turn checkpoint on a
