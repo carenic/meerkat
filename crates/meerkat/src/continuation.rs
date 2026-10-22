@@ -1209,8 +1209,13 @@ pub struct HostOriginalAdmission {
 /// deduplicated onto an existing input. When the admission is unresolved it
 /// is handed to [`HostOriginalBinder::retain_unresolved`] instead.
 pub trait HostOriginalSettlement: Send + Sync {
-    /// Promote the host's custody for the admission. An error is reported,
-    /// never a refusal: the input was admitted.
+    /// Promote the host's custody for the admission. An error is reported
+    /// (a warn trace), never a refusal: the input was admitted. On an error
+    /// Core still applies and acknowledges the delivery and never calls this
+    /// again; the host keeps its candidate pending and settles it from the
+    /// native record (`with_admitted_original` / `durable_admitted_original`)
+    /// within its own bound, the same obligation as an `AdmissionPending`
+    /// answer of its source.
     fn accepted(self: Box<Self>, admission: &HostOriginalAdmission) -> Result<(), String>;
 }
 
@@ -1302,8 +1307,22 @@ pub enum HostOriginalReadiness {
 ///   the authority association (naming `original.original_work`) and the
 ///   trusted ingress observation. With `bind_scoped_original`, pass Core's
 ///   admission key (the input's idempotency key) as its event key. Core
-///   refuses any other change. The original is in the host's own source
-///   custody before `bind` returns.
+///   refuses any other change. Attach the ingress observation only through
+///   `Input::with_ingress_context` or `bind_scoped_original`, which check it
+///   against the final input: an observation of another input set on the
+///   header directly is refused by native admission and leaves the row
+///   pending. The original is in the host's own source custody before
+///   `bind` returns.
+/// - Core never makes a governed session live, on any sink: a session with
+///   no live actor (a cold session) is the host's to recover through its own
+///   governed recovery, which binds its destination and agent before the
+///   agent is constructed. Until then [`Self::bind`] answers
+///   `NotReady(ExecutorUnavailable)` and [`Self::readiness`] answers
+///   `NotReady(ExecutorUnavailable)` (so the setup signal reads
+///   `Offered(NotReady(..))`). The host's executor attachment (or
+///   [`ContinuationHostBindings::source_custody_changed`]) wakes the delivery
+///   owner for the next attempt. A host that wants ingestion to wake a cold
+///   session runs its own recovery; Core never does.
 /// - A binder may make bounded host-side checks before it binds, such as
 ///   re-checking that the owner covers the source's audience from a snapshot
 ///   or a try-read of the registered roster row. Such a check answers
@@ -1731,11 +1750,12 @@ pub trait ContinuationDeliverySink: Send + Sync {
         false
     }
 
-    /// Make `session` live for a governed host original before its binder
-    /// binds it (the binder pins the live actor's controller), as
-    /// [`Self::admit_retained`] prepares a cold session. The default prepares
-    /// nothing: its host makes sessions live, and an attachment wakes the
-    /// delivery owner.
+    /// Prepare `session` for a governed host original before its binder
+    /// binds it, as [`Self::admit_retained`] prepares a cold session (for
+    /// example settling a crash-window provisional tail). It never makes a
+    /// governed session live, on any sink: liveness belongs to the host, and
+    /// its executor attachment wakes the delivery owner. The default prepares
+    /// nothing.
     async fn prepare_governed(&self, session: &SessionId) -> Result<(), ContinuationAdmitError> {
         let _ = session;
         Ok(())
@@ -2145,7 +2165,12 @@ fn continuation_prompt(
 }
 
 /// Where a governed host original's refusal came from, for operators: the
-/// delivery row keeps only the three typed reasons.
+/// delivery row keeps only the three typed reasons. Reported only as the
+/// `refusal_origin` field of a warn trace, with the variant's Debug name:
+/// `RowShape`, `ReservedNamespace`, `OwnerConfirmation`, `BinderDenied` (a
+/// binder's `Denied`, and its `NotOwned` with the `NoAdmissibleWorkBinding`
+/// reason), `BoundInput` or `NativeRefused`. Diagnostic only: no decision may
+/// read it, and a later typed origin would be a new additive API.
 #[derive(Debug, Clone, Copy)]
 enum HostOriginalRefusalOrigin {
     RowShape,
