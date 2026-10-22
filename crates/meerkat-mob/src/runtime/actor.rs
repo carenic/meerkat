@@ -12636,10 +12636,10 @@ impl MobActor {
     }
 
     /// Whether a refused routed effect still names a runtime the machine runs
-    /// for its member: the bound runtime for a binding, the bound and retiring
-    /// runtime for a retire, a live runtime for an ingress. Any other kind is
-    /// never presumed stale (only these three carry refusal feedback today):
-    /// it waits while Stopped and keeps the error in any other phase.
+    /// for its member: the bound and live runtime for a binding, the bound and
+    /// retiring runtime for a retire, a live runtime for an ingress. Any other
+    /// kind is never presumed stale (only these three carry refusal feedback
+    /// today): it waits while Stopped and keeps the error in any other phase.
     fn routed_effect_targets_current_runtime(
         state: &mob_dsl::MobMachineState,
         effect: &super::composition::MobSeamEffect,
@@ -12649,7 +12649,10 @@ impl MobActor {
                 agent_identity,
                 agent_runtime_id,
                 ..
-            } => state.identity_to_runtime.get(agent_identity) == Some(agent_runtime_id),
+            } => {
+                state.identity_to_runtime.get(agent_identity) == Some(agent_runtime_id)
+                    && state.live_runtime_ids.contains(agent_runtime_id)
+            }
             mob_dsl::MobMachineEffect::RequestRuntimeRetire {
                 agent_identity,
                 agent_runtime_id,
@@ -61751,8 +61754,8 @@ mod routed_effect_containment_tests {
             .identity_to_runtime
             .insert(identity, runtime_id.clone());
         assert!(
-            current(&state, &binding),
-            "the bound runtime owns its binding"
+            !current(&state, &binding),
+            "a bound runtime that is no longer live owns no binding"
         );
         assert!(
             !current(&state, &retire),
@@ -61767,6 +61770,10 @@ mod routed_effect_containment_tests {
         );
 
         state.live_runtime_ids.insert(runtime_id);
+        assert!(
+            current(&state, &binding),
+            "the bound live runtime owns its binding"
+        );
         assert!(current(&state, &ingress), "a live runtime takes its input");
     }
 

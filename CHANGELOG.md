@@ -66,13 +66,6 @@ them.
   safety scan, about five minutes later; it now waits for the holder's
   expiry, at least one second, the same way as `AwaitLease`.
 
-- `meerkat-mob`: a refused runtime-retire route for a member that is bound
-  but no longer retiring no longer ends the mob's actor after a resume.
-  While the mob was Stopped such a route waited for the resume, and its
-  refusal, which no phase of the mob machine takes, then ended the actor.
-  The route is now dropped with a warning, as a route for a retired member
-  is.
-
 ## [0.9.4] - 2026-10-20
 
 ### Breaking
