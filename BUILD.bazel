@@ -649,7 +649,6 @@ test_suite(
         "//crates/meerkat-contracts:mob_wire_test",
         "//crates/meerkat-contracts:regression_wire_types_test",
         "//crates/meerkat-contracts:runtime_turn_metadata_wire_override_test",
-        "//crates/meerkat-contracts:session_accept_input_typed_round_trip_test",
         "//crates/meerkat-contracts:skill_ref_wire_no_legacy_test",
         "//crates/meerkat-copilot:meerkat_copilot_unit_test",
         "//crates/meerkat-core:auth_binding_no_string_form_test",

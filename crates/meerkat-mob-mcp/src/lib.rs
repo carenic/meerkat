@@ -71,6 +71,14 @@ mod tokio {
 
 use async_trait::async_trait;
 
+/// The continuation producer namespace a keyed member send commits under.
+/// Core owns the `meerkat.` host namespaces, so no host source shares it.
+pub const MEMBER_SEND_CONTINUATION_NAMESPACE: &str = "meerkat.member_send";
+
+/// The prefix a caller's member-send key carries in the continuation key
+/// ledger, so it never meets another producer's key for the same member.
+pub const MEMBER_SEND_CONTINUATION_KEY_PREFIX: &str = "member_send:";
+
 use meerkat_client::LlmClient;
 use meerkat_contracts::{
     MobDefinitionInput, MobLifecycleParams, MobSpawnManyResultEntry, WireContentInput,
@@ -6107,6 +6115,201 @@ impl MobMcpState {
                 delivery_identity,
             )
             .await
+    }
+
+    /// Deliver `content` to a member under a caller idempotency key: the one
+    /// keyed member-send door for RPC, the public MCP tool and Meta.
+    ///
+    /// A keyed send is committed as a member continuation, so the key is kept
+    /// for the member identity in the continuation key ledger, together with
+    /// the committed delivery, and survives a respawn. The ledger decides a
+    /// replay or a conflict before anything about the member is read, so a
+    /// replay answers the first receipt even after the member was replaced.
+    /// Only a first commit checks the member: it must exist and hold a
+    /// session binding, because a peer-only member would never be served.
+    /// Every answer carries the delivery status read after the commit.
+    ///
+    /// # Errors
+    /// [`MobError::MemberSendIdempotency`] for an invalid key, a conflict, a
+    /// host without a continuation service, a governed runtime, or a status
+    /// read that cannot be made; [`MobError::MemberNotFound`] and
+    /// [`MobError::DeliveryScopeUnavailable`] for a first commit to a member
+    /// that does not exist or has no session binding.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn mob_member_send_keyed(
+        &self,
+        mob_id: &MobId,
+        identity: AgentIdentity,
+        content: ContentInput,
+        handling_mode: HandlingMode,
+        idempotency_key: &str,
+    ) -> Result<meerkat_contracts::WireContinuationReceipt, MobError> {
+        use meerkat_mob::MemberSendIdempotencyRefusal as Refusal;
+
+        let refuse = |refusal: Refusal| MobError::MemberSendIdempotency {
+            identity: identity.clone(),
+            refusal,
+        };
+        let handle = self
+            .admitted_handle_for(mob_id, ControlScope::SendCommand)
+            .await?;
+        meerkat_runtime::validate_canonical_key_text(
+            "idempotency_key",
+            idempotency_key,
+            meerkat_runtime::CALLER_IDEMPOTENCY_KEY_MAX_BYTES,
+        )
+        .map_err(|error| {
+            refuse(Refusal::InvalidKey {
+                detail: error.to_string(),
+            })
+        })?;
+        let service = self
+            .continuation_service()
+            .ok_or_else(|| refuse(Refusal::NoContinuationService))?;
+        if service.governs_work_authority() {
+            return Err(refuse(Refusal::GovernedRuntime));
+        }
+        let owner = meerkat::ContinuationOwner::Member {
+            mob_id: mob_id.to_string(),
+            identity: identity.to_string(),
+        };
+        let key = meerkat::ContinuationKey::new(format!(
+            "{MEMBER_SEND_CONTINUATION_KEY_PREFIX}{idempotency_key}"
+        ))
+        .map_err(|error| {
+            refuse(Refusal::InvalidKey {
+                detail: error.to_string(),
+            })
+        })?;
+        let status_error = |error: meerkat::ContinuationStatusError| match error {
+            meerkat::ContinuationStatusError::Unavailable(detail) => {
+                refuse(Refusal::Unavailable { detail })
+            }
+            meerkat::ContinuationStatusError::Inconsistent(detail) => {
+                refuse(Refusal::Inconsistent { detail })
+            }
+        };
+        if matches!(
+            service
+                .continuation_status(&owner, &key)
+                .await
+                .map_err(status_error)?,
+            meerkat::ContinuationStatus::NotCommitted
+        ) {
+            handle.capture_member_delivery_scope(&identity).await?;
+        }
+        let content_bytes = serde_json::to_vec(&content).map_err(|error| {
+            refuse(Refusal::Inconsistent {
+                detail: format!("member send content does not serialize: {error}"),
+            })
+        })?;
+        let delivery = meerkat::ContinuationDelivery {
+            key: key.clone(),
+            result: meerkat::ContinuationResultRef {
+                producer: meerkat::ContinuationProducer::Host {
+                    namespace: MEMBER_SEND_CONTINUATION_NAMESPACE.to_string(),
+                },
+                producer_id: idempotency_key.to_string(),
+                result_digest: meerkat_runtime::delivery_digest_hex(&[
+                    MEMBER_SEND_CONTINUATION_NAMESPACE.as_bytes(),
+                    &content_bytes,
+                ]),
+                summary: None,
+            },
+            body: meerkat::ContinuationBody::Content { content },
+            handling: match handling_mode {
+                HandlingMode::Queue => meerkat::ContinuationHandling::Queue,
+                HandlingMode::Steer => meerkat::ContinuationHandling::Steer,
+            },
+        };
+        let committed_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+            });
+        let receipt = service
+            .submit(&owner, delivery, committed_at_ms)
+            .await
+            .map_err(|error| match error {
+                meerkat::ContinuationSubmitError::Conflict { existing } => {
+                    refuse(Refusal::Conflict {
+                        delivery_id: existing.delivery_id.clone(),
+                        committed_at_ms: existing.committed_at_ms,
+                    })
+                }
+                meerkat::ContinuationSubmitError::OwnerRetired => {
+                    MobError::MemberNotFound(identity.clone())
+                }
+                meerkat::ContinuationSubmitError::NoAdmissibleWorkBinding => {
+                    refuse(Refusal::GovernedRuntime)
+                }
+                meerkat::ContinuationSubmitError::Invalid(detail) => {
+                    refuse(Refusal::InvalidKey { detail })
+                }
+                meerkat::ContinuationSubmitError::Unavailable(detail) => {
+                    refuse(Refusal::Unavailable { detail })
+                }
+            })?;
+        let status = match service
+            .continuation_status(&owner, &key)
+            .await
+            .map_err(status_error)?
+        {
+            meerkat::ContinuationStatus::NotCommitted => {
+                return Err(refuse(Refusal::Inconsistent {
+                    detail: "the key reads as not committed after its commit".to_string(),
+                }));
+            }
+            meerkat::ContinuationStatus::Pending { admitted: None, .. } => {
+                meerkat_contracts::WireContinuationStatus::Pending
+            }
+            meerkat::ContinuationStatus::Pending {
+                admitted: Some((session, input)),
+                ..
+            }
+            | meerkat::ContinuationStatus::Applied { session, input, .. } => {
+                meerkat_contracts::WireContinuationStatus::Admitted {
+                    session_id: session.to_string(),
+                    input_id: input.to_string(),
+                }
+            }
+            meerkat::ContinuationStatus::Stranded { .. } => {
+                meerkat_contracts::WireContinuationStatus::Stranded
+            }
+            meerkat::ContinuationStatus::Refused { reason, .. } => {
+                meerkat_contracts::WireContinuationStatus::Refused {
+                    reason: serde_json::to_value(reason)
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_string))
+                        .unwrap_or_else(|| format!("{reason:?}")),
+                }
+            }
+        };
+        Ok(meerkat_contracts::WireContinuationReceipt {
+            delivery_id: receipt.delivery_id,
+            committed_at_ms: receipt.committed_at_ms,
+            status,
+        })
+    }
+
+    /// [`Self::mob_member_send_keyed`] on a host that binds no continuation
+    /// service (the browser runtime): the key cannot be kept, so it is
+    /// refused after authorization, never dropped.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn mob_member_send_keyed(
+        &self,
+        mob_id: &MobId,
+        identity: AgentIdentity,
+        _content: ContentInput,
+        _handling_mode: HandlingMode,
+        _idempotency_key: &str,
+    ) -> Result<meerkat_contracts::WireContinuationReceipt, MobError> {
+        self.admitted_handle_for(mob_id, ControlScope::SendCommand)
+            .await?;
+        Err(MobError::MemberSendIdempotency {
+            identity,
+            refusal: meerkat_mob::MemberSendIdempotencyRefusal::NoContinuationService,
+        })
     }
 
     pub async fn mob_ingress_interaction(

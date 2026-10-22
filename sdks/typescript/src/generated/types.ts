@@ -612,6 +612,7 @@ export interface SessionExternalEventEnvelopePeerResponseTerminal {
 export type SessionExternalEventEnvelope = SessionExternalEventEnvelopeGenericJson | SessionExternalEventEnvelopePeerResponseTerminal;
 
 export interface SessionExternalEventParamsGenericJson {
+  idempotency_key?: string | null;
   session_id: string;
   blocks?: WireContentBlock[] | null;
   event_type: string;
@@ -620,6 +621,7 @@ export interface SessionExternalEventParamsGenericJson {
 }
 
 export interface SessionExternalEventParamsPeerResponseTerminal {
+  idempotency_key?: string | null;
   session_id: string;
   display_name?: PeerName | null;
   kind: "peer_response_terminal";
@@ -2074,12 +2076,20 @@ export interface MobMemberSendParams {
   agent_identity: string;
   content: WireContentInput;
   handling_mode?: WireHandlingMode;
+  idempotency_key?: string | null;
   mob_id: string;
   render_metadata?: Record<string, unknown> | null;
 }
 
+export interface WireContinuationReceipt {
+  committed_at_ms: number;
+  delivery_id: string;
+  status: WireContinuationStatus;
+}
+
 export interface MobMemberSendResult {
   agent_identity: string;
+  continuation?: WireContinuationReceipt | null;
   handling_mode: WireHandlingMode;
   member_ref: WireMemberRef;
   mob_id: string;
@@ -3871,6 +3881,27 @@ export type WireNonPortableResourceKind = "rust_bundles" | "per_spawn_external_t
 export type WireMemberPreviewUnavailable = "observation_deadline" | "read_failed" | "session_absent" | "not_observed_while_retiring";
 
 export type WireMemberRegistrationHookCall = "select_destination" | "select_agent_mandate" | "prepare_member_surface" | "verify_member_surface";
+
+export interface WireContinuationStatusPending {
+  state: "pending";
+}
+
+export interface WireContinuationStatusAdmitted {
+  input_id: string;
+  session_id: string;
+  state: "admitted";
+}
+
+export interface WireContinuationStatusStranded {
+  state: "stranded";
+}
+
+export interface WireContinuationStatusRefused {
+  reason: string;
+  state: "refused";
+}
+
+export type WireContinuationStatus = WireContinuationStatusPending | WireContinuationStatusAdmitted | WireContinuationStatusStranded | WireContinuationStatusRefused;
 
 export type WireMobRunStatus = "pending" | "running" | "completed" | "failed" | "canceled";
 

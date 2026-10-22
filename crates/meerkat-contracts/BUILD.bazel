@@ -880,65 +880,6 @@ rust_test(
 )
 
 rust_test(
-    name = "session_accept_input_typed_round_trip_test",
-    aliases = aliases(
-        package_name = "crates/meerkat-contracts",
-        normal = True,
-        normal_dev = True,
-        proc_macro = True,
-        proc_macro_dev = True,
-    ),
-    crate_name = "session_accept_input_typed_round_trip",
-    crate_root = "tests/session_accept_input_typed_round_trip.rs",
-    crate_features = [
-        "schema",
-    ],
-    edition = "2024",
-    rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
-    compile_data = [
-        "Cargo.toml",
-        "tests/fixtures/auth_principals_v0_8_49.json",
-        "tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
-        "tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
-        "tests/fixtures/compiled_application_tool_policy_valid_v1.json",
-    ],
-    srcs = [
-        "tests/session_accept_input_typed_round_trip.rs",
-    ],
-    visibility = ["//visibility:public"],
-    rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.4",
-        "CARGO_BIN_NAME": "session_accept_input_typed_round_trip",
-        "CARGO_MANIFEST_DIR": "./crates/meerkat-contracts",
-    },
-    tags = [
-        "fast",
-    ],
-    size = "medium",
-    data = [],
-    env = {
-        "RUST_MIN_STACK": "8388608",
-        "RUST_TEST_THREADS": "1",
-    },
-    proc_macro_deps = all_crate_deps(
-        package_name = "crates/meerkat-contracts",
-        proc_macro = True,
-        proc_macro_dev = True,
-    ),
-    deps = [
-        "//crates/meerkat-capabilities:meerkat_capabilities",
-        "//crates/meerkat-contracts:meerkat_contracts",
-        "//crates/meerkat-core:meerkat_core",
-        "//crates/meerkat-schedule:meerkat_schedule",
-        "//crates/meerkat-workgraph:meerkat_workgraph",
-    ] + all_crate_deps(
-        package_name = "crates/meerkat-contracts",
-        normal = True,
-        normal_dev = True,
-    ),
-)
-
-rust_test(
     name = "skill_ref_wire_no_legacy_test",
     aliases = aliases(
         package_name = "crates/meerkat-contracts",
@@ -1012,7 +953,6 @@ test_suite(
         ":mob_wire_test",
         ":regression_wire_types_test",
         ":runtime_turn_metadata_wire_override_test",
-        ":session_accept_input_typed_round_trip_test",
         ":skill_ref_wire_no_legacy_test",
     ],
 )

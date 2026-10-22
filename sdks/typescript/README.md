@@ -215,11 +215,14 @@ Returns typed session details including `model`, `provider`, `lastAssistantText`
 ### Session ingress helpers
 
 ```ts
-async sendExternalEvent(sessionId: string, eventType: string, payload: unknown, options?: { blocks?: ContentBlock[] }): Promise<Record<string, unknown>>
+async sendExternalEvent(sessionId: string, eventType: string, payload: unknown, options?: { blocks?: ContentBlock[]; idempotencyKey?: string }): Promise<Record<string, unknown>>
 async injectContext(sessionId: string, text: string, options?: { source?: string; idempotencyKey?: string }): Promise<{ status: string }>
 ```
 
 These expose `session/external_event` and `session/inject_context` as first-class public APIs.
+With `idempotencyKey`, a retried `sendExternalEvent` admits nothing new and
+answers `outcome_type` `deduplicated`; it needs a server contract of 0.9.5 or
+later, and the SDK refuses the key against an older server.
 
 Input reconciliation, ATIF export, transcript revision read/list, forking,
 guarded rewriting, system-prompt update, and revision restore are also public

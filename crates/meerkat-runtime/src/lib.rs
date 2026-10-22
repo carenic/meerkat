@@ -587,9 +587,10 @@ pub use handles::{
     RuntimeTurnStateHandle,
 };
 pub use identifiers::{
+    CALLER_IDEMPOTENCY_KEY_MAX_BYTES, CALLER_IDEMPOTENCY_KEY_NAMESPACE, CanonicalKeyTextError,
     CausationId, ConversationId, CorrelationId, EventCodeId, IdempotencyKey, InputKind, KindId,
     LogicalRuntimeId, LogicalRuntimeIdError, MemberDeliveryAddress, PolicyVersion,
-    ProjectionRuleId, RuntimeEventId, SchemaId, SupersessionKey,
+    ProjectionRuleId, RuntimeEventId, SchemaId, SupersessionKey, validate_canonical_key_text,
 };
 pub use ingress_types::{ContentShape, RequestId, ReservationKey};
 pub use input::{

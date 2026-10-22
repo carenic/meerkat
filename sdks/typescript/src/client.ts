@@ -388,6 +388,8 @@ import { DeferredSession, Session } from "./session.js";
 import {
   Mob,
   type MemberDeliveryReceipt,
+  type MemberSendContinuation,
+  type MemberSendContinuationStatus,
   type MemberSendOptions,
   type MobBoundedHelperResult,
   type MobHandlingMode,
@@ -994,6 +996,7 @@ export class MeerkatClient {
   private requestId = 0;
   private _capabilities: Capability[] = [];
   private _methods = new Set<string>();
+  private _serverContractVersion = "";
   private rkatPath: string;
   private pendingRequests = new Map<
     number,
@@ -1227,6 +1230,7 @@ export class MeerkatClient {
     const initResult = (await this.request("initialize", {})) as Partial<ServerCapabilities> &
       Record<string, unknown>;
     const serverVersion = String(initResult.contract_version ?? "");
+    this._serverContractVersion = serverVersion;
     if (!MeerkatClient.checkVersionCompatible(serverVersion, CONTRACT_VERSION)) {
       throw new MeerkatError(
         "VERSION_MISMATCH",
@@ -1523,11 +1527,50 @@ export class MeerkatClient {
     return MeerkatClient.parseSessionInfo(raw);
   }
 
+  /**
+   * Refuse a caller idempotency key before sending it to a server that would
+   * drop it: before contract 0.9.5 `session/external_event` ignores the field
+   * and admits the call unkeyed.
+   */
+  private requireCallerIdempotencyKeySupport(): void {
+    const minimum = [0, 9, 5];
+    const core = this._serverContractVersion.split("-", 1)[0].split("+", 1)[0];
+    const parts = core.split(".").map((part) => Number(part));
+    const valid = core.length > 0 && parts.every((part) => Number.isInteger(part));
+    let atLeast = valid;
+    if (valid) {
+      for (let index = 0; index < minimum.length; index += 1) {
+        const part = parts[index] ?? 0;
+        if (part !== minimum[index]) {
+          atLeast = part > minimum[index];
+          break;
+        }
+      }
+    }
+    if (!atLeast) {
+      throw new CapabilityUnavailableError(
+        "CAPABILITY_UNAVAILABLE",
+        `idempotencyKey needs a server contract >= ${minimum.join(".")}; `
+          + `this server reports ${this._serverContractVersion || "none"}`,
+      );
+    }
+  }
+
+  /**
+   * Append a durable external event input to a session runtime.
+   *
+   * With `idempotencyKey` a retry admits nothing new: it answers
+   * `outcome_type` `deduplicated` naming the first admission in
+   * `existing_id`. The same key with other event content is refused with
+   * the typed `INPUT_IDEMPOTENCY_CONFLICT`. Object key order inside `payload`
+   * does not matter. The key is scoped to the session and kept for its life;
+   * it needs a server contract of 0.9.5 or later.
+   */
   async sendExternalEvent(
     sessionId: string,
     eventType: string,
     payload: unknown,
-    options?: { blocks?: ContentBlock[] },
+    options?: { blocks?: ContentBlock[]; idempotencyKey?: string },
   ): Promise<Record<string, unknown>> {
     const params: RpcSessionExternalEventParams = {
       session_id: sessionId,
@@ -1537,6 +1580,10 @@ export class MeerkatClient {
     };
     if (options?.blocks !== undefined) {
       params.blocks = options.blocks.map(toWireContentBlock);
+    }
+    if (options?.idempotencyKey !== undefined) {
+      this.requireCallerIdempotencyKeySupport();
+      params.idempotency_key = options.idempotencyKey;
     }
     return this.request("session/external_event", params);
   }
@@ -2383,12 +2430,18 @@ export class MeerkatClient {
     content: string | ContentBlock[],
     options?: MemberSendOptions,
   ): Promise<MemberDeliveryReceipt> {
+    if (options?.idempotencyKey !== undefined) {
+      this.requireCallerIdempotencyKeySupport();
+    }
     const result = await this.request("mob/member_send", {
       mob_id: mobId,
       agent_identity: agentIdentity,
       content: toWireContentInput(content),
       handling_mode: options?.handlingMode,
       render_metadata: options?.renderMetadata,
+      ...(options?.idempotencyKey !== undefined
+        ? { idempotency_key: options.idempotencyKey }
+        : {}),
     });
     const memberRef =
       typeof result.member_ref === "string" && result.member_ref.length > 0
@@ -2410,7 +2463,7 @@ export class MeerkatClient {
         "Invalid mob/member_send response: mob_id mismatch",
       );
     }
-    return {
+    const receipt: MemberDeliveryReceipt = {
       mobId: resolvedMobId,
       agentIdentity: MeerkatClient.parseRequiredString(
         result.agent_identity,
@@ -2421,6 +2474,62 @@ export class MeerkatClient {
         result.handling_mode,
         "Invalid mob/member_send response: missing or unknown handling_mode",
       ),
+    };
+    if (result.continuation !== undefined && result.continuation !== null) {
+      receipt.continuation = MeerkatClient.parseMemberSendContinuation(result.continuation);
+    } else if (options?.idempotencyKey !== undefined) {
+      throw new MeerkatError(
+        "INVALID_RESPONSE",
+        "Invalid mob/member_send response: a keyed send answers its continuation",
+      );
+    }
+    return receipt;
+  }
+
+  private static parseMemberSendContinuation(raw: unknown): MemberSendContinuation {
+    const context = "Invalid mob/member_send response: invalid continuation";
+    if (typeof raw !== "object" || raw === null) {
+      throw new MeerkatError("INVALID_RESPONSE", context);
+    }
+    const record = raw as Record<string, unknown>;
+    const status = record.status as Record<string, unknown> | undefined;
+    if (
+      typeof record.delivery_id !== "string"
+      || record.delivery_id.length === 0
+      || typeof record.committed_at_ms !== "number"
+      || !Number.isInteger(record.committed_at_ms)
+      || typeof status !== "object"
+      || status === null
+    ) {
+      throw new MeerkatError("INVALID_RESPONSE", context);
+    }
+    let parsed: MemberSendContinuationStatus;
+    switch (status.state) {
+      case "pending":
+        parsed = { state: "pending" };
+        break;
+      case "stranded":
+        parsed = { state: "stranded" };
+        break;
+      case "admitted":
+        if (typeof status.session_id !== "string" || typeof status.input_id !== "string") {
+          throw new MeerkatError("INVALID_RESPONSE", context);
+        }
+        parsed = { state: "admitted", sessionId: status.session_id, inputId: status.input_id };
+        break;
+      case "refused":
+        if (typeof status.reason !== "string") {
+          throw new MeerkatError("INVALID_RESPONSE", context);
+        }
+        parsed = { state: "refused", reason: status.reason };
+        break;
+      default:
+        throw new MeerkatError("INVALID_RESPONSE", context);
+    }
+    return {
+      deliveryId: record.delivery_id,
+      committedAtMs: record.committed_at_ms,
+      status: parsed,
     };
   }
 

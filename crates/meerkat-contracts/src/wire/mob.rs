@@ -1646,6 +1646,18 @@ pub struct MobMemberSendParams {
     pub handling_mode: WireHandlingMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub render_metadata: Option<WireRenderMetadata>,
+    /// Optional caller idempotency key, deduplicated for the member identity
+    /// (it survives a respawn). A keyed send is committed as a member
+    /// continuation and answered with a receipt and a delivery status
+    /// (`continuation`), not a turn: the member's delivery owner admits it
+    /// with system origin, it is ordered only among keyed sends, it refuses
+    /// `render_metadata`, and a governed runtime refuses it. A replay keeps
+    /// `delivery_id` and `committed_at_ms`; its status may advance. Other
+    /// content under a used key is refused as `input_idempotency_conflict`.
+    /// Canonical text: non-empty, no surrounding whitespace, no control
+    /// characters, at most 256 bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 /// Response payload for host-side mob member delivery.
@@ -1669,6 +1681,50 @@ pub struct MobMemberSendResult {
     /// retired from app-facing responses per dogma #10.
     pub member_ref: WireMemberRef,
     pub handling_mode: WireHandlingMode,
+    /// The receipt and current delivery status of a keyed send; absent for an
+    /// unkeyed send.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<WireContinuationReceipt>,
+}
+
+/// The receipt of a keyed member send: the durable continuation it was
+/// committed as, and that continuation's delivery status when answered.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct WireContinuationReceipt {
+    /// The committed delivery; identical on every replay of the key.
+    pub delivery_id: String,
+    /// When the key was first committed, in Unix milliseconds; identical on
+    /// every replay of the key.
+    pub committed_at_ms: u64,
+    /// The delivery status read for this answer; it may advance between
+    /// replays.
+    pub status: WireContinuationStatus,
+}
+
+/// Delivery status of a keyed member send. `stranded` is final and means the
+/// content was never admitted: resend it under a new key. A `pending` that
+/// survives a gateway restart is not proof of loss; do not resend it under a
+/// new key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum WireContinuationStatus {
+    // Committed and not admitted yet.
+    Pending,
+    // Admitted as an input of `session_id`: queued in that session's ledger,
+    // not proof that a turn ran. Follow it with `session/input_status`.
+    Admitted {
+        session_id: String,
+        input_id: String,
+    },
+    // Committed and never admitted: the member incarnation it was bound to
+    // was replaced.
+    Stranded,
+    // Settled as refused, never admitted.
+    Refused {
+        reason: String,
+    },
 }
 
 /// Request payload for `mob/ingress_interaction`.

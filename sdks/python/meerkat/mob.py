@@ -86,6 +86,25 @@ RenderMetadata = TypedDict(
     {"class": RenderClass, "salience": NotRequired[RenderSalience]},
 )
 
+MemberSendContinuationStatus = TypedDict(
+    "MemberSendContinuationStatus",
+    {
+        "state": Literal["pending", "admitted", "stranded", "refused"],
+        "session_id": NotRequired[str],
+        "input_id": NotRequired[str],
+        "reason": NotRequired[str],
+    },
+)
+
+MemberSendContinuation = TypedDict(
+    "MemberSendContinuation",
+    {
+        "delivery_id": str,
+        "committed_at_ms": int,
+        "status": MemberSendContinuationStatus,
+    },
+)
+
 MemberDeliveryReceipt = TypedDict(
     "MemberDeliveryReceipt",
     {
@@ -93,6 +112,7 @@ MemberDeliveryReceipt = TypedDict(
         "agent_identity": str,
         "member_ref": MobMemberRef,
         "handling_mode": Literal["queue", "steer"],
+        "continuation": NotRequired[MemberSendContinuation],
     },
 )
 
@@ -319,13 +339,20 @@ class Member:
         *,
         handling_mode: Literal["queue", "steer"] = "queue",
         render_metadata: RenderMetadata | None = None,
+        idempotency_key: str | None = None,
     ) -> MemberDeliveryReceipt:
+        """Send content to this member.
+
+        With ``idempotency_key`` the send is deduplicated for the member
+        identity, see :meth:`MeerkatClient.send_mob_member_content`.
+        """
         return await self._mob._client.send_mob_member_content(
             self._mob.id,
             self.agent_identity,
             content,
             handling_mode=handling_mode,
             render_metadata=render_metadata,
+            idempotency_key=idempotency_key,
         )
 
     async def events(self) -> EventSubscription:

@@ -70,6 +70,37 @@ export interface MobRenderMetadata extends Record<string, unknown> {
 export interface MemberSendOptions {
   handlingMode?: MobHandlingMode;
   renderMetadata?: MobRenderMetadata;
+  /**
+   * Optional caller idempotency key, deduplicated for the member identity
+   * (it survives a respawn). A keyed send is committed as a member
+   * continuation and answered with `continuation`: a receipt and a delivery
+   * status, not a turn. It is admitted with system origin, ordered only among
+   * keyed sends, refuses `renderMetadata`, is refused on a governed runtime,
+   * and needs a server contract of 0.9.5 or later.
+   */
+  idempotencyKey?: string;
+}
+
+/**
+ * Delivery status of a keyed member send. `admitted` means queued in that
+ * session (follow it with `session/input_status`), not that a turn ran.
+ * `stranded` is final: resend under a new key. A `pending` that survives a
+ * server restart is not proof of loss; do not resend it under a new key.
+ */
+export type MemberSendContinuationStatus =
+  | { state: "pending" }
+  | { state: "admitted"; sessionId: string; inputId: string }
+  | { state: "stranded" }
+  | { state: "refused"; reason: string };
+
+/**
+ * Receipt of a keyed member send. `deliveryId` and `committedAtMs` repeat on
+ * every replay of the key; `status` may advance.
+ */
+export interface MemberSendContinuation {
+  deliveryId: string;
+  committedAtMs: number;
+  status: MemberSendContinuationStatus;
 }
 
 export interface MemberDeliveryReceipt {
@@ -77,6 +108,7 @@ export interface MemberDeliveryReceipt {
   agentIdentity: string;
   memberRef: MobMemberRef;
   handlingMode: MobHandlingMode;
+  continuation?: MemberSendContinuation;
 }
 
 export interface MemberRespawnReceipt {

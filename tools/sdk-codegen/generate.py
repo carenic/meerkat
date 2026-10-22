@@ -165,6 +165,9 @@ MOB_RPC_CONTRACT_TYPES = [
     "MobEventsParams",
     "MobEventsResult",
     "MobMemberSendParams",
+    # The keyed member-send receipt, listed before the result that carries
+    # it; its status union is an alias (MOB_RPC_CONTRACT_ALIAS_TYPES).
+    "WireContinuationReceipt",
     "MobMemberSendResult",
     "MobIngressInteractionParams",
     "MobIngressInteractionResult",
@@ -581,6 +584,10 @@ MOB_RPC_CONTRACT_ALIAS_TYPES = [
     # named alias so the handwritten SDK status parsers can type it.
     "WireMemberPreviewUnavailable",
     "WireMemberRegistrationHookCall",
+    # The keyed member-send delivery status: a tagged union, so SDK clients
+    # branch on `state`. An alias, not a contract type: the object emitter
+    # would turn the union into an empty `{}` interface.
+    "WireContinuationStatus",
     "WireMobRunStatus",
     # Closed usage-attribution vocabulary on the run-result accounting block.
     # An alias, not a contract type: the object emitter would turn a
@@ -758,6 +765,9 @@ MOB_RPC_PROMOTED_SCHEMA_DEFS = frozenset(
         # unreachable peer rows to opaque object maps.
         "WirePeerConnectivitySnapshot",
         "WireUnreachablePeer",
+        # The keyed member-send receipt is a schema-local `$defs` entry of
+        # `MobMemberSendResult`; promoted so `continuation` stays typed.
+        "WireContinuationReceipt",
         *BRIDGE_NESTED_CONTRACT_TYPES,
         *BRIDGE_NESTED_ALIAS_TYPES,
         *BRIDGE_REJECTION_NESTED_ALIAS_TYPES,
@@ -7299,6 +7309,8 @@ def generate_web_mob_types(schemas: dict, output_dir: Path) -> None:
     append_interface("MobRespawnResult")
     append_interface("MobEventsResult")
     append_alias("WireHandlingMode")
+    append_alias("WireContinuationStatus")
+    append_interface("WireContinuationReceipt")
     append_interface("MobMemberSendResult")
     append_alias("WireWorkExecutionLifecyclePhase")
     append_interface("WireWorkGraphFlowWorkRef")

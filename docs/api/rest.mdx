@@ -793,6 +793,19 @@ idle session. Correlated terminal peer responses use
   and rejected here.
 </ParamField>
 
+<ParamField body="idempotency_key" type="string">
+  Optional caller key that makes a retry safe. A retry under the same key
+  admits nothing new and answers `202` `{"queued": true}` again. The same key
+  with other event content answers `409` with `{"error", "code":
+  "INPUT_IDEMPOTENCY_CONFLICT", "existing_id"}`; the first admission stands.
+  The key is scoped to the session, shared with the RPC
+  `session/external_event` method, and kept for the session's life. Object key
+  order inside `payload` does not matter. Canonical text: non-empty, no
+  surrounding whitespace, no control characters, at most 256 bytes (`400`
+  otherwise). A server older than 0.9.5 ignores the field, so check the
+  server version before relying on it.
+</ParamField>
+
 <ParamField body="event_type" type="string" required>
   Event classification, for example `"monitor.alert"`.
 </ParamField>

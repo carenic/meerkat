@@ -913,6 +913,34 @@ pub async fn handle_public_tools_call(
             let input: MobMemberSendParams = parse_args(arguments)?;
             let mob_id = parse_mob_id(&input.mob_id)?;
             let content = content_input_from_wire(input.content)?;
+            if let Some(key) = input.idempotency_key.as_deref() {
+                if input.render_metadata.is_some() {
+                    return Err(McpToolError::invalid_params(
+                        "render_metadata does not combine with idempotency_key",
+                    ));
+                }
+                let identity = meerkat_mob::AgentIdentity::from(input.agent_identity.as_str());
+                let continuation = state
+                    .mob_member_send_keyed(
+                        &mob_id,
+                        identity.clone(),
+                        content,
+                        input.handling_mode.into(),
+                        key,
+                    )
+                    .await
+                    .map_err(|err| McpToolError::from_mob(&err))?;
+                return Ok(json!({
+                    "mob_id": mob_id,
+                    "agent_identity": identity,
+                    "member_ref": meerkat_contracts::WireMemberRef::encode(
+                        mob_id.as_str(),
+                        identity.as_ref(),
+                    ),
+                    "handling_mode": input.handling_mode,
+                    "continuation": continuation,
+                }));
+            }
             let receipt = state
                 .mob_member_send(
                     &mob_id,

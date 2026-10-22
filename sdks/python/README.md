@@ -123,8 +123,8 @@ Both use integer unix timestamps for `created_at` and `updated_at`.
 
 - `await client.inject_context(session_id, text, source=..., idempotency_key=...)`
 - `await session.inject_context(...)`
-- `await client.send_external_event(session_id, event_type, payload, blocks=None)`
-- `await session.send_external_event(event_type, payload, blocks=None)`
+- `await client.send_external_event(session_id, event_type, payload, blocks=None, idempotency_key=None)`
+- `await session.send_external_event(event_type, payload, blocks=None, idempotency_key=None)`
 
 ### Turns and streaming
 

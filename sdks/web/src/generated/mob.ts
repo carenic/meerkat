@@ -117,8 +117,36 @@ export interface MobEventsResult {
 
 export type WireHandlingMode = "queue" | "steer";
 
+export interface WireContinuationStatusPending {
+  state: "pending";
+}
+
+export interface WireContinuationStatusAdmitted {
+  input_id: string;
+  session_id: string;
+  state: "admitted";
+}
+
+export interface WireContinuationStatusStranded {
+  state: "stranded";
+}
+
+export interface WireContinuationStatusRefused {
+  reason: string;
+  state: "refused";
+}
+
+export type WireContinuationStatus = WireContinuationStatusPending | WireContinuationStatusAdmitted | WireContinuationStatusStranded | WireContinuationStatusRefused;
+
+export interface WireContinuationReceipt {
+  committed_at_ms: number;
+  delivery_id: string;
+  status: WireContinuationStatus;
+}
+
 export interface MobMemberSendResult {
   agent_identity: string;
+  continuation?: WireContinuationReceipt | null;
   handling_mode: WireHandlingMode;
   member_ref: WireMemberRef;
   mob_id: string;

@@ -2087,7 +2087,10 @@ pub(crate) fn runtime_driver_error_to_rpc(err: RuntimeDriverError) -> RpcError {
         RuntimeDriverError::InputIdempotencyConflict { existing_id } => RpcError {
             code: error::INVALID_PARAMS,
             message: format!("input idempotency conflicts with existing input {existing_id}"),
-            data: Some(serde_json::json!({ "existing_id": existing_id.to_string() })),
+            data: Some(serde_json::json!({
+                "code": "INPUT_IDEMPOTENCY_CONFLICT",
+                "existing_id": existing_id.to_string(),
+            })),
         },
         // The runtime's lifecycle state admits no such request now.
         RuntimeDriverError::NotReady { state } => RpcError {
@@ -8676,6 +8679,25 @@ impl SessionRuntime {
         payload: serde_json::Value,
         blocks: Option<Vec<meerkat_contracts::WireContentBlock>>,
     ) -> Result<meerkat_runtime::AcceptOutcome, RpcError> {
+        self.accept_external_event_via_runtime_with_key(
+            session_id, event_type, payload, blocks, None,
+        )
+        .await
+    }
+
+    /// [`Self::accept_external_event_via_runtime`] under an optional caller
+    /// idempotency key (built by [`meerkat_runtime::IdempotencyKey::caller`]).
+    /// The session's input index keeps the key with the admission: a retry
+    /// with the same event deduplicates onto it, and other content under the
+    /// key is refused as an idempotency conflict.
+    pub(crate) async fn accept_external_event_via_runtime_with_key(
+        self: &Arc<Self>,
+        session_id: &SessionId,
+        event_type: String,
+        payload: serde_json::Value,
+        blocks: Option<Vec<meerkat_contracts::WireContentBlock>>,
+        idempotency_key: Option<meerkat_runtime::IdempotencyKey>,
+    ) -> Result<meerkat_runtime::AcceptOutcome, RpcError> {
         self.accept_external_event_via_runtime_with_context(
             session_id,
             event_type,
@@ -8683,7 +8705,7 @@ impl SessionRuntime {
             blocks,
             ExternalEventRuntimeContext {
                 handling_mode: meerkat_core::types::HandlingMode::Queue,
-                idempotency_key: None,
+                idempotency_key,
                 correlation_id: None,
             },
         )
@@ -24570,8 +24592,11 @@ mod tests {
         assert_eq!(conflict.code, error::INVALID_PARAMS, "{conflict:?}");
         assert_eq!(
             conflict.data,
-            Some(serde_json::json!({ "existing_id": existing_id.to_string() })),
-            "the conflicting input is named in the data"
+            Some(serde_json::json!({
+                "code": "INPUT_IDEMPOTENCY_CONFLICT",
+                "existing_id": existing_id.to_string(),
+            })),
+            "the conflicting input is named in the data, under its typed code"
         );
 
         let missing = runtime_driver_error_to_rpc(RuntimeDriverError::NotFound {
@@ -24661,8 +24686,11 @@ mod tests {
         assert_eq!(conflict.code, error::INVALID_PARAMS, "{conflict:?}");
         assert_eq!(
             conflict.data,
-            Some(serde_json::json!({ "existing_id": existing_id.to_string() })),
-            "the conflicting input is named in the data"
+            Some(serde_json::json!({
+                "code": "INPUT_IDEMPOTENCY_CONFLICT",
+                "existing_id": existing_id.to_string(),
+            })),
+            "the conflicting input is named in the data, under its typed code"
         );
 
         #[cfg(feature = "local-authorization")]

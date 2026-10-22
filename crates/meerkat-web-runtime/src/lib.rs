@@ -2670,7 +2670,11 @@ pub async fn mob_append_system_context(
     ))
 }
 
+/// Member-send options of the browser runtime. Unknown fields are refused,
+/// never dropped: in particular a caller idempotency key, which this runtime
+/// cannot keep (it binds no continuation service).
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MobMemberSendOptions {
     content: meerkat_core::types::ContentInput,
     #[serde(default)]

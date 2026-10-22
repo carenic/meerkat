@@ -28,6 +28,10 @@ export { DeferredSession, Session } from "./session.js";
 export type { DeferredTurnOptions } from "./session.js";
 export { Mob } from "./mob.js";
 export type {
+  MemberDeliveryReceipt,
+  MemberSendContinuation,
+  MemberSendContinuationStatus,
+  MemberSendOptions,
   MobBoundedHelperResult,
   MobBoundedHelperResultStatus,
   MobForkHelperOptions,

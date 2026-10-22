@@ -83,6 +83,14 @@ them.
   and so does the `PartialOrd` order of `OccurrenceLifecycleEffectVariant::*`
   and `OccurrenceLifecycleInputVariant::*`; match them by variant name, not
   by numeric cast or position.
+- `meerkat-contracts`: `SessionExternalEventParams` and `MobMemberSendParams`
+  gain the field `idempotency_key: Option<String>`, and `MobMemberSendResult`
+  gains `continuation: Option<WireContinuationReceipt>` (see Added). Code that
+  builds them with struct literals sets the new fields; `None` keeps the
+  earlier behaviour. The accept-input params that no method took are removed:
+  `wire::runtime::SessionAcceptInputParams`, `WireRunPrimitive`,
+  `WireStagedRunInput`, `WireConversationAppend` and
+  `WireConversationAppendRole`.
 
 ### Added
 
@@ -117,6 +125,37 @@ them.
   is seen as gone, never admitted again. The trait default refuses.
   `MeerkatMachine::accept_existing_input_with_completion_for_attachment_and_member_residency`
   is the same for a mob member's attachment.
+- An optional caller idempotency key on `session/external_event`, on
+  `POST /sessions/{id}/external-events` and on `mob/member_send` (and the
+  `meerkat_mob_member_send` MCP tool), so a retried submit never admits twice.
+  - External events: the key is kept in the session's input index with the
+    admission, under the `caller:` namespace that RPC and REST share. A retry
+    answers `deduplicated` naming the first admission; the same key with
+    other content is refused as `INPUT_IDEMPOTENCY_CONFLICT` (RPC `-32602`
+    with `data.code`, REST `409`). The key survives restarts and the input's
+    completion, and is scoped to one session.
+  - Member sends: the key is kept for the member identity in the
+    continuation key ledger, so it survives a respawn. A keyed send is
+    committed as a member continuation and answered with `continuation`
+    (`WireContinuationReceipt`: `delivery_id`, `committed_at_ms` and a
+    `WireContinuationStatus` of `pending`, `admitted` with its session and
+    input, `stranded` or `refused`). It is admitted with system origin, is
+    ordered only among keyed sends, refuses `render_metadata`, and is refused
+    on a governed runtime or a host without a continuation service. Other
+    content under a used key is refused as `input_idempotency_conflict`.
+  - `meerkat-runtime`: `IdempotencyKey::caller`, `validate_canonical_key_text`,
+    `CanonicalKeyTextError`, `CALLER_IDEMPOTENCY_KEY_MAX_BYTES` (256) and
+    `CALLER_IDEMPOTENCY_KEY_NAMESPACE`; `MobDeliveryIdentity::validate` now
+    calls the same rule. `meerkat-mob`: `MobError::MemberSendIdempotency` and
+    `MemberSendIdempotencyRefusal`. `meerkat-mob-mcp`:
+    `MobMcpState::mob_member_send_keyed`, `MEMBER_SEND_CONTINUATION_NAMESPACE`
+    and `MEMBER_SEND_CONTINUATION_KEY_PREFIX`. `meerkat`:
+    `surface::wire_input_state`, the one projection of a stored input state.
+  - Python SDK: `idempotency_key` on `send_external_event`,
+    `send_mob_member_content` and `Member.send`; TypeScript SDK:
+    `idempotencyKey` on `sendExternalEvent` and `MemberSendOptions`. Both
+    refuse a key against a server older than contract 0.9.5, which would drop
+    it.
 
 ### Changed
 
@@ -126,6 +165,11 @@ them.
   (inherited_instructions on a session fork call) to reactivate_inherited".
   It said only that `reactivate_inherited` carries them into the child. The
   cause, the keys and the error code are unchanged.
+- RPC: an input idempotency conflict carries `data.code`
+  `INPUT_IDEMPOTENCY_CONFLICT` beside `data.existing_id`. REST: the
+  external-events route answers it with `409` and the same code; it was a
+  `500`. The browser runtime refuses unknown member-send option fields, so a
+  key it cannot keep is refused, never dropped.
 
 ### Fixed
 

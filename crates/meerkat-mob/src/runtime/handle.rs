@@ -2737,6 +2737,11 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         | MobError::ForkedParticipantAttachmentReleaseUnproven { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
         }
+        // A keyed member send is a delivery verb, never a spawn-many
+        // provisioning step. Classify as Internal to keep the match total.
+        MobError::MemberSendIdempotency { .. } => {
+            mob_dsl::MobSpawnManyFailureObservationKind::Internal
+        }
     }
 }
 
