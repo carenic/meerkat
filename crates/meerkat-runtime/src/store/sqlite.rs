@@ -25881,9 +25881,11 @@ ORDER BY runtime_id";
 
         /// The 0.9.3 sessions carrying every tool-config and MCP notice shape,
         /// as meerkat-core 0.9.3 serialized them: meerkat-core's cross-version
-        /// fixture, written by its checked-in generator at tag v0.9.3.
+        /// fixture, written by its checked-in generator at tag v0.9.3. This
+        /// crate's copy is a link to it, which `cargo package` ships as the
+        /// file, so the published package's tests read it too.
         const V0_9_3_NOTICE_SESSIONS_FIXTURE: &str =
-            "../../crates/meerkat-core/tests/fixtures/v0_9_3_tool_config_notice_sessions.json";
+            "tests/fixtures/v0_9_3_tool_config_notice_sessions.json";
 
         /// A standalone WholeBlob body as 0.9.3 wrote it, carrying tool-config
         /// (boundary-applied, deferred-catalog, failed-closed, external-tool)
