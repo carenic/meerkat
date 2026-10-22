@@ -61719,39 +61719,38 @@ mod routed_effect_containment_tests {
             super::super::composition::MobSeamEffect::routed(body)
                 .expect("a generated routed effect")
         };
-        let superseded = |effect| MobActor::routed_effect_superseded_by_destroy(effect);
-        assert!(superseded(&routed(
-            mob_dsl::MobMachineEffect::RequestRuntimeBinding {
-                session_id: session.clone(),
-                agent_identity: identity.clone(),
-                agent_runtime_id: runtime_id.clone(),
-                fence_token: mob_dsl::FenceToken(1),
-                generation: None,
-            }
-        )));
-        assert!(superseded(&routed(
-            mob_dsl::MobMachineEffect::RequestRuntimeIngress {
-                session_id: session.clone(),
-                agent_runtime_id: runtime_id.clone(),
-                fence_token: mob_dsl::FenceToken(1),
-                generation: None,
-                work_id: mob_dsl::WorkId::from("work-1"),
-                origin: mob_dsl::WorkOrigin::External,
-                content_attribution: mob_dsl::WorkContentAttribution::Conversational,
-            }
-        )));
+        let binding = routed(mob_dsl::MobMachineEffect::RequestRuntimeBinding {
+            session_id: session.clone(),
+            agent_identity: identity.clone(),
+            agent_runtime_id: runtime_id.clone(),
+            fence_token: mob_dsl::FenceToken(1),
+            generation: None,
+        });
+        let ingress = routed(mob_dsl::MobMachineEffect::RequestRuntimeIngress {
+            session_id: session.clone(),
+            agent_runtime_id: runtime_id.clone(),
+            fence_token: mob_dsl::FenceToken(1),
+            generation: None,
+            work_id: mob_dsl::WorkId::from("work-1"),
+            origin: mob_dsl::WorkOrigin::External,
+            content_attribution: mob_dsl::WorkContentAttribution::Conversational,
+        });
+        let retire = routed(mob_dsl::MobMachineEffect::RequestRuntimeRetire {
+            agent_identity: identity,
+            agent_runtime_id: runtime_id,
+            session_id: session.clone(),
+        });
+        let destroy = routed(mob_dsl::MobMachineEffect::RequestRuntimeDestroy {
+            session_id: session,
+        });
+        assert!(MobActor::routed_effect_superseded_by_destroy(&binding));
+        assert!(MobActor::routed_effect_superseded_by_destroy(&ingress));
         assert!(
-            !superseded(&routed(mob_dsl::MobMachineEffect::RequestRuntimeRetire {
-                agent_identity: identity,
-                agent_runtime_id: runtime_id,
-                session_id: session.clone(),
-            })),
+            !MobActor::routed_effect_superseded_by_destroy(&retire),
             "the destroy dispatches its members' retire routes"
         );
         assert!(
-            !superseded(&routed(mob_dsl::MobMachineEffect::RequestRuntimeDestroy {
-                session_id: session,
-            })),
+            !MobActor::routed_effect_superseded_by_destroy(&destroy),
             "a destroy route is the destroy's own"
         );
     }
