@@ -4094,6 +4094,723 @@ async fn a_mob_start_refuses_a_durable_tail_another_runtime_owner_hosts() {
     let _ = handle_3.shutdown().await;
 }
 
+/// What a process death leaves on an active member's session: the member's
+/// last turn landed its durable rows, its runtime boundary commit did not (a
+/// power cut between the two), and the process died with the member active.
+/// Power is back afterwards, and the realm's sessions are hosted with
+/// OS-locked claims.
+#[cfg(feature = "test-support")]
+struct ActiveMemberTail {
+    runtime_store: Arc<dyn meerkat_runtime::RuntimeStore>,
+    session_id: meerkat_core::types::SessionId,
+    /// The committed head token the runtime authority retained.
+    committed_token: String,
+    /// The physical head's token, ahead of the committed one.
+    ahead_token: String,
+}
+
+#[cfg(feature = "test-support")]
+async fn committed_head_token(
+    runtime_store: &dyn meerkat_runtime::RuntimeStore,
+    session_id: &meerkat_core::types::SessionId,
+) -> String {
+    runtime_store
+        .load_session_boundary_authority(&meerkat_runtime::LogicalRuntimeId::for_session(
+            session_id,
+        ))
+        .await
+        .expect("load runtime session authority")
+        .expect("runtime session authority present")
+        .head_canonical()
+        .expect("head-canonical boundary authority")
+        .committed_head_token()
+        .to_string()
+}
+
+#[cfg(feature = "test-support")]
+async fn physical_head_token(
+    store: &SqliteSessionStore,
+    session_id: &meerkat_core::types::SessionId,
+) -> String {
+    let head = store
+        .load_head(session_id)
+        .await
+        .expect("load the physical head")
+        .expect("the physical head still exists");
+    meerkat_core::session_store::session_head_cas_token(&head)
+        .expect("the physical head has a canonical token")
+}
+
+#[cfg(feature = "test-support")]
+impl ActiveMemberTail {
+    async fn committed_token_now(&self) -> String {
+        committed_head_token(self.runtime_store.as_ref(), &self.session_id).await
+    }
+
+    async fn physical_token_now(&self, store: &SqliteSessionStore) -> String {
+        physical_head_token(store, &self.session_id).await
+    }
+
+    async fn provisional_tail_recorded_now(&self) -> bool {
+        self.runtime_store
+            .load_head_canonical_provisional_tail(&meerkat_runtime::LogicalRuntimeId::for_session(
+                &self.session_id,
+            ))
+            .await
+            .expect("load the provisional tail")
+            .is_some()
+    }
+
+    /// Another runtime owner on the realm (another process, here a second
+    /// owner in this one) takes the member session's hosting claim; that
+    /// owner may still commit the tail itself.
+    fn another_owner_hosts_the_session(&self) -> meerkat_runtime::HostingClaim {
+        let capability =
+            meerkat_runtime::RuntimeStore::hosting_capability(self.runtime_store.as_ref());
+        assert!(
+            capability.is_cross_process(),
+            "the realm store must offer cross-process hosting claims: {capability:?}"
+        );
+        meerkat_runtime::SessionHostingAuthority::new(
+            capability,
+            meerkat_runtime::HostingOwner::mint(),
+        )
+        .grant(&self.session_id)
+        .expect("another runtime owner takes the member session's hosting claim")
+    }
+}
+
+/// Leave an [`ActiveMemberTail`] on member `w-1` of a mob led by `lead-1`.
+#[cfg(feature = "test-support")]
+async fn crash_with_an_active_member_tail(temp: &Path, paths: &Paths) -> ActiveMemberTail {
+    let power_store = Arc::new(PowerCutRuntimeStore::with_hosting_root(
+        &paths.realm_db_path,
+        temp,
+    ));
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = power_store.clone();
+
+    let (service_1, store_1) = persistent_head_canonical_service(paths, runtime_store.clone());
+    let storage_1 = MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage");
+    let handle_1 = MobBuilder::new(mob_definition(MobRuntimeMode::TurnDriven), storage_1)
+        .with_session_service(service_1.clone())
+        .with_default_llm_client(openai_test_client())
+        .create()
+        .await
+        .expect("create persistent mob");
+    handle_1
+        .spawn_spec(SpawnMemberSpec::new("lead", AgentIdentity::from("lead-1")))
+        .await
+        .expect("spawn lead");
+    handle_1
+        .spawn_spec(SpawnMemberSpec::new("worker", AgentIdentity::from("w-1")))
+        .await
+        .expect("spawn worker");
+    let identity = AgentIdentity::from("w-1");
+    let w1_sid = handle_1
+        .resolve_bridge_session_id(&identity)
+        .await
+        .expect("w1 session id");
+    let lead_sid = handle_1
+        .resolve_bridge_session_id(&AgentIdentity::from("lead-1"))
+        .await
+        .expect("lead session id");
+    let mut runtime_release_witnesses = Vec::new();
+    for session_id in [&lead_sid, &w1_sid] {
+        let runtime = service_1
+            .comms_runtime(session_id)
+            .await
+            .unwrap_or_else(|| panic!("comms runtime missing for {session_id}"));
+        runtime_release_witnesses.push(Arc::downgrade(&runtime));
+    }
+
+    send_and_wait(
+        &handle_1,
+        service_1.as_ref(),
+        "w-1",
+        "PRE_CUT_TAIL_TURN token-alpha",
+        "active-tail-lifetime1",
+    )
+    .await;
+    wait_for_head_canonical_authority_convergence(
+        store_1.as_ref(),
+        runtime_store.as_ref(),
+        &w1_sid,
+        "PRE_CUT_TAIL_TURN",
+        "active-tail-pre-cut-boundary",
+    )
+    .await;
+
+    // The next turn's durable row lands; its runtime boundary commit does not.
+    power_store.set_cut(true);
+    let send_result = tokio::time::timeout(Duration::from_secs(30), async {
+        handle_1
+            .member(&identity)
+            .await
+            .expect("member handle")
+            .send(
+                "POST_CUT_TAIL_TURN token-omega".to_string(),
+                HandlingMode::Queue,
+            )
+            .await
+    })
+    .await;
+    eprintln!("[active-tail] send during cut => {send_result:?}");
+    wait_for_row_contains(
+        store_1.as_ref(),
+        &w1_sid,
+        "POST_CUT_TAIL_TURN",
+        "active-tail-row",
+    )
+    .await;
+    power_store
+        .wait_for_prepared_boundary_commit_rejection()
+        .await;
+    let committed_token = committed_head_token(runtime_store.as_ref(), &w1_sid).await;
+    let ahead_token = physical_head_token(&store_1, &w1_sid).await;
+    assert_ne!(
+        ahead_token, committed_token,
+        "the physical head must be ahead of the retained runtime authority"
+    );
+
+    // The process dies with the member active and its tail in place.
+    handle_1
+        .crash_stop_preserving_durable_work_for_test()
+        .await
+        .expect("crash-stop lifetime-1 actor");
+    service_1
+        .try_shutdown()
+        .await
+        .expect("shutdown first session service");
+    drop(handle_1);
+    drop(service_1);
+    drop(store_1);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while runtime_release_witnesses
+            .iter()
+            .any(|runtime| runtime.upgrade().is_some())
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("every old session runtime is released before lifetime 2");
+
+    power_store.set_cut(false);
+    power_store.forward_hosting_capability();
+    ActiveMemberTail {
+        runtime_store,
+        session_id: w1_sid,
+        committed_token,
+        ahead_token,
+    }
+}
+
+/// #1813, the resume side: a mob start never settles a durable tail on an
+/// active member's session while another runtime owner hosts it. The start
+/// refuses, typed, before the mob runs: never a start that settles the tail
+/// and then stops the mob when it binds the member. Once the other owner lets
+/// go, the next start settles the tail under its own claim and runs.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mob_resume_never_settles_an_active_members_tail_another_owner_hosts() {
+    // nextest runs each test in its own process: show refusals logged at ERROR.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::ERROR)
+        .with_writer(std::io::stderr)
+        .try_init();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let tail = crash_with_an_active_member_tail(temp.path(), &paths).await;
+    let other_owner_claim = tail.another_owner_hosts_the_session();
+
+    let (service_2, store_2) =
+        persistent_head_canonical_service(&paths, tail.runtime_store.clone());
+    let refused = MobBuilder::for_resume(
+        MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage"),
+    )
+    .with_session_service(service_2.clone())
+    .with_default_llm_client(openai_test_client())
+    .notify_orchestrator_on_resume(false)
+    .resume()
+    .await;
+    let refused_error = refused.as_ref().err().map(ToString::to_string);
+    let refused_status = match &refused {
+        Ok(handle) => Some(handle.status().await),
+        Err(_) => None,
+    };
+    eprintln!(
+        "[active-tail] start while hosted elsewhere => error {refused_error:?}, status \
+         {refused_status:?}"
+    );
+
+    // Never another owner's tail: the runtime authority and the physical head
+    // are exactly as the cut left them.
+    assert_eq!(
+        tail.committed_token_now().await,
+        tail.committed_token,
+        "a mob start must not settle a durable tail on an active member's session another \
+         runtime owner hosts"
+    );
+    assert_eq!(
+        tail.physical_token_now(&store_2).await,
+        tail.ahead_token,
+        "the refused start must leave the durable tail where the cut left it"
+    );
+    match refused {
+        Err(meerkat_mob::MobError::SessionError(
+            meerkat_core::service::SessionError::ServedElsewhere { id },
+        )) => assert_eq!(
+            id, tail.session_id,
+            "the refusal names the member's session"
+        ),
+        Err(error) => panic!("the start must refuse, typed, as served elsewhere: {error}"),
+        Ok(handle) => {
+            let status = handle.status().await;
+            let _ = handle.shutdown().await;
+            panic!(
+                "a start that cannot host an active member's session must refuse rather than \
+                 run: {status:?}"
+            );
+        }
+    }
+
+    // The other owner lets go; the next start settles the tail under its own
+    // claim and runs with the member.
+    drop(other_owner_claim);
+    let handle = MobBuilder::for_resume(
+        MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage again"),
+    )
+    .with_session_service(service_2.clone())
+    .with_default_llm_client(openai_test_client())
+    .notify_orchestrator_on_resume(false)
+    .resume()
+    .await
+    .unwrap_or_else(|error| {
+        panic!("the mob must start once no other runtime owner hosts the member: {error}")
+    });
+    let status = handle.status().await;
+    assert!(
+        matches!(status, Ok(meerkat_mob::MobState::Running)),
+        "the restarted mob must admit commands: {status:?}"
+    );
+    assert_member_active(
+        &member_entry(&handle, "w-1").await,
+        "after the other owner let go",
+    );
+    assert_member_active(
+        &member_entry(&handle, "lead-1").await,
+        "the lead after the refused start",
+    );
+    wait_for_head_canonical_authority_convergence(
+        store_2.as_ref(),
+        tail.runtime_store.as_ref(),
+        &tail.session_id,
+        "POST_CUT_TAIL_TURN",
+        "hosted-active-tail-adopted-boundary",
+    )
+    .await;
+    send_and_wait(
+        &handle,
+        service_2.as_ref(),
+        "w-1",
+        "AFTER_START token-beta",
+        "hosted-active-tail-after-start",
+    )
+    .await;
+    let _ = handle.shutdown().await;
+}
+
+/// #1813, the spawn side: a resume spawn (here the explicit revival of a
+/// retired member's session) of a session another runtime owner hosts
+/// refuses, typed, naming the session, and the mob runs on. Once the other
+/// owner lets go, the same spawn revives the member. A respawn rebuilds its
+/// member through the same resume provision once it has retired the
+/// member's incarnation.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resume_spawn_of_a_session_another_owner_hosts_refuses_typed() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let power_store = Arc::new(PowerCutRuntimeStore::with_hosting_root(
+        &paths.realm_db_path,
+        temp.path(),
+    ));
+    power_store.forward_hosting_capability();
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = power_store.clone();
+    let (service, store) = persistent_head_canonical_service(&paths, runtime_store.clone());
+
+    let mut definition = mob_definition(MobRuntimeMode::TurnDriven);
+    definition.orchestrator = None;
+    definition.wiring = WiringRules {
+        auto_wire_orchestrator: false,
+        role_wiring: vec![],
+    };
+    let handle = MobBuilder::new(
+        definition,
+        MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage"),
+    )
+    .with_session_service(service.clone())
+    .with_default_llm_client(openai_test_client())
+    .create()
+    .await
+    .expect("create persistent mob");
+    let worker = AgentIdentity::from("w-1");
+    handle
+        .spawn_spec(SpawnMemberSpec::new("worker", worker.clone()))
+        .await
+        .expect("spawn worker");
+    let session_id = handle
+        .resolve_bridge_session_id(&worker)
+        .await
+        .expect("worker session id");
+    send_and_wait(
+        &handle,
+        service.as_ref(),
+        "w-1",
+        "BEFORE_RETIRE token-alpha",
+        "hosted-revival-before-retire",
+    )
+    .await;
+    handle.retire(worker.clone()).await.expect("retire worker");
+
+    // Another runtime owner on the realm takes the retired session's hosting
+    // claim once the retired incarnation has let it go.
+    let capability = meerkat_runtime::RuntimeStore::hosting_capability(runtime_store.as_ref());
+    assert!(
+        capability.is_cross_process(),
+        "the realm store must offer cross-process hosting claims: {capability:?}"
+    );
+    let other_owner = meerkat_runtime::SessionHostingAuthority::new(
+        capability,
+        meerkat_runtime::HostingOwner::mint(),
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while other_owner.serving(&session_id)
+            == meerkat_runtime::SessionServing::HeldByAnotherLocalOwner
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the retired incarnation releases its hosting claim");
+    let other_owner_claim = other_owner
+        .grant(&session_id)
+        .expect("another runtime owner takes the retired session's hosting claim");
+    let committed_before = committed_head_token(runtime_store.as_ref(), &session_id).await;
+    let physical_before = physical_head_token(&store, &session_id).await;
+
+    let refused = tokio::time::timeout(
+        Duration::from_secs(60),
+        handle.spawn_spec(
+            SpawnMemberSpec::new("worker", worker.clone())
+                .with_resume_bridge_session_id(session_id.clone()),
+        ),
+    )
+    .await
+    .expect("the resume spawn settles");
+    eprintln!(
+        "[hosted-revival] resume spawn while hosted elsewhere => {:?}",
+        refused.as_ref().err().map(ToString::to_string)
+    );
+    match refused {
+        Err(meerkat_mob::MobError::SessionError(
+            meerkat_core::service::SessionError::ServedElsewhere { id },
+        )) => assert_eq!(id, session_id, "the refusal names the session"),
+        Err(error) => panic!("the resume spawn must refuse, typed, as served elsewhere: {error}"),
+        Ok(_) => panic!("a resume spawn of a session another runtime owner hosts must refuse"),
+    }
+    assert_eq!(
+        committed_head_token(runtime_store.as_ref(), &session_id).await,
+        committed_before,
+        "the refused spawn must not write the session's runtime authority"
+    );
+    assert_eq!(
+        physical_head_token(&store, &session_id).await,
+        physical_before,
+        "the refused spawn must not write the session's head"
+    );
+    let status = handle.status().await;
+    assert!(
+        matches!(status, Ok(meerkat_mob::MobState::Running)),
+        "a refused spawn leaves the mob running: {status:?}"
+    );
+
+    // The other owner lets go; the same spawn revives the member.
+    drop(other_owner_claim);
+    handle
+        .spawn_spec(
+            SpawnMemberSpec::new("worker", worker.clone())
+                .with_resume_bridge_session_id(session_id.clone()),
+        )
+        .await
+        .expect("revive the worker once no other runtime owner hosts its session");
+    assert_member_active(&member_entry(&handle, "w-1").await, "after the revival");
+    send_and_wait(
+        &handle,
+        service.as_ref(),
+        "w-1",
+        "AFTER_REVIVAL token-beta",
+        "hosted-revival-after",
+    )
+    .await;
+    let _ = handle.shutdown().await;
+}
+
+/// A spawn customizer that refuses one member's restore while `refusing`
+/// holds: the start then leaves that member restore-failed.
+#[cfg(feature = "test-support")]
+struct RefuseOneRestore {
+    member: AgentIdentity,
+    refusing: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "test-support")]
+impl meerkat_mob::runtime::SpawnMemberCustomizer for RefuseOneRestore {
+    fn customize_spawn(
+        &self,
+        ctx: &meerkat_mob::runtime::SpawnCustomizationContext,
+        spec: &mut SpawnMemberSpec,
+    ) -> Result<(), meerkat_mob::MobError> {
+        if ctx.spawn_source == meerkat_mob::runtime::SpawnSource::Resume
+            && spec.identity == self.member
+            && self.refusing.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(meerkat_mob::MobError::Internal(
+                "the test customizer refuses this restore".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Resume the mob over an [`ActiveMemberTail`] with `w-1`'s restore refused
+/// by a spawn customizer: the start's member reconcile never reaches `w-1`'s
+/// session, so its durable tail is still in place when the actor starts.
+#[cfg(feature = "test-support")]
+async fn resume_with_the_tailed_member_restore_refused(
+    paths: &Paths,
+    tail: &ActiveMemberTail,
+) -> (
+    Result<MobHandle, meerkat_mob::MobError>,
+    Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    Arc<SqliteSessionStore>,
+    Arc<RefuseOneRestore>,
+) {
+    let (service, store) = persistent_head_canonical_service(paths, tail.runtime_store.clone());
+    let customizer = Arc::new(RefuseOneRestore {
+        member: AgentIdentity::from("w-1"),
+        refusing: std::sync::atomic::AtomicBool::new(true),
+    });
+    let started = MobBuilder::for_resume(
+        MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage"),
+    )
+    .with_session_service(service.clone())
+    .with_default_llm_client(openai_test_client())
+    .with_spawn_member_customizer(customizer.clone())
+    .notify_orchestrator_on_resume(false)
+    .resume()
+    .await;
+    (started, service, store, customizer)
+}
+
+/// A member whose restore failed at a start (here its spawn customizer
+/// refused it) keeps the durable tail its last turn left, and the start
+/// reads that member's session to restore its operation binding. That read
+/// must not stop the whole mob: the start settles the tail under this
+/// runtime owner's hosting claim and runs. Once the customizer admits the
+/// member, a respawn rebuilds it on the settled session.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mob_start_settles_the_durable_tail_of_a_member_whose_restore_failed() {
+    // nextest runs each test in its own process: show refusals logged at ERROR.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::ERROR)
+        .with_writer(std::io::stderr)
+        .try_init();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let tail = crash_with_an_active_member_tail(temp.path(), &paths).await;
+    let (started, service, store, customizer) =
+        resume_with_the_tailed_member_restore_refused(&paths, &tail).await;
+    let handle = started.expect("the mob starts without the refused member");
+    let status = handle.status().await;
+    assert!(
+        matches!(status, Ok(meerkat_mob::MobState::Running)),
+        "a member whose restore failed must not stop the mob: {status:?}"
+    );
+    wait_for_head_canonical_authority_convergence(
+        store.as_ref(),
+        tail.runtime_store.as_ref(),
+        &tail.session_id,
+        "POST_CUT_TAIL_TURN",
+        "restore-failed-tail-settled-at-start",
+    )
+    .await;
+
+    customizer
+        .refusing
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let respawned = tokio::time::timeout(
+        Duration::from_secs(60),
+        handle.respawn(AgentIdentity::from("w-1"), None),
+    )
+    .await
+    .expect("the respawn settles");
+    eprintln!(
+        "[restore-failed-tail] respawn => {:?}",
+        respawned.as_ref().err().map(ToString::to_string)
+    );
+    respawned.expect("a respawn rebuilds the member on its settled session");
+    assert_member_active(&member_entry(&handle, "w-1").await, "after the respawn");
+    send_and_wait(
+        &handle,
+        service.as_ref(),
+        "w-1",
+        "AFTER_RESPAWN token-beta",
+        "restore-failed-tail-after-respawn",
+    )
+    .await;
+    let _ = handle.shutdown().await;
+}
+
+/// #1813: the same start while another runtime owner on the realm hosts that
+/// member's session does not settle the other owner's tail. The start
+/// refuses, logging the member, its session and the remedy at ERROR, and the
+/// tail stays where it was.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mob_start_refuses_a_restore_failed_members_tail_another_owner_hosts() {
+    // nextest runs each test in its own process: show refusals logged at ERROR.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::ERROR)
+        .with_writer(std::io::stderr)
+        .try_init();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let tail = crash_with_an_active_member_tail(temp.path(), &paths).await;
+    let _other_owner_claim = tail.another_owner_hosts_the_session();
+    let (started, _service, store, _customizer) =
+        resume_with_the_tailed_member_restore_refused(&paths, &tail).await;
+    let status = match &started {
+        Ok(handle) => Some(handle.status().await),
+        Err(_) => None,
+    };
+    eprintln!(
+        "[hosted-restore-failed-tail] start => error {:?}, status {status:?}",
+        started.as_ref().err().map(ToString::to_string)
+    );
+    assert_eq!(
+        tail.committed_token_now().await,
+        tail.committed_token,
+        "a mob start must not settle a durable tail on a session another runtime owner hosts"
+    );
+    assert_eq!(
+        tail.physical_token_now(&store).await,
+        tail.ahead_token,
+        "the refused start must leave the durable tail where the cut left it"
+    );
+    assert!(
+        tail.provisional_tail_recorded_now().await,
+        "the refused start must leave the provisional tail recorded"
+    );
+    assert!(
+        !matches!(status, Some(Ok(meerkat_mob::MobState::Running))),
+        "a start that cannot settle a member's tail another runtime owner hosts must not run: \
+         {status:?}"
+    );
+    if let Ok(handle) = started {
+        let _ = handle.shutdown().await;
+    }
+}
+
+/// A resume spawn onto a session this mob does not own (here another mob's
+/// member session) whose durable tail runs past its committed runtime
+/// boundary refuses, typed, as the transcript revision conflict it is, and
+/// leaves the tail alone: a mob does not complete the boundary of a session
+/// it is about to refuse to adopt.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resume_spawn_onto_a_foreign_session_tail_refuses_typed() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let tail = crash_with_an_active_member_tail(temp.path(), &paths).await;
+    let (service, store) = persistent_head_canonical_service(&paths, tail.runtime_store.clone());
+    let adopting_mob_db_path = temp.path().join("adopting-mob.db");
+    let handle = MobBuilder::new(
+        mob_definition(MobRuntimeMode::TurnDriven),
+        MobStorage::persistent(&adopting_mob_db_path).expect("second mob storage"),
+    )
+    .with_session_service(service.clone())
+    .with_default_llm_client(openai_test_client())
+    .create()
+    .await
+    .expect("create a second mob on the realm");
+    handle
+        .spawn_spec(SpawnMemberSpec::new("lead", AgentIdentity::from("lead-2")))
+        .await
+        .expect("spawn the second mob's lead");
+    let adopter = AgentIdentity::from("w-adopt");
+    let spawned = tokio::time::timeout(
+        Duration::from_secs(60),
+        handle.spawn_spec(
+            SpawnMemberSpec::new("worker", adopter.clone())
+                .with_resume_bridge_session_id(tail.session_id.clone()),
+        ),
+    )
+    .await
+    .expect("the resume spawn settles");
+    eprintln!(
+        "[foreign-tail-spawn] spawn => {:?}",
+        spawned.as_ref().err().map(ToString::to_string)
+    );
+    assert_eq!(
+        tail.committed_token_now().await,
+        tail.committed_token,
+        "a refused adoption must not settle the session's durable tail"
+    );
+    assert_eq!(
+        tail.physical_token_now(&store).await,
+        tail.ahead_token,
+        "a refused adoption must leave the durable tail where the cut left it"
+    );
+    assert!(
+        tail.provisional_tail_recorded_now().await,
+        "a refused adoption must leave the provisional tail recorded"
+    );
+    match &spawned {
+        Err(meerkat_mob::MobError::SessionError(meerkat_core::service::SessionError::Store(
+            error,
+        ))) if error
+            .downcast_ref::<meerkat_core::SessionStoreError>()
+            .is_some_and(|error| {
+                matches!(
+                    error,
+                    meerkat_core::SessionStoreError::TranscriptRevisionConflict { id, .. }
+                        if *id == tail.session_id
+                )
+            }) => {}
+        other => panic!(
+            "the resume spawn must refuse, typed, as the session's transcript revision \
+             conflict: {:?}",
+            other.as_ref().err().map(ToString::to_string)
+        ),
+    }
+    let status = handle.status().await;
+    assert!(
+        matches!(status, Ok(meerkat_mob::MobState::Running)),
+        "a refused spawn leaves the mob running: {status:?}"
+    );
+    assert!(
+        handle
+            .get_member(&adopter)
+            .await
+            .expect("read the roster")
+            .is_none(),
+        "the refused spawn rosters no member"
+    );
+    let _ = handle.shutdown().await;
+}
+
 /// A member whose session has a durable tail ahead of its runtime boundary
 /// authority respawns. The power cut leaves the canonical head carrying a
 /// turn whose runtime boundary commit never became durable (the same window a
@@ -4102,6 +4819,14 @@ async fn a_mob_start_refuses_a_durable_tail_another_runtime_owner_hosts() {
 /// its committed record before it retires anything; that read must not need
 /// the transcript at the boundary the head has moved past, or the respawn is
 /// refused and the member keeps its stale incarnation.
+///
+/// The member's actor has ended with its failed boundary, and a read of its
+/// session refuses as a transcript revision conflict while the tail stands.
+/// The retirement's runtime quiesce reloads the degraded registration, which
+/// commits the tail, before the retirement's route and archive reads; so the
+/// respawn succeeds and the retired session keeps the tail turn exactly once.
+/// Were those reads ordered before the reload, they would refuse, and so would
+/// the respawn.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_member_whose_session_has_a_durable_tail_respawns() {
@@ -4213,6 +4938,38 @@ async fn a_member_whose_session_has_a_durable_tail_respawns() {
 
     // Power is back; the member respawns with the tail in place.
     power_store.set_cut(false);
+    // The member's actor has ended with its failed boundary, and a read of its
+    // session refuses while the tail stands: only the retirement's reload can
+    // settle it.
+    let sessions: &dyn MobSessionService = service.as_ref();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while sessions
+            .has_live_session(&w1_sid)
+            .await
+            .expect("read whether the member's session is live")
+        {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the member's actor ends with its failed boundary");
+    match sessions.load_persisted_session(&w1_sid).await {
+        Err(meerkat_core::service::SessionError::Store(error))
+            if error
+                .downcast_ref::<meerkat_core::SessionStoreError>()
+                .is_some_and(|error| {
+                    matches!(
+                        error,
+                        meerkat_core::SessionStoreError::TranscriptRevisionConflict { id, .. }
+                            if *id == w1_sid
+                    )
+                }) => {}
+        other => panic!(
+            "a read of the session must refuse as its transcript revision conflict while \
+             the tail stands: {:?}",
+            other.map(|session| session.is_some())
+        ),
+    }
     let respawned = tokio::time::timeout(
         Duration::from_secs(60),
         handle.respawn(identity.clone(), None),
@@ -4233,6 +4990,20 @@ async fn a_member_whose_session_has_a_durable_tail_respawns() {
         incarnation_after, incarnation_before,
         "the respawn installs a new incarnation"
     );
+    let retired = service
+        .load_revivable_retired_session(&w1_sid)
+        .await
+        .expect("read the member's retired session")
+        .expect("the respawn archives the member's previous session");
+    let history = to_string(retired.messages()).expect("serialize the retired transcript");
+    for token in ["PRE_CUT_TAIL_TURN", "POST_CUT_TAIL_TURN"] {
+        assert_eq!(
+            history.matches(token).count(),
+            1,
+            "the retirement's reload commits the tail, so the retired session keeps \
+             '{token}' exactly once: {history}"
+        );
+    }
     let _ = handle.shutdown().await;
 }
 

@@ -1881,6 +1881,13 @@ pub trait MobSessionService:
     /// retain the exact observations available from each authority owner.
     /// Downstream heal/resume consumers must use this owner-issued verdict
     /// rather than probing session and runtime stores independently.
+    ///
+    /// The persistent service's verdict is claim-scoped (#1813): its
+    /// preparation (`PersistentSessionService::prepare_committed_boundary_resume`)
+    /// takes this runtime owner's hosting claim for the session before it
+    /// converges the durable tail, and refuses with
+    /// [`SessionError::ServedElsewhere`] or [`SessionError::HostingUnavailable`]
+    /// before any recovery. A wrapper that forwards this method inherits that.
     async fn materialize_session_resume_verdict(
         &self,
         session_id: &SessionId,
@@ -1900,18 +1907,20 @@ pub trait MobSessionService:
     /// owner never settles another owner's in-flight tail (#1813). The claim
     /// ends with the preparation: the caller's next read takes none.
     ///
-    /// The default takes NO hosting claim. It runs the durable-tail
-    /// convergence of [`Self::materialize_session_resume_verdict`] and drops
-    /// the verdict, as a service without hosting claims always did. A
-    /// wrapper around a persistent service must forward this method, or it
-    /// keeps that claimless settle.
+    /// The default runs the durable-tail convergence of
+    /// [`Self::materialize_session_resume_verdict`] and drops the verdict. A
+    /// persistent service's convergence takes the hosting claim as well
+    /// (`PersistentSessionService::prepare_committed_boundary_resume`), but
+    /// materializes the whole resume and answers [`SessionError::Busy`] for
+    /// a session a live actor of the service hosts, so a wrapper around a
+    /// persistent service should forward this method.
     async fn settle_durable_tail_before_cold_start(
         &self,
         session_id: &SessionId,
     ) -> Result<(), SessionError> {
         tracing::debug!(
             %session_id,
-            "settling a durable tail without a hosting claim (service default)"
+            "settling a durable tail through the resume verdict (service default)"
         );
         self.materialize_session_resume_verdict(session_id)
             .await
