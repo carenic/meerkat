@@ -1147,6 +1147,10 @@ fn validate_mob_delivery_binding(binding: &MobTargetBinding) -> Result<(), Sched
 fn helper_options_from_spec(
     spec: &HelperOptionsSpec,
 ) -> Result<HelperOptions, ScheduleDomainError> {
+    // A schedule stored before create-time validation refused the combination
+    // is refused here, before any delivery is admitted or helper spawned.
+    spec.validate_bounded_runtime_mode()
+        .map_err(ScheduleDomainError::InvalidSchedule)?;
     let mut options = HelperOptions::default();
     options.role_name = spec.role_name.clone().map(Into::into);
     if spec.resolved_spawn_snapshot.is_some() {
