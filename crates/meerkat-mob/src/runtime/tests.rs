@@ -92119,6 +92119,9 @@ async fn test_running_steer_without_override_resolves_applied_identity_as_none()
 /// #1102 actor-loop isolation, per-member admission lanes, bounded
 /// deliveries, and the member registration reload primitive.
 mod actor_isolation;
+/// A graceful Shutdown releases the identity leases of the members it
+/// unregistered.
+mod shutdown_lease_release;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 use crate as fixture_mob;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
