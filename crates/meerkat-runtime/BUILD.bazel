@@ -336,11 +336,9 @@ rust_test(
     size = "large",
     data = [
         "//:test_fixtures",
-        "//crates/meerkat-core:package_runfiles",
         "//crates/meerkat-machine-kernels:package_runfiles",
         "//crates/meerkat-machine-schema:package_runfiles",
         "//crates/meerkat-mob:package_runfiles",
-        "//crates/meerkat:package_runfiles",
         "//tests/fixtures/machine-dsl-tests:package_runfiles",
         "//tests/fixtures/mcp-test-server:package_runfiles",
         "//tests/fixtures/surface-build-fixtures:package_runfiles",

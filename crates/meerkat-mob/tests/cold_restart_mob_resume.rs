@@ -2069,6 +2069,7 @@ impl PowerCutRuntimeStore {
     /// with OS-locked claims under `hosting_root`, laid out as a realm lays
     /// them out. The store reports that capability once
     /// [`Self::forward_hosting_capability`] is called.
+    #[cfg(feature = "test-support")]
     fn with_hosting_root(path: &Path, hosting_root: &Path) -> Self {
         let hosting_lock_dir = hosting_root.join("hosting");
         let cold_delivery_lock = hosting_root.join("delivery").join("cold-delivery.lock");
@@ -2105,6 +2106,7 @@ impl PowerCutRuntimeStore {
 
     /// Report the inner store's hosting capability from now on (see
     /// [`Self::with_hosting_root`]).
+    #[cfg(feature = "test-support")]
     fn forward_hosting_capability(&self) {
         self.forward_hosting
             .store(true, std::sync::atomic::Ordering::SeqCst);

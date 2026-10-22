@@ -2,9 +2,10 @@
 //! guarded snapshot read per store tick, closed for maintenance, for a file
 //! replaced at its path, and for a schema or ledger change. Unix only: the
 //! store keeps the reader on unix, and the replacement tests rename open
-//! files.
+//! files. The reader is the SQLite store's, and the tests count its opens
+//! through the store's test hooks: `sqlite-store` and `test-support`.
 
-#![cfg(unix)]
+#![cfg(all(unix, feature = "sqlite-store", feature = "test-support"))]
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use std::path::{Path, PathBuf};
