@@ -4080,6 +4080,13 @@ pub enum BoundedTurnFailure {
         session_id: SessionId,
         input_id: meerkat_core::lifecycle::InputId,
     },
+    /// An input a graceful Shutdown kept queued was older than its requeue
+    /// bound when the next start recovered it, so it ended without running.
+    /// Resubmitting it is now correct.
+    RequeueExpired {
+        session_id: SessionId,
+        input_id: meerkat_core::lifecycle::InputId,
+    },
 }
 
 impl std::fmt::Display for BoundedTurnFailure {
@@ -4185,6 +4192,13 @@ impl std::fmt::Display for BoundedTurnFailure {
             } => write!(
                 f,
                 "input '{input_id}' for session '{session_id}' stays queued across the stop and runs on the next start; re-attach with the same delivery key, do not resubmit"
+            ),
+            Self::RequeueExpired {
+                session_id,
+                input_id,
+            } => write!(
+                f,
+                "input '{input_id}' for session '{session_id}' was requeued across a stop but expired before it ran; resubmit it"
             ),
         }
     }
