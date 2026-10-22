@@ -2660,6 +2660,114 @@ async fn a_destroy_behind_a_commit_the_store_never_answers_is_incomplete_until_i
     );
 }
 
+/// A destroy retried while the store still has not answered a member's
+/// boundary commit past its deadline cannot reload the degraded member: the
+/// runtime refuses the reload, repair-blocked, until the commit reports its
+/// durable outcome. The incomplete report keeps that refusal typed beside its
+/// text, in the incomplete data every surface returns, so a caller can tell a
+/// destroy to retry later from one that failed. Once the commit reports, the
+/// same destroy completes and reports no refusal.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_destroy_whose_member_reload_the_runtime_refuses_reports_the_refusal_typed() {
+    let held = fork_child_whose_boundary_commit_hangs("refused-reload-child").await;
+    let mob_id = held.fixture.source_mob_id();
+    let first = tokio::time::timeout(
+        DEGRADED_DESTROY_BOUND,
+        held.fixture.state.mob_destroy(&mob_id),
+    )
+    .await
+    .expect("the destroy answers while the store has not");
+    assert!(
+        matches!(
+            first,
+            Err(meerkat_mob_mcp::MobMcpDestroyError::Incomplete { .. })
+        ),
+        "a destroy behind the hung commit is incomplete: {first:?}"
+    );
+
+    let run_id = held
+        .store
+        .held_run()
+        .expect("the held boundary commit carries its run's receipt");
+    let refused = tokio::time::timeout(
+        DEGRADED_DESTROY_BOUND,
+        held.fixture.state.mob_destroy(&mob_id),
+    )
+    .await
+    .expect("the retried destroy answers while the store has not");
+    let report = match refused {
+        Err(meerkat_mob_mcp::MobMcpDestroyError::Incomplete { report }) => report,
+        other => panic!("a reload the runtime refuses makes the destroy incomplete: {other:?}"),
+    };
+    let member = format!("{}: ", held.child.as_str());
+    assert!(
+        matches!(report.errors.as_slice(), [error] if error.starts_with(&member)),
+        "the refused reload keeps its text entry: {report:?}"
+    );
+    assert!(
+        report.reloaded_members.is_empty(),
+        "no member was reloaded: {report:?}"
+    );
+    let data = meerkat_mob_mcp::MobMcpDestroyError::incomplete_error_data(&report);
+    assert_eq!(data["retryable"], serde_json::json!(true), "{data}");
+    assert_eq!(
+        data["destroy_report"]["member_reload_refusals"],
+        serde_json::json!([{
+            "member": held.child.as_str(),
+            "refusal": {
+                "kind": "repair_blocked",
+                "reason": format!(
+                    "runtime commit of run {run_id} has not reported its durable outcome; retry the reload after it does"
+                ),
+            },
+        }]),
+        "the incomplete data keeps the runtime's refusal typed: {data}"
+    );
+    assert!(
+        held.fixture.state.handle_for(&mob_id).await.is_ok(),
+        "the mob stays for a retry"
+    );
+
+    held.store.release();
+    let report = tokio::time::timeout(
+        DEGRADED_DESTROY_BOUND,
+        destroy_once_the_released_commit_reports(&held),
+    )
+    .await
+    .expect("the retried destroy finishes")
+    .expect("the retried destroy reloads the member and completes");
+    assert_eq!(report.reloaded_members, vec![held.child.clone()]);
+    assert!(
+        serde_json::to_value(&report)
+            .expect("the report serializes")
+            .get("member_reload_refusals")
+            .is_none(),
+        "a completed destroy reports no refusal: {report:?}"
+    );
+}
+
+/// A destroy report without a refused reload serializes exactly as it did
+/// before refusals were typed: no `member_reload_refusals` key.
+#[test]
+fn a_destroy_report_without_a_refused_reload_serializes_unchanged() {
+    let mut report = meerkat_mob::MobDestroyReport::default();
+    report.errors.push("worker-1: archive failed".to_string());
+    report
+        .reloaded_members
+        .push(AgentIdentity::from("worker-2"));
+    assert_eq!(
+        serde_json::to_string(&report).expect("the report serializes"),
+        r#"{"remote_cleanup_deadline_exceeded":false,"metadata_scrubbed":false,"events_cleared":false,"namespace_cleaned":false,"errors":["worker-1: archive failed"],"reloaded_members":["worker-2"]}"#
+    );
+    let data = meerkat_mob_mcp::MobMcpDestroyError::incomplete_error_data(&report);
+    assert!(
+        data["destroy_report"]
+            .get("member_reload_refusals")
+            .is_none(),
+        "{data}"
+    );
+}
+
 /// Closing a mob's admission if it is idle asks each member whether it has
 /// active inputs. Behind a member's boundary commit that the store never
 /// answers, that read answers busy once the member's session degrades at the
