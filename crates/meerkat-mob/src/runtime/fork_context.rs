@@ -108,8 +108,14 @@ impl ForkContextPlan {
     /// refusal a durable fork reports. A fork whose newest carried row alone
     /// does not fit the budget is refused with
     /// [`MobError::ForkContextTooLarge`].
+    ///
+    /// `source_session` is the session the rows were read from. Only the
+    /// activation rows that session wrote itself are its effective
+    /// instructions; rows it copied from its own source at a durable fork
+    /// are history. When it is not known, every activation row counts.
     pub(super) fn new(
         source_member_id: &AgentIdentity,
+        source_session: Option<&meerkat_core::types::SessionId>,
         rows: Vec<WireHistoryRow>,
         policy: ForkInstructionPolicy,
         max_bytes: usize,
@@ -135,7 +141,10 @@ impl ForkContextPlan {
                 continue;
             };
             fork_notice_rows.insert(index);
-            if let Some(previous) = index.checked_sub(1)
+            // Only a prompt-context fork has a planned row before its
+            // notice; the row before a durable fork's notice is ordinary.
+            if notice.fork == ForkNoticeKind::PromptContext
+                && let Some(previous) = index.checked_sub(1)
                 && matches!(
                     &rows[previous].0,
                     WireSessionMessage::User { transcript_role, .. }
@@ -170,7 +179,9 @@ impl ForkContextPlan {
                 if !instruction_keys_seen.contains(&key) {
                     instruction_keys_seen.push(key.clone());
                 }
-                heads.insert(key, index);
+                if source_session.is_none_or(|session| &identity.origin_session_id == session) {
+                    heads.insert(key, index);
+                }
             }
         }
         let effective_heads: BTreeSet<usize> = heads
@@ -682,6 +693,7 @@ mod tests {
     ) -> Result<ForkContextPlan, MobError> {
         ForkContextPlan::new(
             &AgentIdentity::from("source"),
+            None,
             rows,
             policy,
             MAX_FORK_CONTEXT_BYTES,
@@ -899,6 +911,7 @@ mod tests {
             .collect::<Vec<_>>();
         let plan = ForkContextPlan::new(
             &AgentIdentity::from("source"),
+            None,
             rows,
             ForkInstructionPolicy::RequireExplicitActivation,
             4_000,
@@ -917,6 +930,7 @@ mod tests {
     fn a_newest_row_larger_than_the_budget_is_refused_typed() {
         let refused = ForkContextPlan::new(
             &AgentIdentity::from("source"),
+            None,
             vec![user(&"x".repeat(10_000))],
             ForkInstructionPolicy::RequireExplicitActivation,
             4_000,

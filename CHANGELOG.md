@@ -51,7 +51,8 @@ them.
   before its first input (see the behaviour entry below). Code that matches
   the enum exhaustively adds an arm for it. A 0.9.4 reader decodes the
   block as `Unknown` with its `summary`, so it still shows the model the
-  notice text.
+  notice text, and so does this release for a block holding a fork kind
+  or reason a later release adds.
 - Not measured by the gate (a wire change): `meerkat-core`:
   `ForkInstructionRefusal` gains `skills: Vec<SkillKey>`, the skills a
   prompt-context fork's source loaded with the built-in `load_skill` tool

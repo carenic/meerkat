@@ -20,7 +20,12 @@ use crate::types::{InstructionKey, InstructionNamespace, SessionId, ToolName};
 /// Session metadata key of a fork child's undelivered [`ForkSeed`].
 pub const SESSION_FORK_SEED_KEY: &str = "session_fork_seed_v1";
 
-/// The most names one list of a fork notice holds; the rest are counted.
+/// The most names one tool list of a fork notice holds; the rest are
+/// counted. Tool lists follow the whole tool catalog, so they are bounded.
+/// Instruction keys and skills are named in full: a session holds each key
+/// and each loaded skill once however often it activates or loads it, so
+/// those lists are as long as the host's registered keys and the skills the
+/// source loaded.
 pub const FORK_NOTICE_MAX_NAMES: usize = 64;
 
 /// Which kind of fork a fork notice describes.

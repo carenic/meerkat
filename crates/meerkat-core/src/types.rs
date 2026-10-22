@@ -2857,11 +2857,18 @@ impl<'de> Deserialize<'de> for SystemNoticeBlock {
                 | "auth"
                 | "runtime_notice"
                 | "tool_process_interrupted"
-                | "fork_boundary"
                 | "unknown",
             ) => serde_json::from_value::<SystemNoticeBlockKnown>(value)
                 .map(Into::into)
                 .map_err(serde::de::Error::custom),
+            // A fork notice a later release writes may hold a value this
+            // release does not know (a new fork kind or tools-not-compared
+            // reason). It decodes as an unknown block with its summary, so
+            // the transcript that holds it still loads.
+            Some("fork_boundary") => Ok(serde_json::from_value::<SystemNoticeBlockKnown>(
+                value.clone(),
+            )
+            .map_or_else(|_| Self::unknown_from_value(value), Into::into)),
             Some(_) => Ok(Self::unknown_from_value(value)),
             None => Err(serde::de::Error::custom("missing system notice block type")),
         }

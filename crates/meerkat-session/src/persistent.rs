@@ -6803,10 +6803,11 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         // What the child holds of its source: its effective instruction keys
         // and, read without waiting on a running turn, its visible tools. The
         // child's first run turns them into its fork notice.
-        let child_session_id = forked.id().clone();
+        // Only the rows the source activated itself are effective there;
+        // rows it copied from its own source are history.
         let source_instructions =
             meerkat_core::fork_notice::effective_instruction_keys(forked.messages(), |origin| {
-                origin != &child_session_id
+                origin == &source_session_id
             })
             .into_iter()
             .collect::<Vec<_>>();

@@ -2469,12 +2469,30 @@ where
             return Ok(());
         };
         let child = self.session.id().clone();
-        let seed: crate::fork_notice::ForkSeed =
-            serde_json::from_value(value).map_err(|error| {
-                AgentError::InternalError(format!(
-                    "the fork seed of session {child} is unreadable: {error}"
-                ))
-            })?;
+        let seed: crate::fork_notice::ForkSeed = match serde_json::from_value(value) {
+            Ok(seed) => seed,
+            Err(error) => {
+                // A seed this release cannot read (for example one a later
+                // release wrote) must not stop the session: it is dropped,
+                // and the child is told once that its fork context is gone.
+                tracing::warn!(
+                    session_id = %child,
+                    %error,
+                    "dropping a fork seed this release cannot read"
+                );
+                self.session.push(Message::SystemNotice(
+                    crate::types::SystemNoticeMessage::new(
+                        crate::types::SystemNoticeKind::Generic,
+                        "Fork notice. You are a fork of another agent, but the fork \
+                         context recorded for you could not be read, so it was not \
+                         given to you.",
+                    ),
+                ));
+                self.session
+                    .remove_metadata(crate::fork_notice::SESSION_FORK_SEED_KEY);
+                return Ok(());
+            }
+        };
         if !crate::fork_notice::holds_fork_notice_for(self.session.messages(), &child) {
             let child_instructions =
                 crate::fork_notice::effective_instruction_keys(self.session.messages(), |origin| {

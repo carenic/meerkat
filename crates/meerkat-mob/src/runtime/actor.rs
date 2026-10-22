@@ -6078,10 +6078,24 @@ impl ForkSourceHistoryRead {
         let rows = self.read_rows(session_service).await?;
         super::fork_context::ForkContextPlan::new(
             &self.source_member_id,
+            self.source_session().as_ref(),
             rows,
             self.fork_instruction_policy,
             max_bytes,
         )
+    }
+
+    /// The session the source's history is read from: the local session,
+    /// or the placed member's session on its host.
+    fn source_session(&self) -> Option<SessionId> {
+        match &self.location {
+            ForkSourceHistoryLocation::Local { source_session_id } => {
+                Some(source_session_id.clone())
+            }
+            ForkSourceHistoryLocation::Remote {
+                expected_member, ..
+            } => SessionId::parse(&expected_member.member_session_id).ok(),
+        }
     }
 
     async fn read_rows(
@@ -32204,7 +32218,15 @@ impl MobActor {
             let selected_runtime_mode =
                 normalize_runtime_mode_for_binding(selected_runtime_mode, &selected_binding);
             let mut req = req;
-            if let Some(build) = req.build.as_mut() {
+            if prompt_context_source.is_some() || fork_seed.is_some() {
+                // A fork child's create request always carries a build; a
+                // seed with nowhere to go is an error, never a silent drop.
+                let build = req.build.as_mut().ok_or_else(|| {
+                    MobError::Internal(format!(
+                        "the create request of fork child '{agent_identity}' has no \
+                         build to record its fork seed on"
+                    ))
+                })?;
                 if let Some(source) = prompt_context_source {
                     build.prompt_context_fork_source = Some(source);
                 }
@@ -33807,21 +33829,22 @@ impl MobActor {
         let fork_context_text = if let Some((source_member_id, fork_context)) = fork_spec {
             // §19.L2 placement switch: local and remote SOURCE reads share
             // one proxy + one renderer (DEC-P6E-20).
-            let rows = match self
-                .fork_source_history_rows(&source_member_id, &fork_context)
+            let read = match self
+                .plan_fork_source_history_read(&source_member_id, fork_context.clone())
                 .await
             {
-                Ok(rows) => rows,
+                Ok(read) => read,
                 Err(error) => fail!(error),
             };
             // The host's fork instruction policy decides what the child is
             // given, on the controller, before any placed effect exists.
-            match super::fork_context::ForkContextPlan::new(
-                &source_member_id,
-                rows,
-                self.fork_instruction_policy,
-                super::fork_context::fork_context_budget(&profile.model),
-            ) {
+            match read
+                .read_plan(
+                    self.session_service.as_ref(),
+                    super::fork_context::fork_context_budget(&profile.model),
+                )
+                .await
+            {
                 Ok(plan) => Some(plan.render()),
                 Err(error) => fail!(error),
             }
@@ -40915,22 +40938,6 @@ impl MobActor {
             role: entry.role.clone(),
             peer,
         })
-    }
-
-    /// §19.L2 fork-context read: ONE placement switch, ONE row vocabulary.
-    /// Placed sources proxy `ReadMemberHistory` (`LastMessages` = a single
-    /// tail-addressed round trip); local sources read the session and
-    /// project through the SAME wire page projection. Runs under spawn
-    /// admission — no `ReadHistory` scope check on this internal path.
-    async fn fork_source_history_rows(
-        &self,
-        source_member_id: &AgentIdentity,
-        fork_context: &crate::launch::ForkContext,
-    ) -> Result<Vec<meerkat_contracts::wire::WireHistoryRow>, MobError> {
-        self.plan_fork_source_history_read(source_member_id, fork_context.clone())
-            .await?
-            .read_rows(self.session_service.as_ref())
-            .await
     }
 
     /// Resolve WHERE a fork source's history lives from actor-owned state
