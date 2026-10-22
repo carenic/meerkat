@@ -4025,6 +4025,245 @@ async fn a_mob_start_refuses_a_durable_tail_another_runtime_owner_hosts() {
     let _ = handle_3.shutdown().await;
 }
 
+/// #1813, the resume side: neither a mob start nor an active member's next
+/// materialization settles a durable tail on that member's session while
+/// another runtime owner hosts it. The member's last turn leaves a durable
+/// tail (a power cut between its rows and its runtime boundary) and the
+/// process dies. Before the next start another runtime owner on the realm
+/// (another process, here a second owner in this one) takes the member
+/// session's hosting claim; that owner may still commit the tail itself.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mob_resume_never_settles_an_active_members_tail_another_owner_hosts() {
+    // nextest runs each test in its own process: show refusals logged at ERROR.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::ERROR)
+        .with_writer(std::io::stderr)
+        .try_init();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let power_store = Arc::new(PowerCutRuntimeStore::with_hosting_root(
+        &paths.realm_db_path,
+        temp.path(),
+    ));
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = power_store.clone();
+
+    // ---------------- Lifetime 1 ----------------
+    let (service_1, store_1) = persistent_head_canonical_service(&paths, runtime_store.clone());
+    let storage_1 = MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage");
+    let handle_1 = MobBuilder::new(mob_definition(MobRuntimeMode::TurnDriven), storage_1)
+        .with_session_service(service_1.clone())
+        .with_default_llm_client(openai_test_client())
+        .create()
+        .await
+        .expect("create persistent mob");
+    handle_1
+        .spawn_spec(SpawnMemberSpec::new("lead", AgentIdentity::from("lead-1")))
+        .await
+        .expect("spawn lead");
+    handle_1
+        .spawn_spec(SpawnMemberSpec::new("worker", AgentIdentity::from("w-1")))
+        .await
+        .expect("spawn worker");
+    let identity = AgentIdentity::from("w-1");
+    let w1_sid = handle_1
+        .resolve_bridge_session_id(&identity)
+        .await
+        .expect("w1 session id");
+    let lead_sid = handle_1
+        .resolve_bridge_session_id(&AgentIdentity::from("lead-1"))
+        .await
+        .expect("lead session id");
+    let mut runtime_release_witnesses = Vec::new();
+    for session_id in [&lead_sid, &w1_sid] {
+        let runtime = service_1
+            .comms_runtime(session_id)
+            .await
+            .unwrap_or_else(|| panic!("comms runtime missing for {session_id}"));
+        runtime_release_witnesses.push(Arc::downgrade(&runtime));
+    }
+
+    send_and_wait(
+        &handle_1,
+        service_1.as_ref(),
+        "w-1",
+        "PRE_CUT_TAIL_TURN token-alpha",
+        "active-tail-lifetime1",
+    )
+    .await;
+    wait_for_head_canonical_authority_convergence(
+        store_1.as_ref(),
+        runtime_store.as_ref(),
+        &w1_sid,
+        "PRE_CUT_TAIL_TURN",
+        "active-tail-pre-cut-boundary",
+    )
+    .await;
+
+    // The next turn's durable row lands; its runtime boundary commit does not.
+    power_store.set_cut(true);
+    let send_result = tokio::time::timeout(Duration::from_secs(30), async {
+        handle_1
+            .member(&identity)
+            .await
+            .expect("member handle")
+            .send(
+                "POST_CUT_TAIL_TURN token-omega".to_string(),
+                HandlingMode::Queue,
+            )
+            .await
+    })
+    .await;
+    eprintln!("[active-tail] send during cut => {send_result:?}");
+    wait_for_row_contains(
+        store_1.as_ref(),
+        &w1_sid,
+        "POST_CUT_TAIL_TURN",
+        "active-tail-row",
+    )
+    .await;
+    power_store
+        .wait_for_prepared_boundary_commit_rejection()
+        .await;
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&w1_sid);
+    let committed_token = || async {
+        runtime_store
+            .load_session_boundary_authority(&runtime_id)
+            .await
+            .expect("load runtime session authority")
+            .expect("runtime session authority present")
+            .head_canonical()
+            .expect("head-canonical boundary authority")
+            .committed_head_token()
+            .to_string()
+    };
+    let tail_committed_token = committed_token().await;
+    let ahead_head = store_1
+        .load_head(&w1_sid)
+        .await
+        .expect("load ahead physical head")
+        .expect("ahead physical head exists");
+    let ahead_token = meerkat_core::session_store::session_head_cas_token(&ahead_head)
+        .expect("ahead physical head has a canonical token");
+    assert_ne!(
+        ahead_token, tail_committed_token,
+        "the physical head must be ahead of the retained runtime authority"
+    );
+
+    // The process dies with the member active and its tail in place.
+    handle_1
+        .crash_stop_preserving_durable_work_for_test()
+        .await
+        .expect("crash-stop lifetime-1 actor");
+    service_1
+        .try_shutdown()
+        .await
+        .expect("shutdown first session service");
+    drop(handle_1);
+    drop(service_1);
+    drop(store_1);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while runtime_release_witnesses
+            .iter()
+            .any(|runtime| runtime.upgrade().is_some())
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("every old session runtime is released before lifetime 2");
+
+    // ---------------- Lifetime 2 ----------------
+    // Power is back, and the realm's sessions are hosted with OS-locked
+    // claims. Another runtime owner on the realm hosts the active member's
+    // session before this start.
+    power_store.set_cut(false);
+    power_store.forward_hosting_capability();
+    let capability = meerkat_runtime::RuntimeStore::hosting_capability(runtime_store.as_ref());
+    assert!(
+        capability.is_cross_process(),
+        "the realm store must offer cross-process hosting claims: {capability:?}"
+    );
+    let other_owner = meerkat_runtime::SessionHostingAuthority::new(
+        capability,
+        meerkat_runtime::HostingOwner::mint(),
+    );
+    let _other_owner_claim = other_owner
+        .grant(&w1_sid)
+        .expect("another runtime owner takes the active member's hosting claim");
+
+    let (service_2, store_2) = persistent_head_canonical_service(&paths, runtime_store.clone());
+    let resumed = MobBuilder::for_resume(
+        MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage"),
+    )
+    .with_session_service(service_2.clone())
+    .with_default_llm_client(openai_test_client())
+    .notify_orchestrator_on_resume(false)
+    .resume()
+    .await;
+    let resumed_error = resumed.as_ref().err().map(ToString::to_string);
+    let resumed_status = match &resumed {
+        Ok(handle) => Some(handle.status().await),
+        Err(_) => None,
+    };
+    eprintln!(
+        "[active-tail] start while hosted elsewhere => error {resumed_error:?}, status \
+         {resumed_status:?}"
+    );
+    assert_eq!(
+        committed_token().await,
+        tail_committed_token,
+        "a mob start must not settle a durable tail on an active member's session another \
+         runtime owner hosts"
+    );
+
+    // The member's next materializations: a respawn rebuilds it from its
+    // session, and a send reaches it.
+    if let Ok(handle) = &resumed {
+        let respawned = tokio::time::timeout(
+            Duration::from_secs(60),
+            handle.respawn(identity.clone(), None),
+        )
+        .await;
+        eprintln!("[active-tail] respawn while hosted elsewhere => {respawned:?}");
+        let sent = tokio::time::timeout(Duration::from_secs(30), async {
+            match handle.member(&identity).await {
+                Ok(member) => Some(
+                    member
+                        .send("AFTER_START token-beta".to_string(), HandlingMode::Queue)
+                        .await,
+                ),
+                Err(error) => {
+                    eprintln!("[active-tail] member handle while hosted elsewhere => {error}");
+                    None
+                }
+            }
+        })
+        .await;
+        eprintln!("[active-tail] send while hosted elsewhere => {sent:?}");
+        assert_eq!(
+            committed_token().await,
+            tail_committed_token,
+            "a member materialization must not settle a durable tail on a session another \
+             runtime owner hosts"
+        );
+    }
+    let head_after = store_2
+        .load_head(&w1_sid)
+        .await
+        .expect("load the physical head after the hosted-elsewhere start")
+        .expect("the physical head still exists");
+    assert_eq!(
+        meerkat_core::session_store::session_head_cas_token(&head_after)
+            .expect("the physical head has a canonical token"),
+        ahead_token,
+        "the durable tail must stay where the cut left it while another owner hosts the session"
+    );
+    if let Ok(handle) = resumed {
+        let _ = handle.shutdown().await;
+    }
+}
+
 /// A member whose session has a durable tail ahead of its runtime boundary
 /// authority respawns. The power cut leaves the canonical head carrying a
 /// turn whose runtime boundary commit never became durable (the same window a
