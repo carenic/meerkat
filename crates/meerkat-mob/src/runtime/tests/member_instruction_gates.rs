@@ -1811,8 +1811,8 @@ async fn a_context_fork_of_an_activated_member_carries_no_instruction_body_by_de
     );
     assert!(
         block.contains("[fork_notice]:")
-            && block.contains("host.standing/member")
-            && block.contains("system prompt was not carried"),
+            && block.contains("Activated instructions not carried: host.standing/member")
+            && block.contains("system prompt and host system context were not carried"),
         "the notice names what was not carried: {block}"
     );
     fixture.finish().await;
@@ -1934,8 +1934,9 @@ async fn the_refuse_policy_refuses_a_context_fork_of_an_activated_member_before_
     fixture.finish().await;
 }
 
-/// `reactivate_inherited` carries the source's System rows, activation body
-/// included, and the notice says so.
+/// `reactivate_inherited` carries the source's activated instructions, body
+/// included, and the notice says so. The source's system prompt is never
+/// carried, under any policy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reactivate_inherited_keeps_instruction_bodies_in_a_context_fork() {
     let fixture = Fixture::restored_member_with_policy(
@@ -1962,14 +1963,17 @@ async fn reactivate_inherited_keeps_instruction_bodies_in_a_context_fork() {
     assert!(carries_body(&request), "the activation body is carried");
     let block = fork_block(&request).expect("the first request carries the fork context");
     assert!(
-        block.contains("[system]:"),
-        "the source's System rows are carried: {block}"
+        block.contains("[system]: [meerkat-instruction-activation-v1]"),
+        "the activation row is carried: {block}"
     );
     assert!(
-        block.contains("[fork_notice]:")
-            && block.contains("host.standing/member")
-            && block.contains("were carried"),
-        "the notice says what was carried: {block}"
+        !block.contains("[system]: You are"),
+        "the source's system prompt is not carried: {block}"
+    );
+    assert!(
+        block.contains("Activated instructions carried: host.standing/member")
+            && block.contains("system prompt and host system context were not carried"),
+        "the notice says what was and was not carried: {block}"
     );
     fixture.finish().await;
 }
@@ -2013,6 +2017,61 @@ async fn a_last_messages_context_fork_is_refused_only_when_its_tail_holds_an_act
         }
         other => panic!("a tail holding the activation row is refused, got {other:?}"),
     }
+    fixture.finish().await;
+}
+
+/// Host-injected context (here a per-turn injected row, the carrier of
+/// memory recall) is host-attached, not conversation: under the default
+/// policy a context fork does not carry it, and the notice counts it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_context_fork_does_not_carry_host_injected_context_by_default() {
+    let fixture = Fixture::restored_member().await;
+    fixture.activated_source_with_a_turn().await;
+    let delivery = crate::store::MobDeliveryIdentity::new(
+        "injected-context-probe",
+        "7d2c4f0e-5b1a-4c3e-9f2d-6a8b1c0e4d71",
+    )
+    .expect("canonical delivery identity");
+    let injected = fixture
+        .handle
+        .start_injected_context_work_for_identity_bounded(
+            fixture.identity.clone(),
+            WorkSpec::new("INJECTED-RECALL-MARKER", WorkOrigin::Internal),
+            delivery,
+            BoundedResultSpec::new("injected-result", 4_096).expect("result spec"),
+        )
+        .await
+        .expect("the injected work is admitted");
+    tokio::time::timeout(WAIT, injected.wait())
+        .await
+        .expect("the injected turn finishes")
+        .expect("the injected turn succeeds");
+
+    let before = fixture.client.requests().len();
+    fixture
+        .handle
+        .spawn_spec(
+            context_fork_spec(
+                "injected-child",
+                &fixture.identity,
+                crate::launch::ForkContext::FullHistory,
+            )
+            .with_initial_message("the forked task")
+            .with_runtime_mode(crate::MobRuntimeMode::TurnDriven),
+        )
+        .await
+        .expect("the context fork spawns");
+
+    let request = fixture.first_request_after(before).await;
+    let block = fork_block(&request).expect("the first request carries the fork context");
+    assert!(
+        !block.contains("INJECTED-RECALL-MARKER"),
+        "the injected row is not carried: {block}"
+    );
+    assert!(
+        block.contains("Host-injected context rows not carried: 1"),
+        "the notice counts it: {block}"
+    );
     fixture.finish().await;
 }
 
