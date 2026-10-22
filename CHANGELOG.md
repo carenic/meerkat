@@ -51,6 +51,13 @@ them.
   retires down to the bound at its first compaction after a checkpoint covers
   them.
 
+- `SqliteSessionStore::list` and `load_meta` no longer fail now and then
+  with `SessionStoreError::Corrupted` for an intact HeadCanonical session
+  while a commit to that session lands. Each read took the session's head
+  row and the metadata cells that head names in separate snapshots, so a
+  commit between the two paired the old head with the new metadata. Both
+  reads now take the head and its metadata from one read transaction.
+
 ## [0.9.4] - 2026-10-20
 
 ### Breaking

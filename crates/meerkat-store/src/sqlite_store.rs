@@ -9612,49 +9612,44 @@ impl SessionStore for SqliteSessionStore {
     }
 
     async fn list(&self, filter: SessionFilter) -> Result<Vec<SessionMeta>, SessionStoreError> {
-        let path = self.path.clone();
-        let options = self.options;
-        meerkat_core::session_hosting::spawn_blocking_holding_claim(
-            move || -> Result<Vec<SessionMeta>, SessionStoreError> {
-                enum ListedSession {
-                    Head {
-                        raw_id: String,
-                        head_json: Vec<u8>,
-                        stored_token: String,
-                    },
-                    Legacy(SessionMeta),
-                }
+        #[cfg(test)]
+        let interleaving_path = self.path.clone();
+        // One read transaction: the head rows and the metadata projection
+        // each of them names come from one snapshot, so a commit that lands
+        // between them is never read half before and half after.
+        self.in_read_txn(move |tx| {
+            enum ListedSession {
+                Head {
+                    raw_id: String,
+                    head_json: Vec<u8>,
+                    stored_token: String,
+                },
+                Legacy(SessionMeta),
+            }
 
-                let _guard = meerkat_sqlite::OperationGuard::for_database(&path)
-                    .map_err(StoreError::from)
-                    .map_err(into_session_store_error)?;
-                let conn =
-                    open_session_connection(&path, options).map_err(into_session_store_error)?;
-                let created_after = filter.created_after.map(system_time_millis);
-                let updated_after = filter.updated_after.map(system_time_millis);
-                let offset = i64::try_from(filter.offset.unwrap_or(0)).map_err(|_| {
+            let created_after = filter.created_after.map(system_time_millis);
+            let updated_after = filter.updated_after.map(system_time_millis);
+            let offset = i64::try_from(filter.offset.unwrap_or(0)).map_err(|_| {
+                SessionStoreError::Internal("session list offset exceeds SQLite range".to_string())
+            })?;
+            // SQLite's documented LIMIT -1 form means "no limit" while still
+            // admitting an OFFSET. This keeps pagination in the query for both
+            // bounded and unbounded callers.
+            let limit = match filter.limit {
+                Some(limit) => i64::try_from(limit).map_err(|_| {
                     SessionStoreError::Internal(
-                        "session list offset exceeds SQLite range".to_string(),
+                        "session list limit exceeds SQLite range".to_string(),
                     )
-                })?;
-                // SQLite's documented LIMIT -1 form means "no limit" while still
-                // admitting an OFFSET. This keeps pagination in the query for both
-                // bounded and unbounded callers.
-                let limit = match filter.limit {
-                    Some(limit) => i64::try_from(limit).map_err(|_| {
-                        SessionStoreError::Internal(
-                            "session list limit exceeds SQLite range".to_string(),
-                        )
-                    })?,
-                    None => -1,
-                };
+                })?,
+                None => -1,
+            };
 
-                // Page the compact head/legacy projections first. In particular,
-                // do not resolve every digest-addressed metadata payload only to
-                // discard most of them during in-memory pagination.
-                let mut statement = conn
-                    .prepare(
-                        r"
+            // Page the compact head/legacy projections first. In particular,
+            // do not resolve every digest-addressed metadata payload only to
+            // discard most of them during in-memory pagination.
+            let mut statement = tx
+                .prepare(
+                    r"
                     SELECT session_id, created_at_ms, updated_at_ms, message_count,
                            total_tokens, projection_json, cas_token, is_head
                     FROM (
@@ -9682,130 +9677,120 @@ impl SessionStore for SqliteSessionStore {
                     ORDER BY updated_at_ms DESC, session_id ASC
                     LIMIT ?3 OFFSET ?4
                     ",
-                    )
-                    .map_err(StoreError::from)
-                    .map_err(into_session_store_error)?;
-                let selected = statement
-                    .query_map(
-                        params![created_after, updated_after, limit, offset],
-                        |row| {
-                            if row.get::<_, i64>(7)? == 1 {
-                                Ok(ListedSession::Head {
-                                    raw_id: row.get(0)?,
-                                    head_json: row.get::<_, JsonColumnBytes>(5)?.into_bytes(),
-                                    stored_token: row.get(6)?,
-                                })
-                            } else {
-                                Ok(ListedSession::Legacy(session_meta_from_row(row)?))
-                            }
-                        },
-                    )
-                    .map_err(StoreError::from)
-                    .map_err(into_session_store_error)?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(StoreError::from)
-                    .map_err(into_session_store_error)?;
-                drop(statement);
-                #[cfg(test)]
-                head_read_interleaving::fire(&path);
-
-                let mut metas = Vec::with_capacity(selected.len());
-                for selected in selected {
-                    match selected {
-                        ListedSession::Head {
-                            raw_id,
-                            head_json,
-                            stored_token,
-                        } => {
-                            let id = parse_session_id(raw_id).map_err(into_session_store_error)?;
-                            let mut head: SessionHead = serde_json::from_slice(&head_json)
-                                .map_err(|_| SessionStoreError::Corrupted(id.clone()))?;
-                            if head.id != id || session_head_cas_token(&head)? != stored_token {
-                                return Err(SessionStoreError::Corrupted(id));
-                            }
-                            attach_head_metadata_projection(
-                                &conn,
-                                &mut head,
-                                HeadMetadataProjectionOwner::PhysicalHead,
-                            )?;
-                            metas.push(session_meta_from_head(&head)?);
+                )
+                .map_err(StoreError::from)
+                .map_err(into_session_store_error)?;
+            let selected = statement
+                .query_map(
+                    params![created_after, updated_after, limit, offset],
+                    |row| {
+                        if row.get::<_, i64>(7)? == 1 {
+                            Ok(ListedSession::Head {
+                                raw_id: row.get(0)?,
+                                head_json: row.get::<_, JsonColumnBytes>(5)?.into_bytes(),
+                                stored_token: row.get(6)?,
+                            })
+                        } else {
+                            Ok(ListedSession::Legacy(session_meta_from_row(row)?))
                         }
-                        ListedSession::Legacy(meta) => metas.push(meta),
+                    },
+                )
+                .map_err(StoreError::from)
+                .map_err(into_session_store_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+                .map_err(into_session_store_error)?;
+            drop(statement);
+            #[cfg(test)]
+            head_read_interleaving::fire(&interleaving_path);
+
+            let mut metas = Vec::with_capacity(selected.len());
+            for selected in selected {
+                match selected {
+                    ListedSession::Head {
+                        raw_id,
+                        head_json,
+                        stored_token,
+                    } => {
+                        let id = parse_session_id(raw_id).map_err(into_session_store_error)?;
+                        let mut head: SessionHead = serde_json::from_slice(&head_json)
+                            .map_err(|_| SessionStoreError::Corrupted(id.clone()))?;
+                        if head.id != id || session_head_cas_token(&head)? != stored_token {
+                            return Err(SessionStoreError::Corrupted(id));
+                        }
+                        attach_head_metadata_projection(
+                            tx,
+                            &mut head,
+                            HeadMetadataProjectionOwner::PhysicalHead,
+                        )?;
+                        metas.push(session_meta_from_head(&head)?);
                     }
+                    ListedSession::Legacy(meta) => metas.push(meta),
                 }
-                Ok(metas)
-            },
-        )
+            }
+            Ok(metas)
+        })
         .await
-        .map_err(StoreError::Join)
-        .map_err(into_session_store_error)?
     }
 
     /// Metadata-only partial read over the durable head projection and its
     /// authenticated metadata cells — head row wins, the legacy session row
     /// is the fallback. Never touches `session_json` or strand rows.
     async fn load_meta(&self, id: &SessionId) -> Result<Option<SessionMeta>, SessionStoreError> {
-        let path = self.path.clone();
-        let options = self.options;
         let id = id.clone();
-        meerkat_core::session_hosting::spawn_blocking_holding_claim(
-            move || -> Result<Option<SessionMeta>, SessionStoreError> {
-                let _guard = meerkat_sqlite::OperationGuard::for_database(&path)
-                    .map_err(StoreError::from)
-                    .map_err(into_session_store_error)?;
-                let conn =
-                    open_session_connection(&path, options).map_err(into_session_store_error)?;
-                let head_row = conn
-                    .query_row(
-                        r"
+        #[cfg(test)]
+        let interleaving_path = self.path.clone();
+        // One read transaction, as in `list`: the head row and the metadata
+        // projection it names come from one snapshot.
+        self.in_read_txn(move |tx| {
+            let head_row = tx
+                .query_row(
+                    r"
                     SELECT head_json, cas_token
                     FROM session_heads
                     WHERE session_id = ?1
                     ",
-                        params![id.to_string()],
-                        |row| {
-                            Ok((
-                                row.get::<_, JsonColumnBytes>(0)?.into_bytes(),
-                                row.get::<_, String>(1)?,
-                            ))
-                        },
-                    )
-                    .optional()
-                    .map_err(StoreError::from)
-                    .map_err(into_session_store_error)?;
-                #[cfg(test)]
-                head_read_interleaving::fire(&path);
-                if let Some((head_json, stored_token)) = head_row {
-                    let mut head: SessionHead = serde_json::from_slice(&head_json)
-                        .map_err(|_| SessionStoreError::Corrupted(id.clone()))?;
-                    if head.id != id || session_head_cas_token(&head)? != stored_token {
-                        return Err(SessionStoreError::Corrupted(id));
-                    }
-                    attach_head_metadata_projection(
-                        &conn,
-                        &mut head,
-                        HeadMetadataProjectionOwner::PhysicalHead,
-                    )?;
-                    return Ok(Some(session_meta_from_head(&head)?));
+                    params![id.to_string()],
+                    |row| {
+                        Ok((
+                            row.get::<_, JsonColumnBytes>(0)?.into_bytes(),
+                            row.get::<_, String>(1)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(StoreError::from)
+                .map_err(into_session_store_error)?;
+            #[cfg(test)]
+            head_read_interleaving::fire(&interleaving_path);
+            if let Some((head_json, stored_token)) = head_row {
+                let mut head: SessionHead = serde_json::from_slice(&head_json)
+                    .map_err(|_| SessionStoreError::Corrupted(id.clone()))?;
+                if head.id != id || session_head_cas_token(&head)? != stored_token {
+                    return Err(SessionStoreError::Corrupted(id));
                 }
-                conn.query_row(
-                    r"
+                attach_head_metadata_projection(
+                    tx,
+                    &mut head,
+                    HeadMetadataProjectionOwner::PhysicalHead,
+                )?;
+                return Ok(Some(session_meta_from_head(&head)?));
+            }
+            tx.query_row(
+                r"
                 SELECT session_id, created_at_ms, updated_at_ms, message_count,
                        total_tokens, metadata_json
                 FROM sessions
                 WHERE session_id = ?1
                 ",
-                    params![id.to_string()],
-                    session_meta_from_row,
-                )
-                .optional()
-                .map_err(StoreError::from)
-                .map_err(into_session_store_error)
-            },
-        )
+                params![id.to_string()],
+                session_meta_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+            .map_err(into_session_store_error)
+        })
         .await
-        .map_err(StoreError::Join)
-        .map_err(into_session_store_error)?
     }
 
     async fn delete(&self, id: &SessionId) -> Result<(), SessionStoreError> {
