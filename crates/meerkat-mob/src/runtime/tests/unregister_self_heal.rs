@@ -227,8 +227,9 @@ async fn cut_unregister_host_child() {
         root.join("sessions"),
         sessions
             .iter()
-            .map(|session| format!("{session}\n"))
-            .collect::<String>(),
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
     )
     .expect("record the member sessions");
 
@@ -269,6 +270,8 @@ async fn cut_unregister_host_child() {
 /// Run the child host with `count` members until every unregister waits at
 /// its parked finalization, kill it there, and resume the mob over the same
 /// files. Returns the resumed mob with its store, sessions and members.
+// The host is this test binary re-executed: a test-only process launch.
+#[allow(clippy::disallowed_methods)]
 async fn cut_then_resume(
     count: usize,
 ) -> (
