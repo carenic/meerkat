@@ -3210,7 +3210,7 @@ impl MobActor {
                             effect = ?effect.body(),
                             phase = ?self.dsl_authority.state().lifecycle_phase,
                             rejection = %rejection,
-                            "deferring retirement route refusal feedback: the mob machine cannot take it in this phase"
+                            "the mob machine rejected the retirement route's refusal feedback; the route stays on the continuation for the next attempt"
                         );
                         return Err(rejection);
                     }
