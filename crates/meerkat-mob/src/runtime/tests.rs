@@ -75086,6 +75086,101 @@ async fn a_refused_runtime_retire_for_a_retired_member_leaves_the_stopped_mob_ru
     handle.shutdown().await.expect("shutdown");
 }
 
+/// A Destroy of a Stopped mob whose routed-effect queue still holds an
+/// ingress for one of its members that the consumer refuses. While the mob is
+/// Stopped the machine cannot take that refusal, so the head waits for a
+/// resume. The destroy retires the member anyway, so it must not stall on
+/// that head: each destroy attempt used to report Incomplete until a resume
+/// or a restart emptied the queue.
+#[tokio::test]
+async fn a_destroy_of_a_stopped_mob_does_not_stall_on_a_refused_queued_ingress() {
+    let service = Arc::new(MockSessionService::new());
+    let _adapter = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(sample_definition(), MobStorage::in_memory())
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let mut spec = SpawnMemberSpec::new("worker", "w-1");
+    spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    handle.spawn_spec(spec).await.expect("spawn w-1");
+    let identity = AgentIdentity::from("w-1");
+    let session_id = handle
+        .resolve_bridge_session_id(&identity)
+        .await
+        .expect("session-backed");
+    let dsl_identity = crate::machines::mob_machine::AgentIdentity::from("w-1");
+    let machine = handle
+        .query_machine_state()
+        .await
+        .expect("query machine state");
+    let runtime_id = machine
+        .identity_to_runtime
+        .get(&dsl_identity)
+        .cloned()
+        .expect("w-1 has a runtime");
+    let generation = machine
+        .identity_runtime_generations
+        .get(&dsl_identity)
+        .copied()
+        .expect("w-1 has a generation");
+    handle.stop().await.expect("stop the mob");
+
+    // An ingress for w-1's live runtime under a fence it never held: the
+    // consumer refuses it, and while the mob is Stopped the machine cannot
+    // take that refusal, so the head stays queued.
+    let refused = super::composition::MobSeamEffect::routed(
+        crate::machines::mob_machine::MobMachineEffect::RequestRuntimeIngress {
+            session_id: crate::machines::mob_machine::SessionId::from_domain(&session_id),
+            agent_runtime_id: runtime_id,
+            fence_token: crate::machines::mob_machine::FenceToken(u64::MAX),
+            generation: Some(generation),
+            work_id: crate::machines::mob_machine::WorkId::from("work-refused-while-stopped"),
+            origin: crate::machines::mob_machine::WorkOrigin::External,
+            content_attribution:
+                crate::machines::mob_machine::WorkContentAttribution::Conversational,
+        },
+    )
+    .expect("a runtime ingress is a routed effect");
+    handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::QueueRoutedEffectForTest {
+            effect: refused,
+            reply_tx,
+        })
+        .await
+        .expect("queue the refused ingress")
+        .await
+        .expect("the actor answers the queue command")
+        .expect("the actor queues the refused ingress");
+
+    let first = handle
+        .destroy()
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string());
+    // A retry shows the stall is not transient: the same head refuses again.
+    let retried = if first.is_err() {
+        Some(
+            handle
+                .destroy()
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+        )
+    } else {
+        None
+    };
+    assert_eq!(
+        (first, retried),
+        (Ok(()), None),
+        "the destroy supersedes the member's refused queued ingress"
+    );
+    assert_eq!(
+        handle.status().await.expect("status after destroy"),
+        MobState::Destroyed
+    );
+}
+
 /// Lifecycle-notification failures during retirement remain best-effort.
 ///
 /// The notification may legitimately fail during concurrent teardown, but

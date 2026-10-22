@@ -66,6 +66,15 @@ them.
   safety scan, about five minutes later; it now waits for the holder's
   expiry, at least one second, the same way as `AwaitLease`.
 
+- `meerkat-mob`: a Destroy of a Stopped mob no longer fails with
+  `MobDestroyError::Incomplete` at every attempt when the mob's routed queue
+  still holds a member route that the member's runtime refused. While the
+  mob is Stopped the mob machine cannot take that refusal, so the route
+  waited for a resume, and each destroy attempt dispatched it again and
+  stopped on the refusal until a resume or a restart emptied the queue. A
+  destroy now drops its members' queued runtime-binding and input routes
+  before it dispatches anything; it still sends their retire routes.
+
 ## [0.9.4] - 2026-10-20
 
 ### Breaking

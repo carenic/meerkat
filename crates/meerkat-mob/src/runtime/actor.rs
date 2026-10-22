@@ -12924,6 +12924,27 @@ impl MobActor {
         }
     }
 
+    /// Whether a destroy supersedes a queued routed effect: it retires every
+    /// member and the mob never runs again once its admission closes, so a
+    /// queued binding or ingress for a member can only be refused or be moot.
+    /// Retire and destroy routes stay: the destroy dispatches them.
+    fn routed_effect_superseded_by_destroy(effect: &super::composition::MobSeamEffect) -> bool {
+        matches!(
+            effect.body(),
+            mob_dsl::MobMachineEffect::RequestRuntimeBinding { .. }
+                | mob_dsl::MobMachineEffect::RequestRuntimeIngress { .. }
+        )
+    }
+
+    /// Drop the queued routes a destroy supersedes (see
+    /// [`Self::routed_effect_superseded_by_destroy`]). A refused one, held
+    /// while the mob was Stopped, would otherwise stop every destroy attempt
+    /// at its first routed flush.
+    fn discard_routed_effects_superseded_by_destroy(&mut self) {
+        self.pending_routed_effects
+            .retain(|effect| !Self::routed_effect_superseded_by_destroy(effect));
+    }
+
     fn discard_pending_routed_effects_for_session(&mut self, session_id: &SessionId) {
         let dsl_session_id = mob_dsl::SessionId::from_domain(session_id);
         self.pending_routed_effects.retain(|effect| {
@@ -49744,6 +49765,9 @@ impl MobActor {
             entries,
             mut trust_cleanup_plan_by_member,
         } = boxed_arm_future(|| self.admit_destroy_cleanup()).await?;
+        // Before anything below flushes the routed queue (each member's
+        // retire admission does, in cleanup mode), on every attempt.
+        self.discard_routed_effects_superseded_by_destroy();
         boxed_arm_future(|| self.fail_all_pending_spawns("mob is destroying"))
             .await
             .map_err(|error| {
@@ -61684,6 +61708,52 @@ mod routed_effect_containment_tests {
         assert!(!MobActor::runtime_retire_blocked_on_pending_detach(
             &state, &effect
         ));
+    }
+
+    #[test]
+    fn a_destroy_supersedes_queued_binding_and_ingress_routes_only() {
+        let identity = mob_dsl::AgentIdentity::from("worker");
+        let runtime_id = mob_dsl::AgentRuntimeId::from("worker:1");
+        let session = mob_dsl::SessionId::from("session-worker");
+        let routed = |body| {
+            super::super::composition::MobSeamEffect::routed(body)
+                .expect("a generated routed effect")
+        };
+        let superseded = |effect| MobActor::routed_effect_superseded_by_destroy(effect);
+        assert!(superseded(&routed(
+            mob_dsl::MobMachineEffect::RequestRuntimeBinding {
+                session_id: session.clone(),
+                agent_identity: identity.clone(),
+                agent_runtime_id: runtime_id.clone(),
+                fence_token: mob_dsl::FenceToken(1),
+                generation: None,
+            }
+        )));
+        assert!(superseded(&routed(
+            mob_dsl::MobMachineEffect::RequestRuntimeIngress {
+                session_id: session.clone(),
+                agent_runtime_id: runtime_id.clone(),
+                fence_token: mob_dsl::FenceToken(1),
+                generation: None,
+                work_id: mob_dsl::WorkId::from("work-1"),
+                origin: mob_dsl::WorkOrigin::External,
+                content_attribution: mob_dsl::WorkContentAttribution::Conversational,
+            }
+        )));
+        assert!(
+            !superseded(&routed(mob_dsl::MobMachineEffect::RequestRuntimeRetire {
+                agent_identity: identity,
+                agent_runtime_id: runtime_id,
+                session_id: session.clone(),
+            })),
+            "the destroy dispatches its members' retire routes"
+        );
+        assert!(
+            !superseded(&routed(mob_dsl::MobMachineEffect::RequestRuntimeDestroy {
+                session_id: session,
+            })),
+            "a destroy route is the destroy's own"
+        );
     }
 
     #[test]
