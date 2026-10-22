@@ -43,8 +43,19 @@ impl MeerkatMachine {
         &self,
         request: Arc<ServiceCallRequest>,
     ) -> Result<ServiceCall, OperationAuthorizationError> {
-        let _ = request;
-        Err(OperationAuthorizationError::Unavailable)
+        // An ungoverned machine has no native host, and so no service call:
+        // no ungoverned context is ever handed out for one.
+        let attachment = self
+            .native_work_authorization_host
+            .get()
+            .ok_or(OperationAuthorizationError::Unavailable)?;
+        self.shared
+            .require_governed_execution_custody()
+            .map_err(|_| OperationAuthorizationError::Unavailable)?;
+        let work = attachment.host().service_call_authorization(request)?;
+        Ok(ServiceCall {
+            context: ToolDispatchContext::default().with_work_authorization(Some(work)),
+        })
     }
 }
 

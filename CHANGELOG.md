@@ -86,6 +86,42 @@ them.
 
 ### Added
 
+- `meerkat-runtime`, `meerkat-authorization`: governed service calls, the
+  native seam for provider calls that no runtime input carries, such as a
+  scheduled host runnable that reads a provider through a connector-bound
+  MCP server. Such a call needs governed work authorization, and until now
+  no admitted run or control supplied it to host code, so the call was
+  refused. The trusted host enrolls a service original at
+  operator-reviewed setup: a standing association whose basis selects the
+  operator's grant for exactly the installation's MCP server, the grant
+  recording that server's connector approval. Its original source answers
+  the record through the new defaulted
+  `AuthenticatedOriginalSource::enrolled_service_original` (`EnrolledServiceOriginal`),
+  and an enrolled original always answers `NotRetained` to
+  `retained_custody`, so it never stands for admitted work. Each schedule
+  occurrence then presents a `ServiceCallRequest` to
+  `MeerkatMachine::prepare_service_call`.
+  `ServiceCallRequest::from_trusted_host` refuses as `MalformedFacts` an
+  association that cannot be a service original: one with a controller, a
+  represented subject or contributing work, a basis that selects no MCP
+  server or checked route target, or a namespace with the reserved
+  `meerkat.` prefix. The installed native host
+  (`NativeWorkAuthorizationHost::service_call_authorization`, defaulted to
+  unavailable) admits the request once, and only when its whole
+  association is the enrolled record. It returns a `ServiceCall` (not
+  `Clone`, one per occurrence) whose `dispatch` runs the ordinary fenced
+  dispatch, Domain-scoped and runless, for MCP server operations only.
+  Every operation is prepared from the current enrollment, the operator's
+  grant, the connector approval it records and the operation owner, and is
+  audited to the request's own sink. No review composition is attached,
+  so an operation that needs review is refused, and the connector owner
+  still checks the slot's credential at the call. A scoped composition's
+  admitted-work owner reaches the record through the new defaulted
+  `AdmittedWorkPolicyOwner::enrolled_service_original`; every other owner
+  keeps the default, so the seam is unavailable outside scoped
+  compositions and on ungoverned machines. The `ServiceOccurrence` a
+  request carries is host-asserted audit data, not authority. Additive:
+  no wire, contract or persistence change.
 - `meerkat-schedule`: `ScheduleTargetDelivery::deliver_existing_occurrence`,
   a defaulted method the driver calls to redeliver a reclaimed occurrence
   whose earlier attempt recorded its dispatch, with `ExistingDelivery`

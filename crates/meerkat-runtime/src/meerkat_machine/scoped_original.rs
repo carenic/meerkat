@@ -656,6 +656,24 @@ impl AdmittedWorkPolicyOwner for NamedContributorWork {
             .authorize_context_control(control, binding, now_ms)
     }
 
+    /// The record of an enrolled service original, from the source this
+    /// composition holds, while its operations are not cancelled. A
+    /// cancelled original is `Denied`; a source that cannot say now is
+    /// `Unavailable`. Only the record: the native host compares it with the
+    /// presented claims, and every operation is still decided by the host
+    /// invocation policy, the grant and the operation owner.
+    fn enrolled_service_original(
+        &self,
+        namespace: &QualifiedIngressNamespace,
+        original: &OriginalWorkRef,
+    ) -> Result<Option<InputAuthorityAssociation>, meerkat_core::OperationAuthorizationError> {
+        require_active_operation(self.originals.as_ref(), namespace, original)?;
+        self.originals
+            .enrolled_service_original(namespace, original)
+            .map(|record| record.map(|record| record.association))
+            .map_err(|_| meerkat_core::OperationAuthorizationError::Unavailable)
+    }
+
     // An attachment control names no contributor work; the host invocation
     // policy decides it, as for context control.
     fn authorize_mcp_attachment(
@@ -1071,6 +1089,16 @@ impl NativeWorkAuthorizationHost for WithConfiguredMcpAttachment {
         meerkat_core::OperationAuthorizationError,
     > {
         self.host.mcp_attachment_authorization(control)
+    }
+
+    fn service_call_authorization(
+        &self,
+        request: Arc<crate::input_authority::ServiceCallRequest>,
+    ) -> Result<
+        meerkat_core::authorization::WorkAuthorizationContext,
+        meerkat_core::OperationAuthorizationError,
+    > {
+        self.host.service_call_authorization(request)
     }
 
     fn authenticate_association(

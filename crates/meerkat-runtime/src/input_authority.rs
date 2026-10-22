@@ -259,6 +259,11 @@ impl ServiceCallRequest {
         occurrence: ServiceOccurrence,
         audit: Arc<dyn meerkat_authorization_contracts::audit::AuthorizationAuditSink>,
     ) -> Result<Arc<Self>, meerkat_core::OperationRefused> {
+        if !service_original_shape(&association) {
+            return Err(meerkat_core::OperationRefused::new(
+                meerkat_core::OperationRefusalKind::MalformedFacts,
+            ));
+        }
         Ok(Arc::new(Self {
             association,
             occurrence,
@@ -304,6 +309,43 @@ impl ServiceCallRequest {
             .map(|_| ())
             .map_err(|_| meerkat_core::OperationAuthorizationError::Unavailable)
     }
+}
+
+/// The prefix of the ingress namespaces Core reserves for its own host
+/// work. A service original never names one.
+const RESERVED_SERVICE_NAMESPACE_PREFIX: &str = "meerkat.";
+
+/// Whether `association` can be a service original: no controller (no model
+/// runs for it), no represented subject and no contributing work, a basis
+/// that selects a lineage per operation target with at least one MCP server
+/// or checked MCP route target (a single lineage would cover every target),
+/// and an ingress namespace outside Core's reserved prefix.
+fn service_original_shape(association: &InputAuthorityAssociation) -> bool {
+    use meerkat_authorization_contracts::work_association::{GrantTarget, WorkAuthorityBasis};
+    let claims = association.candidate();
+    let selects_an_mcp_target = match &claims.authority_basis {
+        WorkAuthorityBasis::TargetedGrantLineages { targets, .. } => {
+            targets.iter().any(|selected| {
+                matches!(
+                    selected.target,
+                    GrantTarget::McpServer { .. } | GrantTarget::CheckedMcpRoute { .. }
+                )
+            })
+        }
+        WorkAuthorityBasis::GrantLineage { .. }
+        | WorkAuthorityBasis::HostPolicy { .. }
+        | WorkAuthorityBasis::ServiceMandate { .. } => false,
+    };
+    claims.controller_model.is_none()
+        && claims.controller_grant_lineage.is_empty()
+        && claims.represented_subject.is_none()
+        && claims.contributing_work.is_empty()
+        && selects_an_mcp_target
+        && !claims
+            .ingress_namespace
+            .ingress
+            .namespace
+            .starts_with(RESERVED_SERVICE_NAMESPACE_PREFIX)
 }
 
 impl std::fmt::Debug for ServiceCallRequest {
