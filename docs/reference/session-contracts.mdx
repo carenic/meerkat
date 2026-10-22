@@ -729,6 +729,25 @@ the committed authority is preserved.
   other than `EndTurn` or `ToolUse` (for example `MaxTokens` or `PauseTurn`)
   is held the same way: that turn did not reach a natural end.
 
+A session whose transcript has rewrite occurrences (compaction) is recovered
+the same way: a completed tail becomes a recovered run boundary, an
+interrupted tail is closed with the typed recovery notice, and anything else
+is held. When the run that crashed compacted, its durable tail no longer
+extends the committed authority's message prefix. The store then proves from
+its persisted rewrite rows that the physical head descends from the committed
+authority (a rewrite descendant), and recovery classifies the live tail after
+the last rewrite. Rewrite rows carry no run identity, so a rewrite descendant
+whose live tail holds no message of the run (an empty live tail) is held, and
+so is a tail whose rewrite descent the store cannot prove. Both fail resume
+with `SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY`, never with internal-error
+prose, and recovery never closes such a tail on the store-issued run identity
+alone. Meerkat's own checkpoints never write either shape: a checkpoint
+follows a model response, and the writer proves the descent before it writes.
+Such a hold therefore points to a store changed outside Meerkat. The
+session's committed history stays readable and its durable tail is kept
+intact. Keep a copy of the realm's store for diagnosis, and continue the work
+in a new session.
+
 A committed strict descendant wins over a stale live runtime snapshot
 regardless of local actor liveness, and projection convergence requires
 intra-turn row provenance, so two committed sibling documents can never
