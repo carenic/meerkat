@@ -338,6 +338,21 @@ the stable submission key. The built-in `ScheduledDurableJobRunnable` follows
 this pattern: Schedule owns when to submit, while the jobs subsystem owns the
 attempt, lease, progress, cancellation, and terminal result.
 
+A host runnable that calls a connector-bound MCP server (for example a
+collector that reads a provider on a schedule) needs governed work
+authorization for every call, and a fire carries none: the fire is a
+trigger, not an authority. On a governed runtime (Rust hosts only), the
+host enrolls a service original for the work at operator-reviewed setup,
+whose basis selects the operator's grant for exactly that installation's
+MCP server. Each occurrence then builds a `ServiceCallRequest` from that
+original and the occurrence's identities, admits it with
+`MeerkatMachine::prepare_service_call`, and makes its calls through the
+returned `ServiceCall`. The operator's grant, the connector approval it
+records and the host's operation policy decide each call, which is
+audited. The schedule and occurrence identities the request carries are
+audit data the host asserts, not authority. An ungoverned runtime, or a
+host whose composition does not enroll service originals, refuses.
+
 ## Policies
 
 ### Misfire policy
