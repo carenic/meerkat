@@ -84211,6 +84211,9 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         MobError::MemberDestinationNotInstalled { .. } => {
             "member_destination_not_installed".to_string()
         }
+        MobError::MemberSendIdempotency { refusal, .. } => {
+            format!("member_send_idempotency:{}", refusal.kind())
+        }
     }
 }
 
