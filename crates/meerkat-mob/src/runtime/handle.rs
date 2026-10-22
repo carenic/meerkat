@@ -2442,7 +2442,7 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         MobError::NotExternallyAddressable(_) => {
             mob_dsl::MobSpawnManyFailureObservationKind::NotExternallyAddressable
         }
-        MobError::InvalidTransition { .. } => {
+        MobError::InvalidTransition { .. } | MobError::DrainRequiresStoppedMob { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::InvalidTransition
         }
         MobError::MemberRoleMigrationRequired { .. }
@@ -8021,9 +8021,12 @@ impl MobHandle {
                 .await??;
                 Ok(MobMachineCommandResult::Unit)
             }
-            MobMachineCommand::Stop => {
+            MobMachineCommand::Stop { leave_runs_running } => {
                 let report = self
-                    .send_actor_command(|reply_tx| MobCommand::Stop { reply_tx })
+                    .send_actor_command(|reply_tx| MobCommand::Stop {
+                        leave_runs_running,
+                        reply_tx,
+                    })
                     .await??;
                 Ok(MobMachineCommandResult::Stopped(report))
             }
@@ -14712,10 +14715,26 @@ impl MobHandle {
     /// starts are held; a member that cannot be held is reported, never
     /// hidden behind `Ok`.
     pub async fn stop(&self) -> Result<super::stop_report::MobStopReport, MobError> {
+        self.stop_with_options(super::stop_report::StopOptions::default())
+            .await
+    }
+
+    /// [`Self::stop`] with `options`, for example
+    /// [`StopOptions::leave_runs_running`](super::stop_report::StopOptions::leave_runs_running)
+    /// before a drain.
+    pub async fn stop_with_options(
+        &self,
+        options: super::stop_report::StopOptions,
+    ) -> Result<super::stop_report::MobStopReport, MobError> {
         let hang_guard = tokio::time::Instant::now() + DEFAULT_KICKOFF_WAIT_TIMEOUT;
         let mut lifecycle_watch = None;
         loop {
-            match self.execute_machine_command(MobMachineCommand::Stop).await {
+            match self
+                .execute_machine_command(MobMachineCommand::Stop {
+                    leave_runs_running: options.leave_runs_running,
+                })
+                .await
+            {
                 Ok(MobMachineCommandResult::Stopped(report)) => return Ok(report),
                 Ok(_) => {
                     return Err(MobError::Internal(
@@ -14728,6 +14747,57 @@ impl MobHandle {
                 }
             }
         }
+    }
+
+    /// Wait, bounded by `until`, for the run each member of this Stopped mob
+    /// had when the call started, and report every member.
+    ///
+    /// A graceful shutdown that lets in-flight turns finish runs Stop, then
+    /// this, then Shutdown. The drain cancels nothing and writes nothing
+    /// durable: a run still current at `until` is reported `StillRunning` and
+    /// keeps running, and the Shutdown that follows cancels it as it would
+    /// without a drain. An `until` already past returns at once.
+    ///
+    /// - Refused with [`MobError::DrainRequiresStoppedMob`] unless the mob is
+    ///   Stopped, so that its members' run starts are held.
+    /// - Only runs current when the call starts are drained. A member whose
+    ///   run starts are not held (see [`MemberRunDrainOutcome::starts`]) may
+    ///   start more, which are neither waited for nor reported.
+    /// - A member whose session has an open live channel at the start is
+    ///   reported `LiveChannelOpen` at once and not waited on. A channel
+    ///   opened later is not detected, and that member's run is bounded by
+    ///   `until` like any other.
+    /// - Placed and remote members are `NotLocal`: their host owns their runs.
+    /// - It drains this mob only, not its child mobs, and it does not stop
+    ///   identity reconciliation: a host that wants none in the window
+    ///   quiesces it before Stop.
+    /// - A drained turn runs under a Stopped mob. Mob-mutating tool calls
+    ///   (spawn, delegate or fork, wiring) are refused, typed, and the model
+    ///   sees the error. A peer message is admitted but queued behind the
+    ///   recipient's held run starts, and ends `Abandoned{Stopped}` at the
+    ///   Shutdown. A turn that waits on another member's new run cannot
+    ///   finish, so it is `StillRunning` at the bound.
+    /// - A concurrent Resume leaves the drain waiting only for the runs it
+    ///   captured; runs started after it are not reported.
+    ///
+    /// [`MemberRunDrainOutcome::starts`]: super::stop_report::MemberRunDrainOutcome::starts
+    #[cfg(feature = "runtime-adapter")]
+    pub async fn drain_stopped_runs(
+        &self,
+        until: meerkat_core::time_compat::Instant,
+    ) -> Result<super::stop_report::MobRunDrainReport, MobError> {
+        let snapshot = self.drain_runs_snapshot().await?;
+        Ok(super::run_drain::drain(snapshot, until).await)
+    }
+
+    /// The actor's drain snapshot, atomic with its Stopped check: the first
+    /// half of [`Self::drain_stopped_runs`].
+    #[cfg(feature = "runtime-adapter")]
+    pub(super) async fn drain_runs_snapshot(
+        &self,
+    ) -> Result<super::run_drain::DrainSnapshot, MobError> {
+        self.send_actor_command(|reply_tx| MobCommand::DrainRunsSnapshot { reply_tx })
+            .await?
     }
 
     /// A Stop or Shutdown the actor refused because an operation it owns is

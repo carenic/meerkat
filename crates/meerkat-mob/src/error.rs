@@ -570,6 +570,11 @@ pub enum MobError {
     #[error("invalid state transition: {from} -> {to}")]
     InvalidTransition { from: MobState, to: MobState },
 
+    /// [`MobHandle::drain_stopped_runs`](crate::MobHandle::drain_stopped_runs)
+    /// runs only on a Stopped mob, whose members' run starts are held.
+    #[error("draining runs requires a stopped mob, but the mob is {state}")]
+    DrainRequiresStoppedMob { state: MobState },
+
     /// A wiring operation failed.
     #[error("wiring error: {0}")]
     WiringError(String),

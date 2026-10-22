@@ -2588,3 +2588,686 @@ async fn queued_human_behind_a_running_turn_at_graceful_stop_is_terminated_once_
         .expect("mob shutdown finishes")
         .expect("mob shutdown");
 }
+
+/// A Stop that leaves runs running holds run starts and returns without
+/// waiting for any turn.
+const STOP_RETURNS_WITHIN: Duration = Duration::from_secs(10);
+/// A drain bound the rows whose run ends never reach.
+const UNREACHED_DRAIN_BOUND: Duration = Duration::from_secs(600);
+/// The drain bound of the rows whose run outlives the drain.
+const DRAIN_BOUND: Duration = Duration::from_millis(500);
+
+/// Stop the host's mob, leaving every member's current run running.
+async fn stop_leaving_runs_running(host: &StopHost) -> crate::MobStopReport {
+    tokio::time::timeout(
+        STOP_RETURNS_WITHIN,
+        host.handle
+            .stop_with_options(crate::StopOptions::default().leave_runs_running()),
+    )
+    .await
+    .expect("a Stop that leaves runs running returns without waiting for them")
+    .expect("stop leaving runs running")
+}
+
+/// Drain the stopped mob's runs in two steps: take the drain's snapshot,
+/// then `release` the held model call, then wait within `bound`. The run the
+/// snapshot captures cannot end before the snapshot sees it.
+async fn drain_after_snapshot(
+    host: &StopHost,
+    release: impl FnOnce(),
+    bound: Duration,
+) -> crate::MobRunDrainReport {
+    let snapshot = host
+        .handle
+        .drain_runs_snapshot()
+        .await
+        .expect("a stopped mob's drain snapshot");
+    release();
+    tokio::time::timeout(
+        WAIT,
+        crate::runtime::run_drain::drain(
+            snapshot,
+            meerkat_core::time_compat::Instant::now() + bound,
+        ),
+    )
+    .await
+    .expect("the drain returns once the run it captured ends")
+}
+
+/// How a drained input's bounded waiter ended, with its answer text when it
+/// succeeded.
+async fn drained_answer(turn: WorkTurnHandle) -> (StopAnswer, Option<String>) {
+    match tokio::time::timeout(
+        WAIT,
+        turn.wait_bounded(BoundedResultSpec::new("drained human", 1024).expect("bound")),
+    )
+    .await
+    {
+        Ok(Ok(result)) => (
+            StopAnswer::Succeeded,
+            Some(result.result().result().text().to_owned()),
+        ),
+        Ok(Err(error)) => (StopAnswer::Other(format!("{:?}", error.failure())), None),
+        Err(_) => (StopAnswer::Unresolved, None),
+    }
+}
+
+/// Reopen the host over `root` after a Stop and its Shutdown. The Stop is
+/// durable, so the mob comes back Stopped; it is resumed, as a gateway does
+/// at boot. Returns the reopened host and the state the mob came back in.
+async fn reopen_stopped_host(
+    root: &std::path::Path,
+    client: &ScriptedClient,
+) -> (StopHost, MobState) {
+    let host = open_stop_host(root, client, None).await;
+    let restored = host
+        .handle
+        .status()
+        .await
+        .expect("the reopened mob's state");
+    tokio::time::timeout(WAIT, host.handle.resume())
+        .await
+        .expect("the resume finishes")
+        .expect("resume the stopped mob");
+    (host, restored)
+}
+
+/// How many times the log recorded `run_id` completing.
+fn runs_completed(events: &[AgentEvent], run_id: &meerkat_core::lifecycle::RunId) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(event, AgentEvent::RunCompleted { identity, .. }
+                if identity.run_id.as_ref() == Some(run_id))
+        })
+        .count()
+}
+
+/// A Queue-mode host human input whose own turn is in flight (its model
+/// call held) when the host stops with `StopOptions::leave_runs_running`,
+/// then drains, then shuts down, then restarts over the same durable files.
+///
+/// The Stop holds the member's run starts and leaves its run running. The
+/// drain captures that run while the model call is held and, once it is
+/// released, reports it ended as completed. The input is consumed, its
+/// waiter gets the model's answer, and the run completes once with no
+/// failure, so the Shutdown that follows has nothing to cancel. The restart
+/// keeps the consumed row, runs nothing, and a same-key replay answers the
+/// recorded result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drain_lets_a_stopped_members_in_flight_human_turn_complete() {
+    use meerkat_core::turn_execution_authority::TurnTerminalOutcome;
+    use meerkat_runtime::input_state::{InputLifecycleState, InputTerminalOutcome};
+
+    let (_root, root_path) = stop_root();
+    let client = ScriptedClient::new(true);
+    let host = open_stop_host(&root_path, &client, Some("drain-in-flight")).await;
+    let mob_id = host.handle.mob_id().clone();
+    let (identity, session_id, entry) = spawn_stop_member(&host).await;
+
+    client.block();
+    let requests_before = client.requests().len();
+    let key = delivery("drain-in-flight");
+    let interaction_id = interaction(&key);
+    let spec = WorkSpec::new(HUMAN, WorkOrigin::External);
+    let turn = host
+        .handle
+        .start_host_human_input_bounded(
+            entry.agent_runtime_id.clone(),
+            entry.fence_token,
+            spec.clone(),
+            HandlingMode::Queue,
+            key.clone(),
+            deadline(),
+        )
+        .await
+        .expect("queued human admission");
+    client.wait_for_requests(requests_before + 1).await;
+    let input_id = admitted_input_id(&host.runtime_store, &session_id, &key).await;
+
+    let stop = stop_leaving_runs_running(&host).await;
+    let drain = drain_after_snapshot(&host, || client.release(), UNREACHED_DRAIN_BOUND).await;
+    let (waiter, answer) = drained_answer(turn).await;
+    tokio::time::timeout(WAIT, host.handle.shutdown())
+        .await
+        .expect("the graceful stop finishes")
+        .expect("graceful stop");
+    let at_exit = stop_row(&host.runtime_store, &session_id, &key, &input_id).await;
+    let events = stop_events(&root_path, &session_id).await;
+    let at_stop = observe_at_stop(waiter, &at_exit, &events, interaction_id);
+    let its_run = runs_started_for(&events, interaction_id).first().cloned();
+    let completions = its_run
+        .as_ref()
+        .map(|run_id| runs_completed(&events, run_id));
+    drop(host);
+    await_supervisor_route_release(&mob_id).await;
+
+    let restarted_client = ScriptedClient::new(true);
+    let (restarted, restored) = reopen_stopped_host(&root_path, &restarted_client).await;
+    let after_restart = observe_after_restart(
+        &root_path,
+        &restarted,
+        &restarted_client,
+        &at_exit,
+        (&key, &input_id, spec),
+        &identity,
+        &session_id,
+    )
+    .await;
+    assert_eq!(
+        (
+            stop.members.get(&identity).cloned(),
+            drain.members.get(&identity).cloned(),
+            answer,
+            completions,
+            restored,
+            at_stop,
+            after_restart,
+        ),
+        (
+            its_run.clone().map(|run_id| crate::MemberStopOutcome {
+                run: crate::MemberStopRun::LeftRunning { run_id },
+                starts: crate::MemberRunStarts::Held,
+            }),
+            its_run.clone().map(|run_id| crate::MemberRunDrainOutcome {
+                run: crate::MemberRunDrain::Ended {
+                    run_id,
+                    terminal: Some(TurnTerminalOutcome::Completed),
+                },
+                starts: Some(crate::MemberRunStarts::Held),
+            }),
+            Some(format!("executor-answer-{}", requests_before + 1)),
+            Some(1),
+            MobState::Stopped,
+            AtStop {
+                waiter: StopAnswer::Succeeded,
+                phase: InputLifecycleState::Consumed,
+                outcome: Some(InputTerminalOutcome::Consumed),
+                attempt_count: 1,
+                last_run_id: its_run.clone(),
+                payload_kept: false,
+                replay_identity_kept: true,
+                outbox: false,
+                pending_terminal_owner: false,
+                runs_started: 1,
+                run_failures: Vec::new(),
+                interaction_failed_events: 0,
+            },
+            AfterRestart {
+                recovery_count: at_exit.stored.state.recovery_count,
+                row_unchanged_by_recovery: true,
+                pending_terminal_owner: false,
+                replay: StopAnswer::Succeeded,
+                model_requests: 0,
+                row_unchanged_by_replay: true,
+                runs_started: its_run.into_iter().collect(),
+                run_failures: 0,
+                interaction_failed_events: 0,
+            },
+        ),
+        "the Stop leaves the turn running, the drain waits for it, and it commits its \
+         answer; the restart keeps the consumed row and the replay answers it without a run"
+    );
+    tokio::time::timeout(WAIT, restarted.handle.shutdown())
+        .await
+        .expect("mob shutdown finishes")
+        .expect("mob shutdown");
+}
+
+/// The same in-flight host human input, with its model call held through
+/// the whole drain: the drain reports the run still running once its bound
+/// has passed, and cancels nothing. The Shutdown that follows cancels the run
+/// as it does without a drain, so the input ends exactly as in
+/// `queued_human_mid_turn_at_graceful_stop_fails_once_after_restart_and_keeps_row`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drain_at_its_bound_leaves_the_run_to_the_shutdown_cancel() {
+    use meerkat_core::event::AgentErrorClass;
+    use meerkat_runtime::input_state::{
+        InputAbandonReason, InputLifecycleState, InputTerminalOutcome,
+    };
+
+    let (_root, root_path) = stop_root();
+    let client = ScriptedClient::new(true);
+    let host = open_stop_host(&root_path, &client, Some("drain-bound")).await;
+    let mob_id = host.handle.mob_id().clone();
+    let (identity, session_id, entry) = spawn_stop_member(&host).await;
+
+    client.block();
+    let requests_before = client.requests().len();
+    let key = delivery("drain-bound");
+    let interaction_id = interaction(&key);
+    let spec = WorkSpec::new(HUMAN, WorkOrigin::External);
+    let turn = host
+        .handle
+        .start_host_human_input_bounded(
+            entry.agent_runtime_id.clone(),
+            entry.fence_token,
+            spec.clone(),
+            HandlingMode::Queue,
+            key.clone(),
+            deadline(),
+        )
+        .await
+        .expect("queued human admission");
+    client.wait_for_requests(requests_before + 1).await;
+    let input_id = admitted_input_id(&host.runtime_store, &session_id, &key).await;
+
+    let stop = stop_leaving_runs_running(&host).await;
+    let started = std::time::Instant::now();
+    let drain = tokio::time::timeout(WAIT, host.handle.drain_stopped_runs(started + DRAIN_BOUND))
+        .await
+        .expect("the drain returns at its bound")
+        .expect("drain a stopped mob");
+    let waited = started.elapsed();
+    tokio::time::timeout(WAIT, host.handle.shutdown())
+        .await
+        .expect("the graceful stop finishes")
+        .expect("graceful stop");
+    let waiter = stop_answer(turn, &session_id).await;
+    let at_exit = stop_row(&host.runtime_store, &session_id, &key, &input_id).await;
+    let events = stop_events(&root_path, &session_id).await;
+    let at_stop = observe_at_stop(waiter, &at_exit, &events, interaction_id);
+    let its_run = runs_started_for(&events, interaction_id).first().cloned();
+    drop(host);
+    await_supervisor_route_release(&mob_id).await;
+
+    let restarted_client = ScriptedClient::new(true);
+    let (restarted, restored) = reopen_stopped_host(&root_path, &restarted_client).await;
+    let after_restart = observe_after_restart(
+        &root_path,
+        &restarted,
+        &restarted_client,
+        &at_exit,
+        (&key, &input_id, spec),
+        &identity,
+        &session_id,
+    )
+    .await;
+    assert_eq!(
+        (
+            stop.members
+                .get(&identity)
+                .map(|outcome| outcome.run.clone()),
+            drain.members.get(&identity).cloned(),
+            waited >= DRAIN_BOUND,
+            restored,
+            at_stop,
+            after_restart,
+        ),
+        (
+            its_run
+                .clone()
+                .map(|run_id| crate::MemberStopRun::LeftRunning { run_id }),
+            its_run.clone().map(|run_id| crate::MemberRunDrainOutcome {
+                run: crate::MemberRunDrain::StillRunning { run_id },
+                starts: Some(crate::MemberRunStarts::Held),
+            }),
+            true,
+            MobState::Stopped,
+            AtStop {
+                waiter: StopAnswer::Cancelled,
+                phase: InputLifecycleState::Abandoned,
+                outcome: Some(InputTerminalOutcome::Abandoned {
+                    reason: InputAbandonReason::Cancelled,
+                }),
+                attempt_count: 1,
+                last_run_id: its_run.clone(),
+                payload_kept: false,
+                replay_identity_kept: true,
+                outbox: false,
+                pending_terminal_owner: false,
+                runs_started: 1,
+                run_failures: vec![(AgentErrorClass::Cancelled, "Run was cancelled".to_owned())],
+                interaction_failed_events: 0,
+            },
+            AfterRestart {
+                recovery_count: at_exit.stored.state.recovery_count,
+                row_unchanged_by_recovery: true,
+                pending_terminal_owner: false,
+                replay: StopAnswer::Cancelled,
+                model_requests: 0,
+                row_unchanged_by_replay: true,
+                runs_started: its_run.into_iter().collect(),
+                run_failures: 1,
+                interaction_failed_events: 0,
+            },
+        ),
+        "the drain reports the run still running only after its bound, and the Shutdown \
+         cancels it as without a drain"
+    );
+    tokio::time::timeout(WAIT, restarted.handle.shutdown())
+        .await
+        .expect("mob shutdown finishes")
+        .expect("mob shutdown");
+}
+
+/// A host human input queued behind the in-flight one when the host stops
+/// with `StopOptions::leave_runs_running`: the running turn drains to
+/// completion, and the queued input starts no run while the mob is stopped,
+/// during the drain or after it. The Shutdown then terminates it exactly as
+/// in `queued_human_behind_a_running_turn_at_graceful_stop_is_terminated_once_after_restart_and_keeps_row`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queued_input_starts_no_run_during_the_drain() {
+    use meerkat_core::turn_execution_authority::TurnTerminalOutcome;
+    use meerkat_runtime::input_state::{
+        InputAbandonReason, InputLifecycleState, InputTerminalOutcome,
+    };
+
+    const UNREGISTERED: &str = "runtime session unregistered";
+    let terminated = StopAnswer::RuntimeTerminated {
+        reason: UNREGISTERED.to_owned(),
+        kind: meerkat_core::TurnTerminalCauseKind::FatalFailure,
+        detail: Some(UNREGISTERED.to_owned()),
+    };
+    let (_root, root_path) = stop_root();
+    let client = ScriptedClient::new(true);
+    let host = open_stop_host(&root_path, &client, Some("drain-queued")).await;
+    let mob_id = host.handle.mob_id().clone();
+    let (identity, session_id, entry) = spawn_stop_member(&host).await;
+
+    client.block();
+    let requests_before = client.requests().len();
+    let running_key = delivery("drain-running-ahead");
+    let running = host
+        .handle
+        .start_host_human_input_bounded(
+            entry.agent_runtime_id.clone(),
+            entry.fence_token,
+            WorkSpec::new(HUMAN, WorkOrigin::External),
+            HandlingMode::Queue,
+            running_key.clone(),
+            deadline(),
+        )
+        .await
+        .expect("running human admission");
+    client.wait_for_requests(requests_before + 1).await;
+    let key = delivery("drain-queued-behind");
+    let interaction_id = interaction(&key);
+    let spec = WorkSpec::new(QUEUED_HUMAN, WorkOrigin::External);
+    let queued = host
+        .handle
+        .start_host_human_input_bounded(
+            entry.agent_runtime_id.clone(),
+            entry.fence_token,
+            spec.clone(),
+            HandlingMode::Queue,
+            key.clone(),
+            deadline(),
+        )
+        .await
+        .expect("queued human admission");
+    let input_id = admitted_input_id(&host.runtime_store, &session_id, &key).await;
+
+    stop_leaving_runs_running(&host).await;
+    let drain = drain_after_snapshot(&host, || client.release(), UNREACHED_DRAIN_BOUND).await;
+    let (running_waiter, _) = drained_answer(running).await;
+    let after_drain = (
+        stop_row(&host.runtime_store, &session_id, &key, &input_id)
+            .await
+            .stored
+            .seed
+            .phase,
+        runs_started_for(&stop_events(&root_path, &session_id).await, interaction_id).len(),
+        client.requests().len() - requests_before,
+    );
+    tokio::time::timeout(WAIT, host.handle.shutdown())
+        .await
+        .expect("the graceful stop finishes")
+        .expect("graceful stop");
+    let waiter = stop_answer(queued, &session_id).await;
+    let at_exit = stop_row(&host.runtime_store, &session_id, &key, &input_id).await;
+    let events = stop_events(&root_path, &session_id).await;
+    let at_stop = observe_at_stop(waiter, &at_exit, &events, interaction_id);
+    let running_run = runs_started_for(&events, interaction(&running_key))
+        .first()
+        .cloned();
+    drop(host);
+    await_supervisor_route_release(&mob_id).await;
+
+    let restarted_client = ScriptedClient::new(true);
+    let (restarted, restored) = reopen_stopped_host(&root_path, &restarted_client).await;
+    let after_restart = observe_after_restart(
+        &root_path,
+        &restarted,
+        &restarted_client,
+        &at_exit,
+        (&key, &input_id, spec),
+        &identity,
+        &session_id,
+    )
+    .await;
+    assert_eq!(
+        (
+            drain
+                .members
+                .get(&identity)
+                .map(|outcome| outcome.run.clone()),
+            running_waiter,
+            after_drain,
+            restored,
+            at_stop,
+            after_restart,
+        ),
+        (
+            running_run.map(|run_id| crate::MemberRunDrain::Ended {
+                run_id,
+                terminal: Some(TurnTerminalOutcome::Completed),
+            }),
+            StopAnswer::Succeeded,
+            (InputLifecycleState::Queued, 0, 1),
+            MobState::Stopped,
+            AtStop {
+                waiter: terminated.clone(),
+                phase: InputLifecycleState::Abandoned,
+                outcome: Some(InputTerminalOutcome::Abandoned {
+                    reason: InputAbandonReason::Stopped,
+                }),
+                attempt_count: 0,
+                last_run_id: None,
+                payload_kept: false,
+                replay_identity_kept: true,
+                outbox: false,
+                pending_terminal_owner: false,
+                runs_started: 0,
+                run_failures: Vec::new(),
+                interaction_failed_events: 0,
+            },
+            AfterRestart {
+                recovery_count: at_exit.stored.state.recovery_count,
+                row_unchanged_by_recovery: true,
+                pending_terminal_owner: false,
+                replay: terminated,
+                model_requests: 0,
+                row_unchanged_by_replay: true,
+                runs_started: Vec::new(),
+                run_failures: 0,
+                interaction_failed_events: 0,
+            },
+        ),
+        "the running turn drains to completion while the queued input stays queued and \
+         starts no run; the Shutdown terminates it without a run"
+    );
+    tokio::time::timeout(WAIT, restarted.handle.shutdown())
+        .await
+        .expect("mob shutdown finishes")
+        .expect("mob shutdown");
+}
+
+/// A plain Stop, without `StopOptions::leave_runs_running`, still cancels an
+/// autonomous member's in-flight turn at its next boundary and waits for it
+/// to end: the default Stop is unchanged. The Stop dispatches its cancel
+/// before the held model call is released, so the cancel reaches the run
+/// first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plain_stop_still_cancels_an_autonomous_members_in_flight_turn() {
+    use meerkat_core::event::AgentErrorClass;
+    use meerkat_runtime::input_state::{
+        InputAbandonReason, InputLifecycleState, InputTerminalOutcome,
+    };
+
+    let (_root, root_path) = stop_root();
+    let client = ScriptedClient::new(true);
+    let host = open_stop_host(&root_path, &client, Some("plain-stop-cancels")).await;
+    let (identity, session_id, entry) = spawn_stop_member(&host).await;
+
+    client.block();
+    let requests_before = client.requests().len();
+    let key = delivery("plain-stop-in-flight");
+    let interaction_id = interaction(&key);
+    let turn = host
+        .handle
+        .start_host_human_input_bounded(
+            entry.agent_runtime_id.clone(),
+            entry.fence_token,
+            WorkSpec::new(HUMAN, WorkOrigin::External),
+            HandlingMode::Queue,
+            key.clone(),
+            deadline(),
+        )
+        .await
+        .expect("queued human admission");
+    client.wait_for_requests(requests_before + 1).await;
+    let input_id = admitted_input_id(&host.runtime_store, &session_id, &key).await;
+
+    let (reached, let_cancel_run, answered) =
+        crate::runtime::provisioner::arm_stop_member_cancel_for_test(session_id.clone());
+    let stop = tokio::spawn({
+        let handle = host.handle.clone();
+        async move { handle.stop().await }
+    });
+    tokio::time::timeout(WAIT, reached)
+        .await
+        .expect("the Stop reaches the member's cancel")
+        .expect("the armed cancel hook");
+    let_cancel_run
+        .send(())
+        .expect("the Stop waits at the member's cancel");
+    // Resolves when the member's stop returns, its cancel dispatched.
+    let _ = tokio::time::timeout(WAIT, answered)
+        .await
+        .expect("the member's cancel is dispatched");
+    client.release();
+    let report = tokio::time::timeout(WAIT, stop)
+        .await
+        .expect("the Stop finishes once the cancelled turn ends")
+        .expect("stop task")
+        .expect("plain stop");
+    let waiter = stop_answer(turn, &session_id).await;
+    let row = stop_row(&host.runtime_store, &session_id, &key, &input_id).await;
+    let events = stop_events(&root_path, &session_id).await;
+    let at_stop = observe_at_stop(waiter, &row, &events, interaction_id);
+    let its_run = runs_started_for(&events, interaction_id).first().cloned();
+    assert_eq!(
+        (
+            report
+                .members
+                .get(&identity)
+                .map(|outcome| outcome.run.clone()),
+            at_stop,
+        ),
+        (
+            its_run
+                .clone()
+                .map(|run_id| crate::MemberStopRun::CancelledAtBoundary { run_id }),
+            AtStop {
+                waiter: StopAnswer::Cancelled,
+                phase: InputLifecycleState::Abandoned,
+                outcome: Some(InputTerminalOutcome::Abandoned {
+                    reason: InputAbandonReason::Cancelled,
+                }),
+                attempt_count: 1,
+                last_run_id: its_run,
+                payload_kept: false,
+                replay_identity_kept: true,
+                outbox: false,
+                pending_terminal_owner: false,
+                runs_started: 1,
+                run_failures: vec![(AgentErrorClass::Cancelled, "Run was cancelled".to_owned())],
+                interaction_failed_events: 0,
+            },
+        ),
+        "a plain Stop cancels the autonomous member's turn at its boundary"
+    );
+    tokio::time::timeout(WAIT, host.handle.shutdown())
+        .await
+        .expect("mob shutdown finishes")
+        .expect("mob shutdown");
+}
+
+/// An autonomous member whose current run is its kickoff, its model call
+/// held, when the host stops with `StopOptions::leave_runs_running`: the
+/// Stop leaves the kickoff run running, the drain reports it still running
+/// once its bound has passed, and the Shutdown that follows cancels it as it
+/// would without a drain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kickoff_run_still_running_at_the_drain_bound_is_cancelled_by_the_shutdown() {
+    use meerkat_core::event::AgentErrorClass;
+
+    let (_root, root_path) = stop_root();
+    let client = ScriptedClient::new(false);
+    let host = open_stop_host(&root_path, &client, Some("drain-kickoff")).await;
+    let identity = AgentIdentity::from(format!("host-human-stop-{}", Uuid::new_v4().simple()));
+    let session_id = host
+        .handle
+        .spawn(
+            ProfileName::from("lead"),
+            identity.clone(),
+            Some("fixture kickoff".into()),
+        )
+        .await
+        .expect("spawn autonomous member")
+        .bridge_session_id()
+        .expect("local session member")
+        .clone();
+    client.wait_for_requests(1).await;
+
+    let stop = stop_leaving_runs_running(&host).await;
+    let started = std::time::Instant::now();
+    let drain = tokio::time::timeout(WAIT, host.handle.drain_stopped_runs(started + DRAIN_BOUND))
+        .await
+        .expect("the drain returns at its bound")
+        .expect("drain a stopped mob");
+    let waited = started.elapsed();
+    tokio::time::timeout(WAIT, host.handle.shutdown())
+        .await
+        .expect("the graceful stop finishes")
+        .expect("graceful stop");
+    let events = stop_events(&root_path, &session_id).await;
+    let kickoff_run = events.iter().find_map(|event| match event {
+        AgentEvent::RunStarted { identity, .. } => identity.run_id.clone(),
+        _ => None,
+    });
+    let kickoff_failures = kickoff_run.as_ref().map(|run_id| {
+        run_failures(&events, run_id)
+            .into_iter()
+            .map(|report| (report.class, report.message))
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        (
+            stop.members
+                .get(&identity)
+                .map(|outcome| outcome.run.clone()),
+            drain.members.get(&identity).cloned(),
+            waited >= DRAIN_BOUND,
+            kickoff_failures,
+            client.requests().len(),
+        ),
+        (
+            kickoff_run
+                .clone()
+                .map(|run_id| crate::MemberStopRun::LeftRunning { run_id }),
+            kickoff_run.map(|run_id| crate::MemberRunDrainOutcome {
+                run: crate::MemberRunDrain::StillRunning { run_id },
+                starts: Some(crate::MemberRunStarts::Held),
+            }),
+            true,
+            Some(vec![(
+                AgentErrorClass::Cancelled,
+                "Run was cancelled".to_owned()
+            )]),
+            1,
+        ),
+        "the kickoff run outlives the drain's bound and the Shutdown cancels it"
+    );
+}
