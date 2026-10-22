@@ -26304,6 +26304,130 @@ mod tests {
         );
     }
 
+    /// The same deferred `session/create` prompt as
+    /// `runtime_routed_pending_first_turn_preserves_deferred_prompt_and_injected_context`,
+    /// but the session is first materialized by the `live/open` projection
+    /// (`realtime_session_open_config` reaches
+    /// `materialize_staged_session_for_realtime_open`, which creates the live
+    /// session with `DeferredPromptPolicy::Stage`). The first later turn is
+    /// the ordinary runtime-routed `turn/start`, whose typed appends author
+    /// the turn transcript. The staged prompt must still reach the durable
+    /// transcript and the provider request.
+    #[tokio::test]
+    async fn realtime_open_staged_prompt_reaches_first_runtime_routed_turn() {
+        let _projection_guard = realtime_open_projection_test_guard().await;
+        let temp = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(RecordingMessagesLlmClient::default());
+        let build_config = AgentBuildConfig {
+            llm_client_override: Some(recorder.clone()),
+            ..AgentBuildConfig::new("claude-sonnet-4-5")
+        };
+        let runtime = make_runtime(temp_factory(&temp), 10);
+
+        let session_id = runtime
+            .create_session(
+                build_config,
+                None,
+                Some(ContentInput::Text(
+                    "Remember the codeword ORBIT-7 for later.".to_string(),
+                )),
+                Vec::new(),
+            )
+            .await
+            .expect("create deferred session");
+        assert!(
+            runtime.staged_sessions.contains(&session_id).await,
+            "deferred create must stage the session in the facade registry"
+        );
+
+        // The `live/open` projection step promotes the staged slot into the
+        // live service map with the create-time prompt staged in the
+        // session's deferred-turn state.
+        let open_config = runtime
+            .realtime_session_open_config(
+                &session_id,
+                meerkat_contracts::RealtimeTurningMode::ProviderManaged,
+            )
+            .await
+            .expect("live/open projection materializes the staged session");
+        // Diagnostic only: whether the realtime seed carries the prompt.
+        let realtime_seed_has_staged =
+            format!("{:?}", open_config.seed_messages()).contains("ORBIT-7");
+        drop(open_config);
+        assert!(
+            !runtime.staged_sessions.contains(&session_id).await,
+            "live/open projection must promote the staged slot"
+        );
+        // Diagnostic only: where the create-time prompt sits before the turn.
+        let staged_before_turn = runtime
+            .load_persisted_session(&session_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|session| session.try_deferred_turn_state().ok().flatten())
+            .and_then(|state| {
+                state
+                    .pending_initial_prompt()
+                    .map(|staged| staged.prompt.text_content())
+            });
+
+        // Diagnostic only: the session's own event stream carries the
+        // agent's `RunStarted` (the turn's `mcp_event_tx` does not).
+        let mut session_events = runtime
+            .service
+            .subscribe_session_events(&session_id)
+            .await
+            .expect("subscribe session events");
+        let (event_tx, _event_rx) = mpsc::channel(100);
+        runtime
+            .start_turn_via_runtime(
+                &session_id,
+                "What is the codeword?".into(),
+                Vec::new(),
+                event_tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("runtime-routed first turn");
+
+        let mut run_started_inputs = Vec::new();
+        while let Ok(Some(envelope)) =
+            tokio::time::timeout(Duration::from_millis(500), session_events.next()).await
+        {
+            if let AgentEvent::RunStarted { input, .. } = envelope.payload {
+                run_started_inputs.push(format!("{input:?}"));
+            }
+        }
+        let requests = recorder.requests();
+        let request_dump = format!("{requests:?}");
+        let session = runtime
+            .load_persisted_session(&session_id)
+            .await
+            .expect("load persisted session")
+            .expect("session persisted");
+        let users = user_channel_messages(&session);
+        let llm_request_has_staged = request_dump.contains("ORBIT-7");
+        let transcript_has_staged = users.iter().any(|(_, text)| text.contains("ORBIT-7"));
+        let run_started_has_staged = run_started_inputs
+            .iter()
+            .any(|input| input.contains("ORBIT-7"));
+        assert!(
+            llm_request_has_staged && transcript_has_staged,
+            "staged create-time prompt lost on the first runtime-routed turn: \
+             llm_request_contains={llm_request_has_staged} \
+             transcript_contains={transcript_has_staged} \
+             run_started_contains={run_started_has_staged}; \
+             realtime_seed_contains={realtime_seed_has_staged}; \
+             staged_before_turn={staged_before_turn:?}; \
+             transcript_user_messages={users:?}; llm_requests={}; \
+             run_started_inputs={run_started_inputs:?}",
+            requests.len()
+        );
+    }
+
     /// Project a persisted session's user-channel messages as
     /// `(is_injected_context, text)` pairs, in transcript order.
     fn user_channel_messages(session: &Session) -> Vec<(bool, String)> {
