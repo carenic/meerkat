@@ -58,6 +58,14 @@ them.
   commit between the two paired the old head with the new metadata. Both
   reads now take the head and its metadata from one read transaction.
 
+- The first restore after a process exit that cut a member's runtime
+  unregister no longer leaves the member Broken. That restore concludes the
+  cut teardown and then registers the session again, but the teardown fenced
+  the restoring caller's materialization claim: the fresh registration was
+  refused as owned elsewhere, and only a second restore brought the member
+  back. The recovered drain now carries a claim of its own, so the caller's
+  claim reaches the fresh registration untouched.
+
 ## [0.9.4] - 2026-10-20
 
 ### Breaking
