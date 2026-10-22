@@ -32098,6 +32098,94 @@ async fn fork_member_then_run_detached_refuses_an_autonomous_child_before_forkin
     );
 }
 
+/// A bounded fork child with no runtime mode runs turn-driven, whatever its
+/// profile's default (the sample worker profile is autonomous), the rule
+/// bounded helpers follow too: it never runs an autonomous kickoff turn, and
+/// its one tracked turn returns the bounded result.
+#[tokio::test]
+async fn fork_member_then_run_bounded_runs_a_child_without_a_runtime_mode_turn_driven() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    service.set_return_exact_run_result(true);
+    let source = AgentIdentity::from("bounded-fork-source");
+    spawn_settled_fork_source(&handle, &source).await;
+    let child = AgentIdentity::from("unmoded-bounded-child");
+    let mut spec = bounded_fork_child_spec(&child);
+    spec.runtime_mode = None;
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handle.fork_member_then_run_bounded(
+            &source,
+            spec,
+            None,
+            "fork_child_result",
+            256,
+            meerkat_core::DurableForkSourceAdmission::Quiescent,
+        ),
+    )
+    .await
+    .expect("the bounded run returns within the watchdog")
+    .expect("a child without a runtime mode runs its bounded turn");
+
+    assert_eq!(outcome.turn.result().result().text(), "exact child task");
+    assert_eq!(
+        service.keep_alive_start_turn_call_count(),
+        0,
+        "a bounded fork child without a runtime mode must never run an autonomous kickoff turn"
+    );
+    let entry = handle
+        .get_member(&child)
+        .await
+        .expect("read the roster")
+        .expect("a child whose bounded turn completed stays seated");
+    assert_eq!(entry.runtime_mode, crate::MobRuntimeMode::TurnDriven);
+}
+
+/// The same rule for `fork_member_then_run_detached`.
+#[tokio::test]
+async fn fork_member_then_run_detached_runs_a_child_without_a_runtime_mode_turn_driven() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    service.set_return_exact_run_result(true);
+    let source = AgentIdentity::from("detached-fork-source");
+    spawn_settled_fork_source(&handle, &source).await;
+    let child = AgentIdentity::from("unmoded-detached-child");
+    let mut spec = bounded_fork_child_spec(&child);
+    spec.runtime_mode = None;
+
+    let (_fork, run) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handle.fork_member_then_run_detached(
+            &source,
+            spec,
+            None,
+            "fork_child_result",
+            256,
+            meerkat_core::DurableForkSourceAdmission::Quiescent,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("the detached run is admitted within the watchdog")
+    .expect("a child without a runtime mode starts its bounded turn");
+    tokio::time::timeout(std::time::Duration::from_secs(5), run.outcome())
+        .await
+        .expect("the child's run reaches an outcome within the watchdog")
+        .expect("the child's bounded turn completes");
+
+    assert_eq!(
+        service.keep_alive_start_turn_call_count(),
+        0,
+        "a detached fork child without a runtime mode must never run an autonomous kickoff turn"
+    );
+    let entry = handle
+        .get_member(&child)
+        .await
+        .expect("read the roster")
+        .expect("a child whose bounded turn completed stays seated");
+    assert_eq!(entry.runtime_mode, crate::MobRuntimeMode::TurnDriven);
+}
+
 #[tokio::test]
 async fn test_respawn_contract_aligns_receipt_with_canonical_member_state() {
     let (handle, service) = create_test_mob(sample_definition()).await;

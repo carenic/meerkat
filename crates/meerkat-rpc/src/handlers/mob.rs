@@ -3778,6 +3778,14 @@ mod tests {
             let error = response
                 .error
                 .expect("an autonomous helper must be refused");
+            // UnsupportedForMode carries no typed wire detail: it maps to
+            // INVALID_PARAMS with the error's message and no data.
+            assert_eq!(error.code, crate::error::INVALID_PARAMS);
+            assert!(
+                error.data.is_none(),
+                "unexpected error data: {:?}",
+                error.data
+            );
             assert!(
                 error
                     .message
