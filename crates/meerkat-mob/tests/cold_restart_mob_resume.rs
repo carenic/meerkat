@@ -6156,3 +6156,111 @@ async fn a_resume_delivers_an_owed_first_turn_exactly_once() {
     );
     lifetime.handle.shutdown().await.expect("shutdown mob");
 }
+
+/// The deferred-turn state a retired member's session carries in its store.
+async fn stored_deferred_turn_state(
+    lifetime: &FirstTurnLifetime,
+    session_id: &meerkat::SessionId,
+) -> Option<meerkat_core::SessionDeferredTurnState> {
+    lifetime
+        .service
+        .load_revivable_retired_session(session_id)
+        .await
+        .expect("read the retired session")
+        .expect("the retired session stays revivable")
+        .try_deferred_turn_state()
+        .expect("stored deferred-turn state")
+}
+
+/// A session resumed while its first turn is still pending records the start
+/// of that first turn durably. The run checkpoint persists the session's live
+/// first-turn phase, not the pending copy the resumed agent was built from.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resumed_pending_session_records_the_start_of_its_first_turn() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let identity = AgentIdentity::from("pending-first-turn");
+
+    // Lifetime 1: the member's session is created and runs no turn.
+    let lifetime = start_first_turn_lifetime(
+        &paths,
+        &runtime_store,
+        Some(first_turn_mob_definition("pending-first-turn")),
+    )
+    .await;
+    lifetime
+        .handle
+        .spawn_spec(SpawnMemberSpec::new("worker", identity.clone()))
+        .await
+        .expect("fresh turn-driven spawn with no first turn");
+    let session_id = lifetime
+        .handle
+        .resolve_bridge_session_id(&identity)
+        .await
+        .expect("member session");
+    lifetime
+        .handle
+        .retire(identity.clone())
+        .await
+        .expect("retire member");
+    assert_eq!(
+        stored_deferred_turn_state(&lifetime, &session_id)
+            .await
+            .map(|state| state.first_turn_phase()),
+        Some(meerkat_core::DeferredFirstTurnPhase::Pending),
+        "the session's first turn has not started"
+    );
+    lifetime.handle.shutdown().await.expect("shutdown mob");
+
+    // Lifetime 2: the resumed member runs its first turn.
+    let lifetime = start_first_turn_lifetime(&paths, &runtime_store, None).await;
+    resume_member(
+        &lifetime,
+        "worker",
+        &identity,
+        &session_id,
+        MobRuntimeMode::TurnDriven,
+        None,
+    )
+    .await;
+    settle_with_probe(&lifetime, &identity, "FIRST_TURN_PROBE token-omicron").await;
+    lifetime
+        .handle
+        .retire(identity.clone())
+        .await
+        .expect("retire member");
+    let stored = stored_deferred_turn_state(&lifetime, &session_id).await;
+    assert_ne!(
+        stored.as_ref().map(|state| state.first_turn_phase()),
+        Some(meerkat_core::DeferredFirstTurnPhase::Pending),
+        "a first turn that ran is recorded as started, not still pending"
+    );
+    assert!(
+        stored.is_none_or(|state| !state.allows_initial_turn_overrides()),
+        "the first turn's build-override window stays closed"
+    );
+    lifetime.handle.shutdown().await.expect("shutdown mob");
+
+    // Lifetime 3: a second resume does not mark the first turn pending again.
+    let lifetime = start_first_turn_lifetime(&paths, &runtime_store, None).await;
+    resume_member(
+        &lifetime,
+        "worker",
+        &identity,
+        &session_id,
+        MobRuntimeMode::TurnDriven,
+        None,
+    )
+    .await;
+    assert!(
+        !lifetime
+            .service
+            .live_deferred_first_turn_pending(&session_id)
+            .await
+            .expect("read the live first-turn phase"),
+        "a resume after the first turn ran does not reopen it"
+    );
+    lifetime.handle.shutdown().await.expect("shutdown mob");
+}
