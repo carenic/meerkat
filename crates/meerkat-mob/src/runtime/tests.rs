@@ -84791,6 +84791,10 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         MobError::WorkInputCompletionUnavailable { .. } => {
             "work_input_completion_unavailable".to_string()
         }
+        MobError::MemberInputRequeuedAcrossStop { .. } => {
+            "member_input_requeued_across_stop".to_string()
+        }
+        MobError::MemberInputRequeueExpired { .. } => "member_input_requeue_expired".to_string(),
         MobError::MemberInputRefused { .. } => "member_input_refused".to_string(),
         MobError::GovernedInputUnbound { .. } => "governed_input_unbound".to_string(),
         MobError::InvalidTransition { from, to } => {

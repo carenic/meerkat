@@ -173,6 +173,9 @@ pub(crate) enum MobMachineCommand {
     Shutdown {
         /// Caller-owned bound for the Shutdown's waits (`ShutdownOptions`).
         deadline: Option<meerkat_core::time_compat::Instant>,
+        /// What the Shutdown does with inputs still queued behind a member's
+        /// running turn (`ShutdownOptions`).
+        queued_inputs: crate::runtime::QueuedInputsOnShutdown,
     },
     ForceCancel {
         agent_identity: AgentIdentity,

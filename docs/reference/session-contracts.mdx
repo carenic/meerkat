@@ -797,6 +797,25 @@ waited for it.
   and the last cause. Nothing in that wait reloads the session (see
   [Scheduling](/guides/scheduling)).
 
+A graceful mob Shutdown that keeps queued inputs
+(`QueuedInputsOnShutdown::Requeue` on `meerkat_mob::ShutdownOptions`) fails the
+completion waiters of the inputs it keeps with
+`CompletionWaitError::RequeuedAcrossStop`. Such an input is neither failed nor
+consumed: it stays durably queued, and the session's next start runs it, or
+ends it abandoned with reason `requeue_expired` when it is older than the
+Shutdown's max age by then. Do not resubmit it; after the restart, the same
+idempotency key re-attaches to it.
+
+- A JSON-RPC `turn/start` waiting on it answers `-32003` (session not running)
+  with `data.reason` `requeued_across_stop`, and `data.input_id` and
+  `data.stopped_at`.
+- REST answers `503` with code `SESSION_RUNTIME_UNAVAILABLE` and
+  `details.kind` `requeued_across_stop`.
+- A mob member's bounded wait answers `BoundedTurnFailure::RequeuedAcrossStop`,
+  and a same-key replay of an input that expired answers
+  `BoundedTurnFailure::RequeueExpired`.
+- A scheduled delivery re-reads the input's own outcome, as for the cases above.
+
 An input admission whose store write never answers has the same deadline
 since 0.9.4. Past it the admission refuses with the retryable
 `RuntimeDriverError::RecoveryRepairBlocked`, naming the input, and the session

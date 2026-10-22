@@ -1835,6 +1835,11 @@ fn receipt_failure(
             } => ReceiptFailure::TurnFailed,
             _ => ReceiptFailure::RestartCaused,
         },
+        // A graceful stop kept the turn's input queued for the next start,
+        // or that input aged out before it ran: the stop ended it, never the
+        // turn itself.
+        BoundedTurnFailure::RequeuedAcrossStop { .. }
+        | BoundedTurnFailure::RequeueExpired { .. } => ReceiptFailure::RestartCaused,
         _ => ReceiptFailure::RestartCaused,
     }
 }
@@ -2699,6 +2704,14 @@ mod tests {
             },
             BoundedTurnFailure::CompletionAuthorityClosed {
                 admitted_session_id: session_id.clone(),
+            },
+            BoundedTurnFailure::RequeuedAcrossStop {
+                session_id: session_id.clone(),
+                input_id: meerkat_core::lifecycle::InputId::new(),
+            },
+            BoundedTurnFailure::RequeueExpired {
+                session_id: session_id.clone(),
+                input_id: meerkat_core::lifecycle::InputId::new(),
             },
         ] {
             assert_eq!(

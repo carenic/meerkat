@@ -2316,11 +2316,13 @@ fn wait_failure_completion(error: &CompletionWaitError) -> ScheduleDomainError {
 
 /// The completion of a live wait that failed.
 ///
-/// A rolled-back boundary ([`CompletionWaitError::BoundaryRolledBack`]) or an
+/// A rolled-back boundary ([`CompletionWaitError::BoundaryRolledBack`]), an
 /// unknown durable outcome ([`CompletionWaitError::DurableOutcomeUnknown`])
-/// leaves the input durably admitted with its terminal still to come: it runs
-/// again after its session reloads, or its stalled commit lands. Neither
-/// failure is the input's outcome, so when the host knows the input
+/// or a graceful stop that kept the input queued
+/// ([`CompletionWaitError::RequeuedAcrossStop`]) leaves the input durably
+/// admitted with its terminal still to come: it runs again after its session
+/// reloads, its stalled commit lands, or the next start runs it. None of these
+/// failures is the input's outcome, so when the host knows the input
 /// (`outcome_read`), the completion reads the input's own terminal through
 /// the bounded re-read loop ([`reread_admitted_input_outcome`]), under the
 /// driver's lease renewal, and resolves the occurrence from it; at the bound
@@ -2333,7 +2335,9 @@ async fn completion_after_wait_failure(
 ) -> Result<CompletionOutcome, ScheduleDomainError> {
     match outcome_read {
         Some(outcome_read)
-            if error.is_boundary_rolled_back() || error.is_durable_outcome_unknown() =>
+            if error.is_boundary_rolled_back()
+                || error.is_durable_outcome_unknown()
+                || error.is_requeued_across_stop() =>
         {
             reread_admitted_input_outcome(outcome_read.into_reread(error.to_string())).await
         }
@@ -7566,8 +7570,10 @@ mod tests {
     // A run whose boundary commit rolled back (`BoundaryRolledBack`) or whose
     // durable outcome is unknown (`DurableOutcomeUnknown`) fails its live
     // completion waiters. The input stays admitted and reaches its own
-    // terminal after its session reloads. These tests script the failed wait
-    // and the reads of the input's terminal that follow it.
+    // terminal after its session reloads. A graceful stop that kept a queued
+    // input (`RequeuedAcrossStop`) leaves it admitted the same way, until the
+    // next start runs it. These tests script the failed wait and the reads of
+    // the input's terminal that follow it.
 
     fn rolled_back_boundary() -> CompletionWaitError {
         CompletionWaitError::BoundaryRolledBack {
@@ -7582,13 +7588,19 @@ mod tests {
         }
     }
 
+    fn requeued_across_stop() -> CompletionWaitError {
+        CompletionWaitError::RequeuedAcrossStop {
+            stopped_at: chrono::Utc::now(),
+        }
+    }
+
     /// Which wait failures read the input's own terminal: a rolled-back
-    /// boundary and an unknown durable outcome, when the host knows the
-    /// input. Every other wait failure, and a handle built without its input
-    /// (`AcceptedScheduledInput::with_runtime_handle`), ends the delivery with
-    /// the wait failure at once, with no read.
+    /// boundary, an unknown durable outcome and a graceful stop's requeue,
+    /// when the host knows the input. Every other wait failure, and a handle
+    /// built without its input (`AcceptedScheduledInput::with_runtime_handle`),
+    /// ends the delivery with the wait failure at once, with no read.
     #[tokio::test]
-    async fn only_a_rolled_back_or_unknown_wait_reads_the_inputs_terminal() {
+    async fn only_a_wait_that_leaves_the_input_admitted_reads_its_terminal() {
         use DeliveryCompletionFailureReason::{
             RuntimeCompletionAuthorityUnavailable, RuntimeCompletionChannelClosed,
         };
@@ -7615,6 +7627,18 @@ mod tests {
             (
                 "an unknown durable outcome without its input",
                 unknown_durable_outcome(),
+                false,
+                Some(RuntimeCompletionAuthorityUnavailable),
+            ),
+            (
+                "a requeue across a graceful stop",
+                requeued_across_stop(),
+                true,
+                None,
+            ),
+            (
+                "a requeue across a graceful stop without its input",
+                requeued_across_stop(),
                 false,
                 Some(RuntimeCompletionAuthorityUnavailable),
             ),

@@ -368,6 +368,9 @@ pub struct MemberUnregisterSettlement {
     /// retains the member's bound operation as Shutdown's does.
     #[cfg(feature = "runtime-adapter")]
     ops_adapter: Weak<super::ops_adapter::MobOpsAdapter>,
+    /// What an unregister this settlement begins does with the session's
+    /// queued inputs: the choice of the Shutdown that handed it back.
+    queued_inputs: meerkat_runtime::UnregisterQueuedInputs,
     /// `Settled`, `Failed` or `HandedOver`, once reached.
     terminal: Option<MemberUnregisterState>,
 }
@@ -387,8 +390,22 @@ impl MemberUnregisterSettlement {
             observer,
             runtime: Arc::downgrade(runtime),
             ops_adapter: ops_adapter.map_or_else(Weak::new, Arc::downgrade),
+            queued_inputs: meerkat_runtime::UnregisterQueuedInputs::Stop,
             terminal: None,
         }
+    }
+
+    /// Begin a later unregister with `queued_inputs`, the choice of the
+    /// Shutdown that handed this settlement back. Without it the settlement
+    /// stops the session's queued inputs.
+    #[cfg(feature = "runtime-adapter")]
+    #[must_use]
+    pub(crate) fn with_queued_inputs(
+        mut self,
+        queued_inputs: meerkat_runtime::UnregisterQueuedInputs,
+    ) -> Self {
+        self.queued_inputs = queued_inputs;
+        self
     }
 
     /// The state as known now, without waiting: the terminal state
@@ -471,10 +488,12 @@ impl MemberUnregisterSettlement {
                 };
                 let admitted = crate::tokio::time::timeout(
                     remaining(),
-                    runtime.observe_unregister_session_registration_if_use_unchanged(
-                        &self.registration,
-                        expected_use,
-                    ),
+                    runtime
+                        .observe_unregister_session_registration_with_queued_inputs_if_use_unchanged(
+                            &self.registration,
+                            expected_use,
+                            self.queued_inputs,
+                        ),
                 )
                 .await;
                 match admitted {
@@ -670,6 +689,12 @@ impl ShutdownOptions {
 
 /// What a graceful mob Shutdown does with inputs still queued behind a
 /// member's running turn.
+///
+/// Only a whole-mob Shutdown takes this choice: a member's retirement,
+/// archive or destroy always ends its queued inputs as stopped, since that
+/// session is not expected to resume. Shutdown applies it to the members it
+/// unregisters and keeps; a member already retiring when Shutdown reaches it
+/// is stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum QueuedInputsOnShutdown {
@@ -678,7 +703,35 @@ pub enum QueuedInputsOnShutdown {
     Stop,
     /// Keep eligible queued inputs durably queued, so the mob's next start
     /// runs them, unless they are older than the bound by then.
+    ///
+    /// Eligible: a durable prompt in the queue lane that is still queued
+    /// when the member's runtime stops and is not a directed interaction.
+    /// Every other input still ends as stopped. The waiter of a kept input
+    /// is answered [`RequeuedAcrossStop`](super::BoundedTurnFailure::RequeuedAcrossStop):
+    /// do not resubmit it; a same-key replay after the restart re-attaches
+    /// to it, and one older than the bound by then ends
+    /// [`RequeueExpired`](super::BoundedTurnFailure::RequeueExpired).
+    ///
+    /// This is a guarantee only for members whose run starts the Shutdown
+    /// holds ([`MemberRunStarts::Held`](super::stop_report::MemberRunStarts::Held)).
+    /// A member that cannot hold them may start its queued input once its
+    /// running turn is cancelled, before its runtime stops; that input then
+    /// belongs to the cancelled run and is not kept.
     Requeue(RequeueMaxAge),
+}
+
+impl QueuedInputsOnShutdown {
+    /// The runtime unregister's choice for a member session's queued
+    /// inputs.
+    #[cfg(feature = "runtime-adapter")]
+    pub(crate) fn unregister_queued_inputs(self) -> meerkat_runtime::UnregisterQueuedInputs {
+        match self {
+            Self::Stop => meerkat_runtime::UnregisterQueuedInputs::Stop,
+            Self::Requeue(max_age) => meerkat_runtime::UnregisterQueuedInputs::Requeue {
+                max_age: max_age.get(),
+            },
+        }
+    }
 }
 
 /// The age bound of a requeued input, measured from its admission.
@@ -692,7 +745,20 @@ impl RequeueMaxAge {
     pub const DEFAULT: Duration = Duration::from_mins(15);
 
     /// A bound of `max_age`.
+    ///
+    /// # Errors
+    /// Refuses a bound of zero and a bound over [`Self::CAP`]. A bound is
+    /// never clamped.
     pub fn new(max_age: Duration) -> Result<Self, ShutdownOptionsError> {
+        if max_age.is_zero() {
+            return Err(ShutdownOptionsError::RequeueMaxAgeZero);
+        }
+        if max_age > Self::CAP {
+            return Err(ShutdownOptionsError::RequeueMaxAgeOverCap {
+                max_age,
+                cap: Self::CAP,
+            });
+        }
         Ok(Self(max_age))
     }
 
