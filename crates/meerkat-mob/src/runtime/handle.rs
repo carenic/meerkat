@@ -10404,7 +10404,7 @@ impl MobHandle {
 
     /// List all members including those in `Retiring` state.
     ///
-    /// The `state` field on each [`RosterEntry`] is projected from
+    /// The `state` field on each `RosterEntry` is projected from
     /// `MobMachineState`, not from the event roster's compatibility mirror.
     pub async fn list_all_members(&self) -> Vec<RosterEntry> {
         self.project_all_roster_entries_from_machine_state().await
@@ -10663,8 +10663,8 @@ impl MobHandle {
     /// Application code acting on a mob should prefer the identity-native
     /// [`MobHandle`] APIs: [`MobHandle::member`] to acquire a
     /// capability-bearing handle, [`MemberHandle::internal_turn`] to deliver
-    /// content without the RPC turn-start dance, [`MobHandle::peer_send`]
-    /// / [`MobHandle::member_send`] for peer comms, etc. Those hide the
+    /// content without the RPC turn-start dance, [`MobHandle::send_peer_message`]
+    /// / [`MemberHandle::send_peer_message`] for peer comms, etc. Those hide the
     /// session_id entirely.
     ///
     /// # Dogma fit (A8)
@@ -11101,7 +11101,7 @@ impl MobHandle {
     /// Subscribe to agent events for all active members (point-in-time snapshot).
     ///
     /// Returns one stream per active member that has a live bridge binding. Members
-    /// spawned after this call are not included — use [`subscribe_mob_events`]
+    /// spawned after this call are not included - use [`Self::subscribe_mob_events`]
     /// for a continuously updated view.
     pub async fn subscribe_all_agent_events(
         &self,
@@ -11127,7 +11127,7 @@ impl MobHandle {
     /// Subscribe to a continuously-updated, mob-level event bus.
     ///
     /// Spawns an independent task that merges per-member session streams,
-    /// tags each event with [`AttributedEvent`], and tracks roster changes
+    /// tags each event with [`AttributedEvent`](crate::AttributedEvent), and tracks roster changes
     /// (spawns/retires) automatically. Drop the returned handle to stop
     /// the router.
     pub async fn subscribe_mob_events(
@@ -13971,7 +13971,7 @@ impl MobHandle {
     /// context: the member reads it as a typed injected-context message, and
     /// no conversational user row is synthesized, so nothing downstream (a
     /// live channel's mirror, a transcript view) mistakes it for human input.
-    /// Exact runtime-input custody like [`Self::start_runtime_work_with_delivery_identity_bounded`];
+    /// Exact runtime-input custody like `Self::start_runtime_work_with_delivery_identity_bounded`;
     /// retry only with the SAME delivery identity.
     #[cfg(feature = "runtime-adapter")]
     pub async fn start_injected_context_work_for_identity_bounded(

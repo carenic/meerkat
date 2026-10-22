@@ -2,7 +2,7 @@
 //! DEC-P3H-1..10).
 //!
 //! Serves the build half of `MaterializeMember`: decompiles the digest-covered
-//! [`PortableMemberSpec`] back into [`BuildAgentConfigParams`] and re-runs the
+//! [`PortableMemberSpec`] back into `BuildAgentConfigParams` and re-runs the
 //! ONE compiler (`crate::build::build_agent_config`) — no second prompt/tool
 //! assembly exists (plan §14.2/§15 R1, A1). The member's comms runtime is
 //! materializer-built (durable per-session keypair under the daemon's identity
