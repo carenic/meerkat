@@ -2522,8 +2522,13 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         MobError::BridgeCommandRejected { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::BridgeCommandRejected
         }
-        MobError::MemberRestoreFailed { .. } | MobError::MemberStartupRecoveryFailed { .. } => {
+        MobError::MemberRestoreFailed { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::MemberRestoreFailed
+        }
+        // Never a spawn outcome today (a spawn on a stopped actor gets
+        // ActorCommandChannelClosed); were it one, it classifies as its cause.
+        MobError::MemberStartupRecoveryFailed { cause, .. } => {
+            spawn_many_failure_observation(cause.as_ref())
         }
         // A degraded or detached runtime registration is a session fault of
         // the existing member; the spawn row records it as its session cause.

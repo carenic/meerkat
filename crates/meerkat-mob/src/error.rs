@@ -1898,20 +1898,35 @@ impl MobError {
                 "content_retained": true,
                 "retryable": false,
             })),
-            // The cause keeps its own structured data, so a wire caller
-            // classifies it exactly as it would the cause alone.
+            // The member and its session are this variant's own facts; the
+            // cause keeps its structured data under "cause_data", and its
+            // durable resume hold is also lifted to the top level, under
+            // meerkat's own key, so a reader of that key classifies the
+            // failure exactly as it would the cause alone. Every typed
+            // classifier above and below delegates to the cause.
             Self::MemberStartupRecoveryFailed {
                 member_id,
                 session_id,
                 cause,
-            } => Some(serde_json::json!({
-                "kind": "mob_member_startup_recovery_failed",
-                "member_id": member_id.as_str(),
-                "session_id": session_id.to_string(),
-                "cause": cause.to_string(),
-                "cause_data": cause.structured_data(),
-                "actor_stopped": true,
-            })),
+            } => {
+                let mut data = serde_json::json!({
+                    "kind": "mob_member_startup_recovery_failed",
+                    "member_id": member_id.as_str(),
+                    "session_id": session_id.to_string(),
+                    "cause": cause.to_string(),
+                    "cause_data": cause.structured_data(),
+                    "actor_stopped": true,
+                });
+                if let (Some(hold), Some(object)) =
+                    (cause.durable_resume_hold(), data.as_object_mut())
+                {
+                    object.insert(
+                        meerkat_core::service::SessionError::DURABLE_RESUME_HOLD_KEY.to_string(),
+                        serde_json::Value::from(hold.as_str()),
+                    );
+                }
+                Some(data)
+            }
             Self::MemberRegistrationRefused {
                 member_id,
                 session_id,
@@ -2231,7 +2246,8 @@ impl MobError {
             Self::RuntimeEffectRefused { .. } => true,
             Self::SharedRetirementFailure(error)
             | Self::SharedLifecycleFailure(error)
-            | Self::MemberRetirementStuck { cause: error, .. } => {
+            | Self::MemberRetirementStuck { cause: error, .. }
+            | Self::MemberStartupRecoveryFailed { cause: error, .. } => {
                 error.is_closed_runtime_effect_refusal()
             }
             _ => false,
@@ -2727,43 +2743,64 @@ mod tests {
         }
     }
 
-    /// A member's startup recovery failure keeps its cause's typed meaning
-    /// on every projection, also when the actor shares it with every handle:
-    /// the wire code and the failure class are the cause's, and the
-    /// structured data names the member, its session and the cause's own
-    /// data.
+    /// A member's startup recovery failure, shared with every handle,
+    /// classifies exactly as its bare cause on every typed classifier, for a
+    /// hosting refusal and for a cause that carries a durable resume hold.
+    /// Its structured data names the member and its session, keeps the
+    /// cause's data, and lifts the cause's hold to meerkat's top-level key.
     #[test]
-    fn a_member_startup_recovery_failure_projects_its_cause() {
+    fn a_member_startup_recovery_failure_classifies_as_its_cause() {
+        use meerkat_core::service::SessionError;
         let session_id = meerkat_core::types::SessionId::new();
-        let cause =
-            MobError::SessionError(meerkat_core::service::SessionError::HostingUnavailable {
-                id: session_id.clone(),
-            });
-        let cause_class = cause.failure_class();
-        let failure =
-            MobError::SharedLifecycleFailure(Arc::new(MobError::MemberStartupRecoveryFailed {
-                member_id: AgentIdentity::from("w-1"),
-                session_id: session_id.clone(),
-                cause: Arc::new(cause),
-            }));
-        assert_eq!(
-            failure.wire_error_code(),
-            Some(meerkat_contracts::ErrorCode::SessionRuntimeUnavailable)
-        );
-        assert_eq!(failure.failure_class(), cause_class);
-        let data = failure.structured_data().expect("structured data");
-        assert_eq!(data["kind"], "mob_member_startup_recovery_failed");
-        assert_eq!(data["member_id"], "w-1");
-        assert_eq!(data["session_id"], session_id.to_string());
-        assert_eq!(
-            data["cause_data"]["kind"],
-            meerkat_core::service::SessionError::HOSTING_UNAVAILABLE_KIND
-        );
-        let rendered = failure.to_string();
-        assert!(
-            rendered.contains("w-1") && rendered.contains(&session_id.to_string()),
-            "the message names the member and its session: {rendered}"
-        );
+        type MakeCause = fn(&meerkat_core::types::SessionId) -> SessionError;
+        let causes: [MakeCause; 3] = [
+            |id| SessionError::ServedElsewhere { id: id.clone() },
+            |id| SessionError::HostingUnavailable { id: id.clone() },
+            |id| SessionError::DurableTailHeldForRecovery { id: id.clone() },
+        ];
+        for make_cause in causes {
+            let bare = MobError::SessionError(make_cause(&session_id));
+            let failure =
+                MobError::SharedLifecycleFailure(Arc::new(MobError::MemberStartupRecoveryFailed {
+                    member_id: AgentIdentity::from("w-1"),
+                    session_id: session_id.clone(),
+                    cause: Arc::new(MobError::SessionError(make_cause(&session_id))),
+                }));
+            assert_eq!(failure.durable_resume_hold(), bare.durable_resume_hold());
+            assert_eq!(failure.wire_error_code(), bare.wire_error_code());
+            assert_eq!(failure.failure_class(), bare.failure_class());
+            assert_eq!(
+                format!("{:?}", failure.wire_detail()),
+                format!("{:?}", bare.wire_detail())
+            );
+            assert_eq!(
+                format!("{:?}", failure.bridge_rejection_cause()),
+                format!("{:?}", bare.bridge_rejection_cause())
+            );
+            assert_eq!(
+                failure.is_closed_runtime_effect_refusal(),
+                bare.is_closed_runtime_effect_refusal()
+            );
+            let data = failure.structured_data().expect("structured data");
+            assert_eq!(data["kind"], "mob_member_startup_recovery_failed");
+            assert_eq!(data["member_id"], "w-1");
+            assert_eq!(data["session_id"], session_id.to_string());
+            assert_eq!(
+                data["cause_data"],
+                bare.structured_data().unwrap_or(serde_json::Value::Null)
+            );
+            let hold_key = SessionError::DURABLE_RESUME_HOLD_KEY;
+            assert_eq!(
+                data.get(hold_key).and_then(serde_json::Value::as_str),
+                bare.durable_resume_hold().map(|hold| hold.as_str()),
+                "the top-level hold is the cause's"
+            );
+            let rendered = failure.to_string();
+            assert!(
+                rendered.contains("w-1") && rendered.contains(&session_id.to_string()),
+                "the message names the member and its session: {rendered}"
+            );
+        }
     }
 
     #[test]
