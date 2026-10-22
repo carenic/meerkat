@@ -451,10 +451,7 @@ pub async fn handle_list(id: Option<RpcId>, state: &Arc<MobMcpState>) -> RpcResp
     };
     let mobs = mobs
         .into_iter()
-        .map(|(mob_id, observation)| MobStatusResult {
-            mob_id: mob_id.to_string(),
-            status: meerkat_mob_mcp::wire_mob_lifecycle_status(observation.phase),
-        })
+        .map(|(mob_id, observation)| meerkat_mob_mcp::wire_mob_status_row(&mob_id, &observation))
         .collect::<Vec<_>>();
     RpcResponse::success(id, MobListResult { mobs })
 }
@@ -480,9 +477,12 @@ pub async fn handle_status(
     match state.mob_status(&mob_id).await {
         Ok(status) => RpcResponse::success(
             id,
+            // A mob whose actor has stopped answers its typed failure as the
+            // error below, so a status row carries none.
             MobStatusResult {
                 mob_id: mob_id.to_string(),
                 status: meerkat_mob_mcp::wire_mob_lifecycle_status(status),
+                failure: None,
             },
         ),
         Err(err) => mob_call_error(id, &err),

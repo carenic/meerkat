@@ -4,6 +4,7 @@ import type { AuthBindingRef } from './generated/runtime.js';
 import type {
   WireHostRef,
   WireMemberLifecycleCapabilities,
+  WireMobLifecycleFailure,
   WireMemberPreviewUnavailable,
   WireMemberProgressSnapshot,
   WireMemberRegistrationHookCall,
@@ -20,6 +21,7 @@ export type {
   WireMemberPreviewUnavailable,
   WireMemberProgressSnapshot,
   WireMemberRegistrationHookCall,
+  WireMobLifecycleFailure,
 } from './generated/mob.js';
 
 // ─── Bootstrap / session config (generated wire parity) ─────────
@@ -380,7 +382,13 @@ export type MobPeerTarget = string | ExternalPeerTarget;
 /** Mob status. */
 export interface MobStatus {
   mob_id: string;
+  /** The last machine phase the mob's actor published. */
   status: string;
+  /**
+   * Present means the mob's actor has stopped; `status` is the last machine
+   * phase. Why the actor stopped, typed.
+   */
+  failure?: WireMobLifecycleFailure;
 }
 
 /** Unreachable peer entry from a live member connectivity snapshot. */

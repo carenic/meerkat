@@ -1127,11 +1127,35 @@ pub enum WireMobLifecycleStatus {
 }
 
 /// One active mob row returned by `mob/list`.
+///
+/// `failure` present means the mob's actor has stopped; `status` is the last
+/// machine phase. The actor admits no command until a restart recovers the
+/// mob from its durable state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MobStatusResult {
     pub mob_id: String,
+    /// The last machine phase the mob's actor published.
     pub status: WireMobLifecycleStatus,
+    /// Present means the mob's actor has stopped; `status` is the last
+    /// machine phase. Why the actor stopped, typed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<WireMobLifecycleFailure>,
+}
+
+/// Why a mob's actor has stopped, on a `mob/list` row: the fields a failed
+/// `mob/spawn_many` row carries.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct WireMobLifecycleFailure {
+    /// The mob failure cause, as the mob's machine classifies it.
+    pub cause: MobSpawnManyFailureCause,
+    pub message: String,
+    /// Stable classification supplied by the canonical failure owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<crate::ErrorCode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_data: Option<Value>,
 }
 
 /// Response payload for `mob/list`.

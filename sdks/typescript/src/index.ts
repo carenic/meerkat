@@ -184,6 +184,7 @@ export type {
   MobRunResult,
   MobRevokeScopesParams,
   MobRevokeScopesResult,
+  MobLifecycleFailure,
   MobStatus,
   MobSummary,
   MobTurnStartOptions,

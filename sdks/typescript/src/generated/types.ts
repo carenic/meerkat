@@ -1709,7 +1709,15 @@ export interface MobListResult {
   mobs: Record<string, unknown>[];
 }
 
+export interface WireMobLifecycleFailure {
+  cause: MobSpawnManyFailureCause;
+  code?: "SESSION_NOT_FOUND" | "SCHEDULE_NOT_FOUND" | "SESSION_BUSY" | "SESSION_NOT_RUNNING" | "REQUEST_CANCELLED" | "PROVIDER_ERROR" | "BUDGET_EXHAUSTED" | "HOOK_DENIED" | "AGENT_ERROR" | "CAPABILITY_UNAVAILABLE" | "SKILL_NOT_FOUND" | "SKILL_RESOLUTION_FAILED" | "INVALID_PARAMS" | "INTERNAL_ERROR" | "DUPLICATE_INPUT" | "SUPERVISOR_ROTATION_INCOMPLETE" | "SCOPE_DENIED" | "HOST_UNAVAILABLE" | "STALE_CURSOR" | "STALE_FENCE" | "MEMBER_RELOAD_REQUIRED" | "INPUT_REFUSED" | "INPUT_NOT_READY" | "SESSION_RUNTIME_UNAVAILABLE" | "APPROVAL_STORE_UNAVAILABLE" | "APPROVAL_CONFLICT" | "APPROVAL_COMMIT_UNKNOWN" | "STALE_DELIVERY_SCOPE" | "FORK_INSTRUCTION_REFUSED" | null;
+  message: string;
+  structured_data?: unknown;
+}
+
 export interface MobStatusResult {
+  failure?: WireMobLifecycleFailure | null;
   mob_id: string;
   status: "Creating" | "Running" | "Stopped" | "Completed" | "Destroyed";
 }

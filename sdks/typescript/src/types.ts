@@ -834,7 +834,26 @@ export type MobGrantRecord = Generated.WireGrantRecord;
 
 export interface MobSummary {
   readonly mobId: string;
+  /** The last machine phase the mob's actor published. */
   readonly status: string;
+  /**
+   * Present means the mob's actor has stopped; `status` is the last machine
+   * phase. Why the actor stopped, typed.
+   */
+  readonly failure?: MobLifecycleFailure;
+}
+
+/**
+ * Why a listed mob's actor has stopped: the fields a failed
+ * `mob/spawn_many` row carries.
+ */
+export interface MobLifecycleFailure {
+  /** The mob failure cause, as the mob's machine classifies it. */
+  readonly cause: string;
+  readonly message: string;
+  /** Stable classification supplied by the canonical failure owner. */
+  readonly code?: string;
+  readonly structuredData?: unknown;
 }
 
 export interface MobStatus {

@@ -5262,7 +5262,11 @@ impl MobMcpState {
         self.ensure_restored().await?;
         // A destroyed mob (its phase flips when the destroy is admitted) is
         // not handed out: a clone taken now would keep observing the
-        // database its destroy's storage cleanup drains.
+        // database its destroy's storage cleanup drains. A mob whose actor
+        // has stopped keeps its last live phase and is handed out: hiding it
+        // would make its failure silently absent from the surfaces built on
+        // this snapshot, which read why from the handle
+        // (`lifecycle_observation`, `status`).
         Ok(self
             .mobs
             .read()
@@ -9596,6 +9600,33 @@ pub fn wire_mob_lifecycle_status(state: MobState) -> WireMobLifecycleStatus {
     }
 }
 
+/// Why a listed mob's actor has stopped, on the wire: the fields a failed
+/// `mob/spawn_many` row carries, from the same typed error.
+pub fn wire_mob_lifecycle_failure(error: &MobError) -> meerkat_contracts::WireMobLifecycleFailure {
+    meerkat_contracts::WireMobLifecycleFailure {
+        cause: meerkat_mob::mob_error_wire_code(error),
+        message: error.to_string(),
+        code: error.wire_error_code(),
+        structured_data: error.structured_data(),
+    }
+}
+
+/// One listed mob on the wire: its last machine phase and, once its actor
+/// has stopped, why. Every surface that lists mobs projects through this.
+pub fn wire_mob_status_row(
+    mob_id: &MobId,
+    observation: &meerkat_mob::MobLifecycleObservation,
+) -> meerkat_contracts::MobStatusResult {
+    meerkat_contracts::MobStatusResult {
+        mob_id: mob_id.to_string(),
+        status: wire_mob_lifecycle_status(observation.phase),
+        failure: observation
+            .failure
+            .as_deref()
+            .map(wire_mob_lifecycle_failure),
+    }
+}
+
 impl WireActionArgs {
     fn resolve(
         self,
@@ -9748,7 +9779,7 @@ impl AgentToolDispatcher for MobMcpDispatcher {
                         .map_err(|e| map_mob_err(call, e))?;
                     encode(
                         call,
-                        json!({"mobs": mobs.into_iter().map(|(id, observation)| json!({"mob_id": id, "status": wire_mob_lifecycle_status(observation.phase)})).collect::<Vec<_>>() }),
+                        json!({"mobs": mobs.iter().map(|(id, observation)| wire_mob_status_row(id, observation)).collect::<Vec<_>>() }),
                     )
                 }
             }

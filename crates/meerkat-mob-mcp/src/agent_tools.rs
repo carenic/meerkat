@@ -2238,10 +2238,21 @@ impl AgentMobToolSurface {
                 .can_manage_mob(id.as_str(), handle.incarnation());
             match handle.resolve_current_mob_admission(can_manage_mob).await {
                 Ok(meerkat_mob::CurrentMobAdmission::Allowed) => {
-                    mob_list.push(json!({
+                    let mut row = json!({
                         "mob_id": id,
                         "status": observation.phase.as_str(),
-                    }));
+                    });
+                    // Present means the mob's actor has stopped; `status` is
+                    // the last machine phase.
+                    if let (Some(failure), Some(fields)) =
+                        (observation.failure.as_deref(), row.as_object_mut())
+                    {
+                        fields.insert(
+                            "failure".to_string(),
+                            json!(crate::wire_mob_lifecycle_failure(failure)),
+                        );
+                    }
+                    mob_list.push(row);
                 }
                 Ok(meerkat_mob::CurrentMobAdmission::Denied) | Err(_) => {}
             }

@@ -453,6 +453,7 @@ import type {
   MobProfileDeleteResult,
   MobProfileLookupResult,
   MobRunResult as PublicMobRunResult,
+  MobLifecycleFailure,
   MobSpawnResult,
   MobStatus,
   MobSummary,
@@ -2301,14 +2302,46 @@ export class MeerkatClient {
     const result = await this.request("mob/list", {});
     const mobs = MeerkatClient.requireRecordArray(result.mobs, "Invalid mob/list response");
     const context = "Invalid mob/list response entry";
-    return mobs.map((mob) => ({
-      mobId: MeerkatClient.requireStringField(mob, "mob_id", context),
-      status: MeerkatClient.requireStringField(
-        mob,
-        "status",
-        context,
-      ),
-    }));
+    return mobs.map((mob) => {
+      const summary: MobSummary = {
+        mobId: MeerkatClient.requireStringField(mob, "mob_id", context),
+        status: MeerkatClient.requireStringField(
+          mob,
+          "status",
+          context,
+        ),
+      };
+      const failure = MeerkatClient.parseMobLifecycleFailure(mob.failure, context);
+      return failure === undefined ? summary : { ...summary, failure };
+    });
+  }
+
+  /**
+   * The typed failure of a `mob/list` row. Present means the mob's actor has
+   * stopped; `status` is the last machine phase. Absent or `null` yields
+   * `undefined`.
+   */
+  private static parseMobLifecycleFailure(
+    raw: unknown,
+    context: string,
+  ): MobLifecycleFailure | undefined {
+    if (raw === undefined || raw === null) {
+      return undefined;
+    }
+    const failureContext = `${context}: failure`;
+    const record = MeerkatClient.requireRecord(raw, "failure", context);
+    const code = record.code;
+    if (code !== undefined && code !== null && typeof code !== "string") {
+      throw new MeerkatError("INVALID_RESPONSE", `${failureContext}: code must be a string`);
+    }
+    return {
+      cause: MeerkatClient.requireStringField(record, "cause", failureContext),
+      message: MeerkatClient.requirePresentStringField(record, "message", failureContext),
+      ...(typeof code === "string" ? { code } : {}),
+      ...(record.structured_data === undefined || record.structured_data === null
+        ? {}
+        : { structuredData: record.structured_data }),
+    };
   }
 
   async mobStatus(mobId: string): Promise<{ mobId: string; status: string }> {
