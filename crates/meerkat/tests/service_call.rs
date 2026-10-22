@@ -51,13 +51,16 @@ use meerkat_core::authorization::{
     OperationRefusalKind, OperationRefused, OperationReviewTier, PreparedAuthorizationBinding,
     ToolAuthorizationTarget,
 };
-use meerkat_core::connection::{CredentialAccountId, CredentialAccountRef, RealmId};
+use meerkat_core::connection::{
+    AuthCredentialIdentity, CredentialAccountId, CredentialAccountRef, RealmId,
+};
 use meerkat_core::exact_operation::OperationExecutionScope;
 use meerkat_core::mcp_config::{McpConnectorBinding, McpConnectorOperation};
 use meerkat_core::{
-    AgentToolDispatcher, McpServerConfig, OperationAuthorizationError, PrincipalKind, PrincipalRef,
-    ToolCallView, ToolDef, ToolDispatchOutcome, ToolError, ToolExecutionResolutionContext,
-    ToolOperationTarget, ToolResult, TrustDomainId,
+    AgentToolDispatcher, ControllerModelSelection, McpServerConfig, OperationAuthorizationError,
+    PrincipalKind, PrincipalRef, Provider, SessionLlmIdentity, ToolCallView, ToolDef,
+    ToolDispatchOutcome, ToolError, ToolExecutionResolutionContext, ToolOperationTarget,
+    ToolResult, TrustDomainId,
 };
 use meerkat_providers::auth_oauth::OAuthTokenResult;
 use meerkat_providers::auth_store::{
@@ -1656,6 +1659,24 @@ async fn a_request_that_cannot_be_a_service_original_is_malformed() {
     let mut controller = base();
     controller.controller_grant_lineage = vec![fixture.grant.clone()];
     cases.push(("a controller lineage", controller));
+
+    let mut model = base();
+    model.controller_model = Some(ControllerModelSelection::new(
+        SessionLlmIdentity {
+            model: "controller-model".into(),
+            provider: Provider::Anthropic,
+            self_hosted_server_id: None,
+            provider_params: None,
+            auth_binding: None,
+        },
+        AuthCredentialIdentity::Account(CredentialAccountRef {
+            realm: RealmId::parse(REALM).unwrap(),
+            account: CredentialAccountId::parse("controller").unwrap(),
+        }),
+        "controller-profile".into(),
+        "controller-transport".into(),
+    ));
+    cases.push(("a controller model", model));
 
     let mut subject = base();
     subject.represented_subject = Some(principal(PrincipalKind::Human, "subject"));
