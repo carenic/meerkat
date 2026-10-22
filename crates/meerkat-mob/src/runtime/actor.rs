@@ -19371,7 +19371,9 @@ impl MobActor {
             return;
         };
         match cmd {
-            MobCommand::Stop { reply_tx } if pending.kind == PendingAutonomousStopKind::Stop => {
+            MobCommand::Stop { reply_tx, .. }
+                if pending.kind == PendingAutonomousStopKind::Stop =>
+            {
                 pending.joined.push(LifecycleReplyTx::Stop(reply_tx));
             }
             // A joining Shutdown adopts the pending Shutdown's deadline.
@@ -28685,7 +28687,10 @@ impl MobActor {
                     let _ =
                         reply_tx.send(Ok(self.machine_projection_for_identity(&agent_identity)));
                 }
-                MobCommand::Stop { reply_tx } => {
+                MobCommand::Stop {
+                    leave_runs_running: _,
+                    reply_tx,
+                } => {
                     self.inline_step_watchdog
                         .set_stop_stage(StopInlineStage::PlacedCompletionCleanup);
                     let result = if self.state() == MobState::Destroyed {

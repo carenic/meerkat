@@ -39,6 +39,34 @@ impl MobStopReport {
     }
 }
 
+/// Caller options for
+/// [`MobHandle::stop_with_options`](super::MobHandle::stop_with_options).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StopOptions {
+    /// Leave every member's current run running. See
+    /// [`Self::leave_runs_running`].
+    pub leave_runs_running: bool,
+}
+
+impl StopOptions {
+    /// Leave every member's current run running: an autonomous member's run
+    /// is not cancelled at its next boundary, as a plain Stop does. Its run
+    /// starts are held and its kickoff stop intent is recorded as usual, and
+    /// the Stop reports the run `LeftRunning`.
+    ///
+    /// Meant for Stop, then
+    /// [`MobHandle::drain_stopped_runs`](super::MobHandle::drain_stopped_runs),
+    /// then Shutdown, which cancels what is still running. A host that stops
+    /// with this option and never shuts down leaves autonomous turns running
+    /// under a Stopped mob.
+    #[must_use]
+    pub fn leave_runs_running(mut self) -> Self {
+        self.leave_runs_running = true;
+        self
+    }
+}
+
 /// One member's stop outcome.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MemberStopOutcome {

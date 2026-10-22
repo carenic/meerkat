@@ -457,7 +457,7 @@ impl MobCommand {
             Self::AdmitControlScope { reply_tx, .. } => {
                 let _ = reply_tx.send(Err(error));
             }
-            Self::Stop { reply_tx } => {
+            Self::Stop { reply_tx, .. } => {
                 let _ = reply_tx.send(Err(error));
             }
             Self::CloseIfIdle { reply_tx } => {
@@ -754,7 +754,11 @@ mod tests {
         );
         let (tx, _rx) = oneshot::channel();
         assert_eq!(
-            MobCommand::Stop { reply_tx: tx }.required_control_scope(),
+            MobCommand::Stop {
+                leave_runs_running: false,
+                reply_tx: tx,
+            }
+            .required_control_scope(),
             Some(ControlScope::Retire),
         );
         let (tx, _rx) = oneshot::channel();

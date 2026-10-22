@@ -8010,9 +8010,12 @@ impl MobHandle {
                 .await??;
                 Ok(MobMachineCommandResult::Unit)
             }
-            MobMachineCommand::Stop => {
+            MobMachineCommand::Stop { leave_runs_running } => {
                 let report = self
-                    .send_actor_command(|reply_tx| MobCommand::Stop { reply_tx })
+                    .send_actor_command(|reply_tx| MobCommand::Stop {
+                        leave_runs_running,
+                        reply_tx,
+                    })
                     .await??;
                 Ok(MobMachineCommandResult::Stopped(report))
             }
@@ -14679,10 +14682,26 @@ impl MobHandle {
     /// starts are held; a member that cannot be held is reported, never
     /// hidden behind `Ok`.
     pub async fn stop(&self) -> Result<super::stop_report::MobStopReport, MobError> {
+        self.stop_with_options(super::stop_report::StopOptions::default())
+            .await
+    }
+
+    /// [`Self::stop`] with `options`, for example
+    /// [`StopOptions::leave_runs_running`](super::stop_report::StopOptions::leave_runs_running)
+    /// before a drain.
+    pub async fn stop_with_options(
+        &self,
+        options: super::stop_report::StopOptions,
+    ) -> Result<super::stop_report::MobStopReport, MobError> {
         let hang_guard = tokio::time::Instant::now() + DEFAULT_KICKOFF_WAIT_TIMEOUT;
         let mut lifecycle_watch = None;
         loop {
-            match self.execute_machine_command(MobMachineCommand::Stop).await {
+            match self
+                .execute_machine_command(MobMachineCommand::Stop {
+                    leave_runs_running: options.leave_runs_running,
+                })
+                .await
+            {
                 Ok(MobMachineCommandResult::Stopped(report)) => return Ok(report),
                 Ok(_) => {
                     return Err(MobError::Internal(
@@ -14734,10 +14753,18 @@ impl MobHandle {
         &self,
         until: meerkat_core::time_compat::Instant,
     ) -> Result<super::stop_report::MobRunDrainReport, MobError> {
-        let snapshot = self
-            .send_actor_command(|reply_tx| MobCommand::DrainRunsSnapshot { reply_tx })
-            .await??;
+        let snapshot = self.drain_runs_snapshot().await?;
         Ok(super::run_drain::drain(snapshot, until).await)
+    }
+
+    /// The actor's drain snapshot, atomic with its Stopped check: the first
+    /// half of [`Self::drain_stopped_runs`].
+    #[cfg(feature = "runtime-adapter")]
+    pub(super) async fn drain_runs_snapshot(
+        &self,
+    ) -> Result<super::run_drain::DrainSnapshot, MobError> {
+        self.send_actor_command(|reply_tx| MobCommand::DrainRunsSnapshot { reply_tx })
+            .await?
     }
 
     /// A Stop or Shutdown the actor refused because an operation it owns is

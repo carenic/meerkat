@@ -13661,6 +13661,9 @@ mod input_transition_wait_tests;
 mod live_custody_read_tests;
 
 #[cfg(test)]
+mod live_channel_active_read_tests;
+
+#[cfg(test)]
 mod registration_use_tests;
 
 #[cfg(test)]

@@ -1572,6 +1572,9 @@ pub(super) enum MobCommand {
         reply_tx: oneshot::Sender<Result<super::event_pump::MemberEventTap, MobError>>,
     },
     Stop {
+        /// Leave every member's current run running
+        /// ([`super::stop_report::StopOptions::leave_runs_running`]).
+        leave_runs_running: bool,
         reply_tx: oneshot::Sender<Result<super::stop_report::MobStopReport, MobError>>,
     },
     ResumeLifecycle {
