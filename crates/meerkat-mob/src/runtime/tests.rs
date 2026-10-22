@@ -84069,6 +84069,7 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         MobError::MemberAdmissionBacklogFull { .. } => "member_admission_backlog_full".to_string(),
         MobError::ActorCommandTimedOut { .. } => "actor_command_timed_out".to_string(),
         MobError::MemberReloadRefused { .. } => "member_reload_refused".to_string(),
+        MobError::MemberReloadRepairBlocked { .. } => "member_reload_repair_blocked".to_string(),
         MobError::HeldProvisionUnsupported { .. } => "held_provision_unsupported".to_string(),
         MobError::RespawnPredecessorRestrictionsUnavailable { .. } => {
             "respawn_predecessor_restrictions_unavailable".to_string()

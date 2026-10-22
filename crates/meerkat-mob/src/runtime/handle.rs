@@ -2619,6 +2619,7 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         | MobError::WorkInputCompletionUnavailable { .. }
         | MobError::ActorCommandTimedOut { .. }
         | MobError::MemberReloadRefused { .. }
+        | MobError::MemberReloadRepairBlocked { .. }
         | MobError::MemberReloadTimedOut { .. }
         | MobError::HeldSpawnUnsupported { .. }
         | MobError::HeldSpawnAborted { .. }

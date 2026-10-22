@@ -100,6 +100,21 @@ them.
   "repair_blocked"`. Both new types are `#[non_exhaustive]`, and the field is
   left out of the serialized report when it is empty, so any other destroy
   report is unchanged.
+- `meerkat_mob::MobError::MemberReloadRepairBlocked` (`session_id`,
+  `reason`, `evidence_digest`): a member retirement whose durability reload
+  of the member session the runtime refused as repair-blocked
+  (`RuntimeDriverError::RecoveryRepairBlocked`) reports this typed cause
+  instead of a session error with the refusal as text. A retire that sticks
+  at its quiesce stage, for example while a boundary commit past its
+  deadline has not reported its durable outcome, answers
+  `MemberRetirementStuck` with this cause, and a redrive of the retirement
+  completes it once the outcome is reported. Its structured data is
+  `{kind: "mob_member_reload_repair_blocked", session_id, reason,
+  evidence_digest (when the runtime has one), retryable: true,
+  authority_retained: true, live_shell_discarded: false}` and its wire code
+  `SessionBusy`, as for `MemberReloadRefused`, which
+  `MobHandle::reload_member_registration` still answers for the same
+  refusal.
 - `meerkat-schedule`: `ScheduleTargetDelivery::deliver_existing_occurrence`,
   a defaulted method the driver calls to redeliver a reclaimed occurrence
   whose earlier attempt recorded its dispatch, with `ExistingDelivery`

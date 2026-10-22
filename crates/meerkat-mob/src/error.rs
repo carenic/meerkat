@@ -1562,6 +1562,24 @@ pub enum MobError {
         agent_identity: String,
         reason: String,
     },
+
+    /// A member retirement's durability reload of the member session was
+    /// refused by the runtime as repair-blocked
+    /// (`RuntimeDriverError::RecoveryRepairBlocked`), for example while a
+    /// boundary commit past its deadline has not reported its durable
+    /// outcome. Retryable: once the runtime's evidence settles, a redrive of
+    /// the retirement reloads the member and continues. The retire path
+    /// answers it, usually as the cause of a stuck retirement;
+    /// `MobHandle::reload_member_registration` answers
+    /// [`MobError::MemberReloadRefused`] for the same runtime refusal, and a
+    /// caller treats both alike. The fields mirror the destroy report's
+    /// `MemberReloadRefusal::RepairBlocked`.
+    #[error("member session {session_id} reload is repair-blocked: {reason}")]
+    MemberReloadRepairBlocked {
+        session_id: meerkat_core::types::SessionId,
+        reason: String,
+        evidence_digest: Option<String>,
+    },
 }
 
 /// The stable token of the runtime verdict a member's destination install
@@ -1852,6 +1870,33 @@ impl MobError {
         }
     }
 
+    /// Structured-data `kind` of [`Self::MemberReloadRepairBlocked`].
+    pub(crate) const MEMBER_RELOAD_REPAIR_BLOCKED_KIND: &'static str =
+        "mob_member_reload_repair_blocked";
+
+    /// The structured data of [`Self::MemberReloadRepairBlocked`]. A
+    /// retirement stage carries the refusal across its `SessionError`
+    /// boundary as this data, and the retirement maps it back to the
+    /// variant.
+    pub(crate) fn member_reload_repair_blocked_data(
+        session_id: &meerkat_core::types::SessionId,
+        reason: &str,
+        evidence_digest: Option<&str>,
+    ) -> serde_json::Value {
+        let mut data = serde_json::json!({
+            "kind": Self::MEMBER_RELOAD_REPAIR_BLOCKED_KIND,
+            "session_id": session_id.to_string(),
+            "reason": reason,
+            "retryable": true,
+            "authority_retained": true,
+            "live_shell_discarded": false,
+        });
+        if let (Some(digest), Some(fields)) = (evidence_digest, data.as_object_mut()) {
+            fields.insert("evidence_digest".to_string(), digest.into());
+        }
+        data
+    }
+
     /// Structured data carried by an underlying domain error.
     ///
     /// Session materialization failures use this to preserve typed
@@ -2043,6 +2088,15 @@ impl MobError {
                 "authority_retained": true,
                 "live_shell_discarded": false,
             })),
+            Self::MemberReloadRepairBlocked {
+                session_id,
+                reason,
+                evidence_digest,
+            } => Some(Self::member_reload_repair_blocked_data(
+                session_id,
+                reason,
+                evidence_digest.as_deref(),
+            )),
             Self::MemberReloadTimedOut { session_id, stage } => Some(serde_json::json!({
                 "kind": "mob_member_reload_timed_out",
                 "session_id": session_id.to_string(),
@@ -2149,6 +2203,7 @@ impl MobError {
                 | Self::MemberAdmissionBacklogFull { .. }
                 | Self::ActorCommandTimedOut { .. }
                 | Self::MemberReloadRefused { .. }
+                | Self::MemberReloadRepairBlocked { .. }
                 | Self::MemberReloadTimedOut { .. } => {
                     Some(meerkat_contracts::ErrorCode::SessionBusy)
                 }
@@ -2298,6 +2353,7 @@ impl MobError {
             | Self::BridgeRequestTimedOut { .. }
             | Self::ActorCommandTimedOut { .. }
             | Self::MemberReloadRefused { .. }
+            | Self::MemberReloadRepairBlocked { .. }
             | Self::MemberReloadTimedOut { .. }
             | Self::FlowTurnTimedOut => MobFailureClass::Transport,
             Self::Internal(_)
@@ -2678,6 +2734,50 @@ mod tests {
     }
 
     #[test]
+    fn member_reload_repair_blocked_projects_typed_retryable_data() {
+        let session_id = meerkat_core::types::SessionId::new();
+        let refused = MobError::MemberReloadRepairBlocked {
+            session_id: session_id.clone(),
+            reason: "commit outcome not reported".to_string(),
+            evidence_digest: None,
+        };
+        assert_eq!(
+            refused.to_string(),
+            format!(
+                "member session {session_id} reload is repair-blocked: commit outcome not reported"
+            )
+        );
+        assert_eq!(
+            refused.structured_data(),
+            Some(serde_json::json!({
+                "kind": "mob_member_reload_repair_blocked",
+                "session_id": session_id.to_string(),
+                "reason": "commit outcome not reported",
+                "retryable": true,
+                "authority_retained": true,
+                "live_shell_discarded": false,
+            }))
+        );
+        assert_eq!(
+            refused.wire_error_code(),
+            Some(meerkat_contracts::ErrorCode::SessionBusy)
+        );
+        assert_eq!(refused.failure_class(), MobFailureClass::Transport);
+        assert!(!refused.is_retirement_in_progress());
+        let with_digest = MobError::MemberReloadRepairBlocked {
+            session_id,
+            reason: "commit outcome not reported".to_string(),
+            evidence_digest: Some("digest".to_string()),
+        };
+        assert_eq!(
+            with_digest
+                .structured_data()
+                .and_then(|data| data.get("evidence_digest").cloned()),
+            Some(serde_json::json!("digest"))
+        );
+    }
+
+    #[test]
     fn actor_command_timeout_projects_observation_without_execution_or_retry_verdict() {
         for stage in ["actor_command_admission", "actor_command_reply"] {
             let error = MobError::ActorCommandTimedOut {
@@ -2753,6 +2853,11 @@ mod tests {
             MobError::MemberReloadRefused {
                 session_id: meerkat_core::types::SessionId::new(),
                 reason: "durable authority unreadable".to_string(),
+            },
+            MobError::MemberReloadRepairBlocked {
+                session_id: meerkat_core::types::SessionId::new(),
+                reason: "commit outcome not reported".to_string(),
+                evidence_digest: None,
             },
             MobError::RespawnPredecessorRestrictionsUnavailable {
                 agent_identity: "worker".to_string(),

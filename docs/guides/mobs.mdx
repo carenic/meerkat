@@ -1238,6 +1238,16 @@ the mob unchanged. A refusal later in the destroy comes after its cleanup has
 begun: the mob's admission is closed, and some members may already be
 retired. Any other reload failure stays text in `errors` only.
 
+A retire reloads such a member as well, at its quiesce stage. When the runtime
+refuses that reload as repair-blocked, the retirement sticks: `retire` answers
+`MobError::MemberRetirementStuck`, and since 0.9.5 its cause is
+`MobError::MemberReloadRepairBlocked` (`session_id`, `reason`,
+`evidence_digest`; structured data kind `mob_member_reload_repair_blocked`
+with `retryable: true`, wire code `SessionBusy`) instead of a session error
+with the refusal as text. Redrive the retirement with
+`MobHandle::redrive_retirement` once the boundary commit has reported its
+outcome; the redrive reloads the member and completes the retirement.
+
 ### Admission in custom Rust session services
 
 A custom `MobSessionService` that executes standalone turns must implement
