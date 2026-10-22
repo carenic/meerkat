@@ -29872,7 +29872,7 @@ BuildBuddy-backed Windows release assets.
   behavior with the tool bridge path so peer-to-peer wake and delivery semantics
   stay consistent across mob surfaces.
 - **Windows BuildBuddy release endpoint** (#726) — Windows release binary builds
-  now route directly to the hosted King BuildBuddy endpoint instead of a mutable
+  now route directly to the hosted BuildBuddy endpoint instead of a mutable
   secret-backed endpoint, preventing stale private endpoint routing from
   breaking release asset publication.
 
