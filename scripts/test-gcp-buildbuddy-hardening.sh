@@ -987,6 +987,21 @@ if (proc.returncode == 0 or find(calls, "compute", "instance-templates", "create
 else:
     ok("executor pool ensure refuses an executor key secret without a version")
 
+# --- the GCP project is required ---------------------------------------------------------
+
+for script, label in ((CONTROL, "control plane"), (POOL, "executor pool")):
+    proc, calls = run(script, ["status"], {}, MEERKAT_GCP_PROJECT_ID="")
+    if proc.returncode == 0 or calls or "MEERKAT_GCP_PROJECT_ID must name the GCP project" not in proc.stderr:
+        fail(f"{label} ran without a GCP project: rc={proc.returncode} {[c['argv'] for c in calls]} {proc.stderr[-200:]}")
+    else:
+        ok(f"{label} refuses to run without MEERKAT_GCP_PROJECT_ID and calls nothing")
+    proc, calls = run(script, ["status"], {}, MEERKAT_GCP_PROJECT_ID="", GCP_PROJECT_ID=PROJECT)
+    projects = {value for call in calls for value in flag_values(call, "project")}
+    if proc.returncode != 0 or projects != {PROJECT}:
+        fail(f"{label} does not fall back to GCP_PROJECT_ID: rc={proc.returncode} {projects} {proc.stderr[-200:]}")
+    else:
+        ok(f"{label} reads GCP_PROJECT_ID when MEERKAT_GCP_PROJECT_ID is unset")
+
 sys.exit(1 if FAILURES else 0)
 PY
 

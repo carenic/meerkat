@@ -11,7 +11,8 @@ cache fetched from the checked-in manifests and Cargo.lock. It intentionally
 does not keep the latest source tree in the final image.
 
 Environment:
-  MEERKAT_GCP_PROJECT_ID       GCP project (default: king-dnn-training-dev)
+  MEERKAT_GCP_PROJECT_ID       GCP project (required by build, and by image
+                               unless MEERKAT_CI_IMAGE is set)
   MEERKAT_GCP_REGION           Artifact Registry region (default: europe-west1)
   MEERKAT_CI_IMAGE_REPOSITORY  Artifact Registry repo (default: meerkat-ci)
   MEERKAT_CI_IMAGE_NAME        Image name (default: meerkat-ci-rust)
@@ -23,7 +24,7 @@ EOF
 workspace_root="$(git rev-parse --show-toplevel)"
 cd "${workspace_root}"
 
-project="${MEERKAT_GCP_PROJECT_ID:-king-dnn-training-dev}"
+project="${MEERKAT_GCP_PROJECT_ID:-}"
 region="${MEERKAT_GCP_REGION:-europe-west1}"
 repository="${MEERKAT_CI_IMAGE_REPOSITORY:-meerkat-ci}"
 image_name="${MEERKAT_CI_IMAGE_NAME:-meerkat-ci-rust}"
@@ -35,6 +36,13 @@ fi
 
 image="${MEERKAT_CI_IMAGE:-${region}-docker.pkg.dev/${project}/${repository}/${image_name}:${rust_toolchain}}"
 base_image="${MEERKAT_CI_BASE_IMAGE:-${image}}"
+
+require_project() {
+  if [[ -z "${project}" ]]; then
+    echo "error: MEERKAT_GCP_PROJECT_ID must name the GCP project that hosts the CI image registry" >&2
+    exit 2
+  fi
+}
 
 make_context() {
   local context_dir="$1"
@@ -124,6 +132,9 @@ EOF
 command="${1:-build}"
 case "${command}" in
   image)
+    if [[ -z "${MEERKAT_CI_IMAGE:-}" ]]; then
+      require_project
+    fi
     printf '%s\n' "${image}"
     ;;
   context)
@@ -136,6 +147,7 @@ case "${command}" in
     make_context "${out}"
     ;;
   build)
+    require_project
     tmpdir="$(mktemp -d)"
     trap 'rm -rf "${tmpdir}"' EXIT
     context_dir="${tmpdir}/context"
