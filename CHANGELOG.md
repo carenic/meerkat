@@ -235,6 +235,23 @@ them.
   internal "resume bridge session check failed" error. The spawn does not
   settle the tail; it stays as it was.
 
+- `meerkat-mob`: an identity whose lease claim meets a live holder retries
+  as soon as that holder's lease expires. Reconciliation claims a lease it
+  reads as expired, and the claim can still find it held: another
+  incarnation claimed it in between, or the identity store's clock runs
+  behind the actor's. Such an identity stayed unreconciled until the slow
+  safety scan, about five minutes later; it now waits for the holder's
+  expiry, at least one second, the same way as `AwaitLease`.
+
+- `meerkat-mob`: a Destroy of a Stopped mob no longer fails with
+  `MobDestroyError::Incomplete` at every attempt when the mob's routed queue
+  still holds a member route that the member's runtime refused. While the
+  mob is Stopped the mob machine cannot take that refusal, so the route
+  waited for a resume, and each destroy attempt dispatched it again and
+  stopped on the refusal until a resume or a restart emptied the queue. A
+  destroy now drops its members' queued runtime-binding and input routes
+  before it dispatches anything; it still sends their retire routes.
+
 ## [0.9.4] - 2026-10-20
 
 ### Breaking

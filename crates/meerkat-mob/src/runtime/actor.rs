@@ -12635,9 +12635,11 @@ impl MobActor {
         )
     }
 
-    /// Whether a routed effect still names the runtime the machine runs for
-    /// its member: the bound runtime for a binding or a retire, a live
-    /// runtime for an ingress.
+    /// Whether a refused routed effect still names a runtime the machine runs
+    /// for its member: the bound and live runtime for a binding, the bound and
+    /// retiring runtime for a retire, a live runtime for an ingress. Any other
+    /// kind is never presumed stale (only these three carry refusal feedback
+    /// today): it waits while Stopped and keeps the error in any other phase.
     fn routed_effect_targets_current_runtime(
         state: &mob_dsl::MobMachineState,
         effect: &super::composition::MobSeamEffect,
@@ -12647,16 +12649,23 @@ impl MobActor {
                 agent_identity,
                 agent_runtime_id,
                 ..
+            } => {
+                state.identity_to_runtime.get(agent_identity) == Some(agent_runtime_id)
+                    && state.live_runtime_ids.contains(agent_runtime_id)
             }
-            | mob_dsl::MobMachineEffect::RequestRuntimeRetire {
+            mob_dsl::MobMachineEffect::RequestRuntimeRetire {
                 agent_identity,
                 agent_runtime_id,
                 ..
-            } => state.identity_to_runtime.get(agent_identity) == Some(agent_runtime_id),
+            } => {
+                state.identity_to_runtime.get(agent_identity) == Some(agent_runtime_id)
+                    && state.member_state_markers.get(agent_runtime_id)
+                        == Some(&mob_dsl::MobMemberState::Retiring)
+            }
             mob_dsl::MobMachineEffect::RequestRuntimeIngress {
                 agent_runtime_id, ..
             } => state.live_runtime_ids.contains(agent_runtime_id),
-            _ => false,
+            _ => true,
         }
     }
 
@@ -12828,9 +12837,10 @@ impl MobActor {
                             &effect,
                         ) {
                             // The route outlived the runtime it names (its
-                            // member retired, or now runs another runtime), so
-                            // no phase of the machine takes its refusal. Drop
-                            // it rather than dispatch it again at every flush.
+                            // member retired, runs another runtime, or for a
+                            // retire is no longer retiring), so no phase of
+                            // the machine takes its refusal. Drop it rather
+                            // than dispatch it again at every flush.
                             tracing::warn!(
                                 mob_id = %self.definition.id,
                                 effect = ?effect.body(),
@@ -12843,10 +12853,11 @@ impl MobActor {
                         }
                         if phase == mob_dsl::MobPhase::Stopped {
                             // The machine still runs this member but cannot
-                            // take the feedback while Stopped. Keep the head
-                            // queued, as the pending-detach deferral above
-                            // does: the first flush after activation
-                            // dispatches it again.
+                            // take the feedback while Stopped (binding and
+                            // ingress refusals have Running transitions only).
+                            // Keep the head queued, as the pending-detach
+                            // deferral above does: the first flush after
+                            // activation dispatches it again.
                             tracing::warn!(
                                 mob_id = %self.definition.id,
                                 effect = ?effect.body(),
@@ -12911,6 +12922,27 @@ impl MobActor {
             }
             Err(error) => ActorBoundaryFlushDisposition::Fatal(error),
         }
+    }
+
+    /// Whether a destroy supersedes a queued routed effect: it retires every
+    /// member and the mob never runs again once its admission closes, so a
+    /// queued binding or ingress for a member can only be refused or be moot.
+    /// Retire and destroy routes stay: the destroy dispatches them.
+    fn routed_effect_superseded_by_destroy(effect: &super::composition::MobSeamEffect) -> bool {
+        matches!(
+            effect.body(),
+            mob_dsl::MobMachineEffect::RequestRuntimeBinding { .. }
+                | mob_dsl::MobMachineEffect::RequestRuntimeIngress { .. }
+        )
+    }
+
+    /// Drop the queued routes a destroy supersedes (see
+    /// [`Self::routed_effect_superseded_by_destroy`]). A refused one, held
+    /// while the mob was Stopped, would otherwise stop every destroy attempt
+    /// at its first routed flush.
+    fn discard_routed_effects_superseded_by_destroy(&mut self) {
+        self.pending_routed_effects
+            .retain(|effect| !Self::routed_effect_superseded_by_destroy(effect));
     }
 
     fn discard_pending_routed_effects_for_session(&mut self, session_id: &SessionId) {
@@ -25488,6 +25520,18 @@ impl MobActor {
             if matches!(&outcome, IdentityLeaseClaimOutcome::Acquired(_)) {
                 super::trigger_identity_recovery_fail_stop(
                     super::IdentityRecoveryFailStopPoint::LeaseAcquired,
+                );
+            }
+            if let IdentityLeaseClaimOutcome::HeldByOther(active) = &outcome {
+                // The claim met a live holder although the lease read showed
+                // it expired: another incarnation claimed it in between, or
+                // the store's clock is behind this actor's. Wait for that
+                // holder's expiry, at least one re-check interval.
+                self.schedule_identity_reconcile_wait(
+                    identity,
+                    IdentityReconcileAuthorityKey::from_observation(&intent_observation),
+                    identity_lease_wait_delay(Some(active.expires_at_ms), now_ms)
+                        .max(IDENTITY_RECONCILE_LEASE_RECHECK),
                 );
             }
             return Ok(IdentityReconcilePassDisposition::Outcome(matches!(
@@ -49774,6 +49818,9 @@ impl MobActor {
             entries,
             mut trust_cleanup_plan_by_member,
         } = boxed_arm_future(|| self.admit_destroy_cleanup()).await?;
+        // Before anything below flushes the routed queue (each member's
+        // retire admission does, in cleanup mode), on every attempt.
+        self.discard_routed_effects_superseded_by_destroy();
         boxed_arm_future(|| self.fail_all_pending_spawns("mob is destroying"))
             .await
             .map_err(|error| {
@@ -61717,34 +61764,139 @@ mod routed_effect_containment_tests {
     }
 
     #[test]
+    fn a_destroy_supersedes_queued_binding_and_ingress_routes_only() {
+        let identity = mob_dsl::AgentIdentity::from("worker");
+        let runtime_id = mob_dsl::AgentRuntimeId::from("worker:1");
+        let session = mob_dsl::SessionId::from("session-worker");
+        let routed = |body| {
+            super::super::composition::MobSeamEffect::routed(body)
+                .expect("a generated routed effect")
+        };
+        let binding = routed(mob_dsl::MobMachineEffect::RequestRuntimeBinding {
+            session_id: session.clone(),
+            agent_identity: identity.clone(),
+            agent_runtime_id: runtime_id.clone(),
+            fence_token: mob_dsl::FenceToken(1),
+            generation: None,
+        });
+        let ingress = routed(mob_dsl::MobMachineEffect::RequestRuntimeIngress {
+            session_id: session.clone(),
+            agent_runtime_id: runtime_id.clone(),
+            fence_token: mob_dsl::FenceToken(1),
+            generation: None,
+            work_id: mob_dsl::WorkId::from("work-1"),
+            origin: mob_dsl::WorkOrigin::External,
+            content_attribution: mob_dsl::WorkContentAttribution::Conversational,
+        });
+        let retire = routed(mob_dsl::MobMachineEffect::RequestRuntimeRetire {
+            agent_identity: identity,
+            agent_runtime_id: runtime_id,
+            session_id: session.clone(),
+        });
+        let destroy = routed(mob_dsl::MobMachineEffect::RequestRuntimeDestroy {
+            session_id: session,
+        });
+        assert!(MobActor::routed_effect_superseded_by_destroy(&binding));
+        assert!(MobActor::routed_effect_superseded_by_destroy(&ingress));
+        assert!(
+            !MobActor::routed_effect_superseded_by_destroy(&retire),
+            "the destroy dispatches its members' retire routes"
+        );
+        assert!(
+            !MobActor::routed_effect_superseded_by_destroy(&destroy),
+            "a destroy route is the destroy's own"
+        );
+    }
+
+    #[test]
     fn a_refused_route_names_a_current_runtime_only_while_its_member_runs_it() {
         let identity = mob_dsl::AgentIdentity::from("worker");
         let runtime_id = mob_dsl::AgentRuntimeId::from("worker:1");
+        let session = mob_dsl::SessionId::from("session-worker");
+        let routed = |body| {
+            super::super::composition::MobSeamEffect::routed(body)
+                .expect("a generated routed effect")
+        };
+        let retire = routed(mob_dsl::MobMachineEffect::RequestRuntimeRetire {
+            agent_identity: identity.clone(),
+            agent_runtime_id: runtime_id.clone(),
+            session_id: session.clone(),
+        });
+        let binding = routed(mob_dsl::MobMachineEffect::RequestRuntimeBinding {
+            session_id: session.clone(),
+            agent_identity: identity.clone(),
+            agent_runtime_id: runtime_id.clone(),
+            fence_token: mob_dsl::FenceToken(1),
+            generation: None,
+        });
+        let ingress = routed(mob_dsl::MobMachineEffect::RequestRuntimeIngress {
+            session_id: session.clone(),
+            agent_runtime_id: runtime_id.clone(),
+            fence_token: mob_dsl::FenceToken(1),
+            generation: None,
+            work_id: mob_dsl::WorkId::from("work-1"),
+            origin: mob_dsl::WorkOrigin::External,
+            content_attribution: mob_dsl::WorkContentAttribution::Conversational,
+        });
+        let destroy = routed(mob_dsl::MobMachineEffect::RequestRuntimeDestroy {
+            session_id: session,
+        });
+        let current = |state: &mob_dsl::MobMachineState, effect| {
+            MobActor::routed_effect_targets_current_runtime(state, effect)
+        };
         let mut state = mob_dsl::MobMachineAuthority::new().state().clone();
-        let retire = super::super::composition::MobSeamEffect::routed(
-            mob_dsl::MobMachineEffect::RequestRuntimeRetire {
-                agent_identity: identity.clone(),
-                agent_runtime_id: runtime_id.clone(),
-                session_id: mob_dsl::SessionId::from("session-worker"),
-            },
-        )
-        .expect("runtime retire is a generated routed effect");
 
         assert!(
-            !MobActor::routed_effect_targets_current_runtime(&state, &retire),
+            !current(&state, &retire),
             "a retired member runs no runtime"
         );
+        assert!(
+            !current(&state, &binding),
+            "an unbound member owns no binding"
+        );
+        assert!(
+            !current(&state, &ingress),
+            "a runtime that is not live takes no input"
+        );
+        assert!(
+            current(&state, &destroy),
+            "a kind without a rule is never presumed stale"
+        );
+
         state
             .identity_to_runtime
             .insert(identity.clone(), mob_dsl::AgentRuntimeId::from("worker:2"));
         assert!(
-            !MobActor::routed_effect_targets_current_runtime(&state, &retire),
+            !current(&state, &retire),
             "a member that runs a later runtime does not own the route"
         );
-        state.identity_to_runtime.insert(identity, runtime_id);
-        assert!(MobActor::routed_effect_targets_current_runtime(
-            &state, &retire
-        ));
+        assert!(!current(&state, &binding));
+
+        state
+            .identity_to_runtime
+            .insert(identity, runtime_id.clone());
+        assert!(
+            !current(&state, &binding),
+            "a bound runtime that is no longer live owns no binding"
+        );
+        assert!(
+            !current(&state, &retire),
+            "a bound member that is not retiring takes no retire refusal"
+        );
+        state
+            .member_state_markers
+            .insert(runtime_id.clone(), mob_dsl::MobMemberState::Retiring);
+        assert!(
+            current(&state, &retire),
+            "the retiring runtime owns its retire"
+        );
+
+        state.live_runtime_ids.insert(runtime_id);
+        assert!(
+            current(&state, &binding),
+            "the bound live runtime owns its binding"
+        );
+        assert!(current(&state, &ingress), "a live runtime takes its input");
     }
 
     #[test]
