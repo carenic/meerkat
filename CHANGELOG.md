@@ -190,8 +190,26 @@ them.
   session another runtime owner hosts refuses the start, and the error log
   names the member, its session and the remedy (stop that runtime owner, or
   wait until it releases the session, then start again); the tail stays as
-  it was. The method's default keeps the previous settle, without a claim, so
-  a session-service wrapper around a persistent service must forward it.
+  it was. The method's default settles through the resume verdict, which
+  takes the claim as well (see the next entry) but materializes the whole
+  resume, so a session-service wrapper around a persistent service should
+  forward it.
+- `meerkat-session`, `meerkat-mob`: resuming a session no longer settles a
+  durable tail on a session that another runtime owner on the realm hosts.
+  `PersistentSessionService::prepare_committed_boundary_resume` and
+  `recover_committed_boundary`, which every persistent resume runs (a mob
+  start's member restore, a resume spawn or respawn, a host
+  materialization, an attached actor's recovery), recovered the tail
+  without the session's hosting claim: a mob start adopted another
+  process's in-flight tail on an active member's session, then stopped the
+  mob when it bound the member. Both now take this runtime owner's claim
+  first and refuse with `SessionError::ServedElsewhere`, or
+  `HostingUnavailable` when the claim cannot be taken, before any recovery;
+  the tail stays as it was. `MobBuilder::resume` returns that error, and the
+  error log names the member, its session and the remedy (stop that runtime
+  owner, or wait until it releases the session, then start again). A
+  resume spawn of such a session returns it too, where it failed with an
+  internal error before.
 
 ## [0.9.4] - 2026-10-20
 

@@ -33902,9 +33902,10 @@ default_model = "gpt-5.4"
     }
 
     /// #1813: the CLI's persistent mob session wrapper forwards the
-    /// claim-scoped durable-tail settle. The trait default takes no hosting
-    /// claim, so a wrapper that kept it would settle a durable tail on a
-    /// session another runtime owner on the realm hosts.
+    /// claim-scoped durable-tail settle, which refuses a session another
+    /// runtime owner on the realm hosts. The trait default refuses it as
+    /// well, through the persistent resume verdict, so this row pins the
+    /// refusal; the forward keeps the cheaper cold-attach settle.
     #[cfg(feature = "mob")]
     #[tokio::test]
     async fn mob_cli_session_service_forwards_the_claimed_durable_tail_settle() {

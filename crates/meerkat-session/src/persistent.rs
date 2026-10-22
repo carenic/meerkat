@@ -16544,13 +16544,26 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// classifies candidate bytes, mints a successor, or writes a projection;
     /// the store-owned recovery seam proves and atomically consumes the exact
     /// runtime authority plus physical-head evidence.
+    ///
+    /// A session another runtime owner hosts is refused with
+    /// [`SessionError::ServedElsewhere`] before any recovery (#1813): that
+    /// owner may still commit the session's durable tail itself.
     pub async fn recover_committed_boundary(
         &self,
         id: &SessionId,
     ) -> Result<CommittedBoundaryRecovery, SessionError> {
-        self.recover_committed_boundary_retaining_aligned_body(id)
-            .await
-            .map(|(recovery, _aligned_body)| recovery)
+        // #1813: recovery may settle the session's durable tail, a store-only
+        // write: it holds the session's hosting claim (shared with its
+        // runtime owner's lineage) for its duration, inside its blocking
+        // store writes too, and refuses at once when another runtime owner
+        // hosts the session.
+        let hosting = self.grant_session_hosting(id)?;
+        meerkat_core::session_hosting::with_write_hosting(
+            hosting,
+            self.recover_committed_boundary_retaining_aligned_body(id),
+        )
+        .await
+        .map(|(recovery, _aligned_body)| recovery)
     }
 
     /// [`Self::recover_committed_boundary`], additionally returning the
@@ -16639,7 +16652,30 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// observations. A successful materialization returns a non-cloneable
     /// capability that the same service/store owner must later consume during
     /// actor creation; callers never reduce that proof to a boolean.
+    ///
+    /// A session another runtime owner hosts is refused with
+    /// [`SessionError::ServedElsewhere`] before any recovery (#1813): that
+    /// owner may still commit the session's durable tail itself.
     pub async fn prepare_committed_boundary_resume(
+        &self,
+        id: &SessionId,
+    ) -> Result<PreparedCommittedBoundaryResume, SessionError> {
+        // #1813: the preparation's recovery may settle the session's durable
+        // tail, a store-only write: the preparation holds the session's
+        // hosting claim (shared with its runtime owner's lineage) for its
+        // duration, inside its blocking store writes too, and refuses at once
+        // when another runtime owner hosts the session. Actor creation takes
+        // the claim again and re-observes the prepared authority before it
+        // consumes the receipt, so a write between the two is refused there.
+        let hosting = self.grant_session_hosting(id)?;
+        meerkat_core::session_hosting::with_write_hosting(
+            hosting,
+            self.prepare_committed_boundary_resume_hosted(id),
+        )
+        .await
+    }
+
+    async fn prepare_committed_boundary_resume_hosted(
         &self,
         id: &SessionId,
     ) -> Result<PreparedCommittedBoundaryResume, SessionError> {

@@ -4318,6 +4318,10 @@ async fn a_mob_resume_never_settles_an_active_members_tail_another_owner_hosts()
         &member_entry(&handle, "w-1").await,
         "after the other owner let go",
     );
+    assert_member_active(
+        &member_entry(&handle, "lead-1").await,
+        "the lead after the refused start",
+    );
     wait_for_head_canonical_authority_convergence(
         store_2.as_ref(),
         tail.runtime_store.as_ref(),
