@@ -37658,6 +37658,82 @@ async fn test_attach_existing_session_restores_persisted_inactive_session() {
     );
 }
 
+/// A session with no messages and no deferred-turn state is a deferred
+/// template: the session service marks its first turn pending when a
+/// deferred resume creates it. A resume of such a session therefore owes the
+/// member's first turn and delivers it.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test]
+async fn test_resume_of_a_deferred_template_session_delivers_the_first_turn() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    let _adapter = service.enable_runtime_adapter();
+    let identity = AgentIdentity::from("w-template");
+    let seeded = service
+        .create_session(CreateSessionRequest {
+            injected_context: Vec::new(),
+            model: "claude-sonnet-4-5".to_string(),
+            prompt: "seed".to_string().into(),
+            system_prompt: meerkat_core::SystemPromptOverride::Inherit,
+            max_tokens: Some(4096),
+            event_tx: None,
+            build: Some(meerkat_core::service::SessionBuildOptions {
+                comms_name: Some(
+                    super::actor::render_member_comms_name(
+                        sample_definition().id.as_str(),
+                        "worker",
+                        identity.as_str(),
+                    )
+                    .expect("comms name"),
+                ),
+                ..Default::default()
+            }),
+            initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+            deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+            labels: None,
+        })
+        .await
+        .expect("seed the worker session");
+    let session_id = seeded.session_id.clone();
+    let seeded_session = service
+        .live_session_clone(&session_id)
+        .await
+        .expect("seeded live session");
+    let mut template = Session::with_id(session_id.clone());
+    template
+        .set_session_metadata(
+            seeded_session
+                .session_metadata()
+                .expect("seeded session metadata"),
+        )
+        .expect("template metadata");
+    assert!(
+        template.messages().is_empty()
+            && template
+                .try_deferred_turn_state()
+                .expect("template deferred-turn state")
+                .is_none(),
+        "the fixture is a deferred template"
+    );
+    service.replace_live_session(template).await;
+    MobSessionService::discard_live_session(service.as_ref(), &session_id)
+        .await
+        .expect("keep only the durable template");
+
+    handle
+        .spawn_spec(
+            SpawnMemberSpec::new("worker", identity.as_str())
+                .with_resume_bridge_session_id(session_id.clone()),
+        )
+        .await
+        .expect("resume the template session");
+    wait_for_keep_alive_start_turn_count(service.as_ref(), 1).await;
+    assert_eq!(
+        service.keep_alive_start_turn_call_count(),
+        1,
+        "the template's owed first turn runs once"
+    );
+}
+
 #[tokio::test]
 async fn test_resume_recreates_missing_external_bridge_preserving_backend_identity() {
     let _serial = lock_real_comms_tests();

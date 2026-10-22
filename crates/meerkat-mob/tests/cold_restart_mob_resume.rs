@@ -102,10 +102,21 @@ fn persistent_service(
     Arc<PersistentSessionService<FactoryAgentBuilder>>,
     Arc<JsonlStore>,
 ) {
+    persistent_service_with_client(paths, runtime_store, openai_test_client())
+}
+
+fn persistent_service_with_client(
+    paths: &Paths,
+    runtime_store: Arc<dyn meerkat_runtime::RuntimeStore>,
+    client: Arc<dyn meerkat_client::LlmClient>,
+) -> (
+    Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    Arc<JsonlStore>,
+) {
     paths.materialize_project_context();
     let factory = factory(paths);
     let mut builder = FactoryAgentBuilder::new(factory, Config::default());
-    builder.default_llm_client = Some(openai_test_client());
+    builder.default_llm_client = Some(client);
     let store = Arc::new(JsonlStore::new(paths.sessions_root.clone()));
     builder.default_session_store = Some(Arc::new(StoreAdapter::new(store.clone())));
 
@@ -5525,4 +5536,623 @@ async fn a_destructive_reset_right_after_a_reply_does_not_race_its_boundary_comm
         },
         "a reset right after a reply waits for, or fences, the turn's boundary commit"
     );
+}
+
+// ---------------------------------------------------------------------------
+// First-turn delivery on a resume.
+//
+// A member's first turn (an autonomous member's kickoff, a turn-driven
+// member's initial message) runs at its first spawn. A resume adopts an
+// existing transcript: it delivers that first turn only while the session's
+// first turn never started, and then once.
+// ---------------------------------------------------------------------------
+
+/// Deterministic client that records, for every model request it serves,
+/// the text of the request's new input: every message after the last
+/// assistant message.
+struct CountingTestClient {
+    inner: meerkat_client::TestClient,
+    requests: std::sync::Mutex<Vec<String>>,
+}
+
+impl CountingTestClient {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: meerkat_client::TestClient::for_provider(meerkat_core::Provider::OpenAI),
+            requests: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl meerkat_client::LlmClient for CountingTestClient {
+    fn project_replay_messages(
+        &self,
+        messages: &[meerkat_core::Message],
+    ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+        self.inner.project_replay_messages(messages)
+    }
+
+    fn stream<'a>(
+        &'a self,
+        request: &'a meerkat_client::LlmRequest,
+    ) -> meerkat_llm_core::LlmStream<'a> {
+        let new_input = request
+            .messages
+            .iter()
+            .rev()
+            .take_while(|message| !matches!(message, meerkat_core::Message::BlockAssistant(_)))
+            .map(message_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(new_input);
+        self.inner.stream(request)
+    }
+
+    fn provider(&self) -> meerkat_core::Provider {
+        self.inner.provider()
+    }
+
+    async fn health_check(&self) -> Result<(), meerkat_client::LlmError> {
+        self.inner.health_check().await
+    }
+}
+
+/// The text a transcript message carries. An autonomous member receives a
+/// sent turn as an external-event notice, whose text is its body.
+fn message_text(message: &meerkat_core::Message) -> String {
+    match message {
+        meerkat_core::Message::SystemNotice(notice) => notice.body.clone().unwrap_or_default(),
+        other => other.as_indexable_text(),
+    }
+}
+
+/// One process lifetime of a first-turn scenario: a mob, its session service
+/// and the client that serves every model request of that lifetime.
+struct FirstTurnLifetime {
+    handle: MobHandle,
+    service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    client: Arc<CountingTestClient>,
+}
+
+/// An unwired mob with an autonomous `lead` and a turn-driven `worker`
+/// profile, so the only model requests are the member's own turns.
+fn first_turn_mob_definition(label: &str) -> MobDefinition {
+    let mut definition = mob_definition(MobRuntimeMode::AutonomousHost);
+    definition.id = MobId::from(format!(
+        "first-turn-{label}-{}",
+        meerkat_core::time_compat::new_uuid_v7()
+    ));
+    definition.orchestrator = None;
+    definition.wiring = WiringRules {
+        auto_wire_orchestrator: false,
+        role_wiring: vec![],
+    };
+    definition
+}
+
+/// Start a lifetime: `Some(definition)` creates the mob, `None` resumes it
+/// from its durable storage after a cold restart.
+async fn start_first_turn_lifetime(
+    paths: &Paths,
+    runtime_store: &Arc<dyn meerkat_runtime::RuntimeStore>,
+    definition: Option<MobDefinition>,
+) -> FirstTurnLifetime {
+    let client = CountingTestClient::new();
+    let (service, _store) =
+        persistent_service_with_client(paths, runtime_store.clone(), client.clone());
+    let storage = MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage");
+    let handle = match definition {
+        Some(definition) => MobBuilder::new(definition, storage)
+            .with_session_service(service.clone())
+            .with_default_llm_client(client.clone())
+            .create()
+            .await
+            .expect("create mob"),
+        None => MobBuilder::for_resume(storage)
+            .with_session_service(service.clone())
+            .with_default_llm_client(client.clone())
+            .notify_orchestrator_on_resume(false)
+            .resume()
+            .await
+            .expect("resume mob after a cold restart"),
+    };
+    FirstTurnLifetime {
+        handle,
+        service,
+        client,
+    }
+}
+
+/// Retire the member, as a host does before it re-materializes the identity
+/// later, and end the lifetime.
+async fn retire_and_end_lifetime(lifetime: FirstTurnLifetime, identity: &AgentIdentity) {
+    lifetime
+        .handle
+        .retire(identity.clone())
+        .await
+        .expect("retire member");
+    lifetime.handle.shutdown().await.expect("shutdown mob");
+}
+
+/// Resume `identity` on its existing session, as a host re-materializes an
+/// identity whose member was retired.
+async fn resume_member(
+    lifetime: &FirstTurnLifetime,
+    profile: &str,
+    identity: &AgentIdentity,
+    session_id: &meerkat::SessionId,
+    runtime_mode: MobRuntimeMode,
+    initial_message: Option<&str>,
+) {
+    let mut spec = SpawnMemberSpec::new(profile, identity.clone())
+        .with_resume_bridge_session_id(session_id.clone())
+        .with_runtime_mode(runtime_mode);
+    if let Some(message) = initial_message {
+        spec = spec.with_initial_message(message.to_string());
+    }
+    lifetime
+        .handle
+        .spawn_spec(spec)
+        .await
+        .expect("resume the member on its existing session");
+}
+
+/// Let any first turn settle, then run one probe turn. Turns are serialized
+/// on the member, so once the probe is durable every earlier turn has made
+/// its model request.
+async fn settle_with_probe(lifetime: &FirstTurnLifetime, identity: &AgentIdentity, probe: &str) {
+    lifetime
+        .handle
+        .wait_for_members_kickoff_complete(
+            std::slice::from_ref(identity),
+            Some(Duration::from_secs(60)),
+        )
+        .await
+        .expect("first turn settles");
+    send_and_wait(
+        &lifetime.handle,
+        lifetime.service.as_ref(),
+        identity.as_str(),
+        probe,
+        probe,
+    )
+    .await;
+}
+
+/// Rows of the session's durable transcript that contain `needle`.
+async fn rows_containing(
+    service: &dyn MobSessionService,
+    session_id: &meerkat::SessionId,
+    needle: &str,
+) -> usize {
+    service
+        .read_history(
+            session_id,
+            SessionHistoryQuery {
+                offset: 0,
+                limit: None,
+            },
+        )
+        .await
+        .expect("read history")
+        .messages
+        .iter()
+        .filter(|message| message_text(message).contains(needle))
+        .count()
+}
+
+fn fallback_prompt_prefix(identity: &AgentIdentity) -> String {
+    format!("You have been spawned as '{identity}'")
+}
+
+/// The lifetime's model requests, in order, each carrying its needle in its
+/// new input.
+fn assert_requests(client: &CountingTestClient, needles: &[&str], context: &str) {
+    let requests = client.requests();
+    assert!(
+        requests.len() == needles.len()
+            && requests
+                .iter()
+                .zip(needles)
+                .all(|(request, needle)| request.contains(needle)),
+        "{context}: expected model requests carrying {needles:?}, got {requests:?}"
+    );
+}
+
+/// Fresh autonomous spawn, then a lifetime that ends with the member retired.
+/// Returns the member's session and asserts the fresh spawn ran exactly one
+/// first turn carrying `first_turn_text`.
+async fn fresh_autonomous_member_then_retire(
+    paths: &Paths,
+    runtime_store: &Arc<dyn meerkat_runtime::RuntimeStore>,
+    label: &str,
+    identity: &AgentIdentity,
+    initial_message: Option<&str>,
+    first_turn_text: &str,
+) -> meerkat::SessionId {
+    let lifetime =
+        start_first_turn_lifetime(paths, runtime_store, Some(first_turn_mob_definition(label)))
+            .await;
+    let mut spec = SpawnMemberSpec::new("lead", identity.clone());
+    if let Some(message) = initial_message {
+        spec = spec.with_initial_message(message.to_string());
+    }
+    lifetime
+        .handle
+        .spawn_spec(spec)
+        .await
+        .expect("fresh spawn of the autonomous member");
+    let session_id = lifetime
+        .handle
+        .resolve_bridge_session_id(identity)
+        .await
+        .expect("member session");
+    settle_with_probe(&lifetime, identity, "FRESH_PROBE token-alpha").await;
+    assert_requests(
+        &lifetime.client,
+        &[first_turn_text, "FRESH_PROBE token-alpha"],
+        "a fresh autonomous spawn runs exactly one kickoff turn before the probe",
+    );
+    assert_eq!(
+        rows_containing(lifetime.service.as_ref(), &session_id, first_turn_text).await,
+        1,
+        "the fresh spawn's kickoff is one transcript row"
+    );
+    retire_and_end_lifetime(lifetime, identity).await;
+    session_id
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fresh_autonomous_spawn_without_a_message_runs_one_fallback_kickoff() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let identity = AgentIdentity::from("fresh-fallback");
+    let lifetime = start_first_turn_lifetime(
+        &paths,
+        &runtime_store,
+        Some(first_turn_mob_definition("fresh-fallback")),
+    )
+    .await;
+    lifetime
+        .handle
+        .spawn_spec(SpawnMemberSpec::new("lead", identity.clone()))
+        .await
+        .expect("fresh spawn");
+    let session_id = lifetime
+        .handle
+        .resolve_bridge_session_id(&identity)
+        .await
+        .expect("member session");
+    settle_with_probe(&lifetime, &identity, "FRESH_PROBE token-beta").await;
+
+    let fallback = fallback_prompt_prefix(&identity);
+    assert_requests(
+        &lifetime.client,
+        &[&fallback, "FRESH_PROBE token-beta"],
+        "the kickoff carries the fallback role prompt",
+    );
+    assert_eq!(
+        rows_containing(lifetime.service.as_ref(), &session_id, &fallback).await,
+        1,
+        "exactly one fallback kickoff row"
+    );
+    lifetime.handle.shutdown().await.expect("shutdown mob");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fresh_autonomous_spawn_with_a_message_kicks_off_with_it() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let identity = AgentIdentity::from("fresh-message");
+    let message = "FIRST_TURN_MESSAGE token-gamma";
+    let lifetime = start_first_turn_lifetime(
+        &paths,
+        &runtime_store,
+        Some(first_turn_mob_definition("fresh-message")),
+    )
+    .await;
+    lifetime
+        .handle
+        .spawn_spec(
+            SpawnMemberSpec::new("lead", identity.clone())
+                .with_initial_message(message.to_string()),
+        )
+        .await
+        .expect("fresh spawn");
+    let session_id = lifetime
+        .handle
+        .resolve_bridge_session_id(&identity)
+        .await
+        .expect("member session");
+    settle_with_probe(&lifetime, &identity, "FRESH_PROBE token-delta").await;
+
+    assert_requests(
+        &lifetime.client,
+        &[message, "FRESH_PROBE token-delta"],
+        "the kickoff carries the initial message, once",
+    );
+    assert_eq!(
+        rows_containing(lifetime.service.as_ref(), &session_id, message).await,
+        1
+    );
+    assert_eq!(
+        rows_containing(
+            lifetime.service.as_ref(),
+            &session_id,
+            &fallback_prompt_prefix(&identity)
+        )
+        .await,
+        0,
+        "a spawn with a message runs no fallback prompt"
+    );
+    lifetime.handle.shutdown().await.expect("shutdown mob");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resumed_autonomous_member_without_a_message_runs_no_kickoff() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let identity = AgentIdentity::from("resumed-fallback");
+    let fallback = fallback_prompt_prefix(&identity);
+    let session_id = fresh_autonomous_member_then_retire(
+        &paths,
+        &runtime_store,
+        "resumed-fallback",
+        &identity,
+        None,
+        &fallback,
+    )
+    .await;
+
+    let lifetime = start_first_turn_lifetime(&paths, &runtime_store, None).await;
+    resume_member(
+        &lifetime,
+        "lead",
+        &identity,
+        &session_id,
+        MobRuntimeMode::AutonomousHost,
+        None,
+    )
+    .await;
+    settle_with_probe(&lifetime, &identity, "RESUMED_PROBE token-epsilon").await;
+
+    assert_requests(
+        &lifetime.client,
+        &["RESUMED_PROBE token-epsilon"],
+        "a resume makes no model request of its own",
+    );
+    assert_eq!(
+        rows_containing(lifetime.service.as_ref(), &session_id, &fallback).await,
+        1,
+        "a resume appends no fallback kickoff row to the existing transcript"
+    );
+    retire_and_end_lifetime(lifetime, &identity).await;
+
+    // A second restart: the resumed session is never marked as owing its
+    // first turn again.
+    let lifetime = start_first_turn_lifetime(&paths, &runtime_store, None).await;
+    resume_member(
+        &lifetime,
+        "lead",
+        &identity,
+        &session_id,
+        MobRuntimeMode::AutonomousHost,
+        None,
+    )
+    .await;
+    settle_with_probe(&lifetime, &identity, "RESUMED_PROBE token-xi").await;
+    assert_requests(
+        &lifetime.client,
+        &["RESUMED_PROBE token-xi"],
+        "a second resume makes no model request of its own",
+    );
+    assert_eq!(
+        rows_containing(lifetime.service.as_ref(), &session_id, &fallback).await,
+        1,
+        "the fallback kickoff stays a single row across restarts"
+    );
+    lifetime.handle.shutdown().await.expect("shutdown mob");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resumed_autonomous_member_never_resends_its_initial_message() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let identity = AgentIdentity::from("resumed-message");
+    let message = "FIRST_TURN_MESSAGE token-zeta";
+    let session_id = fresh_autonomous_member_then_retire(
+        &paths,
+        &runtime_store,
+        "resumed-message",
+        &identity,
+        Some(message),
+        message,
+    )
+    .await;
+
+    let lifetime = start_first_turn_lifetime(&paths, &runtime_store, None).await;
+    resume_member(
+        &lifetime,
+        "lead",
+        &identity,
+        &session_id,
+        MobRuntimeMode::AutonomousHost,
+        Some(message),
+    )
+    .await;
+    settle_with_probe(&lifetime, &identity, "RESUMED_PROBE token-eta").await;
+
+    assert_requests(
+        &lifetime.client,
+        &["RESUMED_PROBE token-eta"],
+        "a resume carrying the initial message makes no model request of its own",
+    );
+    assert_eq!(
+        rows_containing(lifetime.service.as_ref(), &session_id, message).await,
+        1,
+        "the initial message stays delivered once"
+    );
+    lifetime.handle.shutdown().await.expect("shutdown mob");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resumed_turn_driven_member_never_reruns_its_initial_turn() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let identity = AgentIdentity::from("resumed-turn-driven");
+    let message = "FIRST_TURN_MESSAGE token-theta";
+
+    let lifetime = start_first_turn_lifetime(
+        &paths,
+        &runtime_store,
+        Some(first_turn_mob_definition("resumed-turn-driven")),
+    )
+    .await;
+    lifetime
+        .handle
+        .spawn_spec(
+            SpawnMemberSpec::new("worker", identity.clone())
+                .with_initial_message(message.to_string()),
+        )
+        .await
+        .expect("fresh turn-driven spawn");
+    let session_id = lifetime
+        .handle
+        .resolve_bridge_session_id(&identity)
+        .await
+        .expect("member session");
+    settle_with_probe(&lifetime, &identity, "FRESH_PROBE token-iota").await;
+    assert_requests(
+        &lifetime.client,
+        &[message, "FRESH_PROBE token-iota"],
+        "a fresh turn-driven spawn runs its initial message once",
+    );
+    retire_and_end_lifetime(lifetime, &identity).await;
+
+    let lifetime = start_first_turn_lifetime(&paths, &runtime_store, None).await;
+    resume_member(
+        &lifetime,
+        "worker",
+        &identity,
+        &session_id,
+        MobRuntimeMode::TurnDriven,
+        Some(message),
+    )
+    .await;
+    settle_with_probe(&lifetime, &identity, "RESUMED_PROBE token-kappa").await;
+
+    assert_requests(
+        &lifetime.client,
+        &["RESUMED_PROBE token-kappa"],
+        "a resume carrying the initial message runs no initial turn",
+    );
+    assert_eq!(
+        rows_containing(lifetime.service.as_ref(), &session_id, message).await,
+        1,
+        "the initial message stays delivered once"
+    );
+    lifetime.handle.shutdown().await.expect("shutdown mob");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resume_delivers_an_owed_first_turn_exactly_once() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let identity = AgentIdentity::from("owed-first-turn");
+    let message = "OWED_FIRST_TURN token-lambda";
+
+    // Lifetime 1: the member's session is created, and its first turn never
+    // starts before the member is retired.
+    let lifetime = start_first_turn_lifetime(
+        &paths,
+        &runtime_store,
+        Some(first_turn_mob_definition("owed-first-turn")),
+    )
+    .await;
+    lifetime
+        .handle
+        .spawn_spec(SpawnMemberSpec::new("worker", identity.clone()))
+        .await
+        .expect("fresh turn-driven spawn with no first turn");
+    let session_id = lifetime
+        .handle
+        .resolve_bridge_session_id(&identity)
+        .await
+        .expect("member session");
+    assert_requests(
+        &lifetime.client,
+        &[],
+        "no first turn ran in the first lifetime",
+    );
+    retire_and_end_lifetime(lifetime, &identity).await;
+
+    // Lifetime 2: the resume owes the first turn and delivers it.
+    let lifetime = start_first_turn_lifetime(&paths, &runtime_store, None).await;
+    resume_member(
+        &lifetime,
+        "worker",
+        &identity,
+        &session_id,
+        MobRuntimeMode::AutonomousHost,
+        Some(message),
+    )
+    .await;
+    settle_with_probe(&lifetime, &identity, "OWED_PROBE token-mu").await;
+    assert_requests(
+        &lifetime.client,
+        &[message, "OWED_PROBE token-mu"],
+        "the owed first turn is delivered by the resume",
+    );
+    assert_eq!(
+        rows_containing(lifetime.service.as_ref(), &session_id, message).await,
+        1
+    );
+    retire_and_end_lifetime(lifetime, &identity).await;
+
+    // Lifetime 3: a second restart owes nothing.
+    let lifetime = start_first_turn_lifetime(&paths, &runtime_store, None).await;
+    resume_member(
+        &lifetime,
+        "worker",
+        &identity,
+        &session_id,
+        MobRuntimeMode::AutonomousHost,
+        Some(message),
+    )
+    .await;
+    settle_with_probe(&lifetime, &identity, "OWED_PROBE token-nu").await;
+    assert_requests(
+        &lifetime.client,
+        &["OWED_PROBE token-nu"],
+        "a delivered first turn is never delivered again",
+    );
+    assert_eq!(
+        rows_containing(lifetime.service.as_ref(), &session_id, message).await,
+        1,
+        "the owed first turn is delivered exactly once across restarts"
+    );
+    lifetime.handle.shutdown().await.expect("shutdown mob");
 }
