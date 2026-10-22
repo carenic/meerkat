@@ -258,7 +258,8 @@ impl TurnFailureSourceKind {
             | AgentError::ModelFallbackResumeHeld { .. }
             | AgentError::ControlAppendBlockedByCallbackBatch
             | AgentError::ClientModelChangeRequiresHotSwap { .. }
-            | AgentError::InstructionActivation(_) => Self::ConfigError,
+            | AgentError::InstructionActivation(_)
+            | AgentError::StagedPromptDirectedTurnRefused => Self::ConfigError,
         })
     }
 

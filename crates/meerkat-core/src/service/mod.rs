@@ -56,6 +56,15 @@ pub enum DeferredPromptPolicy {
     #[default]
     Discard,
     /// Persist the create-time prompt and merge it into the first later turn.
+    ///
+    /// A runtime-authored turn commits it inside its typed appends: folded
+    /// ahead of the turn's first user row, or as a user row ahead of its other
+    /// appends when the turn has none. The run-start hooks and `RunStarted`
+    /// see it exactly as committed. A turn that commits no user row (a pending
+    /// continuation, a vetoed or refused run) leaves it pending, so it lands
+    /// once. A turn whose input carries directed interaction custody is
+    /// refused with `AgentError::StagedPromptDirectedTurnRefused` while the
+    /// prompt is staged.
     Stage,
 }
 
