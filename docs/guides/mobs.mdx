@@ -308,6 +308,16 @@ auto_compact_threshold = 60000
 resume_overrides = ["model", "provider"]
 ```
 
+A resumed member keeps its durable credential binding while its provider is
+unchanged. When `provider` in `resume_overrides` moves a member to another
+provider, the member keeps its history and resolves the new provider's binding
+from its realm, as a fresh member of the profile would: the realm's binding for
+that provider, then the parent realms and `global`, then the provider's
+environment key. A durable binding backed by a credential account keeps that
+account; if no binding for the new provider shares it, the resume is refused
+with a typed error and the durable session is left as it was. A host that runs
+a member for another host needs the release with this behaviour to resume it.
+
 Anthropic prompt caching is a per-profile `provider_params` decision. From
 0.8.33 the default is `automatic` on every backend that supports it (Anthropic
 API, Vertex, and Foundry); Bedrock and other backends that report automatic

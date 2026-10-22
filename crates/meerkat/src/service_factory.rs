@@ -95,6 +95,15 @@ fn build_agent_error_to_session_error(
                 auth_error.kind().as_str()
             )),
         },
+        BuildAgentError::LlmClient(meerkat_client::FactoryError::ConnectionTarget(
+            meerkat_core::ConnectionTargetError::NoCredentialAccountRoute { provider, account },
+        )) => SessionError::credential_account_route_failure(
+            meerkat_core::service::SessionCredentialAccountRouteFailure {
+                provider,
+                realm_id: account.realm,
+                account: account.account,
+            },
+        ),
         BuildAgentError::LlmClient(error) => {
             SessionError::build_llm_identity_unresolvable(error.to_string())
         }
