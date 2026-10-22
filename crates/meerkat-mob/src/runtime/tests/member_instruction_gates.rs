@@ -2473,6 +2473,190 @@ async fn a_fork_of_a_fork_reads_one_current_notice() {
     fixture.finish().await;
 }
 
+/// A durable fork of a durable fork child names, as its source's
+/// instructions, only the keys that child activated itself: the rows it
+/// copied from its own source are history there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_durable_fork_of_a_fork_names_only_its_sources_own_keys() {
+    let fixture = Fixture::restored_member().await;
+    fixture.activated_source_with_a_turn().await;
+    let child = AgentIdentity::from("durable-child");
+    let grandchild = AgentIdentity::from("durable-grandchild");
+    for (source, fork) in [(&fixture.identity, &child), (&child, &grandchild)] {
+        tokio::time::timeout(
+            WAIT,
+            fixture.handle.fork_member(
+                source,
+                SpawnMemberSpec::new(ProfileName::from("lead"), fork.clone()),
+                None,
+            ),
+        )
+        .await
+        .expect("the fork answers")
+        .expect("the fork commits");
+    }
+    let session = fixture
+        .member_session(&grandchild)
+        .await
+        .expect("the grandchild's session");
+    let body = fixture
+        .service
+        .load_durable_session_body(&session)
+        .await
+        .expect("the grandchild loads")
+        .expect("the grandchild is durable");
+    let seed: meerkat_core::fork_notice::ForkSeed = serde_json::from_value(
+        body.metadata()
+            .get(meerkat_core::fork_notice::SESSION_FORK_SEED_KEY)
+            .cloned()
+            .expect("the grandchild holds a fork seed"),
+    )
+    .expect("the seed decodes");
+    assert!(
+        seed.source_instructions.is_empty(),
+        "the child never activated the key it copied: {:?}",
+        seed.source_instructions
+    );
+    fixture.finish().await;
+}
+
+/// A prompt-context fork of a durable fork child names, as its source's
+/// instructions, only the keys that child activated itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_context_fork_of_a_fork_names_only_its_sources_own_keys() {
+    let fixture = Fixture::restored_member().await;
+    fixture.activated_source_with_a_turn().await;
+    let child = AgentIdentity::from("durable-child");
+    tokio::time::timeout(
+        WAIT,
+        fixture.handle.fork_member(
+            &fixture.identity,
+            SpawnMemberSpec::new(ProfileName::from("lead"), child.clone()),
+            None,
+        ),
+    )
+    .await
+    .expect("the fork answers")
+    .expect("the fork commits");
+    let before = fixture.client.requests().len();
+    tokio::time::timeout(
+        WAIT,
+        fixture.handle.fork_helper(
+            &child,
+            AgentIdentity::from("helper-of-the-child"),
+            "helper task text",
+            crate::launch::ForkContext::FullHistory,
+            HelperOptions {
+                role_name: Some(ProfileName::from("lead")),
+                runtime_mode: Some(crate::MobRuntimeMode::TurnDriven),
+                ..HelperOptions::default()
+            },
+            "helper-of-the-child-result",
+            256,
+        ),
+    )
+    .await
+    .expect("fork_helper answers")
+    .expect("fork_helper succeeds");
+    let request = fixture
+        .client
+        .requests()
+        .get(before)
+        .cloned()
+        .expect("the helper's first request");
+    let notice = fork_notice_summary(&request).expect("the helper reads its fork notice");
+    assert!(
+        !notice.contains("host.standing/member"),
+        "the child never activated the key it copied: {notice}"
+    );
+    fixture.finish().await;
+}
+
+/// A source forked while its own turn runs (as when a member forks itself
+/// from one of its tool calls) still has its tools compared: the notice
+/// reads the tools the source's session last published, without waiting on
+/// that turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fork_of_a_running_source_names_a_tool_the_child_cannot_call() {
+    let fixture = Fixture::restored_member().await;
+    fixture.run_turn("source turn before the fork").await;
+    let denied = fixture
+        .client
+        .requests()
+        .last()
+        .and_then(|request| request.tools.iter().map(|tool| tool.name.to_string()).min())
+        .expect("the source can call a tool");
+    fixture.client.block();
+    let before = fixture.client.requests().len();
+    let held = fixture
+        .start_turn("a source turn that runs through the fork")
+        .await;
+    fixture.client.wait_started(before + 1).await;
+
+    let helper = tokio::spawn({
+        let handle = fixture.handle.clone();
+        let identity = fixture.identity.clone();
+        let denied = denied.clone();
+        async move {
+            handle
+                .fork_helper(
+                    &identity,
+                    AgentIdentity::from("running-source-helper"),
+                    "helper task text",
+                    crate::launch::ForkContext::FullHistory,
+                    HelperOptions {
+                        role_name: Some(ProfileName::from("lead")),
+                        runtime_mode: Some(crate::MobRuntimeMode::TurnDriven),
+                        tool_access_policy: Some(meerkat_core::ops::ToolAccessPolicy::DenyList(
+                            [denied.as_str()].into_iter().collect(),
+                        )),
+                        ..HelperOptions::default()
+                    },
+                    "running-source-helper-result",
+                    256,
+                )
+                .await
+        }
+    });
+    // The helper's first model request starts while the source's turn is
+    // still held: the child was created, and its notice built, mid-turn.
+    fixture.client.wait_started(before + 2).await;
+    fixture.client.release();
+    tokio::time::timeout(WAIT, held.wait())
+        .await
+        .expect("the source's turn finishes")
+        .expect("the source's turn runs");
+    tokio::time::timeout(WAIT, helper)
+        .await
+        .expect("fork_helper answers")
+        .expect("fork_helper task")
+        .expect("fork_helper succeeds");
+
+    let request = fixture
+        .client
+        .requests()
+        .into_iter()
+        .skip(before)
+        .find(|request| format!("{:?}", request.messages).contains("helper task text"))
+        .expect("the helper's first request");
+    let notices = fork_notices(&request.messages);
+    assert_eq!(notices.len(), 1, "one fork notice: {:?}", request.messages);
+    let tools = &notices[0].1["tools"];
+    assert_eq!(
+        tools["comparison"], "compared",
+        "the running source's tools are compared: {}",
+        notices[0].1
+    );
+    assert!(
+        tools["removed"]
+            .as_array()
+            .is_some_and(|removed| removed.iter().any(|name| name == denied.as_str())),
+        "the notice names {denied} as removed: {}",
+        notices[0].1
+    );
+    fixture.finish().await;
+}
+
 /// Forwards every session-service method to the real persistent service
 /// except `activate_instruction_under_runtime_turn_boundary`, which keeps the
 /// trait default. Generated mechanically from the trait signatures.

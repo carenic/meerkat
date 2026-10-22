@@ -602,6 +602,35 @@ mod tests {
         assert_eq!(unknown.summary(), Some(notice.summary.as_str()));
     }
 
+    /// A fork_boundary block a later release writes, with a value nested in
+    /// it that this release does not know, still decodes: as an unknown
+    /// block that keeps its summary, so the transcript that holds it loads.
+    #[test]
+    fn a_later_releases_fork_boundary_block_decodes_as_unknown_with_its_summary() {
+        let notice = seed(
+            ForkNoticeKind::Transcript,
+            ForkSeedSourceTools::NotRead {
+                reason: ForkToolsNotComparedReason::SourceNotLive,
+            },
+        )
+        .notice(SessionId::new(), &BTreeSet::new(), &BTreeSet::new());
+        let wire = serde_json::to_value(SystemNoticeBlock::ForkBoundary(Box::new(notice.clone())))
+            .unwrap();
+        let mut later_reason = wire.clone();
+        later_reason["tools"]["reason"] = serde_json::Value::from("a_reason_from_a_later_release");
+        let mut later_kind = wire;
+        later_kind["fork"] = serde_json::Value::from("a_kind_from_a_later_release");
+        for later in [later_reason, later_kind] {
+            let decoded: SystemNoticeBlock = serde_json::from_value(later.clone())
+                .unwrap_or_else(|error| panic!("{later} decodes: {error}"));
+            assert!(
+                !matches!(decoded, SystemNoticeBlock::ForkBoundary(_)),
+                "{later}"
+            );
+            assert_eq!(decoded.summary(), Some(notice.summary.as_str()), "{later}");
+        }
+    }
+
     #[test]
     fn effective_keys_follow_each_keys_last_row() {
         use crate::types::{

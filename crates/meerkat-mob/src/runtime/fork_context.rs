@@ -929,6 +929,107 @@ mod tests {
         }
     }
 
+    /// The refusal a `refuse` policy gives for `rows`, as wire JSON and as
+    /// its message.
+    fn refusal_of(rows: Vec<WireHistoryRow>) -> (serde_json::Value, String) {
+        match plan(rows, ForkInstructionPolicy::Refuse) {
+            Err(MobError::ForkInstructionRefused { refusal, .. }) => (
+                serde_json::to_value(&refusal).expect("refusal wire json"),
+                refusal.to_string(),
+            ),
+            other => panic!(
+                "expected a typed refusal, got {:?}",
+                other.map(|p| p.render())
+            ),
+        }
+    }
+
+    fn readable_load_skill() -> Vec<WireHistoryRow> {
+        vec![
+            load_skill_call(
+                "call-1",
+                json!({"source_uuid": SKILL_SOURCE, "skill_name": "pdf-processing"}),
+            ),
+            tool_result("call-1", "SKILL-BODY"),
+        ]
+    }
+
+    #[test]
+    fn a_refusal_of_keys_only_names_the_keys_only() {
+        let (wire, message) = refusal_of(vec![activation("member", "a1", "BODY-1"), user("hi")]);
+        assert_eq!(wire["keys"], json!([["host.standing", "member"]]), "{wire}");
+        assert!(wire.get("skills").is_none(), "{wire}");
+        assert!(wire.get("unreadable_skill_loads").is_none(), "{wire}");
+        assert!(
+            message.contains("would inherit activated instruction keys [host.standing/member] and the fork instruction policy refuses them"),
+            "{message}"
+        );
+        assert!(!message.contains("skill"), "{message}");
+    }
+
+    #[test]
+    fn a_refusal_of_loaded_skills_only_names_the_skills_only() {
+        let (wire, message) = refusal_of(readable_load_skill());
+        assert_eq!(wire["keys"], json!([]), "{wire}");
+        assert_eq!(wire["skills"].as_array().map(Vec::len), Some(1), "{wire}");
+        assert!(wire.get("unreadable_skill_loads").is_none(), "{wire}");
+        assert!(
+            message.contains(&format!(
+                "would inherit skills loaded by the source [{SKILL_SOURCE}/pdf-processing] and the fork instruction policy refuses them"
+            )),
+            "{message}"
+        );
+        assert!(!message.contains("instruction keys"), "{message}");
+    }
+
+    #[test]
+    fn a_refusal_of_unreadable_load_skill_calls_names_the_calls() {
+        let (wire, message) = refusal_of(vec![
+            load_skill_call("call-1", json!({"bogus": 1})),
+            tool_result("call-1", "SKILL-BODY"),
+        ]);
+        assert_eq!(wire["keys"], json!([]), "{wire}");
+        assert!(wire.get("skills").is_none(), "{wire}");
+        assert_eq!(wire["unreadable_skill_loads"], json!(["call-1"]), "{wire}");
+        assert!(
+            message.contains("would inherit load_skill calls whose skill cannot be read [call-1] and the fork instruction policy refuses them"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("instruction keys") && !message.contains("skills loaded"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_refusal_of_keys_and_skills_names_both() {
+        let mut rows = vec![activation("member", "a1", "BODY-1")];
+        rows.extend(readable_load_skill());
+        let (wire, message) = refusal_of(rows);
+        assert_eq!(wire["keys"], json!([["host.standing", "member"]]), "{wire}");
+        assert_eq!(wire["skills"].as_array().map(Vec::len), Some(1), "{wire}");
+        assert!(wire.get("unreadable_skill_loads").is_none(), "{wire}");
+        assert!(
+            message.contains(&format!(
+                "would inherit activated instruction keys [host.standing/member] and skills loaded by the source [{SKILL_SOURCE}/pdf-processing] and the fork instruction policy refuses them"
+            )),
+            "{message}"
+        );
+    }
+
+    /// A key the source switched off is still a key it activated: `refuse`
+    /// refuses the fork, as it does a durable fork of the same source.
+    #[test]
+    fn refuse_refuses_a_source_whose_only_key_is_switched_off() {
+        let (wire, message) = refusal_of(vec![
+            activation("member", "a1", "BODY-1"),
+            activation("member", "a2", ""),
+            user("hi"),
+        ]);
+        assert_eq!(wire["keys"], json!([["host.standing", "member"]]), "{wire}");
+        assert!(message.contains("host.standing/member"), "{message}");
+    }
+
     fn seed_of(rows: Vec<WireHistoryRow>, policy: ForkInstructionPolicy) -> ForkSeed {
         plan(rows, policy).expect("the fork is planned").seed(
             ForkNoticeSource {
@@ -1072,6 +1173,47 @@ mod tests {
         assert!(
             !kept.contains("[system_notice]"),
             "the copied notice never is: {kept}"
+        );
+    }
+
+    /// A durable fork's notice has no planned row before it: the
+    /// host-injected row that precedes it is the source's own.
+    #[test]
+    fn a_transcript_notice_does_not_claim_the_injected_row_before_it() {
+        let transcript = ForkSeed {
+            fork: ForkNoticeKind::Transcript,
+            source: ForkNoticeSource {
+                member: None,
+                session_id: None,
+            },
+            planned_context: None,
+            source_instructions: Vec::new(),
+            instructions_carried: Vec::new(),
+            skills_removed: Vec::new(),
+            skills_carried: Vec::new(),
+            injected_rows_removed: 0,
+            injected_rows_carried: 0,
+            earlier_rows_omitted: 0,
+            source_tools: ForkSeedSourceTools::NotRead {
+                reason: meerkat_core::fork_notice::ForkToolsNotComparedReason::SourceNotLive,
+            },
+        };
+        let notice = transcript.notice(SessionId::new(), &BTreeSet::new(), &BTreeSet::new());
+        let rows = vec![
+            user_row("RECALL-ROW", TranscriptUserRole::InjectedContext),
+            WireHistoryRow(WireSessionMessage::SystemNotice {
+                kind: SystemNoticeKind::Generic,
+                runtime_origin: None,
+                body: None,
+                blocks: vec![SystemNoticeBlock::ForkBoundary(Box::new(notice))],
+                created_at: AT.to_string(),
+            }),
+            user("hi"),
+        ];
+        let seed = seed_of(rows, ForkInstructionPolicy::RequireExplicitActivation);
+        assert_eq!(
+            seed.injected_rows_removed, 1,
+            "the recall row is the source's host-injected context"
         );
     }
 

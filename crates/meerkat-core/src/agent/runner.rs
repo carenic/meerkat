@@ -6563,6 +6563,57 @@ mod skill_activation_effect_tests {
         assert_eq!(failures, 1);
     }
 
+    /// A fork seed this release cannot read (one a later release wrote,
+    /// read after a downgrade) does not stop the session: the seed is
+    /// dropped, the child is told once that its fork context could not be
+    /// read, and its runs go on.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn an_unreadable_fork_seed_is_dropped_with_one_notice_and_runs_go_on() {
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .build_standalone(
+                Arc::new(StaticLlmClient),
+                Arc::new(NoTools),
+                Arc::new(NoopStore),
+            )
+            .await;
+        agent
+            .session_mut()
+            .try_set_metadata(
+                crate::fork_notice::SESSION_FORK_SEED_KEY,
+                serde_json::json!({"fork": "a_kind_from_a_later_release"}),
+            )
+            .expect("the seed is recorded");
+        for prompt in ["first", "second"] {
+            let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
+            agent
+                .run_with_events(prompt.into(), tx)
+                .await
+                .expect("an unreadable seed does not fail the run");
+        }
+        assert!(
+            agent
+                .session()
+                .metadata()
+                .get(crate::fork_notice::SESSION_FORK_SEED_KEY)
+                .is_none(),
+            "the unreadable seed is dropped"
+        );
+        let notices = agent
+            .session()
+            .messages()
+            .iter()
+            .filter(|message| {
+                matches!(
+                    message,
+                    Message::SystemNotice(notice)
+                        if notice.body.as_deref().is_some_and(|body| body.contains("fork context"))
+                )
+            })
+            .count();
+        assert_eq!(notices, 1, "the child is told once");
+    }
+
     /// Without an engine, a turn that selects no skills still runs normally.
     #[cfg(feature = "workspace-tests")]
     #[tokio::test]

@@ -21021,6 +21021,35 @@ mod tests {
         );
     }
 
+    /// Both fork sources a build names survive the deferred-session round
+    /// trip through `SessionBuildOptions`.
+    #[test]
+    fn fork_sources_survive_the_session_build_options_round_trip() {
+        let binding = meerkat_core::MobMemberBinding {
+            mob_id: "mob".to_string(),
+            role: "lead".to_string(),
+            member: "source".to_string(),
+        };
+        let source_session = meerkat_core::types::SessionId::new();
+        let mut options = SessionBuildOptions::default();
+        options.fork_source = Some(meerkat_core::ForkBuildSource::new(
+            binding.clone(),
+            source_session.clone(),
+        ));
+        options.prompt_context_fork_source = Some(meerkat_core::PromptContextForkSource::new(
+            binding,
+            Some(source_session),
+        ));
+        let mut build = AgentBuildConfig::new("claude-sonnet-4-5");
+        build.apply_session_build_options(&options);
+        let round_tripped = build.to_session_build_options();
+        assert_eq!(round_tripped.fork_source, options.fork_source);
+        assert_eq!(
+            round_tripped.prompt_context_fork_source,
+            options.prompt_context_fork_source
+        );
+    }
+
     #[test]
     fn resumed_self_hosted_binding_overrides_current_registry_server() {
         let temp = tempfile::tempdir().unwrap();
