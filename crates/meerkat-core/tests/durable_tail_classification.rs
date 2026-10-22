@@ -3,14 +3,24 @@
 //! The shell encodes transcript structure; the generated machine assigns one
 //! modern recovery class:
 //!
-//! - Completed: verified strict descendant, exactly one run id, EndTurn, no
+//! - Completed: verified descendant, exactly one run id, EndTurn, no
 //!   dangling calls or orphan results, and nothing after the terminal.
 //! - Repairable: the same coherent single-run shape, no dangling calls, and a
 //!   ToolUse or Absent stop.
 //! - Everything else is Ambiguous and held intact.
 //!
+//! A verified descendant is a verified strict descendant (the row extends the
+//! authority's exact message prefix) or a verified rewrite descendant (the
+//! store proved that transcript rewrite occurrences bridge the authority to
+//! the row). Both pass the same shape checks; neither stands in for the
+//! other.
+//!
 //! A dangling tool_use proves intent, not execution: its external effect may
 //! already have fired, so the machine never auto-closes such a tail.
+//!
+//! Rewrite rows carry no run identity. A rewrite descendant whose live tail
+//! holds no run-stamped message observes no run id, so it is held as
+//! Ambiguous rather than closed on the provisional's run identity alone.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -77,6 +87,31 @@ fn classify(
         messages_after_terminal,
     )
     .1
+}
+
+/// Every head relation the truth table covers.
+const RELATIONS: [DurableHeadRelation; 6] = [
+    DurableHeadRelation::AbsentOrExact,
+    DurableHeadRelation::RuntimeSnapshotAhead,
+    DurableHeadRelation::VerifiedStrictDescendant,
+    DurableHeadRelation::Diverged,
+    DurableHeadRelation::Unverifiable,
+    DurableHeadRelation::VerifiedRewriteDescendant,
+];
+
+/// The table's own oracle for the relation conjunct. The match is
+/// exhaustive on purpose: a new relation does not compile here until the
+/// table decides whether it is a verified descendant (and joins
+/// [`RELATIONS`]).
+fn is_verified_descendant(relation: DurableHeadRelation) -> bool {
+    match relation {
+        DurableHeadRelation::VerifiedStrictDescendant
+        | DurableHeadRelation::VerifiedRewriteDescendant => true,
+        DurableHeadRelation::AbsentOrExact
+        | DurableHeadRelation::RuntimeSnapshotAhead
+        | DurableHeadRelation::Diverged
+        | DurableHeadRelation::Unverifiable => false,
+    }
 }
 
 #[test]
@@ -205,6 +240,158 @@ fn identity_relation_and_shape_contradictions_are_ambiguous() {
 }
 
 #[test]
+fn rewrite_descendant_completed_row_classifies_completed_candidate() {
+    assert_eq!(
+        classify(
+            DurableHeadRelation::VerifiedRewriteDescendant,
+            RunIdCardinality::SingleRunId,
+            DurableTailStopReason::EndTurn,
+            0,
+            0,
+            false,
+        ),
+        DurableTailRecoveryClass::CompletedCandidate
+    );
+}
+
+#[test]
+fn rewrite_descendant_tool_use_and_absent_are_repairable_only_without_dangling_calls() {
+    for stop in [
+        DurableTailStopReason::ToolUse,
+        DurableTailStopReason::Absent,
+    ] {
+        assert_eq!(
+            classify(
+                DurableHeadRelation::VerifiedRewriteDescendant,
+                RunIdCardinality::SingleRunId,
+                stop,
+                0,
+                0,
+                false,
+            ),
+            DurableTailRecoveryClass::InterruptedRepairableCandidate,
+            "a coherent single-run rewrite tail stopped at {stop:?} must be repairable"
+        );
+        for dangling in [1, 3] {
+            assert_eq!(
+                classify(
+                    DurableHeadRelation::VerifiedRewriteDescendant,
+                    RunIdCardinality::SingleRunId,
+                    stop,
+                    dangling,
+                    0,
+                    false,
+                ),
+                DurableTailRecoveryClass::Ambiguous,
+                "a rewrite tail with a dangling call at {stop:?} must hold"
+            );
+        }
+    }
+}
+
+/// An empty live tail after a rewrite observes no run id: rewrite rows carry
+/// no run identity, so the provisional's run id alone never closes it. More
+/// than one run id is held the same way.
+#[test]
+fn rewrite_descendant_without_exactly_one_run_id_is_held_ambiguous() {
+    for cardinality in [RunIdCardinality::NoRunId, RunIdCardinality::MultipleRunIds] {
+        for stop in [
+            DurableTailStopReason::Absent,
+            DurableTailStopReason::EndTurn,
+            DurableTailStopReason::ToolUse,
+            DurableTailStopReason::Other,
+        ] {
+            assert_eq!(
+                classify(
+                    DurableHeadRelation::VerifiedRewriteDescendant,
+                    cardinality,
+                    stop,
+                    0,
+                    0,
+                    false,
+                ),
+                DurableTailRecoveryClass::Ambiguous,
+                "a rewrite tail with {cardinality:?} stopped at {stop:?} must hold"
+            );
+        }
+    }
+}
+
+#[test]
+fn rewrite_descendant_shape_contradictions_are_ambiguous() {
+    for (dangling, orphans, after, stop) in [
+        (0, 1, false, DurableTailStopReason::EndTurn),
+        (0, 1, false, DurableTailStopReason::ToolUse),
+        (0, 0, true, DurableTailStopReason::EndTurn),
+        (0, 0, true, DurableTailStopReason::Absent),
+        (0, 0, false, DurableTailStopReason::Other),
+        (1, 0, false, DurableTailStopReason::EndTurn),
+    ] {
+        assert_eq!(
+            classify(
+                DurableHeadRelation::VerifiedRewriteDescendant,
+                RunIdCardinality::SingleRunId,
+                stop,
+                dangling,
+                orphans,
+                after,
+            ),
+            DurableTailRecoveryClass::Ambiguous,
+            "rewrite tail dangling={dangling} orphans={orphans} after_terminal={after} \
+             stop={stop:?} must hold"
+        );
+    }
+}
+
+/// The rewrite relation is admitted on exactly the strict relation's shape
+/// guards: over every observed shape the two relations get the same class.
+#[test]
+fn rewrite_and_strict_descendants_classify_identically_over_every_shape() {
+    for cardinality in [
+        RunIdCardinality::NoRunId,
+        RunIdCardinality::SingleRunId,
+        RunIdCardinality::MultipleRunIds,
+    ] {
+        for stop in [
+            DurableTailStopReason::Absent,
+            DurableTailStopReason::EndTurn,
+            DurableTailStopReason::ToolUse,
+            DurableTailStopReason::Other,
+        ] {
+            for dangling in [0u64, 1, 3] {
+                for orphans in [0u64, 1] {
+                    for after_terminal in [false, true] {
+                        let strict = classify(
+                            DurableHeadRelation::VerifiedStrictDescendant,
+                            cardinality,
+                            stop,
+                            dangling,
+                            orphans,
+                            after_terminal,
+                        );
+                        let rewrite = classify(
+                            DurableHeadRelation::VerifiedRewriteDescendant,
+                            cardinality,
+                            stop,
+                            dangling,
+                            orphans,
+                            after_terminal,
+                        );
+                        assert_eq!(
+                            rewrite, strict,
+                            "rewrite and strict descendants diverge: \
+                             cardinality={cardinality:?} stop={stop:?} \
+                             dangling={dangling} orphans={orphans} \
+                             after_terminal={after_terminal}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn effect_carries_the_exact_candidate_id_on_every_class() {
     let candidate = "candidate:session-recovery:rev385:cas42:run-7f";
     for (relation, stop, expected) in [
@@ -216,6 +403,16 @@ fn effect_carries_the_exact_candidate_id_on_every_class() {
         (
             DurableHeadRelation::VerifiedStrictDescendant,
             DurableTailStopReason::Absent,
+            DurableTailRecoveryClass::InterruptedRepairableCandidate,
+        ),
+        (
+            DurableHeadRelation::VerifiedRewriteDescendant,
+            DurableTailStopReason::EndTurn,
+            DurableTailRecoveryClass::CompletedCandidate,
+        ),
+        (
+            DurableHeadRelation::VerifiedRewriteDescendant,
+            DurableTailStopReason::ToolUse,
             DurableTailRecoveryClass::InterruptedRepairableCandidate,
         ),
         (
@@ -240,13 +437,6 @@ fn effect_carries_the_exact_candidate_id_on_every_class() {
 
 #[test]
 fn classification_is_total_disjoint_and_matches_the_truth_table() {
-    let relations = [
-        DurableHeadRelation::AbsentOrExact,
-        DurableHeadRelation::RuntimeSnapshotAhead,
-        DurableHeadRelation::VerifiedStrictDescendant,
-        DurableHeadRelation::Diverged,
-        DurableHeadRelation::Unverifiable,
-    ];
     let cardinalities = [
         RunIdCardinality::NoRunId,
         RunIdCardinality::SingleRunId,
@@ -259,7 +449,7 @@ fn classification_is_total_disjoint_and_matches_the_truth_table() {
         DurableTailStopReason::Other,
     ];
 
-    for relation in relations {
+    for relation in RELATIONS {
         for cardinality in cardinalities {
             for stop in stops {
                 for dangling in [0u64, 1, 3] {
@@ -273,8 +463,7 @@ fn classification_is_total_disjoint_and_matches_the_truth_table() {
                                 orphans,
                                 after_terminal,
                             );
-                            let coherent = relation
-                                == DurableHeadRelation::VerifiedStrictDescendant
+                            let coherent = is_verified_descendant(relation)
                                 && cardinality == RunIdCardinality::SingleRunId
                                 && dangling == 0
                                 && orphans == 0
