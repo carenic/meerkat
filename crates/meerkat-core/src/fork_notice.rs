@@ -98,10 +98,6 @@ pub enum ForkToolsNotComparedReason {
     /// The source session was not live when the child was created, so its
     /// visible tools could not be read.
     SourceNotLive,
-    /// The source was running a turn when the child was created (for
-    /// example a source forking itself from one of its own tool calls), and
-    /// its visible tools are not read by waiting for that turn.
-    SourceBusy,
     /// The source runs on a member host whose visible tools were not read.
     PlacedSource,
     /// The source's member host is too old to report its visible tools.

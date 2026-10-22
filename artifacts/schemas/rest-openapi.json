@@ -10400,11 +10400,6 @@
             "type": "string"
           },
           {
-            "const": "source_busy",
-            "description": "The source was running a turn when the child was created (for\nexample a source forking itself from one of its own tool calls), and\nits visible tools are not read by waiting for that turn.",
-            "type": "string"
-          },
-          {
             "const": "placed_source",
             "description": "The source runs on a member host whose visible tools were not read.",
             "type": "string"

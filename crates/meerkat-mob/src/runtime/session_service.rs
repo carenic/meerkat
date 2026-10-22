@@ -1683,7 +1683,8 @@ pub trait MobSessionService:
     /// The visible tool names of the live session `session_id` at a fork
     /// boundary, for the fork child's notice, read without waiting on a
     /// running turn ([`meerkat_core::fork_notice::ForkSeedSourceTools`]). A
-    /// service that cannot report them answers that the source was not live.
+    /// service that cannot report them answers that the source was not live;
+    /// a decorator forwards it to the service it wraps.
     async fn fork_source_tools(
         &self,
         _session_id: &SessionId,

@@ -7892,7 +7892,7 @@ of its members, and the source session when the forking side knows it."""
 ForkNoticeSystemPrompt = Literal['not_carried', 'not_applicable']
 
 # Why a fork notice does not compare the source's tools with the child's.
-ForkToolsNotComparedReason = Literal['source_not_live', 'source_busy', 'placed_source', 'member_host_unsupported']
+ForkToolsNotComparedReason = Literal['source_not_live', 'placed_source', 'member_host_unsupported']
 
 # The tools a fork notice names: the source's visible tool names at the fork
 # boundary against the child's at its first model call, by name only.

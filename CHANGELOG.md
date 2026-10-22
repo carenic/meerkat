@@ -94,6 +94,15 @@ them.
   `MobError::ForkContextTooLarge` (code `INVALID_PARAMS`, data kind
   `fork_context_too_large`).
 
+### Added
+
+- `meerkat-mob`: `MobSessionService` gains `fork_source_tools`, the visible
+  tool names a fork notice compares, read from the set the session task
+  publishes at each command and turn boundary, so a source that is in the
+  middle of a turn is read without waiting on it. Its default reports the
+  tools as not compared: a `MobSessionService` decorator forwards it to
+  the service it wraps, as the RPC and CLI services do.
+
 ### Changed
 
 - `meerkat-core`: the `FORK_INSTRUCTION_REFUSED` message for a fork the

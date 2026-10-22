@@ -6888,7 +6888,7 @@ export interface ForkNoticeSource {
 
 export type ForkNoticeSystemPrompt = "not_carried" | "not_applicable";
 
-export type ForkToolsNotComparedReason = "source_not_live" | "source_busy" | "placed_source" | "member_host_unsupported";
+export type ForkToolsNotComparedReason = "source_not_live" | "placed_source" | "member_host_unsupported";
 
 export interface ForkNoticeToolsCompared {
   added?: ToolName[];
