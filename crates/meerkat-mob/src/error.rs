@@ -1484,6 +1484,20 @@ pub enum MobError {
         refusal: meerkat_core::ForkInstructionRefusal,
     },
 
+    /// A prompt-context fork of `source_member_id` was refused before
+    /// anything was spawned: the newest row of its planned context does not
+    /// fit the fork context budget for the child's model.
+    #[error(
+        "fork of member '{source_member_id}' refused: its newest context row needs \
+         {newest_row_bytes} bytes, more than the {max_bytes}-byte fork context budget; \
+         fork with last_messages or from a source with shorter rows"
+    )]
+    ForkContextTooLarge {
+        source_member_id: AgentIdentity,
+        max_bytes: usize,
+        newest_row_bytes: usize,
+    },
+
     /// A restored member's host refused its registration at `call`. The
     /// refused registration is gone: removed exactly through the canonical
     /// unregister when the revival did not insert it, so the inputs its
@@ -1871,6 +1885,16 @@ impl MobError {
                 "fork_instruction_refusal": refusal,
                 "source_member_id": source_member_id.as_str(),
             })),
+            Self::ForkContextTooLarge {
+                source_member_id,
+                max_bytes,
+                newest_row_bytes,
+            } => Some(serde_json::json!({
+                "kind": "fork_context_too_large",
+                "source_member_id": source_member_id.as_str(),
+                "max_bytes": max_bytes,
+                "newest_row_bytes": newest_row_bytes,
+            })),
             // A restore failure that IS a typed resume hold projects the hold
             // under meerkat's own key, so a wire caller classifies the Broken
             // member exactly as it classifies meerkat's -32013 refusal.
@@ -2166,6 +2190,9 @@ impl MobError {
                 }
                 Self::ForkInstructionRefused { .. } => {
                     Some(meerkat_contracts::ErrorCode::ForkInstructionRefused)
+                }
+                Self::ForkContextTooLarge { .. } => {
+                    Some(meerkat_contracts::ErrorCode::InvalidParams)
                 }
                 _ => None,
             })

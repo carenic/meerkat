@@ -3519,6 +3519,7 @@ export type ForkInstructionRefusalCause = ForkInstructionRefusalCausePolicyRefus
 export interface ForkInstructionRefusal {
   cause: ForkInstructionRefusalCause;
   keys: unknown[][];
+  skills?: SkillKey[];
 }
 
 export type ToolConfigChangeDomain = "tool_scope" | "deferred_catalog";

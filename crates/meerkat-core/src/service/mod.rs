@@ -905,6 +905,40 @@ impl ForkBuildSource {
     }
 }
 
+/// The source of a prompt-context fork child: the mob member whose history
+/// was rendered into the child's first prompt (`MemberLaunchMode::Fork` in
+/// the mob runtime).
+///
+/// Set only by the mob runtime, on that child's create build. No standard
+/// build behaviour reads it; a host's build hook may, for example to carry
+/// the source's content taint to the child. It is not
+/// [`ForkBuildSource`], which is durable-fork provenance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub struct PromptContextForkSource {
+    /// Durable mob-member identity of the source member.
+    pub source_member: crate::MobMemberBinding,
+    /// The source member's session the history was read from, when the
+    /// controller knows it (a placed source's session lives on its host).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
+    pub source_session_id: Option<SessionId>,
+}
+
+impl PromptContextForkSource {
+    pub fn new(
+        source_member: crate::MobMemberBinding,
+        source_session_id: Option<SessionId>,
+    ) -> Self {
+        Self {
+            source_member,
+            source_session_id,
+        }
+    }
+}
+
 /// What a build does with its session.
 ///
 /// [`SessionBuildOptions::resume_session`] carries two different things: the
@@ -1121,6 +1155,10 @@ pub struct SessionBuildOptions {
     /// }
     /// ```
     pub fork_source: Option<ForkBuildSource>,
+    /// Typed source of a prompt-context fork child (see
+    /// [`PromptContextForkSource`]); `None` for every other build. Not read by
+    /// the standard build pipeline.
+    pub prompt_context_fork_source: Option<PromptContextForkSource>,
     /// Additional instruction sections appended to the system prompt after skill
     /// assembly, before tool instructions. Order preserved.
     pub additional_instructions: Option<Vec<String>>,
@@ -2146,6 +2184,7 @@ impl Default for SessionBuildOptions {
             max_inline_peer_notifications: None,
             app_context: None,
             fork_source: None,
+            prompt_context_fork_source: None,
             additional_instructions: None,
             initial_metadata_entries: BTreeMap::new(),
             initial_tool_filter: None,
@@ -2230,6 +2269,10 @@ impl std::fmt::Debug for SessionBuildOptions {
             )
             .field("app_context", &self.app_context.is_some())
             .field("fork_source", &self.fork_source)
+            .field(
+                "prompt_context_fork_source",
+                &self.prompt_context_fork_source,
+            )
             .field("additional_instructions", &self.additional_instructions)
             .field("initial_metadata_entries", &self.initial_metadata_entries)
             .field("initial_tool_filter", &self.initial_tool_filter.is_some())

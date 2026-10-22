@@ -9314,6 +9314,13 @@
               "type": "array"
             },
             "type": "array"
+          },
+          "skills": {
+            "description": "The skills a prompt-context fork would carry because its source\nloaded them with the built-in `load_skill` tool, in key order. Empty\nfor every other refusal, and then not serialized.",
+            "items": {
+              "$ref": "#/$defs/SkillKey"
+            },
+            "type": "array"
           }
         },
         "required": [

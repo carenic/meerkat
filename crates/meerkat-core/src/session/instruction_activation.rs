@@ -333,12 +333,17 @@ pub enum ForkInstructionRefusalCause {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-#[error("{}", fork_instruction_refusal_message(.cause, .keys))]
+#[error("{}", fork_instruction_refusal_message(.cause, .keys, .skills))]
 #[non_exhaustive]
 pub struct ForkInstructionRefusal {
     pub cause: ForkInstructionRefusalCause,
     /// The inherited keys the refusal concerns, in (namespace, key) order.
     pub keys: Vec<(InstructionNamespace, InstructionKey)>,
+    /// The skills a prompt-context fork would carry because its source
+    /// loaded them with the built-in `load_skill` tool, in key order. Empty
+    /// for every other refusal, and then not serialized.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<crate::skills::SkillKey>,
 }
 
 impl ForkInstructionRefusal {
@@ -347,22 +352,46 @@ impl ForkInstructionRefusal {
         cause: ForkInstructionRefusalCause,
         keys: Vec<(InstructionNamespace, InstructionKey)>,
     ) -> Self {
-        Self { cause, keys }
+        Self {
+            cause,
+            keys,
+            skills: Vec::new(),
+        }
+    }
+
+    /// The same refusal, naming the `load_skill` skills it concerns.
+    #[must_use]
+    pub fn with_skills(mut self, skills: Vec<crate::skills::SkillKey>) -> Self {
+        self.skills = skills;
+        self
     }
 }
 
 fn fork_instruction_refusal_message(
     cause: &ForkInstructionRefusalCause,
     keys: &[(InstructionNamespace, InstructionKey)],
+    skills: &[crate::skills::SkillKey],
 ) -> String {
     let keys = keys
         .iter()
         .map(|(namespace, key)| format!("{namespace}/{key}"))
         .collect::<Vec<_>>()
         .join(", ");
+    let skills = if skills.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " and skills loaded by the source [{}]",
+            skills
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
     match cause {
         ForkInstructionRefusalCause::PolicyRefuses => format!(
-            "fork refused: the child would inherit activated instruction keys [{keys}] and the \
+            "fork refused: the child would inherit activated instruction keys [{keys}]{skills} and the \
              fork instruction policy refuses them; to carry them into the child, set the host's \
              fork_instruction_policy (inherited_instructions on a session fork call) to \
              reactivate_inherited"

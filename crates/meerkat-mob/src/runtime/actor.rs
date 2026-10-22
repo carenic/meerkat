@@ -5556,106 +5556,6 @@ fn mob_bridge_rejection_cause(
     }
 }
 
-/// Render forked conversation rows as a text context block for the new
-/// member. ONE renderer over the ONE page row vocabulary
-/// (`WireSessionMessage`, DEC-P6E-20): the local fork branch projects its
-/// domain page through `WireMemberHistoryPageBody::try_from_history_page` and
-/// the remote branch decodes the bridge page — both render here, so local
-/// and remote fork context are byte-identical by construction.
-fn render_fork_context(
-    source_member_id: &AgentIdentity,
-    rows: &[meerkat_contracts::wire::WireHistoryRow],
-) -> String {
-    use meerkat_contracts::wire::{
-        WireAssistantBlock, WireContentBlock, WireContentInput, WireSessionMessage,
-        WireToolResultContent,
-    };
-
-    fn content_input_text(content: &WireContentInput) -> String {
-        match content {
-            WireContentInput::Text(text) => text.clone(),
-            WireContentInput::Blocks(blocks) => blocks
-                .iter()
-                .filter_map(|block| match block {
-                    WireContentBlock::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join(""),
-        }
-    }
-
-    let mut lines = Vec::new();
-    lines.push(format!(
-        "[Forked conversation context from member '{source_member_id}']"
-    ));
-    for row in rows {
-        match &row.0 {
-            WireSessionMessage::System { content, .. } => {
-                lines.push(format!("[system]: {content}"));
-            }
-            WireSessionMessage::SystemNotice { body, .. } => {
-                lines.push(format!(
-                    "[system_notice]: {}",
-                    body.clone().unwrap_or_default()
-                ));
-            }
-            WireSessionMessage::User { content, .. } => {
-                lines.push(format!("[user]: {}", content_input_text(content)));
-            }
-            WireSessionMessage::BlockAssistant { blocks, .. } => {
-                // Both `Text` (display) and `Transcript` (spoken) lanes
-                // project to the rendered text stream; supervisor sees the
-                // assistant's full visible output regardless of lane.
-                let text: String = blocks
-                    .iter()
-                    .filter_map(|block| match block {
-                        WireAssistantBlock::Text { text, .. }
-                        | WireAssistantBlock::Transcript { text, .. } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("");
-                if !text.is_empty() {
-                    lines.push(format!("[assistant]: {text}"));
-                }
-            }
-            WireSessionMessage::ToolResults { results, .. } => {
-                for result in results {
-                    let text: String = match &result.content {
-                        WireToolResultContent::Text(text) => text.clone(),
-                        WireToolResultContent::Blocks(blocks) => blocks
-                            .iter()
-                            .filter_map(|block| match block {
-                                WireContentBlock::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join(""),
-                    };
-                    if !text.is_empty() {
-                        let preview = if text.len() > 200 {
-                            // Find a valid UTF-8 char boundary at or before byte 200
-                            let end = text
-                                .char_indices()
-                                .map(|(i, _)| i)
-                                .take_while(|&i| i <= 200)
-                                .last()
-                                .unwrap_or(0);
-                            format!("{}...", &text[..end])
-                        } else {
-                            text
-                        };
-                        lines.push(format!("[tool_result({})]: {preview}", result.tool_use_id));
-                    }
-                }
-            }
-        }
-    }
-    lines.push("[End of forked context]".to_string());
-    lines.join("\n")
-}
-
 /// Local branch of the placement-switched member history read (DEC-P6E-20/21):
 /// the SAME serving semantics as the member host's `ReadMemberHistory` arm
 /// (tail addressing, per-page cap) over the local session service, projected
@@ -6141,11 +6041,28 @@ pub(super) struct ForkSourceHistoryRead {
     source_member_id: AgentIdentity,
     fork_context: crate::launch::ForkContext,
     location: ForkSourceHistoryLocation,
+    /// The host's policy, which decides what of the source's history the
+    /// child is given (`super::fork_context`).
+    fork_instruction_policy: meerkat_core::ForkInstructionPolicy,
+    /// The source's typed identity, for the child's create build.
+    prompt_context_source: meerkat_core::PromptContextForkSource,
 }
 
 impl ForkSourceHistoryRead {
-    fn source_member_id(&self) -> &AgentIdentity {
-        &self.source_member_id
+    /// Read the source's rows and decide them under the host's fork
+    /// instruction policy, fitted to `max_bytes` (`super::fork_context`).
+    async fn read_plan(
+        &self,
+        session_service: &dyn MobSessionService,
+        max_bytes: usize,
+    ) -> Result<super::fork_context::ForkContextPlan, MobError> {
+        let rows = self.read_rows(session_service).await?;
+        super::fork_context::ForkContextPlan::new(
+            &self.source_member_id,
+            rows,
+            self.fork_instruction_policy,
+            max_bytes,
+        )
     }
 
     async fn read_rows(
@@ -32169,21 +32086,6 @@ impl MobActor {
                 )));
             }
 
-            // ---------- Fork path ----------
-            // When fork_spec is set, read source member's session and render
-            // conversation history as context in the initial prompt. §19.L2:
-            // a PLACED source routes through the same placement switch as
-            // `member_history` (the `ReadMemberHistory` proxy) — the phase-3
-            // `RemoteReadUnavailable` shape now means "tried and failed".
-            let fork_context_text = if let Some(read) = fork_source_read {
-                let rows = read
-                    .read_rows(preparation_context.session_service.as_ref())
-                    .await?;
-                Some(render_fork_context(read.source_member_id(), &rows))
-            } else {
-                None
-            };
-
             let external_tools =
                 precomputed_external_tools?;
             tracing::debug!(
@@ -32236,6 +32138,26 @@ impl MobActor {
                 config.auth_binding = Some(cref.clone());
             }
 
+            // ---------- Fork path ----------
+            // When fork_spec is set, read source member's session and render
+            // conversation history as context in the initial prompt, after
+            // the host's fork instruction policy decided what the child is
+            // given and within the budget for the child's model
+            // (`super::fork_context`). §19.L2: a PLACED source routes
+            // through the same placement switch as `member_history` (the
+            // `ReadMemberHistory` proxy) — the phase-3
+            // `RemoteReadUnavailable` shape now means "tried and failed".
+            let (fork_context_text, prompt_context_source) =
+                if let Some(read) = fork_source_read {
+                    let budget = super::fork_context::fork_context_budget(&config.model);
+                    let plan = read
+                        .read_plan(preparation_context.session_service.as_ref(), budget)
+                        .await?;
+                    (Some(plan.render()), Some(read.prompt_context_source.clone()))
+                } else {
+                    (None, None)
+                };
+
             let base_prompt = initial_message.clone().unwrap_or_else(|| {
                 ContentInput::from(fallback_prompt.clone())
             });
@@ -32260,6 +32182,10 @@ impl MobActor {
             )?;
             let selected_runtime_mode =
                 normalize_runtime_mode_for_binding(selected_runtime_mode, &selected_binding);
+            let mut req = req;
+            if let (Some(source), Some(build)) = (prompt_context_source, req.build.as_mut()) {
+                build.prompt_context_fork_source = Some(source);
+            }
             let peer_name = render_member_comms_name(
                 preparation_context.definition.id.as_str(),
                 profile_name.as_str(),
@@ -33854,7 +33780,17 @@ impl MobActor {
                 Ok(rows) => rows,
                 Err(error) => fail!(error),
             };
-            Some(render_fork_context(&source_member_id, &rows))
+            // The host's fork instruction policy decides what the child is
+            // given, on the controller, before any placed effect exists.
+            match super::fork_context::ForkContextPlan::new(
+                &source_member_id,
+                rows,
+                self.fork_instruction_policy,
+                super::fork_context::fork_context_budget(&profile.model),
+            ) {
+                Ok(plan) => Some(plan.render()),
+                Err(error) => fail!(error),
+            }
         } else {
             None
         };
@@ -40982,7 +40918,7 @@ impl MobActor {
             .member_placement
             .get(&source_dsl)
             .cloned();
-        let location = if let Some(placement) = placement {
+        let (location, source_role, source_session_id) = if let Some(placement) = placement {
             let roster = self.roster.read().await;
             let entry = roster
                 .get(source_member_id)
@@ -40994,12 +40930,16 @@ impl MobActor {
             let expected_member = self
                 .placed_member_incarnation(entry)
                 .map_err(|_| remote_unavailable())?;
-            ForkSourceHistoryLocation::Remote {
-                supervisor_bridge: Arc::clone(&self.supervisor_bridge),
-                peer,
-                placement,
-                expected_member,
-            }
+            (
+                ForkSourceHistoryLocation::Remote {
+                    supervisor_bridge: Arc::clone(&self.supervisor_bridge),
+                    peer,
+                    placement,
+                    expected_member,
+                },
+                entry.role.clone(),
+                None,
+            )
         } else {
             let roster = self.roster.read().await;
             let source_entry = roster
@@ -41013,12 +40953,28 @@ impl MobActor {
                     source_member_id: source_member_id.to_string(),
                     cause: crate::error::ForkSourceUnavailableCause::NoSession,
                 })?;
-            ForkSourceHistoryLocation::Local { source_session_id }
+            (
+                ForkSourceHistoryLocation::Local {
+                    source_session_id: source_session_id.clone(),
+                },
+                source_entry.role.clone(),
+                Some(source_session_id),
+            )
         };
+        let prompt_context_source = meerkat_core::PromptContextForkSource::new(
+            meerkat_core::MobMemberBinding {
+                mob_id: self.definition.id.to_string(),
+                role: source_role.to_string(),
+                member: source_member_id.to_string(),
+            },
+            source_session_id,
+        );
         Ok(ForkSourceHistoryRead {
             source_member_id: source_member_id.clone(),
             fork_context,
             location,
+            fork_instruction_policy: self.fork_instruction_policy,
+            prompt_context_source,
         })
     }
 

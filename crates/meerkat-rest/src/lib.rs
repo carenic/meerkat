@@ -5812,6 +5812,7 @@ async fn create_session_inner(
         max_inline_peer_notifications: None,
         app_context: req.app_context,
         fork_source: None,
+        prompt_context_fork_source: None,
         additional_instructions: req.additional_instructions,
         // The help marker makes every rebuild of a help session from storage
         // refuse it.
@@ -7072,6 +7073,7 @@ async fn continue_session_inner(
             max_inline_peer_notifications: None,
             app_context: None,
             fork_source: None,
+            prompt_context_fork_source: None,
             additional_instructions: None,
             initial_metadata_entries: std::collections::BTreeMap::new(),
             initial_tool_filter: None,

@@ -38027,6 +38027,13 @@
               "type": "array"
             },
             "type": "array"
+          },
+          "skills": {
+            "description": "The skills a prompt-context fork would carry because its source\nloaded them with the built-in `load_skill` tool, in key order. Empty\nfor every other refusal, and then not serialized.",
+            "items": {
+              "$ref": "#/$defs/SkillKey"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -38273,6 +38280,30 @@
       },
       "RealmId": {
         "description": "Opaque slug identifying a realm.",
+        "type": "string"
+      },
+      "SkillKey": {
+        "description": "Canonical runtime identity for a skill.\n\nThis is the single identity carried across every surface — the wire parses\ndirectly into this struct, tools receive this struct, the registry stores\nthis struct. There is no slash-delimited string path form.",
+        "properties": {
+          "skill_name": {
+            "$ref": "#/$defs/SkillName"
+          },
+          "source_uuid": {
+            "$ref": "#/$defs/SourceUuid"
+          }
+        },
+        "required": [
+          "source_uuid",
+          "skill_name"
+        ],
+        "type": "object"
+      },
+      "SkillName": {
+        "description": "Canonical skill slug (lowercase, dash-separated).",
+        "type": "string"
+      },
+      "SourceUuid": {
+        "description": "Canonical source identifier.",
         "type": "string"
       },
       "WireControlScope": {
@@ -44301,6 +44332,13 @@
                 }
               ],
               "type": "array"
+            },
+            "type": "array"
+          },
+          "skills": {
+            "description": "The skills a prompt-context fork would carry because its source\nloaded them with the built-in `load_skill` tool, in key order. Empty\nfor every other refusal, and then not serialized.",
+            "items": {
+              "$ref": "#/$defs/SkillKey"
             },
             "type": "array"
           }
@@ -62800,6 +62838,13 @@
                 }
               ],
               "type": "array"
+            },
+            "type": "array"
+          },
+          "skills": {
+            "description": "The skills a prompt-context fork would carry because its source\nloaded them with the built-in `load_skill` tool, in key order. Empty\nfor every other refusal, and then not serialized.",
+            "items": {
+              "$ref": "#/$defs/SkillKey"
             },
             "type": "array"
           }
@@ -83792,6 +83837,13 @@
               "type": "array"
             },
             "type": "array"
+          },
+          "skills": {
+            "description": "The skills a prompt-context fork would carry because its source\nloaded them with the built-in `load_skill` tool, in key order. Empty\nfor every other refusal, and then not serialized.",
+            "items": {
+              "$ref": "#/$defs/SkillKey"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -101851,6 +101903,30 @@
       "InstructionNamespace": {
         "description": "Application or issuer namespace for one instruction artifact family.",
         "type": "string"
+      },
+      "SkillKey": {
+        "description": "Canonical runtime identity for a skill.\n\nThis is the single identity carried across every surface — the wire parses\ndirectly into this struct, tools receive this struct, the registry stores\nthis struct. There is no slash-delimited string path form.",
+        "properties": {
+          "skill_name": {
+            "$ref": "#/$defs/SkillName"
+          },
+          "source_uuid": {
+            "$ref": "#/$defs/SourceUuid"
+          }
+        },
+        "required": [
+          "source_uuid",
+          "skill_name"
+        ],
+        "type": "object"
+      },
+      "SkillName": {
+        "description": "Canonical skill slug (lowercase, dash-separated).",
+        "type": "string"
+      },
+      "SourceUuid": {
+        "description": "Canonical source identifier.",
+        "type": "string"
       }
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -101874,6 +101950,13 @@
             }
           ],
           "type": "array"
+        },
+        "type": "array"
+      },
+      "skills": {
+        "description": "The skills a prompt-context fork would carry because its source\nloaded them with the built-in `load_skill` tool, in key order. Empty\nfor every other refusal, and then not serialized.",
+        "items": {
+          "$ref": "#/$defs/SkillKey"
         },
         "type": "array"
       }
@@ -112965,6 +113048,13 @@
               "type": "array"
             },
             "type": "array"
+          },
+          "skills": {
+            "description": "The skills a prompt-context fork would carry because its source\nloaded them with the built-in `load_skill` tool, in key order. Empty\nfor every other refusal, and then not serialized.",
+            "items": {
+              "$ref": "#/$defs/SkillKey"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -113211,6 +113301,30 @@
       },
       "RealmId": {
         "description": "Opaque slug identifying a realm.",
+        "type": "string"
+      },
+      "SkillKey": {
+        "description": "Canonical runtime identity for a skill.\n\nThis is the single identity carried across every surface — the wire parses\ndirectly into this struct, tools receive this struct, the registry stores\nthis struct. There is no slash-delimited string path form.",
+        "properties": {
+          "skill_name": {
+            "$ref": "#/$defs/SkillName"
+          },
+          "source_uuid": {
+            "$ref": "#/$defs/SourceUuid"
+          }
+        },
+        "required": [
+          "source_uuid",
+          "skill_name"
+        ],
+        "type": "object"
+      },
+      "SkillName": {
+        "description": "Canonical skill slug (lowercase, dash-separated).",
+        "type": "string"
+      },
+      "SourceUuid": {
+        "description": "Canonical source identifier.",
         "type": "string"
       },
       "WireControlScope": {
@@ -113910,6 +114024,13 @@
               "type": "array"
             },
             "type": "array"
+          },
+          "skills": {
+            "description": "The skills a prompt-context fork would carry because its source\nloaded them with the built-in `load_skill` tool, in key order. Empty\nfor every other refusal, and then not serialized.",
+            "items": {
+              "$ref": "#/$defs/SkillKey"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -114200,6 +114321,30 @@
       },
       "RealmId": {
         "description": "Opaque slug identifying a realm.",
+        "type": "string"
+      },
+      "SkillKey": {
+        "description": "Canonical runtime identity for a skill.\n\nThis is the single identity carried across every surface — the wire parses\ndirectly into this struct, tools receive this struct, the registry stores\nthis struct. There is no slash-delimited string path form.",
+        "properties": {
+          "skill_name": {
+            "$ref": "#/$defs/SkillName"
+          },
+          "source_uuid": {
+            "$ref": "#/$defs/SourceUuid"
+          }
+        },
+        "required": [
+          "source_uuid",
+          "skill_name"
+        ],
+        "type": "object"
+      },
+      "SkillName": {
+        "description": "Canonical skill slug (lowercase, dash-separated).",
+        "type": "string"
+      },
+      "SourceUuid": {
+        "description": "Canonical source identifier.",
         "type": "string"
       },
       "WireControlScope": {

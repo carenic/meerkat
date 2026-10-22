@@ -35,6 +35,47 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- `meerkat-core`: `service::SessionBuildOptions` gains the field
+  `prompt_context_fork_source: Option<PromptContextForkSource>`, and
+  `meerkat`'s `AgentBuildConfig` gains the same field: the typed source
+  member (and, when the controller knows it, the source session) of a
+  prompt-context fork child, which the mob runtime sets on that child's
+  create build. The standard build pipeline does not read it; a host's
+  build hook may. Code that builds either type with a struct literal sets
+  it, normally to `None`.
+- Not measured by the gate (a wire change): `meerkat-core`:
+  `ForkInstructionRefusal` gains `skills: Vec<SkillKey>`, the skills a
+  prompt-context fork's source loaded with the built-in `load_skill` tool
+  (see the next entry). It is serialized only when not empty, and only a
+  prompt-context fork refusal sets it. A decoder built from 0.9.4 denies
+  unknown fields on this type and rejects a refusal that names skills.
+- Not measured by the gate (a behaviour change): `meerkat-mob`: a
+  prompt-context fork (`MemberLaunchMode::Fork`, which
+  `MobHandle::fork_helper` uses) gives the child only what the mob's fork
+  instruction policy allows of its source's history, decided by each
+  row's type (see Fixed):
+  - the source's system prompt and host system context are never carried;
+  - under the default `require_explicit_activation`, activated instruction
+    bodies, skill bodies the source loaded with `load_skill` and
+    host-injected context rows (per-turn memory recall) are not carried,
+    and each `load_skill` result is replaced by a line naming the skill;
+  - under `refuse`, a fork whose rendered rows hold an activation row or a
+    `load_skill` result is refused with `MobError::ForkInstructionRefused`
+    before anything is spawned;
+  - under `reactivate_inherited`, each activated key's effective
+    instruction, the skill bodies and the host-injected context rows are
+    carried.
+  The rendered block ends with a `[fork_notice]:` line that names the
+  source and lists, by name only, what was and was not carried. The
+  rendered rows fit a byte budget, newest first: half the child model's
+  context window at four bytes per token, at most 256 KiB (256 KiB for a
+  model the catalog does not know); the notice counts the older rows it
+  left out. A fork whose newest row alone does not fit is refused before
+  anything is spawned with the new `MobError::ForkContextTooLarge` (code
+  `INVALID_PARAMS`, data kind `fork_context_too_large`).
+
 ### Changed
 
 - `meerkat-core`: the `FORK_INSTRUCTION_REFUSED` message for a fork the
@@ -66,6 +107,15 @@ them.
   row and the metadata cells that head names in separate snapshots, so a
   commit between the two paired the old head with the new metadata. Both
   reads now take the head and its metadata from one read transaction.
+
+- A prompt-context fork no longer hands its source's activated instruction
+  bodies or the skill bodies its source loaded with `load_skill` to the
+  child as plain context under the default fork instruction policy, and
+  the `refuse` policy now refuses such a fork. The renderer copied every
+  System row of the source, its system prompt and activation envelopes
+  included, and every tool result, under every policy. The rows are now
+  decided by their typed activation identity and by the tool call that
+  produced them, never by their text (see Breaking).
 
 ## [0.9.4] - 2026-10-20
 

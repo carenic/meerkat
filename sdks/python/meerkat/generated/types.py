@@ -4978,6 +4978,7 @@ class ForkInstructionRefusal:
 No child session exists when this is returned."""
     cause: ForkInstructionRefusalCause
     keys: list[list[Any]]
+    skills: Optional[list[SkillKey]] = None
 
 
 # Optional typed domain for tool-configuration change payloads.

@@ -2480,12 +2480,17 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         MobError::MemberProvisionFailed { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
         }
-        // Durable-fork provisioning and refusal and bounded helper projection
-        // are separate composite operations. None can originate from a
+        // Durable-fork provisioning and bounded helper projection are
+        // separate composite operations that cannot originate from a
         // spawn-many row, so exposing a session/transport classification here
         // would invent a modeled spawn cause that MobMachine never observed.
+        // A spawn-many fork row can be refused before anything is spawned by
+        // the host's fork instruction policy or by the fork context budget;
+        // MobMachine models no spawn cause for either, so they stay Internal
+        // here and the row's typed code and structured data name the refusal.
         MobError::ForkMemberProvisionFailed { .. }
         | MobError::ForkInstructionRefused { .. }
+        | MobError::ForkContextTooLarge { .. }
         | MobError::InvalidBoundedHelperResult { .. }
         | MobError::ForkJobOwnerNotSource { .. }
         | MobError::BoundedHelperResultUnavailable { .. }
