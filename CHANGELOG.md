@@ -219,6 +219,12 @@ them.
   reads the session again. A session another runtime owner on the realm
   hosts refuses the start, and the error log names the member, its session
   and the remedy; the tail stays as it was.
+- `meerkat-mob`: a resume spawn onto a session whose durable tail runs past
+  its committed runtime boundary, and which no start of the mob restores
+  (another mob's member session, say), now refuses with that typed
+  transcript revision conflict (`SessionError::Store`) instead of an
+  internal "resume bridge session check failed" error. The spawn does not
+  settle the tail; it stays as it was.
 
 ## [0.9.4] - 2026-10-20
 

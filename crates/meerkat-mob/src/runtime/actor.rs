@@ -31949,16 +31949,28 @@ impl MobActor {
                     });
                 }
 
-                // Validate the session exists and is active.
-                let is_active = preparation_context
+                // Validate the session exists and is active. A session whose
+                // durable tail runs past its committed runtime boundary
+                // refuses this read as a transcript revision conflict, and the
+                // refusal stays typed. The spawn does not settle the tail: a
+                // session no start of this mob restores (another mob's member
+                // session, say) is not this spawn's to complete.
+                let is_active = match preparation_context
                     .provisioner
                     .is_member_active(&member_ref)
                     .await
-                    .map_err(|e| {
+                {
+                    Err(MobError::SessionError(error))
+                        if is_transcript_revision_conflict(&error) =>
+                    {
+                        return Err(MobError::SessionError(error));
+                    }
+                    checked => checked.map_err(|e| {
                         MobError::Internal(format!(
                             "resume bridge session check failed for '{agent_identity}': {e}"
                         ))
-                    })?;
+                    })?,
+                };
                 if is_active.unwrap_or(false) {
                     if let Some(declared_predecessor_role) = resume_from_role.as_ref() {
                         return Err(MobError::MemberRoleMigrationRejected {
