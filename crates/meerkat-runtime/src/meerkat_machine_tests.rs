@@ -8404,6 +8404,73 @@ async fn cold_recovery_resumes_typed_v3_unregister_progress() {
     assert_eq!(durable_final.binding().agent_runtime_id(), None);
 }
 
+/// A member restore concludes a cold-recovered drain as a plain registration
+/// does. Its local materialization is the first registration of the session
+/// in the new process: it finds the Draining record a cut unregister left,
+/// concludes the teardown, and prepares the fresh registration for its own
+/// materialization claim instead of refusing the claim that teardown fenced.
+#[tokio::test]
+async fn local_materialization_concludes_a_cold_recovered_drain() {
+    let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let store = Arc::new(RuntimeCommitAtomicityStore::pass_through(Arc::clone(
+        &inner,
+    )));
+    let first_machine = Arc::new(
+        MeerkatMachine::persistent(
+            store.clone() as Arc<dyn crate::store::RuntimeStore>,
+            memory_blob_store(),
+        )
+        .expect("persistent machine"),
+    );
+    let session_id = SessionId::new();
+    let runtime_id = runtime_id_for_session(&session_id);
+    first_machine
+        .register_session(session_id.clone())
+        .await
+        .expect("register session on first process");
+    // Persist Begin + runtime-loop disposition, then fail a later lifecycle
+    // write: the durable record keeps Draining unregister progress, as an
+    // exit during the unregister leaves it.
+    let calls_before = store.commit_machine_lifecycle_calls();
+    store.fail_commit_machine_lifecycle_on_call(calls_before + 3);
+    first_machine
+        .unregister_session(&session_id)
+        .await
+        .expect_err("partial unregister progress should fail once before process loss");
+    assert!(
+        crate::store::load_machine_lifecycle(inner.as_ref(), &runtime_id)
+            .await
+            .expect("load partial record")
+            .expect("partial lifecycle record should exist")
+            .unregister_progress()
+            .is_some(),
+        "the cut unregister left its Draining progress durable"
+    );
+    drop(first_machine);
+
+    let recovered = Arc::new(
+        MeerkatMachine::persistent(
+            store.clone() as Arc<dyn crate::store::RuntimeStore>,
+            memory_blob_store(),
+        )
+        .expect("persistent machine"),
+    );
+    let prepared = recovered
+        .prepare_local_session_materialization(session_id.clone())
+        .await
+        .expect("the materialization concludes the cold-recovered drain and prepares the fresh registration");
+    drop(prepared);
+    assert!(
+        crate::store::load_machine_lifecycle(inner.as_ref(), &runtime_id)
+            .await
+            .expect("load recovered record")
+            .expect("lifecycle record should exist")
+            .unregister_progress()
+            .is_none(),
+        "the concluded teardown left no Draining progress"
+    );
+}
+
 /// OWNER REPRO (0.8.23): a first turn that fails terminally leaves the CLI
 /// unable to finish teardown ("Unregister teardown is still in progress for
 /// runtime rt:session:..."), and the process exits with the drain window

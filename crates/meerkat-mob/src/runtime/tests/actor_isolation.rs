@@ -34,6 +34,8 @@ mod degraded_shutdown;
 mod reload_lane;
 #[path = "run_start_staging.rs"]
 mod run_start_staging;
+#[path = "unregister_self_heal.rs"]
+mod unregister_self_heal;
 
 /// `RuntimeStore` decorator (an `InMemoryRuntimeStore` by default) with
 /// per-session fault switches.
@@ -384,6 +386,11 @@ impl RuntimeStore for FaultInjectingRuntimeStore {
 
     fn supports_compaction_projection_outbox(&self) -> bool {
         self.inner.supports_compaction_projection_outbox()
+    }
+
+    /// A wrapped store with hosting paths keeps its cross-process claims.
+    fn hosting_capability(&self) -> meerkat_runtime::HostingCapability {
+        self.inner.hosting_capability()
     }
 
     async fn observe_machine_lifecycle(
