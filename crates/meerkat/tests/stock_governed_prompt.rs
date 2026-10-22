@@ -1888,13 +1888,14 @@ async fn an_outcome_binds_only_as_the_hosts_external_event() {
     realm.close(vec![session]).await;
 }
 
-/// A stock governed realm never admits a host original. The record is
-/// a consistency check at submit, so a source holding the observation
-/// exactly lets it commit; at the drain the stock delivery host (consent
-/// notices composed, no continuation services bound) answers host
-/// namespaces through no namespace owner, so the observation is refused
-/// `NoAdmissibleWorkBinding`, never bound or admitted, and nothing runs. The
-/// setup signal reads no bound services.
+/// A stock governed realm never admits a host original. The record is a
+/// consistency check at submit, so a source holding the observation exactly
+/// lets it commit. Drained before the host binds its continuation services
+/// (the stock delivery host composes consent notices), the observation stays
+/// pending, as the setup signal (`Unbound`) says. Once the host binds a
+/// source that holds it but offers no binder (the stock composition offers
+/// none), it is refused `NoAdmissibleWorkBinding` and the signal reads
+/// `NotOffered`. It is never bound or admitted, and nothing runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stock_governed_realm_never_admits_a_host_original() {
     use meerkat::{
@@ -1997,7 +1998,7 @@ async fn a_stock_governed_realm_never_admits_a_host_original() {
         meerkat::DetachedJobService::new(Arc::new(meerkat::MemoryDetachedJobStore::new())),
         None,
     )
-    .with_continuation_bindings(bindings)
+    .with_continuation_bindings(Arc::clone(&bindings))
     .with_consent_notices(Arc::new(meerkat::ConsentNoticeProjector::new(
         Arc::new(meerkat_core::ApprovalService::new()),
         domain,
@@ -2006,10 +2007,43 @@ async fn a_stock_governed_realm_never_admits_a_host_original() {
     )));
     let handle =
         meerkat::RuntimeDeliveryOwner::new(Arc::new(meerkat::MemoryDetachedJobStore::new()), inbox)
+            .with_source_changes(bindings.subscribe_source_changes())
             .arm(Arc::new(host))
             .expect("arm the stock delivery owner");
     let mut passes = handle.subscribe_passes();
     let key = ContinuationKey::new("ingest:observation-1").expect("key");
+    let drained = tokio::time::timeout(
+        WAIT,
+        passes.wait_for(|pass| pass.refused > 0 || !pass.blocked_runtimes.is_empty()),
+    )
+    .await
+    .expect("the arming reconcile drained the observation")
+    .expect("owner pass channel")
+    .clone();
+    assert_eq!(
+        drained.refused, 0,
+        "pending before the host binds, never refused: {:?}",
+        drained.failures
+    );
+    assert!(matches!(
+        continuations
+            .continuation_status(&owner, &key)
+            .await
+            .expect("status"),
+        ContinuationStatus::Pending { .. }
+    ));
+
+    // The host binds its services: a source that holds the observation
+    // exactly but, as the stock composition, offers no binder.
+    let _binding = bindings
+        .bind(Arc::new(meerkat::SessionAddressResolver), Arc::new(source))
+        .expect("bind the host's continuation services");
+    assert_eq!(
+        bindings
+            .host_original_readiness(&realm.machine, "app.ingest", &owner)
+            .await,
+        HostOriginalReadiness::NotOffered
+    );
     let status = tokio::time::timeout(WAIT, async {
         loop {
             let status = continuations

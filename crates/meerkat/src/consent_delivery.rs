@@ -672,4 +672,66 @@ mod host_original_tests {
             );
         }
     }
+
+    fn unbound_source() -> ConsentAwareJobSource {
+        let lock_dir = "/tmp/consent-aware-unbound-test";
+        ConsentAwareJobSource {
+            consent: ConsentNoticeJobSource::new(
+                Arc::new(meerkat_core::ApprovalService::new()),
+                HostingPaths {
+                    hosting_lock_dir: lock_dir.into(),
+                    cold_delivery_lock: format!("{lock_dir}/cold-delivery.lock").into(),
+                    database: None,
+                }
+                .domain_ref(),
+            ),
+            others: None,
+        }
+    }
+
+    /// Before the host binds its continuation services, a host original
+    /// outside the reserved namespaces is unavailable (retry later), never
+    /// absent: a delivery drained in that window stays pending, as the
+    /// readiness signal (`Unbound`) promises. A reserved namespace stays
+    /// absent.
+    #[tokio::test]
+    async fn an_unbound_consent_aware_source_answers_a_host_original_unavailable() {
+        let source = unbound_source();
+        assert!(
+            matches!(
+                source.host_original("app.ingest", "observation-1").await,
+                HostOriginalLookup::Unavailable(_)
+            ),
+            "unavailable until the host binds its services, never absent"
+        );
+        assert!(source.host_original_binder("app.ingest").is_none());
+        assert_eq!(
+            source
+                .host_original(
+                    meerkat_core::approval::consent::CONSENT_DELIVERY_NAMESPACE,
+                    "observation-1"
+                )
+                .await,
+            HostOriginalLookup::Absent,
+            "a reserved namespace is never anyone's"
+        );
+    }
+
+    /// The retained-completion twin: before the host binds its continuation
+    /// services, another producer's job is unavailable (retry later), never
+    /// absent, so its retained completion stays pending instead of being
+    /// refused.
+    #[tokio::test]
+    async fn an_unbound_consent_aware_source_answers_another_producers_job_unavailable() {
+        let source = unbound_source();
+        assert!(
+            matches!(
+                source
+                    .retained_job(&ContinuationProducer::ForkOff, "job-1")
+                    .await,
+                RetainedJobLookup::Unavailable(_)
+            ),
+            "unavailable until the host binds its services, never absent"
+        );
+    }
 }
