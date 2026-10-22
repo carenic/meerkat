@@ -19310,6 +19310,99 @@ mod tests {
         assert_eq!(listed[&destroyed], meerkat_mob::MobState::Destroyed);
     }
 
+    /// A managed mob whose actor fail-stopped in its startup recovery, with
+    /// the cause `status()` reports for it.
+    async fn managed_mob_whose_actor_fail_stopped_at_start(
+        state: &Arc<MobMcpState>,
+        mob_id: &str,
+    ) -> (MobId, Arc<MobError>) {
+        let mob_id = MobId::from(mob_id);
+        meerkat_mob::fail_stop_next_actor_start_for_test(&mob_id);
+        let created = state
+            .mob_create_definition(explicit_definition(mob_id.as_str()))
+            .await
+            .expect("create the mob");
+        assert_eq!(created, mob_id);
+        let handle = state.handle_for(&mob_id).await.expect("the mob's handle");
+        assert_eq!(
+            handle.actor_task_watch().wait().await,
+            meerkat_mob::MobActorTaskWait::Returned,
+            "the actor fail-stops in its startup recovery"
+        );
+        match handle.status().await {
+            Err(MobError::SharedLifecycleFailure(cause)) => (mob_id, cause),
+            other => panic!("a fail-stopped actor reports why, typed: {other:?}"),
+        }
+    }
+
+    /// `mob_list` lists a mob whose actor fail-stopped with why it stopped,
+    /// the cause `status()` reports; its phase stays the last one the actor
+    /// published.
+    #[tokio::test]
+    async fn mob_list_lists_a_fail_stopped_mob_with_why_its_actor_stopped() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = persistent_destroy_state(&svc, root.path());
+        let live = state
+            .mob_create_definition(explicit_definition("listed-live"))
+            .await
+            .expect("create the live mob");
+        let (stopped, reported) =
+            managed_mob_whose_actor_fail_stopped_at_start(&state, "listed-fail-stopped").await;
+
+        let listed: BTreeMap<MobId, meerkat_mob::MobLifecycleObservation> = state
+            .mob_list()
+            .await
+            .expect("owner list")
+            .into_iter()
+            .collect();
+        assert!(
+            listed[&live].failure.is_none(),
+            "a live mob is listed without a failure: {:?}",
+            listed[&live]
+        );
+        let observation = &listed[&stopped];
+        assert!(
+            matches!(
+                observation.phase,
+                meerkat_mob::MobState::Creating | meerkat_mob::MobState::Running
+            ),
+            "the phase stays the last one the actor published: {observation:?}"
+        );
+        let failure = observation.failure.as_ref().unwrap_or_else(|| {
+            panic!("a fail-stopped mob is listed with why its actor stopped: {observation:?}")
+        });
+        assert!(
+            Arc::ptr_eq(failure, &reported),
+            "the listed failure is the cause status() reports: {failure:?} vs {reported:?}"
+        );
+    }
+
+    /// `mob_handles_snapshot` still hands out a mob whose actor fail-stopped:
+    /// hiding it would make the failure silently absent from the observation
+    /// surfaces built on the snapshot, which read why from the handle.
+    #[tokio::test]
+    async fn mob_handles_snapshot_still_hands_out_a_fail_stopped_mob() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = persistent_destroy_state(&svc, root.path());
+        let (stopped, _reported) =
+            managed_mob_whose_actor_fail_stopped_at_start(&state, "snapshot-fail-stopped").await;
+
+        let snapshot = state.mob_handles_snapshot().await.expect("owner snapshot");
+        let (_, handle) = snapshot
+            .iter()
+            .find(|(mob_id, _)| *mob_id == stopped)
+            .expect("the fail-stopped mob's handle is handed out");
+        assert!(
+            matches!(
+                handle.status().await,
+                Err(MobError::SharedLifecycleFailure(_))
+            ),
+            "a reader of the handed-out handle gets why its actor stopped"
+        );
+    }
+
     /// A host's create hook is asked before anything of a new mob exists, on
     /// every create path, with what that path itself knows: the owner
     /// session, and whether the mob is that session's implicit delegation

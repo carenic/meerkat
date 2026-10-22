@@ -91840,6 +91840,9 @@ mod host_outage_recovery;
 /// commits hold the mob database's write lock across a slow fsync.
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod identity_fence_contention;
+/// A mob's lifecycle as its handles observe it without asking its actor.
+#[cfg(not(target_arch = "wasm32"))]
+mod lifecycle_observation;
 /// Member binding history reads over real persistent stores, on the running
 /// mob and on its stopped store.
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]

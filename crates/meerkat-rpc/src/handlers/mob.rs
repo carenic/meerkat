@@ -4688,6 +4688,71 @@ mod tests {
         );
     }
 
+    /// `mob/list` lists a mob whose actor fail-stopped with a typed failure
+    /// next to its status: the status stays the last machine phase, and the
+    /// failure says the mob's actor has stopped and why.
+    #[tokio::test]
+    async fn mob_list_rows_carry_a_fail_stopped_mobs_failure() {
+        let state = MobMcpState::new_in_memory_as(meerkat_mob::MobControlPrincipal::Owner);
+        let mob_id = MobId::from("rpc-list-fail-stopped");
+        meerkat_mob::fail_stop_next_actor_start_for_test(&mob_id);
+        let handle = MobBuilder::new(
+            rpc_destroy_test_definition(&mob_id),
+            MobStorage::in_memory(),
+        )
+        .with_session_service(state.session_service())
+        .allow_ephemeral_sessions(true)
+        .create()
+        .await
+        .expect("create the mob");
+        assert_eq!(
+            handle.actor_task_watch().wait().await,
+            meerkat_mob::MobActorTaskWait::Returned,
+            "the actor fail-stops in its startup recovery"
+        );
+        let cause = match handle.status().await {
+            Err(MobError::SharedLifecycleFailure(cause)) => cause,
+            other => panic!("a fail-stopped actor reports why, typed: {other:?}"),
+        };
+        state.mob_insert_handle(mob_id.clone(), handle).await;
+
+        let response = handle_list(Some(RpcId::Num(7)), &state).await;
+        assert!(
+            response.error.is_none(),
+            "owner mob/list must succeed: {:?}",
+            response.error
+        );
+        let result: serde_json::Value =
+            serde_json::from_str(response.result.expect("list result").get())
+                .expect("list result decodes");
+        let row = result["mobs"]
+            .as_array()
+            .expect("mob rows")
+            .iter()
+            .find(|row| row["mob_id"] == mob_id.as_str())
+            .expect("the fail-stopped mob is listed");
+        assert!(
+            row["status"] == "Creating" || row["status"] == "Running",
+            "the status stays the last machine phase: {row}"
+        );
+        let failure = row.get("failure").unwrap_or_else(|| {
+            panic!("a fail-stopped mob's row says why its actor stopped: {row}")
+        });
+        assert_eq!(failure["message"], cause.to_string(), "{row}");
+        assert_eq!(
+            failure["cause"],
+            serde_json::to_value(meerkat_mob::mob_error_wire_code(&cause)).expect("cause"),
+            "{row}"
+        );
+        assert_eq!(
+            failure.get("code").cloned(),
+            cause
+                .wire_error_code()
+                .map(|code| serde_json::to_value(code).expect("code")),
+            "{row}"
+        );
+    }
+
     // ─── Phase 7 (T-A3): console verb round-trips on the owner state ────
 
     fn raw_params(value: serde_json::Value) -> Box<serde_json::value::RawValue> {
