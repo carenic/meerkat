@@ -1863,3 +1863,728 @@ async fn host_human_options_normalize_empty_selection_and_refuse_foreign_interac
     assert_eq!(fixture.input_count().await, inputs);
     fixture.finish().await;
 }
+
+const QUEUED_HUMAN: &str = "A second question, queued behind the running turn.";
+
+/// One host process over the stop fixture's durable files: the realm's
+/// SQLite session and runtime stores, the mob's SQLite storage and the
+/// session event log.
+struct StopHost {
+    handle: MobHandle,
+    runtime_store: Arc<dyn RuntimeStore>,
+}
+
+/// Open a host process over `root`: a new mob (`label`) or, without a label,
+/// the same mob resumed from its durable history.
+async fn open_stop_host(
+    root: &std::path::Path,
+    client: &ScriptedClient,
+    label: Option<&str>,
+) -> StopHost {
+    let factory = meerkat::AgentFactory::new(root.join("factory-store"))
+        .user_config_root(root.join("config"))
+        .runtime_root(root.join("runtime"))
+        .project_root(root.join("project"))
+        .context_root(root.join("context"))
+        .builtins(false)
+        .comms(true);
+    let mut config = meerkat::Config::default();
+    config.agent.model = "gpt-5.5".to_string();
+    config.compaction.auto_compact_threshold = 1_000_000;
+    let mut builder = meerkat::FactoryAgentBuilder::new(factory, config);
+    builder.default_llm_client = Some(Arc::new(client.clone()));
+    let db = root.join("realm.db");
+    let session_store =
+        Arc::new(meerkat_store::SqliteSessionStore::open(&db).expect("session store"));
+    builder.default_session_store = Some(Arc::new(meerkat_store::StoreAdapter::new(
+        session_store.clone(),
+    )));
+    let runtime_store: Arc<dyn RuntimeStore> = Arc::new(
+        meerkat_runtime::SqliteRuntimeStore::new_head_canonical(&db)
+            .expect("co-tenant canonical runtime store"),
+    );
+    let service = Arc::new(
+        Service::new(
+            builder,
+            16,
+            session_store,
+            runtime_store.clone(),
+            Arc::new(meerkat_store::MemoryBlobStore::new()),
+        )
+        .with_event_projection(
+            Arc::new(meerkat_session::event_store::FileEventStore::new(
+                root.join("events"),
+            )),
+            Arc::new(meerkat_session::projector::SessionProjector::new(
+                root.join("projection"),
+            )),
+        ),
+    );
+    let storage = MobStorage::persistent(root.join("mob.db")).expect("persistent mob storage");
+    let handle = match label {
+        Some(label) => {
+            let mut definition = with_unique_mob_id(sample_definition(), label);
+            let lead = definition
+                .profiles
+                .get_mut(&ProfileName::from("lead"))
+                .and_then(ProfileBinding::as_inline_mut)
+                .expect("inline lead");
+            lead.model = "gpt-5.5".to_string();
+            lead.runtime_mode = crate::MobRuntimeMode::AutonomousHost;
+            lead.tools = ToolConfig {
+                comms: true,
+                ..ToolConfig::default()
+            };
+            MobBuilder::new(definition, storage)
+                .with_session_service(service.clone())
+                .with_default_llm_client(Arc::new(client.clone()))
+                .create()
+                .await
+                .expect("create real autonomous mob")
+        }
+        None => tokio::time::timeout(
+            WAIT,
+            MobBuilder::for_resume(storage)
+                .with_session_service(service.clone())
+                .with_default_llm_client(Arc::new(client.clone()))
+                .notify_orchestrator_on_resume(false)
+                .resume(),
+        )
+        .await
+        .expect("mob resume finishes")
+        .expect("resume the same mob from its durable history"),
+    };
+    StopHost {
+        handle,
+        runtime_store,
+    }
+}
+
+/// A fresh fixture root in the system temp dir.
+fn stop_root() -> (tempfile::TempDir, std::path::PathBuf) {
+    let root = tempfile::Builder::new()
+        .prefix("meerkat-host-human-stop-")
+        .tempdir()
+        .expect("fixture storage in the system temp dir");
+    let root_path = root.path().canonicalize().expect("absolute fixture root");
+    for directory in ["config", "runtime", "project", "context"] {
+        std::fs::create_dir_all(root_path.join(directory)).expect("fixture root");
+    }
+    (root, root_path)
+}
+
+/// Spawn the stop fixture's autonomous member and settle its kickoff.
+async fn spawn_stop_member(host: &StopHost) -> (AgentIdentity, SessionId, RosterEntry) {
+    // Unique per test: identity-keyed gates are process-wide.
+    let identity = AgentIdentity::from(format!("host-human-stop-{}", Uuid::new_v4().simple()));
+    let session_id = host
+        .handle
+        .spawn(
+            ProfileName::from("lead"),
+            identity.clone(),
+            Some("fixture kickoff".into()),
+        )
+        .await
+        .expect("spawn autonomous member")
+        .bridge_session_id()
+        .expect("local session member")
+        .clone();
+    host.handle
+        .wait_for_kickoff_complete(Some(WAIT))
+        .await
+        .expect("real autonomous kickoff commits");
+    let entry = host
+        .handle
+        .get_member(&identity)
+        .await
+        .expect("roster read")
+        .expect("member binding");
+    (identity, session_id, entry)
+}
+
+/// The Core input a delivery admitted. The mob admission returns no input
+/// id, so the row is read once by the delivery's idempotency key and then
+/// addressed by its own input id.
+async fn admitted_input_id(
+    runtime_store: &Arc<dyn RuntimeStore>,
+    session_id: &SessionId,
+    key: &MobDeliveryIdentity,
+) -> meerkat_core::lifecycle::InputId {
+    runtime_store
+        .load_input_state_by_idempotency_key(
+            &LogicalRuntimeId::for_session(session_id),
+            &meerkat_runtime::identifiers::IdempotencyKey::new(key.idempotency_key.clone()),
+        )
+        .await
+        .expect("exact runtime-owned key lookup")
+        .expect("the delivery has a canonical input")
+        .state()
+        .state
+        .input_id
+        .clone()
+}
+
+/// The input's stored row by its input id, the exact digest of its stored
+/// bytes, and whether it carries an interaction-terminal carrier or an
+/// unfinished terminal-owner entry.
+struct StopRow {
+    stored: meerkat_runtime::input_state::StoredInputState,
+    digest: String,
+    has_outbox: bool,
+    pending_terminal_owner: bool,
+}
+
+async fn stop_row(
+    runtime_store: &Arc<dyn RuntimeStore>,
+    session_id: &SessionId,
+    key: &MobDeliveryIdentity,
+    input_id: &meerkat_core::lifecycle::InputId,
+) -> StopRow {
+    let runtime_id = LogicalRuntimeId::for_session(session_id);
+    let stored = runtime_store
+        .load_input_state(&runtime_id, input_id)
+        .await
+        .expect("runtime-owned input read")
+        .expect("the input keeps its durable row");
+    let exact = runtime_store
+        .load_input_state_by_idempotency_key(
+            &runtime_id,
+            &meerkat_runtime::identifiers::IdempotencyKey::new(key.idempotency_key.clone()),
+        )
+        .await
+        .expect("exact runtime-owned key lookup")
+        .expect("the delivery still names its input");
+    assert_eq!(&exact.state().state.input_id, input_id);
+    let image = serde_json::to_value(&stored).expect("the row's stored wire image");
+    let mut pending_terminal_owner = false;
+    let mut after = None;
+    loop {
+        let page = runtime_store
+            .load_pending_terminal_owner_ids_page(
+                &runtime_id,
+                after.as_ref(),
+                meerkat_runtime::store::MAX_PENDING_TERMINAL_OWNER_PAGE,
+            )
+            .await
+            .expect("unfinished terminal owners");
+        pending_terminal_owner |= page.contains(input_id);
+        if page.len() < meerkat_runtime::store::MAX_PENDING_TERMINAL_OWNER_PAGE {
+            break;
+        }
+        after = page.last().cloned();
+    }
+    StopRow {
+        has_outbox: !image["interaction_terminal_outbox"].is_null(),
+        digest: exact.exact_row_digest().to_owned(),
+        stored,
+        pending_terminal_owner,
+    }
+}
+
+/// The session's durable event log, read the way a fresh process reads it.
+async fn stop_events(root: &std::path::Path, session_id: &SessionId) -> Vec<AgentEvent> {
+    use meerkat_session::event_store::EventStore as _;
+    meerkat_session::event_store::FileEventStore::new(root.join("events"))
+        .read_from(session_id, 0)
+        .await
+        .expect("read the durable event log")
+        .into_iter()
+        .map(|stored| stored.event)
+        .collect()
+}
+
+/// Every run the log started for `interaction_id`.
+fn runs_started_for(
+    events: &[AgentEvent],
+    interaction_id: InteractionId,
+) -> Vec<meerkat_core::lifecycle::RunId> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::RunStarted { identity, .. }
+                if identity.interaction_id == Some(interaction_id) =>
+            {
+                identity.run_id.clone()
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every failure the log recorded for `run_id`.
+fn run_failures(
+    events: &[AgentEvent],
+    run_id: &meerkat_core::lifecycle::RunId,
+) -> Vec<meerkat_core::event::AgentErrorReport> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::RunFailed {
+                identity,
+                error_report,
+                ..
+            } if identity.run_id.as_ref() == Some(run_id) => Some(error_report.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every interaction failure in the session's log, under any interaction id.
+/// No input in these rows is Core-directed, so a stop publishes none.
+fn interaction_failed_events(events: &[AgentEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::InteractionFailed { .. }))
+        .count()
+}
+
+/// Events in the log that name `interaction_id` anywhere in their wire image.
+fn events_naming(events: &[AgentEvent], interaction_id: InteractionId) -> usize {
+    let id = interaction_id.0.to_string();
+    events
+        .iter()
+        .filter(|event| {
+            serde_json::to_string(event)
+                .expect("event wire image")
+                .contains(&id)
+        })
+        .count()
+}
+
+fn requests_carrying(requests: &[meerkat_client::LlmRequest], text: &str) -> usize {
+    requests
+        .iter()
+        .filter(|request| {
+            request.messages.iter().any(
+                |message| matches!(message, Message::User(user) if user.text_content().contains(text)),
+            )
+        })
+        .count()
+}
+
+/// How a stopped input's bounded waiter ended.
+#[derive(Clone, Debug, PartialEq)]
+enum StopAnswer {
+    Succeeded,
+    Cancelled,
+    RuntimeTerminated {
+        reason: String,
+        kind: meerkat_core::TurnTerminalCauseKind,
+        detail: Option<String>,
+    },
+    Other(String),
+    Refused(String),
+    Unresolved,
+}
+
+async fn stop_answer(turn: WorkTurnHandle, session_id: &SessionId) -> StopAnswer {
+    let Ok(result) = tokio::time::timeout(
+        WAIT,
+        turn.wait_bounded(BoundedResultSpec::new("stopped human", 1024).expect("bound")),
+    )
+    .await
+    else {
+        return StopAnswer::Unresolved;
+    };
+    let Err(error) = result else {
+        return StopAnswer::Succeeded;
+    };
+    match error.failure() {
+        BoundedTurnFailure::Cancelled { session_id: failed } if failed == session_id => {
+            StopAnswer::Cancelled
+        }
+        BoundedTurnFailure::RuntimeTerminated {
+            session_id: failed,
+            reason,
+            error,
+        } if failed == session_id => StopAnswer::RuntimeTerminated {
+            reason: reason.clone(),
+            kind: error.kind,
+            detail: error.detail.clone(),
+        },
+        other => StopAnswer::Other(format!("{other:?}")),
+    }
+}
+
+/// What the stopping process leaves for one input: its waiter's answer, its
+/// row, and its runs and terminal events in the log.
+#[derive(Debug, PartialEq)]
+struct AtStop {
+    waiter: StopAnswer,
+    phase: meerkat_runtime::input_state::InputLifecycleState,
+    outcome: Option<meerkat_runtime::input_state::InputTerminalOutcome>,
+    attempt_count: u32,
+    last_run_id: Option<meerkat_core::lifecycle::RunId>,
+    payload_kept: bool,
+    replay_identity_kept: bool,
+    outbox: bool,
+    pending_terminal_owner: bool,
+    runs_started: usize,
+    run_failures: Vec<(meerkat_core::event::AgentErrorClass, String)>,
+    interaction_failed_events: usize,
+}
+
+fn observe_at_stop(
+    waiter: StopAnswer,
+    row: &StopRow,
+    events: &[AgentEvent],
+    interaction_id: InteractionId,
+) -> AtStop {
+    let runs = runs_started_for(events, interaction_id);
+    AtStop {
+        waiter,
+        phase: row.stored.seed.phase,
+        outcome: row.stored.seed.terminal_outcome.clone(),
+        attempt_count: row.stored.seed.attempt_count,
+        last_run_id: row.stored.seed.last_run_id.clone(),
+        payload_kept: row.stored.state.persisted_input.is_some(),
+        replay_identity_kept: row.stored.state.prompt_replay_identity.is_some(),
+        outbox: row.has_outbox,
+        pending_terminal_owner: row.pending_terminal_owner,
+        runs_started: runs.len(),
+        run_failures: runs
+            .iter()
+            .flat_map(|run| run_failures(events, run))
+            .map(|report| (report.class, report.message))
+            .collect(),
+        interaction_failed_events: interaction_failed_events(events),
+    }
+}
+
+/// What the restarted process does with a stopped input: recovery, a
+/// same-key replay, and the log across both processes.
+#[derive(Debug, PartialEq)]
+struct AfterRestart {
+    recovery_count: u32,
+    row_unchanged_by_recovery: bool,
+    pending_terminal_owner: bool,
+    replay: StopAnswer,
+    model_requests: usize,
+    row_unchanged_by_replay: bool,
+    runs_started: Vec<meerkat_core::lifecycle::RunId>,
+    run_failures: usize,
+    interaction_failed_events: usize,
+}
+
+/// Recovery's view of the row, then a same-key replay of `spec` in the
+/// restarted process, then the row and the log after it.
+async fn observe_after_restart(
+    root: &std::path::Path,
+    host: &StopHost,
+    client: &ScriptedClient,
+    at_exit: &StopRow,
+    input: (
+        &MobDeliveryIdentity,
+        &meerkat_core::lifecycle::InputId,
+        WorkSpec,
+    ),
+    identity: &AgentIdentity,
+    session_id: &SessionId,
+) -> AfterRestart {
+    let (key, input_id, spec) = input;
+    let after_recovery = stop_row(&host.runtime_store, session_id, key, input_id).await;
+    let entry = host
+        .handle
+        .get_member(identity)
+        .await
+        .expect("roster read")
+        .expect("the member survives the restart");
+    let replay = match host
+        .handle
+        .start_host_human_input_bounded(
+            entry.agent_runtime_id.clone(),
+            entry.fence_token,
+            spec,
+            HandlingMode::Queue,
+            key.clone(),
+            deadline(),
+        )
+        .await
+    {
+        Ok(replay) => stop_answer(replay, session_id).await,
+        Err(error) => StopAnswer::Refused(error.to_string()),
+    };
+    let after_replay = stop_row(&host.runtime_store, session_id, key, input_id).await;
+    let events = stop_events(root, session_id).await;
+    let runs = runs_started_for(&events, interaction(key));
+    AfterRestart {
+        recovery_count: after_recovery.stored.state.recovery_count,
+        row_unchanged_by_recovery: after_recovery.digest == at_exit.digest,
+        pending_terminal_owner: after_recovery.pending_terminal_owner,
+        replay,
+        model_requests: client.requests().len(),
+        row_unchanged_by_replay: after_replay.digest == after_recovery.digest,
+        run_failures: runs
+            .iter()
+            .map(|run| run_failures(&events, run).len())
+            .sum(),
+        runs_started: runs,
+        interaction_failed_events: interaction_failed_events(&events),
+    }
+}
+
+/// A Queue-mode host human input whose own turn is in flight (its model
+/// call held) when the host stops gracefully (the stop a gateway runs on
+/// SIGTERM), then a restart over the same durable files.
+///
+/// The stop cancels the in-flight run: the input is abandoned as cancelled
+/// and its payload retired in the same lifecycle commit, and the run fails
+/// once as cancelled. A host human input is not a Core-directed input, so it
+/// has no interaction-terminal carrier and no interaction terminal event.
+/// The restart leaves the terminal row untouched, runs nothing, and a
+/// same-key replay answers the failed terminal. Both processes are observed
+/// before one comparison, so a failure shows the whole shape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queued_human_mid_turn_at_graceful_stop_fails_once_after_restart_and_keeps_row() {
+    use meerkat_core::event::AgentErrorClass;
+    use meerkat_runtime::input_state::{
+        InputAbandonReason, InputLifecycleState, InputTerminalOutcome,
+    };
+
+    let (_root, root_path) = stop_root();
+    let client = ScriptedClient::new(true);
+    let host = open_stop_host(&root_path, &client, Some("host-human-stop")).await;
+    let mob_id = host.handle.mob_id().clone();
+    let (identity, session_id, entry) = spawn_stop_member(&host).await;
+
+    client.block();
+    let requests_before = client.requests().len();
+    let key = delivery("graceful-stop-in-flight");
+    let interaction_id = interaction(&key);
+    let spec = WorkSpec::new(HUMAN, WorkOrigin::External);
+    let turn = host
+        .handle
+        .start_host_human_input_bounded(
+            entry.agent_runtime_id.clone(),
+            entry.fence_token,
+            spec.clone(),
+            HandlingMode::Queue,
+            key.clone(),
+            deadline(),
+        )
+        .await
+        .expect("queued human admission");
+    client.wait_for_requests(requests_before + 1).await;
+    assert_eq!(
+        requests_carrying(&client.requests()[requests_before..], HUMAN),
+        1,
+        "the held model call is the human input's own turn"
+    );
+    let input_id = admitted_input_id(&host.runtime_store, &session_id, &key).await;
+    assert_ne!(
+        input_id.0, interaction_id.0,
+        "a host human input is not Core-directed: its input id is not the interaction id"
+    );
+    let in_flight = stop_row(&host.runtime_store, &session_id, &key, &input_id).await;
+    assert!(in_flight.stored.seed.terminal_outcome.is_none());
+    assert!(in_flight.stored.state.persisted_input.is_some());
+
+    tokio::time::timeout(WAIT, host.handle.shutdown())
+        .await
+        .expect("the graceful stop finishes")
+        .expect("graceful stop");
+    let waiter = stop_answer(turn, &session_id).await;
+    let at_exit = stop_row(&host.runtime_store, &session_id, &key, &input_id).await;
+    let events = stop_events(&root_path, &session_id).await;
+    let at_stop = observe_at_stop(waiter, &at_exit, &events, interaction_id);
+    // The input's own run as the log names it; `runs_started: 1` pins that
+    // it is the only one.
+    let its_run = runs_started_for(&events, interaction_id).first().cloned();
+    drop(host);
+    await_supervisor_route_release(&mob_id).await;
+
+    // Restart: a fresh host over the same files, with a model that records
+    // every request it gets.
+    let restarted_client = ScriptedClient::new(true);
+    let restarted = open_stop_host(&root_path, &restarted_client, None).await;
+    let after_restart = observe_after_restart(
+        &root_path,
+        &restarted,
+        &restarted_client,
+        &at_exit,
+        (&key, &input_id, spec),
+        &identity,
+        &session_id,
+    )
+    .await;
+    assert_eq!(
+        (at_stop, after_restart),
+        (
+            AtStop {
+                waiter: StopAnswer::Cancelled,
+                phase: InputLifecycleState::Abandoned,
+                outcome: Some(InputTerminalOutcome::Abandoned {
+                    reason: InputAbandonReason::Cancelled,
+                }),
+                attempt_count: 1,
+                last_run_id: its_run.clone(),
+                payload_kept: false,
+                replay_identity_kept: true,
+                outbox: false,
+                pending_terminal_owner: false,
+                runs_started: 1,
+                run_failures: vec![(AgentErrorClass::Cancelled, "Run was cancelled".to_owned())],
+                interaction_failed_events: 0,
+            },
+            AfterRestart {
+                recovery_count: at_exit.stored.state.recovery_count,
+                row_unchanged_by_recovery: true,
+                pending_terminal_owner: false,
+                replay: StopAnswer::Cancelled,
+                model_requests: 0,
+                row_unchanged_by_replay: true,
+                runs_started: its_run.into_iter().collect(),
+                run_failures: 1,
+                interaction_failed_events: 0,
+            },
+        ),
+        "the stop cancels the in-flight run once and retires the payload with the \
+         terminal; the restart keeps that terminal and the replay answers it without a run"
+    );
+    tokio::time::timeout(WAIT, restarted.handle.shutdown())
+        .await
+        .expect("mob shutdown finishes")
+        .expect("mob shutdown");
+}
+
+/// A Queue-mode host human input still queued behind a running turn when
+/// the host stops gracefully, then a restart over the same durable files.
+///
+/// The stop terminalizes it through the runtime stop: abandoned as stopped
+/// with its payload retired, and its waiter gets the runtime termination.
+/// The stop runs while the member's runtime registration drains, so the
+/// termination reason is the unregistered one. The input never ran, so the
+/// log has no run for it, and as a non-directed input it has no
+/// interaction-terminal carrier or event. The restart leaves the row
+/// untouched, runs nothing, and a same-key replay answers the same
+/// termination.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queued_human_behind_a_running_turn_at_graceful_stop_is_terminated_once_after_restart_and_keeps_row()
+ {
+    use meerkat_runtime::input_state::{
+        InputAbandonReason, InputLifecycleState, InputTerminalOutcome,
+    };
+
+    // Generated Draining classification: shutdown stops inside the unregister drain.
+    const UNREGISTERED: &str = "runtime session unregistered";
+    let terminated = StopAnswer::RuntimeTerminated {
+        reason: UNREGISTERED.to_owned(),
+        kind: meerkat_core::TurnTerminalCauseKind::FatalFailure,
+        detail: Some(UNREGISTERED.to_owned()),
+    };
+    let (_root, root_path) = stop_root();
+    let client = ScriptedClient::new(true);
+    let host = open_stop_host(&root_path, &client, Some("host-human-stop-queued")).await;
+    let mob_id = host.handle.mob_id().clone();
+    let (identity, session_id, entry) = spawn_stop_member(&host).await;
+
+    client.block();
+    let requests_before = client.requests().len();
+    let running = host
+        .handle
+        .start_host_human_input_bounded(
+            entry.agent_runtime_id.clone(),
+            entry.fence_token,
+            WorkSpec::new(HUMAN, WorkOrigin::External),
+            HandlingMode::Queue,
+            delivery("graceful-stop-running"),
+            deadline(),
+        )
+        .await
+        .expect("running human admission");
+    client.wait_for_requests(requests_before + 1).await;
+    let key = delivery("graceful-stop-queued-behind");
+    let interaction_id = interaction(&key);
+    let spec = WorkSpec::new(QUEUED_HUMAN, WorkOrigin::External);
+    let queued = host
+        .handle
+        .start_host_human_input_bounded(
+            entry.agent_runtime_id.clone(),
+            entry.fence_token,
+            spec.clone(),
+            HandlingMode::Queue,
+            key.clone(),
+            deadline(),
+        )
+        .await
+        .expect("queued human admission");
+    let input_id = admitted_input_id(&host.runtime_store, &session_id, &key).await;
+    assert_ne!(input_id.0, interaction_id.0);
+    let before_stop = stop_row(&host.runtime_store, &session_id, &key, &input_id).await;
+    assert_eq!(before_stop.stored.seed.phase, InputLifecycleState::Queued);
+
+    tokio::time::timeout(WAIT, host.handle.shutdown())
+        .await
+        .expect("the graceful stop finishes")
+        .expect("graceful stop");
+    let waiter = stop_answer(queued, &session_id).await;
+    assert_eq!(
+        stop_answer(running, &session_id).await,
+        StopAnswer::Cancelled,
+        "the running turn ahead of it is cancelled"
+    );
+    let at_exit = stop_row(&host.runtime_store, &session_id, &key, &input_id).await;
+    let events = stop_events(&root_path, &session_id).await;
+    let at_stop = observe_at_stop(waiter, &at_exit, &events, interaction_id);
+    let naming_at_stop = events_naming(&events, interaction_id);
+    drop(host);
+    await_supervisor_route_release(&mob_id).await;
+
+    let restarted_client = ScriptedClient::new(true);
+    let restarted = open_stop_host(&root_path, &restarted_client, None).await;
+    let after_restart = observe_after_restart(
+        &root_path,
+        &restarted,
+        &restarted_client,
+        &at_exit,
+        (&key, &input_id, spec),
+        &identity,
+        &session_id,
+    )
+    .await;
+    let naming_after_restart =
+        events_naming(&stop_events(&root_path, &session_id).await, interaction_id);
+    assert_eq!(
+        (
+            at_stop,
+            after_restart,
+            (naming_at_stop, naming_after_restart),
+        ),
+        (
+            AtStop {
+                waiter: terminated.clone(),
+                phase: InputLifecycleState::Abandoned,
+                outcome: Some(InputTerminalOutcome::Abandoned {
+                    reason: InputAbandonReason::Stopped,
+                }),
+                attempt_count: 0,
+                last_run_id: None,
+                payload_kept: false,
+                replay_identity_kept: true,
+                outbox: false,
+                pending_terminal_owner: false,
+                runs_started: 0,
+                run_failures: Vec::new(),
+                interaction_failed_events: 0,
+            },
+            AfterRestart {
+                recovery_count: at_exit.stored.state.recovery_count,
+                row_unchanged_by_recovery: true,
+                pending_terminal_owner: false,
+                replay: terminated,
+                model_requests: 0,
+                row_unchanged_by_replay: true,
+                runs_started: Vec::new(),
+                run_failures: 0,
+                interaction_failed_events: 0,
+            },
+            (0, 0),
+        ),
+        "the stop terminates the queued input without a run and retires its payload; \
+         the restart keeps that terminal and the replay answers it without a run"
+    );
+    tokio::time::timeout(WAIT, restarted.handle.shutdown())
+        .await
+        .expect("mob shutdown finishes")
+        .expect("mob shutdown");
+}
