@@ -117,6 +117,9 @@ pub mod realtime_transcript;
 pub mod realtime_transcript_revision;
 pub mod realtime_transcript_sidecar;
 pub mod redact;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod resume_identity_cases;
 pub mod retained_work;
 pub mod retry;
 pub mod runtime_bootstrap;

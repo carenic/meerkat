@@ -4231,9 +4231,10 @@ mod tests {
         config.override_image_generation = meerkat_core::ToolCategoryOverride::Enable;
         config.override_mob = meerkat_core::ToolCategoryOverride::Enable;
 
+        // The OpenAI binding the durable session resolved through.
         let durable_auth_binding = meerkat_core::AuthBindingRef {
-            realm: meerkat_core::RealmId::parse("durable").unwrap(),
-            binding: meerkat_core::BindingId::parse("durable_primary").unwrap(),
+            realm: meerkat_core::RealmId::global(),
+            binding: meerkat_core::BindingId::parse("openai").unwrap(),
             profile: None,
             origin: meerkat_core::BindingOrigin::Configured,
         };
@@ -4282,9 +4283,9 @@ mod tests {
             "unmasked provider_params restore durable truth"
         );
         assert_eq!(
-            config.auth_binding.as_ref(),
-            Some(&durable_auth_binding),
-            "an omitted current binding restores the durable configured binding"
+            config.auth_binding, None,
+            "the masked provider moved the session from OpenAI to Anthropic, so the OpenAI \
+             binding is not restored; the build resolves the Anthropic route"
         );
         assert_eq!(
             (
@@ -4350,6 +4351,162 @@ mod tests {
             explicit.auth_binding.as_ref(),
             Some(&explicit_auth_binding),
             "an explicit current binding keeps precedence over durable metadata"
+        );
+    }
+
+    #[test]
+    fn test_provider_resume_override_does_not_restore_the_previous_providers_binding() {
+        // A profile moved from OpenAI to Anthropic with resume_overrides =
+        // ["model", "provider"] resumes a session that persisted the OpenAI
+        // realm binding. That binding authenticates OpenAI only: restoring it
+        // under the Anthropic provider hands AgentFactory (and the member-host
+        // preflight) an identity no binding resolution can build. The stale
+        // binding must not be restored, so the build resolves the profile
+        // provider's binding in the session's realm, as a fresh member of the
+        // same profile would.
+        let openai_binding = meerkat_core::AuthBindingRef {
+            realm: meerkat_core::RealmId::parse("global").unwrap(),
+            binding: meerkat_core::BindingId::parse("openai").unwrap(),
+            profile: None,
+            origin: meerkat_core::BindingOrigin::Configured,
+        };
+        let metadata = SessionMetadata {
+            model_fallback: None,
+            schema_version: meerkat_core::SESSION_METADATA_SCHEMA_VERSION,
+            model: "gpt-5.4".to_string(),
+            max_tokens: 4096,
+            structured_output_retries: 2,
+            provider: meerkat_core::Provider::OpenAI,
+            self_hosted_server_id: None,
+            provider_params: None,
+            tooling: Default::default(),
+            keep_alive: false,
+            comms_name: Some("mob.m/lead/lead-1".to_string()),
+            peer_meta: None,
+            realm_id: None,
+            instance_id: None,
+            backend: None,
+            config_generation: None,
+            auth_binding: Some(openai_binding.clone()),
+            mob_member_binding: None,
+        };
+        let provider_switch = ResumeOverrideMask {
+            model: true,
+            provider: true,
+            ..ResumeOverrideMask::default()
+        };
+
+        let mut switched = AgentBuildConfig::new("claude-sonnet-4-6");
+        switched.provider = Some(meerkat_core::Provider::Anthropic);
+        switched.comms_name = Some("mob.m/lead/lead-1".to_string());
+        switched.resume_override_mask = provider_switch;
+        apply_resumed_session_metadata(&mut switched, &metadata).expect("metadata applies");
+        assert_eq!(
+            (switched.model.as_str(), switched.provider),
+            ("claude-sonnet-4-6", Some(meerkat_core::Provider::Anthropic)),
+            "the masked model and provider keep the profile values"
+        );
+        assert_eq!(
+            switched.auth_binding, None,
+            "the OpenAI binding must not be restored under the Anthropic provider"
+        );
+
+        // The member-host preflight reads the same seam.
+        let preflight = effective_resumed_session_llm_identity(
+            SessionLlmIdentity {
+                model: "claude-sonnet-4-6".to_string(),
+                provider: meerkat_core::Provider::Anthropic,
+                self_hosted_server_id: None,
+                provider_params: None,
+                auth_binding: None,
+            },
+            &metadata,
+            provider_switch,
+        );
+        assert_eq!(
+            (preflight.provider, preflight.auth_binding),
+            (meerkat_core::Provider::Anthropic, None),
+            "the preflight identity carries no binding of the previous provider"
+        );
+
+        // Same provider under the mask: the durable binding still applies.
+        let mut same_provider = AgentBuildConfig::new("gpt-5.5");
+        same_provider.provider = Some(meerkat_core::Provider::OpenAI);
+        same_provider.comms_name = Some("mob.m/lead/lead-1".to_string());
+        same_provider.resume_override_mask = provider_switch;
+        apply_resumed_session_metadata(&mut same_provider, &metadata).expect("metadata applies");
+        assert_eq!(
+            same_provider.auth_binding.as_ref(),
+            Some(&openai_binding),
+            "a model change on the same provider keeps the durable binding"
+        );
+
+        // An explicit current binding keeps precedence across the switch.
+        let anthropic_binding = meerkat_core::AuthBindingRef {
+            realm: meerkat_core::RealmId::parse("global").unwrap(),
+            binding: meerkat_core::BindingId::parse("anthropic").unwrap(),
+            profile: None,
+            origin: meerkat_core::BindingOrigin::Configured,
+        };
+        let mut explicit = AgentBuildConfig::new("claude-sonnet-4-6");
+        explicit.provider = Some(meerkat_core::Provider::Anthropic);
+        explicit.comms_name = Some("mob.m/lead/lead-1".to_string());
+        explicit.resume_override_mask = provider_switch;
+        explicit.auth_binding = Some(anthropic_binding.clone());
+        apply_resumed_session_metadata(&mut explicit, &metadata).expect("metadata applies");
+        assert_eq!(
+            explicit.auth_binding.as_ref(),
+            Some(&anthropic_binding),
+            "an explicit current binding keeps precedence across a provider switch"
+        );
+    }
+
+    fn metadata_for_identity(identity: &SessionLlmIdentity) -> SessionMetadata {
+        SessionMetadata {
+            model_fallback: None,
+            schema_version: meerkat_core::SESSION_METADATA_SCHEMA_VERSION,
+            model: identity.model.clone(),
+            max_tokens: 4096,
+            structured_output_retries: 2,
+            provider: identity.provider,
+            self_hosted_server_id: identity.self_hosted_server_id.clone(),
+            provider_params: identity.provider_params.clone(),
+            tooling: Default::default(),
+            keep_alive: false,
+            comms_name: Some("mob.m/lead/lead-1".to_string()),
+            peer_meta: None,
+            realm_id: None,
+            instance_id: None,
+            backend: None,
+            config_generation: None,
+            auth_binding: identity.auth_binding.clone(),
+            mob_member_binding: None,
+        }
+    }
+
+    /// R11 (mob half). The mob's resume merge, which the resumed build and the
+    /// member-host preflight both read, seats the shared table's identity for
+    /// every case. The factory merge is checked against the same table.
+    #[test]
+    fn test_mob_resume_merge_matches_the_shared_identity_table() {
+        let mut mismatches = Vec::new();
+        for case in meerkat_core::resume_identity_cases::resume_identity_cases() {
+            let seated = effective_resumed_session_llm_identity(
+                case.candidate.clone(),
+                &metadata_for_identity(&case.durable),
+                case.mask,
+            );
+            if seated != case.expected {
+                mismatches.push(format!(
+                    "{}: seated {seated:?}, expected {:?}",
+                    case.name, case.expected
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "the mob merge departs from the shared resume identity table:\n{}",
+            mismatches.join("\n")
         );
     }
 
