@@ -2043,6 +2043,10 @@ struct PowerCutRuntimeStore {
     /// the canonical head, but whose runtime boundary has not committed.
     held_boundary: std::sync::Mutex<Option<meerkat_runtime::LogicalRuntimeId>>,
     boundary_hold: tokio::sync::watch::Sender<BoundaryHold>,
+    /// While set, the store reports its inner store's hosting capability, so
+    /// a service opened over it takes the inner store's OS-locked hosting
+    /// claims (#1813). Unset, it offers no claims, as before.
+    forward_hosting: std::sync::atomic::AtomicBool,
 }
 
 /// Where a held boundary commit is.
@@ -2055,16 +2059,55 @@ enum BoundaryHold {
 
 impl PowerCutRuntimeStore {
     fn new(path: &Path) -> Self {
-        Self {
-            inner: meerkat_runtime::store::SqliteRuntimeStore::new_head_canonical(path)
+        Self::over(
+            meerkat_runtime::store::SqliteRuntimeStore::new_head_canonical(path)
                 .expect("open co-tenant HeadCanonical runtime store"),
+        )
+    }
+
+    /// [`Self::new`] over a store whose sessions are hosted across processes
+    /// with OS-locked claims under `hosting_root`, laid out as a realm lays
+    /// them out. The store reports that capability once
+    /// [`Self::forward_hosting_capability`] is called.
+    fn with_hosting_root(path: &Path, hosting_root: &Path) -> Self {
+        let hosting_lock_dir = hosting_root.join("hosting");
+        let cold_delivery_lock = hosting_root.join("delivery").join("cold-delivery.lock");
+        fs::create_dir_all(&hosting_lock_dir).expect("create the hosting lock dir");
+        fs::create_dir_all(
+            cold_delivery_lock
+                .parent()
+                .expect("the cold delivery lock has a parent"),
+        )
+        .expect("create the cold delivery dir");
+        Self::over(
+            meerkat_runtime::store::SqliteRuntimeStore::new_head_canonical(path)
+                .expect("open co-tenant HeadCanonical runtime store")
+                .with_hosting_paths(meerkat_runtime::HostingPaths {
+                    hosting_lock_dir,
+                    cold_delivery_lock,
+                    database: None,
+                }),
+        )
+    }
+
+    fn over(inner: meerkat_runtime::store::SqliteRuntimeStore) -> Self {
+        Self {
+            inner,
             cut: std::sync::atomic::AtomicBool::new(false),
             prepared_boundary_commit_rejections: std::sync::atomic::AtomicUsize::new(0),
             legacy_boundary_commit_rejections: std::sync::atomic::AtomicUsize::new(0),
             prepared_boundary_commit_rejected: tokio::sync::Notify::new(),
             held_boundary: std::sync::Mutex::new(None),
             boundary_hold: tokio::sync::watch::channel(BoundaryHold::Idle).0,
+            forward_hosting: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Report the inner store's hosting capability from now on (see
+    /// [`Self::with_hosting_root`]).
+    fn forward_hosting_capability(&self) {
+        self.forward_hosting
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Hold `runtime_id`'s next prepared session boundary commits at the
@@ -2144,6 +2187,17 @@ impl PowerCutRuntimeStore {
 impl meerkat_runtime::RuntimeStore for PowerCutRuntimeStore {
     fn session_authority_ops(&self) -> &dyn meerkat_runtime::store::RuntimeSessionAuthorityOps {
         self.inner.session_authority_ops()
+    }
+
+    fn hosting_capability(&self) -> meerkat_runtime::HostingCapability {
+        if self
+            .forward_hosting
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            meerkat_runtime::RuntimeStore::hosting_capability(&self.inner)
+        } else {
+            meerkat_runtime::HostingCapability::None
+        }
     }
 
     fn session_persistence_profile(
@@ -3709,6 +3763,266 @@ async fn a_mob_whose_retiring_member_has_a_durable_tail_restarts() {
     )
     .await;
     let _ = handle_2.shutdown().await;
+}
+
+/// #1813: a mob start never settles a durable tail on a member session that
+/// another runtime owner hosts. The retiring member's last turn leaves a
+/// durable tail (a power cut between its rows and its runtime boundary), and
+/// before the next start another runtime owner on the realm (another process,
+/// here a second owner in this one) takes the member session's hosting
+/// claim. That owner may still commit the tail itself, so the start must not
+/// adopt it: it refuses, typed, naming the member's session, and leaves the
+/// tail as it was. Once that owner lets go, the next start settles the tail
+/// under its own claim and runs, the healthy lead included.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mob_start_refuses_a_durable_tail_another_runtime_owner_hosts() {
+    // nextest runs each test in its own process: the actor's startup refusal
+    // is logged at ERROR, so show it.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::ERROR)
+        .with_writer(std::io::stderr)
+        .try_init();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let power_store = Arc::new(PowerCutRuntimeStore::with_hosting_root(
+        &paths.realm_db_path,
+        temp.path(),
+    ));
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = power_store.clone();
+
+    // ---------------- Lifetime 1 ----------------
+    let (service_1, store_1) = persistent_head_canonical_service(&paths, runtime_store.clone());
+    let storage_1 = MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage");
+    let handle_1 = MobBuilder::new(mob_definition(MobRuntimeMode::TurnDriven), storage_1)
+        .with_session_service(service_1.clone())
+        .with_default_llm_client(openai_test_client())
+        .create()
+        .await
+        .expect("create persistent mob");
+    handle_1
+        .spawn_spec(SpawnMemberSpec::new("lead", AgentIdentity::from("lead-1")))
+        .await
+        .expect("spawn lead");
+    handle_1
+        .spawn_spec(SpawnMemberSpec::new("worker", AgentIdentity::from("w-1")))
+        .await
+        .expect("spawn worker");
+    let identity = AgentIdentity::from("w-1");
+    let w1_sid = handle_1
+        .resolve_bridge_session_id(&identity)
+        .await
+        .expect("w1 session id");
+    let lead_sid = handle_1
+        .resolve_bridge_session_id(&AgentIdentity::from("lead-1"))
+        .await
+        .expect("lead session id");
+    let mut runtime_release_witnesses = Vec::new();
+    for session_id in [&lead_sid, &w1_sid] {
+        let runtime = service_1
+            .comms_runtime(session_id)
+            .await
+            .unwrap_or_else(|| panic!("comms runtime missing for {session_id}"));
+        runtime_release_witnesses.push(Arc::downgrade(&runtime));
+    }
+
+    send_and_wait(
+        &handle_1,
+        service_1.as_ref(),
+        "w-1",
+        "PRE_CUT_TAIL_TURN token-alpha",
+        "hosted-tail-lifetime1",
+    )
+    .await;
+    wait_for_head_canonical_authority_convergence(
+        store_1.as_ref(),
+        runtime_store.as_ref(),
+        &w1_sid,
+        "PRE_CUT_TAIL_TURN",
+        "hosted-tail-pre-cut-boundary",
+    )
+    .await;
+
+    // The next turn's durable row lands; its runtime boundary commit does not.
+    power_store.set_cut(true);
+    let send_result = tokio::time::timeout(Duration::from_secs(30), async {
+        handle_1
+            .member(&identity)
+            .await
+            .expect("member handle")
+            .send(
+                "POST_CUT_TAIL_TURN token-omega".to_string(),
+                HandlingMode::Queue,
+            )
+            .await
+    })
+    .await;
+    eprintln!("[hosted-tail] send during cut => {send_result:?}");
+    wait_for_row_contains(
+        store_1.as_ref(),
+        &w1_sid,
+        "POST_CUT_TAIL_TURN",
+        "hosted-tail-row",
+    )
+    .await;
+    power_store
+        .wait_for_prepared_boundary_commit_rejection()
+        .await;
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&w1_sid);
+    let committed_token = || async {
+        runtime_store
+            .load_session_boundary_authority(&runtime_id)
+            .await
+            .expect("load runtime session authority")
+            .expect("runtime session authority present")
+            .head_canonical()
+            .expect("head-canonical boundary authority")
+            .committed_head_token()
+            .to_string()
+    };
+    let tail_committed_token = committed_token().await;
+    let ahead_head = store_1
+        .load_head(&w1_sid)
+        .await
+        .expect("load ahead physical head")
+        .expect("ahead physical head exists");
+    let ahead_token = meerkat_core::session_store::session_head_cas_token(&ahead_head)
+        .expect("ahead physical head has a canonical token");
+    assert_ne!(
+        ahead_token, tail_committed_token,
+        "the physical head must be ahead of the retained runtime authority"
+    );
+
+    // The member's retirement starts with the tail in place, then the process
+    // dies before it finishes.
+    let retire_result =
+        tokio::time::timeout(Duration::from_secs(10), handle_1.retire(identity.clone())).await;
+    eprintln!("[hosted-tail] retire during cut => {retire_result:?}");
+    handle_1
+        .crash_stop_preserving_durable_work_for_test()
+        .await
+        .expect("crash-stop lifetime-1 actor");
+    service_1
+        .try_shutdown()
+        .await
+        .expect("shutdown first session service");
+    drop(handle_1);
+    drop(service_1);
+    drop(store_1);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while runtime_release_witnesses
+            .iter()
+            .any(|runtime| runtime.upgrade().is_some())
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("every old session runtime is released before lifetime 2");
+
+    // ---------------- Lifetime 2 ----------------
+    // Power is back, and the realm's sessions are hosted with OS-locked
+    // claims. Another runtime owner on the realm hosts the retiring member's
+    // session before this start.
+    power_store.set_cut(false);
+    power_store.forward_hosting_capability();
+    let capability = meerkat_runtime::RuntimeStore::hosting_capability(runtime_store.as_ref());
+    assert!(
+        capability.is_cross_process(),
+        "the realm store must offer cross-process hosting claims: {capability:?}"
+    );
+    let other_owner = meerkat_runtime::SessionHostingAuthority::new(
+        capability,
+        meerkat_runtime::HostingOwner::mint(),
+    );
+    let other_owner_claim = other_owner
+        .grant(&w1_sid)
+        .expect("another runtime owner takes the retiring member's hosting claim");
+
+    let (service_2, store_2) = persistent_head_canonical_service(&paths, runtime_store.clone());
+    let refused = MobBuilder::for_resume(
+        MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage"),
+    )
+    .with_session_service(service_2.clone())
+    .with_default_llm_client(openai_test_client())
+    .notify_orchestrator_on_resume(false)
+    .resume()
+    .await;
+    let refused_status = match &refused {
+        Ok(handle) => Some(handle.status().await),
+        Err(_) => None,
+    };
+    let refused_error = refused.as_ref().err().map(ToString::to_string);
+    eprintln!(
+        "[hosted-tail] start while hosted elsewhere => error {refused_error:?}, status \
+         {refused_status:?}"
+    );
+
+    // Never another owner's tail: the runtime authority and the physical head
+    // are exactly as the cut left them.
+    assert_eq!(
+        committed_token().await,
+        tail_committed_token,
+        "a mob start must not settle a durable tail on a session another runtime owner hosts"
+    );
+    let head_after_refusal = store_2
+        .load_head(&w1_sid)
+        .await
+        .expect("load the physical head after the refused start")
+        .expect("the physical head still exists");
+    assert_eq!(
+        meerkat_core::session_store::session_head_cas_token(&head_after_refusal)
+            .expect("the physical head has a canonical token"),
+        ahead_token,
+        "the refused start must leave the durable tail where the cut left it"
+    );
+    // The start refuses rather than run without the member's cleanup
+    // delivery.
+    assert!(
+        !matches!(refused_status, Some(Ok(meerkat_mob::MobState::Running))),
+        "a mob start that could not restore a retiring member's cleanup delivery must not run: \
+         {refused_status:?}"
+    );
+    if let Ok(handle) = refused {
+        let _ = handle.shutdown().await;
+    }
+
+    // The other owner lets go; the next start settles the tail under its own
+    // claim and runs.
+    drop(other_owner_claim);
+    let handle_3 = MobBuilder::for_resume(
+        MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage again"),
+    )
+    .with_session_service(service_2.clone())
+    .with_default_llm_client(openai_test_client())
+    .notify_orchestrator_on_resume(false)
+    .resume()
+    .await
+    .unwrap_or_else(|error| {
+        panic!("the mob must start once no other runtime owner hosts the member: {error}")
+    });
+    let status = handle_3.status().await;
+    assert!(
+        matches!(status, Ok(meerkat_mob::MobState::Running)),
+        "the restarted mob must admit commands: {status:?}"
+    );
+    assert!(
+        handle_3
+            .get_member(&AgentIdentity::from("lead-1"))
+            .await
+            .expect("read the roster")
+            .is_some(),
+        "the healthy lead is still rostered after the refused start"
+    );
+    wait_for_head_canonical_authority_convergence(
+        store_2.as_ref(),
+        runtime_store.as_ref(),
+        &w1_sid,
+        "POST_CUT_TAIL_TURN",
+        "hosted-tail-adopted-boundary",
+    )
+    .await;
+    let _ = handle_3.shutdown().await;
 }
 
 /// A member whose session has a durable tail ahead of its runtime boundary

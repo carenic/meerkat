@@ -179,6 +179,20 @@ them.
   commit between the two paired the old head with the new metadata. Both
   reads now take the head and its metadata from one read transaction.
 
+- `meerkat-mob`: a mob start no longer settles a durable tail on a retiring
+  member's session that another runtime owner on the realm hosts. The restore
+  of a retiring member's cleanup delivery settled such a tail (a turn's rows
+  that landed after its runtime boundary) without the session's hosting
+  claim, so it could adopt another process's in-flight tail. It now settles
+  the tail under this runtime owner's claim through the new
+  `MobSessionService::settle_durable_tail_before_cold_start`, which the
+  persistent session service implements with its cold-attach preparation. A
+  session another runtime owner hosts refuses the start, and the error log
+  names the member, its session and the remedy (stop that runtime owner, or
+  wait until it releases the session, then start again); the tail stays as
+  it was. The method's default keeps the previous settle, without a claim, so
+  a session-service wrapper around a persistent service must forward it.
+
 ## [0.9.4] - 2026-10-20
 
 ### Breaking
