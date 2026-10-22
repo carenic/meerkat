@@ -84056,6 +84056,9 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
             "bounded_helper_retirement_failed".to_string()
         }
         MobError::MemberRestoreFailed { .. } => "member_restore_failed".to_string(),
+        MobError::MemberStartupRecoveryFailed { .. } => {
+            "member_startup_recovery_failed".to_string()
+        }
         MobError::SpawnMemberAdmissionDenied { .. } => "spawn_member_admission_denied".to_string(),
         MobError::BridgeRequestTimedOut { .. } => "bridge_request_timed_out".to_string(),
         MobError::ForkSourceUnavailable { .. } => "fork_source_unavailable".to_string(),

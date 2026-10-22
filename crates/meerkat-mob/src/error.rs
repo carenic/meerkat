@@ -1898,6 +1898,20 @@ impl MobError {
                 "content_retained": true,
                 "retryable": false,
             })),
+            // The cause keeps its own structured data, so a wire caller
+            // classifies it exactly as it would the cause alone.
+            Self::MemberStartupRecoveryFailed {
+                member_id,
+                session_id,
+                cause,
+            } => Some(serde_json::json!({
+                "kind": "mob_member_startup_recovery_failed",
+                "member_id": member_id.as_str(),
+                "session_id": session_id.to_string(),
+                "cause": cause.to_string(),
+                "cause_data": cause.structured_data(),
+                "actor_stopped": true,
+            })),
             Self::MemberRegistrationRefused {
                 member_id,
                 session_id,
@@ -2116,7 +2130,8 @@ impl MobError {
             Self::MemberRestoreFailed { hold, .. } => *hold,
             Self::SharedRetirementFailure(error)
             | Self::SharedLifecycleFailure(error)
-            | Self::MemberRetirementStuck { cause: error, .. } => error.durable_resume_hold(),
+            | Self::MemberRetirementStuck { cause: error, .. }
+            | Self::MemberStartupRecoveryFailed { cause: error, .. } => error.durable_resume_hold(),
             other => other
                 .structured_data()
                 .as_ref()
@@ -2133,9 +2148,9 @@ impl MobError {
         self.wire_detail()
             .map(|detail| detail.code())
             .or_else(|| match self {
-                Self::SharedRetirementFailure(error) | Self::SharedLifecycleFailure(error) => {
-                    error.wire_error_code()
-                }
+                Self::SharedRetirementFailure(error)
+                | Self::SharedLifecycleFailure(error)
+                | Self::MemberStartupRecoveryFailed { cause: error, .. } => error.wire_error_code(),
                 Self::SessionError(
                     meerkat_core::SessionError::RuntimeUnavailable { .. }
                     | meerkat_core::SessionError::HostingUnavailable { .. },
@@ -2188,7 +2203,10 @@ impl MobError {
         match self {
             Self::SharedRetirementFailure(error)
             | Self::SharedLifecycleFailure(error)
-            | Self::MemberRetirementStuck { cause: error, .. } => error.bridge_rejection_cause(),
+            | Self::MemberRetirementStuck { cause: error, .. }
+            | Self::MemberStartupRecoveryFailed { cause: error, .. } => {
+                error.bridge_rejection_cause()
+            }
             // Cloned: `BridgeRejectionCause` carries payload variants since V4.
             Self::BridgeCommandRejected { cause, .. } => Some(cause.clone()),
             _ => None,
@@ -2261,9 +2279,9 @@ impl MobError {
     /// own domain vocabularies rather than re-matching the variant list.
     pub fn failure_class(&self) -> MobFailureClass {
         match self {
-            Self::SharedRetirementFailure(error) | Self::SharedLifecycleFailure(error) => {
-                error.failure_class()
-            }
+            Self::SharedRetirementFailure(error)
+            | Self::SharedLifecycleFailure(error)
+            | Self::MemberStartupRecoveryFailed { cause: error, .. } => error.failure_class(),
             Self::MobNotFound(_)
             | Self::ProfileNotFound(_)
             | Self::MemberNotFound(_)
@@ -2372,9 +2390,9 @@ impl MobError {
     ///   `mob_rotate_supervisor_error` renderer and richer data envelope.
     pub fn wire_detail(&self) -> Option<WireMobErrorDetail> {
         match self {
-            Self::SharedRetirementFailure(error) | Self::SharedLifecycleFailure(error) => {
-                error.wire_detail()
-            }
+            Self::SharedRetirementFailure(error)
+            | Self::SharedLifecycleFailure(error)
+            | Self::MemberStartupRecoveryFailed { cause: error, .. } => error.wire_detail(),
             Self::ScopeDenied(denial) => Some(WireMobErrorDetail::ScopeDenied(
                 WireScopeDeniedDetail::from(denial),
             )),
@@ -2709,6 +2727,45 @@ mod tests {
         }
     }
 
+    /// A member's startup recovery failure keeps its cause's typed meaning
+    /// on every projection, also when the actor shares it with every handle:
+    /// the wire code and the failure class are the cause's, and the
+    /// structured data names the member, its session and the cause's own
+    /// data.
+    #[test]
+    fn a_member_startup_recovery_failure_projects_its_cause() {
+        let session_id = meerkat_core::types::SessionId::new();
+        let cause =
+            MobError::SessionError(meerkat_core::service::SessionError::HostingUnavailable {
+                id: session_id.clone(),
+            });
+        let cause_class = cause.failure_class();
+        let failure =
+            MobError::SharedLifecycleFailure(Arc::new(MobError::MemberStartupRecoveryFailed {
+                member_id: AgentIdentity::from("w-1"),
+                session_id: session_id.clone(),
+                cause: Arc::new(cause),
+            }));
+        assert_eq!(
+            failure.wire_error_code(),
+            Some(meerkat_contracts::ErrorCode::SessionRuntimeUnavailable)
+        );
+        assert_eq!(failure.failure_class(), cause_class);
+        let data = failure.structured_data().expect("structured data");
+        assert_eq!(data["kind"], "mob_member_startup_recovery_failed");
+        assert_eq!(data["member_id"], "w-1");
+        assert_eq!(data["session_id"], session_id.to_string());
+        assert_eq!(
+            data["cause_data"]["kind"],
+            meerkat_core::service::SessionError::HOSTING_UNAVAILABLE_KIND
+        );
+        let rendered = failure.to_string();
+        assert!(
+            rendered.contains("w-1") && rendered.contains(&session_id.to_string()),
+            "the message names the member and its session: {rendered}"
+        );
+    }
+
     #[test]
     fn test_all_variants_exist() {
         // Ensures all variants are constructible.
@@ -2747,6 +2804,11 @@ mod tests {
                 session_id: Some(meerkat_core::types::SessionId::new()),
                 reason: "restore failed".to_string(),
                 hold: None,
+            },
+            MobError::MemberStartupRecoveryFailed {
+                member_id: AgentIdentity::from("m"),
+                session_id: meerkat_core::types::SessionId::new(),
+                cause: Arc::new(MobError::Internal("restore failed".to_string())),
             },
             MobError::KickoffWaitTimedOut {
                 pending_member_ids: vec![AgentIdentity::from("m")],

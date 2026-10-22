@@ -193,6 +193,21 @@ them.
   it was. The method's default keeps the previous settle, without a claim, so
   a session-service wrapper around a persistent service must forward it.
 
+- `meerkat-mob`: a mob whose startup recovery fails now tells its caller
+  why. When the actor's durable recovery failed before it admitted a
+  command, for example on a retiring member's session that another runtime
+  owner hosts, `MobHandle::status` reported only "mob actor reply channel
+  closed" and `MobHandle::resume` only `ActorCommandChannelClosed`: the
+  member, its session and the cause reached only the host's error log. Both
+  now return the failure, typed, as `MobError::SharedLifecycleFailure`. A
+  member's failure is the new `MobError::MemberStartupRecoveryFailed`, which
+  names the member, its session and the typed cause (such as
+  `SessionError::ServedElsewhere`); its wire code and failure class are the
+  cause's. Other commands on that handle still fail with
+  `ActorCommandChannelClosed`, and `MobBuilder::resume` still returns the
+  handle before startup recovery runs: read `MobHandle::status` for the
+  reason.
+
 ## [0.9.4] - 2026-10-20
 
 ### Breaking

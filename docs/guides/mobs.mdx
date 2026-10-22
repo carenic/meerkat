@@ -1183,6 +1183,15 @@ above) keeps its reason. After any of them `acquire_owner()` is refused and
 `admission_closed()` reports the reason; 0.9.3 and earlier could still hand out
 an owner lease on a shut-down, destroyed or lost actor.
 
+When a mob start's durable recovery fails before the actor admits a command
+(`DurabilityFailStop`), `MobHandle::status` and `MobHandle::resume` return the
+failure, typed, as `MobError::SharedLifecycleFailure`. For a member's session
+it is `MobError::MemberStartupRecoveryFailed`, which names the member, its
+session and the cause, for example `SessionError::ServedElsewhere` while
+another runtime owner on the realm hosts the session. Other commands fail with
+`ActorCommandChannelClosed`. Before 0.9.5, `status` reported only "mob actor
+reply channel closed", and the cause reached only the host's error log.
+
 While a Shutdown drains, a command the close refuses (spawn, respawn, work, a
 flow run, wiring, a host bind, a live commit, resume, reset or reload) fails
 with `AdmissionClosed`, and every other request the actor answers (stop,
