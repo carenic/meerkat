@@ -1042,6 +1042,18 @@ pub struct MaterializeServingContext<'a> {
     pub host_binding_generation: u64,
     pub supervisor: &'a BridgePeerIdentity,
     pub epoch: u64,
+    /// The prompt-context fork a V7 `MaterializeMember` carries: the
+    /// child's session records its seed and its create build the typed
+    /// source.
+    pub prompt_context_fork: Option<MaterializePromptContextFork<'a>>,
+}
+
+/// The prompt-context fork a member build records: the seed the child's
+/// first run delivers ([`meerkat_core::fork_notice::SESSION_FORK_SEED_KEY`]),
+/// as the controller serialized it, and the fork's typed source.
+pub struct MaterializePromptContextFork<'a> {
+    pub seed: serde_json::Value,
+    pub source: &'a meerkat_core::PromptContextForkSource,
 }
 
 pub struct RevivedMemberOutcome {
@@ -1770,6 +1782,7 @@ impl HostMemberMaterializer {
             host_binding_generation,
             supervisor,
             epoch,
+            prompt_context_fork,
         } = context;
         let decompiled = decompile_portable_spec(spec)?;
         // Step 2 — session id + launch resolution (the provisioner template).
@@ -2101,10 +2114,27 @@ impl HostMemberMaterializer {
 
         // Step 5 — create. Kickoff arrives later via DeliverMemberInput
         // (§15.3): Defer + Discard are pinned by `to_create_session_request`.
-        let req = crate::build::to_create_session_request(
+        let mut req = crate::build::to_create_session_request(
             &config,
             meerkat_core::types::ContentInput::Text(String::new()),
         );
+        if let Some(fork) = prompt_context_fork {
+            // A fork child's create request always carries a build; a seed
+            // with nowhere to go is an error, never a silent drop.
+            let Some(build) = req.build.as_mut() else {
+                return Err(MaterializeServeError::Bindings {
+                    detail: format!(
+                        "the create request of fork child session {session_id} has no build \
+                         to record its fork seed on"
+                    ),
+                });
+            };
+            build.prompt_context_fork_source = Some(fork.source.clone());
+            build.initial_metadata_entries.insert(
+                meerkat_core::fork_notice::SESSION_FORK_SEED_KEY.to_string(),
+                fork.seed,
+            );
+        }
         let boundary = materialization_boundary.take().ok_or_else(|| {
             MaterializeServeError::Bindings {
                 detail: format!(

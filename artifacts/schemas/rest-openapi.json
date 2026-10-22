@@ -3887,6 +3887,17 @@
               "launch": {
                 "$ref": "#/components/schemas/MaterializeLaunchMode"
               },
+              "prompt_context_fork": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/BridgePromptContextFork"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "V7: the prompt-context fork a `Fresh` launch carries. Carrying it is\na V7 command; a host before V7 refuses it before reading the payload."
+              },
               "protocol_version": {
                 "$ref": "#/components/schemas/BridgeProtocolVersion"
               },
@@ -4368,6 +4379,76 @@
               "protocol_version",
               "source_member",
               "capability"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "V7 host-addressed probe: the features the host serves that its\ncapability report does not list. It has no effect.",
+            "properties": {
+              "binding_generation": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "command": {
+                "const": "host_features",
+                "type": "string"
+              },
+              "epoch": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "mob_id": {
+                "type": "string"
+              },
+              "protocol_version": {
+                "$ref": "#/components/schemas/BridgeProtocolVersion"
+              },
+              "supervisor": {
+                "$ref": "#/components/schemas/BridgePeerSpec"
+              }
+            },
+            "required": [
+              "command",
+              "supervisor",
+              "epoch",
+              "binding_generation",
+              "protocol_version",
+              "mob_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "V7 member-addressed read of the member session's visible tool names\n(a prompt-context fork's source tools).",
+            "properties": {
+              "command": {
+                "const": "read_member_visible_tools",
+                "type": "string"
+              },
+              "epoch": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "expected_member": {
+                "$ref": "#/components/schemas/BridgeMemberIncarnation"
+              },
+              "protocol_version": {
+                "$ref": "#/components/schemas/BridgeProtocolVersion"
+              },
+              "supervisor": {
+                "$ref": "#/components/schemas/BridgePeerSpec"
+              }
+            },
+            "required": [
+              "command",
+              "supervisor",
+              "epoch",
+              "protocol_version",
+              "expected_member"
             ],
             "type": "object"
           }
@@ -5058,6 +5139,19 @@
         ],
         "type": "object"
       },
+      "BridgeHostFeaturesResponse": {
+        "description": "Reply to `HostFeatures`: an open vocabulary. Not `deny_unknown_fields`,\nand a reader ignores a feature it does not know, so a field or feature a\nlater release adds never fails a reader of this release.",
+        "properties": {
+          "features": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
       "BridgeHostMemberRecord": {
         "additionalProperties": false,
         "description": "One materialized-member row in a `HostStatus` reply.",
@@ -5305,6 +5399,21 @@
         ],
         "type": "string"
       },
+      "BridgeMemberVisibleToolsResponse": {
+        "description": "Reply to `ReadMemberVisibleTools`. `names` is absent when the member's\nsession is not live on its host. Not `deny_unknown_fields`.",
+        "properties": {
+          "names": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "BridgeMobPeerOverlayHandoff": {
         "additionalProperties": false,
         "description": "Generated MobMachine peer overlay handoff carried with peer wiring commands.",
@@ -5433,6 +5542,31 @@
           "name",
           "peer_id",
           "address"
+        ],
+        "type": "object"
+      },
+      "BridgePromptContextFork": {
+        "description": "The prompt-context fork a V7 `MaterializeMember` carries. The host\nrecords the child's fork seed ([`Self::recorded_seed`]) on the child's\nsession (`meerkat_core::fork_notice::SESSION_FORK_SEED_KEY`), where the\nchild's first run delivers it, and sets `source` on the child's create\nbuild.\n\nNot `deny_unknown_fields`, and the seed is opaque to the host: a field a\nlater controller adds cannot fail this host's decode.",
+        "properties": {
+          "planned_context": {
+            "description": "The planned context of the fork (the seed's `planned_context`),\ncarried beside the seed so the bridge escapes it once, as it did\nthe prompt prefix it replaces.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "seed": {
+            "$ref": "#/components/schemas/WireOpaqueJson",
+            "description": "The rest of the child's fork seed\n(`meerkat_core::fork_notice::ForkSeed`), as the controller\nserialized it."
+          },
+          "source": {
+            "$ref": "#/components/schemas/PromptContextForkSource",
+            "description": "The fork's source, for the child's create build."
+          }
+        },
+        "required": [
+          "seed",
+          "source"
         ],
         "type": "object"
       },
@@ -6785,6 +6919,34 @@
             "required": [
               "result",
               "outcome"
+            ],
+            "type": "object"
+          },
+          {
+            "$ref": "#/components/schemas/BridgeHostFeaturesResponse",
+            "description": "Reply to [`BridgeCommand::HostFeatures`].",
+            "properties": {
+              "result": {
+                "const": "host_features",
+                "type": "string"
+              }
+            },
+            "required": [
+              "result"
+            ],
+            "type": "object"
+          },
+          {
+            "$ref": "#/components/schemas/BridgeMemberVisibleToolsResponse",
+            "description": "Reply to [`BridgeCommand::ReadMemberVisibleTools`].",
+            "properties": {
+              "result": {
+                "const": "member_visible_tools",
+                "type": "string"
+              }
+            },
+            "required": [
+              "result"
             ],
             "type": "object"
           }
@@ -15261,6 +15423,26 @@
       "ProfileId": {
         "description": "Opaque slug identifying an auth profile override on a connection.",
         "type": "string"
+      },
+      "PromptContextForkSource": {
+        "description": "The source of a prompt-context fork child: the mob member whose history\nwas rendered into the child's first prompt (`MemberLaunchMode::Fork` in\nthe mob runtime).\n\nSet only by the mob runtime, on that child's create build. No standard\nbuild behaviour reads it; a host's build hook may, for example to carry\nthe source's content taint to the child. It is not\n[`ForkBuildSource`], which is durable-fork provenance.",
+        "properties": {
+          "source_member": {
+            "$ref": "#/components/schemas/MobMemberBinding",
+            "description": "Durable mob-member identity of the source member."
+          },
+          "source_session_id": {
+            "description": "The source member's session the history was read from, when the\ncontroller knows it (a placed source's session lives on its host).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "source_member"
+        ],
+        "type": "object"
       },
       "PromptText": {
         "properties": {

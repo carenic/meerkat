@@ -136,8 +136,10 @@ fork notice (a `fork_boundary` system notice) that names its source and,
 by name only, the instructions and tools it lost or gained and what its
 context carried. A `fork_helper` child gets its context the same way, as
 one row before its first input, so a turn-driven helper sees it in its
-task turn. A child placed on a member host gets the context and the
-notice as the start of its first prompt instead.
+task turn. A child placed on a member host gets them the same way when
+its host serves prompt-context fork children (a host of this release
+does); a host of 0.9.4 or earlier gives it the context and the notice as
+the start of its first prompt instead.
 
 ## Define A Mob
 

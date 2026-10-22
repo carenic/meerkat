@@ -200,6 +200,10 @@ const MEMBER_LIFECYCLE_HANG_GUARD: Duration = Duration::from_secs(600);
 /// actor behind a slow or wedged session-runtime read. Unknown progress is a
 /// truthful result; delaying lifecycle commands is not.
 const MEMBER_PROGRESS_OBSERVATION_TIMEOUT: Duration = Duration::from_millis(250);
+/// The bound on a placed prompt-context fork's `HostFeatures` probe of its
+/// member host: the bound of the controller's other host-addressed reads
+/// (`HostStatus`). Past it the spawn fails before anything is recorded.
+pub(super) const HOST_FEATURES_BRIDGE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Retirement lifecycle notices are advisory - MobMachine topology and the
 /// generated trust mutations below own the actual cleanup. A retiring
 /// member's comms drain may already be quiescent after `StopHostLoop`, so an
@@ -6050,8 +6054,8 @@ pub(super) struct ForkSourceHistoryRead {
 
 impl ForkSourceHistoryRead {
     /// The source's visible tools for the child's fork notice: a local
-    /// source's, read without waiting on a running turn; a placed source's
-    /// are not read.
+    /// source's, read without waiting on a running turn; a placed source's,
+    /// read from its member host within a bound.
     async fn source_tools(
         &self,
         session_service: &dyn MobSessionService,
@@ -6060,10 +6064,18 @@ impl ForkSourceHistoryRead {
             ForkSourceHistoryLocation::Local { source_session_id } => {
                 session_service.fork_source_tools(source_session_id).await
             }
-            ForkSourceHistoryLocation::Remote { .. } => {
-                meerkat_core::fork_notice::ForkSeedSourceTools::NotRead {
-                    reason: meerkat_core::fork_notice::ForkToolsNotComparedReason::PlacedSource,
-                }
+            ForkSourceHistoryLocation::Remote {
+                supervisor_bridge,
+                peer,
+                expected_member,
+                ..
+            } => {
+                super::member_history_proxy::read_remote_member_visible_tools(
+                    supervisor_bridge,
+                    peer,
+                    expected_member,
+                )
+                .await
             }
         }
     }
@@ -14252,6 +14264,7 @@ impl MobActor {
                 resume_from_role: None,
             },
             forked_participant_attachment: None,
+            prompt_context_fork: None,
         });
 
         // §19.L5: the ops owner for a placed member is the owner bridge
@@ -33826,31 +33839,63 @@ impl MobActor {
             } => Some((source_member_id, fork_context)),
             _ => None,
         };
-        let fork_context_text = if let Some((source_member_id, fork_context)) = fork_spec {
-            // §19.L2 placement switch: local and remote SOURCE reads share
-            // one proxy + one renderer (DEC-P6E-20).
-            let read = match self
-                .plan_fork_source_history_read(&source_member_id, fork_context.clone())
-                .await
-            {
-                Ok(read) => read,
-                Err(error) => fail!(error),
+        let (fork_context_text, prompt_context_fork) =
+            if let Some((source_member_id, fork_context)) = fork_spec {
+                // §19.L2 placement switch: local and remote SOURCE reads share
+                // one proxy + one renderer (DEC-P6E-20).
+                let read = match self
+                    .plan_fork_source_history_read(&source_member_id, fork_context.clone())
+                    .await
+                {
+                    Ok(read) => read,
+                    Err(error) => fail!(error),
+                };
+                // The host's fork instruction policy decides what the child is
+                // given, on the controller, before any placed effect exists.
+                let plan = match read
+                    .read_plan(
+                        self.session_service.as_ref(),
+                        super::fork_context::fork_context_budget(&profile.model),
+                    )
+                    .await
+                {
+                    Ok(plan) => plan,
+                    Err(error) => fail!(error),
+                };
+                // A member host that serves prompt-context fork children (V7)
+                // records the planned context as the child's fork seed, which
+                // the child's first run delivers as typed rows; toward an older
+                // host the context rides the child's first prompt. Asked once
+                // per fork, before anything is recorded.
+                let typed_rows = match self.host_serves_prompt_context_forks(&host).await {
+                    Ok(typed_rows) => typed_rows,
+                    Err(error) => fail!(error),
+                };
+                if typed_rows {
+                    let source_tools = read.source_tools(self.session_service.as_ref()).await;
+                    let source = meerkat_core::fork_notice::ForkNoticeSource {
+                        member: Some(read.prompt_context_source.source_member.clone()),
+                        session_id: read.prompt_context_source.source_session_id.clone(),
+                    };
+                    let seed = match serde_json::to_value(plan.seed(source, source_tools)) {
+                        Ok(seed) => seed,
+                        Err(error) => fail!(MobError::Internal(format!(
+                            "failed to record the fork seed of member '{agent_identity}': {error}"
+                        ))),
+                    };
+                    (
+                        None,
+                        Some(super::bridge_protocol::BridgePromptContextFork::from_seed(
+                            seed,
+                            read.prompt_context_source.clone(),
+                        )),
+                    )
+                } else {
+                    (Some(plan.render()), None)
+                }
+            } else {
+                (None, None)
             };
-            // The host's fork instruction policy decides what the child is
-            // given, on the controller, before any placed effect exists.
-            match read
-                .read_plan(
-                    self.session_service.as_ref(),
-                    super::fork_context::fork_context_budget(&profile.model),
-                )
-                .await
-            {
-                Ok(plan) => Some(plan.render()),
-                Err(error) => fail!(error),
-            }
-        } else {
-            None
-        };
 
         // Compose and persist the exact first-turn material BEFORE the
         // canonical Pending carrier. The carrier is the earliest durable
@@ -34354,7 +34399,11 @@ impl MobActor {
         // keeps its V4 shape, so a pre-V6 host is unaffected; a capability
         // seating declares the version whose shape it actually uses, and the
         // receiving host's minimum-version gate is what proves it.
-        let protocol_version = if forked_participant_attachment.is_some() {
+        // The same for the V7 prompt-context fork, which rides only a Fresh
+        // launch and so never meets the Resume-only V6 attachment.
+        let protocol_version = if prompt_context_fork.is_some() {
+            super::bridge_protocol::BridgeProtocolVersion::V7
+        } else if forked_participant_attachment.is_some() {
             super::forked_participant_routing::FORKED_PARTICIPANT_PROTOCOL_VERSION
         } else {
             super::bridge_protocol::BridgeProtocolVersion::V4
@@ -34370,6 +34419,7 @@ impl MobActor {
             spec_digest: effect_digest,
             launch,
             forked_participant_attachment,
+            prompt_context_fork,
         });
 
         // Callers that don't carry an owner ops context (the embedder
@@ -40971,6 +41021,9 @@ impl MobActor {
             let expected_member = self
                 .placed_member_incarnation(entry)
                 .map_err(|_| remote_unavailable())?;
+            // A placed source's session lives on its host: the incarnation
+            // the history is read from names it.
+            let source_session_id = SessionId::parse(&expected_member.member_session_id).ok();
             (
                 ForkSourceHistoryLocation::Remote {
                     supervisor_bridge: Arc::clone(&self.supervisor_bridge),
@@ -40979,7 +41032,7 @@ impl MobActor {
                     expected_member,
                 },
                 entry.role.clone(),
-                None,
+                source_session_id,
             )
         } else {
             let roster = self.roster.read().await;
@@ -51527,6 +51580,95 @@ impl MobActor {
             return Err(Self::bridge_rejection_error(rejection));
         }
         super::bridge_protocol::decode_bridge_payload(&command, value, "periodic host status")
+    }
+
+    /// Whether member host `host` serves prompt-context fork children
+    /// (protocol V7), asked with the effect-free `HostFeatures` probe within
+    /// [`HOST_FEATURES_BRIDGE_TIMEOUT`]. Like the periodic `HostStatus`
+    /// poll it rides the trust edge bind installed and changes no state. A
+    /// host before V7 refuses the probe typed before reading it
+    /// (`UnsupportedProtocolVersion`, or `Unsupported`) and gets the prompt
+    /// prefix; any other failure fails the spawn
+    /// ([`MobError::HostFeaturesProbeFailed`]). A host without recorded
+    /// binding facts is not asked: the spawn's own admission refuses it.
+    async fn host_serves_prompt_context_forks(
+        &self,
+        host: &mob_dsl::HostId,
+    ) -> Result<bool, MobError> {
+        let (endpoint, pubkey) = {
+            let state = self.dsl_authority.state();
+            (
+                state.host_endpoints.get(host).cloned(),
+                state.host_public_keys.get(host).copied(),
+            )
+        };
+        let (Some(endpoint), Some(pubkey)) = (endpoint, pubkey) else {
+            return Ok(false);
+        };
+        let Ok(binding_generation) = self.current_host_binding_generation(host) else {
+            return Ok(false);
+        };
+        let probe_failed = |cause: MobError| MobError::HostFeaturesProbeFailed {
+            host_id: host.as_str().to_string(),
+            cause: Arc::new(cause),
+        };
+        let peer = TrustedPeerDescriptor::unsigned_with_pubkey(
+            host.as_str(),
+            host.as_str(),
+            pubkey.0,
+            endpoint.0.as_str(),
+        )
+        .map_err(|error| {
+            probe_failed(MobError::Internal(format!(
+                "bound host '{}' facts do not form a canonical peer descriptor: {error}",
+                host.as_str()
+            )))
+        })?;
+        let authority = self.supervisor_bridge.authority().await;
+        let probe = async {
+            let supervisor_spec = self
+                .supervisor_bridge
+                .supervisor_spec_for_authority_and_recipient(&authority, &peer)
+                .await?;
+            let command = super::bridge_protocol::BridgeCommand::HostFeatures(
+                super::bridge_protocol::BridgeHostFeaturesPayload {
+                    supervisor: supervisor_spec.into(),
+                    epoch: authority.epoch,
+                    binding_generation,
+                    protocol_version: super::bridge_protocol::BridgeProtocolVersion::V7,
+                    mob_id: self.definition.id.to_string(),
+                },
+            );
+            let value = self
+                .supervisor_bridge
+                .send_bridge_command_as_authority(
+                    &authority,
+                    &peer,
+                    &command,
+                    HOST_FEATURES_BRIDGE_TIMEOUT,
+                )
+                .await?;
+            if let Some(rejection) =
+                Self::bridge_rejection_reply(command.protocol_version(), &value)
+            {
+                return Err(Self::bridge_rejection_error(rejection));
+            }
+            super::bridge_protocol::decode_bridge_payload::<
+                super::bridge_protocol::BridgeHostFeaturesResponse,
+            >(&command, value, "host features")
+        };
+        match probe.await {
+            Ok(features) => {
+                Ok(features.serves(super::bridge_protocol::HOST_FEATURE_PROMPT_CONTEXT_FORK))
+            }
+            Err(MobError::BridgeCommandRejected {
+                cause:
+                    super::bridge_protocol::BridgeRejectionCause::UnsupportedProtocolVersion
+                    | super::bridge_protocol::BridgeRejectionCause::Unsupported,
+                ..
+            }) => Ok(false),
+            Err(error) => Err(probe_failed(error)),
+        }
     }
 
     /// W-E orphan reconciliation sweep: read the host's `HostStatus`

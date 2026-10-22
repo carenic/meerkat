@@ -84100,6 +84100,7 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         MobError::DeliveryInteractionConflict { .. } => "delivery_interaction_conflict".to_string(),
         MobError::ForkInstructionRefused { .. } => "fork_instruction_refused".to_string(),
         MobError::ForkContextTooLarge { .. } => "fork_context_too_large".to_string(),
+        MobError::HostFeaturesProbeFailed { .. } => "host_features_probe_failed".to_string(),
         MobError::IncarnationInconsistent { .. } => "incarnation_inconsistent".to_string(),
         MobError::IncarnationDestroyed { .. } => "incarnation_destroyed".to_string(),
         MobError::ProvenanceUnavailable { .. } => "provenance_unavailable".to_string(),

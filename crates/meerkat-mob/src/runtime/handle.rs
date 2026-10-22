@@ -2488,6 +2488,8 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         // the host's fork instruction policy or by the fork context budget;
         // MobMachine models no spawn cause for either, so they stay Internal
         // here and the row's typed code and structured data name the refusal.
+        // A failed fork-context probe is classified by what failed it.
+        MobError::HostFeaturesProbeFailed { cause, .. } => spawn_many_failure_observation(cause),
         MobError::ForkMemberProvisionFailed { .. }
         | MobError::ForkInstructionRefused { .. }
         | MobError::ForkContextTooLarge { .. }

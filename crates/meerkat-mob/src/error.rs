@@ -1501,6 +1501,18 @@ pub enum MobError {
         required_bytes: usize,
     },
 
+    /// A prompt-context fork placed on member host `host_id` was not
+    /// spawned: the `HostFeatures` probe that decides how the child is
+    /// given its fork context failed with `cause` (a timeout, the
+    /// transport, admission). Nothing was recorded for the child. A host
+    /// that does not know the probe is not a failure: its child gets the
+    /// context as a prefix of its first prompt.
+    #[error("HostFeatures probe of member host '{host_id}' failed: {cause}")]
+    HostFeaturesProbeFailed {
+        host_id: String,
+        cause: Arc<MobError>,
+    },
+
     /// A restored member's host refused its registration at `call`. The
     /// refused registration is gone: removed exactly through the canonical
     /// unregister when the revival did not insert it, so the inputs its
@@ -1879,6 +1891,8 @@ impl MobError {
             Self::SharedRetirementFailure(error) | Self::SharedLifecycleFailure(error) => {
                 error.structured_data()
             }
+            // A failed probe is classified by what failed it.
+            Self::HostFeaturesProbeFailed { cause, .. } => cause.structured_data(),
             Self::SessionError(error) => meerkat_contracts::error::session_error_details(error),
             Self::ForkInstructionRefused {
                 source_member_id,
@@ -2150,6 +2164,7 @@ impl MobError {
                 Self::SharedRetirementFailure(error) | Self::SharedLifecycleFailure(error) => {
                     error.wire_error_code()
                 }
+                Self::HostFeaturesProbeFailed { cause, .. } => cause.wire_error_code(),
                 Self::SessionError(
                     meerkat_core::SessionError::RuntimeUnavailable { .. }
                     | meerkat_core::SessionError::HostingUnavailable { .. },
@@ -2206,6 +2221,7 @@ impl MobError {
             Self::SharedRetirementFailure(error)
             | Self::SharedLifecycleFailure(error)
             | Self::MemberRetirementStuck { cause: error, .. } => error.bridge_rejection_cause(),
+            Self::HostFeaturesProbeFailed { cause, .. } => cause.bridge_rejection_cause(),
             // Cloned: `BridgeRejectionCause` carries payload variants since V4.
             Self::BridgeCommandRejected { cause, .. } => Some(cause.clone()),
             _ => None,
@@ -2392,6 +2408,8 @@ impl MobError {
             Self::SharedRetirementFailure(error) | Self::SharedLifecycleFailure(error) => {
                 error.wire_detail()
             }
+            // A probe that timed out projects the timeout's detail.
+            Self::HostFeaturesProbeFailed { cause, .. } => cause.wire_detail(),
             Self::ScopeDenied(denial) => Some(WireMobErrorDetail::ScopeDenied(
                 WireScopeDeniedDetail::from(denial),
             )),

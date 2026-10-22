@@ -335,8 +335,11 @@ this host gets the context as one injected-context row and a typed fork
 notice (`SystemNoticeBlock::ForkBoundary`, wire `fork_boundary`) before
 its first input, whoever starts that turn, so a turn-driven helper sees
 it in its task turn; the session holds them until then as the metadata
-entry `session_fork_seed_v1`. A child placed on a member host gets the
-context as a prompt prefix ending in a `[fork_notice]:` line. A durable
+entry `session_fork_seed_v1`. A child placed on a member host gets them
+the same way when its host serves prompt-context fork children
+(supervisor bridge protocol 7; the controller asks the host with
+`HostFeatures` first); a host of 0.9.4 or earlier gives it the context
+as a prompt prefix ending in a `[fork_notice]:` line. A durable
 fork's child (`fork_member` and the forks built on it) gets a notice of
 kind `transcript` at its first turn. A notice names the source and, by
 name only, the instructions and tools the child lost or gained and what

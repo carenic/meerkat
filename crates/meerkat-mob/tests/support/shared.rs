@@ -909,6 +909,13 @@ impl meerkat_core::service::SessionServiceHistoryExt for FailingOnceSessionServi
 
 #[async_trait::async_trait]
 impl meerkat_mob::MobSessionService for FailingOnceSessionService {
+    async fn fork_source_tools(
+        &self,
+        session_id: &meerkat_core::SessionId,
+    ) -> meerkat_core::fork_notice::ForkSeedSourceTools {
+        self.inner.fork_source_tools(session_id).await
+    }
+
     async fn predecessor_tool_restrictions(
         &self,
         session_id: &meerkat_core::SessionId,
@@ -2496,23 +2503,38 @@ pub enum ScriptedV7Mode {
     HoldFeatures,
 }
 
-/// The scripted answer to one request stamped `stamped`: `None` serves it
-/// as usual, `Some(None)` holds it, `Some(Some(reply))` answers `reply`.
+/// The scripted answer to one request (`params`, stamped `stamped`):
+/// `None` serves it as usual, `Some(None)` holds it, `Some(Some(reply))`
+/// answers `reply`.
 fn scripted_v7_answer(
     state: &mut ScriptedV7State,
+    params: &serde_json::Value,
     stamped: u64,
     kind: &str,
 ) -> Option<Option<serde_json::Value>> {
     if stamped <= 6 {
         return None;
     }
+    // A host before V7 is the contracts decoder with a V6 table, answered
+    // the way a host answers a decode failure, so this host cannot drift
+    // from a real one.
     let refused = || {
+        let error = meerkat_mob::runtime::bridge_protocol::decode_bridge_command_accepting(
+            params.clone(),
+            BridgeProtocolVersion::V6,
+        )
+        .expect_err("a host before V7 refuses a command stamped above V6");
+        let cause = match &error {
+            meerkat_mob::runtime::bridge_protocol::BridgeCommandDecodeError::UnsupportedProtocolVersion(_) => {
+                BridgeRejectionCause::UnsupportedProtocolVersion
+            }
+            meerkat_mob::runtime::bridge_protocol::BridgeCommandDecodeError::Invalid(_) => {
+                BridgeRejectionCause::Unsupported
+            }
+        };
         serde_json::to_value(BridgeReply::Rejected {
-            cause: BridgeRejectionCause::UnsupportedProtocolVersion,
-            reason: format!(
-                "invalid bridge command: unsupported supervisor bridge protocol version \
-                 {stamped} (supported [2, 3, 4, 5, 6]; default 6)"
-            ),
+            cause,
+            reason: format!("invalid bridge command: {error}"),
         })
         .expect("scripted version refusal")
     };
@@ -3204,7 +3226,7 @@ pub async fn spawn_scripted_host_peer(name: &str) -> ScriptedHostPeer {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     v7.command_kinds.push(kind.clone());
-                    scripted_v7_answer(&mut v7, stamped, &kind)
+                    scripted_v7_answer(&mut v7, &params, stamped, &kind)
                 };
                 let command: Result<BridgeCommand, _> = serde_json::from_value(params.clone());
                 let reply_value: Option<serde_json::Value> = match command {
@@ -4752,6 +4774,7 @@ pub fn sample_materialize_payload(
         spec_digest,
         launch,
         forked_participant_attachment: None,
+        prompt_context_fork: None,
     })
 }
 
