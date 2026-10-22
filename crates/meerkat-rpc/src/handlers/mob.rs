@@ -3716,6 +3716,92 @@ mod tests {
         );
     }
 
+    /// `mob/spawn_helper` and `mob/fork_helper` with `runtime_mode:
+    /// autonomous_host` are refused, typed, before a helper is spawned: a
+    /// bounded helper's one tracked turn cannot complete through autonomous
+    /// inbox delivery.
+    #[tokio::test]
+    async fn helpers_with_an_autonomous_runtime_mode_are_refused_before_spawning() {
+        let mob_id = MobId::from("rpc-autonomous-helper");
+        let state = MobMcpState::new_in_memory();
+        let handle = MobBuilder::new(
+            rpc_destroy_test_definition(&mob_id),
+            MobStorage::in_memory(),
+        )
+        .with_session_service(state.session_service())
+        .allow_ephemeral_sessions(true)
+        .create()
+        .await
+        .expect("create the mob");
+        state
+            .mob_insert_handle(mob_id.clone(), handle.clone())
+            .await;
+        let mut source = meerkat_mob::SpawnMemberSpec::new("worker", AgentIdentity::from("source"));
+        source.runtime_mode = Some(MobRuntimeMode::TurnDriven);
+        handle
+            .spawn_spec(source)
+            .await
+            .expect("spawn the fork source");
+
+        let spawn = serde_json::json!({
+            "mob_id": mob_id.as_str(),
+            "agent_identity": "autonomous-helper",
+            "prompt": "do the thing",
+            "result_label": "helper_result",
+            "max_text_bytes": 4096,
+            "runtime_mode": "autonomous_host",
+        });
+        let raw = serde_json::value::RawValue::from_string(spawn.to_string())
+            .expect("serialize spawn_helper params");
+        let spawned = handle_spawn_helper(Some(RpcId::Num(13)), Some(&raw), &state).await;
+
+        let fork = serde_json::json!({
+            "mob_id": mob_id.as_str(),
+            "source_member_id": "source",
+            "agent_identity": "autonomous-fork",
+            "prompt": "do the thing",
+            "result_label": "helper_result",
+            "max_text_bytes": 4096,
+            "runtime_mode": "autonomous_host",
+        });
+        let raw = serde_json::value::RawValue::from_string(fork.to_string())
+            .expect("serialize fork_helper params");
+        let forked = handle_fork_helper(Some(RpcId::Num(14)), Some(&raw), &state).await;
+
+        for response in [spawned, forked] {
+            assert!(response.result.is_none());
+            let error = response
+                .error
+                .expect("an autonomous helper must be refused");
+            assert!(
+                error
+                    .message
+                    .contains("unsupported for runtime mode autonomous_host"),
+                "the refusal must name the runtime mode: {}",
+                error.message
+            );
+        }
+        let spawned_helpers = handle
+            .events()
+            .replay_all()
+            .await
+            .expect("replay the mob events")
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    &event.kind,
+                    meerkat_mob::event::MobEventKind::MemberSpawned(spawned)
+                        if spawned.agent_identity.as_str() == "autonomous-helper"
+                            || spawned.agent_identity.as_str() == "autonomous-fork"
+                )
+            })
+            .count();
+        assert_eq!(
+            spawned_helpers, 0,
+            "a refused autonomous helper must never be spawned"
+        );
+    }
+
     fn assert_destroy_incomplete_rpc_error_with_message(
         response: RpcResponse,
         expected_error: &str,

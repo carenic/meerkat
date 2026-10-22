@@ -2589,6 +2589,61 @@ mod tests {
         );
     }
 
+    /// A schedule stored before create-time validation refused the
+    /// combination still never spawns an autonomous bounded helper: its
+    /// delivery is refused before admission, so the runtime is never asked
+    /// to spawn or fork one and no model request is made.
+    #[tokio::test]
+    async fn a_stored_autonomous_helper_target_is_refused_before_any_spawn() {
+        let runtime = Arc::new(RecordingMobRuntime::default());
+        let host = MobMcpScheduleHost::from_runtime(runtime.clone());
+        let options = HelperOptionsSpec {
+            runtime_mode: Some(meerkat_schedule::ScheduledMobRuntimeMode::AutonomousHost),
+            ..HelperOptionsSpec::default()
+        };
+        let bindings = [
+            MobTargetBinding::SpawnHelper {
+                mob_id: "ops".to_string(),
+                member_id: "deploy-monitor".to_string(),
+                prompt: "Check deploy state.".to_string(),
+                options: options.clone(),
+            },
+            MobTargetBinding::ForkHelper {
+                mob_id: "ops".to_string(),
+                source_member_id: "lead".to_string(),
+                member_id: "deploy-fork".to_string(),
+                prompt: "Check deploy state.".to_string(),
+                fork_context: meerkat_schedule::ForkContextSpec::default(),
+                options,
+            },
+        ];
+
+        for binding in bindings {
+            let occurrence = sample_occurrence(binding.clone());
+            let delivery_identity = sample_delivery_identity(&occurrence);
+            let refused = host
+                .deliver_mob_target(&occurrence, &delivery_identity, &binding)
+                .await;
+            assert!(
+                matches!(
+                    &refused,
+                    Err(ScheduleDomainError::InvalidSchedule(detail))
+                        if detail.contains("autonomous_host")
+                ),
+                "a stored autonomous helper target must be refused before admission: {:?}",
+                refused.as_ref().err()
+            );
+        }
+        assert!(
+            runtime.spawn_helpers.lock().expect("spawn lock").is_empty(),
+            "the runtime must never be asked to spawn an autonomous helper"
+        );
+        assert!(
+            runtime.fork_helpers.lock().expect("fork lock").is_empty(),
+            "the runtime must never be asked to fork an autonomous helper"
+        );
+    }
+
     #[tokio::test]
     async fn probe_runtime_error_is_reported_as_probe_failure() {
         let runtime = Arc::new(RecordingMobRuntime::default());
