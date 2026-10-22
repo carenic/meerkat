@@ -119,8 +119,17 @@ impl RetainedJobSource for ConsentNoticeJobSource {
 }
 
 /// Answers the consent namespace from the approval owner and every other
-/// job from the host's bound job source. Built only by the session-store
-/// runtime delivery host, so it is compiled with it.
+/// job from the host's bound job source. Until the host binds its
+/// continuation services, every other job and every host original outside
+/// the reserved namespaces is unavailable (retry later), never absent: a
+/// delivery drained in that window (for example by the arming reconcile after
+/// a restart) stays pending and is decided by the bound owner once bound, as
+/// the setup signal (`Unbound`) says. Built only by the session-store runtime
+/// delivery host, so it is compiled with it.
+/// Why a consent-aware host answers no other owner yet.
+#[cfg(feature = "session-store")]
+const UNBOUND_SERVICES: &str = "the host has not bound its continuation services yet";
+
 #[cfg(feature = "session-store")]
 pub(crate) struct ConsentAwareJobSource {
     pub(crate) consent: ConsentNoticeJobSource,
@@ -140,7 +149,7 @@ impl RetainedJobSource for ConsentAwareJobSource {
         }
         match &self.others {
             Some(others) => others.retained_job(producer, job_id).await,
-            None => RetainedJobLookup::Absent,
+            None => RetainedJobLookup::Unavailable(UNBOUND_SERVICES.to_string()),
         }
     }
 
@@ -152,7 +161,7 @@ impl RetainedJobSource for ConsentAwareJobSource {
         }
         match &self.others {
             Some(others) => others.host_original(namespace, producer_id).await,
-            None => crate::HostOriginalLookup::Absent,
+            None => crate::HostOriginalLookup::Unavailable(UNBOUND_SERVICES.to_string()),
         }
     }
 

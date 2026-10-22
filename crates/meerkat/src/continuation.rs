@@ -1322,7 +1322,9 @@ pub enum HostOriginalReadiness {
 ///   `Offered(NotReady(..))`). The host's executor attachment (or
 ///   [`ContinuationHostBindings::source_custody_changed`]) wakes the delivery
 ///   owner for the next attempt. A host that wants ingestion to wake a cold
-///   session runs its own recovery; Core never does.
+///   session runs its own recovery; Core never does. A pending host original
+///   holds its session's later deliveries in order until it settles, so a
+///   cold session's later rows wait for the host's recovery too.
 /// - A binder may make bounded host-side checks before it binds, such as
 ///   re-checking that the owner covers the source's audience from a snapshot
 ///   or a try-read of the registered roster row. Such a check answers
@@ -2322,8 +2324,9 @@ fn check_bound_host_original(
 ///    that admits governed host originals.
 /// 3. The BOUND namespace owner confirms the exact delivery, and the key
 ///    ledger binds its owner and key to this row.
-/// 4. The session is made live, and the owner's binder binds Core's exact
-///    input fresh for it; Core checks the bound input.
+/// 4. The session is prepared (never made live here: liveness is the
+///    host's), and the owner's binder binds Core's exact input fresh for it;
+///    Core checks the bound input.
 /// 5. A fresh id is reserved, and native admission settles the host's
 ///    custody: promoted only on an accepted admission of the bound id,
 ///    dropped when nothing was admitted or a replay deduplicated, retained
@@ -2489,7 +2492,7 @@ async fn admit_host_original(
         ));
     };
 
-    // 4. Make the session live, then bind fresh for it.
+    // 4. Prepare the session (never made live here), then bind fresh for it.
     sink.prepare_governed(session).await?;
     let input_id = reserved_id.clone().unwrap_or_else(InputId::new);
     let handed = continuation_prompt(&delivery, &admission_key, input_id.clone());
