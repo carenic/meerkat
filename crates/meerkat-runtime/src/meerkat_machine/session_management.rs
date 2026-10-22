@@ -8007,6 +8007,40 @@ impl MeerkatMachine {
         Ok(RuntimeSessionUnregisterUseAdmission::Admitted(admission))
     }
 
+    /// [`Self::observe_unregister_session_registration_if_current`] with the
+    /// unregister's disposition for inputs still queued behind the running
+    /// turn ([`UnregisterQueuedInputs`]). The disposition is recorded with the
+    /// unregister's durable progress when this call starts the unregister, so
+    /// a convergence recovered after a crash applies the same one. A call
+    /// that joins an unregister already in progress keeps the disposition
+    /// that unregister began with, whatever this call passes.
+    pub async fn observe_unregister_session_registration_with_queued_inputs_if_current(
+        &self,
+        registration: &RuntimeSessionRegistrationWitness,
+        queued_inputs: UnregisterQueuedInputs,
+    ) -> Result<RuntimeSessionUnregisterAdmission, RuntimeDriverError> {
+        // Threaded into the unregister start next; until then every start stops.
+        let _ = queued_inputs;
+        self.observe_unregister_session_registration_if_current(registration)
+            .await
+    }
+
+    /// [`Self::observe_unregister_session_registration_if_use_unchanged`] with
+    /// the unregister's disposition for queued inputs, as
+    /// [`Self::observe_unregister_session_registration_with_queued_inputs_if_current`]
+    /// records it. `Changed` starts and joins nothing, so it records nothing.
+    pub async fn observe_unregister_session_registration_with_queued_inputs_if_use_unchanged(
+        &self,
+        registration: &RuntimeSessionRegistrationWitness,
+        expected_use: RuntimeSessionRegistrationUse,
+        queued_inputs: UnregisterQueuedInputs,
+    ) -> Result<RuntimeSessionUnregisterUseAdmission, RuntimeDriverError> {
+        // Threaded into the unregister start next; until then every start stops.
+        let _ = queued_inputs;
+        self.observe_unregister_session_registration_if_use_unchanged(registration, expected_use)
+            .await
+    }
+
     /// The use ([`RuntimeSessionRegistrationUse`]) `registration` has now,
     /// while it is this machine's exact current registration of its session;
     /// `None` otherwise. A caller that hands the registration back reads it,

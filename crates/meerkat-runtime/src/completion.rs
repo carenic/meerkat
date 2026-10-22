@@ -78,6 +78,19 @@ pub enum CompletionWaitError {
         "the durable outcome of run {run_id} is unknown: its store did not answer within its commit deadline; read the input after its session reloads"
     )]
     DurableOutcomeUnknown { run_id: RunId },
+    /// The input was still queued when its runtime stopped, and the stop's
+    /// unregister kept it durably queued for the next start
+    /// ([`UnregisterQueuedInputs::Requeue`](crate::UnregisterQueuedInputs::Requeue)).
+    /// It is neither failed nor consumed: the next start runs it, or ends it
+    /// as abandoned with reason `requeue_expired` when it is older than the
+    /// stop's max age by then. Do not resubmit it; read it after the restart.
+    #[error(
+        "the input stays queued across the runtime stop at {stopped_at} and runs on the next start; do not resubmit it"
+    )]
+    RequeuedAcrossStop {
+        /// When the stop kept the input queued.
+        stopped_at: chrono::DateTime<chrono::Utc>,
+    },
 }
 
 impl CompletionWaitError {
@@ -93,7 +106,8 @@ impl CompletionWaitError {
             Self::AttachmentReplaced
             | Self::AuthorityUnavailable(_)
             | Self::BoundaryRolledBack { .. }
-            | Self::DurableOutcomeUnknown { .. } => Some(
+            | Self::DurableOutcomeUnknown { .. }
+            | Self::RequeuedAcrossStop { .. } => Some(
                 crate::meerkat_machine::dsl::RuntimeCompletionWaitFailureObservation::AuthorityUnavailable,
             ),
             Self::DisclosureRefused { .. } => None,
@@ -125,6 +139,13 @@ impl CompletionWaitError {
     #[must_use]
     pub const fn is_durable_outcome_unknown(&self) -> bool {
         matches!(self, Self::DurableOutcomeUnknown { .. })
+    }
+
+    /// Stable typed predicate: a stop kept the input durably queued for the
+    /// next start. The input is not failed.
+    #[must_use]
+    pub const fn is_requeued_across_stop(&self) -> bool {
+        matches!(self, Self::RequeuedAcrossStop { .. })
     }
 }
 

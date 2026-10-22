@@ -74,6 +74,11 @@ pub enum InputAbandonReason {
     /// tool-process-interrupted notice. Abandoned silently, without a receipt,
     /// like a recovered predecessor input.
     ToolProcessInterrupted,
+    /// A graceful stop kept the input durably queued for the next start
+    /// ([`crate::UnregisterQueuedInputs::Requeue`]), and the next start found
+    /// it older than that stop's max age, so it ended without running.
+    /// Resubmitting it is now correct.
+    RequeueExpired,
 }
 
 /// Terminal outcome for an input.
@@ -1512,7 +1517,8 @@ pub(crate) fn receipt_less_terminal(
             | InputAbandonReason::Reset
             | InputAbandonReason::Stopped
             | InputAbandonReason::Destroyed
-            | InputAbandonReason::NeverExecuted => false,
+            | InputAbandonReason::NeverExecuted
+            | InputAbandonReason::RequeueExpired => false,
         },
     };
     if staged_without_receipt {

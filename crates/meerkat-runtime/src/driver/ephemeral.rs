@@ -1901,6 +1901,9 @@ impl EphemeralRuntimeDriver {
                     mm_dsl::InputAbandonReason::ToolProcessInterrupted => {
                         InputAbandonReason::ToolProcessInterrupted
                     }
+                    mm_dsl::InputAbandonReason::RequeueExpired => {
+                        InputAbandonReason::RequeueExpired
+                    }
                 };
                 Some(InputTerminalOutcome::Abandoned { reason })
             }

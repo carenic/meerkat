@@ -633,7 +633,7 @@ pub use meerkat_machine::{
     RuntimeSessionRegistrationWitness, RuntimeSessionUnregisterAdmission,
     RuntimeSessionUnregisterObserver, RuntimeSessionUnregisterUseAdmission,
     SessionDurabilityReloadRequired, StagedCustodyRelease, StagedMeerkatMachine,
-    StandaloneSessionRuntimeAuthorities, classify_runtime_lifecycle_state,
+    StandaloneSessionRuntimeAuthorities, UnregisterQueuedInputs, classify_runtime_lifecycle_state,
     classify_runtime_loop_queue_admission, standalone_session_runtime_authorities,
     standalone_tool_visibility_owner,
 };

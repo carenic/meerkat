@@ -926,6 +926,7 @@ fn input_terminality_parts(
                 InputAbandonReason::ToolProcessInterrupted => {
                     dsl::InputAbandonReason::ToolProcessInterrupted
                 }
+                InputAbandonReason::RequeueExpired => dsl::InputAbandonReason::RequeueExpired,
             }),
         ),
     }
@@ -1392,6 +1393,30 @@ pub enum RuntimeSessionUnregisterAdmission {
     /// The exact coordinator remains process-owned; poll this observer on a
     /// later caller retry.
     Pending(RuntimeSessionUnregisterObserver),
+}
+
+/// What a runtime unregister does with inputs still queued behind the
+/// session's running turn when it stops the runtime.
+///
+/// [`Self::Stop`] ends every non-terminal input as stopped, as an
+/// unregister always has. [`Self::Requeue`] keeps each eligible queued input
+/// (a durable, non-directed prompt in the Queue lane) durably queued instead,
+/// marked for the runtime's next start, which runs it unless it is older than
+/// `max_age` by then. Its waiter is answered
+/// [`CompletionWaitError::RequeuedAcrossStop`](crate::completion::CompletionWaitError::RequeuedAcrossStop).
+/// An unregister already in progress keeps the disposition it began with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum UnregisterQueuedInputs {
+    /// End every non-terminal input as stopped.
+    #[default]
+    Stop,
+    /// Keep eligible queued inputs durably queued for the next start.
+    Requeue {
+        /// The age, measured from admission, past which the next start ends
+        /// a kept input as expired instead of running it.
+        max_age: std::time::Duration,
+    },
 }
 
 /// Answer of

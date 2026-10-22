@@ -3673,6 +3673,9 @@ pub enum InputAbandonReason {
     /// The input's in-flight run had a tool process that host process custody
     /// proved had started; the input is settled instead of replayed.
     ToolProcessInterrupted,
+    /// A graceful stop kept the input queued for the next start, and the next
+    /// start found it older than that stop's max age.
+    RequeueExpired,
 }
 
 impl From<&crate::input_state::InputAbandonReason> for InputAbandonReason {
@@ -3690,6 +3693,7 @@ impl From<&crate::input_state::InputAbandonReason> for InputAbandonReason {
             crate::input_state::InputAbandonReason::ToolProcessInterrupted => {
                 Self::ToolProcessInterrupted
             }
+            crate::input_state::InputAbandonReason::RequeueExpired => Self::RequeueExpired,
         }
     }
 }
@@ -3708,6 +3712,7 @@ impl InputAbandonReason {
             Self::MaxAttemptsExhausted => "max_attempts_exhausted",
             Self::NeverExecuted => "never_executed",
             Self::ToolProcessInterrupted => "tool_process_interrupted",
+            Self::RequeueExpired => "requeue_expired",
         }
     }
 }
