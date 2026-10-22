@@ -37,11 +37,12 @@ them.
 
 ### Fixed
 
-- A graceful mob Shutdown releases a member's identity reconcile lease as soon
-  as it has unregistered the member's runtime, so the next incarnation takes
-  that identity at once. Before, every lease stayed until it expired (up to 30
-  seconds), and the next start waited on each one. A member whose unregister
-  is still running at the Shutdown's deadline keeps its lease, as do a
+- A graceful mob Shutdown releases a member's identity reconcile lease once
+  it has unregistered the member's runtime and the member's session actor has
+  exited, so the next incarnation takes that identity at once. Before, every
+  lease stayed until it expired (up to 30 seconds), and the next start waited
+  on each one. A member whose unregister is still running, or whose session
+  actor still lives, at the Shutdown's deadline keeps its lease, as do a
   retiring member and every member of a process that ends without a
   Shutdown.
 - A turn that compacts its history more often than

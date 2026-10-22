@@ -29494,6 +29494,10 @@ impl MobActor {
         #[cfg(feature = "runtime-adapter")]
         let identity_reconcile_pending =
             identity_reconcile_pending && !self.resume_topology_mutation_pending();
+        // A Shutdown parked on its runtime teardown releases members' identity
+        // leases from there: no reconcile pass claims one again meanwhile.
+        let identity_reconcile_pending =
+            identity_reconcile_pending && self.pending_shutdown_teardown.is_none();
         let identity_reconcile_backoff_wait = self.identity_reconcile_next_backoff_wait();
         let ready_deferred = deferred_commands
             .iter()
