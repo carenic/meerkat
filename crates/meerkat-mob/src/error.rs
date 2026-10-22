@@ -740,6 +740,19 @@ pub enum MobError {
         hold: Option<meerkat_core::service::DurableResumeHold>,
     },
 
+    /// The mob's startup recovery could not restore member `member_id`'s
+    /// session `session_id`, so the mob actor stopped before it admitted any
+    /// command. `cause` is the typed failure, for example
+    /// `SessionError::ServedElsewhere` while another runtime owner on the
+    /// realm hosts the session. Recovery wrote nothing for that session;
+    /// start the mob again once the cause clears.
+    #[error("mob startup could not restore member {member_id} session {session_id}: {cause}")]
+    MemberStartupRecoveryFailed {
+        member_id: AgentIdentity,
+        session_id: meerkat_core::types::SessionId,
+        cause: Arc<MobError>,
+    },
+
     /// The member's runtime registration is durability-degraded: a durable
     /// commit could not be reconciled with the live shell, so the runtime
     /// refuses every ordinary input until a registration-authorized cold

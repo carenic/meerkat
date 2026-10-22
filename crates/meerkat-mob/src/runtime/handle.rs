@@ -2522,7 +2522,7 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         MobError::BridgeCommandRejected { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::BridgeCommandRejected
         }
-        MobError::MemberRestoreFailed { .. } => {
+        MobError::MemberRestoreFailed { .. } | MobError::MemberStartupRecoveryFailed { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::MemberRestoreFailed
         }
         // A degraded or detached runtime registration is a session fault of
