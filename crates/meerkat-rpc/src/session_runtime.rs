@@ -26428,6 +26428,212 @@ mod tests {
         );
     }
 
+    /// Count the persisted user-channel rows that carry `needle`.
+    fn user_rows_containing(session: &Session, needle: &str) -> usize {
+        user_channel_messages(session)
+            .iter()
+            .filter(|(_, text)| text.contains(needle))
+            .count()
+    }
+
+    /// Whether the persisted deferred-turn state still stages a prompt.
+    fn persisted_staged_prompt(session: &Session) -> Option<String> {
+        session
+            .try_deferred_turn_state()
+            .expect("decode persisted deferred-turn state")
+            .and_then(|state| {
+                state
+                    .pending_initial_prompt()
+                    .map(|staged| staged.prompt.text_content())
+            })
+    }
+
+    /// Drop the live actor and the runtime registration, as a process restart
+    /// does; the next turn recovers the session from durable state.
+    async fn restart_session(runtime: &Arc<SessionRuntime>, session_id: &SessionId) {
+        runtime
+            .service
+            .discard_live_session(session_id)
+            .await
+            .expect("discard live session");
+        runtime
+            .runtime_adapter
+            .unregister_session(session_id)
+            .await
+            .expect("runtime session should unregister cleanly");
+    }
+
+    async fn runtime_turn(runtime: &Arc<SessionRuntime>, session_id: &SessionId, prompt: &str) {
+        let (event_tx, _event_rx) = mpsc::channel(100);
+        runtime
+            .start_turn_via_runtime(
+                session_id,
+                prompt.into(),
+                Vec::new(),
+                event_tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("runtime-routed turn");
+    }
+
+    /// The staged prompt is consumed only with the first turn's own
+    /// checkpoint. After that checkpoint the persisted pending flag is clear,
+    /// and a restart does not deliver the prompt again: the transcript keeps
+    /// exactly one staged row.
+    #[tokio::test]
+    async fn realtime_open_staged_prompt_is_delivered_once_across_a_restart() {
+        let _projection_guard = realtime_open_projection_test_guard().await;
+        let temp = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(RecordingMessagesLlmClient::default());
+        let build_config = AgentBuildConfig {
+            llm_client_override: Some(recorder.clone()),
+            ..AgentBuildConfig::new("claude-sonnet-4-5")
+        };
+        let runtime = make_runtime(temp_factory(&temp), 10);
+        // A restart rebuilds the agent from durable state, which does not
+        // carry the build's client override: recovery uses the default one.
+        runtime.set_default_llm_client(Some(recorder.clone()));
+        let session_id = runtime
+            .create_session(
+                build_config,
+                None,
+                Some(ContentInput::Text(
+                    "Remember the codeword ORBIT-7 for later.".to_string(),
+                )),
+                Vec::new(),
+            )
+            .await
+            .expect("create deferred session");
+        drop(
+            runtime
+                .realtime_session_open_config(
+                    &session_id,
+                    meerkat_contracts::RealtimeTurningMode::ProviderManaged,
+                )
+                .await
+                .expect("live/open projection materializes the staged session"),
+        );
+
+        runtime_turn(&runtime, &session_id, "What is the codeword?").await;
+        let after_first = runtime
+            .load_persisted_session(&session_id)
+            .await
+            .expect("load persisted session")
+            .expect("session persisted");
+        let first_rows = user_rows_containing(&after_first, "ORBIT-7");
+        let staged_after_first = persisted_staged_prompt(&after_first);
+
+        restart_session(&runtime, &session_id).await;
+        runtime_turn(&runtime, &session_id, "And after the restart?").await;
+        let after_restart = runtime
+            .load_persisted_session(&session_id)
+            .await
+            .expect("load persisted session")
+            .expect("session persisted");
+        let restart_rows = user_rows_containing(&after_restart, "ORBIT-7");
+        let requests = recorder.requests();
+        let last_request_mentions = requests
+            .last()
+            .map(|request| format!("{request:?}").matches("ORBIT-7").count());
+        assert!(
+            first_rows == 1
+                && staged_after_first.is_none()
+                && restart_rows == 1
+                && last_request_mentions == Some(1),
+            "staged prompt must be delivered exactly once across a restart: \
+             rows_after_first_turn={first_rows} \
+             persisted_staged_after_first_turn={staged_after_first:?} \
+             rows_after_restart_turn={restart_rows} \
+             last_request_mentions={last_request_mentions:?}; \
+             transcript_user_messages={:?}",
+            user_channel_messages(&after_restart)
+        );
+    }
+
+    /// In a voice-first session the staged prompt lands with the first
+    /// later text turn, after the live rows, and a restart does not deliver
+    /// it again (the live row commit re-syncs the actor from durable state,
+    /// which still stages the prompt).
+    #[tokio::test]
+    async fn voice_first_session_delivers_the_staged_prompt_with_the_first_text_turn() {
+        let _projection_guard = realtime_open_projection_test_guard().await;
+        let temp = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(RecordingMessagesLlmClient::default());
+        let build_config = AgentBuildConfig {
+            llm_client_override: Some(recorder.clone()),
+            ..AgentBuildConfig::new("claude-sonnet-4-5")
+        };
+        let runtime = make_runtime(temp_factory(&temp), 10);
+        // A restart rebuilds the agent from durable state, which does not
+        // carry the build's client override: recovery uses the default one.
+        runtime.set_default_llm_client(Some(recorder.clone()));
+        let session_id = runtime
+            .create_session(
+                build_config,
+                None,
+                Some(ContentInput::Text(
+                    "Remember the codeword ORBIT-7 for later.".to_string(),
+                )),
+                Vec::new(),
+            )
+            .await
+            .expect("create deferred session");
+        drop(
+            runtime
+                .realtime_session_open_config(
+                    &session_id,
+                    meerkat_contracts::RealtimeTurningMode::ProviderManaged,
+                )
+                .await
+                .expect("live/open projection materializes the staged session"),
+        );
+        for event in [
+            meerkat_core::RealtimeTranscriptEvent::ItemObserved {
+                item_id: "voice-item-1".to_string(),
+                previous_item_id: None,
+                role: meerkat_core::RealtimeTranscriptRole::User,
+                response_id: None,
+            },
+            meerkat_core::RealtimeTranscriptEvent::UserTranscriptFinal {
+                item_id: "voice-item-1".to_string(),
+                previous_item_id: None,
+                content_index: 0,
+                text: "a spoken hello".to_string(),
+            },
+        ] {
+            runtime
+                .append_realtime_transcript_event(&session_id, event)
+                .await
+                .expect("live user transcript commits");
+        }
+
+        runtime_turn(&runtime, &session_id, "What is the codeword?").await;
+        restart_session(&runtime, &session_id).await;
+        runtime_turn(&runtime, &session_id, "And after the restart?").await;
+
+        let session = runtime
+            .load_persisted_session(&session_id)
+            .await
+            .expect("load persisted session")
+            .expect("session persisted");
+        let users = user_channel_messages(&session);
+        let spoken = users
+            .iter()
+            .position(|(_, text)| text.contains("a spoken hello"));
+        let staged = users.iter().position(|(_, text)| text.contains("ORBIT-7"));
+        let staged_rows = user_rows_containing(&session, "ORBIT-7");
+        assert!(
+            spoken.is_some() && staged.is_some() && spoken < staged && staged_rows == 1,
+            "voice-first: the staged prompt must land once, with the first text turn, after \
+             the live rows: spoken_row={spoken:?} staged_row={staged:?} \
+             staged_rows={staged_rows}; transcript_user_messages={users:?}"
+        );
+    }
+
     /// Project a persisted session's user-channel messages as
     /// `(is_injected_context, text)` pairs, in transcript order.
     fn user_channel_messages(session: &Session) -> Vec<(bool, String)> {

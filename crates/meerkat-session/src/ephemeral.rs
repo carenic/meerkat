@@ -15779,3 +15779,6 @@ mod inline_video_admission_tests {
 
 #[cfg(test)]
 mod tool_application_custody_tests;
+
+#[cfg(test)]
+mod staged_prompt_lowering_tests;
