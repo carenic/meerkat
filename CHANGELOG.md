@@ -118,6 +118,15 @@ them.
   `MeerkatMachine::accept_existing_input_with_completion_for_attachment_and_member_residency`
   is the same for a mob member's attachment.
 
+### Changed
+
+- `meerkat-core`: the `FORK_INSTRUCTION_REFUSED` message for a fork the
+  policy refuses (cause `policy_refuses`) names the setting that changes it:
+  "to carry them into the child, set the host's fork_instruction_policy
+  (inherited_instructions on a session fork call) to reactivate_inherited".
+  It said only that `reactivate_inherited` carries them into the child. The
+  cause, the keys and the error code are unchanged.
+
 ### Fixed
 
 - A turn that compacts its history more often than
