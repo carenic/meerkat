@@ -117,6 +117,7 @@ fn ci_runs_fail_closed_cargo_lanes_on_hosted_runners() {
             "main-unit-rest",
             "mcp-confinement-positive",
             "ratchets",
+            "rustdoc",
             "sdk-host",
             "stagger",
             "tlc-audits",
@@ -264,6 +265,7 @@ fn ci_runs_fail_closed_cargo_lanes_on_hosted_runners() {
         "main-unit-archive-build",
         "main-unit-archive-run",
         "closure-check",
+        "rustdoc",
         "wasm-check",
         "sdk-host",
         "example-web",
@@ -376,6 +378,7 @@ fn pull_requests_leave_the_chain_and_closure_lanes_to_the_push() {
     );
     for (job, flag) in [
         ("closure-check", "closure_check"),
+        ("rustdoc", "rustdoc"),
         ("governed-jsonl", "governed_jsonl"),
         ("mcp-confinement-positive", "mcp_confinement_positive"),
     ] {
@@ -432,6 +435,11 @@ fn pull_requests_leave_the_chain_and_closure_lanes_to_the_push() {
     for contract in [
         "a push plan left lanes to a later push",
         "forbid_failure \"Closure check\" \"${CLOSURE_CHECK_RESULT}\"",
+        "forbid_failure \"Rustdoc\" \"${RUSTDOC_RESULT}\"",
+        // Every crate documented with rustdoc's lints denied, under default
+        // features.
+        "RUSTDOCFLAGS: -Dwarnings",
+        "run: ./scripts/repo-cargo doc --workspace --no-deps --keep-going",
         "forbid_failure \"Governed JSONL\" \"${GOVERNED_JSONL_RESULT}\"",
         "forbid_failure \"MCP confinement positive\" \"${MCP_CONFINEMENT_POSITIVE_RESULT}\"",
         "left to the push (main or release/**): ${DEFERRED_TO_PUSH}",
