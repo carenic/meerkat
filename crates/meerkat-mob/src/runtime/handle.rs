@@ -4808,7 +4808,10 @@ pub(crate) fn legacy_direct_session_error(
 pub struct HelperOptions {
     /// Role name (profile key) to use. If None, requires a default profile in the definition.
     pub role_name: Option<ProfileName>,
-    /// Runtime mode override.
+    /// Runtime mode override. A helper runs one tracked turn, so
+    /// `AutonomousHost` is refused before any spawn with
+    /// `MobError::UnsupportedForMode`: autonomous inbox delivery has no
+    /// tracked turn completion.
     pub runtime_mode: Option<crate::MobRuntimeMode>,
     /// Backend override.
     pub backend: Option<MobBackendKind>,
@@ -16430,8 +16433,11 @@ impl MobHandle {
     /// request before [`Self::fork_member`] runs. That prevents the resume path
     /// from dispatching an untracked initial turn; this composition admits the
     /// same message exactly once through the internal exact work carrier instead.
-    /// The bounded-result request is validated before any fork or member
-    /// admission occurs.
+    /// The bounded-result request and the child's runtime mode are validated
+    /// before any fork or member admission occurs: an `AutonomousHost` child
+    /// is refused with `MobError::UnsupportedForMode`, and a child spec that
+    /// names no runtime mode runs turn-driven, whatever its profile's default,
+    /// as a bounded helper does.
     ///
     /// `source_admission` states where the request comes from. The agent-facing
     /// `fork_off` tool runs inside the source member's own turn and passes
@@ -16449,6 +16455,12 @@ impl MobHandle {
         source_admission: meerkat_core::DurableForkSourceAdmission,
     ) -> Result<ForkMemberBoundedRunOutcome, BoundedMemberRunError> {
         let result_spec = BoundedResultSpec::new(result_label, max_text_bytes)?;
+        Self::refuse_autonomous_bounded_run(member.runtime_mode)?;
+        member.runtime_mode = Some(
+            member
+                .runtime_mode
+                .unwrap_or(crate::MobRuntimeMode::TurnDriven),
+        );
         let task = member.initial_message.take().ok_or_else(|| {
             MobError::InvalidBoundedHelperResult {
                 reason: "fork_member_then_run_bounded requires member.initial_message so the exact turn has one caller-authored input"
@@ -16510,6 +16522,10 @@ impl MobHandle {
     /// A child whose own turn fails is retired. A child whose turn completes
     /// stays seated, exactly like [`Self::fork_member_then_run_bounded`].
     ///
+    /// A child spec with an `AutonomousHost` runtime mode is refused with
+    /// `MobError::UnsupportedForMode` before anything is forked; one that
+    /// names no runtime mode runs turn-driven, whatever its profile's default.
+    ///
     /// Validation, fork, seat and turn admission all happen before this
     /// returns, so every admission failure is reported synchronously and a
     /// child whose turn could not be admitted is retired first. A call
@@ -16533,6 +16549,12 @@ impl MobHandle {
         max_run: Option<Duration>,
         job: Option<ForkJobBinding>,
     ) -> Result<(ForkMemberResult, ForkChildRun), BoundedMemberRunError> {
+        Self::refuse_autonomous_bounded_run(member.runtime_mode)?;
+        member.runtime_mode = Some(
+            member
+                .runtime_mode
+                .unwrap_or(crate::MobRuntimeMode::TurnDriven),
+        );
         let result_label: String = result_label.into();
         // A fork in its source's own turn is its source's: the re-link after
         // a restart relies on that owner (a job bound elsewhere would be
@@ -16971,6 +16993,25 @@ impl MobHandle {
         Ok(snapshot)
     }
 
+    /// A bounded run (a helper, or a fork child run through
+    /// `fork_member_then_run_bounded`/`_detached`) executes one tracked turn,
+    /// and an autonomous host member's inbox delivery has no tracked turn
+    /// completion. That runtime mode is refused before any admission, fork or
+    /// spawn, so no member is seated and no kickoff turn runs.
+    fn refuse_autonomous_bounded_run(
+        runtime_mode: Option<crate::MobRuntimeMode>,
+    ) -> Result<(), MobError> {
+        if runtime_mode == Some(crate::MobRuntimeMode::AutonomousHost) {
+            return Err(MobError::UnsupportedForMode {
+                mode: crate::MobRuntimeMode::AutonomousHost,
+                reason: "a bounded run executes one tracked turn, and autonomous inbox delivery \
+                         has no tracked turn completion"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
     fn bounded_helper_spawn_spec(
         &self,
         identity: AgentIdentity,
@@ -17108,9 +17149,11 @@ impl MobHandle {
     /// Spawn a helper with `HelperSpawn` provenance, run one explicit exact
     /// turn, capture its receiver-bounded result, then attempt retirement.
     ///
-    /// Label and byte-bound validation occurs before control or spawn
-    /// admission. The result is captured before retirement begins, so cleanup
-    /// failure is returned as debt without erasing the certified turn result.
+    /// Label, byte-bound and runtime-mode validation occur before control or
+    /// spawn admission; an `AutonomousHost` runtime mode is refused there with
+    /// `MobError::UnsupportedForMode`. The result is captured before
+    /// retirement begins, so cleanup failure is returned as debt without
+    /// erasing the certified turn result.
     pub async fn spawn_helper(
         &self,
         identity: AgentIdentity,
@@ -17120,6 +17163,7 @@ impl MobHandle {
         max_text_bytes: usize,
     ) -> Result<BoundedHelperRunOutcome, BoundedMemberRunError> {
         let result_spec = BoundedResultSpec::new(result_label, max_text_bytes)?;
+        Self::refuse_autonomous_bounded_run(options.runtime_mode)?;
         self.admit_control_scope(mob_dsl::ControlScope::SendCommand)
             .await?;
         let (spec, turn_options) = self.bounded_helper_spawn_spec(
@@ -17137,8 +17181,10 @@ impl MobHandle {
     /// turn, capture its receiver-bounded result, then attempt retirement.
     ///
     /// The fork context is installed during provisioning, while the task
-    /// itself is admitted once through the exact internal work carrier. Label
-    /// and byte-bound validation occurs before control or spawn admission.
+    /// itself is admitted once through the exact internal work carrier. Label,
+    /// byte-bound and runtime-mode validation occur before control or spawn
+    /// admission; an `AutonomousHost` runtime mode is refused there with
+    /// `MobError::UnsupportedForMode`, before any fork child is seated.
     #[allow(clippy::too_many_arguments)]
     pub async fn fork_helper(
         &self,
@@ -17151,6 +17197,7 @@ impl MobHandle {
         max_text_bytes: usize,
     ) -> Result<BoundedHelperRunOutcome, BoundedMemberRunError> {
         let result_spec = BoundedResultSpec::new(result_label, max_text_bytes)?;
+        Self::refuse_autonomous_bounded_run(options.runtime_mode)?;
         self.admit_control_scope(mob_dsl::ControlScope::SendCommand)
             .await?;
         let (spec, turn_options) = self.bounded_helper_spawn_spec(

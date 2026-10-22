@@ -32111,6 +32111,364 @@ async fn test_spawn_helper_defaults_to_turn_driven_even_when_profile_is_autonomo
     );
 }
 
+/// A bounded helper runs one tracked turn and returns its result, and an
+/// autonomous host member's inbox delivery has no tracked turn completion.
+/// `spawn_helper` with an explicit `AutonomousHost` runtime mode is therefore
+/// refused, typed, before anything is spawned: no member, no kickoff turn,
+/// no model request.
+#[tokio::test]
+async fn spawn_helper_refuses_an_autonomous_runtime_mode_before_spawning() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    service.set_return_exact_run_result(true);
+    let helper = AgentIdentity::from("helper-autonomous");
+
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handle.spawn_helper(
+            helper.clone(),
+            "summarize this",
+            HelperOptions {
+                role_name: Some(ProfileName::from("worker")),
+                runtime_mode: Some(crate::MobRuntimeMode::AutonomousHost),
+                ..HelperOptions::default()
+            },
+            "autonomous-helper",
+            256,
+        ),
+    )
+    .await
+    .expect("the refusal returns within the watchdog");
+
+    assert!(
+        matches!(
+            &refused,
+            Err(BoundedMemberRunError::Admission(
+                MobError::UnsupportedForMode {
+                    mode: crate::MobRuntimeMode::AutonomousHost,
+                    ..
+                }
+            ))
+        ),
+        "an autonomous bounded helper must be refused as UnsupportedForMode: {:?}",
+        refused.as_ref().err()
+    );
+    assert_eq!(
+        service.keep_alive_start_turn_call_count(),
+        0,
+        "a refused autonomous helper must never run a kickoff turn"
+    );
+    let spawned = handle
+        .events()
+        .replay_all()
+        .await
+        .expect("replay the mob events")
+        .into_iter()
+        .any(|event| {
+            matches!(
+                &event.kind,
+                crate::event::MobEventKind::MemberSpawned(spawned)
+                    if spawned.agent_identity == helper
+            )
+        });
+    assert!(
+        !spawned,
+        "a refused autonomous helper must never be spawned"
+    );
+}
+
+/// The fork launch of a bounded helper is refused the same way: no fork
+/// child is seated and no kickoff turn carries the fork context.
+#[tokio::test]
+async fn fork_helper_refuses_an_autonomous_runtime_mode_before_spawning() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    service.set_return_exact_run_result(true);
+    let source = AgentIdentity::from("fork-source");
+    handle
+        .spawn_with_options(
+            ProfileName::from("worker"),
+            source.clone(),
+            None,
+            Some(crate::MobRuntimeMode::TurnDriven),
+            None,
+        )
+        .await
+        .expect("spawn the source member");
+    let helper = AgentIdentity::from("fork-helper-autonomous");
+
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handle.fork_helper(
+            &source,
+            helper.clone(),
+            "continue from source",
+            crate::launch::ForkContext::FullHistory,
+            HelperOptions {
+                role_name: Some(ProfileName::from("worker")),
+                runtime_mode: Some(crate::MobRuntimeMode::AutonomousHost),
+                ..HelperOptions::default()
+            },
+            "fork-helper-result",
+            256,
+        ),
+    )
+    .await
+    .expect("the refusal returns within the watchdog");
+
+    assert!(
+        matches!(
+            &refused,
+            Err(BoundedMemberRunError::Admission(
+                MobError::UnsupportedForMode {
+                    mode: crate::MobRuntimeMode::AutonomousHost,
+                    ..
+                }
+            ))
+        ),
+        "an autonomous bounded fork helper must be refused as UnsupportedForMode: {:?}",
+        refused.as_ref().err()
+    );
+    assert_eq!(
+        service.keep_alive_start_turn_call_count(),
+        0,
+        "a refused autonomous fork helper must never run a kickoff turn"
+    );
+    let spawned = handle
+        .events()
+        .replay_all()
+        .await
+        .expect("replay the mob events")
+        .into_iter()
+        .any(|event| {
+            matches!(
+                &event.kind,
+                crate::event::MobEventKind::MemberSpawned(spawned)
+                    if spawned.agent_identity == helper
+            )
+        });
+    assert!(
+        !spawned,
+        "a refused autonomous fork helper must never be spawned"
+    );
+}
+
+/// `fork_member_then_run_bounded` runs its child's one tracked turn, so a
+/// child spec asking for `AutonomousHost` is refused, typed, before anything
+/// is forked: no child is seated and no kickoff turn runs.
+#[tokio::test]
+async fn fork_member_then_run_bounded_refuses_an_autonomous_child_before_forking() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    service.set_return_exact_run_result(true);
+    let source = AgentIdentity::from("bounded-fork-source");
+    spawn_settled_fork_source(&handle, &source).await;
+    let child = AgentIdentity::from("autonomous-bounded-child");
+    let mut spec = bounded_fork_child_spec(&child);
+    spec.runtime_mode = Some(crate::MobRuntimeMode::AutonomousHost);
+
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handle.fork_member_then_run_bounded(
+            &source,
+            spec,
+            None,
+            "fork_child_result",
+            256,
+            meerkat_core::DurableForkSourceAdmission::Quiescent,
+        ),
+    )
+    .await
+    .expect("the refusal returns within the watchdog");
+
+    assert!(
+        matches!(
+            &refused,
+            Err(BoundedMemberRunError::Admission(
+                MobError::UnsupportedForMode {
+                    mode: crate::MobRuntimeMode::AutonomousHost,
+                    ..
+                }
+            ))
+        ),
+        "an autonomous bounded fork child must be refused as UnsupportedForMode: {:?}",
+        refused.as_ref().err()
+    );
+    assert_eq!(
+        service.keep_alive_start_turn_call_count(),
+        0,
+        "a refused autonomous fork child must never run a kickoff turn"
+    );
+    let spawned = handle
+        .events()
+        .replay_all()
+        .await
+        .expect("replay the mob events")
+        .into_iter()
+        .any(|event| {
+            matches!(
+                &event.kind,
+                crate::event::MobEventKind::MemberSpawned(spawned)
+                    if spawned.agent_identity == child
+            )
+        });
+    assert!(
+        !spawned,
+        "a refused autonomous fork child must never be seated"
+    );
+}
+
+/// `fork_member_then_run_detached` admits its child's one tracked turn
+/// before it returns, so it refuses an `AutonomousHost` child spec the same
+/// way, before anything is forked.
+#[tokio::test]
+async fn fork_member_then_run_detached_refuses_an_autonomous_child_before_forking() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    service.set_return_exact_run_result(true);
+    let source = AgentIdentity::from("detached-fork-source");
+    spawn_settled_fork_source(&handle, &source).await;
+    let child = AgentIdentity::from("autonomous-detached-child");
+    let mut spec = bounded_fork_child_spec(&child);
+    spec.runtime_mode = Some(crate::MobRuntimeMode::AutonomousHost);
+
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handle.fork_member_then_run_detached(
+            &source,
+            spec,
+            None,
+            "fork_child_result",
+            256,
+            meerkat_core::DurableForkSourceAdmission::Quiescent,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("the refusal returns within the watchdog");
+
+    assert!(
+        matches!(
+            &refused,
+            Err(BoundedMemberRunError::Admission(
+                MobError::UnsupportedForMode {
+                    mode: crate::MobRuntimeMode::AutonomousHost,
+                    ..
+                }
+            ))
+        ),
+        "an autonomous detached fork child must be refused as UnsupportedForMode: {:?}",
+        refused.as_ref().err()
+    );
+    assert_eq!(
+        service.keep_alive_start_turn_call_count(),
+        0,
+        "a refused autonomous detached fork child must never run a kickoff turn"
+    );
+    let spawned = handle
+        .events()
+        .replay_all()
+        .await
+        .expect("replay the mob events")
+        .into_iter()
+        .any(|event| {
+            matches!(
+                &event.kind,
+                crate::event::MobEventKind::MemberSpawned(spawned)
+                    if spawned.agent_identity == child
+            )
+        });
+    assert!(
+        !spawned,
+        "a refused autonomous detached fork child must never be seated"
+    );
+}
+
+/// A bounded fork child with no runtime mode runs turn-driven, whatever its
+/// profile's default (the sample worker profile is autonomous), the rule
+/// bounded helpers follow too: it never runs an autonomous kickoff turn, and
+/// its one tracked turn returns the bounded result.
+#[tokio::test]
+async fn fork_member_then_run_bounded_runs_a_child_without_a_runtime_mode_turn_driven() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    service.set_return_exact_run_result(true);
+    let source = AgentIdentity::from("bounded-fork-source");
+    spawn_settled_fork_source(&handle, &source).await;
+    let child = AgentIdentity::from("unmoded-bounded-child");
+    let mut spec = bounded_fork_child_spec(&child);
+    spec.runtime_mode = None;
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handle.fork_member_then_run_bounded(
+            &source,
+            spec,
+            None,
+            "fork_child_result",
+            256,
+            meerkat_core::DurableForkSourceAdmission::Quiescent,
+        ),
+    )
+    .await
+    .expect("the bounded run returns within the watchdog")
+    .expect("a child without a runtime mode runs its bounded turn");
+
+    assert_eq!(outcome.turn.result().result().text(), "exact child task");
+    assert_eq!(
+        service.keep_alive_start_turn_call_count(),
+        0,
+        "a bounded fork child without a runtime mode must never run an autonomous kickoff turn"
+    );
+    let entry = handle
+        .get_member(&child)
+        .await
+        .expect("read the roster")
+        .expect("a child whose bounded turn completed stays seated");
+    assert_eq!(entry.runtime_mode, crate::MobRuntimeMode::TurnDriven);
+}
+
+/// The same rule for `fork_member_then_run_detached`.
+#[tokio::test]
+async fn fork_member_then_run_detached_runs_a_child_without_a_runtime_mode_turn_driven() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    service.set_return_exact_run_result(true);
+    let source = AgentIdentity::from("detached-fork-source");
+    spawn_settled_fork_source(&handle, &source).await;
+    let child = AgentIdentity::from("unmoded-detached-child");
+    let mut spec = bounded_fork_child_spec(&child);
+    spec.runtime_mode = None;
+
+    let (_fork, run) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handle.fork_member_then_run_detached(
+            &source,
+            spec,
+            None,
+            "fork_child_result",
+            256,
+            meerkat_core::DurableForkSourceAdmission::Quiescent,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("the detached run is admitted within the watchdog")
+    .expect("a child without a runtime mode starts its bounded turn");
+    tokio::time::timeout(std::time::Duration::from_secs(5), run.outcome())
+        .await
+        .expect("the child's run reaches an outcome within the watchdog")
+        .expect("the child's bounded turn completes");
+
+    assert_eq!(
+        service.keep_alive_start_turn_call_count(),
+        0,
+        "a detached fork child without a runtime mode must never run an autonomous kickoff turn"
+    );
+    let entry = handle
+        .get_member(&child)
+        .await
+        .expect("read the roster")
+        .expect("a child whose bounded turn completed stays seated");
+    assert_eq!(entry.runtime_mode, crate::MobRuntimeMode::TurnDriven);
+}
+
 #[tokio::test]
 async fn test_respawn_contract_aligns_receipt_with_canonical_member_state() {
     let (handle, service) = create_test_mob(sample_definition()).await;

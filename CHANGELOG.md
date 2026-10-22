@@ -242,6 +242,19 @@ them.
   transcript revision conflict (`SessionError::Store`) instead of an
   internal "resume bridge session check failed" error. The spawn does not
   settle the tail; it stays as it was.
+- `meerkat-mob`, `meerkat-schedule`, `meerkat-mob-mcp`: a bounded helper or
+  bounded fork child with runtime mode `autonomous_host` is now refused with
+  `UnsupportedForMode` before anything is spawned. This covers `spawn_helper`
+  and `fork_helper`, `fork_member_then_run_bounded` and
+  `fork_member_then_run_detached`, RPC `mob/spawn_helper` and
+  `mob/fork_helper`, and scheduled helper targets.
+  Before, the helper was spawned and its autonomous kickoff turn ran (one
+  model request) before the bounded task failed, because autonomous inbox
+  delivery has no tracked turn completion. Schedules now refuse such a helper
+  target at create and update, and a schedule stored with one fails each
+  occurrence before any spawn. A bounded fork child whose spec names no
+  runtime mode now runs turn-driven, as a bounded helper does, instead of
+  inheriting an autonomous profile default and failing the same way.
 
 - `meerkat-mob`: an identity whose lease claim meets a live holder retries
   as soon as that holder's lease expires. Reconciliation claims a lease it
