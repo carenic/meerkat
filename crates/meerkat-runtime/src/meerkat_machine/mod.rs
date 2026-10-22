@@ -2186,7 +2186,7 @@ impl RunStartHoldReason {
 }
 
 /// What a caller refused with
-/// [`RuntimeBindingsError::RegistrationOwned`](crate::RuntimeBindingsError::RegistrationOwned) observes once a session's
+/// [`RuntimeBindingsError::RegistrationOwned`] observes once a session's
 /// actor-materialization claim is no longer in flight.
 ///
 /// In-flight claim phases (prepared, staged, actor creating, pending commit,
@@ -6732,7 +6732,7 @@ impl MeerkatMachine {
     /// so a health caller must publish that failed read as such rather than
     /// publish a zero or stay silent.
     ///
-    /// See [`RuntimeSessionEntry::runtime_loop_is_dead_shell`] for why the
+    /// See `RuntimeSessionEntry::runtime_loop_is_dead_shell` for why the
     /// healthy path is lock-free and the candidate path uses `try_lock`.
     ///
     /// Not `async` on purpose, for the same reason as its sibling.
@@ -6751,7 +6751,7 @@ impl MeerkatMachine {
     ///
     /// "Overdue" is recomputed from machine truth on every call and means
     /// exactly what the staged-run watchdog's notice tier means: the run was
-    /// staged more than [`crate::run_progress::RUN_EXECUTION_START_NOTICE`]
+    /// staged more than `run_progress::RUN_EXECUTION_START_NOTICE`
     /// ago, machine authority still reports it current with its primitive
     /// un-applied, and the loop signalled its turn start so the phase read
     /// describes this run. The wire claim and the existing watchdog log line
@@ -6764,7 +6764,7 @@ impl MeerkatMachine {
     /// not readable, or a past-bound window's authority could not be read
     /// without blocking and no other session was positively overdue. The
     /// per-entry miss propagates here - unlike
-    /// [`RuntimeSessionEntry::runtime_loop_is_dead_shell`], which counts its
+    /// `RuntimeSessionEntry::runtime_loop_is_dead_shell`, which counts its
     /// per-entry miss - because the two misses sit on opposite sides of an
     /// established fact. A dead shell is proven lock-free before its
     /// authority is consulted; the try_lock there only resolves who owns the
@@ -6802,7 +6802,7 @@ impl MeerkatMachine {
 
     /// How many registered sessions hold queued work they have parked: input
     /// in the machine's queued phase older than
-    /// [`crate::run_progress::QUEUED_INPUT_START_NOTICE`], with the executor
+    /// `run_progress::QUEUED_INPUT_START_NOTICE`, with the executor
     /// registration `Active` and no run in flight.
     ///
     /// This is the PRE-staging census - the class where a session resumes
@@ -12901,7 +12901,7 @@ impl MeerkatMachine {
     /// [`Self::persistent_governed_staged`] for a trusted host whose
     /// governed composition is bound to another actual store's files: the
     /// stage also retains `associated`, that store's governed claim (for
-    /// example [`crate::store::SqliteRuntimeStore::try_acquire_governed_execution_custody`]),
+    /// example `SqliteRuntimeStore::try_acquire_governed_execution_custody`),
     /// together with its own store's claim. Every handle sharing the stage's
     /// custody shares both, and both are released only with that custody, so
     /// the associated store's other execution owners stay out for as long as

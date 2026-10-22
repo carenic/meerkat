@@ -440,8 +440,9 @@ impl BoundedSubmitReport {
 /// then collapses at the durable admission point instead of delivering twice.
 ///
 /// The call returns within [`BoundedSubmission::bound`], except for a bound
-/// below [`MIN_EVIDENCE_READ_BOUND`], which cannot fund the classification
-/// slice and so returns within [`MIN_EVIDENCE_READ_BOUND`] instead.
+/// below the minimum evidence-read bound (`MIN_EVIDENCE_READ_BOUND`), which
+/// cannot fund the classification slice and so returns within that minimum
+/// instead.
 #[must_use = "a bounded submission's typed fate is the point of calling it"]
 pub async fn submit_bounded<R>(
     runtime: Arc<R>,
