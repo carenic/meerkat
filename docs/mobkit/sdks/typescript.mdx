@@ -4,7 +4,7 @@ description: "TypeScript SDK for Meta with type-safe contracts, parity tests, an
 icon: "js"
 ---
 
-*Mirrored from MobKit main at [091f73c4a64c](https://github.com/lukacf/meerkat-meta/commit/091f73c4a64cd13e08fc7c8a0484c0bf3a93b4c2) on 2026-10-22; MobKit workspace version 0.9.4 at that commit.*
+*Mirrored from MobKit main at [982c76ab266e](https://github.com/lukacf/meerkat-meta/commit/982c76ab266ef73f028c1ba7dce9e021fa6587e0) on 2026-10-22; MobKit workspace version 0.9.4 at that commit.*
 
 The TypeScript SDK (`@rkat/meta-sdk`) provides type-safe access to the Meta JSON-RPC gateway from Node.js.
 
@@ -50,6 +50,33 @@ const results = await handle.memoryQuery({
 });
 
 ```
+
+## Fork instruction policy
+
+A member forked with `fork_off`, a delegation fork or a council does not run
+the instructions its source activated (`meta/member_activate_instruction`,
+skill bodies activated that way included) unless the gateway's fork instruction
+policy says so. Under the default, `"require_explicit_activation"`, such a fork
+is refused with `fork_instruction_refused` before anything is committed. Set
+the policy on the builder; it is sent as
+`runtime_options.fork_instruction_policy`:
+
+```typescript
+import { Meta } from "@rkat/meta-sdk";
+
+const rt = await Meta.builder()
+  .mob("config/mob.toml")
+  .forkInstructionPolicy("reactivate_inherited")
+  .build();
+```
+
+`forkInstructionPolicy` takes a `ForkInstructionPolicy`:
+`"require_explicit_activation"`, `"reactivate_inherited"` or `"refuse"`;
+another value throws `RangeError`. Unset, nothing is sent and the gateway
+default applies. The setting applies to every fork of the gateway's mob and
+cannot be chosen per fork. See
+[Fork instruction policy](/mobkit/reference/configuration#fork-instruction-policy)
+for what each value does and what `reactivate_inherited` trusts.
 
 ## Waiting for a turn
 
