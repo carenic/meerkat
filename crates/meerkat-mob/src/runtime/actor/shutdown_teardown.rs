@@ -10,6 +10,10 @@
 //! member lifecycle hang guard without one. The parked Shutdown re-enters
 //! with every session's typed outcome; meanwhile the actor keeps serving
 //! status and observation commands.
+//!
+//! A bound member whose runtime the teardown unregistered has its identity
+//! reconcile lease released there and then, so the next incarnation takes
+//! the identity at once instead of waiting the lease out.
 
 use super::*;
 
@@ -64,7 +68,7 @@ impl MobActor {
     ) -> Result<(), Box<InlineShutdownTail>> {
         #[cfg(feature = "runtime-adapter")]
         if let Some(adapter) = self.runtime_adapter.clone() {
-            let (members, targets) = match self.shutdown_teardown_targets() {
+            let (members, bound, targets) = match self.shutdown_teardown_targets() {
                 Ok(targets) => targets,
                 Err(error) => {
                     return Err(Box::new(InlineShutdownTail {
@@ -97,11 +101,19 @@ impl MobActor {
             let command_tx = self.command_tx.clone();
             let mob_id = self.definition.id.clone();
             let ops_adapter = Arc::clone(&self.session_ops_adapter);
+            let lease_release = Arc::new(ShutdownLeaseRelease {
+                store: Arc::clone(&self.identity),
+                mob_id: mob_id.clone(),
+                holder_id: self.identity_reconcile_holder_id.clone(),
+                incarnation_id: self.identity_reconcile_incarnation_id.clone(),
+                members: bound,
+            });
             self.actor_io_tasks.spawn(async move {
                 let outcomes = futures::future::join_all(targets.into_iter().map(
                     |(session_id, retained)| {
                         let adapter = Arc::clone(&adapter);
                         let ops_adapter = Arc::clone(&ops_adapter);
+                        let lease_release = Arc::clone(&lease_release);
                         async move {
                             let outcome = teardown_session(
                                 &adapter,
@@ -121,6 +133,9 @@ impl MobActor {
                                 &session_id,
                                 meerkat_runtime::RunStartHoldReason::MobStop,
                             );
+                            if matches!(outcome, ShutdownUnregisterOutcome::Unregistered) {
+                                lease_release.release(&session_id, deadline).await;
+                            }
                             (session_id, outcome)
                         }
                     },
@@ -148,13 +163,16 @@ impl MobActor {
     /// The sessions Shutdown unregisters: bound members' sessions, the
     /// sessions of Retiring members (their binding moved to the machine's
     /// retire-pending map, including stuck and interrupted retirements), and
-    /// any unregister a previous attempt left with its coordinator.
+    /// any unregister a previous attempt left with its coordinator. Returns
+    /// every member by session, the bound members by session, and the
+    /// targets.
     #[cfg(feature = "runtime-adapter")]
     #[allow(clippy::type_complexity)]
     fn shutdown_teardown_targets(
         &mut self,
     ) -> Result<
         (
+            HashMap<SessionId, AgentIdentity>,
             HashMap<SessionId, AgentIdentity>,
             Vec<(
                 SessionId,
@@ -178,6 +196,7 @@ impl MobActor {
                 members.insert(parse(session_id)?, AgentIdentity::from(identity.0.as_str()));
             }
         }
+        let bound = members.clone();
         for (identity, runtime_id) in &state.identity_to_runtime {
             if state.member_placement.contains_key(identity) {
                 continue;
@@ -198,7 +217,7 @@ impl MobActor {
                 .into_iter()
                 .map(|(session_id, observer)| (session_id, Some(observer))),
         );
-        Ok((members, targets))
+        Ok((members, bound, targets))
     }
 
     /// Re-entry for a Shutdown parked on its runtime teardown.
@@ -262,6 +281,96 @@ impl MobActor {
             "mob shutdown step completed: session_runtime_bindings_torn_down"
         );
         Box::pin(self.finish_shutdown(prior.and(teardown), reply_tx, joined, command_rx)).await
+    }
+}
+
+/// Releases a bound member's identity reconcile lease once Shutdown's
+/// teardown unregistered the member's runtime.
+///
+/// The release is a compare-and-swap on the exact claim this incarnation
+/// holds: a lease another incarnation holds, or one renewed since it was
+/// read, stays. A Retiring member keeps its lease, and its retirement resumes
+/// under the next incarnation once the lease expires. So does a member whose
+/// unregister is still running at the deadline, and any lease a store error or
+/// the deadline leaves.
+#[cfg(feature = "runtime-adapter")]
+struct ShutdownLeaseRelease {
+    store: Arc<dyn crate::store::MobIdentityStore>,
+    mob_id: crate::ids::MobId,
+    holder_id: String,
+    incarnation_id: String,
+    /// The bound members, by session.
+    members: HashMap<SessionId, AgentIdentity>,
+}
+
+#[cfg(feature = "runtime-adapter")]
+impl ShutdownLeaseRelease {
+    /// Release the lease of `session_id`'s bound member, within `deadline`.
+    async fn release(&self, session_id: &SessionId, deadline: Instant) {
+        let Some(member) = self.members.get(session_id) else {
+            return;
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero()
+            || tokio::time::timeout(remaining, self.release_held_lease(member))
+                .await
+                .is_err()
+        {
+            tracing::warn!(
+                mob_id = %self.mob_id,
+                agent_identity = %member,
+                "shutdown deadline left the member's identity lease to expire on its own"
+            );
+        }
+    }
+
+    async fn release_held_lease(&self, member: &AgentIdentity) {
+        let active = match self
+            .store
+            .observe_identity_lease(&self.mob_id, member)
+            .await
+        {
+            Ok(crate::identity::IdentityStoredObservation::Valid(record)) => record.active,
+            Ok(_) => None,
+            Err(error) => {
+                tracing::warn!(
+                    mob_id = %self.mob_id,
+                    agent_identity = %member,
+                    error = %error,
+                    "shutdown could not read the member's identity lease; it expires on its own"
+                );
+                return;
+            }
+        };
+        let Some(claim) = active.filter(|claim| {
+            claim.holder_id == self.holder_id && claim.incarnation_id == self.incarnation_id
+        }) else {
+            return;
+        };
+        match self
+            .store
+            .release_identity_lease(&self.mob_id, member, &claim)
+            .await
+        {
+            Ok(true) => tracing::debug!(
+                mob_id = %self.mob_id,
+                agent_identity = %member,
+                lease_epoch = claim.epoch,
+                "shutdown released the unregistered member's identity lease"
+            ),
+            Ok(false) => tracing::debug!(
+                mob_id = %self.mob_id,
+                agent_identity = %member,
+                lease_epoch = claim.epoch,
+                "shutdown left an identity lease that changed since it was read"
+            ),
+            Err(error) => tracing::warn!(
+                mob_id = %self.mob_id,
+                agent_identity = %member,
+                error = %error,
+                "shutdown could not release the member's identity lease; it expires on its own"
+            ),
+        }
     }
 }
 
