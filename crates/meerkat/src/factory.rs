@@ -319,12 +319,6 @@ impl AssemblyConsequencePolicy {
     }
 }
 
-/// The resources a construction started that must be settled if it is not
-/// finished, armed from the moment the construction first owns each (before
-/// any of its startup awaits) until a finished agent owns them. Dropped while
-/// armed, it spawns each owner's shutdown on the runtime the construction
-/// armed it on; [`Self::settle`] awaits that shutdown and stays armed until it
-/// completes, so a settle that is itself abandoned still hands it on.
 /// A trusted host's composition of one construction's own MCP router adapter.
 ///
 /// Called once per construction that creates a router for its configured MCP
@@ -391,6 +385,12 @@ pub trait McpAdapterCustody: Send + Sync {
 #[error("MCP adapter custody is closed")]
 pub struct McpAdapterCustodyClosed;
 
+/// The resources a construction started that must be settled if it is not
+/// finished, armed from the moment the construction first owns each (before
+/// any of its startup awaits) until a finished agent owns them. Dropped while
+/// armed, it spawns each owner's shutdown on the runtime the construction
+/// armed it on; [`Self::settle`] awaits that shutdown and stays armed until it
+/// completes, so a settle that is itself abandoned still hands it on.
 #[derive(Default)]
 struct ConstructionCleanup {
     #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
