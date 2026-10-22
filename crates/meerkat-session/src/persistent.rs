@@ -30265,6 +30265,383 @@ mod tests {
         );
     }
 
+    /// A session whose committed boundary already carries a compaction, and
+    /// whose next run compacts again before the crash: the first rewrite
+    /// after the boundary advances from the boundary's own rows (not from an
+    /// anchor), and recovery proves exactly that.
+    #[tokio::test]
+    async fn a_crash_tail_that_compacted_again_after_an_earlier_compaction_is_recovered() {
+        let (_directory, service, checkpointer, committed) = retention_checkpoint_fixture().await;
+        let id = committed.id().clone();
+        let retention = meerkat_core::TranscriptHistoryRetention::from_count(4).unwrap();
+        let mut session = committed;
+        compact_and_retire(&mut session, 0, retention);
+        let mut session = service
+            .persist_detached_head_canonical_session(session, "earlier compacting run")
+            .await
+            .expect("the earlier run commits its compaction");
+        session.push(user_message("a row the later run committed nothing for"));
+        let run_id = RunId::new();
+        compact_and_retire(&mut session, 1, retention);
+        session.push(run_stamped_assistant(
+            &run_id,
+            vec![meerkat_core::AssistantBlock::Text {
+                text: "answer after the second compaction".to_string(),
+                meta: None,
+            }],
+            StopReason::EndTurn,
+        ));
+        meerkat_core::SessionCheckpointer::checkpoint_run(
+            &checkpointer,
+            &mut session,
+            &run_id,
+            None,
+        )
+        .await
+        .expect("the later run's checkpoint")
+        .expect("a provisional successor");
+        assert_eq!(physical_rewrite_count(&service, &id).await, 2);
+
+        let recovery = service
+            .recover_committed_boundary(&id)
+            .await
+            .expect("the second compaction's crash tail is recoverable");
+        assert!(
+            matches!(
+                recovery,
+                CommittedBoundaryRecovery::Recovered { message_count }
+                    if message_count == session.messages().len()
+            ),
+            "{recovery:?}"
+        );
+    }
+
+    /// The store's proof that a rewritten head descends from its boundary
+    /// checks that the first rewrite after the boundary advanced from the
+    /// boundary's exact rows. Real heads from the store: the boundary the run
+    /// started on, and the provisional head its compacting checkpoint wrote.
+    #[tokio::test]
+    async fn the_first_rewrite_after_a_boundary_must_advance_from_its_exact_rows() {
+        let (_directory, service, checkpointer, committed) = retention_checkpoint_fixture().await;
+        let id = committed.id().clone();
+        let retention = meerkat_core::TranscriptHistoryRetention::from_count(4).unwrap();
+        let mut session = committed;
+        compact_and_retire(&mut session, 0, retention);
+        let mut session = service
+            .persist_detached_head_canonical_session(session, "earlier compacting run")
+            .await
+            .expect("the earlier run commits its compaction");
+        session.push(user_message("a committed row before the run"));
+        let mut session = service
+            .persist_detached_head_canonical_session(session, "boundary")
+            .await
+            .expect("the boundary commits");
+        let incremental = service.incremental.as_ref().unwrap();
+        let boundary = incremental
+            .load_head(&id)
+            .await
+            .unwrap()
+            .expect("boundary head");
+        let run_id = RunId::new();
+        compact_and_retire(&mut session, 1, retention);
+        meerkat_core::SessionCheckpointer::checkpoint_run(
+            &checkpointer,
+            &mut session,
+            &run_id,
+            None,
+        )
+        .await
+        .expect("the compacting run's checkpoint")
+        .expect("a provisional successor");
+        let physical = incremental
+            .load_head(&id)
+            .await
+            .unwrap()
+            .expect("physical head");
+        let history = session
+            .validated_transcript_history_state()
+            .unwrap()
+            .expect("the run's graph");
+
+        meerkat_core::session_store::prove_rewrite_descent_from_boundary(
+            &boundary, &physical, &history,
+        )
+        .expect("the store-written head descends from its boundary");
+
+        let mut foreign = boundary.clone();
+        foreign.message_row_prefix = physical.message_row_prefix.clone();
+        let error = meerkat_core::session_store::prove_rewrite_descent_from_boundary(
+            &foreign, &physical, &history,
+        )
+        .expect_err("rows the first rewrite did not advance from are no ancestor");
+        assert!(
+            matches!(
+                error,
+                SessionStoreError::TranscriptContinuityViolation { .. }
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// A fresh service over the retention fixture's stores, as a host that
+    /// restarted (or upgraded) opens them.
+    fn reopen_retention_fixture(
+        directory: &std::path::Path,
+    ) -> PersistentSessionService<DummyBuilder> {
+        let database_path = directory.join("runtime.sqlite3");
+        let runtime_store = Arc::new(
+            meerkat_runtime::SqliteRuntimeStore::new_head_canonical(&database_path).unwrap(),
+        );
+        let store = Arc::new(meerkat_store::SqliteSessionStore::open(&database_path).unwrap());
+        PersistentSessionService::new(DummyBuilder, 4, store, runtime_store, memory_blob_store())
+    }
+
+    fn completed_after_compaction(session: &mut Session, run_id: &RunId) {
+        session.push(run_stamped_assistant(
+            run_id,
+            vec![meerkat_core::AssistantBlock::Text {
+                text: "answer after the compaction".to_string(),
+                meta: None,
+            }],
+            StopReason::EndTurn,
+        ));
+    }
+
+    fn interrupted_after_compaction(session: &mut Session, run_id: &RunId) {
+        session.push(run_stamped_assistant(
+            run_id,
+            vec![meerkat_core::AssistantBlock::ToolUse {
+                id: "call-after-compaction".to_string(),
+                name: "probe".into(),
+                args: serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
+                meta: None,
+            }],
+            StopReason::ToolUse,
+        ));
+        session.push(Message::ToolResults {
+            results: vec![ToolResult::new(
+                "call-after-compaction".to_string(),
+                "ok".to_string(),
+                false,
+            )],
+            created_at: std::time::SystemTime::UNIX_EPOCH.into(),
+        });
+    }
+
+    /// The upgrade path: a host died in a compacting run's save window and
+    /// left the durable state the earlier releases could not recover. A host
+    /// opened over the same stores resumes the session through the ordinary
+    /// resume preparation, with no repair step, and serves the recovered run.
+    #[tokio::test]
+    async fn a_session_left_unresumable_by_a_compacting_crash_resumes_after_restart() {
+        let (directory, service, id, physical) =
+            compacted_crash_tail(completed_after_compaction).await;
+        drop(service);
+
+        let restarted = reopen_retention_fixture(directory.path());
+        let resume = restarted
+            .prepare_committed_boundary_resume(&id)
+            .await
+            .expect("the resume preparation recovers the tail");
+        assert!(
+            !matches!(
+                resume,
+                PreparedCommittedBoundaryResume::CommittedBoundaryUnprovable { .. }
+            ),
+            "the session is resumable, not held"
+        );
+        let committed = restarted
+            .load_committed_runtime_session_for_body(&id, "after the restart")
+            .await
+            .unwrap()
+            .expect("the recovered committed head");
+        assert_eq!(
+            meerkat_core::transcript_messages_digest(committed.messages()).unwrap(),
+            meerkat_core::transcript_messages_digest(physical.messages()).unwrap(),
+            "the run the host was saving is the session's committed boundary"
+        );
+    }
+
+    /// Recovery commits no rewrite: the recovered boundary keeps the store's
+    /// rewrite rows and the head's rewrite witness exactly, and the committed
+    /// head carries no inline transcript history.
+    #[tokio::test]
+    async fn recovering_a_compacted_tail_leaves_its_rewrites_as_they_were() {
+        for (label, tail) in [
+            (
+                "completed",
+                completed_after_compaction as fn(&mut Session, &RunId),
+            ),
+            ("interrupted", interrupted_after_compaction),
+        ] {
+            let (_directory, service, id, _physical) = compacted_crash_tail(tail).await;
+            let incremental = service.incremental.as_ref().unwrap();
+            let before_head = incremental.load_head(&id).await.unwrap().expect("head");
+            let before_rewrites = incremental.load_rewrites(&id).await.unwrap();
+
+            service
+                .recover_committed_boundary(&id)
+                .await
+                .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+
+            let after_head = incremental.load_head(&id).await.unwrap().expect("head");
+            let after_rewrites = incremental.load_rewrites(&id).await.unwrap();
+            assert_eq!(
+                after_head.rewrite_count, before_head.rewrite_count,
+                "{label}"
+            );
+            assert_eq!(
+                after_head.rewrite_prefix, before_head.rewrite_prefix,
+                "{label}"
+            );
+            assert_eq!(after_head.graph_prefix, before_head.graph_prefix, "{label}");
+            assert_eq!(
+                after_rewrites
+                    .iter()
+                    .map(|record| record.commit.clone())
+                    .collect::<Vec<_>>(),
+                before_rewrites
+                    .iter()
+                    .map(|record| record.commit.clone())
+                    .collect::<Vec<_>>(),
+                "{label}: the store's rewrite occurrences are unchanged"
+            );
+            assert!(
+                !after_head
+                    .metadata
+                    .contains_key(meerkat_core::SESSION_TRANSCRIPT_HISTORY_STATE_KEY),
+                "{label}: the committed head carries no inline transcript history"
+            );
+        }
+    }
+
+    /// Two hosts recovering the same durable rows independently mint the same
+    /// recovered boundary.
+    #[tokio::test]
+    async fn independent_recoveries_of_a_compacted_tail_agree() {
+        for (label, tail) in [
+            (
+                "completed",
+                completed_after_compaction as fn(&mut Session, &RunId),
+            ),
+            ("interrupted", interrupted_after_compaction),
+        ] {
+            let (directory, service, id, _physical) = compacted_crash_tail(tail).await;
+            drop(service);
+            let copy = tempfile::Builder::new()
+                .prefix(".retention-checkpoint-copy-")
+                .tempdir_in(".")
+                .unwrap();
+            for suffix in ["", "-wal", "-shm"] {
+                let source = directory.path().join(format!("runtime.sqlite3{suffix}"));
+                if source.exists() {
+                    std::fs::copy(
+                        &source,
+                        copy.path().join(format!("runtime.sqlite3{suffix}")),
+                    )
+                    .unwrap();
+                }
+            }
+            let mut tokens = Vec::new();
+            for root in [directory.path(), copy.path()] {
+                let host = reopen_retention_fixture(root);
+                host.recover_committed_boundary(&id)
+                    .await
+                    .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                let head = host
+                    .incremental
+                    .as_ref()
+                    .unwrap()
+                    .load_head(&id)
+                    .await
+                    .unwrap()
+                    .expect("head");
+                tokens.push(session_head_cas_token(&head).unwrap());
+            }
+            assert_eq!(tokens[0], tokens[1], "{label}: one recovered boundary");
+        }
+    }
+
+    /// A compaction can leave the physical transcript shorter than the
+    /// boundary the run started on. Recovery reads the run's tail from the
+    /// rewrite's endpoint, never from the boundary's message count.
+    #[tokio::test]
+    async fn an_interrupted_tail_shorter_than_its_boundary_is_closed_as_interrupted() {
+        let (_directory, service, checkpointer, committed) = retention_checkpoint_fixture().await;
+        let id = committed.id().clone();
+        let mut session = committed;
+        for row in 0..8 {
+            session.push(user_message(&format!("committed row {row}")));
+        }
+        let mut session = service
+            .persist_detached_head_canonical_session(session, "long boundary")
+            .await
+            .expect("the boundary commits");
+        let boundary_len = session.messages().len();
+        let run_id = RunId::new();
+        compact_and_retire(
+            &mut session,
+            0,
+            meerkat_core::TranscriptHistoryRetention::from_count(4).unwrap(),
+        );
+        interrupted_after_compaction(&mut session, &run_id);
+        assert!(
+            session.messages().len() < boundary_len,
+            "the compacted tail is shorter than its boundary"
+        );
+        meerkat_core::SessionCheckpointer::checkpoint_run(
+            &checkpointer,
+            &mut session,
+            &run_id,
+            None,
+        )
+        .await
+        .expect("the compacting run's checkpoint")
+        .expect("a provisional successor");
+
+        let recovery = service
+            .recover_committed_boundary(&id)
+            .await
+            .expect("a shorter compacted tail recovers");
+        assert!(
+            matches!(
+                recovery,
+                CommittedBoundaryRecovery::Recovered { message_count }
+                    if message_count == session.messages().len() + 1
+            ),
+            "{recovery:?}"
+        );
+    }
+
+    /// The rows a run wrote after its rewrite must carry that run's identity.
+    /// A row stamped with another run contradicts the store-issued
+    /// provisional, and recovery refuses it.
+    #[tokio::test]
+    async fn a_compacted_tail_stamped_with_another_run_is_refused() {
+        let (_directory, service, id, _physical) = compacted_crash_tail(|session, _run_id| {
+            session.push(run_stamped_assistant(
+                &RunId::new(),
+                vec![meerkat_core::AssistantBlock::Text {
+                    text: "a row from another run".to_string(),
+                    meta: None,
+                }],
+                StopReason::EndTurn,
+            ));
+        })
+        .await;
+
+        let error = service
+            .recover_committed_boundary(&id)
+            .await
+            .expect_err("a tail that contradicts its run identity is refused");
+        assert!(
+            error
+                .to_string()
+                .contains("store-issued provisional run identity"),
+            "{error}"
+        );
+    }
+
     /// A compacting run's crash tail whose transcript holds nothing the run
     /// wrote after its rewrite carries no run identity: rewrite occurrences
     /// have none. Recovery holds it, typed, and never answers with an

@@ -514,6 +514,21 @@ fn repair_interrupted_tail(
     Ok(())
 }
 
+/// The relation the durable-tail classifier receives: the store's proof,
+/// mapped one to one. The relation is never assumed: an unproven rewrite is
+/// classified as unverifiable, never as a strict continuation.
+fn classifier_relation(source: DurableTailSourceRelation) -> DurableHeadRelation {
+    match source {
+        DurableTailSourceRelation::StrictContinuation => {
+            DurableHeadRelation::VerifiedStrictDescendant
+        }
+        DurableTailSourceRelation::RewriteDescendant { .. } => {
+            DurableHeadRelation::VerifiedRewriteDescendant
+        }
+        DurableTailSourceRelation::UnprovenRewrite => DurableHeadRelation::Unverifiable,
+    }
+}
+
 /// How a recovery source's transcript history differs from the rewrite
 /// witness of the store-issued physical head it was materialized from, if it
 /// does. The head is the authority: values are never derived from the
@@ -632,7 +647,8 @@ fn prepare_head_canonical_recovery_candidate(
     // continuation keeps the boundary's rows as a prefix; a run that
     // compacted rewrote them, and its rows after the final rewrite are the
     // tail the classifier observes.
-    let (relation, tail_base) = match source.relation() {
+    let relation = classifier_relation(source.relation());
+    let tail_base = match source.relation() {
         DurableTailSourceRelation::StrictContinuation => {
             if physical_head.messages().len() <= committed_authority.messages().len()
                 || !physical_head
@@ -644,10 +660,7 @@ fn prepare_head_canonical_recovery_candidate(
                         .to_string(),
                 ));
             }
-            (
-                DurableHeadRelation::VerifiedStrictDescendant,
-                committed_authority.messages().len(),
-            )
+            committed_authority.messages().len()
         }
         DurableTailSourceRelation::RewriteDescendant { live_tail_base } => {
             if live_tail_base > physical_head.messages().len() {
@@ -655,15 +668,9 @@ fn prepare_head_canonical_recovery_candidate(
                     "rewrite descent live-tail base exceeds the physical transcript".to_string(),
                 ));
             }
-            (
-                DurableHeadRelation::VerifiedRewriteDescendant,
-                live_tail_base,
-            )
+            live_tail_base
         }
-        DurableTailSourceRelation::UnprovenRewrite => (
-            DurableHeadRelation::Unverifiable,
-            physical_head.messages().len(),
-        ),
+        DurableTailSourceRelation::UnprovenRewrite => physical_head.messages().len(),
     };
 
     let derived_physical_head_token = source.physical_head_cas_token().to_string();
@@ -2519,5 +2526,130 @@ mod store_authority_tests {
             Err(DurableTailRecoveryError::InvalidEvidence(detail))
                 if detail.contains("store-issued run identity")
         ));
+    }
+}
+
+#[cfg(test)]
+mod physical_history_witness_tests {
+    use super::physical_history_witness_mismatch;
+    use meerkat_core::session_store::{SessionHead, TranscriptStrandId};
+    use meerkat_core::types::UserMessage;
+    use meerkat_core::{
+        Message, Session, TranscriptRewriteReason, TranscriptRewriteSelection,
+        ValidatedTranscriptHistory,
+    };
+
+    /// A session after `compactions` compaction-shaped rewrites, its graph
+    /// and the head a store writes for it.
+    #[allow(clippy::expect_used)]
+    fn compacted(compactions: u64, label: &str) -> (ValidatedTranscriptHistory, SessionHead) {
+        let mut session = Session::new();
+        for compaction in 0..compactions {
+            session.push(Message::User(UserMessage::text(format!(
+                "{label} row {compaction}"
+            ))));
+            let end = session.messages().len();
+            session
+                .commit_transcript_rewrite(
+                    TranscriptRewriteSelection::MessageRange { start: 0, end },
+                    vec![Message::User(UserMessage::text(format!(
+                        "{label} summary {compaction}"
+                    )))],
+                    TranscriptRewriteReason::new("test compaction"),
+                    Some("unit-test".to_string()),
+                    None,
+                )
+                .expect("compaction-shaped rewrite");
+        }
+        let history = session
+            .validated_transcript_history_state()
+            .expect("graph decodes")
+            .expect("graph present");
+        let head = SessionHead::from_session(&session, TranscriptStrandId::root(), compactions)
+            .expect("head");
+        (history, head)
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn a_physical_graph_matching_its_head_is_its_witness() {
+        let (history, head) = compacted(2, "own");
+        assert_eq!(
+            physical_history_witness_mismatch(Some(&history), &head),
+            None
+        );
+        let plain = SessionHead::from_session(&Session::new(), TranscriptStrandId::root(), 0)
+            .expect("head without rewrites");
+        assert_eq!(physical_history_witness_mismatch(None, &plain), None);
+    }
+
+    #[test]
+    fn a_graph_whose_occurrence_count_is_not_the_heads_is_refused() {
+        let (history, mut head) = compacted(2, "own");
+        head.rewrite_count = 3;
+        assert_eq!(
+            physical_history_witness_mismatch(Some(&history), &head),
+            Some("the graph's occurrence count differs from the head's rewrite count")
+        );
+    }
+
+    #[test]
+    fn a_graph_whose_rewrite_prefix_is_not_the_heads_is_refused() {
+        let (history, mut head) = compacted(2, "own");
+        let (_, foreign) = compacted(2, "foreign");
+        head.rewrite_prefix = foreign.rewrite_prefix;
+        assert_eq!(
+            physical_history_witness_mismatch(Some(&history), &head),
+            Some("the graph's rewrite prefix differs from the head's")
+        );
+    }
+
+    #[test]
+    fn a_graph_whose_prefix_is_not_the_heads_graph_prefix_is_refused() {
+        let (history, mut head) = compacted(2, "own");
+        let (_, foreign) = compacted(2, "foreign");
+        head.graph_prefix = foreign.graph_prefix;
+        assert_eq!(
+            physical_history_witness_mismatch(Some(&history), &head),
+            Some("the graph's prefix differs from the head's graph prefix")
+        );
+    }
+
+    #[test]
+    fn a_head_with_rewrites_and_no_graph_is_refused() {
+        let (_, head) = compacted(1, "own");
+        assert_eq!(
+            physical_history_witness_mismatch(None, &head),
+            Some("the head has rewrite occurrences but no graph")
+        );
+    }
+
+    #[test]
+    fn a_head_without_rewrites_carrying_a_graph_is_refused() {
+        let (history, mut head) = compacted(1, "own");
+        head.rewrite_count = 0;
+        assert_eq!(
+            physical_history_witness_mismatch(Some(&history), &head),
+            Some("the head has no rewrite occurrences but the source carries a graph")
+        );
+    }
+
+    #[test]
+    fn the_classifier_relation_is_the_stores_proof() {
+        use super::{DurableTailSourceRelation, classifier_relation};
+        use meerkat_core::session_document::DurableHeadRelation;
+        assert_eq!(
+            classifier_relation(DurableTailSourceRelation::StrictContinuation),
+            DurableHeadRelation::VerifiedStrictDescendant
+        );
+        assert_eq!(
+            classifier_relation(DurableTailSourceRelation::RewriteDescendant { live_tail_base: 3 }),
+            DurableHeadRelation::VerifiedRewriteDescendant
+        );
+        assert_eq!(
+            classifier_relation(DurableTailSourceRelation::UnprovenRewrite),
+            DurableHeadRelation::Unverifiable,
+            "an unproven rewrite is never classified as a strict continuation"
+        );
     }
 }

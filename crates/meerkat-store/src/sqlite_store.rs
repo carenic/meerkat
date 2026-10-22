@@ -13000,6 +13000,76 @@ mod tests {
     /// each compaction. HeadCanonical persistence must keep committing the
     /// pending occurrence from the re-anchored graph, and a cold load replays
     /// the store's whole graph with the same rolling identity.
+    /// The store's proof that a rewritten physical head descends from a
+    /// runtime boundary: the head written over a boundary by a compacting
+    /// mutation descends from it, and the run's rows after the rewrite start
+    /// at the rewrite's endpoint. A boundary whose rewrite prefix the
+    /// persisted rewrite rows do not bridge is unproven, which the caller
+    /// holds, not a store error.
+    #[tokio::test]
+    async fn a_rewritten_head_descends_from_the_head_it_was_written_over() {
+        let (dir, store) = temp_store();
+        let incremental = incremental(&store);
+        let mut session = Session::new();
+        for turn in 0..3 {
+            session.push(user(&format!("seed {turn}")));
+        }
+        let root = PreparedHeadCanonicalMutation::prepare_root(&session).expect("prepare root");
+        incremental
+            .apply_prepared_head_canonical_mutation(&root)
+            .await
+            .expect("persist root");
+        root.acknowledge_session(&mut session, root.successor_head_token())
+            .expect("acknowledge root");
+        let boundary = root.successor_head().clone();
+        session.push(user("run row"));
+        let end = session.messages().len();
+        session
+            .commit_transcript_rewrite(
+                TranscriptRewriteSelection::MessageRange { start: 0, end },
+                vec![user("summary")],
+                TranscriptRewriteReason::new("compaction"),
+                Some("unit-test".to_string()),
+                None,
+            )
+            .expect("commit rewrite");
+        session.push(user("after the rewrite"));
+        let rewrite = PreparedHeadCanonicalRewriteMutation::prepare_intra_turn(
+            &session,
+            &boundary,
+            boundary.clone(),
+        )
+        .expect("prepare the compacting checkpoint");
+        incremental
+            .apply_prepared_head_canonical_rewrite_mutation(&rewrite)
+            .await
+            .expect("persist the compacting checkpoint");
+        let physical = rewrite.successor_head().clone();
+
+        let mut conn = Connection::open(dir.path().join("sessions.sqlite3")).expect("open");
+        let tx = conn.transaction().expect("read transaction");
+        let descent =
+            verify_physical_head_rewrite_descent_for_runtime_in_txn(&tx, &boundary, &physical)
+                .expect("the store reads both heads");
+        assert_eq!(
+            descent.verdict(),
+            &RewriteDescentVerdict::Proven {
+                live_tail_base: physical.message_count - 1
+            }
+        );
+
+        let mut unbridged = boundary.clone();
+        unbridged.rewrite_prefix = physical.rewrite_prefix.clone();
+        let descent =
+            verify_physical_head_rewrite_descent_for_runtime_in_txn(&tx, &unbridged, &physical)
+                .expect("an unproven descent is a verdict, not a store error");
+        assert!(
+            matches!(descent.verdict(), RewriteDescentVerdict::Unproven { .. }),
+            "{:?}",
+            descent.verdict()
+        );
+    }
+
     #[tokio::test]
     async fn head_canonical_persistence_survives_in_memory_history_retirement() {
         let (_dir, store) = temp_store();

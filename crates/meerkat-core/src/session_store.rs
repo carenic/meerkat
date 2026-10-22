@@ -8586,6 +8586,119 @@ mod tests {
         (session, head)
     }
 
+    /// One compaction-shaped rewrite of everything so far down to a summary.
+    fn compact_all(session: &mut Session, label: &str) {
+        let end = session.messages().len();
+        session
+            .commit_transcript_rewrite(
+                TranscriptRewriteSelection::MessageRange { start: 0, end },
+                vec![Message::User(UserMessage::text(format!("summary {label}")))],
+                crate::TranscriptRewriteReason::new("test compaction"),
+                Some("unit-test".to_string()),
+                None,
+            )
+            .expect("compaction-shaped rewrite");
+    }
+
+    /// A committed boundary and a later physical head of the same session
+    /// whose run appended rows and compacted (rewriting rows the boundary
+    /// holds), then appended one more row. `earlier_compactions` rewrites
+    /// happen before the boundary.
+    #[allow(clippy::expect_used)]
+    fn rewritten_successor(
+        earlier_compactions: usize,
+    ) -> (SessionHead, SessionHead, ValidatedTranscriptHistory) {
+        let mut boundary = Session::new();
+        for compaction in 0..earlier_compactions {
+            boundary.push(Message::User(UserMessage::text(format!(
+                "early {compaction}"
+            ))));
+            compact_all(&mut boundary, &format!("early {compaction}"));
+        }
+        boundary.push(Message::User(UserMessage::text(
+            "committed row".to_string(),
+        )));
+        let boundary_head = SessionHead::from_session(
+            &boundary,
+            TranscriptStrandId::root(),
+            u64::try_from(earlier_compactions).expect("small count"),
+        )
+        .expect("boundary head");
+
+        let mut physical = boundary.clone();
+        physical.push(Message::User(UserMessage::text("run row".to_string())));
+        compact_all(&mut physical, "run");
+        physical.push(Message::User(UserMessage::text(
+            "after the rewrite".to_string(),
+        )));
+        let history = physical
+            .validated_transcript_history_state()
+            .expect("graph decodes")
+            .expect("graph present");
+        let physical_head = SessionHead::from_session(
+            &physical,
+            TranscriptStrandId::root(),
+            u64::try_from(earlier_compactions + 1).expect("small count"),
+        )
+        .expect("physical head");
+        (boundary_head, physical_head, history)
+    }
+
+    /// The physical graph's rolling prefix at the boundary's generation must
+    /// be the boundary's own.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn a_boundary_whose_graph_prefix_the_physical_graph_does_not_hold_is_refused() {
+        let (mut boundary, physical, history) = rewritten_successor(2);
+        boundary.graph_prefix = physical.graph_prefix.clone();
+        let error = prove_rewrite_descent_from_boundary(&boundary, &physical, &history)
+            .expect_err("a foreign graph prefix is no ancestor");
+        assert!(
+            matches!(error, SessionStoreError::InvalidTranscriptRewrite { .. }),
+            "{error:?}"
+        );
+    }
+
+    /// A physical graph that retired the boundary's generation no longer
+    /// holds the occurrence that advanced from the boundary.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn a_boundary_below_the_physical_retention_cut_is_refused() {
+        let (boundary, mut physical, _history) = rewritten_successor(2);
+        let mut session = Session::new();
+        for compaction in 0..2 {
+            session.push(Message::User(UserMessage::text(format!(
+                "early {compaction}"
+            ))));
+            compact_all(&mut session, &format!("early {compaction}"));
+        }
+        session.push(Message::User(UserMessage::text(
+            "committed row".to_string(),
+        )));
+        session.push(Message::User(UserMessage::text("run row".to_string())));
+        compact_all(&mut session, "run");
+        session.push(Message::User(UserMessage::text(
+            "after the rewrite".to_string(),
+        )));
+        session
+            .retire_transcript_history(
+                crate::TranscriptHistoryRetention::from_count(1).expect("non-zero retention"),
+            )
+            .expect("retire");
+        let retired = session
+            .validated_transcript_history_state()
+            .expect("graph decodes")
+            .expect("graph present");
+        assert_eq!(retired.state().retired_count(), 2);
+        physical.rewrite_prefix = retired.rewrite_prefix().clone();
+        let error = prove_rewrite_descent_from_boundary(&boundary, &physical, &retired)
+            .expect_err("a retired boundary generation is unprovable");
+        assert!(
+            matches!(error, SessionStoreError::InvalidTranscriptRewrite { .. }),
+            "{error:?}"
+        );
+    }
+
     /// A session materialized from a durable head records the rewrite
     /// occurrences that head covers as its retirement cap; a clone keeps it
     /// and a fork, which has no durable head of its own, does not.
