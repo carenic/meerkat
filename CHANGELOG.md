@@ -495,6 +495,18 @@ them.
   refusal carries `error.data.detail` `remote_custody_required` and leaves
   the attempt pending. `iss` stays MCP-only.
 
+- `meerkat-runtime`: a browser OAuth completion on another redirect than the
+  one its attempt was started on is refused as the caller's mismatched
+  attempt (`OAuthFlowError::RedirectUriMismatch`: wire reason
+  `attempt_mismatch`, RPC `INVALID_PARAMS`, REST 400), not as a flow-owner
+  lifecycle failure (wire reason `infrastructure`, RPC `INTERNAL_ERROR`, REST
+  500) that a host would retry. The runtime's flow owner checks a completion
+  against the attempt its AuthMachine admitted, which refused another
+  redirect only as a rejected transition; the machine's own record of the
+  attempt now tells that case apart. This covers a loopback MCP login and a
+  provider browser login; a completion for another provider keeps its
+  lifecycle rejection.
+
 ## [0.9.4] - 2026-10-20
 
 ### Breaking

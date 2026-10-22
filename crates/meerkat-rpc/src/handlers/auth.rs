@@ -6905,6 +6905,54 @@ mod tests {
             );
         }
     }
+
+    /// A loopback completion on another redirect than the one its start
+    /// admitted is the caller's attempt mismatch (`INVALID_PARAMS`, reason
+    /// `attempt_mismatch`), not an infrastructure fault a host would retry.
+    #[tokio::test]
+    async fn mcp_loopback_completion_on_another_redirect_is_an_attempt_mismatch() {
+        use meerkat::test_fixtures::mcp_oauth::{CODE_CANARY, McpOAuthFixture};
+
+        let fixture = McpOAuthFixture::spawn().await.unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let (runtime, mcp) = registered_callback_runtime(&fixture, &project, None);
+        let started = rpc_result(
+            handle_auth_login_start(
+                Some(RpcId::Num(1)),
+                Some(
+                    raw_params(serde_json::json!({
+                        "mcp": mcp,
+                        "redirect_uri": "http://127.0.0.1:1/mcp/oauth/callback",
+                    }))
+                    .as_ref(),
+                ),
+                &runtime,
+            )
+            .await,
+        );
+        let refused = handle_auth_login_complete(
+            Some(RpcId::Num(2)),
+            Some(
+                raw_params(serde_json::json!({
+                    "mcp": mcp,
+                    "code": CODE_CANARY,
+                    "state": started["state"],
+                    "redirect_uri": "http://127.0.0.1:2/mcp/oauth/callback",
+                }))
+                .as_ref(),
+            ),
+            &runtime,
+        )
+        .await;
+        assert_eq!(
+            refused.error.as_ref().map(|error| error.code),
+            Some(error::INVALID_PARAMS),
+            "{refused:?}"
+        );
+        let data = auth_error_data(&refused);
+        assert_eq!(data["reason"], "attempt_mismatch", "{data}");
+        assert!(data.get("detail").is_none(), "{data}");
+    }
 }
 #[cfg(test)]
 fn credential_identity(binding: &AuthBindingRef) -> meerkat_core::AuthCredentialIdentity {
