@@ -6635,8 +6635,13 @@ impl SessionBackend {
 
         // The turn's outcome is its input's terminal, not a failed attempt
         // the runtime still retries.
-        let completion =
-            wait_for_runtime_input_terminal(adapter, session_id, &canonical_input_id, handle).await;
+        let (completion, input_terminal) =
+            match wait_for_runtime_input_terminal(adapter, session_id, &canonical_input_id, handle)
+                .await
+            {
+                Ok((outcome, input_terminal)) => (Ok(outcome), input_terminal),
+                Err(error) => (Err(error), None),
+            };
         drop(queued_context);
         let delivery_outcome = deferred_turn_outcome_from_completion(&completion);
         let committed_projection = enqueue_committed_parent_projection_after_runtime_completion(
@@ -6648,7 +6653,12 @@ impl SessionBackend {
         )
         .await;
         observe_committed_parent_projection_result(session_id, &committed_projection);
-        let result = runtime_completion_to_mob_result(session_id, completion);
+        let result = runtime_completion_to_mob_result(
+            session_id,
+            &canonical_input_id,
+            completion,
+            input_terminal.as_ref(),
+        );
         if let Some(delivery) = deferred_delivery {
             delivery.release(delivery_outcome);
         }
@@ -6917,22 +6927,38 @@ impl SessionBackend {
                                 input_id: input_id.clone(),
                             })
                         });
+                    // A replay of an input the next start ended as an expired
+                    // requeue is answered from its committed terminal, typed,
+                    // whatever its public completion reads.
+                    let requeue_expired = !matches!(
+                        &result,
+                        Ok(meerkat_runtime::completion::CompletionOutcome::Completed(_)
+                            | meerkat_runtime::completion::CompletionOutcome::CompletedWithoutResult)
+                    ) && replayed_input_requeue_expired(adapter, session_id, input_id).await;
                     if let Some(delivery) = deferred_delivery {
                         let outcome = match &result {
-                            Ok(completion) => {
+                            Ok(completion) if !requeue_expired => {
                                 deferred_turn_outcome_from_completion(&Ok(completion.clone()))
                             }
-                            Err(_) => DeferredTurnEventOutcome::Failed,
+                            Ok(_) | Err(_) => DeferredTurnEventOutcome::Failed,
                         };
                         delivery.release(outcome);
                     }
                     if let Some(completion_tx) = completion_tx {
-                        let _ = completion_tx.send(result.map(|terminal| {
-                            super::handle::ExactTurnCompletion {
+                        let completion = if requeue_expired {
+                            Ok(super::handle::ExactTurnCompletion {
+                                session_id: session_id.clone(),
+                                terminal: super::handle::ExactTurnTerminal::RequeueExpired {
+                                    input_id: input_id.clone(),
+                                },
+                            })
+                        } else {
+                            result.map(|terminal| super::handle::ExactTurnCompletion {
                                 session_id: session_id.clone(),
                                 terminal: super::handle::ExactTurnTerminal::Runtime(terminal),
-                            }
-                        }));
+                            })
+                        };
+                        let _ = completion_tx.send(completion);
                     }
                     return Ok(admission);
                 }
@@ -6951,10 +6977,23 @@ impl SessionBackend {
             };
 
             let completion_session_id = session_id.clone();
+            let completion_input_id = admission.as_ref().map_or_else(
+                || requested_input_id.clone(),
+                |admitted| admitted.input_id.clone(),
+            );
             let completion_adapter = Arc::clone(adapter);
             let completion_session_service = Arc::clone(&self.session_service);
             tokio::spawn(async move {
-                let completion = handle.wait().await;
+                // The committed terminal comes with the outcome, so a typed
+                // terminal (an expired requeue) is answered from it.
+                let (completion, input_terminal) =
+                    match handle.try_wait_with_terminal_outcome().await {
+                        Ok(observation) => {
+                            let (outcome, input_terminal) = observation.into_parts();
+                            (Ok(outcome), input_terminal)
+                        }
+                        Err(error) => (Err(error), None),
+                    };
                 drop(queued_context);
                 let delivery_outcome = deferred_turn_outcome_from_completion(&completion);
                 let committed_projection =
@@ -6966,7 +7005,12 @@ impl SessionBackend {
                         &completion,
                     )
                     .await;
-                let result = runtime_completion_to_exact_turn(&completion_session_id, completion);
+                let result = runtime_completion_to_exact_turn(
+                    &completion_session_id,
+                    &completion_input_id,
+                    completion,
+                    input_terminal.as_ref(),
+                );
                 observe_committed_parent_projection_result(
                     &completion_session_id,
                     &committed_projection,
@@ -6996,6 +7040,10 @@ impl SessionBackend {
 /// answered the input (a terminal without a receipt), when the runtime no
 /// longer holds it or its live registration, or when it is parked, the
 /// failed attempt stays the last outcome observed.
+///
+/// The input's committed terminal comes with the outcome when the wait
+/// observed it, so a caller answers a typed terminal (an expired requeue)
+/// from it rather than from the outcome's reason text.
 #[cfg(feature = "runtime-adapter")]
 async fn wait_for_runtime_input_terminal(
     adapter: &MeerkatMachine,
@@ -7003,7 +7051,10 @@ async fn wait_for_runtime_input_terminal(
     input_id: &InputId,
     handle: meerkat_runtime::completion::CompletionHandle,
 ) -> Result<
-    meerkat_runtime::completion::CompletionOutcome,
+    (
+        meerkat_runtime::completion::CompletionOutcome,
+        Option<meerkat_runtime::InputTerminalOutcome>,
+    ),
     meerkat_runtime::completion::CompletionWaitError,
 > {
     use meerkat_runtime::terminal_status::{
@@ -7011,7 +7062,7 @@ async fn wait_for_runtime_input_terminal(
     };
     let (attempt, input_terminal) = handle.try_wait_with_terminal_outcome().await?.into_parts();
     if input_terminal.is_some() {
-        return Ok(attempt);
+        return Ok((attempt, input_terminal));
     }
     let read_input = || {
         adapter.input_terminal_receipt(session_id, InteractionSelector::InputId(input_id.clone()))
@@ -7036,12 +7087,17 @@ async fn wait_for_runtime_input_terminal(
         {
             Ok(Ok(Some(InputTerminalReceiptWait::Resolved(read)))) => {
                 return Ok(match read.report {
-                    InputTerminalReceiptRead::Finalized(receipt) => receipt.into_outcome(),
-                    _ => attempt,
+                    InputTerminalReceiptRead::Finalized(receipt) => {
+                        let terminal = receipt.terminal().clone();
+                        (receipt.into_outcome(), Some(terminal))
+                    }
+                    _ => (attempt, None),
                 });
             }
-            Ok(Ok(_)) => return Ok(attempt),
-            Ok(Err(error)) => return retried_input_read_failure(input_id, error),
+            Ok(Ok(_)) => return Ok((attempt, None)),
+            Ok(Err(error)) => {
+                return retried_input_read_failure(input_id, error).map(|outcome| (outcome, None));
+            }
             Err(_elapsed) => match read_input().await {
                 Ok(Some(read)) => match read.report {
                     InputTerminalReceiptRead::Pending {
@@ -7058,16 +7114,20 @@ async fn wait_for_runtime_input_terminal(
                                 attempt_count,
                                 "retried input's session made no progress within its bound; reporting its failed attempt"
                             );
-                            return Ok(attempt);
+                            return Ok((attempt, None));
                         }
                     }
                     InputTerminalReceiptRead::Finalized(receipt) => {
-                        return Ok(receipt.into_outcome());
+                        let terminal = receipt.terminal().clone();
+                        return Ok((receipt.into_outcome(), Some(terminal)));
                     }
-                    _ => return Ok(attempt),
+                    _ => return Ok((attempt, None)),
                 },
-                Ok(None) => return Ok(attempt),
-                Err(error) => return retried_input_read_failure(input_id, error),
+                Ok(None) => return Ok((attempt, None)),
+                Err(error) => {
+                    return retried_input_read_failure(input_id, error)
+                        .map(|outcome| (outcome, None));
+                }
             },
         }
     }
@@ -7130,14 +7190,87 @@ fn retried_input_read_failure(
     }
 }
 
+/// The typed requeue answer of an admitted input's wait, if it has one: a
+/// graceful stop kept the input durably queued for the next start
+/// ([`CompletionWaitError::RequeuedAcrossStop`](meerkat_runtime::completion::CompletionWaitError::RequeuedAcrossStop)),
+/// or the next start ended it as older than its requeue bound (its committed
+/// terminal abandoned with
+/// [`InputAbandonReason::RequeueExpired`](meerkat_runtime::InputAbandonReason::RequeueExpired)).
+/// Neither is ever completion plumbing or an abandoned reason string.
+#[cfg(feature = "runtime-adapter")]
+fn requeue_terminal(
+    input_id: &InputId,
+    completion: &Result<
+        meerkat_runtime::completion::CompletionOutcome,
+        meerkat_runtime::completion::CompletionWaitError,
+    >,
+    input_terminal: Option<&meerkat_runtime::InputTerminalOutcome>,
+) -> Option<super::handle::ExactTurnTerminal> {
+    if let Err(meerkat_runtime::completion::CompletionWaitError::RequeuedAcrossStop { .. }) =
+        completion
+    {
+        return Some(super::handle::ExactTurnTerminal::RequeuedAcrossStop {
+            input_id: input_id.clone(),
+        });
+    }
+    match input_terminal {
+        Some(meerkat_runtime::InputTerminalOutcome::Abandoned {
+            reason: meerkat_runtime::InputAbandonReason::RequeueExpired,
+        }) => Some(super::handle::ExactTurnTerminal::RequeueExpired {
+            input_id: input_id.clone(),
+        }),
+        _ => None,
+    }
+}
+
+/// Whether `input_id`'s committed terminal is an expired requeue: the next
+/// start ended an input a graceful stop had kept queued, as older than its
+/// requeue bound. Read from the input's typed terminal, never from a reason
+/// string. A read that fails or finds no terminal says no.
+#[cfg(feature = "runtime-adapter")]
+async fn replayed_input_requeue_expired(
+    adapter: &MeerkatMachine,
+    session_id: &SessionId,
+    input_id: &InputId,
+) -> bool {
+    use meerkat_runtime::terminal_status::{InputTerminalReceiptRead, InteractionSelector};
+    let Ok(Some(read)) = adapter
+        .input_terminal_receipt(session_id, InteractionSelector::InputId(input_id.clone()))
+        .await
+    else {
+        return false;
+    };
+    let terminal = match &read.report {
+        InputTerminalReceiptRead::Finalized(receipt) => Some(receipt.terminal()),
+        InputTerminalReceiptRead::TerminalWithoutReceipt { terminal, .. } => Some(terminal),
+        InputTerminalReceiptRead::Pending { terminal, .. } => terminal.as_ref(),
+        // A read shape this crate does not know reports no terminal.
+        _ => None,
+    };
+    matches!(
+        terminal,
+        Some(meerkat_runtime::InputTerminalOutcome::Abandoned {
+            reason: meerkat_runtime::InputAbandonReason::RequeueExpired,
+        })
+    )
+}
+
 #[cfg(feature = "runtime-adapter")]
 fn runtime_completion_to_exact_turn(
     session_id: &SessionId,
+    input_id: &InputId,
     completion: Result<
         meerkat_runtime::completion::CompletionOutcome,
         meerkat_runtime::completion::CompletionWaitError,
     >,
+    input_terminal: Option<&meerkat_runtime::InputTerminalOutcome>,
 ) -> Result<super::handle::ExactTurnCompletion, MobError> {
+    if let Some(terminal) = requeue_terminal(input_id, &completion, input_terminal) {
+        return Ok(super::handle::ExactTurnCompletion {
+            session_id: session_id.clone(),
+            terminal,
+        });
+    }
     let outcome = completion.map_err(|error| {
         MobError::Internal(format!("runtime completion waiter failed: {error}"))
     })?;
@@ -7150,12 +7283,14 @@ fn runtime_completion_to_exact_turn(
 #[cfg(feature = "runtime-adapter")]
 fn runtime_completion_to_mob_result(
     session_id: &SessionId,
+    input_id: &InputId,
     completion: Result<
         meerkat_runtime::completion::CompletionOutcome,
         meerkat_runtime::completion::CompletionWaitError,
     >,
+    input_terminal: Option<&meerkat_runtime::InputTerminalOutcome>,
 ) -> Result<(), MobError> {
-    runtime_completion_to_exact_turn(session_id, completion)
+    runtime_completion_to_exact_turn(session_id, input_id, completion, input_terminal)
         .and_then(super::handle::legacy_exact_turn_result)
         .map(drop)
 }
@@ -11430,6 +11565,7 @@ mod tests {
         let session_id = SessionId::new();
         let err = runtime_completion_to_mob_result(
             &session_id,
+            &meerkat_core::lifecycle::InputId::new(),
             Ok(
                 meerkat_runtime::completion::CompletionOutcome::CallbackPending {
                     tool_use_id: "call-1".to_string(),
@@ -11437,6 +11573,7 @@ mod tests {
                     args: json!({ "value": "browser" }),
                 },
             ),
+            None,
         )
         .expect_err("callback pending should remain resumable mob state");
 
@@ -11461,11 +11598,13 @@ mod tests {
         let session_id = SessionId::new();
         let err = runtime_completion_to_mob_result(
             &session_id,
+            &meerkat_core::lifecycle::InputId::new(),
             Err(
                 meerkat_runtime::completion::CompletionWaitError::AuthorityUnavailable(
                     "generated runtime completion authority missing".to_string(),
                 ),
             ),
+            None,
         )
         .expect_err("waiter failure should not become a successful mob result");
 
@@ -11475,6 +11614,86 @@ mod tests {
                 assert!(message.contains("generated runtime completion authority missing"));
             }
             other => panic!("expected internal mob waiter error, got {other:?}"),
+        }
+    }
+
+    /// A wait a graceful stop answered by keeping the input queued, and a
+    /// terminal the next start ended as an expired requeue, are answered
+    /// typed with the input's id: never completion plumbing, never an
+    /// internal error, never an abandoned reason string. Any other abandoned
+    /// terminal keeps its runtime outcome.
+    #[test]
+    fn requeue_waits_and_terminals_are_answered_typed() {
+        use super::super::handle::ExactTurnTerminal;
+        use meerkat_runtime::{InputAbandonReason, InputTerminalOutcome};
+        let session_id = SessionId::new();
+        let input_id = meerkat_core::lifecycle::InputId::new();
+        let abandoned = || {
+            Ok(meerkat_runtime::completion::CompletionOutcome::Abandoned {
+                reason: "abandoned".to_string(),
+                error: meerkat_core::TurnErrorMetadata::runtime_apply_failure("abandoned"),
+            })
+        };
+        let requeued = || {
+            Err(
+                meerkat_runtime::completion::CompletionWaitError::RequeuedAcrossStop {
+                    stopped_at: chrono::Utc::now(),
+                },
+            )
+        };
+        let expired = InputTerminalOutcome::Abandoned {
+            reason: InputAbandonReason::RequeueExpired,
+        };
+        let stopped = InputTerminalOutcome::Abandoned {
+            reason: InputAbandonReason::Stopped,
+        };
+
+        let kept = runtime_completion_to_exact_turn(&session_id, &input_id, requeued(), None)
+            .expect("a requeued wait is a typed terminal");
+        assert!(
+            matches!(&kept.terminal, ExactTurnTerminal::RequeuedAcrossStop { input_id: kept_id } if kept_id == &input_id),
+            "{kept:?}"
+        );
+        let aged =
+            runtime_completion_to_exact_turn(&session_id, &input_id, abandoned(), Some(&expired))
+                .expect("an expired requeue is a typed terminal");
+        assert!(
+            matches!(&aged.terminal, ExactTurnTerminal::RequeueExpired { input_id: aged_id } if aged_id == &input_id),
+            "{aged:?}"
+        );
+        let other =
+            runtime_completion_to_exact_turn(&session_id, &input_id, abandoned(), Some(&stopped))
+                .expect("another abandoned terminal keeps its outcome");
+        assert!(
+            matches!(
+                &other.terminal,
+                ExactTurnTerminal::Runtime(
+                    meerkat_runtime::completion::CompletionOutcome::Abandoned { .. }
+                )
+            ),
+            "{other:?}"
+        );
+
+        match runtime_completion_to_mob_result(&session_id, &input_id, requeued(), None) {
+            Err(MobError::MemberInputRequeuedAcrossStop {
+                session_id: kept_session,
+                input_id: kept_id,
+            }) => assert_eq!(
+                (kept_session, kept_id),
+                (session_id.clone(), input_id.clone())
+            ),
+            other => panic!("expected the typed requeued answer, got {other:?}"),
+        }
+        match runtime_completion_to_mob_result(&session_id, &input_id, abandoned(), Some(&expired))
+        {
+            Err(MobError::MemberInputRequeueExpired {
+                session_id: aged_session,
+                input_id: aged_id,
+            }) => assert_eq!(
+                (aged_session, aged_id),
+                (session_id.clone(), input_id.clone())
+            ),
+            other => panic!("expected the typed expired answer, got {other:?}"),
         }
     }
 
@@ -11507,7 +11726,9 @@ mod tests {
 
         let synchronous = runtime_completion_to_mob_result(
             &session_id,
+            &meerkat_core::lifecycle::InputId::new(),
             Ok(meerkat_runtime::completion::CompletionOutcome::CompletedWithoutResult),
+            None,
         );
         observe_committed_parent_projection_result(&session_id, &projection);
         assert!(
@@ -11517,7 +11738,9 @@ mod tests {
 
         let tracked = runtime_completion_to_exact_turn(
             &session_id,
+            &meerkat_core::lifecycle::InputId::new(),
             Ok(meerkat_runtime::completion::CompletionOutcome::CompletedWithoutResult),
+            None,
         );
         observe_committed_parent_projection_result(&session_id, &projection);
         assert!(

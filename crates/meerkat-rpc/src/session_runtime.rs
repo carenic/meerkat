@@ -4518,6 +4518,7 @@ impl SessionRuntime {
         &self,
         error: meerkat_runtime::completion::CompletionWaitError,
         session_id: &SessionId,
+        input_id: Option<&meerkat_core::lifecycle::InputId>,
     ) -> RpcError {
         // Not a waiter failure: the input completed and its cleanup ran.
         if error.is_disclosure_refused() {
@@ -4529,6 +4530,11 @@ impl SessionRuntime {
                     "reason": "result_disclosure_refused",
                 })),
             };
+        }
+        // Not a failure either: a graceful stop kept the input durably
+        // queued, and the session's next start runs it.
+        if let Some(requeued) = requeued_across_stop_rpc_error(&error, session_id, input_id) {
+            return requeued;
         }
         match self
             .runtime_adapter
@@ -8676,6 +8682,11 @@ impl SessionRuntime {
                 .await);
         };
 
+        let waited_input_id = match &outcome {
+            AcceptOutcome::Deduplicated { existing_id, .. } => existing_id.clone(),
+            AcceptOutcome::Accepted { input_id, .. } => input_id.clone(),
+            _ => input_id.clone(),
+        };
         let completion_rx = self.spawn_runtime_pre_admission_cleanup_with_outcome(
             session_id.clone(),
             input_id,
@@ -8696,7 +8707,11 @@ impl SessionRuntime {
             Ok(outcome) => outcome,
             Err(error) => {
                 return Err(self
-                    .runtime_completion_wait_error_to_rpc_error(error, session_id)
+                    .runtime_completion_wait_error_to_rpc_error(
+                        error,
+                        session_id,
+                        Some(&waited_input_id),
+                    )
                     .await);
             }
         };
@@ -14807,6 +14822,33 @@ fn completion_outcome_to_rpc_result(
     }
 }
 
+/// The typed answer to a wait a graceful stop ended by keeping the input
+/// durably queued for the session's next start: `-32003` (session not
+/// running) with `data.reason` `requeued_across_stop`, never the generated
+/// wait-failure authority's internal class. Do not resubmit the input; the
+/// same idempotency key after the restart re-attaches to it. `None` for any
+/// other wait failure.
+fn requeued_across_stop_rpc_error(
+    error: &meerkat_runtime::completion::CompletionWaitError,
+    session_id: &SessionId,
+    input_id: Option<&meerkat_core::lifecycle::InputId>,
+) -> Option<RpcError> {
+    let meerkat_runtime::completion::CompletionWaitError::RequeuedAcrossStop { stopped_at } = error
+    else {
+        return None;
+    };
+    Some(RpcError {
+        code: meerkat_contracts::ErrorCode::SessionNotRunning.jsonrpc_code(),
+        message: error.to_string(),
+        data: Some(serde_json::json!({
+            "session_id": session_id.to_string(),
+            "input_id": input_id.map(ToString::to_string),
+            "reason": "requeued_across_stop",
+            "stopped_at": stopped_at,
+        })),
+    })
+}
+
 fn runtime_completion_wait_failure_rpc_code(
     public_error_class: meerkat_runtime::meerkat_machine::dsl::RuntimeCompletionWaitFailurePublicErrorClass,
 ) -> i32 {
@@ -14912,6 +14954,42 @@ mod tests {
     // The module-level import is `mcp`-gated; tests use Duration in every
     // feature set (the governed JSONL lane builds without `mcp`).
     use std::time::Duration;
+
+    /// A wait a graceful stop ended by keeping the input queued for the
+    /// next start answers session-not-running with the typed reason, the
+    /// input and the stop time, never the internal wait-failure class; every
+    /// other wait failure keeps its own answer.
+    #[test]
+    fn a_wait_requeued_across_a_stop_answers_its_typed_reason() {
+        let session_id = SessionId::new();
+        let input_id = meerkat_core::lifecycle::InputId::new();
+        let stopped_at = chrono::Utc::now();
+        let requeued =
+            meerkat_runtime::completion::CompletionWaitError::RequeuedAcrossStop { stopped_at };
+        let error = requeued_across_stop_rpc_error(&requeued, &session_id, Some(&input_id))
+            .expect("a requeued wait has a typed answer");
+        assert_eq!(
+            error.code,
+            meerkat_contracts::ErrorCode::SessionNotRunning.jsonrpc_code()
+        );
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({
+                "session_id": session_id.to_string(),
+                "input_id": input_id.to_string(),
+                "reason": "requeued_across_stop",
+                "stopped_at": stopped_at,
+            }))
+        );
+        assert!(
+            requeued_across_stop_rpc_error(
+                &meerkat_runtime::completion::CompletionWaitError::ChannelClosed,
+                &session_id,
+                Some(&input_id),
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn delivery_admission_preserves_native_refusal_without_parsing_rpc_text() {

@@ -279,6 +279,7 @@ async fn shutdown_cancels_a_member_turn_and_a_second_shutdown_joins_it() {
     let mut second = handle
         .enqueue_actor_command_for_test(|reply_tx| MobCommand::Shutdown {
             deadline: None,
+            queued_inputs: crate::runtime::QueuedInputsOnShutdown::Stop,
             reply_tx,
         })
         .await

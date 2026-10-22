@@ -222,6 +222,26 @@ them.
   interrupts converges with the same one. The default, `Stop`, and every stop
   outside such an unregister end every non-terminal input as stopped, as in
   0.9.4.
+- `meerkat-rpc`, `meerkat-rest`, `meerkat-mcp-server`, `meerkat`: a
+  completion wait that a graceful mob Shutdown answered by keeping its input
+  queued (`CompletionWaitError::RequeuedAcrossStop`) is answered typed on
+  every surface, never as the internal `completion_authority_unavailable`
+  class. JSON-RPC answers `-32003` (session not running) with `data.reason`
+  `requeued_across_stop`, `data.input_id` and `data.stopped_at`. REST answers
+  `503` `SESSION_RUNTIME_UNAVAILABLE` with `details.kind`
+  `requeued_across_stop`. The MCP server releases the attachment's
+  request-local admission, since the next start's attachment runs the input,
+  and a scheduled delivery re-reads the input's own outcome, as for a
+  rolled-back boundary. Do not resubmit such an input: after the restart the
+  same idempotency key re-attaches to it.
+- `meerkat-mob`: `MobError::MemberInputRequeuedAcrossStop` and
+  `MobError::MemberInputRequeueExpired` (appended; `MobError` is
+  `#[non_exhaustive]`), the answers of a non-bounded member turn whose input a
+  graceful Shutdown kept queued, or that the next start ended as older than
+  its requeue bound. Delegation, fork relinking and temporary councils read
+  both typed outcomes as an end imposed from outside, never as the turn's own
+  failure, and a directed turn's host observation keeps its tracked turn
+  pending for the next start.
 
 ### Changed
 

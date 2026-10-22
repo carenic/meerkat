@@ -1872,6 +1872,7 @@ const QUEUED_HUMAN: &str = "A second question, queued behind the running turn.";
 struct StopHost {
     handle: MobHandle,
     runtime_store: Arc<dyn RuntimeStore>,
+    adapter: Arc<meerkat_runtime::MeerkatMachine>,
 }
 
 /// Open a host process over `root`: a new mob (`label`) or, without a label,
@@ -1954,9 +1955,14 @@ async fn open_stop_host(
         .expect("mob resume finishes")
         .expect("resume the same mob from its durable history"),
     };
+    let adapter = service
+        .acquire_runtime_adapter(None)
+        .expect("acquire runtime authority")
+        .expect("runtime owner");
     StopHost {
         handle,
         runtime_store,
+        adapter,
     }
 }
 
@@ -3143,5 +3149,99 @@ fn requeue_max_age_refuses_zero_and_over_the_cap() {
             Ok(Duration::from_millis(1)),
             Duration::from_mins(15),
         )
+    );
+}
+
+/// A requeue Shutdown whose deadline passes before a member's unregister is
+/// admitted (its registration transaction is held) reports the member
+/// pending and hands the unregister to its settlement. The settlement begins
+/// that unregister with the Shutdown's choice: once the transaction is free
+/// and the settlement settles, the input queued behind the running turn is
+/// kept durably queued and marked for the next start, exactly as when
+/// Shutdown begins the unregister itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requeue_shutdown_whose_admission_misses_the_deadline_still_keeps_the_queued_input() {
+    use crate::runtime::{MemberShutdownOutcome, MemberUnregisterState};
+    use meerkat_core::time_compat::Instant;
+    use meerkat_runtime::input_state::InputLifecycleState;
+
+    let (_root, root_path) = stop_root();
+    let client = ScriptedClient::new(true);
+    let host = open_stop_host(&root_path, &client, Some("host-human-requeue-settlement")).await;
+    let (identity, session_id, entry) = spawn_stop_member(&host).await;
+
+    client.block();
+    let requests_before = client.requests().len();
+    let running = start_stop_input(
+        &host,
+        &entry,
+        WorkSpec::new(HUMAN, WorkOrigin::External),
+        HandlingMode::Queue,
+        &delivery("requeue-settlement-running"),
+    )
+    .await
+    .expect("running human admission");
+    client.wait_for_requests(requests_before + 1).await;
+    let key = delivery("requeue-settlement-queued");
+    let interaction_id = interaction(&key);
+    let queued = start_stop_input(
+        &host,
+        &entry,
+        WorkSpec::new(QUEUED_HUMAN, WorkOrigin::External),
+        HandlingMode::Queue,
+        &key,
+    )
+    .await
+    .expect("queued human admission");
+    let input_id = admitted_input_id(&host.runtime_store, &session_id, &key).await;
+
+    let guard = host
+        .adapter
+        .hold_session_registration_transaction_for_test(&session_id)
+        .await;
+    let report = tokio::time::timeout(
+        WAIT,
+        host.handle.shutdown_with_report(
+            requeue_options(crate::RequeueMaxAge::DEFAULT)
+                .with_deadline(Instant::now() + Duration::from_secs(1)),
+        ),
+    )
+    .await
+    .expect("the requeue stop returns at its deadline")
+    .expect("requeue stop");
+    let mut settlement = match report.members.get(&identity) {
+        Some(MemberShutdownOutcome::UnregisterPending {
+            stage, settlement, ..
+        }) => {
+            assert_eq!(stage, "registration_transaction_admission");
+            settlement.clone()
+        }
+        other => panic!("expected the member pending at its unregister admission, got {other:?}"),
+    };
+    drop(guard);
+    assert_eq!(
+        settlement.settle_within(Instant::now() + WAIT).await,
+        MemberUnregisterState::Settled,
+        "the settlement begins and finishes the member's unregister"
+    );
+
+    let waiter = stop_answer(queued, &session_id).await;
+    let _ = stop_answer(running, &session_id).await;
+    let at_exit = stop_row(&host.runtime_store, &session_id, &key, &input_id).await;
+    let events = stop_events(&root_path, &session_id).await;
+    assert_eq!(
+        observe_requeued_at_stop(waiter, &at_exit, &events, interaction_id),
+        RequeuedAtStop {
+            waiter: StopAnswer::RequeuedAcrossStop(input_id.clone()),
+            phase: InputLifecycleState::Queued,
+            outcome: serde_json::Value::Null,
+            payload_kept: true,
+            replay_identity_kept: true,
+            requeue_mark: true,
+            outbox: false,
+            pending_terminal_owner: false,
+            runs_started: 0,
+        },
+        "an unregister the settlement begins keeps the queued input, as Shutdown's own does"
     );
 }

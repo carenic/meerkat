@@ -42,6 +42,7 @@ async fn shutdown_teardown_discards_a_degraded_registration_first() {
             mob.session(0),
             None,
             Instant::now() + Duration::from_secs(5),
+            meerkat_runtime::UnregisterQueuedInputs::Stop,
         ),
     )
     .await
@@ -513,6 +514,7 @@ async fn a_degraded_registration_without_a_teardown_handoff_settles_through_the_
             &teardown_target,
             None,
             Instant::now() + Duration::from_secs(5),
+            meerkat_runtime::UnregisterQueuedInputs::Stop,
         ),
     )
     .await

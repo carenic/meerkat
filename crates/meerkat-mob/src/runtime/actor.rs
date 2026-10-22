@@ -7863,6 +7863,10 @@ pub(super) struct MobActor {
     pub(super) shutdown_report: super::MobShutdownReport,
     /// Caller-owned bound of the Shutdown in progress (`ShutdownOptions`).
     pub(super) shutdown_deadline: Option<Instant>,
+    /// What the Shutdown in progress does with inputs still queued behind a
+    /// member's running turn (`ShutdownOptions`).
+    #[cfg(feature = "runtime-adapter")]
+    pub(super) shutdown_queued_inputs: super::QueuedInputsOnShutdown,
     /// A Shutdown parked while its runtime teardown runs off the actor loop.
     pub(super) pending_shutdown_teardown: Option<shutdown_teardown::PendingShutdownTeardown>,
     /// Stuck retirements a resume handed back for re-drive, started one at a
@@ -16790,6 +16794,10 @@ impl MobActor {
         }
         let report = std::mem::take(&mut self.shutdown_report);
         self.shutdown_deadline = None;
+        #[cfg(feature = "runtime-adapter")]
+        {
+            self.shutdown_queued_inputs = super::QueuedInputsOnShutdown::Stop;
+        }
         let outstanding = report
             .members
             .values()
@@ -29232,7 +29240,11 @@ impl MobActor {
                     return Box::pin(self.resolve_shutdown_teardown(ticket, outcomes, command_rx))
                         .await;
                 }
-                MobCommand::Shutdown { deadline, reply_tx } => {
+                MobCommand::Shutdown {
+                    deadline,
+                    queued_inputs,
+                    reply_tx,
+                } => {
                     // A Shutdown arriving while one is parked on its runtime
                     // teardown receives that Shutdown's result.
                     if let Some(pending) = self.pending_shutdown_teardown.as_mut() {
@@ -29240,6 +29252,12 @@ impl MobActor {
                         return ActorLoopControl::SkipBoundary;
                     }
                     self.shutdown_deadline = deadline;
+                    #[cfg(feature = "runtime-adapter")]
+                    {
+                        self.shutdown_queued_inputs = queued_inputs;
+                    }
+                    #[cfg(not(feature = "runtime-adapter"))]
+                    let _ = queued_inputs;
                     // Probe only: Shutdown commits at its end. The probed
                     // transition owns the run-start hold obligation.
                     let admission = self

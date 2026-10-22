@@ -3378,6 +3378,20 @@ async fn run_directed_turn_watcher(
         Some(handle) => Some(handle.try_wait().await),
         None => None,
     };
+    // A graceful stop kept the input durably queued for the next start: it is
+    // neither failed nor terminal here. Record nothing; the tracked turn
+    // stays Pending and the next start's recovery reattaches to it.
+    if let Some(Err(error)) = &completion_result
+        && error.is_requeued_across_stop()
+    {
+        tracing::info!(
+            session_id = %session,
+            input_id = %input_id,
+            error = %error,
+            "input kept queued across a graceful stop; retaining tracked turn Pending for the next start"
+        );
+        return;
+    }
     if completion_result.as_ref().is_some_and(|result| {
         result
             .as_ref()
