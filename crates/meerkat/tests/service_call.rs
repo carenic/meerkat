@@ -242,11 +242,24 @@ fn restrictions(
     approval: Option<&meerkat_core::McpConnectorApproval>,
     lifetime: LifetimeRestriction,
 ) -> ExecutionRestrictions {
-    let mut actions: Vec<ActionRef> = operations.iter().map(|op| mcp_action(op)).collect();
-    let mut domains = vec![installation_domain(server)];
-    if let Some(approval) = approval {
-        actions.push(mcp_connector_action(server, approval));
-        domains.push(mcp_connector_domain(&operator(), server, approval));
+    covering(&[(server, operations, approval)], lifetime)
+}
+
+/// The operator's restrictions for the collector on every installation of
+/// `installations`: (server, its operations, its connector approval).
+fn covering(
+    installations: &[(&str, &[&str], Option<&meerkat_core::McpConnectorApproval>)],
+    lifetime: LifetimeRestriction,
+) -> ExecutionRestrictions {
+    let mut actions: Vec<ActionRef> = Vec::new();
+    let mut domains = Vec::new();
+    for (server, operations, approval) in installations {
+        actions.extend(operations.iter().map(|op| mcp_action(op)));
+        domains.push(installation_domain(server));
+        if let Some(approval) = approval {
+            actions.push(mcp_connector_action(server, approval));
+            domains.push(mcp_connector_domain(&operator(), server, approval));
+        }
     }
     ExecutionRestrictions {
         actions: ExactRestriction::exact(actions),
@@ -1148,24 +1161,45 @@ async fn a_grant_revoked_between_calls_refuses_the_next_call_locally() {
 }
 
 /// Another connector-bound server on the same router has no lineage in
-/// the service original's basis: Denied before its credential is admitted.
+/// the service original's basis: its call is Denied before its credential
+/// is admitted, even under a grant that covers both installations, so only
+/// the basis's selection by target keeps the call to the selected server.
 #[tokio::test]
 async fn a_second_connector_server_has_no_lineage_and_is_denied() {
     let host = Host::new().await;
-    let both = host
-        .router(vec![
-            host.mail(),
-            server(
-                SECOND_SERVER,
-                &CALENDAR_OPERATIONS,
-                &host.calls,
-                &host.issuer,
-                SUBJECT,
+    let calendar = server(
+        SECOND_SERVER,
+        &CALENDAR_OPERATIONS,
+        &host.calls,
+        &host.issuer,
+        SUBJECT,
+    );
+    let calendar_approval = calendar.connector_approval();
+    let both_installations = host
+        .grants
+        .issue_root(
+            &operator(),
+            id("collector-both"),
+            collector(),
+            None,
+            covering(
+                &[
+                    (SERVER, &MAIL_OPERATIONS, Some(&host.approval)),
+                    (
+                        SECOND_SERVER,
+                        &CALENDAR_OPERATIONS,
+                        Some(&calendar_approval),
+                    ),
+                ],
+                LifetimeRestriction::unrestricted(),
             ),
-        ])
-        .await;
+        )
+        .expect("a grant covering both installations");
+    let original = association(candidate("setup-both", SERVER, &both_installations));
+    host.originals.enroll(&original);
+    let both = host.router(vec![host.mail(), calendar]).await;
     let audit = Arc::new(Audit::default());
-    let call = host.admitted(&audit);
+    let call = host.prepare(original, &audit).expect("admitted");
     let refused = dispatch(&call, &both, "list_events").await;
     assert_eq!(
         refusal_kind(&refused),
