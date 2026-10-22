@@ -4640,6 +4640,90 @@ async fn a_mob_start_refuses_a_restore_failed_members_tail_another_owner_hosts()
     }
 }
 
+/// A resume spawn onto a session this mob does not own (here another mob's
+/// member session) whose durable tail runs past its committed runtime
+/// boundary refuses, typed, as the transcript revision conflict it is, and
+/// leaves the tail alone: a mob does not complete the boundary of a session
+/// it is about to refuse to adopt.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resume_spawn_onto_a_foreign_session_tail_refuses_typed() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let tail = crash_with_an_active_member_tail(temp.path(), &paths).await;
+    let (service, store) = persistent_head_canonical_service(&paths, tail.runtime_store.clone());
+    let adopting_mob_db_path = temp.path().join("adopting-mob.db");
+    let handle = MobBuilder::new(
+        mob_definition(MobRuntimeMode::TurnDriven),
+        MobStorage::persistent(&adopting_mob_db_path).expect("second mob storage"),
+    )
+    .with_session_service(service.clone())
+    .with_default_llm_client(openai_test_client())
+    .create()
+    .await
+    .expect("create a second mob on the realm");
+    handle
+        .spawn_spec(SpawnMemberSpec::new("lead", AgentIdentity::from("lead-2")))
+        .await
+        .expect("spawn the second mob's lead");
+    let adopter = AgentIdentity::from("w-adopt");
+    let spawned = tokio::time::timeout(
+        Duration::from_secs(60),
+        handle.spawn_spec(
+            SpawnMemberSpec::new("worker", adopter.clone())
+                .with_resume_bridge_session_id(tail.session_id.clone()),
+        ),
+    )
+    .await
+    .expect("the resume spawn settles");
+    eprintln!(
+        "[foreign-tail-spawn] spawn => {:?}",
+        spawned.as_ref().err().map(ToString::to_string)
+    );
+    assert_eq!(
+        tail.committed_token_now().await,
+        tail.committed_token,
+        "a refused adoption must not settle the session's durable tail"
+    );
+    assert_eq!(
+        tail.physical_token_now(&store).await,
+        tail.ahead_token,
+        "a refused adoption must leave the durable tail where the cut left it"
+    );
+    match &spawned {
+        Err(meerkat_mob::MobError::SessionError(meerkat_core::service::SessionError::Store(
+            error,
+        ))) if error
+            .downcast_ref::<meerkat_core::SessionStoreError>()
+            .is_some_and(|error| {
+                matches!(
+                    error,
+                    meerkat_core::SessionStoreError::TranscriptRevisionConflict { id, .. }
+                        if *id == tail.session_id
+                )
+            }) => {}
+        other => panic!(
+            "the resume spawn must refuse, typed, as the session's transcript revision \
+             conflict: {:?}",
+            other.as_ref().err().map(ToString::to_string)
+        ),
+    }
+    let status = handle.status().await;
+    assert!(
+        matches!(status, Ok(meerkat_mob::MobState::Running)),
+        "a refused spawn leaves the mob running: {status:?}"
+    );
+    assert!(
+        handle
+            .get_member(&adopter)
+            .await
+            .expect("read the roster")
+            .is_none(),
+        "the refused spawn rosters no member"
+    );
+    let _ = handle.shutdown().await;
+}
+
 /// A member whose session has a durable tail ahead of its runtime boundary
 /// authority respawns. The power cut leaves the canonical head carrying a
 /// turn whose runtime boundary commit never became durable (the same window a
