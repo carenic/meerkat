@@ -83,6 +83,14 @@ them.
   and so does the `PartialOrd` order of `OccurrenceLifecycleEffectVariant::*`
   and `OccurrenceLifecycleInputVariant::*`; match them by variant name, not
   by numeric cast or position.
+- `meerkat-mob-mcp`: `MobMcpState::mob_list` returns each managed mob with
+  its `MobLifecycleObservation` instead of its `MobState` (see Fixed, a
+  listed mob whose actor has stopped); the phase is the observation's
+  `phase`.
+- `meerkat-contracts`: `MobStatusResult` gains the field
+  `failure: Option<WireMobLifecycleFailure>`, so code that builds it as a
+  struct literal sets `failure: None`. The wire stays additive: the field is
+  left out when absent.
 
 ### Added
 
@@ -117,6 +125,13 @@ them.
   is seen as gone, never admitted again. The trait default refuses.
   `MeerkatMachine::accept_existing_input_with_completion_for_attachment_and_member_residency`
   is the same for a mob member's attachment.
+- `meerkat-mob`: `MobLifecycleObservation`, a mob's lifecycle as its
+  handles observe it without asking its actor: the last phase the actor
+  published and, once the actor has stopped, why (`failure`). Read it with
+  `MobHandle::lifecycle_observation` or `MobReadHandle::lifecycle_observation`.
+- `meerkat-contracts`: `WireMobLifecycleFailure`, why a listed mob's actor has
+  stopped: `cause`, `message`, `code` and `structured_data`, the fields of a
+  failed `mob/spawn_many` row.
 
 ### Changed
 
@@ -252,6 +267,17 @@ them.
   stayed uncertain reports that the same way, as `MobError::AdmissionClosed`
   with `MobAdmissionCloseReason::DurabilityFailStop`; the mutation itself is
   still named only in the error log where it failed.
+
+- `meerkat-mob-mcp`, `meerkat-rpc`, `meerkat-web-runtime`: a mob whose actor
+  has stopped (it fail-stopped, or its task ended while the mob was live) is
+  no longer listed as if it ran. `mob/list`, the MCP `meerkat_mob_list` and
+  agent `mob_list` tools, the Web runtime's `listMobs` and the TypeScript
+  SDK's `listMobs` give its row a typed `failure`: present means the mob's
+  actor has stopped; `status` is the last machine phase. The Python SDK's
+  `list_mobs` returns the row as it is. Before, the row read `Running` and
+  nothing else, while `mob/status` reported the failure.
+  `MobHandle::status_observation_snapshot` is still the phase alone; its
+  documentation now says so and points to `lifecycle_observation`.
 
 ## [0.9.4] - 2026-10-20
 
