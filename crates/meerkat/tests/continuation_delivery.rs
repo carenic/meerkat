@@ -3586,3 +3586,710 @@ fn team_incarnation() -> meerkat_core::service::MobIncarnationId {
         .parse()
         .expect("canonical mob incarnation id")
 }
+
+// ---------------------------------------------------------------------------
+// Retired addresses: a reservation left on an address that retired is
+// settled from the reserved session's ledger, and a stranded answer is
+// final: no admission follows it.
+// ---------------------------------------------------------------------------
+
+/// Retirements the test records, read by the delivery host and by the status
+/// read's resolver alike, as one host's records are.
+#[derive(Default)]
+struct Retirements(Mutex<std::collections::HashSet<LogicalRuntimeId>>);
+
+impl Retirements {
+    fn retire(&self, address: &LogicalRuntimeId) {
+        self.0.lock().expect("lock").insert(address.clone());
+    }
+
+    fn retired(&self, address: &LogicalRuntimeId) -> bool {
+        self.0.lock().expect("lock").contains(address)
+    }
+}
+
+/// The status read's resolver: session addresses, retired once recorded.
+/// `before_observe` runs inside the next observation, before it answers.
+struct RetiringResolver {
+    retirements: Arc<Retirements>,
+    before_observe: Mutex<Option<futures::future::BoxFuture<'static, ()>>>,
+}
+
+#[async_trait::async_trait]
+impl meerkat::ContinuationAddressResolver for RetiringResolver {
+    async fn current_address(
+        &self,
+        owner: &ContinuationOwner,
+    ) -> Result<Option<LogicalRuntimeId>, String> {
+        meerkat::ContinuationAddressResolver::current_address(&SessionAddressResolver, owner).await
+    }
+
+    async fn resolve_address(
+        &self,
+        address: &LogicalRuntimeId,
+    ) -> Result<AddressResolution, String> {
+        if self.retirements.retired(address) {
+            return Ok(AddressResolution::Retired);
+        }
+        meerkat::ContinuationAddressResolver::resolve_address(&SessionAddressResolver, address)
+            .await
+    }
+
+    async fn observe_address(
+        &self,
+        address: &LogicalRuntimeId,
+    ) -> Result<meerkat::AddressObservation, String> {
+        let hook = self.before_observe.lock().expect("lock").take();
+        if let Some(hook) = hook {
+            hook.await;
+        }
+        Ok(if self.retirements.retired(address) {
+            meerkat::AddressObservation::Retired
+        } else {
+            meerkat::AddressObservation::MayServe
+        })
+    }
+}
+
+/// A delivery host over the same retirements: a retired address resolves
+/// Retired. A session in `elsewhere` is another runtime owner's. The next
+/// route asked can be parked: the pass has resolved its address then, and
+/// has reserved nothing yet.
+struct RetiringHost {
+    sink: Arc<RecordingSink>,
+    retirements: Arc<Retirements>,
+    /// Addresses served by another session than their own (a repoint).
+    served_by: Mutex<HashMap<LogicalRuntimeId, SessionId>>,
+    elsewhere: Mutex<std::collections::HashSet<SessionId>>,
+    held_route: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+}
+
+impl RetiringHost {
+    fn new(sink: Arc<RecordingSink>, retirements: Arc<Retirements>) -> Arc<Self> {
+        Arc::new(Self {
+            sink,
+            retirements,
+            served_by: Mutex::new(HashMap::new()),
+            elsewhere: Mutex::new(std::collections::HashSet::new()),
+            held_route: Mutex::new(None),
+        })
+    }
+
+    fn serve(&self, address: &LogicalRuntimeId, session: SessionId) {
+        self.served_by
+            .lock()
+            .expect("lock")
+            .insert(address.clone(), session);
+    }
+
+    /// Park the next route asked. The first receiver fires when it parks;
+    /// the route answers once the sender fires.
+    fn hold_next_route(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.held_route.lock().expect("lock") = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+}
+
+#[async_trait::async_trait]
+impl RuntimeDeliveryHost for RetiringHost {
+    async fn delivery_route(&self, session_id: &SessionId) -> Option<meerkat::DeliveryRoute> {
+        let held = self.held_route.lock().expect("lock").take();
+        if let Some((entered, release)) = held {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
+        if self.elsewhere.lock().expect("lock").contains(session_id) {
+            return Some(meerkat::DeliveryRoute::ServedElsewhere);
+        }
+        Some(meerkat::DeliveryRoute::ServedHere(Arc::new(NoJobs)))
+    }
+
+    async fn claim_cold_delivery(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<Result<meerkat_runtime::HostingClaim, meerkat_runtime::HostingRefused>> {
+        Some(meerkat_runtime::grant_session_hosting(
+            &meerkat_runtime::HostingCapability::ProcessLocal,
+            &meerkat_runtime::HostingOwner::mint(),
+            session_id,
+        ))
+    }
+
+    async fn resolve_address(&self, address: &LogicalRuntimeId) -> AddressResolution {
+        if self.retirements.retired(address) {
+            return AddressResolution::Retired;
+        }
+        if let Some(session) = self.served_by.lock().expect("lock").get(address) {
+            return AddressResolution::Session(session.clone());
+        }
+        meerkat::default_address_resolution(address)
+    }
+
+    async fn continuation_sink(
+        &self,
+        _session_id: &SessionId,
+    ) -> Option<Arc<dyn ContinuationDeliverySink>> {
+        Some(self.sink.clone() as Arc<dyn ContinuationDeliverySink>)
+    }
+}
+
+/// A fixture whose status read observes `retirements` through `resolver`.
+struct RetiringFixture {
+    fixture: Fixture,
+    retirements: Arc<Retirements>,
+    resolver: Arc<RetiringResolver>,
+}
+
+impl RetiringFixture {
+    fn on(store: Arc<dyn RuntimeStore>, dir: Option<tempfile::TempDir>) -> Self {
+        let retirements = Arc::new(Retirements::default());
+        let resolver = Arc::new(RetiringResolver {
+            retirements: Arc::clone(&retirements),
+            before_observe: Mutex::new(None),
+        });
+        let inbox = RuntimeDeliveryInbox::new(store);
+        Self {
+            fixture: Fixture {
+                continuations: ContinuationOwnerService::new(
+                    inbox.clone(),
+                    resolver.clone(),
+                    Arc::new(meerkat_runtime::MeerkatMachine::ephemeral()),
+                ),
+                inbox,
+                _dir: dir,
+            },
+            retirements,
+            resolver,
+        }
+    }
+
+    fn memory() -> Self {
+        Self::on(Arc::new(InMemoryRuntimeStore::new()), None)
+    }
+
+    #[cfg(feature = "sqlite-store")]
+    fn sqlite() -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = meerkat_runtime::SqliteRuntimeStore::new(dir.path().join("runtime.sqlite3"))
+            .expect("open sqlite runtime store");
+        Self::on(Arc::new(store), Some(dir))
+    }
+
+    async fn status(&self, owner: &ContinuationOwner, key: &str) -> ContinuationStatus {
+        self.fixture
+            .continuations
+            .continuation_status(owner, &ContinuationKey::new(key).expect("key"))
+            .await
+            .expect("status")
+    }
+
+    async fn admission_entry(
+        &self,
+        address: &LogicalRuntimeId,
+        delivery_id: &str,
+    ) -> Option<ContinuationAdmission> {
+        self.fixture
+            .inbox
+            .continuation_admission(
+                address,
+                &RuntimeDeliveryId::new(delivery_id.to_string()).expect("id"),
+            )
+            .await
+            .expect("admission index read")
+    }
+}
+
+/// Wait for the owner's first pass, its reconcile, which visits every
+/// runtime with a pending row.
+async fn wait_for_reconcile(passes: &mut watch::Receiver<RuntimeDeliveryPass>) {
+    wait_for_pass(passes, "the reconcile pass", |pass| pass.generation >= 1).await;
+}
+
+/// A drain resolved the address, then the address retired and a status read
+/// answered stranded. The drain, released, must admit nothing, so a resend
+/// under a new key is the only delivery.
+#[tokio::test]
+async fn a_drain_that_resolved_before_the_retire_admits_nothing_after_a_stranded_answer() {
+    let cut = RetiringFixture::memory();
+    let sink = Arc::new(RecordingSink::default());
+    let session = SessionId::new();
+    let owner = ContinuationOwner::Session {
+        session_id: session.clone(),
+    };
+    let receipt = cut
+        .fixture
+        .continuations
+        .submit(&owner, delivery("task-1", host_producer()), 1)
+        .await
+        .expect("commit");
+    let address = LogicalRuntimeId::new(receipt.address.clone());
+
+    let host = RetiringHost::new(sink.clone(), Arc::clone(&cut.retirements));
+    let (entered, release) = host.hold_next_route();
+    let handle = cut.fixture.owner().arm(host).expect("arm");
+    let mut passes = handle.subscribe_passes();
+    tokio::time::timeout(EVENT_GUARD, entered)
+        .await
+        .expect("the drain reached the session's route")
+        .expect("route hold");
+
+    cut.retirements.retire(&address);
+    let stranded = cut.status(&owner, "task-1").await;
+    assert!(
+        matches!(stranded, ContinuationStatus::Stranded { .. }),
+        "never admitted, and the address retired: {stranded:?}"
+    );
+
+    release.send(()).expect("release the drain");
+    wait_for_reconcile(&mut passes).await;
+    assert!(
+        sink.admissions().is_empty(),
+        "nothing is admitted after a stranded answer: {:?}",
+        sink.admissions()
+    );
+    let still = cut.status(&owner, "task-1").await;
+    assert!(
+        matches!(still, ContinuationStatus::Stranded { .. }),
+        "a stranded continuation stays stranded: {still:?}"
+    );
+}
+
+/// The same through a repoint: a crash left a reservation in s1, and the
+/// pass resolved the address to s2. The address retires while the drain is
+/// held. Released, the drain repoints to s2, observes the retire and
+/// releases the repointed reservation: nothing is admitted.
+#[tokio::test]
+async fn a_drain_that_repoints_after_the_retire_releases_the_repointed_reservation() {
+    let cut = RetiringFixture::memory();
+    let sink = Arc::new(RecordingSink::default());
+    let (s1, s2) = (SessionId::new(), SessionId::new());
+    let owner = ContinuationOwner::Session {
+        session_id: s1.clone(),
+    };
+    let receipt = cut
+        .fixture
+        .continuations
+        .submit(&owner, delivery("task-1", host_producer()), 1)
+        .await
+        .expect("commit");
+    let address = LogicalRuntimeId::new(receipt.address.clone());
+    cut.fixture
+        .admission(
+            &address,
+            &receipt.delivery_id,
+            ContinuationAdmissionTransition::Reserve {
+                session_id: s1.clone(),
+                input_id: InputId::new(),
+            },
+        )
+        .await;
+
+    let host = RetiringHost::new(sink.clone(), Arc::clone(&cut.retirements));
+    host.serve(&address, s2.clone());
+    let (entered, release) = host.hold_next_route();
+    let handle = cut.fixture.owner().arm(host).expect("arm");
+    let mut passes = handle.subscribe_passes();
+    tokio::time::timeout(EVENT_GUARD, entered)
+        .await
+        .expect("the drain reached the serving session's route")
+        .expect("route hold");
+
+    cut.retirements.retire(&address);
+    let reserved = cut.status(&owner, "task-1").await;
+    assert!(
+        matches!(reserved, ContinuationStatus::Pending { admitted: None, .. }),
+        "a reservation exists, so the read is not stranded: {reserved:?}"
+    );
+
+    release.send(()).expect("release the drain");
+    wait_for_reconcile(&mut passes).await;
+    assert!(
+        sink.admissions().is_empty(),
+        "nothing is admitted after the retire: {:?}",
+        sink.admissions()
+    );
+    assert_eq!(
+        cut.admission_entry(&address, &receipt.delivery_id).await,
+        None,
+        "the repointed reservation is released"
+    );
+    let stranded = cut.status(&owner, "task-1").await;
+    assert!(
+        matches!(stranded, ContinuationStatus::Stranded { .. }),
+        "never admitted, and the address retired: {stranded:?}"
+    );
+}
+
+/// A reservation the drain left before a crash, whose input never reached
+/// the reserved session, on an address that retired since: the owner settles
+/// it from that session's ledger, and the continuation reads stranded.
+async fn a_reservation_left_on_a_retired_address_without_its_input_reads_stranded(
+    cut: RetiringFixture,
+) {
+    let sink = Arc::new(RecordingSink::default());
+    let session = SessionId::new();
+    let owner = ContinuationOwner::Session {
+        session_id: session.clone(),
+    };
+    let receipt = cut
+        .fixture
+        .continuations
+        .submit(&owner, delivery("task-1", host_producer()), 1)
+        .await
+        .expect("commit");
+    let address = LogicalRuntimeId::new(receipt.address.clone());
+    cut.fixture
+        .admission(
+            &address,
+            &receipt.delivery_id,
+            ContinuationAdmissionTransition::Reserve {
+                session_id: session.clone(),
+                input_id: InputId::new(),
+            },
+        )
+        .await;
+    cut.retirements.retire(&address);
+
+    let handle = cut
+        .fixture
+        .owner()
+        .arm(RetiringHost::new(
+            sink.clone(),
+            Arc::clone(&cut.retirements),
+        ))
+        .expect("arm");
+    let mut passes = handle.subscribe_passes();
+    wait_for_reconcile(&mut passes).await;
+
+    let status = cut.status(&owner, "task-1").await;
+    assert!(
+        matches!(status, ContinuationStatus::Stranded { .. }),
+        "the reserved session never held the input: {status:?}"
+    );
+    assert!(sink.admissions().is_empty(), "nothing is admitted");
+    assert_eq!(
+        cut.admission_entry(&address, &receipt.delivery_id).await,
+        None,
+        "the reservation is released"
+    );
+}
+
+/// As above, but the input reached the reserved session before the crash:
+/// the owner records that admission, and the continuation reads admitted.
+async fn a_reservation_left_on_a_retired_address_with_its_input_reads_admitted(
+    cut: RetiringFixture,
+) {
+    let sink = Arc::new(RecordingSink::default());
+    let session = SessionId::new();
+    let owner = ContinuationOwner::Session {
+        session_id: session.clone(),
+    };
+    let receipt = cut
+        .fixture
+        .continuations
+        .submit(&owner, delivery("task-1", host_producer()), 1)
+        .await
+        .expect("commit");
+    let address = LogicalRuntimeId::new(receipt.address.clone());
+    let reserved = InputId::new();
+    cut.fixture
+        .admission(
+            &address,
+            &receipt.delivery_id,
+            ContinuationAdmissionTransition::Reserve {
+                session_id: session.clone(),
+                input_id: reserved.clone(),
+            },
+        )
+        .await;
+    sink.already_holds(
+        &session,
+        &continuation_input(reserved.clone(), &receipt.delivery_id, "result"),
+    );
+    cut.retirements.retire(&address);
+
+    let handle = cut
+        .fixture
+        .owner()
+        .arm(RetiringHost::new(
+            sink.clone(),
+            Arc::clone(&cut.retirements),
+        ))
+        .expect("arm");
+    let mut passes = handle.subscribe_passes();
+    wait_for_reconcile(&mut passes).await;
+
+    let status = cut.status(&owner, "task-1").await;
+    assert_eq!(
+        status,
+        ContinuationStatus::Pending {
+            receipt,
+            sequence: 1,
+            admitted: Some((session, reserved)),
+        },
+        "the reserved session holds the input"
+    );
+    assert!(sink.admissions().is_empty(), "nothing is admitted again");
+}
+
+/// As above, but the reserved session holds ANOTHER input under the
+/// admission key: never this delivery by key alone. The owner keeps the
+/// reservation, reports the conflict in its pass, and the continuation stays
+/// pending; nothing is applied.
+async fn a_reservation_left_on_a_retired_address_beside_another_input_stays_pending(
+    cut: RetiringFixture,
+) {
+    let sink = Arc::new(RecordingSink::default());
+    let session = SessionId::new();
+    let owner = ContinuationOwner::Session {
+        session_id: session.clone(),
+    };
+    let receipt = cut
+        .fixture
+        .continuations
+        .submit(&owner, delivery("task-1", host_producer()), 1)
+        .await
+        .expect("commit");
+    let address = LogicalRuntimeId::new(receipt.address.clone());
+    let reserved = InputId::new();
+    cut.fixture
+        .admission(
+            &address,
+            &receipt.delivery_id,
+            ContinuationAdmissionTransition::Reserve {
+                session_id: session.clone(),
+                input_id: reserved.clone(),
+            },
+        )
+        .await;
+    sink.holds_legacy_row(&session, &receipt.delivery_id);
+    cut.retirements.retire(&address);
+
+    let handle = cut
+        .fixture
+        .owner()
+        .arm(RetiringHost::new(
+            sink.clone(),
+            Arc::clone(&cut.retirements),
+        ))
+        .expect("arm");
+    let mut passes = handle.subscribe_passes();
+    let pass = wait_for_pass(&mut passes, "the reconcile pass", |pass| {
+        pass.generation >= 1
+    })
+    .await;
+    assert!(
+        pass.failures
+            .iter()
+            .any(|failure| failure.contains(&receipt.delivery_id)),
+        "the conflict is reported: {:?}",
+        pass.failures
+    );
+
+    let status = cut.status(&owner, "task-1").await;
+    assert!(
+        matches!(status, ContinuationStatus::Pending { admitted: None, .. }),
+        "another input is never this delivery: {status:?}"
+    );
+    assert_eq!(
+        cut.admission_entry(&address, &receipt.delivery_id).await,
+        Some(ContinuationAdmission::Reserved {
+            session_id: session,
+            input_id: reserved,
+        }),
+        "the reservation stays"
+    );
+    assert!(sink.admissions().is_empty(), "nothing is admitted");
+}
+
+macro_rules! retired_cut {
+    ($case:ident) => {
+        mod $case {
+            #[tokio::test]
+            async fn memory() {
+                super::$case(super::RetiringFixture::memory()).await;
+            }
+
+            #[cfg(feature = "sqlite-store")]
+            #[tokio::test]
+            async fn sqlite() {
+                super::$case(super::RetiringFixture::sqlite()).await;
+            }
+        }
+    };
+}
+
+retired_cut!(a_reservation_left_on_a_retired_address_without_its_input_reads_stranded);
+retired_cut!(a_reservation_left_on_a_retired_address_with_its_input_reads_admitted);
+retired_cut!(a_reservation_left_on_a_retired_address_beside_another_input_stays_pending);
+
+/// A reservation that lands between a status read's entry read and its
+/// observation of the retirement is seen: the read answers pending, never
+/// stranded. The owner then settles it from the reserved session's ledger.
+#[tokio::test]
+async fn a_reservation_made_while_the_status_observes_the_retire_reads_pending() {
+    let cut = RetiringFixture::memory();
+    let sink = Arc::new(RecordingSink::default());
+    let session = SessionId::new();
+    let owner = ContinuationOwner::Session {
+        session_id: session.clone(),
+    };
+    let receipt = cut
+        .fixture
+        .continuations
+        .submit(&owner, delivery("task-1", host_producer()), 1)
+        .await
+        .expect("commit");
+    let address = LogicalRuntimeId::new(receipt.address.clone());
+    cut.retirements.retire(&address);
+
+    let inbox = cut.fixture.inbox.clone();
+    let hook_address = address.clone();
+    let delivery_id = RuntimeDeliveryId::new(receipt.delivery_id.clone()).expect("id");
+    let hook_session = session.clone();
+    *cut.resolver.before_observe.lock().expect("lock") = Some(Box::pin(async move {
+        let outcome = inbox
+            .transition_continuation_admission(
+                &hook_address,
+                &delivery_id,
+                ContinuationAdmissionTransition::Reserve {
+                    session_id: hook_session,
+                    input_id: InputId::new(),
+                },
+            )
+            .await
+            .expect("admission index write");
+        assert!(
+            matches!(outcome, ContinuationAdmissionOutcome::Transitioned(_)),
+            "{outcome:?}"
+        );
+    }));
+    let status = cut.status(&owner, "task-1").await;
+    assert!(
+        matches!(status, ContinuationStatus::Pending { admitted: None, .. }),
+        "a reservation exists, so the read is not stranded: {status:?}"
+    );
+
+    let handle = cut
+        .fixture
+        .owner()
+        .arm(RetiringHost::new(
+            sink.clone(),
+            Arc::clone(&cut.retirements),
+        ))
+        .expect("arm");
+    let mut passes = handle.subscribe_passes();
+    wait_for_reconcile(&mut passes).await;
+    let settled = cut.status(&owner, "task-1").await;
+    assert!(
+        matches!(settled, ContinuationStatus::Stranded { .. }),
+        "the reserved session never held the input: {settled:?}"
+    );
+    assert!(sink.admissions().is_empty(), "nothing is admitted");
+}
+
+/// The owner settles a reservation only under the reserved session's
+/// custody: a session another runtime owner serves keeps its reservation
+/// for that owner, and the continuation stays pending.
+#[tokio::test]
+async fn a_reservation_on_a_retired_address_is_left_to_the_host_that_serves_its_session() {
+    let cut = RetiringFixture::memory();
+    let sink = Arc::new(RecordingSink::default());
+    let session = SessionId::new();
+    let owner = ContinuationOwner::Session {
+        session_id: session.clone(),
+    };
+    let receipt = cut
+        .fixture
+        .continuations
+        .submit(&owner, delivery("task-1", host_producer()), 1)
+        .await
+        .expect("commit");
+    let address = LogicalRuntimeId::new(receipt.address.clone());
+    let reserved = InputId::new();
+    cut.fixture
+        .admission(
+            &address,
+            &receipt.delivery_id,
+            ContinuationAdmissionTransition::Reserve {
+                session_id: session.clone(),
+                input_id: reserved.clone(),
+            },
+        )
+        .await;
+    cut.retirements.retire(&address);
+
+    let host = RetiringHost::new(sink.clone(), Arc::clone(&cut.retirements));
+    host.elsewhere.lock().expect("lock").insert(session.clone());
+    let handle = cut.fixture.owner().arm(host).expect("arm");
+    let mut passes = handle.subscribe_passes();
+    wait_for_reconcile(&mut passes).await;
+
+    let status = cut.status(&owner, "task-1").await;
+    assert!(
+        matches!(status, ContinuationStatus::Pending { admitted: None, .. }),
+        "another host serves the reserved session: {status:?}"
+    );
+    assert_eq!(
+        cut.admission_entry(&address, &receipt.delivery_id).await,
+        Some(ContinuationAdmission::Reserved {
+            session_id: session,
+            input_id: reserved,
+        }),
+        "the reservation is left to that host"
+    );
+    assert!(sink.admissions().is_empty(), "nothing is admitted");
+}
+
+/// A live address still drains, once, through the observation that follows
+/// its reservation.
+#[tokio::test]
+async fn a_live_address_still_drains_once_through_the_post_reserve_observation() {
+    let cut = RetiringFixture::memory();
+    let sink = Arc::new(RecordingSink::default());
+    let session = SessionId::new();
+    let owner = ContinuationOwner::Session {
+        session_id: session.clone(),
+    };
+    let handle = cut
+        .fixture
+        .owner()
+        .arm(RetiringHost::new(
+            sink.clone(),
+            Arc::clone(&cut.retirements),
+        ))
+        .expect("arm");
+    let mut passes = handle.subscribe_passes();
+    let receipt = cut
+        .fixture
+        .continuations
+        .submit(&owner, delivery("task-1", host_producer()), 1)
+        .await
+        .expect("commit");
+    let status = wait_for_status(&cut.fixture, &owner, "task-1", &mut passes, |status| {
+        matches!(status, ContinuationStatus::Applied { .. })
+    })
+    .await;
+    let admissions = sink.admissions();
+    assert_eq!(admissions.len(), 1, "admitted exactly once: {admissions:?}");
+    assert_eq!(
+        status,
+        ContinuationStatus::Applied {
+            receipt,
+            session,
+            input: admissions[0].2.clone(),
+        }
+    );
+}
