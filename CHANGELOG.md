@@ -84,6 +84,21 @@ them.
   and `OccurrenceLifecycleInputVariant::*`; match them by variant name, not
   by numeric cast or position.
 
+- Resumed provider switches (see Fixed, provider override on resume):
+  `meerkat-core`'s `ConnectionTargetError` gains the variant
+  `NoCredentialAccountRoute { provider, account }`; `meerkat`'s
+  `LlmIdentityPreflightError` gains the variant
+  `BindingSelection { source }`; and `meerkat-mob`'s
+  `MaterializePreflightProbe::preflight_llm_identity` gains the parameter
+  `resume_prior: Option<&SessionLlmIdentity>` (the resumed session's durable
+  identity, `None` for a fresh member). Behaviour-only: a resume whose
+  provider override changes the provider no longer restores the durable
+  binding, also when the configuration now points that binding's name at the
+  new provider; the new provider resolves its own route. A resumed
+  self-hosted session whose build claims the model or the provider without
+  naming a server follows the registry's server for its model, in the
+  factory and in a mob member's merge alike, instead of the durable server.
+
 ### Added
 
 - `meerkat-schedule`: `ScheduleTargetDelivery::deliver_existing_occurrence`,
@@ -118,7 +133,36 @@ them.
   `MeerkatMachine::accept_existing_input_with_completion_for_attachment_and_member_residency`
   is the same for a mob member's attachment.
 
+- `meerkat-core`: `resolve_resumed_session_llm_identity` and
+  `resolve_resumed_session_auth_binding`, the one rule every resume merge
+  uses for the resumed LLM identity, and `resolve_session_auth_binding`, the
+  binding rule they share with turn and hot-swap overrides.
+  `SessionCredentialAccountRouteFailure` with
+  `SessionError::credential_account_route_failure` and
+  `SessionError::credential_account_route_failure_data` carry a refused
+  account-backed provider switch typed across session, Meta and RPC
+  boundaries. `meerkat`: `AgentFactory::preflight_resumed_llm_identity`.
+
 ### Fixed
+
+- A durable session resumed with `provider` in a mob profile's
+  `resume_overrides` (or a surface resume that changes provider) after the
+  profile moved to another provider no longer fails with
+  `ProviderMismatch` ("binding 'global:openai' resolves backend=OpenAI
+  auth=OpenAI, expected provider Anthropic"), leaving a Meta identity Broken.
+  Both resume merges restored the old provider's binding under the new
+  provider. One Core rule now decides the resumed identity for the mob merge,
+  the factory merge, the surface recovery merge and the member-host preflight:
+  the durable binding is kept while the provider is unchanged, and a changed
+  provider resolves its binding from the session's realm as a fresh member
+  would (the realm's binding, then the parent realms and `global`, then the
+  environment key). A binding backed by a credential account keeps its
+  account, by the hot swap's affinity rule, or the resume refuses with the
+  typed `NoCredentialAccountRoute` and leaves the durable session untouched.
+  The history replays to the new provider without the old provider's native
+  reasoning items. A name re-pointed in configuration at the new provider is
+  not reused: the new provider's route is resolved afresh. Hosts that run
+  members for other hosts need this release to resume such members.
 
 - A turn that compacts its history more often than
   `[compaction] history_retained_rewrites` keeps (five or more compactions at

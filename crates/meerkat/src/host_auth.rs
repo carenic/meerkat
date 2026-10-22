@@ -762,6 +762,7 @@ fn connection_target_reason(
         | E::InvalidBindingId { .. }
         | E::ProviderMismatch { .. }
         | E::AmbiguousCredentialAccountBindings { .. }
+        | E::NoCredentialAccountRoute { .. }
         | E::RealmChain(_) => R::InvalidTarget,
     }
 }

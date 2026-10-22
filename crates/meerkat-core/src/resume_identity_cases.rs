@@ -115,7 +115,7 @@ pub fn resume_identity_cases() -> Vec<ResumeIdentityCase> {
         "muse-glimmer-30b",
         Provider::SelfHosted,
         Some("muse_vllm"),
-        durable_params.clone(),
+        durable_params,
         Some(muse.clone()),
     );
 
@@ -144,7 +144,7 @@ pub fn resume_identity_cases() -> Vec<ResumeIdentityCase> {
         "cerebras-gpt-oss-120b",
         Provider::SelfHosted,
         None,
-        build_params.clone(),
+        build_params,
         None,
     );
 
@@ -182,7 +182,7 @@ pub fn resume_identity_cases() -> Vec<ResumeIdentityCase> {
                 Some(openai.clone()),
                 None,
                 None,
-                Some(openai.clone()),
+                Some(openai),
                 None,
             ],
             servers: [None; 6],

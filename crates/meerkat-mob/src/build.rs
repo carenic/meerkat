@@ -781,32 +781,21 @@ fn merge_resumed_tool_category(
 
 /// Resolve the exact LLM identity a mob resume will hand to AgentFactory.
 ///
-/// The portable profile is the candidate; durable metadata wins for every
-/// unmasked field. An explicit current binding keeps precedence, while an
-/// omitted binding restores the durable configured binding. Both the actual
-/// resumed build and member-host Tier-2 preflight use this one pure seam.
+/// The portable profile is the candidate and `mask` is its declared
+/// `resume_overrides`. The one Core rule every resume merge uses decides it
+/// ([`meerkat_core::resolve_resumed_session_llm_identity`]): durable metadata
+/// wins for every unmasked field, an explicit current binding keeps
+/// precedence, and an omitted binding restores the durable binding only while
+/// the provider is unchanged. A profile that moves the member to another
+/// provider resolves that provider's route, as a fresh member would. Both the
+/// actual resumed build and member-host Tier-2 preflight use this one pure
+/// seam.
 pub(crate) fn effective_resumed_session_llm_identity(
-    mut candidate: SessionLlmIdentity,
+    candidate: SessionLlmIdentity,
     metadata: &SessionMetadata,
     mask: ResumeOverrideMask,
 ) -> SessionLlmIdentity {
-    if !mask.model {
-        candidate.model = metadata.model.clone();
-    }
-    if !mask.provider {
-        candidate.provider = metadata.provider;
-        candidate.self_hosted_server_id = metadata.self_hosted_server_id.clone();
-    }
-    if !mask.provider_params {
-        candidate.provider_params = metadata.provider_params.clone();
-    }
-    if !mask.auth_binding && candidate.auth_binding.is_none() {
-        candidate.auth_binding = metadata
-            .auth_binding
-            .clone()
-            .filter(|binding| !binding.is_env_default());
-    }
-    candidate
+    meerkat_core::resolve_resumed_session_llm_identity(candidate, &metadata.llm_identity(), &mask)
 }
 
 pub(crate) fn resumed_comms_name_matches_current_or_legacy(current: &str, stored: &str) -> bool {

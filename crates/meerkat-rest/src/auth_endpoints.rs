@@ -171,6 +171,7 @@ fn target_error_status(error: &ConnectionTargetError) -> StatusCode {
         | ConnectionTargetError::InvalidBindingId { .. }
         | ConnectionTargetError::ProviderMismatch { .. }
         | ConnectionTargetError::AmbiguousCredentialAccountBindings { .. }
+        | ConnectionTargetError::NoCredentialAccountRoute { .. }
         | ConnectionTargetError::RealmChain(_) => StatusCode::BAD_REQUEST,
     }
 }

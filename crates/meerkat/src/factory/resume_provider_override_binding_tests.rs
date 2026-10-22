@@ -505,6 +505,44 @@ impl Harness {
         self.factory.build_agent(resume, &self.config).await
     }
 
+    /// Preflight the switch the way a member host does: the resume merge's
+    /// identity, with the durable identity as the resume prior.
+    async fn preflight_switched(
+        &self,
+        durable: &Session,
+    ) -> Result<(), crate::LlmIdentityPreflightError> {
+        let durable = durable
+            .session_metadata()
+            .expect("durable metadata")
+            .llm_identity();
+        let mask = meerkat_core::service::ResumeOverrideMask {
+            model: true,
+            provider: true,
+            ..Default::default()
+        };
+        let identity = meerkat_core::resolve_resumed_session_llm_identity(
+            SessionLlmIdentity {
+                model: ANTHROPIC_MODEL.to_string(),
+                provider: Provider::Anthropic,
+                self_hosted_server_id: None,
+                provider_params: None,
+                auth_binding: None,
+            },
+            &durable,
+            &mask,
+        );
+        self.factory
+            .preflight_resumed_llm_identity(
+                &self.config,
+                &identity,
+                Some(&durable),
+                &std::collections::BTreeMap::new(),
+                None,
+                None,
+            )
+            .await
+    }
+
     /// Resume `durable` with no override: durable truth wins, as on a cold
     /// restart of an unchanged profile.
     async fn resume_unchanged(&self, durable: Session) -> Result<DynAgent, BuildAgentError> {
@@ -721,6 +759,21 @@ async fn account_backed_provider_switch_keeps_the_credential_account() {
         "fixture: the session runs on the account-backed OpenAI route"
     );
 
+    // The member-host preflight reaches the build's route.
+    harness
+        .preflight_switched(&durable)
+        .await
+        .expect("the preflight resolves the account-sharing route");
+    let preflighted = harness.log.resolved();
+    assert!(
+        !preflighted.is_empty()
+            && preflighted
+                .iter()
+                .all(|entry| *entry == (Provider::Anthropic, realm_binding("anthropic_account"))),
+        "the preflight keeps the credential account: {preflighted:?}"
+    );
+    harness.log.clear();
+
     let mut resumed = expect_switched(harness.resume_switched(durable, None, None).await);
     resumed
         .run(SECOND_PROMPT.to_string().into())
@@ -752,6 +805,23 @@ async fn account_backed_provider_switch_without_a_shared_route_refuses() {
     ]);
     let harness = Harness::new(config, Scenario::default());
     let durable = harness.create_openai_session(None).await;
+    let expected = meerkat_core::ConnectionTargetError::NoCredentialAccountRoute {
+        provider: Provider::Anthropic,
+        account: meerkat_core::CredentialAccountRef {
+            realm: RealmId::global(),
+            account: meerkat_core::CredentialAccountId::parse(ACCOUNT).expect("valid account"),
+        },
+    };
+
+    // The member-host preflight refuses with the build's typed error.
+    match harness.preflight_switched(&durable).await {
+        Err(crate::LlmIdentityPreflightError::BindingSelection { source }) => {
+            assert_eq!(source, expected);
+        }
+        Err(other) => panic!("expected the typed BindingSelection refusal, got {other}"),
+        Ok(()) => panic!("the preflight must refuse a switch with no account route"),
+    }
+
     let error = match harness.resume_switched(durable, None, None).await {
         Ok(_) => panic!("a switch with no route sharing the account must refuse"),
         Err(error) => error,
@@ -761,6 +831,12 @@ async fn account_backed_provider_switch_without_a_shared_route_refuses() {
         rendered.contains("has no route sharing credential account 'global:acct_a'"),
         "the refusal names the account the switch cannot keep: {rendered}"
     );
+    match error {
+        BuildAgentError::LlmClient(meerkat_client::FactoryError::ConnectionTarget(source)) => {
+            assert_eq!(source, expected, "the build and the preflight refuse alike");
+        }
+        other => panic!("expected the typed NoCredentialAccountRoute refusal, got {other}"),
+    }
     assert!(
         harness.log.resolved().is_empty(),
         "nothing resolves for a refused account switch"
@@ -1060,6 +1136,7 @@ fn self_hosted_config() -> Config {
         SelfHostedApiStyle, SelfHostedModelConfig, SelfHostedServerConfig, SelfHostedTransport,
     };
     let mut config = Config::default();
+    config.self_hosted.default_model = Some("muse-glimmer-30b".to_string());
     let mut section = RealmConfigSection {
         default_binding: Some("muse".to_string()),
         ..Default::default()
@@ -1210,5 +1287,28 @@ fn factory_resume_merge_matches_the_shared_identity_table() {
         mismatches.is_empty(),
         "the factory merge departs from the shared resume identity table:\n{}",
         mismatches.join("\n")
+    );
+}
+
+/// M5. The refused account switch stays typed across the session error
+/// boundary, so the mob and Meta can classify it, and it is still a build
+/// identity failure.
+#[test]
+fn credential_account_route_refusal_round_trips_as_a_typed_session_error() {
+    let failure = meerkat_core::service::SessionCredentialAccountRouteFailure {
+        provider: Provider::Anthropic,
+        realm_id: RealmId::global(),
+        account: meerkat_core::CredentialAccountId::parse(ACCOUNT).expect("valid account"),
+    };
+    let error =
+        meerkat_core::service::SessionError::credential_account_route_failure(failure.clone());
+    assert_eq!(error.credential_account_route_failure_data(), Some(failure));
+    assert!(error.is_build_llm_identity_unresolvable());
+    assert_eq!(error.provider_auth_failure_data(), None);
+    assert!(
+        error
+            .to_string()
+            .contains("has no route sharing credential account 'global:acct_a'"),
+        "{error}"
     );
 }
