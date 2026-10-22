@@ -208,6 +208,11 @@ impl ContinuationAddressResolver for MobContinuationResolver {
         if entry.generation.get() != member.generation {
             return Ok(AddressObservation::Retired);
         }
+        // The phase alone decides. A mob whose actor has stopped (it
+        // fail-stopped, or its task ended) keeps its last live phase and its
+        // members' addresses stay `MayServe`: `Retired` means the records
+        // prove the incarnation never serves again, and recovery resumes this
+        // one, so a continuation bound to it stays pending for it.
         Ok(match handle.status_observation_snapshot() {
             crate::MobState::Completed | crate::MobState::Destroyed => AddressObservation::Retired,
             _ => AddressObservation::MayServe,
@@ -222,6 +227,11 @@ impl MobHandle {
     /// completion that ends after the destroy) must not reach a mob created
     /// again under the id, so it submits nothing. The phase is published
     /// before the destroy returns, to every clone.
+    ///
+    /// A handle of a mob whose actor has stopped (it fail-stopped, or its
+    /// task ended) still submits: that mob is not retired, the continuation
+    /// commits durably for the member's incarnation, and recovery resumes
+    /// that incarnation. Refusing would drop the producer's completion.
     fn require_undestroyed_continuation_owner(
         &self,
     ) -> Result<(), meerkat::ContinuationSubmitError> {
