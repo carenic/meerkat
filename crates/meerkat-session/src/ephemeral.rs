@@ -7846,9 +7846,16 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
         &self,
         expected_actor: &LiveSessionActorWitness,
     ) -> Result<meerkat_core::ControllerModelClient, TryPinControllerError> {
-        // RED stub: the boundary always reads as held.
-        let _ = expected_actor;
-        Err(TryPinControllerError::TurnBoundaryHeld)
+        let Ok(_turn_finalization_guard) = self
+            .turn_finalization_gate_for_session(expected_actor.session_id())
+            .await
+            .try_lock_owned()
+        else {
+            return Err(TryPinControllerError::TurnBoundaryHeld);
+        };
+        self.pin_controller_client_for_actor(expected_actor)
+            .await
+            .map_err(TryPinControllerError::Session)
     }
 
     /// Attach one reviewed MCP server to the exact live actor's own router.

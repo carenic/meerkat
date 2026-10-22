@@ -17281,14 +17281,40 @@ impl MeerkatMachine {
         input: Input,
         custody: Box<dyn crate::input_admission_custody::NativeInputAdmissionCustody>,
     ) -> AcceptInputWithCompletionFuture<'a> {
-        // RED stub: nothing is admitted; the custody settles NotAdmitted.
+        // Construct before boxing: even a never-polled future owns its cleanup.
         let custody = crate::input_admission_custody::NativeInputAdmissionGuard::new(custody);
-        let _ = (session_id, input);
+        let session_id = session_id.clone();
         Box::pin(async move {
-            drop(custody);
-            Err(RuntimeDriverError::ValidationFailed {
-                reason: "session-level custody admission is not implemented".to_string(),
-            })
+            if !matches!(input, Input::Prompt(_)) || input.header().idempotency_key.is_none() {
+                return Err(RuntimeDriverError::ValidationFailed {
+                    reason: "exact prompt replay requires a prompt with a stable idempotency key"
+                        .to_string(),
+                });
+            }
+            match self
+                .execute_meerkat_machine_ingress_command_with_custody(
+                    MeerkatMachineCommand::AcceptWithCompletion {
+                        session_id,
+                        input,
+                        register_completion: true,
+                        replay_policy: crate::accept::InputReplayPolicy::ExactPrompt,
+                        admission_requirement: crate::accept::AdmissionRequirement::Any,
+                        member_residency: MemberResidencyExpectation::Unfenced,
+                        expected_attachment: None,
+                    },
+                    Some(custody),
+                )
+                .await?
+            {
+                MeerkatMachineCommandResult::AcceptWithCompletion {
+                    outcome,
+                    handle,
+                    admission_signal: _,
+                } => Ok((outcome, handle)),
+                other => Err(RuntimeDriverError::Internal(format!(
+                    "unexpected custody accept result: {other:?}"
+                ))),
+            }
         })
     }
 

@@ -143,6 +143,25 @@ impl RetainedJobSource for ConsentAwareJobSource {
             None => RetainedJobLookup::Absent,
         }
     }
+
+    /// Host originals come from the host's bound source only, never in a
+    /// reserved (Core-owned) namespace such as the consent namespace.
+    async fn host_original(&self, namespace: &str, producer_id: &str) -> crate::HostOriginalLookup {
+        if crate::is_reserved_host_namespace(namespace) {
+            return crate::HostOriginalLookup::Absent;
+        }
+        match &self.others {
+            Some(others) => others.host_original(namespace, producer_id).await,
+            None => crate::HostOriginalLookup::Absent,
+        }
+    }
+
+    fn host_original_binder(&self, namespace: &str) -> Option<Arc<dyn crate::HostOriginalBinder>> {
+        if crate::is_reserved_host_namespace(namespace) {
+            return None;
+        }
+        self.others.as_ref()?.host_original_binder(namespace)
+    }
 }
 
 /// One entry of a consent round, as the issuing owner's whole-owner

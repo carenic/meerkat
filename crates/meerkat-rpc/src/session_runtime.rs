@@ -2756,6 +2756,48 @@ impl meerkat::ContinuationDeliverySink for SessionRuntimeContinuationSink {
                 .map(|(outcome, _completion)| outcome),
         )
     }
+
+    fn admits_governed(&self) -> bool {
+        true
+    }
+
+    /// A cold session is attached first, as a retained resume does, so a
+    /// host binder can pin its live actor's controller.
+    async fn prepare_governed(
+        &self,
+        session: &SessionId,
+    ) -> Result<(), meerkat::ContinuationAdmitError> {
+        self.runtime
+            .prepare_cold_attach(session)
+            .await
+            .map_err(|error| meerkat::ContinuationAdmitError::Failed(error.message))
+    }
+
+    async fn admit_governed(
+        &self,
+        session: &SessionId,
+        input: meerkat_runtime::Input,
+        custody: Box<dyn meerkat_runtime::input_admission_custody::NativeInputAdmissionCustody>,
+    ) -> Result<meerkat::GovernedAdmissionOutcome, meerkat_runtime::RuntimeDriverError> {
+        self.runtime
+            .runtime_adapter
+            .accept_input_with_completion_and_custody(session, input, custody)
+            .await
+            .map(|(outcome, _completion)| outcome.into())
+    }
+
+    async fn admitted_input_by_id(
+        &self,
+        session: &SessionId,
+        input_id: &meerkat_core::lifecycle::InputId,
+    ) -> Result<Option<meerkat_runtime::input_state::StoredInputState>, String> {
+        use meerkat_runtime::SessionServiceRuntimeExt as _;
+        self.runtime
+            .runtime_adapter
+            .input_state(session, input_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
 }
 
 #[async_trait::async_trait]

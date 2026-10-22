@@ -19,7 +19,8 @@ use meerkat::{
     AddressObservation, AddressResolution, ContinuationAddressResolver, ContinuationBody,
     ContinuationDelivery, ContinuationHandling, ContinuationKey, ContinuationOwner,
     ContinuationOwnerService, ContinuationProducer, ContinuationResultRef, ContinuationSubmitError,
-    RetainedJobFacts, RetainedJobLookup, RetainedJobRecord, RetainedJobSource,
+    HostOriginalBinder, HostOriginalLookup, RetainedJobFacts, RetainedJobLookup, RetainedJobRecord,
+    RetainedJobSource,
 };
 use meerkat_core::SessionId;
 use meerkat_core::event::BackgroundJobTerminalStatus;
@@ -242,6 +243,12 @@ impl HostJobSource {
         if namespaces.iter().any(String::is_empty) {
             return Err(HostJobSourceError::EmptyNamespace);
         }
+        if let Some(reserved) = namespaces
+            .iter()
+            .find(|namespace| meerkat::is_reserved_host_namespace(namespace))
+        {
+            return Err(HostJobSourceError::ReservedNamespace(reserved.clone()));
+        }
         Ok(Self { namespaces, source })
     }
 
@@ -277,6 +284,26 @@ impl RetainedJobSource for ComposedJobSource {
                 _ => RetainedJobLookup::Absent,
             },
             _ => self.native.retained_job(producer, job_id).await,
+        }
+    }
+
+    /// Host originals come from the host's source for exactly its declared
+    /// namespaces; any other namespace is owned by no one here.
+    async fn host_original(&self, namespace: &str, producer_id: &str) -> HostOriginalLookup {
+        match &self.host {
+            Some(host) if host.owns_namespace(namespace) => {
+                host.source.host_original(namespace, producer_id).await
+            }
+            _ => HostOriginalLookup::Absent,
+        }
+    }
+
+    fn host_original_binder(&self, namespace: &str) -> Option<Arc<dyn HostOriginalBinder>> {
+        match &self.host {
+            Some(host) if host.owns_namespace(namespace) => {
+                host.source.host_original_binder(namespace)
+            }
+            _ => None,
         }
     }
 }

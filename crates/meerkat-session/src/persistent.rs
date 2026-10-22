@@ -11802,9 +11802,27 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         &self,
         witness: &LiveSessionActorWitness,
     ) -> Result<Option<LiveSessionActorTurnBoundaryLease>, crate::TurnBoundaryHeld> {
-        // RED stub: the boundary always reads as held.
-        let _ = witness;
-        Err(crate::TurnBoundaryHeld)
+        let Ok(turn_finalization_guard) = self
+            .turn_finalization_gate_for_session(witness.session_id())
+            .await
+            .try_lock_owned()
+        else {
+            return Err(crate::TurnBoundaryHeld);
+        };
+        let Some(current) = self
+            .inner
+            .live_session_actor_witness(witness.session_id())
+            .await
+        else {
+            return Ok(None);
+        };
+        if &current != witness {
+            return Ok(None);
+        }
+        Ok(Some(LiveSessionActorTurnBoundaryLease {
+            witness: current,
+            _turn_finalization_guard: turn_finalization_guard,
+        }))
     }
 
     /// Pin the exact live actor's selected controller client without waiting
@@ -11816,9 +11834,18 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         &self,
         witness: &LiveSessionActorWitness,
     ) -> Result<meerkat_core::ControllerModelClient, crate::TryPinControllerError> {
-        // RED stub: the boundary always reads as held.
-        let _ = witness;
-        Err(crate::TryPinControllerError::TurnBoundaryHeld)
+        let lease = self
+            .try_acquire_live_session_actor_turn_boundary_lease_exact(witness)
+            .await
+            .map_err(|_| crate::TryPinControllerError::TurnBoundaryHeld)?
+            .ok_or_else(|| {
+                crate::TryPinControllerError::Session(SessionError::NotFound {
+                    id: witness.session_id().clone(),
+                })
+            })?;
+        self.pin_controller_client_for_actor(&lease)
+            .await
+            .map_err(crate::TryPinControllerError::Session)
     }
 
     /// Reserve runtime-turn capacity for the actor protected by `lease`.
