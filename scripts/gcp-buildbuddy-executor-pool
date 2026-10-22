@@ -22,7 +22,8 @@ refuses while any pool instance was made from another template. The executor
 key, endpoint and CA secret names must all differ.
 
 Environment:
-  MEERKAT_GCP_PROJECT_ID                 GCP project (default: king-dnn-training-dev)
+  MEERKAT_GCP_PROJECT_ID                 GCP project (required; GCP_PROJECT_ID is
+                                         read when it is unset)
   MEERKAT_GCP_ZONE                       GCP zone (default: europe-west1-b)
   MEERKAT_GCP_BUILDBUDDY_MIG             MIG name (default: meerkat-bb-exec)
   MEERKAT_GCP_BUILDBUDDY_TEMPLATE        Instance template name (default: derived)
@@ -54,7 +55,16 @@ project-wide secretAccessor binding for it is removed.
 EOF
 }
 
-project="${MEERKAT_GCP_PROJECT_ID:-${GCP_PROJECT_ID:-king-dnn-training-dev}}"
+project="${MEERKAT_GCP_PROJECT_ID:-${GCP_PROJECT_ID:-}}"
+if [[ -z "${project}" ]]; then
+  case "${1:-}" in
+    -h | --help) ;;
+    *)
+      echo "error: MEERKAT_GCP_PROJECT_ID must name the GCP project of the BuildBuddy executor pool" >&2
+      exit 2
+      ;;
+  esac
+fi
 zone="${MEERKAT_GCP_ZONE:-europe-west1-b}"
 mig="${MEERKAT_GCP_BUILDBUDDY_MIG:-meerkat-bb-exec}"
 template=""

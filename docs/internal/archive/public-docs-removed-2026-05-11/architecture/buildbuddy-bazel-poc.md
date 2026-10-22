@@ -279,7 +279,7 @@ only the submitter/coordinator:
    `//platforms:linux_x86_64_gcp_ci`. That platform routes actions to
    BuildBuddy pool `meerkat-ci`, enables external network, and runs actions in
    the pre-baked Artifact Registry image
-   `europe-west1-docker.pkg.dev/king-dnn-training-dev/meerkat-ci/meerkat-ci-rust:1.94.0`.
+   `europe-west1-docker.pkg.dev/<project>/meerkat-ci/meerkat-ci-rust:1.94.0`.
 6. `executors-down` parks the managed instance group with stopped standby
    VMs after the submitters finish. In GitHub CI it sets running size to zero,
    preserves the configured stopped size, and can skip waiting for every stop to
