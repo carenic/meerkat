@@ -27,8 +27,11 @@ use meerkat_contracts::wire::{
     WireAssistantBlock, WireContentBlock, WireContentInput, WireHistoryRow, WireSessionMessage,
     WireToolResult, WireToolResultContent,
 };
+use meerkat_core::fork_notice::{
+    ForkNoticeKind, ForkNoticeSource, ForkSeed, ForkSeedSourceTools, InstructionKeyRef,
+};
 use meerkat_core::skills::{LOAD_SKILL_TOOL_NAME, SkillKey, SkillName, SourceUuid};
-use meerkat_core::types::TranscriptUserRole;
+use meerkat_core::types::{SystemNoticeBlock, TranscriptUserRole};
 use meerkat_core::{
     ForkInstructionPolicy, ForkInstructionRefusal, ForkInstructionRefusalCause,
     InstructionContentDigest, InstructionKey, InstructionNamespace,
@@ -91,6 +94,8 @@ pub(super) struct ForkContextPlan {
     instruction_keys: Vec<(InstructionNamespace, InstructionKey)>,
     /// Skills loaded through `load_skill`, as the notice names them.
     skills: Vec<String>,
+    /// The same skills, typed, where their arguments named one.
+    skill_keys: Vec<SkillKey>,
     injected_rows: usize,
     omitted_rows: usize,
 }
@@ -111,6 +116,41 @@ impl ForkContextPlan {
     ) -> Result<Self, MobError> {
         let carries_session_state = matches!(policy, ForkInstructionPolicy::ReactivateInherited);
         let load_skill_calls = load_skill_calls(&rows);
+
+        // A fork notice in the source's history belongs to an earlier fork,
+        // never to this child: it is not carried. The injected-context row it
+        // follows is that fork's planned context, which carries what the
+        // notice says it carried, so it is session-acquired state too.
+        let mut fork_notice_rows = BTreeSet::new();
+        let mut fork_context_rows: BTreeMap<usize, (Vec<InstructionKeyRef>, Vec<SkillKey>)> =
+            BTreeMap::new();
+        for (index, row) in rows.iter().enumerate() {
+            let WireSessionMessage::SystemNotice { blocks, .. } = &row.0 else {
+                continue;
+            };
+            let Some(notice) = blocks.iter().find_map(|block| match block {
+                SystemNoticeBlock::ForkBoundary(notice) => Some(notice),
+                _ => None,
+            }) else {
+                continue;
+            };
+            fork_notice_rows.insert(index);
+            if let Some(previous) = index.checked_sub(1)
+                && matches!(
+                    &rows[previous].0,
+                    WireSessionMessage::User { transcript_role, .. }
+                        if *transcript_role == TranscriptUserRole::InjectedContext
+                )
+            {
+                fork_context_rows.insert(
+                    previous,
+                    (
+                        notice.instructions_carried.clone(),
+                        notice.skills_carried.clone(),
+                    ),
+                );
+            }
+        }
 
         // Each activation key's effective head: its latest row, unless that
         // row switches the key off (an empty body).
@@ -144,7 +184,7 @@ impl ForkContextPlan {
                 _ => false,
             })
             .collect();
-        let instruction_keys = instruction_keys_seen
+        let mut instruction_keys = instruction_keys_seen
             .iter()
             .filter(|key| {
                 heads
@@ -156,6 +196,23 @@ impl ForkContextPlan {
 
         let mut skills = Vec::new();
         let mut skill_keys: Vec<SkillKey> = Vec::new();
+        for (carried_keys, carried_skills) in fork_context_rows.values() {
+            for carried in carried_keys {
+                let key = (carried.namespace.clone(), carried.key.clone());
+                if !instruction_keys_seen.contains(&key) {
+                    instruction_keys_seen.push(key.clone());
+                }
+                if !instruction_keys.contains(&key) {
+                    instruction_keys.push(key);
+                }
+            }
+            for skill in carried_skills {
+                if !skill_keys.contains(skill) {
+                    skill_keys.push(skill.clone());
+                    skills.push(skill.to_string());
+                }
+            }
+        }
         let mut system_rows = 0usize;
         let mut injected_rows = 0usize;
         let mut row_lines: Vec<Vec<String>> = Vec::with_capacity(rows.len());
@@ -176,6 +233,15 @@ impl ForkContextPlan {
                     system_rows += 1;
                     Vec::new()
                 }
+                WireSessionMessage::User { content, .. }
+                    if fork_context_rows.contains_key(&index) =>
+                {
+                    if carries_session_state {
+                        vec![format!("[user]: {}", content_input_text(content))]
+                    } else {
+                        Vec::new()
+                    }
+                }
                 WireSessionMessage::User {
                     content,
                     transcript_role,
@@ -190,6 +256,9 @@ impl ForkContextPlan {
                 }
                 WireSessionMessage::User { content, .. } => {
                     vec![format!("[user]: {}", content_input_text(content))]
+                }
+                WireSessionMessage::SystemNotice { .. } if fork_notice_rows.contains(&index) => {
+                    Vec::new()
                 }
                 WireSessionMessage::SystemNotice { body, .. } => {
                     vec![format!(
@@ -271,6 +340,7 @@ impl ForkContextPlan {
             system_rows,
             instruction_keys,
             skills,
+            skill_keys,
             injected_rows,
             omitted_rows: 0,
         };
@@ -374,6 +444,53 @@ impl ForkContextPlan {
         lines.push(self.notice_with_omitted(self.omitted_rows));
         lines.push(FORK_CONTEXT_END.to_string());
         lines.join("\n")
+    }
+
+    /// The fork seed of a child whose create build records it: the planned
+    /// rows without the notice line, which Core turns into the child's typed
+    /// fork notice ([`meerkat_core::fork_notice`]) at its first run.
+    pub(super) fn seed(
+        &self,
+        source: ForkNoticeSource,
+        source_tools: ForkSeedSourceTools,
+    ) -> ForkSeed {
+        let mut lines = Vec::with_capacity(self.lines.len() + 2);
+        lines.push(self.header());
+        lines.extend(self.lines.iter().cloned());
+        lines.push(FORK_CONTEXT_END.to_string());
+        let source_instructions = self
+            .instruction_keys
+            .iter()
+            .map(|(namespace, key)| InstructionKeyRef::new(namespace.clone(), key.clone()))
+            .collect::<Vec<_>>();
+        let count = |rows: usize| u32::try_from(rows).unwrap_or(u32::MAX);
+        let (carried_skills, removed_skills) = if self.carries_session_state {
+            (self.skill_keys.clone(), Vec::new())
+        } else {
+            (Vec::new(), self.skill_keys.clone())
+        };
+        let (injected_carried, injected_removed) = if self.carries_session_state {
+            (self.injected_rows, 0)
+        } else {
+            (0, self.injected_rows)
+        };
+        ForkSeed {
+            fork: ForkNoticeKind::PromptContext,
+            source,
+            planned_context: Some(lines.join("\n")),
+            instructions_carried: if self.carries_session_state {
+                source_instructions.clone()
+            } else {
+                Vec::new()
+            },
+            source_instructions,
+            skills_removed: removed_skills,
+            skills_carried: carried_skills,
+            injected_rows_removed: count(injected_removed),
+            injected_rows_carried: count(injected_carried),
+            earlier_rows_omitted: count(self.omitted_rows),
+            source_tools,
+        }
     }
 }
 
@@ -810,6 +927,152 @@ mod tests {
                 other.map(|p| p.render())
             ),
         }
+    }
+
+    fn seed_of(rows: Vec<WireHistoryRow>, policy: ForkInstructionPolicy) -> ForkSeed {
+        plan(rows, policy).expect("the fork is planned").seed(
+            ForkNoticeSource {
+                member: None,
+                session_id: None,
+            },
+            ForkSeedSourceTools::NotRead {
+                reason: meerkat_core::fork_notice::ForkToolsNotComparedReason::SourceNotLive,
+            },
+        )
+    }
+
+    /// An earlier fork's typed rows as a child's history holds them: its
+    /// planned context and the notice that says what that context carried.
+    fn earlier_fork_rows(carried: Vec<InstructionKeyRef>) -> Vec<WireHistoryRow> {
+        let seed = ForkSeed {
+            fork: ForkNoticeKind::PromptContext,
+            source: ForkNoticeSource {
+                member: None,
+                session_id: None,
+            },
+            planned_context: None,
+            source_instructions: carried.clone(),
+            instructions_carried: carried,
+            skills_removed: Vec::new(),
+            skills_carried: Vec::new(),
+            injected_rows_removed: 0,
+            injected_rows_carried: 0,
+            earlier_rows_omitted: 0,
+            source_tools: ForkSeedSourceTools::NotRead {
+                reason: meerkat_core::fork_notice::ForkToolsNotComparedReason::SourceNotLive,
+            },
+        };
+        let notice = seed.notice(SessionId::new(), &BTreeSet::new(), &BTreeSet::new());
+        vec![
+            user_row(
+                "[Forked conversation context from member 'grandparent']\nEARLIER-CONTEXT",
+                TranscriptUserRole::InjectedContext,
+            ),
+            WireHistoryRow(WireSessionMessage::SystemNotice {
+                kind: SystemNoticeKind::Generic,
+                runtime_origin: None,
+                body: None,
+                blocks: vec![SystemNoticeBlock::ForkBoundary(Box::new(notice))],
+                created_at: AT.to_string(),
+            }),
+        ]
+    }
+
+    fn standing_ref() -> InstructionKeyRef {
+        InstructionKeyRef::new(
+            InstructionNamespace::new("host.standing").unwrap(),
+            InstructionKey::new("member").unwrap(),
+        )
+    }
+
+    #[test]
+    fn the_seed_carries_the_planned_rows_without_the_notice_line() {
+        let rows = vec![
+            system("You are the source."),
+            activation("member", "standing-1", "STANDING-BODY"),
+            user_row("RECALL", TranscriptUserRole::InjectedContext),
+            load_skill_call(
+                "call-1",
+                json!({"source_uuid": SKILL_SOURCE, "skill_name": "pdf-processing"}),
+            ),
+            tool_result("call-1", "SKILL-BODY"),
+            user("the conversation"),
+        ];
+        let seed = seed_of(
+            rows.clone(),
+            ForkInstructionPolicy::RequireExplicitActivation,
+        );
+        let context = seed.planned_context.clone().expect("a prompt-context seed");
+        assert!(context.contains("[user]: the conversation"), "{context}");
+        assert!(!context.contains("[fork_notice]"), "{context}");
+        for leaked in [
+            "You are the source.",
+            "STANDING-BODY",
+            "RECALL",
+            "SKILL-BODY",
+        ] {
+            assert!(!context.contains(leaked), "{leaked} leaked: {context}");
+        }
+        assert_eq!(seed.source_instructions, vec![standing_ref()]);
+        assert!(seed.instructions_carried.is_empty());
+        assert_eq!(seed.skills_removed.len(), 1);
+        assert!(seed.skills_carried.is_empty());
+        assert_eq!(seed.injected_rows_removed, 1);
+
+        let kept = seed_of(rows, ForkInstructionPolicy::ReactivateInherited);
+        assert_eq!(kept.instructions_carried, vec![standing_ref()]);
+        assert_eq!(kept.skills_carried.len(), 1);
+        assert!(kept.skills_removed.is_empty());
+        assert_eq!(kept.injected_rows_carried, 1);
+        let notice = kept.notice(SessionId::new(), &BTreeSet::new(), &BTreeSet::new());
+        assert!(
+            notice.instructions_removed.is_empty(),
+            "carried keys are not removed: {notice:?}"
+        );
+    }
+
+    #[test]
+    fn an_earlier_forks_notice_is_not_carried_and_its_context_is_session_state() {
+        let mut rows = vec![system("You are the child.")];
+        rows.extend(earlier_fork_rows(vec![standing_ref()]));
+        rows.push(user("the child's task"));
+
+        let text = rendered(
+            rows.clone(),
+            ForkInstructionPolicy::RequireExplicitActivation,
+        );
+        assert!(!text.contains("EARLIER-CONTEXT"), "{text}");
+        assert!(!text.contains("[system_notice]"), "{text}");
+        assert!(text.contains("[user]: the child's task"), "{text}");
+        let seed = seed_of(
+            rows.clone(),
+            ForkInstructionPolicy::RequireExplicitActivation,
+        );
+        assert_eq!(
+            seed.source_instructions,
+            vec![standing_ref()],
+            "the keys the earlier context carried are the source's"
+        );
+        assert_eq!(
+            seed.injected_rows_removed, 0,
+            "it is not a host-injected row"
+        );
+
+        match plan(rows.clone(), ForkInstructionPolicy::Refuse) {
+            Err(MobError::ForkInstructionRefused { refusal, .. }) => {
+                assert_eq!(refusal.keys.len(), 1, "{refusal:?}");
+            }
+            other => panic!(
+                "refuse refuses the carried keys, got {:?}",
+                other.map(|p| p.render())
+            ),
+        }
+        let kept = rendered(rows, ForkInstructionPolicy::ReactivateInherited);
+        assert!(kept.contains("EARLIER-CONTEXT"), "{kept}");
+        assert!(
+            !kept.contains("[system_notice]"),
+            "the copied notice never is: {kept}"
+        );
     }
 
     #[test]

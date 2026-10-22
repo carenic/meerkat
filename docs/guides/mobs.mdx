@@ -119,6 +119,26 @@ part of a mob definition:
   key that was effective in the source, and the child runs at once.
 - `refuse`: every fork whose child would inherit an activation is refused.
 
+`fork_helper` (a member spawned with `MemberLaunchMode::Fork`) starts a
+fresh session instead and gives it the source's recent conversation as
+context. The same policy decides what of it the child gets, by each row's
+type. The source's system prompt and host system context are never
+carried. Under the default, the source's activated instructions, the
+skills it loaded with `load_skill` (each named in their place) and
+host-injected context such as memory recall are left out; under `refuse`
+a fork whose context holds an activation or a loaded skill is refused;
+under `reactivate_inherited` they are carried. The context fits a byte
+budget, newest rows first, and a fork whose newest row alone does not fit
+is refused with `fork_context_too_large`.
+
+A fork child is told what it was given. Before its first input it gets a
+fork notice (a `fork_boundary` system notice) that names its source and,
+by name only, the instructions and tools it lost or gained and what its
+context carried. A `fork_helper` child gets its context the same way, as
+one row before its first input, so a turn-driven helper sees it in its
+task turn. A child placed on a member host gets the context and the
+notice as the start of its first prompt instead.
+
 ## Define A Mob
 
 A small mob definition has profiles and optional wiring:

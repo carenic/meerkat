@@ -317,6 +317,32 @@ such a council record. Upgrade member hosts before their controller: a 0.9.3
 member host answers `ReactivateInherited` with the refusal cause
 `member_host_unsupported` and forks participants without the policy otherwise.
 
+Prompt-context forks (`MemberLaunchMode::Fork`, `fork_helper`): the
+child gets a planned text of the source's history, decided by each row's
+type under the same policy. The source's system prompt and host system
+context are never carried. Under `RequireExplicitActivation` activation
+bodies, skill bodies the source loaded with `load_skill` (a line names
+each skill) and host-injected context rows (memory recall) are left out;
+under `Refuse` such a fork is refused with `ForkInstructionRefused`
+(`refusal.skills` names the skills); under `ReactivateInherited` they are
+carried. The rows fit a byte budget, newest first (half the child model's
+window at four bytes per token, at most 256 KiB); a newest row that alone
+does not fit is refused before anything is spawned with
+`MobError::ForkContextTooLarge` (`INVALID_PARAMS`, data kind
+`fork_context_too_large`). The child's create build carries
+`SessionBuildOptions::prompt_context_fork_source`. A child created on
+this host gets the context as one injected-context row and a typed fork
+notice (`SystemNoticeBlock::ForkBoundary`, wire `fork_boundary`) before
+its first input, whoever starts that turn, so a turn-driven helper sees
+it in its task turn; the session holds them until then as the metadata
+entry `session_fork_seed_v1`. A child placed on a member host gets the
+context as a prompt prefix ending in a `[fork_notice]:` line. A durable
+fork's child (`fork_member` and the forks built on it) gets a notice of
+kind `transcript` at its first turn. A notice names the source and, by
+name only, the instructions and tools the child lost or gained and what
+a prompt-context fork carried. A 0.9.4 reader decodes the block as an
+unknown notice with its summary.
+
 Refused restore (since 0.9.4): when a registration hook (`select_destination`,
 `select_agent_mandate`, `prepare_member_surface` or `verify_member_surface`)
 refuses a restored member, the restore removes that registration exactly (the
@@ -932,7 +958,8 @@ spawn authority; supply `member_id` and `task`, optionally `message_count`,
 `max_text_bytes`, and `max_run_secs`. Unknown arguments are rejected. The
 child runs turn-driven whatever its role's default runtime mode. This
 durable transcript fork is distinct from `MemberLaunchMode::Fork` /
-`fork_helper`, which seed a fresh session's prompt with rendered history;
+`fork_helper`, which seed a fresh session with a planned text of the
+source's history (see "Prompt-context forks");
 low-level `Session::fork()` / `fork_at()` / `fork_replacing()` are separate
 structural primitives. Every fork starts with zero usage: the source's
 lifetime token counters are not copied into the child.

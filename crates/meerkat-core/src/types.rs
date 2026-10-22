@@ -2595,6 +2595,11 @@ pub enum SystemNoticeBlock {
         cessation: crate::tool_process::ToolProcessCessation,
         disposition: crate::tool_process::InterruptedToolRunDisposition,
     },
+    /// What a fork child was given of its source, delivered once before its
+    /// first input ([`crate::fork_notice`]). Its `summary` is the notice as
+    /// the model reads it, so a reader that does not know this block type
+    /// still shows it as an unknown notice.
+    ForkBoundary(Box<crate::fork_notice::ForkBoundaryNotice>),
     Unknown {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
@@ -2697,6 +2702,7 @@ enum SystemNoticeBlockKnown {
         cessation: crate::tool_process::ToolProcessCessation,
         disposition: crate::tool_process::InterruptedToolRunDisposition,
     },
+    ForkBoundary(Box<crate::fork_notice::ForkBoundaryNotice>),
     Unknown {
         #[serde(default)]
         summary: Option<String>,
@@ -2826,6 +2832,7 @@ impl From<SystemNoticeBlockKnown> for SystemNoticeBlock {
                 cessation,
                 disposition,
             },
+            SystemNoticeBlockKnown::ForkBoundary(notice) => Self::ForkBoundary(notice),
             SystemNoticeBlockKnown::Unknown { summary, payload } => {
                 Self::Unknown { summary, payload }
             }
@@ -2850,6 +2857,7 @@ impl<'de> Deserialize<'de> for SystemNoticeBlock {
                 | "auth"
                 | "runtime_notice"
                 | "tool_process_interrupted"
+                | "fork_boundary"
                 | "unknown",
             ) => serde_json::from_value::<SystemNoticeBlockKnown>(value)
                 .map(Into::into)
@@ -2905,6 +2913,7 @@ impl SystemNoticeBlock {
             | Self::Auth { detail, .. }
             | Self::RuntimeNotice { detail, .. } => detail.as_deref(),
             Self::ToolConfig { .. } | Self::ToolProcessInterrupted { .. } => None,
+            Self::ForkBoundary(notice) => Some(notice.summary.as_str()),
         }
     }
 
@@ -3370,6 +3379,16 @@ impl SystemNoticeMessage {
                     .to_string(),
             ),
             blocks,
+        )
+    }
+
+    /// The fork notice a fork child is given once, before its first input
+    /// ([`crate::fork_notice`]). It renders as an ordinary system notice.
+    pub fn fork_boundary(notice: crate::fork_notice::ForkBoundaryNotice) -> Self {
+        Self::with_block(
+            SystemNoticeKind::Generic,
+            None,
+            SystemNoticeBlock::ForkBoundary(Box::new(notice)),
         )
     }
 

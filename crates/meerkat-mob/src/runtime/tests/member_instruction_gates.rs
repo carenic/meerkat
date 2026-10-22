@@ -1739,6 +1739,20 @@ fn carries_body(request: &meerkat_client::LlmRequest) -> bool {
     format!("{:?}", request.messages).contains(BODY)
 }
 
+/// The text of the typed fork notice `request` holds, as the model reads it.
+fn fork_notice_summary(request: &meerkat_client::LlmRequest) -> Option<String> {
+    request.messages.iter().find_map(|message| {
+        let Message::SystemNotice(notice) = message else {
+            return None;
+        };
+        notice.blocks.iter().find_map(|block| {
+            let block = serde_json::to_value(block).expect("notice block wire json");
+            (block["type"] == "fork_boundary")
+                .then(|| block["summary"].as_str().unwrap_or_default().to_string())
+        })
+    })
+}
+
 fn context_fork_spec(
     identity: &str,
     source: &AgentIdentity,
@@ -1809,11 +1823,11 @@ async fn a_context_fork_of_an_activated_member_carries_no_instruction_body_by_de
         !block.contains("[system]:"),
         "no System row of the source is rendered: {block}"
     );
+    let notice = fork_notice_summary(&request).expect("the child reads its typed fork notice");
     assert!(
-        block.contains("[fork_notice]:")
-            && block.contains("Activated instructions not carried: host.standing/member")
-            && block.contains("system prompt and host system context were not carried"),
-        "the notice names what was not carried: {block}"
+        notice.contains("Instructions the source had that you do not: host.standing/member")
+            && notice.contains("system prompt and host system context were not carried"),
+        "the notice names what was not carried: {notice}"
     );
     fixture.finish().await;
 }
@@ -1844,9 +1858,10 @@ async fn an_autonomous_context_fork_carries_no_instruction_body_by_default() {
         "the kickoff carries no activation body"
     );
     let block = fork_block(&request).expect("the kickoff carries the fork context");
+    let notice = fork_notice_summary(&request).expect("the kickoff reads its typed fork notice");
     assert!(
-        !block.contains("[system]:") && block.contains("host.standing/member"),
-        "no System row is rendered and the notice names the key: {block}"
+        !block.contains("[system]:") && notice.contains("host.standing/member"),
+        "no System row is rendered and the notice names the key: {block} / {notice}"
     );
     fixture.finish().await;
 }
@@ -1970,10 +1985,12 @@ async fn reactivate_inherited_keeps_instruction_bodies_in_a_context_fork() {
         !block.contains("[system]: You are"),
         "the source's system prompt is not carried: {block}"
     );
+    let notice = fork_notice_summary(&request).expect("the child reads its typed fork notice");
     assert!(
-        block.contains("Activated instructions carried: host.standing/member")
-            && block.contains("system prompt and host system context were not carried"),
-        "the notice says what was and was not carried: {block}"
+        notice.contains(
+            "Instructions of the source carried in the context above: host.standing/member"
+        ) && notice.contains("system prompt and host system context were not carried"),
+        "the notice says what was and was not carried: {notice}"
     );
     fixture.finish().await;
 }
@@ -2068,9 +2085,10 @@ async fn a_context_fork_does_not_carry_host_injected_context_by_default() {
         !block.contains("INJECTED-RECALL-MARKER"),
         "the injected row is not carried: {block}"
     );
+    let notice = fork_notice_summary(&request).expect("the child reads its typed fork notice");
     assert!(
-        block.contains("Host-injected context rows not carried: 1"),
-        "the notice counts it: {block}"
+        notice.contains("Host-injected context rows of the source not carried: 1"),
+        "the notice counts it: {notice}"
     );
     fixture.finish().await;
 }
@@ -2119,9 +2137,10 @@ async fn a_turn_driven_fork_helper_sees_its_planned_context() {
         !carries_body(&request) && !block.contains("[system]:"),
         "the context carries no System row of the source: {block}"
     );
+    let notice = fork_notice_summary(&request).expect("the helper reads its typed fork notice");
     assert!(
-        block.contains("host.standing/member"),
-        "the notice names the key: {block}"
+        notice.contains("host.standing/member"),
+        "the notice names the key: {notice}"
     );
     fixture.finish().await;
 }
@@ -2396,10 +2415,7 @@ async fn a_fork_notice_names_a_tool_the_child_cannot_call() {
         .cloned()
         .expect("the helper's first request");
     assert!(
-        request
-            .tools
-            .iter()
-            .all(|tool| tool.name.to_string() != denied),
+        request.tools.iter().all(|tool| tool.name != denied),
         "the helper cannot call {denied}"
     );
     let notices = fork_notices(&request.messages);

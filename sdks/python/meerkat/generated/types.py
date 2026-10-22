@@ -7855,6 +7855,87 @@ class ContentBlockSkillContext(TypedDict, total=False):
 
 ContentBlock = ContentBlockText | ContentBlockImageInline | ContentBlockImageBlob | ContentBlockVideoInline | ContentBlockVideoUri | ContentBlockStructured | ContentBlockSkillContext
 
+# Which kind of fork a fork notice describes.
+ForkNoticeKind = Literal['transcript', 'prompt_context']
+
+@dataclass
+class MobMemberBinding:
+    """Durable, typed identity of a mob member, carried on
+[`SessionMetadata`](crate::session::SessionMetadata).
+
+This is the canonical owner of the `(mob_id, role, member)` identity fact
+that ownership routing (`owns_persisted_bridge_session`) and outbound
+peer-added payloads previously recovered by splitting the untyped
+`comms_name` string and re-deriving the realm by format convention.
+
+`comms_name`/`realm_id`/`peer_meta` remain on the metadata as the transport
+routing name and discovery metadata — identity and transport are separate
+facts. Old persisted rows written before this field existed deserialize as
+`None` (the field is `#[serde(default, skip_serializing_if)]` on the
+metadata), so back-read is safe."""
+    member: str
+    mob_id: str
+    role: str
+
+
+@dataclass
+class ForkNoticeSource:
+    """The source a fork notice names: the source member when a mob forked one
+of its members, and the source session when the forking side knows it."""
+    member: Optional[MobMemberBinding] = None
+    session_id: Optional[str] = None
+
+
+# What a fork did with its source's own system prompt and host system
+# context.
+ForkNoticeSystemPrompt = Literal['not_carried', 'not_applicable']
+
+# Why a fork notice does not compare the source's tools with the child's.
+ForkToolsNotComparedReason = Literal['source_not_live', 'source_busy', 'placed_source', 'member_host_unsupported']
+
+# The tools a fork notice names: the source's visible tool names at the fork
+# boundary against the child's at its first model call, by name only.
+class ForkNoticeToolsCompared(TypedDict, total=False):
+    added: NotRequired[list[ToolName]]
+    comparison: Required[Literal['compared']]
+    omitted: NotRequired[int]
+    removed: NotRequired[list[ToolName]]
+
+class ForkNoticeToolsNotCompared(TypedDict, total=False):
+    comparison: Required[Literal['not_compared']]
+    reason: Required[ForkToolsNotComparedReason]
+
+ForkNoticeTools = ForkNoticeToolsCompared | ForkNoticeToolsNotCompared
+
+@dataclass
+class InstructionKeyRef:
+    """One instruction key a fork notice names."""
+    key: str
+    namespace: str
+
+
+@dataclass
+class ForkBoundaryNotice:
+    """What a fork child was given of its source, by name only: the typed
+content of a [`SystemNoticeBlock::ForkBoundary`](crate::types::SystemNoticeBlock)
+notice. `summary` is the notice as the model reads it; a reader that does
+not know the block type decodes it as an unknown notice with that summary."""
+    child_session_id: str
+    fork: ForkNoticeKind
+    source: ForkNoticeSource
+    source_system_prompt: ForkNoticeSystemPrompt
+    summary: str
+    tools: ForkNoticeTools
+    earlier_rows_omitted: Optional[int] = None
+    injected_rows_carried: Optional[int] = None
+    injected_rows_removed: Optional[int] = None
+    instructions_added: Optional[list[InstructionKeyRef]] = None
+    instructions_carried: Optional[list[InstructionKeyRef]] = None
+    instructions_removed: Optional[list[InstructionKeyRef]] = None
+    skills_carried: Optional[list[SkillKey]] = None
+    skills_removed: Optional[list[SkillKey]] = None
+
+
 # Unique identifier for an interaction.
 InteractionId = str
 
@@ -8027,12 +8108,29 @@ class SystemNoticeBlockToolProcessInterrupted(TypedDict, total=False):
     tool_call_id: NotRequired[Optional[str]]
     type: Required[Literal['tool_process_interrupted']]
 
+class SystemNoticeBlockForkBoundary(TypedDict, total=False):
+    child_session_id: Required[str]
+    earlier_rows_omitted: NotRequired[int]
+    fork: Required[ForkNoticeKind]
+    injected_rows_carried: NotRequired[int]
+    injected_rows_removed: NotRequired[int]
+    instructions_added: NotRequired[list[InstructionKeyRef]]
+    instructions_carried: NotRequired[list[InstructionKeyRef]]
+    instructions_removed: NotRequired[list[InstructionKeyRef]]
+    skills_carried: NotRequired[list[SkillKey]]
+    skills_removed: NotRequired[list[SkillKey]]
+    source: Required[ForkNoticeSource]
+    source_system_prompt: Required[ForkNoticeSystemPrompt]
+    summary: Required[str]
+    tools: Required[ForkNoticeTools]
+    type: Required[Literal['fork_boundary']]
+
 class SystemNoticeBlockUnknown(TypedDict, total=False):
     payload: NotRequired[Any]
     summary: NotRequired[Optional[str]]
     type: Required[Literal['unknown']]
 
-SystemNoticeBlock = SystemNoticeBlockComms | SystemNoticeBlockExternalEvent | SystemNoticeBlockToolConfig | SystemNoticeBlockMcp | SystemNoticeBlockBackgroundJob | SystemNoticeBlockAuth | SystemNoticeBlockRuntimeNotice | SystemNoticeBlockToolProcessInterrupted | SystemNoticeBlockUnknown
+SystemNoticeBlock = SystemNoticeBlockComms | SystemNoticeBlockExternalEvent | SystemNoticeBlockToolConfig | SystemNoticeBlockMcp | SystemNoticeBlockBackgroundJob | SystemNoticeBlockAuth | SystemNoticeBlockRuntimeNotice | SystemNoticeBlockToolProcessInterrupted | SystemNoticeBlockForkBoundary | SystemNoticeBlockUnknown
 
 # Typed system notice content carried in the transcript.
 SystemNoticeKind = Literal['generic', 'comms', 'external_event', 'mcp_pending', 'mcp', 'background_job', 'tool_scope', 'tool_scope_warning'] | Literal['auth_reauth_required'] | Literal['tool_process_recovery']

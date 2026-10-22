@@ -6049,6 +6049,25 @@ pub(super) struct ForkSourceHistoryRead {
 }
 
 impl ForkSourceHistoryRead {
+    /// The source's visible tools for the child's fork notice: a local
+    /// source's, read without waiting on a running turn; a placed source's
+    /// are not read.
+    async fn source_tools(
+        &self,
+        session_service: &dyn MobSessionService,
+    ) -> meerkat_core::fork_notice::ForkSeedSourceTools {
+        match &self.location {
+            ForkSourceHistoryLocation::Local { source_session_id } => {
+                session_service.fork_source_tools(source_session_id).await
+            }
+            ForkSourceHistoryLocation::Remote { .. } => {
+                meerkat_core::fork_notice::ForkSeedSourceTools::NotRead {
+                    reason: meerkat_core::fork_notice::ForkToolsNotComparedReason::PlacedSource,
+                }
+            }
+        }
+    }
+
     /// Read the source's rows and decide them under the host's fork
     /// instruction policy, fitted to `max_bytes` (`super::fork_context`).
     async fn read_plan(
@@ -32147,29 +32166,31 @@ impl MobActor {
             // through the same placement switch as `member_history` (the
             // `ReadMemberHistory` proxy) — the phase-3
             // `RemoteReadUnavailable` shape now means "tried and failed".
-            let (fork_context_text, prompt_context_source) =
-                if let Some(read) = fork_source_read {
-                    let budget = super::fork_context::fork_context_budget(&config.model);
-                    let plan = read
-                        .read_plan(preparation_context.session_service.as_ref(), budget)
-                        .await?;
-                    (Some(plan.render()), Some(read.prompt_context_source.clone()))
-                } else {
-                    (None, None)
+            // The child is not handed the context as a prompt prefix: its
+            // create build records the planned context as a typed fork seed,
+            // which Core delivers once, before the child's first input, as an
+            // injected-context row and a typed fork notice, whoever authors
+            // that first turn.
+            let (fork_seed, prompt_context_source) = if let Some(read) = fork_source_read {
+                let session_service = preparation_context.session_service.as_ref();
+                let budget = super::fork_context::fork_context_budget(&config.model);
+                let plan = read.read_plan(session_service, budget).await?;
+                let source_tools = read.source_tools(session_service).await;
+                let source = meerkat_core::fork_notice::ForkNoticeSource {
+                    member: Some(read.prompt_context_source.source_member.clone()),
+                    session_id: read.prompt_context_source.source_session_id.clone(),
                 };
+                (
+                    Some(plan.seed(source, source_tools)),
+                    Some(read.prompt_context_source.clone()),
+                )
+            } else {
+                (None, None)
+            };
 
-            let base_prompt = initial_message.clone().unwrap_or_else(|| {
+            let prompt = initial_message.clone().unwrap_or_else(|| {
                 ContentInput::from(fallback_prompt.clone())
             });
-            let prompt = if let Some(fork_text) = fork_context_text {
-                let mut blocks = vec![meerkat_core::types::ContentBlock::Text {
-                    text: format!("{fork_text}\n\n"),
-                }];
-                blocks.extend(base_prompt.into_blocks());
-                ContentInput::Blocks(blocks)
-            } else {
-                base_prompt
-            };
             let initial_turn_prompt = initial_message.as_ref().map(|_| prompt.clone());
             let req = build::to_create_session_request(&config, prompt.clone());
             let req = with_spawn_budget_limits(req, budget_limits);
@@ -32183,8 +32204,21 @@ impl MobActor {
             let selected_runtime_mode =
                 normalize_runtime_mode_for_binding(selected_runtime_mode, &selected_binding);
             let mut req = req;
-            if let (Some(source), Some(build)) = (prompt_context_source, req.build.as_mut()) {
-                build.prompt_context_fork_source = Some(source);
+            if let Some(build) = req.build.as_mut() {
+                if let Some(source) = prompt_context_source {
+                    build.prompt_context_fork_source = Some(source);
+                }
+                if let Some(seed) = fork_seed {
+                    let seed = serde_json::to_value(&seed).map_err(|error| {
+                        MobError::Internal(format!(
+                            "failed to record the fork seed of member '{agent_identity}': {error}"
+                        ))
+                    })?;
+                    build.initial_metadata_entries.insert(
+                        meerkat_core::fork_notice::SESSION_FORK_SEED_KEY.to_string(),
+                        seed,
+                    );
+                }
             }
             let peer_name = render_member_comms_name(
                 preparation_context.definition.id.as_str(),

@@ -2453,6 +2453,52 @@ where
             .await
     }
 
+    /// Deliver the fork seed recorded on this session when it was created
+    /// as a fork child ([`crate::fork_notice::ForkSeed`]): the planned
+    /// context of a prompt-context fork as one injected-context row, then the
+    /// typed fork notice, computed against this child's own instruction keys
+    /// and visible tools now. The seed is removed with the delivery, in the
+    /// same session state the run commits.
+    fn deliver_fork_seed(&mut self) -> Result<(), AgentError> {
+        let Some(value) = self
+            .session
+            .metadata()
+            .get(crate::fork_notice::SESSION_FORK_SEED_KEY)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let child = self.session.id().clone();
+        let seed: crate::fork_notice::ForkSeed =
+            serde_json::from_value(value).map_err(|error| {
+                AgentError::InternalError(format!(
+                    "the fork seed of session {child} is unreadable: {error}"
+                ))
+            })?;
+        if !crate::fork_notice::holds_fork_notice_for(self.session.messages(), &child) {
+            let child_instructions =
+                crate::fork_notice::effective_instruction_keys(self.session.messages(), |origin| {
+                    origin == &child
+                });
+            let child_tools = self.tool_scope.visible_tool_names().map_err(|error| {
+                AgentError::InternalError(format!(
+                    "the visible tools of fork child {child} are unreadable: {error}"
+                ))
+            })?;
+            let notice = seed.notice(child, &child_instructions, &child_tools);
+            if let Some(planned) = seed.planned_context {
+                let row = self.stamp_user_message_identity(UserMessage::injected_context(planned));
+                self.session.push(Message::User(row));
+            }
+            self.session.push(Message::SystemNotice(
+                crate::types::SystemNoticeMessage::fork_boundary(notice),
+            ));
+        }
+        self.session
+            .remove_metadata(crate::fork_notice::SESSION_FORK_SEED_KEY);
+        Ok(())
+    }
+
     fn stamp_user_message_identity(&self, mut message: UserMessage) -> UserMessage {
         if let Some(identity) = self.active_transcript_identity.as_ref() {
             message.identity = identity.clone();
@@ -2673,6 +2719,14 @@ where
             .run_started_hooks(&run_prompt_input, event_tx.as_ref())
             .await
         {
+            self.handle_run_failure(&err, event_tx.as_ref()).await;
+            self.clear_runtime_execution_kind();
+            return Err(err);
+        }
+
+        // A fork child is given what its forking side recorded once, before
+        // the first run's own input rows, whoever authored that run.
+        if let Err(err) = self.deliver_fork_seed() {
             self.handle_run_failure(&err, event_tx.as_ref()).await;
             self.clear_runtime_execution_kind();
             return Err(err);

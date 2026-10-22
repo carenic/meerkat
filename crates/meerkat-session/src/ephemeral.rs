@@ -1419,6 +1419,10 @@ mod session_event_stream_tests {
 /// authority.
 type SessionState = TurnAdmissionProjection;
 
+/// The longest [`EphemeralSessionService::fork_source_tools`] waits for an
+/// idle source's tool scope before it reports the source busy.
+pub const FORK_SOURCE_TOOLS_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// A live session actor's turn activity, as published by its generated
 /// turn-admission projection.
 ///
@@ -5662,6 +5666,40 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
                 "Session task dropped the reply channel".to_string(),
             ))
         })
+    }
+
+    /// The visible tool names of the live session `id` at a fork boundary,
+    /// for the child's fork notice ([`meerkat_core::fork_notice`]). A session
+    /// with an active turn is reported busy instead of awaited: the source
+    /// may be forking itself from one of its own tool calls, and its task
+    /// answers no command until that turn ends. A read that still waits
+    /// past [`FORK_SOURCE_TOOLS_WAIT`] is reported busy too.
+    pub async fn fork_source_tools(
+        &self,
+        id: &SessionId,
+    ) -> meerkat_core::fork_notice::ForkSeedSourceTools {
+        use meerkat_core::fork_notice::{ForkSeedSourceTools, ForkToolsNotComparedReason};
+        let Some(activity) = self.session_activity_watch(id).await else {
+            return ForkSeedSourceTools::NotRead {
+                reason: ForkToolsNotComparedReason::SourceNotLive,
+            };
+        };
+        if activity.is_active() {
+            return ForkSeedSourceTools::NotRead {
+                reason: ForkToolsNotComparedReason::SourceBusy,
+            };
+        }
+        match tokio::time::timeout(FORK_SOURCE_TOOLS_WAIT, self.tool_scope_snapshot(id)).await {
+            Ok(Ok(Some(snapshot))) => ForkSeedSourceTools::Read {
+                names: snapshot.visible_names,
+            },
+            Ok(Ok(None) | Err(_)) => ForkSeedSourceTools::NotRead {
+                reason: ForkToolsNotComparedReason::SourceNotLive,
+            },
+            Err(_) => ForkSeedSourceTools::NotRead {
+                reason: ForkToolsNotComparedReason::SourceBusy,
+            },
+        }
     }
 
     /// How a live session's next model request projects its tool catalog:

@@ -45,6 +45,13 @@ them.
   create build. The standard build pipeline does not read it; a host's
   build hook may. Code that builds either type with a struct literal sets
   it, normally to `None`.
+- `meerkat-core`: `SystemNoticeBlock` gains the variant
+  `ForkBoundary(Box<fork_notice::ForkBoundaryNotice>)` (wire block type
+  `fork_boundary`): the typed fork notice a fork child is given once,
+  before its first input (see the behaviour entry below). Code that matches
+  the enum exhaustively adds an arm for it. A 0.9.4 reader decodes the
+  block as `Unknown` with its `summary`, so it still shows the model the
+  notice text.
 - Not measured by the gate (a wire change): `meerkat-core`:
   `ForkInstructionRefusal` gains `skills: Vec<SkillKey>`, the skills a
   prompt-context fork's source loaded with the built-in `load_skill` tool
@@ -67,14 +74,21 @@ them.
   - under `reactivate_inherited`, each activated key's effective
     instruction, the skill bodies and the host-injected context rows are
     carried.
-  The rendered block ends with a `[fork_notice]:` line that names the
-  source and lists, by name only, what was and was not carried. The
-  rendered rows fit a byte budget, newest first: half the child model's
-  context window at four bytes per token, at most 256 KiB (256 KiB for a
-  model the catalog does not know); the notice counts the older rows it
-  left out. A fork whose newest row alone does not fit is refused before
-  anything is spawned with the new `MobError::ForkContextTooLarge` (code
-  `INVALID_PARAMS`, data kind `fork_context_too_large`).
+  A child created on this host gets the planned context as one typed
+  injected-context row and a typed fork notice (`fork_boundary` block)
+  before its first input, whoever starts that first turn, instead of a
+  prefix of its first prompt; the notice names the source and, by name
+  only, the instructions, skills and tools the child lost or gained. A
+  child placed on a member host still gets the context as a prompt prefix
+  that ends with a `[fork_notice]:` line. A durable fork's child
+  (`fork_member` and the forks built on it) gets the same notice, of kind
+  `transcript`, at its first turn. The rendered rows fit a byte budget,
+  newest first: half the child model's context window at four bytes per
+  token, at most 256 KiB (256 KiB for a model the catalog does not know);
+  the notice counts the older rows it left out. A fork whose newest row
+  alone does not fit is refused before anything is spawned with the new
+  `MobError::ForkContextTooLarge` (code `INVALID_PARAMS`, data kind
+  `fork_context_too_large`).
 
 ### Changed
 
@@ -116,6 +130,15 @@ them.
   included, and every tool result, under every policy. The rows are now
   decided by their typed activation identity and by the tool call that
   produced them, never by their text (see Breaking).
+
+- A turn-driven `MobHandle::fork_helper` (the default helper mode) now sees
+  its fork context. The helper is created without an initial message, so
+  the rendered context went into a deferred create request that discards
+  its prompt, and the helper received only its task. The planned context
+  is now recorded on the child's session and delivered before its first
+  input, as a typed row (see Breaking). A turn-driven fork child placed on
+  a member host without an initial message still receives no fork
+  context.
 
 ## [0.9.4] - 2026-10-20
 

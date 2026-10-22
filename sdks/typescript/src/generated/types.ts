@@ -6872,6 +6872,59 @@ export type BackgroundJobTerminalStatus = "completed" | "failed" | "aborted" | "
 
 export type CommsNoticeKind = string;
 
+export type ForkNoticeKind = "transcript" | "prompt_context";
+
+export interface MobMemberBinding {
+  member: string;
+  mob_id: string;
+  role: string;
+}
+
+export interface ForkNoticeSource {
+  member?: MobMemberBinding | null;
+  session_id?: string | null;
+}
+
+export type ForkNoticeSystemPrompt = "not_carried" | "not_applicable";
+
+export type ForkToolsNotComparedReason = "source_not_live" | "source_busy" | "placed_source" | "member_host_unsupported";
+
+export interface ForkNoticeToolsCompared {
+  added?: ToolName[];
+  comparison: "compared";
+  omitted?: number;
+  removed?: ToolName[];
+}
+
+export interface ForkNoticeToolsNotCompared {
+  comparison: "not_compared";
+  reason: ForkToolsNotComparedReason;
+}
+
+export type ForkNoticeTools = ForkNoticeToolsCompared | ForkNoticeToolsNotCompared;
+
+export interface InstructionKeyRef {
+  key: string;
+  namespace: string;
+}
+
+export interface ForkBoundaryNotice {
+  child_session_id: string;
+  earlier_rows_omitted?: number;
+  fork: ForkNoticeKind;
+  injected_rows_carried?: number;
+  injected_rows_removed?: number;
+  instructions_added?: InstructionKeyRef[];
+  instructions_carried?: InstructionKeyRef[];
+  instructions_removed?: InstructionKeyRef[];
+  skills_carried?: SkillKey[];
+  skills_removed?: SkillKey[];
+  source: ForkNoticeSource;
+  source_system_prompt: ForkNoticeSystemPrompt;
+  summary: string;
+  tools: ForkNoticeTools;
+}
+
 export type InteractionId = string;
 
 export type InterruptedInputKind = "prompt" | "peer" | "flow_step" | "external_event" | "continuation" | "operation" | "unknown";
@@ -7030,13 +7083,31 @@ export interface SystemNoticeBlockToolProcessInterrupted {
   type: "tool_process_interrupted";
 }
 
+export interface SystemNoticeBlockForkBoundary {
+  child_session_id: string;
+  earlier_rows_omitted?: number;
+  fork: ForkNoticeKind;
+  injected_rows_carried?: number;
+  injected_rows_removed?: number;
+  instructions_added?: InstructionKeyRef[];
+  instructions_carried?: InstructionKeyRef[];
+  instructions_removed?: InstructionKeyRef[];
+  skills_carried?: SkillKey[];
+  skills_removed?: SkillKey[];
+  source: ForkNoticeSource;
+  source_system_prompt: ForkNoticeSystemPrompt;
+  summary: string;
+  tools: ForkNoticeTools;
+  type: "fork_boundary";
+}
+
 export interface SystemNoticeBlockUnknown {
   payload?: unknown;
   summary?: string | null;
   type: "unknown";
 }
 
-export type SystemNoticeBlock = SystemNoticeBlockComms | SystemNoticeBlockExternalEvent | SystemNoticeBlockToolConfig | SystemNoticeBlockMcp | SystemNoticeBlockBackgroundJob | SystemNoticeBlockAuth | SystemNoticeBlockRuntimeNotice | SystemNoticeBlockToolProcessInterrupted | SystemNoticeBlockUnknown;
+export type SystemNoticeBlock = SystemNoticeBlockComms | SystemNoticeBlockExternalEvent | SystemNoticeBlockToolConfig | SystemNoticeBlockMcp | SystemNoticeBlockBackgroundJob | SystemNoticeBlockAuth | SystemNoticeBlockRuntimeNotice | SystemNoticeBlockToolProcessInterrupted | SystemNoticeBlockForkBoundary | SystemNoticeBlockUnknown;
 
 export type SystemNoticeKind = "generic" | "comms" | "external_event" | "mcp_pending" | "mcp" | "background_job" | "tool_scope" | "tool_scope_warning" | "auth_reauth_required" | "tool_process_recovery";
 
