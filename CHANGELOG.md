@@ -433,6 +433,14 @@ them.
   not reused: the new provider's route is resolved afresh. Hosts that run
   members for other hosts need this release to resume such members.
 
+- A connector OAuth login on one of its client profile's
+  `registered_redirect_uris` can complete over RPC: `auth/login/start`
+  returns its `host_attempt_handle`, and `auth/login/complete` passes the
+  one the host sends (before, RPC dropped it both ways, so such a login was
+  always refused as needing the host's custody). Without the handle the
+  refusal carries `error.data.detail` `remote_custody_required` and leaves
+  the attempt pending. `iss` stays MCP-only.
+
 ## [0.9.4] - 2026-10-20
 
 ### Breaking
