@@ -213,6 +213,7 @@ impl ForkContextPlan {
                 }
             }
         }
+        let mut unreadable_skill_loads: Vec<String> = Vec::new();
         let mut system_rows = 0usize;
         let mut injected_rows = 0usize;
         let mut row_lines: Vec<Vec<String>> = Vec::with_capacity(rows.len());
@@ -295,10 +296,16 @@ impl ForkContextPlan {
                             if !skills.contains(&skill) {
                                 skills.push(skill.clone());
                             }
-                            if let Some(key) = &call.key
-                                && !skill_keys.contains(key)
-                            {
-                                skill_keys.push(key.clone());
+                            match &call.key {
+                                Some(key) if !skill_keys.contains(key) => {
+                                    skill_keys.push(key.clone());
+                                }
+                                Some(_) => {}
+                                None => {
+                                    if !unreadable_skill_loads.contains(&result.tool_use_id) {
+                                        unreadable_skill_loads.push(result.tool_use_id.clone());
+                                    }
+                                }
                             }
                             if carries_session_state {
                                 tool_result_line(result)
@@ -329,7 +336,8 @@ impl ForkContextPlan {
                     ForkInstructionRefusalCause::PolicyRefuses,
                     keys,
                 )
-                .with_skills(skill_keys),
+                .with_skills(skill_keys)
+                .with_unreadable_skill_loads(unreadable_skill_loads),
             });
         }
 
@@ -369,7 +377,7 @@ impl ForkContextPlan {
                     return Err(MobError::ForkContextTooLarge {
                         source_member_id: source_member_id.clone(),
                         max_bytes,
-                        newest_row_bytes: reserved + bytes,
+                        required_bytes: reserved + bytes,
                     });
                 }
                 omitted += 1;
@@ -916,11 +924,11 @@ mod tests {
         match refused {
             Err(MobError::ForkContextTooLarge {
                 max_bytes,
-                newest_row_bytes,
+                required_bytes,
                 ..
             }) => {
                 assert_eq!(max_bytes, 4_000);
-                assert!(newest_row_bytes > 10_000);
+                assert!(required_bytes > 10_000);
             }
             other => panic!(
                 "expected ForkContextTooLarge, got {:?}",

@@ -32164,7 +32164,7 @@ impl MobActor {
             // given and within the budget for the child's model
             // (`super::fork_context`). §19.L2: a PLACED source routes
             // through the same placement switch as `member_history` (the
-            // `ReadMemberHistory` proxy) — the phase-3
+            // `ReadMemberHistory` proxy) - the phase-3
             // `RemoteReadUnavailable` shape now means "tried and failed".
             // The child is not handed the context as a prompt prefix: its
             // create build records the planned context as a typed fork seed,

@@ -333,7 +333,10 @@ pub enum ForkInstructionRefusalCause {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-#[error("{}", fork_instruction_refusal_message(.cause, .keys, .skills))]
+#[error(
+    "{}",
+    fork_instruction_refusal_message(.cause, .keys, .skills, .unreadable_skill_loads)
+)]
 #[non_exhaustive]
 pub struct ForkInstructionRefusal {
     pub cause: ForkInstructionRefusalCause,
@@ -344,6 +347,12 @@ pub struct ForkInstructionRefusal {
     /// for every other refusal, and then not serialized.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<crate::skills::SkillKey>,
+    /// The tool call ids of `load_skill` calls in a prompt-context fork's
+    /// source whose arguments name no skill. Their results count as
+    /// loaded skills, so the fork fails closed on them. Empty for every
+    /// other refusal, and then not serialized.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable_skill_loads: Vec<String>,
 }
 
 impl ForkInstructionRefusal {
@@ -356,6 +365,7 @@ impl ForkInstructionRefusal {
             cause,
             keys,
             skills: Vec::new(),
+            unreadable_skill_loads: Vec::new(),
         }
     }
 
@@ -365,37 +375,59 @@ impl ForkInstructionRefusal {
         self.skills = skills;
         self
     }
+
+    /// The same refusal, naming the `load_skill` calls whose arguments
+    /// name no skill, by tool call id.
+    #[must_use]
+    pub fn with_unreadable_skill_loads(mut self, calls: Vec<String>) -> Self {
+        self.unreadable_skill_loads = calls;
+        self
+    }
 }
 
 fn fork_instruction_refusal_message(
     cause: &ForkInstructionRefusalCause,
     keys: &[(InstructionNamespace, InstructionKey)],
     skills: &[crate::skills::SkillKey],
+    unreadable_skill_loads: &[String],
 ) -> String {
     let keys = keys
         .iter()
         .map(|(namespace, key)| format!("{namespace}/{key}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let skills = if skills.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " and skills loaded by the source [{}]",
-            skills
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    };
     match cause {
-        ForkInstructionRefusalCause::PolicyRefuses => format!(
-            "fork refused: the child would inherit activated instruction keys [{keys}]{skills} and the \
-             fork instruction policy refuses them; to carry them into the child, set the host's \
-             fork_instruction_policy (inherited_instructions on a session fork call) to \
-             reactivate_inherited"
-        ),
+        ForkInstructionRefusalCause::PolicyRefuses => {
+            // Only what the child would inherit is named: a prompt-context
+            // fork can be refused for loaded skills alone.
+            let mut inherited = Vec::new();
+            if !keys.is_empty() || (skills.is_empty() && unreadable_skill_loads.is_empty()) {
+                inherited.push(format!("activated instruction keys [{keys}]"));
+            }
+            if !skills.is_empty() {
+                inherited.push(format!(
+                    "skills loaded by the source [{}]",
+                    skills
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if !unreadable_skill_loads.is_empty() {
+                inherited.push(format!(
+                    "load_skill calls whose skill cannot be read [{}]",
+                    unreadable_skill_loads.join(", ")
+                ));
+            }
+            format!(
+                "fork refused: the child would inherit {} and the fork instruction policy \
+                 refuses them; to carry them into the child, set the host's \
+                 fork_instruction_policy (inherited_instructions on a session fork call) to \
+                 reactivate_inherited",
+                inherited.join(" and ")
+            )
+        }
         ForkInstructionRefusalCause::NotEffectiveInSource => format!(
             "fork refused: instruction keys [{keys}] were inherited but never activated in the \
              source, so there is no effective activation to carry into the child"

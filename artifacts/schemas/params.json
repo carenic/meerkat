@@ -9407,6 +9407,13 @@
               "$ref": "#/$defs/SkillKey"
             },
             "type": "array"
+          },
+          "unreadable_skill_loads": {
+            "description": "The tool call ids of `load_skill` calls in a prompt-context fork's\nsource whose arguments name no skill. Their results count as\nloaded skills, so the fork fails closed on them. Empty for every\nother refusal, and then not serialized.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         },
         "required": [

@@ -1488,14 +1488,17 @@ pub enum MobError {
     /// anything was spawned: the newest row of its planned context does not
     /// fit the fork context budget for the child's model.
     #[error(
-        "fork of member '{source_member_id}' refused: its newest context row needs \
-         {newest_row_bytes} bytes, more than the {max_bytes}-byte fork context budget; \
-         fork with last_messages or from a source with shorter rows"
+        "fork of member '{source_member_id}' refused: its newest context row with the \
+         fork context framing needs {required_bytes} bytes, more than the \
+         {max_bytes}-byte fork context budget; fork with last_messages or from a \
+         source with shorter rows"
     )]
     ForkContextTooLarge {
         source_member_id: AgentIdentity,
         max_bytes: usize,
-        newest_row_bytes: usize,
+        /// The bytes the newest row needs together with the fork context
+        /// framing (header, fork notice and end marker).
+        required_bytes: usize,
     },
 
     /// A restored member's host refused its registration at `call`. The
@@ -1888,12 +1891,12 @@ impl MobError {
             Self::ForkContextTooLarge {
                 source_member_id,
                 max_bytes,
-                newest_row_bytes,
+                required_bytes,
             } => Some(serde_json::json!({
                 "kind": "fork_context_too_large",
                 "source_member_id": source_member_id.as_str(),
                 "max_bytes": max_bytes,
-                "newest_row_bytes": newest_row_bytes,
+                "required_bytes": required_bytes,
             })),
             // A restore failure that IS a typed resume hold projects the hold
             // under meerkat's own key, so a wire caller classifies the Broken

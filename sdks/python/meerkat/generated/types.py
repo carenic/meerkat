@@ -4979,6 +4979,7 @@ No child session exists when this is returned."""
     cause: ForkInstructionRefusalCause
     keys: list[list[Any]]
     skills: Optional[list[SkillKey]] = None
+    unreadable_skill_loads: Optional[list[str]] = None
 
 
 # Optional typed domain for tool-configuration change payloads.
