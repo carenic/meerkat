@@ -11,6 +11,11 @@
 //! the reconcile pass reads, so every lease it grants stays live for the whole
 //! test: a lease left held never expires here, and the next incarnation can
 //! take an identity only after a release.
+//!
+//! A member's session actor holds the session's hosting claim until it exits,
+//! and the runtime unregister does not wait for that exit. The lease of a
+//! member whose actor still lives is not released: a successor given the
+//! identity would find the session still hosted here.
 
 use super::actor_isolation::FaultInjectingRuntimeStore;
 use super::*;
@@ -32,6 +37,165 @@ impl crate::store::MobIdentityStoreClock for FrozenIdentityClock {
     }
 }
 
+/// Holds one session's next actor exit. An exiting actor's agent releases what
+/// it owns before the actor reports its exit, and the session task owns the
+/// session's hosting claim until then: a held actor keeps the claim until the
+/// test lets it go.
+#[derive(Clone)]
+struct ActorExitGate {
+    held: Arc<std::sync::Mutex<Option<SessionId>>>,
+    reached: Arc<tokio::sync::watch::Sender<bool>>,
+    released: Arc<tokio::sync::Semaphore>,
+}
+
+impl ActorExitGate {
+    fn new() -> Self {
+        Self {
+            held: Arc::new(std::sync::Mutex::new(None)),
+            reached: Arc::new(tokio::sync::watch::channel(false).0),
+            released: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+
+    /// Hold the next exit of an actor for `session`.
+    fn hold(&self, session: &SessionId) {
+        *self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session.clone());
+    }
+
+    /// Wait until the held actor waits at its exit.
+    async fn wait_reached(&self) {
+        let mut reached = self.reached.subscribe();
+        tokio::time::timeout(STEP, reached.wait_for(|reached| *reached))
+            .await
+            .expect("the held actor reaches its exit")
+            .expect("the exit gate is alive");
+    }
+
+    /// Let the held actor exit.
+    fn release(&self) {
+        self.released.add_permits(1);
+    }
+
+    async fn pass(&self, session: &SessionId) {
+        let held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_if(|held| held == session)
+            .is_some();
+        if held {
+            self.reached.send_replace(true);
+            if let Ok(permit) = self.released.acquire().await {
+                permit.forget();
+            }
+        }
+    }
+}
+
+/// The persistent mock agent, with its exit passing the fixture's gate.
+struct ExitGatedAgent {
+    inner: PersistentMockAgent,
+    gate: ActorExitGate,
+}
+
+#[async_trait]
+impl SessionAgent for ExitGatedAgent {
+    async fn run_with_events(
+        &mut self,
+        prompt: meerkat_core::types::ContentInput,
+        event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+    ) -> Result<RunResult, meerkat_core::error::AgentError> {
+        self.inner.run_with_events(prompt, event_tx).await
+    }
+
+    fn set_skill_references(&mut self, refs: Option<Vec<meerkat_core::skills::SkillKey>>) {
+        self.inner.set_skill_references(refs);
+    }
+
+    fn set_turn_tool_overlay(
+        &mut self,
+        overlay: Option<meerkat_core::service::TurnToolOverlay>,
+    ) -> Result<(), meerkat_core::error::AgentError> {
+        self.inner.set_turn_tool_overlay(overlay)
+    }
+
+    fn cancel(&mut self) {
+        self.inner.cancel();
+    }
+
+    fn observed_session_tail(&self) -> meerkat_core::pending_continuation::ObservedSessionTailKind {
+        self.inner.observed_session_tail()
+    }
+
+    fn hot_swap_llm_identity(
+        &mut self,
+        client: std::sync::Arc<dyn meerkat_core::AgentLlmClient>,
+        identity: meerkat_core::SessionLlmIdentity,
+        request_policy: meerkat_core::SessionLlmRequestPolicy,
+    ) -> Result<(), meerkat_core::error::AgentError> {
+        self.inner
+            .hot_swap_llm_identity(client, identity, request_policy)
+    }
+
+    fn session_id(&self) -> SessionId {
+        self.inner.session_id()
+    }
+
+    fn snapshot(&self) -> SessionSnapshot {
+        self.inner.snapshot()
+    }
+
+    fn session_clone(&self) -> Result<Session, meerkat_core::error::AgentError> {
+        self.inner.session_clone()
+    }
+
+    fn session_transcript_authority(
+        &self,
+    ) -> Result<
+        meerkat_session::ephemeral::SessionTranscriptAuthoritySnapshot,
+        meerkat_core::error::AgentError,
+    > {
+        self.inner.session_transcript_authority()
+    }
+
+    fn durable_llm_identity(&self) -> Option<SessionLlmIdentity> {
+        self.inner.durable_llm_identity()
+    }
+
+    fn transient_turn_context_state(&self) -> meerkat_core::TransientTurnContextStateHandle {
+        self.inner.transient_turn_context_state()
+    }
+
+    async fn release_owned_resources(&mut self) {
+        self.inner.release_owned_resources().await;
+        let session = self.inner.session_id();
+        self.gate.pass(&session).await;
+    }
+}
+
+struct ExitGatedBuilder {
+    gate: ActorExitGate,
+}
+
+#[async_trait]
+impl SessionAgentBuilder for ExitGatedBuilder {
+    type Agent = ExitGatedAgent;
+
+    async fn build_agent(
+        &self,
+        req: &CreateSessionRequest,
+        event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+    ) -> Result<Self::Agent, SessionError> {
+        Ok(ExitGatedAgent {
+            inner: PersistentMockBuilder.build_agent(req, event_tx).await?,
+            gate: self.gate.clone(),
+        })
+    }
+}
+
 /// In-memory mob stores with a frozen identity clock, a session service over a
 /// runtime store that can park a session's unregister finalization, and the
 /// definition every incarnation runs.
@@ -43,8 +207,9 @@ struct LeaseFixture {
     runtime_metadata: Arc<InMemoryMobRuntimeMetadataStore>,
     identity: Arc<InMemoryMobIdentityStore>,
     identity_status: Arc<InMemoryMobIdentityStatusStore>,
-    service: Arc<meerkat_session::PersistentSessionService<PersistentMockBuilder>>,
+    service: Arc<meerkat_session::PersistentSessionService<ExitGatedBuilder>>,
     runtime_store: Arc<FaultInjectingRuntimeStore>,
+    exit_gate: ActorExitGate,
 }
 
 impl LeaseFixture {
@@ -65,8 +230,11 @@ impl LeaseFixture {
             meerkat_runtime::InMemoryRuntimeStore::new(),
         ));
         let session_store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
+        let exit_gate = ActorExitGate::new();
         let service = Arc::new(meerkat_session::PersistentSessionService::new(
-            PersistentMockBuilder,
+            ExitGatedBuilder {
+                gate: exit_gate.clone(),
+            },
             16,
             session_store,
             Arc::clone(&runtime_store) as Arc<dyn meerkat_runtime::RuntimeStore>,
@@ -82,7 +250,15 @@ impl LeaseFixture {
             identity_status: Arc::new(InMemoryMobIdentityStatusStore::new()),
             service,
             runtime_store,
+            exit_gate,
         }
+    }
+
+    /// The runtime machine the session service owns.
+    fn machine(&self) -> Arc<meerkat_runtime::MeerkatMachine> {
+        MobSessionService::acquire_runtime_adapter(self.service.as_ref(), None)
+            .expect("the service owns a runtime machine")
+            .expect("a persistent service has a machine")
     }
 
     fn storage(&self) -> MobStorage {
@@ -408,5 +584,145 @@ async fn a_mob_that_ends_without_a_shutdown_keeps_its_identity_lease() {
         fixture.lease(member).await.as_ref(),
         Some(&previous),
         "a Shutdown never releases a lease another incarnation holds"
+    );
+}
+
+/// A Shutdown whose deadline passes while the member's session actor still
+/// lives keeps the member's lease: the actor holds the session's hosting claim
+/// until it exits. The Shutdown has returned by the time the actor exits, so
+/// the lease stays until it expires, and the next incarnation waits for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shutdown_keeps_the_lease_of_a_member_whose_session_actor_outlives_it() {
+    let fixture = LeaseFixture::new("lease-actor-outlives");
+    let (handle, members) = fixture.create(&["worker-1"]).await;
+    let (member, session) = &members[0];
+    let previous = fixture
+        .lease(member)
+        .await
+        .expect("a converged identity holds a live lease");
+    fixture.exit_gate.hold(session);
+
+    let report = handle
+        .shutdown_with_report(
+            ShutdownOptions::default()
+                .with_deadline(meerkat_core::time_compat::Instant::now() + Duration::from_secs(2)),
+        )
+        .await
+        .expect("the shutdown answers");
+    assert!(
+        matches!(
+            report.members.get(member),
+            Some(MemberShutdownOutcome::Unregistered)
+        ),
+        "{report:?}"
+    );
+    fixture.exit_gate.wait_reached().await;
+    assert_eq!(
+        fixture.lease(member).await.as_ref(),
+        Some(&previous),
+        "the lease stays while the member's session actor lives"
+    );
+
+    fixture.exit_gate.release();
+    tokio::time::timeout(STEP, fixture.service.await_removed_actor_exit(session))
+        .await
+        .expect("the released actor exits");
+    assert_eq!(
+        fixture.lease(member).await.as_ref(),
+        Some(&previous),
+        "nothing releases the lease after the Shutdown returned"
+    );
+
+    let resumed = fixture.resume().await;
+    let awaited = tokio::time::timeout(STEP, async {
+        loop {
+            if matches!(
+                resumed
+                    .identity_convergence_status(member)
+                    .await
+                    .expect("read the convergence status"),
+                IdentityStoredObservation::Valid(crate::identity::IdentityConvergenceStatus {
+                    decision: Some(IdentityReconcileDecision::AwaitLease),
+                    ..
+                })
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        awaited.is_ok(),
+        "the next incarnation waits for the kept lease"
+    );
+    resumed.shutdown().await.expect("shut the resumed mob down");
+}
+
+/// Within its deadline, a Shutdown releases a member's lease once the member's
+/// session actor has exited, and never while the actor still lives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shutdown_releases_the_lease_once_the_member_session_actor_has_exited() {
+    let fixture = LeaseFixture::new("lease-actor-exits");
+    let (handle, members) = fixture.create(&["worker-1"]).await;
+    let (member, session) = &members[0];
+    let previous = fixture
+        .lease(member)
+        .await
+        .expect("a converged identity holds a live lease");
+    fixture.exit_gate.hold(session);
+    let machine = fixture.machine();
+
+    let shutdown = tokio::spawn({
+        let handle = handle.clone();
+        async move {
+            handle
+                .shutdown_with_report(ShutdownOptions::default().with_deadline(
+                    meerkat_core::time_compat::Instant::now() + Duration::from_secs(10),
+                ))
+                .await
+        }
+    });
+    fixture.exit_gate.wait_reached().await;
+    tokio::time::timeout(STEP, async {
+        while machine
+            .current_session_registration_witness(session)
+            .await
+            .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the Shutdown unregisters the member's runtime");
+    let released_early = tokio::time::timeout(Duration::from_secs(1), async {
+        while fixture.lease(member).await.is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        released_early.is_err(),
+        "the lease is released only once the member's session actor has exited"
+    );
+    assert_eq!(fixture.lease(member).await.as_ref(), Some(&previous));
+
+    fixture.exit_gate.release();
+    let report = tokio::time::timeout(STEP, shutdown)
+        .await
+        .expect("the shutdown returns once the actor exited")
+        .expect("the shutdown task")
+        .expect("the shutdown answers");
+    assert!(
+        matches!(
+            report.members.get(member),
+            Some(MemberShutdownOutcome::Unregistered)
+        ),
+        "{report:?}"
+    );
+    assert_eq!(
+        fixture.lease(member).await,
+        None,
+        "the lease is released once the member's session actor exited"
     );
 }
