@@ -17265,6 +17265,33 @@ impl MeerkatMachine {
             .await
     }
 
+    /// [`Self::accept_input_with_completion`] for a keyed prompt whose
+    /// process-local resource owner (for example a trusted host's custody of
+    /// the original the prompt binds) is settled by native admission, as
+    /// [`Self::accept_input_with_completion_for_attachment_and_replay_policy_with_custody`]
+    /// settles it, without an attachment fence. The replay contract is
+    /// `ExactPrompt`: a duplicate is the same prompt and context, verified
+    /// from the existing admission's retained witness. Before the credential
+    /// boundary, dropping the returned future settles `NotAdmitted`; after
+    /// it, dropping the acknowledgement cannot cancel the native-owned
+    /// settlement. This does not change the native admission result.
+    pub fn accept_input_with_completion_and_custody<'a>(
+        &'a self,
+        session_id: &'a SessionId,
+        input: Input,
+        custody: Box<dyn crate::input_admission_custody::NativeInputAdmissionCustody>,
+    ) -> AcceptInputWithCompletionFuture<'a> {
+        // RED stub: nothing is admitted; the custody settles NotAdmitted.
+        let custody = crate::input_admission_custody::NativeInputAdmissionGuard::new(custody);
+        let _ = (session_id, input);
+        Box::pin(async move {
+            drop(custody);
+            Err(RuntimeDriverError::ValidationFailed {
+                reason: "session-level custody admission is not implemented".to_string(),
+            })
+        })
+    }
+
     pub(crate) async fn accept_peer_ingress_with_completion(
         &self,
         facts: meerkat_core::interaction::PeerIngressClaimCommitFacts,

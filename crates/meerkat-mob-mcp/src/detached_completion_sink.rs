@@ -216,13 +216,18 @@ pub enum HostJobSourceError {
     /// An empty namespace names no host operation.
     #[error("a host job source namespace must not be empty")]
     EmptyNamespace,
+    /// The namespace is Core-owned ([`meerkat::RESERVED_HOST_NAMESPACE_PREFIX`],
+    /// for example consent notices): no host source may own it.
+    #[error("host namespace {0:?} is reserved for Core")]
+    ReservedNamespace(String),
 }
 
 impl HostJobSource {
-    /// `source` answers for the `Host` producer in exactly `namespaces`.
+    /// `source` answers for the `Host` producer in exactly `namespaces`:
+    /// their committed setup results and their host originals.
     ///
     /// # Errors
-    /// No namespace, or an empty one.
+    /// No namespace, an empty one, or a reserved (Core-owned) one.
     pub fn new(
         namespaces: impl IntoIterator<Item = impl Into<String>>,
         source: Arc<dyn RetainedJobSource>,
@@ -241,7 +246,11 @@ impl HostJobSource {
     }
 
     fn owns(&self, producer: &ContinuationProducer) -> bool {
-        matches!(producer, ContinuationProducer::Host { namespace } if self.namespaces.contains(namespace))
+        matches!(producer, ContinuationProducer::Host { namespace } if self.owns_namespace(namespace))
+    }
+
+    fn owns_namespace(&self, namespace: &str) -> bool {
+        self.namespaces.contains(namespace)
     }
 }
 

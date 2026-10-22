@@ -518,3 +518,139 @@ mod tests {
         assert!(!ends_notice_input(&InputTerminalOutcome::Consumed));
     }
 }
+
+#[cfg(all(test, feature = "session-store"))]
+#[allow(clippy::expect_used)]
+mod host_original_tests {
+    use std::sync::Arc;
+
+    use meerkat_core::SessionId;
+    use meerkat_core::session_hosting::HostingPaths;
+
+    use super::{ConsentAwareJobSource, ConsentNoticeJobSource};
+    use crate::{
+        BoundHostOriginal, ContinuationDelivery, ContinuationHandling, ContinuationKey,
+        ContinuationOwner, ContinuationProducer, ContinuationResultRef, HostOriginalBinder,
+        HostOriginalBinderReadiness, HostOriginalFacts, HostOriginalLookup, HostOriginalRef,
+        HostOriginalRefusal, HostOriginalSettlement, RetainedJobLookup, RetainedJobSource,
+    };
+
+    /// A host source that claims every host original and offers a binder for
+    /// every namespace.
+    struct ClaimsEverything(HostOriginalFacts);
+
+    #[async_trait::async_trait]
+    impl RetainedJobSource for ClaimsEverything {
+        async fn retained_job(
+            &self,
+            _producer: &ContinuationProducer,
+            _job_id: &str,
+        ) -> RetainedJobLookup {
+            RetainedJobLookup::Absent
+        }
+
+        async fn host_original(&self, _namespace: &str, _producer_id: &str) -> HostOriginalLookup {
+            HostOriginalLookup::Found(self.0.clone())
+        }
+
+        fn host_original_binder(&self, _namespace: &str) -> Option<Arc<dyn HostOriginalBinder>> {
+            Some(Arc::new(InertBinder))
+        }
+    }
+
+    struct InertBinder;
+
+    #[async_trait::async_trait]
+    impl HostOriginalBinder for InertBinder {
+        async fn bind(
+            &self,
+            _original: &HostOriginalRef,
+            _session: &SessionId,
+            _input: meerkat_runtime::Input,
+        ) -> Result<BoundHostOriginal, HostOriginalRefusal> {
+            Err(HostOriginalRefusal::NotOwned)
+        }
+
+        async fn readiness(
+            &self,
+            _namespace: &str,
+            _owner: &ContinuationOwner,
+        ) -> HostOriginalBinderReadiness {
+            HostOriginalBinderReadiness::Ready
+        }
+
+        fn retain_unresolved(&self, _settlement: Box<dyn HostOriginalSettlement>, _detail: &str) {}
+    }
+
+    fn facts() -> HostOriginalFacts {
+        HostOriginalFacts::new(
+            ContinuationOwner::Session {
+                session_id: SessionId::new(),
+            },
+            ContinuationDelivery {
+                key: ContinuationKey::new("ingest:1").expect("key"),
+                result: ContinuationResultRef {
+                    producer: ContinuationProducer::Host {
+                        namespace: "app.ingest".into(),
+                    },
+                    producer_id: "observation-1".into(),
+                    result_digest: "sha256:observation-1".into(),
+                    summary: None,
+                },
+                body: "a new item arrived".into(),
+                handling: ContinuationHandling::Queue,
+            },
+            meerkat_runtime::OriginalWorkRef {
+                authority: meerkat_core::PrincipalRef::in_domain(
+                    meerkat_core::PrincipalKind::ServiceAccount,
+                    "collector",
+                    meerkat_core::TrustDomainId::new("host-test").expect("domain"),
+                )
+                .expect("qualified"),
+                work: meerkat_authorization_contracts::evidence::EvidenceId::new("observation-1")
+                    .expect("work id"),
+            },
+        )
+    }
+
+    /// The consent-aware composition forwards host originals and their binder
+    /// to the host's source, but never in a reserved (Core-owned) namespace,
+    /// the consent namespace included, whatever the host's source claims.
+    #[tokio::test]
+    async fn the_consent_aware_source_never_forwards_a_reserved_namespace() {
+        let lock_dir = "/tmp/consent-aware-host-original-test";
+        let domain = HostingPaths {
+            hosting_lock_dir: lock_dir.into(),
+            cold_delivery_lock: format!("{lock_dir}/cold-delivery.lock").into(),
+            database: None,
+        }
+        .domain_ref();
+        let facts = facts();
+        let source = ConsentAwareJobSource {
+            consent: ConsentNoticeJobSource::new(
+                Arc::new(meerkat_core::ApprovalService::new()),
+                domain,
+            ),
+            others: Some(Arc::new(ClaimsEverything(facts.clone()))),
+        };
+        assert_eq!(
+            source.host_original("app.ingest", "observation-1").await,
+            HostOriginalLookup::Found(facts)
+        );
+        assert!(source.host_original_binder("app.ingest").is_some());
+        for reserved in [
+            meerkat_core::approval::consent::CONSENT_DELIVERY_NAMESPACE,
+            "meerkat.other",
+        ] {
+            assert_eq!(
+                source.host_original(reserved, "observation-1").await,
+                HostOriginalLookup::Absent,
+                "{reserved}"
+            );
+            assert!(
+                source.host_original_binder(reserved).is_none(),
+                "{reserved}"
+            );
+        }
+    }
+}
