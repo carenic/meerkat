@@ -193,6 +193,18 @@ them.
   it was. The method's default keeps the previous settle, without a claim, so
   a session-service wrapper around a persistent service must forward it.
 
+- `meerkat-auth-core`, `meerkat-runtime`, `meerkat-mob`: the published
+  packages' own tests now build and pass standalone, with no library change.
+  In 0.9.4, plain `cargo test` in the unpacked package did not compile
+  auth-core's lib tests (a test helper named `meerkat-runtime`, a
+  dev-dependency the package does not carry), nor runtime's and mob's
+  default-feature test targets (one test file needed `sqlite-store` and
+  `test-support`, one test needed `test-support`). With the command its
+  README prints, one runtime lib test failed, because it read a meerkat-core
+  fixture the runtime package did not ship; the package now ships it. The
+  static standalone guard now also follows a `CARGO_MANIFEST_DIR` join
+  through a same-file string constant.
+
 ## [0.9.4] - 2026-10-20
 
 ### Breaking
