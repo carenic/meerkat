@@ -500,3 +500,160 @@ async fn only_a_migrated_mob_serves_addresses_without_a_mob_incarnation() {
     );
     migrated.shutdown().await.expect("stop the resume");
 }
+
+/// A mob whose actor stopped, and the mob the host then holds again under
+/// its id, each with the member `w-cont`. The lookup holds the first until
+/// the test replaces it.
+async fn stopped_mob_and_the_mob_created_again() -> (MobHandle, MobHandle, Arc<CurrentMob>) {
+    let (first, _first_service) = create_test_mob(sample_definition()).await;
+    let identity = AgentIdentity::from("w-cont");
+    first
+        .spawn_spec(SpawnMemberSpec::new("worker", identity.as_str()))
+        .await
+        .expect("spawn");
+    let mobs = Arc::new(CurrentMob(std::sync::Mutex::new(first.clone())));
+    let (second, _second_service) = create_test_mob(sample_definition()).await;
+    assert_eq!(second.mob_id(), first.mob_id());
+    assert_ne!(second.incarnation(), first.incarnation());
+    second
+        .spawn_spec(SpawnMemberSpec::new("worker", identity.as_str()))
+        .await
+        .expect("spawn under the same identity");
+    (first, second, mobs)
+}
+
+fn continuation_service(mobs: Arc<CurrentMob>) -> ContinuationOwnerService {
+    ContinuationOwnerService::new(
+        RuntimeDeliveryInbox::new(Arc::new(InMemoryRuntimeStore::new())),
+        Arc::new(MobContinuationResolver::new(mobs)),
+        Arc::new(meerkat_runtime::MeerkatMachine::ephemeral()),
+    )
+}
+
+/// The mob created again under the id reuses a key the stopped mob's member
+/// bound: the key ledger is per member identity, so the live handle gets
+/// today's replay of the first receipt, never `OwnerRetired`.
+#[tokio::test]
+async fn a_live_mob_reusing_a_key_an_earlier_incarnation_bound_replays_it() {
+    let (first, second, mobs) = stopped_mob_and_the_mob_created_again().await;
+    let identity = AgentIdentity::from("w-cont");
+    let continuations = continuation_service(mobs.clone());
+    let earlier = first
+        .submit_continuation(&continuations, &identity, delivery("task-1"), 1)
+        .await
+        .expect("the first mob binds the key");
+    first
+        .crash_stop_preserving_durable_work_for_test()
+        .await
+        .expect("stop the first mob's actor");
+    mobs.replace(second.clone());
+
+    assert_eq!(
+        second
+            .submit_continuation(&continuations, &identity, delivery("task-1"), 2)
+            .await
+            .expect("the live mob's handle replays the key"),
+        earlier
+    );
+}
+
+/// A stopped mob's handle does not replay a key the mob created again under
+/// the id bound: it would answer with the live incarnation's receipt.
+#[tokio::test]
+async fn a_stopped_mobs_handle_replays_nothing_the_mob_created_again_bound() {
+    let (first, second, mobs) = stopped_mob_and_the_mob_created_again().await;
+    let identity = AgentIdentity::from("w-cont");
+    first
+        .crash_stop_preserving_durable_work_for_test()
+        .await
+        .expect("stop the first mob's actor");
+    mobs.replace(second.clone());
+    let continuations = continuation_service(mobs);
+    second
+        .submit_continuation(&continuations, &identity, delivery("task-2"), 1)
+        .await
+        .expect("the live mob binds the key");
+
+    assert_eq!(
+        first
+            .submit_continuation(&continuations, &identity, delivery("task-2"), 2)
+            .await,
+        Err(ContinuationSubmitError::OwnerRetired)
+    );
+}
+
+/// The job outcomes a test owner holds: one fork_off job.
+struct OneForkJob(meerkat::RetainedJobFacts);
+
+#[async_trait::async_trait]
+impl meerkat::RetainedJobSource for OneForkJob {
+    async fn retained_job(
+        &self,
+        producer: &ContinuationProducer,
+        job_id: &str,
+    ) -> meerkat::RetainedJobLookup {
+        if producer == &ContinuationProducer::ForkOff && job_id == "job-1" {
+            meerkat::RetainedJobLookup::Found(self.0.clone())
+        } else {
+            meerkat::RetainedJobLookup::Absent
+        }
+    }
+}
+
+/// A stopped mob's handle commits no retained job outcome for the mob the
+/// host holds again under its id, as for a plain continuation.
+#[tokio::test]
+async fn a_stopped_mobs_handle_commits_no_retained_outcome_for_the_mob_created_again() {
+    let (first, second, mobs) = stopped_mob_and_the_mob_created_again().await;
+    let identity = AgentIdentity::from("w-cont");
+    first
+        .crash_stop_preserving_durable_work_for_test()
+        .await
+        .expect("stop the first mob's actor");
+    mobs.replace(second.clone());
+    let continuations = continuation_service(mobs);
+    let jobs = OneForkJob(meerkat::RetainedJobFacts {
+        owner_session_id: second
+            .resolve_bridge_session_id(&identity)
+            .await
+            .expect("bridge session"),
+        retained_work: None,
+        result_digest: "sha256:result".into(),
+    });
+    let job = meerkat::RetainedJobRecord::from_owner(&jobs, ContinuationProducer::ForkOff, "job-1")
+        .await
+        .expect("read")
+        .expect("committed job");
+    let completion = ContinuationDelivery {
+        key: ContinuationKey::new("fork_off:job-1").expect("key"),
+        result: ContinuationResultRef {
+            producer: ContinuationProducer::ForkOff,
+            producer_id: "job-1".into(),
+            result_digest: "sha256:result".into(),
+            summary: None,
+        },
+        body: "the fork finished".into(),
+        handling: ContinuationHandling::Queue,
+    };
+
+    assert_eq!(
+        first
+            .submit_retained_continuation(&continuations, &identity, completion, &job, 1)
+            .await,
+        Err(ContinuationSubmitError::OwnerRetired)
+    );
+    let owner = ContinuationOwner::Member {
+        mob_id: second.mob_id().as_str().to_string(),
+        identity: identity.as_str().to_string(),
+    };
+    assert_eq!(
+        continuations
+            .continuation_status(
+                &owner,
+                &ContinuationKey::new("fork_off:job-1").expect("key")
+            )
+            .await
+            .expect("status"),
+        ContinuationStatus::NotCommitted
+    );
+}
