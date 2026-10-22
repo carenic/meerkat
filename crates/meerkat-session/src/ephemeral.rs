@@ -9972,11 +9972,13 @@ fn lower_staged_initial_prompt(
     let Some(staged) = staged else {
         return Ok((prompt, appends));
     };
-    if appends.is_empty() {
-        return Ok((merge_content_inputs(staged.clone(), prompt), appends));
-    }
+    // Fail closed whatever the turn carries: a directed turn's `RunStarted`
+    // must equal its input's own projection, with or without typed appends.
     if directed_turn {
         return Err(AgentError::StagedPromptDirectedTurnRefused);
+    }
+    if appends.is_empty() {
+        return Ok((merge_content_inputs(staged.clone(), prompt), appends));
     }
     if let Some(first_user) = appends
         .iter_mut()

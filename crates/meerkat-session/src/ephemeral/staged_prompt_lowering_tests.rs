@@ -530,6 +530,24 @@ async fn staged_prompt_refuses_a_directed_turn_and_stays_pending() {
     assert_eq!(staged_prompt_pending(&service, &id).await, None);
 }
 
+/// Independent of the appends: a directed turn whose input projects to
+/// no typed appends is refused too, so its `RunStarted` content can never
+/// carry the staged text.
+#[test]
+fn a_directed_turn_without_typed_appends_is_refused_while_a_prompt_is_staged() {
+    let staged = ContentInput::Text(STAGED.to_string());
+    let lowered = super::lower_staged_initial_prompt(
+        Some(&staged),
+        ContentInput::Text("directed work".to_string()),
+        Vec::new(),
+        true,
+    );
+    assert!(
+        matches!(lowered, Err(AgentError::StagedPromptDirectedTurnRefused)),
+        "a directed turn must be refused whatever its appends: {lowered:?}"
+    );
+}
+
 /// A run that fails before it starts (no `RunStarted`, nothing
 /// committed, as a run-start hook veto) leaves the staged prompt pending; the
 /// retry delivers it exactly once and later turns do not repeat it.
