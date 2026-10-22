@@ -210,6 +210,15 @@ them.
   owner, or wait until it releases the session, then start again). A
   resume spawn of such a session returns it too, where it failed with an
   internal error before.
+- `meerkat-mob`: a mob start no longer stops when a member whose restore
+  failed at that start (its spawn customizer refused it, say) holds a
+  durable tail. The start read that member's session to restore its
+  operation binding, met the tail as a transcript revision conflict, and
+  stopped the whole mob, at every start. It now settles the tail under this
+  runtime owner's hosting claim, as it does for a retiring member's, and
+  reads the session again. A session another runtime owner on the realm
+  hosts refuses the start, and the error log names the member, its session
+  and the remedy; the tail stays as it was.
 
 ## [0.9.4] - 2026-10-20
 
