@@ -49,11 +49,12 @@ use crate::meerkat_machine::dsl as mm_dsl;
 use crate::runtime_state::RuntimeState;
 use crate::store::{
     CommittedRecoveryBoundary, CommittedWholeBlobProvisionalTail, CommittedWholeBlobSnapshot,
-    MachineLifecycleBindingFacts, MachineLifecycleCommit, MachineLifecycleExpectedVersion,
-    MachineLifecycleObservation, MachineLifecycleRunFacts, PreparedDurableTailRecoverySource,
-    PreparedRecoveryEvidence, PreparedRecoveryReceiptDigestEnrichment,
-    PreparedRecoveryReceiptSource, PreparedRuntimeSessionCommit, RecoveryInputSetRevision,
-    RuntimeSessionPersistenceProfile, RuntimeStore, RuntimeStoreError, SupervisorAuthoritySnapshot,
+    DurableTailSourceRelation, MachineLifecycleBindingFacts, MachineLifecycleCommit,
+    MachineLifecycleExpectedVersion, MachineLifecycleObservation, MachineLifecycleRunFacts,
+    PreparedDurableTailRecoverySource, PreparedRecoveryEvidence,
+    PreparedRecoveryReceiptDigestEnrichment, PreparedRecoveryReceiptSource,
+    PreparedRuntimeSessionCommit, RecoveryInputSetRevision, RuntimeSessionPersistenceProfile,
+    RuntimeStore, RuntimeStoreError, SupervisorAuthoritySnapshot,
 };
 use meerkat_core::lifecycle::InputId;
 use meerkat_core::lifecycle::core_executor::BoundSessionCommit;
@@ -406,6 +407,7 @@ fn exact_whole_blob_candidate_id(
 fn generated_recovery_classification(
     session_id: &SessionId,
     candidate_id: &str,
+    relation: DurableHeadRelation,
     observation: &DurableTailObservation,
 ) -> Result<ClassifiedRecoveryClass, DurableTailRecoveryError> {
     // The generated machine is invoked and consumed inside this function.
@@ -416,7 +418,7 @@ fn generated_recovery_classification(
         .classify_durable_tail(
             SessionDocumentKey::new(session_id.to_string()),
             candidate_id.to_string(),
-            DurableHeadRelation::VerifiedStrictDescendant,
+            relation,
             observation.run_id_cardinality,
             observation.terminal_stop_reason,
             observation.dangling_tool_use_ids.len() as u64,
@@ -512,6 +514,33 @@ fn repair_interrupted_tail(
     Ok(())
 }
 
+/// How a recovery source's transcript history differs from the rewrite
+/// witness of the store-issued physical head it was materialized from, if it
+/// does. The head is the authority: values are never derived from the
+/// session itself.
+fn physical_history_witness_mismatch(
+    history: Option<&meerkat_core::ValidatedTranscriptHistory>,
+    head: &meerkat_core::session_store::SessionHead,
+) -> Option<&'static str> {
+    let Some(history) = history else {
+        return (head.rewrite_count != 0)
+            .then_some("the head has rewrite occurrences but no graph");
+    };
+    if head.rewrite_count == 0 {
+        return Some("the head has no rewrite occurrences but the source carries a graph");
+    }
+    if u64::try_from(history.commit_count()).ok() != Some(head.rewrite_count) {
+        return Some("the graph's occurrence count differs from the head's rewrite count");
+    }
+    if history.rewrite_prefix() != &head.rewrite_prefix {
+        return Some("the graph's rewrite prefix differs from the head's");
+    }
+    if head.graph_prefix.as_ref() != Some(history.graph_prefix()) {
+        return Some("the graph's prefix differs from the head's graph prefix");
+    }
+    None
+}
+
 fn prepare_head_canonical_recovery_candidate(
     source: &PreparedDurableTailRecoverySource,
 ) -> Result<RecoveryCandidatePreparation, DurableTailRecoveryError> {
@@ -599,21 +628,55 @@ fn prepare_head_canonical_recovery_candidate(
                 .to_string(),
         ));
     }
-    if physical_head.messages().len() <= committed_authority.messages().len()
-        || !physical_head
-            .messages()
-            .starts_with(committed_authority.messages())
-    {
-        return Err(DurableTailRecoveryError::InvalidEvidence(
-            "physical recovery head is not an exact strict transcript continuation".to_string(),
-        ));
-    }
+    // The relation is the store's proof, never assumed here: a strict
+    // continuation keeps the boundary's rows as a prefix; a run that
+    // compacted rewrote them, and its rows after the final rewrite are the
+    // tail the classifier observes.
+    let (relation, tail_base) = match source.relation() {
+        DurableTailSourceRelation::StrictContinuation => {
+            if physical_head.messages().len() <= committed_authority.messages().len()
+                || !physical_head
+                    .messages()
+                    .starts_with(committed_authority.messages())
+            {
+                return Err(DurableTailRecoveryError::InvalidEvidence(
+                    "physical recovery head is not an exact strict transcript continuation"
+                        .to_string(),
+                ));
+            }
+            (
+                DurableHeadRelation::VerifiedStrictDescendant,
+                committed_authority.messages().len(),
+            )
+        }
+        DurableTailSourceRelation::RewriteDescendant { live_tail_base } => {
+            if live_tail_base > physical_head.messages().len() {
+                return Err(DurableTailRecoveryError::InvalidEvidence(
+                    "rewrite descent live-tail base exceeds the physical transcript".to_string(),
+                ));
+            }
+            (
+                DurableHeadRelation::VerifiedRewriteDescendant,
+                live_tail_base,
+            )
+        }
+        DurableTailSourceRelation::UnprovenRewrite => (
+            DurableHeadRelation::Unverifiable,
+            physical_head.messages().len(),
+        ),
+    };
 
     let derived_physical_head_token = source.physical_head_cas_token().to_string();
 
-    let observation = observe_durable_tail(committed_authority.messages().len(), physical_head);
-    if observation.tail_run_id.as_ref() != Some(provisional.run_id())
-        || observation.run_id_cardinality != RunIdCardinality::SingleRunId
+    let observation = observe_durable_tail(tail_base, physical_head);
+    // Rewrite occurrences carry no run identity, so a rewritten tail with no
+    // run-stamped assistant row after its final rewrite has no transcript
+    // evidence of its run: the machine classifies it, and holds it.
+    let unattributed_rewrite = relation != DurableHeadRelation::VerifiedStrictDescendant
+        && observation.run_id_cardinality == RunIdCardinality::NoRunId;
+    if !unattributed_rewrite
+        && (observation.tail_run_id.as_ref() != Some(provisional.run_id())
+            || observation.run_id_cardinality != RunIdCardinality::SingleRunId)
     {
         return Err(DurableTailRecoveryError::InvalidEvidence(
             "physical tail transcript contradicts its store-issued provisional run identity"
@@ -629,35 +692,40 @@ fn prepare_head_canonical_recovery_candidate(
         provisional.run_id(),
         &observation,
     );
-    let classified = generated_recovery_classification(&session_id, &candidate_id, &observation)?;
+    let classified =
+        generated_recovery_classification(&session_id, &candidate_id, relation, &observation)?;
     let class = runtime_recovery_class(classified)?;
     if class == DurableTailRecoveryClass::Ambiguous {
         return Ok(RecoveryCandidatePreparation::Held);
     }
     let candidate_run_id = provisional.run_id().clone();
 
-    // The canonical physical materialization is already the exact durable
-    // successor content. Starting from it is both simpler and deterministic:
-    // replaying the suffix onto an inline transcript graph manufactures fresh
-    // revision-body timestamps in `Session::push`, so two processes would
-    // mint different recovered boundaries for the same durable rows.
-    //
-    // Head-canonical materialization must be slim. Retained rewrite bodies are
-    // an out-of-line store concern and the carried rewrite-prefix/history
-    // witness in SessionHead is the recovery document's authority.
-    if physical_head
+    // The recovered document starts from the canonical physical
+    // materialization, which is already the exact durable successor content.
+    // Its rewrite authority is the store-issued physical SessionHead's
+    // witness (rewrite count, rewrite prefix, graph prefix). A head with
+    // rewrite occurrences materializes with exactly the graph the store
+    // replayed from its rewrite rows and bound to that witness; the
+    // recovered document keeps that graph as recovery-owned state and never
+    // extends it. With the witness exact, the recovered mutation proves an
+    // empty pending rewrite suffix, so recovery commits no rewrite; appending
+    // the recovery notice leaves the graph untouched, and the recovered
+    // envelope is re-adopted from the physical head, so every process mints
+    // the same recovered boundary from the same durable rows. A graph the
+    // head does not describe is invalid evidence.
+    let physical_history = physical_head
         .validated_transcript_history_state()
         .map_err(|error| {
             DurableTailRecoveryError::InvalidEvidence(format!(
                 "physical-head transcript history is malformed: {error}"
             ))
-        })?
-        .is_some()
+        })?;
+    if let Some(mismatch) =
+        physical_history_witness_mismatch(physical_history.as_ref(), observed_physical_head)
     {
-        return Err(DurableTailRecoveryError::InvalidEvidence(
-            "head-canonical recovery source unexpectedly contains inline transcript history"
-                .to_string(),
-        ));
+        return Err(DurableTailRecoveryError::InvalidEvidence(format!(
+            "head-canonical recovery source carries a transcript history its physical head does not describe: {mismatch}"
+        )));
     }
     let mut recovered = physical_head.clone();
     match class {
@@ -831,9 +899,11 @@ fn prepare_whole_blob_recovery_candidate(
         provisional_authority.run_id(),
         &observation,
     );
+    // The exact prefix check above is this source's descent proof.
     let class = runtime_recovery_class(generated_recovery_classification(
         committed_authority.session_id(),
         &candidate_id,
+        DurableHeadRelation::VerifiedStrictDescendant,
         &observation,
     )?)?;
     if class == DurableTailRecoveryClass::Ambiguous {

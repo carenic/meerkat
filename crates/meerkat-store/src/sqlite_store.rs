@@ -6822,6 +6822,116 @@ pub fn verify_physical_head_retains_boundary_prefix_for_runtime_in_txn(
     physical.with_verified_ancestor_row_prefix(expected_boundary_prefix.clone())
 }
 
+/// What the store proved about a physical head that carries transcript
+/// rewrite occurrences its runtime boundary does not.
+///
+/// Only [`verify_physical_head_rewrite_descent_for_runtime_in_txn`] mints
+/// one, so a recovery source can take its relation from this proof and from
+/// nowhere else.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct HeadCanonicalRewriteDescent {
+    physical: meerkat_core::VerifiedSessionHeadMaterialization,
+    verdict: RewriteDescentVerdict,
+}
+
+/// The store's verdict on a rewritten physical head's descent.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RewriteDescentVerdict {
+    /// The physical head descends from the boundary through store-proven
+    /// rewrite occurrences. The rows the run wrote after its final rewrite
+    /// start at `live_tail_base`.
+    Proven { live_tail_base: u64 },
+    /// The physical head verifies on its own, but nothing proves it descends
+    /// from the boundary.
+    Unproven { reason: String },
+}
+
+impl HeadCanonicalRewriteDescent {
+    #[must_use]
+    pub fn verdict(&self) -> &RewriteDescentVerdict {
+        &self.verdict
+    }
+
+    /// The physical head's materialization, verified on its own lineage,
+    /// and the verdict on its descent.
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        meerkat_core::VerifiedSessionHeadMaterialization,
+        RewriteDescentVerdict,
+    ) {
+        (self.physical, self.verdict)
+    }
+}
+
+/// Prove that a physical head carrying more rewrite occurrences than its
+/// runtime boundary descends from that boundary.
+///
+/// A rewrite replaces rows, so the boundary is no row prefix of the physical
+/// transcript; [`verify_physical_head_retains_boundary_prefix_for_runtime_in_txn`]
+/// refuses such a head. Here the physical head is verified on its own
+/// lineage, its persisted rewrite rows must bridge the boundary's rewrite
+/// prefix to its own (so the boundary must not predate the retention cut),
+/// and its replayed graph must hold the boundary's rewrite and graph prefix
+/// and advance its first post-boundary occurrence from the boundary's exact
+/// rows ([`meerkat_core::session_store::prove_rewrite_descent_from_boundary`]).
+/// Store failures are errors; evidence that does not prove the descent is
+/// [`RewriteDescentVerdict::Unproven`].
+#[doc(hidden)]
+pub fn verify_physical_head_rewrite_descent_for_runtime_in_txn(
+    tx: &Transaction<'_>,
+    boundary_head: &SessionHead,
+    physical_head: &SessionHead,
+) -> Result<HeadCanonicalRewriteDescent, SessionStoreError> {
+    if boundary_head.id != physical_head.id
+        || boundary_head.restored_session_version()? != physical_head.restored_session_version()?
+        || boundary_head.created_at != physical_head.created_at
+    {
+        return Err(SessionStoreError::Corrupted(physical_head.id.clone()));
+    }
+    let physical = verify_head_canonical_with_metadata_owner_in_txn(
+        tx,
+        physical_head,
+        HeadMetadataProjectionOwner::PhysicalHead,
+    )?;
+    let unproven = |physical, error: SessionStoreError| match error {
+        SessionStoreError::Io(_) | SessionStoreError::Internal(_) => Err(error),
+        error => Ok(HeadCanonicalRewriteDescent {
+            physical,
+            verdict: RewriteDescentVerdict::Unproven {
+                reason: error.to_string(),
+            },
+        }),
+    };
+    if let Err(error) = verify_head_rewrite_prefix_descent_in_txn(tx, boundary_head, physical_head)
+    {
+        return unproven(physical, error);
+    }
+    let Some(replayed) = replay_head_canonical_history_in_txn(tx, physical_head)? else {
+        return unproven(
+            physical,
+            SessionStoreError::InvalidTranscriptRewrite {
+                id: physical_head.id.clone(),
+                reason: "physical head carries no rewrite graph".to_string(),
+            },
+        );
+    };
+    match meerkat_core::session_store::prove_rewrite_descent_from_boundary(
+        boundary_head,
+        physical_head,
+        replayed.history(),
+    ) {
+        Ok(live_tail_base) => Ok(HeadCanonicalRewriteDescent {
+            physical,
+            verdict: RewriteDescentVerdict::Proven { live_tail_base },
+        }),
+        Err(error) => unproven(physical, error),
+    }
+}
+
 fn activation_boundary_strand_and_prove_rewrite_descent_in_txn(
     tx: &Transaction<'_>,
     id: &SessionId,

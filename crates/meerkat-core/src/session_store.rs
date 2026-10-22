@@ -2310,6 +2310,162 @@ impl VerifiedHeadCanonicalTranscriptHistory {
     }
 }
 
+/// Prove that a physical head descends from a runtime boundary head through
+/// the transcript rewrite occurrences written after it, and return the
+/// physical transcript's final audited rewrite endpoint (the row count the
+/// live tail after the last rewrite starts at).
+///
+/// A rewrite replaces rows, so a physical head written by a run that
+/// compacted does not keep the boundary's rows as a prefix. Its descent is
+/// proven the way the checkpoint that wrote it proved it against the head it
+/// observed:
+/// - `history` is the physical head's store-replayed graph and still holds
+///   every occurrence from the boundary's generation on, so the boundary is
+///   not below the retention cut;
+/// - the graph's rewrite prefix and rolling graph prefix at the boundary's
+///   generation are exactly the boundary's;
+/// - the first occurrence after the boundary advances from the boundary's
+///   exact rows: its base endpoint plus the leading rows of its parent
+///   advance give the boundary's exact row prefix (or, for a boundary before
+///   the anchor's rows were checkpointed, the boundary's rows extended by
+///   the missing anchor rows give the base).
+///
+/// The caller must also prove that its persisted rewrite rows bridge the two
+/// heads' rewrite prefixes; this function checks the graph, not the rows.
+#[doc(hidden)]
+pub fn prove_rewrite_descent_from_boundary(
+    boundary: &SessionHead,
+    physical: &SessionHead,
+    history: &ValidatedTranscriptHistory,
+) -> Result<u64, SessionStoreError> {
+    let id = &physical.id;
+    let unproven = |reason: String| SessionStoreError::InvalidTranscriptRewrite {
+        id: id.clone(),
+        reason,
+    };
+    if &boundary.id != id {
+        return Err(unproven(
+            "rewrite descent heads belong to different sessions".to_string(),
+        ));
+    }
+    if boundary.rewrite_count >= physical.rewrite_count {
+        return Err(unproven(format!(
+            "physical head carries {} rewrite occurrence(s), not more than the boundary's {}",
+            physical.rewrite_count, boundary.rewrite_count
+        )));
+    }
+    let state = history.state();
+    let physical_count = usize::try_from(physical.rewrite_count)
+        .map_err(|_| SessionStoreError::Corrupted(id.clone()))?;
+    if state.commit_count() != physical_count
+        || history.rewrite_prefix() != &physical.rewrite_prefix
+    {
+        return Err(unproven(
+            "replayed rewrite graph is not the physical head's graph".to_string(),
+        ));
+    }
+    let boundary_count = usize::try_from(boundary.rewrite_count)
+        .map_err(|_| SessionStoreError::Corrupted(id.clone()))?;
+    if boundary_count < state.retired_count() {
+        return Err(unproven(format!(
+            "boundary generation {boundary_count} predates the physical graph's retention cut at {}",
+            state.retired_count()
+        )));
+    }
+    if state
+        .rewrite_prefix_at(boundary_count)
+        .is_none_or(|prefix| prefix.as_ref() != &boundary.rewrite_prefix)
+    {
+        return Err(unproven(
+            "physical rewrite prefix does not extend the boundary's".to_string(),
+        ));
+    }
+    if state.graph_prefix_at(boundary_count) != boundary.graph_prefix.as_ref() {
+        return Err(unproven(
+            "physical graph prefix at the boundary's generation differs from the boundary's"
+                .to_string(),
+        ));
+    }
+
+    let edge = state.edge(boundary_count).ok_or_else(|| {
+        unproven("the first rewrite occurrence after the boundary is not retained".to_string())
+    })?;
+    let (base_count, base_prefix) = state
+        .occurrence_base_endpoint(boundary_count)
+        .ok_or_else(|| SessionStoreError::Corrupted(id.clone()))?;
+    let boundary_len = usize::try_from(boundary.message_count)
+        .map_err(|_| SessionStoreError::Corrupted(id.clone()))?;
+    let boundary_prefix = boundary.message_row_prefix.as_ref().ok_or_else(|| {
+        unproven("runtime boundary has no exact message-row prefix authority".to_string())
+    })?;
+    if base_count != edge.messages_before_base() || boundary_len > edge.messages_before() {
+        return Err(unproven(format!(
+            "rewrite occurrence {} cannot extend the boundary's rows",
+            edge.rewrite_generation()
+        )));
+    }
+    if boundary_len < base_count {
+        // The first rewrite of a graph may adopt anchor rows the boundary
+        // had not checkpointed yet: the boundary's rows prefix the anchor.
+        if boundary_count != 0 {
+            return Err(unproven(
+                "only the first compact occurrence may bridge an uncheckpointed anchor suffix"
+                    .to_string(),
+            ));
+        }
+        let anchor_messages = state.anchor().messages();
+        if anchor_messages.len() != base_count {
+            return Err(SessionStoreError::Corrupted(id.clone()));
+        }
+        let bridge = anchor_messages[boundary_len..base_count]
+            .iter()
+            .map(|message| serde_json::to_vec(message).map_err(SessionStoreError::from))
+            .collect::<Result<Vec<_>, _>>()?;
+        if &boundary_prefix.extend_serialized_rows(&bridge)? != base_prefix {
+            return Err(SessionStoreError::TranscriptContinuityViolation {
+                id: id.clone(),
+                previous_revision: boundary_prefix.digest().to_string(),
+                incoming_revision: base_prefix.digest().to_string(),
+                reason: "boundary rows do not prefix the compact rewrite anchor".to_string(),
+            });
+        }
+    } else {
+        let appended = edge.parent_advance().appended();
+        let already = boundary_len - base_count;
+        if already > appended.len() {
+            return Err(unproven(
+                "boundary rows exceed the first occurrence's parent advance".to_string(),
+            ));
+        }
+        let leading = appended[..already]
+            .iter()
+            .map(|message| serde_json::to_vec(message).map_err(SessionStoreError::from))
+            .collect::<Result<Vec<_>, _>>()?;
+        let expected = base_prefix.extend_serialized_rows(&leading)?;
+        if &expected != boundary_prefix {
+            return Err(SessionStoreError::TranscriptContinuityViolation {
+                id: id.clone(),
+                previous_revision: boundary_prefix.digest().to_string(),
+                incoming_revision: expected.digest().to_string(),
+                reason: "boundary rows do not match the first rewrite occurrence's parent advance"
+                    .to_string(),
+            });
+        }
+    }
+
+    let live_tail_base = history
+        .final_audited_live_tail_base()
+        .ok_or_else(|| SessionStoreError::Corrupted(id.clone()))?;
+    let live_tail_base =
+        u64::try_from(live_tail_base).map_err(|_| SessionStoreError::Corrupted(id.clone()))?;
+    if live_tail_base > physical.message_count {
+        return Err(unproven(
+            "final audited rewrite endpoint exceeds the physical transcript".to_string(),
+        ));
+    }
+    Ok(live_tail_base)
+}
+
 impl VerifiedSessionHeadMaterialization {
     #[must_use]
     pub fn head(&self) -> &SessionHead {

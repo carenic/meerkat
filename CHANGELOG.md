@@ -104,6 +104,11 @@ them.
   earlier behaviour. On the wire every new field is optional and omitted when
   absent, so loopback starts and completions and every existing error keep
   their exact JSON.
+- `meerkat-machine-schema`, `meerkat-core` and `meerkat-machine-kernels`:
+  `DurableHeadRelation` (the session document's DSL enum and its two
+  generated copies) gains the variant `VerifiedRewriteDescendant`, appended
+  after `Unverifiable`. All three are exhaustive, so a `match` on one adds the
+  arm.
 
 ### Added
 
@@ -189,6 +194,26 @@ them.
   cause, the keys and the error code are unchanged.
 
 ### Fixed
+
+- `meerkat-runtime`, `meerkat-store`, `meerkat-core`: a crash tail of a
+  HeadCanonical session that had compacted at least once could not be
+  recovered. A host that stopped after a run's final save and before that
+  run's boundary commit (a crash, a forced kill, an out-of-memory kill) left
+  the session unresumable: every later resume failed with an internal
+  durable-tail recovery error, whether that run compacted or only appended
+  rows. Recovery refused a session that carried its rewrite history, and it
+  could not prove that a run whose compaction rewrote rows still descends from
+  the committed boundary. It now accepts the history exactly as the store's
+  physical head records it, and proves a rewritten tail's descent through the
+  store's rewrite rows. Such a tail recovers like any other: a completed run
+  becomes the recovered boundary, an interrupted run is closed with the typed
+  recovery notice and is not requeued, and a tail recovery cannot classify, or
+  whose descent the store cannot prove, is held with
+  `SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY` instead of an internal error.
+  Sessions that 0.9.0 to 0.9.4 left in this state resume after upgrading, with
+  no repair step, when their head records a graph prefix. Every host that
+  keeps sessions in a persistent HeadCanonical store reaches this path,
+  persistent Meta deployments included.
 
 - A graceful mob Shutdown releases a member's identity reconcile lease once
   it has unregistered the member's runtime and the member's session actor has

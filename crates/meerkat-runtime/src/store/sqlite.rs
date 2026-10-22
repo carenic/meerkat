@@ -14820,25 +14820,48 @@ ORDER BY runtime_id";
                     })?;
                     return Ok(Some(source));
                 }
-                let physical =
-                    meerkat_store::sqlite_store::verify_physical_head_retains_boundary_prefix_for_runtime_in_txn(
-                        &tx,
-                        boundary_head,
-                        &physical_head,
-                    )
-                    .map_err(|error| {
-                        map_head_canonical_session_store_error(
-                            &runtime_id,
-                            error,
+                // A run that compacted rewrote rows the boundary holds, so
+                // its physical head keeps no boundary row prefix: the store
+                // proves the descent through the rewrite occurrences instead.
+                let source = if physical_head.rewrite_count > boundary_head.rewrite_count {
+                    let descent =
+                        meerkat_store::sqlite_store::verify_physical_head_rewrite_descent_for_runtime_in_txn(
+                            &tx,
+                            boundary_head,
+                            &physical_head,
                         )
-                    })?;
-                let source =
+                        .map_err(|error| {
+                            map_head_canonical_session_store_error(
+                                &runtime_id,
+                                error,
+                            )
+                        })?;
+                    PreparedDurableTailRecoverySource::rewritten(
+                        authority,
+                        provisional,
+                        committed,
+                        descent,
+                    )?
+                } else {
+                    let physical =
+                        meerkat_store::sqlite_store::verify_physical_head_retains_boundary_prefix_for_runtime_in_txn(
+                            &tx,
+                            boundary_head,
+                            &physical_head,
+                        )
+                        .map_err(|error| {
+                            map_head_canonical_session_store_error(
+                                &runtime_id,
+                                error,
+                            )
+                        })?;
                     PreparedDurableTailRecoverySource::new(
                         authority,
                         provisional,
                         committed,
                         physical,
-                    )?;
+                    )?
+                };
                 tx.commit().map_err(|error| {
                     RuntimeStoreError::ReadFailed(error.to_string())
                 })?;
