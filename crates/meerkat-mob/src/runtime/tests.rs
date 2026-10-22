@@ -16860,9 +16860,10 @@ async fn an_adopted_identity_converges_once_the_previous_incarnations_lease_expi
         other => panic!("a converged identity holds a live lease, got {other:?}"),
     };
 
-    // The process ends without releasing the lease. Its last renewal is the
-    // short one below, so the lease is still live when the next incarnation
-    // starts and expires a few seconds later.
+    // The graceful shutdown releases the lease. The claim below takes it again
+    // for the previous incarnation, as a process that ended without a
+    // shutdown leaves it: still live when the next incarnation starts, and
+    // expiring a few seconds later.
     handle
         .shutdown()
         .await
@@ -17125,10 +17126,11 @@ async fn a_lost_identity_lease_claim_is_retried_once_the_holders_lease_expires()
         other => panic!("a converged identity holds a live lease, got {other:?}"),
     };
 
-    // The process ends without releasing the lease, after a last renewal
-    // that the store stamps with its own, lagging clock: the resumed actor
-    // reads that lease as expired, but the store holds it for the renewal's
-    // lifetime.
+    // The graceful shutdown releases the lease. The claim below takes it again
+    // for the previous incarnation, as a process that ended without a
+    // shutdown leaves it, stamped by the store's own, lagging clock: the
+    // resumed actor reads that lease as expired, but the store holds it for
+    // the claim's lifetime.
     handle
         .shutdown()
         .await
@@ -92119,6 +92121,9 @@ async fn test_running_steer_without_override_resolves_applied_identity_as_none()
 /// #1102 actor-loop isolation, per-member admission lanes, bounded
 /// deliveries, and the member registration reload primitive.
 mod actor_isolation;
+/// A graceful Shutdown releases the identity leases of the members it
+/// unregistered.
+mod shutdown_lease_release;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 use crate as fixture_mob;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]

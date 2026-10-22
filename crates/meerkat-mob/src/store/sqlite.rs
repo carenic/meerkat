@@ -13056,6 +13056,58 @@ mod tests {
         );
     }
 
+    /// A lease release is a CAS on the exact claim: once the holder renewed
+    /// the lease, the claim it held before is stale and releases nothing.
+    #[tokio::test]
+    async fn sqlite_identity_lease_release_refuses_a_renewed_claim() {
+        let (_dir, path) = temp_db_path();
+        let stores = SqliteMobStores::open(&path).unwrap();
+        let clock = Arc::new(TestIdentityClock::new(100));
+        let store = SqliteMobIdentityStore::with_clock(
+            stores.path.clone(),
+            stores.identity_store_instance_id.clone(),
+            clock.clone(),
+        );
+        let mob_id = MobId::from("sqlite-identity-lease-release");
+        let identity = AgentIdentity::from("member-a");
+        let first = match store
+            .claim_or_renew_identity_lease(&mob_id, &identity, "controller", "inc-a", 10)
+            .await
+            .unwrap()
+        {
+            IdentityLeaseClaimOutcome::Acquired(claim) => claim,
+            other => panic!("expected acquire, got {other:?}"),
+        };
+        clock.set(105);
+        let renewed = match store
+            .claim_or_renew_identity_lease(&mob_id, &identity, "controller", "inc-a", 10)
+            .await
+            .unwrap()
+        {
+            IdentityLeaseClaimOutcome::Renewed(claim) => claim,
+            other => panic!("expected renewal, got {other:?}"),
+        };
+        assert!(
+            !store
+                .release_identity_lease(&mob_id, &identity, &first)
+                .await
+                .unwrap()
+        );
+        assert!(matches!(
+            store.observe_identity_lease(&mob_id, &identity).await.unwrap(),
+            IdentityStoredObservation::Valid(IdentityLeaseRecord {
+                active: Some(active),
+                ..
+            }) if active == renewed
+        ));
+        assert!(
+            store
+                .release_identity_lease(&mob_id, &identity, &renewed)
+                .await
+                .unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn sqlite_identity_lease_refuses_to_overwrite_malformed_authority() {
         let (_dir, path) = temp_db_path();

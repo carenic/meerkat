@@ -410,6 +410,28 @@ impl RuntimeStore for FaultInjectingRuntimeStore {
             .await
     }
 
+    /// A wrapped store keeps its conditional lifecycle registration, which
+    /// identity reconciliation needs.
+    async fn compare_and_swap_machine_lifecycle_with_fence(
+        &self,
+        runtime_id: &LogicalRuntimeId,
+        expected: meerkat_runtime::store::MachineLifecycleExpectedVersion,
+        replacement: meerkat_runtime::store::MachineLifecycleCommit,
+        write_fence: Arc<dyn meerkat_runtime::store::RuntimeStoreWriteFence>,
+    ) -> Result<
+        meerkat_runtime::store::FencedMachineLifecycleCasOutcome,
+        meerkat_runtime::store::RuntimeStoreError,
+    > {
+        self.inner
+            .compare_and_swap_machine_lifecycle_with_fence(
+                runtime_id,
+                expected,
+                replacement,
+                write_fence,
+            )
+            .await
+    }
+
     async fn commit_session_snapshot(
         &self,
         runtime_id: &LogicalRuntimeId,
