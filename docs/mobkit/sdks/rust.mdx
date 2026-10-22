@@ -4,7 +4,7 @@ description: "Use Meta as a Rust library: bootstrap runtimes, route module calls
 icon: "code"
 ---
 
-*Mirrored from MobKit main at [091f73c4a64c](https://github.com/lukacf/meerkat-meta/commit/091f73c4a64cd13e08fc7c8a0484c0bf3a93b4c2) on 2026-10-22; MobKit workspace version 0.9.4 at that commit.*
+*Mirrored from MobKit main at [982c76ab266e](https://github.com/lukacf/meerkat-meta/commit/982c76ab266ef73f028c1ba7dce9e021fa6587e0) on 2026-10-22; MobKit workspace version 0.9.4 at that commit.*
 
 The Rust crate `meerkat-meta` is the primary interface for Meta. All other interfaces (JSON-RPC, SDKs, console) are built on top of it.
 
@@ -320,6 +320,18 @@ launches, on create and on resume. Unset, Meerkat's default
 `mob_spec(...)` refuses it with
 `UnifiedRuntimeBuilderError::ConflictingConfiguration`: set it on that spec
 with `MobBootstrapSpec::with_fork_instruction_policy`.
+
+The mob does not store the policy, so the builder applies it on every create
+and resume, and it cannot be chosen per fork. Under the default, a fork you
+drive yourself with `UnifiedRuntime::fork_member` is committed, and its child
+runs no turn until you activate each inherited key on it with
+`runtime.mob_handle().activate_member_instruction(child, request)`; read the
+key's `key_state` with `read_member_instruction_activations` first for the
+`expectation` and `supersedes` to use. A fork that starts its own first turn
+(`fork_off`, a delegation fork, a council participant, the bounded and
+detached member forks) is refused with `MobError::ForkInstructionRefused`
+instead. See [Fork instruction policy](/mobkit/reference/configuration#fork-instruction-policy)
+for what a fork copies and what `ReactivateInherited` trusts.
 
 ## Module routing
 

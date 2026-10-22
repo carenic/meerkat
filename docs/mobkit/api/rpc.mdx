@@ -4,7 +4,7 @@ description: "JSON-RPC 2.0 protocol for Meta runtime operations: gating, memory,
 icon: "plug"
 ---
 
-*Mirrored from MobKit main at [091f73c4a64c](https://github.com/lukacf/meerkat-meta/commit/091f73c4a64cd13e08fc7c8a0484c0bf3a93b4c2) on 2026-10-22; MobKit workspace version 0.9.4 at that commit.*
+*Mirrored from MobKit main at [982c76ab266e](https://github.com/lukacf/meerkat-meta/commit/982c76ab266ef73f028c1ba7dce9e021fa6587e0) on 2026-10-22; MobKit workspace version 0.9.4 at that commit.*
 
 Meta exposes its operational API over JSON-RPC 2.0. SDK gateways use JSON lines over stdio, while the embedded console uses `POST /console/rpc` for console-specific methods and explicitly implemented runtime operations. The HTTP dispatcher is not a general stdio passthrough; check `meta/capabilities` on the surface you use.
 
@@ -1990,6 +1990,11 @@ Errors keep Meerkat's classes distinct in `data.class`:
 
 Nothing retries inside the gateway. An identity with no member session is
 refused as `admission` / `target_not_materialized`, with nothing appended.
+
+A fork of the member copies its activations only as history: the gateway's
+`runtime_options.fork_instruction_policy` decides whether the child gets its
+own activation of each key, or whether the fork is refused. See
+[Fork instruction policy](/mobkit/reference/configuration#fork-instruction-policy).
 
 ### `meta/member_instruction_activations`
 
