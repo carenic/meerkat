@@ -49428,6 +49428,7 @@ impl MobActor {
     /// Report the members the destroy reloaded before it started (`reloaded`,
     /// first) together with any it reloaded later, before their ingress
     /// detach, on the report `result` carries.
+    #[allow(clippy::result_large_err)] // the destroy's typed report, incomplete or not, is its answer
     fn with_destroy_reloaded_members(
         result: Result<super::handle::MobDestroyReport, super::handle::MobDestroyError>,
         reloaded: Vec<AgentIdentity>,
