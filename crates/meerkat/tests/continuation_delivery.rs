@@ -3586,3 +3586,452 @@ fn team_incarnation() -> meerkat_core::service::MobIncarnationId {
         .parse()
         .expect("canonical mob incarnation id")
 }
+
+// ---------------------------------------------------------------------------
+// Host-originated continuations on a governed runtime.
+//
+// The rows below assert behaviour only. Everything that depends on how a
+// host continuation is committed with its namespace's committed owner, how
+// that owner holds or disowns it, and what a governed sink admitted lives in
+// `host_continuation_shape`, the one place that changes when the governed
+// admission shape lands.
+// ---------------------------------------------------------------------------
+
+const INGEST_NAMESPACE: &str = "app.ingest";
+const OBSERVATION: &str = "observation-1";
+const OBSERVATION_DIGEST: &str = "sha256:observation-1";
+const OBSERVATION_KEY: &str = "ingest:observation-1";
+
+fn ingest_producer() -> ContinuationProducer {
+    ContinuationProducer::Host {
+        namespace: INGEST_NAMESPACE.into(),
+    }
+}
+
+/// One external observation, delivered under its host namespace.
+fn observation_delivery() -> ContinuationDelivery {
+    ContinuationDelivery {
+        key: ContinuationKey::new(OBSERVATION_KEY).expect("key"),
+        result: ContinuationResultRef {
+            producer: ingest_producer(),
+            producer_id: OBSERVATION.into(),
+            result_digest: OBSERVATION_DIGEST.into(),
+            summary: None,
+        },
+        body: "a new item arrived".into(),
+        handling: ContinuationHandling::Queue,
+    }
+}
+
+/// The namespace's committed owner, holding the observation owed to
+/// `session`.
+fn ingest_owner(session: &SessionId) -> Arc<FakeJobs> {
+    let jobs = FakeJobs::holding(OBSERVATION, host_continuation_shape::owed_to(session));
+    *jobs.producer.lock().expect("lock") = Some(ingest_producer());
+    jobs
+}
+
+/// Commit a permitted job notification behind the first row of `address`.
+async fn a_permitted_delivery_behind(
+    fixture: &Fixture,
+    address: &LogicalRuntimeId,
+    session: &SessionId,
+) {
+    let job_id = meerkat::JobId::generated();
+    fixture
+        .inbox
+        .submit(
+            address,
+            meerkat_runtime::RuntimeDeliverySubmission::new(
+                RuntimeDeliveryId::new("job:permitted:1").expect("id"),
+                meerkat_runtime::RuntimeDeliveryKind::JobNotification,
+                job_id.as_str(),
+                1,
+                "lineage",
+                serde_json::to_vec(&meerkat::JobNotificationDeliveryPayload {
+                    job_id: job_id.clone(),
+                    delivery_sequence: 1,
+                    origin_session_id: session.clone(),
+                    interaction_lineage_id: meerkat::InteractionLineageId::new(),
+                    targets: Vec::new(),
+                    notification: meerkat::JobNotification::new(
+                        "n-1", "n-1", "progress", "halfway",
+                    )
+                    .expect("notification"),
+                })
+                .expect("encode"),
+            )
+            .expect("submission"),
+        )
+        .await
+        .expect("a permitted delivery behind it");
+}
+
+/// The observation's status once the owner admitted or settled it.
+async fn settled_observation(
+    fixture: &Fixture,
+    owner: &ContinuationOwner,
+    passes: &mut watch::Receiver<RuntimeDeliveryPass>,
+) -> ContinuationStatus {
+    wait_for_status(fixture, owner, OBSERVATION_KEY, passes, |status| {
+        matches!(
+            status,
+            ContinuationStatus::Applied { .. }
+                | ContinuationStatus::Refused { .. }
+                | ContinuationStatus::Stranded { .. }
+        )
+    })
+    .await
+}
+
+/// On a governed runtime a host continuation that its namespace's committed
+/// owner confirms is admitted exactly once, into the session it is owed to,
+/// and never as an authority-free input. The owner is asked again at
+/// admission: a confirmation read at commit time is not enough.
+#[tokio::test]
+async fn a_confirmed_host_continuation_is_admitted_once_on_a_governed_runtime() {
+    let fixture = Fixture::new();
+    let session = SessionId::new();
+    let owner = ContinuationOwner::Session {
+        session_id: session.clone(),
+    };
+    let jobs = ingest_owner(&session);
+    let receipt = host_continuation_shape::commit(
+        &fixture.continuations,
+        &owner,
+        observation_delivery(),
+        &jobs,
+    )
+    .await
+    .expect("commit the host continuation from its namespace owner");
+    let asked_at_commit = jobs.lookups();
+    let sink = Arc::new(RecordingSink::governed());
+    let handle = fixture
+        .owner()
+        .arm(Host::with_jobs(sink.clone(), Arc::clone(&jobs)))
+        .expect("arm");
+    let mut passes = handle.subscribe_passes();
+    let (applied, admitted_session, input) =
+        match settled_observation(&fixture, &owner, &mut passes).await {
+            ContinuationStatus::Applied {
+                receipt,
+                session,
+                input,
+            } => (receipt, session, input),
+            other => panic!(
+                "a confirmed host continuation is admitted on a governed runtime, got {other:?}"
+            ),
+        };
+    assert_eq!(applied, receipt);
+    assert_eq!(admitted_session, session);
+    assert_eq!(
+        host_continuation_shape::admitted(&sink),
+        vec![(session.clone(), input)],
+        "admitted exactly once, into the session it is owed to"
+    );
+    assert!(
+        sink.admissions().is_empty(),
+        "never admitted as an authority-free input"
+    );
+    assert!(
+        jobs.lookups() > asked_at_commit,
+        "the namespace owner confirmed it again at admission"
+    );
+}
+
+/// A host continuation its namespace's committed owner does not confirm
+/// exactly is refused with the existing typed reason before anything is
+/// reserved or admitted, and the delivery behind it proceeds.
+async fn an_unconfirmed_host_continuation_is_refused(disown: host_continuation_shape::Disown) {
+    let fixture = Fixture::new();
+    let session = SessionId::new();
+    let owner = ContinuationOwner::Session {
+        session_id: session.clone(),
+    };
+    let jobs = ingest_owner(&session);
+    let receipt = host_continuation_shape::commit(
+        &fixture.continuations,
+        &owner,
+        observation_delivery(),
+        &jobs,
+    )
+    .await
+    .expect("commit while the namespace owner holds it");
+    host_continuation_shape::disown(&jobs, disown);
+    let address = LogicalRuntimeId::new(receipt.address.clone());
+    a_permitted_delivery_behind(&fixture, &address, &session).await;
+    let sink = Arc::new(RecordingSink::governed());
+    let handle = fixture
+        .owner()
+        .arm(Host::with_jobs(sink.clone(), Arc::clone(&jobs)))
+        .expect("arm");
+    let mut passes = handle.subscribe_passes();
+    let pass = wait_for_pass(
+        &mut passes,
+        "the unconfirmed host continuation settled",
+        |pass| pass.refused > 0,
+    )
+    .await;
+    assert_eq!(
+        pass.applied, 1,
+        "{disown:?}: the permitted delivery behind it is delivered"
+    );
+    assert!(
+        host_continuation_shape::admitted(&sink).is_empty()
+            && sink.admissions().is_empty()
+            && sink.resumes().is_empty(),
+        "{disown:?}: nothing was admitted"
+    );
+    assert_eq!(
+        fixture
+            .inbox
+            .continuation_admission(
+                &address,
+                &RuntimeDeliveryId::new(receipt.delivery_id.clone()).expect("id"),
+            )
+            .await
+            .expect("admission index"),
+        None,
+        "{disown:?}: nothing was reserved"
+    );
+    assert_eq!(
+        status_of(&fixture, &owner, OBSERVATION_KEY).await,
+        ContinuationStatus::Refused {
+            receipt,
+            sequence: 1,
+            reason: meerkat_runtime::RuntimeDeliveryRefusalReason::NoAdmissibleWorkBinding
+        },
+        "{disown:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_host_continuation_of_a_namespace_its_owner_does_not_hold_is_refused() {
+    an_unconfirmed_host_continuation_is_refused(host_continuation_shape::Disown::OtherNamespace)
+        .await;
+}
+
+#[tokio::test]
+async fn a_host_continuation_its_owner_holds_for_another_owner_is_refused() {
+    an_unconfirmed_host_continuation_is_refused(host_continuation_shape::Disown::OtherOwner).await;
+}
+
+#[tokio::test]
+async fn a_host_continuation_with_other_content_than_its_owner_committed_is_refused() {
+    an_unconfirmed_host_continuation_is_refused(host_continuation_shape::Disown::OtherResult).await;
+}
+
+#[tokio::test]
+async fn a_host_continuation_its_owner_no_longer_holds_is_refused() {
+    an_unconfirmed_host_continuation_is_refused(host_continuation_shape::Disown::Forgotten).await;
+}
+
+/// A namespace owner that cannot be read now decides nothing: the host
+/// continuation stays pending (never settled, never admitted) and is
+/// admitted once the owner answers again.
+#[tokio::test]
+async fn an_unreadable_namespace_owner_keeps_the_host_continuation_pending_until_it_answers() {
+    let fixture = Fixture::new();
+    let session = SessionId::new();
+    let owner = ContinuationOwner::Session {
+        session_id: session.clone(),
+    };
+    let jobs = ingest_owner(&session);
+    let receipt = host_continuation_shape::commit(
+        &fixture.continuations,
+        &owner,
+        observation_delivery(),
+        &jobs,
+    )
+    .await
+    .expect("commit the host continuation from its namespace owner");
+    *jobs.unavailable.lock().expect("lock") = Some("the namespace owner is offline".into());
+    let sink = Arc::new(RecordingSink::governed());
+    let (attachments, attachment_commits) = watch::channel(0_u64);
+    let handle = fixture
+        .owner()
+        .with_attachment_commits(attachment_commits)
+        .arm(Host::with_jobs(sink.clone(), Arc::clone(&jobs)))
+        .expect("arm");
+    let mut passes = handle.subscribe_passes();
+    let pass = wait_for_pass(
+        &mut passes,
+        "the host continuation blocked or settled",
+        |pass| pass.refused > 0 || !pass.blocked_runtimes.is_empty(),
+    )
+    .await;
+    assert_eq!(
+        pass.refused, 0,
+        "an owner that cannot be read decides nothing: {:?}",
+        pass.failures
+    );
+    assert!(
+        host_continuation_shape::admitted(&sink).is_empty() && sink.admissions().is_empty(),
+        "nothing is admitted while its owner cannot be read"
+    );
+    assert!(
+        matches!(
+            status_of(&fixture, &owner, OBSERVATION_KEY).await,
+            ContinuationStatus::Pending { .. }
+        ),
+        "pending, never settled"
+    );
+
+    *jobs.unavailable.lock().expect("lock") = None;
+    attachments.send_modify(|generation| *generation += 1);
+    let status = settled_observation(&fixture, &owner, &mut passes).await;
+    assert!(
+        matches!(&status, ContinuationStatus::Applied { receipt: applied, .. } if *applied == receipt),
+        "admitted once the owner confirms it, got {status:?}"
+    );
+    assert_eq!(host_continuation_shape::admitted(&sink).len(), 1);
+}
+
+/// Without a native work authorization host nothing changes: a host
+/// continuation, committed from its namespace owner or plainly, is admitted
+/// as the authority-free input it always was, and the namespace owner is
+/// never asked at admission (here it no longer even holds the namespace).
+#[tokio::test]
+async fn an_ungoverned_runtime_admits_host_continuations_as_before() {
+    let fixture = Fixture::new();
+    let session = SessionId::new();
+    let owner = ContinuationOwner::Session {
+        session_id: session.clone(),
+    };
+    let jobs = ingest_owner(&session);
+    let owned = host_continuation_shape::commit(
+        &fixture.continuations,
+        &owner,
+        observation_delivery(),
+        &jobs,
+    )
+    .await
+    .expect("commit the host continuation from its namespace owner");
+    let plain = fixture
+        .continuations
+        .submit(&owner, delivery("task-1", host_producer()), 1)
+        .await
+        .expect("commit a plain host continuation");
+    host_continuation_shape::disown(&jobs, host_continuation_shape::Disown::OtherNamespace);
+    let asked = jobs.lookups();
+    let sink = Arc::new(RecordingSink::default());
+    let handle = fixture
+        .owner()
+        .arm(Host::with_jobs(sink.clone(), Arc::clone(&jobs)))
+        .expect("arm");
+    let mut passes = handle.subscribe_passes();
+    let owned_status = settled_observation(&fixture, &owner, &mut passes).await;
+    let plain_status = wait_for_status(&fixture, &owner, "task-1", &mut passes, |status| {
+        matches!(status, ContinuationStatus::Applied { .. })
+    })
+    .await;
+    assert!(
+        matches!(&owned_status, ContinuationStatus::Applied { receipt, session: admitted, .. } if *receipt == owned && *admitted == session),
+        "{owned_status:?}"
+    );
+    assert!(
+        matches!(&plain_status, ContinuationStatus::Applied { receipt, session: admitted, .. } if *receipt == plain && *admitted == session),
+        "{plain_status:?}"
+    );
+    let admissions = sink.admissions();
+    assert_eq!(admissions.len(), 2, "each admitted once: {admissions:?}");
+    assert!(
+        admissions
+            .iter()
+            .all(|(admitted_session, _, _)| *admitted_session == session),
+        "into the owner's session: {admissions:?}"
+    );
+    assert!(
+        host_continuation_shape::admitted(&sink).is_empty(),
+        "no governed admission without a native work authorization host"
+    );
+    assert_eq!(
+        jobs.lookups(),
+        asked,
+        "the namespace owner is never asked at admission"
+    );
+}
+
+/// The only code of the host continuation rows that depends on the governed
+/// admission shape: how a host continuation is committed from its
+/// namespace's committed owner, how that owner holds or disowns it, and what
+/// a governed sink admitted. The rows above assert behaviour only and do not
+/// change when the shape lands.
+///
+/// At this base a governed runtime has no admission for a host continuation:
+/// it is committed from its owner's record as a retained completion that
+/// retains no work, and a governed runtime refuses such a row.
+mod host_continuation_shape {
+    use super::*;
+
+    /// How a row makes the namespace owner stop confirming a committed host
+    /// continuation.
+    #[derive(Debug, Clone, Copy)]
+    pub(super) enum Disown {
+        /// The owner holds another namespace.
+        OtherNamespace,
+        /// The owner holds it for another owner.
+        OtherOwner,
+        /// The owner committed other content.
+        OtherResult,
+        /// The owner holds it no more.
+        Forgotten,
+    }
+
+    /// What the namespace owner holds for the observation owed to `session`.
+    pub(super) fn owed_to(session: &SessionId) -> RetainedJobFacts {
+        RetainedJobFacts {
+            owner_session_id: session.clone(),
+            retained_work: None,
+            result_digest: OBSERVATION_DIGEST.into(),
+        }
+    }
+
+    pub(super) fn disown(jobs: &FakeJobs, disown: Disown) {
+        match disown {
+            Disown::OtherNamespace => {
+                *jobs.producer.lock().expect("lock") = Some(ContinuationProducer::Host {
+                    namespace: "app.other".into(),
+                });
+            }
+            Disown::OtherOwner => jobs.change(OBSERVATION, |facts| {
+                facts.owner_session_id = SessionId::new();
+            }),
+            Disown::OtherResult => jobs.change(OBSERVATION, |facts| {
+                facts.result_digest = "sha256:another-observation".into();
+            }),
+            Disown::Forgotten => {
+                jobs.jobs.lock().expect("lock").remove(OBSERVATION);
+            }
+        }
+    }
+
+    /// Commit `delivery` for `owner` from its namespace owner's record.
+    pub(super) async fn commit(
+        continuations: &ContinuationOwnerService,
+        owner: &ContinuationOwner,
+        delivery: ContinuationDelivery,
+        jobs: &FakeJobs,
+    ) -> Result<meerkat::ContinuationReceipt, meerkat::ContinuationSubmitError> {
+        let record = RetainedJobRecord::from_owner(
+            jobs,
+            delivery.result.producer.clone(),
+            delivery.result.producer_id.clone(),
+        )
+        .await
+        .map_err(meerkat::ContinuationSubmitError::Unavailable)?
+        .ok_or(meerkat::ContinuationSubmitError::NoAdmissibleWorkBinding)?;
+        continuations
+            .submit_retained_completion(owner, delivery, &record, 1)
+            .await
+    }
+
+    /// What `sink` admitted through a governed admission, in order: the
+    /// session and the input.
+    pub(super) fn admitted(sink: &RecordingSink) -> Vec<(SessionId, InputId)> {
+        sink.resumes()
+            .into_iter()
+            .map(|(session, input, _)| (session, input))
+            .collect()
+    }
+}

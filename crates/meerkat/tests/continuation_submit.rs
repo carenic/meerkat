@@ -742,3 +742,333 @@ fn team_incarnation() -> meerkat_core::service::MobIncarnationId {
         .parse()
         .expect("canonical mob incarnation id")
 }
+
+// ---------------------------------------------------------------------------
+// Host-originated continuations on a governed runtime: the submit side.
+//
+// The rows below assert behaviour only. How a host continuation is committed
+// from its namespace's committed owner, and how that owner holds it, lives in
+// `host_continuation_shape`, the one place that changes when the governed
+// admission shape lands.
+// ---------------------------------------------------------------------------
+
+const INGEST_NAMESPACE: &str = "app.ingest";
+const OBSERVATION: &str = "observation-1";
+const OBSERVATION_DIGEST: &str = "sha256:observation-1";
+
+/// One external observation under its host namespace, keyed `key`.
+fn observation(key: &str, result_digest: &str) -> ContinuationDelivery {
+    ContinuationDelivery {
+        key: ContinuationKey::new(key).expect("key"),
+        result: ContinuationResultRef {
+            producer: ContinuationProducer::Host {
+                namespace: INGEST_NAMESPACE.into(),
+            },
+            producer_id: OBSERVATION.into(),
+            result_digest: result_digest.into(),
+            summary: None,
+        },
+        body: "a new item arrived".into(),
+        handling: ContinuationHandling::Queue,
+    }
+}
+
+/// A continuation service whose runtime has a native work authorization
+/// host installed.
+fn governed_service(store: Arc<dyn RuntimeStore>) -> ContinuationOwnerService {
+    let governed = meerkat_runtime::MeerkatMachine::ephemeral()
+        .with_native_work_authorization_host(Arc::new(RefusingWorkAuthority))
+        .expect("install the native work authorization host");
+    ContinuationOwnerService::new(
+        RuntimeDeliveryInbox::new(store),
+        Arc::new(SessionAddressResolver),
+        Arc::new(governed),
+    )
+}
+
+async fn status_of(
+    continuations: &ContinuationOwnerService,
+    owner: &ContinuationOwner,
+    key: &str,
+) -> ContinuationStatus {
+    continuations
+        .continuation_status(owner, &ContinuationKey::new(key).expect("key"))
+        .await
+        .expect("status")
+}
+
+/// On a governed runtime a host continuation commits when its namespace's
+/// committed owner confirms it, and a replay returns the original receipt
+/// byte for byte. The public submit keeps refusing every host continuation:
+/// the namespace owner's confirmation is the only way in.
+#[tokio::test]
+async fn a_governed_runtime_commits_a_host_continuation_its_namespace_owner_confirms() {
+    let store: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());
+    let continuations = governed_service(store);
+    let session_id = SessionId::new();
+    let owner = ContinuationOwner::Session {
+        session_id: session_id.clone(),
+    };
+    let source = host_continuation_shape::NamespaceOwner::holding(
+        INGEST_NAMESPACE,
+        &session_id,
+        OBSERVATION_DIGEST,
+    );
+    let receipt = host_continuation_shape::commit(
+        &continuations,
+        &owner,
+        observation("ingest:1", OBSERVATION_DIGEST),
+        &source,
+    )
+    .await
+    .expect("a confirmed host continuation commits on a governed runtime");
+    assert_eq!(
+        host_continuation_shape::commit(
+            &continuations,
+            &owner,
+            observation("ingest:1", OBSERVATION_DIGEST),
+            &source,
+        )
+        .await
+        .expect("replay"),
+        receipt,
+        "a replay returns the original receipt"
+    );
+    assert_eq!(
+        status_of(&continuations, &owner, "ingest:1").await,
+        ContinuationStatus::Pending {
+            receipt,
+            sequence: 1,
+            admitted: None
+        }
+    );
+    assert_eq!(
+        continuations
+            .submit(&owner, observation("ingest:2", OBSERVATION_DIGEST), 1)
+            .await
+            .expect_err("the public submit carries no confirmation"),
+        ContinuationSubmitError::NoAdmissibleWorkBinding
+    );
+    assert_eq!(
+        status_of(&continuations, &owner, "ingest:2").await,
+        ContinuationStatus::NotCommitted
+    );
+}
+
+/// On a governed runtime a host continuation its namespace's committed owner
+/// does not confirm commits nothing, refused with the existing typed
+/// reasons: no owner holds it (`NoAdmissibleWorkBinding`), or the delivery
+/// names other content or another owner than the one it was committed for
+/// (`Invalid`).
+#[tokio::test]
+async fn a_governed_runtime_commits_no_host_continuation_its_namespace_owner_does_not_confirm() {
+    let store: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());
+    let continuations = governed_service(store);
+    let session_id = SessionId::new();
+    let owner = ContinuationOwner::Session {
+        session_id: session_id.clone(),
+    };
+    let other_namespace = host_continuation_shape::NamespaceOwner::holding(
+        "app.other",
+        &session_id,
+        OBSERVATION_DIGEST,
+    );
+    assert_eq!(
+        host_continuation_shape::commit(
+            &continuations,
+            &owner,
+            observation("ingest:1", OBSERVATION_DIGEST),
+            &other_namespace,
+        )
+        .await
+        .expect_err("an owner of another namespace confirms nothing"),
+        ContinuationSubmitError::NoAdmissibleWorkBinding
+    );
+    let forgotten = host_continuation_shape::NamespaceOwner::holding(
+        INGEST_NAMESPACE,
+        &session_id,
+        OBSERVATION_DIGEST,
+    );
+    forgotten.forget();
+    assert_eq!(
+        host_continuation_shape::commit(
+            &continuations,
+            &owner,
+            observation("ingest:1", OBSERVATION_DIGEST),
+            &forgotten,
+        )
+        .await
+        .expect_err("an owner that holds it no more confirms nothing"),
+        ContinuationSubmitError::NoAdmissibleWorkBinding
+    );
+    let source = host_continuation_shape::NamespaceOwner::holding(
+        INGEST_NAMESPACE,
+        &session_id,
+        OBSERVATION_DIGEST,
+    );
+    assert!(
+        matches!(
+            host_continuation_shape::commit(
+                &continuations,
+                &owner,
+                observation("ingest:1", "sha256:another-observation"),
+                &source,
+            )
+            .await,
+            Err(ContinuationSubmitError::Invalid(_))
+        ),
+        "other content than the owner committed"
+    );
+    assert!(
+        matches!(
+            host_continuation_shape::commit(
+                &continuations,
+                &ContinuationOwner::Session {
+                    session_id: SessionId::new()
+                },
+                observation("ingest:1", OBSERVATION_DIGEST),
+                &source,
+            )
+            .await,
+            Err(ContinuationSubmitError::Invalid(_))
+        ),
+        "owed to another owner than the owner committed it for"
+    );
+    assert_eq!(
+        status_of(&continuations, &owner, "ingest:1").await,
+        ContinuationStatus::NotCommitted,
+        "nothing was committed"
+    );
+}
+
+/// Without a native work authorization host nothing changes: a host
+/// continuation commits plainly or from its namespace owner, and each replay
+/// returns its original receipt.
+#[tokio::test]
+async fn an_ungoverned_runtime_commits_host_continuations_as_before() {
+    let store: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());
+    let (continuations, _) = service(store, Arc::new(SessionAddressResolver));
+    let session_id = SessionId::new();
+    let owner = ContinuationOwner::Session {
+        session_id: session_id.clone(),
+    };
+    let plain = continuations
+        .submit(&owner, observation("ingest:plain", OBSERVATION_DIGEST), 1)
+        .await
+        .expect("a plain host continuation commits");
+    assert_eq!(
+        continuations
+            .submit(&owner, observation("ingest:plain", OBSERVATION_DIGEST), 2)
+            .await
+            .expect("replay"),
+        plain
+    );
+    let source = host_continuation_shape::NamespaceOwner::holding(
+        INGEST_NAMESPACE,
+        &session_id,
+        OBSERVATION_DIGEST,
+    );
+    let owned = host_continuation_shape::commit(
+        &continuations,
+        &owner,
+        observation("ingest:owned", OBSERVATION_DIGEST),
+        &source,
+    )
+    .await
+    .expect("a host continuation commits from its namespace owner");
+    assert_eq!(
+        host_continuation_shape::commit(
+            &continuations,
+            &owner,
+            observation("ingest:owned", OBSERVATION_DIGEST),
+            &source,
+        )
+        .await
+        .expect("replay"),
+        owned
+    );
+    assert_ne!(plain.delivery_id, owned.delivery_id);
+}
+
+/// The only code of the host continuation rows that depends on the governed
+/// admission shape: how a host continuation is committed from its
+/// namespace's committed owner, and how that owner holds it. The rows above
+/// assert behaviour only and do not change when the shape lands.
+///
+/// At this base a governed runtime has no admission for a host continuation:
+/// it is committed from its owner's record as a retained completion that
+/// retains no work, which a governed runtime refuses.
+mod host_continuation_shape {
+    use super::*;
+
+    /// The committed owner of one host namespace, holding at most the one
+    /// observation of these rows; a test edits it.
+    pub(super) struct NamespaceOwner {
+        namespace: String,
+        facts: Mutex<Option<meerkat::RetainedJobFacts>>,
+    }
+
+    impl NamespaceOwner {
+        /// An owner of `namespace` holding the observation owed to
+        /// `session`, with the result `result_digest`.
+        pub(super) fn holding(namespace: &str, session: &SessionId, result_digest: &str) -> Self {
+            Self {
+                namespace: namespace.into(),
+                facts: Mutex::new(Some(meerkat::RetainedJobFacts {
+                    owner_session_id: session.clone(),
+                    retained_work: None,
+                    result_digest: result_digest.into(),
+                })),
+            }
+        }
+
+        /// The owner holds the observation no more.
+        pub(super) fn forget(&self) {
+            *self.facts.lock().expect("lock") = None;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl meerkat::RetainedJobSource for NamespaceOwner {
+        async fn retained_job(
+            &self,
+            producer: &ContinuationProducer,
+            job_id: &str,
+        ) -> meerkat::RetainedJobLookup {
+            match producer {
+                ContinuationProducer::Host { namespace }
+                    if *namespace == self.namespace && job_id == OBSERVATION =>
+                {
+                    self.facts
+                        .lock()
+                        .expect("lock")
+                        .clone()
+                        .map_or(meerkat::RetainedJobLookup::Absent, |facts| {
+                            meerkat::RetainedJobLookup::Found(facts)
+                        })
+                }
+                _ => meerkat::RetainedJobLookup::Absent,
+            }
+        }
+    }
+
+    /// Commit `delivery` for `owner` from its namespace owner's record.
+    pub(super) async fn commit(
+        continuations: &ContinuationOwnerService,
+        owner: &ContinuationOwner,
+        delivery: ContinuationDelivery,
+        source: &NamespaceOwner,
+    ) -> Result<meerkat::ContinuationReceipt, ContinuationSubmitError> {
+        let record = meerkat::RetainedJobRecord::from_owner(
+            source,
+            delivery.result.producer.clone(),
+            delivery.result.producer_id.clone(),
+        )
+        .await
+        .map_err(ContinuationSubmitError::Unavailable)?
+        .ok_or(ContinuationSubmitError::NoAdmissibleWorkBinding)?;
+        continuations
+            .submit_retained_completion(owner, delivery, &record, 1)
+            .await
+    }
+}
