@@ -86,6 +86,20 @@ them.
 
 ### Added
 
+- `meerkat_mob::MobDestroyReport` gains `member_reload_refusals`: the
+  members whose durability reload the runtime refused as repair-blocked
+  (`RuntimeDriverError::RecoveryRepairBlocked`), each a
+  `MobDestroyMemberRefusal` with its `MemberReloadRefusal::RepairBlocked`
+  (`reason`, `evidence_digest`). A destroy that could not reload such a
+  member answered `Incomplete` with that refusal flattened into one
+  `errors` string; the string stays, and the typed entry beside it tells a
+  caller to retry the destroy later, for example once a boundary commit past
+  its deadline has reported its durable outcome. The `mob_destroy_incomplete`
+  data of every surface carries it as
+  `destroy_report.member_reload_refusals[].refusal.kind ==
+  "repair_blocked"`. Both new types are `#[non_exhaustive]`, and the field is
+  left out of the serialized report when it is empty, so any other destroy
+  report is unchanged.
 - `meerkat-schedule`: `ScheduleTargetDelivery::deliver_existing_occurrence`,
   a defaulted method the driver calls to redeliver a reclaimed occurrence
   whose earlier attempt recorded its dispatch, with `ExistingDelivery`

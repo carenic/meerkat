@@ -1226,6 +1226,14 @@ waits on that member's ingress detach reloads the member from its durable
 store, retries its retirement once, and names it in
 `MobDestroyReport::reloaded_members`; 0.9.3 answered `Incomplete`.
 
+When the runtime refuses such a reload as repair-blocked, for example while a
+boundary commit past its deadline has not reported its durable outcome, the
+destroy answers `Incomplete` and leaves the mob unchanged. Since 0.9.5 its
+report also lists the member in `MobDestroyReport::member_reload_refusals`
+(`{"member": ..., "refusal": {"kind": "repair_blocked", "reason": ...}}`
+in the `destroy_report` of the `mob_destroy_incomplete` data): retry the
+destroy later. Any other reload failure stays text in `errors` only.
+
 ### Admission in custom Rust session services
 
 A custom `MobSessionService` that executes standalone turns must implement

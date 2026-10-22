@@ -2588,22 +2588,22 @@ async fn destroy_once_the_released_commit_reports(
         .store
         .held_run()
         .expect("the held boundary commit carries its run's receipt");
-    let outcome_pending = meerkat_runtime::RuntimeDriverError::RecoveryRepairBlocked {
-        evidence_digest: None,
+    let outcome_pending = meerkat_mob::MemberReloadRefusal::RepairBlocked {
         reason: format!(
             "runtime commit of run {run_id} has not reported its durable outcome; retry the reload after it does"
         ),
-    }
-    .to_string();
-    let member = format!("{}: ", held.child.as_str());
+        evidence_digest: None,
+    };
     let mob_id = held.fixture.source_mob_id();
     loop {
         match held.fixture.state.mob_destroy(&mob_id).await {
             Err(meerkat_mob_mcp::MobMcpDestroyError::Incomplete { report })
                 if report.reloaded_members.is_empty()
+                    && report.errors.len() == 1
                     && matches!(
-                        report.errors.as_slice(),
-                        [error] if error.starts_with(&member) && error.ends_with(&outcome_pending)
+                        report.member_reload_refusals.as_slice(),
+                        [refused] if refused.member == held.child
+                            && refused.refusal == outcome_pending
                     ) =>
             {
                 tokio::time::sleep(Duration::from_millis(20)).await;

@@ -3033,6 +3033,47 @@ pub(super) enum DegradedUnregisterStep {
     Failed(String),
 }
 
+/// Why a durability reload
+/// ([`MemberSessionDisposalArc::reload_durability_degraded_registration_until`])
+/// did not settle.
+#[cfg(feature = "runtime-adapter")]
+#[derive(Debug)]
+pub(super) enum DurabilityReloadFailure {
+    /// The runtime answered the reload with this refusal.
+    Refused(meerkat_runtime::RuntimeDriverError),
+    /// The reload was not asked, or not answered within the deadline.
+    Session(SessionError),
+}
+
+#[cfg(feature = "runtime-adapter")]
+impl From<SessionError> for DurabilityReloadFailure {
+    fn from(error: SessionError) -> Self {
+        Self::Session(error)
+    }
+}
+
+#[cfg(feature = "runtime-adapter")]
+impl DurabilityReloadFailure {
+    /// The runtime's refusal, when it refused the reload.
+    pub(super) fn runtime_refusal(&self) -> Option<&meerkat_runtime::RuntimeDriverError> {
+        match self {
+            Self::Refused(error) => Some(error),
+            Self::Session(_) => None,
+        }
+    }
+
+    /// The session error a retirement reports for this failure of
+    /// `session_id`'s reload.
+    pub(super) fn into_session_error(self, session_id: &SessionId) -> SessionError {
+        match self {
+            Self::Refused(error) => MemberSessionDisposalArc::runtime_archive_error(format!(
+                "durability-reload disposal failed for {session_id}: {error}"
+            )),
+            Self::Session(error) => error,
+        }
+    }
+}
+
 #[cfg(feature = "runtime-adapter")]
 struct PendingTurnFinalizationBoundary {
     completed: Arc<tokio::sync::Notify>,
@@ -4239,14 +4280,16 @@ impl MemberSessionDisposalArc {
     /// boundary commit consumed only in memory is pending there again, so the
     /// retirement that follows records its fate instead of losing it with
     /// the in-memory run. A registration that is not degraded, or no longer
-    /// current, is left untouched (`NotDegraded`, `NotCurrent`).
+    /// current, is left untouched (`NotDegraded`, `NotCurrent`). A refusal
+    /// from the runtime stays typed ([`DurabilityReloadFailure::Refused`]).
     pub(super) async fn reload_durability_degraded_registration_until(
         adapter: &Arc<MeerkatMachine>,
         ops_adapter: Option<&Arc<super::ops_adapter::MobOpsAdapter>>,
         registration: &RuntimeSessionRegistrationWitness,
         session_id: &SessionId,
         deadline: Instant,
-    ) -> Result<meerkat_runtime::ReloadRequiredRegistrationDisposition, SessionError> {
+    ) -> Result<meerkat_runtime::ReloadRequiredRegistrationDisposition, DurabilityReloadFailure>
+    {
         // A reload-required discard atomically replaces the registration
         // with a cold successor. The exact bound operation identity must
         // ride that replacement as a durable retention request so the
@@ -4266,11 +4309,7 @@ impl MemberSessionDisposalArc {
         )
         .await
         .map_err(|_| Self::runtime_retirement_in_progress(session_id, "durability_reload_discard"))?
-        .map_err(|error| {
-            Self::runtime_archive_error(format!(
-                "durability-reload disposal failed for {session_id}: {error}"
-            ))
-        })
+        .map_err(DurabilityReloadFailure::Refused)
     }
 
     /// Before an exact unregister: discard `registration` first when its
@@ -4381,7 +4420,8 @@ impl MemberSessionDisposalArc {
                 session_id,
                 deadline,
             )
-            .await?;
+            .await
+            .map_err(|failure| failure.into_session_error(session_id))?;
             if matches!(
                 disposition,
                 meerkat_runtime::ReloadRequiredRegistrationDisposition::Discarded

@@ -49470,12 +49470,12 @@ impl MobActor {
             match boxed_arm_future(|| self.reload_member_if_durability_degraded(entry)).await {
                 Ok(true) => reloaded.push(entry.agent_identity.clone()),
                 Ok(false) => {}
-                Err(error) => {
+                Err(failure) => {
                     let mut report = super::handle::MobDestroyReport {
                         reloaded_members: reloaded,
                         ..Default::default()
                     };
-                    report.push_error(error);
+                    report.push_member_reload_failure(&entry.agent_identity, failure);
                     return Err(super::handle::MobDestroyError::Incomplete { report });
                 }
             }
@@ -49502,12 +49502,13 @@ impl MobActor {
     /// member's retirement then records what became of it. Bounded by the
     /// member retire budget. Returns whether the member was reloaded; `Err`
     /// is the destroy report's entry for a reload that failed, or for a
-    /// member still degraded after it.
+    /// member still degraded after it, typed when the runtime refused the
+    /// reload as repair-blocked.
     #[cfg(feature = "runtime-adapter")]
     async fn reload_member_if_durability_degraded(
         &self,
         entry: &RosterEntry,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, super::handle::MemberReloadFailure> {
         let Some(adapter) = self.runtime_adapter.as_ref() else {
             return Ok(false);
         };
@@ -49529,10 +49530,13 @@ impl MobActor {
             .current_session_registration_witness(session_id)
             .await
         else {
-            return Err(format!(
-                "{}: {required}; the runtime has no current registration the destroy can reload",
-                entry.agent_identity
-            ));
+            return Err(super::handle::MemberReloadFailure {
+                message: format!(
+                    "{}: {required}; the runtime has no current registration the destroy can reload",
+                    entry.agent_identity
+                ),
+                refusal: None,
+            });
         };
         tracing::warn!(
             mob_id = %self.definition.id,
@@ -49550,11 +49554,18 @@ impl MobActor {
                 Instant::now() + super::provisioner::MEMBER_RETIRE_TOTAL_TIMEOUT,
             )
             .await
-            .map_err(|error| {
-                format!(
-                    "{}: {required}; reloading it before the destroy failed: {error}",
-                    entry.agent_identity
-                )
+            .map_err(|failure| {
+                let refusal = failure
+                    .runtime_refusal()
+                    .and_then(super::handle::MemberReloadRefusal::from_runtime_refusal);
+                super::handle::MemberReloadFailure {
+                    message: format!(
+                        "{}: {required}; reloading it before the destroy failed: {}",
+                        entry.agent_identity,
+                        failure.into_session_error(session_id)
+                    ),
+                    refusal,
+                }
             })?;
         if matches!(
             disposition,
@@ -49564,10 +49575,13 @@ impl MobActor {
         }
         match adapter.durability_reload_required(session_id).await {
             None => Ok(false),
-            Some(still) => Err(format!(
-                "{}: {still}; the runtime still requires a durability reload after the destroy's reload attempt",
-                entry.agent_identity
-            )),
+            Some(still) => Err(super::handle::MemberReloadFailure {
+                message: format!(
+                    "{}: {still}; the runtime still requires a durability reload after the destroy's reload attempt",
+                    entry.agent_identity
+                ),
+                refusal: None,
+            }),
         }
     }
 
@@ -49834,8 +49848,8 @@ impl MobActor {
                 match boxed_arm_future(|| self.reload_member_if_durability_degraded(entry)).await {
                     Ok(true) => report.reloaded_members.push(entry.agent_identity.clone()),
                     Ok(false) => {}
-                    Err(error) => {
-                        report.push_error(error);
+                    Err(failure) => {
+                        report.push_member_reload_failure(&entry.agent_identity, failure);
                         return Err(MobDestroyError::Incomplete { report });
                     }
                 }
@@ -49869,12 +49883,13 @@ impl MobActor {
                             continue;
                         }
                         Ok(false) => {}
-                        Err(reload_error) => {
+                        Err(reload_failure) => {
                             report.push_error(format!(
                                 "{}: destroy retire admission failed: {error}",
                                 entry.agent_identity
                             ));
-                            report.push_error(reload_error);
+                            report
+                                .push_member_reload_failure(&entry.agent_identity, reload_failure);
                             return Err(MobDestroyError::Incomplete { report });
                         }
                     }
