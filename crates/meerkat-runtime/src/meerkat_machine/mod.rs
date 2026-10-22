@@ -8271,6 +8271,23 @@ impl MeerkatMachine {
         }
     }
 
+    /// Whether `session_id` has an active live channel, at this instant
+    /// (`false` also for a session that is not registered). A point-in-time
+    /// observation: no lock is held across an await, and a channel opened
+    /// right after it is not seen.
+    pub async fn session_live_channel_active(&self, session_id: &SessionId) -> bool {
+        let Ok(authority) = self.session_dsl_authority(session_id).await else {
+            return false;
+        };
+        let authority = authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        authority
+            .state()
+            .live_active_channel_by_session
+            .contains_key(&session_id.to_string())
+    }
+
     /// Wait until the run current for `session_id` when this is called is no
     /// longer current, and return its id; `None` when no run was current.
     /// See [`Self::wait_run_settled`].

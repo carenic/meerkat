@@ -18743,6 +18743,60 @@ impl MobActor {
         }
     }
 
+    /// The members of this Stopped mob as a drain of its runs starts: each
+    /// roster member's local session, its current run and live channel at
+    /// this instant, and its run starts as this process's last Stop recorded
+    /// them. Refused unless the mob is Stopped.
+    #[cfg(feature = "runtime-adapter")]
+    async fn drain_runs_snapshot(&self) -> Result<super::run_drain::DrainSnapshot, MobError> {
+        let state = self.state();
+        if state != MobState::Stopped {
+            return Err(MobError::DrainRequiresStoppedMob { state });
+        }
+        let entries = {
+            let roster = self.roster.read().await;
+            roster.list().cloned().collect::<Vec<_>>()
+        };
+        let mut members = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let local = !super::member_runtime_is_host_owned(
+                self.dsl_authority.state(),
+                &entry.agent_identity,
+            ) && !self.placed_member_carrier_dormant(&entry.agent_identity);
+            let local_session = local
+                .then(|| entry.member_ref.bridge_session_id().cloned())
+                .flatten();
+            let facts = match (&self.runtime_adapter, &local_session) {
+                (Some(adapter), Some(session_id)) => super::run_drain::DrainMemberFacts {
+                    reload_required: adapter
+                        .durability_reload_required(session_id)
+                        .await
+                        .is_some(),
+                    live_channel_active: adapter.session_live_channel_active(session_id).await,
+                    current_run: adapter.current_run(session_id).await,
+                    local_session,
+                },
+                _ => super::run_drain::DrainMemberFacts {
+                    local_session,
+                    ..super::run_drain::DrainMemberFacts::default()
+                },
+            };
+            let starts = self
+                .stop_member_outcomes
+                .get(&entry.agent_identity)
+                .map(|outcome| outcome.starts.clone());
+            members.push(super::run_drain::DrainSnapshotMember {
+                target: super::run_drain::drain_target(facts, starts.as_ref()),
+                identity: entry.agent_identity,
+                starts,
+            });
+        }
+        Ok(super::run_drain::DrainSnapshot {
+            members,
+            machine: self.runtime_adapter.clone(),
+        })
+    }
+
     /// Hold roster members' run starts (#1500) for a Shutdown, returning each
     /// member's outcome: it holds only the members whose runtime this mob
     /// hosts (`local_only`), one after another. A remote member's host is not
@@ -29170,6 +29224,10 @@ impl MobActor {
                 }
                 MobCommand::QueryPhase { reply_tx } => {
                     let _ = reply_tx.send(Ok(self.state()));
+                }
+                #[cfg(feature = "runtime-adapter")]
+                MobCommand::DrainRunsSnapshot { reply_tx } => {
+                    let _ = reply_tx.send(self.drain_runs_snapshot().await);
                 }
                 MobCommand::CloseIfIdle { reply_tx } => {
                     let outcome = self.close_admission_if_idle(deferred_commands).await;

@@ -173,6 +173,8 @@ impl MobCommand {
             | Self::GetIdentityConvergenceStatus { .. }
             | Self::MemberMachineProjection { .. }
             | Self::QueryPhase { .. } => Some(ControlScope::List),
+            #[cfg(feature = "runtime-adapter")]
+            Self::DrainRunsSnapshot { .. } => Some(ControlScope::List),
 
             // Composite/projection surfaces choose their outer scope as data
             // and enter the same serialized actor admission before any raw
@@ -543,6 +545,10 @@ impl MobCommand {
                 let _ = reply_tx.send(Err(error));
             }
             Self::QueryPhase { reply_tx } => {
+                let _ = reply_tx.send(Err(error));
+            }
+            #[cfg(feature = "runtime-adapter")]
+            Self::DrainRunsSnapshot { reply_tx } => {
                 let _ = reply_tx.send(Err(error));
             }
             Self::Wire { reply_tx, .. } | Self::Unwire { reply_tx, .. } => {

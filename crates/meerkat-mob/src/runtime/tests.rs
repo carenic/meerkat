@@ -84746,6 +84746,9 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         MobError::InvalidTransition { from, to } => {
             format!("invalid_transition:{}->{}", from.as_str(), to.as_str())
         }
+        MobError::DrainRequiresStoppedMob { state } => {
+            format!("drain_requires_stopped_mob:{}", state.as_str())
+        }
         MobError::MobMachineRejected { context, .. } => {
             format!("mob_machine_rejected:{context}")
         }

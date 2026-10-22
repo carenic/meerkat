@@ -145,3 +145,55 @@ impl HostRunStartHoldReason {
         }
     }
 }
+
+/// What [`MobHandle::drain_stopped_runs`](super::MobHandle::drain_stopped_runs)
+/// found for each member of a Stopped mob: whether the run each member had
+/// when the drain started ended within its bound.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct MobRunDrainReport {
+    /// One outcome per roster member, by identity.
+    pub members: BTreeMap<AgentIdentity, MemberRunDrainOutcome>,
+}
+
+/// One member's drain outcome: what happened to its run, and whether its run
+/// starts are held, as the Stop the drain follows reported them.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct MemberRunDrainOutcome {
+    /// The member's run, as the drain saw it.
+    pub run: MemberRunDrain,
+    /// The member's run starts as this process's last Stop recorded them;
+    /// `None` when no Stop outcome is recorded in this process (the mob was
+    /// stopped before a restart, or by another process). A member whose
+    /// starts are not `Held` may have started runs the drain neither waited
+    /// for nor reports.
+    pub starts: Option<MemberRunStarts>,
+}
+
+/// A member's run as a drain saw it. Only the run current when the drain
+/// started is drained.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "run", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MemberRunDrain {
+    /// The member had no run when the drain started.
+    NoRun,
+    /// The run ended within the bound. `terminal` is the run's recorded
+    /// terminal, or `None` when its runtime registration ended with it.
+    Ended {
+        run_id: RunId,
+        terminal: Option<meerkat_core::turn_execution_authority::TurnTerminalOutcome>,
+    },
+    /// The run was still current at the bound. The drain does not cancel it:
+    /// a mob Shutdown that follows does, as without a drain.
+    StillRunning { run_id: RunId },
+    /// The member's session had an open live channel when the drain started.
+    /// Its run, if any, was not waited for.
+    LiveChannelOpen { run_id: Option<RunId> },
+    /// A placed or remote member: its host owns its run.
+    NotLocal,
+    /// The member's runtime registration needs a durability reload: no run
+    /// outcome is recorded on it.
+    ReloadRequired,
+}
