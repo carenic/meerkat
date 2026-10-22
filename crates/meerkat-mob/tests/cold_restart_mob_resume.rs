@@ -4082,6 +4082,16 @@ impl ActiveMemberTail {
         physical_head_token(store, &self.session_id).await
     }
 
+    async fn provisional_tail_recorded_now(&self) -> bool {
+        self.runtime_store
+            .load_head_canonical_provisional_tail(&meerkat_runtime::LogicalRuntimeId::for_session(
+                &self.session_id,
+            ))
+            .await
+            .expect("load the provisional tail")
+            .is_some()
+    }
+
     /// Another runtime owner on the realm (another process, here a second
     /// owner in this one) takes the member session's hosting claim; that
     /// owner may still commit the tail itself.
@@ -4631,6 +4641,10 @@ async fn a_mob_start_refuses_a_restore_failed_members_tail_another_owner_hosts()
         "the refused start must leave the durable tail where the cut left it"
     );
     assert!(
+        tail.provisional_tail_recorded_now().await,
+        "the refused start must leave the provisional tail recorded"
+    );
+    assert!(
         !matches!(status, Some(Ok(meerkat_mob::MobState::Running))),
         "a start that cannot settle a member's tail another runtime owner hosts must not run: \
          {status:?}"
@@ -4689,6 +4703,10 @@ async fn a_resume_spawn_onto_a_foreign_session_tail_refuses_typed() {
         tail.physical_token_now(&store).await,
         tail.ahead_token,
         "a refused adoption must leave the durable tail where the cut left it"
+    );
+    assert!(
+        tail.provisional_tail_recorded_now().await,
+        "a refused adoption must leave the provisional tail recorded"
     );
     match &spawned {
         Err(meerkat_mob::MobError::SessionError(meerkat_core::service::SessionError::Store(
