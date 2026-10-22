@@ -14,13 +14,14 @@ use meerkat_runtime::{
 };
 use meerkat_schedule::{
     DeliveryCompletion, DeliveryCompletionFailureReason, DeliveryDispatch, DeliveryFailureReason,
-    DeliveryReceipt, DeliveryReceiptStage, DeliveryTerminal, HostRunnableInvocation,
-    HostRunnableParams, HostRunnableTargetBinding, IdentityTargetBinding, MobTargetBinding,
-    Occurrence, OccurrencePhase, RunnableProbe, ScheduleDeliveryIdentity, ScheduleDomainError,
-    ScheduleDriver, ScheduleDriverConfig, ScheduleFilter, ScheduleRunnableHost, ScheduleService,
-    ScheduleStoreKind, ScheduleStoreWakeMode, ScheduleTargetDelivery, ScheduleTargetProbe,
-    ScheduledSessionAction, SessionMaterializationSpec, SessionTargetBinding, TargetBinding,
-    TargetProbeOutcome, UpdateScheduleRequest,
+    DeliveryReceipt, DeliveryReceiptStage, DeliveryTerminal, ExistingDelivery,
+    ExistingDeliveryAnswer, HostRunnableInvocation, HostRunnableParams, HostRunnableTargetBinding,
+    IdentityTargetBinding, MobTargetBinding, Occurrence, OccurrencePhase, RunnableProbe,
+    ScheduleDeliveryIdentity, ScheduleDomainError, ScheduleDriver, ScheduleDriverConfig,
+    ScheduleFilter, ScheduleRunnableHost, ScheduleService, ScheduleStoreKind,
+    ScheduleStoreWakeMode, ScheduleTargetDelivery, ScheduleTargetProbe, ScheduledSessionAction,
+    SessionMaterializationSpec, SessionTargetBinding, TargetBinding, TargetProbeOutcome,
+    UpdateScheduleRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -424,6 +425,53 @@ pub trait SurfaceScheduleMobHost: Send + Sync {
     ) -> Result<Option<DeliveryDispatch>, ScheduleDomainError> {
         let _ = (occurrence, identity, binding);
         Ok(None)
+    }
+
+    /// Redeliver a mob target whose earlier attempt recorded its dispatch,
+    /// without a fresh delivery ([`ExistingDelivery`]). The default delivers
+    /// an admitted one through [`Self::deliver_mob_target`], whose durable
+    /// stable-key records answer an exact replay, and answers
+    /// [`ExistingDeliveryAnswer::NotAdmittedPastDeadline`] for an unproven
+    /// late one: a host that cannot tell whether it admitted the delivery
+    /// never delivers a late occurrence fresh.
+    async fn deliver_existing_mob_target(
+        &self,
+        occurrence: &Occurrence,
+        identity: &ScheduleDeliveryIdentity,
+        binding: &MobTargetBinding,
+        existing: ExistingDelivery,
+    ) -> Result<ExistingDeliveryAnswer, ScheduleDomainError> {
+        match existing {
+            ExistingDelivery::Admitted => self
+                .deliver_mob_target(occurrence, identity, binding)
+                .await
+                .map(ExistingDeliveryAnswer::Dispatch),
+            _ => Ok(ExistingDeliveryAnswer::NotAdmittedPastDeadline),
+        }
+    }
+
+    /// The same for an identity this host may own. `None` when it does not
+    /// own the identity (the session host delivers it). The default
+    /// delivers an admitted one through [`Self::deliver_identity_target`],
+    /// and answers an unproven late one for an identity it owns (its probe
+    /// answers) with [`ExistingDeliveryAnswer::NotAdmittedPastDeadline`].
+    async fn deliver_existing_identity_target(
+        &self,
+        occurrence: &Occurrence,
+        identity: &ScheduleDeliveryIdentity,
+        binding: &IdentityTargetBinding,
+        existing: ExistingDelivery,
+    ) -> Result<Option<ExistingDeliveryAnswer>, ScheduleDomainError> {
+        match existing {
+            ExistingDelivery::Admitted => Ok(self
+                .deliver_identity_target(occurrence, identity, binding)
+                .await?
+                .map(ExistingDeliveryAnswer::Dispatch)),
+            _ => Ok(self
+                .probe_identity_target(binding)
+                .await?
+                .map(|_| ExistingDeliveryAnswer::NotAdmittedPastDeadline)),
+        }
     }
 }
 
@@ -1163,6 +1211,168 @@ impl ScheduleTargetDelivery for SharedScheduleTargetAdapter {
                 Ok(self.deliver_host_runnable(occurrence, identity, binding))
             }
         }
+    }
+
+    /// Redeliver a reclaimed occurrence whose earlier attempt recorded its
+    /// dispatch. Nothing is materialized or created first: an on-demand
+    /// session target that was never bound has no earlier admission. A
+    /// session target's runtime admission may only deduplicate against the
+    /// earlier input (the runtime's deduplicate-only admission, decided where
+    /// it decides deduplication); mob targets and mob-owned identities go to
+    /// the mob host.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn deliver_existing_occurrence(
+        &self,
+        occurrence: &Occurrence,
+        identity: &ScheduleDeliveryIdentity,
+        existing: ExistingDelivery,
+    ) -> Result<ExistingDeliveryAnswer, ScheduleDomainError> {
+        if let Some(refused) = self.refuse_foreign_mandate(occurrence, identity).await? {
+            return Ok(ExistingDeliveryAnswer::Dispatch(refused));
+        }
+        match &occurrence.target_snapshot {
+            TargetBinding::Session(binding) => {
+                let session_id = match binding.as_ref() {
+                    SessionTargetBinding::ExactSession { session_id, .. }
+                    | SessionTargetBinding::ResumableSession { session_id, .. } => {
+                        session_id.clone()
+                    }
+                    SessionTargetBinding::MaterializeOnDemandSession {
+                        bound_session_id: Some(session_id),
+                        ..
+                    } => session_id.clone(),
+                    SessionTargetBinding::MaterializeOnDemandSession {
+                        bound_session_id: None,
+                        ..
+                    } => return Ok(existing_delivery_unknown(occurrence, identity, existing)),
+                };
+                let materialized_session_id = bound_target_session_id(&occurrence.target_snapshot);
+                let resolved = ResolvedScheduledSession {
+                    session_id,
+                    materialized_session_id,
+                };
+                self.deliver_existing_session_action(
+                    occurrence,
+                    identity,
+                    resolved,
+                    binding.action(),
+                    existing,
+                )
+                .await
+            }
+            TargetBinding::Identity(binding) => {
+                if let Some(answer) = self
+                    .mob_host
+                    .deliver_existing_identity_target(occurrence, identity, binding, existing)
+                    .await?
+                {
+                    return Ok(answer);
+                }
+                // An identity that no longer resolves holds no earlier
+                // admission to replay.
+                let Ok(resolved) = self.resolve_identity(occurrence, identity, binding).await
+                else {
+                    return Ok(existing_delivery_unknown(occurrence, identity, existing));
+                };
+                self.deliver_existing_session_action(
+                    occurrence,
+                    identity,
+                    resolved,
+                    binding.action(),
+                    existing,
+                )
+                .await
+            }
+            TargetBinding::Mob(binding) => {
+                self.mob_host
+                    .deliver_existing_mob_target(occurrence, identity, binding, existing)
+                    .await
+            }
+            // An in-process callback keeps no admission record: an admitted
+            // one runs as before, an unproven late one is never run fresh.
+            TargetBinding::HostRunnable(binding) => match existing {
+                ExistingDelivery::Admitted => Ok(ExistingDeliveryAnswer::Dispatch(
+                    self.deliver_host_runnable(occurrence, identity, binding),
+                )),
+                _ => Ok(ExistingDeliveryAnswer::NotAdmittedPastDeadline),
+            },
+        }
+    }
+}
+
+/// The answer for a redelivery whose target holds no earlier admission: an
+/// admitted one fails with nothing admitted, an unproven late one was never
+/// admitted.
+#[cfg(not(target_arch = "wasm32"))]
+fn existing_delivery_unknown(
+    occurrence: &Occurrence,
+    identity: &ScheduleDeliveryIdentity,
+    existing: ExistingDelivery,
+) -> ExistingDeliveryAnswer {
+    match existing {
+        ExistingDelivery::Admitted => ExistingDeliveryAnswer::Dispatch(immediate_delivery_failure(
+            occurrence,
+            "the admitted input is no longer known to the target; nothing was admitted".to_string(),
+            DeliveryFailureReason::RuntimeRejected,
+            Some(identity.correlation_id.clone()),
+            None,
+        )),
+        _ => ExistingDeliveryAnswer::NotAdmittedPastDeadline,
+    }
+}
+
+/// A redelivery in progress whose runtime admission may only deduplicate
+/// against the earlier input ([`ExistingDelivery`]). The adapter sets it
+/// around the session host's delivery, and
+/// [`accept_schedule_runtime_input_with_reconciliation`], which every
+/// runtime-backed host's delivery reaches, admits through the runtime's
+/// deduplicate-only admission while it is set. `not_admitted` records that
+/// an unproven late redelivery found no earlier admission.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+struct ExistingAdmissionScope {
+    existing: ExistingDelivery,
+    not_admitted: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+tokio::task_local! {
+    static EXISTING_ADMISSION: ExistingAdmissionScope;
+}
+
+/// The redelivery scope of the current delivery, if any.
+#[cfg(not(target_arch = "wasm32"))]
+fn existing_admission_scope() -> Option<ExistingAdmissionScope> {
+    EXISTING_ADMISSION.try_with(Clone::clone).ok()
+}
+
+impl SharedScheduleTargetAdapter {
+    /// Deliver a session action as a redelivery that may only find the
+    /// earlier admission.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn deliver_existing_session_action(
+        &self,
+        occurrence: &Occurrence,
+        identity: &ScheduleDeliveryIdentity,
+        resolved: ResolvedScheduledSession,
+        action: &ScheduledSessionAction,
+        existing: ExistingDelivery,
+    ) -> Result<ExistingDeliveryAnswer, ScheduleDomainError> {
+        let not_admitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let scope = ExistingAdmissionScope {
+            existing,
+            not_admitted: Arc::clone(&not_admitted),
+        };
+        let delivered = EXISTING_ADMISSION
+            .scope(
+                scope,
+                self.deliver_session_action(occurrence, identity, resolved, action),
+            )
+            .await;
+        if not_admitted.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(ExistingDeliveryAnswer::NotAdmittedPastDeadline);
+        }
+        delivered.map(ExistingDeliveryAnswer::Dispatch)
     }
 }
 
@@ -2726,6 +2936,24 @@ where
                 "scheduled runtime input omitted its stable idempotency key".to_string(),
             )
         })?;
+    // A redelivery of an occurrence whose earlier attempt recorded its
+    // dispatch admits only as a replay of that attempt's input.
+    #[cfg(not(target_arch = "wasm32"))]
+    let existing = existing_admission_scope();
+    #[cfg(target_arch = "wasm32")]
+    let existing: Option<std::convert::Infallible> = None;
+    if let Some(existing) = existing {
+        return accept_existing_schedule_runtime_input(
+            runtime_adapter,
+            session_id,
+            occurrence,
+            identity,
+            input,
+            materialized_session_id,
+            existing,
+        )
+        .await;
+    }
     let redrive = input.clone();
     let redrive_input_id = redrive.id().clone();
     match accept(input).await {
@@ -2791,6 +3019,87 @@ where
             }
         },
     }
+}
+
+/// Admit a redelivery through the runtime's deduplicate-only admission,
+/// which decides it where it decides deduplication: the earlier input's
+/// replay, or [`RuntimeDriverError::NoExistingAdmission`] with nothing
+/// admitted. No admission is retried or reconciled here, since none can be
+/// fresh.
+/// - The replay: the occurrence waits for that input's own outcome.
+/// - No earlier admission of an admitted redelivery (recovery discarded the
+///   row, or a store-less runtime archived it): delivery_failed, nothing
+///   admitted.
+/// - No earlier admission of an unproven late redelivery: the adapter answers
+///   that the target never admitted it, and the occurrence ends misfired.
+/// - Any other error says nothing about the earlier admission: the
+///   occurrence stays reclaimable (`DeliveryRepairDeferred`).
+#[cfg(not(target_arch = "wasm32"))]
+async fn accept_existing_schedule_runtime_input(
+    runtime_adapter: &MeerkatMachine,
+    session_id: &SessionId,
+    occurrence: &Occurrence,
+    identity: &ScheduleDeliveryIdentity,
+    input: meerkat_runtime::Input,
+    materialized_session_id: Option<SessionId>,
+    scope: ExistingAdmissionScope,
+) -> Result<DeliveryDispatch, ScheduleDomainError> {
+    match runtime_adapter
+        .accept_existing_input_with_completion(session_id, input)
+        .await
+    {
+        Ok((outcome, handle)) => {
+            runtime_delivery_dispatch_from_admission(
+                runtime_adapter,
+                session_id,
+                occurrence,
+                identity,
+                outcome,
+                handle,
+                materialized_session_id,
+            )
+            .await
+        }
+        Err(RuntimeDriverError::NoExistingAdmission { key }) => match scope.existing {
+            ExistingDelivery::Admitted => Ok(immediate_delivery_failure(
+                occurrence,
+                format!(
+                    "the admitted input is no longer known to the runtime (idempotency key {key}); nothing was admitted"
+                ),
+                DeliveryFailureReason::RuntimeRejected,
+                Some(identity.correlation_id.clone()),
+                materialized_session_id,
+            )),
+            _ => {
+                scope
+                    .not_admitted
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(ScheduleDomainError::DeliveryFailed {
+                    occurrence_id: occurrence.occurrence_id.clone(),
+                    reason: format!(
+                        "the runtime never admitted idempotency key {key}; nothing was admitted"
+                    ),
+                })
+            }
+        },
+        Err(error) => Err(ScheduleDomainError::DeliveryRepairDeferred {
+            detail: format!("the redelivery could not read its earlier admission: {error}"),
+        }),
+    }
+}
+
+/// Browser builds run no schedule driver, so nothing redelivers there.
+#[cfg(target_arch = "wasm32")]
+async fn accept_existing_schedule_runtime_input(
+    _runtime_adapter: &MeerkatMachine,
+    _session_id: &SessionId,
+    _occurrence: &Occurrence,
+    _identity: &ScheduleDeliveryIdentity,
+    _input: meerkat_runtime::Input,
+    _materialized_session_id: Option<SessionId>,
+    scope: std::convert::Infallible,
+) -> Result<DeliveryDispatch, ScheduleDomainError> {
+    match scope {}
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4438,6 +4747,85 @@ mod tests {
             planning_horizon_days: Some(1),
             planning_horizon_occurrences: Some(1),
         }
+    }
+
+    /// A redelivery never materializes a session: an on-demand target that
+    /// was never bound holds no earlier admission. An admitted redelivery
+    /// ends delivery_failed with nothing admitted, and an unproven late one
+    /// answers that the target never admitted it.
+    #[tokio::test]
+    async fn redelivery_of_an_unbound_on_demand_target_materializes_nothing() {
+        let store =
+            Arc::new(meerkat_schedule::MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>;
+        let service = ScheduleService::new(store);
+        let materialize_calls = Arc::new(AtomicUsize::new(0));
+        let session_host: Arc<dyn SurfaceScheduleSessionHost> = Arc::new(PanicOnMaterializeHost {
+            materialize_calls: Arc::clone(&materialize_calls),
+        });
+        let mob_host: Arc<dyn SurfaceScheduleMobHost> =
+            Arc::new(NoopScheduleMobHost::new("mob targets unused here"));
+        let adapter = SharedScheduleTargetAdapter::new(service.clone(), session_host, mob_host);
+        let schedule = service
+            .create(meerkat_schedule::CreateScheduleRequest {
+                name: Some("redelivery-unbound".to_string()),
+                description: None,
+                trigger: meerkat_schedule::TriggerSpec::Once {
+                    due_at_utc: chrono::Utc::now() - ChronoDuration::seconds(1),
+                },
+                target: materialize_on_demand_target(),
+                misfire_policy: meerkat_schedule::MisfirePolicy::Skip,
+                overlap_policy: meerkat_schedule::OverlapPolicy::AllowConcurrent,
+                missing_target_policy: meerkat_schedule::MissingTargetPolicy::Skip,
+                labels: BTreeMap::new(),
+                planning_horizon_days: Some(1),
+                planning_horizon_occurrences: Some(1),
+            })
+            .await
+            .expect("schedule create should plan one occurrence");
+        let occurrence = service
+            .list_occurrences(&schedule.schedule_id)
+            .await
+            .expect("list occurrences")
+            .into_iter()
+            .next()
+            .expect("one planned occurrence");
+        let identity = ScheduleDeliveryIdentity::for_occurrence(&occurrence);
+
+        let admitted = adapter
+            .deliver_existing_occurrence(&occurrence, &identity, ExistingDelivery::Admitted)
+            .await
+            .expect("the admitted redelivery answers");
+        let ExistingDeliveryAnswer::Dispatch(dispatch) = admitted else {
+            panic!("an admitted redelivery answers with a dispatch: {admitted:?}");
+        };
+        assert_eq!(
+            dispatch.receipt.stage,
+            DeliveryReceiptStage::DispatchStarted
+        );
+        let terminal = dispatch.completion.await.expect("the failure terminal");
+        assert_eq!(terminal.phase, OccurrencePhase::DeliveryFailed);
+        assert!(
+            terminal
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("no longer known")),
+            "{:?}",
+            terminal.detail
+        );
+
+        let unproven = adapter
+            .deliver_existing_occurrence(&occurrence, &identity, ExistingDelivery::UnprovenLate)
+            .await
+            .expect("the unproven redelivery answers");
+        assert!(matches!(
+            unproven,
+            ExistingDeliveryAnswer::NotAdmittedPastDeadline
+        ));
+        assert_eq!(
+            materialize_calls.load(Ordering::SeqCst),
+            0,
+            "a redelivery materializes nothing"
+        );
     }
 
     /// A service with a probe attached, and the adapter that owns the probe:

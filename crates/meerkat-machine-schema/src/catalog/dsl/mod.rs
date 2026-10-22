@@ -4685,6 +4685,10 @@ pub fn occurrence_lifecycle_schema_metadata() -> MachineSchemaMetadata {
                 &["Accepted", "Deduplicated"],
             ),
             NamedTypeBinding::string_enum(
+                "AdmissionEvidence",
+                &["Unrecorded", "Started", "Accepted"],
+            ),
+            NamedTypeBinding::string_enum(
                 "DeliveryFailureReason",
                 &[
                     "TargetMaterializationFailed",
@@ -4766,6 +4770,8 @@ pub fn occurrence_lifecycle_schema_metadata() -> MachineSchemaMetadata {
                     "ResolveDeliveryFailure",
                     "ResolveTargetProbe",
                     "ResolveDueMisfire",
+                    "ResolveReclaimExhausted",
+                    "ResolveUnprovenLateNotAdmitted",
                     "Supersede",
                     "RenewLease",
                     "LeaseExpired",
