@@ -25570,9 +25570,12 @@ impl MobActor {
                 .await;
                 if preliminary == IdentityReconcileDecision::AwaitLease {
                     // Another incarnation holds the lease. A holder that
-                    // crashed or stopped never releases it, and nothing else
-                    // wakes this identity when it expires (only the slow
-                    // safety scan would), so wait for that expiry.
+                    // crashed never releases it, nor does a Shutdown that
+                    // kept it (a member still unregistering, or whose
+                    // session actor had not exited, at its deadline; a
+                    // retiring member). Neither that expiry nor a release
+                    // wakes this identity (only the slow safety scan
+                    // would), so wait for the observed expiry.
                     let expires_at_ms = match &lease_observation {
                         IdentityStoredObservation::Valid(record) => {
                             record.active.as_ref().map(|active| active.expires_at_ms)
