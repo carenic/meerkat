@@ -145,7 +145,9 @@ them.
     with `data.code`, REST `409`). The key survives restarts and the input's
     completion, and is scoped to one session.
   - Member sends: the key is kept for the member identity in the
-    continuation key ledger, so it survives a respawn. A keyed send is
+    continuation key ledger, so it survives a respawn and a re-creation of
+    the mob under the same id (keys never expire; a replay there answers the
+    first delivery, `stranded` when it was never admitted). A keyed send is
     committed as a member continuation and answered with `continuation`
     (`WireContinuationReceipt`: `delivery_id`, `committed_at_ms` and a
     `WireContinuationStatus` of `pending`, `admitted` with its session and

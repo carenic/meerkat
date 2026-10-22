@@ -1551,6 +1551,11 @@ delivery status, not a turn:
 
 - A replay of the key repeats `delivery_id` and `committed_at_ms`; `status`
   may advance.
+- Keys never expire. A key stays bound for the member identity across
+  respawns and across a re-creation of the mob under the same id (after a
+  destroy or a crash stop): its replay answers the first delivery and its
+  status, `stranded` when the incarnation it was bound to never admitted it.
+  Send new content under a new key.
 - `pending`: committed, not admitted yet. A `pending` that survives a server
   restart is not proof of loss; do not resend it under a new key.
 - `admitted`: queued in `session_id` as `input_id`, not proof that a turn ran.

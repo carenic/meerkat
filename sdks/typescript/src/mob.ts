@@ -72,7 +72,8 @@ export interface MemberSendOptions {
   renderMetadata?: MobRenderMetadata;
   /**
    * Optional caller idempotency key, deduplicated for the member identity
-   * (it survives a respawn). A keyed send is committed as a member
+   * (it survives a respawn and a re-creation of the mob under the same id;
+   * keys never expire). A keyed send is committed as a member
    * continuation and answered with `continuation`: a receipt and a delivery
    * status, not a turn. It is admitted with system origin, ordered only among
    * keyed sends, refuses `renderMetadata`, is refused on a governed runtime,

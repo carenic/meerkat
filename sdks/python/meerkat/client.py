@@ -3128,7 +3128,8 @@ class MeerkatClient:
         """Send content to a mob member.
 
         With ``idempotency_key`` the send is deduplicated for the member
-        identity (it survives a respawn) and committed as a member
+        identity (it survives a respawn and a re-creation of the mob under
+        the same id; keys never expire) and committed as a member
         continuation. The answer then carries ``continuation``: a receipt and
         a delivery status, not a turn. ``delivery_id`` and ``committed_at_ms``
         repeat on every replay; ``status`` may advance (``pending``,
