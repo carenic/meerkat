@@ -69,6 +69,12 @@ async fn session_driver(
 
 /// Accept one keyed prompt (it stays queued: no executor serves the session)
 /// and step it to applied with no run: the state a cancellation must wait out.
+///
+/// The admission hands the session mutation gate to its accepted boundary
+/// work, which releases it on the process-owned runtime, out of the paused
+/// clock's sight. The gate is taken once before the step, so that work is
+/// done before any cancellation starts: a cancellation started while it still
+/// held the gate would wait for the gate, not for the input.
 async fn input_between_steps(
     machine: &MeerkatMachine,
     session_id: &SessionId,
@@ -79,6 +85,7 @@ async fn input_between_steps(
     <MeerkatMachine as SessionServiceRuntimeExt>::accept_input(machine, session_id, input)
         .await
         .expect("accept the prompt");
+    take_the_gate_once(machine, session_id).await;
     session_driver(machine, session_id)
         .await
         .lock()
@@ -88,9 +95,24 @@ async fn input_between_steps(
     input_id
 }
 
+/// Take the session mutation gate and give it back at once. The gate is first
+/// come, first served, so its holder and every waiter queued on it before
+/// this call have had their turn.
+async fn take_the_gate_once(machine: &MeerkatMachine, session_id: &SessionId) {
+    drop(
+        machine
+            .session_mutation_gate(session_id)
+            .await
+            .expect("registered session gate")
+            .lock_settled(SettledGateWait::TestFixture)
+            .await,
+    );
+}
+
 /// Let every other task run until it is idle. The paused clock advances only
 /// then, so a cancellation started before this call has read the input and
-/// parked by the time it returns.
+/// parked by the time it returns, as long as it waits for nothing off this
+/// runtime: `input_between_steps` leaves no admission work holding the gate.
 async fn until_parked() {
     crate::tokio::time::sleep(Duration::from_millis(1)).await;
 }
@@ -150,22 +172,14 @@ fn hold_next_boundary_work(machine: &MeerkatMachine) -> crate::tokio::sync::ones
 }
 
 /// Release the held boundary work after the row's commit, then take the gate
-/// once: the gate is first come, first served, so every waiter queued on it
-/// before has had its turn.
+/// once, so a cancellation queued on it has had its turn.
 async fn release_after_the_commit(
     machine: &MeerkatMachine,
     session_id: &SessionId,
     commit: crate::tokio::sync::oneshot::Sender<()>,
 ) {
     let _ = commit.send(());
-    drop(
-        machine
-            .session_mutation_gate(session_id)
-            .await
-            .expect("registered session gate")
-            .lock_settled(SettledGateWait::TestFixture)
-            .await,
-    );
+    take_the_gate_once(machine, session_id).await;
 }
 
 /// Commit the input's terminal without the step signal: apply the generated
@@ -384,8 +398,10 @@ async fn persistent_exact_cancellation_reads_again_at_the_bound() {
 
 /// R1 behind the admission's boundary work: while that work holds the
 /// session mutation gate, a cancellation waits for the gate, not for the
-/// input. Held until the unsignalled commit, it would read the input only
-/// after that commit and answer at once, as the unheld rows occasionally did.
+/// input. Held until the unsignalled commit, the cancellation would read the
+/// input only after that commit and answer at once, as the unheld rows did
+/// now and then. `input_between_steps` waits the work out, so here the hold
+/// ends on its paused-time bound before the cancellation starts.
 #[tokio::test(start_paused = true)]
 async fn ephemeral_exact_cancellation_reads_again_at_the_bound_behind_boundary_work() {
     exact_cancellation_reads_again_at_the_bound(
