@@ -415,7 +415,7 @@ fn locks_path(file: &std::fs::File, path: &Path) -> std::io::Result<bool> {
     }
 }
 
-/// A config document's exclusive (writer) custody; see [`Custody`]. Every
+/// A config document's exclusive (writer) custody; see `Custody`. Every
 /// `ConfigRuntime` writer holds it across the document mutation and the
 /// generation publication.
 pub struct ConfigWriterLock {
@@ -456,7 +456,7 @@ impl ConfigWriterLock {
     }
 }
 
-/// A config document's shared (reader) custody; see [`Custody`]. It excludes
+/// A config document's shared (reader) custody; see `Custody`. It excludes
 /// writers for as long as it is held, and never other readers.
 pub struct ConfigReadLock {
     path: PathBuf,

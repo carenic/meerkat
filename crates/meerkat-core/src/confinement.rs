@@ -467,9 +467,9 @@ pub fn trusted_search_path(
 /// could change), from `environment` (the host's own): every variable
 /// except one that makes the launched program, or a program it starts, load
 /// code or startup options from somewhere else
-/// ([`is_load_injection_variable`]), which is dropped, with the paths a
+/// (`is_load_injection_variable`), which is dropped, with the paths a
 /// confined process could change taken out of the values
-/// ([`trusted_variable_value`]): `PATH` without its relative directories
+/// (`trusted_variable_value`): `PATH` without its relative directories
 /// and the directories `untrusted` names, any other list of absolute paths
 /// likewise, and a value that is one path `untrusted` names dropped. A
 /// variable left without a value is dropped, so the platform's default
@@ -494,7 +494,7 @@ pub fn trusted_environment(
 /// Give `command` the environment an operator configured for it
 /// (`configured`, such as a credential command's `env`). Under a host that
 /// confines its agents' launches (`untrusted` given) each value loses the
-/// paths a confined process could change ([`trusted_variable_value`]), and
+/// paths a confined process could change (`trusted_variable_value`), and
 /// a configured variable left without a value is not passed on at all.
 /// A configured variable is the operator's own, so no name is refused for
 /// itself, and without such a host every value passes as configured.
