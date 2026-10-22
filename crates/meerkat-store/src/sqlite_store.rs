@@ -9377,6 +9377,41 @@ impl SqliteSessionStore {
     }
 }
 
+/// Test-only interleaving point between a read path's head-row read and the
+/// metadata projection it attaches: a test arms it for one database path to
+/// land a concurrent commit exactly there.
+#[cfg(test)]
+pub(crate) mod head_read_interleaving {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    type Hook = Box<dyn FnOnce() + Send>;
+
+    static ARMED: Mutex<Vec<(PathBuf, Hook)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn arm(path: &Path, hook: impl FnOnce() + Send + 'static) {
+        ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((path.to_path_buf(), Box::new(hook)));
+    }
+
+    pub(crate) fn fire(path: &Path) {
+        let hook = {
+            let mut armed = ARMED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            armed
+                .iter()
+                .position(|(armed_path, _)| armed_path == path)
+                .map(|index| armed.remove(index).1)
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
 impl SqliteSessionStore {
     /// Run `op` in one immediate write transaction on a blocking thread. The
     /// thread holds the calling task's scoped session hosting claims until it
@@ -9671,6 +9706,8 @@ impl SessionStore for SqliteSessionStore {
                     .map_err(StoreError::from)
                     .map_err(into_session_store_error)?;
                 drop(statement);
+                #[cfg(test)]
+                head_read_interleaving::fire(&path);
 
                 let mut metas = Vec::with_capacity(selected.len());
                 for selected in selected {
@@ -9736,6 +9773,8 @@ impl SessionStore for SqliteSessionStore {
                     .optional()
                     .map_err(StoreError::from)
                     .map_err(into_session_store_error)?;
+                #[cfg(test)]
+                head_read_interleaving::fire(&path);
                 if let Some((head_json, stored_token)) = head_row {
                     let mut head: SessionHead = serde_json::from_slice(&head_json)
                         .map_err(|_| SessionStoreError::Corrupted(id.clone()))?;
@@ -11748,6 +11787,93 @@ mod tests {
         // Canonical truth still recoverable from session_json via load().
         let loaded = store.load(session.id()).await.unwrap().unwrap();
         assert_eq!(loaded.id(), session.id());
+    }
+
+    /// A HeadCanonical session with a metadata key committed through the
+    /// store, plus the prepared successor that changes the key.
+    async fn committed_head_with_a_metadata_change(
+        store: &SqliteSessionStore,
+    ) -> (SessionId, PreparedHeadCanonicalMutation) {
+        let mut session = Session::new();
+        session.set_metadata("observed", serde_json::json!(1));
+        let root = PreparedHeadCanonicalMutation::prepare_root(&session).expect("prepare root");
+        store
+            .apply_prepared_head_canonical_mutation(&root)
+            .await
+            .expect("commit the root head");
+        root.acknowledge_session(&mut session, root.successor_head_token())
+            .expect("acknowledge the root head");
+        session.set_metadata("observed", serde_json::json!(2));
+        let successor =
+            PreparedHeadCanonicalMutation::prepare(&session, Some(root.successor_head().clone()))
+                .expect("prepare the successor");
+        (session.id().clone(), successor)
+    }
+
+    /// Commit `mutation` on a second connection when the armed read path
+    /// fires its interleaving point.
+    fn commit_on_a_second_connection(
+        path: &Path,
+        mutation: PreparedHeadCanonicalMutation,
+    ) -> impl FnOnce() + Send + 'static {
+        let path = path.to_path_buf();
+        move || {
+            let mut conn = open_connection(&path).expect("second connection");
+            let tx = begin_immediate_transaction(&mut conn).expect("write transaction");
+            apply_prepared_head_canonical_mutation_in_txn(&tx, &mutation)
+                .expect("concurrent successor commit");
+            tx.commit().expect("commit the successor");
+        }
+    }
+
+    /// A commit that lands between `list`'s head read and the metadata
+    /// projection it attaches is not corruption: the listing reads one
+    /// snapshot and reports the session as that snapshot holds it.
+    #[tokio::test]
+    async fn list_reads_one_snapshot_across_a_concurrent_commit() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("sessions.sqlite3");
+        let store = SqliteSessionStore::open(&path).unwrap();
+        let (id, successor) = committed_head_with_a_metadata_change(&store).await;
+        let successor_token = successor.successor_head_token().to_string();
+        head_read_interleaving::arm(&path, commit_on_a_second_connection(&path, successor));
+
+        let listed = store
+            .list(SessionFilter::default())
+            .await
+            .expect("a concurrent commit is not corruption");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id);
+        let head = store.load_head(&id).await.unwrap().unwrap();
+        assert_eq!(
+            session_head_cas_token(&head).unwrap(),
+            successor_token,
+            "the concurrent commit landed"
+        );
+    }
+
+    /// The same for `load_meta`.
+    #[tokio::test]
+    async fn load_meta_reads_one_snapshot_across_a_concurrent_commit() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("sessions.sqlite3");
+        let store = SqliteSessionStore::open(&path).unwrap();
+        let (id, successor) = committed_head_with_a_metadata_change(&store).await;
+        let successor_token = successor.successor_head_token().to_string();
+        head_read_interleaving::arm(&path, commit_on_a_second_connection(&path, successor));
+
+        let meta = store
+            .load_meta(&id)
+            .await
+            .expect("a concurrent commit is not corruption")
+            .expect("the session exists");
+        assert_eq!(meta.id, id);
+        let head = store.load_head(&id).await.unwrap().unwrap();
+        assert_eq!(
+            session_head_cas_token(&head).unwrap(),
+            successor_token,
+            "the concurrent commit landed"
+        );
     }
 
     // -----------------------------------------------------------------------
