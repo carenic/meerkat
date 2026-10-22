@@ -1949,6 +1949,76 @@ async fn the_refuse_policy_refuses_a_context_fork_of_an_activated_member_before_
     fixture.finish().await;
 }
 
+/// A `spawn_many` row whose prompt-context fork the policy refuses fails
+/// alone, before any effect: its error keeps the typed refusal, the wire code
+/// and the structured kind (the spawn-many cause is `internal`, since the mob
+/// machine models no spawn cause for a fork refusal), and the other row
+/// spawns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_spawn_many_row_whose_fork_is_refused_keeps_its_typed_refusal() {
+    let fixture =
+        Fixture::restored_member_with_policy(meerkat_core::ForkInstructionPolicy::Refuse).await;
+    fixture.activated_source_with_a_turn().await;
+
+    let rows = tokio::time::timeout(
+        WAIT,
+        fixture.handle.spawn_many(vec![
+            context_fork_spec(
+                "refused-row",
+                &fixture.identity,
+                crate::launch::ForkContext::FullHistory,
+            )
+            .with_initial_message("the forked task"),
+            SpawnMemberSpec::new(ProfileName::from("lead"), AgentIdentity::from("plain-row")),
+        ]),
+    )
+    .await
+    .expect("spawn_many answers")
+    .expect("the batch is admitted");
+    let [refused, plain] = rows.as_slice() else {
+        panic!("one result per row: {rows:?}");
+    };
+    let failure = refused.as_ref().expect_err("the fork row is refused");
+    match failure.error() {
+        MobError::ForkInstructionRefused {
+            source_member_id,
+            refusal,
+        } => {
+            assert_eq!(source_member_id, &fixture.identity);
+            assert_policy_refusal(refusal);
+        }
+        other => panic!("expected the typed fork instruction refusal, got {other:?}"),
+    }
+    assert_eq!(
+        failure.cause(),
+        meerkat_contracts::MobSpawnManyFailureCause::Internal
+    );
+    assert_eq!(
+        failure.error().wire_error_code(),
+        Some(meerkat_contracts::ErrorCode::ForkInstructionRefused)
+    );
+    assert_eq!(
+        failure
+            .error()
+            .structured_data()
+            .and_then(|data| data.get("kind").cloned()),
+        Some(serde_json::json!(
+            meerkat_core::service::SessionError::FORK_INSTRUCTION_REFUSED_KIND
+        ))
+    );
+    assert!(plain.is_ok(), "the other row spawns: {plain:?}");
+    assert!(
+        fixture
+            .handle
+            .get_member(&AgentIdentity::from("refused-row"))
+            .await
+            .expect("roster read")
+            .is_none(),
+        "the refused row is not seated"
+    );
+    fixture.finish().await;
+}
+
 /// `reactivate_inherited` carries the source's activated instructions, body
 /// included, and the notice says so. The source's system prompt is never
 /// carried, under any policy.
