@@ -196,7 +196,7 @@ them.
 - `meerkat-auth-core`, `meerkat-runtime`, `meerkat-mob`: the published
   packages' own tests now build and pass standalone, with no library change.
   In 0.9.4, plain `cargo test` in the unpacked package did not compile
-  auth-core's lib tests (a test helper named `meerkat-runtime`, a
+  auth-core's lib tests (a test helper used `meerkat-runtime`, a
   dev-dependency the package does not carry), nor runtime's and mob's
   default-feature test targets (one test file needed `sqlite-store` and
   `test-support`, one test needed `test-support`). With the command its
