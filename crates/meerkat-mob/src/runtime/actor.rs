@@ -30913,9 +30913,13 @@ impl MobActor {
                 ));
             }
             if !io.session_service.has_live_session(session).await?
-                && Self::load_cleanup_session_settling_durable_tail(&io, session)
-                    .await?
-                    .is_none()
+                && Self::load_cleanup_session_settling_durable_tail(
+                    &io,
+                    &entry.agent_identity,
+                    session,
+                )
+                .await?
+                .is_none()
                 && !io
                     .adapter
                     .archive_runtime_residue_present(session)
@@ -30980,9 +30984,18 @@ impl MobActor {
     /// recovery the resume path runs (a proven continuation is adopted, an
     /// unprovable one is kept intact), and the session is read once more; a
     /// tail the recovery keeps still refuses, typed, as before.
+    ///
+    /// The settle runs under this runtime owner's hosting claim for the
+    /// session (#1813), taken for the settle alone; the second read takes
+    /// none. A session another runtime owner on the realm hosts is refused,
+    /// typed, without settling its tail: that owner may still commit the
+    /// tail itself. The start then fails before admission, since nothing
+    /// restores the member's cleanup delivery later in this incarnation; the
+    /// refusal names the member, its session and the remedy.
     #[cfg(feature = "runtime-adapter")]
     async fn load_cleanup_session_settling_durable_tail(
         io: &ResumeOperationBindingIo,
+        member: &AgentIdentity,
         session: &SessionId,
     ) -> Result<Option<meerkat_core::Session>, MobError> {
         match io.session_service.load_persisted_session(session).await {
@@ -30992,9 +31005,28 @@ impl MobActor {
                     "settling a durable tail ahead of its runtime boundary before restoring \
                      local cleanup delivery"
                 );
-                io.session_service
-                    .materialize_session_resume_verdict(session)
-                    .await?;
+                if let Err(error) = io
+                    .session_service
+                    .settle_durable_tail_before_cold_start(session)
+                    .await
+                {
+                    if matches!(
+                        error,
+                        meerkat_core::service::SessionError::ServedElsewhere { .. }
+                            | meerkat_core::service::SessionError::HostingUnavailable { .. }
+                    ) {
+                        tracing::error!(
+                            %member,
+                            session_id = %session,
+                            %error,
+                            "retiring member's session has a durable tail and this runtime owner \
+                             cannot host it; the mob start refuses rather than settle another \
+                             owner's tail. Stop the runtime owner that hosts the session, or wait \
+                             until it releases it, then start the mob again"
+                        );
+                    }
+                    return Err(error.into());
+                }
                 Ok(io.session_service.load_persisted_session(session).await?)
             }
             loaded => Ok(loaded?),

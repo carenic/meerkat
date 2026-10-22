@@ -1886,6 +1886,38 @@ pub trait MobSessionService:
         session_id: &SessionId,
     ) -> Result<SessionResumeVerdict, SessionError>;
 
+    /// Settle a durable tail ahead of the committed runtime boundary before a
+    /// start path reads a session that no live actor of this service hosts:
+    /// the cleanup delivery of a retiring member, which a mob start restores
+    /// before it admits any command.
+    ///
+    /// The persistent service takes this runtime owner's hosting claim for
+    /// the session and hands it to its cold-attach preparation
+    /// (`PersistentSessionService::prepare_cold_attach`). A session another
+    /// runtime owner hosts is refused with [`SessionError::ServedElsewhere`],
+    /// and one whose claim cannot be taken with
+    /// [`SessionError::HostingUnavailable`], before any recovery, so this
+    /// owner never settles another owner's in-flight tail (#1813). The claim
+    /// ends with the preparation: the caller's next read takes none.
+    ///
+    /// The default takes NO hosting claim. It runs the durable-tail
+    /// convergence of [`Self::materialize_session_resume_verdict`] and drops
+    /// the verdict, as a service without hosting claims always did. A
+    /// wrapper around a persistent service must forward this method, or it
+    /// keeps that claimless settle.
+    async fn settle_durable_tail_before_cold_start(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), SessionError> {
+        tracing::debug!(
+            %session_id,
+            "settling a durable tail without a hosting claim (service default)"
+        );
+        self.materialize_session_resume_verdict(session_id)
+            .await
+            .map(|_| ())
+    }
+
     /// Load the persisted session METADATA view when available.
     ///
     /// Metadata-only sibling of [`Self::load_persisted_session`] (meta
@@ -3166,6 +3198,17 @@ where
         let admission = self.reserve_create_session_admission().await?;
         self.create_session_with_reserved_admission_under_runtime_turn_boundary(req, admission)
             .await
+    }
+
+    async fn settle_durable_tail_before_cold_start(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), SessionError> {
+        // #1813: the hosting claim is taken first and handed over by move; a
+        // session another runtime owner hosts is refused here, typed, before
+        // any recovery.
+        let claim = self.grant_session_hosting(session_id)?;
+        self.prepare_cold_attach(session_id, claim).await
     }
 
     async fn materialize_session_resume_verdict(
