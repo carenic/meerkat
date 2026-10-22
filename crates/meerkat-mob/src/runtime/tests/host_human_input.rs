@@ -2180,6 +2180,7 @@ enum StopAnswer {
     Unresolved,
     RequeuedAcrossStop(meerkat_core::lifecycle::InputId),
     Abandoned(String),
+    RequeueExpired(meerkat_core::lifecycle::InputId),
 }
 
 async fn stop_answer(turn: WorkTurnHandle, session_id: &SessionId) -> StopAnswer {
@@ -2216,6 +2217,10 @@ async fn stop_answer(turn: WorkTurnHandle, session_id: &SessionId) -> StopAnswer
             reason,
             ..
         } if failed == session_id => StopAnswer::Abandoned(reason.clone()),
+        BoundedTurnFailure::RequeueExpired {
+            session_id: failed,
+            input_id,
+        } if failed == session_id => StopAnswer::RequeueExpired(input_id.clone()),
         other => StopAnswer::Other(format!("{other:?}")),
     }
 }
@@ -2888,7 +2893,7 @@ async fn requeue_shutdown_expires_a_queued_human_input_older_than_the_bound_at_r
             StopAnswer::RequeuedAcrossStop(input_id.clone()),
             true,
             RequeuedAfterRestart {
-                replay: StopAnswer::Abandoned("requeue expired".to_owned()),
+                replay: StopAnswer::RequeueExpired(input_id.clone()),
                 phase: InputLifecycleState::Abandoned,
                 outcome: serde_json::json!({
                     "outcome_type": "abandoned",
