@@ -55,10 +55,10 @@ impl StopOptions {
     /// starts are held and its kickoff stop intent is recorded as usual, and
     /// the Stop reports the run `LeftRunning` and returns without waiting
     /// for any turn. A Stop that arrives while a plain Stop still waits for
-    /// the turns it cancelled joins that Stop and returns its report, and a
-    /// Stop with this option does not recall the cancels an earlier plain
-    /// Stop that failed already dispatched: those runs still end at their
-    /// next boundary.
+    /// the turns it cancelled joins that Stop and returns its report. A Stop
+    /// with this option does not recall cancels that an earlier, failed
+    /// plain Stop already dispatched: those runs still end at their next
+    /// boundary.
     ///
     /// Meant for Stop, then
     /// [`MobHandle::drain_stopped_runs`](super::MobHandle::drain_stopped_runs),
