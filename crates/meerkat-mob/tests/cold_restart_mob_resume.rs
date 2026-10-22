@@ -2038,6 +2038,19 @@ struct PowerCutRuntimeStore {
     prepared_boundary_commit_rejections: std::sync::atomic::AtomicUsize,
     legacy_boundary_commit_rejections: std::sync::atomic::AtomicUsize,
     prepared_boundary_commit_rejected: tokio::sync::Notify,
+    /// While set, this runtime's prepared session boundary commit waits at
+    /// the gate until released: a turn whose final checkpoint already wrote
+    /// the canonical head, but whose runtime boundary has not committed.
+    held_boundary: std::sync::Mutex<Option<meerkat_runtime::LogicalRuntimeId>>,
+    boundary_hold: tokio::sync::watch::Sender<BoundaryHold>,
+}
+
+/// Where a held boundary commit is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoundaryHold {
+    Idle,
+    Entered,
+    Released,
 }
 
 impl PowerCutRuntimeStore {
@@ -2049,9 +2062,43 @@ impl PowerCutRuntimeStore {
             prepared_boundary_commit_rejections: std::sync::atomic::AtomicUsize::new(0),
             legacy_boundary_commit_rejections: std::sync::atomic::AtomicUsize::new(0),
             prepared_boundary_commit_rejected: tokio::sync::Notify::new(),
+            held_boundary: std::sync::Mutex::new(None),
+            boundary_hold: tokio::sync::watch::channel(BoundaryHold::Idle).0,
         }
     }
 
+    /// Hold `runtime_id`'s next prepared session boundary commits at the
+    /// gate until [`Self::release_boundary_commits`].
+    fn hold_boundary_commits(&self, runtime_id: meerkat_runtime::LogicalRuntimeId) {
+        *self.held_boundary.lock().expect("boundary hold lock") = Some(runtime_id);
+        self.boundary_hold.send_replace(BoundaryHold::Idle);
+    }
+
+    /// Resolve once a held boundary commit has reached the gate.
+    async fn wait_boundary_commit_held(&self) {
+        let mut hold = self.boundary_hold.subscribe();
+        hold.wait_for(|state| *state == BoundaryHold::Entered)
+            .await
+            .expect("boundary hold channel");
+    }
+
+    fn release_boundary_commits(&self) {
+        *self.held_boundary.lock().expect("boundary hold lock") = None;
+        self.boundary_hold.send_replace(BoundaryHold::Released);
+    }
+}
+
+/// Releases the held boundary commits when dropped, so a row that fails
+/// before its own release never leaves a commit parked at the gate.
+struct ReleaseBoundaryCommitsOnDrop(Arc<PowerCutRuntimeStore>);
+
+impl Drop for ReleaseBoundaryCommitsOnDrop {
+    fn drop(&mut self) {
+        self.0.release_boundary_commits();
+    }
+}
+
+impl PowerCutRuntimeStore {
     fn set_cut(&self, cut: bool) {
         self.cut.store(cut, std::sync::atomic::Ordering::SeqCst);
     }
@@ -2125,6 +2172,27 @@ impl meerkat_runtime::RuntimeStore for PowerCutRuntimeStore {
                 "power cut (commit_prepared_session_boundary): durable runtime-store write lost"
                     .to_string(),
             ));
+        }
+        let held = self
+            .held_boundary
+            .lock()
+            .expect("boundary hold lock")
+            .as_ref()
+            == Some(runtime_id);
+        if held {
+            let mut hold = self.boundary_hold.subscribe();
+            // A release that lands after the `held` read stays released: it
+            // is never overwritten by Entered, so this commit cannot park.
+            self.boundary_hold.send_if_modified(|state| {
+                if *state == BoundaryHold::Released {
+                    return false;
+                }
+                *state = BoundaryHold::Entered;
+                true
+            });
+            let _ = hold
+                .wait_for(|state| *state == BoundaryHold::Released)
+                .await;
         }
         self.inner
             .commit_prepared_session_boundary(runtime_id, request)
@@ -4197,4 +4265,179 @@ async fn a_member_retired_while_its_turn_reaches_the_boundary_retires() {
         "the retired member leaves the roster"
     );
     let _ = handle.shutdown().await;
+}
+
+/// One destructive reset as Meta's identity reset sends it: an atomic
+/// successor respawn onto a fresh session, with no parent auto-wiring.
+async fn destructive_reset(handle: &MobHandle, identity: &AgentIdentity) -> Result<(), String> {
+    let mut successor = SpawnMemberSpec::new("worker", identity.clone());
+    successor.launch_mode = meerkat_mob::MemberLaunchMode::Fresh;
+    successor.auto_wire_parent = false;
+    handle
+        .respawn_with_successor_spec(successor)
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+/// Send `prompt` to the member and wait (bounded) until its current session's
+/// history carries it.
+async fn turn_lands(
+    handle: &MobHandle,
+    service: &dyn MobSessionService,
+    identity: &AgentIdentity,
+    prompt: &str,
+) -> Result<(), String> {
+    let session_id = handle
+        .resolve_bridge_session_id(identity)
+        .await
+        .ok_or_else(|| "the member has no session".to_string())?;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        handle
+            .member(identity)
+            .await
+            .map_err(|error| error.to_string())?
+            .send(prompt.to_string(), HandlingMode::Queue)
+            .await
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|_| format!("sending {prompt} timed out"))??;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if history_blob(service, &session_id).await.contains(prompt) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "{prompt} never reached the history of {session_id}"
+            ));
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// What one reset-after-reply scenario observed.
+#[derive(Debug, PartialEq, Eq)]
+struct ResetRaceObserved {
+    reset: Result<(), String>,
+    successor_on_a_new_session: bool,
+    retried_reset: Option<Result<(), String>>,
+    next_turn: Result<(), String>,
+}
+
+/// A host resets a member to a clean slate (Meta's identity reset: an atomic
+/// successor respawn onto a fresh session) right after the member's reply,
+/// while that turn's runtime boundary commit is still in flight. The turn's
+/// final checkpoint has already moved the session's canonical head past the
+/// boundary the runtime last committed. The reset must not race that commit:
+/// it succeeds, the successor runs on a new session, and the member answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_destructive_reset_right_after_a_reply_does_not_race_its_boundary_commit() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let gated_store = Arc::new(PowerCutRuntimeStore::new(&paths.realm_db_path));
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = gated_store.clone();
+    let (service, _store) = persistent_head_canonical_service(&paths, runtime_store);
+    let storage = MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage");
+    let handle = MobBuilder::new(mob_definition(MobRuntimeMode::TurnDriven), storage)
+        .with_session_service(service.clone())
+        .with_default_llm_client(openai_test_client())
+        .create()
+        .await
+        .expect("create persistent mob");
+    let identity = AgentIdentity::from("w-1");
+    handle
+        .spawn_spec(SpawnMemberSpec::new("worker", identity.clone()))
+        .await
+        .expect("spawn worker");
+    let old_session = handle
+        .resolve_bridge_session_id(&identity)
+        .await
+        .expect("worker session");
+
+    // The member answers; its turn's runtime boundary commit waits at the gate.
+    gated_store.hold_boundary_commits(meerkat_runtime::LogicalRuntimeId::for_session(&old_session));
+    let _release_on_every_path = ReleaseBoundaryCommitsOnDrop(Arc::clone(&gated_store));
+    tokio::time::timeout(Duration::from_secs(30), async {
+        handle
+            .member(&identity)
+            .await
+            .expect("member handle")
+            .send(
+                "RESET_RACE_TURN remember 42".to_string(),
+                HandlingMode::Queue,
+            )
+            .await
+            .expect("send the turn")
+    })
+    .await
+    .expect("the turn is admitted");
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        gated_store.wait_boundary_commit_held(),
+    )
+    .await
+    .expect("the turn's boundary commit reaches the gate");
+
+    // The host resets the member while that commit is in flight.
+    let mut reset = tokio::spawn({
+        let handle = handle.clone();
+        let identity = identity.clone();
+        async move { destructive_reset(&handle, &identity).await }
+    });
+    let while_held = tokio::time::timeout(Duration::from_secs(5), &mut reset)
+        .await
+        .ok()
+        .map(|joined| joined.expect("reset task"));
+    gated_store.release_boundary_commits();
+    let reset_result = match while_held.clone() {
+        Some(result) => result,
+        None => tokio::time::timeout(Duration::from_secs(30), reset)
+            .await
+            .expect("the reset returns once the commit lands")
+            .expect("reset task"),
+    };
+    eprintln!("[reset-race] while the commit was held: {while_held:?}; reset: {reset_result:?}");
+
+    // Impact when the reset was refused: a retried reset, then a turn.
+    let retried_reset = if reset_result.is_err() {
+        Some(
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                destructive_reset(&handle, &identity),
+            )
+            .await
+            .unwrap_or_else(|_| Err("the retried reset timed out".to_string())),
+        )
+    } else {
+        None
+    };
+    let successor_on_a_new_session = handle
+        .resolve_bridge_session_id(&identity)
+        .await
+        .is_some_and(|session| session != old_session);
+    let next_turn = turn_lands(
+        &handle,
+        service.as_ref(),
+        &identity,
+        "AFTER_RESET_TURN token-omega",
+    )
+    .await;
+
+    assert_eq!(
+        ResetRaceObserved {
+            reset: reset_result,
+            successor_on_a_new_session,
+            retried_reset,
+            next_turn,
+        },
+        ResetRaceObserved {
+            reset: Ok(()),
+            successor_on_a_new_session: true,
+            retried_reset: None,
+            next_turn: Ok(()),
+        },
+        "a reset right after a reply waits for, or fences, the turn's boundary commit"
+    );
 }

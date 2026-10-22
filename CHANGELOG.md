@@ -35,6 +35,22 @@ them.
 
 ## [Unreleased]
 
+### Fixed
+
+- A turn that compacts its history more often than
+  `[compaction] history_retained_rewrites` keeps (five or more compactions at
+  the default of 4) no longer ends at its intra-turn checkpoint on a
+  HeadCanonical store with "failed to prove pending rewrite suffix:
+  transcript revision ... was retired with N older rewrite(s)", which
+  abandoned the turn. The agent checkpoints at the end of a run, so every
+  compaction of the run lands before that checkpoint, and the checkpoint
+  persists them by proving the rewrite graph's suffix from the head the run
+  started on; compaction had already retired the bodies of the oldest of
+  them. A session that a HeadCanonical head describes now keeps every rewrite
+  occurrence that head does not cover yet, even past the retention bound, and
+  retires down to the bound at its first compaction after a checkpoint covers
+  them.
+
 ## [0.9.4] - 2026-10-20
 
 ### Breaking
