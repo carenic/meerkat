@@ -7856,6 +7856,42 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `ResolveCheckpointCompletionResultFailedStopped`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `ClassifyStopInputDispositionRetainInitializing`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyStopInputDispositionRetainIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyStopInputDispositionRetainAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyStopInputDispositionRetainRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyStopInputDispositionRetainRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyStopInputDispositionRetainStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyStopInputDispositionAbandonInitializing`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyStopInputDispositionAbandonIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyStopInputDispositionAbandonAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyStopInputDispositionAbandonRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyStopInputDispositionAbandonRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyStopInputDispositionAbandonStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 
 ### Effects
 - `RuntimeBound`
@@ -8617,6 +8653,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `AbandonedCompletionResultResolved`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `StopInputDispositionClassified`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 
 ### Invariants
 - `live_delegation_steer_records_are_authorized_and_single`
@@ -8758,6 +8797,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `unregister_drain_obligations_require_draining`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `unregister_requeue_max_age_matches_disposition`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `current_run_only_while_running_or_retired`

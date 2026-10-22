@@ -75,6 +75,7 @@ rust_library(
         "tests/fixtures/hooks/run_override.json",
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
@@ -125,6 +126,7 @@ rust_library(
         "tests/fixtures/hooks/run_override.json",
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = [
@@ -176,6 +178,7 @@ rust_test(
         "tests/fixtures/hooks/run_override.json",
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
@@ -262,6 +265,7 @@ rust_test(
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_tool_config_notice_sessions.json",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = [
         "tests/auth_binding_no_string_form.rs",
@@ -335,6 +339,7 @@ rust_test(
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_tool_config_notice_sessions.json",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = [
         "tests/compiled_application_tool_policy.rs",
@@ -414,6 +419,7 @@ rust_test(
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_tool_config_notice_sessions.json",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = [
         "tests/confinement_refusal_contracts.rs",
@@ -487,6 +493,7 @@ rust_test(
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_tool_config_notice_sessions.json",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = [
         "tests/core_source_ratchets.rs",
@@ -562,6 +569,7 @@ rust_test(
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_tool_config_notice_sessions.json",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = [
         "tests/document_cost_probe.rs",
@@ -637,6 +645,7 @@ rust_test(
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_tool_config_notice_sessions.json",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = [
         "tests/durable_tail_classification.rs",
@@ -710,6 +719,7 @@ rust_test(
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_tool_config_notice_sessions.json",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = [
         "tests/fork_at_rotates_session_id.rs",
@@ -785,6 +795,7 @@ rust_test(
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_tool_config_notice_sessions.json",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = [
         "tests/hooks_contracts.rs",
@@ -858,6 +869,7 @@ rust_test(
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_tool_config_notice_sessions.json",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = [
         "tests/image_generation_contracts.rs",
@@ -931,6 +943,7 @@ rust_test(
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_tool_config_notice_sessions.json",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = [
         "tests/live_assistant_playback_authority.rs",
@@ -1004,6 +1017,7 @@ rust_test(
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_tool_config_notice_sessions.json",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = [
         "tests/mcp_config_crossproc.rs",
@@ -1077,6 +1091,7 @@ rust_test(
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_tool_config_notice_sessions.json",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = [
         "tests/model_routing_control_history.rs",
@@ -1150,6 +1165,7 @@ rust_test(
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_tool_config_notice_sessions.json",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = [
         "tests/ops_lifecycle_integration.rs",
@@ -1222,6 +1238,7 @@ rust_test(
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_tool_config_notice_sessions.json",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = [
         "tests/rct_contracts.rs",
@@ -1295,6 +1312,7 @@ rust_test(
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_tool_config_notice_sessions.json",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = [
         "tests/realm_connection_config.rs",
@@ -1368,6 +1386,7 @@ rust_test(
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_tool_config_notice_sessions.json",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = [
         "tests/realm_hosting_config.rs",
@@ -1441,6 +1460,7 @@ rust_test(
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_tool_config_notice_sessions.json",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = [
         "tests/runtime_turn_metadata_typed_round_trip.rs",
@@ -1514,6 +1534,7 @@ rust_test(
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_tool_config_notice_sessions.json",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = [
         "tests/session_document_strict_read_parity.rs",
@@ -1587,6 +1608,7 @@ rust_test(
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_tool_config_notice_sessions.json",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = [
         "tests/source_identity_resolve_enforces_lifecycle.rs",
@@ -1660,6 +1682,7 @@ rust_test(
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_tool_config_notice_sessions.json",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = [
         "tests/tool_notice_projection.rs",
@@ -1733,6 +1756,7 @@ rust_test(
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_tool_config_notice_sessions.json",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = [
         "tests/transcript_delta_retention.rs",
@@ -1806,6 +1830,7 @@ rust_test(
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_tool_config_notice_sessions.json",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = [
         "tests/transcript_digest_budget.rs",
@@ -1879,6 +1904,7 @@ rust_test(
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_tool_config_notice_sessions.json",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = [
         "tests/transcript_graph_ingress_validation.rs",
@@ -1952,6 +1978,7 @@ rust_test(
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_tool_config_notice_sessions.json",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = [
         "tests/transcript_history_retention.rs",
@@ -2025,6 +2052,7 @@ rust_test(
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_tool_config_notice_sessions.json",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = [
         "tests/v0_8_10_recovery_migration.rs",
@@ -2098,6 +2126,7 @@ rust_test(
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_tool_config_notice_sessions.json",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = [
         "tests/v0_9_3_tool_config_notice_rows.rs",
@@ -2171,6 +2200,7 @@ rust_test(
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_tool_config_notice_sessions.json",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = [
         "tests/wedge_evidence_probe.rs",
@@ -2246,6 +2276,7 @@ rust_test(
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_tool_config_notice_sessions.json",
+        "tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt",
     ],
     srcs = [
         "tests/wholeblob_compaction_media_guard.rs",

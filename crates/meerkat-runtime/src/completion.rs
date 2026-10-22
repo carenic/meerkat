@@ -1927,15 +1927,48 @@ impl CompletionRegistry {
         }
     }
 
-    pub(crate) fn fail_inputs<I>(&mut self, input_ids: I, error: CompletionWaitError)
+    /// Fail the waiters of `input_ids` with `error`. Returns how many of the
+    /// inputs had waiters.
+    pub(crate) fn fail_inputs<I>(&mut self, input_ids: I, error: CompletionWaitError) -> usize
     where
         I: IntoIterator<Item = InputId>,
     {
+        let mut failed = 0;
         for input_id in input_ids {
             if let Some(senders) = self.take_waiters(&input_id) {
                 Self::send_error(senders, error.clone());
+                failed += 1;
             }
         }
+        failed
+    }
+
+    /// Answer every waiter still registered when an unregister's drain
+    /// resumes after the stop terminalization. A waiter of an input the stop
+    /// kept queued for the next start gets
+    /// [`CompletionWaitError::RequeuedAcrossStop`] with the stop's time; every
+    /// other one gets `AuthorityUnavailable`, since the terminalization has
+    /// already published every terminal recipient. Returns how many kept
+    /// inputs still had waiters here.
+    pub(crate) fn drain_unregistered_waiters<I>(&mut self, kept: I) -> usize
+    where
+        I: IntoIterator<Item = (InputId, chrono::DateTime<chrono::Utc>)>,
+    {
+        let mut late = 0;
+        for (input_id, stopped_at) in kept {
+            late += self.fail_inputs(
+                [input_id],
+                CompletionWaitError::RequeuedAcrossStop { stopped_at },
+            );
+        }
+        self.fail_not_pending_waiters(
+            |_| false,
+            CompletionWaitError::AuthorityUnavailable(
+                "runtime session unregistered after canonical terminal recipients resolved"
+                    .to_string(),
+            ),
+        );
+        late
     }
 
     /// Fail waiter plumbing whose input IDs are no longer pending after a
@@ -2129,6 +2162,40 @@ mod tests {
             CompletionOutcome::Completed(r) => assert_eq!(r.text, "hello"),
             other => panic!("Expected Completed, got {other:?}"),
         }
+    }
+
+    /// The unregister drain answers each waiter of an input the stop kept
+    /// queued with the requeued answer and the stop's time, never with the
+    /// unregistered failure; every other leftover waiter gets that failure.
+    #[tokio::test]
+    async fn the_unregister_drain_answers_a_kept_inputs_waiters_as_requeued() {
+        let mut registry = CompletionRegistry::new();
+        let kept = InputId::new();
+        let other = InputId::new();
+        let kept_waiters = [
+            registry.register(kept.clone()),
+            registry.register(kept.clone()),
+        ];
+        let other_waiter = registry.register(other);
+        let stopped_at = chrono::Utc::now();
+
+        let late = registry.drain_unregistered_waiters([(kept, stopped_at)]);
+
+        assert_eq!(late, 1, "the kept input still had waiters at the drain");
+        for waiter in kept_waiters {
+            match waiter.try_wait().await {
+                Err(error) => assert_eq!(
+                    error,
+                    CompletionWaitError::RequeuedAcrossStop { stopped_at }
+                ),
+                Ok(outcome) => panic!("a kept input's waiter completed: {outcome:?}"),
+            }
+        }
+        match other_waiter.try_wait().await {
+            Err(CompletionWaitError::AuthorityUnavailable(_)) => {}
+            other => panic!("expected the unregistered failure, got {other:?}"),
+        }
+        assert!(!registry.debug_has_waiters());
     }
 
     #[tokio::test]

@@ -1357,6 +1357,11 @@ impl PersistentRuntimeDriver {
                     state.unregister_runtime_loop_forced_abort,
                     state.unregister_comms_drain_forced_abort,
                 )
+                .with_requeue_max_age_ms(
+                    (state.unregister_queued_inputs
+                        == crate::meerkat_machine::dsl::UnregisterQueuedInputsDisposition::Requeue)
+                        .then_some(state.unregister_requeue_max_age_ms),
+                )
             },
         )
     }
@@ -2645,6 +2650,7 @@ impl PersistentRuntimeDriver {
 
     pub(crate) async fn finalize_runtime_executor_exit(
         &mut self,
+        retained_before_exit: &[InputId],
     ) -> Result<(), RuntimeDriverError> {
         self.require_durability_ready()?;
         let changed_input_ids = self.inner.active_input_ids();
@@ -2656,7 +2662,7 @@ impl PersistentRuntimeDriver {
                 err.to_string(),
             ));
         }
-        if let Err(err) = self.inner.stop_runtime_cleanup() {
+        if let Err(err) = self.inner.stop_runtime_cleanup(retained_before_exit) {
             return Err(self.post_transition_failure(
                 checkpoint,
                 "stop_runtime_cleanup",
@@ -3776,6 +3782,8 @@ mod tests {
                 fence_token,
                 generation,
                 runtime_epoch_id: runtime_epoch_id.clone(),
+                queued_inputs: crate::meerkat_machine::dsl::UnregisterQueuedInputsDisposition::Stop,
+                requeue_max_age_ms: 0,
             },
         );
         let (runtime_pending, comms_pending, waiters_pending) = {

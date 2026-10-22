@@ -2647,6 +2647,7 @@ struct RequeuedAtStop {
     replay_identity_kept: bool,
     requeue_mark: bool,
     outbox: bool,
+    terminal_completion: bool,
     pending_terminal_owner: bool,
     runs_started: usize,
 }
@@ -2666,6 +2667,7 @@ fn observe_requeued_at_stop(
         replay_identity_kept: row.stored.state.prompt_replay_identity.is_some(),
         requeue_mark: !row.image["stop_requeue"].is_null(),
         outbox: row.has_outbox,
+        terminal_completion: !row.image["terminal_completion"].is_null(),
         pending_terminal_owner: row.pending_terminal_owner,
         runs_started: runs_started_for(events, interaction_id).len(),
     }
@@ -2723,8 +2725,8 @@ async fn observe_requeued_after_restart(
 /// Under a requeue Shutdown, a Queue-mode host human input still queued
 /// behind a running turn stays durably queued: its waiter is told it was
 /// requeued, its row keeps its payload, its replay identity and a requeue
-/// mark, and nothing ran it. The running input is still cancelled and is not
-/// run again. After the restart the requeued input runs exactly once and a
+/// mark, it has no terminal completion and no carrier, and nothing ran it.
+/// The running input is still cancelled and is not run again. After the restart the requeued input runs exactly once and a
 /// same-key replay re-attaches to its result.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn requeue_shutdown_keeps_a_queued_human_input_and_runs_it_once_after_restart() {
@@ -2804,6 +2806,7 @@ async fn requeue_shutdown_keeps_a_queued_human_input_and_runs_it_once_after_rest
                 replay_identity_kept: true,
                 requeue_mark: true,
                 outbox: false,
+                terminal_completion: false,
                 pending_terminal_owner: false,
                 runs_started: 0,
             },

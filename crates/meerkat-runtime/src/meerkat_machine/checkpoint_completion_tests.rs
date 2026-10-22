@@ -509,7 +509,7 @@ async fn earlier_release_pending_run_result_finalizes_after_cold_restart() {
     let current = String::from_utf8(fixture.raw_row(&input_id)).unwrap();
     let current_stamp = format!(
         "\"stored_input_state_version\":{}",
-        version_authority::stored_input_state_version()
+        version_authority::stored_input_state_version_for_row(false)
     );
     let earlier = current.replacen(&current_stamp, "\"stored_input_state_version\":6", 1);
     assert_ne!(earlier, current, "the fixture must carry the earlier stamp");

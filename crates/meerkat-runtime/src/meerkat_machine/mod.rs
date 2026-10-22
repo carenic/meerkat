@@ -1304,6 +1304,10 @@ struct UnregisterTeardownCoordinator {
     epoch_id: meerkat_core::RuntimeEpochId,
     coordinator_id: uuid::Uuid,
     result_rx: crate::tokio::sync::watch::Receiver<Option<UnregisterTeardownResult>>,
+    /// The disposition the caller that installed this coordinator asked for.
+    /// `BeginUnregisterSession` records it once; from then on the generated
+    /// state and the durable progress own it.
+    queued_inputs: UnregisterQueuedInputs,
 }
 
 /// Read-only terminal-result observer for one exact runtime unregister
@@ -1417,6 +1421,22 @@ pub enum UnregisterQueuedInputs {
         /// a kept input as expired instead of running it.
         max_age: std::time::Duration,
     },
+}
+
+impl UnregisterQueuedInputs {
+    /// The generated disposition and the max age, in whole milliseconds and
+    /// at least one, that `BeginUnregisterSession` records.
+    pub(crate) fn dsl_disposition(self) -> (dsl::UnregisterQueuedInputsDisposition, u64) {
+        match self {
+            Self::Stop => (dsl::UnregisterQueuedInputsDisposition::Stop, 0),
+            Self::Requeue { max_age } => (
+                dsl::UnregisterQueuedInputsDisposition::Requeue,
+                u64::try_from(max_age.as_millis())
+                    .unwrap_or(u64::MAX)
+                    .max(1),
+            ),
+        }
+    }
 }
 
 /// Answer of
@@ -3769,6 +3789,80 @@ impl PendingRuntimeExecutorAttachment {
             );
         }
         Ok(abandoned)
+    }
+
+    /// End, before this attachment can serve, every input an earlier
+    /// graceful stop kept queued that is now older than that stop's max age
+    /// (`crate::input_state::stop_requeue_expired` at `now`). Each is
+    /// abandoned through the machine's `AbandonInput` with the typed
+    /// [`crate::input_state::InputAbandonReason::RequeueExpired`], durably
+    /// committed with its payload retired, so it never runs. The retained
+    /// mutation guard and the pending (non-serving) slot keep the input set
+    /// complete. Every attachment passes here before its serving gate, so no
+    /// path serves a kept input that has not been checked. Returns the
+    /// expired inputs.
+    pub(crate) async fn settle_expired_stop_requeued_inputs(
+        &mut self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<InputId>, RuntimeDriverError> {
+        let (driver, completions) = self
+            .exact_pending_driver("requeue expiry settlement")
+            .await?;
+        let expired = {
+            let mut driver = driver.lock().await;
+            let candidates: Vec<InputId> = driver
+                .as_driver()
+                .active_input_ids()
+                .into_iter()
+                .filter(|input_id| {
+                    driver
+                        .as_driver()
+                        .input_state(input_id)
+                        .is_some_and(|state| {
+                            let admitted_at = state
+                                .persisted_input
+                                .as_ref()
+                                .map_or(state.created_at, |input| input.header().timestamp);
+                            crate::input_state::stop_requeue_expired(
+                                state.stop_requeue.as_ref(),
+                                admitted_at,
+                                now,
+                            )
+                        })
+                })
+                .collect();
+            let mut expired = Vec::with_capacity(candidates.len());
+            for input_id in candidates {
+                if driver
+                    .abandon_queued_input(
+                        &input_id,
+                        crate::input_state::InputAbandonReason::RequeueExpired,
+                    )
+                    .await?
+                {
+                    // Committed: told once this attachment releases its
+                    // mutation guard, even if a later input fails here.
+                    self.runless_terminal.owe();
+                    expired.push(input_id);
+                } else {
+                    tracing::warn!(
+                        session_id = %self.witness.session_id(),
+                        %input_id,
+                        "an input a stop kept queued was not queued at its expiry settlement; left as is"
+                    );
+                }
+            }
+            expired
+        };
+        if !expired.is_empty() {
+            // As for an interrupted run's inputs: the old input is durably
+            // ended, and a retry is a new request.
+            completions.lock().await.fail_inputs(
+                expired.clone(),
+                crate::completion::CompletionWaitError::AttachmentReplaced,
+            );
+        }
+        Ok(expired)
     }
 
     /// Settle the session's interrupted-run evidence before serving, in a

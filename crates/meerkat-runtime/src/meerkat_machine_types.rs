@@ -1293,6 +1293,11 @@ meerkat_machine_runtime_internal_inputs!(
         CompletionWaitersResolvedForUnregister,
         RuntimeLoopStoppedForUnregister,
     ],
+    // Inputs added after 0.9.4 go last, so the earlier variants keep their
+    // positions.
+    InputQueueLifecycle => [
+        ClassifyStopInputDisposition,
+    ],
 );
 
 macro_rules! meerkat_machine_fieldless_runtime_internal_inputs {

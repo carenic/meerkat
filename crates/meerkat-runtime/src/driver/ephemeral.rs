@@ -4431,13 +4431,158 @@ impl EphemeralRuntimeDriver {
         Ok(abandoned)
     }
 
-    pub(crate) fn stop_runtime_cleanup(&mut self) -> Result<(), RuntimeDriverError> {
-        self.abandon_all_non_terminal(InputAbandonReason::Stopped)?;
+    pub(crate) fn stop_runtime_cleanup(
+        &mut self,
+        retained_before_exit: &[InputId],
+    ) -> Result<(), RuntimeDriverError> {
+        self.stop_non_terminal_inputs(retained_before_exit)?;
         Ok(())
     }
 
-    pub(crate) fn finalize_stop_runtime(&mut self) -> Result<(), RuntimeDriverError> {
-        self.stop_runtime_cleanup()
+    /// The inputs among `input_ids` that the generated stop classifier
+    /// retains now. The stop terminalization asks before the executor's exit,
+    /// to stage the runless carriers for the other inputs only; the exit
+    /// does not change a verdict, and the stop checks that it gives the same
+    /// one ([`Self::stop_non_terminal_inputs`]).
+    pub(crate) fn stop_retained_input_ids(
+        &mut self,
+        input_ids: &[InputId],
+    ) -> Result<Vec<InputId>, RuntimeDriverError> {
+        let mut retained = Vec::new();
+        for id in input_ids {
+            if !self.input_is_non_terminal_by_authority(id) {
+                continue;
+            }
+            if let (mm_dsl::StopInputDisposition::Retain, _) = self.classify_stop_input(id)? {
+                retained.push(id.clone());
+            }
+        }
+        Ok(retained)
+    }
+
+    /// End the non-terminal inputs of a runtime stop. The generated stop
+    /// classifier decides each one: an input it retains (the unregister
+    /// began with the requeue disposition, and the input is an eligible
+    /// queued prompt) stays queued with its payload and is durably marked
+    /// with the stop's time and max age; every other input ends as stopped.
+    /// Returns the retained inputs.
+    ///
+    /// `retained_before_exit` is the set the classifier retained before the
+    /// executor's exit, for which no runless carrier was staged. The stop
+    /// refuses before it changes any input if its own verdicts differ.
+    pub(crate) fn stop_non_terminal_inputs(
+        &mut self,
+        retained_before_exit: &[InputId],
+    ) -> Result<Vec<InputId>, RuntimeDriverError> {
+        let non_terminal_ids: Vec<InputId> = self
+            .ledger
+            .iter()
+            .filter_map(|(id, _)| {
+                self.input_is_non_terminal_by_authority(id)
+                    .then(|| id.clone())
+            })
+            .collect();
+        let mut verdicts = Vec::with_capacity(non_terminal_ids.len());
+        for id in non_terminal_ids {
+            let verdict = self.classify_stop_input(&id)?;
+            verdicts.push((id, verdict));
+        }
+        let retained_now: std::collections::HashSet<&InputId> = verdicts
+            .iter()
+            .filter(|(_, (disposition, _))| *disposition == mm_dsl::StopInputDisposition::Retain)
+            .map(|(id, _)| id)
+            .collect();
+        let retained_before: std::collections::HashSet<&InputId> =
+            retained_before_exit.iter().collect();
+        if retained_now != retained_before {
+            return Err(RuntimeDriverError::Internal(format!(
+                "the stop classifier retained {retained_now:?} after the executor exit but \
+                 {retained_before:?} before it, whose complement got the runless carriers"
+            )));
+        }
+        let stopped_at = Utc::now();
+        let mut retained = Vec::new();
+        let mut stopped = Vec::new();
+        for (id, verdict) in verdicts {
+            match verdict {
+                (mm_dsl::StopInputDisposition::Retain, max_age_ms) => {
+                    let state = self.ledger.get_mut(&id).ok_or_else(|| {
+                        RuntimeDriverError::Internal(format!(
+                            "input {id} vanished from the ledger while its stop was classified"
+                        ))
+                    })?;
+                    state.stop_requeue = Some(crate::input_state::StopRequeueMark {
+                        stopped_at,
+                        max_age_ms,
+                    });
+                    state.updated_at = stopped_at;
+                    retained.push(id);
+                }
+                (mm_dsl::StopInputDisposition::Abandon, _) => stopped.push(id),
+            }
+        }
+        self.abandon_non_terminal_inputs(&stopped, &InputAbandonReason::Stopped)?;
+        Ok(retained)
+    }
+
+    /// Ask the generated stop classifier about one non-terminal input. The
+    /// shell supplies only the facts the machine does not hold: the row's
+    /// durability (a row without its payload cannot run again, so it is
+    /// observed as missing) and whether the input is a directed one.
+    fn classify_stop_input(
+        &mut self,
+        input_id: &InputId,
+    ) -> Result<(mm_dsl::StopInputDisposition, u64), RuntimeDriverError> {
+        let (durability, directed) = {
+            let state = self.ledger.get(input_id).ok_or_else(|| {
+                RuntimeDriverError::Internal(format!(
+                    "input {input_id} is not in the ledger its stop classification reads"
+                ))
+            })?;
+            match state.persisted_input.as_ref() {
+                Some(input) => (
+                    mm_dsl::InputDurabilityKind::from(state.durability),
+                    // A payload whose directed correlation does not validate
+                    // is never kept.
+                    !matches!(
+                        crate::input::validated_directed_interaction_id(input),
+                        Ok(None)
+                    ),
+                ),
+                None => (mm_dsl::InputDurabilityKind::Missing, false),
+            }
+        };
+        let key = Self::dsl_key(input_id);
+        let effects = self.dsl_apply_effects(
+            mm_dsl::MeerkatMachineInput::ClassifyStopInputDisposition {
+                input_id: key.clone(),
+                durability,
+                directed,
+            },
+            "ClassifyStopInputDisposition",
+        )?;
+        effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                mm_dsl::MeerkatMachineEffect::StopInputDispositionClassified {
+                    input_id,
+                    disposition,
+                    requeue_max_age_ms,
+                } if input_id == key => Some((disposition, requeue_max_age_ms)),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                RuntimeDriverError::Internal(format!(
+                    "ClassifyStopInputDisposition emitted no verdict for input {input_id}"
+                ))
+            })
+    }
+
+    pub(crate) fn finalize_stop_runtime(
+        &mut self,
+        retained_before_exit: &[InputId],
+    ) -> Result<(), RuntimeDriverError> {
+        self.stop_runtime_cleanup(retained_before_exit)
     }
 
     pub fn recover_ephemeral(&mut self) -> Result<RecoveryReport, RuntimeDriverError> {
@@ -5633,9 +5778,19 @@ impl EphemeralRuntimeDriver {
                 }
             })
             .collect();
-        let dsl_reason = mm_dsl::InputAbandonReason::from(&reason);
+        self.abandon_non_terminal_inputs(&non_terminal_ids, &reason)
+    }
+
+    /// Abandon each of `non_terminal_ids` with `reason` through the generated
+    /// `AbandonInput`.
+    fn abandon_non_terminal_inputs(
+        &mut self,
+        non_terminal_ids: &[InputId],
+        reason: &InputAbandonReason,
+    ) -> Result<usize, RuntimeDriverError> {
+        let dsl_reason = mm_dsl::InputAbandonReason::from(reason);
         let mut count = 0;
-        for id in &non_terminal_ids {
+        for id in non_terminal_ids {
             let key = Self::dsl_key(id);
             let attempt_count = u64::from(self.input_attempt_count(id));
             let from_phase = self.input_phase(id).ok_or_else(|| {
@@ -7663,6 +7818,251 @@ mod tests {
                     pending_after.then(|| mm_dsl::PeerId(addressee.to_string())),
                 );
             });
+        }
+    }
+
+    /// Open the unregister drain with `disposition` on the driver's contract
+    /// session authority.
+    fn begin_unregister_with(
+        driver: &mut EphemeralRuntimeDriver,
+        queued_inputs: mm_dsl::UnregisterQueuedInputsDisposition,
+        requeue_max_age_ms: u64,
+    ) {
+        let state = driver.dsl.lock().state().clone();
+        driver
+            .dsl_apply(
+                mm_dsl::MeerkatMachineInput::BeginUnregisterSession {
+                    session_id: state
+                        .session_id
+                        .clone()
+                        .expect("contract session authority is registered"),
+                    agent_runtime_id: state.active_runtime_id.clone(),
+                    fence_token: state.active_fence_token,
+                    generation: state.active_runtime_generation,
+                    runtime_epoch_id: state.active_runtime_epoch_id.clone(),
+                    queued_inputs,
+                    requeue_max_age_ms,
+                },
+                "BeginUnregisterSession",
+            )
+            .expect("the unregister drain opens");
+    }
+
+    /// A durable queued prompt, an ephemeral queued prompt and a staged
+    /// prompt, on a driver with a registered contract session.
+    async fn stop_classification_fixture(
+        name: &str,
+    ) -> (EphemeralRuntimeDriver, InputId, InputId, InputId) {
+        let mut driver = EphemeralRuntimeDriver::new(LogicalRuntimeId::new(name));
+        driver
+            .ensure_contract_session_authority()
+            .expect("contract session authority");
+        let staged = prompt_input("staged by the running turn");
+        let staged_id = staged.id().clone();
+        driver.accept_input(staged).await.unwrap();
+        let run_id = RunId::new();
+        driver.contract_begin_run_authority(run_id.clone()).unwrap();
+        driver
+            .machine_realize_stage_batch(std::slice::from_ref(&staged_id), &run_id)
+            .unwrap();
+        let durable = prompt_input("queued behind the running turn");
+        let durable_id = durable.id().clone();
+        driver.accept_input(durable).await.unwrap();
+        let mut ephemeral = PromptInput::new("queued and ephemeral", None);
+        ephemeral.header.durability = InputDurability::Ephemeral;
+        let ephemeral = Input::Prompt(ephemeral);
+        let ephemeral_id = ephemeral.id().clone();
+        driver.accept_input(ephemeral).await.unwrap();
+        (driver, durable_id, ephemeral_id, staged_id)
+    }
+
+    /// Under an unregister that began with the requeue disposition, the
+    /// generated stop classifier keeps exactly the durable queued prompt:
+    /// marked, still queued, payload kept. The ephemeral prompt and the
+    /// staged one, which belongs to the running turn, end as stopped.
+    #[tokio::test]
+    async fn a_requeue_stop_keeps_only_the_eligible_queued_prompt() {
+        let (mut driver, durable_id, ephemeral_id, staged_id) =
+            stop_classification_fixture("stop-requeue-keeps-eligible").await;
+        begin_unregister_with(
+            &mut driver,
+            mm_dsl::UnregisterQueuedInputsDisposition::Requeue,
+            900_000,
+        );
+
+        let active = driver.active_input_ids();
+        let before_exit = driver.stop_retained_input_ids(&active).unwrap();
+        let retained = driver.stop_non_terminal_inputs(&before_exit).unwrap();
+
+        assert_eq!(before_exit, vec![durable_id.clone()]);
+        assert_eq!(retained, vec![durable_id.clone()]);
+        let kept = driver.ledger.get(&durable_id).expect("kept row");
+        assert_eq!(kept.stop_requeue.map(|mark| mark.max_age_ms), Some(900_000));
+        assert!(
+            kept.persisted_input.is_some(),
+            "a kept input keeps its payload"
+        );
+        assert_eq!(
+            driver.input_phase(&durable_id),
+            Some(InputLifecycleState::Queued)
+        );
+        for stopped in [&ephemeral_id, &staged_id] {
+            assert_eq!(
+                driver.input_terminal_outcome(stopped),
+                Some(InputTerminalOutcome::Abandoned {
+                    reason: InputAbandonReason::Stopped
+                }),
+                "{stopped}"
+            );
+            assert!(driver.ledger.get(stopped).unwrap().stop_requeue.is_none());
+        }
+    }
+
+    /// Under the stop disposition, and on a stop outside any unregister, the
+    /// classifier keeps nothing: every non-terminal input ends as stopped,
+    /// exactly as before the requeue disposition existed.
+    #[tokio::test]
+    async fn a_stopping_unregister_and_a_plain_stop_keep_nothing() {
+        for begin in [true, false] {
+            let (mut driver, durable_id, ephemeral_id, staged_id) =
+                stop_classification_fixture("stop-keeps-nothing").await;
+            if begin {
+                begin_unregister_with(
+                    &mut driver,
+                    mm_dsl::UnregisterQueuedInputsDisposition::Stop,
+                    0,
+                );
+            }
+
+            let active = driver.active_input_ids();
+            let before_exit = driver.stop_retained_input_ids(&active).unwrap();
+            let retained = driver.stop_non_terminal_inputs(&before_exit).unwrap();
+
+            assert!(before_exit.is_empty(), "begin={begin}");
+            assert!(retained.is_empty(), "begin={begin}");
+            for stopped in [&durable_id, &ephemeral_id, &staged_id] {
+                assert_eq!(
+                    driver.input_terminal_outcome(stopped),
+                    Some(InputTerminalOutcome::Abandoned {
+                        reason: InputAbandonReason::Stopped
+                    }),
+                    "begin={begin} {stopped}"
+                );
+                assert!(driver.ledger.get(stopped).unwrap().stop_requeue.is_none());
+            }
+        }
+    }
+
+    /// Under the requeue disposition a prompt queued in the steer lane behind
+    /// the running turn is not kept: it ends as stopped, unmarked, while the
+    /// durable prompt queued in the queue lane is kept.
+    #[tokio::test]
+    async fn a_requeue_stop_does_not_keep_a_queued_steer_prompt() {
+        let (mut driver, durable_id, _, _) =
+            stop_classification_fixture("stop-requeue-steer").await;
+        let steer = Input::Prompt(PromptInput::new(
+            "steer behind the running turn",
+            Some(
+                meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
+                    handling_mode: Some(meerkat_core::types::HandlingMode::Steer),
+                    ..Default::default()
+                },
+            ),
+        ));
+        let steer_id = steer.id().clone();
+        let resolved = driver
+            .resolve_admission_with_active_turn_boundary(&steer, true)
+            .expect("steer admission behind the running turn");
+        driver
+            .accept_resolved_input(steer, resolved)
+            .await
+            .expect("steer accepted");
+        assert_eq!(driver.dsl_steer_lane(), vec![steer_id.clone()]);
+        assert_eq!(
+            driver.input_phase(&steer_id),
+            Some(InputLifecycleState::Queued)
+        );
+        begin_unregister_with(
+            &mut driver,
+            mm_dsl::UnregisterQueuedInputsDisposition::Requeue,
+            900_000,
+        );
+
+        let active = driver.active_input_ids();
+        let before_exit = driver.stop_retained_input_ids(&active).unwrap();
+        let retained = driver.stop_non_terminal_inputs(&before_exit).unwrap();
+
+        assert_eq!(retained, vec![durable_id]);
+        assert_eq!(
+            driver.input_terminal_outcome(&steer_id),
+            Some(InputTerminalOutcome::Abandoned {
+                reason: InputAbandonReason::Stopped
+            })
+        );
+        assert!(driver.ledger.get(&steer_id).unwrap().stop_requeue.is_none());
+    }
+
+    /// The stop refuses, before it changes any input, when its verdicts
+    /// differ from the set the classifier retained before the executor's
+    /// exit, whose complement got the runless carriers: a kept input with a
+    /// carrier, or a stopped one without, is never committed.
+    #[tokio::test]
+    async fn a_stop_whose_verdicts_differ_from_the_pre_exit_set_changes_nothing() {
+        let (mut driver, durable_id, ephemeral_id, staged_id) =
+            stop_classification_fixture("stop-verdicts-must-agree").await;
+        begin_unregister_with(
+            &mut driver,
+            mm_dsl::UnregisterQueuedInputsDisposition::Requeue,
+            900_000,
+        );
+
+        for claimed_before_exit in [Vec::new(), vec![durable_id.clone(), ephemeral_id.clone()]] {
+            let error = driver
+                .stop_non_terminal_inputs(&claimed_before_exit)
+                .expect_err("differing verdicts are refused");
+            assert!(
+                error.to_string().contains("the stop classifier retained"),
+                "{error}"
+            );
+            for untouched in [&durable_id, &ephemeral_id] {
+                assert_eq!(
+                    driver.input_phase(untouched),
+                    Some(InputLifecycleState::Queued),
+                    "{untouched}"
+                );
+                assert!(driver.ledger.get(untouched).unwrap().stop_requeue.is_none());
+            }
+            assert_eq!(driver.input_terminal_outcome(&staged_id), None);
+        }
+    }
+
+    /// The generated begin refuses a requeue without a max age and a stop
+    /// with one, so the disposition and its max age always agree.
+    #[tokio::test]
+    async fn the_unregister_disposition_and_its_max_age_must_agree() {
+        for (queued_inputs, max_age_ms) in [
+            (mm_dsl::UnregisterQueuedInputsDisposition::Requeue, 0),
+            (mm_dsl::UnregisterQueuedInputsDisposition::Stop, 60_000),
+        ] {
+            let mut driver =
+                EphemeralRuntimeDriver::new(LogicalRuntimeId::new("unregister-disposition-shape"));
+            driver
+                .ensure_contract_session_authority()
+                .expect("contract session authority");
+            let state = driver.dsl.lock().state().clone();
+            let refused = driver.dsl_apply(
+                mm_dsl::MeerkatMachineInput::BeginUnregisterSession {
+                    session_id: state.session_id.clone().unwrap(),
+                    agent_runtime_id: state.active_runtime_id.clone(),
+                    fence_token: state.active_fence_token,
+                    generation: state.active_runtime_generation,
+                    runtime_epoch_id: state.active_runtime_epoch_id.clone(),
+                    queued_inputs,
+                    requeue_max_age_ms: max_age_ms,
+                },
+                "BeginUnregisterSession",
+            );
+            assert!(refused.is_err(), "{queued_inputs:?} with {max_age_ms}");
         }
     }
 

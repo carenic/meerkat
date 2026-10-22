@@ -95,6 +95,19 @@ pub enum InputTerminalOutcome {
     Abandoned { reason: InputAbandonReason },
 }
 
+/// The durable mark of an input a graceful stop kept queued for the next
+/// start ([`crate::UnregisterQueuedInputs::Requeue`]). The next start runs the
+/// input unless it is older than `max_age_ms`, measured from its admission;
+/// an older one ends as [`InputAbandonReason::RequeueExpired`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StopRequeueMark {
+    /// When the stop kept the input.
+    pub stopped_at: DateTime<Utc>,
+    /// The max age the stop's unregister began with, in milliseconds.
+    pub max_age_ms: u64,
+}
+
 /// A single entry in the input's state history (shell bookkeeping).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputStateHistoryEntry {
@@ -1484,6 +1497,9 @@ pub(crate) fn input_terminal_completion_outcome(
 ///   silently settles the recovered inputs of a run whose tool process host
 ///   custody proved had started
 ///   (`PendingRuntimeExecutorAttachment::abandon_interrupted_run_inputs`).
+/// - `Abandoned { RequeueExpired }`: the same pre-serve settlement ends an
+///   input a graceful stop kept queued once it is older than the stop's max
+///   age (`PendingRuntimeExecutorAttachment::settle_expired_stop_requeued_inputs`).
 ///
 /// `Cancelled` and `MaxAttemptsExhausted` are also reached with a receipt
 /// (tracked cancel, attachment replacement, a failed run's batch); a row of
@@ -1512,13 +1528,13 @@ pub(crate) fn receipt_less_terminal(
         InputTerminalOutcome::Abandoned { reason } => match reason {
             InputAbandonReason::Cancelled
             | InputAbandonReason::MaxAttemptsExhausted { .. }
-            | InputAbandonReason::ToolProcessInterrupted => true,
+            | InputAbandonReason::ToolProcessInterrupted
+            | InputAbandonReason::RequeueExpired => true,
             InputAbandonReason::Retired
             | InputAbandonReason::Reset
             | InputAbandonReason::Stopped
             | InputAbandonReason::Destroyed
-            | InputAbandonReason::NeverExecuted
-            | InputAbandonReason::RequeueExpired => false,
+            | InputAbandonReason::NeverExecuted => false,
         },
     };
     if staged_without_receipt {
@@ -2013,6 +2029,8 @@ pub struct InputState {
     /// after completion/publication obligations close; terminal history is
     /// carried by the seed and receipts above.
     pub persisted_input: Option<Input>,
+    /// Set when a graceful stop kept this queued input for the next start.
+    pub stop_requeue: Option<StopRequeueMark>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -2044,6 +2062,7 @@ impl InputState {
             interaction_terminal_outbox: None,
             scoped_destination: ScopedDestinationWitness::Unrecorded,
             persisted_input: None,
+            stop_requeue: None,
             created_at: now,
         }
     }
@@ -2125,6 +2144,8 @@ struct InputStateSerde {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     persisted_input: Option<Input>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    stop_requeue: Option<StopRequeueMark>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     last_run_id: Option<RunId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_boundary_sequence: Option<u64>,
@@ -2150,7 +2171,8 @@ impl Serialize for StoredInputState {
             authority_contributors: self.state.authority_contributors.clone(),
             retained_resume: self.state.retained_resume.clone(),
             stored_input_state_version:
-                meerkat_core::generated::session_persistence_version_authority::stored_input_state_version(
+                meerkat_core::generated::session_persistence_version_authority::stored_input_state_version_for_row(
+                    carries_requeue_facts(self.state.stop_requeue.as_ref(), self.seed.terminal_outcome.as_ref()),
                 ),
             input_id: self.state.input_id.clone(),
             current_state: self.seed.phase,
@@ -2174,6 +2196,7 @@ impl Serialize for StoredInputState {
             interaction_terminal_outbox: self.state.interaction_terminal_outbox.clone(),
             scoped_destination: self.state.scoped_destination.clone(),
             persisted_input: self.state.persisted_input.clone(),
+            stop_requeue: self.state.stop_requeue,
             last_run_id: self.seed.last_run_id.clone(),
             last_boundary_sequence: self.seed.last_boundary_sequence,
             admission_sequence: self.seed.admission_sequence,
@@ -2183,6 +2206,42 @@ impl Serialize for StoredInputState {
         };
         helper.serialize(serializer)
     }
+}
+
+/// Whether an input a graceful stop kept queued has expired: its age at `now`,
+/// measured from `admitted_at`, is over the mark's max age. An input without
+/// a mark never expires (it is not a kept input), and a negative age (the
+/// clock went back) is not expired.
+#[must_use]
+pub(crate) fn stop_requeue_expired(
+    mark: Option<&StopRequeueMark>,
+    admitted_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> bool {
+    let Some(mark) = mark else {
+        return false;
+    };
+    let Ok(age_ms) = u64::try_from((now - admitted_at).num_milliseconds()) else {
+        return false;
+    };
+    age_ms > mark.max_age_ms
+}
+
+/// Whether the row carries a fact only stored input state v8 can hold: a
+/// stop's requeue mark or the requeue-expired abandon reason. Such a row is
+/// written as v8; every other row stays v7, so a host that never requeues
+/// keeps the v7 downgrade.
+fn carries_requeue_facts(
+    stop_requeue: Option<&StopRequeueMark>,
+    terminal_outcome: Option<&InputTerminalOutcome>,
+) -> bool {
+    stop_requeue.is_some()
+        || matches!(
+            terminal_outcome,
+            Some(InputTerminalOutcome::Abandoned {
+                reason: InputAbandonReason::RequeueExpired
+            })
+        )
 }
 
 /// Whether an authority association the row carries bounds its resource
@@ -2254,6 +2313,23 @@ impl<'de> Deserialize<'de> for StoredInputState {
             return Err(<D::Error as serde::de::Error>::custom(
                 "stored input state before v7 cannot carry an authorization audit refusal read \
                  or a policy read's publication instance",
+            ));
+        }
+        if observed_stored_input_state_version < 8 && helper.stop_requeue.is_some() {
+            return Err(<D::Error as serde::de::Error>::custom(
+                "stored input state before v8 cannot carry a stop requeue mark",
+            ));
+        }
+        if observed_stored_input_state_version < 8
+            && matches!(
+                helper.terminal_outcome,
+                Some(InputTerminalOutcome::Abandoned {
+                    reason: InputAbandonReason::RequeueExpired
+                })
+            )
+        {
+            return Err(<D::Error as serde::de::Error>::custom(
+                "stored input state before v8 cannot carry the requeue-expired abandon reason",
             ));
         }
         if observed_stored_input_state_version == 3 && helper.interaction_terminal_outbox.is_some()
@@ -2342,6 +2418,7 @@ impl<'de> Deserialize<'de> for StoredInputState {
             interaction_terminal_outbox: helper.interaction_terminal_outbox,
             scoped_destination: helper.scoped_destination,
             persisted_input: helper.persisted_input,
+            stop_requeue: helper.stop_requeue,
             created_at: helper.created_at,
         };
         let seed = InputStateSeed {
@@ -3046,6 +3123,80 @@ mod tests {
             error
                 .to_string()
                 .contains("disagrees with the retained replay payload")
+        );
+    }
+    /// The expiry of an input a graceful stop kept queued is decided from its
+    /// admission age against the stop's max age alone: exactly at the bound
+    /// or just under it keeps the input, just over ends it, a negative age
+    /// (the clock went back) keeps it, and an input without a mark is not a
+    /// kept input and never expires.
+    #[test]
+    fn stop_requeue_expiry_is_the_admission_age_over_the_marks_max_age() {
+        let admitted_at = DateTime::parse_from_rfc3339("2026-10-22T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mark = StopRequeueMark {
+            stopped_at: admitted_at,
+            max_age_ms: 60_000,
+        };
+        let at = |offset_ms: i64| admitted_at + chrono::Duration::milliseconds(offset_ms);
+        assert!(!stop_requeue_expired(Some(&mark), admitted_at, at(60_000)));
+        assert!(!stop_requeue_expired(Some(&mark), admitted_at, at(59_999)));
+        assert!(stop_requeue_expired(Some(&mark), admitted_at, at(60_001)));
+        assert!(!stop_requeue_expired(Some(&mark), admitted_at, at(-5_000)));
+        assert!(!stop_requeue_expired(None, admitted_at, at(86_400_000)));
+    }
+
+    /// A row carrying a requeue-across-stop fact (a stop's requeue mark or the
+    /// requeue-expired abandon reason) is written as stored input state v8
+    /// and round-trips byte for byte; every other row is written at the v7
+    /// baseline. A row stamped before v8 cannot carry either fact.
+    #[test]
+    fn a_requeue_fact_is_written_at_v8_and_refused_in_an_older_row() {
+        let mut row = StoredInputState::new_accepted(InputId::new());
+        let plain = serde_json::to_value(&row).unwrap();
+        assert_eq!(plain["stored_input_state_version"], 7);
+
+        row.state.stop_requeue = Some(StopRequeueMark {
+            stopped_at: Utc::now(),
+            max_age_ms: 900_000,
+        });
+        let marked = serde_json::to_value(&row).unwrap();
+        assert_eq!(marked["stored_input_state_version"], 8);
+        let reread: StoredInputState = serde_json::from_value(marked.clone()).unwrap();
+        assert_eq!(reread.state.stop_requeue, row.state.stop_requeue);
+        assert_eq!(serde_json::to_value(&reread).unwrap(), marked);
+        let mut older_mark = marked;
+        older_mark["stored_input_state_version"] = serde_json::json!(7);
+        let error = serde_json::from_value::<StoredInputState>(older_mark).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("stored input state before v8 cannot carry a stop requeue mark"),
+            "{error}"
+        );
+
+        let mut expired = StoredInputState::new_accepted(InputId::new());
+        expired.seed.phase = InputLifecycleState::Abandoned;
+        expired.seed.terminal_outcome = Some(InputTerminalOutcome::Abandoned {
+            reason: InputAbandonReason::RequeueExpired,
+        });
+        let expired_json = serde_json::to_value(&expired).unwrap();
+        assert_eq!(expired_json["stored_input_state_version"], 8);
+        assert_eq!(
+            expired_json["terminal_outcome"]["reason"],
+            serde_json::json!("requeue_expired")
+        );
+        let reread: StoredInputState = serde_json::from_value(expired_json.clone()).unwrap();
+        assert_eq!(reread.seed.terminal_outcome, expired.seed.terminal_outcome);
+        let mut older_expired = expired_json;
+        older_expired["stored_input_state_version"] = serde_json::json!(7);
+        let error = serde_json::from_value::<StoredInputState>(older_expired).unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "stored input state before v8 cannot carry the requeue-expired abandon reason"
+            ),
+            "{error}"
         );
     }
 

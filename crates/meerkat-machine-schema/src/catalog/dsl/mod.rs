@@ -1861,6 +1861,7 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
                     "MaxAttemptsExhausted",
                     "NeverExecuted",
                     "ToolProcessInterrupted",
+                    "RequeueExpired",
                 ],
             ),
             NamedTypeBinding::string_enum("InputLane", &["Queue", "Steer"]),
@@ -2731,6 +2732,11 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
                 &["Retain", "Discard"],
             ),
             NamedTypeBinding::string_enum(
+                "UnregisterQueuedInputsDisposition",
+                &["Stop", "Requeue"],
+            ),
+            NamedTypeBinding::string_enum("StopInputDisposition", &["Abandon", "Retain"]),
+            NamedTypeBinding::string_enum(
                 "RecoveredTerminalCompletionDisposition",
                 &["Recover", "DiscardUnrecoverable", "Blocked"],
             ),
@@ -3158,6 +3164,7 @@ runtime_internal_inputs!(
         ClassifyOperationCompletionWake,
         ClassifyOperationDurability,
         ClassifyRecoveredInputDurability,
+        ClassifyStopInputDisposition,
         ClassifyRecoveredOperationRecord,
         ClassifyRuntimeLifecycleDurability,
         ClassifyRuntimeLifecycleState,

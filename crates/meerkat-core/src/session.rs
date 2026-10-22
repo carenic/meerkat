@@ -19078,6 +19078,40 @@ mod deferred_tool_failure_tests {
         include!("../tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt");
     }
 
+    // Byte-exact released v0.9.4 authority, commit
+    // e91835c5fea0170d0dfc1d297d70269234fd4a16, source blob
+    // 845ba539ac70e8bc670b343df78a8dbbdd59e455: the newest released reader.
+    #[allow(dead_code)]
+    mod released_v0_9_4_version_authority {
+        include!("../tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt");
+    }
+
+    /// The released 0.9.4 authority admits stored input state v3 to v7. A
+    /// row this binary writes without a requeue-across-stop fact is stamped
+    /// at the v7 baseline, so 0.9.4 still reads it; a row carrying such a
+    /// fact is v8, which 0.9.4 refuses with its typed version error instead
+    /// of misreading the fact.
+    #[test]
+    fn released_v0_9_4_reader_reads_baseline_rows_and_refuses_requeue_rows_typed() {
+        use crate::generated::session_persistence_version_authority as current;
+        assert_eq!(
+            released_v0_9_4_version_authority::restore_stored_input_state_version(
+                current::stored_input_state_version_for_row(false)
+            ),
+            Ok(7)
+        );
+        let refusal = released_v0_9_4_version_authority::restore_stored_input_state_version(
+            current::stored_input_state_version_for_row(true),
+        )
+        .expect_err("0.9.4 refuses a v8 row");
+        assert!(
+            refusal.to_string().contains(
+                "generated session persistence version authority rejected StoredInputState"
+            ),
+            "{refusal}"
+        );
+    }
+
     /// The released 0.9.3 authority admits stored input state v3 to v6 and
     /// rejects a current row: once a 0.9.4 binary has written an input row,
     /// a 0.9.3 binary cannot reopen it.

@@ -2243,6 +2243,8 @@ pub enum InputAbandonReason {
     NeverExecuted,
     #[serde(rename = "ToolProcessInterrupted")]
     ToolProcessInterrupted,
+    #[serde(rename = "RequeueExpired")]
+    RequeueExpired,
 }
 impl InputAbandonReason {
     pub fn as_str(&self) -> &'static str {
@@ -2255,6 +2257,7 @@ impl InputAbandonReason {
             Self::MaxAttemptsExhausted => "MaxAttemptsExhausted",
             Self::NeverExecuted => "NeverExecuted",
             Self::ToolProcessInterrupted => "ToolProcessInterrupted",
+            Self::RequeueExpired => "RequeueExpired",
         }
     }
 }
@@ -2270,6 +2273,7 @@ impl std::convert::TryFrom<&str> for InputAbandonReason {
             "MaxAttemptsExhausted" => Ok(Self::MaxAttemptsExhausted),
             "NeverExecuted" => Ok(Self::NeverExecuted),
             "ToolProcessInterrupted" => Ok(Self::ToolProcessInterrupted),
+            "RequeueExpired" => Ok(Self::RequeueExpired),
             other => Err(format!("invalid InputAbandonReason value `{other}`")),
         }
     }
@@ -11766,6 +11770,56 @@ impl std::fmt::Display for StagedSessionPhase {
     serde::Serialize,
     serde::Deserialize,
 )]
+pub enum StopInputDisposition {
+    #[default]
+    #[serde(rename = "Abandon")]
+    Abandon,
+    #[serde(rename = "Retain")]
+    Retain,
+}
+impl StopInputDisposition {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Abandon => "Abandon",
+            Self::Retain => "Retain",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for StopInputDisposition {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "Abandon" => Ok(Self::Abandon),
+            "Retain" => Ok(Self::Retain),
+            other => Err(format!("invalid StopInputDisposition value `{other}`")),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for StopInputDisposition {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for StopInputDisposition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum SupervisorAuthorizeAdmissionResultKind {
     #[default]
     #[serde(rename = "Proceed")]
@@ -13396,6 +13450,58 @@ impl std::fmt::Display for TurnTerminalOutcome {
     serde::Serialize,
     serde::Deserialize,
 )]
+pub enum UnregisterQueuedInputsDisposition {
+    #[default]
+    #[serde(rename = "Stop")]
+    Stop,
+    #[serde(rename = "Requeue")]
+    Requeue,
+}
+impl UnregisterQueuedInputsDisposition {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Stop => "Stop",
+            Self::Requeue => "Requeue",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for UnregisterQueuedInputsDisposition {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "Stop" => Ok(Self::Stop),
+            "Requeue" => Ok(Self::Requeue),
+            other => Err(format!(
+                "invalid UnregisterQueuedInputsDisposition value `{other}`"
+            )),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for UnregisterQueuedInputsDisposition {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for UnregisterQueuedInputsDisposition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum UserInterruptObservationKind {
     #[default]
     #[serde(rename = "Accepted")]
@@ -13837,6 +13943,8 @@ pub struct State {
     pub unregister_teardown_retains_snapshot: bool,
     pub unregister_runtime_loop_forced_abort: bool,
     pub unregister_comms_drain_forced_abort: bool,
+    pub unregister_queued_inputs: UnregisterQueuedInputsDisposition,
+    pub unregister_requeue_max_age_ms: u64,
     pub staged_session_phase: StagedSessionPhase,
     pub staged_session_id: Option<SessionId>,
     pub staged_session_keep_alive: Option<bool>,
@@ -14513,6 +14621,11 @@ impl std::fmt::Debug for State {
             .field(
                 "unregister_comms_drain_forced_abort",
                 &self.unregister_comms_drain_forced_abort,
+            )
+            .field("unregister_queued_inputs", &self.unregister_queued_inputs)
+            .field(
+                "unregister_requeue_max_age_ms",
+                &self.unregister_requeue_max_age_ms,
             )
             .field("staged_session_phase", &self.staged_session_phase)
             .field("staged_session_id", &self.staged_session_id)
@@ -15887,6 +16000,8 @@ pub mod inputs {
         pub fence_token: Option<FenceToken>,
         pub generation: Option<Generation>,
         pub runtime_epoch_id: Option<RuntimeEpochId>,
+        pub queued_inputs: UnregisterQueuedInputsDisposition,
+        pub requeue_max_age_ms: u64,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct BeginUnregisterUnservedAttachment {
@@ -18618,6 +18733,12 @@ pub mod inputs {
         pub has_interaction_terminal_outbox: bool,
         pub finalization: RuntimeCompletionFinalizationObservation,
     }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ClassifyStopInputDisposition {
+        pub input_id: String,
+        pub durability: InputDurabilityKind,
+        pub directed: bool,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -19037,6 +19158,7 @@ pub enum Input {
     RecoverInputCompletionBoundary(inputs::RecoverInputCompletionBoundary),
     ResolveCheckpointCompletionResult(inputs::ResolveCheckpointCompletionResult),
     ResolveAbandonedCompletionResult(inputs::ResolveAbandonedCompletionResult),
+    ClassifyStopInputDisposition(inputs::ClassifyStopInputDisposition),
 }
 impl Input {
     pub fn kind(&self) -> InputKind {
@@ -19618,6 +19740,7 @@ impl Input {
             Self::ResolveAbandonedCompletionResult(_) => {
                 InputKind::ResolveAbandonedCompletionResult
             }
+            Self::ClassifyStopInputDisposition(_) => InputKind::ClassifyStopInputDisposition,
         }
     }
 }
@@ -20026,6 +20149,7 @@ pub enum InputKind {
     RecoverInputCompletionBoundary,
     ResolveCheckpointCompletionResult,
     ResolveAbandonedCompletionResult,
+    ClassifyStopInputDisposition,
 }
 
 pub mod signals {
@@ -21767,6 +21891,12 @@ pub mod effects {
         pub result_class: RuntimeCompletionResultClass,
         pub cleanup_outcome: RuntimeCompletionObservedOutcome,
     }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct StopInputDispositionClassified {
+        pub input_id: String,
+        pub disposition: StopInputDisposition,
+        pub requeue_max_age_ms: u64,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -22036,6 +22166,7 @@ pub enum Effect {
     TerminalCompletionCorrelationClassified(effects::TerminalCompletionCorrelationClassified),
     CheckpointCompletionResultResolved(effects::CheckpointCompletionResultResolved),
     AbandonedCompletionResultResolved(effects::AbandonedCompletionResultResolved),
+    StopInputDispositionClassified(effects::StopInputDispositionClassified),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EffectKind {
@@ -22292,6 +22423,7 @@ pub enum EffectKind {
     TerminalCompletionCorrelationClassified,
     CheckpointCompletionResultResolved,
     AbandonedCompletionResultResolved,
+    StopInputDispositionClassified,
 }
 
 pub mod command_capabilities {
@@ -25329,6 +25461,18 @@ pub enum TransitionId {
     ResolveCheckpointCompletionResultFailedRunning,
     ResolveCheckpointCompletionResultFailedRetired,
     ResolveCheckpointCompletionResultFailedStopped,
+    ClassifyStopInputDispositionRetainInitializing,
+    ClassifyStopInputDispositionRetainIdle,
+    ClassifyStopInputDispositionRetainAttached,
+    ClassifyStopInputDispositionRetainRunning,
+    ClassifyStopInputDispositionRetainRetired,
+    ClassifyStopInputDispositionRetainStopped,
+    ClassifyStopInputDispositionAbandonInitializing,
+    ClassifyStopInputDispositionAbandonIdle,
+    ClassifyStopInputDispositionAbandonAttached,
+    ClassifyStopInputDispositionAbandonRunning,
+    ClassifyStopInputDispositionAbandonRetired,
+    ClassifyStopInputDispositionAbandonStopped,
 }
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -25480,6 +25624,8 @@ pub fn initial_state() -> State {
         unregister_teardown_retains_snapshot: false,
         unregister_runtime_loop_forced_abort: false,
         unregister_comms_drain_forced_abort: false,
+        unregister_queued_inputs: UnregisterQueuedInputsDisposition::Stop,
+        unregister_requeue_max_age_ms: 0,
         staged_session_phase: StagedSessionPhase::NotStaged,
         staged_session_id: None,
         staged_session_keep_alive: None,

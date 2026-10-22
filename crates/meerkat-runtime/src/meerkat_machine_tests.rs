@@ -18568,6 +18568,8 @@ async fn exact_hard_interrupt_reaches_retiring_draining_run_only() {
                 fence_token: state.active_fence_token,
                 generation: state.active_runtime_generation,
                 runtime_epoch_id: state.active_runtime_epoch_id,
+                queued_inputs: mm_dsl::UnregisterQueuedInputsDisposition::Stop,
+                requeue_max_age_ms: 0,
             },
             "BeginUnregisterSession(exact retiring interrupt regression)",
         )
@@ -21378,6 +21380,7 @@ mod stop_teardown_coordinator_class {
                 epoch_id: entry.epoch_id.clone(),
                 coordinator_id: uuid::Uuid::new_v4(),
                 result_rx,
+                queued_inputs: UnregisterQueuedInputs::Stop,
             });
         }
         drop(held_transaction);
@@ -22617,6 +22620,8 @@ mod stop_under_gate_deadlock_class {
                     fence_token: first_sample.active_fence_token,
                     generation: first_sample.active_runtime_generation,
                     runtime_epoch_id: first_sample.active_runtime_epoch_id,
+                    queued_inputs: mm_dsl::UnregisterQueuedInputsDisposition::Stop,
+                    requeue_max_age_ms: 0,
                 },
                 "BeginUnregisterSession(test post-stop watcher recheck)",
             )
@@ -22673,6 +22678,8 @@ mod stop_under_gate_deadlock_class {
                     fence_token: state.active_fence_token,
                     generation: state.active_runtime_generation,
                     runtime_epoch_id: state.active_runtime_epoch_id,
+                    queued_inputs: mm_dsl::UnregisterQueuedInputsDisposition::Stop,
+                    requeue_max_age_ms: 0,
                 },
                 "BeginUnregisterSession(test stop coordinator phase recheck)",
             )
@@ -23869,6 +23876,8 @@ async fn exact_run_boundary_cancel_remains_admitted_after_unregister_drain_begin
                 fence_token: state.active_fence_token,
                 generation: state.active_runtime_generation,
                 runtime_epoch_id: state.active_runtime_epoch_id,
+                queued_inputs: mm_dsl::UnregisterQueuedInputsDisposition::Stop,
+                requeue_max_age_ms: 0,
             },
             "BeginUnregisterSession(exact retire cancel regression)",
         )
@@ -55677,6 +55686,8 @@ fn unregister_completes_after_normal_close_of_a_staged_live_channel() {
                 fence_token,
                 generation,
                 runtime_epoch_id: None,
+                queued_inputs: mm_dsl::UnregisterQueuedInputsDisposition::Stop,
+                requeue_max_age_ms: 0,
             }
         }),
         "begin unregister",

@@ -2427,6 +2427,11 @@ pub enum InputAbandonReason {
     /// input is settled instead of replayed so the tool's effects cannot be
     /// repeated unknowingly. Resolves to the public `Abandoned` class.
     ToolProcessInterrupted,
+    /// A graceful stop kept the input queued for the next start
+    /// (`ClassifyStopInputDisposition` answered `Retain`), and the next start
+    /// found it older than that stop's max age, so it ended without running.
+    /// Resolves to the public `Abandoned` class.
+    RequeueExpired,
 }
 
 /// Typed work-lane assignment for admitted inputs. Replaces the former
@@ -2801,6 +2806,28 @@ pub enum RecoveredInputRecoveryDisposition {
     #[default]
     Retain,
     Discard,
+}
+
+/// What an unregister does with inputs still queued behind the session's
+/// running turn when it stops the runtime. `BeginUnregisterSession` records
+/// it with the unregister; `ClassifyStopInputDisposition` reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum UnregisterQueuedInputsDisposition {
+    /// End every non-terminal input as stopped.
+    #[default]
+    Stop,
+    /// Keep each eligible queued input durably queued for the next start.
+    Requeue,
+}
+
+/// Generated verdict of a runtime stop for one non-terminal input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum StopInputDisposition {
+    /// End the input as stopped.
+    #[default]
+    Abandon,
+    /// Keep the input durably queued for the next start.
+    Retain,
 }
 
 /// Generated disposition for one recovered durable terminal-completion batch.
@@ -3793,6 +3820,15 @@ macro_rules! meerkat_catalog_machine_dsl {
             unregister_teardown_retains_snapshot: bool,
             unregister_runtime_loop_forced_abort: bool,
             unregister_comms_drain_forced_abort: bool,
+            // The disposition the unregister began with for inputs still
+            // queued behind the running turn, and the max age a kept input
+            // carries to the next start. BeginUnregisterSession records both
+            // (the shell keeps them with the unregister's durable progress, so
+            // a recovered convergence replays the same values), and
+            // ClassifyStopInputDisposition reads them. Stop and 0 outside an
+            // unregister.
+            unregister_queued_inputs: Enum<UnregisterQueuedInputsDisposition>,
+            unregister_requeue_max_age_ms: u64,
             staged_session_phase: StagedSessionPhase,
             staged_session_id: Option<SessionId>,
             staged_session_keep_alive: Option<bool>,
@@ -4619,6 +4655,8 @@ macro_rules! meerkat_catalog_machine_dsl {
             unregister_teardown_retains_snapshot = false,
             unregister_runtime_loop_forced_abort = false,
             unregister_comms_drain_forced_abort = false,
+            unregister_queued_inputs = UnregisterQueuedInputsDisposition::Stop,
+            unregister_requeue_max_age_ms = 0,
             staged_session_phase = StagedSessionPhase::NotStaged,
             staged_session_id = None,
             staged_session_keep_alive = None,
@@ -5102,6 +5140,8 @@ macro_rules! meerkat_catalog_machine_dsl {
                 fence_token: Option<FenceToken>,
                 generation: Option<Generation>,
                 runtime_epoch_id: Option<RuntimeEpochId>,
+                queued_inputs: Enum<UnregisterQueuedInputsDisposition>,
+                requeue_max_age_ms: u64,
             },
             BeginUnregisterUnservedAttachment {
                 session_id: SessionId,
@@ -7068,6 +7108,11 @@ macro_rules! meerkat_catalog_machine_dsl {
                 has_interaction_terminal_outbox: bool,
                 finalization: Enum<RuntimeCompletionFinalizationObservation>,
             },
+            ClassifyStopInputDisposition {
+                input_id: String,
+                durability: Enum<InputDurabilityKind>,
+                directed: bool,
+            },
         }
 
         surface_only [
@@ -8409,6 +8454,11 @@ macro_rules! meerkat_catalog_machine_dsl {
                 result_class: Enum<RuntimeCompletionResultClass>,
                 cleanup_outcome: Enum<RuntimeCompletionObservedOutcome>,
             },
+            StopInputDispositionClassified {
+                input_id: String,
+                disposition: Enum<StopInputDisposition>,
+                requeue_max_age_ms: u64,
+            },
         }
 
         // =====================================================================
@@ -8675,6 +8725,7 @@ macro_rules! meerkat_catalog_machine_dsl {
         disposition RequestRuntimeLoopStopForUnregister => external seam OwnerRealizationOnly,
         disposition RequestCommsDrainExitForUnregister => external seam OwnerRealizationOnly,
         disposition RequestCompletionWaiterResolutionForUnregister => external seam OwnerRealizationOnly,
+        disposition StopInputDispositionClassified => local seam NoOwnerRealization,
 
         // =====================================================================
         // Helpers
@@ -10015,7 +10066,17 @@ macro_rules! meerkat_catalog_machine_dsl {
             || (self.unregister_runtime_loop_drain_pending == false
                 && self.unregister_comms_drain_exit_pending == false
                 && self.unregister_completion_waiter_drain_pending == false
-                && self.unregister_teardown_retains_snapshot == false)
+                && self.unregister_teardown_retains_snapshot == false
+                && self.unregister_queued_inputs == UnregisterQueuedInputsDisposition::Stop
+                && self.unregister_requeue_max_age_ms == 0)
+        }
+
+        // A requeue carries a max age; a stop carries none.
+        invariant unregister_requeue_max_age_matches_disposition {
+            (self.unregister_queued_inputs == UnregisterQueuedInputsDisposition::Stop
+                && self.unregister_requeue_max_age_ms == 0)
+            || (self.unregister_queued_inputs == UnregisterQueuedInputsDisposition::Requeue
+                && self.unregister_requeue_max_age_ms > 0)
         }
 
         invariant current_run_only_while_running_or_retired {
@@ -11438,13 +11499,18 @@ macro_rules! meerkat_catalog_machine_dsl {
         // Draining.
         transition BeginUnregisterSession {
             per_phase [Idle, Attached, Running]
-            on input BeginUnregisterSession { session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id }
+            on input BeginUnregisterSession { session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id, queued_inputs, requeue_max_age_ms }
             guard "session_matches_current" { self.session_id == Some(session_id) }
             guard "runtime_binding_matches_observation" { self.active_runtime_id == agent_runtime_id }
             guard "fence_binding_matches_observation" { self.active_fence_token == fence_token }
             guard "generation_binding_matches_observation" { self.active_runtime_generation == generation }
             guard "epoch_binding_matches_observation" { self.active_runtime_epoch_id == runtime_epoch_id }
             guard "not_already_draining" { self.registration_phase != RegistrationPhase::Draining }
+            guard "queued_inputs_max_age_matches_disposition" {
+                (queued_inputs == UnregisterQueuedInputsDisposition::Stop && requeue_max_age_ms == 0)
+                || (queued_inputs == UnregisterQueuedInputsDisposition::Requeue
+                    && requeue_max_age_ms > 0)
+            }
             update {
                 self.registration_phase = RegistrationPhase::Draining;
                 self.unregister_runtime_loop_drain_pending = true;
@@ -11453,6 +11519,8 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.unregister_teardown_retains_snapshot = false;
                 self.unregister_runtime_loop_forced_abort = false;
                 self.unregister_comms_drain_forced_abort = false;
+                self.unregister_queued_inputs = queued_inputs;
+                self.unregister_requeue_max_age_ms = requeue_max_age_ms;
             }
             to Idle
             emit RequestRuntimeLoopStopForUnregister { session_id: session_id }
@@ -11462,13 +11530,18 @@ macro_rules! meerkat_catalog_machine_dsl {
 
         transition BeginUnregisterSessionRetainsSnapshot {
             per_phase [Retired, Stopped]
-            on input BeginUnregisterSession { session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id }
+            on input BeginUnregisterSession { session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id, queued_inputs, requeue_max_age_ms }
             guard "session_matches_current" { self.session_id == Some(session_id) }
             guard "runtime_binding_matches_observation" { self.active_runtime_id == agent_runtime_id }
             guard "fence_binding_matches_observation" { self.active_fence_token == fence_token }
             guard "generation_binding_matches_observation" { self.active_runtime_generation == generation }
             guard "epoch_binding_matches_observation" { self.active_runtime_epoch_id == runtime_epoch_id }
             guard "not_already_draining" { self.registration_phase != RegistrationPhase::Draining }
+            guard "queued_inputs_max_age_matches_disposition" {
+                (queued_inputs == UnregisterQueuedInputsDisposition::Stop && requeue_max_age_ms == 0)
+                || (queued_inputs == UnregisterQueuedInputsDisposition::Requeue
+                    && requeue_max_age_ms > 0)
+            }
             update {
                 self.registration_phase = RegistrationPhase::Draining;
                 self.unregister_runtime_loop_drain_pending = true;
@@ -11477,6 +11550,8 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.unregister_teardown_retains_snapshot = true;
                 self.unregister_runtime_loop_forced_abort = false;
                 self.unregister_comms_drain_forced_abort = false;
+                self.unregister_queued_inputs = queued_inputs;
+                self.unregister_requeue_max_age_ms = requeue_max_age_ms;
             }
             to Idle
             emit RequestRuntimeLoopStopForUnregister { session_id: session_id }
@@ -11511,6 +11586,10 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.unregister_teardown_retains_snapshot = true;
                 self.unregister_runtime_loop_forced_abort = false;
                 self.unregister_comms_drain_forced_abort = false;
+                // An attachment that never served has no queued work of its
+                // own to keep: its unregister always stops.
+                self.unregister_queued_inputs = UnregisterQueuedInputsDisposition::Stop;
+                self.unregister_requeue_max_age_ms = 0;
             }
             to Idle
             emit RequestRuntimeLoopStopForUnregister { session_id: session_id }
@@ -16009,6 +16088,8 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.unregister_comms_drain_exit_pending = false;
                 self.unregister_completion_waiter_drain_pending = false;
                 self.unregister_teardown_retains_snapshot = false;
+                self.unregister_queued_inputs = UnregisterQueuedInputsDisposition::Stop;
+                self.unregister_requeue_max_age_ms = 0;
             }
             to Destroyed
             emit RuntimeDestroyed { agent_runtime_id: self.active_runtime_id.get("value"), fence_token: self.active_fence_token.get("value") }
@@ -38432,6 +38513,62 @@ macro_rules! meerkat_catalog_machine_dsl {
                 requires_session_checkpoint: requires_session_checkpoint,
                 result_class: RuntimeCompletionResultClass::AbandonedWithError,
                 cleanup_outcome: RuntimeCompletionObservedOutcome::FinalizationFailed
+            }
+        }
+
+        // 26c-stop. ClassifyStopInputDisposition: the generated verdict of a
+        // runtime stop for each non-terminal input. The stop terminalization
+        // asks it for every such input under the driver lock, in the step
+        // that commits the stop, and abandons exactly the Abandon set as
+        // stopped. Retain needs an unregister that began with the Requeue
+        // disposition and an eligible input: still queued, in the Queue lane,
+        // a prompt, not directed and durable. A staged or applied input
+        // belongs to the cancelled run and is never kept, so it cannot run
+        // twice. Every other input is Abandon, so under the Stop
+        // disposition, or outside an unregister, the verdict is today's
+        // blanket abandon. The shell supplies durability and directedness;
+        // the phase, lane and kind are machine facts.
+        transition ClassifyStopInputDispositionRetain {
+            per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
+            on input ClassifyStopInputDisposition { input_id, durability, directed }
+            guard "requeue_eligible" {
+                self.registration_phase == RegistrationPhase::Draining
+                && self.unregister_queued_inputs == UnregisterQueuedInputsDisposition::Requeue
+                && self.input_phases.contains_key(input_id)
+                && self.input_phases.get(input_id).get("value") == InputPhase::Queued
+                && self.input_lane.get_cloned(input_id) == Some(InputLane::Queue)
+                && self.input_is_prompt.get_cloned(input_id) == Some(true)
+                && directed == false
+                && durability == InputDurabilityKind::Durable
+            }
+            update {}
+            to Idle
+            emit StopInputDispositionClassified {
+                input_id: input_id,
+                disposition: StopInputDisposition::Retain,
+                requeue_max_age_ms: self.unregister_requeue_max_age_ms
+            }
+        }
+
+        transition ClassifyStopInputDispositionAbandon {
+            per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
+            on input ClassifyStopInputDisposition { input_id, durability, directed }
+            guard "not_requeue_eligible" {
+                !(self.registration_phase == RegistrationPhase::Draining
+                    && self.unregister_queued_inputs == UnregisterQueuedInputsDisposition::Requeue
+                    && self.input_phases.contains_key(input_id)
+                    && self.input_phases.get(input_id).get("value") == InputPhase::Queued
+                    && self.input_lane.get_cloned(input_id) == Some(InputLane::Queue)
+                    && self.input_is_prompt.get_cloned(input_id) == Some(true)
+                    && directed == false
+                    && durability == InputDurabilityKind::Durable)
+            }
+            update {}
+            to Idle
+            emit StopInputDispositionClassified {
+                input_id: input_id,
+                disposition: StopInputDisposition::Abandon,
+                requeue_max_age_ms: 0
             }
         }
     }

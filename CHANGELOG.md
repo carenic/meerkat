@@ -104,6 +104,28 @@ them.
   earlier behaviour. On the wire every new field is optional and omitted when
   absent, so loopback starts and completions and every existing error keep
   their exact JSON.
+- `meerkat-machine-kernels`: the generated runtime machine
+  (`generated::meerkat`) gains the stop classifier of a graceful stop that
+  keeps queued inputs (see Added, queued prompts kept across a graceful stop).
+  `Input` and `InputKind` gain `ClassifyStopInputDisposition`, `Effect` and
+  `EffectKind` gain `StopInputDispositionClassified`, `TransitionId` gains
+  `ClassifyStopInputDispositionRetain*` and
+  `ClassifyStopInputDispositionAbandon*` (one per phase from `Initializing` to
+  `Stopped`), and `InputAbandonReason` gains `RequeueExpired`. Each is
+  appended last, so no existing implicit discriminant changes. The new enums
+  are `UnregisterQueuedInputsDisposition` (`Stop`, `Requeue`) and
+  `StopInputDisposition` (`Abandon`, `Retain`). `State` gains the public fields
+  `unregister_queued_inputs` and `unregister_requeue_max_age_ms`, and the
+  input struct `BeginUnregisterSession` gains `queued_inputs` and
+  `requeue_max_age_ms` (struct literals need them; `Stop` and `0` keep the
+  earlier behaviour).
+- `meerkat-machine-schema` (`catalog::dsl::meerkat_machine`): the runtime
+  machine's DSL types gain the same variants, appended last, and the same
+  input fields (`MeerkatMachineInput::BeginUnregisterSession` gains
+  `queued_inputs` and `requeue_max_age_ms`).
+- `meerkat-runtime`: `MeerkatMachineRuntimeInternalInput` gains
+  `ClassifyStopInputDisposition`, appended last. The enum is exhaustive, so a
+  `match` outside the crate needs the arm.
 
 ### Added
 
@@ -178,6 +200,28 @@ them.
   is seen as gone, never admitted again. The trait default refuses.
   `MeerkatMachine::accept_existing_input_with_completion_for_attachment_and_member_residency`
   is the same for a mob member's attachment.
+- Queued prompts kept across a graceful stop. `meerkat-mob`:
+  `ShutdownOptions::with_queued_inputs(QueuedInputsOnShutdown::Requeue(max_age))`
+  with a `RequeueMaxAge` (default 15 minutes; zero and more than 24 hours are
+  refused with `ShutdownOptionsError`). `meerkat-runtime`:
+  `UnregisterQueuedInputs::Requeue { max_age }` through
+  `MeerkatMachine::observe_unregister_session_registration_with_queued_inputs_if_current`
+  and `observe_unregister_session_registration_with_queued_inputs_if_use_unchanged`.
+  An input is kept when it is still queued behind the running turn, in the
+  queue lane, a prompt, not directed, and durable. It stays in the session's
+  input store with its payload and a stop mark, its completion waiter ends
+  with `CompletionWaitError::RequeuedAcrossStop { stopped_at }`
+  (`BoundedTurnFailure::RequeuedAcrossStop` for a mob member), and the next
+  start runs it once, in admission order, before new work. An input older
+  than `max_age`, measured from its admission, when the next start recovers
+  it ends as abandoned with `InputAbandonReason::RequeueExpired` instead and
+  never runs (`BoundedTurnFailure::RequeueExpired` for a member; resubmit it
+  if it is still wanted). An admission time ahead of the clock is not
+  expired. The generated runtime machine decides each input, and the
+  unregister records its disposition durably, so an unregister that a crash
+  interrupts converges with the same one. The default, `Stop`, and every stop
+  outside such an unregister end every non-terminal input as stopped, as in
+  0.9.4.
 
 ### Changed
 
@@ -187,6 +231,16 @@ them.
   (inherited_instructions on a session fork call) to reactivate_inherited".
   It said only that `reactivate_inherited` carries them into the child. The
   cause, the keys and the error code are unchanged.
+- `meerkat-runtime` persistence: an input row that carries a stop mark or
+  the `RequeueExpired` reason is written as stored input state version 8, and
+  the machine lifecycle record of an unregister in progress with the requeue
+  disposition as version 6. Every other row and record keeps version 7 and
+  version 5, which 0.9.4 reads. 0.9.4 refuses a version 8 row or a version 6
+  record with its typed unsupported-version error, so a store that holds one
+  does not open after a downgrade (a kept input's row keeps its mark after it
+  runs). In `meerkat-core`'s generated version authority,
+  `STORED_INPUT_STATE_VERSION` is 8, and `STORED_INPUT_STATE_BASELINE_VERSION`
+  (7) and `stored_input_state_version_for_row` are new.
 
 ### Fixed
 
