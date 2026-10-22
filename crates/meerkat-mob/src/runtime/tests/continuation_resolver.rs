@@ -337,6 +337,64 @@ async fn a_handle_of_a_destroyed_mob_submits_nothing_to_the_mob_created_again() 
     );
 }
 
+/// A handle kept from a mob whose actor has stopped (here a crash stop, so
+/// its phase stays the last live one it published) must not bind the member
+/// of a mob created again under the id: it names its own incarnation, and
+/// the mob the host holds under the id is another.
+#[tokio::test]
+async fn a_stopped_mobs_handle_submits_nothing_to_the_mob_created_again() {
+    let (first, _first_service) = create_test_mob(sample_definition()).await;
+    let identity = AgentIdentity::from("w-cont");
+    first
+        .spawn_spec(SpawnMemberSpec::new("worker", identity.as_str()))
+        .await
+        .expect("spawn");
+    first
+        .crash_stop_preserving_durable_work_for_test()
+        .await
+        .expect("stop the first mob's actor");
+    assert!(
+        matches!(
+            first.status_observation_snapshot(),
+            MobState::Creating | MobState::Running
+        ),
+        "a stopped actor keeps its last live phase"
+    );
+    let (second, _second_service) = create_test_mob(sample_definition()).await;
+    assert_ne!(second.incarnation(), first.incarnation());
+    second
+        .spawn_spec(SpawnMemberSpec::new("worker", identity.as_str()))
+        .await
+        .expect("spawn under the same identity");
+    let continuations = ContinuationOwnerService::new(
+        RuntimeDeliveryInbox::new(Arc::new(InMemoryRuntimeStore::new())),
+        Arc::new(MobContinuationResolver::new(Arc::new(OneMob(
+            second.clone(),
+        )))),
+        Arc::new(meerkat_runtime::MeerkatMachine::ephemeral()),
+    );
+
+    let submitted = first
+        .submit_continuation(&continuations, &identity, delivery("late"), 1)
+        .await;
+    let owner = ContinuationOwner::Member {
+        mob_id: second.mob_id().as_str().to_string(),
+        identity: identity.as_str().to_string(),
+    };
+    assert_eq!(
+        continuations
+            .continuation_status(&owner, &ContinuationKey::new("late").expect("key"))
+            .await
+            .expect("status"),
+        ContinuationStatus::NotCommitted,
+        "nothing is committed for the new mob's member: {submitted:?}"
+    );
+    assert_eq!(
+        submitted.expect_err("the first mob's incarnation is not the one the host holds"),
+        ContinuationSubmitError::OwnerRetired
+    );
+}
+
 /// An address minted before 0.9.4 names no mob incarnation, and a mob
 /// created since is a later incarnation under its id: it never serves the
 /// rows owed to the members of an older mob.
