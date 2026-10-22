@@ -11820,8 +11820,12 @@ mod tests {
         move || {
             let mut conn = open_connection(&path).expect("second connection");
             let tx = begin_immediate_transaction(&mut conn).expect("write transaction");
-            apply_prepared_head_canonical_mutation_in_txn(&tx, &mutation)
+            let outcome = apply_prepared_head_canonical_mutation_in_txn(&tx, &mutation)
                 .expect("concurrent successor commit");
+            assert!(matches!(
+                outcome,
+                HeadCanonicalMutationApplyOutcome::Applied
+            ));
             tx.commit().expect("commit the successor");
         }
     }
