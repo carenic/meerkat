@@ -235,7 +235,9 @@ them.
   model request) before the bounded task failed, because autonomous inbox
   delivery has no tracked turn completion. Schedules now refuse such a helper
   target at create and update, and a schedule stored with one fails each
-  occurrence before any spawn.
+  occurrence before any spawn. A bounded fork child whose spec names no
+  runtime mode now runs turn-driven, as a bounded helper does, instead of
+  inheriting an autonomous profile default and failing the same way.
 
 ## [0.9.4] - 2026-10-20
 

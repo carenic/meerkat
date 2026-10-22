@@ -16435,7 +16435,9 @@ impl MobHandle {
     /// same message exactly once through the internal exact work carrier instead.
     /// The bounded-result request and the child's runtime mode are validated
     /// before any fork or member admission occurs: an `AutonomousHost` child
-    /// is refused with `MobError::UnsupportedForMode`.
+    /// is refused with `MobError::UnsupportedForMode`, and a child spec that
+    /// names no runtime mode runs turn-driven, whatever its profile's default,
+    /// as a bounded helper does.
     ///
     /// `source_admission` states where the request comes from. The agent-facing
     /// `fork_off` tool runs inside the source member's own turn and passes
@@ -16454,6 +16456,11 @@ impl MobHandle {
     ) -> Result<ForkMemberBoundedRunOutcome, BoundedMemberRunError> {
         let result_spec = BoundedResultSpec::new(result_label, max_text_bytes)?;
         Self::refuse_autonomous_bounded_run(member.runtime_mode)?;
+        member.runtime_mode = Some(
+            member
+                .runtime_mode
+                .unwrap_or(crate::MobRuntimeMode::TurnDriven),
+        );
         let task = member.initial_message.take().ok_or_else(|| {
             MobError::InvalidBoundedHelperResult {
                 reason: "fork_member_then_run_bounded requires member.initial_message so the exact turn has one caller-authored input"
@@ -16516,7 +16523,8 @@ impl MobHandle {
     /// stays seated, exactly like [`Self::fork_member_then_run_bounded`].
     ///
     /// A child spec with an `AutonomousHost` runtime mode is refused with
-    /// `MobError::UnsupportedForMode` before anything is forked.
+    /// `MobError::UnsupportedForMode` before anything is forked; one that
+    /// names no runtime mode runs turn-driven, whatever its profile's default.
     ///
     /// Validation, fork, seat and turn admission all happen before this
     /// returns, so every admission failure is reported synchronously and a
@@ -16542,6 +16550,11 @@ impl MobHandle {
         job: Option<ForkJobBinding>,
     ) -> Result<(ForkMemberResult, ForkChildRun), BoundedMemberRunError> {
         Self::refuse_autonomous_bounded_run(member.runtime_mode)?;
+        member.runtime_mode = Some(
+            member
+                .runtime_mode
+                .unwrap_or(crate::MobRuntimeMode::TurnDriven),
+        );
         let result_label: String = result_label.into();
         // A fork in its source's own turn is its source's: the re-link after
         // a restart relies on that owner (a job bound elsewhere would be
