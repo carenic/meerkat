@@ -4321,6 +4321,86 @@ pub(crate) mod tests {
         ));
     }
 
+    /// A completion on another redirect than the one the AuthMachine
+    /// admitted is the caller's mismatched attempt. Verify and consume
+    /// refuse it typed ([`OAuthFlowError::RedirectUriMismatch`]), not as a
+    /// lifecycle fault a host would retry, and the attempt stays admitted
+    /// for its own redirect.
+    #[test]
+    fn browser_redirect_mismatch_is_refused_typed_and_leaves_the_attempt() {
+        let lifecycle = Arc::new(RuntimeAuthLeaseHandle::new());
+        let authority =
+            RuntimeOAuthFlowHandle::new_with_auth_lease(Duration::from_secs(60), lifecycle.clone());
+        let target = target();
+        let provider = OAuthProviderIdentity::OpenAiChatGpt;
+        let redirect_uri = "http://127.0.0.1:41001/callback";
+        let other_redirect_uri = "http://127.0.0.1:41002/callback";
+        let state = authority
+            .start(
+                target.clone(),
+                provider,
+                redirect_uri.to_string(),
+                "verifier".to_string(),
+            )
+            .expect("browser flow admitted");
+
+        assert_eq!(
+            authority
+                .verify(&state, &target, provider, other_redirect_uri)
+                .err(),
+            Some(OAuthFlowError::RedirectUriMismatch)
+        );
+        assert_eq!(
+            authority
+                .consume(&state, &target, provider, other_redirect_uri)
+                .err(),
+            Some(OAuthFlowError::RedirectUriMismatch)
+        );
+        assert!(
+            lifecycle.has_oauth_browser_flow_for_test(&target, &state),
+            "a refused completion leaves the attempt admitted"
+        );
+        assert_eq!(
+            authority
+                .consume(&state, &target, provider, redirect_uri)
+                .expect("the attempt completes on its own redirect")
+                .pkce_verifier,
+            "verifier"
+        );
+    }
+
+    /// The AuthMachine checks the provider before the redirect, so a
+    /// completion for another provider keeps the machine's lifecycle
+    /// rejection even when its redirect differs too.
+    #[test]
+    fn browser_provider_mismatch_on_another_redirect_stays_a_lifecycle_rejection() {
+        let lifecycle = Arc::new(RuntimeAuthLeaseHandle::new());
+        let authority =
+            RuntimeOAuthFlowHandle::new_with_auth_lease(Duration::from_secs(60), lifecycle);
+        let target = target();
+        let state = authority
+            .start(
+                target.clone(),
+                OAuthProviderIdentity::OpenAiChatGpt,
+                "http://127.0.0.1:41001/callback".to_string(),
+                "verifier".to_string(),
+            )
+            .expect("browser flow admitted");
+
+        assert!(matches!(
+            authority.verify(
+                &state,
+                &target,
+                OAuthProviderIdentity::GoogleCodeAssist,
+                "http://127.0.0.1:41002/callback",
+            ),
+            Err(OAuthFlowError::LifecycleRejected {
+                operation: "verify_oauth_browser_flow",
+                ..
+            })
+        ));
+    }
+
     // --- 0.7.2 disciplined shell inputs (lane L3 auth-release) ---
     //
     // Shell-level interleaving pins for the release drain (D1) and the
