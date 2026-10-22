@@ -91,6 +91,16 @@ them.
   `wire::runtime::SessionAcceptInputParams`, `WireRunPrimitive`,
   `WireStagedRunInput`, `WireConversationAppend` and
   `WireConversationAppendRole`.
+- `meerkat-runtime`: the continuation admission index can release a
+  reservation (see Fixed, continuations on a retired address).
+  `ContinuationAdmissionTransition` gains the variant `Release`,
+  `ContinuationAdmissionOutcome` gains the variant `Released`, and
+  `ContinuationAdmissionTransition::next` answers
+  `Option<ContinuationAdmissionEntry>` (`Holds(entry)`, or `Released` for a
+  legal release) instead of `Option<ContinuationAdmission>`. A store that
+  implements `RuntimeStore::transition_continuation_admission` itself
+  removes the entry for `Released`, in the same transaction; a store that
+  forwards the transition is unchanged.
 
 ### Added
 
@@ -156,6 +166,13 @@ them.
     `idempotencyKey` on `sendExternalEvent` and `MemberSendOptions`. Both
     refuse a key against a server older than contract 0.9.5, which would drop
     it.
+- `meerkat`: `RuntimeDeliveryHost::observe_address` (defaulted: derived from
+  `resolve_address`), `ContinuationHostBindings::observe_address`,
+  `JobRuntimeDeliveryApplier::with_address_observer`, and the variants
+  `ContinuationAdmitError::AddressRetired`,
+  `JobOutboxProjectionError::AddressRetired` and
+  `BlockedDeliveryReason::AddressRetired`. `meerkat-runtime`:
+  `ContinuationAdmissionEntry`.
 
 ### Changed
 
@@ -172,6 +189,21 @@ them.
   key it cannot keep is refused, never dropped.
 
 ### Fixed
+
+- Continuations on a retired address. A continuation whose drain reserved it
+  before a crash, on an address that retired since, no longer reads
+  `pending` forever: the delivery owner settles the reservation from the
+  reserved session's input ledger, under that session's custody, so it reads
+  admitted when the input is there and stranded when it is not (another
+  input under the key keeps the reservation, reported in the owner's pass).
+  A `stranded` status is now final: a drain that resolved the address before
+  it retired observes the address again after its reservation and before
+  the admission, releases the reservation and admits nothing, and a status
+  read reads the admission index again after it observed the retirement, so
+  a resend under a new key is the only delivery. A host's
+  `RuntimeDeliveryHost::observe_address` must agree on Retired with the
+  continuation status read; both shipped hosts delegate to the bound
+  resolver.
 
 - A turn that compacts its history more often than
   `[compaction] history_retained_rewrites` keeps (five or more compactions at

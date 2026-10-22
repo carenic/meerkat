@@ -5558,13 +5558,60 @@ pub enum ContinuationAdmissionTransition {
         session_id: meerkat_core::types::SessionId,
         input_id: InputId,
     },
+    /// The reservation of `session_id` under `input_id` admitted nothing and
+    /// never will: its delivery address retired, and that session's input
+    /// ledger holds no admission under the key, read under the session's
+    /// custody or by the drain that made the reservation. Remove it, so the
+    /// delivery reads as never admitted. Only that exact reservation is
+    /// removed; an applied entry, another session's or another input's
+    /// reservation, and no entry are refused.
+    Release {
+        session_id: meerkat_core::types::SessionId,
+        input_id: InputId,
+    },
+}
+
+/// The admission index entry after a legal
+/// [`ContinuationAdmissionTransition`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContinuationAdmissionEntry {
+    /// The entry holds this state.
+    Holds(ContinuationAdmission),
+    /// The entry is removed: a released reservation.
+    Released,
 }
 
 impl ContinuationAdmissionTransition {
     /// The entry after this transition, or `None` when it is rejected from
     /// `current`. Re-applying the transition that produced `current` is a
-    /// no-op that answers `current`.
-    pub fn next(&self, current: Option<&ContinuationAdmission>) -> Option<ContinuationAdmission> {
+    /// no-op that answers `current`. A release is not repeatable: no entry
+    /// is no reservation.
+    pub fn next(
+        &self,
+        current: Option<&ContinuationAdmission>,
+    ) -> Option<ContinuationAdmissionEntry> {
+        if let Self::Release {
+            session_id,
+            input_id,
+        } = self
+        {
+            return match current {
+                Some(ContinuationAdmission::Reserved {
+                    session_id: reserved,
+                    input_id: reserved_input,
+                }) if reserved == session_id && reserved_input == input_id => {
+                    Some(ContinuationAdmissionEntry::Released)
+                }
+                _ => None,
+            };
+        }
+        self.next_held(current)
+            .map(ContinuationAdmissionEntry::Holds)
+    }
+
+    /// The entry a reserve, repoint or apply leaves, or `None` when it is
+    /// rejected from `current`.
+    fn next_held(&self, current: Option<&ContinuationAdmission>) -> Option<ContinuationAdmission> {
         match (self, current) {
             (
                 Self::Reserve {
@@ -5631,6 +5678,9 @@ impl ContinuationAdmissionTransition {
 pub enum ContinuationAdmissionOutcome {
     /// The entry now holds this state.
     Transitioned(ContinuationAdmission),
+    /// The reservation was removed
+    /// ([`ContinuationAdmissionTransition::Release`]).
+    Released,
     /// The transition is not legal from `current`; nothing was written.
     Rejected {
         current: Option<ContinuationAdmission>,
@@ -9255,10 +9305,11 @@ pub trait RuntimeStore: Send + Sync {
     }
 
     /// Change the admission index entry of one continuation delivery by
-    /// [`ContinuationAdmissionTransition::next`], reading and writing it in
-    /// one store transaction. A reservation is written before the input is
-    /// admitted, so recovery can find an admission that reached the session
-    /// but not the inbox acknowledgement.
+    /// [`ContinuationAdmissionTransition::next`], reading and writing (or
+    /// removing, for a release) it in one store transaction. A reservation
+    /// is written before the input is admitted, so recovery can find an
+    /// admission that reached the session but not the inbox
+    /// acknowledgement.
     async fn transition_continuation_admission(
         &self,
         address: &LogicalRuntimeId,

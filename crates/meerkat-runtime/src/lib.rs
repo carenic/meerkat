@@ -1145,8 +1145,8 @@ pub use service_ext::{SessionServiceRuntimeExt, persistent_runtime_pre_dequeue_h
 pub use store::{
     CommittedRecoveryBoundary, CommittedWholeBlobMetadata, CommittedWholeBlobProvisionalTail,
     CommittedWholeBlobSnapshot, CommittingWholeBlobSession, ContinuationAdmission,
-    ContinuationAdmissionOutcome, ContinuationAdmissionTransition, ContinuationKeyBinding,
-    DeliveryGenerationReader, FencedPreparedRuntimeSessionCommitOutcome,
+    ContinuationAdmissionEntry, ContinuationAdmissionOutcome, ContinuationAdmissionTransition,
+    ContinuationKeyBinding, DeliveryGenerationReader, FencedPreparedRuntimeSessionCommitOutcome,
     HeadCanonicalProvisionalTailAuthority, HeadCanonicalRuntimeAuthorityActivation,
     HeadCanonicalStoreAuthority, InMemoryRuntimeStore, InputIdempotencyIndexConstraint,
     InputStateRow, KEPT_DELIVERY_READER_IDLE, KeyedRuntimeDeliveryCasOutcome,

@@ -2773,6 +2773,16 @@ impl meerkat::RuntimeDeliveryHost for SessionRuntimeDeliveryHost {
         }
     }
 
+    async fn observe_address(
+        &self,
+        address: &meerkat_runtime::LogicalRuntimeId,
+    ) -> Result<meerkat::AddressObservation, String> {
+        match self.runtime.upgrade() {
+            Some(runtime) => runtime.continuation_bindings.observe_address(address).await,
+            None => Err("the session runtime is gone".into()),
+        }
+    }
+
     fn retained_job_source(&self) -> Option<Arc<dyn meerkat::RetainedJobSource>> {
         self.runtime.upgrade()?.continuation_bindings.job_source()
     }
