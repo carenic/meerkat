@@ -349,8 +349,14 @@ run_wrapper gcp-tls "${GCP[@]}" BUILDBUDDY_GRPC_URL=grpcs://127.0.0.1:1986 BUILD
 expect_ran "gcp-buildbuddy over its IAP tunnel" "--remote_cache=grpcs://127.0.0.1:1986" \
   "--remote_executor=grpcs://127.0.0.1:1986" "--bes_backend=grpcs://127.0.0.1:1986" \
   "--tls_certificate=${TEST_ROOT}/control-ca.pem" \
-  "--remote_exec_header=x-buildbuddy-platform.container-image=docker://${FAKE_CI_IMAGE}" \
+  "--remote_default_exec_properties=container-image=docker://${FAKE_CI_IMAGE}" \
   "--remote_exec_header=x-buildbuddy-platform.use-self-hosted-executors=true"
+
+if grep -qF -- "x-buildbuddy-platform.container-image" "${wrapper_work}/tmp/fake-bb.argv"; then
+  fail "gcp-buildbuddy still sends the container image as a header; the platform property is its one source"
+else
+  pass "gcp-buildbuddy sends the container image only as a platform property"
+fi
 
 # --- control plane and executor pool scenarios --------------------------------
 
@@ -1054,11 +1060,26 @@ else:
 
 platforms_build = open(os.path.join(REPO, "tools", "bazel", "platforms", "BUILD.bazel"), encoding="utf-8").read()
 gcp_block = re.search(r'platform\(\n    name = "linux_x86_64_gcp_ci",\n(.*?)\n\)\n', platforms_build, re.S)
-gcp_images = re.findall(r'"container-image":\s*"([^"]*)"', gcp_block.group(1)) if gcp_block else None
-if gcp_images != [""]:
-    fail(f"linux_x86_64_gcp_ci must unset container-image with an empty string, not name an image: {gcp_images}")
+gcp_body = gcp_block.group(1) if gcp_block else ""
+gcp_constraints = sorted(re.findall(r'"(@[^"]+)"', gcp_body.split("constraint_values = [", 1)[-1].split("]", 1)[0]))
+if (not gcp_block or "exec_properties" in gcp_body or "parents" in gcp_body
+        or gcp_constraints != ["@bazel_tools//tools/cpp:gcc", "@platforms//cpu:x86_64", "@platforms//os:linux"]):
+    fail(f"linux_x86_64_gcp_ci must set no exec_properties and no parent, with the parent's constraints: {gcp_body!r}")
 else:
-    ok("linux_x86_64_gcp_ci unsets the container-image it would inherit")
+    ok("linux_x86_64_gcp_ci sets no exec_properties and no parent, with the former parent's constraints")
+# Its properties are the .bazelrc defaults of its config (buildbuddy-linux-rbe, then
+# buildbuddy-linux-gcp-ci-rbe); the wrapper adds only the container image.
+gcp_defaults = {}
+with open(os.path.join(REPO, ".bazelrc"), encoding="utf-8") as handle:
+    for line in handle:
+        found = re.match(r"build:(buildbuddy-linux-rbe|buildbuddy-linux-gcp-ci-rbe) --remote_default_exec_properties=([^=\s]+)=(\S*)$", line.strip())
+        if found:
+            gcp_defaults[found.group(2)] = found.group(3)
+want_defaults = {"Arch": "amd64", "OSFamily": "linux", "Pool": "meerkat-ci", "dockerNetwork": "off", "network": "external"}
+if gcp_defaults != want_defaults:
+    fail(f"the gcp platform's .bazelrc defaults changed: {gcp_defaults} (want {want_defaults})")
+else:
+    ok("the gcp platform's .bazelrc defaults are its former properties, with no container image")
 registry_path = re.compile(r"[a-z0-9-]+-docker\.pkg\.dev/[a-z][a-z0-9-]{4,28}[a-z0-9]/")
 scanned = [os.path.join(REPO, ".bazelrc")]
 for directory, _, names in os.walk(os.path.join(REPO, "tools", "bazel")):
