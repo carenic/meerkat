@@ -348,7 +348,9 @@ impl ForkContextPlan {
                     keys,
                 )
                 .with_skills(skill_keys)
-                .with_unreadable_skill_loads(unreadable_skill_loads),
+                .with_unreadable_skill_loads(
+                    u32::try_from(unreadable_skill_loads.len()).unwrap_or(u32::MAX),
+                ),
             });
         }
 
@@ -1005,16 +1007,16 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_of_unreadable_load_skill_calls_names_the_calls() {
+    fn a_refusal_of_unreadable_load_skill_calls_counts_the_calls() {
         let (wire, message) = refusal_of(vec![
             load_skill_call("call-1", json!({"bogus": 1})),
             tool_result("call-1", "SKILL-BODY"),
         ]);
         assert_eq!(wire["keys"], json!([]), "{wire}");
         assert!(wire.get("skills").is_none(), "{wire}");
-        assert_eq!(wire["unreadable_skill_loads"], json!(["call-1"]), "{wire}");
+        assert_eq!(wire["unreadable_skill_loads"], json!(1), "{wire}");
         assert!(
-            message.contains("would inherit load_skill calls whose skill cannot be read [call-1] and the fork instruction policy refuses them"),
+            message.contains("would inherit 1 load_skill call whose skill cannot be read and the fork instruction policy refuses them"),
             "{message}"
         );
         assert!(

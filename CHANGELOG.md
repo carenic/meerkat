@@ -54,11 +54,11 @@ them.
   notice text, and so does this release for a block holding a fork kind
   or reason a later release adds.
 - Not measured by the gate (a wire change): `meerkat-core`:
-  `ForkInstructionRefusal` gains `skills: Vec<SkillKey>`, the skills a
+  `ForkInstructionRefusal` gains `skills: Box<[SkillKey]>`, the skills a
   prompt-context fork's source loaded with the built-in `load_skill` tool
-  (see the next entry), and `unreadable_skill_loads: Box<[String]>`, the
-  tool call ids of `load_skill` calls whose arguments name no skill. Each
-  is serialized only when not empty, and only a prompt-context fork
+  (see the next entry), and `unreadable_skill_loads: u32`, the number of
+  `load_skill` calls whose arguments name no skill. Each is serialized
+  only when not empty or zero, and only a prompt-context fork
   refusal sets them; its message names only what the child would
   inherit. A decoder built from 0.9.4 denies unknown fields on this type
   and rejects a refusal that names either.

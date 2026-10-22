@@ -21031,15 +21031,17 @@ mod tests {
             member: "source".to_string(),
         };
         let source_session = meerkat_core::types::SessionId::new();
-        let mut options = SessionBuildOptions::default();
-        options.fork_source = Some(meerkat_core::ForkBuildSource::new(
-            binding.clone(),
-            source_session.clone(),
-        ));
-        options.prompt_context_fork_source = Some(meerkat_core::PromptContextForkSource::new(
-            binding,
-            Some(source_session),
-        ));
+        let options = SessionBuildOptions {
+            fork_source: Some(meerkat_core::ForkBuildSource::new(
+                binding.clone(),
+                source_session.clone(),
+            )),
+            prompt_context_fork_source: Some(meerkat_core::PromptContextForkSource::new(
+                binding,
+                Some(source_session),
+            )),
+            ..SessionBuildOptions::default()
+        };
         let mut build = AgentBuildConfig::new("claude-sonnet-4-5");
         build.apply_session_build_options(&options);
         let round_tripped = build.to_session_build_options();

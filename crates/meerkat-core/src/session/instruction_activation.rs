@@ -342,23 +342,29 @@ pub struct ForkInstructionRefusal {
     pub cause: ForkInstructionRefusalCause,
     /// The inherited keys the refusal concerns, in (namespace, key) order.
     pub keys: Vec<(InstructionNamespace, InstructionKey)>,
+    // `SessionError` and `MobError` carry this refusal inline, so the two
+    // prompt-context fields below keep it at the size it had with one
+    // list beside `keys`: a boxed slice and a count.
     /// The skills a prompt-context fork would carry because its source
     /// loaded them with the built-in `load_skill` tool, in key order. Empty
     /// for every other refusal, and then not serialized.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub skills: Vec<crate::skills::SkillKey>,
-    /// The tool call ids of `load_skill` calls in a prompt-context fork's
-    /// source whose arguments name no skill. Their results count as
-    /// loaded skills, so the fork fails closed on them. Empty for every
-    /// other refusal, and then not serialized.
-    // A boxed slice, not a `Vec`: `SessionError` carries this refusal
-    // inline, and a third `Vec` here makes every `SessionError` larger.
+    #[serde(default, skip_serializing_if = "no_skills")]
+    pub skills: Box<[crate::skills::SkillKey]>,
+    /// How many `load_skill` calls in a prompt-context fork's source have
+    /// arguments that name no skill. Their results count as loaded
+    /// skills, so the fork fails closed on them. Zero for every other
+    /// refusal, and then not serialized.
     #[serde(default, skip_serializing_if = "no_unreadable_skill_loads")]
-    pub unreadable_skill_loads: Box<[String]>,
+    pub unreadable_skill_loads: u32,
 }
 
-fn no_unreadable_skill_loads(calls: &[String]) -> bool {
-    calls.is_empty()
+fn no_skills(skills: &[crate::skills::SkillKey]) -> bool {
+    skills.is_empty()
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn no_unreadable_skill_loads(count: &u32) -> bool {
+    *count == 0
 }
 
 impl ForkInstructionRefusal {
@@ -370,33 +376,35 @@ impl ForkInstructionRefusal {
         Self {
             cause,
             keys,
-            skills: Vec::new(),
-            unreadable_skill_loads: Box::default(),
+            skills: Box::default(),
+            unreadable_skill_loads: 0,
         }
     }
 
     /// The same refusal, naming the `load_skill` skills it concerns.
     #[must_use]
     pub fn with_skills(mut self, skills: Vec<crate::skills::SkillKey>) -> Self {
-        self.skills = skills;
+        self.skills = skills.into_boxed_slice();
         self
     }
 
-    /// The same refusal, naming the `load_skill` calls whose arguments
-    /// name no skill, by tool call id.
+    /// The same refusal, counting the `load_skill` calls whose arguments
+    /// name no skill.
     #[must_use]
-    pub fn with_unreadable_skill_loads(mut self, calls: Vec<String>) -> Self {
-        self.unreadable_skill_loads = calls.into_boxed_slice();
+    pub fn with_unreadable_skill_loads(mut self, count: u32) -> Self {
+        self.unreadable_skill_loads = count;
         self
     }
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn fork_instruction_refusal_message(
     cause: &ForkInstructionRefusalCause,
     keys: &[(InstructionNamespace, InstructionKey)],
     skills: &[crate::skills::SkillKey],
-    unreadable_skill_loads: &[String],
+    unreadable_skill_loads: &u32,
 ) -> String {
+    let unreadable_skill_loads = *unreadable_skill_loads;
     let keys = keys
         .iter()
         .map(|(namespace, key)| format!("{namespace}/{key}"))
@@ -407,7 +415,7 @@ fn fork_instruction_refusal_message(
             // Only what the child would inherit is named: a prompt-context
             // fork can be refused for loaded skills alone.
             let mut inherited = Vec::new();
-            if !keys.is_empty() || (skills.is_empty() && unreadable_skill_loads.is_empty()) {
+            if !keys.is_empty() || (skills.is_empty() && unreadable_skill_loads == 0) {
                 inherited.push(format!("activated instruction keys [{keys}]"));
             }
             if !skills.is_empty() {
@@ -420,11 +428,12 @@ fn fork_instruction_refusal_message(
                         .join(", ")
                 ));
             }
-            if !unreadable_skill_loads.is_empty() {
-                inherited.push(format!(
-                    "load_skill calls whose skill cannot be read [{}]",
-                    unreadable_skill_loads.join(", ")
-                ));
+            match unreadable_skill_loads {
+                0 => {}
+                1 => inherited.push("1 load_skill call whose skill cannot be read".to_string()),
+                count => inherited.push(format!(
+                    "{count} load_skill calls whose skill cannot be read"
+                )),
             }
             format!(
                 "fork refused: the child would inherit {} and the fork instruction policy \

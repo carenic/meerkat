@@ -3520,7 +3520,7 @@ export interface ForkInstructionRefusal {
   cause: ForkInstructionRefusalCause;
   keys: unknown[][];
   skills?: SkillKey[];
-  unreadable_skill_loads?: string[];
+  unreadable_skill_loads?: number;
 }
 
 export type ToolConfigChangeDomain = "tool_scope" | "deferred_catalog";
