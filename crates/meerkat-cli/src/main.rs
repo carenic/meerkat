@@ -13074,6 +13074,17 @@ impl meerkat_mob::MobSessionService for RunMobSessionService {
         .await
     }
 
+    async fn settle_durable_tail_before_cold_start(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), meerkat_core::service::SessionError> {
+        <EphemeralSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::settle_durable_tail_before_cold_start(
+            &self.inner,
+            session_id,
+        )
+        .await
+    }
+
     async fn create_session_under_runtime_turn_boundary(
         &self,
         req: meerkat_core::service::CreateSessionRequest,
@@ -16854,6 +16865,17 @@ impl meerkat_mob::MobSessionService for MobCliSessionService {
         session_id: &SessionId,
     ) -> Result<meerkat_mob::SessionResumeVerdict, meerkat_core::service::SessionError> {
         <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::materialize_session_resume_verdict(
+            &self.inner,
+            session_id,
+        )
+        .await
+    }
+
+    async fn settle_durable_tail_before_cold_start(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), meerkat_core::service::SessionError> {
+        <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::settle_durable_tail_before_cold_start(
             &self.inner,
             session_id,
         )
