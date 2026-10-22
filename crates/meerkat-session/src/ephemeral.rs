@@ -5259,7 +5259,7 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
             })?
             .map_err(SessionError::Agent)?;
 
-        let state = lock_deferred_turn_state(&deferred_turn_state).clone();
+        let state = live_deferred_turn_state_for_durable_write(&deferred_turn_state);
         session.set_deferred_turn_state(state).map_err(|err| {
             SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
                 "failed to serialize deferred-turn state: {err}"
@@ -5413,7 +5413,7 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
         if !still_current {
             return Ok(None);
         }
-        let state = lock_deferred_turn_state(&deferred_turn_state).clone();
+        let state = live_deferred_turn_state_for_durable_write(&deferred_turn_state);
         session.set_deferred_turn_state(state).map_err(|error| {
             SessionError::Agent(AgentError::InternalError(format!(
                 "failed to serialize generation-bound deferred-turn state: {error}"
@@ -9832,6 +9832,18 @@ fn lock_deferred_turn_state(
             poisoned.into_inner()
         }
     }
+}
+
+/// The live deferred-turn state a durable write of the session carries.
+///
+/// The live handle owns the deferred first turn: its phase, staged prompt and
+/// staged tool results. Every durable write of a live session (an export, a
+/// run checkpoint) stamps this value, never a copy the session's agent was
+/// built from, so the store records the first turn's start.
+pub(crate) fn live_deferred_turn_state_for_durable_write(
+    state: &Arc<std::sync::Mutex<SessionDeferredTurnState>>,
+) -> SessionDeferredTurnState {
+    lock_deferred_turn_state(state).clone()
 }
 
 fn lock_active_capacity_lease(

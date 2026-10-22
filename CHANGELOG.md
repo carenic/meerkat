@@ -234,6 +234,14 @@ them.
   transcript revision conflict (`SessionError::Store`) instead of an
   internal "resume bridge session check failed" error. The spawn does not
   settle the tail; it stays as it was.
+- `meerkat-session`: a session resumed while its first turn was still pending
+  now records that first turn's start durably. A run checkpoint persisted the
+  deferred-turn state the resumed agent was built from, so after the first
+  turn ran the store still said it was pending: every later resume marked the
+  first turn pending again and reopened its build-override window. A
+  checkpoint now persists the session's live deferred-turn state, the value an
+  export already wrote. A session that carries no deferred-turn state is
+  persisted as before.
 
 ## [0.9.4] - 2026-10-20
 
