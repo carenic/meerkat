@@ -2126,6 +2126,337 @@ async fn a_turn_driven_fork_helper_sees_its_planned_context() {
     fixture.finish().await;
 }
 
+// Slice B: a fork child holds what it was given as typed rows of its own
+// transcript, delivered once by Core before its first input: the planned
+// context as an injected-context row (prompt-context forks) and a typed
+// fork notice naming its source and what it lost or gained.
+
+impl Fixture {
+    /// The child's durable transcript once its first turn committed: a user
+    /// row containing `needle` and an answer after it. A read that races the
+    /// child's own commit is retried.
+    async fn transcript_after_first_turn(
+        &self,
+        child: &AgentIdentity,
+        needle: &str,
+    ) -> (SessionId, Vec<Message>) {
+        tokio::time::timeout(WAIT, async {
+            loop {
+                if let Some(id) = self.member_session(child).await
+                    && let Ok(Some(session)) = self.service.load_durable_session_body(&id).await
+                {
+                    let rows = session.messages().to_vec();
+                    let task = rows.iter().position(
+                        |row| matches!(row, Message::User(user) if user.text_content().contains(needle)),
+                    );
+                    if let Some(task) = task
+                        && rows[task..]
+                            .iter()
+                            .any(|row| matches!(row, Message::BlockAssistant(_)))
+                    {
+                        return (id, rows);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the child's first turn commits")
+    }
+}
+
+/// The typed fork notice blocks in `rows`, as wire JSON, with their row index.
+fn fork_notices(rows: &[Message]) -> Vec<(usize, serde_json::Value)> {
+    rows.iter()
+        .enumerate()
+        .filter_map(|(index, row)| {
+            let Message::SystemNotice(notice) = row else {
+                return None;
+            };
+            notice
+                .blocks
+                .iter()
+                .map(|block| serde_json::to_value(block).expect("notice block wire json"))
+                .find(|block| block["type"] == "fork_boundary")
+                .map(|block| (index, block))
+        })
+        .collect()
+}
+
+/// The index of the first user row containing `needle`.
+fn user_row(rows: &[Message], needle: &str) -> Option<usize> {
+    rows.iter()
+        .position(|row| matches!(row, Message::User(user) if user.text_content().contains(needle)))
+}
+
+async fn spawn_context_child_with_task(
+    fixture: &Fixture,
+    child: &str,
+    source: &AgentIdentity,
+    task: &str,
+) {
+    fixture
+        .handle
+        .spawn_spec(
+            context_fork_spec(child, source, crate::launch::ForkContext::FullHistory)
+                .with_initial_message(task)
+                .with_runtime_mode(crate::MobRuntimeMode::TurnDriven),
+        )
+        .await
+        .expect("the context fork spawns");
+}
+
+/// The planned context is the child's own typed injected-context row, before
+/// its first input, and the first input is a row of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_context_fork_child_holds_its_context_as_an_injected_row_before_its_first_input() {
+    let fixture = Fixture::restored_member().await;
+    fixture.activated_source_with_a_turn().await;
+    let child = AgentIdentity::from("context-child");
+    spawn_context_child_with_task(
+        &fixture,
+        "context-child",
+        &fixture.identity,
+        "the forked task",
+    )
+    .await;
+
+    let (_, rows) = fixture
+        .transcript_after_first_turn(&child, "the forked task")
+        .await;
+    let injected = rows.iter().position(|row| {
+        matches!(
+            row,
+            Message::User(user)
+                if user.transcript_role == meerkat_core::types::TranscriptUserRole::InjectedContext
+                    && user.text_content().contains(FORK_HEADER)
+        )
+    });
+    let task = user_row(&rows, "the forked task");
+    let (Some(injected), Some(task)) = (injected, task) else {
+        panic!("the context is a typed injected row and the task a row of its own: {rows:#?}");
+    };
+    assert!(
+        injected < task,
+        "the context precedes the first input: {rows:#?}"
+    );
+    let Message::User(task_row) = &rows[task] else {
+        unreachable!("user_row found a user row");
+    };
+    assert!(
+        !task_row.text_content().contains(FORK_HEADER),
+        "the first input carries no context: {rows:#?}"
+    );
+    fixture.finish().await;
+}
+
+/// The child holds exactly one typed fork notice, after its context and
+/// before its first input, naming its source, itself and the key it did not
+/// get; the model reads it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_context_fork_child_holds_one_typed_fork_notice_naming_its_source() {
+    let fixture = Fixture::restored_member().await;
+    fixture.activated_source_with_a_turn().await;
+    let child = AgentIdentity::from("context-child");
+    spawn_context_child_with_task(
+        &fixture,
+        "context-child",
+        &fixture.identity,
+        "the forked task",
+    )
+    .await;
+
+    let (child_session, rows) = fixture
+        .transcript_after_first_turn(&child, "the forked task")
+        .await;
+    let notices = fork_notices(&rows);
+    assert_eq!(notices.len(), 1, "exactly one fork notice row: {rows:#?}");
+    let (at, block) = &notices[0];
+    assert_eq!(block["fork"], "prompt_context", "{block}");
+    assert_eq!(
+        block["child_session_id"],
+        child_session.to_string(),
+        "{block}"
+    );
+    assert_eq!(
+        block["source"]["member"]["member"], "restored-member",
+        "{block}"
+    );
+    assert_eq!(
+        block["instructions_removed"][0]["namespace"], "host.standing",
+        "{block}"
+    );
+    assert_eq!(block["instructions_removed"][0]["key"], "member", "{block}");
+    let task = user_row(&rows, "the forked task").expect("the task row");
+    assert!(*at < task, "the notice precedes the first input: {rows:#?}");
+
+    let request = fixture
+        .client
+        .requests()
+        .into_iter()
+        .find(|request| format!("{:?}", request.messages).contains("the forked task"))
+        .expect("the child's first request");
+    assert!(
+        fork_notices(&request.messages).len() == 1,
+        "the model reads the notice row: {:?}",
+        request.messages
+    );
+    fixture.finish().await;
+}
+
+/// A durable member fork's child holds one typed fork notice of kind
+/// transcript at its first turn: after the copied prefix, before its input.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_durable_fork_child_holds_a_fork_notice_from_its_first_turn() {
+    let fixture = Fixture::restored_member().await;
+    fixture.run_turn("source turn before the fork").await;
+    let child = AgentIdentity::from("fork-child");
+    tokio::time::timeout(
+        WAIT,
+        fixture.handle.fork_member(
+            &fixture.identity,
+            SpawnMemberSpec::new(ProfileName::from("lead"), child.clone()),
+            None,
+        ),
+    )
+    .await
+    .expect("the fork answers")
+    .expect("the fork commits and seats the child");
+    let turn = fixture.start_turn_for(&child, "the child's task").await;
+    tokio::time::timeout(WAIT, turn.wait())
+        .await
+        .expect("the child's turn finishes")
+        .expect("the child's turn runs");
+
+    let (child_session, rows) = fixture
+        .transcript_after_first_turn(&child, "the child's task")
+        .await;
+    let notices = fork_notices(&rows);
+    assert_eq!(notices.len(), 1, "exactly one fork notice row: {rows:#?}");
+    let (at, block) = &notices[0];
+    assert_eq!(block["fork"], "transcript", "{block}");
+    assert_eq!(
+        block["child_session_id"],
+        child_session.to_string(),
+        "{block}"
+    );
+    assert_eq!(
+        block["source"]["member"]["member"], "restored-member",
+        "{block}"
+    );
+    let copied = user_row(&rows, "source turn before the fork").expect("the copied prefix");
+    let task = user_row(&rows, "the child's task").expect("the task row");
+    assert!(
+        copied < *at && *at < task,
+        "the notice follows the copied prefix and precedes the first input: {rows:#?}"
+    );
+    fixture.finish().await;
+}
+
+/// The fork notice names, by name only, a tool the source could call and the
+/// child cannot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fork_notice_names_a_tool_the_child_cannot_call() {
+    let fixture = Fixture::restored_member().await;
+    fixture.run_turn("source turn before the fork").await;
+    let denied = fixture
+        .client
+        .requests()
+        .last()
+        .and_then(|request| request.tools.iter().map(|tool| tool.name.to_string()).min())
+        .expect("the source can call a tool");
+    let before = fixture.client.requests().len();
+    tokio::time::timeout(
+        WAIT,
+        fixture.handle.fork_helper(
+            &fixture.identity,
+            AgentIdentity::from("narrow-helper"),
+            "helper task text",
+            crate::launch::ForkContext::FullHistory,
+            HelperOptions {
+                role_name: Some(ProfileName::from("lead")),
+                runtime_mode: Some(crate::MobRuntimeMode::TurnDriven),
+                tool_access_policy: Some(meerkat_core::ops::ToolAccessPolicy::DenyList(
+                    [denied.as_str()].into_iter().collect(),
+                )),
+                ..HelperOptions::default()
+            },
+            "narrow-helper-result",
+            256,
+        ),
+    )
+    .await
+    .expect("fork_helper answers")
+    .expect("fork_helper succeeds");
+
+    let request = fixture
+        .client
+        .requests()
+        .get(before)
+        .cloned()
+        .expect("the helper's first request");
+    assert!(
+        request
+            .tools
+            .iter()
+            .all(|tool| tool.name.to_string() != denied),
+        "the helper cannot call {denied}"
+    );
+    let notices = fork_notices(&request.messages);
+    assert_eq!(notices.len(), 1, "one fork notice: {:?}", request.messages);
+    let removed = notices[0].1["tools"]["removed"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        removed.iter().any(|name| name == denied.as_str()),
+        "the notice names {denied} as removed: {}",
+        notices[0].1
+    );
+    fixture.finish().await;
+}
+
+/// A fork of a fork reads one current notice, naming its own source: the
+/// grandparent's context and notice in its source's transcript are not
+/// carried as text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fork_of_a_fork_reads_one_current_notice() {
+    let fixture = Fixture::restored_member().await;
+    fixture.activated_source_with_a_turn().await;
+    let child = AgentIdentity::from("context-child");
+    spawn_context_child_with_task(
+        &fixture,
+        "context-child",
+        &fixture.identity,
+        "the forked task",
+    )
+    .await;
+    fixture
+        .transcript_after_first_turn(&child, "the forked task")
+        .await;
+
+    let before = fixture.client.requests().len();
+    spawn_context_child_with_task(
+        &fixture,
+        "context-grandchild",
+        &child,
+        "the grandchild task",
+    )
+    .await;
+    let request = fixture.first_request_after(before).await;
+    let text = format!("{:?}", request.messages);
+    assert_eq!(
+        text.matches("You are a fork of member").count(),
+        1,
+        "one notice reaches the grandchild: {text}"
+    );
+    assert!(
+        text.contains("You are a fork of member 'context-child'"),
+        "the notice names the grandchild's own source: {text}"
+    );
+    fixture.finish().await;
+}
+
 /// Forwards every session-service method to the real persistent service
 /// except `activate_instruction_under_runtime_turn_boundary`, which keeps the
 /// trait default. Generated mechanically from the trait signatures.
