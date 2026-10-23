@@ -799,19 +799,33 @@ pub enum DroppedRunSuspension {
     /// The run's save without the cursor (its end-of-run save, or the closing
     /// write of its exit) had landed: its latest checkpoint holds the run's
     /// committed work and no cursor. Nothing of the run is left to resume,
-    /// and its inputs must not run again.
+    /// and its inputs must not run again. It is not suspended: nothing of the
+    /// run was cleared, and the caller ends it with
+    /// [`Agent::cancel_dropped_run`], which publishes the run's terminal
+    /// where it is still owed.
     PastFinalSave {
-        /// The suspended run.
+        /// The run past its final save.
+        run_id: crate::lifecycle::RunId,
+    },
+    /// The run takes no round commits (its agent has no session
+    /// checkpointer, or it is a live bridge run, which commits nothing), so
+    /// nothing durable names its progress and it cannot be suspended: a stop
+    /// cancels it, as before. Nothing of the run was cleared; the caller ends
+    /// it with [`Agent::cancel_dropped_run`].
+    NotResumable {
+        /// The run that cannot be suspended.
         run_id: crate::lifecycle::RunId,
     },
 }
 
 impl DroppedRunSuspension {
-    /// The suspended run.
+    /// The run this outcome names.
     #[must_use]
     pub fn run_id(&self) -> &crate::lifecycle::RunId {
         match self {
-            Self::Resumable { run_id } | Self::PastFinalSave { run_id } => run_id,
+            Self::Resumable { run_id }
+            | Self::PastFinalSave { run_id }
+            | Self::NotResumable { run_id } => run_id,
         }
     }
 }

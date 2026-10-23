@@ -2486,6 +2486,7 @@ impl MeerkatMachine {
             registration_use: std::sync::atomic::AtomicU64::new(self.next_registration_use()),
             agent_binding: super::agent_mandate::SessionAgentBinding::default(),
             tool_surface_gate: meerkat_core::ToolSurfaceGateSlot::default(),
+            resumed_run_admission: Default::default(),
             mcp_observation: meerkat_core::McpObservationSlot::default(),
             runtime_id: runtime_id.clone(),
             _hosting_claim: self.grant_registration_hosting(session_id)?,
@@ -2662,6 +2663,7 @@ impl MeerkatMachine {
             registration_use: std::sync::atomic::AtomicU64::new(self.next_registration_use()),
             agent_binding: super::agent_mandate::SessionAgentBinding::default(),
             tool_surface_gate: meerkat_core::ToolSurfaceGateSlot::default(),
+            resumed_run_admission: Default::default(),
             mcp_observation: meerkat_core::McpObservationSlot::default(),
             runtime_id: runtime_id.clone(),
             _hosting_claim: self.grant_registration_hosting(&session_id)?,
@@ -2972,6 +2974,16 @@ impl MeerkatMachine {
             %runtime_id,
             "MeerkatMachine::register_session_inner recovering driver"
         );
+        // A run the durable session left open keeps its inputs bound: the
+        // persistent recovery marks it resumable on this registration's live
+        // authority before it normalizes them.
+        let resumable_run = match &entry {
+            super::driver::DriverEntry::Persistent(_) => {
+                self.observe_resumable_run_for_registration(session_id)
+                    .await?
+            }
+            super::driver::DriverEntry::Ephemeral(_) => None,
+        };
         let recover_result = match &mut entry {
             super::driver::DriverEntry::Ephemeral(driver) => {
                 crate::traits::RuntimeDriver::recover(driver).await
@@ -2983,14 +2995,14 @@ impl MeerkatMachine {
                         .recover_inputs_after_runtime_authority_with_fence(
                             recovered_unregister_progress.as_ref(),
                             write_fence,
-                            None,
+                            resumable_run.as_ref(),
                         )
                         .await
                 } else {
                     driver
                         .recover_inputs_after_runtime_authority(
                             recovered_unregister_progress.as_ref(),
-                            None,
+                            resumable_run.as_ref(),
                         )
                         .await
                 }
@@ -3031,6 +3043,7 @@ impl MeerkatMachine {
             registration_use: std::sync::atomic::AtomicU64::new(self.next_registration_use()),
             agent_binding: super::agent_mandate::SessionAgentBinding::default(),
             tool_surface_gate: meerkat_core::ToolSurfaceGateSlot::default(),
+            resumed_run_admission: Default::default(),
             mcp_observation: meerkat_core::McpObservationSlot::default(),
             runtime_id: runtime_id.clone(),
             _hosting_claim: hosting_claim,
@@ -4973,6 +4986,15 @@ impl MeerkatMachine {
                     durability_health.clone(),
                 )?;
                 recovered_entry.set_consent_hosting(hosting_claim.clone());
+                // As in the prepared registration: a run the durable session
+                // left open keeps its inputs bound.
+                let resumable_run = match &recovered_entry {
+                    super::driver::DriverEntry::Persistent(_) => {
+                        self.observe_resumable_run_for_registration(&session_id)
+                            .await?
+                    }
+                    super::driver::DriverEntry::Ephemeral(_) => None,
+                };
                 let recover_result = match &mut recovered_entry {
                     super::driver::DriverEntry::Ephemeral(driver) => {
                         crate::traits::RuntimeDriver::recover(driver).await
@@ -4981,7 +5003,7 @@ impl MeerkatMachine {
                         driver
                             .recover_inputs_after_runtime_authority(
                                 recovery.unregister_progress.as_ref(),
-                                None,
+                                resumable_run.as_ref(),
                             )
                             .await
                     }
@@ -5035,6 +5057,7 @@ impl MeerkatMachine {
                         ),
                         agent_binding: super::agent_mandate::SessionAgentBinding::default(),
                         tool_surface_gate: meerkat_core::ToolSurfaceGateSlot::default(),
+                        resumed_run_admission: Default::default(),
                         mcp_observation: meerkat_core::McpObservationSlot::default(),
                         runtime_id,
                         _hosting_claim: hosting_claim,
@@ -5324,8 +5347,11 @@ impl MeerkatMachine {
                         "runtime driver registration was repaired by generated executor authority; publishing attachment"
                     );
                 }
+                // A run marked resumable wakes the loop at commit too, so it
+                // resumes without waiting for new input.
                 (
-                    !driver_guard.as_driver().active_input_ids().is_empty(),
+                    !driver_guard.as_driver().active_input_ids().is_empty()
+                        || driver_guard.resumable_run_id().is_some(),
                     driver_guard.runtime_loop_commit_deadline(),
                 )
             };
@@ -5632,13 +5658,11 @@ impl MeerkatMachine {
         // it had no wake sender. Re-read the queue now that the gate is held
         // through commit, or that input stays queued until something else
         // wakes the loop (#1482).
-        let should_wake = should_wake
-            || !driver
-                .lock()
-                .await
-                .as_driver()
-                .active_input_ids()
-                .is_empty();
+        let should_wake = should_wake || {
+            let driver_guard = driver.lock().await;
+            !driver_guard.as_driver().active_input_ids().is_empty()
+                || driver_guard.resumable_run_id().is_some()
+        };
         let exact_pending_is_current = {
             let sessions = self.sessions.read().await;
             sessions.get(&session_id).is_some_and(|entry| {
@@ -11005,16 +11029,70 @@ ControlFlow::Break(()) => return Ok(()),
             // Active-or-Draining authority needed to commit and terminalize.
             // Thus BeginUnregisterSession either follows a published run ID or
             // makes every later queue-admission attempt fail closed.
+            //
+            // A graceful unregister that requeues suspends a durable session's
+            // in-flight run instead: the turn is dropped at its next await as
+            // a hard cancel drops it, but with no terminal and no closing
+            // write, and the runtime loop marks the run resumable before the
+            // stop classifies any input. The run's inputs then stay bound to
+            // it, and the next start resumes it from its last committed
+            // round. The saga asks only when the machine would admit the
+            // suspension now; a run it would not, a surface that cannot
+            // suspend, or a run that is no longer current, falls back to the
+            // hard cancel.
             if let (Some(interrupt_handle), Some(expected_run_id)) =
                 (loop_interrupt_handle, loop_interrupt_run_id)
             {
+                let suspend_eligible = {
+                    let driver = crate::stack_relief::box_in_own_frame(|| driver_handle.lock())
+                        .await;
+                    driver.suspension_admissible(&expected_run_id)
+                };
+                let suspended = suspend_eligible
+                    && match crate::stack_relief::box_in_own_frame(|| {
+                        crate::tokio::time::timeout(
+                            UNREGISTER_INTERRUPT_DELIVERY_GRACE,
+                            interrupt_handle.suspend_run_if_current(
+                                &expected_run_id,
+                                "runtime session unregistered for a requeue".to_string(),
+                            ),
+                        )
+                    })
+                    .await
+                    {
+                        Ok(Ok(suspended)) => suspended,
+                        Ok(Err(error)) => {
+                            tracing::debug!(
+                                %session_id,
+                                %error,
+                                "in-flight run suspension during a requeue unregister returned an error; cancelling it instead"
+                            );
+                            false
+                        }
+                        Err(_elapsed) => {
+                            // The suspension may still land; a hard cancel now
+                            // would race it. The saga waits for the loop.
+                            tracing::warn!(
+                                %session_id,
+                                "in-flight run suspension delivery exceeded its grace window; exact executor remains owned by the runtime loop"
+                            );
+                            true
+                        }
+                    };
                 match crate::stack_relief::box_in_own_frame(|| {
                     crate::tokio::time::timeout(
                         UNREGISTER_INTERRUPT_DELIVERY_GRACE,
-                        interrupt_handle.hard_cancel_run_if_current(
-                            &expected_run_id,
-                            "runtime session unregistered".to_string(),
-                        ),
+                        async {
+                            if suspended {
+                                return Ok(true);
+                            }
+                            interrupt_handle
+                                .hard_cancel_run_if_current(
+                                    &expected_run_id,
+                                    "runtime session unregistered".to_string(),
+                                )
+                                .await
+                        },
                     )
                 })
                 .await

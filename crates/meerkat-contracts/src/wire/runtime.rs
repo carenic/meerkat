@@ -1560,6 +1560,9 @@ pub struct WireRuntimeTurnMetadata {
 pub enum WireRuntimeExecutionKind {
     ContentTurn,
     ResumePending,
+    /// The continuation of a run a durable session left open. A dispatch
+    /// kind only: no input is admitted with it.
+    ResumeRun,
 }
 
 /// Typed wire projection of
@@ -1579,6 +1582,7 @@ impl From<meerkat_core::lifecycle::run_primitive::RuntimeExecutionKind>
         match value {
             Core::ContentTurn => Self::ContentTurn,
             Core::ResumePending => Self::ResumePending,
+            Core::ResumeRun => Self::ResumeRun,
         }
     }
 }
@@ -1590,6 +1594,7 @@ impl From<WireRuntimeExecutionKind>
         match value {
             WireRuntimeExecutionKind::ContentTurn => Self::ContentTurn,
             WireRuntimeExecutionKind::ResumePending => Self::ResumePending,
+            WireRuntimeExecutionKind::ResumeRun => Self::ResumeRun,
         }
     }
 }

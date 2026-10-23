@@ -1696,6 +1696,25 @@ pub trait CoreExecutorInterruptHandle: Send + Sync {
         expected_run_id: &RunId,
         reason: String,
     ) -> Result<bool, CoreExecutorError>;
+
+    /// Suspend one exact active run for a graceful requeue stop: the turn is
+    /// dropped at its next await point, as a hard cancel drops it, but the run
+    /// ends with no terminal and no closing write, so its last committed round
+    /// stays the point the next start resumes from. The executor's `apply`
+    /// then answers with a suspended outcome for the run.
+    ///
+    /// `Ok(false)` means the run is not current, or this surface cannot
+    /// suspend; the stop then hard-cancels the run. The default suspends
+    /// nothing. The same exact-run comparison as
+    /// [`Self::hard_cancel_run_if_current`] applies.
+    async fn suspend_run_if_current(
+        &self,
+        expected_run_id: &RunId,
+        reason: String,
+    ) -> Result<bool, CoreExecutorError> {
+        let _ = (expected_run_id, reason);
+        Ok(false)
+    }
 }
 
 /// Cloneable capability for exact durable interaction-terminal publication.

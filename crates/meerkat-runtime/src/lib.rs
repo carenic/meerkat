@@ -102,6 +102,7 @@ pub mod protocol_supervisor_trust_publish;
 #[path = "generated/protocol_supervisor_trust_revoke.rs"]
 pub mod protocol_supervisor_trust_revoke;
 pub mod recovery;
+pub mod resumed_run_admission;
 pub mod retained_work;
 pub(crate) mod run_progress;
 pub mod run_stop;
@@ -673,6 +674,11 @@ pub use meerkat_machine_types::{
 pub use ops_lifecycle::{
     OpsLifecycleConfig, OpsLifecyclePersistenceRequest, PersistedOpsSnapshot,
     RuntimeOpsLifecycleRegistry,
+};
+pub use resumed_run_admission::{
+    RESUMED_RUN_ADMISSION_ATTEMPT_TIMEOUT, RESUMED_RUN_ADMISSION_ATTEMPTS,
+    RESUMED_RUN_ADMISSION_RETRY_DELAY, ResumedRunAdmission, ResumedRunAdmissionDecision,
+    ResumedRunAdmissionRequest,
 };
 pub use run_stop::{RunStopContributor, RunStopReceipt};
 #[cfg(not(target_arch = "wasm32"))]

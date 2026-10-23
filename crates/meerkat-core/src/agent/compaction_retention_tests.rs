@@ -208,6 +208,8 @@ struct HeadCanonicalCheckpointer {
     rebases: bool,
     /// Which checkpoints were re-bases, in order.
     rebased: Mutex<Vec<bool>>,
+    /// The re-based flag of the run cursor each checkpoint carried.
+    cursor_rebased: Mutex<Vec<Option<bool>>>,
 }
 
 impl HeadCanonicalCheckpointer {
@@ -226,6 +228,13 @@ impl HeadCanonicalCheckpointer {
 enum CursorPoint {
     ToolsPending,
     AwaitingModel,
+}
+
+fn cursor_rebased(session: &Session) -> Option<bool> {
+    session
+        .try_run_cursor()
+        .expect("the cursor decodes")
+        .map(|cursor| cursor.rebased)
 }
 
 fn cursor_point(session: &Session) -> Option<(u64, CursorPoint)> {
@@ -306,6 +315,10 @@ impl SessionCheckpointer for HeadCanonicalCheckpointer {
             .unwrap()
             .push(checkpoint_tail(session, run_id));
         self.cursors.lock().unwrap().push(cursor_point(session));
+        self.cursor_rebased
+            .lock()
+            .unwrap()
+            .push(cursor_rebased(session));
         self.rebased.lock().unwrap().push(false);
         if self.whole_blob {
             return Ok(Some(next_receipt(session, run_id, previous)));
@@ -348,6 +361,10 @@ impl SessionCheckpointer for HeadCanonicalCheckpointer {
             .unwrap()
             .push(checkpoint_tail(session, run_id));
         self.cursors.lock().unwrap().push(cursor_point(session));
+        self.cursor_rebased
+            .lock()
+            .unwrap()
+            .push(cursor_rebased(session));
         self.rebased.lock().unwrap().push(true);
         Ok(next_receipt(session, run_id, None))
     }
@@ -528,7 +545,9 @@ async fn a_long_run_without_a_durable_head_stops_round_commits_at_its_first_rewr
 /// a re-base (here every round's first commit, since the run compacts at
 /// every boundary after the first), and the second commit chains on it. The
 /// end-of-run save after the final boundary's compaction is a re-base too,
-/// without a cursor, so no tail recovery would refuse is ever written.
+/// without a cursor, so no tail recovery would refuse is ever written. From
+/// the run's first re-base on, every cursor says the run re-based, so a
+/// restart does not forget that its inputs are in the committed history.
 #[tokio::test]
 async fn a_long_run_without_a_durable_head_rebases_after_each_rewrite() {
     let checkpointer = Arc::new(HeadCanonicalCheckpointer::whole_blob(true));
@@ -536,18 +555,24 @@ async fn a_long_run_without_a_durable_head_rebases_after_each_rewrite() {
 
     let cursors = checkpointer.cursors.lock().unwrap().clone();
     let rebased = checkpointer.rebased.lock().unwrap().clone();
+    let cursor_rebased = checkpointer.cursor_rebased.lock().unwrap().clone();
     let mut expected_cursors = Vec::new();
     let mut expected_rebased = Vec::new();
+    let mut expected_cursor_rebased = Vec::new();
     for round in 0..TOOL_TURNS as u64 {
         expected_cursors.push(Some((round, CursorPoint::ToolsPending)));
         expected_rebased.push(round > 0);
+        expected_cursor_rebased.push(Some(round > 0));
         expected_cursors.push(Some((round, CursorPoint::AwaitingModel)));
         expected_rebased.push(false);
+        expected_cursor_rebased.push(Some(round > 0));
     }
     expected_cursors.push(None);
     expected_rebased.push(true);
+    expected_cursor_rebased.push(None);
     assert_eq!(cursors, expected_cursors);
     assert_eq!(rebased, expected_rebased);
+    assert_eq!(cursor_rebased, expected_cursor_rebased);
 }
 
 /// Without a checkpointer a run cannot move its durable head, so it takes no

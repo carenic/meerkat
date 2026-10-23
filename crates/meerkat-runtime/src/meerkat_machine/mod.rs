@@ -1238,6 +1238,7 @@ pub use admitted_original::{
     AdmittedOriginal, AdmittedOriginalRefusal, DurableAdmittedOriginal,
     DurableAdmittedOriginalRefusal,
 };
+mod resumed_run;
 mod retained_resume;
 mod runtime_control;
 pub use agent_mandate::{
@@ -1738,6 +1739,9 @@ struct RuntimeSessionEntry {
     /// The tool-surface gate this registration's trusted host installed, if
     /// any. Every registration owns a fresh, empty slot.
     tool_surface_gate: meerkat_core::ToolSurfaceGateSlot,
+    /// The resumed-run admission this registration's host bound, if any.
+    /// Every registration owns a fresh, empty slot.
+    resumed_run_admission: crate::resumed_run_admission::ResumedRunAdmissionSlot,
     /// The MCP adapter this registration's latest finished construction
     /// installed, for observation only. Every registration owns a fresh slot.
     mcp_observation: meerkat_core::McpObservationSlot,
@@ -3906,6 +3910,13 @@ impl PendingRuntimeExecutorAttachment {
     /// complete. Every attachment passes here before its serving gate, so no
     /// path serves a kept input that has not been checked. Returns the
     /// expired inputs.
+    ///
+    /// A run the same stop kept open (marked resumable again by this
+    /// registration, its inputs still bound to it) is checked first, as a
+    /// whole: when any of its inputs is over the stop's max age, the run is
+    /// settled with the same reason (`DriverEntry::settle_resumable_run`)
+    /// instead of resumed. Its inputs are Staged or Applied, never queued,
+    /// so the per-input sweep would not see them.
     pub(crate) async fn settle_expired_stop_requeued_inputs(
         &mut self,
         now: chrono::DateTime<chrono::Utc>,
@@ -3913,11 +3924,47 @@ impl PendingRuntimeExecutorAttachment {
         let (driver, completions) = self
             .exact_pending_driver("requeue expiry settlement")
             .await?;
+        // The expired run whose tail repair requires the session to reload.
+        let mut reload_for_run = None;
         let expired = {
             let mut driver = driver.lock().await;
+            let mut expired = Vec::new();
+            if let Some(run_id) = driver.resumable_run_id()
+                && driver.resumable_run_stop_requeue_expired(&run_id, now)
+            {
+                let settled = driver
+                    .settle_resumable_run(
+                        &run_id,
+                        crate::input_state::InputAbandonReason::RequeueExpired,
+                    )
+                    .await?;
+                tracing::info!(
+                    session_id = %self.witness.session_id(),
+                    %run_id,
+                    inputs = settled.len(),
+                    "a run a graceful stop kept open outlived the stop's max age; settled instead of resumed"
+                );
+                if !settled.is_empty() {
+                    // Committed: told once this attachment releases its
+                    // mutation guard, as for an expired queued input.
+                    self.runless_terminal.owe();
+                }
+                expired.extend(settled);
+                // The settled run never resumes, so its provisional tail is
+                // repaired as an interrupted run, after the abandonment
+                // committed: its rows stay in the transcript, and the
+                // session's next run commits its first round over the
+                // repaired body.
+                if driver
+                    .repair_settled_run_tail(self.witness.session_id(), &run_id)
+                    .await
+                {
+                    reload_for_run = Some(run_id);
+                }
+            }
             let candidates =
                 crate::input_state::expired_stop_requeued_inputs(driver.as_driver(), now);
-            let mut expired = Vec::with_capacity(candidates.len());
+            expired.reserve(candidates.len());
             for input_id in candidates {
                 if driver
                     .abandon_queued_input(
@@ -3947,6 +3994,26 @@ impl PendingRuntimeExecutorAttachment {
                 expired.clone(),
                 crate::completion::CompletionWaitError::AttachmentReplaced,
             );
+        }
+        // The repair committed a boundary this registration did not, so the
+        // seeded actor is stale, and a tail it left would refuse the
+        // session's next run's first round commit: either way the session
+        // reloads at once, and this attachment does not serve. A crash right
+        // after the settlement leaves the same state for the next
+        // registration's recovery.
+        if let Some(run_id) = reload_for_run {
+            let reason =
+                format!("expired run {run_id}'s provisional tail was repaired or still stands");
+            self.machine
+                .require_session_durability_reload(
+                    self.witness.session_id(),
+                    "expired_resumable_run_tail_repair",
+                    reason.clone(),
+                )
+                .await;
+            return Err(RuntimeDriverError::Internal(format!(
+                "{reason}; the session reloads before it serves"
+            )));
         }
         Ok(expired)
     }

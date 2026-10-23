@@ -1578,6 +1578,21 @@ pub trait MobSessionService:
         )))
     }
 
+    /// Suspend one exact run for a graceful requeue stop after machine
+    /// admission: the turn is dropped as a hard cancel drops it, and the run
+    /// ends with no terminal and no closing write, so the next start resumes
+    /// it. `false` for a stale run, and by default: a service that cannot
+    /// suspend leaves the stop to hard-cancel the run.
+    #[cfg(feature = "runtime-adapter")]
+    async fn suspend_run_with_machine_authority(
+        &self,
+        _session_id: &SessionId,
+        _expected_run_id: &RunId,
+        _authority: meerkat_runtime::MachineSessionControlAuthority,
+    ) -> Result<bool, SessionError> {
+        Ok(false)
+    }
+
     /// Apply a live cooperative boundary cancel after `MeerkatMachine` accepts the command.
     ///
     /// The machine has ALREADY admitted the cancel when this runs — the
@@ -3899,6 +3914,22 @@ where
         authority: meerkat_runtime::MachineSessionControlAuthority,
     ) -> Result<bool, SessionError> {
         meerkat_session::PersistentSessionService::<B>::interrupt_run_with_machine_authority(
+            self,
+            session_id,
+            expected_run_id,
+            authority,
+        )
+        .await
+    }
+
+    #[cfg(feature = "runtime-adapter")]
+    async fn suspend_run_with_machine_authority(
+        &self,
+        session_id: &SessionId,
+        expected_run_id: &RunId,
+        authority: meerkat_runtime::MachineSessionControlAuthority,
+    ) -> Result<bool, SessionError> {
+        meerkat_session::PersistentSessionService::<B>::suspend_run_with_machine_authority(
             self,
             session_id,
             expected_run_id,

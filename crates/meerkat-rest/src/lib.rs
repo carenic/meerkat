@@ -359,6 +359,26 @@ impl CoreExecutorInterruptHandle for RestSessionRuntimeInterruptHandle {
             })
             .map_err(|err| CoreExecutorError::control_failed_runtime(err.to_string()))
     }
+
+    async fn suspend_run_if_current(
+        &self,
+        expected_run_id: &meerkat_core::lifecycle::RunId,
+        _reason: String,
+    ) -> Result<bool, CoreExecutorError> {
+        self.context
+            .session_service
+            .suspend_run_with_machine_authority(
+                &self.session_id,
+                expected_run_id,
+                self.context.runtime_adapter.session_control_authority(),
+            )
+            .await
+            .or_else(|err| match err {
+                SessionError::NotRunning { .. } => Ok(false),
+                err => Err(err),
+            })
+            .map_err(|err| CoreExecutorError::control_failed_runtime(err.to_string()))
+    }
 }
 
 #[doc(hidden)]

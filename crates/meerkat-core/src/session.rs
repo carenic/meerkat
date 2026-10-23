@@ -3513,10 +3513,25 @@ pub struct SessionRunCursor {
     /// Loop state the resumed run restores.
     #[serde(default)]
     pub loop_state: RunLoopCarryOver,
+    /// The run re-based its session's committed base (a WholeBlob run whose
+    /// transcript a compaction rewrote; see
+    /// [`crate::SessionCheckpointer::rebase_run`]), with this commit or an
+    /// earlier one: its inputs are already in the committed history, so a
+    /// failure of the run consumes them and never replays them. Set on the
+    /// re-base's own commit and on every later commit of the run, a resumed
+    /// run's included. A cursor without the field reads `false`, and a cursor
+    /// that is `false` is written without it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rebased: bool,
+}
+
+// serde's `skip_serializing_if` passes the field by reference.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl SessionRunCursor {
-    /// A cursor with default loop state.
+    /// A cursor with default loop state, of a run that has not re-based.
     #[must_use]
     pub fn new(
         run_id: RunId,
@@ -3530,6 +3545,7 @@ impl SessionRunCursor {
             round,
             resume_point,
             loop_state: RunLoopCarryOver::default(),
+            rebased: false,
         }
     }
 }
@@ -3685,6 +3701,33 @@ mod tool_call_dedupe_key_tests {
             key.call_digest,
             "38b1125ea162352a034af675380c760044701e87c5f410996c40011108edaea9"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod run_cursor_rebased_tests {
+    use super::*;
+
+    /// The re-based flag survives the cursor's round trip, a cursor written
+    /// without it reads as not re-based, and a cursor that is not re-based is
+    /// written exactly as before the field existed.
+    #[test]
+    fn the_rebased_flag_round_trips_and_reads_false_when_absent() {
+        let mut cursor =
+            SessionRunCursor::new(RunId::new(), Vec::new(), 2, RunResumePoint::AwaitingModel);
+        let plain = serde_json::to_value(&cursor).expect("the cursor serializes");
+        assert!(plain.get("rebased").is_none(), "{plain}");
+        let read: SessionRunCursor =
+            serde_json::from_value(plain).expect("a cursor without the flag reads");
+        assert!(!read.rebased);
+
+        cursor.rebased = true;
+        let marked = serde_json::to_value(&cursor).expect("the cursor serializes");
+        assert_eq!(marked.get("rebased"), Some(&serde_json::Value::Bool(true)));
+        let read: SessionRunCursor =
+            serde_json::from_value(marked).expect("a re-based cursor reads");
+        assert_eq!(read, cursor);
     }
 }
 

@@ -13206,6 +13206,25 @@ impl CoreExecutorInterruptHandle for MobSessionServiceInterruptHandle {
             })
             .map_err(|err| CoreExecutorError::control_failed_runtime(err.to_string()))
     }
+
+    async fn suspend_run_if_current(
+        &self,
+        expected_run_id: &CoreRunId,
+        _reason: String,
+    ) -> Result<bool, CoreExecutorError> {
+        self.session_service
+            .suspend_run_with_machine_authority(
+                &self.bridge_session_id,
+                expected_run_id,
+                self.runtime_adapter.session_control_authority(),
+            )
+            .await
+            .or_else(|err| match err {
+                SessionError::NotRunning { .. } => Ok(false),
+                err => Err(err),
+            })
+            .map_err(|err| CoreExecutorError::control_failed_runtime(err.to_string()))
+    }
 }
 
 #[cfg(feature = "runtime-adapter")]

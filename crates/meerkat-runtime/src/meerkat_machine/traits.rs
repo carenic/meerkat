@@ -2424,7 +2424,22 @@ impl MeerkatMachine {
             .map_err(RuntimeControlPlaneError::Internal)?;
 
         let mut drv = driver.lock().await;
-        let mut report = match Box::pin(machine_retire(&mut drv)).await {
+        // A run the session left open never resumes past a retire: its mark
+        // ends with the retire, and the retire's sweep settles its bound
+        // inputs with the rest. A failed retire restores the staged state,
+        // the mark with it.
+        let retire_result = match drv.resumable_run_id() {
+            Some(run_id) => {
+                match drv
+                    .end_resumable_run(&run_id, &crate::input_state::InputAbandonReason::Retired)
+                {
+                    Ok(()) => Box::pin(machine_retire(&mut drv)).await,
+                    Err(error) => Err(error),
+                }
+            }
+            None => Box::pin(machine_retire(&mut drv)).await,
+        };
+        let mut report = match retire_result {
             Ok(report) => report,
             Err(err) => {
                 drop(drv);

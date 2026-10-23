@@ -326,6 +326,29 @@ impl TrajectoryBuilder {
                     });
                 }
             }
+            // A run resumed after a restart opens with `RunResumed` in place of
+            // `RunStarted`: it carries no input (the run's input step came
+            // from its original start), and the turn still pending is the
+            // run's own. At `tools_pending` that turn is the staged round,
+            // whose calls run again under the same ids: the observations it
+            // already holds are the ones the crash interrupted, and the
+            // re-dispatched calls answer them afresh.
+            AgentEvent::RunResumed {
+                session_id: id,
+                resume_point,
+                ..
+            } => {
+                self.session_id = Some(id.to_string());
+                self.extraction_open = false;
+                if matches!(
+                    resume_point,
+                    meerkat_core::event::RunResumePointKind::ToolsPending
+                ) && let Some(turn) = pending.as_mut()
+                {
+                    turn.observations.clear();
+                    turn.timed_out_calls.clear();
+                }
+            }
             AgentEvent::TurnStarted { turn_number, .. } => {
                 match pending.take() {
                     // The loop re-announces the turn it is already in when a

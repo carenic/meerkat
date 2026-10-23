@@ -3008,7 +3008,7 @@ fn recovery_class_name(
     }
 }
 
-#[cfg(feature = "sqlite-store")]
+#[cfg(any(feature = "sqlite-store", not(target_arch = "wasm32")))]
 fn recovery_class_from_name(
     name: &str,
 ) -> Result<crate::meerkat_machine::dsl::DurableTailRecoveryClass, RuntimeStoreError> {
@@ -3049,7 +3049,7 @@ fn recovery_disposition_name(
     }
 }
 
-#[cfg(feature = "sqlite-store")]
+#[cfg(any(feature = "sqlite-store", not(target_arch = "wasm32")))]
 fn recovery_disposition_from_name(
     name: &str,
 ) -> Result<crate::meerkat_machine::dsl::DurableTailRecoveryDisposition, RuntimeStoreError> {
@@ -3446,7 +3446,7 @@ impl PreparedRecoveryInputUpdate {
         })
     }
 
-    #[cfg(feature = "sqlite-store")]
+    #[cfg(any(feature = "sqlite-store", not(target_arch = "wasm32")))]
     fn decode(
         input_id: InputId,
         expected_row_digest: String,

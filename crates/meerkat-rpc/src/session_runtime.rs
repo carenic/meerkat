@@ -5143,6 +5143,20 @@ impl SessionRuntime {
             .await
     }
 
+    pub(crate) async fn suspend_run_live_with_machine_authority(
+        &self,
+        session_id: &SessionId,
+        expected_run_id: &RunId,
+    ) -> Result<bool, SessionError> {
+        self.service
+            .suspend_run_with_machine_authority(
+                session_id,
+                expected_run_id,
+                self.runtime_adapter.session_control_authority(),
+            )
+            .await
+    }
+
     pub(crate) async fn cancel_after_boundary_live_with_machine_authority(
         &self,
         session_id: &SessionId,
@@ -14741,6 +14755,15 @@ pub(crate) fn session_error_to_rpc(err: SessionError) -> RpcError {
         },
         _ => None,
     };
+    // A run a stop suspended keeps its typed outcome across this process's
+    // bridge to the session runtime's executor.
+    let core_executor_suspended_run_id = match err.primary_error() {
+        SessionError::Agent(error) => match error.primary_error() {
+            meerkat_core::AgentError::RunSuspended { run_id } => Some(run_id.to_string()),
+            _ => None,
+        },
+        _ => None,
+    };
     RpcError {
         code,
         message: err.to_string(),
@@ -14748,6 +14771,14 @@ pub(crate) fn session_error_to_rpc(err: SessionError) -> RpcError {
             .map(|reason| {
                 serde_json::json!({
                     "core_executor_teardown_reason": reason.as_str(),
+                })
+            })
+            .or_else(|| {
+                core_executor_suspended_run_id.map(|run_id| {
+                    serde_json::Value::Object(serde_json::Map::from_iter([(
+                        crate::session_executor::CORE_EXECUTOR_SUSPENDED_RUN_ID_KEY.to_string(),
+                        serde_json::Value::String(run_id),
+                    )]))
                 })
             })
             .or_else(|| err.structured_data())

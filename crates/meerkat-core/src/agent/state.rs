@@ -929,6 +929,15 @@ pub(crate) struct RunRoundCommits {
     /// checkpoint holds its committed work and no cursor, and nothing of the
     /// run is left to resume. A later round commit clears it.
     final_save_written: bool,
+    /// The run commits its tool rounds: its agent had a session checkpointer
+    /// when the run started, and the run is not a live bridge run, which
+    /// commits nothing. A run without round commits has no resume point.
+    commits_enabled: bool,
+    /// The run re-based its session's committed base, in this process or, for
+    /// a resumed run, before its restart (its cursor said so): its inputs are
+    /// in the committed history. Every later cursor of the run carries it
+    /// ([`crate::SessionRunCursor::rebased`]).
+    rebased: bool,
 }
 
 impl RunRoundCommits {
@@ -968,6 +977,11 @@ impl RunRoundCommits {
     /// checkpoint (see the field).
     pub(crate) const fn final_save_written(&self) -> bool {
         self.final_save_written
+    }
+
+    /// Whether the run commits its tool rounds (see the field).
+    pub(crate) const fn commits_enabled(&self) -> bool {
+        self.commits_enabled
     }
 
     /// Whether a checkpoint of the live session without the cursor leaves a
@@ -1746,8 +1760,10 @@ where
     /// and never reaches this run's commits.
     fn begin_round_commits(&mut self, run_id: &RunId) {
         self.session.clear_run_cursor();
+        let commits_enabled = self.round_commits_enabled();
         self.round_commits = RunRoundCommits {
             run_id: Some(run_id.clone()),
+            commits_enabled,
             ..RunRoundCommits::default()
         };
         for input_id in std::mem::take(&mut self.run_start_input_ids) {
@@ -1769,11 +1785,14 @@ where
             crate::RunResumePoint::ToolsPending { .. } => (cursor.round, false),
             crate::RunResumePoint::AwaitingModel => (cursor.round.saturating_add(1), true),
         };
+        let commits_enabled = self.round_commits_enabled();
         self.round_commits = RunRoundCommits {
             run_id: Some(cursor.run_id.clone()),
             round,
             cursor_written: true,
             run_row_since_rewrite,
+            commits_enabled,
+            rebased: cursor.rebased,
             ..RunRoundCommits::default()
         };
         for input_id in cursor.bound_input_ids.iter().cloned() {
@@ -1944,7 +1963,7 @@ where
             },
         );
         cursor.loop_state = self.round_loop_carry_over(ctx, ctx.turn_count, Vec::new())?;
-        if self.write_round_commit(ctx.run_id, &cursor).await? {
+        if self.write_round_commit(ctx.run_id, &mut cursor).await? {
             Ok(())
         } else {
             Err(AgentError::InternalError(format!(
@@ -1984,7 +2003,7 @@ where
         // The round is complete: a resumed run continues from the next turn.
         cursor.loop_state =
             self.round_loop_carry_over(ctx, ctx.turn_count.saturating_add(1), pending_ops)?;
-        self.write_round_commit(ctx.run_id, &cursor).await?;
+        self.write_round_commit(ctx.run_id, &mut cursor).await?;
         Ok(())
     }
 
@@ -1999,18 +2018,22 @@ where
     async fn write_round_commit(
         &mut self,
         run_id: &RunId,
-        cursor: &crate::SessionRunCursor,
+        cursor: &mut crate::SessionRunCursor,
     ) -> Result<bool, AgentError> {
+        let rebase = self
+            .round_commits
+            .needs_rebase(self.session.has_durable_head_canonical_head());
+        // A run that re-based, with this commit or an earlier one, says so in
+        // its cursor: its inputs are in the committed history, which a restart
+        // must not forget.
+        cursor.rebased = self.round_commits.rebased || rebase;
         self.session.set_run_cursor(cursor).map_err(|error| {
             AgentError::InternalError(format!(
                 "failed to record the run cursor of round {}: {error}",
                 cursor.round
             ))
         })?;
-        let written = if self
-            .round_commits
-            .needs_rebase(self.session.has_durable_head_canonical_head())
-        {
+        let written = if rebase {
             self.write_round_rebase(run_id).await
         } else {
             self.write_session_checkpoint(run_id, SessionSaveDurability::Required)
@@ -2028,7 +2051,7 @@ where
         self.round_commits.final_save_written = false;
         #[cfg(any(test, feature = "test-support"))]
         if let Some(observer) = self.round_commit_observer.as_ref() {
-            observer(cursor);
+            observer(&*cursor);
         }
         Ok(true)
     }
@@ -2080,6 +2103,7 @@ where
         }
         self.latest_run_checkpoint_receipt = Some(receipt);
         self.round_commits.rewritten_since_base = false;
+        self.round_commits.rebased = true;
         Ok(())
     }
 

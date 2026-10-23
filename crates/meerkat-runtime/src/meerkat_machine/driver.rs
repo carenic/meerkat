@@ -4414,6 +4414,43 @@ impl DriverEntry {
         }
     }
 
+    /// Discard `run_id`'s provisional tail by its exact authority, if the
+    /// store holds it; see `PersistentRuntimeDriver::discard_run_provisional_tail`.
+    /// An ephemeral runtime keeps no tail.
+    pub(crate) async fn discard_run_provisional_tail(
+        &self,
+        run_id: &meerkat_core::lifecycle::RunId,
+    ) -> Result<bool, RuntimeDriverError> {
+        match self {
+            DriverEntry::Ephemeral(_) => Ok(true),
+            DriverEntry::Persistent(driver) => driver.discard_run_provisional_tail(run_id).await,
+        }
+    }
+
+    /// Whether `run_id`'s provisional tail records that the run re-based; see
+    /// `PersistentRuntimeDriver::run_tail_records_rebase`. An ephemeral
+    /// runtime keeps no tail.
+    pub(crate) async fn run_tail_records_rebase(
+        &self,
+        run_id: &meerkat_core::lifecycle::RunId,
+    ) -> Result<bool, RuntimeDriverError> {
+        match self {
+            DriverEntry::Ephemeral(_) => Ok(false),
+            DriverEntry::Persistent(driver) => driver.run_tail_records_rebase(run_id).await,
+        }
+    }
+
+    /// The run whose provisional tail the store holds for this runtime, if
+    /// any. An ephemeral runtime keeps none.
+    pub(crate) async fn provisional_tail_run(
+        &self,
+    ) -> Result<Option<meerkat_core::lifecycle::RunId>, RuntimeDriverError> {
+        match self {
+            DriverEntry::Ephemeral(_) => Ok(None),
+            DriverEntry::Persistent(driver) => driver.provisional_tail_run().await,
+        }
+    }
+
     pub(crate) async fn load_compaction_checkpoint_snapshot(
         &self,
     ) -> Result<Option<Arc<Vec<u8>>>, RuntimeDriverError> {
@@ -7482,6 +7519,7 @@ pub(crate) fn machine_authorize_stage_for_run(
 
 pub(crate) fn machine_validate_boundary_applied(
     driver: &DriverEntry,
+    run_id: &RunId,
     contributing_work_ids: &[InputId],
 ) -> Result<(), RuntimeDriverError> {
     if contributing_work_ids.is_empty() {
@@ -7492,7 +7530,11 @@ pub(crate) fn machine_validate_boundary_applied(
 
     for work_id in contributing_work_ids {
         let lifecycle = driver.as_driver().input_phase(work_id);
-        if lifecycle != Some(InputLifecycleState::Staged) {
+        // A resumed run's contributor can already be applied by one of the
+        // run's committed rounds; it still belongs to this run.
+        if lifecycle != Some(InputLifecycleState::Staged)
+            && !driver.input_bound_to_open_run(work_id, run_id)
+        {
             return Err(RuntimeDriverError::Internal(format!(
                 "boundary applied requires staged contributors, but {work_id:?} is {lifecycle:?}"
             )));
@@ -7544,7 +7586,7 @@ pub(crate) fn machine_validate_run_commit_receipt(
         )));
     }
 
-    machine_validate_boundary_applied(driver, &receipt.contributing_input_ids)
+    machine_validate_boundary_applied(driver, run_id, &receipt.contributing_input_ids)
 }
 
 pub(crate) fn machine_staged_contributors(driver: &DriverEntry) -> Vec<InputId> {

@@ -1181,6 +1181,131 @@ impl PersistentRuntimeDriver {
             })
     }
 
+    /// The run whose provisional (uncommitted) tail the store holds for this
+    /// runtime, if any. While one stands, the committed base must not be
+    /// rewritten or re-issued under it.
+    pub(crate) async fn provisional_tail_run(
+        &self,
+    ) -> Result<Option<meerkat_core::lifecycle::RunId>, RuntimeDriverError> {
+        let store_error = |error: crate::store::RuntimeStoreError| {
+            RuntimeDriverError::Internal(format!(
+                "provisional tail lookup for {} failed: {error}",
+                self.runtime_id
+            ))
+        };
+        match self.store.session_persistence_profile() {
+            crate::store::RuntimeSessionPersistenceProfile::WholeBlobV1 => Ok(self
+                .store
+                .load_whole_blob_provisional_tail(&self.runtime_id)
+                .await
+                .map_err(store_error)?
+                .map(|tail| tail.authority().run_id().clone())),
+            crate::store::RuntimeSessionPersistenceProfile::HeadCanonicalV1 => Ok(self
+                .store
+                .load_head_canonical_provisional_tail(&self.runtime_id)
+                .await
+                .map_err(store_error)?
+                .map(|authority| authority.run_id().clone())),
+        }
+    }
+
+    /// The runtime store this driver commits to.
+    pub(crate) fn store_ref(&self) -> &dyn RuntimeStore {
+        self.store.as_ref()
+    }
+
+    /// Discard `run_id`'s provisional tail from the store by the tail's own
+    /// exact authority, if the store holds that run's tail. `Ok(true)`: no
+    /// tail of `run_id` stands any more (discarded now, or none was there).
+    /// `Ok(false)`: another run's tail stands, or the exact discard lost its
+    /// race, so a tail is still in the store.
+    pub(crate) async fn discard_run_provisional_tail(
+        &self,
+        run_id: &meerkat_core::lifecycle::RunId,
+    ) -> Result<bool, RuntimeDriverError> {
+        let store_error = |error: crate::store::RuntimeStoreError| {
+            RuntimeDriverError::Internal(format!(
+                "provisional tail discard of run {run_id} for {} failed: {error}",
+                self.runtime_id
+            ))
+        };
+        match self.store.session_persistence_profile() {
+            crate::store::RuntimeSessionPersistenceProfile::WholeBlobV1 => {
+                match self
+                    .store
+                    .load_whole_blob_provisional_tail(&self.runtime_id)
+                    .await
+                    .map_err(store_error)?
+                {
+                    None => Ok(true),
+                    Some(tail) if tail.authority().run_id() == run_id => self
+                        .store
+                        .discard_whole_blob_provisional_tail(&self.runtime_id, tail.authority())
+                        .await
+                        .map_err(store_error),
+                    Some(_) => Ok(false),
+                }
+            }
+            crate::store::RuntimeSessionPersistenceProfile::HeadCanonicalV1 => {
+                match self
+                    .store
+                    .load_head_canonical_provisional_tail(&self.runtime_id)
+                    .await
+                    .map_err(store_error)?
+                {
+                    None => Ok(true),
+                    Some(authority) if authority.run_id() == run_id => self
+                        .store
+                        .discard_head_canonical_provisional_tail(&self.runtime_id, &authority)
+                        .await
+                        .map_err(store_error),
+                    Some(_) => Ok(false),
+                }
+            }
+        }
+    }
+
+    /// Whether `run_id`'s WholeBlob provisional tail records that the run
+    /// re-based, so the run's inputs are already in the committed body: the
+    /// tail's run cursor names the run and carries the re-base. A tail
+    /// document or cursor that does not decode, or a cursor of another run,
+    /// counts as recording it (fail closed). False when the store holds no
+    /// tail of the run, for a tail without a cursor, and on a HeadCanonical
+    /// store, which never re-bases.
+    pub(crate) async fn run_tail_records_rebase(
+        &self,
+        run_id: &meerkat_core::lifecycle::RunId,
+    ) -> Result<bool, RuntimeDriverError> {
+        if self.store.session_persistence_profile()
+            != crate::store::RuntimeSessionPersistenceProfile::WholeBlobV1
+        {
+            return Ok(false);
+        }
+        let tail = self
+            .store
+            .load_whole_blob_provisional_tail(&self.runtime_id)
+            .await
+            .map_err(|error| {
+                RuntimeDriverError::Internal(format!(
+                    "provisional tail read of run {run_id} for {} failed: {error}",
+                    self.runtime_id
+                ))
+            })?;
+        let Some(tail) = tail.filter(|tail| tail.authority().run_id() == run_id) else {
+            return Ok(false);
+        };
+        let Ok(document) =
+            meerkat_core::Session::decode_whole_blob_document(tail.candidate_bytes())
+        else {
+            return Ok(true);
+        };
+        Ok(match document.session().try_run_cursor() {
+            Ok(None) => false,
+            Ok(Some(cursor)) => cursor.run_id != *run_id || cursor.rebased,
+            Err(_) => true,
+        })
+    }
+
     pub(crate) async fn load_compaction_checkpoint_snapshot(
         &self,
     ) -> Result<Option<Arc<Vec<u8>>>, RuntimeDriverError> {
@@ -2381,6 +2506,39 @@ impl PersistentRuntimeDriver {
             Err(error) => Err(self.mark_durability_reload_required(
                 "staged_input_binding_commit",
                 format!("atomic staged input binding persist failed: {error}"),
+            )),
+        }
+    }
+
+    /// Clear the requeue marks a graceful stop left on a resumed run's
+    /// inputs, durably, as the run starts and before it is dispatched: the
+    /// run runs now, so a later crash of it is never read as an expired stop.
+    /// Fail-closed like the staged-binding persist: a failed write requires a
+    /// reload. Inputs without a mark write nothing.
+    pub(crate) async fn clear_resumed_run_stop_marks(
+        &mut self,
+        input_ids: &[InputId],
+    ) -> Result<(), RuntimeDriverError> {
+        if !self.inner.any_stop_requeue_mark(input_ids) {
+            return Ok(());
+        }
+        self.require_durability_ready()?;
+        let cleared = self.inner.clear_stop_requeue_marks(input_ids);
+        let records = self
+            .inner
+            .authorized_stored_input_states_for_ids(&cleared)?;
+        if records.is_empty() {
+            return Ok(());
+        }
+        match self
+            .store
+            .persist_input_states_atomically(&self.runtime_id, &records)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) => Err(self.mark_durability_reload_required(
+                "resumed_run_stop_mark_clear",
+                format!("resumed run stop mark clearing persist failed: {error}"),
             )),
         }
     }
@@ -3916,6 +4074,93 @@ mod tests {
                 })
             );
         }
+    }
+
+    /// The unregister saga asks the executor to suspend an in-flight run only
+    /// when the machine would admit the suspension now: never outside a
+    /// requeue stop, and never for an ephemeral session, whose rounds are not
+    /// durable; under a requeue stop on a persistent driver with the run
+    /// current, it would. RED before: the saga asked whenever the stop
+    /// requeued, and a refused suspension ended the run with no terminal on
+    /// the session's stream. Unrun: written while Cargo is not run.
+    #[tokio::test]
+    async fn a_suspension_is_asked_only_when_the_machine_would_admit_it() {
+        use crate::meerkat_machine::driver::DriverEntry;
+        use crate::meerkat_machine::dsl as mm_dsl;
+
+        let store: Arc<dyn RuntimeStore> = Arc::new(crate::store::InMemoryRuntimeStore::new());
+        let blobs: Arc<dyn BlobStore> = Arc::new(meerkat_store::MemoryBlobStore::new());
+        let runtime_id = LogicalRuntimeId::new("suspension-admission-preview");
+        let mut driver = PersistentRuntimeDriver::new_with_control_and_durability_health(
+            runtime_id,
+            Arc::clone(&store),
+            Arc::clone(&blobs),
+            Arc::new(StdRwLock::new(
+                crate::driver::ephemeral::RuntimeControlProjection::default(),
+            )),
+            crate::driver::ephemeral::new_ingress_dsl_authority(),
+            crate::meerkat_machine::driver::ready_durability_health_for_test(),
+        );
+        driver
+            .inner_mut()
+            .ensure_contract_session_authority()
+            .expect("contract session authority");
+        let run_id = meerkat_core::lifecycle::RunId::new();
+        driver
+            .inner_mut()
+            .contract_begin_run_authority(run_id.clone())
+            .expect("the run begins");
+        let entry = DriverEntry::Persistent(driver);
+        assert!(
+            !entry.suspension_admissible(&run_id),
+            "no requeue stop is draining"
+        );
+        let DriverEntry::Persistent(driver) = entry else {
+            panic!("the entry stays persistent");
+        };
+        {
+            let authority = driver.inner_ref().shared_dsl_authority();
+            let mut authority = authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = authority.state().clone();
+            mm_dsl::MeerkatMachineMutator::apply(
+                &mut *authority,
+                mm_dsl::MeerkatMachineInput::BeginUnregisterSession {
+                    session_id: state
+                        .session_id
+                        .clone()
+                        .expect("the contract session is registered"),
+                    agent_runtime_id: state.active_runtime_id.clone(),
+                    fence_token: state.active_fence_token,
+                    generation: state.active_runtime_generation,
+                    runtime_epoch_id: state.active_runtime_epoch_id.clone(),
+                    queued_inputs: mm_dsl::UnregisterQueuedInputsDisposition::Requeue,
+                    requeue_max_age_ms: 900_000,
+                },
+            )
+            .expect("the unregister drain opens with the requeue disposition");
+        }
+        let entry = DriverEntry::Persistent(driver);
+        assert!(
+            entry.suspension_admissible(&run_id),
+            "a requeue stop on a durable session would suspend the current run"
+        );
+        assert!(
+            !entry.suspension_admissible(&meerkat_core::lifecycle::RunId::new()),
+            "never a run that is not current"
+        );
+        assert!(
+            entry.resumable_run_id().is_none(),
+            "the preview changes nothing"
+        );
+        let ephemeral = DriverEntry::Ephemeral(crate::driver::EphemeralRuntimeDriver::new(
+            LogicalRuntimeId::new("suspension-admission-ephemeral"),
+        ));
+        assert!(
+            !ephemeral.suspension_admissible(&run_id),
+            "an ephemeral session's rounds are not durable"
+        );
     }
 
     /// The requeue disposition an unregister begins with reaches the store with

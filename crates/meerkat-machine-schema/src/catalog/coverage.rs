@@ -1967,7 +1967,7 @@ pub fn canonical_machine_coverage_manifests() -> Vec<MachineCoverageManifest> {
                 "session_turn_admission_authority",
                 "SessionTurnAdmissionMachine",
                 "crates/meerkat-session/src/generated/session_turn_admission.rs",
-                "generated SessionTurnAdmissionMachine owner for the ephemeral turn-admission lifecycle: ProjectTurnAdmission, ClaimTurn, AbortClaim, BeginTurn, ResolveTurn, FinalizeTurnToShutdown, FinalizeTurnToIdle, RequestInterruptAdmittedFirst, RequestInterruptAdmittedDuplicate, RequestInterruptRunningFirst, RequestInterruptRunningDuplicate, RequestShutdownImmediateIdle, RequestShutdownImmediateAdmitted, RequestShutdownDeferredRunning, RequestShutdownDeferredCompleting, RequestShutdownAlreadyShuttingDown, ResolvePendingAdmissionDrained, AuthorizeSessionTeardown, AuthorizeCancelAfterBoundaryAdmitted, AuthorizeCancelAfterBoundaryRunning, AuthorizeStartTurnDispatchAdmitted, AuthorizeStartTurnDispatchShuttingDown, ResolveDispositionContentTurn, ResolveDispositionResumePendingWithBoundary, ResolveDispositionResumePendingWithoutBoundary, ResolveDispositionDirectPrompt, ResolveDispositionDirectPending, ResolveDispositionDirectNoPending, ResolveRuntimeKeepAliveEnable, ResolveRuntimeKeepAlivePreserve, and ResolveLastStartTurnPublicTerminalNoPending; effects TurnAdmissionProjected, TurnInterruptRequested, PendingAdmissionDrainRequested, SessionTeardownAuthorized, StartTurnDispatchResolved, CancelAfterBoundaryAuthorized, StartTurnDispositionResolved, StartTurnPublicTerminalResolved, RuntimeKeepAliveResolved; invariants shutdown_phase_is_not_active, drain_obligation_only_while_shutting_down, and teardown_authorization_only_after_drain",
+                "generated SessionTurnAdmissionMachine owner for the ephemeral turn-admission lifecycle: ProjectTurnAdmission, ClaimTurn, AbortClaim, BeginTurn, ResolveTurn, FinalizeTurnToShutdown, FinalizeTurnToIdle, RequestInterruptAdmittedFirst, RequestInterruptAdmittedDuplicate, RequestInterruptRunningFirst, RequestInterruptRunningDuplicate, RequestShutdownImmediateIdle, RequestShutdownImmediateAdmitted, RequestShutdownDeferredRunning, RequestShutdownDeferredCompleting, RequestShutdownAlreadyShuttingDown, ResolvePendingAdmissionDrained, AuthorizeSessionTeardown, AuthorizeCancelAfterBoundaryAdmitted, AuthorizeCancelAfterBoundaryRunning, AuthorizeStartTurnDispatchAdmitted, AuthorizeStartTurnDispatchShuttingDown, ResolveDispositionContentTurn, ResolveDispositionResumePendingWithBoundary, ResolveDispositionResumePendingWithoutBoundary, ResolveDispositionDirectPrompt, ResolveDispositionDirectPending, ResolveDispositionDirectNoPending, ResolveDispositionResumeRun, ResolveRuntimeKeepAliveEnable, ResolveRuntimeKeepAlivePreserve, and ResolveLastStartTurnPublicTerminalNoPending; effects TurnAdmissionProjected, TurnInterruptRequested, PendingAdmissionDrainRequested, SessionTeardownAuthorized, StartTurnDispatchResolved, CancelAfterBoundaryAuthorized, StartTurnDispositionResolved, StartTurnPublicTerminalResolved, RuntimeKeepAliveResolved; invariants shutdown_phase_is_not_active, drain_obligation_only_while_shutting_down, and teardown_authorization_only_after_drain",
                 CoverageClaims::none()
                     .transitions(&[
                         "ProjectTurnAdmissionIdle",
@@ -2002,6 +2002,7 @@ pub fn canonical_machine_coverage_manifests() -> Vec<MachineCoverageManifest> {
                         "ResolveDispositionDirectPrompt",
                         "ResolveDispositionDirectPending",
                         "ResolveDispositionDirectNoPending",
+                        "ResolveDispositionResumeRun",
                         "ResolveRuntimeKeepAliveEnable",
                         "ResolveRuntimeKeepAlivePreserve",
                         "ResolveLastStartTurnPublicTerminalNoPendingIdle",
@@ -2108,7 +2109,7 @@ pub fn canonical_machine_coverage_manifests() -> Vec<MachineCoverageManifest> {
                 ),
                 scenario(
                     "turn_admission_start_turn_disposition",
-                    "ResolveDispositionContentTurn, ResolveDispositionResumePendingWithBoundary, ResolveDispositionResumePendingWithoutBoundary, ResolveDispositionDirectPrompt, ResolveDispositionDirectPending, ResolveDispositionDirectNoPending, and ResolveLastStartTurnPublicTerminalNoPending resolve the start-turn disposition from the execution kind, prompt content observation, and the SessionDocumentMachine-emitted PendingContinuationDisposition under StartTurnDispositionResolved and StartTurnPublicTerminalResolved; the shell mirrors the disposition and never decides",
+                    "ResolveDispositionContentTurn, ResolveDispositionResumePendingWithBoundary, ResolveDispositionResumePendingWithoutBoundary, ResolveDispositionDirectPrompt, ResolveDispositionDirectPending, ResolveDispositionDirectNoPending, ResolveDispositionResumeRun, and ResolveLastStartTurnPublicTerminalNoPending resolve the start-turn disposition from the execution kind, prompt content observation, and the SessionDocumentMachine-emitted PendingContinuationDisposition under StartTurnDispositionResolved and StartTurnPublicTerminalResolved (a resumed run resolves from its execution kind alone: its boundary is the session run cursor); the shell mirrors the disposition and never decides",
                     CoverageClaims::none()
                         .transitions(&[
                             "ResolveTurn",
@@ -2118,6 +2119,7 @@ pub fn canonical_machine_coverage_manifests() -> Vec<MachineCoverageManifest> {
                             "ResolveDispositionDirectPrompt",
                             "ResolveDispositionDirectPending",
                             "ResolveDispositionDirectNoPending",
+                            "ResolveDispositionResumeRun",
                         ])
                         .effects(&[
                             "StartTurnDispositionResolved",

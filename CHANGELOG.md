@@ -322,6 +322,17 @@ them.
   or on the directory itself, and an event that names no path still count.
   0.9.4 counted every event but an access on all three files.
 
+- Behaviour-only (not measured by the gate): `meerkat-runtime`: a graceful
+  stop that requeues (`UnregisterQueuedInputs::Requeue`, for example a
+  deploy) now suspends a durable session's in-flight run instead
+  of cancelling it. The run keeps its inputs bound with the stop's requeue
+  mark, their waiters are answered `RequeuedAcrossStop`, and the next start
+  resumes the run from its last committed round, or ends its inputs as
+  `RequeueExpired` past the max age. A stop without Requeue, an explicit stop
+  or cancel, retire, destroy and reset still end the run as before, and a run
+  whose turn has already ended (completed, failed or cancelled) is never
+  suspended.
+
 - Behaviour-only (not measured by the gate): `meerkat-runtime`:
   `SqliteRuntimeStore::delivery_generation_reader` returns a reader on the
   fresh-open read path too, where 0.9.4 returned `None`. It keeps no
@@ -577,6 +588,23 @@ them.
   as `Unknown` with the value as sent and is written back unchanged, and the
   Python and TypeScript SDKs keep it as the string the server sent.
 
+- `meerkat-core`: `RuntimeExecutionKind` gains `ResumeRun`, the dispatch kind
+  of a run a durable session left open and the runtime resumes. It is never an
+  admission kind. The enum is exhaustive, so a `match` outside the crate needs
+  the arm. The gate's finding: an added enum variant.
+
+- `meerkat-contracts`: `WireRuntimeExecutionKind` gains `ResumeRun`
+  (`"resume_run"`), mirroring the core kind. The enum is exhaustive, so a
+  `match` outside the crate needs the arm. The gate's finding: an added enum
+  variant.
+
+- `meerkat-runtime`: `meerkat_machine::dsl::RecoveredRuntimeExecutionKind`
+  implements `TryFrom<RuntimeExecutionKind>`, with the error
+  `DispatchOnlyExecutionKind`, instead of `From`. Recovering a stored input
+  that carries the dispatch-only `ResumeRun` kind is refused as store
+  corruption. Code that converted with `from` or `into` calls `try_from`.
+  Declared by hand: the removed `From` impl may not be a gate finding.
+
 - `meerkat-mob`: `Profile` gains `durable: bool` (see Added, durable
   workers), and so do its wire forms `meerkat_contracts::WireMobProfile`,
   `MobProfileInput` and `PortableProfile`. A struct literal needs the field;
@@ -683,6 +711,7 @@ them.
   `resolve-held-tail` and the candidate, and the recovery row records the
   operator's disposition and the candidate id. A quarantined session, and a
   tail held for any other reason, are refused.
+
 - `meerkat-core`: per-round commits and resumable runs. A run whose agent has
   a session checkpointer commits every tool round twice:
   - The first commit comes after the model call and before any tool of the
@@ -763,6 +792,11 @@ them.
     base. An end-of-run or closing save after a rewrite with no round commit
     since is a re-base too, without a cursor. A checkpointer that does not
     re-base (the default) takes no round commit after the run's first rewrite.
+    From its first re-base on, the run's cursor says so
+    (`SessionRunCursor::rebased`, read as `false` when absent, and written
+    only when `true`), on the re-base's own commit and every later one, a
+    resumed run's included: a restart does not forget that the run's inputs
+    are in the committed history.
   - `SessionCheckpointer::dispatch_fence_check` lets a checkpointer over a
     host store refuse dispatch once its writer's self-fence window has
     closed. The agent asks right before each model request (a compaction's
@@ -773,16 +807,20 @@ them.
     round starts, the round's results are not committed, and the run writes
     nothing more.
   - A stop that keeps a durable session's queued work (a host draining and
-    requeueing, for a deploy) suspends the session's run instead of
-    cancelling it. The session layer drops the run future at its next await
-    point, and `Agent::suspend_dropped_run` ends the run without a terminal,
-    without a turn-authority change and without a write. It answers where the
-    run stood (`DroppedRunSuspension`): `Resumable { run_id }`, whose last
-    round commit, cursor included, stays its resume point (a save without the
-    cursor still in flight counts here, and the next start's recovery reads
-    which tail the store holds), or `PastFinalSave { run_id }`, whose save
-    without the cursor had landed, so its work is committed and its inputs
-    must not run again. A resumable run's turn answers
+    requeueing, for a deploy) suspends the session's run instead of cancelling
+    it. The session layer drops the run future at its next await point, and
+    `Agent::suspend_dropped_run` answers where the run stood
+    (`DroppedRunSuspension`). `Resumable { run_id }`: its last round commit,
+    cursor included, stays its resume point (a save without the cursor still
+    in flight counts here, and the next start's recovery reads which tail the
+    store holds), and the call ends the run without a terminal, without a
+    turn-authority change and without a write. The two other outcomes are not
+    suspensions, and nothing of the run is cleared: the caller cancels it with
+    `Agent::cancel_dropped_run`, which publishes the terminal still owed, as
+    for every stop. `PastFinalSave { run_id }`: its save without the cursor
+    had landed, so its work is committed and its inputs must not run again.
+    `NotResumable { run_id }`: the run takes no round commits (no session
+    checkpointer, or a live bridge run). A resumable run's turn answers
     `AgentError::RunSuspended { run_id }`, which a core executor reports as
     `CoreExecutorError::Suspended { run_id }`: neither a cancellation nor an
     apply failure.
@@ -1470,6 +1508,92 @@ them.
   not know, instead of failing the read. A `custody_deferred` that is not an
   object, or whose restore or cause is not a string, is still refused.
 
+- Resumed runs, runtime and session plumbing. A durable session that stops
+  inside a run continues that run on its next open, under the run's original
+  id, instead of running its inputs again:
+  - Registration observes the run the session's durable tail left open and
+    keeps its inputs bound while the run is marked resumable.
+  - The session layer dispatches the new `RuntimeExecutionKind::ResumeRun` to
+    `SessionAgent::resume_run_with_events` with the run's id and the
+    provisional checkpoint receipt its actor was seeded with
+    (`SessionAgentResumeInput`). A resumed dispatch whose live image does not
+    begin with the tail the receipt names is refused before any call runs
+    again. An agent without durable round commits refuses a resume (the
+    method's default).
+  - `SessionAgent::set_run_start_input_ids` names the inputs the runtime bound
+    to every runtime-dispatched run, so a durable session's run cursor names
+    them.
+  - A host gates a resume with an optional `ResumedRunAdmission` bound to the
+    session's registration (`MeerkatMachine::bind_resumed_run_admission`;
+    `MeerkatMachine::resumed_run_admission_bound` tells whether one is
+    bound). `Continue` resumes the run; `Superseded` settles it like a stop;
+    `Unavailable`, or an attempt that does not answer within
+    `RESUMED_RUN_ADMISSION_ATTEMPT_TIMEOUT`, is asked again up to
+    `RESUMED_RUN_ADMISSION_ATTEMPTS` times and then settles the run the same
+    way. Without a bound admission the run resumes.
+  - A run that fails while its inputs replay first has its provisional tail
+    discarded, so a later recovery cannot commit their content as an
+    interrupted run while the replay appends them again. A discard that
+    fails requires a cold reload of the session's runtime
+    (`MeerkatMachine::require_session_durability_reload`), so nothing is
+    replayed.
+  - The resumed actor is seeded from the run's provisional tail with the
+    tail's checkpoint receipt (`MeerkatMachine::resumable_run_id` reads the
+    mark). A recovery that holds or refuses the tail keeps the tail and the
+    mark for reconciliation, and the session is not materialized. An open
+    run that no runtime registration marks (a session served without a
+    runtime, for one) is refused as `SessionError::DurableTailHeldForRecovery`
+    instead of failing on its first write. The resumed agent waits for its
+    MCP servers before it re-dispatches the round's staged calls, and
+    receives the interrupted tool calls of its run that the runtime still
+    owes notices for (`MeerkatMachine::owed_interrupted_tool_calls`).
+  - A marked run that is settled without resuming (a refused resume, an
+    expired requeue stop, or a stop) has its provisional tail repaired as
+    interrupted once its inputs' abandonment commits: rows kept, open calls
+    answered outcome-unknown, notice appended. The repair commits a boundary
+    the live session did not, so the session reloads before it serves again;
+    a tail the repair cannot resolve is left to the next registration's
+    recovery, with the same reload. `MeerkatMachine::release_resumable_run`,
+    whose inputs run again, discards the tail by its exact authority before
+    it requeues them; it refuses a run whose tail records its re-base, whose
+    inputs are already committed, and such a run is settled instead. While a
+    provisional tail stands, the runtime's startup and teardown
+    reconciliation of the compaction outbox keeps the outboxed stages and
+    waits for the run's boundary to refresh and finalize.
+  - `CoreExecutorInterruptHandle::suspend_run_if_current` lets a surface
+    suspend a durable session's in-flight run for a graceful requeue stop
+    instead of cancelling it; its default suspends nothing, and the stop then
+    cancels the run as before. The stop asks for a suspension only when the
+    runtime would admit it. A suspended run publishes no terminal event on
+    the session's event stream; a run the suspension finds past its final
+    save, or one that takes no round commits, is cancelled with its terminal
+    as before.
+  - A run whose WholeBlob re-base committed its inputs into the session's
+    history, and whose turn then fails, ends as a failed run with its inputs
+    consumed and its boundary committed from the rounds it ran. A failure
+    that requires the session to reload, or one whose last committed round
+    still owes its tool calls, stops the runtime executor instead, and the
+    run is resumed or repaired at the next start; it is never replayed. The
+    re-base is recorded in the run's cursor, so this holds for a run resumed
+    after a restart too, including one whose resumed dispatch is refused
+    before it runs: its provisional tail is kept, not discarded, and the
+    runtime executor stops. A re-base whose store call failed with its outcome
+    unknown is settled from the store first: applied, the run is re-based;
+    not applied, its failure is an ordinary one; unknown, the runtime
+    executor stops and nothing is requeued or discarded.
+  - A run that ends in a hard-failure terminal commits its latest checkpoint
+    as its failed boundary. When its closing save failed and that checkpoint
+    is still a round's first commit, whose staged calls may have run, or when
+    the failure requires the session to reload, the runtime executor stops
+    instead, and the run is resumed or repaired at the next start.
+  - While a run is marked resumable, the runtime loop resumes it before any
+    queued input and records no transcript notice ahead of it. A stop
+    settles the marked run as cancelled; retire, reset and destroy end it
+    with their own sweeps. A graceful unregister that requeues keeps a
+    marked run that has not resumed: its inputs stay bound to it, and the
+    next start resumes it unless one of them is older than the stop's max
+    age, which settles the whole run with
+    `InputAbandonReason::RequeueExpired` instead.
 - Durable workers: a mob profile with `durable = true` spawns its members as
   durable workers. The spawn records a durable identity
   (`SpawnContinuityIntent::DurableIdentity`, keyed by the member's identity),
@@ -1502,15 +1626,12 @@ them.
 
 ### Changed
 
-- `meerkat-runtime`: a graceful stop that requeues (`UnregisterQueuedInputs::Requeue`,
-  for example a deploy) now suspends a durable session's in-flight run instead
-  of cancelling it. The run keeps its inputs bound with the stop's requeue
-  mark, their waiters are answered `RequeuedAcrossStop`, and the next start
-  resumes the run from its last committed round, or ends its inputs as
-  `RequeueExpired` past the max age. A stop without Requeue, an explicit stop
-  or cancel, retire, destroy and reset still end the run as before, and a run
-  whose turn has already ended (completed, failed or cancelled) is never
-  suspended.
+- `meerkat-session`: materializing a durable session whose durable-tail
+  recovery held or refused its tail now answers the typed
+  `SessionError::DurableTailHeldForRecovery` or
+  `SessionError::DurableTailRecoveryRefused` instead of an internal error, so
+  a caller can tell a session withheld for reconciliation from a fault. The
+  tail and every durable row are kept, as before.
 - `rkat-rpc` and `rkat-rest`: a graceful shutdown keeps a durable session's
   work for its next start instead of cancelling it. `rkat-rpc`'s shutdown
   (when its input ends, on SIGTERM or on an interrupt) and the REST server's
@@ -2331,6 +2452,13 @@ them.
   recovered as interrupted although its transcript is whole: that save
   re-based the run, so its rows are already the committed base, and the run
   shows the interrupted notice. Nothing is lost or run twice.
+- A remote client (JSON-RPC or REST) whose turn on a durable session is in
+  flight when the server stops gracefully, keeping the session's work, gets
+  no typed suspended answer. Its request ends as a shutdown error: the
+  session-not-running error with `kind: requeued_across_stop`, or a closed
+  connection when the server exits first. The server resumes the run at its
+  next start. Read the run's status before retrying: resubmitting the input
+  runs it again.
 - The usage of a model call that a restart interrupted is not recorded,
   although the provider bills it. Asynchronous operations a resumed run was
   waiting for ended with the restart: the run does not wait for them, and the

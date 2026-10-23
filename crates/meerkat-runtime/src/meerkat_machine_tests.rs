@@ -54737,6 +54737,562 @@ async fn empty_compaction_outbox_skips_the_identity_checkpoint_cycle_after_commi
     assert_eq!(store.session_snapshot_commits(), 2);
 }
 
+/// While a run's provisional tail stands over the committed WholeBlob base (a
+/// run resumed from it, or kept across a requeue stop), the startup and
+/// teardown reconciliation keeps the outboxed intents' stages and does nothing
+/// else: no reload, no recommit (the store refuses one under the tail), no
+/// executor checkpoint (it would replace the resumed actor's image with the
+/// committed base) and no finalization. Once the tail is gone, the recovery
+/// form refreshes as before. Unrun: written while Cargo is not run.
+#[tokio::test]
+async fn compaction_reconciliation_defers_to_a_standing_provisional_tail() {
+    struct RecordingCompactionExecutor {
+        reconcile_intent_counts: Vec<usize>,
+        checkpoint_calls: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreExecutor for RecordingCompactionExecutor {
+        async fn apply(
+            &mut self,
+            _run_id: RunId,
+            _primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            Err(CoreExecutorError::Internal(
+                "outbox reconciliation never applies a primitive".to_string(),
+            ))
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn checkpoint_committed_session_snapshot(
+            &mut self,
+            _session_snapshot: Arc<Vec<u8>>,
+        ) -> Result<(), CoreExecutorError> {
+            self.checkpoint_calls += 1;
+            Ok(())
+        }
+
+        async fn reconcile_committed_compaction_projections(
+            &mut self,
+            intents: &[meerkat_core::CompactionProjectionIntent],
+        ) -> Result<(), CoreExecutorError> {
+            self.reconcile_intent_counts.push(intents.len());
+            Ok(())
+        }
+    }
+
+    let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let store = Arc::new(RuntimeCommitAtomicityStore::pass_through(Arc::clone(
+        &inner,
+    )));
+    let mut session = meerkat_core::Session::new();
+    session.push(meerkat_core::types::Message::User(
+        meerkat_core::types::UserMessage::text("committed before the run"),
+    ));
+    let session_id = session.id().clone();
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    let committed = serde_json::to_vec(&session).expect("committed session serializes");
+    let base = inner
+        .inject_committed_whole_blob_bytes_for_test(&runtime_id, &session_id, committed)
+        .await
+        .expect("base authority");
+    session.push(meerkat_core::types::Message::User(
+        meerkat_core::types::UserMessage::text("the open run's committed round"),
+    ));
+    let run_id = RunId::new();
+    let prepared = crate::store::PreparedWholeBlobProvisionalTail::prepare_from_session(
+        base,
+        run_id.clone(),
+        1,
+        &session,
+    )
+    .expect("the run's tail prepares");
+    crate::store::RuntimeStore::write_prepared_whole_blob_provisional_tail(
+        inner.as_ref(),
+        &runtime_id,
+        prepared,
+    )
+    .await
+    .expect("the run's tail is written");
+
+    let driver: crate::meerkat_machine::SharedDriver = Arc::new(Mutex::new(
+        DriverEntry::Persistent(PersistentRuntimeDriver::new(
+            runtime_id.clone(),
+            Arc::clone(&store) as Arc<dyn RuntimeStore>,
+            memory_blob_store(),
+        )),
+    ));
+    let mut executor = RecordingCompactionExecutor {
+        reconcile_intent_counts: Vec::new(),
+        checkpoint_calls: 0,
+    };
+
+    for empty_outbox in [
+        crate::runtime_loop::EmptyOutboxCheckpoint::RefreshFromStore,
+        crate::runtime_loop::EmptyOutboxCheckpoint::SkipIdentityRefresh,
+    ] {
+        let checkpoint = crate::runtime_loop::reconcile_loaded_compaction_projection_outbox(
+            &driver,
+            &mut executor,
+            Vec::new(),
+            empty_outbox,
+        )
+        .await
+        .expect("reconciliation under a standing tail succeeds");
+        assert_eq!(checkpoint, None, "{empty_outbox:?}");
+    }
+    assert_eq!(
+        executor.reconcile_intent_counts,
+        vec![0, 0],
+        "the outboxed intents' stages are reconciled every time"
+    );
+    assert_eq!(
+        executor.checkpoint_calls, 0,
+        "the resumed actor's image is left exactly as seeded"
+    );
+    assert_eq!(inner.committed_whole_blob_bytes_loads(), 0);
+    assert_eq!(store.session_snapshot_loads(), 0);
+    assert_eq!(
+        store.session_snapshot_commits(),
+        0,
+        "nothing is written under the tail"
+    );
+    let tail =
+        crate::store::RuntimeStore::load_whole_blob_provisional_tail(inner.as_ref(), &runtime_id)
+            .await
+            .expect("the tail loads")
+            .expect("the tail still stands");
+    assert_eq!(tail.authority().run_id(), &run_id);
+
+    // Once the run's tail is gone, the recovery form heals as before.
+    assert!(
+        crate::store::RuntimeStore::discard_whole_blob_provisional_tail(
+            inner.as_ref(),
+            &runtime_id,
+            tail.authority(),
+        )
+        .await
+        .expect("the tail discards")
+    );
+    let checkpoint = crate::runtime_loop::reconcile_loaded_compaction_projection_outbox(
+        &driver,
+        &mut executor,
+        Vec::new(),
+        crate::runtime_loop::EmptyOutboxCheckpoint::RefreshFromStore,
+    )
+    .await
+    .expect("the recovery form refreshes once no tail stands");
+    assert!(checkpoint.is_some());
+    assert_eq!(executor.checkpoint_calls, 1);
+    assert_eq!(store.session_snapshot_commits(), 1);
+}
+
+/// A settled run's tail repair makes the session reload whenever it would
+/// otherwise serve over stale state: a tail of another run stands (the run
+/// guard touches nothing), so the session reloads; with no tail at all the
+/// committed document is already aligned, nothing is written, and the session
+/// keeps serving. This row covers those two arms. The committing arm (the
+/// settled run's own tail, its inputs terminal, repaired and answered as a
+/// reload) needs the settled run's durable input rows, which the run-guarded
+/// recovery's own contract row builds; the harness covers it end to end.
+/// Unrun: written while Cargo is not run.
+#[tokio::test]
+async fn a_settled_runs_repair_reloads_unless_no_tail_stood() {
+    let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let mut session = meerkat_core::Session::new();
+    session.push(meerkat_core::types::Message::User(
+        meerkat_core::types::UserMessage::text("committed before the run"),
+    ));
+    let session_id = session.id().clone();
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    let base = inner
+        .inject_committed_whole_blob_bytes_for_test(
+            &runtime_id,
+            &session_id,
+            serde_json::to_vec(&session).expect("committed session serializes"),
+        )
+        .await
+        .expect("base authority");
+    let driver = DriverEntry::Persistent(PersistentRuntimeDriver::new(
+        runtime_id.clone(),
+        Arc::clone(&inner) as Arc<dyn RuntimeStore>,
+        memory_blob_store(),
+    ));
+    let settled_run = RunId::new();
+    assert!(
+        !driver
+            .repair_settled_run_tail(&session_id, &settled_run)
+            .await,
+        "no tail stood: the committed document is aligned and the session keeps serving"
+    );
+
+    let mut candidate = session.clone();
+    candidate.push(meerkat_core::types::Message::User(
+        meerkat_core::types::UserMessage::text("another run's committed round"),
+    ));
+    let other_run = RunId::new();
+    crate::store::RuntimeStore::write_prepared_whole_blob_provisional_tail(
+        inner.as_ref(),
+        &runtime_id,
+        crate::store::PreparedWholeBlobProvisionalTail::prepare_from_session(
+            base,
+            other_run.clone(),
+            1,
+            &candidate,
+        )
+        .expect("the other run's tail prepares"),
+    )
+    .await
+    .expect("the other run's tail is written");
+    assert!(
+        driver
+            .repair_settled_run_tail(&session_id, &settled_run)
+            .await,
+        "another run's tail stands: the session reloads"
+    );
+    let tail =
+        crate::store::RuntimeStore::load_whole_blob_provisional_tail(inner.as_ref(), &runtime_id)
+            .await
+            .expect("the tail loads")
+            .expect("the other run's tail is untouched");
+    assert_eq!(tail.authority().run_id(), &other_run);
+}
+
+/// Under a standing provisional tail the reconciliation keeps an outboxed
+/// compaction intent pending: the executor reconciles its stage, and nothing
+/// finalizes it (a finalization here would fail on an intent the store never
+/// outboxed). Its finalization belongs to the run's boundary. Unrun: written
+/// while Cargo is not run.
+#[tokio::test]
+async fn compaction_reconciliation_keeps_an_outboxed_intent_pending_under_a_tail() {
+    struct CountingExecutor {
+        reconcile_intent_counts: Vec<usize>,
+        checkpoint_calls: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreExecutor for CountingExecutor {
+        async fn apply(
+            &mut self,
+            _run_id: RunId,
+            _primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            Err(CoreExecutorError::Internal(
+                "outbox reconciliation never applies a primitive".to_string(),
+            ))
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn checkpoint_committed_session_snapshot(
+            &mut self,
+            _session_snapshot: Arc<Vec<u8>>,
+        ) -> Result<(), CoreExecutorError> {
+            self.checkpoint_calls += 1;
+            Ok(())
+        }
+
+        async fn reconcile_committed_compaction_projections(
+            &mut self,
+            intents: &[meerkat_core::CompactionProjectionIntent],
+        ) -> Result<(), CoreExecutorError> {
+            self.reconcile_intent_counts.push(intents.len());
+            Ok(())
+        }
+    }
+
+    let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let mut session = meerkat_core::Session::new();
+    session.append_system_message("system prompt");
+    for turn in 0..5 {
+        session.push(meerkat_core::types::Message::User(
+            meerkat_core::types::UserMessage::text(format!("question {turn}")),
+        ));
+    }
+    let live = session.messages().to_vec();
+    let mut replacement = vec![live[0].clone()];
+    replacement.push(meerkat_core::types::Message::User(
+        meerkat_core::types::UserMessage::compaction_summary(
+            "[Compaction summary] earlier questions",
+        ),
+    ));
+    replacement.extend(live[4..].iter().cloned());
+    let (_rewrite, intent) = session
+        .stage_validated_compaction_for_test(replacement, 12)
+        .expect("the run compacts");
+    let session_id = session.id().clone();
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    let base = inner
+        .inject_committed_whole_blob_bytes_for_test(
+            &runtime_id,
+            &session_id,
+            serde_json::to_vec(&session).expect("the compacted session serializes"),
+        )
+        .await
+        .expect("base authority");
+    let mut candidate = session.clone();
+    candidate.push(meerkat_core::types::Message::User(
+        meerkat_core::types::UserMessage::text("a round after the compaction"),
+    ));
+    crate::store::RuntimeStore::write_prepared_whole_blob_provisional_tail(
+        inner.as_ref(),
+        &runtime_id,
+        crate::store::PreparedWholeBlobProvisionalTail::prepare_from_session(
+            base,
+            RunId::new(),
+            1,
+            &candidate,
+        )
+        .expect("the run's tail prepares"),
+    )
+    .await
+    .expect("the run's tail is written");
+
+    let driver: crate::meerkat_machine::SharedDriver = Arc::new(Mutex::new(
+        DriverEntry::Persistent(PersistentRuntimeDriver::new(
+            runtime_id,
+            Arc::clone(&inner) as Arc<dyn RuntimeStore>,
+            memory_blob_store(),
+        )),
+    ));
+    let mut executor = CountingExecutor {
+        reconcile_intent_counts: Vec::new(),
+        checkpoint_calls: 0,
+    };
+    for empty_outbox in [
+        crate::runtime_loop::EmptyOutboxCheckpoint::RefreshFromStore,
+        crate::runtime_loop::EmptyOutboxCheckpoint::SkipIdentityRefresh,
+    ] {
+        let checkpoint = crate::runtime_loop::reconcile_loaded_compaction_projection_outbox(
+            &driver,
+            &mut executor,
+            vec![intent.clone()],
+            empty_outbox,
+        )
+        .await
+        .expect("nothing is finalized under the tail");
+        assert_eq!(checkpoint, None, "{empty_outbox:?}");
+    }
+    assert_eq!(
+        executor.reconcile_intent_counts,
+        vec![1, 1],
+        "the intent's stage is reconciled, and kept"
+    );
+    assert_eq!(executor.checkpoint_calls, 0);
+}
+
+/// A released run (its inputs requeued to run again) leaves no provisional
+/// tail: it is discarded by its own exact authority, and the session's next
+/// run then writes its first round commit over the same committed base.
+/// Another run's tail is never discarded in its place. Unrun: written while
+/// Cargo is not run.
+#[tokio::test]
+async fn a_released_runs_tail_is_discarded_so_the_next_runs_first_commit_lands() {
+    let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let mut session = meerkat_core::Session::new();
+    session.push(meerkat_core::types::Message::User(
+        meerkat_core::types::UserMessage::text("committed before the run"),
+    ));
+    let session_id = session.id().clone();
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    let base = inner
+        .inject_committed_whole_blob_bytes_for_test(
+            &runtime_id,
+            &session_id,
+            serde_json::to_vec(&session).expect("committed session serializes"),
+        )
+        .await
+        .expect("base authority");
+    let write_tail = |run_id: RunId, text: &'static str| {
+        let mut candidate = session.clone();
+        candidate.push(meerkat_core::types::Message::User(
+            meerkat_core::types::UserMessage::text(text),
+        ));
+        let prepared = crate::store::PreparedWholeBlobProvisionalTail::prepare_from_session(
+            base.clone(),
+            run_id,
+            1,
+            &candidate,
+        )
+        .expect("the tail prepares");
+        let inner = Arc::clone(&inner);
+        let runtime_id = runtime_id.clone();
+        async move {
+            crate::store::RuntimeStore::write_prepared_whole_blob_provisional_tail(
+                inner.as_ref(),
+                &runtime_id,
+                prepared,
+            )
+            .await
+        }
+    };
+    let tail_run = |inner: Arc<crate::store::InMemoryRuntimeStore>,
+                    runtime_id: LogicalRuntimeId| async move {
+        crate::store::RuntimeStore::load_whole_blob_provisional_tail(inner.as_ref(), &runtime_id)
+            .await
+            .expect("the tail loads")
+            .map(|tail| tail.authority().run_id().clone())
+    };
+
+    let released_run = RunId::new();
+    write_tail(released_run.clone(), "the released run's committed round")
+        .await
+        .expect("the released run's tail is written");
+    let driver = DriverEntry::Persistent(PersistentRuntimeDriver::new(
+        runtime_id.clone(),
+        Arc::clone(&inner) as Arc<dyn RuntimeStore>,
+        memory_blob_store(),
+    ));
+
+    assert!(
+        !driver
+            .discard_run_provisional_tail(&RunId::new())
+            .await
+            .expect("the tail reads"),
+        "another run's discard leaves the released run's tail alone"
+    );
+    assert_eq!(
+        tail_run(Arc::clone(&inner), runtime_id.clone()).await,
+        Some(released_run.clone())
+    );
+
+    assert!(
+        driver
+            .discard_run_provisional_tail(&released_run)
+            .await
+            .expect("the tail discards")
+    );
+    assert_eq!(tail_run(Arc::clone(&inner), runtime_id.clone()).await, None);
+    assert!(
+        driver
+            .discard_run_provisional_tail(&released_run)
+            .await
+            .expect("nothing left to discard"),
+        "no tail of the run is left"
+    );
+
+    write_tail(RunId::new(), "the next run's first round")
+        .await
+        .expect("the next run's first round commit lands over the same base");
+}
+
+/// A run whose provisional tail records its re-base is never released to
+/// requeue (`MeerkatMachine::release_resumable_run` refuses it): its inputs
+/// are already in the committed body. The driver reads the fact from the
+/// tail's own cursor. A tail of the run whose cursor carries the re-base,
+/// or whose cursor names another run, records it; a cursor without the
+/// re-base, a tail without a cursor, and no tail at all do not. RED before:
+/// a release discarded such a tail and requeued the inputs. Unrun: written
+/// while Cargo is not run.
+#[tokio::test]
+async fn a_run_tail_that_records_its_rebase_is_never_released() {
+    let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let mut session = meerkat_core::Session::new();
+    session.push(meerkat_core::types::Message::User(
+        meerkat_core::types::UserMessage::text("committed by the run's re-base"),
+    ));
+    let session_id = session.id().clone();
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    let base = inner
+        .inject_committed_whole_blob_bytes_for_test(
+            &runtime_id,
+            &session_id,
+            serde_json::to_vec(&session).expect("committed session serializes"),
+        )
+        .await
+        .expect("base authority");
+    let driver = DriverEntry::Persistent(PersistentRuntimeDriver::new(
+        runtime_id.clone(),
+        Arc::clone(&inner) as Arc<dyn RuntimeStore>,
+        memory_blob_store(),
+    ));
+    let run_id = RunId::new();
+    assert!(
+        !driver
+            .run_tail_records_rebase(&run_id)
+            .await
+            .expect("the tail reads"),
+        "no tail records no re-base"
+    );
+
+    for (cursor_run, rebased, records) in [
+        (Some(run_id.clone()), true, true),
+        (Some(run_id.clone()), false, false),
+        (Some(RunId::new()), false, true),
+        (None, false, false),
+    ] {
+        assert!(
+            driver
+                .discard_run_provisional_tail(&run_id)
+                .await
+                .expect("the previous tail of the run discards"),
+            "no other run's tail stands"
+        );
+        let mut candidate = session.clone();
+        candidate.push(meerkat_core::types::Message::User(
+            meerkat_core::types::UserMessage::text("a round the run committed after its re-base"),
+        ));
+        if let Some(cursor_run) = cursor_run.clone() {
+            let mut cursor = meerkat_core::SessionRunCursor::new(
+                cursor_run,
+                Vec::new(),
+                1,
+                meerkat_core::RunResumePoint::AwaitingModel,
+            );
+            cursor.rebased = rebased;
+            candidate
+                .set_run_cursor(&cursor)
+                .expect("the cursor is recorded");
+        }
+        crate::store::RuntimeStore::write_prepared_whole_blob_provisional_tail(
+            inner.as_ref(),
+            &runtime_id,
+            crate::store::PreparedWholeBlobProvisionalTail::prepare_from_session(
+                base.clone(),
+                run_id.clone(),
+                1,
+                &candidate,
+            )
+            .expect("the run's tail prepares"),
+        )
+        .await
+        .expect("the run's tail is written");
+        assert_eq!(
+            driver
+                .run_tail_records_rebase(&run_id)
+                .await
+                .expect("the tail reads"),
+            records,
+            "cursor of {cursor_run:?}, rebased {rebased}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Runtime host health probes.
 //

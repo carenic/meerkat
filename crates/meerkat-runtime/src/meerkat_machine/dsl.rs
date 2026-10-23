@@ -4288,11 +4288,24 @@ pub enum RecoveredRuntimeExecutionKind {
     ResumePending,
 }
 
-impl From<meerkat_core::lifecycle::RuntimeExecutionKind> for RecoveredRuntimeExecutionKind {
-    fn from(kind: meerkat_core::lifecycle::RuntimeExecutionKind) -> Self {
+/// A stored input carried an execution kind that only a dispatch may carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("execution kind {0:?} is a dispatch kind and is never admitted or recovered")]
+pub struct DispatchOnlyExecutionKind(pub meerkat_core::lifecycle::RuntimeExecutionKind);
+
+impl TryFrom<meerkat_core::lifecycle::RuntimeExecutionKind> for RecoveredRuntimeExecutionKind {
+    type Error = DispatchOnlyExecutionKind;
+
+    fn try_from(kind: meerkat_core::lifecycle::RuntimeExecutionKind) -> Result<Self, Self::Error> {
         match kind {
-            meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn => Self::ContentTurn,
-            meerkat_core::lifecycle::RuntimeExecutionKind::ResumePending => Self::ResumePending,
+            meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn => Ok(Self::ContentTurn),
+            meerkat_core::lifecycle::RuntimeExecutionKind::ResumePending => Ok(Self::ResumePending),
+            // The resumed-run step stamps ResumeRun on the run it dispatches,
+            // never on an admitted input, so a stored input that carries it
+            // is corrupt.
+            kind @ meerkat_core::lifecycle::RuntimeExecutionKind::ResumeRun => {
+                Err(DispatchOnlyExecutionKind(kind))
+            }
         }
     }
 }

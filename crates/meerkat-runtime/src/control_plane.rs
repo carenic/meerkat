@@ -668,8 +668,42 @@ pub(crate) async fn terminalize_async_stop_once(
     publication_handle: Option<&dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
     runless_terminal: &mut crate::meerkat_machine::RunlessTerminalAnnouncement,
 ) -> Result<(), RuntimeDriverError> {
-    let (completion_input_ids, requeued_input_ids, candidate_owner_input_id, termination_reason) = {
+    let (
+        settled_resumable_input_ids,
+        completion_input_ids,
+        requeued_input_ids,
+        candidate_owner_input_id,
+        termination_reason,
+    ) = {
         let mut driver = driver.lock().await;
+        // A run the session left open and has not resumed ends with the stop,
+        // as an in-flight run does: its bound inputs are abandoned as
+        // cancelled and its mark ends, before the stop classifies the rest. A
+        // graceful unregister that keeps queued work keeps that run too: the
+        // next registration finds it open again.
+        let settled_resumable_input_ids = match driver.resumable_run_id() {
+            Some(run_id) if !driver.stop_keeps_queued_work() => {
+                let settled = driver
+                    .settle_resumable_run(
+                        &run_id,
+                        crate::input_state::InputAbandonReason::Cancelled,
+                    )
+                    .await?;
+                // Its provisional tail is repaired as an interrupted run,
+                // after the abandonment committed: every committed round
+                // stays. A tail the repair leaves standing is the next
+                // registration's recovery's to repair, before anything
+                // serves.
+                if let Some(session_id) = driver.session_id() {
+                    driver.repair_settled_run_tail(&session_id, &run_id).await;
+                }
+                settled
+            }
+            _ => Vec::new(),
+        };
+        if !settled_resumable_input_ids.is_empty() {
+            runless_terminal.owe();
+        }
         let active_input_ids = driver.as_driver().active_input_ids();
         let termination_reason = generated_runtime_termination_reason(&driver).to_string();
         // `Stopped` must still replay RuntimeExecutorExited so an interrupted
@@ -714,6 +748,7 @@ pub(crate) async fn terminalize_async_stop_once(
         let candidate_owner_input_id =
             crate::meerkat_machine::driver::DriverEntry::commit_prepared_runless_interaction_terminal_outboxes(prepared);
         (
+            settled_resumable_input_ids,
             completion_input_ids,
             requeued_input_ids,
             candidate_owner_input_id,
@@ -723,6 +758,12 @@ pub(crate) async fn terminalize_async_stop_once(
 
     if let Some(completions) = completions {
         let mut completions = completions.lock().await;
+        completions.fail_inputs(
+            settled_resumable_input_ids,
+            crate::completion::CompletionWaitError::AuthorityUnavailable(format!(
+                "the run these inputs were bound to ended with the stop before it resumed: {termination_reason}"
+            )),
+        );
         for (input_id, stopped_at) in requeued_input_ids {
             completions.fail_inputs(
                 [input_id],

@@ -3306,19 +3306,12 @@ where
     }
 
     /// A resumed run runs only as the runtime dispatched it. A runtime-stamped
-    /// agent never resumes under a content turn's or a pending
-    /// continuation's execution kind, whose admission is not a resume's: the
-    /// runtime's resumed-run dispatch kind, which arrives with the runtime's
-    /// resume dispatch, is the one this requires. An agent the runtime does
-    /// not stamp (a direct embedding) resumes as its host calls it.
+    /// agent resumes only under `RuntimeExecutionKind::ResumeRun`, never under
+    /// a content turn's or a pending continuation's execution kind, whose
+    /// admission is not a resume's. An agent the runtime does not stamp (a
+    /// direct embedding) resumes as its host calls it.
     fn require_resumed_run_execution_kind(&self) -> Result<(), AgentError> {
-        if !self.runtime_execution_kind_required {
-            return Ok(());
-        }
-        Err(AgentError::InternalError(format!(
-            "a runtime-backed run resumes only under the resumed-run dispatch kind, not {:?}",
-            self.runtime_execution_kind
-        )))
+        self.require_runtime_execution_kind(crate::lifecycle::RuntimeExecutionKind::ResumeRun)
     }
 
     /// The inputs the session layer staged for a resumed run must be the
@@ -3393,32 +3386,42 @@ where
     /// requeueing, for a deploy), and say where the suspended run stood;
     /// `None` when no run had started.
     ///
-    /// Unlike [`Self::cancel_dropped_run`] it realizes nothing: no terminal is
+    /// [`crate::DroppedRunSuspension::Resumable`]: the run's last round
+    /// commit, cursor included, stays its resume point. Unlike
+    /// [`Self::cancel_dropped_run`] this realizes nothing: no terminal is
     /// published on the stream or the tap, nothing is applied to the turn
     /// authority (the runtime suspends the run in its own machine), and
     /// nothing is written. The agent's run state is cleared, the live session
-    /// keeps no cursor and the dispatch context no round.
+    /// keeps no cursor and the dispatch context no round, and the session
+    /// layer answers the turn with [`AgentError::RunSuspended`].
     ///
-    /// [`crate::DroppedRunSuspension::Resumable`]: the run's last round
-    /// commit, cursor included, stays its resume point, and the session layer
-    /// answers the turn with [`AgentError::RunSuspended`].
-    /// [`crate::DroppedRunSuspension::PastFinalSave`]: the run's save without
-    /// the cursor had landed, so its work is committed and nothing is left to
-    /// resume; its inputs must not run again.
+    /// The two other outcomes are not suspensions, and nothing of the run is
+    /// cleared: the caller ends it with [`Self::cancel_dropped_run`], which
+    /// publishes the run's terminal where it is still owed, as for every
+    /// stop. [`crate::DroppedRunSuspension::PastFinalSave`]: the run's save
+    /// without the cursor had landed, so its work is committed, nothing is
+    /// left to resume, and its inputs must not run again.
+    /// [`crate::DroppedRunSuspension::NotResumable`]: the run takes no round
+    /// commits, so it has no resume point.
     pub fn suspend_dropped_run(&mut self) -> Option<crate::DroppedRunSuspension> {
         let run_id = self.runtime_started_run_id.clone();
-        // Read before the run state is cleared below.
-        let past_final_save = self.round_commits.final_save_written();
+        if let Some(run_id) = run_id.as_ref() {
+            if !self.round_commits.commits_enabled() {
+                return Some(crate::DroppedRunSuspension::NotResumable {
+                    run_id: run_id.clone(),
+                });
+            }
+            if self.round_commits.final_save_written() {
+                return Some(crate::DroppedRunSuspension::PastFinalSave {
+                    run_id: run_id.clone(),
+                });
+            }
+        }
         self.runtime_terminal_failure_witness = None;
         self.session.clear_run_cursor();
         self.tool_dispatch_context.clear_round();
         self.clear_runtime_execution_kind();
-        let run_id = run_id?;
-        Some(if past_final_save {
-            crate::DroppedRunSuspension::PastFinalSave { run_id }
-        } else {
-            crate::DroppedRunSuspension::Resumable { run_id }
-        })
+        run_id.map(|run_id| crate::DroppedRunSuspension::Resumable { run_id })
     }
 
     fn dropped_run_terminal_event(&self) -> Option<(AgentEvent, crate::agent::OwedRunTerminal)> {

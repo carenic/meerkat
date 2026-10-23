@@ -1311,7 +1311,8 @@ async fn a_suspended_run_keeps_its_last_round_commit_and_realizes_nothing() {
 /// A run whose future the host drops after its end-of-run save landed has
 /// nothing left to resume: its latest checkpoint holds its answer and no
 /// cursor. The agent reports it past its final save, so the stop runs none
-/// of its inputs again.
+/// of its inputs again, and leaves it to the caller's cancellation, which
+/// gives the session's stream the run's terminal it was still owed.
 #[tokio::test]
 async fn a_run_suspended_after_its_final_save_reports_it() {
     let client = ScriptedClient::new(vec![
@@ -1386,6 +1387,132 @@ async fn a_run_suspended_after_its_final_save_reports_it() {
         run_id
     );
     assert!(cursor_of(agent.session()).is_none());
+
+    let owed = agent.cancel_dropped_run();
+    assert!(
+        matches!(owed, Some(AgentEvent::RunFailed { .. })),
+        "the stream is still owed the run's terminal: {owed:?}"
+    );
+    assert!(
+        agent.suspend_dropped_run().is_none(),
+        "the cancellation ended the run"
+    );
+}
+
+/// A run that takes no round commits has no resume point, so a stop that
+/// keeps the session's work cannot suspend it: the agent reports it not
+/// resumable and leaves its state for the caller's cancellation. That holds
+/// for an agent without a session checkpointer and for a live bridge run,
+/// which commits nothing although its session is durable.
+#[tokio::test]
+async fn a_run_without_round_commits_is_not_resumable() {
+    for live_bridge in [false, true] {
+        let client = ScriptedClient::new(vec![Step::Tools(vec![("call-1", "probe", "{}")])]);
+        let tools = RecordingTools::new(RecordingTools::probes(), Some("probe"));
+        let checkpointer = RecordingCheckpointer::new();
+        let mut agent = build_agent(
+            fresh_session(),
+            &client,
+            &tools,
+            live_bridge.then(|| Arc::clone(&checkpointer)),
+            true,
+            None,
+        )
+        .await;
+        if live_bridge {
+            // As the live bridge operation installs it: a run that commits
+            // nothing, over the bridge's frozen tool surface.
+            agent.noncommitting_live_bridge_run = true;
+            agent.live_bridge_tool_defs = Some(tools.tools());
+        }
+        run_until_stopped(agent.run("start".into()), &tools.entered).await;
+
+        let suspension = agent
+            .suspend_dropped_run()
+            .expect("the dropped run had started");
+        let meerkat_core::DroppedRunSuspension::NotResumable { run_id } = suspension else {
+            panic!("a run without round commits has no resume point: {suspension:?}");
+        };
+        let key = tools.dispatched()[0]
+            .1
+            .clone()
+            .expect("the round's call carries its key");
+        assert_eq!(key.run_id, run_id, "live bridge: {live_bridge}");
+        assert!(
+            checkpointer.commits().is_empty(),
+            "nothing durable names the run's progress"
+        );
+        assert_eq!(
+            agent.tool_dispatch_context.round(),
+            Some(0),
+            "the run's state is left for the caller's cancellation"
+        );
+
+        let _ = agent.cancel_dropped_run();
+        assert_eq!(agent.tool_dispatch_context.round(), None);
+        assert!(
+            agent.suspend_dropped_run().is_none(),
+            "the cancellation ended the run"
+        );
+    }
+}
+
+/// A run that re-based before its restart still says so after it: the
+/// resumed run restores the flag from its cursor, and every later commit's
+/// cursor carries it, although the run does not re-base again. A restart
+/// therefore never forgets that the run's inputs are in the committed
+/// history.
+#[tokio::test]
+async fn a_resumed_run_keeps_the_rebased_flag_its_cursor_carried() {
+    let mut stopped = stop_inside_first_round(
+        vec![("call-1", "probe", "{}")],
+        RecordingTools::probes(),
+        "probe",
+    )
+    .await;
+    assert!(!stopped.cursor.rebased, "the run had not re-based");
+    stopped.cursor.rebased = true;
+    stopped
+        .tail
+        .set_run_cursor(&stopped.cursor)
+        .expect("the cursor records");
+
+    let client = ScriptedClient::new(vec![Step::Answer("done")]);
+    let tools = RecordingTools::new(RecordingTools::probes(), None);
+    let checkpointer = RecordingCheckpointer::new();
+    let mut agent = build_agent(
+        stopped.tail.clone(),
+        &client,
+        &tools,
+        Some(Arc::clone(&checkpointer)),
+        false,
+        None,
+    )
+    .await;
+    agent
+        .resume_run(
+            stopped.cursor.clone(),
+            stopped.receipt.clone(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .expect("the resumed run completes");
+
+    let commits = checkpointer.commits();
+    assert_eq!(
+        commits.len(),
+        2,
+        "the resumed round's second commit, then the end-of-run save"
+    );
+    let cursor = cursor_of(&commits[0].0).expect("a round commit carries the cursor");
+    assert!(matches!(cursor.resume_point, RunResumePoint::AwaitingModel));
+    assert!(cursor.rebased, "the restored flag rides every later cursor");
+    assert!(
+        cursor_of(&commits[1].0).is_none(),
+        "the end-of-run save has no cursor"
+    );
 }
 
 /// The cursor lists the inputs the session layer staged for the run; a run

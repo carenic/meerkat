@@ -2263,15 +2263,23 @@ pub(crate) fn expired_stop_requeued_inputs(
         .active_input_ids()
         .into_iter()
         .filter(|input_id| {
-            driver.input_state(input_id).is_some_and(|state| {
-                let admitted_at = state
-                    .persisted_input
-                    .as_ref()
-                    .map_or(state.created_at, |input| input.header().timestamp);
-                stop_requeue_expired(state.stop_requeue.as_ref(), admitted_at, now)
-            })
+            driver
+                .input_state(input_id)
+                .is_some_and(|state| input_stop_requeue_expired(state, now))
         })
         .collect()
+}
+
+/// Whether the input carries a graceful stop's mark that has expired at
+/// `now` ([`stop_requeue_expired`]), its age measured from its admission:
+/// the payload's own timestamp, or the row's creation when the payload is
+/// gone.
+pub(crate) fn input_stop_requeue_expired(state: &InputState, now: DateTime<Utc>) -> bool {
+    let admitted_at = state
+        .persisted_input
+        .as_ref()
+        .map_or(state.created_at, |input| input.header().timestamp);
+    stop_requeue_expired(state.stop_requeue.as_ref(), admitted_at, now)
 }
 
 /// Whether the row carries a fact only stored input state v8 can hold: a
@@ -3192,6 +3200,39 @@ mod tests {
         assert!(stop_requeue_expired(Some(&mark), admitted_at, at(60_001)));
         assert!(!stop_requeue_expired(Some(&mark), admitted_at, at(-5_000)));
         assert!(!stop_requeue_expired(None, admitted_at, at(86_400_000)));
+    }
+
+    /// An input's expiry measures its age from the payload's own admission
+    /// timestamp, and from the row's creation once the payload is gone; an
+    /// unmarked row never expires. A run a graceful stop kept open is checked
+    /// input by input through the same reading.
+    #[test]
+    fn an_inputs_stop_requeue_expiry_reads_its_admission_from_its_payload() {
+        use crate::input::PromptInput;
+
+        let mut state = InputState::new_accepted(InputId::new());
+        let created_at = state.created_at;
+        let at = |offset_ms: i64| created_at + chrono::Duration::milliseconds(offset_ms);
+        assert!(
+            !input_stop_requeue_expired(&state, at(86_400_000)),
+            "an unmarked row never expires"
+        );
+        state.stop_requeue = Some(StopRequeueMark {
+            stopped_at: created_at,
+            max_age_ms: 60_000,
+        });
+        assert!(!input_stop_requeue_expired(&state, at(60_000)));
+        assert!(input_stop_requeue_expired(&state, at(60_001)));
+
+        let mut prompt = PromptInput::new("kept across the stop", None);
+        prompt.header.timestamp = at(30_000);
+        state.persisted_input = Some(Input::Prompt(prompt));
+        assert!(
+            !input_stop_requeue_expired(&state, at(60_001)),
+            "the payload's admission is the age's origin"
+        );
+        assert!(!input_stop_requeue_expired(&state, at(90_000)));
+        assert!(input_stop_requeue_expired(&state, at(90_001)));
     }
 
     /// A row carrying a requeue-across-stop fact (a stop's requeue mark or the
