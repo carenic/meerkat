@@ -481,12 +481,48 @@ const MEERKAT_TRANSITION_ENUM_LATE_TAIL: &[&str] = &[
     "AuthorizeOperatorDurableTailRepairRefuseNonQuiescentDestroyed",
 ];
 
+// Append-only emission tails for the other machines, whose public
+// TransitionId otherwise follows catalog declaration order. A new arm sits
+// beside its siblings in the catalog, where its first-match chain needs it;
+// listing it here emits it after every published variant instead of moving
+// them. Listed transitions are emitted last, in this order. Append only.
+#[cfg(not(test))]
+const MACHINE_TRANSITION_ENUM_LATE_TAILS: &[(&str, &[&str])] = &[
+    (
+        "SessionDocumentMachine",
+        &["ClassifyDurableTailContinuable"],
+    ),
+    (
+        "SessionTurnAdmissionMachine",
+        &["ResolveDispositionResumeRun"],
+    ),
+];
+
 #[cfg(not(test))]
 fn transitions_in_public_enum_order(
     schema: &MachineSchema,
 ) -> Result<Vec<&TransitionSchema>, MachineKernelRenderError> {
     if schema.machine.as_ref() != "MeerkatMachine" {
-        return Ok(schema.transitions.iter().collect());
+        let late_names = MACHINE_TRANSITION_ENUM_LATE_TAILS
+            .iter()
+            .find(|(machine, _)| *machine == schema.machine.as_ref())
+            .map_or(&[][..], |(_, names)| *names);
+        let mut ordered: Vec<&TransitionSchema> = schema
+            .transitions
+            .iter()
+            .filter(|transition| !late_names.contains(&transition.name.as_ref()))
+            .collect();
+        for expected_name in late_names {
+            let transition = schema
+                .transitions
+                .iter()
+                .find(|transition| transition.name.as_ref() == *expected_name)
+                .ok_or_else(|| MachineKernelRenderError::MissingPublicTransitionTail {
+                    transition: (*expected_name).to_owned(),
+                })?;
+            ordered.push(transition);
+        }
+        return Ok(ordered);
     }
 
     let named_transitions = |names: &[&str]| {
