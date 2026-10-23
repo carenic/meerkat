@@ -661,6 +661,10 @@ tier = \"r2\"\n";
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("config_state.lock");
         let held = ConfigWriterLock::acquire(&path).await.unwrap();
+        // A process another test spawns holds a copy of every descriptor this
+        // process has open until it executes its program. This copy stands
+        // for one such process still starting at the release.
+        let inherited = held._file.try_clone().unwrap();
         let waiter = ConfigWriterLock::acquire_within(&path, Duration::from_millis(200)).await;
         assert!(matches!(waiter, Err(ConfigRuntimeError::LockTimeout)));
         assert!(ConfigWriterLock::try_hold(&path).unwrap().is_none());
@@ -672,6 +676,7 @@ tier = \"r2\"\n";
         ConfigWriterLock::try_hold(&path)
             .unwrap()
             .expect("released custody is free");
+        drop(inherited);
     }
 
     #[tokio::test]
