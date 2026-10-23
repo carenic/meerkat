@@ -1038,6 +1038,7 @@ pub(super) enum MobCommand {
         external_delivery_intent: Option<crate::store::MobExternalDeliveryIntent>,
         scoped_event_tx: Option<tokio::sync::mpsc::Sender<meerkat_core::ScopedAgentEvent>>,
         exact_operation: Option<super::handle::FlowOperationCustody>,
+        role_targets: Option<std::sync::Arc<crate::run::FlowRoleTargets>>,
         reply_tx: oneshot::Sender<Result<RunId, MobError>>,
     },
     PreviewRunFlowAdmission {

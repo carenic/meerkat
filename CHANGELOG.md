@@ -561,6 +561,15 @@ them.
   variants; callers requiring non-interruption must not treat
   `ClosedOrphanedDrain` as `Closed`.
 
+- `meerkat-mob`: `MobRun` gains the public field
+  `role_targets: Option<FlowRoleTargets>`, the member set a role-targeted
+  flow run was admitted with (see Added). Code that builds a `MobRun` with a
+  struct literal must set it (`None` for a role-wide run). The run gains the
+  serialized key only when it is role-targeted, so a role-wide run's stored
+  and wire form is unchanged. A bound run read by an older runtime shows no
+  role_targets, and an in-flight bound run canceled by an older runtime loses
+  it; a gate must treat a missing binding as not authorized.
+
 ### Added
 
 - `MeerkatMachine::session_input_states` exposes the existing strict input
@@ -1192,6 +1201,39 @@ them.
   and Web SDKs surface it as `{"unknown": value}` and ignore a field they do
   not know, instead of failing the read. A `custody_deferred` that is not an
   object, or whose restore or cause is not a string, is still refused.
+
+- `meerkat-mob`: role-targeted flow runs, so several runs can share one mob
+  and one role while each dispatches only to its own members.
+  `MobHandle::run_flow_with_role_targets` starts a run with
+  `FlowRoleTargets`, which maps each role the flow's steps dispatch to onto
+  the existing members that role's steps may use, for example
+  `{"reviewer": ["rev-a1", "rev-a2"]}`. Building or decoding the value refuses
+  an empty map, a role without members, a role named twice and a member
+  listed twice (`FlowRoleTargetsError`). The mob actor admits the binding once,
+  before anything is written, provisioned or dispatched: it must bind every
+  role the flow's steps use and no other, no quorum may need more members
+  than its role binds, and every bound identity must be an Active member of
+  the mob that holds the role. A refusal is
+  `MobError::FlowRoleTargetsRefused`, whose structured data carries the typed
+  `FlowRoleTargetRefusal` as
+  `{"kind": "flow_role_targets_refused", "flow_id": ..., "refusal": {"kind": ...}}`
+  (`role_not_in_flow`, `role_unbound`, `quorum_exceeds_bound_set`,
+  `not_a_member`, `role_mismatch`, `not_active`). The admitted binding is
+  fixed for the run and recorded on `MobRun::role_targets`, which flow status
+  and run lists return. Every execution of a step, each `repeat_until`
+  iteration included, dispatches only to the bound members of its role that
+  are still Active and still hold the role. When they can no longer meet the
+  step's collection policy, the run fails with the `InsufficientTargets`
+  failure class (`MobError::BoundFlowTargetsUnavailable`) before that step
+  dispatches any turn, whatever the step's `failure_policy`. A bound run never
+  substitutes another member and never waits for one, and no flow member is
+  provisioned for it (an installed embedder flow-target barrier still runs
+  first, as for every run). Outputs keep their per-member attribution (the
+  `StepTargetCompleted` targets and the keys of a multi-target step's
+  aggregate output), and a collection policy counts each bound member at most
+  once. A bound run cut off by a restart is canceled with
+  `ExecutionCustodyLost` like any other run; its binding stays on the record
+  and nothing reuses it, so the next run is admitted afresh.
 
 ### Changed
 
@@ -1980,6 +2022,14 @@ them.
   notification when ordinary outbound byte or message admission is saturated.
   Reserved capacity follows the stream through close races, pending delivery and
   transport disconnect, without blocking the agent event producer.
+
+### Known limitations
+
+- `meerkat-mob`: role-target admission and each step's choice of targets are
+  checks that the mob actor and the flow engine make over the mob machine's
+  member facts; the mob machine does not decide them itself. The role-wide
+  target choice every flow step already used works the same way. The 0.9.6
+  line moves both into the mob machine.
 
 ## [0.9.4] - 2026-10-20
 
