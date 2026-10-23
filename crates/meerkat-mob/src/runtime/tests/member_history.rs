@@ -457,6 +457,97 @@ async fn durable_identity_members_lists_only_live_durable_identity_spawns() {
     );
 }
 
+// Each binding carries the labels its incarnation was spawned with: a
+// respawn's successor keeps them, the predecessor's retired binding and a
+// retired member's last binding keep them, and the stopped mob's store
+// answers the same. A member spawned without labels has none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_binding_carries_the_labels_its_incarnation_was_spawned_with() {
+    let fixture = Fixture::new("member-history-labels").await;
+    let handle = &fixture.handle;
+    let labelled = unique_identity("labelled");
+    let plain = unique_identity("plain");
+    let labels = std::collections::BTreeMap::from([
+        ("agent_identity".to_string(), "host:labelled".to_string()),
+        ("team".to_string(), "north".to_string()),
+    ]);
+    handle
+        .spawn_spec(SpawnMemberSpec::new("lead", labelled.clone()).with_labels(labels.clone()))
+        .await
+        .expect("spawn the labelled member");
+    handle
+        .spawn_spec(SpawnMemberSpec::new("lead", plain.clone()))
+        .await
+        .expect("spawn a member without labels");
+    let first_session = handle
+        .resolve_bridge_session_id(&labelled)
+        .await
+        .expect("a session-backed member");
+
+    handle
+        .respawn(labelled.clone(), None)
+        .await
+        .expect("respawn the labelled member");
+    let history = handle
+        .member_binding_history()
+        .await
+        .expect("read the history");
+    let successor = history
+        .last_binding(&labelled)
+        .expect("the successor's binding");
+    assert_eq!(
+        (successor.state(), successor.labels()),
+        (MemberBindingState::Live, &labels),
+        "the successor keeps the spawn labels"
+    );
+    let predecessor = history
+        .binding_for_session(&first_session)
+        .expect("the predecessor's binding");
+    assert_eq!(
+        (predecessor.state(), predecessor.labels()),
+        (MemberBindingState::Retired, &labels)
+    );
+    assert!(
+        history
+            .last_binding(&plain)
+            .expect("the plain member's binding")
+            .labels()
+            .is_empty()
+    );
+
+    handle
+        .retire(labelled.clone())
+        .await
+        .expect("retire the labelled member");
+    let retired = handle
+        .last_member_binding(&labelled)
+        .await
+        .expect("read the history")
+        .expect("a retired binding");
+    assert_eq!(
+        (retired.state(), retired.labels()),
+        (MemberBindingState::Retired, &labels)
+    );
+
+    let mob_db = fixture.mob_db();
+    let _root = fixture.stop().await;
+    let stored = MobStorage::read_member_binding_history(&mob_db)
+        .await
+        .expect("read the stopped mob's history");
+    assert_eq!(
+        stored
+            .last_binding(&labelled)
+            .map(|binding| binding.labels()),
+        Some(&labels)
+    );
+    assert_eq!(
+        stored
+            .last_binding(&plain)
+            .map(|binding| binding.labels().is_empty()),
+        Some(true)
+    );
+}
+
 // A mob reset ends every membership. The identity has no last binding
 // after it, so the wake is a fresh spawn on a new session, while the
 // pre-reset session still resolves to its retired binding.
