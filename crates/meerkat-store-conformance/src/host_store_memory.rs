@@ -13,18 +13,21 @@
 //! commit id that landed being sent again with different updates, and a
 //! deleted scope name being created again.
 //!
-//! Fence leases run on the store's own clock, which moves only when a test
-//! moves it ([`InMemoryHostStore::advance_clock`],
-//! [`InMemoryHostStore::lapse_fence_leases`]), so lease rows are
-//! deterministic.
+//! Fence leases run on the store's own clock. By default it is a manual
+//! clock that only [`InMemoryHostStore::advance_clock`] and
+//! [`InMemoryHostStore::lapse_fence_leases`] move, so lease rows are
+//! deterministic; [`InMemoryHostStore::with_clock`] reads another time
+//! source instead (for example the elapsed time of a paused test runtime),
+//! plus whatever those two added.
 //!
 //! It is not durable across processes. A conformance factory hands out
 //! handles over one shared instance, which is how a test kills every Core
 //! object and reopens over the same store: the store outlives the "process".
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -61,11 +64,32 @@ impl ScopeState {
     }
 }
 
+/// Where the store's clock reads its time: nowhere (a manual clock) or an
+/// outside time source.
+#[derive(Clone, Default)]
+struct StoreClock(Option<Arc<dyn Fn() -> Duration + Send + Sync>>);
+
+impl StoreClock {
+    fn read(&self) -> Duration {
+        self.0.as_ref().map_or(Duration::ZERO, |read| read())
+    }
+}
+
+impl fmt::Debug for StoreClock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "StoreClock(outside)"
+        } else {
+            "StoreClock(manual)"
+        })
+    }
+}
+
 /// The realm's state.
 #[derive(Debug, Default)]
 struct Realm {
-    /// The store's clock.
-    clock: Duration,
+    /// How far tests moved the store's clock past its time source.
+    advanced: Duration,
     /// The highest fence token acquired; 0 before the first acquire.
     fence: u64,
     /// When the lease of the holder of `fence` ends, on the store's clock.
@@ -79,12 +103,13 @@ struct Realm {
 }
 
 impl Realm {
-    /// What remains of the current holder's lease; zero when none is live.
-    fn live_lease(&self) -> Duration {
+    /// What remains at `now` of the current holder's lease; zero when none
+    /// is live.
+    fn live_lease(&self, now: Duration) -> Duration {
         if self.fence == 0 {
             Duration::ZERO
         } else {
-            self.lease_end.saturating_sub(self.clock)
+            self.lease_end.saturating_sub(now)
         }
     }
 
@@ -103,21 +128,36 @@ impl Realm {
 #[derive(Debug, Default)]
 pub struct InMemoryHostStore {
     timing: FenceTiming,
+    clock: StoreClock,
     realm: Mutex<Realm>,
 }
 
 impl InMemoryHostStore {
-    /// An empty realm with the default fence timing.
+    /// An empty realm with the default fence timing and a manual clock.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// An empty realm whose leases follow `timing`.
+    /// An empty realm whose leases follow `timing`, on a manual clock.
     #[must_use]
     pub fn with_fence_timing(timing: FenceTiming) -> Self {
         Self {
             timing,
+            ..Self::default()
+        }
+    }
+
+    /// An empty realm whose leases follow `timing`, on a clock that reads
+    /// `now` (time since any fixed start).
+    #[must_use]
+    pub fn with_clock(
+        timing: FenceTiming,
+        now: impl Fn() -> Duration + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            timing,
+            clock: StoreClock(Some(Arc::new(now))),
             realm: Mutex::default(),
         }
     }
@@ -125,14 +165,19 @@ impl InMemoryHostStore {
     /// Move the store's clock forward by `by`.
     pub fn advance_clock(&self, by: Duration) {
         let mut realm = self.realm();
-        realm.clock = realm.clock.saturating_add(by);
+        realm.advanced = realm.advanced.saturating_add(by);
     }
 
     /// Move the store's clock to the end of the current holder's lease, so
     /// that no holder is live.
     pub fn lapse_fence_leases(&self) {
         let mut realm = self.realm();
-        realm.clock = realm.clock.max(realm.lease_end);
+        let left = realm.lease_end.saturating_sub(self.now(&realm));
+        realm.advanced = realm.advanced.saturating_add(left);
+    }
+
+    fn now(&self, realm: &Realm) -> Duration {
+        self.clock.read().saturating_add(realm.advanced)
     }
 
     fn realm(&self) -> MutexGuard<'_, Realm> {
@@ -228,12 +273,41 @@ fn apply(realm: &mut Realm, update: &ScopeUpdate, commit_id: &CommitId) {
     state.commit_id.clone_from(commit_id);
 }
 
+/// Hooks for the canary stores of this crate's tests, which break the
+/// contract on purpose.
+#[cfg(test)]
+impl InMemoryHostStore {
+    /// Apply update `index` of `batch` on its own, checked as a commit
+    /// would check it, without marking the commit id as landed.
+    pub(crate) fn apply_one_update(
+        &self,
+        batch: &CommitBatch,
+        index: usize,
+    ) -> Result<(), HostStoreError> {
+        let mut realm = self.realm();
+        realm.check_acquired(batch.fence())?;
+        if batch.fence().get() < realm.fence {
+            return Err(HostStoreError::FencedOut {
+                current: FenceToken::new(realm.fence),
+            });
+        }
+        let update = batch
+            .updates()
+            .get(index)
+            .ok_or_else(|| HostStoreError::Invalid(format!("no update {index}")))?;
+        check_update(&realm, update)?;
+        apply(&mut realm, update, batch.commit_id());
+        Ok(())
+    }
+}
+
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl HostStore for InMemoryHostStore {
     async fn acquire_fence(&self, mode: AcquireMode) -> Result<FenceGrant, HostStoreError> {
         let mut realm = self.realm();
-        let live = realm.live_lease();
+        let now = self.now(&realm);
+        let live = realm.live_lease(now);
         if mode == AcquireMode::Exclusive && !live.is_zero() {
             return Err(HostStoreError::Held {
                 holder: FenceToken::new(realm.fence),
@@ -244,7 +318,7 @@ impl HostStore for InMemoryHostStore {
             .fence
             .checked_add(1)
             .ok_or_else(|| HostStoreError::Unavailable("fence tokens exhausted".to_string()))?;
-        realm.lease_end = realm.clock.saturating_add(self.timing.lease());
+        realm.lease_end = now.saturating_add(self.timing.lease());
         Ok(FenceGrant {
             token: FenceToken::new(realm.fence),
             superseded_lease: live,
@@ -259,7 +333,7 @@ impl HostStore for InMemoryHostStore {
                 current: FenceToken::new(realm.fence),
             });
         }
-        realm.lease_end = realm.clock.saturating_add(self.timing.lease());
+        realm.lease_end = self.now(&realm).saturating_add(self.timing.lease());
         Ok(())
     }
 

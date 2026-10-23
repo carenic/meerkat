@@ -517,6 +517,32 @@ them.
 
 ### Added
 
+- `meerkat_core::host_store`: the host store SPI, a small storage interface
+  a host implements so that Core can keep a realm's durable state in the
+  host's own database, an append only store such as BigQuery included. A
+  host store holds scopes (a kind, a name, a versioned head and ordered
+  rows) and answers six operations: `acquire_fence`, `renew_fence`,
+  `load_head`, `list_heads` (listing, and the bulk load of heads at boot and
+  failover), `read_rows`, and `commit` of a `CommitBatch` over one or more
+  scopes (at most 8 MiB, each row at most 1 MiB). The module documentation
+  states the nine obligations and the valid ways to meet each, at commit or
+  at load. The host sizes the fence renew interval and lease through
+  `HostStore::fence_timing` (`FenceTiming`, by default 10 s and 30 s): an
+  exclusive acquire refuses typed (`HostStoreError::Held`) while another
+  holder's lease lasts, and a takeover's `FenceGrant` says how long the new
+  writer waits before it dispatches anything.
+- `meerkat-store-conformance`: `chapters::host_store` checks a host store
+  against those obligations through a `HostStoreFactory`, whose every open
+  stands for a new process: reopen; a kill before, during and after a
+  commit; stale fences, leases and takeovers, with a commit of unknown
+  outcome; two batches for one version; retries; rows, removal and listing
+  over 210 scopes; the batch and row limits; and 210 scopes committing
+  concurrently. `InMemoryHostStore` is the reference store that passes it.
+  `chapters::long_run` and `chapters::durable_worker` drive Core through a
+  `LongRunHarness` or `DurableWorkerHarness`, and check that a run or a
+  durable worker killed at any point of a round resumes at its last
+  committed round under the same run id, with every round once and one
+  receipt.
 - `MemberBinding::labels()`: the application labels the incarnation was
   spawned with, as its spawn recorded them (a member reset keeps them). Every
   read of the member binding history carries them, the store-level

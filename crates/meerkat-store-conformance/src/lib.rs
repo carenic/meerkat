@@ -48,6 +48,17 @@
 //!   honesty, and the dangling session→blob reference shape (`NotFound`,
 //!   never silent success).
 //!
+//! - [`chapters::host_store`]: every `meerkat_core::host_store::HostStore`
+//!   (a host provided store): the nine obligations of the host store
+//!   contract, at a scale of at least 200 scopes, through a
+//!   [`HostStoreFactory`] whose every open stands for a new process. The
+//!   in crate [`InMemoryHostStore`] is the reference that passes it.
+//! - [`chapters::long_run`] / [`chapters::durable_worker`]: Core over any
+//!   store, through a [`LongRunHarness`] or [`DurableWorkerHarness`]: a run
+//!   (or a durable worker) killed at any point of a round resumes at its
+//!   last committed round under the same run id and identity, and finishes
+//!   with every round once and one receipt.
+//!
 //! Chapters contain **no provider-specific code**: everything is expressed
 //! through the `meerkat-core` trait contracts, so a downstream backend runs
 //! the same assertions CI runs against the in-repo stores.
@@ -69,6 +80,10 @@ mod factory;
 mod failure;
 pub mod fixtures;
 mod host_store_memory;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod host_store_tests;
+mod long_run;
 mod wrappers;
 
 pub use emulated_cas::EmulatedCasSessionStore;
@@ -78,6 +93,10 @@ pub use factory::{
 };
 pub use failure::ConformanceFailure;
 pub use host_store_memory::InMemoryHostStore;
+pub use long_run::{
+    BeforeResume, DurableWorkerHarness, KillMode, KillPoint, KilledRun, KilledWorker,
+    LongRunHarness, LongRunPlan, RestartReport, RestartedWorker, ResumeGate, ResumedRun, call_id,
+};
 pub use wrappers::{
     DefaultRangeVerbIncrementalStore, ForwardingSessionStore, SwallowingSessionStore,
 };
