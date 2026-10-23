@@ -12,7 +12,7 @@
 use crate::Provider;
 use crate::generated::{session_document, session_persistence_version_authority};
 use crate::lifecycle::run_primitive::{TurnMetadataOverride, TurnRequestContext};
-use crate::lifecycle::{CoreBoundaryDeliveryWitness, CoreBoundaryStageError, RunId};
+use crate::lifecycle::{CoreBoundaryDeliveryWitness, CoreBoundaryStageError, InputId, RunId};
 use crate::peer_meta::PeerMeta;
 use crate::realtime_transcript::{
     RealtimeTranscriptApplyOutcome, RealtimeTranscriptEvent, RealtimeUserContentIdentity,
@@ -2099,6 +2099,13 @@ impl Session {
 /// Metadata key used to store deferred-turn control state.
 pub const SESSION_DEFERRED_TURN_STATE_KEY: &str = "session_deferred_turn_state";
 
+/// Metadata key holding the open run cursor of a durable session.
+///
+/// Every round commit writes it with the round's transcript; the run's final
+/// save removes it. Recovery reads it to continue the same run from its last
+/// committed round instead of running its input again.
+pub const SESSION_RUN_CURSOR_KEY: &str = "session_run_cursor_v1";
+
 /// Metadata key for a mixed local/external callback batch whose completed
 /// sibling outcomes must remain hidden until the external callback result can
 /// complete the provider-adjacent `ToolResults` set.
@@ -3381,6 +3388,101 @@ impl From<session_document::SessionDocumentLifecycle> for SessionLifecycleTermin
             session_document::SessionDocumentLifecycle::Archived => Self::Archived,
         }
     }
+}
+
+/// Where a resumed run re-enters its loop.
+///
+/// A durable session commits every inner-loop round twice: once after the
+/// model call (the assistant message with its tool calls) and once after the
+/// tools (their results). The resume point names which of the two the last
+/// committed round reached.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RunResumePoint {
+    /// The round's assistant message and these tool calls are committed and
+    /// their results are not. A resumed run dispatches exactly these calls
+    /// again, under the same call ids, without calling the model.
+    ToolsPending {
+        /// Provider tool call ids of the committed assistant message, in
+        /// emission order.
+        call_ids: Vec<String>,
+    },
+    /// The round's tool results are committed, or the run has not called the
+    /// model yet. A resumed run makes the next model call.
+    AwaitingModel,
+}
+
+/// Run-scoped loop state a resumed run restores.
+///
+/// The agent loop owns these fields and may add more; other components treat
+/// the value as opaque and carry it unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct RunLoopCarryOver {
+    /// Model calls the run has completed.
+    #[serde(default)]
+    pub turn_count: u32,
+    /// Tool calls the run has completed.
+    #[serde(default)]
+    pub tool_call_count: u32,
+}
+
+/// Durable cursor of an open run in a durable session.
+///
+/// Every round commit writes it into the session document under
+/// [`SESSION_RUN_CURSOR_KEY`]; the run's final save removes it. It names the
+/// run, the inputs bound to it, the last committed round and where the run
+/// resumes, so recovery can continue the same run instead of running its
+/// input again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SessionRunCursor {
+    /// The open run.
+    pub run_id: RunId,
+    /// Every input bound to the run so far: the input that started it and
+    /// each steer or peer input applied at one of its round boundaries.
+    pub bound_input_ids: Vec<InputId>,
+    /// Zero-based index of the last committed round.
+    pub round: u64,
+    /// Where the run resumes.
+    pub resume_point: RunResumePoint,
+    /// Loop state the resumed run restores.
+    #[serde(default)]
+    pub loop_state: RunLoopCarryOver,
+}
+
+impl SessionRunCursor {
+    /// A cursor with default loop state.
+    #[must_use]
+    pub fn new(
+        run_id: RunId,
+        bound_input_ids: Vec<InputId>,
+        round: u64,
+        resume_point: RunResumePoint,
+    ) -> Self {
+        Self {
+            run_id,
+            bound_input_ids,
+            round,
+            resume_point,
+            loop_state: RunLoopCarryOver::default(),
+        }
+    }
+}
+
+/// Deduplication key a tool sees for one call of one round of one run.
+///
+/// A resumed run dispatches the calls of a round whose results were not
+/// committed again, under the same key, so a tool with external effects can
+/// recognize a repeat.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ToolCallDedupeKey {
+    /// The run the call belongs to.
+    pub run_id: RunId,
+    /// Zero-based round index within the run.
+    pub round: u64,
+    /// Provider tool call id.
+    pub call_id: String,
 }
 
 /// Durable control state for deferred first-turn prompt and staged callback tool results.
@@ -7081,6 +7183,26 @@ impl Session {
                     .map_err(<serde_json::Error as serde::de::Error>::custom)
             })
             .transpose()
+    }
+
+    /// Store the open run cursor that a round commit carries.
+    pub fn set_run_cursor(&mut self, cursor: &SessionRunCursor) -> Result<(), serde_json::Error> {
+        let value = serde_json::to_value(cursor)?;
+        self.set_metadata_unchecked(SESSION_RUN_CURSOR_KEY, value);
+        Ok(())
+    }
+
+    /// Load the open run cursor, if this session carries one.
+    pub fn try_run_cursor(&self) -> Result<Option<SessionRunCursor>, serde_json::Error> {
+        self.metadata
+            .get(SESSION_RUN_CURSOR_KEY)
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+    }
+
+    /// Remove the run cursor once the run's final boundary is saved.
+    pub fn clear_run_cursor(&mut self) {
+        self.remove_metadata_unchecked(SESSION_RUN_CURSOR_KEY);
     }
 
     /// Whether this session is a deferred template: it carries no messages
