@@ -516,6 +516,10 @@ them.
   variant and an enum marked non-exhaustive. A downstream match needs a
   wildcard arm; `rejected_before_effect` stays false for the new variant.
 
+- `meerkat-mob`: `IdentityLeaseCondition` gains `HeldByEndedIncarnation`, an
+  unexpired lease of an earlier incarnation of the same mob whose process
+  has ended; the mob machine maps it to `AcquireLease`. Exhaustive matches
+  need an arm (see Fixed).
 - `meerkat`: `LiveOrchestrator` gains the field `session_addressing`
   (`LiveSessionAddressing`: `SessionScoped` or `MobMember`), so code that
   builds it with a struct literal sets it. A surface that opens live channels
@@ -1784,6 +1788,20 @@ them.
   restore already failed, is deferred instead (see the entries next to this
   one).
 
+- `meerkat-mob`, `meerkat-store`: a mob restarted after its process crashed,
+  was killed or exited without a Shutdown kept every adopted identity's
+  admission closed (`IdentityConvergenceAdmissionClosed`) until the earlier
+  incarnation's identity reconcile lease expired, up to 30 s. A restart over a
+  persistent store now takes such a lease at once when it can prove that the
+  earlier process ended: a process holds an exclusive lock on
+  `<mob store>.incarnation-custody` from before it mints its first
+  incarnation until it exits, and marks the incarnations it mints under that
+  lock. A restart in the same process, a restart while another process holds
+  the lock, an incarnation minted without the lock (by an earlier version, or
+  while another process held it) and a store without a file wait as before.
+  `rkat storage doctor` lists the lock file as `mob-incarnation-custody-lock`,
+  and `rkat storage prune` never removes it. `MobIdentityStore` gains the
+  provided method `incarnation_custody_store` (default `None`).
 - `meerkat`, `meerkat-rpc`: the session-scoped `live/open`, and the
   projection, refresh-config, identity and precheck reads behind it, restored
   a mob member's session from storage by its session id alone when it was
