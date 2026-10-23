@@ -5641,20 +5641,6 @@ macro_rules! meerkat_catalog_machine_dsl {
                 // names that run). Such an input stays bound, not requeued.
                 bound_run_resumable: bool,
             },
-            // Same-run resume after a restart. Registration marks the run its
-            // stored cursor names; the runtime then resumes it (ResumeRun),
-            // releases it to ordinary requeue when recovery does not continue
-            // it (ReleaseResumableRun), or settles it when it must end
-            // (SettleResumableRun: stop, retire, destroy, reset, unregister,
-            // or a refused resume).
-            MarkRunResumable { run_id: RunId },
-            ResumeRun { run_id: RunId },
-            ReleaseResumableRun { run_id: RunId },
-            SettleResumableRun { run_id: RunId, reason: Enum<InputAbandonReason> },
-            // A graceful requeue stop keeps a durable session's in-flight run
-            // resumable (A28). `durable_session` is the shell's observation
-            // that the session commits every round (a persistent driver).
-            SuspendRunForStop { run_id: RunId, durable_session: bool },
             ClassifyRecoveredInputDurability {
                 input_id: String,
                 durability: Enum<InputDurabilityKind>,
@@ -5875,10 +5861,6 @@ macro_rules! meerkat_catalog_machine_dsl {
             StageForRun { input_id: String, run_id: RunId },
             IncrementAttemptCount { input_id: String },
             RollbackStaged { input_id: String, lane: Enum<InputLane> },
-            // An Applied or AppliedPendingConsumption contributor of `run_id`
-            // returns to `lane`: a failed run's replayed contributor, or a
-            // kept input of a resumable run that is released.
-            ReplayAppliedRunContributor { input_id: String, run_id: RunId, lane: Enum<InputLane> },
             ResolveStagedRollback { input_id: String, lane: Enum<InputLane> },
             ResolveUnstageableQueuedInput { input_id: String, lane: Enum<InputLane> },
             MarkApplied { input_id: String },
@@ -7168,6 +7150,27 @@ macro_rules! meerkat_catalog_machine_dsl {
                 directed: bool,
                 objective_bound: bool,
             },
+            // Inputs added after the published ones are declared here, last,
+            // so the generated InputKind keeps every earlier discriminant.
+            //
+            // Same-run resume after a restart. Registration marks the run its
+            // stored cursor names; the runtime then resumes it (ResumeRun),
+            // releases it to ordinary requeue when recovery does not continue
+            // it (ReleaseResumableRun), or settles it when it must end
+            // (SettleResumableRun: stop, retire, destroy, reset, unregister,
+            // or a refused resume).
+            MarkRunResumable { run_id: RunId },
+            ResumeRun { run_id: RunId },
+            ReleaseResumableRun { run_id: RunId },
+            SettleResumableRun { run_id: RunId, reason: Enum<InputAbandonReason> },
+            // A graceful requeue stop keeps a durable session's in-flight run
+            // resumable. `durable_session` is the shell's observation that the
+            // session commits every round (a persistent driver).
+            SuspendRunForStop { run_id: RunId, durable_session: bool },
+            // An Applied or AppliedPendingConsumption contributor of `run_id`
+            // returns to `lane`: a failed run's replayed contributor, or a
+            // kept input of a resumable run that is released.
+            ReplayAppliedRunContributor { input_id: String, run_id: RunId, lane: Enum<InputLane> },
         }
 
         surface_only [
@@ -7415,19 +7418,6 @@ macro_rules! meerkat_catalog_machine_dsl {
                 requeued: bool,
                 history_reason: Option<Enum<RecoveredInputNormalizationReasonKind>>,
             },
-            ResumableRunMarked { run_id: RunId },
-            // The runtime starts exactly this run, with exactly the inputs
-            // bound to it, ahead of every queued input.
-            ResumedRunAuthorized { run_id: RunId },
-            // The shell normalizes the run's kept inputs again with the
-            // registration-time observations and bound_run_resumable false:
-            // a Staged input and an Applied input with a missing receipt
-            // requeue, as today.
-            ResumableRunReleased { run_id: RunId },
-            // The shell abandons the run's bound inputs with `reason`.
-            ResumableRunSettled { run_id: RunId, reason: Enum<InputAbandonReason> },
-            // A graceful requeue stop left the in-flight run resumable.
-            RunSuspendedForStop { run_id: RunId },
             RecoveredInputDurabilityClassified {
                 input_id: String,
                 disposition: Enum<RecoveredInputRecoveryDisposition>,
@@ -8527,6 +8517,21 @@ macro_rules! meerkat_catalog_machine_dsl {
                 disposition: Enum<StopInputDisposition>,
                 requeue_max_age_ms: u64,
             },
+            // Effects added after the published ones are declared here, last,
+            // so the generated EffectKind keeps every earlier discriminant.
+            ResumableRunMarked { run_id: RunId },
+            // The runtime starts exactly this run, with exactly the inputs
+            // bound to it, ahead of every queued input.
+            ResumedRunAuthorized { run_id: RunId },
+            // The shell normalizes the run's kept inputs again with the
+            // registration-time observations and bound_run_resumable false:
+            // a Staged input and an Applied input with a missing receipt
+            // requeue, as today.
+            ResumableRunReleased { run_id: RunId },
+            // The shell abandons the run's bound inputs with `reason`.
+            ResumableRunSettled { run_id: RunId, reason: Enum<InputAbandonReason> },
+            // A graceful requeue stop left the in-flight run resumable.
+            RunSuspendedForStop { run_id: RunId },
         }
 
         // =====================================================================
