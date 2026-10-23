@@ -15859,6 +15859,18 @@ mod tests {
             .await
             .expect("stage known external visibility filter");
 
+        // A sibling test on the realm the other sticky-fallback tests use
+        // holds its primary binding's credential lifecycle while this turn
+        // falls back, as plain `cargo test` runs them at once in one
+        // process. The rotation releases this test's primary lease, which
+        // must not be that binding.
+        let _sibling = meerkat_core::auth::acquire_auth_login_lifecycle_guard(
+            &meerkat_core::handles::LeaseKey::from_auth_binding(&configured_auth_binding(
+                "fallback_test",
+                "default_anthropic",
+            )),
+        )
+        .await;
         let (_accept, completion) = adapter
             .accept_input_with_completion(
                 &session_id,
