@@ -25555,6 +25555,157 @@ mod tests {
         ));
     }
 
+    /// The store checkpointer's run re-base through the real seam: a
+    /// single-turn WholeBlob run whose one boundary compacts saves its end
+    /// with no cursor and no earlier tail (`rebase_run` with no previous
+    /// receipt). The receipt names the new tail at candidate sequence 1 on
+    /// the new base. The process crashes before the boundary commit, and a
+    /// restarted session service recovers the session's committed boundary
+    /// as an interrupted run's closing save. Unrun until the candidate's
+    /// validation.
+    #[tokio::test]
+    async fn a_checkpointer_closing_rebase_recovers_after_a_restart() {
+        use meerkat_core::lifecycle::core_executor::BoundSessionCommit;
+        use meerkat_core::types::{AssistantBlock, BlockAssistantMessage};
+        use meerkat_runtime::store::PreparedRuntimeSessionCommit;
+
+        let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
+        let runtime_store: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());
+        let mut committed = Session::new();
+        committed.push(Message::User(UserMessage::text(
+            "earlier context".to_string(),
+        )));
+        committed.push(Message::User(UserMessage::text(
+            "more earlier context".to_string(),
+        )));
+        let session_id = committed.id().clone();
+        let runtime_id =
+            PersistentSessionService::<DummyBuilder>::runtime_id_for_session(&session_id);
+        let base_authority = runtime_store
+            .commit_prepared_session_boundary(
+                &runtime_id,
+                PreparedRuntimeSessionCommit::snapshot_only(
+                    BoundSessionCommit::sealed(Arc::new(committed.clone())).unwrap(),
+                ),
+            )
+            .await
+            .unwrap()
+            .authority()
+            .and_then(RuntimeSessionAuthority::whole_blob)
+            .cloned()
+            .expect("a WholeBlob base");
+        // The live actor's checkpointer over that base.
+        let checkpointer = StoreCheckpointer {
+            runtime_store: Arc::clone(&runtime_store),
+            incremental: None,
+            blob_store: memory_blob_store(),
+            gate: Arc::new(CheckpointerGate {
+                cancelled: Mutex::new(false),
+            }),
+            whole_blob_base_authority: std::sync::Mutex::new(Some(base_authority.clone())),
+            latest_run_checkpoint_receipt: Mutex::new(None),
+            latest_run_transcript_retirement: std::sync::Mutex::new(None),
+            live_deferred_turn_state: std::sync::OnceLock::new(),
+            unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
+            rebased_run: std::sync::Mutex::new(None),
+            rewrite_audit: None,
+        };
+        assert!(meerkat_core::SessionCheckpointer::rebases_runs(
+            &checkpointer
+        ));
+
+        // The run answered, then compacted at its final boundary: its
+        // end-of-run save carries no cursor.
+        let run_id = RunId::new();
+        let mut session = committed;
+        session.push(Message::User(UserMessage::text("the question".to_string())));
+        session.push(Message::BlockAssistant(BlockAssistantMessage {
+            blocks: vec![AssistantBlock::Text {
+                text: "the answer".to_string(),
+                meta: None,
+            }],
+            stop_reason: Some(StopReason::EndTurn),
+            identity: meerkat_core::types::TranscriptMessageIdentity::default()
+                .with_run_id(run_id.clone()),
+            created_at: meerkat_core::types::message_timestamp_now(),
+            assistant_message_id: None,
+        }));
+        let parent = session.transcript_revision().unwrap();
+        session
+            .commit_transcript_rewrite(
+                meerkat_core::TranscriptRewriteSelection::MessageRange { start: 0, end: 2 },
+                vec![Message::User(UserMessage::compaction_summary(
+                    "earlier context, compacted",
+                ))],
+                meerkat_core::TranscriptRewriteReason::new("compaction"),
+                Some("checkpointer-closing-rebase".to_string()),
+                Some(parent),
+            )
+            .unwrap();
+        assert!(session.try_run_cursor().unwrap().is_none());
+        let compacted_messages = session.messages().to_vec();
+        let receipt = meerkat_core::SessionCheckpointer::rebase_run(
+            &checkpointer,
+            &mut session,
+            &run_id,
+            None,
+        )
+        .await
+        .expect("the closing save re-bases");
+        let tail = receipt
+            .whole_blob()
+            .cloned()
+            .expect("a WholeBlob provisional receipt");
+        assert_eq!(tail.run_id(), &run_id);
+        assert_eq!(tail.candidate_sequence(), 1);
+        assert_eq!(
+            tail.base_store_revision(),
+            base_authority.store_revision() + 1
+        );
+        assert_eq!(tail.candidate_blob_sha256(), tail.base_blob_sha256());
+
+        // The process crashes before the boundary commit; a new session
+        // service over the same stores recovers.
+        drop(checkpointer);
+        let restarted = PersistentSessionService::new(
+            DummyBuilder,
+            4,
+            Arc::clone(&store),
+            Arc::clone(&runtime_store),
+            memory_blob_store(),
+        );
+        let recovery = restarted
+            .recover_committed_boundary(&session_id)
+            .await
+            .expect("the closing save recovers");
+        assert_eq!(
+            recovery,
+            CommittedBoundaryRecovery::Recovered {
+                message_count: compacted_messages.len() + 1,
+            }
+        );
+        let recovered = runtime_store
+            .load_committed_whole_blob_snapshot(&runtime_id)
+            .await
+            .unwrap()
+            .expect("the recovered boundary");
+        let messages = recovered.session().messages();
+        assert_eq!(
+            &messages[..compacted_messages.len()],
+            compacted_messages.as_slice(),
+            "nothing the run wrote is lost or duplicated"
+        );
+        assert!(matches!(messages.last(), Some(Message::SystemNotice(_))));
+        assert!(
+            runtime_store
+                .load_whole_blob_provisional_tail(&runtime_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the recovery consumes the tail"
+        );
+    }
+
     struct WholeBlobAuthorityReadProbe {
         inner: InMemoryRuntimeStore,
         bounded_authority_reads: AtomicUsize,
