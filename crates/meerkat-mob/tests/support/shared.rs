@@ -680,14 +680,31 @@ pub struct FailingOnceSessionService {
     recorded_creates: std::sync::Mutex<Vec<RecordedMemberCreate>>,
 }
 
-/// The build facts of one member create a fixture host's session service
-/// received.
+/// The build facts of one member create: one a fixture host's session
+/// service received, or one the controlling host's agent builder built.
 #[derive(Debug, Clone)]
 pub struct RecordedMemberCreate {
     pub mob_member_binding: Option<meerkat_core::MobMemberBinding>,
     pub prompt_context_fork_source: Option<meerkat_core::PromptContextForkSource>,
     /// The fork seed the create records on the child's session, as JSON.
     pub fork_seed: Option<serde_json::Value>,
+}
+
+impl RecordedMemberCreate {
+    fn of(req: &meerkat_core::service::CreateSessionRequest) -> Self {
+        let build = req.build.as_ref();
+        Self {
+            mob_member_binding: build.and_then(|build| build.mob_member_binding.clone()),
+            prompt_context_fork_source: build
+                .and_then(|build| build.prompt_context_fork_source.clone()),
+            fork_seed: build.and_then(|build| {
+                build
+                    .initial_metadata_entries
+                    .get(meerkat_core::fork_notice::SESSION_FORK_SEED_KEY)
+                    .cloned()
+            }),
+        }
+    }
 }
 
 impl FailingOnceSessionService {
@@ -724,21 +741,10 @@ impl FailingOnceSessionService {
     }
 
     fn record_create(&self, req: &meerkat_core::service::CreateSessionRequest) {
-        let build = req.build.as_ref();
         self.recorded_creates
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(RecordedMemberCreate {
-                mob_member_binding: build.and_then(|build| build.mob_member_binding.clone()),
-                prompt_context_fork_source: build
-                    .and_then(|build| build.prompt_context_fork_source.clone()),
-                fork_seed: build.and_then(|build| {
-                    build
-                        .initial_metadata_entries
-                        .get(meerkat_core::fork_notice::SESSION_FORK_SEED_KEY)
-                        .cloned()
-                }),
-            });
+            .push(RecordedMemberCreate::of(req));
     }
 
     /// True once the injected failure has fired.
@@ -3840,6 +3846,112 @@ fn persistent_service_with_client_in_realm(
     client: Arc<dyn meerkat_client::LlmClient>,
     workgraph_realm: &str,
 ) -> Arc<meerkat_session::PersistentSessionService<meerkat::FactoryAgentBuilder>> {
+    persistent_service_with_builder_in_realm(
+        paths,
+        runtime_store,
+        client,
+        workgraph_realm,
+        |builder| builder,
+    )
+}
+
+/// The controlling host's agent builder: the fixture's factory builder,
+/// recording the build facts of every session it builds
+/// ([`ControllingMob::recorded_member_creates`]) before building it.
+pub struct RecordingAgentBuilder {
+    inner: meerkat::FactoryAgentBuilder,
+    creates: Arc<std::sync::Mutex<Vec<RecordedMemberCreate>>>,
+}
+
+impl RecordingAgentBuilder {
+    fn record(&self, req: &meerkat_core::service::CreateSessionRequest) {
+        self.creates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(RecordedMemberCreate::of(req));
+    }
+}
+
+#[async_trait::async_trait]
+impl meerkat_session::SessionAgentBuilder for RecordingAgentBuilder {
+    type Agent = <meerkat::FactoryAgentBuilder as meerkat_session::SessionAgentBuilder>::Agent;
+
+    async fn model_supports_inline_video(
+        &self,
+        identity: &meerkat_core::SessionLlmIdentity,
+    ) -> Option<bool> {
+        <meerkat::FactoryAgentBuilder as meerkat_session::SessionAgentBuilder>::model_supports_inline_video(
+            &self.inner,
+            identity,
+        )
+        .await
+    }
+
+    async fn build_agent(
+        &self,
+        req: &meerkat_core::service::CreateSessionRequest,
+        event_tx: tokio::sync::mpsc::Sender<meerkat_core::event::AgentEvent>,
+    ) -> Result<Self::Agent, meerkat_core::service::SessionError> {
+        self.record(req);
+        <meerkat::FactoryAgentBuilder as meerkat_session::SessionAgentBuilder>::build_agent(
+            &self.inner,
+            req,
+            event_tx,
+        )
+        .await
+    }
+
+    async fn build_agent_taking_tools(
+        &self,
+        req: &mut meerkat_core::service::CreateSessionRequest,
+        event_tx: tokio::sync::mpsc::Sender<meerkat_core::event::AgentEvent>,
+    ) -> Result<Self::Agent, meerkat_core::service::SessionError> {
+        self.record(req);
+        <meerkat::FactoryAgentBuilder as meerkat_session::SessionAgentBuilder>::build_agent_taking_tools(
+            &self.inner,
+            req,
+            event_tx,
+        )
+        .await
+    }
+
+    async fn abort_absent_session_compaction_stages(
+        &self,
+        session_id: &meerkat_core::SessionId,
+    ) -> Result<(), meerkat_core::service::SessionError> {
+        <meerkat::FactoryAgentBuilder as meerkat_session::SessionAgentBuilder>::abort_absent_session_compaction_stages(
+            &self.inner,
+            session_id,
+        )
+        .await
+    }
+}
+
+/// [`persistent_service_with_client_in_realm`] over the controlling host's
+/// recording builder, which records into `creates`.
+fn recording_persistent_service_in_realm(
+    paths: &ControllingMobPaths,
+    runtime_store: Arc<dyn meerkat_runtime::RuntimeStore>,
+    client: Arc<dyn meerkat_client::LlmClient>,
+    workgraph_realm: &str,
+    creates: Arc<std::sync::Mutex<Vec<RecordedMemberCreate>>>,
+) -> Arc<meerkat_session::PersistentSessionService<RecordingAgentBuilder>> {
+    persistent_service_with_builder_in_realm(
+        paths,
+        runtime_store,
+        client,
+        workgraph_realm,
+        |inner| RecordingAgentBuilder { inner, creates },
+    )
+}
+
+fn persistent_service_with_builder_in_realm<B: meerkat_session::SessionAgentBuilder + 'static>(
+    paths: &ControllingMobPaths,
+    runtime_store: Arc<dyn meerkat_runtime::RuntimeStore>,
+    client: Arc<dyn meerkat_client::LlmClient>,
+    workgraph_realm: &str,
+    wrap_builder: impl FnOnce(meerkat::FactoryAgentBuilder) -> B,
+) -> Arc<meerkat_session::PersistentSessionService<B>> {
     paths.materialize_project_context();
     let factory = meerkat::AgentFactory::new(paths.runtime_root.join("factory-store"))
         .user_config_root(paths.user_config_root.clone())
@@ -3880,7 +3992,7 @@ fn persistent_service_with_client_in_realm(
     // PollMemberEvents and terminal_seq binding from this log.
     Arc::new(
         meerkat_session::PersistentSessionService::new(
-            builder,
+            wrap_builder(builder),
             32,
             store_dyn,
             runtime_store,
@@ -4025,7 +4137,10 @@ pub fn controlling_mob_definition(mob_id: meerkat_mob::MobId) -> meerkat_mob::Mo
 
 pub struct ControllingMob {
     pub handle: meerkat_mob::MobHandle,
-    pub service: Arc<meerkat_session::PersistentSessionService<meerkat::FactoryAgentBuilder>>,
+    pub service: Arc<meerkat_session::PersistentSessionService<RecordingAgentBuilder>>,
+    /// Every session build the controlling host made, in order, across
+    /// fixture restarts ([`Self::recorded_member_creates`]).
+    member_creates: Arc<std::sync::Mutex<Vec<RecordedMemberCreate>>>,
     /// Durable RuntimeStore authority retained across fixture process restarts.
     ///
     /// The service and runtime machine are process-local, but the RuntimeStore
@@ -4219,11 +4334,13 @@ async fn create_controlling_mob_composed_with_client(
     let mob_id = meerkat_mob::MobId::from(format!("{label}-{}", uuid::Uuid::new_v4().simple()));
     let workgraph_realm = meerkat_core::mob_realm_id(mob_id.as_str())
         .expect("fixture mob id produces a canonical workgraph realm");
-    let service = persistent_service_with_client_in_realm(
+    let member_creates = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let service = recording_persistent_service_in_realm(
         &paths,
         Arc::clone(&runtime_store),
         local_llm_client,
         workgraph_realm.as_str(),
+        Arc::clone(&member_creates),
     );
     let metadata: Arc<dyn meerkat_mob::store::MobRuntimeMetadataStore> =
         Arc::new(meerkat_mob::store::InMemoryMobRuntimeMetadataStore::new());
@@ -4304,6 +4421,7 @@ async fn create_controlling_mob_composed_with_client(
     ControllingMob {
         handle,
         service,
+        member_creates,
         runtime_store,
         storage_metadata: metadata,
         storage_identity: identity,
@@ -4320,6 +4438,15 @@ async fn create_controlling_mob_composed_with_client(
 }
 
 impl ControllingMob {
+    /// The build facts of every session the controlling host built, in
+    /// order: what a pre-build seam over its session service reads.
+    pub fn recorded_member_creates(&self) -> Vec<RecordedMemberCreate> {
+        self.member_creates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// `bind_host` against a `HostDaemonFixture` descriptor (wraps
     /// `descriptor_to_bind_request` + `MobHandle::bind_host`).
     pub async fn bind_fixture(
@@ -4452,6 +4579,7 @@ impl ControllingMob {
         let ControllingMob {
             handle,
             service,
+            member_creates,
             runtime_store,
             storage_metadata,
             storage_identity,
@@ -4587,7 +4715,15 @@ impl ControllingMob {
             .await
             .expect("cold restart waits for every old session runtime to be released");
             let paths = ControllingMobPaths::new(temp.path());
-            persistent_service(&paths, Arc::clone(&runtime_store))
+            recording_persistent_service_in_realm(
+                &paths,
+                Arc::clone(&runtime_store),
+                Arc::new(meerkat_client::TestClient::for_provider(
+                    meerkat_core::Provider::Anthropic,
+                )),
+                "test-realm",
+                Arc::clone(&member_creates),
+            )
         } else {
             service
         };
@@ -4668,6 +4804,7 @@ impl ControllingMob {
         ControllingMob {
             handle,
             service,
+            member_creates,
             runtime_store,
             storage_metadata,
             storage_identity,
