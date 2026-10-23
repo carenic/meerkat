@@ -7007,7 +7007,7 @@ export interface ForkNoticeSource {
 
 export type ForkNoticeSystemPrompt = "not_carried" | "not_applicable";
 
-export type ForkToolsNotComparedReason = "source_not_live" | "placed_source" | "member_host_unsupported";
+export type ForkToolsNotComparedReason = "source_not_live" | "placed_source" | "member_host_unsupported" | "seed_unreadable";
 
 export interface ForkNoticeToolsCompared {
   added?: ToolName[];

@@ -321,6 +321,16 @@ is `Refused` (nothing to revoke, no cleanup debt); a 0.9.3 reader cannot decode
 such a council record. Upgrade member hosts before their controller: a 0.9.3
 member host answers `ReactivateInherited` with the refusal cause
 `member_host_unsupported` and forks participants without the policy otherwise.
+A durable fork child's model reads each copied activation row as a
+`[meerkat-inherited-instruction-v2]` header without its body. Copied
+`load_skill` results and per-turn skill context follow the host's declared
+policy (`DurableSessionForkTarget::declared_instructions`): named without
+the body under `RequireExplicitActivation`, refused under `Refuse`
+(`refusal.skills`), carried under `ReactivateInherited`; a fork without an
+activation window strips them under the default instead of refusing. A row
+that does not hold the bytes its identity names fails
+`Session::messages_for_model_boundary` with `ModelBoundaryProjectionError`,
+and the turn is refused.
 
 Prompt-context forks (`MemberLaunchMode::Fork`, `fork_helper`): the
 child gets a planned text of the source's history, decided by each row's

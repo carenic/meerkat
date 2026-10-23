@@ -3265,6 +3265,11 @@ pub struct DurableSessionForkTarget {
     /// The fork instruction policy this fork applies, already resolved for
     /// the path's activation window ([`crate::ForkInstructionPolicy::effective`]).
     pub inherited_instructions: crate::ForkInstructionPolicy,
+    /// The host's fork instruction policy as declared, before that
+    /// resolution. The skills the copied rows loaded follow it: a child
+    /// runs without activating them, so a fork without an activation
+    /// window strips them under the default instead of refusing.
+    pub declared_instructions: crate::ForkInstructionPolicy,
 }
 
 /// Outcome of a durable fork that first waited, bounded, for the source

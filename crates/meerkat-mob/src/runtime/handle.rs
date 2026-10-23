@@ -16701,6 +16701,7 @@ impl MobHandle {
             cache_identity: None,
             source_admission,
             inherited_instructions: self.fork_instruction_policy.effective(activation_window),
+            declared_instructions: self.fork_instruction_policy,
         };
         Ok((source_session_id, fork_target))
     }

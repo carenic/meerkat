@@ -2482,9 +2482,9 @@ impl MobError {
                 Self::SharedRetirementFailure(error)
                 | Self::SharedLifecycleFailure(error)
                 | Self::MemberStartupRecoveryFailed { cause: error, .. } => error.wire_error_code(),
+                Self::HostFeaturesProbeFailed { cause, .. } => cause.wire_error_code(),
                 // The close's answer (AdmissionClosed carries no code).
                 Self::DurabilityFailStop { .. } => None,
-                Self::HostFeaturesProbeFailed { cause, .. } => cause.wire_error_code(),
                 Self::SessionError(
                     meerkat_core::SessionError::RuntimeUnavailable { .. }
                     | meerkat_core::SessionError::HostingUnavailable { .. },
@@ -2546,8 +2546,8 @@ impl MobError {
             | Self::MemberStartupRecoveryFailed { cause: error, .. } => {
                 error.bridge_rejection_cause()
             }
-            Self::DurabilityFailStop { .. } => None,
             Self::HostFeaturesProbeFailed { cause, .. } => cause.bridge_rejection_cause(),
+            Self::DurabilityFailStop { .. } => None,
             // Cloned: `BridgeRejectionCause` carries payload variants since V4.
             Self::BridgeCommandRejected { cause, .. } => Some(cause.clone()),
             _ => None,
@@ -2657,10 +2657,10 @@ impl MobError {
             Self::SharedRetirementFailure(error)
             | Self::SharedLifecycleFailure(error)
             | Self::MemberStartupRecoveryFailed { cause: error, .. } => error.failure_class(),
-            // The close's answer: AdmissionClosed falls to MobRejected.
-            Self::DurabilityFailStop { .. } => MobFailureClass::MobRejected,
             // A failed probe is classified by what failed it.
             Self::HostFeaturesProbeFailed { cause, .. } => cause.failure_class(),
+            // The close's answer: AdmissionClosed falls to MobRejected.
+            Self::DurabilityFailStop { .. } => MobFailureClass::MobRejected,
             Self::MobNotFound(_)
             | Self::ProfileNotFound(_)
             | Self::MemberNotFound(_)
@@ -2779,9 +2779,9 @@ impl MobError {
             Self::SharedRetirementFailure(error)
             | Self::SharedLifecycleFailure(error)
             | Self::MemberStartupRecoveryFailed { cause: error, .. } => error.wire_detail(),
-            Self::DurabilityFailStop { .. } => None,
             // A probe that timed out projects the timeout's detail.
             Self::HostFeaturesProbeFailed { cause, .. } => cause.wire_detail(),
+            Self::DurabilityFailStop { .. } => None,
             Self::ScopeDenied(denial) => Some(WireMobErrorDetail::ScopeDenied(
                 WireScopeDeniedDetail::from(denial),
             )),

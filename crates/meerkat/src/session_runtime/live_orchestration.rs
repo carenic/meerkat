@@ -655,7 +655,9 @@ impl ExperimentalLivePendingChannel {
 }
 
 fn realtime_projection_messages_full(session: &Session) -> Result<Vec<Message>, SessionError> {
-    Ok(session.messages_for_model_boundary())
+    session
+        .messages_for_model_boundary()
+        .map_err(|error| SessionError::Agent(error.into()))
 }
 
 /// Project replayable dialogue/tool history for realtime delivery.
@@ -2404,7 +2406,9 @@ mod orchestrator {
                 turning_mode,
                 identity,
                 tools,
-                session.messages_for_model_boundary(),
+                session
+                    .messages_for_model_boundary()
+                    .map_err(|error| SessionError::Agent(error.into()))?,
                 session.messages(),
             )?
             .with_open_projection_lease(lease)
@@ -3808,7 +3812,9 @@ mod orchestrator {
                 turning_mode,
                 identity,
                 tools,
-                current.messages_for_model_boundary(),
+                current
+                    .messages_for_model_boundary()
+                    .map_err(|error| SessionError::Agent(error.into()))?,
                 current.messages(),
             )?
             .with_user_content_identities(current.realtime_user_content_identities())

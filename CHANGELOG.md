@@ -373,11 +373,12 @@ them.
 
 - Not measured by the gate (a wire change): `meerkat-core`:
   `ForkInstructionRefusal` gains `skills: Box<[SkillKey]>`, the skills a
-  prompt-context fork's source loaded with the built-in `load_skill` tool
-  (see the next entry), and `unreadable_skill_loads: u32`, the number of
+  fork's source loaded with the built-in `load_skill` tool or, for a
+  durable fork, was given as per-turn skill context (see the next
+  entries), and `unreadable_skill_loads: u32`, the number of
   `load_skill` calls whose arguments name no skill. Each is serialized
-  only when not empty or zero, and only a prompt-context fork
-  refusal sets them; its message names only what the child would
+  only when not empty or zero, and only a refusal that concerns
+  loaded skills sets them; its message names only what the child would
   inherit. A decoder built from 0.9.4 denies unknown fields on this type
   and rejects a refusal that names either.
 
@@ -415,6 +416,53 @@ them.
   alone does not fit is refused before anything is spawned with the new
   `MobError::ForkContextTooLarge` (code `INVALID_PARAMS`, data kind
   `fork_context_too_large`).
+
+- `meerkat-core`: `Session::messages_for_model_boundary` returns
+  `Result<Vec<Message>, ModelBoundaryProjectionError>`. A transcript row
+  that does not hold the bytes its typed identity names now fails the
+  projection, and the agent refuses the model request (an
+  `InstructionActivation` error, `MalformedHistory`), instead of passing
+  the stored bytes to the model. `messages_for_model_boundary_prefix`
+  keeps its error type and fails the same way. Callers that read the
+  vector handle the error.
+
+- `meerkat-core`: `DurableSessionForkTarget` gains
+  `declared_instructions: ForkInstructionPolicy`, and `meerkat-mob`:
+  `forked_participant::PlannedForkRequest` gains the same field: the
+  host's fork instruction policy before it is resolved for the fork's
+  activation window. The skills a durable fork copies follow it (see the
+  next entry). Code that builds these types sets it, normally to the
+  policy it resolved `inherited_instructions` from. `meerkat-session`:
+  `PersistentSessionService::fork_durable_session_with_planned_identity`
+  takes the fork instruction policies of a fork without a target as one
+  new `ForkInstructionPolicies { inherited, declared }` in place of its
+  `inherited_instructions` parameter; `inherited` is that parameter's
+  value.
+
+- Not measured by the gate (a behaviour change): `meerkat-core`: a durable
+  fork child (`fork_member` and the forks built on it, `fork_off`,
+  council participants, and the session `fork_at` and `fork_replace`
+  calls) reads the rows it copied by the fork instruction policy:
+  - an activation row it copied reaches its model as a
+    `[meerkat-inherited-instruction-v2]` header that names the key, with
+    no body (the v1 projection kept the body); a body reaches the
+    child's model only from the child's own activation or
+    re-activation row;
+  - a skill its source loaded with `load_skill`, or was given as
+    per-turn skill context, reaches the child's model as a line naming
+    the skill, unless the host's policy is `reactivate_inherited`; under
+    `refuse` such a fork is refused with `FORK_INSTRUCTION_REFUSED`
+    (`refusal.skills` names the skills). Skills follow the policy as the
+    host declared it, so a fork that leaves no activation window strips
+    them under the default instead of refusing;
+  - a fork notice it copied from an earlier fork reaches its model as
+    history: one line naming the session that notice was given to.
+  The child's own fork notice names the skills it removed or carried. A
+  fork seed this release cannot read (a corrupt record, or one a later
+  release wrote) is dropped, and the child gets a fork notice that
+  carries nothing and names no source (its tools are `not_compared`
+  with the new reason `seed_unreadable`), so the rows it holds stay
+  copied history and a skill they loaded reaches its model by name only.
 
 - `meerkat-machine-kernels`: the generated runtime machine
   (`generated::meerkat`) gains the stop classifier of a graceful stop that
@@ -1565,6 +1613,11 @@ them.
   fails the spawn with that typed refusal, and the member is released. No
   durable intent covers this first turn, so a controller crash before its
   delivery loses it.
+
+- A durable fork child's model no longer reads the bodies of activation
+  rows and skills it copied from its source when the fork instruction
+  policy does not carry them, and a malformed activation row now refuses
+  the model request instead of reaching the model as stored.
 
 - A prompt-context fork no longer hands its source's activated instruction
   bodies or the skill bodies its source loaded with `load_skill` to the

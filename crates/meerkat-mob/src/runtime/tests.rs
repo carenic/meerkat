@@ -32094,8 +32094,9 @@ async fn test_fork_helper_tool_access_policy_reaches_session_metadata() {
 
 /// A prompt-context fork child's create request carries its typed source
 /// (`SessionBuildOptions::prompt_context_fork_source`): the source
-/// member's binding and its session. The child's creation stays a spawn
-/// with no durable fork source, and no other create carries one.
+/// member's binding and its session. The child's creation is not a fork
+/// creation (its provenance is Unproven: the host forked it) and has no
+/// durable fork source, and no other create carries one.
 #[tokio::test]
 async fn test_fork_helper_create_carries_the_typed_prompt_context_source() {
     let mut definition = sample_definition();

@@ -612,10 +612,25 @@ async fn a_self_starting_fork_reactivates_inherited_instructions_when_the_host_o
     let child_request = requests
         .get(requests_before)
         .expect("the child's first turn reached the model");
+    // The inherited row reaches the model as a header that names the key;
+    // the body comes once, from the child's own re-activation.
     assert_eq!(
         system_rows_with_body(child_request),
-        2,
-        "the child's request carries the inherited history row and its own activation"
+        1,
+        "the child's request carries the body once, from its own activation"
+    );
+    assert_eq!(
+        child_request
+            .messages
+            .iter()
+            .filter(|message| matches!(
+                message,
+                Message::System(system)
+                    if system.content.starts_with("[meerkat-inherited-instruction-v2]")
+            ))
+            .count(),
+        1,
+        "the inherited history row is a header without its body"
     );
     let child = fixture
         .durable(&outcome.fork.session_id)
@@ -1195,6 +1210,7 @@ async fn planned_child_evidence_measures_the_prefix_without_the_reactivation_row
             planned_child_session_id: planned.clone(),
             prefix_message_count: None,
             inherited_instructions: meerkat_core::ForkInstructionPolicy::ReactivateInherited,
+            declared_instructions: meerkat_core::ForkInstructionPolicy::ReactivateInherited,
         },
     )
     .await
@@ -2618,6 +2634,125 @@ async fn a_fork_of_a_fork_reads_one_current_notice() {
     );
     assert!(
         text.contains("You are a fork of member 'context-child'"),
+        "the notice names the grandchild's own source: {text}"
+    );
+    fixture.finish().await;
+}
+
+/// Under `reactivate_inherited` a durable fork child's model reads the
+/// activation body once, from the child's own re-activation row: the
+/// inherited row it copied is a header that names the key, without the body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_durable_fork_child_request_carries_inherited_rows_without_bodies() {
+    let fixture = Fixture::restored_member_with_policy(
+        meerkat_core::ForkInstructionPolicy::ReactivateInherited,
+    )
+    .await;
+    fixture.activated_source_with_a_turn().await;
+    let child = AgentIdentity::from("fork-child");
+    tokio::time::timeout(
+        WAIT,
+        fixture.handle.fork_member(
+            &fixture.identity,
+            SpawnMemberSpec::new(ProfileName::from("lead"), child.clone()),
+            None,
+        ),
+    )
+    .await
+    .expect("the fork answers")
+    .expect("the fork commits and seats the child");
+    let before = fixture.client.requests().len();
+    let turn = fixture.start_turn_for(&child, "the child's task").await;
+    tokio::time::timeout(WAIT, turn.wait())
+        .await
+        .expect("the child's turn finishes")
+        .expect("the child's turn runs");
+
+    let request = fixture.first_request_after(before).await;
+    assert_eq!(
+        system_rows_with_body(&request),
+        1,
+        "the body reaches the child's model once: {:?}",
+        request.messages
+    );
+    let headers = request
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::System(system)
+                if system
+                    .content
+                    .starts_with("[meerkat-inherited-instruction-v2]") =>
+            {
+                Some(system.content.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(headers.len(), 1, "one inherited header: {headers:?}");
+    assert!(
+        headers[0].contains("status=not_active_in_child")
+            && headers[0].contains("\"member\"")
+            && !headers[0].contains(BODY),
+        "the header names the key, not the body: {}",
+        headers[0]
+    );
+    fixture.finish().await;
+}
+
+/// A durable fork of a durable fork child reads one current notice, naming
+/// its own source: the notice its source was given is history there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_durable_fork_of_a_fork_reads_one_current_notice() {
+    let fixture = Fixture::restored_member().await;
+    fixture.run_turn("source turn before the forks").await;
+    let child = AgentIdentity::from("durable-child");
+    let grandchild = AgentIdentity::from("durable-grandchild");
+    tokio::time::timeout(
+        WAIT,
+        fixture.handle.fork_member(
+            &fixture.identity,
+            SpawnMemberSpec::new(ProfileName::from("lead"), child.clone()),
+            None,
+        ),
+    )
+    .await
+    .expect("the fork answers")
+    .expect("the fork commits");
+    let turn = fixture.start_turn_for(&child, "the child's task").await;
+    tokio::time::timeout(WAIT, turn.wait())
+        .await
+        .expect("the child's turn finishes")
+        .expect("the child's turn runs");
+    tokio::time::timeout(
+        WAIT,
+        fixture.handle.fork_member(
+            &child,
+            SpawnMemberSpec::new(ProfileName::from("lead"), grandchild.clone()),
+            None,
+        ),
+    )
+    .await
+    .expect("the second fork answers")
+    .expect("the second fork commits");
+    let before = fixture.client.requests().len();
+    let turn = fixture
+        .start_turn_for(&grandchild, "the grandchild's task")
+        .await;
+    tokio::time::timeout(WAIT, turn.wait())
+        .await
+        .expect("the grandchild's turn finishes")
+        .expect("the grandchild's turn runs");
+
+    let request = fixture.first_request_after(before).await;
+    let text = format!("{:?}", request.messages);
+    assert_eq!(
+        text.matches("You are a fork of").count(),
+        1,
+        "one current notice reaches the grandchild: {text}"
+    );
+    assert!(
+        text.contains("You are a fork of member 'durable-child'"),
         "the notice names the grandchild's own source: {text}"
     );
     fixture.finish().await;

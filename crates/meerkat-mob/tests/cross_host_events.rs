@@ -1362,6 +1362,87 @@ async fn a_context_fork_of_a_placed_source_compares_its_tools() {
     fixture.shutdown().await;
 }
 
+/// A LOCAL context-fork child of a PLACED source: its create build on the
+/// controlling host carries the typed source, naming the source member and
+/// the source's session on its member host. The placed source itself is
+/// never built on the controlling host.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_context_fork_child_of_a_placed_source_carries_its_typed_source() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let mut opts = HostFixtureOptions::named("xhe-b2r5-host").with_member_build();
+    opts.member_llm_client = Some(scripted_member_client_completing("b2r5-reply"));
+    let fixture = spawn_host_daemon_fixture(opts)
+        .await
+        .expect("spawn member-build host fixture");
+    let controlling = create_controlling_mob("xhe-b2r5").await;
+    let report = controlling.bind_fixture(&fixture).await;
+    b2_placed_source_with_a_turn(
+        &controlling,
+        "source-b2r5",
+        &report.host_id,
+        "b2r5-tail-marker",
+    )
+    .await;
+    let mut spec = meerkat_mob::SpawnMemberSpec::new("worker", "child-b2r5")
+        .with_backend(meerkat_mob::MobBackendKind::Session);
+    spec.launch_mode = meerkat_mob::MemberLaunchMode::Fork {
+        source_member_id: identity("source-b2r5"),
+        fork_context: meerkat_mob::ForkContext::LastMessages { count: 2 },
+    };
+    controlling
+        .handle
+        .spawn_spec(spec)
+        .await
+        .expect("the local fork child of a placed source spawns");
+
+    let creates = controlling.recorded_member_creates();
+    let creates_of = |member: &str| {
+        creates
+            .iter()
+            .filter(|create| {
+                create
+                    .mob_member_binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.member == member)
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        creates_of("source-b2r5").is_empty(),
+        "the placed source is built on its member host only: {creates:#?}"
+    );
+    let child_creates = creates_of("child-b2r5");
+    let [child] = child_creates.as_slice() else {
+        panic!("one build of the local child on the controlling host: {creates:#?}");
+    };
+    let typed = child
+        .prompt_context_fork_source
+        .as_ref()
+        .unwrap_or_else(|| panic!("the local child's build carries its typed source: {child:#?}"));
+    assert_eq!(
+        typed.source_member,
+        meerkat_core::MobMemberBinding {
+            mob_id: controlling.mob_id.to_string(),
+            role: "worker".to_string(),
+            member: "source-b2r5".to_string(),
+        },
+        "the typed source names the placed source member"
+    );
+    let source_session = fixture
+        .host_binding_record(controlling.mob_id.as_str())
+        .await
+        .materialized
+        .get("source-b2r5")
+        .map(|row| row.session_id.clone())
+        .expect("the source's materialized row");
+    assert_eq!(
+        typed.source_session_id.as_ref().map(ToString::to_string),
+        Some(source_session),
+        "the typed source names the placed source's session on its member host"
+    );
+    fixture.shutdown().await;
+}
+
 /// A scripted host plus a scripted member endpoint for `child`, so the
 /// child's first input is observable.
 async fn b2_scripted_host_with_child(

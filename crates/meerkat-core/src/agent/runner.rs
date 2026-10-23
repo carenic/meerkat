@@ -1788,7 +1788,7 @@ where
         self.session
             .validate_instruction_activation_turn_readiness()
             .map_err(AgentError::InstructionActivation)?;
-        let mut messages = self.session.messages_for_model_boundary();
+        let mut messages = self.session.messages_for_model_boundary()?;
         if let Some(instructions) = self.output_schema_request_instructions() {
             crate::structured_output::project_output_schema_instructions(
                 &mut messages,
@@ -2472,22 +2472,25 @@ where
         let seed: crate::fork_notice::ForkSeed = match serde_json::from_value(value) {
             Ok(seed) => seed,
             Err(error) => {
-                // A seed this release cannot read (for example one a later
-                // release wrote) must not stop the session: it is dropped,
-                // and the child is told once that its fork context is gone.
+                // A seed this release cannot read (a corrupt record, or one a
+                // later release wrote) must not stop the session: it is
+                // dropped, and the child is told once, by a fork notice of
+                // its own that carries nothing, that its fork context is
+                // gone. The notice keeps every row the child holds copied
+                // history, as the undelivered seed did, so no skill body
+                // those rows loaded reaches the model.
                 tracing::warn!(
                     session_id = %child,
                     %error,
                     "dropping a fork seed this release cannot read"
                 );
-                self.session.push(Message::SystemNotice(
-                    crate::types::SystemNoticeMessage::new(
-                        crate::types::SystemNoticeKind::Generic,
-                        "Fork notice. You are a fork of another agent, but the fork \
-                         context recorded for you could not be read, so it was not \
-                         given to you.",
-                    ),
-                ));
+                if !crate::fork_notice::holds_fork_notice_for(self.session.messages(), &child) {
+                    self.session.push(Message::SystemNotice(
+                        crate::types::SystemNoticeMessage::fork_boundary(
+                            crate::fork_notice::ForkBoundaryNotice::for_unreadable_seed(child),
+                        ),
+                    ));
+                }
                 self.session
                     .remove_metadata(crate::fork_notice::SESSION_FORK_SEED_KEY);
                 return Ok(());
@@ -6673,8 +6676,8 @@ mod skill_activation_effect_tests {
 
     /// A fork seed this release cannot read (one a later release wrote,
     /// read after a downgrade) does not stop the session: the seed is
-    /// dropped, the child is told once that its fork context could not be
-    /// read, and its runs go on.
+    /// dropped, the child is told once, by a fork notice of its own, that its
+    /// fork context could not be read, and its runs go on.
     #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn an_unreadable_fork_seed_is_dropped_with_one_notice_and_runs_go_on() {
@@ -6707,6 +6710,7 @@ mod skill_activation_effect_tests {
                 .is_none(),
             "the unreadable seed is dropped"
         );
+        let child = agent.session().id().clone();
         let notices = agent
             .session()
             .messages()
@@ -6715,11 +6719,165 @@ mod skill_activation_effect_tests {
                 matches!(
                     message,
                     Message::SystemNotice(notice)
-                        if notice.body.as_deref().is_some_and(|body| body.contains("fork context"))
+                        if notice.blocks.iter().any(|block| matches!(
+                            block,
+                            crate::types::SystemNoticeBlock::ForkBoundary(fork)
+                                if fork.child_session_id == child
+                                    && fork.summary.contains("fork context")
+                        ))
                 )
             })
             .count();
-        assert_eq!(notices, 1, "the child is told once");
+        assert_eq!(notices, 1, "the child is told once, by its own fork notice");
+    }
+
+    /// A fork seed this release cannot read, a corrupt one or one a later
+    /// release wrote, carries nothing: the child gets a fork notice of its
+    /// own that carries nothing, so every row it held stays copied history,
+    /// and no request of the child carries the body of a skill those rows
+    /// loaded, even when the seed says the skill is carried.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn an_unreadable_fork_seed_keeps_copied_skill_bodies_from_the_model() {
+        const SKILL_SOURCE: &str = "dc256086-0d2f-4f61-a307-320d4148107f";
+        const LOADED_BODY: &str = "COPIED-SKILL-BODY-MARKER";
+        const CONTEXT_BODY: &str = "COPIED-SKILL-CONTEXT-MARKER";
+
+        struct RecordingLlmClient(std::sync::Mutex<Vec<Vec<Message>>>);
+
+        #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+        impl AgentLlmClient for RecordingLlmClient {
+            async fn stream_response(
+                &self,
+                messages: &[Message],
+                _tools: &[Arc<ToolDef>],
+                _max_tokens: u32,
+                _temperature: Option<f32>,
+                _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
+            ) -> Result<super::super::LlmStreamResult, AgentError> {
+                self.0.lock().unwrap().push(messages.to_vec());
+                Ok(super::super::LlmStreamResult::new(
+                    vec![AssistantBlock::Text {
+                        text: "ok".to_string(),
+                        meta: None,
+                    }],
+                    StopReason::EndTurn,
+                    normalized_test_usage(self, Usage::default()),
+                ))
+            }
+
+            fn provider(&self) -> crate::provider::Provider {
+                crate::provider::Provider::Other
+            }
+
+            fn model(&self) -> &'static str {
+                "mock-model"
+            }
+        }
+
+        let skill = fixture_skill_key("pdf-processing");
+        let corrupt_seed = serde_json::json!("not a fork seed");
+        // A later release's seed: a source-tools status this release does
+        // not know, and the skill carried.
+        let later_release_seed = serde_json::json!({
+            "fork": "transcript",
+            "source": {"session_id": crate::types::SessionId::new().to_string()},
+            "skills_carried": [{"source_uuid": SKILL_SOURCE, "skill_name": "pdf-processing"}],
+            "source_tools": {"status": "read_from_member_host", "names": []},
+        });
+        for seed in [corrupt_seed, later_release_seed] {
+            let client = Arc::new(RecordingLlmClient(std::sync::Mutex::new(Vec::new())));
+            let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+                .build_standalone(client.clone(), Arc::new(NoTools), Arc::new(NoopStore))
+                .await;
+            let copied = agent.session_mut();
+            copied.push(Message::User(UserMessage::text("load the skill")));
+            copied.push(Message::BlockAssistant(BlockAssistantMessage::new(
+                vec![AssistantBlock::ToolUse {
+                    id: "load-1".to_string(),
+                    name: crate::skills::LOAD_SKILL_TOOL_NAME.to_string(),
+                    args: to_raw_value(&serde_json::json!({
+                        "source_uuid": SKILL_SOURCE,
+                        "skill_name": "pdf-processing",
+                    }))
+                    .unwrap(),
+                    meta: None,
+                }],
+                StopReason::ToolUse,
+            )));
+            copied.push(Message::ToolResults {
+                results: vec![crate::types::ToolResult::new(
+                    "load-1".to_string(),
+                    LOADED_BODY.to_string(),
+                    false,
+                )],
+                created_at: crate::types::message_timestamp_now(),
+            });
+            let mut with_context = UserMessage::text("a turn with skill context");
+            with_context
+                .content
+                .push(crate::types::ContentBlock::SkillContext {
+                    skill_key: skill.clone(),
+                    text: CONTEXT_BODY.to_string(),
+                });
+            copied.push(Message::User(with_context));
+            copied.push(Message::BlockAssistant(BlockAssistantMessage::new(
+                vec![AssistantBlock::Text {
+                    text: "loaded".to_string(),
+                    meta: None,
+                }],
+                StopReason::EndTurn,
+            )));
+            copied
+                .try_set_metadata(crate::fork_notice::SESSION_FORK_SEED_KEY, seed.clone())
+                .expect("the seed is recorded");
+            for prompt in ["first", "second"] {
+                let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
+                agent
+                    .run_with_events(prompt.into(), tx)
+                    .await
+                    .expect("an unreadable seed does not fail the run");
+            }
+
+            let requests = client.0.lock().unwrap().clone();
+            assert_eq!(requests.len(), 2, "one request per run ({seed})");
+            for request in &requests {
+                let text = serde_json::to_string(request).unwrap();
+                assert!(
+                    !text.contains(LOADED_BODY) && !text.contains(CONTEXT_BODY),
+                    "no copied skill body reaches the model ({seed}): {text}"
+                );
+                assert!(
+                    text.contains(&format!(
+                        "skill {skill} was loaded here; its body is not carried into this fork"
+                    )),
+                    "the copied result names the skill ({seed}): {text}"
+                );
+            }
+            let child = agent.session().id().clone();
+            let (_, notice) =
+                crate::fork_notice::own_fork_notice(agent.session().messages(), &child)
+                    .expect("the child holds a fork notice of its own");
+            assert!(
+                notice.instructions_carried.is_empty()
+                    && notice.skills_carried.is_empty()
+                    && notice.injected_rows_carried == 0
+                    && notice.source.member.is_none()
+                    && notice.source.session_id.is_none(),
+                "the notice carries nothing and names no source ({seed}): {notice:?}"
+            );
+            assert_eq!(
+                serde_json::to_value(&notice.tools).unwrap(),
+                serde_json::json!({"comparison": "not_compared", "reason": "seed_unreadable"}),
+                "the notice says the seed could not be read ({seed})"
+            );
+            assert!(
+                notice.summary.contains("could not be read"),
+                "{}",
+                notice.summary
+            );
+        }
     }
 
     /// Without an engine, a turn that selects no skills still runs normally.
