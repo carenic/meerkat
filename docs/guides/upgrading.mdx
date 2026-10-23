@@ -184,6 +184,20 @@ set `custody_deferred` (`None`) where you build `MobMemberStatusResult` with a
 struct literal, and handle the `Unknown` case where you read a custody
 restore or cause.
 
+#### Live open advisories
+
+- `meerkat-contracts`: `LiveOpenResult` gains the field
+  `advisories: Vec<WireLiveOpenAdvisory>`, left out of the wire when empty.
+  It lists what a successful `live/open` went ahead without: today
+  `staged_prompt_refused`, when a run-start hook refused the session's staged
+  create-time prompt (the prompt stays staged for the first text turn). The
+  vocabulary may grow: `WireLiveOpenAdvisory` has an `Unknown(String)` variant
+  for a value this version does not know, and the Python and TypeScript SDKs
+  keep such a value as the string the server sent instead of failing the open.
+
+**Do:** set `advisories: Vec::new()` where you build `LiveOpenResult` with a
+struct literal, and treat an advisory you do not know as informational.
+
 ### Other behaviour changes
 
 - **A Broken member no longer stops a mob start:** when a member whose
@@ -254,6 +268,7 @@ restore or cause.
    still wanted".
 7. Add a wildcard arm where you match `RuntimeBindingsError`, and set
    `custody_deferred` in `MobMemberStatusResult` struct literals.
+8. Set `advisories` in `LiveOpenResult` struct literals.
 
 ## Upgrading to 0.9.4
 

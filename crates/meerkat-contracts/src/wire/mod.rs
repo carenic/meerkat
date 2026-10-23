@@ -142,7 +142,7 @@ pub use live::{
     LiveWebrtcAnswerResult, WireLiveAdapterErrorCode, WireLiveAdapterObservation,
     WireLiveAdapterStatus, WireLiveChannelCapabilities, WireLiveCloseReason,
     WireLiveConfigRejectionReason, WireLiveContinuityMode, WireLiveDegradationReason,
-    WireLiveExecutionIdentityOverrideV1, WireLiveExecutionIdentityVersion,
+    WireLiveExecutionIdentityOverrideV1, WireLiveExecutionIdentityVersion, WireLiveOpenAdvisory,
     WireLiveProviderInputLatency, WireLiveProviderInputLatencyReading, WireLiveResponseFailure,
     WireLiveResponseFailureStatus, WireLiveResponseModality, WireLiveTransportBootstrap,
     WireProvider, WireRealtimeTranscriptEvent,

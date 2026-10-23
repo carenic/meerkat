@@ -7792,6 +7792,65 @@ async def test_live_channel_passes_seed_max_chars_on_open():
 
 
 @pytest.mark.asyncio
+async def test_live_open_advisories_keep_unknown_values_and_fail_closed_when_malformed():
+    """`advisories` on a live open result is advisory and its vocabulary may
+    grow: a value this SDK does not know is kept as the string the server
+    sent, on the raw session open and the parsed member open alike, and an
+    absent field reads as no advisories. A field that is not a list of
+    non-empty strings is malformed and fails closed.
+    """
+    from meerkat.types import LiveOpenResult, WireLiveOpenAdvisory
+
+    def open_result(**extra: object) -> dict[str, object]:
+        return {
+            "channel_id": "live_advised",
+            "transport": {"transport": "websocket", "url": "ws://x", "token": "t"},
+            "capabilities": {
+                "audio_in": True,
+                "audio_out": True,
+                "text_in": True,
+                "text_out": True,
+                "image_in": False,
+                "video_in": False,
+                "transcript_supported": True,
+                "barge_in_supported": True,
+                "provider_native_resume": False,
+            },
+            "continuity": {"mode": "transcript_only"},
+            **extra,
+        }
+
+    responses: list[dict[str, object]] = []
+
+    async def fake_request(method, params):
+        return responses.pop(0)
+
+    client = MeerkatClient()
+    client._request = fake_request  # type: ignore[method-assign]
+    advised = ["staged_prompt_refused", "a_later_advisory"]
+
+    responses.append(open_result(advisories=list(advised)))
+    raw = await client.live_open("session-advised")
+    responses.append(open_result(advisories=list(advised)))
+    member = await client.open_mob_member_live("mob-1", "worker")
+    responses.append(open_result())
+    member_without = await client.open_mob_member_live("mob-1", "worker")
+
+    assert raw["advisories"] == advised
+    assert member.advisories == advised
+    assert member_without.advisories == []
+    assert set(get_args(get_type_hints(LiveOpenResult)["advisories"])) == {
+        list[WireLiveOpenAdvisory],
+        type(None),
+    }
+
+    for malformed in ("staged_prompt_refused", [7], [""], None):
+        responses.append(open_result(advisories=malformed))
+        with pytest.raises(MeerkatError, match="Invalid mob/member_live_open response"):
+            await client.open_mob_member_live("mob-1", "worker")
+
+
+@pytest.mark.asyncio
 async def test_client_live_open_passes_explicit_commit_turning_mode():
     """R4-2 (P2): explicit-commit on the wire so the G9 typed text-only
     ``live_commit_input(response_modality="text")`` path is reachable.

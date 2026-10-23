@@ -5790,7 +5790,10 @@ export interface WireLiveTransportBootstrapUnknown {
 
 export type WireLiveTransportBootstrap = WireLiveTransportBootstrapWebsocket | WireLiveTransportBootstrapWebrtc | WireLiveTransportBootstrapUnknown;
 
+export type WireLiveOpenAdvisory = "staged_prompt_refused" | string;
+
 export interface LiveOpenResult {
+  advisories?: WireLiveOpenAdvisory[];
   capabilities: WireLiveChannelCapabilities;
   channel_id: string;
   continuity: WireLiveContinuityMode;

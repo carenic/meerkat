@@ -7459,6 +7459,7 @@ mod tests {
                         provider_native_resume: false,
                     },
                     continuity: crate::wire::WireLiveContinuityMode::Fresh,
+                    advisories: Vec::new(),
                 },
             }),
             BridgeReply::MemberLiveChannelStatusReport {

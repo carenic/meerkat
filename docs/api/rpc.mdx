@@ -2451,7 +2451,7 @@ Create a session on a realtime-capable model and call `live/open`:
 }
 ```
 
-`live/open` returns a `LiveOpenResult` with transport bootstrap (e.g. WebSocket URL), `WireLiveChannelCapabilities`, and `WireLiveContinuityMode`.
+`live/open` returns a `LiveOpenResult` with transport bootstrap (e.g. WebSocket URL), `WireLiveChannelCapabilities`, and `WireLiveContinuityMode`, plus `advisories` when the open went ahead without something. Today that is `staged_prompt_refused`: a run-start hook refused the session's staged create-time prompt, so the realtime model was not given it, and it stays staged for the session's first text turn or a later open. The advisory vocabulary may grow: an advisory a client does not know is not an error, and the SDKs keep it as the string the server sent.
 
 <ParamField body="session_id" type="string" required>
   Session whose canonical history seeds the live channel.

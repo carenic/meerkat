@@ -2320,6 +2320,11 @@ enum SessionCommand {
         content: ContentInput,
         reply_tx: oneshot::Sender<Result<(), meerkat_core::error::AgentError>>,
     },
+    DeliverStagedPromptForLiveOpen {
+        reply_tx: oneshot::Sender<
+            Result<StagedPromptLiveOpenDelivery, meerkat_core::error::AgentError>,
+        >,
+    },
     AppendExternalAssistantOutput {
         blocks: Vec<meerkat_core::types::AssistantBlock>,
         stop_reason: meerkat_core::types::StopReason,
@@ -3293,6 +3298,26 @@ pub trait McpAttemptGuardSource {
     fn mcp_attempt_guards(&self) -> Option<&Self::Guards>;
 }
 
+/// What a live open did with a session's staged create-time prompt
+/// ([`EphemeralSessionService::deliver_staged_prompt_for_live_open`]).
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum StagedPromptLiveOpenDelivery {
+    /// No create-time prompt was staged, or a turn already consumed it.
+    NothingStaged,
+    /// Committed as the session's next user row, ahead of the realtime seed.
+    Delivered,
+    /// A `RunStarted` hook refused it; it stays staged for the first turn.
+    Refused(meerkat_core::error::AgentError),
+    /// The session's turn boundary was held, so an open that never waits
+    /// behind a turn asked nothing of the actor. A turn in flight has already
+    /// consumed a staged prompt; any other holder leaves it staged for the
+    /// next open or the first turn. Only the non-waiting delivery
+    /// (`PersistentSessionService::try_deliver_staged_prompt_for_live_open`)
+    /// answers this.
+    TurnBoundaryHeld,
+}
+
 /// Trait for building agents from session creation requests.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -3997,6 +4022,17 @@ pub trait SessionAgent: Send {
             "HeadCanonical boundary acknowledgement is not supported by this session agent"
                 .to_string(),
         ))
+    }
+
+    /// Admit a staged create-time prompt that a live open delivers in place
+    /// of a turn: the `RunStarted` hooks a turn carrying it would run. A
+    /// denial keeps the prompt staged. The default (an agent without hooks)
+    /// admits it.
+    async fn admit_staged_prompt_for_live_open(
+        &mut self,
+        _prompt: &ContentInput,
+    ) -> Result<(), meerkat_core::error::AgentError> {
+        Ok(())
     }
 
     /// Append externally-produced user content into the canonical transcript.
@@ -6586,6 +6622,35 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
                 accounting,
                 reply_tx,
             })
+            .await
+            .map_err(|_| {
+                SessionError::Agent(meerkat_core::error::AgentError::InternalError(
+                    "Session task has exited".to_string(),
+                ))
+            })?;
+        reply_rx
+            .await
+            .map_err(|_| {
+                SessionError::Agent(meerkat_core::error::AgentError::InternalError(
+                    "Session task dropped the reply channel".to_string(),
+                ))
+            })?
+            .map_err(SessionError::Agent)
+    }
+
+    /// Deliver the session's staged create-time prompt for a live open: run
+    /// the `RunStarted` hooks a turn carrying it would run and, when they
+    /// admit it, commit it as the session's next user row, so the realtime
+    /// seed carries it. Consumed exactly once: a later first turn finds no
+    /// staged prompt, and one a turn already consumed is never delivered here.
+    pub async fn deliver_staged_prompt_for_live_open(
+        &self,
+        id: &SessionId,
+    ) -> Result<StagedPromptLiveOpenDelivery, SessionError> {
+        let command_tx = self.session_command_tx(id).await?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        command_tx
+            .send(SessionCommand::DeliverStagedPromptForLiveOpen { reply_tx })
             .await
             .map_err(|_| {
                 SessionError::Agent(meerkat_core::error::AgentError::InternalError(
@@ -10276,6 +10341,9 @@ async fn drain_session_task_commands<A: SessionAgent>(
             SessionCommand::AppendExternalUserContent { reply_tx, .. } => {
                 let _ = reply_tx.send(Err(meerkat_core::error::AgentError::Cancelled));
             }
+            SessionCommand::DeliverStagedPromptForLiveOpen { reply_tx } => {
+                let _ = reply_tx.send(Err(meerkat_core::error::AgentError::Cancelled));
+            }
             SessionCommand::AppendExternalAssistantOutput { reply_tx, .. } => {
                 let _ = reply_tx.send(Err(meerkat_core::error::AgentError::Cancelled));
             }
@@ -11521,6 +11589,49 @@ async fn session_task<A: SessionAgent>(
                         control.publish_session_event(envelope).await;
                         Ok(())
                     }
+                };
+                let _ = reply_tx.send(result);
+            }
+            SessionCommand::DeliverStagedPromptForLiveOpen { reply_tx } => {
+                // Consume the deferred inputs, keep only the staged prompt and
+                // restore the first-turn phase and staged tool results at
+                // once: a live open delivers the prompt, the first turn still
+                // starts the session.
+                let mut consumed = {
+                    let mut guard = lock_deferred_turn_state(&deferred_turn_state);
+                    guard.consume_for_started_turn()
+                };
+                let staged = consumed.take_initial_prompt();
+                restore_deferred_turn_inputs(&deferred_turn_state, consumed);
+                let Some(prompt) = staged
+                    .pending_initial_prompt()
+                    .map(|pending| pending.prompt.clone())
+                else {
+                    let _ = reply_tx.send(Ok(StagedPromptLiveOpenDelivery::NothingStaged));
+                    continue;
+                };
+                let result = match agent.admit_staged_prompt_for_live_open(&prompt).await {
+                    Err(refusal) => {
+                        restore_deferred_turn_inputs(&deferred_turn_state, staged);
+                        Ok(StagedPromptLiveOpenDelivery::Refused(refusal))
+                    }
+                    Ok(()) => match agent.append_external_user_content(prompt) {
+                        Ok(()) => {
+                            let snap = agent.snapshot();
+                            control.publish_summary(SessionSummaryCache {
+                                updated_at: snap.updated_at,
+                                message_count: snap.message_count,
+                                total_tokens: snap.total_tokens,
+                                usage: snap.usage,
+                                last_assistant_text: snap.last_assistant_text,
+                            });
+                            Ok(StagedPromptLiveOpenDelivery::Delivered)
+                        }
+                        Err(error) => {
+                            restore_deferred_turn_inputs(&deferred_turn_state, staged);
+                            Err(error)
+                        }
+                    },
                 };
                 let _ = reply_tx.send(result);
             }

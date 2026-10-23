@@ -2512,6 +2512,7 @@ mod tests {
                 provider_native_resume: false,
             },
             continuity: meerkat_contracts::WireLiveContinuityMode::Degraded,
+            advisories: Vec::new(),
         };
         assert_eq!(round_trip(&v), v);
     }

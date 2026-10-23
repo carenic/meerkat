@@ -1859,6 +1859,22 @@ where
         Ok(())
     }
 
+    /// Admit a staged create-time prompt that a live open delivers to the
+    /// realtime model in place of a turn: the mandatory hook topology and the
+    /// `RunStarted` hooks a turn carrying the prompt would run, over a run
+    /// input of exactly that prompt. A hook denial is returned as the turn
+    /// would see it, and the caller keeps the prompt staged.
+    pub async fn admit_staged_prompt_for_live_open(
+        &mut self,
+        prompt: &ContentInput,
+    ) -> Result<(), AgentError> {
+        self.admit_mandatory_hook_topology()?;
+        let input = RunInput::Content {
+            content: prompt.clone(),
+        };
+        self.run_started_hooks(&input, None).await
+    }
+
     async fn run_started_hooks(
         &mut self,
         input: &RunInput,

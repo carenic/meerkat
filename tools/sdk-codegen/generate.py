@@ -936,6 +936,9 @@ def _promote_nested_schema_def(name: str) -> bool:
         # the schema-local `$defs` as anonymous `dict[str, Any]` / `unknown`.
         "WireLiveChannelCapabilities",
         "WireLiveContinuityMode",
+        # Keep `LiveOpenResult.advisories` entries named: an open vocabulary
+        # (known values plus any string), so a reader keeps unknown advisories.
+        "WireLiveOpenAdvisory",
         # G8 (P2): promote `WireLiveTransportBootstrap` so `LiveOpenResult.transport`
         # carries the typed discriminated-union shape into SDK codegen instead
         # of falling back to `Record<string, unknown>` / `dict[str, Any]`.
@@ -3998,6 +4001,11 @@ def generate_python_types(schemas: dict, output_dir: Path, *, has_comms: bool = 
         wire_schema,
         "Wire projection of LiveTransportBootstrap (internally-tagged on `transport`).",
     )
+    append_python_alias(
+        "WireLiveOpenAdvisory",
+        wire_schema,
+        "An advisory on a successful live/open (an open vocabulary).",
+    )
     append_python_dataclass("LiveOpenResult", wire_schema, "Response payload for live/open.")
     append_python_dataclass(
         "LiveWebrtcAnswerParams",
@@ -4899,6 +4907,7 @@ def generate_typescript_types(schemas: dict, output_dir: Path, *, has_comms: boo
     # G8 (P2): typed wire mirror for `LiveOpenResult.transport`
     # (discriminated union on `transport`).
     append_typescript_alias("WireLiveTransportBootstrap", wire_schema)
+    append_typescript_alias("WireLiveOpenAdvisory", wire_schema)
     append_typescript_interface("LiveOpenResult", wire_schema)
     append_typescript_interface("LiveWebrtcAnswerParams", wire_schema)
     append_typescript_interface("LiveWebrtcAnswerResult", wire_schema)

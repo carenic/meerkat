@@ -22710,6 +22710,13 @@
       "LiveOpenResult": {
         "description": "Response payload for `live/open`.\n\n`capabilities`, `continuity`, and `transport` are typed wire-side mirrors\nof the core `LiveChannelCapabilities` / `LiveContinuityMode` /\n`LiveTransportBootstrap` so SDK codegen sees the real shape (typed\nbooleans, internally-tagged variant payloads, discriminated transport\nunion) instead of an opaque JSON blob. CC5/CC6 (PR #650 verifier\nfollow-up); G8 (P2): `transport` typed-mirror.\n\n`Eq`: all fields are strings/enums/bools, and the bridge reply chain\n(`BridgeReply::MemberLiveChannelOpened`) requires it.",
         "properties": {
+          "advisories": {
+            "description": "What the open went ahead without: advisories, not failures. Omitted\nwhen there are none. The vocabulary may grow: a reader keeps an\nadvisory it does not know as it was sent instead of refusing the\nresult.",
+            "items": {
+              "$ref": "#/$defs/WireLiveOpenAdvisory"
+            },
+            "type": "array"
+          },
           "capabilities": {
             "$ref": "#/$defs/WireLiveChannelCapabilities"
           },
@@ -22861,6 +22868,20 @@
             "type": "object"
           }
         ]
+      },
+      "WireLiveOpenAdvisory": {
+        "anyOf": [
+          {
+            "const": "staged_prompt_refused",
+            "description": "A RunStarted hook refused the session's staged create-time prompt,\nso the realtime model was not given it. It stays staged for the\nsession's first text turn or a later open.",
+            "type": "string"
+          },
+          {
+            "description": "An advisory this version does not know, as it was sent.",
+            "type": "string"
+          }
+        ],
+        "description": "An advisory on a successful live/open: something the open went ahead\nwithout. The vocabulary may grow: a reader keeps an advisory it does not\nknow as it was sent."
       },
       "WireLiveTransportBootstrap": {
         "description": "Wire projection of [`meerkat_core::live_adapter::LiveTransportBootstrap`].\n\nInternally-tagged on `transport` (snake_case) — matches the core enum's\nserde shape exactly so the wire payload is byte-identical. G8 (P2):\ncloses the typed-surface gap that left `transport: unknown` in TS and\n`Any` in Python at the SDK boundary.\n\nThe core enum is `#[non_exhaustive]`; new transports (e.g. WebRTC\nreintroduction per Round-4 T4) appear here as additional typed variants\nrather than as a free-form JSON blob.",
@@ -46423,6 +46444,13 @@
       "LiveOpenResult": {
         "description": "Response payload for `live/open`.\n\n`capabilities`, `continuity`, and `transport` are typed wire-side mirrors\nof the core `LiveChannelCapabilities` / `LiveContinuityMode` /\n`LiveTransportBootstrap` so SDK codegen sees the real shape (typed\nbooleans, internally-tagged variant payloads, discriminated transport\nunion) instead of an opaque JSON blob. CC5/CC6 (PR #650 verifier\nfollow-up); G8 (P2): `transport` typed-mirror.\n\n`Eq`: all fields are strings/enums/bools, and the bridge reply chain\n(`BridgeReply::MemberLiveChannelOpened`) requires it.",
         "properties": {
+          "advisories": {
+            "description": "What the open went ahead without: advisories, not failures. Omitted\nwhen there are none. The vocabulary may grow: a reader keeps an\nadvisory it does not know as it was sent instead of refusing the\nresult.",
+            "items": {
+              "$ref": "#/$defs/WireLiveOpenAdvisory"
+            },
+            "type": "array"
+          },
           "capabilities": {
             "$ref": "#/$defs/WireLiveChannelCapabilities"
           },
@@ -51528,6 +51556,20 @@
             "type": "object"
           }
         ]
+      },
+      "WireLiveOpenAdvisory": {
+        "anyOf": [
+          {
+            "const": "staged_prompt_refused",
+            "description": "A RunStarted hook refused the session's staged create-time prompt,\nso the realtime model was not given it. It stays staged for the\nsession's first text turn or a later open.",
+            "type": "string"
+          },
+          {
+            "description": "An advisory this version does not know, as it was sent.",
+            "type": "string"
+          }
+        ],
+        "description": "An advisory on a successful live/open: something the open went ahead\nwithout. The vocabulary may grow: a reader keeps an advisory it does not\nknow as it was sent."
       },
       "WireLiveTransportBootstrap": {
         "description": "Wire projection of [`meerkat_core::live_adapter::LiveTransportBootstrap`].\n\nInternally-tagged on `transport` (snake_case) — matches the core enum's\nserde shape exactly so the wire payload is byte-identical. G8 (P2):\ncloses the typed-surface gap that left `transport: unknown` in TS and\n`Any` in Python at the SDK boundary.\n\nThe core enum is `#[non_exhaustive]`; new transports (e.g. WebRTC\nreintroduction per Round-4 T4) appear here as additional typed variants\nrather than as a free-form JSON blob.",
@@ -65466,6 +65508,13 @@
       "LiveOpenResult": {
         "description": "Response payload for `live/open`.\n\n`capabilities`, `continuity`, and `transport` are typed wire-side mirrors\nof the core `LiveChannelCapabilities` / `LiveContinuityMode` /\n`LiveTransportBootstrap` so SDK codegen sees the real shape (typed\nbooleans, internally-tagged variant payloads, discriminated transport\nunion) instead of an opaque JSON blob. CC5/CC6 (PR #650 verifier\nfollow-up); G8 (P2): `transport` typed-mirror.\n\n`Eq`: all fields are strings/enums/bools, and the bridge reply chain\n(`BridgeReply::MemberLiveChannelOpened`) requires it.",
         "properties": {
+          "advisories": {
+            "description": "What the open went ahead without: advisories, not failures. Omitted\nwhen there are none. The vocabulary may grow: a reader keeps an\nadvisory it does not know as it was sent instead of refusing the\nresult.",
+            "items": {
+              "$ref": "#/$defs/WireLiveOpenAdvisory"
+            },
+            "type": "array"
+          },
           "capabilities": {
             "$ref": "#/$defs/WireLiveChannelCapabilities"
           },
@@ -72199,6 +72248,20 @@
             "type": "object"
           }
         ]
+      },
+      "WireLiveOpenAdvisory": {
+        "anyOf": [
+          {
+            "const": "staged_prompt_refused",
+            "description": "A RunStarted hook refused the session's staged create-time prompt,\nso the realtime model was not given it. It stays staged for the\nsession's first text turn or a later open.",
+            "type": "string"
+          },
+          {
+            "description": "An advisory this version does not know, as it was sent.",
+            "type": "string"
+          }
+        ],
+        "description": "An advisory on a successful live/open: something the open went ahead\nwithout. The vocabulary may grow: a reader keeps an advisory it does not\nknow as it was sent."
       },
       "WireLiveTransportBootstrap": {
         "description": "Wire projection of [`meerkat_core::live_adapter::LiveTransportBootstrap`].\n\nInternally-tagged on `transport` (snake_case) — matches the core enum's\nserde shape exactly so the wire payload is byte-identical. G8 (P2):\ncloses the typed-surface gap that left `transport: unknown` in TS and\n`Any` in Python at the SDK boundary.\n\nThe core enum is `#[non_exhaustive]`; new transports (e.g. WebRTC\nreintroduction per Round-4 T4) appear here as additional typed variants\nrather than as a free-form JSON blob.",
@@ -86953,6 +87016,13 @@
       "LiveOpenResult": {
         "description": "Response payload for `live/open`.\n\n`capabilities`, `continuity`, and `transport` are typed wire-side mirrors\nof the core `LiveChannelCapabilities` / `LiveContinuityMode` /\n`LiveTransportBootstrap` so SDK codegen sees the real shape (typed\nbooleans, internally-tagged variant payloads, discriminated transport\nunion) instead of an opaque JSON blob. CC5/CC6 (PR #650 verifier\nfollow-up); G8 (P2): `transport` typed-mirror.\n\n`Eq`: all fields are strings/enums/bools, and the bridge reply chain\n(`BridgeReply::MemberLiveChannelOpened`) requires it.",
         "properties": {
+          "advisories": {
+            "description": "What the open went ahead without: advisories, not failures. Omitted\nwhen there are none. The vocabulary may grow: a reader keeps an\nadvisory it does not know as it was sent instead of refusing the\nresult.",
+            "items": {
+              "$ref": "#/$defs/WireLiveOpenAdvisory"
+            },
+            "type": "array"
+          },
           "capabilities": {
             "$ref": "#/$defs/WireLiveChannelCapabilities"
           },
@@ -92058,6 +92128,20 @@
             "type": "object"
           }
         ]
+      },
+      "WireLiveOpenAdvisory": {
+        "anyOf": [
+          {
+            "const": "staged_prompt_refused",
+            "description": "A RunStarted hook refused the session's staged create-time prompt,\nso the realtime model was not given it. It stays staged for the\nsession's first text turn or a later open.",
+            "type": "string"
+          },
+          {
+            "description": "An advisory this version does not know, as it was sent.",
+            "type": "string"
+          }
+        ],
+        "description": "An advisory on a successful live/open: something the open went ahead\nwithout. The vocabulary may grow: a reader keeps an advisory it does not\nknow as it was sent."
       },
       "WireLiveTransportBootstrap": {
         "description": "Wire projection of [`meerkat_core::live_adapter::LiveTransportBootstrap`].\n\nInternally-tagged on `transport` (snake_case) — matches the core enum's\nserde shape exactly so the wire payload is byte-identical. G8 (P2):\ncloses the typed-surface gap that left `transport: unknown` in TS and\n`Any` in Python at the SDK boundary.\n\nThe core enum is `#[non_exhaustive]`; new transports (e.g. WebRTC\nreintroduction per Round-4 T4) appear here as additional typed variants\nrather than as a free-form JSON blob.",
@@ -112594,6 +112678,20 @@
           }
         ]
       },
+      "WireLiveOpenAdvisory": {
+        "anyOf": [
+          {
+            "const": "staged_prompt_refused",
+            "description": "A RunStarted hook refused the session's staged create-time prompt,\nso the realtime model was not given it. It stays staged for the\nsession's first text turn or a later open.",
+            "type": "string"
+          },
+          {
+            "description": "An advisory this version does not know, as it was sent.",
+            "type": "string"
+          }
+        ],
+        "description": "An advisory on a successful live/open: something the open went ahead\nwithout. The vocabulary may grow: a reader keeps an advisory it does not\nknow as it was sent."
+      },
       "WireLiveTransportBootstrap": {
         "description": "Wire projection of [`meerkat_core::live_adapter::LiveTransportBootstrap`].\n\nInternally-tagged on `transport` (snake_case) — matches the core enum's\nserde shape exactly so the wire payload is byte-identical. G8 (P2):\ncloses the typed-surface gap that left `transport: unknown` in TS and\n`Any` in Python at the SDK boundary.\n\nThe core enum is `#[non_exhaustive]`; new transports (e.g. WebRTC\nreintroduction per Round-4 T4) appear here as additional typed variants\nrather than as a free-form JSON blob.",
         "oneOf": [
@@ -112668,6 +112766,13 @@
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "description": "Response payload for `live/open`.\n\n`capabilities`, `continuity`, and `transport` are typed wire-side mirrors\nof the core `LiveChannelCapabilities` / `LiveContinuityMode` /\n`LiveTransportBootstrap` so SDK codegen sees the real shape (typed\nbooleans, internally-tagged variant payloads, discriminated transport\nunion) instead of an opaque JSON blob. CC5/CC6 (PR #650 verifier\nfollow-up); G8 (P2): `transport` typed-mirror.\n\n`Eq`: all fields are strings/enums/bools, and the bridge reply chain\n(`BridgeReply::MemberLiveChannelOpened`) requires it.",
     "properties": {
+      "advisories": {
+        "description": "What the open went ahead without: advisories, not failures. Omitted\nwhen there are none. The vocabulary may grow: a reader keeps an\nadvisory it does not know as it was sent instead of refusing the\nresult.",
+        "items": {
+          "$ref": "#/$defs/WireLiveOpenAdvisory"
+        },
+        "type": "array"
+      },
       "capabilities": {
         "$ref": "#/$defs/WireLiveChannelCapabilities"
       },
@@ -177960,6 +178065,22 @@
       }
     ],
     "title": "WireLiveDegradationReason"
+  },
+  "WireLiveOpenAdvisory": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "anyOf": [
+      {
+        "const": "staged_prompt_refused",
+        "description": "A RunStarted hook refused the session's staged create-time prompt,\nso the realtime model was not given it. It stays staged for the\nsession's first text turn or a later open.",
+        "type": "string"
+      },
+      {
+        "description": "An advisory this version does not know, as it was sent.",
+        "type": "string"
+      }
+    ],
+    "description": "An advisory on a successful live/open: something the open went ahead\nwithout. The vocabulary may grow: a reader keeps an advisory it does not\nknow as it was sent.",
+    "title": "WireLiveOpenAdvisory"
   },
   "WireLiveProviderInputLatency": {
     "$defs": {

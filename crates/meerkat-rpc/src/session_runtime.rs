@@ -26572,10 +26572,11 @@ mod tests {
     /// but the session is first materialized by the `live/open` projection
     /// (`realtime_session_open_config` reaches
     /// `materialize_staged_session_for_realtime_open`, which creates the live
-    /// session with `DeferredPromptPolicy::Stage`). The first later turn is
-    /// the ordinary runtime-routed `turn/start`, whose typed appends author
-    /// the turn transcript. The staged prompt must still reach the durable
-    /// transcript and the provider request.
+    /// session with `DeferredPromptPolicy::Stage`). The open delivers the
+    /// staged prompt itself: the realtime seed carries it as a committed user
+    /// row and nothing stays staged. The first later turn is the ordinary
+    /// runtime-routed `turn/start`, whose provider request carries the prompt
+    /// from the transcript, once.
     #[tokio::test]
     async fn realtime_open_staged_prompt_reaches_first_runtime_routed_turn() {
         let _projection_guard = realtime_open_projection_test_guard().await;
@@ -26613,7 +26614,7 @@ mod tests {
             )
             .await
             .expect("live/open projection materializes the staged session");
-        // Diagnostic only: whether the realtime seed carries the prompt.
+        // The open delivered the staged prompt into the realtime seed.
         let realtime_seed_has_staged =
             format!("{:?}", open_config.seed_messages()).contains("ORBIT-7");
         drop(open_config);
@@ -26621,7 +26622,7 @@ mod tests {
             !runtime.staged_sessions.contains(&session_id).await,
             "live/open projection must promote the staged slot"
         );
-        // Diagnostic only: where the create-time prompt sits before the turn.
+        // Nothing stays staged once the open delivered it.
         let staged_before_turn = runtime
             .load_persisted_session(&session_id)
             .await
@@ -26678,8 +26679,13 @@ mod tests {
             .iter()
             .any(|input| input.contains("ORBIT-7"));
         assert!(
-            llm_request_has_staged && transcript_has_staged,
-            "staged create-time prompt lost on the first runtime-routed turn: \
+            realtime_seed_has_staged
+                && staged_before_turn.is_none()
+                && llm_request_has_staged
+                && transcript_has_staged
+                && request_dump.matches("ORBIT-7").count() == 1,
+            "the live open must deliver the staged create-time prompt into its seed, and the \
+             first runtime-routed turn must carry it once from the transcript: \
              llm_request_contains={llm_request_has_staged} \
              transcript_contains={transcript_has_staged} \
              run_started_contains={run_started_has_staged}; \
@@ -26743,9 +26749,9 @@ mod tests {
             .expect("runtime-routed turn");
     }
 
-    /// The staged prompt is consumed only with the first turn's own
-    /// checkpoint. After that checkpoint the persisted pending flag is clear,
-    /// and a restart does not deliver the prompt again: the transcript keeps
+    /// The live open consumes the staged prompt and persists that with its
+    /// row, so the persisted pending flag is clear after the first turn, and
+    /// a restart does not deliver the prompt again: the transcript keeps
     /// exactly one staged row.
     #[tokio::test]
     async fn realtime_open_staged_prompt_is_delivered_once_across_a_restart() {
@@ -26817,12 +26823,11 @@ mod tests {
         );
     }
 
-    /// In a voice-first session the staged prompt lands with the first
-    /// later text turn, after the live rows, and a restart does not deliver
-    /// it again (the live row commit re-syncs the actor from durable state,
-    /// which still stages the prompt).
+    /// In a voice-first session the live open delivers the staged prompt as
+    /// the session's first user row, ahead of the live rows; neither the first
+    /// text turn nor a restart delivers it again.
     #[tokio::test]
-    async fn voice_first_session_delivers_the_staged_prompt_with_the_first_text_turn() {
+    async fn voice_first_session_delivers_the_staged_prompt_at_the_live_open() {
         let _projection_guard = realtime_open_projection_test_guard().await;
         let temp = tempfile::tempdir().unwrap();
         let recorder = Arc::new(RecordingMessagesLlmClient::default());
@@ -26890,9 +26895,9 @@ mod tests {
         let staged = users.iter().position(|(_, text)| text.contains("ORBIT-7"));
         let staged_rows = user_rows_containing(&session, "ORBIT-7");
         assert!(
-            spoken.is_some() && staged.is_some() && spoken < staged && staged_rows == 1,
-            "voice-first: the staged prompt must land once, with the first text turn, after \
-             the live rows: spoken_row={spoken:?} staged_row={staged:?} \
+            spoken.is_some() && staged.is_some() && staged < spoken && staged_rows == 1,
+            "voice-first: the staged prompt must land once, at the live open, ahead of the \
+             live rows: spoken_row={spoken:?} staged_row={staged:?} \
              staged_rows={staged_rows}; transcript_user_messages={users:?}"
         );
     }
