@@ -230,6 +230,10 @@ impl RpcStreamTerminalAdmission {
     }
 
     pub(crate) fn new(max_inflight: usize) -> Self {
+        // At the 4096-stream production limit, the 64 KiB minimum charge and
+        // 4x multiplier yield a 1 GiB accounting ceiling. Semaphore permits
+        // represent admission units; they do not allocate payload buffers.
+        // Each serialized terminal is still bounded to 16 KiB.
         Self(RpcOutboundAdmission::new(
             max_inflight * RPC_OUTBOUND_MIN_CHARGE_BYTES * RPC_OUTBOUND_MEMORY_MULTIPLIER,
             max_inflight,

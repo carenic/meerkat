@@ -6866,7 +6866,7 @@ class MeerkatClient:
                 context,
             )
         elif provider == "gemini_function_call":
-            MeerkatClient._require_present_string_field(meta, "id", context)
+            MeerkatClient._require_present_string_field(meta, "provider_id", context)
             MeerkatClient._validate_nullable_response_string(meta, "thoughtSignature", context)
         elif provider == "open_ai":
             MeerkatClient._require_present_string_field(meta, "id", context)
