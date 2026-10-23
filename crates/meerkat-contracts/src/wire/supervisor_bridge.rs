@@ -6413,12 +6413,14 @@ mod tests {
 
     #[test]
     fn v4_command_with_future_protocol_version_rejects_before_serde() {
+        // Protocol 7 is decoded (never advertised), so the first future
+        // version is 8.
         for cmd in all_v4_commands() {
             let mut value = serde_json::to_value(&cmd).expect("serialize command");
             value
                 .as_object_mut()
                 .expect("command object")
-                .insert("protocol_version".to_string(), json!(7));
+                .insert("protocol_version".to_string(), json!(8));
             let err = decode_bridge_command(value)
                 .expect_err("future protocol version must reject pre-serde");
             assert!(

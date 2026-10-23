@@ -2503,15 +2503,22 @@ pub enum ScriptedV7Mode {
     HoldFeatures,
 }
 
-/// The scripted answer to one request (`params`, stamped `stamped`):
-/// `None` serves it as usual, `Some(None)` holds it, `Some(Some(reply))`
-/// answers `reply`.
+/// How the scripted host answers one request stamped above V6.
+enum ScriptedV7Answer {
+    /// It never answers.
+    Hold,
+    /// It answers this reply.
+    Reply(serde_json::Value),
+}
+
+/// The scripted answer to one request (`params`, stamped `stamped`), or
+/// `None` to serve it as usual.
 fn scripted_v7_answer(
     state: &mut ScriptedV7State,
     params: &serde_json::Value,
     stamped: u64,
     kind: &str,
-) -> Option<Option<serde_json::Value>> {
+) -> Option<ScriptedV7Answer> {
     if stamped <= 6 {
         return None;
     }
@@ -2539,15 +2546,17 @@ fn scripted_v7_answer(
         .expect("scripted version refusal")
     };
     match &state.mode {
-        ScriptedV7Mode::BeforeV7 => Some(Some(refused())),
-        ScriptedV7Mode::HoldFeatures if kind == "host_features" => Some(None),
-        ScriptedV7Mode::Features(features) if kind == "host_features" => Some(Some(
-            serde_json::json!({ "result": "host_features", "features": features }),
-        )),
+        ScriptedV7Mode::BeforeV7 => Some(ScriptedV7Answer::Reply(refused())),
+        ScriptedV7Mode::HoldFeatures if kind == "host_features" => Some(ScriptedV7Answer::Hold),
+        ScriptedV7Mode::Features(features) if kind == "host_features" => {
+            Some(ScriptedV7Answer::Reply(
+                serde_json::json!({ "result": "host_features", "features": features }),
+            ))
+        }
         _ if kind == "materialize_member"
             && std::mem::take(&mut state.refuse_next_v7_materialize) =>
         {
-            Some(Some(refused()))
+            Some(ScriptedV7Answer::Reply(refused()))
         }
         _ => None,
     }
@@ -3226,11 +3235,14 @@ pub async fn spawn_scripted_host_peer(name: &str) -> ScriptedHostPeer {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     v7.command_kinds.push(kind.clone());
-                    scripted_v7_answer(&mut v7, &params, stamped, &kind)
+                    scripted_v7_answer(&mut v7, params, stamped, &kind)
                 };
                 let command: Result<BridgeCommand, _> = serde_json::from_value(params.clone());
                 let reply_value: Option<serde_json::Value> = match command {
-                    _ if v7_answer.is_some() => v7_answer.take().flatten(),
+                    _ if v7_answer.is_some() => match v7_answer.take() {
+                        Some(ScriptedV7Answer::Reply(reply)) => Some(reply),
+                        Some(ScriptedV7Answer::Hold) | None => None,
+                    },
                     // --- phase-3 scripted V4 serving arms ---
                     Ok(BridgeCommand::MaterializeMember(payload)) => {
                         let supervisor_spec =
