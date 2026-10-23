@@ -8,6 +8,8 @@
 //! Responses wire keeps the shape it had: no sources asked for or replayed,
 //! `annotations: []`.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use super::*;
 use axum::{Json, Router, extract::State, response::IntoResponse, routing::post};
 use meerkat_core::AgentLlmClient;
@@ -247,7 +249,7 @@ fn has_input_item(body: &Value, kind: &str) -> bool {
         .any(|item| item["type"] == kind)
 }
 
-/// R1. A search one step ran reaches the next stateless step: every request
+/// A search one step ran reaches the next stateless step: every request
 /// with the hosted search asks for the sources it consulted, and the next
 /// step replays the `web_search_call` with them and the answer with its
 /// `url_citation` annotations. (Fails-old: nothing asked for the sources, so
@@ -303,7 +305,7 @@ async fn a_searched_answer_reaches_the_next_stateless_step_with_its_sources_and_
     assert!(!has_input_item(next, "message_annotations"), "{next}");
 }
 
-/// R2. Controls, unchanged: a request without the hosted search asks for no
+/// Controls, unchanged: a request without the hosted search asks for no
 /// sources; Chat Completions replays no search evidence at all; a stored
 /// continuation (`store: true`) still sends `previous_response_id` and only
 /// the history after that response.
@@ -395,7 +397,7 @@ fn a_stored_continuation_with_the_hosted_search_asks_for_its_sources() {
     assert!(asks_for_sources(&body), "{body}");
 }
 
-/// R3. Only `url_citation` entries whose character range fits the replayed
+/// Only `url_citation` entries whose character range fits the replayed
 /// text go back; any other annotation, and a range past the text, is
 /// dropped, never moved. (Fails-old: nothing went back.)
 #[test]
@@ -431,11 +433,12 @@ fn only_url_citations_that_fit_their_text_replay() {
     );
 }
 
-/// R3. An answer whose text came from several `output_text` parts replays
-/// no citations: each part's indices count from the start of that part, and
+/// An answer whose text came from several `output_text` parts replays no
+/// citations: each part's indices count from the start of that part, and
 /// capture joins the parts into one text, so a citation of the second part
-/// would mark the wrong words. Run through capture, like R1. (Fails-old: the
-/// second part's citation replayed on the joined text, misplaced.)
+/// would mark the wrong words. Run through capture, like the two-step row.
+/// (Fails-old: the second part's citation replayed on the joined text,
+/// misplaced.)
 #[tokio::test]
 async fn an_answer_from_several_text_parts_replays_no_citations() {
     let (client, seen, server) = spawn_search_stub(two_part_answer()).await;
@@ -476,7 +479,7 @@ async fn an_answer_from_several_text_parts_replays_no_citations() {
     assert!(!has_input_item(next, "message_annotations"), "{next}");
 }
 
-/// R3. Two citations blocks for one message replay none either: which one
+/// Two citations blocks for one message replay none either: which one
 /// belongs to the replayed text cannot be told.
 #[test]
 fn two_citations_blocks_for_one_message_replay_none() {
@@ -498,7 +501,7 @@ fn two_citations_blocks_for_one_message_replay_none() {
     assert!(!has_input_item(&body, "message_annotations"), "{body}");
 }
 
-/// R3. A search recorded before this change replays as it did: the call
+/// A search recorded before this change replays as it did: the call
 /// without sources verbatim, and the answer with `annotations: []`, because
 /// its citations block does not say how many text parts the answer had (and
 /// the oldest blocks carry no message id).
