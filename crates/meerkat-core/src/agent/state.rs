@@ -8711,6 +8711,10 @@ where
         let batch = self
             .collect_calling_llm_tool_outcomes(ctx, tool_defs, dispatch_results)
             .await?;
+        // Only the round's own calls carry its dedupe key: a tool call the
+        // host dispatches between rounds (an external call, a tool
+        // application, a retained consent attempt) carries none.
+        self.tool_dispatch_context.clear_round();
         self.commit_calling_llm_tool_turn(
             ctx,
             assistant_msg,
