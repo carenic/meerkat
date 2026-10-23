@@ -5186,4 +5186,7 @@ mod tool_application_tests;
 
 #[cfg(all(test, feature = "session-store", not(target_arch = "wasm32")))]
 #[allow(clippy::expect_used)]
+mod host_store_fence_tests;
+#[cfg(all(test, feature = "session-store", not(target_arch = "wasm32")))]
+#[allow(clippy::expect_used)]
 mod staged_prompt_tests;
