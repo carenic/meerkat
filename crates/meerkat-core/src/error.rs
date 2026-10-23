@@ -1661,6 +1661,69 @@ mod tests {
         ));
     }
 
+    /// A pending callback call keeps its dedupe key in the single shape and
+    /// in the batch shape, writes it beside the call on the wire, and omits
+    /// it when the call has none. A call written before keys existed reads
+    /// as having none. Unrun until the candidate's validation.
+    #[test]
+    fn a_pending_callback_call_keeps_its_dedupe_key_in_either_shape() {
+        let arguments = serde_json::value::RawValue::from_string(r#"{"q":1}"#.to_string()).unwrap();
+        let key =
+            crate::ToolCallDedupeKey::new(crate::RunId::new(), 2, "call-7", "tool", &arguments)
+                .unwrap();
+        let call = PendingCallbackToolCall {
+            tool_use_id: "call-7".into(),
+            tool_name: "tool".into(),
+            args: serde_json::json!({"q": 1}),
+            settlement_failures: Vec::new(),
+            dedupe_key: Some(key.clone()),
+        };
+        match AgentError::callback_pending_with_settlement(call.clone()) {
+            AgentError::CallbackPending { dedupe_key, .. } => {
+                assert_eq!(dedupe_key.as_deref(), Some(&key));
+            }
+            other => panic!("expected the single-call shape, got: {other}"),
+        }
+        let marker = crate::ToolDispatchSettlementFailure {
+            admission_source: crate::ToolDispatchAdmissionSource::ConfiguredGate,
+            effect_kind: crate::LiveBridgeEffectKind::ToolDispatch,
+            physical_outcome: crate::LiveBridgeEffectOutcome::Unknown,
+            failure_kind: crate::ToolDispatchTerminalErrorKind::ExecutionFailed,
+        };
+        let with_failure = PendingCallbackToolCall {
+            settlement_failures: vec![marker],
+            ..call.clone()
+        };
+        match AgentError::callback_pending_with_settlement(with_failure) {
+            AgentError::CallbackBatchPending { pending_tool_calls } => {
+                assert_eq!(pending_tool_calls[0].dedupe_key.as_ref(), Some(&key));
+            }
+            other => panic!("expected the batch shape, got: {other}"),
+        }
+
+        let wire = serde_json::to_value(&call).unwrap();
+        assert_eq!(wire["dedupe_key"], serde_json::to_value(&key).unwrap());
+        assert_eq!(wire["dedupe_key"]["call_id"], "call-7");
+        assert_eq!(wire["dedupe_key"]["round"], 2);
+        let keyless = PendingCallbackToolCall {
+            dedupe_key: None,
+            ..call
+        };
+        assert!(
+            serde_json::to_value(&keyless)
+                .unwrap()
+                .get("dedupe_key")
+                .is_none()
+        );
+        let legacy: PendingCallbackToolCall = serde_json::from_value(serde_json::json!({
+            "tool_use_id": "call-7",
+            "tool_name": "tool",
+            "args": {"q": 1}
+        }))
+        .unwrap();
+        assert_eq!(legacy.dedupe_key, None);
+    }
+
     /// The model payload of an operation refusal carries exactly the closed
     /// kind and whether the guarded tool code ran, for every kind and both
     /// facts, also beneath settlement failures: an uncertified refusal

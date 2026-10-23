@@ -2292,6 +2292,106 @@ mod tests {
         assert!(!result.result.is_error);
     }
 
+    /// Answer one `tool/execute` request with a plain result.
+    fn answer_tool_execute(
+        request: RpcRequest,
+        response_tx: oneshot::Sender<CallbackResponseHandoff>,
+    ) {
+        assert!(
+            response_tx
+                .send(CallbackResponseHandoff::unmetered_for_test(
+                    RpcResponse::success(
+                        request.id,
+                        serde_json::json!({"content":"done","is_error":false}),
+                    )
+                ))
+                .is_ok()
+        );
+    }
+
+    /// A callback tool's `tool/execute` request carries the call's dedupe
+    /// key, unchanged, as `params.dedupe_key`. (Unrun until the candidate's
+    /// validation.)
+    #[tokio::test]
+    async fn a_keyed_tool_execute_request_carries_the_dedupe_key() {
+        let (callback_tx, mut callback_rx) = mpsc::channel(10);
+        let id_counter = Arc::new(AtomicU64::new(0));
+        let tools = Arc::new(StdRwLock::new(vec![make_tool_def("search")]));
+        let dispatcher = CallbackToolDispatcher::new(tools, callback_tx, id_counter, vec![]);
+        let args = RawValue::from_string("{\"q\":\"test\"}".to_string()).unwrap();
+        let key = meerkat_core::ToolCallDedupeKey::new(
+            meerkat_core::RunId::new(),
+            3,
+            "tc-keyed",
+            "search",
+            &args,
+        )
+        .unwrap();
+        let expected = serde_json::to_value(&key).unwrap();
+
+        let handle = tokio::spawn(async move {
+            let call = ToolCallView {
+                id: "tc-keyed",
+                name: "search",
+                args: &args,
+            };
+            dispatcher.send_tool_execute(call, Some(key)).await
+        });
+
+        let (request, response_tx, _outbound_permit) =
+            callback_rx.recv().await.unwrap().into_parts();
+        assert_eq!(request.method, "tool/execute");
+        let params: serde_json::Value =
+            serde_json::from_str(request.params.as_deref().unwrap().get()).unwrap();
+        assert_eq!(params["tool_use_id"], "tc-keyed");
+        assert_eq!(params["dedupe_key"], expected);
+        assert_eq!(params["dedupe_key"]["call_id"], "tc-keyed");
+        assert_eq!(params["dedupe_key"]["round"], 3);
+        answer_tool_execute(request, response_tx);
+
+        let result = handle.await.unwrap().unwrap();
+        assert_eq!(result.result.text_content(), "done");
+    }
+
+    /// A call without a dedupe key (outside an agent-loop round) sends a
+    /// `tool/execute` request with no `dedupe_key` field, through either
+    /// dispatch entry. (Unrun until the candidate's validation.)
+    #[tokio::test]
+    async fn an_unkeyed_tool_execute_request_omits_the_dedupe_key() {
+        for with_context in [false, true] {
+            let (callback_tx, mut callback_rx) = mpsc::channel(10);
+            let id_counter = Arc::new(AtomicU64::new(0));
+            let tools = Arc::new(StdRwLock::new(vec![make_tool_def("search")]));
+            let dispatcher = CallbackToolDispatcher::new(tools, callback_tx, id_counter, vec![]);
+
+            let handle = tokio::spawn(async move {
+                let args = RawValue::from_string("{\"q\":\"test\"}".to_string()).unwrap();
+                let call = ToolCallView {
+                    id: "tc-plain",
+                    name: "search",
+                    args: &args,
+                };
+                if with_context {
+                    let context = meerkat_core::ToolDispatchContext::default();
+                    dispatcher.dispatch_with_context(call, &context).await
+                } else {
+                    dispatcher.dispatch(call).await
+                }
+            });
+
+            let (request, response_tx, _outbound_permit) =
+                callback_rx.recv().await.unwrap().into_parts();
+            let params: serde_json::Value =
+                serde_json::from_str(request.params.as_deref().unwrap().get()).unwrap();
+            assert_eq!(params["tool_use_id"], "tc-plain");
+            assert!(params.get("dedupe_key").is_none(), "{params}");
+            answer_tool_execute(request, response_tx);
+
+            let result = handle.await.unwrap().unwrap();
+            assert_eq!(result.result.text_content(), "done");
+        }
+    }
+
     #[tokio::test]
     async fn callback_dispatcher_timeout_returns_tool_error() {
         let (callback_tx, _callback_rx) = mpsc::channel(10);

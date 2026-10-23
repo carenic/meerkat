@@ -3526,6 +3526,71 @@ mod tests {
         ));
     }
 
+    /// A candidate whose call has a dedupe key keeps it through the durable
+    /// row (it re-serializes byte-identically under its digest and projects
+    /// back to the same core terminal) and pairs only with an event whose
+    /// pending call carries the same key. (Unrun until the candidate's
+    /// validation.)
+    #[test]
+    fn keyed_callback_candidate_keeps_its_dedupe_key_and_pairs_only_with_it() {
+        let interaction_id = InteractionId(uuid::Uuid::new_v4());
+        let args = serde_json::json!({"value": 1});
+        let raw_args = serde_json::value::RawValue::from_string(args.to_string()).unwrap();
+        let key = meerkat_core::ToolCallDedupeKey::new(
+            meerkat_core::RunId::new(),
+            2,
+            "call-9",
+            "external",
+            &raw_args,
+        )
+        .unwrap();
+        let candidate = InteractionTerminalCandidate::CallbackPending {
+            tool_use_id: Some("call-9".to_string()),
+            tool_name: "external".to_string(),
+            args: args.clone(),
+            dedupe_key: Some(key.clone()),
+        };
+
+        let encoded = serde_json::to_vec(&candidate).unwrap();
+        let decoded: InteractionTerminalCandidate = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(
+            interaction_terminal_payload_digest(&decoded).unwrap(),
+            interaction_terminal_payload_digest(&candidate).unwrap(),
+        );
+        assert!(matches!(
+            decoded.core_apply_terminal(),
+            Some(meerkat_core::lifecycle::core_executor::CoreApplyTerminal::CallbackPending {
+                dedupe_key: Some(ref restored),
+                ..
+            }) if *restored == key
+        ));
+
+        let event = |dedupe_key| AgentEvent::InteractionCallbackPending {
+            interaction_id,
+            tool_name: "external".to_string(),
+            args: args.clone(),
+            pending_tool_calls: vec![meerkat_core::error::PendingCallbackToolCall {
+                tool_use_id: "call-9".to_string(),
+                tool_name: "external".to_string(),
+                args: args.clone(),
+                settlement_failures: Vec::new(),
+                dedupe_key,
+            }],
+        };
+        assert!(interaction_terminal_candidate_matches_event(
+            &candidate,
+            interaction_id,
+            &event(Some(key)),
+            false,
+        ));
+        assert!(!interaction_terminal_candidate_matches_event(
+            &candidate,
+            interaction_id,
+            &event(None),
+            false,
+        ));
+    }
+
     #[test]
     fn stored_input_state_unknown_versions_still_fail_closed() {
         let mut fixture =

@@ -17334,6 +17334,47 @@ matching the required schema. Output ONLY the JSON, no additional text or markdo
         assert_eq!(details["resumable"], true);
         assert_eq!(details["tool_name"], "external_mock");
         assert_eq!(details["args"], json!({ "value": "browser" }));
+        assert!(
+            details["pending_tool_calls"][0].get("dedupe_key").is_none(),
+            "a call without a dedupe key omits the field"
+        );
+    }
+
+    /// A pending callback call's dedupe key reaches the `CALLBACK_PENDING`
+    /// details unchanged. (Unrun until the candidate's validation.)
+    #[test]
+    fn completion_outcome_to_api_result_carries_the_callback_dedupe_key() {
+        let session_id = SessionId::new();
+        let realm = meerkat_core::RealmId::parse("test-realm").expect("valid test realm id");
+        let arguments = serde_json::value::RawValue::from_string(r#"{"value":"browser"}"#.into())
+            .expect("valid arguments");
+        let key = meerkat_core::ToolCallDedupeKey::new(
+            meerkat_core::RunId::new(),
+            1,
+            "call-1",
+            "external_mock",
+            &arguments,
+        )
+        .expect("valid dedupe key");
+        let err = completion_outcome_to_api_result(
+            meerkat_runtime::completion::CompletionOutcome::CallbackPending {
+                tool_use_id: "call-1".to_string(),
+                tool_name: "external_mock".to_string(),
+                args: json!({ "value": "browser" }),
+                dedupe_key: Some(key.clone()),
+            },
+            &session_id,
+            &realm,
+            false,
+        )
+        .expect_err("callback pending should map to an API error");
+        let ApiError::InternalWithData { details, .. } = err else {
+            panic!("expected InternalWithData callback error");
+        };
+        assert_eq!(
+            details["pending_tool_calls"][0]["dedupe_key"],
+            serde_json::to_value(&key).expect("key serializes")
+        );
     }
 
     #[test]
