@@ -2997,6 +2997,10 @@ impl RuntimeStore for InMemoryRuntimeStore {
         Ok(successor)
     }
 
+    fn supports_whole_blob_run_rebase(&self) -> bool {
+        true
+    }
+
     async fn commit_prepared_whole_blob_run_rebase(
         &self,
         runtime_id: &LogicalRuntimeId,

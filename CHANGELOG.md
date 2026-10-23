@@ -650,16 +650,16 @@ them.
     across a resume.
   - A WholeBlob session is recovered only from a strict continuation of its
     committed transcript, which a compaction breaks. So a WholeBlob run's
-    first round commit after a compaction is a re-base: one store call
-    commits the compacted session, without its cursor, as the session's
-    committed base, and restarts the run's provisional tail on it with the
-    cursor (`SessionCheckpointer::rebases_runs` and
-    `SessionCheckpointer::rebase_run`; the session service's checkpointer
-    does it for WholeBlob, and publishes the rewrites' audit receipt). The
-    run's later round commits continue the new base. An end-of-run or
-    closing save after a rewrite with no round commit since is a re-base
-    too, without a cursor. A checkpointer that does not re-base (the
-    default) takes no round commit after the run's first rewrite.
+    first round commit after a compaction is a re-base: one store call commits
+    the compacted session, without its cursor, as the session's committed
+    base, and restarts the run's provisional tail on it with the cursor
+    (`SessionCheckpointer::rebases_runs` and
+    `SessionCheckpointer::rebase_run`; the session service's checkpointer does
+    it for WholeBlob over a store that supports it, and publishes the
+    rewrites' audit receipt). The run's later round commits continue the new
+    base. An end-of-run or closing save after a rewrite with no round commit
+    since is a re-base too, without a cursor. A checkpointer that does not
+    re-base (the default) takes no round commit after the run's first rewrite.
   - `SessionCheckpointer::dispatch_fence_check` lets a checkpointer over a
     host store refuse dispatch once its writer's self-fence window has
     closed. The agent asks right before each model request (a compaction's
@@ -730,7 +730,11 @@ them.
   moved either. A run's closing save after its last rewrite re-bases too:
   its document carries no run cursor, and the successor and the candidate
   are that one document. The in-memory and SQLite stores implement it; the
-  default answers `Unsupported`.
+  default answers `Unsupported`. `RuntimeStore::supports_whole_blob_run_rebase`
+  says whether a store implements it (default `false`; the in-memory and
+  SQLite stores answer `true`): the session service re-bases a WholeBlob run
+  only over a store that answers `true`, and over any other store the run
+  takes no round commit after its first rewrite. A decorator forwards both.
 - `MemberBinding::labels()`: the application labels the incarnation was
   spawned with, as its spawn recorded them (a member reset keeps them). Every
   read of the member binding history carries them, the store-level

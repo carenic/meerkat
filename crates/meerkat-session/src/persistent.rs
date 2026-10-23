@@ -2798,6 +2798,7 @@ impl meerkat_core::SessionCheckpointer for StoreCheckpointer {
     fn rebases_runs(&self) -> bool {
         self.runtime_store.session_persistence_profile()
             == RuntimeSessionPersistenceProfile::WholeBlobV1
+            && self.runtime_store.supports_whole_blob_run_rebase()
     }
 
     async fn rebase_run(
@@ -2817,7 +2818,7 @@ impl meerkat_core::SessionCheckpointer for StoreCheckpointer {
         }
         if !self.rebases_runs() {
             return Err(AgentError::InternalError(format!(
-                "a run re-base is a WholeBlob operation, not one of session {}'s profile",
+                "the runtime store of session {} does not re-base runs: a run re-base is a WholeBlob operation of a store that supports it",
                 session.id()
             )));
         }
@@ -25488,6 +25489,50 @@ mod tests {
             self.boundary_apply_bytes.store(0, Ordering::Release);
             self.boundary_apply_snapshots.store(0, Ordering::Release);
         }
+    }
+
+    /// The store checkpointer re-bases WholeBlob runs only over a runtime
+    /// store that says it implements the run re-base. A decorator that
+    /// forwards the store's other operations but not that one leaves its runs
+    /// on the fallback (no round commit after a rewrite) instead of failing
+    /// their next round commit.
+    #[test]
+    fn the_checkpointer_rebases_runs_only_over_a_store_that_supports_it() {
+        let checkpointer = |runtime_store: Arc<dyn RuntimeStore>| StoreCheckpointer {
+            runtime_store,
+            incremental: None,
+            blob_store: memory_blob_store(),
+            gate: Arc::new(CheckpointerGate {
+                cancelled: Mutex::new(false),
+            }),
+            whole_blob_base_authority: std::sync::Mutex::new(None),
+            latest_run_checkpoint_receipt: Mutex::new(None),
+            latest_run_transcript_retirement: std::sync::Mutex::new(None),
+            live_deferred_turn_state: std::sync::OnceLock::new(),
+            unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
+            rebased_run: std::sync::Mutex::new(None),
+            rewrite_audit: None,
+        };
+
+        let memory: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());
+        assert_eq!(
+            memory.session_persistence_profile(),
+            RuntimeSessionPersistenceProfile::WholeBlobV1
+        );
+        assert!(memory.supports_whole_blob_run_rebase());
+        assert!(meerkat_core::SessionCheckpointer::rebases_runs(
+            &checkpointer(memory)
+        ));
+
+        let decorated: Arc<dyn RuntimeStore> = Arc::new(CountingRuntimeStore::new());
+        assert_eq!(
+            decorated.session_persistence_profile(),
+            RuntimeSessionPersistenceProfile::WholeBlobV1
+        );
+        assert!(!decorated.supports_whole_blob_run_rebase());
+        assert!(!meerkat_core::SessionCheckpointer::rebases_runs(
+            &checkpointer(decorated)
+        ));
     }
 
     struct WholeBlobAuthorityReadProbe {
