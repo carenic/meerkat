@@ -1357,32 +1357,49 @@ Shutdown report such a member's run and run starts as `ReloadRequired` instead
 of failing on it, and a Shutdown holds every member's run starts, reporting the
 first failure in roster order.
 
-Since 0.9.5 a Shutdown can keep queued work for the next start:
-`ShutdownOptions::default().with_queued_inputs(QueuedInputsOnShutdown::Requeue(max_age))`,
-where `max_age` is a `RequeueMaxAge` (`RequeueMaxAge::new(duration)` refuses
-a bound under one millisecond, zero included, or over 24 hours with
-`ShutdownOptionsError`; the default is
-`RequeueMaxAge::DEFAULT`, 15 minutes). A member input still queued behind the
-running turn is kept when it is a durable prompt in the queue lane that is
-neither directed nor bound to an objective, as a host human input submitted
-with `HandlingMode::Queue` is. It
+Since 0.9.5 a graceful Shutdown keeps a durable member's work for the mob's
+next start. `MobHandle::shutdown()` and `ShutdownOptions::default()` take
+`QueuedInputsOnShutdown::RequeueDurable`, which resolves per member:
+`QueuedInputsOnShutdown::Requeue(RequeueMaxAge::DEFAULT)` (15 minutes) for a
+member whose session commits each round (the mob's session service keeps
+persistent sessions, whose runs commit each round, and its runtime has a
+persistence store), and `QueuedInputsOnShutdown::Stop` for any other member.
+`ShutdownOptions::default().with_queued_inputs(QueuedInputsOnShutdown::Requeue(max_age))`
+applies another bound to every member, where `max_age` is a `RequeueMaxAge`
+(`RequeueMaxAge::new(duration)` refuses a bound under one millisecond, zero
+included, or over 24 hours with `ShutdownOptionsError`), and
+`.with_queued_inputs(QueuedInputsOnShutdown::Stop)` ends every member's work
+as stopped, as the 0.9.4 default did.
+
+Under `Requeue` the Shutdown holds a member's run starts and does not cancel
+its running turn: the member's runtime stop suspends a run that commits each
+round at its last committed round, as a crash leaves it, and the mob's next
+start resumes that run, redoing the work since that commit. The run's waiter
+ends with `BoundedTurnFailure::RequeuedAcrossStop`. The runtime stop still
+cancels a run that commits no rounds, such as a live bridge run, and an
+autonomous member's running turn is still cancelled at once, since the
+Shutdown ends its kickoff. A member
+input still queued behind the running turn is kept when it is a durable
+prompt in the queue lane that is neither directed nor bound to an objective,
+as a host human input submitted with `HandlingMode::Queue` is. It
 stays in the member's input store, its waiter ends with
 `BoundedTurnFailure::RequeuedAcrossStop`, and the mob's next start runs it
 once, in admission order, before new work; a same-key replay after the
-restart re-attaches to its result. Do not resubmit it. The cancelled
-turn's user message is not in what the kept input's turn sees. If it is older than
+restart re-attaches to its result. Do not resubmit it. When the running turn
+was cancelled, its user message is not in what the kept input's turn sees. If
+it is older than
 `max_age`, measured from its admission, when a start finds it still queued
 (every such start checks again), it
 ends as abandoned (`requeue_expired`) without running, and a same-key replay
 answers `BoundedTurnFailure::RequeueExpired`: resubmit it if it is still
-wanted. The running turn's own input still ends cancelled, and steer,
-ephemeral, event, directed and objective-bound inputs still end as stopped. A
+wanted. Steer, ephemeral, event, directed and objective-bound inputs still
+end as stopped. A
 member's kickoff is bound to its objective, so a kickoff still queued at a
 requeue Shutdown ends as stopped and is recorded failed, as with `Stop`.
-`QueuedInputsOnShutdown::Stop`, the default, ends every queued input as
-stopped, as in 0.9.4. 0.9.4 cannot open a store that holds a kept input still
-queued, and cannot read a kept or expired input's row after it ran or expired
-(see [Upgrading](/guides/upgrading)).
+0.9.4 cannot open a store that holds a kept input still queued or a kept run,
+and cannot read a kept or expired input's row after it ran or expired (see
+[Upgrading](/guides/upgrading)): shut a mob down with
+`QueuedInputsOnShutdown::Stop` before you downgrade it.
 
 A mob restored with an unfinished destroy starts with admission closed before
 `MobBuilder::resume` returns its handle, so nothing is spawned into it while the

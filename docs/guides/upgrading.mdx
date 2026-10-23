@@ -208,9 +208,12 @@ restore or cause.
   at-least-once: deduplicate on `delivery_idempotency_key`. See
   [Executor Lease And Crash Recovery](/guides/scheduling#executor-lease-and-crash-recovery).
 
-- **Queued prompts kept across a graceful stop (opt-in):** a mob Shutdown
-  with `ShutdownOptions::with_queued_inputs(QueuedInputsOnShutdown::Requeue(max_age))`
-  (or an unregister with `UnregisterQueuedInputs::Requeue { max_age }`) keeps
+- **Queued prompts kept across a graceful stop (the mob default for durable
+  members):** a default mob Shutdown (`QueuedInputsOnShutdown::RequeueDurable`:
+  a requeue with a 15-minute bound for each member whose session commits each
+  round durably, a stop for the others), a mob Shutdown with
+  `ShutdownOptions::with_queued_inputs(QueuedInputsOnShutdown::Requeue(max_age))`,
+  or an unregister with `UnregisterQueuedInputs::Requeue { max_age }` keeps
   each input still queued behind the running turn that is a durable prompt
   in the queue lane, neither directed nor bound to an objective (so never a
   member's kickoff). Its waiter ends with
@@ -219,7 +222,10 @@ restore or cause.
   both with `kind` `requeued_across_stop`. A
   kept input older than `max_age` when a start finds it still queued ends as
   `RequeueExpired` without running; every start that finds it queued checks
-  again. Without the option nothing changes.
+  again. The same Shutdown keeps such a member's running turn too: the
+  runtime stop suspends the run at its last committed round and the next
+  start resumes it. Pass `QueuedInputsOnShutdown::Stop` for the 0.9.4
+  behavior.
   A kept input's row is written as stored input state version 8, and an
   unregister in progress with the requeue disposition as machine lifecycle
   record version 6; every other row and record keeps version 7 and version 5.
@@ -247,11 +253,13 @@ restore or cause.
    destroy's report through the SDK accessor, not the error text.
 5. Pass `UnregisterQueuedInputsDisposition::Stop` and `0` where you build
    `BeginUnregisterSession` or `State` of the generated runtime machine.
-6. Before you use `QueuedInputsOnShutdown::Requeue`, note that 0.9.4 cannot
-   open the store while a kept input is still queued, and cannot read a kept
-   or expired input's row after that. Treat `RequeuedAcrossStop` as "runs at
-   the next start" (do not resubmit) and `RequeueExpired` as "resubmit if
-   still wanted".
+6. A default mob Shutdown now keeps durable members' running turns and
+   eligible queued inputs (`QueuedInputsOnShutdown::RequeueDurable`). 0.9.4
+   cannot open the store while a kept input or run is still pending, and
+   cannot read a kept or expired input's row after that: shut down with
+   `ShutdownOptions::default().with_queued_inputs(QueuedInputsOnShutdown::Stop)`
+   before a downgrade. Treat `RequeuedAcrossStop` as "runs at the next start"
+   (do not resubmit) and `RequeueExpired` as "resubmit if still wanted".
 7. Add a wildcard arm where you match `RuntimeBindingsError`, and set
    `custody_deferred` in `MobMemberStatusResult` struct literals.
 

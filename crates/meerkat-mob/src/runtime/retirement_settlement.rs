@@ -671,8 +671,9 @@ pub struct ShutdownOptions {
     /// every member still being waited on is reported and Shutdown returns.
     /// `None` uses the member lifecycle hang guard as the failure bound.
     pub deadline: Option<meerkat_core::time_compat::Instant>,
-    /// What the Shutdown does with inputs still queued behind a member's
-    /// running turn. The default is [`QueuedInputsOnShutdown::Stop`].
+    /// What the Shutdown does with a member's running turn and the inputs
+    /// still queued behind it. The default is
+    /// [`QueuedInputsOnShutdown::RequeueDurable`].
     pub queued_inputs: QueuedInputsOnShutdown,
 }
 
@@ -684,10 +685,13 @@ impl ShutdownOptions {
         self
     }
 
-    /// Choose what the Shutdown does with inputs still queued behind a
-    /// member's running turn. [`QueuedInputsOnShutdown::Requeue`] keeps only
-    /// the eligible ones: an input bound to an objective, such as a member's
-    /// kickoff, still ends as stopped.
+    /// Choose what the Shutdown does with a member's running turn and the
+    /// inputs still queued behind it, for every member alike, instead of the
+    /// per-member default ([`QueuedInputsOnShutdown::RequeueDurable`]).
+    /// [`QueuedInputsOnShutdown::Requeue`] keeps only the eligible queued
+    /// inputs: an input bound to an objective, such as a member's kickoff,
+    /// still ends as stopped. [`QueuedInputsOnShutdown::Stop`] is the
+    /// behavior before 0.9.5.
     #[must_use]
     pub fn with_queued_inputs(mut self, queued_inputs: QueuedInputsOnShutdown) -> Self {
         self.queued_inputs = queued_inputs;
@@ -695,8 +699,8 @@ impl ShutdownOptions {
     }
 }
 
-/// What a graceful mob Shutdown does with inputs still queued behind a
-/// member's running turn.
+/// What a graceful mob Shutdown does with a member's running turn and the
+/// inputs still queued behind it.
 ///
 /// Only a whole-mob Shutdown takes this choice: a member's retirement,
 /// archive or destroy always ends its queued inputs as stopped, since that
@@ -706,18 +710,40 @@ impl ShutdownOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum QueuedInputsOnShutdown {
-    /// End them as stopped.
+    /// The default since 0.9.5: [`Self::Requeue`] with
+    /// [`RequeueMaxAge::DEFAULT`] for a member whose session commits each
+    /// round (the mob's session service keeps persistent sessions, whose runs
+    /// commit each round, and its runtime has a persistence store), and
+    /// [`Self::Stop`] for any other member. A deploy that shuts the mob down
+    /// gracefully therefore keeps durable members' work for the next start;
+    /// pass [`Self::Stop`] to end it as before 0.9.5.
     #[default]
+    RequeueDurable,
+    /// End them as stopped: the runtime stop cancels the running turn, and
+    /// every queued input ends as stopped. The default before 0.9.5.
     Stop,
-    /// Keep eligible queued inputs durably queued, so the mob's next start
-    /// runs them, unless they are older than the bound by then.
+    /// Keep a durable member's work for the mob's next start: its running
+    /// turn and its eligible queued inputs, unless they are older than the
+    /// bound by then.
     ///
-    /// Eligible: a durable prompt in the queue lane that is still queued
-    /// when the member's runtime stops, is not a directed interaction and is
-    /// not bound to an objective. A member's kickoff is bound to its
-    /// objective, so it is never kept: it ends as stopped and its kickoff is
-    /// recorded failed, as under [`Self::Stop`]. Every other input still
-    /// ends as stopped. The waiter of a kept input
+    /// The Shutdown holds the member's run starts and does not cancel its
+    /// running turn itself: it unregisters the member's runtime with this
+    /// choice, and the runtime's stop suspends a run that commits each round
+    /// at its last committed round, as a crash would leave it. The next
+    /// start resumes that run, redoing the work since that commit. The
+    /// waiters of the run's inputs are answered
+    /// [`RequeuedAcrossStop`](super::BoundedTurnFailure::RequeuedAcrossStop).
+    /// An autonomous member's running turn is still cancelled at once,
+    /// since the Shutdown ends its kickoff, and the runtime stop cancels a
+    /// run that commits no rounds (a live bridge run, or any run of a
+    /// session without a checkpointer).
+    ///
+    /// Eligible queued inputs: a durable prompt in the queue lane that is
+    /// still queued when the member's runtime stops, is not a directed
+    /// interaction and is not bound to an objective. A member's kickoff is
+    /// bound to its objective, so it is never kept: it ends as stopped and
+    /// its kickoff is recorded failed, as under [`Self::Stop`]. Every other
+    /// input still ends as stopped. The waiter of a kept input
     /// is answered [`RequeuedAcrossStop`](super::BoundedTurnFailure::RequeuedAcrossStop):
     /// do not resubmit it; a same-key replay after the restart re-attaches
     /// to it, and one older than the bound by then ends
@@ -732,12 +758,22 @@ pub enum QueuedInputsOnShutdown {
 }
 
 impl QueuedInputsOnShutdown {
-    /// The runtime unregister's choice for a member session's queued
-    /// inputs.
+    /// The runtime unregister's choice for one member session.
+    /// `commits_per_round` says whether that session commits each round
+    /// durably, which decides [`Self::RequeueDurable`]; an explicit choice
+    /// applies as given.
     #[cfg(feature = "runtime-adapter")]
-    pub(crate) fn unregister_queued_inputs(self) -> meerkat_runtime::UnregisterQueuedInputs {
+    pub(crate) fn unregister_queued_inputs(
+        self,
+        commits_per_round: bool,
+    ) -> meerkat_runtime::UnregisterQueuedInputs {
         match self {
-            Self::Stop => meerkat_runtime::UnregisterQueuedInputs::Stop,
+            Self::RequeueDurable if commits_per_round => {
+                meerkat_runtime::UnregisterQueuedInputs::Requeue {
+                    max_age: RequeueMaxAge::DEFAULT,
+                }
+            }
+            Self::RequeueDurable | Self::Stop => meerkat_runtime::UnregisterQueuedInputs::Stop,
             Self::Requeue(max_age) => meerkat_runtime::UnregisterQueuedInputs::Requeue {
                 max_age: max_age.get(),
             },

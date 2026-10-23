@@ -2352,8 +2352,9 @@ async fn observe_after_restart(
 }
 
 /// A Queue-mode host human input whose own turn is in flight (its model
-/// call held) when the host stops gracefully (the stop a gateway runs on
-/// SIGTERM), then a restart over the same durable files.
+/// call held) when the host stops gracefully with an explicit
+/// `QueuedInputsOnShutdown::Stop`, then a restart over the same durable
+/// files.
 ///
 /// The stop cancels the in-flight run: the input is abandoned as cancelled
 /// and its payload retired in the same lifecycle commit, and the run fails
@@ -2407,7 +2408,7 @@ async fn queued_human_mid_turn_at_graceful_stop_fails_once_after_restart_and_kee
     assert!(in_flight.stored.seed.terminal_outcome.is_none());
     assert!(in_flight.stored.state.persisted_input.is_some());
 
-    tokio::time::timeout(WAIT, host.handle.shutdown())
+    tokio::time::timeout(WAIT, host.handle.shutdown_with_report(stop_options()))
         .await
         .expect("the graceful stop finishes")
         .expect("graceful stop");
@@ -2476,7 +2477,8 @@ async fn queued_human_mid_turn_at_graceful_stop_fails_once_after_restart_and_kee
 }
 
 /// A Queue-mode host human input still queued behind a running turn when
-/// the host stops gracefully, then a restart over the same durable files.
+/// the host stops gracefully with an explicit `QueuedInputsOnShutdown::Stop`,
+/// then a restart over the same durable files.
 ///
 /// The stop terminalizes it through the runtime stop: abandoned as stopped
 /// with its payload retired, and its waiter gets the runtime termination.
@@ -2541,7 +2543,7 @@ async fn queued_human_behind_a_running_turn_at_graceful_stop_is_terminated_once_
     let before_stop = stop_row(&host.runtime_store, &session_id, &key, &input_id).await;
     assert_eq!(before_stop.stored.seed.phase, InputLifecycleState::Queued);
 
-    tokio::time::timeout(WAIT, host.handle.shutdown())
+    tokio::time::timeout(WAIT, host.handle.shutdown_with_report(stop_options()))
         .await
         .expect("the graceful stop finishes")
         .expect("graceful stop");
@@ -2624,6 +2626,12 @@ fn requeue_options(max_age: Duration) -> crate::ShutdownOptions {
     crate::ShutdownOptions::default().with_queued_inputs(crate::QueuedInputsOnShutdown::Requeue(
         crate::RequeueMaxAge::new(max_age).expect("an accepted requeue bound"),
     ))
+}
+
+/// Shutdown options that end every member's work as stopped, as the default
+/// did before 0.9.5.
+fn stop_options() -> crate::ShutdownOptions {
+    crate::ShutdownOptions::default().with_queued_inputs(crate::QueuedInputsOnShutdown::Stop)
 }
 
 /// Start a Queue- or Steer-mode host human input on the stop fixture's member.
@@ -2731,6 +2739,28 @@ async fn observe_requeued_after_restart(
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requeue_shutdown_keeps_a_queued_human_input_and_runs_it_once_after_restart() {
+    keeps_a_queued_human_input_across_the_shutdown(
+        "host-human-requeue",
+        requeue_options(crate::RequeueMaxAge::DEFAULT),
+    )
+    .await;
+}
+
+/// The default Shutdown (`QueuedInputsOnShutdown::RequeueDurable`) over this
+/// fixture's persistent session service and runtime resolves to a requeue
+/// with the default bound: the queued human input is kept and runs once after
+/// the restart, exactly as under an explicit requeue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_default_shutdown_keeps_a_queued_human_input_as_a_requeue_shutdown_does() {
+    keeps_a_queued_human_input_across_the_shutdown(
+        "host-human-default-shutdown",
+        crate::ShutdownOptions::default(),
+    )
+    .await;
+}
+
 /// Under a requeue Shutdown, a Queue-mode host human input still queued
 /// behind a running turn stays durably queued: its waiter is told it was
 /// requeued, its row keeps its payload, its replay identity and a requeue
@@ -2739,13 +2769,15 @@ async fn observe_requeued_after_restart(
 /// restart the requeued input runs exactly once, its first model request
 /// does not carry the cancelled turn's user message, and a same-key replay
 /// re-attaches to its result.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn requeue_shutdown_keeps_a_queued_human_input_and_runs_it_once_after_restart() {
+async fn keeps_a_queued_human_input_across_the_shutdown(
+    mob_name: &str,
+    options: crate::ShutdownOptions,
+) {
     use meerkat_runtime::input_state::InputLifecycleState;
 
     let (_root, root_path) = stop_root();
     let client = ScriptedClient::new(true);
-    let host = open_stop_host(&root_path, &client, Some("host-human-requeue")).await;
+    let host = open_stop_host(&root_path, &client, Some(mob_name)).await;
     let mob_id = host.handle.mob_id().clone();
     let (identity, session_id, entry) = spawn_stop_member(&host).await;
 
@@ -2772,14 +2804,10 @@ async fn requeue_shutdown_keeps_a_queued_human_input_and_runs_it_once_after_rest
     let before_stop = stop_row(&host.runtime_store, &session_id, &key, &input_id).await;
     assert_eq!(before_stop.stored.seed.phase, InputLifecycleState::Queued);
 
-    tokio::time::timeout(
-        WAIT,
-        host.handle
-            .shutdown_with_report(requeue_options(crate::RequeueMaxAge::DEFAULT)),
-    )
-    .await
-    .expect("the requeue stop finishes")
-    .expect("requeue stop");
+    tokio::time::timeout(WAIT, host.handle.shutdown_with_report(options))
+        .await
+        .expect("the requeue stop finishes")
+        .expect("requeue stop");
     let waiter = stop_answer(queued, &session_id).await;
     let running_answer = stop_answer(running, &session_id).await;
     let at_exit = stop_row(&host.runtime_store, &session_id, &key, &input_id).await;
@@ -3554,7 +3582,7 @@ async fn row_image(
     (stored, image)
 }
 
-/// Run one Shutdown, `requeue` or the default Stop, over a plain host human
+/// Run one Shutdown, `requeue` or an explicit Stop, over a plain host human
 /// input and an objective-bound one queued behind one running turn, then
 /// restart and let the restarted process run whatever was kept.
 async fn objective_bound_shutdown(mob_name: &str, requeue: bool) -> ObjectiveShutdownScenario {
@@ -3603,7 +3631,7 @@ async fn objective_bound_shutdown(mob_name: &str, requeue: bool) -> ObjectiveShu
     let options = if requeue {
         requeue_options(crate::RequeueMaxAge::DEFAULT)
     } else {
-        crate::ShutdownOptions::default()
+        stop_options()
     };
     tokio::time::timeout(WAIT, host.handle.shutdown_with_report(options))
         .await
@@ -3747,6 +3775,45 @@ fn requeue_max_age_refuses_zero_and_over_the_cap() {
             Ok(Duration::from_millis(1)),
             Duration::from_mins(15),
         )
+    );
+}
+
+/// The default Shutdown choice is `RequeueDurable`. It resolves per session:
+/// a requeue with the default bound for a session that commits each round
+/// durably, a stop for any other. An explicit choice applies as given.
+#[test]
+fn the_default_shutdown_requeues_only_sessions_that_commit_each_round() {
+    use crate::{QueuedInputsOnShutdown, RequeueMaxAge, ShutdownOptions};
+    use meerkat_runtime::UnregisterQueuedInputs;
+
+    let bound = RequeueMaxAge::new(Duration::from_secs(90)).expect("an accepted requeue bound");
+    assert_eq!(
+        (
+            QueuedInputsOnShutdown::default(),
+            ShutdownOptions::default().queued_inputs,
+        ),
+        (
+            QueuedInputsOnShutdown::RequeueDurable,
+            QueuedInputsOnShutdown::RequeueDurable,
+        )
+    );
+    assert_eq!(
+        [
+            QueuedInputsOnShutdown::RequeueDurable.unregister_queued_inputs(true),
+            QueuedInputsOnShutdown::RequeueDurable.unregister_queued_inputs(false),
+            QueuedInputsOnShutdown::Stop.unregister_queued_inputs(true),
+            QueuedInputsOnShutdown::Requeue(bound).unregister_queued_inputs(false),
+        ],
+        [
+            UnregisterQueuedInputs::Requeue {
+                max_age: RequeueMaxAge::DEFAULT,
+            },
+            UnregisterQueuedInputs::Stop,
+            UnregisterQueuedInputs::Stop,
+            UnregisterQueuedInputs::Requeue {
+                max_age: Duration::from_secs(90),
+            },
+        ]
     );
 }
 
@@ -4072,8 +4139,9 @@ async fn a_drain_lets_a_stopped_members_in_flight_human_turn_complete() {
 
 /// The same in-flight host human input, with its model call held through
 /// the whole drain: the drain reports the run still running once its bound
-/// has passed, and cancels nothing. The Shutdown that follows cancels the run
-/// as it does without a drain, so the input ends exactly as in
+/// has passed, and cancels nothing. The Shutdown that follows, an explicit
+/// Stop, cancels the run as it does without a drain, so the input ends
+/// exactly as in
 /// `queued_human_mid_turn_at_graceful_stop_fails_once_after_restart_and_keeps_row`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_drain_at_its_bound_leaves_the_run_to_the_shutdown_cancel() {
@@ -4115,7 +4183,7 @@ async fn a_drain_at_its_bound_leaves_the_run_to_the_shutdown_cancel() {
         .expect("the drain returns at its bound")
         .expect("drain a stopped mob");
     let waited = started.elapsed();
-    tokio::time::timeout(WAIT, host.handle.shutdown())
+    tokio::time::timeout(WAIT, host.handle.shutdown_with_report(stop_options()))
         .await
         .expect("the graceful stop finishes")
         .expect("graceful stop");
@@ -4200,8 +4268,9 @@ async fn a_drain_at_its_bound_leaves_the_run_to_the_shutdown_cancel() {
 /// A host human input queued behind the in-flight one when the host stops
 /// with `StopOptions::leave_runs_running`: the running turn drains to
 /// completion, and the queued input starts no run while the mob is stopped,
-/// during the drain or after it. The Shutdown then terminates it exactly as
-/// in `queued_human_behind_a_running_turn_at_graceful_stop_is_terminated_once_after_restart_and_keeps_row`.
+/// during the drain or after it. The Shutdown, an explicit Stop, then
+/// terminates it exactly as in
+/// `queued_human_behind_a_running_turn_at_graceful_stop_is_terminated_once_after_restart_and_keeps_row`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_queued_input_starts_no_run_during_the_drain() {
     use meerkat_core::turn_execution_authority::TurnTerminalOutcome;
@@ -4266,7 +4335,7 @@ async fn a_queued_input_starts_no_run_during_the_drain() {
         runs_started_for(&stop_events(&root_path, &session_id).await, interaction_id).len(),
         client.requests().len() - requests_before,
     );
-    tokio::time::timeout(WAIT, host.handle.shutdown())
+    tokio::time::timeout(WAIT, host.handle.shutdown_with_report(stop_options()))
         .await
         .expect("the graceful stop finishes")
         .expect("graceful stop");

@@ -1090,9 +1090,10 @@ them.
   it if it is still wanted). Every start that finds it queued checks again. An admission time ahead of the clock is not
   expired. The generated runtime machine decides each input, and the
   unregister records its disposition durably, so an unregister that a crash
-  interrupts converges with the same one. The default, `Stop`, and every stop
-  outside such an unregister end every non-terminal input as stopped, as in
-  0.9.4.
+  interrupts converges with the same one. The runtime unregister's default,
+  `Stop`, and every stop outside such an unregister end every non-terminal
+  input as stopped, as in 0.9.4. The mob Shutdown's default changed (see
+  Changed).
 
 - `meerkat-runtime`, `meerkat-rpc`, `meerkat-rest`, `meerkat-mcp-server`,
   `meerkat`: a completion wait that a graceful mob Shutdown answered by
@@ -1203,6 +1204,24 @@ them.
   answers `Unsupported`.
 
 ### Changed
+
+- `meerkat-mob`: the default graceful Shutdown of a durable member now keeps
+  its in-flight run and its eligible queued prompts for the mob's next start
+  (Requeue, 15 minutes) instead of cancelling them. `MobHandle::shutdown` and
+  `ShutdownOptions::default()` take the new default
+  `QueuedInputsOnShutdown::RequeueDurable`, which resolves per member:
+  `QueuedInputsOnShutdown::Requeue(RequeueMaxAge::DEFAULT)` for a member whose
+  session commits each round (a persistent session service over a runtime
+  with a persistence store), `Stop` for any other member. Under Requeue the
+  Shutdown holds the member's run starts and does not cancel its running
+  turn: the runtime stop suspends a run that commits each round at its last
+  committed round, and the next start resumes it; a run that commits no
+  rounds (a live bridge run) is still cancelled. An autonomous member's
+  running turn is still cancelled at once. An explicit `with_queued_inputs`
+  choice applies as given, an explicit `Stop` included;
+  `with_queued_inputs(QueuedInputsOnShutdown::Stop)` keeps the 0.9.4
+  behavior, and is the Shutdown to use before a downgrade, since 0.9.4 cannot
+  open a store that holds a kept input or run.
 
 - `meerkat-core`, `meerkat-session`, `meerkat-runtime`: a HeadCanonical run
   that compacts more often than `history_retained_rewrites` keeps now saves an

@@ -862,7 +862,9 @@ waited for it.
   [Scheduling](/guides/scheduling)).
 
 A graceful mob Shutdown that keeps queued inputs
-(`QueuedInputsOnShutdown::Requeue` on `meerkat_mob::ShutdownOptions`) fails the
+(`QueuedInputsOnShutdown::Requeue` on `meerkat_mob::ShutdownOptions`, and
+since 0.9.5 the default `QueuedInputsOnShutdown::RequeueDurable` for a member
+session that commits each round durably) fails the
 completion waiters of the inputs it keeps with
 `CompletionWaitError::RequeuedAcrossStop`. Such an input is neither failed nor
 consumed: it stays durably queued, and the session's next start runs it, or
