@@ -82,15 +82,22 @@ impl MobActor {
             let ticket = self.next_autonomous_stop_ticket;
             self.next_autonomous_stop_ticket = ticket.wrapping_add(1);
             let deadline = Instant::now() + self.shutdown_wait_budget();
-            // The Shutdown's choice for queued inputs applies to every
-            // unregister it begins for a member it keeps: a bound member's
-            // session. A retiring member's session is not expected to
-            // resume, so its queued inputs end stopped, as its retirement
-            // would end them. An unregister an earlier Shutdown left with
-            // its coordinator keeps the choice it began with; this one's
-            // applies only if that coordinator ends without unregistering
-            // and the unregister is begun again.
-            let requested = self.shutdown_queued_inputs.unregister_queued_inputs();
+            // The Shutdown's choice applies to every unregister it begins for
+            // a member it keeps: a bound member's session. Its default
+            // resolves per session: a session that commits each round keeps
+            // its running turn and eligible queued inputs for the next start
+            // (`member_sessions_commit_each_round`; every session this
+            // teardown unregisters lives on the mob's own service and
+            // runtime). A run that commits no rounds (a live bridge run) is
+            // still cancelled by the runtime stop. A retiring member's session
+            // is not expected to resume, so its queued inputs end stopped, as
+            // its retirement would end them. An unregister an earlier Shutdown
+            // left with its coordinator keeps the choice it began with; this
+            // one's applies only if that coordinator ends without
+            // unregistering and the unregister is begun again.
+            let requested = self
+                .shutdown_queued_inputs
+                .unregister_queued_inputs(self.member_sessions_commit_each_round());
             let targets = targets
                 .into_iter()
                 .map(|(session_id, retained)| {

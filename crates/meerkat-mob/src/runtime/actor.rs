@@ -2411,6 +2411,149 @@ impl InitialTurnHandle {
     }
 }
 
+/// What answers an autonomous kickoff's waiter.
+#[cfg(feature = "runtime-adapter")]
+enum KickoffCompletion {
+    /// The kickoff input's live completion.
+    Live(meerkat_runtime::completion::CompletionHandle),
+    /// The kickoff input was terminal already when it was admitted again
+    /// under its key, so no completion will come: its receipt answers.
+    Terminal {
+        adapter: Arc<meerkat_runtime::MeerkatMachine>,
+        session_id: SessionId,
+        input_id: meerkat_core::lifecycle::InputId,
+    },
+    /// The admission refused the kickoff input: nothing will run it.
+    Refused(String),
+}
+
+#[cfg(feature = "runtime-adapter")]
+impl KickoffCompletion {
+    /// What the waiter of an admission of a kickoff input waits on: the
+    /// handle the admission answered, for a deduplicated admission of an
+    /// input already terminal that input's receipt, and for a refused
+    /// admission its refusal. `None` only for an accepted admission that
+    /// answered no handle.
+    fn of_admission(
+        adapter: &Arc<meerkat_runtime::MeerkatMachine>,
+        session_id: &SessionId,
+        outcome: &meerkat_runtime::AcceptOutcome,
+        handle: Option<meerkat_runtime::completion::CompletionHandle>,
+    ) -> Option<Self> {
+        match (handle, outcome) {
+            (Some(handle), _) => Some(Self::Live(handle)),
+            (None, meerkat_runtime::AcceptOutcome::Deduplicated { existing_id, .. }) => {
+                Some(Self::Terminal {
+                    adapter: Arc::clone(adapter),
+                    session_id: session_id.clone(),
+                    input_id: existing_id.clone(),
+                })
+            }
+            (None, meerkat_runtime::AcceptOutcome::Rejected { reason, .. }) => {
+                Some(Self::Refused(format!("{reason:?}")))
+            }
+            (None, _) => None,
+        }
+    }
+
+    async fn wait(
+        self,
+    ) -> Result<
+        meerkat_runtime::completion::CompletionOutcome,
+        meerkat_runtime::completion::CompletionWaitError,
+    > {
+        match self {
+            Self::Live(handle) => handle.wait().await,
+            Self::Terminal {
+                adapter,
+                session_id,
+                input_id,
+            } => terminal_kickoff_outcome(&adapter, &session_id, &input_id).await,
+            Self::Refused(reason) => Err(
+                meerkat_runtime::completion::CompletionWaitError::AuthorityUnavailable(format!(
+                    "the kickoff input was refused at admission: {reason}"
+                )),
+            ),
+        }
+    }
+}
+
+/// The outcome of a kickoff whose input is terminal already, read from the
+/// input's terminal receipt: its finalized outcome, or a typed failure
+/// naming why there is none. A kickoff never waits on an input that can
+/// answer no completion.
+#[cfg(feature = "runtime-adapter")]
+async fn terminal_kickoff_outcome(
+    adapter: &meerkat_runtime::MeerkatMachine,
+    session_id: &SessionId,
+    input_id: &meerkat_core::lifecycle::InputId,
+) -> Result<
+    meerkat_runtime::completion::CompletionOutcome,
+    meerkat_runtime::completion::CompletionWaitError,
+> {
+    use meerkat_runtime::completion::CompletionWaitError;
+    use meerkat_runtime::terminal_status::InputTerminalReceiptRead;
+
+    let refused = |detail: String| {
+        Err(CompletionWaitError::AuthorityUnavailable(format!(
+            "the kickoff input {input_id} {detail}"
+        )))
+    };
+    match adapter
+        .input_terminal_receipt(
+            session_id,
+            meerkat_runtime::InteractionSelector::InputId(input_id.clone()),
+        )
+        .await
+    {
+        Ok(Some(read)) => match read.report {
+            InputTerminalReceiptRead::Finalized(receipt) => Ok((*receipt).into_outcome()),
+            InputTerminalReceiptRead::TerminalWithoutReceipt { terminal, .. } => {
+                refused(format!("ended without a run: {terminal:?}"))
+            }
+            _ => refused("answered no completion and has no terminal".to_string()),
+        },
+        Ok(None) => refused("has no terminal read".to_string()),
+        Err(error) => refused(format!("could not be read: {error}")),
+    }
+}
+
+/// Own an autonomous kickoff's completion wait: once `completion` answers,
+/// re-enter the actor with `KickoffOutcomeResolved` and wait for its
+/// acknowledgement. Without a completion the task ends at once.
+#[cfg(feature = "runtime-adapter")]
+fn spawn_kickoff_outcome_waiter(
+    command_tx: mpsc::Sender<RoutedMobCommand>,
+    agent_identity: AgentIdentity,
+    completion: Option<KickoffCompletion>,
+) -> InitialTurnHandle {
+    let handle = tokio::spawn(async move {
+        if let Some(completion) = completion {
+            let outcome = completion.wait().await;
+            let (ack_tx, ack_rx) = oneshot::channel();
+            if command_tx
+                .send(RoutedMobCommand::internal(
+                    MobCommand::KickoffOutcomeResolved {
+                        agent_identity: agent_identity.clone(),
+                        outcome,
+                        ack_tx,
+                    },
+                ))
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    agent_identity = %agent_identity,
+                    "mob actor dropped before kickoff outcome could be recorded"
+                );
+            } else {
+                let _ = ack_rx.await;
+            }
+        }
+    });
+    InitialTurnHandle { handle }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AutonomousStopInterruptIncarnation {
     member_ref: MemberRef,
@@ -2457,6 +2600,32 @@ pub(super) struct AutonomousMemberStopOutcome {
 enum PendingAutonomousStopKind {
     Stop,
     Shutdown,
+}
+
+/// Which autonomous members a stop keeps for the next start: their kickoff
+/// origin stays open and their running turn is not interrupted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutonomousStopKeep {
+    /// None: a Stop that interrupts runs closes every kickoff origin.
+    Nothing,
+    /// Every local member whose session commits each round: a Stop that
+    /// leaves runs running leaves their kickoff to the Shutdown that follows.
+    DurableMembers,
+    /// The members whose durable run the Shutdown in progress keeps.
+    ShutdownChoice,
+}
+
+/// What one stop does with one autonomous member, as MobMachine resolves it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutonomousStopMemberAction {
+    /// Close its kickoff origin and interrupt its running turn.
+    Interrupt,
+    /// Nothing: its registration already stopped, or it is a terminal
+    /// retirement retry anchor.
+    Skip,
+    /// A Shutdown that keeps the member's durable run for the next start:
+    /// its kickoff stays open and the runtime stop suspends its running turn.
+    KeepForResume,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4274,6 +4443,44 @@ fn machine_kickoff_turn_metadata(
             agent_identity,
         )?),
     )
+}
+
+/// The idempotency key of a local autonomous member's kickoff input, one per
+/// member incarnation. A start after a Shutdown that kept the kickoff's run
+/// finds that input by it and never admits the kickoff again.
+#[cfg(feature = "runtime-adapter")]
+fn local_kickoff_idempotency_key(
+    agent_runtime_id: &AgentRuntimeId,
+) -> meerkat_runtime::IdempotencyKey {
+    meerkat_runtime::IdempotencyKey::new(format!("mob-kickoff:{agent_runtime_id}"))
+}
+
+/// The deduplicate-only input that finds a kept kickoff input by its
+/// incarnation key. Its own content is never admitted: without an earlier
+/// input under the key, the admission refuses and admits nothing.
+#[cfg(feature = "runtime-adapter")]
+fn kept_kickoff_reattach_input(agent_runtime_id: &AgentRuntimeId) -> meerkat_runtime::Input {
+    use meerkat_runtime::{Input, InputHeader, PromptInput};
+
+    Input::Prompt(PromptInput {
+        injected_context: Vec::new(),
+        header: InputHeader {
+            ingress_context: None,
+            retained_resume: None,
+            authority_association: None,
+            id: meerkat_core::lifecycle::InputId::new(),
+            timestamp: chrono::Utc::now(),
+            source: meerkat_runtime::InputOrigin::Operator,
+            durability: meerkat_runtime::InputDurability::Durable,
+            visibility: meerkat_runtime::InputVisibility::default(),
+            idempotency_key: Some(local_kickoff_idempotency_key(agent_runtime_id)),
+            supersession_key: None,
+            correlation_id: None,
+        },
+        content: ContentInput::Text("re-attach the kept kickoff".to_string()),
+        typed_turn_appends: Vec::new(),
+        turn_metadata: None,
+    })
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -17281,6 +17488,16 @@ impl MobActor {
     ) -> Result<(), MobError> {
         let outcome = match outcome {
             Ok(outcome) => outcome,
+            // A Shutdown that keeps the member's durable run suspended the
+            // kickoff's run for the next start: the kickoff stays in flight
+            // under its objective, and that start re-attaches its waiter.
+            Err(error) if error.is_requeued_across_stop() => {
+                tracing::debug!(
+                    agent_identity = %agent_identity,
+                    "the kickoff run was kept across the stop; its kickoff stays in flight"
+                );
+                return Ok(());
+            }
             Err(error) => {
                 return self
                     .apply_kickoff_input(
@@ -18992,10 +19209,14 @@ impl MobActor {
         Ok(())
     }
 
-    async fn autonomous_shutdown_member_should_interrupt(
+    /// MobMachine's action for one autonomous member of a stop.
+    /// `keeps_durable_run` says this stop keeps the member's durable run for
+    /// the next start ([`Self::stop_keeps_durable_run`]).
+    async fn autonomous_shutdown_member_action(
         &mut self,
         entry: &RosterEntry,
-    ) -> Result<bool, MobError> {
+        keeps_durable_run: bool,
+    ) -> Result<AutonomousStopMemberAction, MobError> {
         let session_id = entry.member_ref.bridge_session_id().cloned();
         #[cfg(feature = "runtime-adapter")]
         if let (Some(adapter), Some(session_id), Some(stopped_registration)) = (
@@ -19015,14 +19236,14 @@ impl MobActor {
                     // A is absent after its exact unregister. Retain the
                     // terminal observer as the member-stop stage witness until
                     // this actor exits successfully.
-                    return Ok(false);
+                    return Ok(AutonomousStopMemberAction::Skip);
                 }
                 Some(current) if current == &stopped_registration => {
                     // This exact registration reached the completed
                     // member-stop stage before its unregister observer was
                     // installed. Re-run the global stop scan on every
                     // Shutdown retry, but suppress only this one exact A.
-                    return Ok(false);
+                    return Ok(AutonomousStopMemberAction::Skip);
                 }
                 Some(_) => {
                     // A same-SessionId replacement B is fresh shutdown work.
@@ -19136,6 +19357,7 @@ impl MobActor {
                 runtime_residue_present,
                 archive_authority_known,
                 placed_release_confirmed,
+                keeps_durable_run,
             },
             "resolve_autonomous_shutdown_member_action",
         )?;
@@ -19172,10 +19394,62 @@ impl MobActor {
                 entry.agent_identity
             )));
         }
-        Ok(matches!(
-            action,
-            mob_dsl::AutonomousShutdownMemberActionKind::Interrupt
-        ))
+        Ok(match action {
+            mob_dsl::AutonomousShutdownMemberActionKind::Interrupt => {
+                AutonomousStopMemberAction::Interrupt
+            }
+            mob_dsl::AutonomousShutdownMemberActionKind::SkipTerminalRetirementAnchor => {
+                AutonomousStopMemberAction::Skip
+            }
+            mob_dsl::AutonomousShutdownMemberActionKind::KeepForResume => {
+                AutonomousStopMemberAction::KeepForResume
+            }
+        })
+    }
+
+    /// Whether this mob's member sessions commit each round: its session
+    /// service keeps persistent sessions, which give each session a
+    /// checkpointer so its runs commit each round, and its runtime has a
+    /// persistence store that keeps their inputs and resume points. Every
+    /// local member session lives on that one service and runtime.
+    #[cfg(feature = "runtime-adapter")]
+    pub(super) fn member_sessions_commit_each_round(&self) -> bool {
+        self.session_service.supports_persistent_sessions()
+            && self
+                .runtime_adapter
+                .as_ref()
+                .is_some_and(|adapter| adapter.has_runtime_persistence())
+    }
+
+    /// Whether a stop that keeps `keep` keeps `entry`'s durable run for the
+    /// next start. The member's session must be local to this mob's runtime.
+    /// A Stop that leaves runs running keeps it when the session commits each
+    /// round; a Shutdown keeps it when its choice resolves to a requeue for
+    /// the session, which a session that commits each round gets by default.
+    fn stop_keeps_durable_run(&self, entry: &RosterEntry, keep: AutonomousStopKeep) -> bool {
+        #[cfg(feature = "runtime-adapter")]
+        {
+            let local_session = entry.member_ref.bridge_session_id().is_some()
+                && !super::member_runtime_is_host_owned(
+                    self.dsl_authority.state(),
+                    &entry.agent_identity,
+                );
+            local_session
+                && match keep {
+                    AutonomousStopKeep::Nothing => false,
+                    AutonomousStopKeep::DurableMembers => self.member_sessions_commit_each_round(),
+                    AutonomousStopKeep::ShutdownChoice => matches!(
+                        self.shutdown_queued_inputs
+                            .unregister_queued_inputs(self.member_sessions_commit_each_round()),
+                        meerkat_runtime::UnregisterQueuedInputs::Requeue { .. }
+                    ),
+                }
+        }
+        #[cfg(not(feature = "runtime-adapter"))]
+        {
+            let _ = (entry, keep);
+            false
+        }
     }
 
     /// The current Stop's per-member report (#1500).
@@ -19430,7 +19704,11 @@ impl MobActor {
         &mut self,
         kind: PendingAutonomousStopKind,
     ) -> Result<Vec<(AgentIdentity, AutonomousStopInterrupted)>, MobError> {
-        let entries = self.close_all_autonomous_kickoff_origins().await?;
+        let keep = match kind {
+            PendingAutonomousStopKind::Stop => AutonomousStopKeep::Nothing,
+            PendingAutonomousStopKind::Shutdown => AutonomousStopKeep::ShutdownChoice,
+        };
+        let entries = self.close_all_autonomous_kickoff_origins(keep).await?;
         if entries.is_empty() {
             return Ok(Vec::new());
         }
@@ -19459,8 +19737,15 @@ impl MobActor {
     /// Phase 1 of every autonomous stop, for each autonomous member MobMachine
     /// says to interrupt: durably close its kickoff origin, then refuse while
     /// placed kickoff cleanup is pending. Returns those members; a Stop that
-    /// leaves runs running interrupts none of them.
-    async fn close_all_autonomous_kickoff_origins(&mut self) -> Result<Vec<RosterEntry>, MobError> {
+    /// leaves runs running interrupts none of them. A member whose durable
+    /// run the stop keeps (`keep`) is left out: its kickoff origin stays open
+    /// and its running turn is left running, to the Shutdown that follows a
+    /// Stop that leaves runs running, or to the runtime stop of a Shutdown,
+    /// which suspends it.
+    async fn close_all_autonomous_kickoff_origins(
+        &mut self,
+        keep: AutonomousStopKeep,
+    ) -> Result<Vec<RosterEntry>, MobError> {
         let entries = {
             let roster = self.roster.read().await;
             roster
@@ -19475,16 +19760,18 @@ impl MobActor {
         // not infer whether a row is live or a publication-only retry anchor.
         let mut interruptible_entries = Vec::with_capacity(entries.len());
         for entry in entries {
-            if self
-                .autonomous_shutdown_member_should_interrupt(&entry)
+            let keeps_durable_run = self.stop_keeps_durable_run(&entry, keep);
+            match self
+                .autonomous_shutdown_member_action(&entry, keeps_durable_run)
                 .await?
             {
-                interruptible_entries.push(entry);
-            } else {
-                self.autonomous_stop_interrupts
-                    .remove(&entry.agent_identity);
-                self.autonomous_stop_interrupted
-                    .remove(&entry.agent_identity);
+                AutonomousStopMemberAction::Interrupt => interruptible_entries.push(entry),
+                AutonomousStopMemberAction::Skip | AutonomousStopMemberAction::KeepForResume => {
+                    self.autonomous_stop_interrupts
+                        .remove(&entry.agent_identity);
+                    self.autonomous_stop_interrupted
+                        .remove(&entry.agent_identity);
+                }
             }
         }
         let entries = interruptible_entries;
@@ -21163,6 +21450,20 @@ impl MobActor {
                 first_error.get_or_insert(error);
                 continue;
             }
+            // A kickoff a Shutdown kept in flight: its run resumes on this
+            // start (once a Stopped mob resumes, its held run starts release),
+            // and its waiter is re-attached at the first readiness pass that
+            // observes the member's runtime.
+            #[cfg(feature = "runtime-adapter")]
+            if stage == super::state::LifecycleProgressStage::AutonomousRuntimeReadiness
+                && self
+                    .dsl_authority
+                    .state()
+                    .member_kickoff_starting
+                    .contains(&mob_dsl::AgentIdentity::from_domain(&entry.agent_identity))
+            {
+                self.rearm_kept_kickoff(&entry).await;
+            }
             if stage != super::state::LifecycleProgressStage::AutonomousRuntimeReadiness
                 || self.state() != MobState::Running
             {
@@ -21191,6 +21492,74 @@ impl MobActor {
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+
+    /// Re-attach the kickoff waiter of a local autonomous member whose
+    /// kickoff a Shutdown kept in flight, so the kickoff resolves under its
+    /// objective once the resumed run ends. The kept kickoff input is found
+    /// by its incarnation key and never admitted anew; one already terminal
+    /// answers from its receipt. A member with no such input (its kickoff
+    /// never reached the runtime, or an earlier version admitted it without a
+    /// key) keeps its kickoff as it is.
+    #[cfg(feature = "runtime-adapter")]
+    async fn rearm_kept_kickoff(&mut self, entry: &RosterEntry) {
+        use meerkat_runtime::SessionServiceRuntimeExt as _;
+
+        let (Some(adapter), Some(session_id)) = (
+            self.runtime_adapter.clone(),
+            entry.member_ref.bridge_session_id().cloned(),
+        ) else {
+            return;
+        };
+        if super::member_runtime_is_host_owned(self.dsl_authority.state(), &entry.agent_identity)
+            || self
+                .autonomous_initial_turns
+                .lock()
+                .await
+                .contains_key(&entry.agent_identity)
+        {
+            return;
+        }
+        let agent_identity = entry.agent_identity.clone();
+        let completion = match adapter
+            .accept_existing_input_with_completion(
+                &session_id,
+                kept_kickoff_reattach_input(&entry.agent_runtime_id),
+            )
+            .await
+        {
+            Ok((outcome, handle)) => {
+                KickoffCompletion::of_admission(&adapter, &session_id, &outcome, handle)
+            }
+            Err(error) => {
+                tracing::debug!(
+                    agent_identity = %agent_identity,
+                    error = %error,
+                    "no kept kickoff input to re-attach"
+                );
+                return;
+            }
+        };
+        let Some(completion) = completion else {
+            tracing::warn!(
+                agent_identity = %agent_identity,
+                "the kept kickoff's re-attach found no earlier input"
+            );
+            return;
+        };
+        let waiter = spawn_kickoff_outcome_waiter(
+            self.command_tx.clone(),
+            agent_identity.clone(),
+            Some(completion),
+        );
+        self.autonomous_initial_turns
+            .lock()
+            .await
+            .insert(agent_identity.clone(), waiter);
+        tracing::info!(
+            agent_identity = %agent_identity,
+            "re-attached the kept kickoff's waiter"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -29275,8 +29644,12 @@ impl MobActor {
                                     // for any turn.
                                     self.inline_step_watchdog
                                         .set_stop_stage(StopInlineStage::AutonomousStops);
-                                    if let Err(error) =
-                                        Box::pin(self.close_all_autonomous_kickoff_origins()).await
+                                    if let Err(error) = Box::pin(
+                                        self.close_all_autonomous_kickoff_origins(
+                                            AutonomousStopKeep::DurableMembers,
+                                        ),
+                                    )
+                                    .await
                                     {
                                         tracing::warn!(
                                             mob_id = %self.definition.id,

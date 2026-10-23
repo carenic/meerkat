@@ -62,6 +62,20 @@ them.
   run_id }`.
   Behaviour: while a run is marked resumable, `Prepare` for any other run is
   refused and no queued batch is authorized.
+- `meerkat-machine-schema`, `meerkat-mob`, `meerkat-machine-kernels`:
+  MobMachine's `ResolveAutonomousShutdownMemberAction` input (the schema's
+  and meerkat-mob's `MobMachineInput` variant and the kernel's input struct)
+  gains the field `keeps_durable_run: bool`, appended last, so code that
+  builds it literally must set it (`false` keeps the earlier behavior).
+  `AutonomousShutdownMemberActionKind` (meerkat-machine-schema and the
+  kernel) gains `KeepForResume`, appended last; an exhaustive match needs the
+  new arm. The kernel `generated::mob::TransitionId` gains
+  `ResolveAutonomousShutdownMemberActionKeepForResumeRunning`,
+  `ResolveAutonomousShutdownMemberActionKeepForResumeStopped` and
+  `ResolveAutonomousShutdownMemberActionKeepForResumeCompleted`, appended
+  last, so no existing implicit discriminant changes (see Changed, the
+  default graceful Shutdown of a durable member).
+
 - `meerkat-core::ProviderMeta` and `meerkat-contracts::WireProviderMeta` gain
   the `GeminiFunctionCall { provider_id, thought_signature }` variant,
   serialized with `provider: "gemini_function_call"` and required
@@ -1420,9 +1434,10 @@ them.
   it if it is still wanted). Every start that finds it queued checks again. An admission time ahead of the clock is not
   expired. The generated runtime machine decides each input, and the
   unregister records its disposition durably, so an unregister that a crash
-  interrupts converges with the same one. The default, `Stop`, and every stop
-  outside such an unregister end every non-terminal input as stopped, as in
-  0.9.4.
+  interrupts converges with the same one. The runtime unregister's default,
+  `Stop`, and every stop outside such an unregister end every non-terminal
+  input as stopped, as in 0.9.4. The mob Shutdown's default changed (see
+  Changed).
 
 - `meerkat-runtime`, `meerkat-rpc`, `meerkat-rest`, `meerkat-mcp-server`,
   `meerkat`: a completion wait that a graceful mob Shutdown answered by
@@ -1652,6 +1667,32 @@ them.
   `MeerkatMachine::unregister_session_registration_until_terminal_with_queued_inputs_if_current`
   and `meerkat-rest` adds `unregister_runtime_sessions_for_shutdown`, the
   entry points the two shutdowns use.
+- `meerkat-mob`: the default graceful Shutdown of a durable member now keeps
+  its in-flight run and its eligible queued prompts for the mob's next start
+  (Requeue, 15 minutes) instead of cancelling them. `MobHandle::shutdown` and
+  `ShutdownOptions::default()` take the new default
+  `QueuedInputsOnShutdown::RequeueDurable`, which resolves per member:
+  `QueuedInputsOnShutdown::Requeue(RequeueMaxAge::DEFAULT)` for a member whose
+  session commits each round (a persistent session service over a runtime
+  with a persistence store), `Stop` for any other member. Under Requeue the
+  Shutdown holds the member's run starts and does not cancel its running
+  turn: the runtime stop suspends a run that commits each round at its last
+  committed round, and the next start resumes it; a run that commits no
+  rounds (a live bridge run) is still cancelled. A durable autonomous member
+  keeps its kickoff open too: the Shutdown neither records it cancelled nor
+  cancels its run, and the next start resumes the run under the same
+  objective and resolves the kickoff when it ends. A Stop that leaves runs
+  running (`StopOptions::leave_runs_running`) no longer closes such a
+  member's kickoff either: the Shutdown that follows decides. A plain Stop
+  still closes it. A local autonomous kickoff input now carries the Core
+  idempotency key `mob-kickoff:<member runtime id>`, by which that start
+  finds it again.
+  An explicit `with_queued_inputs` choice applies as given, an explicit
+  `Stop` included;
+  `with_queued_inputs(QueuedInputsOnShutdown::Stop)` keeps the 0.9.4
+  behavior, and is the Shutdown to use before a downgrade, since 0.9.4 cannot
+  open a store that holds a kept input or run.
+
 - `meerkat-core`, `meerkat-session`, `meerkat-runtime`: a HeadCanonical run's
   round commits (see Added, per-round commits) move its durable head over the
   run's compaction rewrites, and the run retires its compaction history to

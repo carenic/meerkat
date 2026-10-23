@@ -436,7 +436,7 @@ impl SpawnActivationWorkerContext {
                 "autonomous member '{agent_identity}' requires admission-capable substrate (runtime adapter)"
             ))
         })?;
-        let (_outcome, completion_handle) = adapter
+        let (outcome, completion_handle) = adapter
             .accept_input_with_completion(&bridge_session_id, input)
             .await
             .map_err(|e| {
@@ -444,36 +444,24 @@ impl SpawnActivationWorkerContext {
                     "autonomous prompt admission failed for '{agent_identity}': {e}"
                 ))
             })?;
-        let log_id = agent_identity.clone();
-        let completion_command_tx = self.command_tx.clone();
-        let handle = tokio::spawn(async move {
-            if let Some(h) = completion_handle {
-                let outcome = h.wait().await;
-                let (ack_tx, ack_rx) = oneshot::channel();
-                if completion_command_tx
-                    .send(RoutedMobCommand::internal(
-                        MobCommand::KickoffOutcomeResolved {
-                            agent_identity: log_id.clone(),
-                            outcome,
-                            ack_tx,
-                        },
-                    ))
-                    .await
-                    .is_err()
-                {
-                    tracing::warn!(
-                        agent_identity = %log_id,
-                        "mob actor dropped before kickoff outcome could be recorded"
-                    );
-                } else {
-                    let _ = ack_rx.await;
-                }
-            }
-        });
+        // An admission deduplicated under the incarnation's kickoff key
+        // against an input that is already terminal answers no completion;
+        // that input's receipt answers the kickoff instead.
+        let completion = super::KickoffCompletion::of_admission(
+            &adapter,
+            &bridge_session_id,
+            &outcome,
+            completion_handle,
+        );
+        let waiter = super::spawn_kickoff_outcome_waiter(
+            self.command_tx.clone(),
+            agent_identity.clone(),
+            completion,
+        );
         self.autonomous_initial_turns
             .lock()
             .await
-            .insert(agent_identity.clone(), InitialTurnHandle { handle });
+            .insert(agent_identity.clone(), waiter);
         tracing::debug!(agent_identity = %agent_identity, "autonomous member started");
         Ok(())
     }
@@ -2807,7 +2795,11 @@ impl MobActor {
                 source: meerkat_runtime::InputOrigin::Operator,
                 durability: meerkat_runtime::InputDurability::Durable,
                 visibility: meerkat_runtime::InputVisibility::default(),
-                idempotency_key: None,
+                // One per incarnation: a start after a Shutdown that kept
+                // this kickoff's run finds the input by it.
+                idempotency_key: Some(super::local_kickoff_idempotency_key(
+                    &state.agent_runtime_id,
+                )),
                 supersession_key: None,
                 correlation_id: None,
             },

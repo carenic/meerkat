@@ -15720,10 +15720,15 @@ impl MobHandle {
     /// Without a deadline the member lifecycle hang guard is the failure
     /// bound. Durable state stays re-drivable on the next start either way.
     ///
-    /// `options.queued_inputs` chooses what happens to inputs still queued
-    /// behind a member's running turn: the default ends them as stopped;
-    /// [`QueuedInputsOnShutdown::Requeue`](super::QueuedInputsOnShutdown::Requeue)
-    /// keeps the eligible ones durably queued for the mob's next start.
+    /// `options.queued_inputs` chooses what happens to a member's running
+    /// turn and the inputs still queued behind it. The default,
+    /// [`QueuedInputsOnShutdown::RequeueDurable`](super::QueuedInputsOnShutdown::RequeueDurable),
+    /// keeps them for the mob's next start for a member whose session
+    /// commits each round durably (its run resumes at its last committed
+    /// round, and its eligible queued inputs run after it), and ends them as
+    /// stopped for any other member;
+    /// [`QueuedInputsOnShutdown::Stop`](super::QueuedInputsOnShutdown::Stop)
+    /// ends them as stopped for every member, as before 0.9.5.
     pub async fn shutdown_with_report(
         &self,
         options: super::ShutdownOptions,
@@ -15759,8 +15764,13 @@ impl MobHandle {
     /// keeps its `Retiring` state and that retirement is driven again on the
     /// mob's next start. Members the Shutdown could not settle are logged at
     /// warn; use [`Self::shutdown_with_report`] for the per-member account.
+    ///
+    /// The Shutdown takes the default
+    /// [`QueuedInputsOnShutdown::RequeueDurable`](super::QueuedInputsOnShutdown::RequeueDurable)
+    /// for members' running turns and queued inputs, as
+    /// [`Self::shutdown_with_report`] with default options does.
     pub async fn shutdown(&self) -> Result<(), MobError> {
-        self.shutdown_until(None, super::QueuedInputsOnShutdown::Stop)
+        self.shutdown_until(None, super::QueuedInputsOnShutdown::default())
             .await
     }
 
