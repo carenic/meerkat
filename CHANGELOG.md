@@ -523,6 +523,22 @@ them.
 
 ### Added
 
+- Host store adapters: a realm's runtime and session state can live in the
+  host's own database through the host store SPI
+  (`meerkat_core::host_store`). `meerkat_runtime::store::spi::SpiRealm` is
+  the one handle per process: it holds the realm's fence, renews it, stops
+  writes as soon as a renew fails or its self-fence window passes, and
+  commits each call's changes as one batch with per-scope locks and no
+  realm-wide lock. `SpiRuntimeStore` keeps the in-memory runtime store's
+  WholeBlob semantics and writes every change through before it answers;
+  `SpiSessionStore` is the session slot, read through the runtime store.
+  `meerkat::HostStoreProvider` composes them as a `RealmStorageProvider` and
+  hands its realm to the mob storage. Values too large for a row live in
+  chunk scopes inside the SPI, a boot loads only the runtime bodies recovery
+  acts on, and a batch that fails poisons the scopes it touched until the
+  realm is reopened (a lost fence poisons the realm). On such a realm an
+  OAuth login in progress is process-local: a restart cancels it and the
+  user starts it again. Completed credentials are not affected.
 - `MemberBinding::labels()`: the application labels the incarnation was
   spawned with, as its spawn recorded them (a member reset keeps them). Every
   read of the member binding history carries them, the store-level

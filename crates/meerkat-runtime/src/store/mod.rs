@@ -12,6 +12,7 @@ pub use execution_custody::{
 };
 
 pub mod memory;
+pub mod spi;
 #[cfg(feature = "sqlite-store")]
 pub mod sqlite;
 #[cfg(any(test, feature = "test-support"))]
@@ -4347,7 +4348,7 @@ impl PreparedRecoveryEvidence {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-#[cfg(feature = "sqlite-store")]
+#[cfg(any(feature = "sqlite-store", not(target_arch = "wasm32")))]
 struct CommittedRecoveryReceiptDigestEnrichmentWire {
     original_receipt: RunBoundaryReceipt,
     original_exact_row_token: String,
@@ -4356,7 +4357,7 @@ struct CommittedRecoveryReceiptDigestEnrichmentWire {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-#[cfg(feature = "sqlite-store")]
+#[cfg(any(feature = "sqlite-store", not(target_arch = "wasm32")))]
 struct CommittedRecoveryInputUpdateWire {
     input_id: InputId,
     expected_row_digest: String,
@@ -4365,7 +4366,7 @@ struct CommittedRecoveryInputUpdateWire {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(tag = "profile", rename_all = "snake_case", deny_unknown_fields)]
-#[cfg(feature = "sqlite-store")]
+#[cfg(any(feature = "sqlite-store", not(target_arch = "wasm32")))]
 enum CommittedRecoverySessionAuthorityWire {
     WholeBlobV1 {
         base_store_revision: u64,
@@ -4385,7 +4386,7 @@ enum CommittedRecoverySessionAuthorityWire {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-#[cfg(feature = "sqlite-store")]
+#[cfg(any(feature = "sqlite-store", not(target_arch = "wasm32")))]
 struct CommittedRecoveryBoundaryWire {
     version: u16,
     session_id: meerkat_core::types::SessionId,
@@ -4412,7 +4413,7 @@ pub struct CommittedRecoveryBoundary {
 }
 
 impl CommittedRecoveryBoundary {
-    #[cfg(feature = "sqlite-store")]
+    #[cfg(any(feature = "sqlite-store", not(target_arch = "wasm32")))]
     const VERSION: u16 = 6;
 
     pub(crate) fn from_prepared(
@@ -4433,7 +4434,7 @@ impl CommittedRecoveryBoundary {
         &self.receipt
     }
 
-    #[cfg(feature = "sqlite-store")]
+    #[cfg(any(feature = "sqlite-store", not(target_arch = "wasm32")))]
     pub(crate) fn encode(&self) -> Result<Vec<u8>, RuntimeStoreError> {
         serde_json::to_vec(&CommittedRecoveryBoundaryWire {
             version: Self::VERSION,
@@ -4510,7 +4511,7 @@ impl CommittedRecoveryBoundary {
         })
     }
 
-    #[cfg(feature = "sqlite-store")]
+    #[cfg(any(feature = "sqlite-store", not(target_arch = "wasm32")))]
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, RuntimeStoreError> {
         let wire: CommittedRecoveryBoundaryWire =
             serde_json::from_slice(bytes).map_err(|error| {

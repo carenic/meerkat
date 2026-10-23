@@ -495,7 +495,8 @@ pub use persistence::{
 };
 #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
 pub use storage_provider::{
-    DiskStorageProvider, RealmOpenContext, RealmStorageProvider, RealmStoreSet,
+    DiskStorageProvider, HostStoreProvider, HostSuppliedStores, RealmOpenContext,
+    RealmStorageProvider, RealmStoreSet,
 };
 
 mod meerkat_machine;
