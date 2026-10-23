@@ -1928,6 +1928,10 @@ mod tests {
         assert_database_write_ticks_changed(&alias.join("store.sqlite3"));
     }
 
+    /// The sweep ticks with no notification. Once the watch registers, a
+    /// platform can report the watched directory's own recent creation (macOS
+    /// FSEvents does, and an event on the directory itself is relevant), so
+    /// Changed ticks before the first sweep are skipped.
     #[test]
     fn the_sweep_ticks_without_a_notification() {
         let dir = tempfile::tempdir().unwrap();
@@ -1939,10 +1943,24 @@ mod tests {
                 SqliteWatchControl::Handled
             })
             .expect("watch starts");
-        let tick = tick_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the sweep ticks within the hang guard");
-        assert_eq!(tick, SqliteWatchTick::Sweep);
+        next_sweep(&tick_rx).expect("the sweep ticks within the hang guard");
+    }
+
+    /// Wait, within the hang guard, for a Sweep tick, skipping Changed ticks.
+    fn next_sweep(tick_rx: &mpsc::Receiver<SqliteWatchTick>) -> Result<(), String> {
+        let deadline = Instant::now() + HANG_GUARD;
+        let mut changed = 0_usize;
+        loop {
+            match tick_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(SqliteWatchTick::Sweep) => return Ok(()),
+                Ok(SqliteWatchTick::Changed) => changed += 1,
+                Err(error) => {
+                    return Err(format!(
+                        "no Sweep tick within the hang guard, {changed} Changed: {error}"
+                    ));
+                }
+            }
+        }
     }
 
     #[test]
