@@ -344,6 +344,19 @@ pub(crate) fn web_search_message_annotations(value: &Value) -> Option<Vec<Value>
     (!web_citations.is_empty()).then_some(web_citations)
 }
 
+/// The `message_annotations` server content of one assistant message: its
+/// web-search citations, and how many `output_text` parts its text has.
+/// Citation indices count from the start of their own part, and the parts
+/// are joined into one text at capture, so only the citations of a message
+/// with one text part can be placed on its replayed text.
+pub(crate) fn message_citations_content(annotations: Vec<Value>, text_parts: usize) -> Value {
+    serde_json::json!({
+        "type": "message_annotations",
+        "annotations": annotations,
+        "text_parts": text_parts,
+    })
+}
+
 /// The `include` entry that asks for the sources a hosted web search
 /// consulted, inside its `web_search_call` item.
 const WEB_SEARCH_SOURCES_INCLUDE: &str = "web_search_call.action.sources";
@@ -386,10 +399,11 @@ fn without_web_search_sources(item: &Value) -> Value {
 #[derive(Default)]
 struct WebSearchCitations<'a> {
     by_message: HashMap<&'a str, &'a [Value]>,
-    /// Messages with more than one citations block. Each block came from its
-    /// own text part, whose indices count from the start of that part, and
-    /// the parts were joined at capture, so none of them can be placed.
-    several: HashSet<&'a str>,
+    /// Messages whose citations cannot be placed on the replayed text: its
+    /// text came from several parts, the block does not say how many (it was
+    /// recorded before the part count was), or the message has more than one
+    /// citations block.
+    unplaceable: HashSet<&'a str>,
 }
 
 impl<'a> WebSearchCitations<'a> {
@@ -410,12 +424,14 @@ impl<'a> WebSearchCitations<'a> {
             let Some(annotations) = content.get("annotations").and_then(Value::as_array) else {
                 continue;
             };
-            if citations
-                .by_message
-                .insert(id.as_str(), annotations.as_slice())
-                .is_some()
+            let one_text_part = content.get("text_parts").and_then(Value::as_u64) == Some(1);
+            if !one_text_part
+                || citations
+                    .by_message
+                    .insert(id.as_str(), annotations.as_slice())
+                    .is_some()
             {
-                citations.several.insert(id.as_str());
+                citations.unplaceable.insert(id.as_str());
             }
         }
         citations
@@ -425,7 +441,7 @@ impl<'a> WebSearchCitations<'a> {
     /// `url_citation` entries whose character range fits the text. A range
     /// that does not fit is dropped, never moved.
     fn for_message(&self, id: &str, text: &str) -> Vec<Value> {
-        if self.several.contains(id) {
+        if self.unplaceable.contains(id) {
             return Vec::new();
         }
         let Some(annotations) = self.by_message.get(id) else {
@@ -2947,6 +2963,10 @@ impl OpenAiClient {
                                                 "message" => {
                                                     // content is an array: [{"type": "output_text", "text": "..."}, ...]
                                                     if let Some(content_parts) = item.get("content").and_then(|c| c.as_array()) {
+                                                        let text_parts = content_parts
+                                                            .iter()
+                                                            .filter(|part| part.get("type").and_then(Value::as_str) == Some("output_text"))
+                                                            .count();
                                                         for part in content_parts {
                                                             if let Some(part_type) = part.get("type").and_then(|t| t.as_str()) {
                                                                 match part_type {
@@ -2961,10 +2981,7 @@ impl OpenAiClient {
                                                                                     .and_then(|v| v.as_str())
                                                                                     .map(std::string::ToString::to_string),
                                                                                 kind: ServerToolKind::WebSearch,
-                                                                                content: serde_json::json!({
-                                                                                    "type": "message_annotations",
-                                                                                    "annotations": annotations
-                                                                                }),
+                                                                                content: message_citations_content(annotations, text_parts),
                                                                                 meta: openai_response_meta(active_response_id.as_deref()),
                                                                             };
                                                                         }

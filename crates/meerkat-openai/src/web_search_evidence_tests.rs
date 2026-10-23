@@ -56,10 +56,31 @@ fn asks_for_sources(body: &Value) -> bool {
     })
 }
 
+/// The answer as one `output_text` part citing its first word.
+fn one_part_answer() -> Value {
+    json!([{"type": "output_text", "text": ANSWER, "annotations": [citation()]}])
+}
+
+/// The same answer as two `output_text` parts, the citation on the second.
+/// Its indices count from the start of that part ("an agent runtime."), so
+/// on the joined text they would mark the wrong words.
+fn two_part_answer() -> Value {
+    json!([
+        {"type": "output_text", "text": "Meerkat is ", "annotations": []},
+        {"type": "output_text", "text": "an agent runtime.", "annotations": [{
+            "type": "url_citation",
+            "url": "https://example.com/runtime",
+            "title": "Runtime",
+            "start_index": 0,
+            "end_index": 16
+        }]}
+    ])
+}
+
 /// One searched answer as the API streams it: a search call whose action
 /// carries the sources only when the request asked for them, then the answer
-/// citing its first source.
-fn searched_answer_stream(with_sources: bool) -> String {
+/// with `answer_parts` as its content.
+fn searched_answer_stream(with_sources: bool, answer_parts: &Value) -> String {
     let mut action = json!({"type": "search", "query": "meerkat runtime"});
     if with_sources {
         action["sources"] = sources();
@@ -74,7 +95,7 @@ fn searched_answer_stream(with_sources: bool) -> String {
                 "id": "msg_1",
                 "role": "assistant",
                 "status": "completed",
-                "content": [{"type": "output_text", "text": ANSWER, "annotations": [citation()]}]
+                "content": answer_parts
             }
         ],
         "usage": {"input_tokens": 12, "output_tokens": 7}
@@ -92,6 +113,7 @@ fn searched_answer_stream(with_sources: bool) -> String {
 #[derive(Clone)]
 struct SearchStub {
     seen: Arc<Mutex<Vec<Value>>>,
+    answer_parts: Value,
 }
 
 /// Records each request body and answers it like the API answers a searched
@@ -104,11 +126,13 @@ async fn searched_answer(
     stub.seen.lock().expect("seen mutex").push(body);
     (
         [("content-type", "text/event-stream")],
-        searched_answer_stream(with_sources),
+        searched_answer_stream(with_sources, &stub.answer_parts),
     )
 }
 
-async fn spawn_search_stub() -> (
+async fn spawn_search_stub(
+    answer_parts: Value,
+) -> (
     OpenAiClient,
     Arc<Mutex<Vec<Value>>>,
     tokio::task::JoinHandle<()>,
@@ -116,7 +140,10 @@ async fn spawn_search_stub() -> (
     let seen = Arc::new(Mutex::new(Vec::new()));
     let app = Router::new()
         .route("/v1/responses", post(searched_answer))
-        .with_state(SearchStub { seen: seen.clone() });
+        .with_state(SearchStub {
+            seen: seen.clone(),
+            answer_parts,
+        });
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind test server");
@@ -136,11 +163,22 @@ fn answer_meta() -> Option<Box<ProviderMeta>> {
     }))
 }
 
-fn citations_block(id: Option<&str>, annotations: Value) -> AssistantBlock {
+/// A message's citations block as capture records it: `text_parts` is the
+/// number of `output_text` parts of the message, absent in a block recorded
+/// before capture counted them.
+fn citations_block(
+    id: Option<&str>,
+    annotations: Value,
+    text_parts: Option<u64>,
+) -> AssistantBlock {
+    let mut content = json!({"type": "message_annotations", "annotations": annotations});
+    if let Some(text_parts) = text_parts {
+        content["text_parts"] = json!(text_parts);
+    }
     AssistantBlock::ServerToolContent {
         id: id.map(str::to_owned),
         kind: ServerToolKind::WebSearch,
-        content: json!({"type": "message_annotations", "annotations": annotations}),
+        content,
         meta: openai_response_meta(Some("resp_search")),
     }
 }
@@ -176,7 +214,7 @@ fn captured_answer_blocks() -> Vec<AssistantBlock> {
             text: ANSWER.to_string(),
             meta: answer_meta(),
         },
-        citations_block(Some("msg_1"), json!([citation()])),
+        citations_block(Some("msg_1"), json!([citation()]), Some(1)),
     ]
 }
 
@@ -216,7 +254,7 @@ fn has_input_item(body: &Value, kind: &str) -> bool {
 /// the API sent none, and the answer replayed `annotations: []`.)
 #[tokio::test]
 async fn a_searched_answer_reaches_the_next_stateless_step_with_its_sources_and_citations() {
-    let (client, seen, server) = spawn_search_stub().await;
+    let (client, seen, server) = spawn_search_stub(one_part_answer()).await;
     let adapter = LlmClientAdapter::new(Arc::new(client), "gpt-5.5".to_string())
         .with_provider_params(Some(hosted_web_search()));
     let question = Message::User(UserMessage::text("What is Meerkat?".to_string()));
@@ -379,7 +417,11 @@ fn only_url_citations_that_fit_their_text_replay() {
             text: ANSWER.to_string(),
             meta: answer_meta(),
         },
-        citations_block(Some("msg_1"), json!([citation(), past_the_text, file])),
+        citations_block(
+            Some("msg_1"),
+            json!([citation(), past_the_text, file]),
+            Some(1),
+        ),
     ]);
     let body = next_step_body(&client, &history);
     assert_eq!(
@@ -389,19 +431,63 @@ fn only_url_citations_that_fit_their_text_replay() {
     );
 }
 
-/// R3. A message whose citations came from several text parts replays none:
-/// each part's indices count from that part, and the parts were joined at
-/// capture.
+/// R3. An answer whose text came from several `output_text` parts replays
+/// no citations: each part's indices count from the start of that part, and
+/// capture joins the parts into one text, so a citation of the second part
+/// would mark the wrong words. Run through capture, like R1. (Fails-old: the
+/// second part's citation replayed on the joined text, misplaced.)
+#[tokio::test]
+async fn an_answer_from_several_text_parts_replays_no_citations() {
+    let (client, seen, server) = spawn_search_stub(two_part_answer()).await;
+    let adapter = LlmClientAdapter::new(Arc::new(client), "gpt-5.5".to_string())
+        .with_provider_params(Some(hosted_web_search()));
+    let question = Message::User(UserMessage::text("What is Meerkat?".to_string()));
+    let step = AgentLlmClient::stream_response(
+        &adapter,
+        std::slice::from_ref(&question),
+        &[],
+        1024,
+        None,
+        None,
+    )
+    .await
+    .expect("the searched step");
+    let history = vec![
+        question,
+        Message::BlockAssistant(BlockAssistantMessage::new(
+            step.blocks().to_vec(),
+            step.stop_reason(),
+        )),
+        Message::User(UserMessage::text("Which page says so?".to_string())),
+    ];
+    AgentLlmClient::stream_response(&adapter, &history, &[], 1024, None, None)
+        .await
+        .expect("the next step");
+    server.abort();
+
+    let seen = seen.lock().expect("seen mutex").clone();
+    let next = &seen[1];
+    let answer = input_item(next, "message");
+    assert_eq!(
+        answer["content"][0]["text"], "Meerkat is an agent runtime.",
+        "{answer}"
+    );
+    assert_eq!(answer["content"][0]["annotations"], json!([]), "{answer}");
+    assert!(!has_input_item(next, "message_annotations"), "{next}");
+}
+
+/// R3. Two citations blocks for one message replay none either: which one
+/// belongs to the replayed text cannot be told.
 #[test]
-fn citations_from_several_text_parts_replay_none() {
+fn two_citations_blocks_for_one_message_replay_none() {
     let client = OpenAiClient::new("test-key".to_string());
     let history = searched_history(vec![
         AssistantBlock::Text {
             text: ANSWER.to_string(),
             meta: answer_meta(),
         },
-        citations_block(Some("msg_1"), json!([citation()])),
-        citations_block(Some("msg_1"), json!([citation()])),
+        citations_block(Some("msg_1"), json!([citation()]), Some(1)),
+        citations_block(Some("msg_1"), json!([citation()]), Some(1)),
     ]);
     let body = next_step_body(&client, &history);
     assert_eq!(
@@ -412,11 +498,12 @@ fn citations_from_several_text_parts_replay_none() {
     assert!(!has_input_item(&body, "message_annotations"), "{body}");
 }
 
-/// R3. A search recorded before this change (a call without sources, and
-/// citations captured without their message id) replays as recorded:
-/// the call verbatim, the answer with `annotations: []`.
+/// R3. A search recorded before this change replays as it did: the call
+/// without sources verbatim, and the answer with `annotations: []`, because
+/// its citations block does not say how many text parts the answer had (and
+/// the oldest blocks carry no message id).
 #[test]
-fn a_search_recorded_without_sources_replays_as_recorded() {
+fn a_search_recorded_before_this_change_replays_as_it_did() {
     let client = OpenAiClient::new("test-key".to_string());
     let call = json!({"type": "search", "query": "meerkat runtime"});
     let history = searched_history(vec![
@@ -425,7 +512,7 @@ fn a_search_recorded_without_sources_replays_as_recorded() {
             text: ANSWER.to_string(),
             meta: answer_meta(),
         },
-        citations_block(None, json!([citation()])),
+        citations_block(Some("msg_1"), json!([citation()]), None),
     ]);
     let body = next_step_body(&client, &history);
     assert_eq!(
@@ -439,6 +526,20 @@ fn a_search_recorded_without_sources_replays_as_recorded() {
         "{body}"
     );
     assert!(!has_input_item(&body, "message_annotations"), "{body}");
+
+    let oldest = searched_history(vec![
+        AssistantBlock::Text {
+            text: ANSWER.to_string(),
+            meta: answer_meta(),
+        },
+        citations_block(None, json!([citation()]), None),
+    ]);
+    let body = next_step_body(&client, &oldest);
+    assert_eq!(
+        input_item(&body, "message")["content"][0]["annotations"],
+        json!([]),
+        "{body}"
+    );
 }
 
 /// The ChatGPT backend, Azure OpenAI and Copilot wires keep the search shape

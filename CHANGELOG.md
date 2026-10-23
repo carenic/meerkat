@@ -274,11 +274,14 @@ them.
   `web_search_call.action.sources`), and later steps replay the search call
   with those sources and the answer's `url_citation` annotations on its text
   instead of `annotations: []`. Only citations whose range fits the replayed
-  text go back, and a message whose citations came from several text parts
-  replays none. The text of the pages never comes back; for that, opt in to
-  `store: true` (stored continuation) or use the Meerkat `web_search`
-  fallback tool. The ChatGPT backend, Azure OpenAI and GitHub Copilot
-  Responses wires keep their request shape: no sources asked for or
+  text go back, and only for an answer whose text came from one text part:
+  the citations block of an OpenAI answer (its `message_annotations` server
+  content) now also records how many `output_text` parts the answer had
+  (`text_parts`), and an answer from several parts, or one recorded before
+  this change, replays none. The text of the pages never comes back; for
+  that, opt in to `store: true` (stored continuation) or use the Meerkat
+  `web_search` fallback tool. The ChatGPT backend, Azure OpenAI and GitHub
+  Copilot Responses wires keep their request shape: no sources asked for or
   replayed, and `annotations: []`. No API change.
 
 ### Fixed
