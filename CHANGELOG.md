@@ -1269,6 +1269,14 @@ them.
   occurrence that head does not cover yet, even past the retention bound, and
   retires down to the bound at its first compaction after a checkpoint covers
   them.
+- `meerkat-store`: one delivery receipt that does not decode no longer pins
+  its occurrence in the SQLite schedule store. To decide whether a lapsed
+  occurrence's earlier attempt was admitted, the claim scan decoded every
+  receipt of the occurrence whole, so a receipt with a corrupt field, or with
+  a value a newer release wrote that an older one reads after a downgrade,
+  made the row a fault on every scan: never reclaimed, misfired or
+  exhausted. The scan now reads only each receipt's stage; a receipt whose
+  stage does not decode is still the row's fault.
 - `meerkat-schedule`, `meerkat`, `meerkat-store`, `meerkat-mob-mcp`: a
   scheduled delivery whose executor died after the target admitted it ended
   `misfired` under `skip` once its lease lapsed: the reclaim past the misfire
