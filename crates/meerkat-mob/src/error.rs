@@ -1250,6 +1250,11 @@ pub enum MobError {
         tool_use_id: String,
         tool_name: String,
         args: serde_json::Value,
+        /// The call's dedupe key, as on
+        /// [`meerkat_core::error::PendingCallbackToolCall`]: a host answering
+        /// the call sees the same key if a resumed run asks again. Boxed so
+        /// the error stays small.
+        dedupe_key: Option<Box<meerkat_core::ToolCallDedupeKey>>,
     },
     /// A member turn is waiting on one exact multi-callback result set.
     #[error(
@@ -4236,6 +4241,7 @@ mod tests {
                     tool_use_id: "call-1".to_string(),
                     tool_name: "t".to_string(),
                     args: serde_json::Value::Null,
+                    dedupe_key: None,
                 },
                 MobFailureClass::RuntimeRejected,
             ),

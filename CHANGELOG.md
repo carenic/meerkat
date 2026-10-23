@@ -585,8 +585,12 @@ them.
   `CoreApplyTerminal::CallbackPending` gains `dedupe_key:
   Option<ToolCallDedupeKey>`. `meerkat-runtime`: the struct variant
   `CompletionOutcome::CallbackPending` gains `dedupe_key:
-  Option<ToolCallDedupeKey>`. `meerkat-contracts`: `WirePendingToolCall`
-  gains `dedupe_key: Option<ToolCallDedupeKey>`, and
+  Option<ToolCallDedupeKey>`. `meerkat-mob`: the struct variants
+  `MobError::CallbackPending` and `BoundedTurnFailure::CallbackPending` gain
+  `dedupe_key: Option<Box<ToolCallDedupeKey>>`, so a host answering a
+  member's callback from either sees the key, as the batch variants already
+  carry it on each `PendingCallbackToolCall`. `meerkat-contracts`:
+  `WirePendingToolCall` gains `dedupe_key: Option<ToolCallDedupeKey>`, and
   `WireCallbackPending::single` takes the key as its eighth argument. Rust
   code that builds these with struct literals names the new field
   (`dedupe_key: None` for a call outside an agent-loop round), and a pattern
@@ -665,8 +669,10 @@ them.
     `WirePendingToolCall`) as `dedupe_key`: in the
     `interaction_callback_pending` event, the MCP server's
     `pending_tool_calls`, the REST `CALLBACK_PENDING` details, the CLI's
-    pending output and the RPC callback-pending error data. A Web runtime JS
-    tool callback gets it as an optional second argument, a JSON string.
+    pending output, the RPC callback-pending error data and a mob member's
+    callback-pending failure (`MobError::CallbackPending`,
+    `BoundedTurnFailure::CallbackPending`). A Web runtime JS tool callback
+    gets it as an optional second argument, a JSON string.
   - SDKs: each exports `ToolCallDedupeKey`. The Python SDK passes it to a
     callback handler that declares a `dedupe_key` parameter; the TypeScript
     SDK passes it as a handler's optional second argument; the Web SDK passes

@@ -11859,6 +11859,7 @@ mod tests {
                 tool_use_id,
                 tool_name,
                 args,
+                ..
             } => {
                 assert_eq!(actual_session_id, session_id);
                 assert_eq!(tool_use_id, "call-1");
@@ -12044,6 +12045,7 @@ mod tests {
                 tool_use_id,
                 tool_name,
                 args,
+                ..
             } => {
                 assert_eq!(actual_session_id, session_id);
                 assert_eq!(tool_use_id, "call-1");
