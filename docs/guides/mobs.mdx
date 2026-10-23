@@ -1200,10 +1200,15 @@ it is `MobError::MemberStartupRecoveryFailed`, which names the member, its
 session and the cause, for example `SessionError::ServedElsewhere` while
 another runtime owner on the realm hosts the session. Other commands fail with
 `ActorCommandChannelClosed`. An actor that fail-stops later, on a durable
-mutation whose outcome stayed uncertain, reports `MobError::AdmissionClosed`
-with `DurabilityFailStop` the same way. Before 0.9.5, `status` reported only
-"mob actor reply channel closed", and the cause reached only the host's error
-log.
+mutation whose outcome stayed uncertain, reports `MobError::DurabilityFailStop`
+the same way: its `cause` is that mutation's own error, the first one when
+several stayed uncertain, and the command that hit it got the same error,
+shared in `SharedLifecycleFailure`. The record classifies as the admission
+close it stands for (no wire code, failure class `MobRejected`, `mob/list`
+cause `internal`) and carries no durable resume hold, even when its cause
+does: the mob needs a restart, not a parked member. Before 0.9.5, `status`
+reported only "mob actor reply channel closed", and the cause reached only the
+host's error log.
 
 `MobHandle::lifecycle_observation()` (and the same method on `MobReadHandle`)
 reads that answer without asking the actor: the last phase the actor

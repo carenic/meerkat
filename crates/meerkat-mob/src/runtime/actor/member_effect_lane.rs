@@ -837,7 +837,10 @@ impl MobActor {
                 %ticket,
                 "member effect completion has no matching custody"
             );
-            self.durable_uncertainty_fail_stop = true;
+            self.durable_uncertainty_fail_stop
+                .record_unreplied(MobError::Internal(
+                    "member effect completion has no matching custody".to_string(),
+                ));
             return;
         };
         // The ticket is NOT removed here. It is released only after the
@@ -858,7 +861,7 @@ impl MobActor {
                     "member effect panicked; running its declared unsettled commit"
                 );
                 let Some(unsettled_commit) = inflight.unsettled_commit.take() else {
-                    self.durable_uncertainty_fail_stop = true;
+                    self.durable_uncertainty_fail_stop.record_unreplied(error);
                     return;
                 };
                 (unsettled_commit, Some(error))
