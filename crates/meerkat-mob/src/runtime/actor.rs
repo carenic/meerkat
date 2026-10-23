@@ -24987,6 +24987,41 @@ impl MobActor {
         }
     }
 
+    /// The `AcquireLease` execution for a lease classified
+    /// `HeldByEndedIncarnation`: release exactly the claim that was read, so
+    /// the ordinary claim that follows takes the lease over. False when the
+    /// stored claim is no longer the one read (renewed, released or taken in
+    /// between); nothing is released then.
+    async fn release_ended_incarnation_lease(
+        &self,
+        identity: &AgentIdentity,
+        observation: &crate::identity::IdentityStoredObservation<
+            crate::identity::IdentityLeaseRecord,
+        >,
+    ) -> Result<bool, MobError> {
+        let crate::identity::IdentityStoredObservation::Valid(record) = observation else {
+            return Ok(false);
+        };
+        let Some(ended) = record.active.as_ref() else {
+            return Ok(false);
+        };
+        let released = self
+            .identity
+            .release_identity_lease(&self.definition.id, identity, ended)
+            .await
+            .map_err(MobError::from)?;
+        if released {
+            tracing::info!(
+                mob_id = %self.definition.id,
+                identity = %identity,
+                ended_incarnation = %ended.incarnation_id,
+                lease_epoch = ended.epoch,
+                "taking over the identity lease of an incarnation whose process has ended"
+            );
+        }
+        Ok(released)
+    }
+
     fn identity_lease_condition(
         &self,
         observation: &crate::identity::IdentityStoredObservation<
@@ -25010,6 +25045,19 @@ impl MobActor {
                 }
                 Some(active) if now_ms >= active.expires_at_ms => {
                     IdentityLeaseCondition::HeldByExpiredIncarnation
+                }
+                // An earlier incarnation of this mob whose process has ended
+                // (this process holds the store's incarnation custody, and
+                // that incarnation was minted under it elsewhere): nothing of
+                // it runs, so the machine takes its lease over at once.
+                Some(active)
+                    if active.holder_id == self.identity_reconcile_holder_id
+                        && super::identity_incarnation_custody::incarnation_process_ended(
+                            &self.identity_reconcile_incarnation_id,
+                            &active.incarnation_id,
+                        ) =>
+                {
+                    IdentityLeaseCondition::HeldByEndedIncarnation
                 }
                 Some(_) => IdentityLeaseCondition::HeldByOtherLiveIncarnation,
             },
@@ -25971,6 +26019,20 @@ impl MobActor {
                 None,
             )
             .await;
+            if lease_condition == IdentityLeaseCondition::HeldByEndedIncarnation
+                && !self
+                    .release_ended_incarnation_lease(identity, &lease_observation)
+                    .await?
+            {
+                // The claim changed after it was read: read and classify it
+                // again on the next pass rather than claim over it.
+                self.schedule_identity_reconcile_wait(
+                    identity,
+                    IdentityReconcileAuthorityKey::from_observation(&intent_observation),
+                    IDENTITY_RECONCILE_LEASE_RECHECK,
+                );
+                return Ok(IdentityReconcilePassDisposition::Outcome(false));
+            }
             let outcome = self
                 .identity
                 .claim_or_renew_identity_lease(
@@ -26035,9 +26097,12 @@ impl MobActor {
                 )
                 .await;
                 if preliminary == IdentityReconcileDecision::AwaitLease {
-                    // Another incarnation holds the lease. A holder that
-                    // crashed never releases it, nor does a Shutdown that
-                    // kept it (a member still unregistering, or whose
+                    // Another incarnation holds the lease, and this process
+                    // cannot prove that incarnation's process has ended
+                    // (a proven one is HeldByEndedIncarnation, taken over
+                    // above). A holder that crashed in a process this one
+                    // cannot prove ended never releases it, nor does a
+                    // Shutdown that kept it (a member still unregistering, or whose
                     // session actor had not exited, at its deadline; a
                     // retiring member). Neither that expiry nor a release
                     // wakes this identity (only the slow safety scan

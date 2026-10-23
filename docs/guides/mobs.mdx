@@ -1209,6 +1209,17 @@ in-flight resume work. Cleanup failures retain exact retry authority; an
 unproven cleanup is not a successful cancellation. Compensation preserves
 durable session documents and refuses to remove a successor attachment.
 
+A mob restarted over a persistent store after its process crashed, was killed
+or exited without a Shutdown takes its adopted identities' reconcile leases at
+once, so each identity's admission reopens as soon as it converges. The
+process proves that its predecessor ended with an exclusive lock on the mob
+store's `.incarnation-custody` file, which it holds until it exits; never
+delete that file while a process may use the store (`rkat storage doctor`
+lists it as `mob-incarnation-custody-lock`, and `rkat storage prune` leaves
+it). A restart in the same process, a restart while another process holds the
+lock, a lease taken without the lock, and a store without a file wait for the
+earlier lease to expire (up to 30 s), as before 0.9.5.
+
 ### Durable workers
 
 Since 0.9.5 a profile can make its members durable workers:

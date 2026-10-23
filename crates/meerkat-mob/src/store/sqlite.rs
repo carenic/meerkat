@@ -4912,6 +4912,12 @@ fn insert_identity_receipt(
 
 #[async_trait]
 impl MobIdentityStore for SqliteMobIdentityStore {
+    // Canonical: `SqliteMobStores::open` canonicalizes the path that
+    // `identity_store` hands on (see `identity_incarnation_custody`).
+    fn incarnation_custody_store(&self) -> Option<&Path> {
+        Some(&self.path)
+    }
+
     #[cfg(feature = "runtime-adapter")]
     fn prepare_runtime_write_fence(
         &self,

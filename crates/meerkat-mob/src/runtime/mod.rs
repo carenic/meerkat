@@ -228,6 +228,7 @@ mod fork_context;
 pub mod forked_participant_routing;
 mod handle;
 mod held_spawn;
+mod identity_incarnation_custody;
 mod identity_local_services;
 #[cfg(any(test, feature = "test-support"))]
 mod identity_recovery_test_support;
