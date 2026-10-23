@@ -2320,6 +2320,159 @@ async fn operator_resolves_a_held_tail_through_the_store_traits() {
     );
 }
 
+/// A host stopped the session's runtime and ended before it unregistered:
+/// the lifecycle row stays `Stopped` (no current run, no unregister in
+/// progress), and the session's tail is held as ambiguous. The operator verb
+/// runs over the store alone and never registers the runtime. The dry run
+/// reads that row as the `Idle` row a start's registration normalizes it to,
+/// reports the normalization and writes nothing: the row stays `Stopped`
+/// and the tail stays. The applied repair commits the tail as interrupted
+/// and writes the `Idle` row with it. RED before: the verb read the row as
+/// not quiescent and refused the repair. Unrun: written while Cargo is not
+/// run.
+#[tokio::test]
+async fn operator_resolves_a_held_tail_over_a_runtime_a_host_left_stopped() {
+    use meerkat_core::lifecycle::core_executor::BoundSessionCommit;
+    use meerkat_core::types::{
+        AssistantBlock, BlockAssistantMessage, Message, StopReason, TranscriptMessageIdentity,
+        UserMessage,
+    };
+    use meerkat_runtime::recovery::{
+        HeldTailRepairVerdict, HeldTailResolution, resolve_held_durable_tail,
+    };
+    use meerkat_runtime::store::{PreparedRuntimeSessionCommit, PreparedWholeBlobProvisionalTail};
+
+    let store = Arc::new(InMemoryRuntimeStore::new());
+    let run_id = RunId::new();
+    let mut committed = meerkat_core::Session::new();
+    committed.push(Message::User(UserMessage::text("invoke a tool")));
+    let session_id = committed.id().clone();
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+
+    // A host stops the session's runtime and ends before it unregisters.
+    {
+        let host =
+            MeerkatMachine::persistent(store.clone() as Arc<dyn RuntimeStore>, memory_blob_store())
+                .expect("persistent machine");
+        host.register_session(session_id.clone())
+            .await
+            .expect("register the session");
+        let registration = host
+            .current_session_registration_witness(&session_id)
+            .await
+            .expect("the registration is current");
+        assert!(
+            host.stop_runtime_executor_until_terminal_if_current(&registration, "host stop")
+                .await
+                .unwrap()
+        );
+    }
+    assert_eq!(
+        load_runtime_state(store.as_ref(), &runtime_id)
+            .await
+            .unwrap(),
+        Some(RuntimeState::Stopped),
+        "the ended host leaves the lifecycle row Stopped"
+    );
+
+    let committed_authority = store
+        .commit_prepared_session_boundary(
+            &runtime_id,
+            PreparedRuntimeSessionCommit::snapshot_only(
+                BoundSessionCommit::sealed(Arc::new(committed.clone())).unwrap(),
+            ),
+        )
+        .await
+        .unwrap()
+        .authority()
+        .and_then(|authority| authority.whole_blob())
+        .cloned()
+        .expect("initial boundary returns WholeBlob store authority");
+    let mut held = committed;
+    held.push(Message::BlockAssistant(BlockAssistantMessage {
+        blocks: vec![AssistantBlock::ToolUse {
+            id: "held-call".to_string(),
+            name: "durable_tool".to_string(),
+            args: serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
+            meta: None,
+        }],
+        stop_reason: Some(StopReason::ToolUse),
+        identity: TranscriptMessageIdentity::default().with_run_id(run_id.clone()),
+        created_at: meerkat_core::types::message_timestamp_now(),
+        assistant_message_id: None,
+    }));
+    store
+        .write_prepared_whole_blob_provisional_tail(
+            &runtime_id,
+            PreparedWholeBlobProvisionalTail::prepare(
+                committed_authority,
+                run_id.clone(),
+                1,
+                &BoundSessionCommit::sealed(Arc::new(held)).unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let HeldTailResolution::Ambiguous(plan) =
+        resolve_held_durable_tail(store.as_ref(), &session_id, false)
+            .await
+            .expect("the dry run reads the held tail")
+    else {
+        panic!("a dangling-call tail is held as ambiguous");
+    };
+    assert_eq!(plan.verdict, HeldTailRepairVerdict::WouldRepair);
+    assert!(plan.runtime_quiescent);
+    assert!(plan.normalizes_stopped_lifecycle);
+    assert!(
+        store
+            .load_whole_blob_provisional_tail(&runtime_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "the dry run leaves the tail"
+    );
+    assert_eq!(
+        load_runtime_state(store.as_ref(), &runtime_id)
+            .await
+            .unwrap(),
+        Some(RuntimeState::Stopped),
+        "the dry run leaves the row Stopped"
+    );
+
+    let HeldTailResolution::Ambiguous(applied) =
+        resolve_held_durable_tail(store.as_ref(), &session_id, true)
+            .await
+            .expect("the repair applies")
+    else {
+        panic!("the held tail is still ambiguous when applied");
+    };
+    assert_eq!(applied.candidate_id, plan.candidate_id);
+    assert_eq!(
+        applied.verdict,
+        HeldTailRepairVerdict::Repaired {
+            boundary_sequence: 1
+        }
+    );
+    assert!(applied.normalizes_stopped_lifecycle);
+    assert!(
+        store
+            .load_whole_blob_provisional_tail(&runtime_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "the repair consumes the held tail"
+    );
+    assert_eq!(
+        load_runtime_state(store.as_ref(), &runtime_id)
+            .await
+            .unwrap(),
+        Some(RuntimeState::Idle),
+        "the repair writes the Idle row a start would normalize the Stopped row to"
+    );
+}
+
 /// A tail recovery does not hold (an interrupted run that ordinary recovery
 /// repairs) is not the operator's: nothing is written.
 #[tokio::test]

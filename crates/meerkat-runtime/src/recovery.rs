@@ -251,9 +251,19 @@ pub struct HeldTailRepair {
     /// Other inputs stay for ordinary redelivery.
     pub terminalized_inputs: Vec<InputId>,
     /// Whether the persisted lifecycle row is quiescent (missing, Idle or
-    /// Retired) with no current run. The repair is refused otherwise. A live
-    /// host whose runtime is idle is not detected, so stop every host first.
+    /// Retired, or a Stopped row this repair normalizes) with no current
+    /// run. The repair is refused otherwise. A live host whose runtime is
+    /// idle is not detected, so stop every host first.
     pub runtime_quiescent: bool,
+    /// Whether the persisted lifecycle row is `Stopped` with no current run
+    /// and no unregister in progress: a host stopped the runtime and ended
+    /// before it unregistered. The verb reads it as the clean `Idle` row a
+    /// start's registration replaces it with (unbound, its supervisor,
+    /// unregister-progress and live-bridge facts kept); a dry run writes
+    /// nothing, and an applied repair writes that row in its own commit. A
+    /// `Stopped` row with a current run or an unregister in progress is not
+    /// quiescent, and the repair is refused.
+    pub normalizes_stopped_lifecycle: bool,
     /// The machine's verdict.
     pub verdict: HeldTailRepairVerdict,
 }
@@ -1982,12 +1992,16 @@ struct ObservedPersistedLifecycle {
     /// The lifecycle phase to re-assert on commit. Recovery never invents a
     /// phase: Missing rows create quiescent Idle; Idle stays Idle; Retired
     /// stays Retired (a retired runtime is not resurrected by recovering its
-    /// session document).
+    /// session document); a Stopped row an operator's repair normalizes
+    /// becomes the clean Idle row a start's registration writes.
     reassert_state: RuntimeState,
     binding: MachineLifecycleBindingFacts,
     supervisor_authority: SupervisorAuthoritySnapshot,
     unregister_progress: Option<crate::store::MachineUnregisterProgressSnapshot>,
     live_bridge_recovery: crate::live_execution::LiveBridgeRecoveryImage,
+    /// An operator reads this `Stopped` row as the clean `Idle` row a
+    /// start's registration replaces it with (`observe_persisted_lifecycle`).
+    normalizes_stopped: bool,
 }
 
 /// Project the persisted lifecycle row into what the recovery machine judges.
@@ -2001,12 +2015,38 @@ struct ObservedPersistedLifecycle {
 /// persisted current run keeps its own guard. Every other drive reads each
 /// phase as persisted; a `Stopped` runtime is not quiescent there, because a
 /// later start may resume its run.
+///
+/// An operator's drive (`resolve-held-tail`) runs under an exclusive open of
+/// the runtime database, which proves no live process owns the session, and
+/// never registers the runtime. A `Stopped` row with no current run and no
+/// unregister in progress (a host stopped the runtime and ended before it
+/// unregistered) reads there as the clean `Idle` row a start's registration
+/// replaces it with, on the same generated reconcile verdict
+/// (`NormalizeOrReplace`): unbound, no run facts, its supervisor,
+/// unregister-progress and live-bridge facts kept. Only an applied repair
+/// writes that row, in its own commit fenced on the observed row version; a
+/// `Stopped` row with a current run or an unregister in progress is not
+/// quiescent there either.
 fn observe_persisted_lifecycle(
     observation: MachineLifecycleObservation,
     candidate_run_id: &meerkat_core::RunId,
     mode: DriveMode,
 ) -> ObservedPersistedLifecycle {
     let ending_session = mode == DriveMode::SessionArchive;
+    let normalizes_stopped = matches!(mode, DriveMode::Operator { .. })
+        && matches!(
+            &observation,
+            MachineLifecycleObservation::Decoded { record, .. }
+                if record.runtime_state() == Some(RuntimeState::Stopped)
+                    && record.run().current_run_id().is_none()
+                    && record.unregister_progress().is_none()
+        )
+        && matches!(
+            crate::meerkat_machine::driver::runtime_authority_reconcile_decision_for_observation(
+                &observation
+            ),
+            Ok(mm_dsl::RuntimeAuthorityReconcileDecision::NormalizeOrReplace)
+        );
     let mut observed = match observation {
         MachineLifecycleObservation::Missing => ObservedPersistedLifecycle {
             lifecycle: mm_dsl::DurableRecoveryObservedLifecycle::MissingRow,
@@ -2017,6 +2057,7 @@ fn observe_persisted_lifecycle(
             supervisor_authority: SupervisorAuthoritySnapshot::UnboundNoReceipt,
             unregister_progress: None,
             live_bridge_recovery: crate::live_execution::LiveBridgeRecoveryImage::default(),
+            normalizes_stopped: false,
         },
         MachineLifecycleObservation::Decoded { record, version } => {
             let (lifecycle, reassert_state) = match record.runtime_state() {
@@ -2031,6 +2072,10 @@ fn observe_persisted_lifecycle(
                 Some(RuntimeState::Stopped) if ending_session => (
                     mm_dsl::DurableRecoveryObservedLifecycle::Retired,
                     RuntimeState::Stopped,
+                ),
+                Some(RuntimeState::Stopped) if normalizes_stopped => (
+                    mm_dsl::DurableRecoveryObservedLifecycle::Idle,
+                    RuntimeState::Idle,
                 ),
                 Some(_) => (
                     mm_dsl::DurableRecoveryObservedLifecycle::NonQuiescent,
@@ -2055,10 +2100,16 @@ fn observe_persisted_lifecycle(
                 current_run,
                 expected_version: MachineLifecycleExpectedVersion::Version(version),
                 reassert_state,
-                binding: record.binding().clone(),
+                // The normalized row is unbound, as registration's replacement.
+                binding: if normalizes_stopped {
+                    MachineLifecycleBindingFacts::default()
+                } else {
+                    record.binding().clone()
+                },
                 supervisor_authority: record.supervisor_authority().clone(),
                 unregister_progress: record.unregister_progress().cloned(),
                 live_bridge_recovery: record.live_bridge_recovery().clone(),
+                normalizes_stopped,
             }
         }
         MachineLifecycleObservation::Unsupported { version, .. }
@@ -2071,6 +2122,7 @@ fn observe_persisted_lifecycle(
             supervisor_authority: SupervisorAuthoritySnapshot::UnboundNoReceipt,
             unregister_progress: None,
             live_bridge_recovery: crate::live_execution::LiveBridgeRecoveryImage::default(),
+            normalizes_stopped: false,
         },
     };
     if ending_session
@@ -2483,6 +2535,14 @@ pub async fn recover_durable_tail_for_run(
 /// no current run, no prior commit that covers or contradicts the tail,
 /// attributable inputs) and refuses otherwise.
 ///
+/// The caller opens the store exclusively, so no live process owns the
+/// session, and nothing registers its runtime. A lifecycle row a host left
+/// `Stopped` when it ended before unregistering (no current run, no
+/// unregister in progress) therefore counts as the clean `Idle` row a
+/// start's registration would normalize it to: the plan reports it
+/// ([`HeldTailRepair::normalizes_stopped_lifecycle`]), and an applied repair
+/// writes that row with its commit, fenced on the observed row version.
+///
 /// With `apply` false (the dry run) nothing is written: the answer reports
 /// what the repair keeps, answers and terminalizes, and the verdict. With
 /// `apply` true an authorized repair commits the tail as interrupted through
@@ -2602,6 +2662,7 @@ fn operator_plan(
                 | mm_dsl::DurableRecoveryObservedLifecycle::Idle
                 | mm_dsl::DurableRecoveryObservedLifecycle::Retired
         ) && observed.current_run == mm_dsl::DurableRecoveryObservedRun::NoRun,
+        normalizes_stopped_lifecycle: observed.normalizes_stopped,
         verdict,
     }
 }
@@ -2780,6 +2841,7 @@ async fn recover_durable_tail_capturing(
             supervisor_authority: SupervisorAuthoritySnapshot::UnboundNoReceipt,
             unregister_progress: None,
             live_bridge_recovery: crate::live_execution::LiveBridgeRecoveryImage::default(),
+            normalizes_stopped: false,
         },
         Err(error) => return Err(error.into()),
     };
@@ -3545,12 +3607,13 @@ mod store_authority_tests {
     /// The archive of a session that is ending reads every quiescent
     /// persisted runtime (a missing row, `Idle`, `Stopped`, `Retired`) as
     /// `Retired` and re-asserts the observed phase, so the machine never
-    /// continues a run there. Ordinary recovery and the operator verb read
-    /// each phase as persisted, `Stopped` as not quiescent, and a running
-    /// runtime is not quiescent for any drive. RED before: an archive's
-    /// recovery read an `Idle` runtime as `Idle`, so a continuable tail
-    /// answered `Continue` inside the archive. Unrun: written while Cargo is
-    /// not run.
+    /// continues a run there. Ordinary recovery reads each phase as
+    /// persisted, `Stopped` as not quiescent; the operator verb reads a clean
+    /// `Stopped` row as the `Idle` row a registration normalizes it to. A
+    /// running runtime is not quiescent for any drive. RED before: an
+    /// archive's recovery read an `Idle` runtime as `Idle`, so a continuable
+    /// tail answered `Continue` inside the archive. Unrun: written while
+    /// Cargo is not run.
     #[test]
     fn a_session_archive_reads_every_quiescent_persisted_runtime_as_retired() {
         use crate::meerkat_machine::dsl::DurableRecoveryObservedLifecycle as Observed;
@@ -3572,10 +3635,14 @@ mod store_authority_tests {
         }
 
         let run_id = RunId::new();
-        for (state, as_persisted) in [
-            (RuntimeState::Idle, Observed::Idle),
-            (RuntimeState::Stopped, Observed::NonQuiescent),
-            (RuntimeState::Retired, Observed::Retired),
+        for (state, as_persisted, for_operator) in [
+            (RuntimeState::Idle, Observed::Idle, Observed::Idle),
+            (
+                RuntimeState::Stopped,
+                Observed::NonQuiescent,
+                Observed::Idle,
+            ),
+            (RuntimeState::Retired, Observed::Retired, Observed::Retired),
         ] {
             let archive =
                 observe_persisted_lifecycle(persisted(state), &run_id, DriveMode::SessionArchive);
@@ -3593,13 +3660,22 @@ mod store_authority_tests {
                 ),
                 "{state}"
             );
-            for mode in [DriveMode::Recovery, DriveMode::Operator { apply: true }] {
-                assert_eq!(
-                    observe_persisted_lifecycle(persisted(state), &run_id, mode).lifecycle,
-                    as_persisted,
-                    "{state} {mode:?}"
-                );
-            }
+            assert_eq!(
+                observe_persisted_lifecycle(persisted(state), &run_id, DriveMode::Recovery)
+                    .lifecycle,
+                as_persisted,
+                "{state}"
+            );
+            assert_eq!(
+                observe_persisted_lifecycle(
+                    persisted(state),
+                    &run_id,
+                    DriveMode::Operator { apply: true },
+                )
+                .lifecycle,
+                for_operator,
+                "{state}"
+            );
         }
 
         let archive = observe_persisted_lifecycle(
@@ -3635,6 +3711,106 @@ mod store_authority_tests {
                 "{mode:?}"
             );
         }
+    }
+
+    /// The operator verb runs under an exclusive open and never registers
+    /// the runtime, so it reads a `Stopped` row a host left when it ended
+    /// before unregistering (no current run, no unregister in progress) as
+    /// the clean `Idle` row a start's registration replaces it with: Idle
+    /// re-asserted, unbound, no run facts, the supervisor and live-bridge
+    /// facts kept, fenced on the observed row version. A `Stopped` row with
+    /// a current run, or with an unregister in progress, stays not
+    /// quiescent, and ordinary recovery never normalizes. RED before: the
+    /// operator read every `Stopped` row as not quiescent, so the verb
+    /// refused a session whose host ended between its stop and its
+    /// unregister. Unrun: written while Cargo is not run.
+    #[test]
+    fn an_operator_reads_a_clean_stopped_row_as_the_idle_row_registration_writes() {
+        use crate::meerkat_machine::dsl::DurableRecoveryObservedLifecycle as Observed;
+
+        fn stopped(
+            run: MachineLifecycleRunFacts,
+            unregister_progress: Option<crate::store::MachineUnregisterProgressSnapshot>,
+        ) -> MachineLifecycleObservation {
+            let encoded =
+                MachineLifecycleCommit::new_with_binding_run_unregister_progress_and_live_bridge(
+                    RuntimeState::Stopped,
+                    MachineLifecycleBindingFacts::new(
+                        Some("agent-runtime".to_string()),
+                        Some(7),
+                        Some(2),
+                        Some("epoch-of-the-ended-process".to_string()),
+                    ),
+                    run,
+                    SupervisorAuthoritySnapshot::UnboundNoReceipt,
+                    unregister_progress,
+                    crate::live_execution::LiveBridgeRecoveryImage::default(),
+                )
+                .store_record()
+                .encode()
+                .expect("encode a stopped lifecycle image");
+            MachineLifecycleObservation::from_raw_record(&encoded)
+        }
+
+        let run_id = RunId::new();
+        let operator = DriveMode::Operator { apply: false };
+        let clean = observe_persisted_lifecycle(
+            stopped(MachineLifecycleRunFacts::default(), None),
+            &run_id,
+            operator,
+        );
+        assert_eq!(clean.lifecycle, Observed::Idle);
+        assert!(clean.normalizes_stopped);
+        assert_eq!(clean.reassert_state, RuntimeState::Idle);
+        assert_eq!(clean.binding, MachineLifecycleBindingFacts::default());
+        assert_eq!(
+            clean.current_run,
+            crate::meerkat_machine::dsl::DurableRecoveryObservedRun::NoRun
+        );
+        assert!(matches!(
+            clean.expected_version,
+            MachineLifecycleExpectedVersion::Version(_)
+        ));
+        let reassertion = durable_tail_lifecycle_reassertion(&clean);
+        assert_eq!(reassertion.snapshot().runtime_state(), RuntimeState::Idle);
+        assert_eq!(
+            reassertion.snapshot().binding(),
+            &MachineLifecycleBindingFacts::default()
+        );
+        assert!(reassertion.snapshot().run().current_run_id().is_none());
+        assert!(reassertion.expected_version().is_some());
+
+        let with_run = observe_persisted_lifecycle(
+            stopped(
+                MachineLifecycleRunFacts::new(Some(run_id.clone()), None),
+                None,
+            ),
+            &run_id,
+            operator,
+        );
+        assert_eq!(with_run.lifecycle, Observed::NonQuiescent);
+        assert!(!with_run.normalizes_stopped);
+
+        let unregistering = observe_persisted_lifecycle(
+            stopped(
+                MachineLifecycleRunFacts::default(),
+                Some(crate::store::MachineUnregisterProgressSnapshot::new(
+                    true, true, true, false, false,
+                )),
+            ),
+            &run_id,
+            operator,
+        );
+        assert_eq!(unregistering.lifecycle, Observed::NonQuiescent);
+        assert!(!unregistering.normalizes_stopped);
+
+        let ordinary = observe_persisted_lifecycle(
+            stopped(MachineLifecycleRunFacts::default(), None),
+            &run_id,
+            DriveMode::Recovery,
+        );
+        assert_eq!(ordinary.lifecycle, Observed::NonQuiescent);
+        assert!(!ordinary.normalizes_stopped);
     }
 
     #[test]

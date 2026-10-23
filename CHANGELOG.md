@@ -746,7 +746,14 @@ them.
   a result are answered with outcome-unknown error results, a notice names
   `resolve-held-tail` and the candidate, and the recovery row records the
   operator's disposition and the candidate id. A quarantined session, and a
-  tail held for any other reason, are refused.
+  tail held for any other reason, are refused. A lifecycle row a host left
+  `Stopped` when it ended before unregistering (no current run, no
+  unregister in progress) counts as the clean `Idle` row a start's
+  registration would normalize it to, because the caller's exclusive open
+  proves no live process owns the session: the plan reports it
+  (`HeldTailRepair::normalizes_stopped_lifecycle`), and an applied repair
+  writes that row with its commit. A `Stopped` row with a current run or an
+  unregister in progress is still refused.
 
 - `meerkat-core`: per-round commits and resumable runs. A run whose agent has
   a session checkpointer commits every tool round twice:
@@ -899,8 +906,10 @@ them.
   default it writes nothing to the session and reports why the tail is held
   (the run's rows, its last stop, the calls without a result, the run
   cursor), what the repair keeps, answers and ends, whether the persisted
-  lifecycle row is quiescent, and the machine's verdict; `--apply` commits a
-  repair the machine authorizes. It exits non-zero when the tail is held for
+  lifecycle row is quiescent (a row a host left `Stopped` before it
+  unregistered is normalized as a start would, and the report says so), and
+  the machine's verdict; `--apply` commits a repair the machine authorizes.
+  It exits non-zero when the tail is held for
   another reason or the repair is refused (a repair needs every host of the
   session stopped; an idle live host is not detected), and it never retries.
   `meerkat-runtime`: `SqliteRuntimeStore::open_existing` opens an existing

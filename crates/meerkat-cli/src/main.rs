@@ -17992,7 +17992,9 @@ async fn resolve_held_tail_session(
         // persistence profile, so a head-canonical database and a WholeBlob
         // one both open. No actor can own the session in this process; the
         // operator stops every host of the session first, and the repair is
-        // refused while the persisted lifecycle row is not quiescent.
+        // refused while the persisted lifecycle row is not quiescent. A row a
+        // host left Stopped when it ended before unregistering counts as the
+        // Idle row a start would normalize it to, and the repair writes it.
         let (session_id, database) = match runtime_store {
             Some(path) => {
                 let session_id = SessionId::parse(id).map_err(|error| {
@@ -18148,6 +18150,7 @@ fn held_tail_resolution_json(
                     .map(ToString::to_string)
                     .collect::<Vec<_>>(),
                 "runtime_quiescent": repair.runtime_quiescent,
+                "normalizes_stopped_lifecycle": repair.normalizes_stopped_lifecycle,
                 "verdict": verdict,
             });
             if let (Some(sequence), Some(object)) = (boundary_sequence, repair_json.as_object_mut())
@@ -18237,6 +18240,13 @@ fn print_held_tail_resolution(
                 "  persisted lifecycle quiescent: {}",
                 yes_no(repair.runtime_quiescent)
             );
+            if repair.normalizes_stopped_lifecycle {
+                println!(
+                    "  the persisted lifecycle row is Stopped (a host stopped the runtime and \
+                     ended before unregistering it): the repair writes the clean Idle row a \
+                     start would normalize it to"
+                );
+            }
             match repair.verdict {
                 HeldTailRepairVerdict::WouldRepair => println!(
                     "verdict: the runtime machine authorizes the repair; nothing was written. \
