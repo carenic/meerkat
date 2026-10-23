@@ -9212,6 +9212,25 @@ async fn process_queue(
                         match terminalization_outcome {
                             OwnedRuntimeLoopTerminalizationOutcome::Persisted => {
                                 authority_binding.release_ended_run_tool_markers(&run_id);
+                                // The cancel dropped the run future, so the
+                                // run's last round commit is still the store's
+                                // provisional tail. The cancellation is
+                                // committed now (no current run, the run's
+                                // inputs abandoned): close that tail as an
+                                // interrupted run before anything else runs,
+                                // so the session's next save and next run do
+                                // not meet it. A suspension never reaches this
+                                // arm.
+                                if cancelled {
+                                    driver
+                                        .lock()
+                                        .await
+                                        .settle_cancelled_run_tail(
+                                            &authority_binding.session_id,
+                                            &run_id,
+                                        )
+                                        .await;
+                                }
                             }
                             OwnedRuntimeLoopTerminalizationOutcome::Rejected(error) => {
                                 tracing::error!(
