@@ -891,18 +891,6 @@ struct CallingLlmToolBatch {
     deferred_failure: Option<crate::session::DeferredToolBatchFailureKind>,
 }
 
-/// Whether a run in a session without a durable HeadCanonical head (a
-/// WholeBlob session) keeps taking round commits after it rewrote its
-/// transcript.
-///
-/// Recovery accepts such a session's provisional tail only as a strict
-/// continuation of its committed transcript, and a tail written after a
-/// rewrite is not one: recovery would refuse it, and every later resume of
-/// the session would fail. So, `false`: the run's last round commit before its
-/// first rewrite stays its resume point, and its end-of-run save is its next
-/// write, as before per-round commits.
-const WHOLE_BLOB_ROUND_COMMITS_AFTER_REWRITE: bool = false;
-
 /// Per-round commit state of the active run.
 ///
 /// A durable run commits every tool round twice: after the model call (the
@@ -928,8 +916,14 @@ pub(crate) struct RunRoundCommits {
     /// store-issued provisional run id), but a checkpoint without the cursor
     /// is attributable only by such a message.
     run_row_since_rewrite: bool,
-    /// The run rewrote its transcript at least once.
-    rewritten: bool,
+    /// The run rewrote its transcript since the committed base its round
+    /// commits chain from. A session without a durable HeadCanonical head (a
+    /// WholeBlob session) is recovered only from a strict continuation of
+    /// that base, which a rewrite breaks: its next round commit must re-base
+    /// the run (see [`crate::SessionCheckpointer::rebase_run`]), or, with a
+    /// checkpointer that does not re-base, the run takes no more round
+    /// commits.
+    rewritten_since_base: bool,
 }
 
 impl RunRoundCommits {
@@ -937,7 +931,7 @@ impl RunRoundCommits {
     /// be gone from its live tail.
     pub(crate) fn note_transcript_rewrite(&mut self) {
         self.run_row_since_rewrite = false;
-        self.rewritten = true;
+        self.rewritten_since_base = true;
     }
 
     /// The run's own assistant message entered the live transcript.
@@ -954,15 +948,23 @@ impl RunRoundCommits {
 
     /// Whether a round commit may be written. `rewrite_tolerant`: the
     /// session has a durable HeadCanonical head, whose recovery reads a
-    /// rewritten tail (see [`WHOLE_BLOB_ROUND_COMMITS_AFTER_REWRITE`]).
-    fn commits_allowed(&self, rewrite_tolerant: bool) -> bool {
-        rewrite_tolerant || WHOLE_BLOB_ROUND_COMMITS_AFTER_REWRITE || !self.rewritten
+    /// rewritten tail. `rebases`: the checkpointer re-bases a run after a
+    /// rewrite.
+    fn commits_allowed(&self, rewrite_tolerant: bool, rebases: bool) -> bool {
+        rewrite_tolerant || rebases || !self.rewritten_since_base
+    }
+
+    /// Whether the next round commit must be written as a re-base.
+    fn needs_rebase(&self, rewrite_tolerant: bool) -> bool {
+        !rewrite_tolerant && self.rewritten_since_base
     }
 
     /// Whether a checkpoint of the live session without the cursor leaves a
-    /// tail recovery attributes to the run and accepts.
+    /// tail recovery attributes to the run and accepts: an assistant message
+    /// of the run after its last rewrite, on a base the tail strictly
+    /// continues (or a HeadCanonical head, which reads a rewritten tail).
     fn closing_tail_attributable(&self, rewrite_tolerant: bool) -> bool {
-        self.run_row_since_rewrite && self.commits_allowed(rewrite_tolerant)
+        self.run_row_since_rewrite && (rewrite_tolerant || !self.rewritten_since_base)
     }
 }
 
@@ -1680,13 +1682,16 @@ where
 
     /// Whether the active run writes a round commit now: round commits are
     /// enabled, and the run has not rewritten the transcript of a session
-    /// that recovery reads only as a strict continuation (see
-    /// [`WHOLE_BLOB_ROUND_COMMITS_AFTER_REWRITE`]).
+    /// that recovery reads only as a strict continuation, unless its
+    /// checkpointer re-bases it (see [`RunRoundCommits::commits_allowed`]).
     fn round_commit_allowed(&self) -> bool {
         self.round_commits_enabled()
-            && self
-                .round_commits
-                .commits_allowed(self.session.has_durable_head_canonical_head())
+            && self.round_commits.commits_allowed(
+                self.session.has_durable_head_canonical_head(),
+                self.checkpointer
+                    .as_ref()
+                    .is_some_and(|checkpointer| checkpointer.rebases_runs()),
+            )
     }
 
     /// Whether this writer may still dispatch: the session checkpointer's
@@ -1868,14 +1873,16 @@ where
     /// the model, and dispatches its calls again under their call ids.
     ///
     /// Taken in every tool round: the run's first round, the round right
-    /// after a compaction and a round with a callback call included. Skipped
-    /// by design only while the run takes no round commits (see
-    /// [`Agent::round_commit_allowed`]) and when the message carries an
-    /// image, because the cursor travels in the session head, which media
-    /// externalization does not reach. A round that skips it dispatches its
-    /// calls without one; a crash inside it asks the model again, and only a
-    /// call with the same name and arguments under the same call id meets the
-    /// same dedupe key.
+    /// after a compaction and a round with a callback call included. The
+    /// first round commit after a rewrite of a WholeBlob session is a re-base
+    /// ([`Agent::write_round_rebase`]). Skipped by design only while the run
+    /// takes no round commits (see [`Agent::round_commit_allowed`]), when the
+    /// message carries an image, because the cursor travels in the session
+    /// head, which media externalization does not reach, and for a message
+    /// without an assistant message id, which recovery could not match. A
+    /// round that skips it dispatches its calls without one; a crash inside it
+    /// asks the model again, and only a call with the same name and arguments
+    /// under the same call id meets the same dedupe key.
     ///
     /// A first commit that fails, or that the checkpointer does not make
     /// durable (it returns no receipt), fails the round before any of its
@@ -1886,8 +1893,11 @@ where
         ctx: &CallingLlmTurnCtx<'_>,
         assistant_msg: &BlockAssistantMessage,
     ) -> Result<(), AgentError> {
+        // Recovery matches a staged message to the transcript by its
+        // assistant message id; every message the loop stamps has one.
         if !self.round_commit_allowed()
             || !assistant_image_events_from_blocks(&assistant_msg.blocks).is_empty()
+            || assistant_msg.assistant_message_id.is_none()
         {
             return Ok(());
         }
@@ -1963,10 +1973,16 @@ where
                 cursor.round
             ))
         })?;
-        if let Err(error) = self
-            .write_session_checkpoint(run_id, SessionSaveDurability::Required)
-            .await
+        let written = if self
+            .round_commits
+            .needs_rebase(self.session.has_durable_head_canonical_head())
         {
+            self.write_round_rebase(run_id).await
+        } else {
+            self.write_session_checkpoint(run_id, SessionSaveDurability::Required)
+                .await
+        };
+        if let Err(error) = written {
             self.session.clear_run_cursor();
             return Err(error);
         }
@@ -1980,6 +1996,55 @@ where
             observer(cursor);
         }
         Ok(true)
+    }
+
+    /// Write a round commit as a re-base (see
+    /// [`crate::SessionCheckpointer::rebase_run`]): the run's first round
+    /// commit after a rewrite of a session recovered only from strict
+    /// continuations. The live session, without its cursor, becomes the
+    /// committed base and the run's tail restarts on it with the cursor, so
+    /// the run's later round commits continue the new base strictly. The
+    /// receipt chain restarts there.
+    async fn write_round_rebase(&mut self, run_id: &RunId) -> Result<(), AgentError> {
+        self.sync_control_state_to_session().map_err(|error| {
+            AgentError::InternalError(format!(
+                "failed to sync agent control state before a run re-base: {error}"
+            ))
+        })?;
+        let checkpointer = self.checkpointer.clone().ok_or_else(|| {
+            AgentError::InternalError("a run re-base needs a session checkpointer".to_string())
+        })?;
+        let previous = match self.latest_run_checkpoint_receipt.take() {
+            Some(receipt)
+                if receipt.session_id() == self.session.id() && receipt.run_id() == run_id =>
+            {
+                Some(receipt)
+            }
+            Some(receipt) => {
+                return Err(AgentError::InternalError(format!(
+                    "actor retained provisional receipt for session {}/run {}, not active session {}/run {}",
+                    receipt.session_id(),
+                    receipt.run_id(),
+                    self.session.id(),
+                    run_id
+                )));
+            }
+            None => None,
+        };
+        let receipt = checkpointer
+            .rebase_run(&mut self.session, run_id, previous.as_ref())
+            .await?;
+        if receipt.session_id() != self.session.id()
+            || receipt.run_id() != run_id
+            || receipt.candidate_sequence() != 1
+        {
+            return Err(AgentError::InternalError(
+                "session checkpointer returned a re-base receipt for the wrong session/run or not the first candidate on its new base".to_string(),
+            ));
+        }
+        self.latest_run_checkpoint_receipt = Some(receipt);
+        self.round_commits.rewritten_since_base = false;
+        Ok(())
     }
 
     /// End the run's resumability at an exit that took no end-of-run save.

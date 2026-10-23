@@ -356,6 +356,44 @@ pub trait SessionCheckpointer: Send + Sync {
         previous: Option<&RunCheckpointReceipt>,
     ) -> Result<Option<RunCheckpointReceipt>, AgentError>;
 
+    /// Whether this checkpointer re-bases a run whose transcript a compaction
+    /// rewrote ([`Self::rebase_run`]).
+    ///
+    /// A session recovered only from strict continuations of its committed
+    /// transcript (WholeBlob) cannot take a plain round commit after a
+    /// rewrite: recovery would refuse the tail. A checkpointer that answers
+    /// `true` turns the run's first round commit after a rewrite into a
+    /// re-base. The default answers `false`: such a run then takes no round
+    /// commit after its first rewrite, and its last round commit before it
+    /// stays its resume point.
+    fn rebases_runs(&self) -> bool {
+        false
+    }
+
+    /// Write a run's round commit as a re-base, in one store call: the
+    /// session, without its run cursor, becomes the session's committed
+    /// base, and the run's provisional tail restarts on it as the same
+    /// document with the cursor.
+    ///
+    /// The agent asks for the first round commit after a rewrite of a
+    /// session recovered only from strict continuations, when
+    /// [`Self::rebases_runs`] answers `true`. `previous` is the run's latest
+    /// receipt, if any; the returned receipt names the new tail, with
+    /// candidate sequence 1 on the new base, and the run's next checkpoints
+    /// chain from it. Any error is a failed round commit: a round whose first
+    /// commit fails dispatches nothing.
+    async fn rebase_run(
+        &self,
+        session: &mut crate::Session,
+        _run_id: &RunId,
+        _previous: Option<&RunCheckpointReceipt>,
+    ) -> Result<RunCheckpointReceipt, AgentError> {
+        Err(AgentError::InternalError(format!(
+            "the session checkpointer of session {} does not re-base runs",
+            session.id()
+        )))
+    }
+
     /// Whether this writer may still act on the session now.
     ///
     /// A checkpointer over a host store answers from its fence handle's
