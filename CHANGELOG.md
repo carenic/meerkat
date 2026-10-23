@@ -1190,6 +1190,18 @@ them.
   committed round. An explicit continuity intent on the spawn wins over the
   profile.
 
+- `meerkat-runtime`: a WholeBlob run re-bases at a compaction.
+  `PreparedWholeBlobRunRebase::prepare` proves the compacted document's
+  descent from the committed base (the run's own appended rounds included)
+  and prepares the committed successor without the run cursor and the
+  provisional candidate with it; `RuntimeStore::commit_prepared_whole_blob_run_rebase`
+  commits the successor and restarts the run's provisional tail on it (same
+  run, candidate sequence one) in one transaction, comparing both the
+  committed authority and the current tail, and answers
+  `WholeBlobRunRebaseOutcome::Stale` without writing when another writer
+  moved either. The in-memory and SQLite stores implement it; the default
+  answers `Unsupported`.
+
 ### Changed
 
 - `meerkat-core`, `meerkat-session`, `meerkat-runtime`: a HeadCanonical run
