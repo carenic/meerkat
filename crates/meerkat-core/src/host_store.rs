@@ -53,13 +53,15 @@
 //!    them. Whatever the rule, a batch carrying a lower fence token never
 //!    beats one carrying a higher token at the same version.
 //! 5. **Fencing.** After a token is acquired, a batch carrying a lower token
-//!    that is committed later never becomes visible, and everything
-//!    acknowledged before the acquire stays visible: a load after the
-//!    acquire shows it. Valid ways: refuse the batch at commit
+//!    whose commit point comes later never becomes visible, and every batch
+//!    whose commit point comes before the acquire stays visible, whether or
+//!    not its writer saw the acknowledgement: a load after the acquire shows
+//!    it. Valid ways: refuse the batch at commit
 //!    ([`HostStoreError::FencedOut`]); at load, ignore every batch whose
 //!    token is below the highest token acquired before its commit point.
 //!    The commit point is the store's own server assigned commit order (for
-//!    example its marker's commit time), never a writer's clock.
+//!    example its marker's commit time), never a writer's clock; commit
+//!    points that tie are ordered by a fixed rule, such as the commit id.
 //! 6. **Logical removal.** Truncate, drop and delete take effect for loads
 //!    together with their batch. Physical cleanup may come later or never;
 //!    tombstones are fine.
@@ -81,24 +83,42 @@
 //! load, by the fixed rules above. Core treats both the same way: the
 //! fenced or conflicting batch is not part of the realm.
 //!
+//! # Fence leases
+//!
+//! The store records a lease for the holder of the highest token: it lasts
+//! [`FenceTiming::lease`] from the holder's last acquire or renew, as the
+//! store's own clock saw it. A holder counts as live while its recorded
+//! lease lasts. The host sizes the lease and the renew interval through
+//! [`HostStore::fence_timing`]; the defaults are [`FENCE_LEASE_SECS`] and
+//! [`FENCE_RENEW_INTERVAL_SECS`]. A shorter lease shortens the wait at a
+//! restart and at a takeover; a longer interval renews less often.
+//!
 //! # Writer rules (Core's side)
 //!
 //! - A writer acquires with [`AcquireMode::Exclusive`]; a live holder makes
-//!   that answer [`HostStoreError::Held`], so two processes never fence each
-//!   other back and forth. Only an explicit takeover uses
-//!   [`AcquireMode::Takeover`].
-//! - A holder renews at least every [`FENCE_RENEW_INTERVAL_SECS`] and stops
-//!   writing as soon as a renew fails. A holder counts as live for
-//!   [`FENCE_LEASE_SECS`] after its last acquire or renew.
-//! - After an acquire that supersedes a holder (a takeover, or a holder
-//!   whose lease ran out), the new writer waits one renew interval before it
-//!   dispatches anything, so the old writer has failed a renew and stopped.
-//!   There is no fence check on the per-round path.
+//!   that answer [`HostStoreError::Held`] with what remains of its lease, so
+//!   two processes never fence each other back and forth. Only an explicit
+//!   takeover uses [`AcquireMode::Takeover`].
+//! - A holder renews once per renew interval and stops writing as soon as a
+//!   renew fails.
+//! - A holder fences itself on its own clock: it makes no model call and
+//!   dispatches nothing unless its last successful acquire or renew started
+//!   less than [`FenceTiming::self_fence_window`] ago, the lease minus a
+//!   margin of one renew interval. This takes no store I/O per round, and
+//!   there is no fence check on the per round path.
+//! - After an acquire that supersedes a live holder, the new writer waits
+//!   out what remained of that holder's recorded lease
+//!   ([`FenceGrant::superseded_lease`]) before it makes a model call or
+//!   dispatches anything. By then the old holder has fenced itself: the
+//!   store started that lease no earlier than the holder started the
+//!   acquire or renew it came from, and the holder stops a renew interval
+//!   before the lease ends.
 //! - The bulk load of heads ([`HostStore::list_heads`]) runs after the
 //!   acquire and before the first commit, so it observes one cut.
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -116,12 +136,102 @@ pub const MAX_SCOPE_NAME_BYTES: usize = 512;
 /// The most bytes of a commit id.
 pub const MAX_COMMIT_ID_BYTES: usize = 128;
 
-/// How often a fence holder renews its token, in seconds.
+/// How often a fence holder renews its token by default, in seconds. A host
+/// sizes its own interval through [`HostStore::fence_timing`].
 pub const FENCE_RENEW_INTERVAL_SECS: u64 = 10;
 
-/// How long a fence holder counts as live after its last acquire or renew,
-/// in seconds.
+/// How long a fence holder counts as live after its last acquire or renew
+/// by default, in seconds. A host sizes its own lease through
+/// [`HostStore::fence_timing`].
 pub const FENCE_LEASE_SECS: u64 = 30;
+
+/// The fewest renew intervals a lease lasts, so that one late or failed
+/// renew does not make a live holder fence itself.
+pub const FENCE_MIN_LEASE_RENEWALS: u32 = 3;
+
+const _: () =
+    assert!(FENCE_LEASE_SECS >= FENCE_RENEW_INTERVAL_SECS * FENCE_MIN_LEASE_RENEWALS as u64);
+
+/// How a realm's fence is renewed and how long a holder stays live, as the
+/// host sizes them for its backend and its rollout (see the module
+/// documentation on fence leases). The defaults are
+/// [`FENCE_RENEW_INTERVAL_SECS`] and [`FENCE_LEASE_SECS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FenceTiming {
+    renew_interval: Duration,
+    lease: Duration,
+}
+
+impl FenceTiming {
+    /// The shortest renew interval a host may choose.
+    pub const MIN_RENEW_INTERVAL: Duration = Duration::from_secs(1);
+
+    /// The longest lease a host may choose. A takeover may wait this long.
+    pub const MAX_LEASE: Duration = Duration::from_secs(60 * 60);
+
+    /// A timing that renews every `renew_interval` and keeps a holder live
+    /// for `lease` after its last acquire or renew. The interval is at least
+    /// [`Self::MIN_RENEW_INTERVAL`], and the lease lasts at least
+    /// [`FENCE_MIN_LEASE_RENEWALS`] intervals and at most
+    /// [`Self::MAX_LEASE`].
+    pub fn try_new(renew_interval: Duration, lease: Duration) -> Result<Self, HostStoreError> {
+        if renew_interval < Self::MIN_RENEW_INTERVAL {
+            return Err(HostStoreError::Invalid(format!(
+                "a fence renew interval of {renew_interval:?} is shorter than {:?}",
+                Self::MIN_RENEW_INTERVAL
+            )));
+        }
+        let shortest_lease = renew_interval.saturating_mul(FENCE_MIN_LEASE_RENEWALS);
+        if lease < shortest_lease || lease > Self::MAX_LEASE {
+            return Err(HostStoreError::Invalid(format!(
+                "a fence lease of {lease:?} lies outside {shortest_lease:?} to {:?}",
+                Self::MAX_LEASE
+            )));
+        }
+        Ok(Self {
+            renew_interval,
+            lease,
+        })
+    }
+
+    /// How often a holder renews.
+    pub const fn renew_interval(self) -> Duration {
+        self.renew_interval
+    }
+
+    /// How long a holder counts as live after its last acquire or renew.
+    pub const fn lease(self) -> Duration {
+        self.lease
+    }
+
+    /// How long after the start of its last successful acquire or renew a
+    /// holder may still make a model call or dispatch, on its own clock: the
+    /// lease minus a margin of one renew interval.
+    pub const fn self_fence_window(self) -> Duration {
+        self.lease.saturating_sub(self.renew_interval)
+    }
+}
+
+impl Default for FenceTiming {
+    fn default() -> Self {
+        Self {
+            renew_interval: Duration::from_secs(FENCE_RENEW_INTERVAL_SECS),
+            lease: Duration::from_secs(FENCE_LEASE_SECS),
+        }
+    }
+}
+
+/// What an acquire answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FenceGrant {
+    /// The new token, higher than any acquired before it in the realm.
+    pub token: FenceToken,
+    /// What remained, at the acquire, of the lease of the holder this
+    /// acquire superseded, as the store recorded that lease; zero when no
+    /// holder was live. The new holder waits this long before it makes a
+    /// model call or dispatches anything.
+    pub superseded_lease: Duration,
+}
 
 /// How [`HostStore::acquire_fence`] treats a live holder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -618,10 +728,13 @@ pub enum HostStoreError {
     /// applied.
     #[error("unavailable: {0}")]
     Unavailable(String),
-    /// An exclusive acquire found a live holder: `holder` renewed within
-    /// [`FENCE_LEASE_SECS`]. Nothing was acquired.
-    #[error("the fence is held by token {holder}")]
-    Held { holder: FenceToken },
+    /// An exclusive acquire found a live holder: `holder`, whose recorded
+    /// lease lasts `remaining` longer. Nothing was acquired.
+    #[error("the fence is held by token {holder} for {remaining:?} more")]
+    Held {
+        holder: FenceToken,
+        remaining: Duration,
+    },
 }
 
 /// The storage interface a host implements for one realm. Core is the only
@@ -630,16 +743,27 @@ pub enum HostStoreError {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait HostStore: Send + Sync {
     /// Acquire the realm's fence: answer a token higher than any acquired
-    /// before, durably, so that batches carrying lower tokens committed from
-    /// now on never become visible, and loads from now on show every batch
-    /// acknowledged before (obligation 5). With [`AcquireMode::Exclusive`],
-    /// a live holder makes it answer [`HostStoreError::Held`].
-    async fn acquire_fence(&self, mode: AcquireMode) -> Result<FenceToken, HostStoreError>;
+    /// before, durably, so that batches carrying lower tokens whose commit
+    /// point comes later never become visible, and loads from now on show
+    /// every batch committed before (obligation 5). The store records the
+    /// new holder's lease ([`HostStore::fence_timing`]). With
+    /// [`AcquireMode::Exclusive`], a live holder makes it answer
+    /// [`HostStoreError::Held`]; with [`AcquireMode::Takeover`], the grant
+    /// carries what remained of that holder's recorded lease.
+    async fn acquire_fence(&self, mode: AcquireMode) -> Result<FenceGrant, HostStoreError>;
 
-    /// Confirm that no token higher than `token` exists, and extend a lease
-    /// if the store uses one. [`HostStoreError::FencedOut`] stops the
-    /// caller's writes.
+    /// Confirm that no token higher than `token` exists, and record a new
+    /// lease for its holder from now ([`HostStore::fence_timing`]).
+    /// [`HostStoreError::FencedOut`] stops the caller's writes.
     async fn renew_fence(&self, token: FenceToken) -> Result<(), HostStoreError>;
+
+    /// The renew interval and the lease the host chose for this store. The
+    /// store records leases of this length; Core renews at this interval and
+    /// fences itself on [`FenceTiming::self_fence_window`]. The default is
+    /// [`FenceTiming::default`].
+    fn fence_timing(&self) -> FenceTiming {
+        FenceTiming::default()
+    }
 
     /// The scope's visible head and version, or `None` when the scope does
     /// not exist (never created, or deleted).
