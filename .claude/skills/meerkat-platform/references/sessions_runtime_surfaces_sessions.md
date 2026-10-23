@@ -4,8 +4,9 @@ summaries, archive; per-turn `turn/start` fields and refused build settings;
 turn queueing and the 3-attempt retry cap; interrupt versus `turn/stop_run`;
 forks, transcript edits and retention; system prompts; events (0.9.4
 content-filtered `run_failed` reason, compaction summary source), cursor
-replay, ATIF export; durable resume holds, repair-wholeblob, tool-process
-recovery.
+replay, ATIF export; durable runs (0.9.5 per-round commits, same-run resume,
+tool reruns and the dedupe key), durable resume holds, repair-wholeblob,
+tool-process recovery.
 
 # Sessions on Every Surface (Meerkat 0.9)
 
@@ -281,7 +282,9 @@ settings before the turn, so REST can change build settings that RPC refuses.
   silent loss; refresh from history. Event sequence numbers continue across
   actor incarnations of the same session (0.8.49).
 - `run_started`, `run_completed` and `run_failed` carry an `identity` with the
-  run id (0.8.44). `turn_completed` is published for every committed provider
+  run id (0.8.44). Since 0.9.5 `run_resumed {run_id, round, resume_point}`
+  marks a run that continued after a restart (see the durable runs section).
+  `turn_completed` is published for every committed provider
   call, including tool-loop calls (0.8.43). Assistant events and history rows
   carry an optional `assistant_message_id`; history rows from live speech also
   carry `realtime_origin` (0.8.45). Runtime-appended `system_notice` rows
@@ -311,6 +314,74 @@ settings before the turn, so REST can change build settings that RPC refuses.
   `INVALID_PARAMS`, and a host without event replay refuses with "event
   replay is not enabled for this runtime host". Rust embedders need the
   facade's `atif` feature (off by default) for `meerkat::atif`.
+
+## Durable runs: per-round commits and resume (0.9.5)
+
+Contract and limits: `docs/guides/durable-runs.mdx`.
+
+- Every session with a checkpointer (persistent `sqlite`, `jsonl` and
+  host-store realms) commits twice per tool round, round 0 included; there is
+  no switch, and ephemeral sessions never do. The first commit, after the
+  model response and before any tool runs, stages the assistant message in
+  the session's run cursor, not the transcript. The second, after the tools,
+  writes the message and its results to the transcript together and moves the
+  cursor to the next model call, so a committed transcript never ends in a
+  tool call without its result. The final round (no tool calls) ends with the
+  normal end-of-run save, which clears the cursor. Structured-output
+  extraction takes no round commits. A failed round commit ends the run; a
+  failed first commit dispatches nothing.
+- Cost: `sqlite` (HeadCanonical) writes the round's rows; `jsonl` and
+  host-store realms (WholeBlob) write the whole session document at each
+  commit, so the bytes grow with the square of the tool rounds. A compaction
+  keeps the commits going: on WholeBlob it re-bases the run (one store call
+  commits the compacted document as the committed base and restarts the run's
+  tail on it).
+- Resume: when the session is opened again (any surface, or a mob rebuilding
+  its `durable = true` workers) its open run continues under the same run id;
+  no new input is needed. There is no boot sweep: a session nobody opens
+  keeps its open run until its next open. A crash before the run's first
+  commit runs its input again as a new run. A run that fails and whose inputs
+  are requeued for another attempt discards its round commits and starts over,
+  as before 0.9.5; a WholeBlob run that has re-based instead consumes its
+  inputs on failure, since they are already committed.
+- Event `run_resumed {run_id, round, resume_point}`: `tools_pending` (the
+  saved response stands in for the model call and its calls are dispatched
+  again under the same call ids, with no new assistant, tool-call request or
+  turn-completed events for it) or `awaiting_model` (the next model call).
+- Carried over: turn and tool-call counts, the run's usage and its elapsed
+  time (the budget continues; downtime is not charged). Lost: the round in
+  progress; its model call is billed but its usage is not recorded.
+- A resumed run waits for its tool surface first (each MCP server up to its
+  connect timeout); a tool still missing answers with an error result.
+- Inputs: while a run waits to resume, no other run starts, but new inputs
+  still queue and run after it. Bound inputs are the start input plus every
+  steer or peer input applied at a committed round; an input applied only in
+  the lost round is redelivered. A stop before the resume abandons them as
+  cancelled and fails the run; retire, destroy, reset and unregister abandon
+  them; a graceful unregister that keeps queued work leaves the run to resume
+  at the next start.
+- Not resumed, closed as interrupted with content kept: a bound input already
+  settled, a retired runtime, or a run with no bound inputs (direct and
+  machine-service turns). Held (`SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY`),
+  never committed: a cursor that disagrees with the transcript, and a tail
+  left behind with requeued inputs.
+- Reruns are at least once and pass authorization, approval review and
+  pre-tool hooks again. Rust tools read
+  `ToolDispatchContext::tool_call_dedupe_key(call) -> Option<ToolCallDedupeKey>`
+  (`run_id`, `round`, `call_id`, `call_digest` = lowercase hex SHA-256 of the
+  tool name and canonical arguments; `ToolCallDedupeKey::new` derives it) and
+  deduplicate on all four fields. MCP tools and host callback tools are
+  dispatched again too, and a callback request is sent again. Core sends the
+  key on no wire: a host adds it to an MCP call's metadata in
+  `McpCallContextProvider::prepare(target, call, context)`, and a callback
+  host computes `meerkat_core::tool_call_digest(name, args)` and pairs it with
+  the `tool_use_id` (run id and round are not in a callback request).
+- Not rerun, answered with an `outcome_uncertain` tool error instead: a call
+  whose process custody shows the process may have run, a Core comms tool
+  that sends to another agent (every comms tool but `peers`), and a call that
+  would run detached under a runner that declares itself non-resumable.
+- Durable workers and the mob resume gate: `references/mobs.md`. Realms in a
+  host's own database: `references/sessions_runtime_surfaces_storage_config.md`.
 
 ## Durable recovery holds and repair
 
@@ -344,7 +415,10 @@ job, monitor or command hook), process custody (Linux and macOS) stops that
 earlier incarnation's processes before the agent is rebuilt. The run's inputs are
 settled as interrupted and not replayed, and the transcript gets a
 `tool_process_recovery` notice with a `tool_process_interrupted` block (the
-tool's effects may be partial or complete). Custody knows whether the tool
+tool's effects may be partial or complete). Since 0.9.5 a run that can resume
+from a committed round (above) resumes instead: the call whose process may
+have run gets an `outcome_uncertain` result rather than running again, and the
+notice is still added. Custody knows whether the tool
 process started: a spawn gate holds the command until the host has durably
 recorded it, and if the host dies first nothing runs. When custody cannot be
 proven,
