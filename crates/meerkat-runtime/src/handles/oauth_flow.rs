@@ -2046,7 +2046,7 @@ impl OAuthFlowAuthority for RuntimeOAuthFlowHandle {
     }
 
     /// Exact: the outcome is probed from the attempt's own state (see
-    /// [`RuntimeOAuthFlowHandle::start_browser_attempt`]).
+    /// `RuntimeOAuthFlowHandle::start_browser_attempt`).
     fn start_with_admission(
         &self,
         target: AuthCredentialIdentity,
