@@ -2381,14 +2381,110 @@ impl InitialTurnHandle {
     }
 }
 
-/// Own an autonomous kickoff's completion wait: once `completion` resolves,
+/// What answers an autonomous kickoff's waiter.
+#[cfg(feature = "runtime-adapter")]
+enum KickoffCompletion {
+    /// The kickoff input's live completion.
+    Live(meerkat_runtime::completion::CompletionHandle),
+    /// The kickoff input was terminal already when it was admitted again
+    /// under its key, so no completion will come: its receipt answers.
+    Terminal {
+        adapter: Arc<meerkat_runtime::MeerkatMachine>,
+        session_id: SessionId,
+        input_id: meerkat_core::lifecycle::InputId,
+    },
+}
+
+#[cfg(feature = "runtime-adapter")]
+impl KickoffCompletion {
+    /// What the waiter of an admission of a kickoff input waits on: the
+    /// handle the admission answered, or, for a deduplicated admission of an
+    /// input already terminal, that input's receipt. `None` only for an
+    /// admission that answered neither.
+    fn of_admission(
+        adapter: &Arc<meerkat_runtime::MeerkatMachine>,
+        session_id: &SessionId,
+        outcome: &meerkat_runtime::AcceptOutcome,
+        handle: Option<meerkat_runtime::completion::CompletionHandle>,
+    ) -> Option<Self> {
+        match (handle, outcome) {
+            (Some(handle), _) => Some(Self::Live(handle)),
+            (None, meerkat_runtime::AcceptOutcome::Deduplicated { existing_id, .. }) => {
+                Some(Self::Terminal {
+                    adapter: Arc::clone(adapter),
+                    session_id: session_id.clone(),
+                    input_id: existing_id.clone(),
+                })
+            }
+            (None, _) => None,
+        }
+    }
+
+    async fn wait(
+        self,
+    ) -> Result<
+        meerkat_runtime::completion::CompletionOutcome,
+        meerkat_runtime::completion::CompletionWaitError,
+    > {
+        match self {
+            Self::Live(handle) => handle.wait().await,
+            Self::Terminal {
+                adapter,
+                session_id,
+                input_id,
+            } => terminal_kickoff_outcome(&adapter, &session_id, &input_id).await,
+        }
+    }
+}
+
+/// The outcome of a kickoff whose input is terminal already, read from the
+/// input's terminal receipt: its finalized outcome, or a typed failure
+/// naming why there is none. A kickoff never waits on an input that can
+/// answer no completion.
+#[cfg(feature = "runtime-adapter")]
+async fn terminal_kickoff_outcome(
+    adapter: &meerkat_runtime::MeerkatMachine,
+    session_id: &SessionId,
+    input_id: &meerkat_core::lifecycle::InputId,
+) -> Result<
+    meerkat_runtime::completion::CompletionOutcome,
+    meerkat_runtime::completion::CompletionWaitError,
+> {
+    use meerkat_runtime::completion::CompletionWaitError;
+    use meerkat_runtime::terminal_status::InputTerminalReceiptRead;
+
+    let refused = |detail: String| {
+        Err(CompletionWaitError::AuthorityUnavailable(format!(
+            "the kickoff input {input_id} {detail}"
+        )))
+    };
+    match adapter
+        .input_terminal_receipt(
+            session_id,
+            meerkat_runtime::InteractionSelector::InputId(input_id.clone()),
+        )
+        .await
+    {
+        Ok(Some(read)) => match read.report {
+            InputTerminalReceiptRead::Finalized(receipt) => Ok((*receipt).into_outcome()),
+            InputTerminalReceiptRead::TerminalWithoutReceipt { terminal, .. } => {
+                refused(format!("ended without a run: {terminal:?}"))
+            }
+            _ => refused("answered no completion and has no terminal".to_string()),
+        },
+        Ok(None) => refused("has no terminal read".to_string()),
+        Err(error) => refused(format!("could not be read: {error}")),
+    }
+}
+
+/// Own an autonomous kickoff's completion wait: once `completion` answers,
 /// re-enter the actor with `KickoffOutcomeResolved` and wait for its
-/// acknowledgement. Without a completion handle the task ends at once.
+/// acknowledgement. Without a completion the task ends at once.
 #[cfg(feature = "runtime-adapter")]
 fn spawn_kickoff_outcome_waiter(
     command_tx: mpsc::Sender<RoutedMobCommand>,
     agent_identity: AgentIdentity,
-    completion: Option<meerkat_runtime::completion::CompletionHandle>,
+    completion: Option<KickoffCompletion>,
 ) -> InitialTurnHandle {
     let handle = tokio::spawn(async move {
         if let Some(completion) = completion {
@@ -21358,16 +21454,15 @@ impl MobActor {
     }
 
     /// Re-attach the kickoff waiter of a local autonomous member whose
-    /// kickoff a requeue Shutdown kept in flight, so the kickoff resolves
-    /// under its objective once the resumed run ends. The kept kickoff input
-    /// is found by its incarnation key and never admitted anew; one already
-    /// terminal resolves the kickoff from its receipt. A member with no such
-    /// input (its kickoff never reached the runtime, or an earlier version
-    /// admitted it without a key) keeps its kickoff as it is.
+    /// kickoff a Shutdown kept in flight, so the kickoff resolves under its
+    /// objective once the resumed run ends. The kept kickoff input is found
+    /// by its incarnation key and never admitted anew; one already terminal
+    /// answers from its receipt. A member with no such input (its kickoff
+    /// never reached the runtime, or an earlier version admitted it without a
+    /// key) keeps its kickoff as it is.
     #[cfg(feature = "runtime-adapter")]
     async fn rearm_kept_kickoff(&mut self, entry: &RosterEntry) {
         use meerkat_runtime::SessionServiceRuntimeExt as _;
-        use meerkat_runtime::terminal_status::InputTerminalReceiptRead;
 
         let (Some(adapter), Some(session_id)) = (
             self.runtime_adapter.clone(),
@@ -21385,42 +21480,15 @@ impl MobActor {
             return;
         }
         let agent_identity = entry.agent_identity.clone();
-        let existing_id = match adapter
+        let completion = match adapter
             .accept_existing_input_with_completion(
                 &session_id,
                 kept_kickoff_reattach_input(&entry.agent_runtime_id),
             )
             .await
         {
-            Ok((
-                meerkat_runtime::AcceptOutcome::Deduplicated { existing_id, .. },
-                Some(completion),
-            )) => {
-                let waiter = spawn_kickoff_outcome_waiter(
-                    self.command_tx.clone(),
-                    agent_identity.clone(),
-                    Some(completion),
-                );
-                self.autonomous_initial_turns
-                    .lock()
-                    .await
-                    .insert(agent_identity.clone(), waiter);
-                tracing::info!(
-                    agent_identity = %agent_identity,
-                    input_id = %existing_id,
-                    "re-attached the kept kickoff's waiter"
-                );
-                return;
-            }
-            Ok((meerkat_runtime::AcceptOutcome::Deduplicated { existing_id, .. }, None)) => {
-                existing_id
-            }
-            Ok(_) => {
-                tracing::warn!(
-                    agent_identity = %agent_identity,
-                    "the kept kickoff's re-attach found no earlier input"
-                );
-                return;
+            Ok((outcome, handle)) => {
+                KickoffCompletion::of_admission(&adapter, &session_id, &outcome, handle)
             }
             Err(error) => {
                 tracing::debug!(
@@ -21431,62 +21499,26 @@ impl MobActor {
                 return;
             }
         };
-        // The kept kickoff input is terminal already: its receipt resolves
-        // the kickoff.
-        let resolved = match adapter
-            .input_terminal_receipt(
-                &session_id,
-                meerkat_runtime::InteractionSelector::InputId(existing_id.clone()),
-            )
-            .await
-        {
-            Ok(Some(read)) => match read.report {
-                InputTerminalReceiptRead::Finalized(receipt) => {
-                    let receipt = *receipt;
-                    self.resolve_kickoff_outcome(&agent_identity, Ok(receipt.into_outcome()))
-                        .await
-                }
-                InputTerminalReceiptRead::TerminalWithoutReceipt { terminal, .. } => self
-                    .apply_kickoff_input(
-                        &agent_identity,
-                        mob_dsl::MobMachineInput::KickoffResolveFailed {
-                            member_id: mob_dsl::AgentIdentity::from_domain(&agent_identity),
-                            error: format!(
-                                "the kept kickoff input {existing_id} ended without a run: {terminal:?}"
-                            ),
-                        },
-                        "rearm_kept_kickoff_terminal_without_receipt",
-                    )
-                    .await
-                    .map(|_| ()),
-                _ => {
-                    tracing::warn!(
-                        agent_identity = %agent_identity,
-                        input_id = %existing_id,
-                        "the kept kickoff input has neither a waiter nor a terminal"
-                    );
-                    Ok(())
-                }
-            },
-            Ok(None) => {
-                tracing::warn!(
-                    agent_identity = %agent_identity,
-                    input_id = %existing_id,
-                    "the kept kickoff input has no terminal read"
-                );
-                Ok(())
-            }
-            Err(error) => Err(MobError::Internal(format!(
-                "reading the kept kickoff input {existing_id} of '{agent_identity}' failed: {error}"
-            ))),
-        };
-        if let Err(error) = resolved {
+        let Some(completion) = completion else {
             tracing::warn!(
                 agent_identity = %agent_identity,
-                error = %error,
-                "failed resolving the kept kickoff from its receipt"
+                "the kept kickoff's re-attach found no earlier input"
             );
-        }
+            return;
+        };
+        let waiter = spawn_kickoff_outcome_waiter(
+            self.command_tx.clone(),
+            agent_identity.clone(),
+            Some(completion),
+        );
+        self.autonomous_initial_turns
+            .lock()
+            .await
+            .insert(agent_identity.clone(), waiter);
+        tracing::info!(
+            agent_identity = %agent_identity,
+            "re-attached the kept kickoff's waiter"
+        );
     }
 
     // ------------------------------------------------------------------

@@ -22550,9 +22550,9 @@ macro_rules! mob_catalog_machine_dsl {
                 || self.runtime_retire_pending_sessions.contains_key(agent_runtime_id) == true
                 || placed_release_confirmed == false
             }
-            guard "kept_for_resume" {
-                keeps_durable_run == true
-                && self.member_state_markers.get_cloned(agent_runtime_id) != Some(MobMemberState::Retiring)
+            guard "kept_for_resume" { keeps_durable_run == true }
+            guard "member_not_retiring" {
+                self.member_state_markers.get_cloned(agent_runtime_id) != Some(MobMemberState::Retiring)
             }
             update {}
             to Running

@@ -436,7 +436,7 @@ impl SpawnActivationWorkerContext {
                 "autonomous member '{agent_identity}' requires admission-capable substrate (runtime adapter)"
             ))
         })?;
-        let (_outcome, completion_handle) = adapter
+        let (outcome, completion_handle) = adapter
             .accept_input_with_completion(&bridge_session_id, input)
             .await
             .map_err(|e| {
@@ -444,10 +444,19 @@ impl SpawnActivationWorkerContext {
                     "autonomous prompt admission failed for '{agent_identity}': {e}"
                 ))
             })?;
+        // An admission deduplicated under the incarnation's kickoff key
+        // against an input that is already terminal answers no completion;
+        // that input's receipt answers the kickoff instead.
+        let completion = super::KickoffCompletion::of_admission(
+            &adapter,
+            &bridge_session_id,
+            &outcome,
+            completion_handle,
+        );
         let waiter = super::spawn_kickoff_outcome_waiter(
             self.command_tx.clone(),
             agent_identity.clone(),
-            completion_handle,
+            completion,
         );
         self.autonomous_initial_turns
             .lock()

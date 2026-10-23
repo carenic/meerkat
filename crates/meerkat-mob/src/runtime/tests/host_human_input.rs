@@ -5142,3 +5142,92 @@ async fn a_draining_deploy_keeps_a_durable_autonomous_members_kickoff_for_the_ne
         .expect("mob shutdown finishes")
         .expect("mob shutdown");
 }
+
+/// A kickoff the durable record still calls starting while its input has
+/// already ended (the run finished just as the process stopped, before its
+/// kickoff record): the restarted mob finds the input by its incarnation key
+/// and, with no completion left to wait on, resolves the kickoff from the
+/// input's receipt instead of waiting. No second kickoff is admitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kept_kickoff_whose_input_already_ended_resolves_from_its_receipt() {
+    let (_root, root_path) = stop_root();
+    let client = ScriptedClient::new(true);
+    let host = open_stop_host(&root_path, &client, Some("kickoff-ended")).await;
+    let mob_id = host.handle.mob_id().clone();
+    let identity = AgentIdentity::from(format!("host-human-stop-{}", Uuid::new_v4().simple()));
+    host.handle
+        .spawn(
+            ProfileName::from("lead"),
+            identity.clone(),
+            Some(KEPT_KICKOFF.into()),
+        )
+        .await
+        .expect("spawn autonomous member");
+    tokio::time::timeout(WAIT, host.handle.wait_for_kickoff_complete(Some(WAIT)))
+        .await
+        .expect("the kickoff resolves")
+        .expect("kickoff wait");
+    let before = host
+        .handle
+        .get_member(&identity)
+        .await
+        .expect("roster read")
+        .expect("the member is in the roster")
+        .kickoff
+        .expect("the member has a kickoff");
+    assert_eq!(before.phase, crate::roster::MobMemberKickoffPhase::Started);
+    tokio::time::timeout(WAIT, host.handle.shutdown_with_report(stop_options()))
+        .await
+        .expect("the graceful stop finishes")
+        .expect("graceful stop");
+    drop(host);
+    await_supervisor_route_release(&mob_id).await;
+
+    // The durable record calls the kickoff starting again, as a stop that
+    // landed between the run's end and its kickoff record leaves it.
+    let storage = MobStorage::persistent(root_path.join("mob.db")).expect("reopen the mob store");
+    storage
+        .events
+        .append(crate::event::NewMobEvent::for_test(
+            mob_id.clone(),
+            crate::event::MobEventKind::MemberKickoffUpdated {
+                member: identity.clone(),
+                kickoff: crate::roster::MobMemberKickoffSnapshot {
+                    phase: crate::roster::MobMemberKickoffPhase::Starting,
+                    error: None,
+                    ..before.clone()
+                },
+            },
+        ))
+        .await
+        .expect("record the kickoff starting");
+    drop(storage);
+
+    let restarted_client = ScriptedClient::new(true);
+    let restarted = open_stop_host(&root_path, &restarted_client, None).await;
+    tokio::time::timeout(WAIT, restarted.handle.wait_for_kickoff_complete(Some(WAIT)))
+        .await
+        .expect("the kickoff resolves instead of waiting")
+        .expect("kickoff wait");
+    let after = restarted
+        .handle
+        .get_member(&identity)
+        .await
+        .expect("roster read")
+        .expect("the member survives the restart")
+        .kickoff
+        .expect("the member keeps its kickoff");
+    assert_eq!(
+        (
+            after.phase,
+            after.objective_id == before.objective_id,
+            requests_carrying(&restarted_client.requests(), KEPT_KICKOFF),
+        ),
+        (crate::roster::MobMemberKickoffPhase::Started, true, 0),
+        "the ended kickoff input's receipt resolves the kickoff, and nothing is admitted again"
+    );
+    tokio::time::timeout(WAIT, restarted.handle.shutdown())
+        .await
+        .expect("mob shutdown finishes")
+        .expect("mob shutdown");
+}

@@ -37,6 +37,20 @@ them.
 
 ### Breaking
 
+- `meerkat-machine-schema`, `meerkat-mob`, `meerkat-machine-kernels`:
+  MobMachine's `ResolveAutonomousShutdownMemberAction` input (the schema's
+  and meerkat-mob's `MobMachineInput` variant and the kernel's input struct)
+  gains the field `keeps_durable_run: bool`, appended last, so code that
+  builds it literally must set it (`false` keeps the earlier behavior).
+  `AutonomousShutdownMemberActionKind` (meerkat-machine-schema and the
+  kernel) gains `KeepForResume`, appended last; an exhaustive match needs the
+  new arm. The kernel `generated::mob::TransitionId` gains
+  `ResolveAutonomousShutdownMemberActionKeepForResumeRunning`,
+  `ResolveAutonomousShutdownMemberActionKeepForResumeStopped` and
+  `ResolveAutonomousShutdownMemberActionKeepForResumeCompleted`, appended
+  last, so no existing implicit discriminant changes (see Changed, the
+  default graceful Shutdown of a durable member).
+
 - `meerkat-core::ProviderMeta` and `meerkat-contracts::WireProviderMeta` gain
   the `GeminiFunctionCall { provider_id, thought_signature }` variant,
   serialized with `provider: "gemini_function_call"` and required
