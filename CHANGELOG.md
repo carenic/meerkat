@@ -1693,6 +1693,22 @@ them.
   once. A bound run cut off by a restart is canceled with
   `ExecutionCustodyLost` like any other run; its binding stays on the record
   and nothing reuses it, so the next run is admitted afresh.
+- `MobBuilder::with_durable_resume_gate`: a host's check before a durable
+  worker's interrupted run resumes. The mob binds the `DurableResumeGate` on
+  the runtime registration of each durable worker it provisions itself (at
+  spawn, cold restore, explicit resume and warm revival), and the runtime
+  asks it before it resumes a run the worker left open, with the worker's
+  mob, identity and profile, its session, the run, the run's bound inputs
+  and, when the run carries one, its WorkGraph attention projection, or why
+  that projection could not be decoded (`DurableResumeRequest`). `Continue`
+  resumes the run.
+  `Superseded` settles it like a stop: its inputs are abandoned as refused
+  resumes and the run fails, never to resume. `Unavailable` is a host fault,
+  asked again up to 3 times in about 30 seconds before the run is settled
+  the same way. Other members are never asked, and without a gate every run
+  resumes. The gate is an in-process callback of the mob's own host: a
+  durable worker placed on and materialized by another host resumes its runs
+  there without asking it.
 
 ### Changed
 

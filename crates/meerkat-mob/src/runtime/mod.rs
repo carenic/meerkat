@@ -217,6 +217,10 @@ mod delegation;
 mod delivery_scope;
 mod delivery_wait;
 mod disposal;
+#[cfg(feature = "runtime-adapter")]
+mod durable_resume;
+#[cfg(feature = "runtime-adapter")]
+pub use durable_resume::{DurableResumeGate, DurableResumeRequest, DurableResumeVerdict};
 mod edge_locks;
 mod event_pump;
 mod event_router;

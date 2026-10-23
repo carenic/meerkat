@@ -428,6 +428,12 @@ pub struct ProvisionMemberRequest {
     /// step stopped there awaits the cleanup of what it holds and fails
     /// typed. It coordinates cancellation only and never supplies authority.
     pub(crate) held_bound: Option<super::held_spawn::HeldProvisionBound>,
+    /// The continuity intent of the incarnation this provision builds, as
+    /// its `MemberSpawned` records it. A durable identity is a durable
+    /// worker: when the mob has a `DurableResumeGate`, the backend binds it
+    /// on the worker's exact registration before the worker's actor is
+    /// created.
+    pub(crate) continuity_intent: super::handle::SpawnContinuityIntent,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2389,6 +2395,10 @@ pub struct SessionBackend {
     // clones, so a later transaction on a registration that kept its gate
     // receives that gate's decision.
     member_surface_gate_routes: super::registration_hook::MemberSurfaceGateRoutes,
+    // Optional host check before a durable worker's interrupted run resumes;
+    // the backend binds it on the exact registration of each durable worker
+    // it provisions (a host's placed-member materialization binds none).
+    durable_resume: Option<super::durable_resume::DurableResumeBinding>,
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -6286,6 +6296,7 @@ impl SessionBackend {
             settlement_ledger: None,
             member_runtime_registration_hook: None,
             member_surface_gate_routes: Default::default(),
+            durable_resume: None,
         }
     }
 
@@ -6301,6 +6312,26 @@ impl SessionBackend {
     ) -> Self {
         self.member_runtime_registration_hook = Some(hook);
         self
+    }
+
+    pub fn with_durable_resume_gate(mut self, gate: Arc<dyn super::DurableResumeGate>) -> Self {
+        self.durable_resume = Some(super::durable_resume::DurableResumeBinding::new(gate));
+        self
+    }
+
+    /// The resume gate bind `req` owes its member: one for a durable worker
+    /// when the mob has a gate and a runtime that can resume runs, none
+    /// otherwise.
+    fn durable_resume_bind(
+        &self,
+        req: &ProvisionMemberRequest,
+    ) -> Result<Option<super::durable_resume::PendingDurableResumeBind>, MobError> {
+        match (self.durable_resume.as_ref(), self.runtime_adapter.as_ref()) {
+            (Some(binding), Some(machine)) => {
+                binding.pending_bind(machine, &req.continuity_intent, &req.create_session)
+            }
+            _ => Ok(None),
+        }
     }
 
     fn registration_composition(&self) -> super::registration_hook::MemberRegistrationComposition {
@@ -8698,11 +8729,17 @@ impl PreparedServiceActorTransaction {
     /// and before the actor is created. A setup stopped there is aborted
     /// below like a failed create (awaited) and keeps its typed failure with
     /// that abort's cleanup outcome.
+    ///
+    /// A durable worker's `durable_resume` bind is made on the exact prepared
+    /// registration after the host hooks and before the actor is created, so
+    /// the mob's resume gate is in place before the runtime can resume a run
+    /// on it. A failed bind fails the create like a failed hook.
     pub(super) async fn create_owned_with_route(
         self,
         req: meerkat_core::service::CreateSessionRequest,
         route: super::session_service::SessionActorMaterializationRoute,
         registration_composition: super::registration_hook::MemberRegistrationComposition,
+        durable_resume: Option<super::durable_resume::PendingDurableResumeBind>,
         held_bound: Option<super::held_spawn::HeldProvisionBound>,
         restored: Option<RestoredMemberRefusalCleanup>,
     ) -> Result<(meerkat_core::RunResult, Self), MobError> {
@@ -8802,6 +8839,19 @@ impl PreparedServiceActorTransaction {
                                     .into(),
                             ));
                         }
+                    }
+                    if let Some(bind) = durable_resume {
+                        let registration = transaction
+                            .prepared()?
+                            .registration_witness()
+                            .await
+                            .ok_or_else(|| {
+                                MobError::Internal(
+                                    "durable worker resume gate install lost the exact prepared registration"
+                                        .into(),
+                                )
+                            })?;
+                        bind.bind_on(&registration).await?;
                     }
                     if let Some(stop) = held_stop() {
                         return Err(stop);
@@ -13740,6 +13790,11 @@ impl SessionBackend {
                 "member registration hook requires the canonical runtime adapter".into(),
             ));
         }
+        // A durable worker owes its resume gate bind on the registration its
+        // owned create prepares (see `create_owned_with_route`). It is
+        // resolved before anything is held, so a worker that cannot carry
+        // its gate is refused before anything is created.
+        let mut durable_resume = backend.durable_resume_bind(&req)?;
         let mut prepared_materialization: Option<PreparedSessionMaterialization> = None;
         let mut attached_actor_recovery: Option<(
             PreparedAttachedSessionActorRecovery,
@@ -14147,6 +14202,7 @@ impl SessionBackend {
                     req.create_session,
                     actor_materialization_route,
                     backend.registration_composition(),
+                    durable_resume.take(),
                     held_bound.clone(),
                     restored_refusal_cleanup.take(),
                 )
@@ -16330,6 +16386,11 @@ impl MultiBackendProvisioner {
         self
     }
 
+    pub fn with_durable_resume_gate(mut self, gate: Arc<dyn super::DurableResumeGate>) -> Self {
+        self.session = self.session.with_durable_resume_gate(gate);
+        self
+    }
+
     pub(super) fn with_composition_signal_dispatcher(
         mut self,
         dispatcher: Option<meerkat_runtime::meerkat_machine::MeerkatCompositionSignalDispatcher>,
@@ -17978,6 +18039,7 @@ impl MobProvisioner for MultiBackendProvisioner {
                         runtime_revival_intent: req.runtime_revival_intent,
                         direct_member_incarnation: None,
                         held_bound: req.held_bound,
+                        continuity_intent: req.continuity_intent,
                     })
                 })
                 .await

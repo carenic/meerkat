@@ -1052,6 +1052,7 @@ mod tests {
             runtime_revival_intent: RuntimeRevivalIntent::None,
             direct_member_incarnation: None,
             held_bound: None,
+            continuity_intent: crate::runtime::SpawnContinuityIntent::Ephemeral,
         };
 
         let failure = provisioner

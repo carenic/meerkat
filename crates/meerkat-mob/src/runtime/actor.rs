@@ -6399,6 +6399,8 @@ struct DeferredResumeProvision {
     ops_registry: Option<Arc<dyn meerkat_core::ops_lifecycle::OpsLifecycleRegistry>>,
     generated_self_owned_operation_owner: Option<SessionId>,
     direct_member_incarnation: Option<super::bridge_protocol::BridgeDirectMemberIncarnation>,
+    /// The incarnation's continuity intent, for the provision request.
+    continuity_intent: super::handle::SpawnContinuityIntent,
 }
 
 impl SpawnProvisionInput {
@@ -6499,6 +6501,7 @@ impl DeferredResumeProvision {
             ops_registry,
             generated_self_owned_operation_owner,
             direct_member_incarnation,
+            continuity_intent,
         } = *self;
 
         let authorized_resume = session_service
@@ -6558,6 +6561,7 @@ impl DeferredResumeProvision {
             runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
             direct_member_incarnation,
             held_bound: None,
+            continuity_intent,
         };
         let materialized_session_id = admit_bridge_session_for_spawn(&mut request.create_session);
         if materialized_session_id != resume_id {
@@ -33610,6 +33614,7 @@ impl MobActor {
                             ops_registry: ops_registry.clone(),
                             generated_self_owned_operation_owner: None,
                             direct_member_incarnation: None,
+                            continuity_intent: continuity_intent.clone(),
                         };
                         return Ok((
                             profile_name,
@@ -33708,6 +33713,7 @@ impl MobActor {
                             super::provisioner::RuntimeRevivalIntent::None,
                         direct_member_incarnation: None,
                         held_bound: None,
+                        continuity_intent: continuity_intent.clone(),
                     };
                     let resolved_labels = labels.unwrap_or_default();
                     return Ok((
@@ -33877,6 +33883,7 @@ impl MobActor {
                 runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
                 direct_member_incarnation: None,
                 held_bound: None,
+                continuity_intent: continuity_intent.clone(),
             };
             let resolved_labels = labels.unwrap_or_default();
             Ok((
@@ -37081,6 +37088,7 @@ impl MobActor {
             runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
             direct_member_incarnation: None,
             held_bound: None,
+            continuity_intent: continuity_intent.clone(),
         };
         let admitted_bridge_session_id =
             admit_bridge_session_for_spawn(&mut provision_request.create_session);

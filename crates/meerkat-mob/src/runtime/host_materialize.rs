@@ -2205,6 +2205,10 @@ impl HostMemberMaterializer {
                             self.surface_gate_routes.clone(),
                         )
                     }),
+                // A host materializes a placed member without the mob's
+                // durable resume gate: the mob binds it on its own
+                // provisions only.
+                None,
                 None,
                 None,
             )
@@ -2822,6 +2826,10 @@ impl HostMemberMaterializer {
                             self.surface_gate_routes.clone(),
                         )
                     }),
+                // A host materializes a placed member without the mob's
+                // durable resume gate: the mob binds it on its own
+                // provisions only.
+                None,
                 None,
                 None,
             )

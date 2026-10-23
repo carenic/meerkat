@@ -14874,6 +14874,7 @@ async fn archived_document_without_runtime_record_is_revivable() {
             generated_self_owned_operation_owner: Some(session_id.clone()),
             runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
             held_bound: None,
+            continuity_intent: crate::runtime::SpawnContinuityIntent::Ephemeral,
         })
         .await
         .expect("materialize imported archived document through the real resume transaction");
@@ -31975,6 +31976,254 @@ async fn a_durable_policy_auto_spawn_without_persistent_sessions_is_refused_type
     assert_eq!(service.active_session_count().await, 0);
 }
 
+/// Lets every durable worker's run resume.
+#[cfg(feature = "runtime-adapter")]
+struct ContinueResumeGate;
+
+#[cfg(feature = "runtime-adapter")]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl crate::DurableResumeGate for ContinueResumeGate {
+    async fn check(&self, _request: &crate::DurableResumeRequest) -> crate::DurableResumeVerdict {
+        crate::DurableResumeVerdict::Continue
+    }
+}
+
+/// Whether `identity`'s current registration on `machine` holds a resumed
+/// run admission.
+#[cfg(feature = "runtime-adapter")]
+async fn member_registration_holds_resume_admission(
+    handle: &MobHandle,
+    machine: &meerkat_runtime::MeerkatMachine,
+    identity: &AgentIdentity,
+) -> bool {
+    let session_id = handle
+        .resolve_bridge_session_id(identity)
+        .await
+        .expect("a session-backed member");
+    let registration = machine
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("the member's session is registered");
+    machine
+        .resumed_run_admission_bound(&registration)
+        .await
+        .expect("read the registration's admission")
+}
+
+/// The mob binds its durable resume gate on a durable worker's exact
+/// registration when the worker spawns, and on no other member's.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test]
+async fn a_durable_worker_spawns_with_the_resume_gate_bound_on_its_registration() {
+    let service = Arc::new(MockSessionService::new());
+    let machine = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(durable_worker_definition(), MobStorage::in_memory())
+        .with_session_service(service.clone())
+        .with_durable_resume_gate(Arc::new(ContinueResumeGate))
+        .create()
+        .await
+        .expect("create mob");
+    let worker = AgentIdentity::from("durable-worker-1");
+    let mut spec = SpawnMemberSpec::new(ProfileName::from("worker"), worker.clone());
+    spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    handle
+        .spawn_spec(spec)
+        .await
+        .expect("spawn the durable worker");
+    let ordinary = AgentIdentity::from("ordinary-lead-1");
+    handle
+        .spawn_spec(SpawnMemberSpec::new(
+            ProfileName::from("lead"),
+            ordinary.clone(),
+        ))
+        .await
+        .expect("spawn an ordinary member");
+
+    assert!(member_registration_holds_resume_admission(&handle, &machine, &worker).await);
+    assert!(!member_registration_holds_resume_admission(&handle, &machine, &ordinary).await);
+}
+
+/// A mob without a gate binds nothing, even on a durable worker.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test]
+async fn a_durable_worker_without_a_gate_has_no_resume_admission() {
+    let service = Arc::new(MockSessionService::new());
+    let machine = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(durable_worker_definition(), MobStorage::in_memory())
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let worker = AgentIdentity::from("durable-worker-1");
+    let mut spec = SpawnMemberSpec::new(ProfileName::from("worker"), worker.clone());
+    spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    handle
+        .spawn_spec(spec)
+        .await
+        .expect("spawn the durable worker");
+    assert!(!member_registration_holds_resume_admission(&handle, &machine, &worker).await);
+}
+
+/// A durable worker restored after a crash, by a mob resumed in the same
+/// process on the same runtime, is rebuilt with the gate bound on its
+/// registration: the restore binds it on a fresh registration, and keeps
+/// the one an adopted registration already holds instead of failing.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test]
+async fn a_restored_durable_worker_keeps_its_resume_gate() {
+    let service = Arc::new(MockSessionService::new());
+    let machine = service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let restart_storage = MobStorage::with_events_and_runtime_metadata(
+        storage.events.clone(),
+        storage.runtime_metadata.clone(),
+    );
+    let handle = MobBuilder::new(durable_worker_definition(), storage)
+        .with_session_service(service.clone())
+        .with_durable_resume_gate(Arc::new(ContinueResumeGate))
+        .create()
+        .await
+        .expect("create mob");
+    let worker = AgentIdentity::from("durable-worker-1");
+    let mut spec = SpawnMemberSpec::new(ProfileName::from("worker"), worker.clone());
+    spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    handle
+        .spawn_spec(spec)
+        .await
+        .expect("spawn the durable worker");
+    let session = handle
+        .resolve_bridge_session_id(&worker)
+        .await
+        .expect("the worker's session");
+    MobSessionService::discard_live_session(service.as_ref(), &session)
+        .await
+        .expect("discard the live session");
+    crash_stop_and_release_routes(handle).await;
+
+    let resumed = MobBuilder::for_resume(restart_storage)
+        .with_session_service(service.clone())
+        .with_durable_resume_gate(Arc::new(ContinueResumeGate))
+        .resume()
+        .await
+        .expect("resume the mob");
+    assert_eq!(
+        resumed.resolve_bridge_session_id(&worker).await,
+        Some(session),
+        "the worker is restored on its own session"
+    );
+    assert!(member_registration_holds_resume_admission(&resumed, &machine, &worker).await);
+}
+
+/// A stopped mob's durable worker that an explicit resume rebuilds, after a
+/// crash in the same process, is rebuilt with the gate bound on its
+/// registration: the explicit resume provisions it with the continuity
+/// intent its incarnation was spawned with, read from the journal.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test]
+async fn an_explicitly_resumed_durable_worker_keeps_its_resume_gate() {
+    let service = Arc::new(MockSessionService::new());
+    let machine = service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let restart_storage = MobStorage::with_events_and_runtime_metadata(
+        storage.events.clone(),
+        storage.runtime_metadata.clone(),
+    );
+    let handle = MobBuilder::new(durable_worker_definition(), storage)
+        .with_session_service(service.clone())
+        .with_durable_resume_gate(Arc::new(ContinueResumeGate))
+        .create()
+        .await
+        .expect("create mob");
+    let worker = AgentIdentity::from("durable-worker-1");
+    let mut spec = SpawnMemberSpec::new(ProfileName::from("worker"), worker.clone());
+    spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    handle
+        .spawn_spec(spec)
+        .await
+        .expect("spawn the durable worker");
+    let session = handle
+        .resolve_bridge_session_id(&worker)
+        .await
+        .expect("the worker's session");
+    handle.stop().await.expect("stop the mob");
+    MobSessionService::discard_live_session(service.as_ref(), &session)
+        .await
+        .expect("discard the live session");
+    crash_stop_and_release_routes(handle).await;
+
+    let resumed = MobBuilder::for_resume(restart_storage)
+        .with_session_service(service.clone())
+        .with_durable_resume_gate(Arc::new(ContinueResumeGate))
+        .resume()
+        .await
+        .expect("resume the stopped mob");
+    resumed
+        .resume()
+        .await
+        .expect("the explicit resume rebuilds the stopped worker");
+    assert_eq!(
+        resumed.resolve_bridge_session_id(&worker).await,
+        Some(session),
+        "the worker is rebuilt on its own session"
+    );
+    assert!(member_registration_holds_resume_admission(&resumed, &machine, &worker).await);
+}
+
+/// A durable worker whose idle executor the runtime retired (its live
+/// session and its registration gone) is revived on a fresh registration,
+/// with the gate bound on it: the warm revival provisions it with the
+/// continuity intent its incarnation was spawned with, read from the
+/// journal.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test]
+async fn a_warm_revived_durable_worker_keeps_its_resume_gate() {
+    let service = Arc::new(MockSessionService::new());
+    let machine = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(durable_worker_definition(), MobStorage::in_memory())
+        .with_session_service(service.clone())
+        .with_durable_resume_gate(Arc::new(ContinueResumeGate))
+        .create()
+        .await
+        .expect("create mob");
+    let worker = AgentIdentity::from("durable-worker-1");
+    let mut spec = SpawnMemberSpec::new(ProfileName::from("worker"), worker.clone());
+    spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    handle
+        .spawn_spec(spec)
+        .await
+        .expect("spawn the durable worker");
+    let session = handle
+        .resolve_bridge_session_id(&worker)
+        .await
+        .expect("the worker's session");
+    let builds_before = member_build_count(&service, &worker).await;
+
+    MobSessionService::discard_live_session(service.as_ref(), &session)
+        .await
+        .expect("discard the idle live session");
+    machine
+        .unregister_session(&session)
+        .await
+        .expect("the runtime unregisters the idle executor");
+    assert!(!machine.contains_session(&session).await);
+
+    handle
+        .ensure_member_live(&worker)
+        .await
+        .expect("the warm revival rebuilds the worker");
+    assert_eq!(
+        member_build_count(&service, &worker).await,
+        builds_before + 1,
+        "the worker is rebuilt once"
+    );
+    assert!(
+        machine.contains_session(&session).await,
+        "the worker is registered again on its own session"
+    );
+    assert!(member_registration_holds_resume_admission(&handle, &machine, &worker).await);
+}
+
 /// Appends its tag to the spec's labels, or fails when it has none.
 struct ChainStep(Option<&'static str>);
 
@@ -47727,6 +47976,7 @@ async fn provision_runtime_backed_disposal_fixture(
             generated_self_owned_operation_owner: Some(session_id),
             runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
             held_bound: None,
+            continuity_intent: crate::runtime::SpawnContinuityIntent::Ephemeral,
         })
         .await
         .unwrap_or_else(|error| {
@@ -51559,6 +51809,7 @@ async fn test_provision_member_uses_local_bindings_before_routed_runtime_bound()
             generated_self_owned_operation_owner: Some(bridge_session_id.clone()),
             runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
             held_bound: None,
+            continuity_intent: crate::runtime::SpawnContinuityIntent::Ephemeral,
         })
         .await
         .expect("member provision should install local runtime resources");
@@ -51647,6 +51898,7 @@ async fn retained_resume_request(
         generated_self_owned_operation_owner: Some(session_id.clone()),
         runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
         held_bound: None,
+        continuity_intent: crate::runtime::SpawnContinuityIntent::Ephemeral,
     }
 }
 
@@ -51968,6 +52220,7 @@ async fn test_multi_backend_session_provision_forwards_injected_authorized_resum
             generated_self_owned_operation_owner: Some(session_id.clone()),
             runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
             held_bound: None,
+            continuity_intent: crate::runtime::SpawnContinuityIntent::Ephemeral,
         })
         .await
         .expect_err("stale injected authority must fail after Prepared");
@@ -52039,6 +52292,7 @@ async fn test_multi_backend_session_provision_forwards_injected_authorized_resum
             generated_self_owned_operation_owner: Some(session_id.clone()),
             runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
             held_bound: None,
+            continuity_intent: crate::runtime::SpawnContinuityIntent::Ephemeral,
         })
         .await
         .expect("session arm should consume the injected resume authorization");
@@ -52327,6 +52581,7 @@ async fn test_fresh_provision_failure_preserves_resumable_document_and_quiesces_
             generated_self_owned_operation_owner: Some(SessionId::new()),
             runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
             held_bound: None,
+            continuity_intent: crate::runtime::SpawnContinuityIntent::Ephemeral,
         })
         .await
         .expect_err("post-create owner mismatch must fail before receipt publication");
@@ -52404,6 +52659,7 @@ async fn test_fresh_provision_failure_preserves_resumable_document_and_quiesces_
             generated_self_owned_operation_owner: Some(session_id.clone()),
             runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
             held_bound: None,
+            continuity_intent: crate::runtime::SpawnContinuityIntent::Ephemeral,
         })
         .await
         .expect("explicit resume should reconstruct the preserved session");
@@ -52482,6 +52738,7 @@ async fn test_retired_session_revival_failure_preserves_resumable_document() {
             generated_self_owned_operation_owner: Some(session_id.clone()),
             runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
             held_bound: None,
+            continuity_intent: crate::runtime::SpawnContinuityIntent::Ephemeral,
         })
         .await
         .expect("seed session provision");
@@ -52560,6 +52817,7 @@ async fn test_retired_session_revival_failure_preserves_resumable_document() {
             generated_self_owned_operation_owner: Some(mismatched_owner),
             runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
             held_bound: None,
+            continuity_intent: crate::runtime::SpawnContinuityIntent::Ephemeral,
         })
         .await
         .expect_err("post-attachment validation must fail");
@@ -52647,6 +52905,7 @@ async fn test_retired_session_revival_failure_preserves_resumable_document() {
             generated_self_owned_operation_owner: Some(session_id.clone()),
             runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
             held_bound: None,
+            continuity_intent: crate::runtime::SpawnContinuityIntent::Ephemeral,
         })
         .await
         .expect("explicit resume should reconstruct the preserved promoted session");

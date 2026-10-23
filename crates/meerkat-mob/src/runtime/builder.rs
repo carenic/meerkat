@@ -656,6 +656,8 @@ pub struct MobBuilder {
     runtime_adapter: RuntimeAdapterOption,
     #[cfg(feature = "runtime-adapter")]
     member_runtime_registration_hook: Option<Arc<dyn super::MemberRuntimeRegistrationHook>>,
+    #[cfg(feature = "runtime-adapter")]
+    durable_resume_gate: Option<Arc<dyn super::DurableResumeGate>>,
     workgraph_service: Option<meerkat::WorkGraphService>,
     allow_ephemeral_sessions: bool,
     notify_orchestrator_on_resume: bool,
@@ -1425,6 +1427,71 @@ async fn record_seeded_member_endpoint_broken(
         },
     );
     Ok(())
+}
+
+/// Each identity's latest incarnation in a journal: its generation and the
+/// continuity intent it was spawned with.
+pub(super) type RecordedContinuity =
+    HashMap<AgentIdentity, (crate::ids::Generation, super::handle::SpawnContinuityIntent)>;
+
+/// The continuity intent each identity's latest incarnation in `events` was
+/// spawned with, with that incarnation's generation: its own spawn, carried
+/// across a `MemberReset`, which keeps the incarnation under a new
+/// generation. The roster is projected from the same journal, so every entry
+/// of the current epoch finds its own incarnation's spawn here.
+pub(super) fn recorded_continuity_intents(events: &[crate::event::MobEvent]) -> RecordedContinuity {
+    let mut recorded: RecordedContinuity = HashMap::new();
+    for event in events {
+        match &event.kind {
+            MobEventKind::MemberSpawned(spawned) => {
+                recorded.insert(
+                    spawned.agent_identity.clone(),
+                    (spawned.generation, spawned.continuity_intent.clone()),
+                );
+            }
+            MobEventKind::MemberReset {
+                agent_identity,
+                previous_generation,
+                new_generation,
+                ..
+            } => {
+                if let Some((generation, _)) = recorded.get_mut(agent_identity)
+                    && *generation == *previous_generation
+                {
+                    *generation = *new_generation;
+                }
+            }
+            _ => {}
+        }
+    }
+    recorded
+}
+
+/// The continuity intent `entry`'s incarnation was spawned with (its own
+/// spawn, carried across `MemberReset`): what its restore, explicit resume or
+/// warm revival provisions it as. A rebuild refuses an entry whose own spawn
+/// is missing from `recorded` (the roster's projection from the same journal
+/// rules that out) instead of rebuilding a possibly durable worker without
+/// its resume gate; the refusal is traced as the broken invariant it is.
+pub(super) fn entry_continuity_intent(
+    recorded: &RecordedContinuity,
+    entry: &RosterEntry,
+) -> Result<super::handle::SpawnContinuityIntent, String> {
+    recorded
+        .get(&entry.agent_identity)
+        .filter(|(generation, _)| *generation == entry.generation)
+        .map(|(_, intent)| intent.clone())
+        .ok_or_else(|| {
+            tracing::error!(
+                agent_identity = %entry.agent_identity,
+                generation = %entry.generation,
+                "a restored member's own spawn is missing from its journal epoch"
+            );
+            format!(
+                "the journal holds no spawn of member '{}' at generation {}, so its continuity intent is unknown",
+                entry.agent_identity, entry.generation
+            )
+        })
 }
 
 fn recovered_session_bindings_without_endpoint(
@@ -7209,6 +7276,8 @@ impl MobBuilder {
             runtime_adapter: None,
             #[cfg(feature = "runtime-adapter")]
             member_runtime_registration_hook: None,
+            #[cfg(feature = "runtime-adapter")]
+            durable_resume_gate: None,
             workgraph_service: None,
             allow_ephemeral_sessions: false,
             notify_orchestrator_on_resume: true,
@@ -7294,6 +7363,8 @@ impl MobBuilder {
             runtime_adapter: None,
             #[cfg(feature = "runtime-adapter")]
             member_runtime_registration_hook: None,
+            #[cfg(feature = "runtime-adapter")]
+            durable_resume_gate: None,
             workgraph_service: None,
             allow_ephemeral_sessions: false,
             notify_orchestrator_on_resume: true,
@@ -7397,6 +7468,21 @@ impl MobBuilder {
         hook: Arc<dyn super::MemberRuntimeRegistrationHook>,
     ) -> Self {
         self.member_runtime_registration_hook = Some(hook);
+        self
+    }
+
+    /// Install the host's check before a durable worker's interrupted run
+    /// resumes (see [`super::DurableResumeGate`]). The mob binds it on the
+    /// exact runtime registration of each durable worker it provisions itself
+    /// (at spawn, cold restore, explicit resume and warm revival), before the
+    /// worker's actor exists; the runtime asks it before it resumes a run the
+    /// worker left open. A durable worker placed on and materialized by
+    /// another host resumes its runs there without asking the gate. Members
+    /// that are not durable workers are never checked, and without a gate
+    /// every run resumes.
+    #[cfg(feature = "runtime-adapter")]
+    pub fn with_durable_resume_gate(mut self, gate: Arc<dyn super::DurableResumeGate>) -> Self {
+        self.durable_resume_gate = Some(gate);
         self
     }
 
@@ -7639,6 +7725,8 @@ impl MobBuilder {
                 runtime_adapter,
                 #[cfg(feature = "runtime-adapter")]
                 member_runtime_registration_hook,
+                #[cfg(feature = "runtime-adapter")]
+                durable_resume_gate,
                 workgraph_service,
                 allow_ephemeral_sessions,
                 notify_orchestrator_on_resume,
@@ -7870,6 +7958,7 @@ impl MobBuilder {
                     session_service,
                     runtime_adapter,
                     member_runtime_registration_hook,
+                    durable_resume_gate,
                     workgraph_service,
                     tool_bundles,
                     default_llm_client,
@@ -7980,6 +8069,8 @@ impl MobBuilder {
             runtime_adapter,
             #[cfg(feature = "runtime-adapter")]
             member_runtime_registration_hook,
+            #[cfg(feature = "runtime-adapter")]
+            durable_resume_gate,
             workgraph_service,
             allow_ephemeral_sessions,
             notify_orchestrator_on_resume,
@@ -8306,8 +8397,12 @@ impl MobBuilder {
             )
             .with_binding_persistence(definition.id.clone(), storage.runtime_metadata.clone())
             .with_composition_signal_dispatcher(composition_signal_dispatcher);
-            let runtime_provisioner = Arc::new(match member_runtime_registration_hook.clone() {
+            let runtime_provisioner = match member_runtime_registration_hook.clone() {
                 Some(hook) => runtime_provisioner.with_member_runtime_registration_hook(hook),
+                None => runtime_provisioner,
+            };
+            let runtime_provisioner = Arc::new(match durable_resume_gate.clone() {
+                Some(gate) => runtime_provisioner.with_durable_resume_gate(gate),
                 None => runtime_provisioner,
             });
             drive_recovered_placed_carrier_cleanup(
@@ -9317,6 +9412,7 @@ impl MobBuilder {
             });
         let legacy_recovered_session_bindings =
             recovered_session_bindings_without_endpoint(epoch_events);
+        let recorded_continuity = recorded_continuity_intents(epoch_events);
         let mut new_recovered_session_bindings_without_endpoint = HashSet::new();
         let listed_sessions = session_service
             .list(meerkat_core::service::SessionQuery::default())
@@ -9975,6 +10071,14 @@ impl MobBuilder {
                     .await;
                     continue;
                 }
+                // A durable worker is restored with its resume gate.
+                let continuity_intent = match entry_continuity_intent(&recorded_continuity, entry) {
+                    Ok(intent) => intent,
+                    Err(reason) => {
+                        record_restore_failure(bridge_session_id.clone(), reason).await;
+                        continue;
+                    }
+                };
                 match provisioner
                     .provision_member(super::provisioner::ProvisionMemberRequest {
                         create_session: req,
@@ -9991,6 +10095,7 @@ impl MobBuilder {
                         runtime_revival_intent:
                             super::provisioner::RuntimeRevivalIntent::ColdRestore,
                         held_bound: None,
+                        continuity_intent,
                     })
                     .await
                 {
@@ -10152,6 +10257,13 @@ impl MobBuilder {
                 entry.role.as_str(),
                 entry.agent_identity.as_str(),
             )?;
+            let continuity_intent = match entry_continuity_intent(&recorded_continuity, entry) {
+                Ok(intent) => intent,
+                Err(reason) => {
+                    record_restore_failure(bridge_session_id.clone(), reason).await;
+                    continue;
+                }
+            };
             let mut provision_request = super::provisioner::ProvisionMemberRequest {
                 create_session: req,
                 authorized_resume: None,
@@ -10166,6 +10278,7 @@ impl MobBuilder {
                 // back typed, as on the durable arm above.
                 runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::ColdRestore,
                 held_bound: None,
+                continuity_intent,
             };
             let admitted_bridge_session_id =
                 super::actor::admit_bridge_session_for_spawn(&mut provision_request.create_session);
@@ -10551,6 +10664,7 @@ impl MobBuilder {
         session_service: Arc<dyn MobSessionService>,
         runtime_adapter: RuntimeAdapterOption,
         member_runtime_registration_hook: Option<Arc<dyn super::MemberRuntimeRegistrationHook>>,
+        durable_resume_gate: Option<Arc<dyn super::DurableResumeGate>>,
         workgraph_service: Option<meerkat::WorkGraphService>,
         tool_bundles: BTreeMap<String, Arc<dyn AgentToolDispatcher>>,
         default_llm_client: Option<Arc<dyn LlmClient>>,
@@ -10602,8 +10716,12 @@ impl MobBuilder {
             )
             .with_binding_persistence(definition.id.clone(), runtime_metadata.clone())
             .with_composition_signal_dispatcher(composition_signal_dispatcher);
-            let provisioner = Arc::new(match member_runtime_registration_hook {
+            let provisioner = match member_runtime_registration_hook {
                 Some(hook) => provisioner.with_member_runtime_registration_hook(hook),
+                None => provisioner,
+            };
+            let provisioner = Arc::new(match durable_resume_gate {
+                Some(gate) => provisioner.with_durable_resume_gate(gate),
                 None => provisioner,
             });
             let session_ops_adapter = provisioner.session_ops_adapter();
@@ -11521,6 +11639,111 @@ mod tests {
     };
     use chrono::Utc;
     use meerkat_core::time_compat::UNIX_EPOCH;
+
+    /// A restore provisions every roster entry with the continuity intent of
+    /// its own spawn, matched by generation: after a retire and a respawn,
+    /// the respawn's intent decides, and a reset carries the spawn's intent
+    /// to its new generation. An entry whose own spawn the journal does not
+    /// hold is refused, never restored as ephemeral.
+    #[cfg(feature = "runtime-adapter")]
+    #[test]
+    fn a_restored_member_takes_its_own_spawns_continuity_intent() {
+        let identity = AgentIdentity::from("worker-1");
+        let durable = crate::runtime::SpawnContinuityIntent::DurableIdentity {
+            continuity_key: "worker-1".to_string(),
+        };
+        let event = |cursor: u64, kind: MobEventKind| MobEvent {
+            cursor,
+            timestamp: Utc::now(),
+            mob_id: MobId::from("restore-mob"),
+            kind,
+        };
+        let spawned = |generation: Generation, intent: crate::runtime::SpawnContinuityIntent| {
+            let mut spawned = MemberSpawnedEvent::new(
+                identity.clone(),
+                generation,
+                crate::ids::FenceToken::new(1),
+                crate::ids::AgentRuntimeId::new(identity.clone(), generation),
+                ProfileName::from("worker"),
+            )
+            .with_bridge_member_ref(Some(
+                crate::event::MemberRef::from_bridge_session_id(
+                    meerkat_core::types::SessionId::new(),
+                ),
+            ));
+            spawned.continuity_intent = intent;
+            MobEventKind::MemberSpawned(spawned)
+        };
+        let events = vec![
+            event(
+                1,
+                spawned(
+                    Generation::new(0),
+                    crate::runtime::SpawnContinuityIntent::Ephemeral,
+                ),
+            ),
+            event(
+                2,
+                MobEventKind::MemberRetired {
+                    agent_identity: identity.clone(),
+                    generation: Generation::new(0),
+                    role: ProfileName::from("worker"),
+                },
+            ),
+            event(3, spawned(Generation::new(1), durable.clone())),
+        ];
+        let roster = Roster::project(&events);
+        let recorded = recorded_continuity_intents(&events);
+        let entries = roster.list().cloned().collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        for entry in &entries {
+            assert_eq!(entry.generation, Generation::new(1));
+            assert_eq!(
+                entry_continuity_intent(&recorded, entry),
+                Ok(durable.clone())
+            );
+        }
+
+        let mut unrecorded = entries[0].clone();
+        unrecorded.generation = Generation::new(2);
+        let refused = entry_continuity_intent(&recorded, &unrecorded)
+            .expect_err("an entry without its own spawn is refused");
+        assert!(
+            refused.contains("worker-1") && refused.contains("generation 2"),
+            "{refused}"
+        );
+
+        // A reset keeps the incarnation under a new generation, with no new
+        // spawn: the entry takes its spawn's intent across it.
+        let reset_events = vec![
+            event(1, spawned(Generation::new(0), durable.clone())),
+            event(
+                2,
+                MobEventKind::MemberReset {
+                    agent_identity: identity.clone(),
+                    previous_generation: Generation::new(0),
+                    new_generation: Generation::new(1),
+                    fence_token: crate::ids::FenceToken::new(2),
+                    agent_runtime_id: crate::ids::AgentRuntimeId::new(
+                        identity.clone(),
+                        Generation::new(1),
+                    ),
+                },
+            ),
+        ];
+        let roster = Roster::project(&reset_events);
+        let recorded = recorded_continuity_intents(&reset_events);
+        let entries = roster.list().cloned().collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].generation, Generation::new(1));
+        assert_eq!(
+            entry_continuity_intent(&recorded, &entries[0]),
+            Ok(durable.clone())
+        );
+        let mut unrecorded = entries[0].clone();
+        unrecorded.generation = Generation::new(2);
+        assert!(entry_continuity_intent(&recorded, &unrecorded).is_err());
+    }
 
     #[cfg(feature = "runtime-adapter")]
     mod cold_runtime_restoration {

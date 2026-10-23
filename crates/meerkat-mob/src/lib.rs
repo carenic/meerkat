@@ -355,6 +355,8 @@ pub use runtime::{
     MemberIdentityManagement, ScopeIncarnation, ScopedRecoveryUnresolved, ScopedWorkRecovery,
     ScopedWorkState, WorkAdmissionStage,
 };
+#[cfg(feature = "runtime-adapter")]
+pub use runtime::{DurableResumeGate, DurableResumeRequest, DurableResumeVerdict};
 pub use runtime::{FlowFrameKernel, FlowFrameMutator};
 pub use runtime::{
     FlowTurnExecutor, FlowTurnFailureDisposition, FlowTurnOutcome, FlowTurnTicket,
