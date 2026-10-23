@@ -592,7 +592,10 @@ them.
   (`dedupe_key: None` for a call outside an agent-loop round), and a pattern
   that lists every field adds it or `..`. On the wire the field is optional
   and omitted when absent, so readers that ignore unknown fields are
-  unaffected.
+  unaffected. A pending callback call persisted with a dedupe key cannot be
+  finalized after downgrading to a runtime that lacks the field: its stored
+  candidate digest no longer verifies there. A row without a key keeps its
+  bytes.
 
 ### Added
 
