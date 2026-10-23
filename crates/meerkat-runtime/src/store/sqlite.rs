@@ -29893,6 +29893,7 @@ ORDER BY runtime_id";
             assert_eq!(committed.store_revision(), base.store_revision() + 1);
             assert_eq!(tail.run_id(), &run_id);
             assert_eq!(tail.candidate_sequence(), 1);
+            assert_eq!(tail.base_blob_sha256(), committed.blob_sha256());
             assert_eq!(tail.candidate_blob_sha256(), committed.blob_sha256());
             let stored = store
                 .load_committed_whole_blob_snapshot(&runtime_id)
@@ -29913,6 +29914,14 @@ ORDER BY runtime_id";
                     .try_run_cursor()
                     .unwrap()
                     .is_none()
+            );
+            // An exact replay answers the same pair and writes nothing.
+            assert_eq!(
+                store
+                    .commit_prepared_whole_blob_run_rebase(&runtime_id, rebase.store_parts())
+                    .await
+                    .unwrap(),
+                crate::store::WholeBlobRunRebaseOutcome::Applied { committed, tail }
             );
         }
 
