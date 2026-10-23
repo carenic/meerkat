@@ -363,7 +363,8 @@ Contract and limits: `docs/guides/durable-runs.mdx`.
   the lost round is redelivered. A stop before the resume abandons them as
   cancelled and fails the run; retire, destroy, reset and unregister abandon
   them; a graceful unregister that keeps queued work leaves the run to resume
-  at the next start.
+  at the next start, unless a bound input is older than the stop's max age
+  by then.
 - Not resumed, closed as interrupted with content kept: a bound input already
   settled, a retired runtime, or a run with no bound inputs (direct and
   machine-service turns). Held (`SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY`),
@@ -393,10 +394,14 @@ Contract and limits: `docs/guides/durable-runs.mdx`.
   in flight like a crash: the turn stops at once (work since the last round
   commit is redone), its inputs stay bound with waiters answered
   `requeued_across_stop`, and the run continues at the next open, before
-  the kept queued prompts; inputs older than `max_age` (from admission) at
-  that start end `requeue_expired` instead. No Requeue, an explicit
-  stop/cancel, retire, destroy, reset, or a session without per-round
-  commits still ends the run.
+  the kept queued prompts; if a bound input is older than `max_age` (from
+  admission; unregister: no default, 1 ms to 24 h; mob: 15 min default) at
+  that start, the inputs end `requeue_expired` instead. No Requeue, an
+  explicit stop/cancel, retire, destroy, reset, or a session without
+  per-round commits still ends the run. `rkat-rpc` shuts down without
+  Requeue (input end, SIGTERM, interrupt) and REST cancels requests sent
+  with `X-Meerkat-Request-Id` on SIGTERM, so those runs end; embedding hosts
+  opt in.
 - Durable workers and the mob resume gate: `references/mobs.md`. Realms in a
   host's own database: `references/sessions_runtime_surfaces_storage_config.md`.
 

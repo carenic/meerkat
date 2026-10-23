@@ -96,8 +96,10 @@ Contract, obligations and conformance: `docs/reference/host-store-spi.mdx`.
   `renew interval + 2 x visibility lag`, and the window must stay at least
   two intervals. `FencedOut` stops every write until the realm is reopened;
   after any other failed renew, or a lease that ran out, the holder writes
-  and dispatches nothing until a fresh acquire (a later renew never restores
-  it).
+  and dispatches nothing until it re-acquires the fence, which it does by
+  itself before its next write (a later renew never restores it); if
+  another process took the fence or committed meanwhile, the realm stops
+  until it is reopened.
 - Opening lists every head once. A session body loads at open only when
   recovery must act on it (unsettled inputs, an open run cursor, a current
   run), otherwise on first use, and stays loaded until the session is

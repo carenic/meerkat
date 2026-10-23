@@ -231,10 +231,14 @@ The store relies on Core keeping these rules:
 
 - **Exclusive acquire.** Core acquires with `AcquireMode::Exclusive`, so two
   processes never fence each other back and forth. Only an explicit takeover
-  uses `AcquireMode::Takeover`.
+  uses `AcquireMode::Takeover`. Core also takes over its own recorded lease
+  when a stopped holder re-acquires and an exclusive acquire answers `Held`
+  with its own token.
 - **Renewing.** The holder renews once per renew interval. After a failed
   renew, or once its lease has run out, it stops every write and dispatch,
-  and goes on only through a fresh acquire, with a new token; it never
+  and goes on only through a fresh acquire, with a new token, which it makes
+  by itself before its next write; if another process took the fence or
+  committed meanwhile, the realm stops until it is opened again. It never
   resumes on a later renew.
 - **Self-fencing.** The holder fences itself on its own clock: it makes no
   model call, dispatches nothing and commits nothing unless its last
