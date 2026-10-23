@@ -4643,6 +4643,28 @@ impl ControllingMob {
                 .list(meerkat_core::service::SessionQuery::default())
                 .await
                 .expect("list process-local sessions before cold restart");
+            // This mode stands in for a process exit, which writes nothing.
+            // The session service shutdown below ends a turn in flight with
+            // RunFailed, so a restart over such a cut would read a shutdown's
+            // outcome, not a crash's. Refuse that cut by name.
+            let mut in_flight = Vec::new();
+            for summary in &listed_sessions {
+                let active = summary.is_active
+                    || service
+                        .read(&summary.session_id)
+                        .await
+                        .is_ok_and(|view| view.state.is_active);
+                if active {
+                    in_flight.push(summary.session_id.clone());
+                }
+            }
+            assert!(
+                in_flight.is_empty(),
+                "restart_after_actor_fail_stop stands in for a process exit, but sessions \
+                 {in_flight:?} have a turn in flight: the session service shutdown would end \
+                 it with RunFailed, so the restart would see a shutdown, not a crash. Cut with \
+                 no run in flight, or tear the process down without writing, as a crash does"
+            );
             let mut runtime_release_witnesses = Vec::new();
             for summary in listed_sessions {
                 if let Some(runtime) = service.comms_runtime(&summary.session_id).await {

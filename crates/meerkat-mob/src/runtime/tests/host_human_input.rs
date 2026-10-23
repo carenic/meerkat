@@ -1872,6 +1872,8 @@ const QUEUED_HUMAN: &str = "A second question, queued behind the running turn.";
 struct StopHost {
     handle: MobHandle,
     runtime_store: Arc<dyn RuntimeStore>,
+    /// The process's session service, for its members' comms runtimes.
+    service: Arc<Service>,
 }
 
 /// Open a host process over `root`: a new mob (`label`) or, without a label,
@@ -1957,6 +1959,7 @@ async fn open_stop_host(
     StopHost {
         handle,
         runtime_store,
+        service,
     }
 }
 
@@ -3091,6 +3094,287 @@ async fn a_queued_input_starts_no_run_during_the_drain() {
         .await
         .expect("mob shutdown finishes")
         .expect("mob shutdown");
+}
+
+/// One input of the crash-mid-drain row across the crash: its phase when the
+/// process died and when the restarted process opened, whether the reopen
+/// changed its row, and what the resumed mob then did with it.
+#[derive(Debug, PartialEq)]
+struct AcrossTheCrash {
+    phase_at_crash: meerkat_runtime::input_state::InputLifecycleState,
+    phase_at_reopen: meerkat_runtime::input_state::InputLifecycleState,
+    row_unchanged_at_reopen: bool,
+    recovery_count_at_reopen: u32,
+    replay: StopAnswer,
+    phase_after_resume: meerkat_runtime::input_state::InputLifecycleState,
+    runs_started: usize,
+    runs_completed: usize,
+    run_failures: usize,
+}
+
+/// A host that dies in the middle of a drain: it stopped with
+/// `StopOptions::leave_runs_running`, its member's turn is in flight (the
+/// model call held) with a second input queued behind it, and the drain is
+/// waiting for that turn when the process dies.
+///
+/// The drain writes nothing, so the restart finds what a crash between a
+/// Stop and its Shutdown always left. The mob comes back Stopped. The queued
+/// input is still Queued with its row unchanged, and no run started for it.
+/// The interrupted turn's input is back in Queued, as for any run a crash
+/// cut off. Once the restarted mob resumes, the interrupted input runs to
+/// completion first and the queued one after it, each exactly once, and a
+/// same-key replay of each answers its result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crash_mid_drain_leaves_the_queued_input_for_the_restarted_mob() {
+    use meerkat_runtime::input_state::InputLifecycleState;
+
+    let (_root, root_path) = stop_root();
+    let client = ScriptedClient::new(true);
+    // The first process runs on its own runtime, so the crash below drops
+    // every task it spawned: the actor, the held turn and the drain.
+    let incarnation = CrashableMobIncarnation::new();
+    let (host, member, requests_before, inputs, captured, drain) = {
+        let root_path = root_path.clone();
+        let client = client.clone();
+        incarnation
+            .install(async move {
+                let host = open_stop_host(&root_path, &client, Some("drain-crash")).await;
+                let (identity, session_id, entry) = spawn_stop_member(&host).await;
+                let comms = host
+                    .service
+                    .comms_runtime(&session_id)
+                    .await
+                    .map(|runtime| Arc::downgrade(&runtime))
+                    .expect("the member's comms runtime");
+                client.block();
+                let requests_before = client.requests().len();
+                let mut inputs = Vec::new();
+                for (label, text) in [
+                    ("drain-crash-running", HUMAN),
+                    ("drain-crash-queued", QUEUED_HUMAN),
+                ] {
+                    let key = delivery(label);
+                    let spec = WorkSpec::new(text, WorkOrigin::External);
+                    let waiter = host
+                        .handle
+                        .start_host_human_input_bounded(
+                            entry.agent_runtime_id.clone(),
+                            entry.fence_token,
+                            spec.clone(),
+                            HandlingMode::Queue,
+                            key.clone(),
+                            deadline(),
+                        )
+                        .await
+                        .expect("human admission");
+                    if inputs.is_empty() {
+                        client.wait_for_requests(requests_before + 1).await;
+                    }
+                    let input_id = admitted_input_id(&host.runtime_store, &session_id, &key).await;
+                    inputs.push((key, input_id, spec, waiter));
+                }
+                stop_leaving_runs_running(&host).await;
+                let snapshot = host
+                    .handle
+                    .drain_runs_snapshot()
+                    .await
+                    .expect("a stopped mob's drain snapshot");
+                let captured: Vec<_> = snapshot
+                    .members
+                    .iter()
+                    .map(|member| (member.identity.clone(), member.target.clone()))
+                    .collect();
+                let mut drain = tokio::spawn(crate::runtime::run_drain::drain(
+                    snapshot,
+                    meerkat_core::time_compat::Instant::now() + UNREACHED_DRAIN_BOUND,
+                ));
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(300), &mut drain)
+                        .await
+                        .is_err(),
+                    "the drain waits for the held turn"
+                );
+                (
+                    host,
+                    (identity, session_id, comms),
+                    requests_before,
+                    inputs,
+                    captured,
+                    drain,
+                )
+            })
+            .await
+    };
+    let (identity, session_id, comms) = member;
+    let mut at_crash = Vec::new();
+    for (key, input_id, _, _) in &inputs {
+        at_crash.push(stop_row(&host.runtime_store, &session_id, key, input_id).await);
+    }
+    let requests_at_crash = client.requests().len() - requests_before;
+    let events_at_crash = stop_events(&root_path, &session_id).await.len();
+
+    incarnation.crash().await;
+    // The kill landed: the actor is gone and the drain never returned.
+    let StopHost {
+        handle,
+        runtime_store,
+        service,
+    } = host;
+    let actor_gone = handle.command_tx.is_closed();
+    let drain_cancelled = drain.await.err().is_some_and(|error| error.is_cancelled());
+    let mob_id = handle.mob_id().clone();
+    drop((handle, service));
+    let inputs: Vec<_> = inputs
+        .into_iter()
+        .map(|(key, input_id, spec, waiter)| {
+            drop(waiter);
+            (key, input_id, spec)
+        })
+        .collect();
+    // A process exit frees the member's comms name. The crashed
+    // incarnation's in-memory session state outlives its runtime in this
+    // process, so the restart frees the name itself. That writes nothing:
+    // both rows and the event log read the same as at the crash.
+    let name_freed = comms.upgrade().map(|runtime| runtime.retire_inproc_route());
+    let mut unchanged_since_crash = Vec::new();
+    for (index, (key, input_id, _)) in inputs.iter().enumerate() {
+        let row = stop_row(&runtime_store, &session_id, key, input_id).await;
+        unchanged_since_crash.push(row.digest == at_crash[index].digest);
+    }
+    unchanged_since_crash.push(stop_events(&root_path, &session_id).await.len() == events_at_crash);
+    drop(runtime_store);
+    await_supervisor_route_release(&mob_id).await;
+
+    let restarted_client = ScriptedClient::new(true);
+    let restarted = open_stop_host(&root_path, &restarted_client, None).await;
+    let restored = restarted
+        .handle
+        .status()
+        .await
+        .expect("the reopened mob's state");
+    let mut at_reopen = Vec::new();
+    for (key, input_id, _) in &inputs {
+        at_reopen.push(stop_row(&restarted.runtime_store, &session_id, key, input_id).await);
+    }
+    tokio::time::timeout(WAIT, restarted.handle.resume())
+        .await
+        .expect("the resume finishes")
+        .expect("resume the stopped mob");
+    let entry = restarted
+        .handle
+        .get_member(&identity)
+        .await
+        .expect("roster read")
+        .expect("the member survives the restart");
+    let mut replays = Vec::new();
+    for (key, _, spec) in &inputs {
+        let replay = restarted
+            .handle
+            .start_host_human_input_bounded(
+                entry.agent_runtime_id.clone(),
+                entry.fence_token,
+                spec.clone(),
+                HandlingMode::Queue,
+                key.clone(),
+                deadline(),
+            )
+            .await
+            .expect("same-key replay admission");
+        replays.push(drained_answer(replay).await.0);
+    }
+    // A replay answers once its input settles, which can be before the run's
+    // RunCompleted reaches the event log. The log is complete once the
+    // shutdown returns, so it is read after it, as in the other Stop rows.
+    tokio::time::timeout(WAIT, restarted.handle.shutdown())
+        .await
+        .expect("mob shutdown finishes")
+        .expect("mob shutdown");
+    let events = stop_events(&root_path, &session_id).await;
+    let mut across = Vec::new();
+    for (index, (key, input_id, _)) in inputs.iter().enumerate() {
+        let after = stop_row(&restarted.runtime_store, &session_id, key, input_id).await;
+        let runs = runs_started_for(&events, interaction(key));
+        across.push(AcrossTheCrash {
+            phase_at_crash: at_crash[index].stored.seed.phase,
+            phase_at_reopen: at_reopen[index].stored.seed.phase,
+            row_unchanged_at_reopen: at_reopen[index].digest == at_crash[index].digest,
+            recovery_count_at_reopen: at_reopen[index].stored.state.recovery_count,
+            replay: replays[index].clone(),
+            phase_after_resume: after.stored.seed.phase,
+            runs_started: runs.len(),
+            runs_completed: runs.iter().map(|run| runs_completed(&events, run)).sum(),
+            run_failures: runs
+                .iter()
+                .map(|run| run_failures(&events, run).len())
+                .sum(),
+        });
+    }
+    let interrupted_run = runs_started_for(&events, interaction(&inputs[0].0))
+        .first()
+        .cloned()
+        .expect("the interrupted turn's run is in the log");
+    let requests: Vec<_> = restarted_client
+        .requests()
+        .iter()
+        .map(|request| {
+            (
+                requests_carrying(std::slice::from_ref(request), HUMAN),
+                requests_carrying(std::slice::from_ref(request), QUEUED_HUMAN),
+            )
+        })
+        .collect();
+    assert_eq!(
+        (
+            (actor_gone, drain_cancelled, captured, requests_at_crash),
+            (name_freed, unchanged_since_crash),
+            restored,
+            across,
+            requests,
+        ),
+        (
+            (
+                true,
+                true,
+                vec![(
+                    identity.clone(),
+                    crate::runtime::run_drain::DrainTarget::Wait {
+                        session_id: session_id.clone(),
+                        run_id: interrupted_run,
+                    },
+                )],
+                1,
+            ),
+            (Some(true), vec![true, true, true]),
+            MobState::Stopped,
+            vec![
+                AcrossTheCrash {
+                    phase_at_crash: InputLifecycleState::Staged,
+                    phase_at_reopen: InputLifecycleState::Queued,
+                    row_unchanged_at_reopen: false,
+                    recovery_count_at_reopen: 0,
+                    replay: StopAnswer::Succeeded,
+                    phase_after_resume: InputLifecycleState::Consumed,
+                    runs_started: 2,
+                    runs_completed: 1,
+                    run_failures: 0,
+                },
+                AcrossTheCrash {
+                    phase_at_crash: InputLifecycleState::Queued,
+                    phase_at_reopen: InputLifecycleState::Queued,
+                    row_unchanged_at_reopen: true,
+                    recovery_count_at_reopen: 0,
+                    replay: StopAnswer::Succeeded,
+                    phase_after_resume: InputLifecycleState::Consumed,
+                    runs_started: 1,
+                    runs_completed: 1,
+                    run_failures: 0,
+                },
+            ],
+            vec![(1, 0), (1, 1)],
+        ),
+        "a crash while the drain waits leaves the Stop's state: the queued input stays Queued \
+         and runs once after the restart, after the interrupted input runs again"
+    );
 }
 
 /// A plain Stop, without `StopOptions::leave_runs_running`, still cancels an
