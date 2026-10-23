@@ -1795,19 +1795,19 @@ them.
   restore already failed, is deferred instead (see the entries next to this
   one).
 
-- `meerkat`, `meerkat-rpc`: the session-scoped `live/open` opened a live
-  channel on a mob member's session by its session id alone, with none of
-  the checks the member's mob makes first (a member that is retiring, in
-  cleanup or revoke, or whose restore failed). When the member's session was
-  not live, the open, and the projection, refresh-config, identity and
-  precheck reads behind it, also restored that session from storage outside
-  its mob (a member whose custody restore was deferred stays down). Both are
-  now refused with `INVALID_PARAMS` (-32602) and data kind
+- `meerkat`, `meerkat-rpc`: the session-scoped `live/open`, and the
+  projection, refresh-config, identity and precheck reads behind it, restored
+  a mob member's session from storage by its session id alone when it was
+  not live, outside its mob (a member whose custody restore was deferred
+  stays down), and the open went ahead on a member session that was live,
+  with none of the checks the member's mob makes first (a member that is
+  retiring, in cleanup or revoke, or whose restore failed). Both are now
+  refused with `INVALID_PARAMS` (-32602) and data kind
   `mob_member_session_addressed_by_id` (with the session, mob and member):
   nothing is opened or restored, and `mob/member_live_open` opens the member
-  through its mob. A member therefore has no WebRTC channel, since
-  `mob/member_live_open` is WebSocket only. The reads behind a channel that
-  already exists find a live member session as before.
+  through its mob. A member therefore has no WebRTC channel (see Breaking).
+  The reads behind a channel that already exists find a live member session
+  as before.
   `SessionError::mob_member_session_addressed_by_id` and
   `SessionError::is_mob_member_session_addressed_by_id` name the refusal.
 - `meerkat-mob`: a mob restarted while another runtime owner on the realm
