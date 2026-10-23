@@ -1113,11 +1113,16 @@ pub fn session_turn_admission_schema_metadata() -> MachineSchemaMetadata {
             ),
             NamedTypeBinding::string_enum(
                 "StartTurnExecutionKind",
-                &["ContentTurn", "ResumePending"],
+                &["ContentTurn", "ResumePending", "ResumeRun"],
             ),
             NamedTypeBinding::string_enum(
                 "StartTurnDisposition",
-                &["RunContentTurn", "RunPending", "NoPendingBoundary"],
+                &[
+                    "RunContentTurn",
+                    "RunPending",
+                    "NoPendingBoundary",
+                    "ResumeRun",
+                ],
             ),
             NamedTypeBinding::string_enum("StartTurnPublicTerminal", &["NoPendingBoundary"]),
             NamedTypeBinding::string_enum(
