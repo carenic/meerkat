@@ -135,19 +135,11 @@ actor's life, with Stop, Shutdown and Destroy available. `MobError` is
 
 Shutdown report: `shutdown_with_report(ShutdownOptions)`
 (`ShutdownOptions::default().with_deadline(deadline)` bounds its waits;
-since 0.9.5 the default `QueuedInputsOnShutdown::RequeueDurable`, also what
-`shutdown()` takes, keeps a member's work for the next start when its session
-commits each round durably (`Requeue(RequeueMaxAge::DEFAULT)`, 15 minutes;
-`Stop` for other members): its running turn is suspended at its last
-committed round and resumes at the next start (a durable autonomous member's
-kickoff stays open and resumes under its objective), and durable queued
-prompts that are neither directed nor
-bound to an objective (never a member's kickoff) run after it. Their waiters
-get `BoundedTurnFailure::RequeuedAcrossStop`, or `RequeueExpired` when older
-than `max_age` at that start.
-`.with_queued_inputs(QueuedInputsOnShutdown::Requeue(max_age))` sets another
-bound for every member, and `.with_queued_inputs(QueuedInputsOnShutdown::Stop)`
-ends all of it as stopped, as the 0.9.4 default did)
+since 0.9.5 `.with_queued_inputs(QueuedInputsOnShutdown::Requeue(max_age))`
+keeps durable queued prompts that are neither directed nor bound to an
+objective (never a member's kickoff) for the next start, whose waiters get
+`BoundedTurnFailure::RequeuedAcrossStop`, or `RequeueExpired` when older than
+`max_age` at that start)
 returns a `MobShutdownReport` with per-member `members`
 (`MemberShutdownOutcome`), `runs` and `run_starts`; `is_clean()` is true when
 every member is `Unregistered`. Since 0.9.4 `UnregisterPending { stage,
