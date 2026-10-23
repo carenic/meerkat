@@ -275,7 +275,7 @@ fn apply(realm: &mut Realm, update: &ScopeUpdate, commit_id: &CommitId) {
 
 /// Hooks for the canary stores of this crate's tests, which break the
 /// contract on purpose.
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 impl InMemoryHostStore {
     /// Apply update `index` of `batch` on its own, checked as a commit
     /// would check it, without marking the commit id as landed.
