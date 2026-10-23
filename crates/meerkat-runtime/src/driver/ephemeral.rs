@@ -6516,6 +6516,45 @@ impl EphemeralRuntimeDriver {
         self.consume_inputs(&applied, run_id)
     }
 
+    /// Abandon with `reason` each contributor a committed round of the ended
+    /// `run_id` already applied, as `abandon_staged_inputs` abandons the staged
+    /// ones, so none of the run's inputs stays bound to it. Returns how many
+    /// were abandoned.
+    fn abandon_applied_contributors_of_run(
+        &mut self,
+        run_id: &RunId,
+        input_ids: &[InputId],
+        reason: &InputAbandonReason,
+    ) -> Result<usize, RuntimeDriverError> {
+        let dsl_reason = mm_dsl::InputAbandonReason::from(reason);
+        let applied = self.applied_contributors_of_run(run_id, input_ids);
+        for (input_id, from) in &applied {
+            let attempt_count = u64::from(self.input_attempt_count(input_id));
+            self.dsl_apply(
+                mm_dsl::MeerkatMachineInput::AbandonInput {
+                    input_id: Self::dsl_key(input_id),
+                    reason: dsl_reason,
+                    attempt_count,
+                },
+                "AbandonInput(AppliedRunContributor)",
+            )?;
+            self.sync_terminal_projection_from_machine(
+                input_id,
+                *from,
+                InputLifecycleState::Abandoned,
+                "Abandon",
+            )?;
+            self.events
+                .push(self.make_envelope(RuntimeEvent::InputLifecycle(
+                    InputLifecycleEvent::Abandoned {
+                        input_id: input_id.clone(),
+                        reason: reason.clone(),
+                    },
+                )));
+        }
+        Ok(applied.len())
+    }
+
     /// Machine-owned realization for a validated cancelled run.
     pub(crate) fn machine_realize_run_cancelled(
         &mut self,
@@ -6529,6 +6568,13 @@ impl EphemeralRuntimeDriver {
         );
         let _ =
             self.abandon_staged_inputs(contributing_input_ids, InputAbandonReason::Cancelled)?;
+        // A resumed run's contributors one of its committed rounds already
+        // applied end with the cancellation too: none stays bound to the run.
+        let _ = self.abandon_applied_contributors_of_run(
+            run_id,
+            contributing_input_ids,
+            &InputAbandonReason::Cancelled,
+        )?;
         Ok(())
     }
 

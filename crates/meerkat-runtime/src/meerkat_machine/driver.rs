@@ -7732,17 +7732,18 @@ pub(crate) fn machine_validate_run_failed(
     Ok(())
 }
 
-/// The contributors a failed run disposes of: its staged contributors and,
-/// for a resumed run, each input one of `run_id`'s committed rounds already
-/// applied that is still bound to the run.
+/// The contributors an ended run (failed or cancelled) disposes of: its staged
+/// contributors and, for a resumed run, each input one of `run_id`'s committed
+/// rounds already applied that is still bound to the run.
 ///
 /// Only a resumed run holds applied contributors. None of them may stay bound
 /// to the run once it ends: left applied, a later registration would find the
 /// run open and resumable again. The run's realization disposes of them with
 /// the staged ones: a replayed failure returns them to their lanes
 /// (`ReplayAppliedRunContributor`), a machine-terminal failure consumes them,
-/// and a run that never began executing consumes them too (they did execute,
-/// so they are never reported as never executed).
+/// a run that never began executing consumes them too (they did execute, so
+/// they are never reported as never executed), and a cancellation abandons
+/// them as cancelled.
 ///
 /// A resumed run's set lists its bound inputs in admission order, the order
 /// the generated resume plan dispatched them in and so the order of a receipt
@@ -7771,17 +7772,22 @@ fn machine_ended_run_contributors(
 
 pub(crate) fn machine_validate_run_cancelled(
     driver: &DriverEntry,
+    run_id: &RunId,
     contributing_work_ids: &[InputId],
 ) -> Result<(), RuntimeDriverError> {
     if contributing_work_ids.is_empty() {
         return Err(RuntimeDriverError::Internal(
-            "run cancelled requires at least one staged contributor".to_string(),
+            "run cancelled requires at least one contributor".to_string(),
         ));
     }
 
     for work_id in contributing_work_ids {
         let lifecycle = driver.as_driver().input_phase(work_id);
-        if lifecycle != Some(InputLifecycleState::Staged) {
+        // A resumed run's contributor can already be applied by one of the
+        // run's committed rounds; it still belongs to this run.
+        if lifecycle != Some(InputLifecycleState::Staged)
+            && !driver.input_bound_to_open_run(work_id, run_id)
+        {
             return Err(RuntimeDriverError::Internal(format!(
                 "run cancelled requires staged contributors, but {work_id:?} is {lifecycle:?}"
             )));
@@ -10952,7 +10958,11 @@ pub(crate) async fn cancel_runtime_loop_run(
     let mut driver = driver.lock().await;
     let cancelled_run_id = run_id.clone();
     let staged_input_ids = machine_staged_contributors(&driver);
-    machine_validate_run_cancelled(&driver, &staged_input_ids)
+    // A cancellation abandons every input bound to the run, the ones a
+    // resumed run's committed rounds already applied included.
+    let contributing_input_ids =
+        machine_ended_run_contributors(&driver, &cancelled_run_id, &staged_input_ids);
+    machine_validate_run_cancelled(&driver, &cancelled_run_id, &contributing_input_ids)
         .map_err(RuntimeLoopRunFailError::Rejected)?;
     let terminal_checkpoint = driver
         .begin_terminal_transition("cancelled_run_terminal_commit")
@@ -10960,7 +10970,7 @@ pub(crate) async fn cancel_runtime_loop_run(
     let candidate = crate::input_state::InteractionTerminalCandidate::Cancelled;
     let completion_batch = match driver.stage_input_terminal_completion_batch(
         InteractionTerminalBatchScope::Run(&cancelled_run_id),
-        &staged_input_ids,
+        &contributing_input_ids,
         candidate.clone(),
         false,
     ) {
@@ -10976,7 +10986,7 @@ pub(crate) async fn cancel_runtime_loop_run(
     };
     let interaction_outboxes = match authorized_staged_directed_terminal_outboxes(
         &driver,
-        &staged_input_ids,
+        &contributing_input_ids,
         &completion_batch,
     ) {
         Ok(outboxes) => outboxes,
@@ -11021,7 +11031,7 @@ pub(crate) async fn cancel_runtime_loop_run(
         return Err(RuntimeLoopRunFailError::Rejected(error));
     }
     if let Err(run_err) = driver
-        .machine_realize_run_cancelled(cancelled_run_id.clone(), staged_input_ids)
+        .machine_realize_run_cancelled(cancelled_run_id.clone(), contributing_input_ids)
         .await
     {
         let error = RuntimeDriverError::Internal(format!(

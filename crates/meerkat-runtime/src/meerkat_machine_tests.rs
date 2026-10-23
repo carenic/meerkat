@@ -38342,6 +38342,57 @@ async fn assert_cold_registration_neither_resumes_nor_requeues(run: ResumedRunWi
     );
 }
 
+/// RED before: a cancelled resumed run whose inputs one of its committed
+/// rounds had all applied could not end. Its cancel collected only staged
+/// contributors and was refused ("run cancelled requires at least one staged
+/// contributor"), and a refused cancel stops the runtime loop's executor.
+/// The cancel now ends the run, so the loop's refusal arm is never taken, and
+/// the applied input ends cancelled, as the graceful stop leaves an in-flight
+/// input. A cold registration then neither resumes the run nor requeues the
+/// input.
+#[tokio::test]
+async fn a_resumed_run_whose_inputs_were_all_applied_is_cancellable() {
+    let run = resumed_run_with_applied_inputs(1, 0, false).await;
+
+    crate::meerkat_machine::cancel_runtime_loop_run(&run.driver, run.run_id.clone())
+        .await
+        .expect("the cancel ends the run instead of stopping the executor");
+
+    let cancelled = (
+        crate::input_state::InputLifecycleState::Abandoned,
+        Some(crate::input_state::InputTerminalOutcome::Abandoned {
+            reason: crate::input_state::InputAbandonReason::Cancelled,
+        }),
+    );
+    assert_eq!(ended_run_input_outcomes(&run).await, vec![cancelled]);
+    assert_cold_registration_neither_resumes_nor_requeues(run).await;
+}
+
+/// RED before: a cancelled resumed run abandoned only its staged inputs; the
+/// one a committed round had already applied stayed bound to the cancelled
+/// run, and a later registration found the run open and resumable again.
+/// Every input bound to the run now ends cancelled.
+#[tokio::test]
+async fn a_cancelled_resumed_run_leaves_none_of_its_inputs_bound() {
+    let run = resumed_run_with_applied_inputs(1, 1, false).await;
+
+    crate::meerkat_machine::cancel_runtime_loop_run(&run.driver, run.run_id.clone())
+        .await
+        .expect("the cancel ends the run");
+
+    let cancelled = (
+        crate::input_state::InputLifecycleState::Abandoned,
+        Some(crate::input_state::InputTerminalOutcome::Abandoned {
+            reason: crate::input_state::InputAbandonReason::Cancelled,
+        }),
+    );
+    assert_eq!(
+        ended_run_input_outcomes(&run).await,
+        vec![cancelled.clone(), cancelled]
+    );
+    assert_cold_registration_neither_resumes_nor_requeues(run).await;
+}
+
 /// RED before: a machine-terminal failure of a resumed run collected only its
 /// staged inputs, so the receipt, which names every input of the run, did
 /// not match them and the failure was refused. The run's failed boundary
