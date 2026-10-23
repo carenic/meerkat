@@ -1269,14 +1269,6 @@ them.
   occurrence that head does not cover yet, even past the retention bound, and
   retires down to the bound at its first compaction after a checkpoint covers
   them.
-- `meerkat-store`: one delivery receipt that does not decode no longer pins
-  its occurrence in the SQLite schedule store. To decide whether a lapsed
-  occurrence's earlier attempt was admitted, the claim scan decoded every
-  receipt of the occurrence whole, so a receipt with a corrupt field, or with
-  a value a newer release wrote that an older one reads after a downgrade,
-  made the row a fault on every scan: never reclaimed, misfired or
-  exhausted. The scan now reads only each receipt's stage; a receipt whose
-  stage does not decode is still the row's fault.
 - `meerkat-schedule`, `meerkat`, `meerkat-store`, `meerkat-mob-mcp`: a
   scheduled delivery whose executor died after the target admitted it ended
   `misfired` under `skip` once its lease lapsed: the reclaim past the misfire
@@ -1309,9 +1301,11 @@ them.
     durable external-delivery record and begins none;
   - no dispatch was recorded (a crash before the dispatch start was
     recorded): the misfire policy decides, as before.
-  The evidence is read from the occurrence's receipt history in both stores
-  (SQLite decodes `receipt_json` of a reclaimed row only), so no column and no
-  schema step is added.
+  The evidence is read from the occurrence's receipt history in both stores,
+  so no column and no schema step is added. SQLite reads only the stage of
+  each receipt of a reclaimed row, so a receipt whose other fields do not
+  decode (a value a newer release wrote, read after a downgrade) does not pin
+  the row; a receipt whose stage does not decode is the row's fault.
   The scheduling guide also names the failure class that the 0.9.4
   `runtime_completion_authority_unavailable` end is recorded with:
   `internal_error`.
