@@ -4971,15 +4971,17 @@ mod tests {
     /// Exercise provider parsing, block assembly, durable serialization, replay
     /// projection and the actual next HTTP request together.
     async fn function_call_id_roundtrip(chunks: Vec<Vec<Value>>) -> (Vec<AssistantBlock>, Value) {
-        let mut payload = chunks
-            .into_iter()
-            .map(|parts| {
-                format!(
-                    "data: {}\n",
-                    json!({"candidates": [{"content": {"parts": parts}}]})
-                )
-            })
-            .collect::<String>();
+        use std::fmt::Write as _;
+
+        let mut payload = String::new();
+        for parts in chunks {
+            writeln!(
+                payload,
+                "data: {}",
+                json!({"candidates": [{"content": {"parts": parts}}]})
+            )
+            .expect("write to a String");
+        }
         payload.push_str("data: {\"candidates\":[{\"finishReason\":\"STOP\"}]}\n");
         let events = gemini_stream_events(payload).await;
         let mut assembler = meerkat_llm_core::BlockAssembler::new();
