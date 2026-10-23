@@ -533,6 +533,11 @@ function handleEvent(event: AgentEvent): string {
       // batch requested and what this attempt sent (absent when the batch
       // applies no level).
       return `${event.type}:${event.requested.disposition}:${event.outcome?.kind ?? 'none'}`;
+    case 'run_resumed':
+      // A durable run resumed from its run cursor after a restart, in place
+      // of `run_started`: the same `run_id` continues from `round`, at
+      // `tools_pending` (the staged calls run again) or `awaiting_model`.
+      return `${event.type}:${event.session_id}:${event.run_id}:${event.round}:${event.resume_point}`;
     default: {
       const _exhaustive: never = event;
       return _exhaustive;
