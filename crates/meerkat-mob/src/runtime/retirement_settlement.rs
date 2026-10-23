@@ -679,7 +679,9 @@ impl ShutdownOptions {
     }
 
     /// Choose what the Shutdown does with inputs still queued behind a
-    /// member's running turn.
+    /// member's running turn. [`QueuedInputsOnShutdown::Requeue`] keeps only
+    /// the eligible ones: an input bound to an objective, such as a member's
+    /// kickoff, still ends as stopped.
     #[must_use]
     pub fn with_queued_inputs(mut self, queued_inputs: QueuedInputsOnShutdown) -> Self {
         self.queued_inputs = queued_inputs;
@@ -705,8 +707,11 @@ pub enum QueuedInputsOnShutdown {
     /// runs them, unless they are older than the bound by then.
     ///
     /// Eligible: a durable prompt in the queue lane that is still queued
-    /// when the member's runtime stops and is not a directed interaction.
-    /// Every other input still ends as stopped. The waiter of a kept input
+    /// when the member's runtime stops, is not a directed interaction and is
+    /// not bound to an objective. A member's kickoff is bound to its
+    /// objective, so it is never kept: it ends as stopped and its kickoff is
+    /// recorded failed, as under [`Self::Stop`]. Every other input still
+    /// ends as stopped. The waiter of a kept input
     /// is answered [`RequeuedAcrossStop`](super::BoundedTurnFailure::RequeuedAcrossStop):
     /// do not resubmit it; a same-key replay after the restart re-attaches
     /// to it, and one older than the bound by then ends

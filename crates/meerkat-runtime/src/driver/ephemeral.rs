@@ -4528,12 +4528,13 @@ impl EphemeralRuntimeDriver {
     /// Ask the generated stop classifier about one non-terminal input. The
     /// shell supplies only the facts the machine does not hold: the row's
     /// durability (a row without its payload cannot run again, so it is
-    /// observed as missing) and whether the input is a directed one.
+    /// observed as missing), whether the input is a directed one, and
+    /// whether its own turn metadata binds it to an objective.
     fn classify_stop_input(
         &mut self,
         input_id: &InputId,
     ) -> Result<(mm_dsl::StopInputDisposition, u64), RuntimeDriverError> {
-        let (durability, directed) = {
+        let (durability, directed, objective_bound) = {
             let state = self.ledger.get(input_id).ok_or_else(|| {
                 RuntimeDriverError::Internal(format!(
                     "input {input_id} is not in the ledger its stop classification reads"
@@ -4548,8 +4549,12 @@ impl EphemeralRuntimeDriver {
                         crate::input::validated_directed_interaction_id(input),
                         Ok(None)
                     ),
+                    crate::runtime_loop::input_own_turn_metadata(input)
+                        .transcript_identity
+                        .objective_id
+                        .is_some(),
                 ),
-                None => (mm_dsl::InputDurabilityKind::Missing, false),
+                None => (mm_dsl::InputDurabilityKind::Missing, false, false),
             }
         };
         let key = Self::dsl_key(input_id);
@@ -4558,6 +4563,7 @@ impl EphemeralRuntimeDriver {
                 input_id: key.clone(),
                 durability,
                 directed,
+                objective_bound,
             },
             "ClassifyStopInputDisposition",
         )?;

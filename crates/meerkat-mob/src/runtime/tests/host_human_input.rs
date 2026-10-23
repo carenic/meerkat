@@ -3284,12 +3284,15 @@ struct ObjectiveBoundAfterShutdown {
     requeue_mark: bool,
     row_unchanged_by_restart: bool,
     requests_after_restart: usize,
+    runs_started: usize,
 }
 
 /// What one Shutdown left of a plain queued host human input and of one
-/// bound to an objective.
+/// bound to an objective. `plain_runs` counts the plain input's runs in the
+/// whole log, so a kept input that ran twice shows.
 struct ObjectiveShutdownScenario {
     plain_kept: bool,
+    plain_runs: usize,
     bound: ObjectiveBoundAfterShutdown,
 }
 
@@ -3400,6 +3403,7 @@ async fn objective_bound_shutdown(mob_name: &str, requeue: bool) -> ObjectiveShu
         Err(error) => StopAnswer::Refused(error.to_string()),
     };
     let requests = restarted_client.requests();
+    let events = stop_events(&root_path, &session_id).await;
     let after = row_image(&restarted.runtime_store, &session_id, &bound_id)
         .await
         .1;
@@ -3412,7 +3416,9 @@ async fn objective_bound_shutdown(mob_name: &str, requeue: bool) -> ObjectiveShu
         requeue_mark: !image["stop_requeue"].is_null(),
         row_unchanged_by_restart: after == image,
         requests_after_restart: requests_carrying(&requests, BOUND_HUMAN),
+        runs_started: runs_started_for(&events, interaction(&bound_key)).len(),
     };
+    let plain_runs = runs_started_for(&events, interaction(&plain_key)).len();
     let plain_kept = matches!(plain_waiter, StopAnswer::RequeuedAcrossStop(_))
         && plain_marked
         && plain_replay == StopAnswer::Succeeded
@@ -3421,7 +3427,11 @@ async fn objective_bound_shutdown(mob_name: &str, requeue: bool) -> ObjectiveShu
         .await
         .expect("mob shutdown finishes")
         .expect("mob shutdown");
-    ObjectiveShutdownScenario { plain_kept, bound }
+    ObjectiveShutdownScenario {
+        plain_kept,
+        plain_runs,
+        bound,
+    }
 }
 
 /// Requeue keeps no input bound to an objective. A member's kickoff is one
@@ -3442,9 +3452,14 @@ async fn requeue_shutdown_ends_objective_bound_inputs_exactly_as_a_stop_shutdown
     let stop = objective_bound_shutdown("host-human-objective-stop", false).await;
     let requeue = objective_bound_shutdown("host-human-objective-requeue", true).await;
     assert_eq!(
-        (stop.plain_kept, requeue.plain_kept),
-        (false, true),
-        "only the requeue Shutdown keeps the plain input"
+        (
+            stop.plain_kept,
+            stop.plain_runs,
+            requeue.plain_kept,
+            requeue.plain_runs
+        ),
+        (false, 0, true, 1),
+        "only the requeue Shutdown keeps the plain input, which then runs once"
     );
     assert_eq!(
         requeue.bound, stop.bound,
@@ -3456,9 +3471,10 @@ async fn requeue_shutdown_ends_objective_bound_inputs_exactly_as_a_stop_shutdown
             requeue.bound.requeue_mark,
             requeue.bound.row_unchanged_by_restart,
             requeue.bound.requests_after_restart,
+            requeue.bound.runs_started,
         ),
-        (InputLifecycleState::Abandoned, false, true, 0),
-        "terminal at the stop, never run after the restart"
+        (InputLifecycleState::Abandoned, false, true, 0, 0),
+        "terminal at the stop, never run, before or after the restart"
     );
 }
 

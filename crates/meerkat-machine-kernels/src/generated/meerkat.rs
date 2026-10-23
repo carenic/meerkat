@@ -18738,6 +18738,7 @@ pub mod inputs {
         pub input_id: String,
         pub durability: InputDurabilityKind,
         pub directed: bool,
+        pub objective_bound: bool,
     }
 }
 

@@ -62834,6 +62834,28 @@ mod kickoff_tests {
         );
     }
 
+    /// The producer half of the requeue rule's objective binding: the turn
+    /// metadata that delegation, fork and helper work carry on a turn-driven
+    /// member holds their objective in its transcript identity, on the
+    /// input's own turn metadata, where the runtime's stop classifier reads
+    /// it. Work without an objective carries none.
+    #[test]
+    fn submit_work_turn_metadata_carries_the_objective_the_stop_classifier_reads() {
+        let objective_id = meerkat_core::interaction::ObjectiveId::new();
+        let metadata = submit_work_turn_metadata(None, None, Some(objective_id))
+            .expect("an objective alone never conflicts")
+            .expect("an objective produces turn metadata");
+        assert_eq!(
+            metadata.transcript_identity.objective_id,
+            Some(objective_id)
+        );
+        assert!(
+            submit_work_turn_metadata(None, None, None)
+                .expect("empty metadata never conflicts")
+                .is_none()
+        );
+    }
+
     #[test]
     fn malformed_machine_kickoff_objective_fails_closed() {
         let identity = AgentIdentity::from("worker-1");

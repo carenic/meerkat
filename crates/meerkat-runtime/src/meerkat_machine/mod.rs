@@ -1404,9 +1404,10 @@ pub enum RuntimeSessionUnregisterAdmission {
 ///
 /// [`Self::Stop`] ends every non-terminal input as stopped, as an
 /// unregister always has. [`Self::Requeue`] keeps each eligible queued input
-/// (a durable, non-directed prompt in the Queue lane) durably queued instead,
-/// marked for the runtime's next start, which runs it unless it is older than
-/// `max_age` by then. Its waiter is answered
+/// (a durable prompt in the Queue lane that is neither directed nor bound to
+/// an objective) durably queued instead, marked for the runtime's next start,
+/// which runs it unless it is older than `max_age` by then. Its waiter is
+/// answered
 /// [`CompletionWaitError::RequeuedAcrossStop`](crate::completion::CompletionWaitError::RequeuedAcrossStop).
 /// An unregister already in progress keeps the disposition it began with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

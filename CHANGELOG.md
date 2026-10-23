@@ -107,7 +107,8 @@ them.
 - `meerkat-machine-kernels`: the generated runtime machine
   (`generated::meerkat`) gains the stop classifier of a graceful stop that
   keeps queued inputs (see Added, queued prompts kept across a graceful stop).
-  `Input` and `InputKind` gain `ClassifyStopInputDisposition`, `Effect` and
+  `Input` and `InputKind` gain `ClassifyStopInputDisposition` (`input_id`,
+  `durability`, `directed`, `objective_bound`), `Effect` and
   `EffectKind` gain `StopInputDispositionClassified`, `TransitionId` gains
   `ClassifyStopInputDispositionRetain*` and
   `ClassifyStopInputDispositionAbandon*` (one per phase from `Initializing` to
@@ -208,7 +209,10 @@ them.
   `MeerkatMachine::observe_unregister_session_registration_with_queued_inputs_if_current`
   and `observe_unregister_session_registration_with_queued_inputs_if_use_unchanged`.
   An input is kept when it is still queued behind the running turn, in the
-  queue lane, a prompt, not directed, and durable. It stays in the session's
+  queue lane, a prompt, not directed, not bound to an objective, and durable.
+  A member's kickoff is bound to its objective, so a requeue Shutdown ends a
+  queued kickoff as stopped, exactly as `Stop` does. A kept input stays in the
+  session's
   input store with its payload and a stop mark, its completion waiter ends
   with `CompletionWaitError::RequeuedAcrossStop { stopped_at }`
   (`BoundedTurnFailure::RequeuedAcrossStop` for a mob member), and the next

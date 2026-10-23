@@ -895,7 +895,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `RecoverInputCompletionBoundary`(input_id: String, run_id: RunId, sequence: u64, boundary: Option<RecoveredRunApplyBoundary>, execution_kind: RecoveredRuntimeExecutionKind)
 - `ResolveCheckpointCompletionResult`(owner_input_id: String, run_id: RunId, candidate_digest: String, completion_input_ids_digest: String, requires_session_checkpoint: Bool, recipient_input_ids: Set<String>, finalization: RuntimeCompletionFinalizationObservation)
 - `ResolveAbandonedCompletionResult`(owner_input_id: String, run_id: RunId, candidate_digest: String, completion_input_ids_digest: String, recipient_input_ids: Set<String>, terminal_outcome: TurnTerminalOutcome, terminal_cause_kind: TurnTerminalCauseKind, requires_session_checkpoint: Bool, has_interaction_terminal_outbox: Bool, finalization: RuntimeCompletionFinalizationObservation)
-- `ClassifyStopInputDisposition`(input_id: String, durability: InputDurabilityKind, directed: Bool)
+- `ClassifyStopInputDisposition`(input_id: String, durability: InputDurabilityKind, directed: Bool, objective_bound: Bool)
 
 ## Signals
 - `Initialize`
@@ -27813,7 +27813,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `ClassifyStopInputDispositionRetainInitializing`
 - From: `Initializing`
-- On: `ClassifyStopInputDisposition`(input_id, durability, directed)
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
 - Guards:
   - `requeue_eligible`
 - Emits: `StopInputDispositionClassified`
@@ -27821,7 +27821,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `ClassifyStopInputDispositionRetainIdle`
 - From: `Idle`
-- On: `ClassifyStopInputDisposition`(input_id, durability, directed)
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
 - Guards:
   - `requeue_eligible`
 - Emits: `StopInputDispositionClassified`
@@ -27829,7 +27829,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `ClassifyStopInputDispositionRetainAttached`
 - From: `Attached`
-- On: `ClassifyStopInputDisposition`(input_id, durability, directed)
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
 - Guards:
   - `requeue_eligible`
 - Emits: `StopInputDispositionClassified`
@@ -27837,7 +27837,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `ClassifyStopInputDispositionRetainRunning`
 - From: `Running`
-- On: `ClassifyStopInputDisposition`(input_id, durability, directed)
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
 - Guards:
   - `requeue_eligible`
 - Emits: `StopInputDispositionClassified`
@@ -27845,7 +27845,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `ClassifyStopInputDispositionRetainRetired`
 - From: `Retired`
-- On: `ClassifyStopInputDisposition`(input_id, durability, directed)
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
 - Guards:
   - `requeue_eligible`
 - Emits: `StopInputDispositionClassified`
@@ -27853,7 +27853,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `ClassifyStopInputDispositionRetainStopped`
 - From: `Stopped`
-- On: `ClassifyStopInputDisposition`(input_id, durability, directed)
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
 - Guards:
   - `requeue_eligible`
 - Emits: `StopInputDispositionClassified`
@@ -27861,7 +27861,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `ClassifyStopInputDispositionAbandonInitializing`
 - From: `Initializing`
-- On: `ClassifyStopInputDisposition`(input_id, durability, directed)
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
 - Guards:
   - `not_requeue_eligible`
 - Emits: `StopInputDispositionClassified`
@@ -27869,7 +27869,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `ClassifyStopInputDispositionAbandonIdle`
 - From: `Idle`
-- On: `ClassifyStopInputDisposition`(input_id, durability, directed)
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
 - Guards:
   - `not_requeue_eligible`
 - Emits: `StopInputDispositionClassified`
@@ -27877,7 +27877,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `ClassifyStopInputDispositionAbandonAttached`
 - From: `Attached`
-- On: `ClassifyStopInputDisposition`(input_id, durability, directed)
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
 - Guards:
   - `not_requeue_eligible`
 - Emits: `StopInputDispositionClassified`
@@ -27885,7 +27885,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `ClassifyStopInputDispositionAbandonRunning`
 - From: `Running`
-- On: `ClassifyStopInputDisposition`(input_id, durability, directed)
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
 - Guards:
   - `not_requeue_eligible`
 - Emits: `StopInputDispositionClassified`
@@ -27893,7 +27893,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `ClassifyStopInputDispositionAbandonRetired`
 - From: `Retired`
-- On: `ClassifyStopInputDisposition`(input_id, durability, directed)
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
 - Guards:
   - `not_requeue_eligible`
 - Emits: `StopInputDispositionClassified`
@@ -27901,7 +27901,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `ClassifyStopInputDispositionAbandonStopped`
 - From: `Stopped`
-- On: `ClassifyStopInputDisposition`(input_id, durability, directed)
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
 - Guards:
   - `not_requeue_eligible`
 - Emits: `StopInputDispositionClassified`

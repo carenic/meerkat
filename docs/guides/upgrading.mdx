@@ -152,8 +152,9 @@ add the arms (or a wildcard) where you match these enums exhaustively.
 - **Queued prompts kept across a graceful stop (opt-in):** a mob Shutdown
   with `ShutdownOptions::with_queued_inputs(QueuedInputsOnShutdown::Requeue(max_age))`
   (or an unregister with `UnregisterQueuedInputs::Requeue { max_age }`) keeps
-  each input still queued behind the running turn that is a durable,
-  non-directed prompt in the queue lane. Its waiter ends with
+  each input still queued behind the running turn that is a durable prompt
+  in the queue lane, neither directed nor bound to an objective (so never a
+  member's kickoff). Its waiter ends with
   `RequeuedAcrossStop`, and the next start runs it once, before new work. A
   kept input older than `max_age` when the next start recovers it ends as
   `RequeueExpired` without running. Without the option nothing changes.

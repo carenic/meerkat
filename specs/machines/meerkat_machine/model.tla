@@ -36740,97 +36740,97 @@ ResolveCheckpointCompletionResultFailedStopped(owner_input_id, run_id, candidate
     /\ UnchangedFrame_741e27c6cf983c4d
 
 
-ClassifyStopInputDispositionRetainInitializing(input_id, durability, directed) ==
+ClassifyStopInputDispositionRetainInitializing(input_id, durability, directed, objective_bound) ==
     /\ phase = "Initializing"
-    /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (durability = "Durable")))
+    /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (objective_bound = FALSE) /\ (durability = "Durable")))
     /\ phase' = "Initializing"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_741e27c6cf983c4d
 
 
-ClassifyStopInputDispositionRetainIdle(input_id, durability, directed) ==
+ClassifyStopInputDispositionRetainIdle(input_id, durability, directed, objective_bound) ==
     /\ phase = "Idle"
-    /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (durability = "Durable")))
+    /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (objective_bound = FALSE) /\ (durability = "Durable")))
     /\ phase' = "Idle"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_741e27c6cf983c4d
 
 
-ClassifyStopInputDispositionRetainAttached(input_id, durability, directed) ==
+ClassifyStopInputDispositionRetainAttached(input_id, durability, directed, objective_bound) ==
     /\ phase = "Attached"
-    /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (durability = "Durable")))
+    /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (objective_bound = FALSE) /\ (durability = "Durable")))
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_741e27c6cf983c4d
 
 
-ClassifyStopInputDispositionRetainRunning(input_id, durability, directed) ==
+ClassifyStopInputDispositionRetainRunning(input_id, durability, directed, objective_bound) ==
     /\ phase = "Running"
-    /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (durability = "Durable")))
+    /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (objective_bound = FALSE) /\ (durability = "Durable")))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_741e27c6cf983c4d
 
 
-ClassifyStopInputDispositionRetainRetired(input_id, durability, directed) ==
+ClassifyStopInputDispositionRetainRetired(input_id, durability, directed, objective_bound) ==
     /\ phase = "Retired"
-    /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (durability = "Durable")))
+    /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (objective_bound = FALSE) /\ (durability = "Durable")))
     /\ phase' = "Retired"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_741e27c6cf983c4d
 
 
-ClassifyStopInputDispositionRetainStopped(input_id, durability, directed) ==
+ClassifyStopInputDispositionRetainStopped(input_id, durability, directed, objective_bound) ==
     /\ phase = "Stopped"
-    /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (durability = "Durable")))
+    /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (objective_bound = FALSE) /\ (durability = "Durable")))
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_741e27c6cf983c4d
 
 
-ClassifyStopInputDispositionAbandonInitializing(input_id, durability, directed) ==
+ClassifyStopInputDispositionAbandonInitializing(input_id, durability, directed, objective_bound) ==
     /\ phase = "Initializing"
-    /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ~(((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (durability = "Durable"))))
+    /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ~(((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (objective_bound = FALSE) /\ (durability = "Durable"))))
     /\ phase' = "Initializing"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_741e27c6cf983c4d
 
 
-ClassifyStopInputDispositionAbandonIdle(input_id, durability, directed) ==
+ClassifyStopInputDispositionAbandonIdle(input_id, durability, directed, objective_bound) ==
     /\ phase = "Idle"
-    /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ~(((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (durability = "Durable"))))
+    /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ~(((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (objective_bound = FALSE) /\ (durability = "Durable"))))
     /\ phase' = "Idle"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_741e27c6cf983c4d
 
 
-ClassifyStopInputDispositionAbandonAttached(input_id, durability, directed) ==
+ClassifyStopInputDispositionAbandonAttached(input_id, durability, directed, objective_bound) ==
     /\ phase = "Attached"
-    /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ~(((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (durability = "Durable"))))
+    /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ~(((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (objective_bound = FALSE) /\ (durability = "Durable"))))
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_741e27c6cf983c4d
 
 
-ClassifyStopInputDispositionAbandonRunning(input_id, durability, directed) ==
+ClassifyStopInputDispositionAbandonRunning(input_id, durability, directed, objective_bound) ==
     /\ phase = "Running"
-    /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ~(((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (durability = "Durable"))))
+    /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ~(((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (objective_bound = FALSE) /\ (durability = "Durable"))))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_741e27c6cf983c4d
 
 
-ClassifyStopInputDispositionAbandonRetired(input_id, durability, directed) ==
+ClassifyStopInputDispositionAbandonRetired(input_id, durability, directed, objective_bound) ==
     /\ phase = "Retired"
-    /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ~(((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (durability = "Durable"))))
+    /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ~(((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (objective_bound = FALSE) /\ (durability = "Durable"))))
     /\ phase' = "Retired"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_741e27c6cf983c4d
 
 
-ClassifyStopInputDispositionAbandonStopped(input_id, durability, directed) ==
+ClassifyStopInputDispositionAbandonStopped(input_id, durability, directed, objective_bound) ==
     /\ phase = "Stopped"
-    /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ~(((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (durability = "Durable"))))
+    /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ~(((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (objective_bound = FALSE) /\ (durability = "Durable"))))
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_741e27c6cf983c4d
@@ -39447,18 +39447,18 @@ Next ==
     \/ (phase = "Running") /\ \E owner_input_id \in StringValues : \E run_id \in RunIdValues : \E candidate_digest \in StringValues : \E completion_input_ids_digest \in StringValues : \E requires_session_checkpoint \in BOOLEAN : \E recipient_input_ids \in SetOfStringValues : \E finalization \in RuntimeCompletionFinalizationObservationValues : ResolveCheckpointCompletionResultFailedRunning(owner_input_id, run_id, candidate_digest, completion_input_ids_digest, requires_session_checkpoint, recipient_input_ids, finalization)
     \/ (phase = "Retired") /\ \E owner_input_id \in StringValues : \E run_id \in RunIdValues : \E candidate_digest \in StringValues : \E completion_input_ids_digest \in StringValues : \E requires_session_checkpoint \in BOOLEAN : \E recipient_input_ids \in SetOfStringValues : \E finalization \in RuntimeCompletionFinalizationObservationValues : ResolveCheckpointCompletionResultFailedRetired(owner_input_id, run_id, candidate_digest, completion_input_ids_digest, requires_session_checkpoint, recipient_input_ids, finalization)
     \/ (phase = "Stopped") /\ \E owner_input_id \in StringValues : \E run_id \in RunIdValues : \E candidate_digest \in StringValues : \E completion_input_ids_digest \in StringValues : \E requires_session_checkpoint \in BOOLEAN : \E recipient_input_ids \in SetOfStringValues : \E finalization \in RuntimeCompletionFinalizationObservationValues : ResolveCheckpointCompletionResultFailedStopped(owner_input_id, run_id, candidate_digest, completion_input_ids_digest, requires_session_checkpoint, recipient_input_ids, finalization)
-    \/ (phase = "Initializing") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : ClassifyStopInputDispositionRetainInitializing(input_id, durability, FALSE)
-    \/ (phase = "Idle") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : ClassifyStopInputDispositionRetainIdle(input_id, durability, FALSE)
-    \/ (phase = "Attached") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : ClassifyStopInputDispositionRetainAttached(input_id, durability, FALSE)
-    \/ (phase = "Running") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : ClassifyStopInputDispositionRetainRunning(input_id, durability, FALSE)
-    \/ (phase = "Retired") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : ClassifyStopInputDispositionRetainRetired(input_id, durability, FALSE)
-    \/ (phase = "Stopped") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : ClassifyStopInputDispositionRetainStopped(input_id, durability, FALSE)
-    \/ (phase = "Initializing") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : \E directed \in BOOLEAN : ClassifyStopInputDispositionAbandonInitializing(input_id, durability, directed)
-    \/ (phase = "Idle") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : \E directed \in BOOLEAN : ClassifyStopInputDispositionAbandonIdle(input_id, durability, directed)
-    \/ (phase = "Attached") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : \E directed \in BOOLEAN : ClassifyStopInputDispositionAbandonAttached(input_id, durability, directed)
-    \/ (phase = "Running") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : \E directed \in BOOLEAN : ClassifyStopInputDispositionAbandonRunning(input_id, durability, directed)
-    \/ (phase = "Retired") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : \E directed \in BOOLEAN : ClassifyStopInputDispositionAbandonRetired(input_id, durability, directed)
-    \/ (phase = "Stopped") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : \E directed \in BOOLEAN : ClassifyStopInputDispositionAbandonStopped(input_id, durability, directed)
+    \/ (phase = "Initializing") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : ClassifyStopInputDispositionRetainInitializing(input_id, durability, FALSE, FALSE)
+    \/ (phase = "Idle") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : ClassifyStopInputDispositionRetainIdle(input_id, durability, FALSE, FALSE)
+    \/ (phase = "Attached") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : ClassifyStopInputDispositionRetainAttached(input_id, durability, FALSE, FALSE)
+    \/ (phase = "Running") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : ClassifyStopInputDispositionRetainRunning(input_id, durability, FALSE, FALSE)
+    \/ (phase = "Retired") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : ClassifyStopInputDispositionRetainRetired(input_id, durability, FALSE, FALSE)
+    \/ (phase = "Stopped") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : ClassifyStopInputDispositionRetainStopped(input_id, durability, FALSE, FALSE)
+    \/ (phase = "Initializing") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : \E directed \in BOOLEAN : \E objective_bound \in BOOLEAN : ClassifyStopInputDispositionAbandonInitializing(input_id, durability, directed, objective_bound)
+    \/ (phase = "Idle") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : \E directed \in BOOLEAN : \E objective_bound \in BOOLEAN : ClassifyStopInputDispositionAbandonIdle(input_id, durability, directed, objective_bound)
+    \/ (phase = "Attached") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : \E directed \in BOOLEAN : \E objective_bound \in BOOLEAN : ClassifyStopInputDispositionAbandonAttached(input_id, durability, directed, objective_bound)
+    \/ (phase = "Running") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : \E directed \in BOOLEAN : \E objective_bound \in BOOLEAN : ClassifyStopInputDispositionAbandonRunning(input_id, durability, directed, objective_bound)
+    \/ (phase = "Retired") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : \E directed \in BOOLEAN : \E objective_bound \in BOOLEAN : ClassifyStopInputDispositionAbandonRetired(input_id, durability, directed, objective_bound)
+    \/ (phase = "Stopped") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : \E directed \in BOOLEAN : \E objective_bound \in BOOLEAN : ClassifyStopInputDispositionAbandonStopped(input_id, durability, directed, objective_bound)
     \/ TerminalStutter
 
 live_delegation_steer_records_are_authorized_and_single == ((DOMAIN live_delegation_steer_digest_by_continuation = DOMAIN live_delegation_steer_operation_by_continuation) /\ (DOMAIN live_delegation_steer_reconciliation_by_continuation = DOMAIN live_delegation_steer_operation_by_continuation) /\ (\A continuation_id \in DOMAIN live_delegation_steer_delivered_by_continuation : (continuation_id \in DOMAIN live_delegation_steer_operation_by_continuation)))

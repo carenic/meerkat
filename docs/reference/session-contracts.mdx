@@ -804,7 +804,9 @@ completion waiters of the inputs it keeps with
 consumed: it stays durably queued, and the session's next start runs it, or
 ends it abandoned with reason `requeue_expired` when it is older than the
 Shutdown's max age by then. Do not resubmit it; after the restart, the same
-idempotency key re-attaches to it.
+idempotency key re-attaches to it. Only a durable prompt in the queue lane
+that is neither directed nor bound to an objective is kept: a member's kickoff,
+and any other objective-bound input, ends as stopped, as without the option.
 
 - A JSON-RPC `turn/start` waiting on it answers `-32003` (session not running)
   with `data.reason` `requeued_across_stop`, and `data.input_id` and

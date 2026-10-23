@@ -7112,6 +7112,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 input_id: String,
                 durability: Enum<InputDurabilityKind>,
                 directed: bool,
+                objective_bound: bool,
             },
         }
 
@@ -38522,15 +38523,20 @@ macro_rules! meerkat_catalog_machine_dsl {
         // that commits the stop, and abandons exactly the Abandon set as
         // stopped. Retain needs an unregister that began with the Requeue
         // disposition and an eligible input: still queued, in the Queue lane,
-        // a prompt, not directed and durable. A staged or applied input
-        // belongs to the cancelled run and is never kept, so it cannot run
-        // twice. Every other input is Abandon, so under the Stop
-        // disposition, or outside an unregister, the verdict is today's
-        // blanket abandon. The shell supplies durability and directedness;
-        // the phase, lane and kind are machine facts.
+        // a prompt, not directed, not bound to an objective, and durable. A
+        // staged or applied input belongs to the cancelled run and is never
+        // kept, so it cannot run twice. An objective-bound input is never
+        // kept either: its objective's owner records its outcome in the
+        // stopping process (a mob records a member's kickoff, which is
+        // objective-bound, as failed when it does not run there), so a kept
+        // one would run after a restart that record already settled. Every
+        // other input is Abandon, so under the Stop disposition, or outside
+        // an unregister, the verdict is today's blanket abandon. The shell
+        // supplies durability, directedness and the objective binding; the
+        // phase, lane and kind are machine facts.
         transition ClassifyStopInputDispositionRetain {
             per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
-            on input ClassifyStopInputDisposition { input_id, durability, directed }
+            on input ClassifyStopInputDisposition { input_id, durability, directed, objective_bound }
             guard "requeue_eligible" {
                 self.registration_phase == RegistrationPhase::Draining
                 && self.unregister_queued_inputs == UnregisterQueuedInputsDisposition::Requeue
@@ -38539,6 +38545,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 && self.input_lane.get_cloned(input_id) == Some(InputLane::Queue)
                 && self.input_is_prompt.get_cloned(input_id) == Some(true)
                 && directed == false
+                && objective_bound == false
                 && durability == InputDurabilityKind::Durable
             }
             update {}
@@ -38552,7 +38559,7 @@ macro_rules! meerkat_catalog_machine_dsl {
 
         transition ClassifyStopInputDispositionAbandon {
             per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
-            on input ClassifyStopInputDisposition { input_id, durability, directed }
+            on input ClassifyStopInputDisposition { input_id, durability, directed, objective_bound }
             guard "not_requeue_eligible" {
                 !(self.registration_phase == RegistrationPhase::Draining
                     && self.unregister_queued_inputs == UnregisterQueuedInputsDisposition::Requeue
@@ -38561,6 +38568,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                     && self.input_lane.get_cloned(input_id) == Some(InputLane::Queue)
                     && self.input_is_prompt.get_cloned(input_id) == Some(true)
                     && directed == false
+                    && objective_bound == false
                     && durability == InputDurabilityKind::Durable)
             }
             update {}
