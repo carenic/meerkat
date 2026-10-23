@@ -722,15 +722,18 @@ them.
   a session that is ending
   (`recovery::recover_durable_tail_for_session_archive`), which judges a
   quiescent persisted runtime (no row, `Idle`, `Stopped` or `Retired`) as
-  retired: an archive never continues a run. Before that recovery the archive
-  ends, under its runtime lease, the work the runtime kept for a later start
+  retired: an archive never continues a run. When that recovery holds the
+  tail beside the work the runtime kept for a later start, the archive ends
+  that work under its runtime lease
   (`MeerkatMachine::end_unresumed_work_with_archive_lease_before`): the inputs
   of the run it keeps resumable, and every queued input, are abandoned as
-  cancelled, as a live retire cancels its queue. A retire or destroy that
-  archives a member before a restarted host registers its runtime again
-  (after a graceful stop kept its run and requeued its queue) therefore
-  commits the tail as interrupted instead of ending with
-  `SessionError::DurableTailHeldForRecovery`. A
+  cancelled, as a live retire cancels its queue; then it runs the recovery
+  once more. A retire or destroy that archives a member before a restarted
+  host registers its runtime again (after a graceful stop kept its run and
+  requeued its queue) therefore commits the tail as interrupted instead of
+  ending with `SessionError::DurableTailHeldForRecovery`. A tail the first
+  recovery commits keeps its run's inputs for that commit: a run whose
+  answer landed before its boundary has them consumed, not cancelled. A
   tail with no assistant
   message and no tool result is attributed to its run by the store-issued
   provisional binding on a strict continuation (round zero's first commit, or

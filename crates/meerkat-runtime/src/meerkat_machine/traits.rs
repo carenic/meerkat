@@ -2137,8 +2137,9 @@ impl MeerkatMachine {
     }
 
     /// End, under `lease`, the work this session's runtime still keeps for a
-    /// later start, before the session's archive settles a durable tail it
-    /// met. Returns the inputs it ended.
+    /// later start, when the session's archive met a durable tail that its
+    /// recovery held beside that work; the archive then runs its recovery
+    /// once more. Returns the inputs it ended.
     ///
     /// The archive can run before any start registers the session's runtime
     /// again: after a graceful stop that kept a durable run and requeued its
@@ -2154,10 +2155,10 @@ impl MeerkatMachine {
     ///   answered here; a directed input's publication is the archive's to
     ///   converge, after it releases the lease.
     ///
-    /// Every input commits through the lease's own driver. The archive's
-    /// recovery then finds them terminal, so its commit terminalizes nothing
-    /// this driver still holds, and the retire under the same lease does not
-    /// write over them. The runless-terminal hint is told when this returns,
+    /// Every input commits through the lease's own driver. The recovery the
+    /// archive runs next finds them terminal, so its commit terminalizes
+    /// nothing this driver still holds, and the retire under the same lease
+    /// does not write over them. The runless-terminal hint is told when this returns,
     /// while the archive still holds M: it is a pure signal to a delivery
     /// owner, which waits for M if it needs it, and the terminals it
     /// announces are durable by then.
