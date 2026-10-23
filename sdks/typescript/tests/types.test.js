@@ -748,12 +748,29 @@ describe("Typed Events", () => {
     }
   });
 
-  it("should parse tool_execution_completed", () => {
+  it("should parse tool_execution_completed without a result body", () => {
     const event = parseEvent({
       type: "tool_execution_completed",
       id: "t1",
       name: "search",
-      result: "found it",
+      is_error: false,
+      duration_ms: 42,
+    });
+    assert.equal(event.type, "tool_execution_completed");
+    if (event.type === "tool_execution_completed") {
+      assert.equal(event.name, "search");
+      assert.equal(event.durationMs, 42);
+      assert.equal(event.isError, false);
+      // The execution fact carries no body: it is on tool_result_received.
+      assert.equal("content" in event, false);
+    }
+  });
+
+  it("should ignore an older server's body on tool_execution_completed", () => {
+    const event = parseEvent({
+      type: "tool_execution_completed",
+      id: "t1",
+      name: "search",
       content: [
         { type: "text", text: "found it" },
         { type: "image", media_type: "image/png", source: "inline", data: "AAAA" },
@@ -763,13 +780,11 @@ describe("Typed Events", () => {
     });
     assert.equal(event.type, "tool_execution_completed");
     if (event.type === "tool_execution_completed") {
-      assert.equal(event.name, "search");
-      assert.equal(event.durationMs, 42);
-      assert.equal(event.isError, false);
-      assert.deepEqual(event.content, [
-        { type: "text", text: "found it" },
-        { type: "image", media_type: "image/png", source: "inline", data: "AAAA" },
-      ]);
+      assert.deepEqual(
+        [event.id, event.name, event.isError, event.durationMs],
+        ["t1", "search", false, 42],
+      );
+      assert.equal("content" in event, false);
     }
   });
 
@@ -790,13 +805,11 @@ describe("Typed Events", () => {
 
   it("should preserve malformed tool result content blocks", () => {
     const event = parseEvent({
-      type: "tool_execution_completed",
+      type: "tool_result_received",
       id: "t1",
       name: "search",
-      result: "found it",
       content: "not blocks",
       is_error: false,
-      duration_ms: 42,
     });
 
     assert.equal(event.type, "malformed_event");
@@ -810,13 +823,11 @@ describe("Typed Events", () => {
       type: "tool_execution_completed",
       id: "t1",
       name: "search",
-      content: [{ type: "text", text: "found it" }],
     });
     const malformed = parseEvent({
       type: "tool_execution_completed",
       id: "t1",
       name: "search",
-      content: [{ type: "text", text: "found it" }],
       is_error: "false",
     });
 
@@ -827,8 +838,6 @@ describe("Typed Events", () => {
       assert.equal(malformed.isError, undefined);
       assert.equal(missing.durationMs, undefined);
       assert.equal(malformed.durationMs, undefined);
-      assert.deepEqual(missing.content, [{ type: "text", text: "found it" }]);
-      assert.deepEqual(malformed.content, [{ type: "text", text: "found it" }]);
     }
   });
 

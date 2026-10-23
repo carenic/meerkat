@@ -467,7 +467,7 @@ match event {
 
     // Tool execution
     AgentEvent::ToolExecutionStarted { id, name } => {}
-    AgentEvent::ToolExecutionCompleted { id, name, content, is_error, duration_ms } => {}
+    AgentEvent::ToolExecutionCompleted { id, name, is_error, duration_ms } => {}
     AgentEvent::ToolExecutionTimedOut { id, name, timeout_ms } => {}
 
     // Compaction
