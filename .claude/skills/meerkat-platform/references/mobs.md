@@ -142,7 +142,8 @@ directed nor bound to an objective (never a member's kickoff) for the next
 start, whose waiters get
 `BoundedTurnFailure::RequeuedAcrossStop`, or `RequeueExpired` when older than
 `max_age` at that start; the running turn of a member whose session commits
-every round is kept too and
+every round is kept too (an autonomous member's running kickoff
+included, resumed under the same objective) and
 continues from its last committed round at that start)
 returns a `MobShutdownReport` with per-member `members`
 (`MemberShutdownOutcome`), `runs` and `run_starts`; `is_clean()` is true when

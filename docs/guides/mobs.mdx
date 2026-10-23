@@ -1384,6 +1384,8 @@ too: it stops at once, its inputs stay bound to its run with the same waiter
 answer and the same max age, and the run continues from its last committed
 round at the next start, before the kept inputs run (see
 [Durable runs: graceful stops and deploys](/guides/durable-runs#graceful-stops-and-deploys)).
+This includes an autonomous member's running kickoff: the member keeps its
+kickoff, and its run resumes under the same objective at the next start.
 On any other member the running turn's own input still ends cancelled, and
 the cancelled turn's user message is not in what the kept input's turn sees.
 Steer, ephemeral, event, directed and objective-bound inputs that are not
