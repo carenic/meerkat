@@ -3115,7 +3115,8 @@ mod hosting {
         }
 
         /// Move the store's delivery generation on through a connection of
-        /// the test's own, as another process's delivery would.
+        /// the test's own, as another process's delivery would (the delivery
+        /// domain is provisioned already).
         fn move_the_delivery_generation(conn: &meerkat_sqlite::Connection) {
             conn.execute(
                 "UPDATE runtime_delivery_generation SET generation = generation + 1 \
@@ -3123,6 +3124,34 @@ mod hosting {
                 [],
             )
             .expect("move the delivery generation");
+        }
+
+        /// Commit delivery authority `revision` through a store of the test's
+        /// own on the same file, as another process's delivery would: it
+        /// moves the store's delivery generation, and its first commit
+        /// provisions the delivery domain. The owner hears of it only through
+        /// its store watch.
+        async fn commit_a_delivery_elsewhere(path: &std::path::Path, revision: u64) {
+            let store = SqliteRuntimeStore::new(path.to_path_buf()).expect("another store");
+            let outcome = store
+                .compare_and_swap_runtime_delivery_authority(
+                    &LogicalRuntimeId::new("elsewhere"),
+                    revision.checked_sub(1).filter(|observed| *observed > 0),
+                    meerkat_runtime::RuntimeDeliveryAuthorityRecord::from_parts(
+                        revision,
+                        br#"{"opaque":true}"#.to_vec(),
+                    ),
+                    None,
+                )
+                .await
+                .expect("a delivery commit");
+            assert!(
+                matches!(
+                    outcome,
+                    meerkat_runtime::RuntimeDeliveryAuthorityCasOutcome::Applied(_)
+                ),
+                "{outcome:?}"
+            );
         }
 
         /// The owner's own reads are no store change. Its arming read opens
@@ -3233,10 +3262,7 @@ mod hosting {
             let opens = hooks::verified_opens(&path);
             let reconciled = passes.borrow().generation;
 
-            let conn = meerkat_sqlite::open(&path, meerkat_sqlite::ConnectionProfile::PRIMARY)
-                .expect("another connection");
-            move_the_delivery_generation(&conn);
-            drop(conn);
+            commit_a_delivery_elsewhere(&path, 1).await;
             wait_real("the commit's reconcile", EVENT_GUARD, || {
                 passes.borrow().generation > reconciled
             })
@@ -3259,6 +3285,7 @@ mod hosting {
             let (fixture, path, capability) = watched_store();
             hooks::force_fresh_reads(&path);
             let wal = wal_of(&path);
+            commit_a_delivery_elsewhere(&path, 1).await;
             // Held through the test: no read is the store's first or last
             // connection, so the WAL stays and no read changes it.
             let held = meerkat_sqlite::open(&path, meerkat_sqlite::ConnectionProfile::PRIMARY)
