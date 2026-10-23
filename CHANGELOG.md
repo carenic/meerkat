@@ -556,8 +556,10 @@ them.
   at load. The host sizes the fence renew interval and lease through
   `HostStore::fence_timing` (`FenceTiming`, by default 10 s and 30 s), and
   may declare the self-fence margin (`FenceTiming::try_with_margin`: at
-  least one renew interval plus twice the store's visibility lag);
-  `SelfFence` reports a writer's window. An exclusive acquire refuses typed
+  least one renew interval plus twice the store's visibility lag) and its
+  longest commit (`FenceTiming::try_with_max_commit_latency`, 2 s by
+  default), which bounds how long a fenced write waits for a commit in
+  flight before it backs off; `SelfFence` reports a writer's window. An exclusive acquire refuses typed
   (`HostStoreError::Held`) while another holder's lease lasts, a takeover's
   `FenceGrant` says how long the new writer waits before it dispatches
   anything, and a holder whose renew failed or whose window closed acquires
@@ -594,10 +596,14 @@ them.
   `meerkat::HostStoreProvider` composes them as a `RealmStorageProvider` and
   hands its realm to the mob storage. Values too large for a row live in
   chunk scopes inside the SPI, a boot loads only the runtime bodies recovery
-  acts on, and a batch that fails poisons the scopes it touched until the
-  realm is reopened (a lost fence poisons the realm). On such a realm an
-  OAuth login in progress is process-local: a restart cancels it and the
-  user starts it again. Completed credentials are not affected.
+  acts on, and a batch that fails poisons the scopes it would have changed
+  until the realm is reopened (a lost fence poisons the realm). A change too
+  large for one batch is refused typed (`SpiError::TooLarge`). On such a
+  realm an OAuth login in progress is process-local: a restart cancels it
+  and the user starts it again. Completed credentials are not affected.
+  Temporary councils are process-local too: the default council store
+  declares itself process-bound, so a council that requires durable custody
+  is refused.
 - `MemberBinding::labels()`: the application labels the incarnation was
   spawned with, as its spawn recorded them (a member reset keeps them). Every
   read of the member binding history carries them, the store-level

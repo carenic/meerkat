@@ -1075,10 +1075,30 @@ impl SpiMobIdentityStore {
 /// A runtime write fence that holds the identity scope's lock across the
 /// fenced runtime write, so the in-memory fence validates only identity
 /// authority the host acknowledged (no commit of that scope is in flight).
+/// While a commit of that scope is in flight it answers Backoff, and the
+/// runtime retries it for the host's declared longest commit
+/// ([`meerkat_core::host_store::FenceTiming::max_commit_latency`]).
 #[cfg(feature = "runtime-adapter")]
-struct SpiIdentityRuntimeWriteFence {
+pub(super) struct SpiIdentityRuntimeWriteFence {
     cell: Arc<meerkat_runtime::store::spi::ScopeCell>,
     inner: Arc<dyn meerkat_runtime::RuntimeStoreWriteFence>,
+    backoff_bound: std::time::Duration,
+}
+
+#[cfg(feature = "runtime-adapter")]
+impl SpiIdentityRuntimeWriteFence {
+    /// The fence over `bundle`'s identity scope around `inner`, retried for
+    /// the host's declared longest commit.
+    pub(super) fn over(
+        bundle: &Bundle,
+        inner: Arc<dyn meerkat_runtime::RuntimeStoreWriteFence>,
+    ) -> Self {
+        Self {
+            cell: bundle.realm.cell(&bundle.identity_scope),
+            inner,
+            backoff_bound: bundle.realm.timing().max_commit_latency(),
+        }
+    }
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -1102,6 +1122,10 @@ impl meerkat_runtime::RuntimeStoreWriteFence for SpiIdentityRuntimeWriteFence {
         drop(state);
         outcome
     }
+
+    fn backoff_retry_bound(&self) -> std::time::Duration {
+        self.backoff_bound
+    }
 }
 
 #[async_trait]
@@ -1117,10 +1141,10 @@ impl MobIdentityStore for SpiMobIdentityStore {
             self.bundle
                 .identity
                 .prepare_runtime_write_fence(permit, expected_session, observed)?;
-        Ok(Arc::new(SpiIdentityRuntimeWriteFence {
-            cell: self.bundle.realm.cell(&self.bundle.identity_scope),
+        Ok(Arc::new(SpiIdentityRuntimeWriteFence::over(
+            &self.bundle,
             inner,
-        }))
+        )))
     }
 
     /// I: read.
@@ -1527,8 +1551,9 @@ impl MobIdentityStatusStore for SpiMobIdentityStatusStore {
 
 /// [`MobRunStore`] over the storage's run scope. Every write names one run
 /// and exports that run (or that run's remote turn intents or receipts)
-/// only. `cas_run_snapshot_and_append_terminal_event_with_authority` keeps
-/// the trait's own two-step form, as the in-memory store does.
+/// only. `cas_run_snapshot_and_append_terminal_event_with_authority` commits
+/// the terminal run and its terminal event in one batch over the run and
+/// mob scopes, as the SQLite store does in one transaction.
 #[derive(Debug, Clone)]
 pub struct SpiMobRunStore {
     bundle: Arc<Bundle>,
@@ -1713,6 +1738,54 @@ impl MobRunStore for SpiMobRunStore {
                     authority_inputs,
                 ),
             )
+            .await
+    }
+
+    /// R + M in one batch: the terminal run snapshot and its terminal event,
+    /// so terminal run truth and terminal event truth never split. The
+    /// event goes to this storage's own log, which every event store of the
+    /// storage shares; `events` is not used, as in the SQLite store.
+    async fn cas_run_snapshot_and_append_terminal_event_with_authority(
+        &self,
+        run_id: &RunId,
+        expected_status: MobRunStatus,
+        expected_flow_state: &flow_run::State,
+        next_status: MobRunStatus,
+        next_flow_state: &flow_run::State,
+        authority_inputs: Vec<mob_dsl::MobMachineInput>,
+        _events: &dyn MobEventStore,
+        terminal_event: NewMobEvent,
+    ) -> Result<Option<MobEvent>, MobStoreError> {
+        // Validated before any change, as the trait's default does.
+        validate_mob_event_write_authority(&terminal_event.kind)?;
+        if terminal_event_identity(&terminal_event.kind).is_none() {
+            return Err(MobStoreError::Internal(
+                "cas_run_snapshot_and_append_terminal_event_with_authority requires a terminal flow event".to_string(),
+            ));
+        }
+        let touch = Touch {
+            run: Some(run_id.clone()),
+            ..appended()
+        };
+        let bundle = &self.bundle;
+        self.bundle
+            .write(touch, async move {
+                let transitioned = bundle
+                    .runs
+                    .cas_run_snapshot_with_authority(
+                        run_id,
+                        expected_status,
+                        expected_flow_state,
+                        next_status,
+                        next_flow_state,
+                        authority_inputs,
+                    )
+                    .await?;
+                if !transitioned {
+                    return Ok(None);
+                }
+                bundle.events.append(terminal_event).await.map(Some)
+            })
             .await
     }
 

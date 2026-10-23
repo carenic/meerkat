@@ -218,7 +218,10 @@ pub struct HostSuppliedStores {
 ///
 /// OAuth login flows in progress stay process-local on such a realm: a
 /// restart cancels a login in progress and the user starts it again.
-/// Completed credentials are not affected.
+/// Completed credentials are not affected. Temporary councils are
+/// process-local too: the default council store declares itself
+/// process-bound, so a council that requires durable custody is refused and
+/// a process-bound one does not survive a restart.
 pub struct HostStoreProvider {
     name: String,
     realm: Arc<SpiRealm>,

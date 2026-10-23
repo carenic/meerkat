@@ -93,6 +93,13 @@
 //! [`FENCE_RENEW_INTERVAL_SECS`]. A shorter lease shortens the wait at a
 //! restart and at a takeover; a longer interval renews less often.
 //!
+//! The host also declares the longest one commit takes on its backend
+//! ([`FenceTiming::max_commit_latency`], [`FENCE_MAX_COMMIT_LATENCY_SECS`]
+//! by default). A fenced write that meets a commit in flight on the
+//! authority it checks waits that long before it reports the write as
+//! backed off, so a host whose commits are slower declares a longer bound
+//! instead of failing those writes.
+//!
 //! # Writer rules (Core's side)
 //!
 //! - A writer acquires with [`AcquireMode::Exclusive`]; a live holder makes
@@ -168,6 +175,11 @@ pub const FENCE_LEASE_SECS: u64 = 30;
 /// renew does not make a live holder fence itself.
 pub const FENCE_MIN_LEASE_RENEWALS: u32 = 3;
 
+/// The longest one commit takes by default, in seconds. A host declares its
+/// own bound through [`HostStore::fence_timing`]
+/// ([`FenceTiming::try_with_max_commit_latency`]).
+pub const FENCE_MAX_COMMIT_LATENCY_SECS: u64 = 2;
+
 const _: () =
     assert!(FENCE_LEASE_SECS >= FENCE_RENEW_INTERVAL_SECS * FENCE_MIN_LEASE_RENEWALS as u64);
 
@@ -180,6 +192,7 @@ pub struct FenceTiming {
     renew_interval: Duration,
     lease: Duration,
     self_fence_margin: Duration,
+    max_commit_latency: Duration,
 }
 
 impl FenceTiming {
@@ -238,6 +251,29 @@ impl FenceTiming {
             renew_interval,
             lease,
             self_fence_margin,
+            max_commit_latency: Duration::from_secs(FENCE_MAX_COMMIT_LATENCY_SECS),
+        })
+    }
+
+    /// This timing with a host-declared longest commit: how long one
+    /// [`HostStore::commit`] can take on the host's backend. A fenced write
+    /// that meets a commit in flight on the authority it checks waits this
+    /// long before it reports the write as backed off. The bound is longer
+    /// than zero and at most the lease.
+    pub fn try_with_max_commit_latency(
+        self,
+        max_commit_latency: Duration,
+    ) -> Result<Self, HostStoreError> {
+        if max_commit_latency.is_zero() || max_commit_latency > self.lease {
+            return Err(HostStoreError::Invalid(format!(
+                "a longest commit of {max_commit_latency:?} is not longer than zero and at most \
+                 the lease of {:?}",
+                self.lease
+            )));
+        }
+        Ok(Self {
+            max_commit_latency,
+            ..self
         })
     }
 
@@ -263,6 +299,13 @@ impl FenceTiming {
     pub const fn self_fence_window(self) -> Duration {
         self.lease.saturating_sub(self.self_fence_margin)
     }
+
+    /// The host-declared longest commit: [`FENCE_MAX_COMMIT_LATENCY_SECS`]
+    /// unless the host declared another
+    /// ([`Self::try_with_max_commit_latency`]).
+    pub const fn max_commit_latency(self) -> Duration {
+        self.max_commit_latency
+    }
 }
 
 impl Default for FenceTiming {
@@ -271,6 +314,7 @@ impl Default for FenceTiming {
             renew_interval: Duration::from_secs(FENCE_RENEW_INTERVAL_SECS),
             lease: Duration::from_secs(FENCE_LEASE_SECS),
             self_fence_margin: Duration::from_secs(FENCE_RENEW_INTERVAL_SECS),
+            max_commit_latency: Duration::from_secs(FENCE_MAX_COMMIT_LATENCY_SECS),
         }
     }
 }
@@ -907,5 +951,32 @@ mod tests {
         // A window under two renew intervals.
         assert!(FenceTiming::try_with_margin(secs(10), secs(30), secs(12)).is_err());
         assert!(FenceTiming::try_with_margin(secs(10), secs(30), secs(30)).is_err());
+    }
+
+    // Unrun until the candidate's validation.
+    #[test]
+    fn a_declared_longest_commit_is_kept_within_the_lease() {
+        let secs = Duration::from_secs;
+        assert_eq!(FenceTiming::default().max_commit_latency(), secs(2));
+        let slow = FenceTiming::default().try_with_max_commit_latency(secs(10));
+        assert_eq!(
+            slow.clone().map(FenceTiming::max_commit_latency),
+            Ok(secs(10))
+        );
+        // The rest of the timing is unchanged.
+        assert_eq!(
+            slow.map(FenceTiming::self_fence_window),
+            Ok(FenceTiming::default().self_fence_window())
+        );
+        assert!(
+            FenceTiming::default()
+                .try_with_max_commit_latency(Duration::ZERO)
+                .is_err()
+        );
+        assert!(
+            FenceTiming::default()
+                .try_with_max_commit_latency(secs(31))
+                .is_err()
+        );
     }
 }

@@ -9,11 +9,16 @@
 //! 2. a mutation checks the self-fence first ([`SpiRealm::ensure_lease`]),
 //!    so a writer past its window changes nothing;
 //! 3. lock the named scopes in order, refuse poisoned ones, and load a body
-//!    that is not resident yet (D2);
-//! 4. run the in-memory method, recording every map entry it touches;
+//!    that is not resident yet (D2); a mutation checks the self-fence again,
+//!    since the lock waits may have outlasted the window;
+//! 4. run the in-memory method, recording every map entry it touches; from
+//!    here until the hand-off, a dropped call poisons the locked scopes
+//!    ([`ArmedScopes`]);
 //! 5. refuse and poison when it touched a scope it did not lock (M2);
-//! 6. export the touched entries and commit them to the host as one batch
-//!    ([`SpiRealm::commit`]) before answering.
+//! 6. export the touched entries and hand them, with the scopes and the
+//!    gate, to a task that commits them to the host as one batch
+//!    ([`SpiRealm::commit`]) and adopts it, or poisons, whether or not the
+//!    caller still waits; the call answers once it settled.
 //!
 //! Which scopes each method names is written beside it; the capture, not the
 //! list, decides what is committed, and a touch outside the list is a typed
@@ -37,7 +42,9 @@ use meerkat_core::lifecycle::{InputId, RunBoundaryReceipt, RunId};
 use tokio::sync::RwLock;
 
 use super::SpiError;
-use super::realm::{ScopeDelta, ScopeFamily, ScopeGuard, ScopeId, ScopeState, SpiRealm};
+use super::realm::{
+    ArmedScopes, ScopeDelta, ScopeFamily, ScopeGuard, ScopeId, ScopeState, SpiRealm,
+};
 use crate::identifiers::{IdempotencyKey, LogicalRuntimeId};
 use crate::input_state::{InputStatePersistenceRecord, StoredInputState};
 use crate::ops_lifecycle::PersistedOpsSnapshot;
@@ -239,8 +246,10 @@ pub struct SpiRuntimeStore {
     memory: InMemoryRuntimeStore,
     /// Shared by single-scope calls, exclusive for cross-scope reads and the
     /// controller custody (M1, M8).
-    gate: RwLock<()>,
-    mob_host: StdMutex<MobHostRecords>,
+    gate: Arc<RwLock<()>>,
+    /// The mob host records; a change lands here only after its batch did,
+    /// on the task that committed it.
+    mob_host: Arc<StdMutex<MobHostRecords>>,
 }
 
 impl std::fmt::Debug for SpiRuntimeStore {
@@ -322,13 +331,14 @@ impl SpiRuntimeStore {
                     .journal_import(&scope, &body)
                     .await
                     .map_err(memory_error)?;
+                state.mark_loaded();
             }
         }
         Ok(Self {
             realm,
             memory,
-            gate: RwLock::new(()),
-            mob_host: StdMutex::new(records),
+            gate: Arc::new(RwLock::new(())),
+            mob_host: Arc::new(StdMutex::new(records)),
         })
     }
 
@@ -340,6 +350,11 @@ impl SpiRuntimeStore {
 
     /// Run one in-memory method under its scopes and commit what it changed
     /// before answering. See the module documentation.
+    ///
+    /// Cancel safety: from the start of a mutation until its commit
+    /// is handed to a task that owns the scopes, dropping this future
+    /// poisons them ([`ArmedScopes`]); after the hand-off the task lands the
+    /// batch and adopts it (or poisons) whether or not anyone still waits.
     async fn call<T, F>(&self, mode: Mode, ids: Vec<ScopeId>, op: F) -> Result<T, RuntimeStoreError>
     where
         F: std::future::Future<Output = Result<T, RuntimeStoreError>> + Send,
@@ -349,25 +364,61 @@ impl SpiRuntimeStore {
             Mode::Mutate => error.into_write(),
             Mode::Read | Mode::ReadPinned => error.into_read(),
         };
-        let _gate = self.gate.read().await;
+        let gate = Arc::clone(&self.gate).read_owned().await;
         match mode {
             Mode::Mutate => self.realm.ensure_lease().await.map_err(refuse)?,
             Mode::Read | Mode::ReadPinned => self.realm.check_realm().map_err(refuse)?,
         }
-        let mut guards = self.realm.lock_scopes(&ids).await;
-        for guard in &mut guards {
+        let guards = self.realm.lock_scopes(&ids).await;
+        let mut scopes = ArmedScopes::new(Arc::clone(&self.realm), guards).hold(gate);
+        for guard in scopes.guards_mut() {
             self.realm.check_scope(guard).map_err(refuse)?;
             if mode != Mode::ReadPinned {
                 self.ensure_loaded(guard).await.map_err(refuse)?;
             }
         }
+        if mode == Mode::Mutate {
+            // The lock waits may have outlasted the window: check it again
+            // before memory changes, so a lapse refuses cleanly.
+            self.realm.ensure_lease().await.map_err(refuse)?;
+            scopes.arm();
+        }
         let (result, touches) = journal::capture(op).await;
         if touches.whole.is_empty() && touches.entries.is_empty() {
+            scopes.disarm();
             return result;
         }
-        self.commit_touches(&mut guards, &touches)
+        let (deltas, runtimes) = match self.prepare_commit(scopes.guards(), &touches).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // Memory changed and cannot be exported: poison what it touched.
+                let cause = error.to_string();
+                let touched: HashSet<ScopeId> = touches.scopes().iter().map(scope_id_of).collect();
+                for guard in scopes.guards_mut() {
+                    if touched.contains(guard.id()) {
+                        self.realm.poison(guard, &cause);
+                    }
+                }
+                scopes.disarm();
+                return Err(error.into_write());
+            }
+        };
+        let mut scopes = scopes
+            .commit_detached(deltas)
             .await
             .map_err(SpiError::into_write)?;
+        // D2: an archived runtime with nothing left for recovery leaves
+        // memory once its archive is durable.
+        for runtime_id in runtimes {
+            let id = ScopeId::new(RUNTIME_FAMILY, runtime_id.clone());
+            if let Ok(state) = find(scopes.guards_mut(), &id)
+                && state.is_loaded()
+                && self.memory.journal_archived_idle(&runtime_id).await
+            {
+                self.memory.journal_evict_body(&runtime_id).await;
+                state.unload();
+            }
+        }
         result
     }
 
@@ -401,38 +452,27 @@ impl SpiRuntimeStore {
             return Ok(());
         };
         let body = self.realm.load_body(state).await?;
+        // The import holds the in-memory lock without awaiting: it lands
+        // whole or not at all, so a dropped call leaves the scope unloaded.
         if let Err(error) = self.memory.journal_import(&scope, &body).await {
             let cause = format!("its body did not import: {error}");
             self.realm.poison(state, &cause);
             return Err(memory_error(error));
         }
+        state.mark_loaded();
         Ok(())
     }
 
-    async fn commit_touches(
+    /// Turn what a call touched into one delta per changed locked scope
+    /// (paired with its index among `guards`), and name the runtimes whose
+    /// archive may let their body leave memory. A touch outside the locked
+    /// scopes is refused (M2) and poisons that scope, or the realm when the
+    /// scope is busy.
+    async fn prepare_commit(
         &self,
-        guards: &mut [ScopeGuard],
+        guards: &[ScopeGuard],
         touches: &Touches,
-    ) -> Result<(), SpiError> {
-        let outcome = self.commit_touches_inner(guards, touches).await;
-        if let Err(error) = &outcome {
-            // Memory may now differ from the host for every touched scope.
-            let cause = error.to_string();
-            let touched: HashSet<ScopeId> = touches.scopes().iter().map(scope_id_of).collect();
-            for guard in &mut *guards {
-                if touched.contains(guard.id()) {
-                    self.realm.poison(guard, &cause);
-                }
-            }
-        }
-        outcome
-    }
-
-    async fn commit_touches_inner(
-        &self,
-        guards: &mut [ScopeGuard],
-        touches: &Touches,
-    ) -> Result<(), SpiError> {
+    ) -> Result<(Vec<(usize, ScopeDelta)>, Vec<String>), SpiError> {
         let locked: HashSet<ScopeId> = guards.iter().map(|guard| guard.id().clone()).collect();
         let stray: Vec<ScopeId> = touches
             .scopes()
@@ -462,10 +502,9 @@ impl SpiRuntimeStore {
             .journal_export(touches)
             .await
             .map_err(memory_error)?;
-        let mut states: Vec<&mut ScopeState> = Vec::new();
         let mut deltas = Vec::new();
         let mut runtimes = Vec::new();
-        for guard in &mut *guards {
+        for (index, guard) in guards.iter().enumerate() {
             let Some(scope) = touch_scope_of(guard.id())? else {
                 continue;
             };
@@ -485,33 +524,19 @@ impl SpiRuntimeStore {
             if let TouchScope::Runtime(runtime_id) = &scope {
                 runtimes.push(runtime_id.clone());
             }
-            states.push(&mut **guard);
-            deltas.push(delta);
+            deltas.push((index, delta));
         }
-        self.realm.commit(&mut states, deltas).await?;
-        drop(states);
-        // D2: an archived runtime with nothing left for recovery leaves
-        // memory once its archive is durable.
-        for runtime_id in runtimes {
-            let id = ScopeId::new(RUNTIME_FAMILY, runtime_id.clone());
-            if let Ok(state) = find(guards, &id)
-                && state.is_loaded()
-                && self.memory.journal_archived_idle(&runtime_id).await
-            {
-                self.memory.journal_evict_body(&runtime_id).await;
-                state.unload();
-            }
-        }
-        Ok(())
+        Ok((deltas, runtimes))
     }
 
-    /// Lock one mob's host record scopes for a change: gate shared,
-    /// self-fence, locks, poison checks.
+    /// Lock one mob's host record scopes: gate shared, self-fence (again
+    /// after the locks for a change), locks, poison checks. The gate
+    /// travels with the scopes.
     async fn mob_host_scopes(
         &self,
         ids: &[ScopeId],
         mutate: bool,
-    ) -> Result<(tokio::sync::RwLockReadGuard<'_, ()>, Vec<ScopeGuard>), RuntimeStoreError> {
+    ) -> Result<ArmedScopes, RuntimeStoreError> {
         let refuse = |error: SpiError| {
             if mutate {
                 error.into_write()
@@ -519,44 +544,67 @@ impl SpiRuntimeStore {
                 error.into_read()
             }
         };
-        let gate = self.gate.read().await;
+        let gate = Arc::clone(&self.gate).read_owned().await;
         if mutate {
             self.realm.ensure_lease().await.map_err(refuse)?;
         } else {
             self.realm.check_realm().map_err(refuse)?;
         }
         let guards = self.realm.lock_scopes(ids).await;
-        for guard in &guards {
+        let scopes = ArmedScopes::new(Arc::clone(&self.realm), guards).hold(gate);
+        for guard in scopes.guards() {
             self.realm.check_scope(guard).map_err(refuse)?;
         }
-        Ok((gate, guards))
+        if mutate {
+            self.realm.ensure_lease().await.map_err(refuse)?;
+        }
+        Ok(scopes)
     }
 
-    /// Commit record scope changes: each scope's value sets its record
-    /// entry, or removes it (and so the scope) when `None`.
+    /// Commit record scope changes, each scope's value setting its record
+    /// entry or removing it (and so the scope) when `None`, then `apply`
+    /// them to the records in memory. Both run on a task that owns the
+    /// scopes and the gate, so a caller dropped meanwhile still leaves
+    /// memory and host agreeing.
     async fn commit_records(
         &self,
-        guards: &mut [ScopeGuard],
+        scopes: ArmedScopes,
         changes: BTreeMap<ScopeId, Option<Vec<u8>>>,
+        apply: impl FnOnce(&mut MobHostRecords) + Send + 'static,
     ) -> Result<(), RuntimeStoreError> {
-        let mut states: Vec<&mut ScopeState> = Vec::with_capacity(changes.len());
         let mut deltas = Vec::with_capacity(changes.len());
-        for guard in &mut *guards {
+        for (index, guard) in scopes.guards().iter().enumerate() {
             if let Some(value) = changes.get(guard.id()) {
-                deltas.push(ScopeDelta::Changes(vec![(
-                    RECORD_ENTRY.to_string(),
-                    value.clone().map(Arc::new),
-                )]));
-                states.push(&mut **guard);
+                deltas.push((
+                    index,
+                    ScopeDelta::Changes(vec![(
+                        RECORD_ENTRY.to_string(),
+                        value.clone().map(Arc::new),
+                    )]),
+                ));
             }
         }
-        if states.len() != changes.len() {
+        if deltas.len() != changes.len() {
             return Err(SpiError::Misuse("a record scope is not locked".into()).into_write());
         }
-        self.realm
-            .commit(&mut states, deltas)
-            .await
-            .map_err(SpiError::into_write)
+        let records = Arc::clone(&self.mob_host);
+        let task = tokio::spawn(async move {
+            let mut scopes = scopes;
+            // A task dropped mid-commit (a runtime shutdown) poisons: the
+            // batch may land without memory following it.
+            scopes.arm();
+            let outcome = scopes.commit_in_place(deltas).await;
+            if outcome.is_ok() {
+                apply(&mut *lock_records(&records));
+            }
+            outcome
+        });
+        match task.await {
+            Ok(outcome) => outcome.map_err(SpiError::into_write),
+            Err(error) => {
+                Err(SpiError::Misuse(format!("the host commit task failed: {error}")).into_write())
+            }
+        }
     }
 }
 
@@ -1668,7 +1716,7 @@ impl RuntimeStore for SpiRuntimeStore {
         &self,
         mob_id: &str,
     ) -> Result<Option<Vec<u8>>, RuntimeStoreError> {
-        let (_gate, _guards) = self
+        let _scopes = self
             .mob_host_scopes(&[mob_host_binding_scope(mob_id)], false)
             .await?;
         Ok(lock_records(&self.mob_host).bindings.get(mob_id).cloned())
@@ -1693,7 +1741,7 @@ impl RuntimeStore for SpiRuntimeStore {
     ) -> Result<bool, RuntimeStoreError> {
         let binding = mob_host_binding_scope(mob_id);
         let revocation = mob_host_revocation_scope(mob_id);
-        let (_gate, mut guards) = self
+        let scopes = self
             .mob_host_scopes(&[binding.clone(), revocation.clone()], true)
             .await?;
         if lock_records(&self.mob_host).bindings.contains_key(mob_id) {
@@ -1702,12 +1750,12 @@ impl RuntimeStore for SpiRuntimeStore {
         let mut changes = BTreeMap::new();
         changes.insert(binding, Some(record_json.to_vec()));
         changes.insert(revocation, None);
-        self.commit_records(&mut guards, changes).await?;
-        let mut records = lock_records(&self.mob_host);
-        records
-            .bindings
-            .insert(mob_id.to_string(), record_json.to_vec());
-        records.revocations.remove(mob_id);
+        let (mob_id, record) = (mob_id.to_string(), record_json.to_vec());
+        self.commit_records(scopes, changes, move |records| {
+            records.revocations.remove(&mob_id);
+            records.bindings.insert(mob_id, record);
+        })
+        .await?;
         Ok(true)
     }
 
@@ -1718,7 +1766,7 @@ impl RuntimeStore for SpiRuntimeStore {
         next_json: &[u8],
     ) -> Result<bool, RuntimeStoreError> {
         let binding = mob_host_binding_scope(mob_id);
-        let (_gate, mut guards) = self.mob_host_scopes(&[binding.clone()], true).await?;
+        let scopes = self.mob_host_scopes(&[binding.clone()], true).await?;
         let matches = lock_records(&self.mob_host)
             .bindings
             .get(mob_id)
@@ -1728,10 +1776,11 @@ impl RuntimeStore for SpiRuntimeStore {
         }
         let mut changes = BTreeMap::new();
         changes.insert(binding, Some(next_json.to_vec()));
-        self.commit_records(&mut guards, changes).await?;
-        lock_records(&self.mob_host)
-            .bindings
-            .insert(mob_id.to_string(), next_json.to_vec());
+        let (mob_id, record) = (mob_id.to_string(), next_json.to_vec());
+        self.commit_records(scopes, changes, move |records| {
+            records.bindings.insert(mob_id, record);
+        })
+        .await?;
         Ok(true)
     }
 
@@ -1741,7 +1790,7 @@ impl RuntimeStore for SpiRuntimeStore {
         expected_json: &[u8],
     ) -> Result<bool, RuntimeStoreError> {
         let binding = mob_host_binding_scope(mob_id);
-        let (_gate, mut guards) = self.mob_host_scopes(&[binding.clone()], true).await?;
+        let scopes = self.mob_host_scopes(&[binding.clone()], true).await?;
         let matches = lock_records(&self.mob_host)
             .bindings
             .get(mob_id)
@@ -1751,8 +1800,11 @@ impl RuntimeStore for SpiRuntimeStore {
         }
         let mut changes = BTreeMap::new();
         changes.insert(binding, None);
-        self.commit_records(&mut guards, changes).await?;
-        lock_records(&self.mob_host).bindings.remove(mob_id);
+        let mob_id = mob_id.to_string();
+        self.commit_records(scopes, changes, move |records| {
+            records.bindings.remove(&mob_id);
+        })
+        .await?;
         Ok(true)
     }
 
@@ -1760,7 +1812,7 @@ impl RuntimeStore for SpiRuntimeStore {
         &self,
         mob_id: &str,
     ) -> Result<Option<Vec<u8>>, RuntimeStoreError> {
-        let (_gate, _guards) = self
+        let _scopes = self
             .mob_host_scopes(&[mob_host_revocation_scope(mob_id)], false)
             .await?;
         Ok(lock_records(&self.mob_host)
@@ -1789,7 +1841,7 @@ impl RuntimeStore for SpiRuntimeStore {
     ) -> Result<bool, RuntimeStoreError> {
         let binding = mob_host_binding_scope(mob_id);
         let revocation = mob_host_revocation_scope(mob_id);
-        let (_gate, mut guards) = self
+        let scopes = self
             .mob_host_scopes(&[binding.clone(), revocation.clone()], true)
             .await?;
         let matches = lock_records(&self.mob_host)
@@ -1802,12 +1854,12 @@ impl RuntimeStore for SpiRuntimeStore {
         let mut changes = BTreeMap::new();
         changes.insert(binding, None);
         changes.insert(revocation, Some(receipt_json.to_vec()));
-        self.commit_records(&mut guards, changes).await?;
-        let mut records = lock_records(&self.mob_host);
-        records.bindings.remove(mob_id);
-        records
-            .revocations
-            .insert(mob_id.to_string(), receipt_json.to_vec());
+        let (mob_id, receipt) = (mob_id.to_string(), receipt_json.to_vec());
+        self.commit_records(scopes, changes, move |records| {
+            records.bindings.remove(&mob_id);
+            records.revocations.insert(mob_id, receipt);
+        })
+        .await?;
         Ok(true)
     }
 }

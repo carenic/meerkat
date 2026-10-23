@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use meerkat_core::host_store::{AcquireMode, FenceTiming, ScopeKind};
@@ -13,7 +14,8 @@ use meerkat_core::lifecycle::InputId;
 use super::realm::{CHECKPOINT_MIN_BYTES, INLINE_VALUE_LIMIT};
 use super::test_host::TestHost;
 use super::{
-    ScopeDelta, ScopeFamily, ScopeId, SpiError, SpiRealm, SpiRealmConfig, SpiRuntimeStore,
+    ArmedScopes, ScopeDelta, ScopeFamily, ScopeId, SpiError, SpiRealm, SpiRealmConfig,
+    SpiRuntimeStore,
 };
 use crate::identifiers::LogicalRuntimeId;
 use crate::input_state::{InputStatePersistenceRecord, StoredInputState};
@@ -386,6 +388,8 @@ async fn reload(
         let mut state = cell.lock().await;
         image.extend(realm.pinned_values(&state).await.unwrap());
         image.extend(realm.load_body(&mut state).await.unwrap());
+        // The test is the adapter here: it holds the loaded values.
+        state.mark_loaded();
     }
     (realm, image)
 }
@@ -751,4 +755,311 @@ async fn a_stopped_writer_finds_a_foreign_write_and_stays_down() {
             .await
             .is_err()
     );
+}
+
+// Unrun until the candidate's validation. A renew slower than the
+// renew interval counts as failed even under a longer configured timeout,
+// so renew starts stay one interval apart.
+#[tokio::test(start_paused = true)]
+async fn a_renew_slower_than_the_interval_stops_the_writer() {
+    let timing = FenceTiming::try_new(Duration::from_secs(1), Duration::from_secs(3)).unwrap();
+    let host = Arc::new(TestHost::with_timing(timing));
+    let config = SpiRealmConfig {
+        renew_timeout: Duration::from_secs(5),
+        ..SpiRealmConfig::default()
+    };
+    let realm = SpiRealm::open(Arc::clone(&host) as _, config)
+        .await
+        .unwrap();
+    host.faults.lock().unwrap().renew_delay = Some(Duration::from_millis(1500));
+    // The renew that starts at 1 s is cut off at 2 s; the configured 5 s
+    // would have let it succeed at 2.5 s.
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    assert!(!realm.lease_is_live(), "the slow renew counts as failed");
+}
+
+// Unrun until the candidate's validation. A re-acquire whose listing
+// outlasts the window renews once with the new token before it resumes, so
+// the writer resumes with an open window instead of stopping again.
+#[tokio::test(start_paused = true)]
+async fn a_slow_reacquire_listing_still_resumes_with_an_open_window() {
+    let timing = FenceTiming::try_new(Duration::from_secs(1), Duration::from_secs(3)).unwrap();
+    let host = Arc::new(TestHost::with_timing(timing));
+    let (realm, store) = open(&host).await;
+    let first = realm.fence();
+    {
+        let mut faults = host.faults.lock().unwrap();
+        faults.renew_unavailable = 1;
+        faults.list_delay = Some(Duration::from_millis(2500));
+    }
+    // 1 s: the renew fails. 2 s: the re-acquire starts, and its listing
+    // takes until 4.5 s, past the 2 s window counted from the acquire.
+    tokio::time::sleep(Duration::from_millis(4600)).await;
+    assert!(realm.fence() > first, "a fresh token");
+    assert!(
+        realm.lease_is_live(),
+        "the renew after the listing restarted the window"
+    );
+    store
+        .persist_input_state(
+            &LogicalRuntimeId::new("resumed"),
+            &persistable(StoredInputState::new_accepted(InputId::new())),
+        )
+        .await
+        .expect("writes resume");
+}
+
+// Unrun until the candidate's validation. A batch that landed while
+// its commit kept answering errors poisons its scope only; the next
+// re-acquire accepts that scope at either version instead of reading the
+// batch as another writer's and poisoning the realm.
+#[tokio::test(start_paused = true)]
+async fn a_batch_of_unknown_outcome_does_not_poison_the_realm_at_a_reacquire() {
+    let timing = FenceTiming::try_new(Duration::from_secs(1), Duration::from_secs(3)).unwrap();
+    let host = Arc::new(TestHost::with_timing(timing));
+    let config = SpiRealmConfig {
+        commit_retry_budget: Duration::from_millis(500),
+        ..SpiRealmConfig::default()
+    };
+    let realm = SpiRealm::open(Arc::clone(&host) as _, config)
+        .await
+        .unwrap();
+    let store = SpiRuntimeStore::open(Arc::clone(&realm)).await.unwrap();
+    {
+        let mut faults = host.faults.lock().unwrap();
+        faults.indeterminate_after_apply = 1;
+        faults.load_head_unavailable = 1000;
+        faults.landed_retry_unavailable = 1000;
+    }
+    let unknown = LogicalRuntimeId::new("unknown");
+    let refused = store
+        .persist_input_state(
+            &unknown,
+            &persistable(StoredInputState::new_accepted(InputId::new())),
+        )
+        .await;
+    assert!(refused.is_err(), "the outcome stayed unknown");
+    {
+        let mut faults = host.faults.lock().unwrap();
+        faults.load_head_unavailable = 0;
+        faults.landed_retry_unavailable = 0;
+        faults.renew_unavailable = 1;
+    }
+    // The renew at 1 s fails; the tick at 2 s re-acquires.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(
+        realm.realm_poisoned().is_none(),
+        "{:?}",
+        realm.realm_poisoned()
+    );
+    assert!(realm.lease_is_live());
+    assert!(
+        store.load_input_states(&unknown).await.is_err(),
+        "the unknown batch's scope stays poisoned"
+    );
+    store
+        .persist_input_state(
+            &LogicalRuntimeId::new("other"),
+            &persistable(StoredInputState::new_accepted(InputId::new())),
+        )
+        .await
+        .expect("another runtime writes");
+}
+
+// Unrun until the candidate's validation. A call dropped while its
+// batch is in flight still lands it and adopts the new version, so the next
+// call on the scope commits on top of it instead of conflicting.
+#[tokio::test]
+async fn a_call_dropped_during_its_commit_still_lands_and_adopts_it() {
+    let host = Arc::new(TestHost::new());
+    let (realm, store) = open(&host).await;
+    let store = Arc::new(store);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    *host.commit_gate.lock().unwrap() = Some(Arc::clone(&gate));
+    let runtime = LogicalRuntimeId::new("dropped");
+    let call = {
+        let store = Arc::clone(&store);
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            store
+                .persist_input_state(
+                    &runtime,
+                    &persistable(StoredInputState::new_accepted(InputId::new())),
+                )
+                .await
+        })
+    };
+    while host.commits_started.load(Ordering::Acquire) == 0 {
+        tokio::task::yield_now().await;
+    }
+    call.abort();
+    assert!(call.await.unwrap_err().is_cancelled());
+    *host.commit_gate.lock().unwrap() = None;
+    gate.notify_one();
+    // The handed-off commit settles on its own task; the next call waits
+    // for the scope's lock, then commits on top of it.
+    store
+        .persist_input_state(
+            &runtime,
+            &persistable(StoredInputState::new_accepted(InputId::new())),
+        )
+        .await
+        .expect("the next call commits on top of the dropped call's batch");
+    assert!(realm.realm_poisoned().is_none());
+    let store = Arc::try_unwrap(store).expect("the dropped call released the store");
+    let (_realm, reopened) = reopen(&host, (realm, store)).await;
+    assert_eq!(
+        reopened.load_input_states(&runtime).await.unwrap().len(),
+        2,
+        "both batches are on the host"
+    );
+}
+
+// Unrun until the candidate's validation. Scopes dropped while armed
+// (a call dropped during its in-memory change) are poisoned; disarmed, they
+// are not.
+#[tokio::test]
+async fn armed_scopes_poison_when_dropped_and_only_then() {
+    let host = Arc::new(TestHost::new());
+    let realm = SpiRealm::open(Arc::clone(&host) as _, SpiRealmConfig::default())
+        .await
+        .unwrap();
+    let armed = ScopeId::new(TEST_FAMILY, "armed");
+    let calm = ScopeId::new(TEST_FAMILY, "calm");
+    let mut scopes = ArmedScopes::new(
+        Arc::clone(&realm),
+        realm.lock_scopes(std::slice::from_ref(&armed)).await,
+    );
+    scopes.arm();
+    drop(scopes);
+    let mut scopes = ArmedScopes::new(
+        Arc::clone(&realm),
+        realm.lock_scopes(std::slice::from_ref(&calm)).await,
+    );
+    scopes.arm();
+    scopes.disarm();
+    drop(scopes);
+    assert!(realm.cell(&armed).lock().await.poison().is_some());
+    assert!(realm.cell(&calm).lock().await.poison().is_none());
+}
+
+// Unrun until the candidate's validation. A large value moved to
+// another entry in one commit (a boundary promotion moves the provisional
+// tail's body to the session entry) keeps its chunk instead of uploading
+// the bytes again.
+#[tokio::test]
+async fn a_large_value_moved_between_entries_keeps_its_chunk() {
+    let host = Arc::new(TestHost::new());
+    let realm = SpiRealm::open(Arc::clone(&host) as _, SpiRealmConfig::default())
+        .await
+        .unwrap();
+    let id = ScopeId::new(TEST_FAMILY, "promote");
+    let body = Arc::new(vec![3_u8; INLINE_VALUE_LIMIT + 1]);
+    commit_one(
+        &realm,
+        &id,
+        ScopeDelta::Changes(vec![("tail".into(), Some(Arc::clone(&body)))]),
+    )
+    .await
+    .unwrap();
+    let chunk_names = |host: &TestHost| -> Vec<String> {
+        host.scopes_of(ScopeKind::Record)
+            .keys()
+            .filter(|name| name.starts_with("ch:"))
+            .cloned()
+            .collect()
+    };
+    let before = chunk_names(&host);
+    assert_eq!(before.len(), 1);
+    let commits = host.commit_count();
+    // Equal bytes in another allocation: the digest decides.
+    commit_one(
+        &realm,
+        &id,
+        ScopeDelta::Changes(vec![
+            ("tail".into(), None),
+            ("session".into(), Some(Arc::new(body.as_ref().clone()))),
+        ]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        chunk_names(&host),
+        before,
+        "the session entry took the chunk over"
+    );
+    assert_eq!(
+        host.commit_count(),
+        commits + 1,
+        "one batch and no chunk upload"
+    );
+    let (_realm, image) = reload(&host, realm).await;
+    assert_eq!(image.get("session"), Some(&body));
+    assert!(!image.contains_key("tail"));
+}
+
+// Unrun until the candidate's validation. A change that cannot fit one
+// batch, even with every large row set spilled, is refused typed, and the
+// scopes it would have changed are poisoned.
+#[tokio::test]
+async fn a_change_that_cannot_fit_one_batch_is_refused_typed() {
+    let host = Arc::new(TestHost::new());
+    let realm = SpiRealm::open(Arc::clone(&host) as _, SpiRealmConfig::default())
+        .await
+        .unwrap();
+    // 40 scopes with a 200 KiB row each: no row set is large enough to
+    // spill, and together they pass the batch budget.
+    let ids: Vec<ScopeId> = (0..40)
+        .map(|n| ScopeId::new(TEST_FAMILY, format!("wide-{n:02}")))
+        .collect();
+    let mut guards = realm.lock_scopes(&ids).await;
+    let mut states: Vec<_> = guards.iter_mut().map(|guard| &mut **guard).collect();
+    let value = Arc::new(vec![1_u8; 200 * 1024]);
+    let deltas = ids
+        .iter()
+        .map(|_| ScopeDelta::Changes(vec![("row".into(), Some(Arc::clone(&value)))]))
+        .collect();
+    let refused = realm.commit(&mut states, deltas).await;
+    assert!(
+        matches!(refused, Err(SpiError::TooLarge { .. })),
+        "{refused:?}"
+    );
+    drop(states);
+    assert!(guards.iter().all(|guard| guard.poison().is_some()));
+    assert_eq!(host.commit_count(), 0);
+}
+
+// Unrun until the candidate's validation. A failed batch poisons the
+// scopes it would have changed, not a scope locked with it whose delta
+// changes nothing.
+#[tokio::test]
+async fn a_failed_batch_leaves_an_unchanged_locked_scope_serving() {
+    let host = Arc::new(TestHost::new());
+    let realm = SpiRealm::open(Arc::clone(&host) as _, SpiRealmConfig::default())
+        .await
+        .unwrap();
+    let read = ScopeId::new(TEST_FAMILY, "read");
+    let written = ScopeId::new(TEST_FAMILY, "written");
+    let same = || ScopeDelta::Changes(vec![("pin".into(), Some(Arc::new(b"same".to_vec())))]);
+    commit_one(&realm, &read, same()).await.unwrap();
+    host.faults.lock().unwrap().conflict = 1;
+    // Locked in scope order: "read" before "written".
+    let mut guards = realm.lock_scopes(&[read, written]).await;
+    let mut states: Vec<_> = guards.iter_mut().map(|guard| &mut **guard).collect();
+    let refused = realm
+        .commit(
+            &mut states,
+            vec![
+                same(),
+                ScopeDelta::Changes(vec![("pin".into(), Some(Arc::new(b"new".to_vec())))]),
+            ],
+        )
+        .await;
+    assert!(refused.is_err());
+    drop(states);
+    assert!(
+        guards[0].poison().is_none(),
+        "the unchanged scope still serves"
+    );
+    assert!(guards[1].poison().is_some());
 }

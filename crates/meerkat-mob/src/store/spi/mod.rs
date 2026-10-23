@@ -5,8 +5,11 @@
 //! through, so a process holds one fence for both. The mob adapter
 //! keeps the in-memory stores' semantics exactly: every call runs against
 //! them, and every call that changes them commits one host batch before it
-//! answers. A batch that fails poisons its scopes; the realm refuses
-//! every later call on them until it is reopened.
+//! answers. A batch that fails poisons the scopes it would have changed; the
+//! realm refuses every later call on them until it is reopened. A call
+//! dropped while it changes memory poisons the scopes it locked; once its
+//! batch is handed off, a task that owns the scopes lands it, or poisons,
+//! whether or not anyone still waits.
 //!
 //! # Layout
 //!
@@ -66,8 +69,18 @@
 //! is therefore the state of the mobs open in this process: an open storage
 //! holds its whole event log, runs and identity state in memory, as the
 //! in-memory stores do. A storage whose handles are all dropped releases
-//! that state; the realm keeps only its per-entry digests until the next
-//! open reloads the bodies.
+//! that state. The realm keeps each scope's journal state until it closes:
+//! a digest per entry, and for an entry value of 64 KiB or more that value's
+//! allocation (so an unchanged value is recognized without hashing). The
+//! next open reloads the bodies.
+//!
+//! # Not covered
+//!
+//! Temporary councils have no host store adapter: their records stay in the
+//! council store the host composes. The default in-memory council store
+//! declares itself process-bound, so a council that requires durable
+//! custody is refused, and a process-bound council does not survive a
+//! restart.
 
 mod stores;
 #[cfg(test)]
@@ -80,7 +93,7 @@ use std::sync::{Arc, Mutex as StdMutex, Weak};
 
 use meerkat_core::host_store::ScopeKind;
 use meerkat_runtime::store::spi::{
-    ScopeDelta, ScopeFamily, ScopeGuard, ScopeId, SpiError, SpiRealm,
+    ArmedScopes, ScopeDelta, ScopeFamily, ScopeGuard, ScopeId, SpiError, SpiRealm,
 };
 use serde::de::DeserializeOwned;
 
@@ -777,56 +790,80 @@ impl Bundle {
         out
     }
 
-    /// Run a write: self-fence, lock the touched scopes, run the in-memory
-    /// call, export what it touched and commit it as one batch, then answer.
-    async fn write<T, F>(&self, touch: Touch, write: F) -> Result<T, MobStoreError>
+    /// Run a write: self-fence, lock the touched scopes, self-fence again
+    /// (the lock waits may outlast the window), run the in-memory call,
+    /// export what it touched, and commit it as one batch before answering.
+    ///
+    /// Cancel safety: from the start of the in-memory call until the
+    /// hand-off, a dropped call poisons the locked scopes
+    /// ([`ArmedScopes`]). The commit, the event publication and the
+    /// witnesses then run on a task that owns the scopes, so a caller
+    /// dropped after the hand-off still lands its batch, or poisons, as if
+    /// it had waited. A failed batch poisons only the scopes it would have
+    /// changed.
+    async fn write<T, F>(self: &Arc<Self>, touch: Touch, write: F) -> Result<T, MobStoreError>
     where
         F: Future<Output = Result<T, MobStoreError>>,
     {
         self.realm.ensure_lease().await.map_err(write_error)?;
-        let mut guards = self.realm.lock_scopes(&self.scope_ids(touch.locks())).await;
-        for guard in &guards {
+        let guards = self.realm.lock_scopes(&self.scope_ids(touch.locks())).await;
+        let mut scopes = ArmedScopes::new(Arc::clone(&self.realm), guards);
+        for guard in scopes.guards() {
             self.realm.check_scope(guard).map_err(write_error)?;
         }
-        self.check_witnesses(&mut guards)
+        self.check_witnesses(scopes.guards_mut())
             .await
             .map_err(write_error)?;
+        self.realm.ensure_lease().await.map_err(write_error)?;
+        scopes.arm();
         let out = write.await;
-        self.commit_touched(&touch, &mut guards).await?;
-        for guard in &guards {
-            self.record_witness(guard.id().family.tag).await;
+        // Even a failed in-memory call is exported: the journal writes
+        // nothing when no bytes changed, and a partial change is never left
+        // unwritten.
+        let deltas = match self.export(&touch, scopes.guards()).await {
+            Ok(deltas) => deltas,
+            Err(error) => {
+                // Memory may have changed and cannot be exported.
+                let cause = error.to_string();
+                for guard in scopes.guards_mut() {
+                    self.realm.poison(guard, &cause);
+                }
+                scopes.disarm();
+                return Err(error);
+            }
+        };
+        let bundle = Arc::clone(self);
+        let settle = tokio::spawn(async move {
+            let mut scopes = scopes;
+            let outcome = scopes.commit_in_place(deltas).await;
+            if outcome.is_ok() {
+                if touch.events.is_some() {
+                    bundle.publish_committed_events().await;
+                }
+                for guard in scopes.guards() {
+                    bundle.record_witness(guard.id().family.tag).await;
+                }
+            }
+            outcome
+        });
+        match settle.await {
+            Ok(Ok(())) => out,
+            Ok(Err(error)) => Err(write_error(error)),
+            Err(error) => Err(write_error(SpiError::Misuse(format!(
+                "the host commit task failed: {error}"
+            )))),
         }
-        out
     }
 
     /// Export what `touch` names from the in-memory state of each locked
-    /// scope and commit it as one batch. Even a failed in-memory call is
-    /// exported: the journal writes nothing when no bytes changed, and a
-    /// partial change is never left unwritten. Any failure from here on
-    /// poisons every locked scope: memory may hold what the host does
-    /// not.
-    async fn commit_touched(
+    /// scope, paired with the scope's index among `guards`.
+    async fn export(
         &self,
         touch: &Touch,
-        guards: &mut [ScopeGuard],
-    ) -> Result<(), MobStoreError> {
-        let outcome = self.export_and_commit(touch, guards).await;
-        if let Err(error) = &outcome {
-            let cause = error.to_string();
-            for guard in &mut *guards {
-                self.realm.poison(&mut **guard, &cause);
-            }
-        }
-        outcome
-    }
-
-    async fn export_and_commit(
-        &self,
-        touch: &Touch,
-        guards: &mut [ScopeGuard],
-    ) -> Result<(), MobStoreError> {
+        guards: &[ScopeGuard],
+    ) -> Result<Vec<(usize, ScopeDelta)>, MobStoreError> {
         let mut deltas = Vec::with_capacity(guards.len());
-        for guard in &*guards {
+        for (index, guard) in guards.iter().enumerate() {
             let tag = guard.id().family.tag;
             let full = guard.wants_full_image();
             let delta = if tag == MOB_FAMILY.tag {
@@ -858,18 +895,9 @@ impl Bundle {
                     "the mob adapter locked a scope of family {tag}"
                 ))));
             };
-            deltas.push(delta);
+            deltas.push((index, delta));
         }
-        let mut states: Vec<&mut meerkat_runtime::store::spi::ScopeState> =
-            guards.iter_mut().map(|guard| &mut **guard).collect();
-        self.realm
-            .commit(&mut states, deltas)
-            .await
-            .map_err(write_error)?;
-        if touch.events.is_some() {
-            self.publish_committed_events().await;
-        }
-        Ok(())
+        Ok(deltas)
     }
 
     /// Send the events committed since the last send, in cursor order.
@@ -1390,6 +1418,9 @@ impl Bundle {
             } else if tag == MOB_STATUS_FAMILY.tag {
                 self.import_statuses(&body).await?;
             }
+            // A load that fails or is dropped discards this fresh bundle,
+            // and the scope stays unloaded until a load completes.
+            guard.mark_loaded();
         }
         let last = self
             .events
@@ -1797,22 +1828,33 @@ impl SpiMobStoreHost {
                 "mob storage '{storage_key}' still holds events; destroy the mob first"
             )));
         }
-        let mut guards = self.realm.lock_scopes(&probe.all_scope_ids()).await;
-        for guard in &guards {
+        let guards = self.realm.lock_scopes(&probe.all_scope_ids()).await;
+        let scopes = ArmedScopes::new(Arc::clone(&self.realm), guards);
+        for guard in scopes.guards() {
             self.realm.check_scope(guard).map_err(write_error)?;
         }
-        let deltas = guards
-            .iter()
-            .map(|_| ScopeDelta::Full(BTreeMap::new()))
+        self.realm.ensure_lease().await.map_err(write_error)?;
+        let deltas: Vec<(usize, ScopeDelta)> = (0..scopes.guards().len())
+            .map(|index| (index, ScopeDelta::Full(BTreeMap::new())))
             .collect();
-        let mut states: Vec<&mut meerkat_runtime::store::spi::ScopeState> =
-            guards.iter_mut().map(|guard| &mut **guard).collect();
-        self.realm
-            .commit(&mut states, deltas)
-            .await
-            .map_err(write_error)?;
-        drop(guards);
-        lock_std(&self.inner.stored).remove(storage_key);
-        Ok(())
+        // The deletes and the listing update run on a task of their own, so
+        // a caller dropped meanwhile leaves them agreeing.
+        let inner = Arc::clone(&self.inner);
+        let storage_key = storage_key.to_string();
+        let settle = tokio::spawn(async move {
+            let mut scopes = scopes;
+            scopes.arm();
+            let outcome = scopes.commit_in_place(deltas).await;
+            if outcome.is_ok() {
+                lock_std(&inner.stored).remove(&storage_key);
+            }
+            outcome
+        });
+        match settle.await {
+            Ok(outcome) => outcome.map_err(write_error),
+            Err(error) => Err(write_error(SpiError::Misuse(format!(
+                "the host commit task failed: {error}"
+            )))),
+        }
     }
 }

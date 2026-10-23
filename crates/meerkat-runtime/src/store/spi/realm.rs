@@ -24,13 +24,18 @@
 //!   acquire that superseded a live holder (a takeover), the open waits out
 //!   [`FenceGrant::superseded_lease`](meerkat_core::host_store::FenceGrant)
 //!   before the realm serves anything.
-//! - A background task renews once per the host's renew interval
-//!   ([`HostStore::fence_timing`]). A fenced out answer poisons the realm;
-//!   any other failed renew, or a window seen closed, STOPS the writer, and
-//!   a stopped writer never resumes on a later renew: it re-acquires the
-//!   fence (exclusive; its own still-recorded lease is superseded) and
-//!   resumes only when a fresh listing shows no batch it did not write.
-//!   Another live holder, or a foreign batch, poisons the realm.
+//! - A background task starts a renew once per the host's renew interval
+//!   ([`HostStore::fence_timing`]), on a fixed period, and a renew slower
+//!   than the interval counts as failed, so renew starts stay one interval
+//!   apart. A fenced out answer poisons the realm; any other failed renew,
+//!   or a window seen closed, STOPS the writer, and a stopped writer never
+//!   resumes on a later renew: it re-acquires the fence (exclusive; its own
+//!   still-recorded lease is superseded), resumes only when a fresh listing
+//!   shows no batch it did not write, and renews once with the new token
+//!   before it does. Another live holder, or a foreign batch, poisons the
+//!   realm. Renews and re-acquires never overlap, and a re-acquire runs on
+//!   a task of its own, so a dropped caller never leaves a granted token
+//!   unrecorded.
 //! - **Self-fence on the local clock:** a mutation runs only while the last
 //!   renew did not fail and the last successful acquire or renew *started*
 //!   less than the lease minus the host-declared margin ago
@@ -51,7 +56,19 @@
 //! reopens the realm. A fence loss poisons the whole realm. An unknown
 //! outcome is always settled (by retrying the same batch, or by reading the
 //! head's commit id) before a scope's next version is written (C-2), and a
-//! poisoned scope writes no next version at all.
+//! poisoned scope writes no next version at all. A batch whose outcome stays
+//! unknown is remembered as such, so a later re-acquire does not read it as
+//! another writer's.
+//!
+//! # Cancellation
+//!
+//! An adapter call changes memory before its batch commits, and its future
+//! can be dropped at any await. Adapters hold their locked scopes in an
+//! [`ArmedScopes`]: dropped while armed (the in-memory change has started
+//! and its batch is not handed off), it poisons them. The commit runs on a
+//! task that owns the scopes, so once handed off it lands and is adopted,
+//! or poisons, whether or not the caller still waits. A body counts as
+//! loaded only once the adapter installed it in memory.
 
 use std::any::{Any, TypeId};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -121,7 +138,10 @@ const LISTED_KINDS: [ScopeKind; 4] = [
 pub struct SpiRealmConfig {
     /// How the open acquires the fence.
     pub acquire: AcquireMode,
-    /// How long one renew may take before it counts as failed.
+    /// How long one renew may take before it counts as failed. The realm
+    /// holds renews to at most the host's renew interval: a slower
+    /// renew would push the next renew's start more than one interval past
+    /// the last.
     pub renew_timeout: Duration,
     /// How long an unknown or unavailable commit is retried before the
     /// scopes it touched are poisoned.
@@ -372,6 +392,12 @@ impl ScopeState {
             .collect()
     }
 
+    /// The adapter installed the body [`SpiRealm::load_body`] answered: the
+    /// scope may now commit.
+    pub fn mark_loaded(&mut self) {
+        self.body = Body::Loaded;
+    }
+
     /// Forget the folded rows (the body is dropped from memory). The next
     /// commit needs a [`SpiRealm::load_body`] first.
     pub fn unload(&mut self) {
@@ -434,6 +460,15 @@ pub enum ScopeDelta {
     /// The scope's complete image: every entry not in it is removed. Lets
     /// the journal write a checkpoint ([`ScopeState::wants_full_image`]).
     Full(BTreeMap<String, Arc<Vec<u8>>>),
+}
+
+impl ScopeDelta {
+    /// Whether the delta names no entry at all (a full image never counts
+    /// as empty: it may remove every entry).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Changes(changes) if changes.is_empty())
+    }
 }
 
 /// A listed head not yet claimed by an adapter.
@@ -512,6 +547,11 @@ pub struct SpiRealm {
     /// it: a re-acquire compares a fresh listing with it to prove no other
     /// writer committed while this one was stopped.
     known_heads: StdMutex<HashMap<(ScopeKind, String), ScopeVersion>>,
+    /// Scopes a batch with an unknown outcome touched, with every version
+    /// (`None`: absent) each may be at: the batch may or may not have
+    /// landed. A re-acquire accepts any of them; a later landed batch
+    /// on the scope settles it.
+    uncertain: StdMutex<HashMap<(ScopeKind, String), Vec<Option<ScopeVersion>>>>,
     realm_poison: StdMutex<Option<String>>,
     poisoned_scopes: AtomicUsize,
     cells: StdMutex<HashMap<ScopeId, Arc<ScopeCell>>>,
@@ -521,6 +561,11 @@ pub struct SpiRealm {
     chunks: StdMutex<HashMap<String, ChunkMeta>>,
     /// Per-realm adapter state, one value per type ([`SpiRealm::extension`]).
     extensions: Mutex<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>,
+    /// The renew timeout in force: the configured one, held to the renew
+    /// interval.
+    renew_timeout: Duration,
+    /// This realm, for the work it hands to tasks of its own.
+    me: std::sync::Weak<SpiRealm>,
 }
 
 impl std::fmt::Debug for SpiRealm {
@@ -584,7 +629,8 @@ impl SpiRealm {
             }
             Err(error) => return Err(SpiError::Host(error)),
         };
-        let realm = Arc::new(Self {
+        let renew_timeout = config.renew_timeout.min(timing.renew_interval());
+        let realm = Arc::new_cyclic(|me| Self {
             host,
             timing,
             self_fence_window,
@@ -597,6 +643,7 @@ impl SpiRealm {
             fence_gate: tokio::sync::RwLock::new(()),
             renew_gate: Mutex::new(()),
             known_heads: StdMutex::new(HashMap::new()),
+            uncertain: StdMutex::new(HashMap::new()),
             realm_poison: StdMutex::new(None),
             poisoned_scopes: AtomicUsize::new(0),
             cells: StdMutex::new(HashMap::new()),
@@ -605,11 +652,14 @@ impl SpiRealm {
             chunks: StdMutex::new(HashMap::new()),
             extensions: Mutex::new(HashMap::new()),
             config,
+            renew_timeout,
+            me: me.clone(),
         });
         realm.spawn_renewal();
         if !grant.superseded_lease.is_zero() {
-            // The superseded holder fences itself a renew interval before
-            // its recorded lease ends; nothing here serves until then.
+            // The superseded holder stops writing the self-fence margin
+            // before its recorded lease ends; nothing here serves until that
+            // lease is over.
             tokio::time::sleep(grant.superseded_lease).await;
         }
         realm.list_all().await?;
@@ -743,7 +793,18 @@ impl SpiRealm {
             return Ok(());
         }
         self.stop("the self-fence window closed");
-        self.reacquire().await
+        // The re-acquire runs on a task of its own: a caller dropped
+        // after the host granted a token must not leave that token
+        // unrecorded, or the next renew would answer fenced out.
+        let Some(realm) = self.me.upgrade() else {
+            return Err(SpiError::LeaseLapsed("the realm is closing".into()));
+        };
+        match tokio::spawn(async move { realm.reacquire().await }).await {
+            Ok(outcome) => outcome,
+            Err(error) => Err(SpiError::LeaseLapsed(format!(
+                "the re-acquire task failed: {error}"
+            ))),
+        }
     }
 
     /// Acquire the fence again after a stop, and resume only when no other
@@ -752,6 +813,11 @@ impl SpiRealm {
     /// version this writer last saw or wrote.
     async fn reacquire(&self) -> Result<(), SpiError> {
         let _serial = self.renew_gate.lock().await;
+        self.reacquire_serialized().await
+    }
+
+    /// [`Self::reacquire`] under the renew gate, which the caller holds.
+    async fn reacquire_serialized(&self) -> Result<(), SpiError> {
         self.check_realm()?;
         if self.lease_is_live() {
             return Ok(());
@@ -806,17 +872,62 @@ impl SpiRealm {
             }
         };
         let listed = self.list_versions().await?;
-        let unchanged = *lock(&self.known_heads) == listed;
-        if !unchanged {
+        if !self.listing_matches(&listed) {
             return Err(self.poison_realm(
                 "another writer committed while this one was stopped; reopen the realm".into(),
             ));
         }
         self.fence.store(grant.token.get(), Ordering::Release);
-        *lock(&self.lease_start) = started;
+        *lock(&self.known_heads) = listed;
+        lock(&self.uncertain).clear();
+        // The listing may have outlasted the window counted from the
+        // acquire: renew once with the new token and count the window
+        // from that renew's start.
+        let renew_started = Instant::now();
+        match tokio::time::timeout(self.renew_timeout, self.host.renew_fence(grant.token)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(HostStoreError::FencedOut { current })) => {
+                return Err(self.poison_realm(format!(
+                    "fenced out right after a re-acquire: token {current} superseded token {}",
+                    grant.token
+                )));
+            }
+            Ok(Err(error)) => {
+                return Err(SpiError::LeaseLapsed(format!(
+                    "the renew after a re-acquire failed: {error}"
+                )));
+            }
+            Err(_) => {
+                return Err(SpiError::LeaseLapsed(
+                    "the renew after a re-acquire timed out".into(),
+                ));
+            }
+        }
+        *lock(&self.lease_start) = renew_started.max(started);
         self.stopped.store(false, Ordering::Release);
         tracing::info!(token = %grant.token, "host store writer re-acquired the fence and resumes");
         Ok(())
+    }
+
+    /// Whether a fresh listing shows only batches this writer wrote: every
+    /// scope at the version this writer last saw or wrote, or, for a scope a
+    /// batch with an unknown outcome touched, at any version that batch
+    /// leaves possible.
+    fn listing_matches(&self, listed: &HashMap<(ScopeKind, String), ScopeVersion>) -> bool {
+        let known = lock(&self.known_heads);
+        let uncertain = lock(&self.uncertain);
+        let keys: HashSet<&(ScopeKind, String)> = known
+            .keys()
+            .chain(listed.keys())
+            .chain(uncertain.keys())
+            .collect();
+        keys.into_iter().all(|key| {
+            let seen = listed.get(key).copied();
+            match uncertain.get(key) {
+                Some(possible) => possible.contains(&seen) || seen == known.get(key).copied(),
+                None => seen == known.get(key).copied(),
+            }
+        })
     }
 
     /// The version of every visible scope, from one listing.
@@ -845,12 +956,47 @@ impl SpiRealm {
     /// knows.
     fn record_landed(&self, batch: &CommitBatch) {
         let mut known = lock(&self.known_heads);
+        let mut uncertain = lock(&self.uncertain);
         for update in batch.updates() {
             let key = (update.scope.kind, update.scope.name.as_str().to_string());
+            uncertain.remove(&key);
             if update.delete {
                 known.remove(&key);
             } else {
                 known.insert(key, update.next);
+            }
+        }
+    }
+
+    /// Record a batch whose outcome stays unknown: each scope it touched
+    /// may be at its previous or its next version. Its scopes are
+    /// poisoned (D3); this keeps a re-acquire from reading the batch as
+    /// another writer's.
+    fn record_unsettled(&self, batch: &CommitBatch) {
+        let mut uncertain = lock(&self.uncertain);
+        for update in batch.updates() {
+            let key = (update.scope.kind, update.scope.name.as_str().to_string());
+            let possible = uncertain.entry(key).or_default();
+            let after = (!update.delete).then_some(update.next);
+            for version in [update.previous, after] {
+                if !possible.contains(&version) {
+                    possible.push(version);
+                }
+            }
+        }
+    }
+
+    /// Commit `batch` ([`Self::commit_settled`]) and record what it did to
+    /// the scope versions this writer knows, landed or unknown.
+    async fn commit_recorded(&self, batch: &CommitBatch) -> Result<(), SpiError> {
+        match self.commit_settled(batch).await {
+            Ok(()) => {
+                self.record_landed(batch);
+                Ok(())
+            }
+            Err(error) => {
+                self.record_unsettled(batch);
+                Err(error)
             }
         }
     }
@@ -900,22 +1046,27 @@ impl SpiRealm {
                 if realm.realm_poisoned().is_some() {
                     return;
                 }
+                // Renews and re-acquires never overlap: a renew still in
+                // flight with an old token cannot meet the new one.
+                let _serial = realm.renew_gate.lock().await;
                 if realm.stopped.load(Ordering::Acquire) || !realm.lease_is_live() {
                     realm.stop("the self-fence window closed");
-                    if let Err(error) = realm.reacquire().await {
+                    if let Err(error) = realm.reacquire_serialized().await {
                         tracing::warn!(%error, "host store re-acquire failed; writes stay stopped");
                     }
                     continue;
                 }
                 let started = Instant::now();
                 let token = realm.fence();
-                match tokio::time::timeout(
-                    realm.config.renew_timeout,
-                    realm.host.renew_fence(token),
-                )
-                .await
+                match tokio::time::timeout(realm.renew_timeout, realm.host.renew_fence(token)).await
                 {
                     Ok(Ok(())) => realm.renewed(started),
+                    Ok(Err(HostStoreError::FencedOut { current }))
+                        if current != token && current == realm.fence() =>
+                    {
+                        // A stale renew of this writer's own superseded
+                        // token: the current token is ours.
+                    }
                     Ok(Err(HostStoreError::FencedOut { current })) => {
                         realm.poison_realm(format!(
                             "fenced out: token {current} superseded token {token}"
@@ -1048,8 +1199,7 @@ impl SpiRealm {
         }
         let _commits = self.fence_gate.read().await;
         let batch = CommitBatch::try_new(self.commit_id()?, self.fence(), updates)?;
-        self.commit_settled(&batch).await?;
-        self.record_landed(&batch);
+        self.commit_recorded(&batch).await?;
         let mut table = lock(&self.chunks);
         for (name, _) in chunks {
             table.remove(name);
@@ -1193,7 +1343,10 @@ impl SpiRealm {
 
     /// Fold the scope's rows into its row entries (D2: a body loads when
     /// Core opens the scope). Unreferenced chunks the scope owns are deleted
-    /// afterwards, best effort.
+    /// afterwards, best effort. The scope counts as loaded only once the
+    /// adapter has installed the answered values in its memory and called
+    /// [`ScopeState::mark_loaded`], so a call dropped in between leaves it
+    /// unloaded and the next call loads it again.
     pub async fn load_body(
         &self,
         state: &mut ScopeState,
@@ -1247,7 +1400,6 @@ impl SpiRealm {
         }
         state.rows = stamps;
         state.row_chunks = row_chunks;
-        state.body = Body::Loaded;
         self.collect_owned_garbage(state).await;
         Ok(values)
     }
@@ -1298,7 +1450,9 @@ impl SpiRealm {
     }
 
     /// Delete chunks this scope owns but no longer references (a crash
-    /// between their write and the referencing batch). Best effort.
+    /// between their write and the referencing batch). Best effort. The
+    /// deletes run on a task of their own, which the caller awaits: a caller
+    /// dropped meanwhile leaves no landed delete unrecorded.
     async fn collect_owned_garbage(&self, state: &ScopeState) {
         let Some(name) = state.name.as_ref() else {
             return;
@@ -1313,11 +1467,23 @@ impl SpiRealm {
             .filter(|(chunk, meta)| meta.owner == name.as_str() && !referenced.contains(*chunk))
             .map(|(chunk, meta)| (chunk.clone(), meta.version))
             .collect();
-        for group in garbage.chunks(64) {
-            if let Err(error) = self.delete_chunks(group).await {
-                tracing::warn!(scope = %state.id, %error, "could not delete unreferenced host store chunks");
-                return;
+        if garbage.is_empty() {
+            return;
+        }
+        let Some(realm) = self.me.upgrade() else {
+            return;
+        };
+        let scope = state.id.to_string();
+        let deletes = tokio::spawn(async move {
+            for group in garbage.chunks(64) {
+                if let Err(error) = realm.delete_chunks(group).await {
+                    tracing::warn!(%scope, %error, "could not delete unreferenced host store chunks");
+                    return;
+                }
             }
+        });
+        if let Err(error) = deletes.await {
+            tracing::warn!(%error, "the host store chunk delete task failed");
         }
     }
 
@@ -1372,8 +1538,11 @@ impl SpiRealm {
     /// chunk batches that must land first), before the call answers.
     ///
     /// # Errors
-    /// Any failure after which the host may differ from memory poisons
-    /// every scope of the batch (D3); a fence loss poisons the realm.
+    /// The memory side already changed, so every failure poisons what may
+    /// now differ from the host (D3): a failed or unknown batch poisons the
+    /// scopes it would have changed (not the ones only locked to read), a
+    /// failure before any batch was sent poisons every scope whose delta
+    /// names an entry, and a fence loss poisons the realm.
     pub async fn commit(
         &self,
         scopes: &mut [&mut ScopeState],
@@ -1384,22 +1553,24 @@ impl SpiRealm {
                 "a commit pairs every locked scope with one delta".into(),
             ));
         }
-        self.check_realm()?;
-        for state in &*scopes {
-            self.check_scope(state)?;
-            if state.body != Body::Loaded {
-                return Err(SpiError::Misuse(format!(
-                    "{} is committed before its body was loaded",
-                    state.id
-                )));
+        let changed: Vec<usize> = deltas
+            .iter()
+            .enumerate()
+            .filter(|(_, delta)| !delta.is_empty())
+            .map(|(index, _)| index)
+            .collect();
+        let mut plans = match self.plan_all(scopes, deltas) {
+            Ok(plans) => plans,
+            Err(error) => {
+                // Memory already changed and no batch was sent: every scope
+                // with a change may now differ from the host.
+                let cause = error.to_string();
+                for index in changed {
+                    self.poison_scope(&mut *scopes[index], &cause);
+                }
+                return Err(error);
             }
-        }
-        let mut plans = Vec::new();
-        for (index, (state, delta)) in scopes.iter().zip(deltas).enumerate() {
-            if let Some(plan) = self.plan(index, state, delta)? {
-                plans.push(plan);
-            }
-        }
+        };
         if plans.is_empty() {
             return Ok(());
         }
@@ -1424,6 +1595,30 @@ impl SpiRealm {
                 Err(error)
             }
         }
+    }
+
+    fn plan_all(
+        &self,
+        scopes: &[&mut ScopeState],
+        deltas: Vec<ScopeDelta>,
+    ) -> Result<Vec<ScopePlan>, SpiError> {
+        self.check_realm()?;
+        for state in scopes {
+            self.check_scope(state)?;
+            if state.body != Body::Loaded {
+                return Err(SpiError::Misuse(format!(
+                    "{} is committed before its body was loaded",
+                    state.id
+                )));
+            }
+        }
+        let mut plans = Vec::new();
+        for (index, (state, delta)) in scopes.iter().zip(deltas).enumerate() {
+            if let Some(plan) = self.plan(index, state, delta)? {
+                plans.push(plan);
+            }
+        }
+        Ok(plans)
     }
 
     async fn write_plans(&self, plans: &mut [ScopePlan]) -> Result<(), SpiError> {
@@ -1491,9 +1686,23 @@ impl SpiRealm {
                 delete: true,
             });
         }
+        let bytes = updates
+            .iter()
+            .map(ScopeUpdate::payload_bytes)
+            .fold(0, usize::saturating_add);
+        if bytes > MAX_BATCH_BYTES {
+            let heads = updates
+                .iter()
+                .map(|update| update.head.as_ref().map_or(0, Vec::len))
+                .fold(0, usize::saturating_add);
+            return Err(SpiError::TooLarge {
+                head_bytes: heads,
+                row_bytes: bytes.saturating_sub(heads),
+                budget: MAX_BATCH_BYTES,
+            });
+        }
         let batch = CommitBatch::try_new(self.commit_id()?, self.fence(), updates)?;
-        self.commit_settled(&batch).await?;
-        self.record_landed(&batch);
+        self.commit_recorded(&batch).await?;
         let mut table = lock(&self.chunks);
         for name in dead.keys() {
             table.remove(name);
@@ -1582,8 +1791,7 @@ impl SpiRealm {
                 delete: false,
             };
             let batch = CommitBatch::try_new(self.commit_id()?, self.fence(), vec![update])?;
-            self.commit_settled(&batch).await?;
-            self.record_landed(&batch);
+            self.commit_recorded(&batch).await?;
             previous = Some(next);
             lock(&self.chunks).insert(
                 pending.chunk.name.as_str().to_string(),
@@ -1792,28 +2000,62 @@ impl SpiRealm {
                 op_bytes: op_len,
             }
         };
+        // A large value equal to a chunk this plan retires takes that chunk
+        // over instead of uploading the bytes again: a boundary
+        // promotion moves the provisional tail's body to the session entry
+        // unchanged in one commit.
+        let mut chunk_for = |value: &Arc<Vec<u8>>,
+                             retiring: &mut HashMap<([u8; 32], u64), Vec<ChunkRef>>|
+         -> Result<ChunkRef, SpiError> {
+            let digest = codec::sha256(value);
+            if let Some(chunk) = retiring
+                .get_mut(&(digest, value.len() as u64))
+                .and_then(Vec::pop)
+            {
+                return Ok(chunk);
+            }
+            let pending = self.new_chunk(&name, value)?;
+            let chunk = pending.chunk.clone();
+            new_chunks.push(pending);
+            Ok(chunk)
+        };
+        let mut retiring: HashMap<([u8; 32], u64), Vec<ChunkRef>> = HashMap::new();
         if let Some(image) = checkpoint_image {
             // A checkpoint: RESET, then every live row entry. Unchanged
             // chunked values keep their chunk; every earlier spill dies.
             ops.push(RowOp::Reset);
             live_after = 0;
-            let mut kept_chunks: HashSet<String> = HashSet::new();
+            let kept: HashMap<&String, ChunkRef> = image
+                .iter()
+                .filter_map(|(key, value)| {
+                    state
+                        .rows
+                        .get(key)
+                        .filter(|stamp| stamp.chunk.is_some() && stamp.matches(value))
+                        .and_then(|stamp| stamp.chunk.clone())
+                        .map(|chunk| (key, chunk))
+                })
+                .collect();
+            let kept_names: HashSet<&str> =
+                kept.values().map(|chunk| chunk.name.as_str()).collect();
+            for stamp in state.rows.values() {
+                if let Some(chunk) = &stamp.chunk
+                    && !kept_names.contains(chunk.name.as_str())
+                {
+                    retiring
+                        .entry((chunk.sha256, chunk.len))
+                        .or_default()
+                        .push(chunk.clone());
+                }
+            }
             for (key, value) in &image {
-                let reuse = state
-                    .rows
-                    .get(key)
-                    .filter(|stamp| stamp.chunk.is_some() && stamp.matches(value))
-                    .and_then(|stamp| stamp.chunk.clone());
-                let stamp = if let Some(chunk) = reuse {
-                    kept_chunks.insert(chunk.name.as_str().to_string());
+                let stamp = if let Some(chunk) = kept.get(key) {
+                    ops.push(RowOp::PutChunk(key.clone(), chunk.clone()));
+                    stamp_for(key, value, Some(chunk.clone()))
+                } else if value.len() > INLINE_VALUE_LIMIT {
+                    let chunk = chunk_for(value, &mut retiring)?;
                     ops.push(RowOp::PutChunk(key.clone(), chunk.clone()));
                     stamp_for(key, value, Some(chunk))
-                } else if value.len() > INLINE_VALUE_LIMIT {
-                    let pending = self.new_chunk(&name, value)?;
-                    ops.push(RowOp::PutChunk(key.clone(), pending.chunk.clone()));
-                    let stamp = stamp_for(key, value, Some(pending.chunk.clone()));
-                    new_chunks.push(pending);
-                    stamp
                 } else {
                     ops.push(RowOp::Put(key.clone(), Arc::clone(value)));
                     stamp_for(key, value, None)
@@ -1821,21 +2063,19 @@ impl SpiRealm {
                 live_after += stamp.op_bytes;
                 stamps_after.push((key.clone(), Some(stamp)));
             }
-            for stamp in state.rows.values() {
-                if let Some(chunk) = &stamp.chunk
-                    && !kept_chunks.contains(chunk.name.as_str())
-                {
-                    dead_chunks.push(chunk.clone());
-                }
-            }
             dead_chunks.extend(state.row_chunks.iter().map(|(_, chunk)| chunk.clone()));
         } else {
+            for (key, _) in &row_changes {
+                if let Some(chunk) = state.rows.get(key).and_then(|stamp| stamp.chunk.as_ref()) {
+                    retiring
+                        .entry((chunk.sha256, chunk.len))
+                        .or_default()
+                        .push(chunk.clone());
+                }
+            }
             for (key, value) in row_changes {
                 if let Some(old) = state.rows.get(&key) {
                     live_after = live_after.saturating_sub(old.op_bytes);
-                    if let Some(chunk) = &old.chunk {
-                        dead_chunks.push(chunk.clone());
-                    }
                 }
                 match value {
                     None => {
@@ -1844,11 +2084,9 @@ impl SpiRealm {
                     }
                     Some(value) => {
                         let stamp = if value.len() > INLINE_VALUE_LIMIT {
-                            let pending = self.new_chunk(&name, &value)?;
-                            ops.push(RowOp::PutChunk(key.clone(), pending.chunk.clone()));
-                            let stamp = stamp_for(&key, &value, Some(pending.chunk.clone()));
-                            new_chunks.push(pending);
-                            stamp
+                            let chunk = chunk_for(&value, &mut retiring)?;
+                            ops.push(RowOp::PutChunk(key.clone(), chunk.clone()));
+                            stamp_for(&key, &value, Some(chunk))
                         } else {
                             ops.push(RowOp::Put(key.clone(), Arc::clone(&value)));
                             stamp_for(&key, &value, None)
@@ -1859,6 +2097,7 @@ impl SpiRealm {
                 }
             }
         }
+        dead_chunks.extend(retiring.into_values().flatten());
         let rows = codec::encode_rows(&ops)?;
         Ok(Some(ScopePlan {
             index,
@@ -1899,9 +2138,11 @@ impl SpiRealm {
                 .filter(|plan| plan.spill.is_none() && plan.row_bytes() > MAX_ROW_BYTES / 4)
                 .max_by_key(|plan| plan.row_bytes())
             else {
-                return Err(SpiError::Misuse(format!(
-                    "a batch of {heads} head bytes and {rows} row bytes cannot be made to fit"
-                )));
+                return Err(SpiError::TooLarge {
+                    head_bytes: heads,
+                    row_bytes: rows,
+                    budget: BATCH_BUDGET,
+                });
             };
             let packed = Arc::new(codec::pack_rows(&largest.rows));
             let owner = largest.scope.name.clone();
@@ -1946,6 +2187,144 @@ impl SpiRealm {
         state.live_bytes = plan.live_after;
         state.window = window;
         state.body = Body::Loaded;
+    }
+}
+
+/// The locked scopes of one adapter call that changes memory.
+///
+/// A call mutates memory first and commits to the host after; its future can
+/// be dropped at any await in between (a cancelled task, an aborted drain).
+/// Armed, this guard poisons every scope it holds when it is dropped, since
+/// memory may then hold a change the host never got. The commit runs on a
+/// task that owns the scopes ([`ArmedScopes::commit_detached`]), so a caller
+/// dropped after the hand-off still lands its batch and adopts it, or
+/// poisons, exactly as if it had waited. An adapter gate held with the
+/// scopes ([`ArmedScopes::hold`]) stays held until the commit settles.
+pub struct ArmedScopes {
+    realm: Arc<SpiRealm>,
+    guards: Vec<ScopeGuard>,
+    armed: bool,
+    gate: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+}
+
+impl std::fmt::Debug for ArmedScopes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArmedScopes")
+            .field("scopes", &self.guards.len())
+            .field("armed", &self.armed)
+            .field("gate", &self.gate.is_some())
+            .finish()
+    }
+}
+
+impl ArmedScopes {
+    /// Wrap locked scopes, disarmed.
+    #[must_use]
+    pub fn new(realm: Arc<SpiRealm>, guards: Vec<ScopeGuard>) -> Self {
+        Self {
+            realm,
+            guards,
+            armed: false,
+            gate: None,
+        }
+    }
+
+    /// Keep an adapter's gate held for as long as these scopes are, so a
+    /// commit handed off by a dropped caller still runs under it.
+    #[must_use]
+    pub fn hold(mut self, gate: tokio::sync::OwnedRwLockReadGuard<()>) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
+    /// From now on a drop poisons every held scope: call it right before the
+    /// in-memory change starts.
+    pub fn arm(&mut self) {
+        self.armed = true;
+    }
+
+    /// The change settled (nothing changed, or its commit adopted or
+    /// poisoned): a drop no longer poisons.
+    pub fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    #[must_use]
+    pub fn guards(&self) -> &[ScopeGuard] {
+        &self.guards
+    }
+
+    pub fn guards_mut(&mut self) -> &mut [ScopeGuard] {
+        &mut self.guards
+    }
+
+    /// Commit `deltas` (each paired with the index of its scope in
+    /// [`Self::guards`]) as one batch ([`SpiRealm::commit`], which poisons
+    /// what a failed batch may have changed), then disarm.
+    ///
+    /// # Errors
+    /// The commit's failure. A delta naming a scope these do not hold is
+    /// [`SpiError::Misuse`] and leaves the scopes armed, so their drop
+    /// poisons them all.
+    pub async fn commit_in_place(
+        &mut self,
+        deltas: Vec<(usize, ScopeDelta)>,
+    ) -> Result<(), SpiError> {
+        let mut by_index: BTreeMap<usize, ScopeDelta> = deltas.into_iter().collect();
+        let mut states: Vec<&mut ScopeState> = Vec::with_capacity(by_index.len());
+        let mut ordered = Vec::with_capacity(by_index.len());
+        for (index, guard) in self.guards.iter_mut().enumerate() {
+            if let Some(delta) = by_index.remove(&index) {
+                states.push(&mut **guard);
+                ordered.push(delta);
+            }
+        }
+        if !by_index.is_empty() {
+            return Err(SpiError::Misuse(
+                "a commit names a scope it does not hold".to_string(),
+            ));
+        }
+        let outcome = self.realm.commit(&mut states, ordered).await;
+        self.armed = false;
+        outcome
+    }
+
+    /// [`Self::commit_in_place`] on a task that owns these scopes (and the
+    /// held gate) until the commit settles; answers them back once it
+    /// landed.
+    ///
+    /// # Errors
+    /// The commit's failure; the scopes are released after the realm
+    /// poisoned what the batch may have changed.
+    pub async fn commit_detached(self, deltas: Vec<(usize, ScopeDelta)>) -> Result<Self, SpiError> {
+        let task = tokio::spawn(async move {
+            let mut scopes = self;
+            let outcome = scopes.commit_in_place(deltas).await;
+            (scopes, outcome)
+        });
+        match task.await {
+            Ok((scopes, Ok(()))) => Ok(scopes),
+            Ok((scopes, Err(error))) => {
+                drop(scopes);
+                Err(error)
+            }
+            // The task panicked or its runtime shut down: it dropped its
+            // armed scopes, which poisoned them.
+            Err(error) => Err(SpiError::Misuse(format!(
+                "the host commit task failed: {error}"
+            ))),
+        }
+    }
+}
+
+impl Drop for ArmedScopes {
+    fn drop(&mut self) {
+        if self.armed {
+            let cause = "a call was dropped while it changed this scope; memory may hold a change the host never got";
+            for guard in &mut self.guards {
+                self.realm.poison(guard, cause);
+            }
+        }
     }
 }
 
