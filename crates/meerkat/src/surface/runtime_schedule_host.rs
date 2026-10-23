@@ -1756,6 +1756,137 @@ mod tests {
         (service, runtime_adapter, result.session_id)
     }
 
+    /// A live orchestrator over a fixture's service, addressing sessions as
+    /// `session_addressing`, with no live host composed.
+    #[cfg(all(
+        feature = "session-store",
+        feature = "comms",
+        feature = "jsonl-store",
+        feature = "live",
+        not(target_arch = "wasm32")
+    ))]
+    fn fixture_live_orchestrator<'a>(
+        service: &'a Arc<PersistentSessionService<crate::FactoryAgentBuilder>>,
+        runtime_adapter: &'a Arc<MeerkatMachine>,
+        staged_sessions: &'a Arc<crate::StagedSessionRegistry>,
+        staged_capacity_admissions: &'a crate::session_runtime::admission::StagedCapacityAdmissions,
+        session_addressing: crate::session_runtime::live_orchestration::LiveSessionAddressing,
+    ) -> crate::session_runtime::live_orchestration::LiveOrchestrator<'a> {
+        crate::session_runtime::live_orchestration::LiveOrchestrator {
+            service,
+            staged_sessions,
+            staged_capacity_admissions,
+            runtime_adapter,
+            host: None,
+            config_runtime: None,
+            default_llm_client: None,
+            agent_llm_client_decorator: None,
+            external_tools: None,
+            archive_runtime_cleanup: crate::session_runtime::runtime_state::ArchiveRuntimeCleanup {
+                runtime_adapter: Arc::clone(runtime_adapter),
+                pending_session_event_streams: None,
+                mcp_state: None,
+                mob_state: None,
+            },
+            realm_id: None,
+            instance_id: None,
+            backend: None,
+            ingress_reconciler: None,
+            actor_witness_capture: Arc::new(
+                |_session_id: SessionId,
+                 _actor_witness_slot: crate::LiveSessionActorWitnessSlot| {},
+            ),
+            session_addressing,
+        }
+    }
+
+    /// A session-scoped surface opens no live channel on a mob member's
+    /// session, live or not, and restores none from storage: the member's
+    /// mob opens its channels after checking the member. The open's refusal
+    /// is typed (the mob-member kind); a live member session is still found
+    /// for the reads behind a channel that exists, and nothing is restored.
+    /// The member live host addresses the same session through its mob and
+    /// is never refused. Before, a session-scoped open of a live member
+    /// session went ahead without any member check.
+    #[cfg(all(
+        feature = "session-store",
+        feature = "comms",
+        feature = "jsonl-store",
+        feature = "live",
+        not(target_arch = "wasm32")
+    ))]
+    #[tokio::test]
+    async fn a_session_scoped_surface_opens_no_mob_member_session_live_or_cold() {
+        use crate::session_runtime::live_orchestration::LiveSessionAddressing;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (service, runtime_adapter, session_id) =
+            live_peer_only_mob_session(&temp, "member-open-refusal").await;
+        let staged_sessions = Arc::new(crate::StagedSessionRegistry::new());
+        let staged_capacity_admissions: crate::session_runtime::admission::StagedCapacityAdmissions =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let scoped = fixture_live_orchestrator(
+            &service,
+            &runtime_adapter,
+            &staged_sessions,
+            &staged_capacity_admissions,
+            LiveSessionAddressing::SessionScoped,
+        );
+        let member_host = fixture_live_orchestrator(
+            &service,
+            &runtime_adapter,
+            &staged_sessions,
+            &staged_capacity_admissions,
+            LiveSessionAddressing::MobMember,
+        );
+
+        let refused = scoped
+            .refuse_mob_member_session_by_id(&session_id)
+            .await
+            .expect_err("a session-scoped open refuses a live member session");
+        assert!(
+            refused.is_mob_member_session_addressed_by_id(),
+            "{refused:?}"
+        );
+        scoped
+            .recover_live_session_for_realtime_open(&session_id)
+            .await
+            .expect("a live member session is found, not restored");
+        member_host
+            .refuse_mob_member_session_by_id(&session_id)
+            .await
+            .expect("the member live host opens through the mob");
+
+        // Cold: the live actor is gone, the durable member session stays.
+        service
+            .discard_live_session(&session_id)
+            .await
+            .expect("discard the live member session");
+        let refused = scoped
+            .recover_live_session_for_realtime_open(&session_id)
+            .await
+            .expect_err("a session-scoped recovery refuses a cold member session");
+        assert!(
+            refused.is_mob_member_session_addressed_by_id(),
+            "{refused:?}"
+        );
+        if let Err(error) = member_host
+            .recover_live_session_for_realtime_open(&session_id)
+            .await
+        {
+            assert!(
+                !error.is_mob_member_session_addressed_by_id(),
+                "the member live host is never refused as a session-scoped surface: {error:?}"
+            );
+        }
+
+        let _ = service.discard_live_session(&session_id).await;
+        runtime_adapter
+            .unregister_session(&session_id)
+            .await
+            .expect("unregister the member session");
+    }
+
     /// A redelivery to a mob member's session runs its existing-only
     /// admission under the session's own fence (its exact attachment and its
     /// member residency), as the ordinary admission does, and with the fence
