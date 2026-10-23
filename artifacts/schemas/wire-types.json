@@ -125869,7 +125869,7 @@
         "type": "string"
       },
       "WireMemberCustodyDeferral": {
-        "description": "A member's custody restore a mob start deferred, as its status shows it.",
+        "description": "A member's custody restore a mob start deferred, as its status shows it.\nAdvisory: its vocabularies may grow, and a reader surfaces a value it does\nnot know instead of refusing it.",
         "properties": {
           "cause": {
             "$ref": "#/$defs/WireMemberCustodyDeferralCause",
@@ -125887,7 +125887,7 @@
         "type": "object"
       },
       "WireMemberCustodyDeferralCause": {
-        "description": "The cause a deferred member custody restore last met.",
+        "description": "The cause a deferred member custody restore last met. The vocabulary\nmay grow: a reader surfaces a cause it does not know instead of\nrefusing it.",
         "oneOf": [
           {
             "const": "served_elsewhere",
@@ -125907,7 +125907,7 @@
         ]
       },
       "WireMemberCustodyRestore": {
-        "description": "Which startup restore of a member's custody a mob start deferred.",
+        "description": "Which startup restore of a member's custody a mob start deferred. The\nvocabulary may grow: a reader surfaces a restore it does not know\ninstead of refusing it.",
         "oneOf": [
           {
             "const": "startup_binding",
@@ -174142,7 +174142,7 @@
   "WireMemberCustodyDeferral": {
     "$defs": {
       "WireMemberCustodyDeferralCause": {
-        "description": "The cause a deferred member custody restore last met.",
+        "description": "The cause a deferred member custody restore last met. The vocabulary\nmay grow: a reader surfaces a cause it does not know instead of\nrefusing it.",
         "oneOf": [
           {
             "const": "served_elsewhere",
@@ -174162,7 +174162,7 @@
         ]
       },
       "WireMemberCustodyRestore": {
-        "description": "Which startup restore of a member's custody a mob start deferred.",
+        "description": "Which startup restore of a member's custody a mob start deferred. The\nvocabulary may grow: a reader surfaces a restore it does not know\ninstead of refusing it.",
         "oneOf": [
           {
             "const": "startup_binding",
@@ -174178,7 +174178,7 @@
       }
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "description": "A member's custody restore a mob start deferred, as its status shows it.",
+    "description": "A member's custody restore a mob start deferred, as its status shows it.\nAdvisory: its vocabularies may grow, and a reader surfaces a value it does\nnot know instead of refusing it.",
     "properties": {
       "cause": {
         "$ref": "#/$defs/WireMemberCustodyDeferralCause",
@@ -174198,7 +174198,7 @@
   },
   "WireMemberCustodyDeferralCause": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "description": "The cause a deferred member custody restore last met.",
+    "description": "The cause a deferred member custody restore last met. The vocabulary\nmay grow: a reader surfaces a cause it does not know instead of\nrefusing it.",
     "oneOf": [
       {
         "const": "served_elsewhere",
@@ -174220,7 +174220,7 @@
   },
   "WireMemberCustodyRestore": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "description": "Which startup restore of a member's custody a mob start deferred.",
+    "description": "Which startup restore of a member's custody a mob start deferred. The\nvocabulary may grow: a reader surfaces a restore it does not know\ninstead of refusing it.",
     "oneOf": [
       {
         "const": "startup_binding",

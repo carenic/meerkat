@@ -202,7 +202,8 @@ from .generated.types import (
     WireReachability,
     WireMemberPreviewUnavailable,
     WireMemberRegistrationHookCall,
-    WireMemberCustodyDeferral,
+    WireMemberCustodyDeferralCause,
+    WireMemberCustodyRestore,
     WireExternalRouteInstallObligation,
     WireRouteInstallObligation,
     WireRuntimeBinding,
@@ -237,6 +238,7 @@ from .mob import (
     MobKickoffMemberSnapshot,
     MobLifecycleAction,
     MobMember,
+    MobMemberCustodyDeferral,
     MobMemberRef,
     MobMemberSnapshot,
     MobPeerConnectivity,
@@ -8155,11 +8157,15 @@ class MeerkatClient:
     @staticmethod
     def _parse_member_custody_deferral(
         raw: dict[str, Any], context: str
-    ) -> WireMemberCustodyDeferral | None:
+    ) -> MobMemberCustodyDeferral | None:
         """Return the member's custody restore a mob start deferred.
 
-        Absent or ``null`` means no restore is deferred. The restore and the
-        cause are closed vocabularies, and an unknown field fails closed.
+        Absent or ``null`` means no restore is deferred. The field is
+        advisory and its vocabularies may grow: a ``restore`` or ``cause``
+        this SDK does not know is read as ``{"unknown": <the value>}``, and a
+        field it does not know is ignored, so a newer server never fails the
+        read. A value that is not an object, or a restore or cause that is
+        not a string, is malformed and fails closed.
         """
         value = raw.get("custody_deferred")
         if value is None:
@@ -8168,25 +8174,29 @@ class MeerkatClient:
             raise MeerkatError(
                 "INVALID_RESPONSE", f"{context}: invalid custody_deferred"
             )
-        if value.get("restore") not in {"startup_binding", "cleanup_delivery"}:
+        restore = value.get("restore")
+        if not isinstance(restore, str):
             raise MeerkatError(
                 "INVALID_RESPONSE", f"{context}: invalid custody_deferred.restore"
             )
-        if value.get("cause") not in {
-            "served_elsewhere",
-            "hosting_unavailable",
-            "durable_tail_unprovable",
-        }:
+        cause = value.get("cause")
+        if not isinstance(cause, str):
             raise MeerkatError(
                 "INVALID_RESPONSE", f"{context}: invalid custody_deferred.cause"
             )
-        unknown = set(value) - {"restore", "cause"}
-        if unknown:
-            raise MeerkatError(
-                "INVALID_RESPONSE",
-                f"{context}: unknown custody_deferred field {sorted(unknown)[0]}",
-            )
-        return cast(WireMemberCustodyDeferral, value)
+        return {
+            "restore": (
+                cast(WireMemberCustodyRestore, restore)
+                if restore in {"startup_binding", "cleanup_delivery"}
+                else {"unknown": restore}
+            ),
+            "cause": (
+                cast(WireMemberCustodyDeferralCause, cause)
+                if cause
+                in {"served_elsewhere", "hosting_unavailable", "durable_tail_unprovable"}
+                else {"unknown": cause}
+            ),
+        }
 
     @staticmethod
     def _optional_string_field(

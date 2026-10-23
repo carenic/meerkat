@@ -40,7 +40,8 @@ from .generated.types import (
     WireReachability,
     WireMemberPreviewUnavailable,
     WireMemberRegistrationHookCall,
-    WireMemberCustodyDeferral,
+    WireMemberCustodyDeferralCause,
+    WireMemberCustodyRestore,
     WireRuntimeBinding,
     WireToolAccessPolicy,
     WireToolFilter,
@@ -177,6 +178,21 @@ MobMemberLifecycleCapabilities = TypedDict(
     },
 )
 
+# A custody restore or cause this SDK does not know, as the server sent it:
+# the deferral vocabularies may grow, and an unknown value is surfaced, not
+# refused.
+MobMemberCustodyUnknown = TypedDict("MobMemberCustodyUnknown", {"unknown": str})
+
+# A member's custody restore a mob start deferred: the restore and the cause
+# its last attempt met.
+MobMemberCustodyDeferral = TypedDict(
+    "MobMemberCustodyDeferral",
+    {
+        "restore": WireMemberCustodyRestore | MobMemberCustodyUnknown,
+        "cause": WireMemberCustodyDeferralCause | MobMemberCustodyUnknown,
+    },
+)
+
 MobMemberSnapshot = TypedDict(
     "MobMemberSnapshot",
     {
@@ -213,7 +229,7 @@ MobMemberSnapshot = TypedDict(
         # Set when a mob start deferred the member's custody restore instead
         # of failing the whole start: the restore and the cause its last
         # attempt met. Every operation on the member re-attempts it first.
-        "custody_deferred": NotRequired[WireMemberCustodyDeferral],
+        "custody_deferred": NotRequired[MobMemberCustodyDeferral],
     },
 )
 
@@ -234,7 +250,7 @@ MobKickoffMemberSnapshot = TypedDict(
         # As on MobMemberSnapshot.
         "preview_unavailable": NotRequired[WireMemberPreviewUnavailable],
         "registration_refusal": NotRequired[WireMemberRegistrationHookCall],
-        "custody_deferred": NotRequired[WireMemberCustodyDeferral],
+        "custody_deferred": NotRequired[MobMemberCustodyDeferral],
     },
 )
 

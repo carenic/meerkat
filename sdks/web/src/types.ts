@@ -7,7 +7,8 @@ import type {
   WireMemberPreviewUnavailable,
   WireMemberProgressSnapshot,
   WireMemberRegistrationHookCall,
-  WireMemberCustodyDeferral,
+  WireMemberCustodyDeferralCause,
+  WireMemberCustodyRestore,
   WireMobMemberStatus,
   WireNonPortableResourceKind,
   WireReachability,
@@ -462,7 +463,22 @@ export interface MobMemberSnapshot {
    * failing the whole start: the restore and the cause its last attempt met.
    * Every operation on the member re-attempts it first.
    */
-  custody_deferred?: WireMemberCustodyDeferral;
+  custody_deferred?: MobMemberCustodyDeferral;
+}
+
+/**
+ * A custody restore or cause this SDK does not know, as the server sent it:
+ * the deferral vocabularies may grow, and an unknown value is surfaced, not
+ * refused.
+ */
+export interface MobMemberCustodyUnknown {
+  unknown: string;
+}
+
+/** A member's custody restore a mob start deferred, and the cause its last attempt met. */
+export interface MobMemberCustodyDeferral {
+  restore: WireMemberCustodyRestore | MobMemberCustodyUnknown;
+  cause: WireMemberCustodyDeferralCause | MobMemberCustodyUnknown;
 }
 
 /** Result envelope for helper-style mob flows. */

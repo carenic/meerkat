@@ -35,6 +35,8 @@ export type {
   MobHelperOptions,
   MobKickoffMemberSnapshot,
   MobKickoffWaitOptions,
+  MobMemberCustodyDeferral,
+  MobMemberCustodyUnknown,
   MobMemberSnapshot,
   MobPeerConnectivity,
   MobPeerConnectivitySnapshot,
