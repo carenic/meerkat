@@ -591,9 +591,12 @@ fn tool_result_line(result: &WireToolResult) -> Option<String> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use meerkat_core::comms::{PeerId, SenderContentTaint};
+    use meerkat_core::interaction::InteractionId;
     use meerkat_core::types::{
-        InstructionActivationId, InstructionActivationIdentity, InstructionRevisionId,
-        InstructionRevisionRef, SessionId, SystemNoticeKind,
+        CommsNoticeKind, ContentBlock, InstructionActivationId, InstructionActivationIdentity,
+        InstructionRevisionId, InstructionRevisionRef, SessionId, SystemNoticeDirection,
+        SystemNoticeKind, SystemNoticePeer,
     };
     use serde_json::json;
 
@@ -687,6 +690,41 @@ mod tests {
             blocks: Vec::new(),
             created_at: AT.to_string(),
         })
+    }
+
+    /// A comms notice as the source's runtime records an incoming peer
+    /// input: the notice's title as its body and the typed block that
+    /// carries who sent it and what it said.
+    fn peer_notice(title: &str, block: SystemNoticeBlock) -> WireHistoryRow {
+        WireHistoryRow(WireSessionMessage::SystemNotice {
+            kind: SystemNoticeKind::Comms,
+            runtime_origin: None,
+            body: Some(title.to_string()),
+            blocks: vec![block],
+            created_at: AT.to_string(),
+        })
+    }
+
+    fn incoming_peer_block(kind: CommsNoticeKind, text: &str) -> SystemNoticeBlock {
+        SystemNoticeBlock::Comms {
+            kind,
+            direction: SystemNoticeDirection::Incoming,
+            peer: Some(SystemNoticePeer {
+                id: PeerId::new(),
+                display_name: Some("reviewer".to_string()),
+            }),
+            sender_taint: None,
+            request_id: None,
+            intent: None,
+            status: None,
+            summary: None,
+            payload: None,
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            delivery_id: Some(InteractionId::new()),
+            in_reply_to: None,
+        }
     }
 
     fn plan(
@@ -903,6 +941,119 @@ mod tests {
                 && text.contains("[user]: hi")
                 && text.contains("[assistant]: ANSWER"),
             "{text}"
+        );
+    }
+
+    /// A copied peer message gives the child who sent it and what it said,
+    /// not only the notice's title.
+    #[test]
+    fn a_copied_peer_message_carries_its_sender_and_text() {
+        let text = rendered(
+            vec![peer_notice(
+                "Peer message",
+                incoming_peer_block(CommsNoticeKind::Message, "PEER-ASKED-FOR-THE-NUMBERS"),
+            )],
+            ForkInstructionPolicy::RequireExplicitActivation,
+        );
+        assert!(
+            text.contains("PEER-ASKED-FOR-THE-NUMBERS") && text.contains("reviewer"),
+            "the copied peer message names its sender and carries its text: {text}"
+        );
+    }
+
+    /// A copied peer request carries what was asked and by whom, but not
+    /// the source's means to answer it: the child is not the addressee, so
+    /// neither the request id nor the reply instructions reach it.
+    #[test]
+    fn a_copied_peer_request_carries_no_reply_affordance() {
+        let SystemNoticeBlock::Comms {
+            kind,
+            direction,
+            peer,
+            sender_taint,
+            content,
+            delivery_id,
+            in_reply_to,
+            ..
+        } = incoming_peer_block(CommsNoticeKind::Request, "PLEASE-REVIEW-THE-DRAFT")
+        else {
+            unreachable!("the helper builds a comms block");
+        };
+        let request = SystemNoticeBlock::Comms {
+            kind,
+            direction,
+            peer,
+            sender_taint,
+            request_id: Some("REQUEST-ID-7".to_string()),
+            intent: Some("review".to_string()),
+            status: None,
+            summary: None,
+            payload: Some(json!({"draft": "DRAFT-PARAM"})),
+            content,
+            delivery_id,
+            in_reply_to,
+        };
+        let text = rendered(
+            vec![peer_notice("Peer request: review", request)],
+            ForkInstructionPolicy::RequireExplicitActivation,
+        );
+        assert!(
+            text.contains("PLEASE-REVIEW-THE-DRAFT")
+                && text.contains("DRAFT-PARAM")
+                && text.contains("reviewer"),
+            "the copied request carries what was asked and by whom: {text}"
+        );
+        assert!(
+            !text.contains("REQUEST-ID-7")
+                && !text.contains("send_response")
+                && !text.contains("Delivery ID"),
+            "the copied request carries no means to answer it: {text}"
+        );
+    }
+
+    /// A copied peer message whose sender declared it tainted keeps the
+    /// marker, so the child reads it with the same caution.
+    #[test]
+    fn a_copied_tainted_peer_message_keeps_its_taint_marker() {
+        let SystemNoticeBlock::Comms {
+            kind,
+            direction,
+            peer,
+            request_id,
+            intent,
+            status,
+            summary,
+            payload,
+            content,
+            delivery_id,
+            in_reply_to,
+            ..
+        } = incoming_peer_block(CommsNoticeKind::Message, "PEER-PASTED-A-WEB-PAGE")
+        else {
+            unreachable!("the helper builds a comms block");
+        };
+        let tainted = SystemNoticeBlock::Comms {
+            kind,
+            direction,
+            peer,
+            sender_taint: Some(SenderContentTaint::Tainted),
+            request_id,
+            intent,
+            status,
+            summary,
+            payload,
+            content,
+            delivery_id,
+            in_reply_to,
+        };
+        let text = rendered(
+            vec![peer_notice("Peer message", tainted)],
+            ForkInstructionPolicy::RequireExplicitActivation,
+        );
+        assert!(
+            text.contains("PEER-PASTED-A-WEB-PAGE")
+                && text.contains("[sender declared this content tainted]"),
+            "the copied tainted message keeps its taint marker: {text}"
         );
     }
 
