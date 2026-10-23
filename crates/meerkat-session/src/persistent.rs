@@ -6234,13 +6234,23 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// the live actor. An observation settles it only while the actor is
     /// hosted and the recovery gate is free; an archive holds that gate, so it
     /// runs the same store-owned, machine-authorized recovery here instead
-    /// (the recovery machine refuses a runtime that is not quiescent). A
+    /// (the recovery machine refuses a runtime that is not quiescent). The
+    /// session ends with this archive, so a runtime whose executor stopped
+    /// (persisted `Stopped`, for example after its loop failed closed on a
+    /// read of this very tail) counts as quiescent here, as a retired one
+    /// does; a persisted current run still refuses. A
     /// committed or already aligned tail returns `Ok`, and the archive reads
     /// once more. A held tail ends the archive with
     /// [`SessionError::DurableTailHeldForRecovery`] and a refused one with
     /// [`SessionError::DurableTailRecoveryRefused`]; both keep the tail
     /// intact. Without a recorded provisional tail, or outside HeadCanonical,
     /// nothing here settles the conflict, which is returned unchanged.
+    ///
+    /// The archive never continues a run: its recovery judges a quiescent
+    /// runtime retired, so a continuable tail (an open run at a committed
+    /// round) is repaired and committed as interrupted, and the inputs bound
+    /// to its run are terminalized in the same commit. An unbound content
+    /// input beside such a tail holds it, as it holds an interrupted one.
     async fn settle_durable_tail_under_archive_gates(
         &self,
         id: &SessionId,
@@ -6267,7 +6277,10 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 return Err(conflict);
             }
         }
-        match self.store_owned_durable_tail_recovery_outcome(id).await? {
+        match self
+            .store_owned_durable_tail_recovery_outcome_for_archive(id)
+            .await?
+        {
             (meerkat_runtime::recovery::DurableTailRecoveryOutcome::Committed { .. }, _) => {
                 tracing::info!(
                     session_id = %id,
@@ -6292,6 +6305,19 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                     "durable-tail recovery refused the tail of a session being archived"
                 );
                 Err(SessionError::DurableTailRecoveryRefused { id: id.clone() })
+            }
+            // Unreachable: the archive's recovery judges the runtime retired,
+            // and the machine never continues a run of a retired runtime.
+            // Nothing was written, so the tail is intact.
+            (meerkat_runtime::recovery::DurableTailRecoveryOutcome::Continue { .. }, _) => {
+                tracing::error!(
+                    session_id = %id,
+                    "durable-tail recovery answered a run continuation inside the archive of a session that is ending"
+                );
+                Err(SessionError::Agent(AgentError::InternalError(format!(
+                    "durable-tail recovery for session {id} answered a run continuation \
+                     inside its archive, which judges the runtime retired"
+                ))))
             }
         }
     }
@@ -6354,7 +6380,37 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             id,
         )
         .await
-        .map_err(|error| match error {
+        .map_err(|error| Self::store_owned_durable_tail_recovery_error(id, error))
+    }
+
+    /// [`Self::store_owned_durable_tail_recovery_outcome`] for an archive of
+    /// a session that is ending, which holds the session's turn boundary,
+    /// recovery gate and runtime archive lease: a persisted `Stopped`
+    /// lifecycle is quiescent there (the executor exited, and no later start
+    /// resumes the run).
+    async fn store_owned_durable_tail_recovery_outcome_for_archive(
+        &self,
+        id: &SessionId,
+    ) -> Result<
+        (
+            meerkat_runtime::recovery::DurableTailRecoveryOutcome,
+            Option<CommittedWholeBlobSnapshot>,
+        ),
+        SessionError,
+    > {
+        meerkat_runtime::recovery::recover_durable_tail_for_session_archive(
+            self.runtime_store.as_ref(),
+            id,
+        )
+        .await
+        .map_err(|error| Self::store_owned_durable_tail_recovery_error(id, error))
+    }
+
+    fn store_owned_durable_tail_recovery_error(
+        id: &SessionId,
+        error: meerkat_runtime::recovery::DurableTailRecoveryError,
+    ) -> SessionError {
+        match error {
             // Recovery reads the committed WholeBlob document before it
             // can judge the tail. A document the current decoder refuses
             // is the typed "session needs the sanctioned repair" fact,
@@ -6367,7 +6423,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             error => SessionError::Agent(AgentError::InternalError(format!(
                 "durable-tail recovery for session {id}: {error}"
             ))),
-        })
+        }
     }
 
     async fn discard_stale_live_session_if_needed(
