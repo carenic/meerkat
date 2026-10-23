@@ -437,8 +437,8 @@ WebSocket, and keep WebRTC for sessions that are not mob members.
   running turn the same way, with its kickoff open, unless the member is
   retiring or host-placed. Because a graceful shutdown that does not choose
   uses Requeue for such sessions, a deploy no longer cancels their runs in
-  flight; the REST server first lets runs attached to open requests finish,
-  and `rkat-mcp` still cancels its requests in flight. See
+  flight; the REST server first lets runs attached to open requests finish.
+  See
   [Durable Runs: graceful stops and deploys](/guides/durable-runs#graceful-stops-and-deploys).
 - **Host stores:** a host can keep a realm's durable state in its own
   database through the host store SPI (`meerkat_core::host_store`), checked

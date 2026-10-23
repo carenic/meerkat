@@ -160,9 +160,6 @@ per-round commits, and Stop for any other session:
   cancelling it, an autonomous member's included (see
   [Mobs](/guides/mobs)).
 
-`rkat-mcp`'s shutdown is not one of them: it still cancels its requests in
-flight.
-
 A host that chooses explicitly keeps its choice: an unregister with
 `UnregisterQueuedInputs::Stop`, or a Shutdown with
 `with_queued_inputs(QueuedInputsOnShutdown::Stop)`, ends runs in flight as

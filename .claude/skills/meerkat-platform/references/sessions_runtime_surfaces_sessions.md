@@ -413,10 +413,9 @@ Contract and limits: `docs/guides/durable-runs.mdx`.
   shutdown error, not `requeued_across_stop`), REST (SIGTERM, interrupt,
   after its open requests finish, so a run attached to an open request is
   not suspended) and a mob Shutdown without `with_queued_inputs` (its
-  default `QueuedInputsOnShutdown::RequeueDurable`, per member); `rkat-mcp`
-  still cancels its requests in flight; an explicit `Stop` keeps 0.9.4
-  behaviour, and a host's own unregister without a disposition stops
-  (`UnregisterQueuedInputs::default()` is `Stop`).
+  default `QueuedInputsOnShutdown::RequeueDurable`, per member); an explicit
+  `Stop` keeps 0.9.4 behaviour, and a host's own unregister without a
+  disposition stops (`UnregisterQueuedInputs::default()` is `Stop`).
 - Durable workers and the mob resume gate: `references/mobs.md`. Realms in a
   host's own database: `references/sessions_runtime_surfaces_storage_config.md`.
 
