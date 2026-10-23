@@ -121,12 +121,13 @@ pub use definition::{
     UnknownProfileKeys,
 };
 pub use error::{
-    FlowStepDispatchRejectKind, ForkSourceUnavailableCause, ForkedParticipantLeaseOperation,
-    ForkedParticipantOwnerHostRejection, ForkedParticipantSourceRejection,
-    IncarnationInconsistency, MemberCustodyDeferral, MemberCustodyDeferralCause,
-    MemberCustodyRestore, MemberProvisionFailureCause, MemberRegistrationHookCall,
-    MemberRuntimeDetachment, MemberSendIdempotencyRefusal, MobDefinitionProjectionMismatchKind,
-    MobError, MobFailureClass, OperatorAuthorityCeilingRefusal, RuntimeEffectKind,
+    FlowRoleTargetRefusal, FlowStepDispatchRejectKind, ForkSourceUnavailableCause,
+    ForkedParticipantLeaseOperation, ForkedParticipantOwnerHostRejection,
+    ForkedParticipantSourceRejection, IncarnationInconsistency, MemberCustodyDeferral,
+    MemberCustodyDeferralCause, MemberCustodyRestore, MemberProvisionFailureCause,
+    MemberRegistrationHookCall, MemberRuntimeDetachment, MemberSendIdempotencyRefusal,
+    MobDefinitionProjectionMismatchKind, MobError, MobFailureClass,
+    OperatorAuthorityCeilingRefusal, RuntimeEffectKind,
 };
 pub use event::{
     AttributedEvent, FlowCancelClass, ForkJobTerminalEvent, MemberWireEdge, MobEvent, MobEventKind,
@@ -238,10 +239,10 @@ pub use profile::{
 };
 pub use roster::{MobMemberKickoffPhase, MobMemberKickoffSnapshot};
 pub use run::{
-    CreateMobAdmission, FailureLedgerEntry, FlowContext, FlowRunConfig, FrameSnapshot,
-    LoopContextHistory, LoopIterationLedgerEntry, LoopSnapshot, MobFlowRunPublicResultClass,
-    MobRun, MobRunStatus, ProfileMutationAdmission, StepLedgerEntry, StepRunStatus,
-    mob_machine_create_mob_admission, mob_machine_profile_mutation_admission,
+    CreateMobAdmission, FailureLedgerEntry, FlowContext, FlowRoleTargets, FlowRoleTargetsError,
+    FlowRunConfig, FrameSnapshot, LoopContextHistory, LoopIterationLedgerEntry, LoopSnapshot,
+    MobFlowRunPublicResultClass, MobRun, MobRunStatus, ProfileMutationAdmission, StepLedgerEntry,
+    StepRunStatus, mob_machine_create_mob_admission, mob_machine_profile_mutation_admission,
     mob_machine_run_public_result_class, mob_machine_run_status_is_terminal,
     mob_machine_step_status_is_terminal,
 };

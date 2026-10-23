@@ -412,6 +412,89 @@ impl std::fmt::Display for MemberRegistrationHookCall {
     }
 }
 
+/// Why role-targets admission refused a flow run.
+///
+/// The verdict is computed once, inside the mob actor command that admits the
+/// run, from MobMachine's own member facts, before anything is written,
+/// provisioned or dispatched. On the wire it rides the error data as a closed
+/// vocabulary, `{"kind": "<variant>", ...fields}`, so no caller reads the
+/// message text to tell a binding refusal from other invalid params.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum FlowRoleTargetRefusal {
+    /// A bound role is not the role of any step of the flow.
+    RoleNotInFlow { role: ProfileName },
+    /// A role that a step of the flow dispatches to is not bound.
+    RoleUnbound { role: ProfileName },
+    /// A quorum step needs more producers than its role's bound set holds.
+    QuorumExceedsBoundSet {
+        step_id: StepId,
+        required: u8,
+        bound: usize,
+    },
+    /// A bound identity is not a member of this mob.
+    NotAMember {
+        role: ProfileName,
+        member: AgentIdentity,
+    },
+    /// A bound member holds a different role.
+    RoleMismatch {
+        role: ProfileName,
+        member: AgentIdentity,
+        member_role: ProfileName,
+    },
+    /// A bound member holds the role but is not Active.
+    NotActive {
+        role: ProfileName,
+        member: AgentIdentity,
+        status: crate::runtime::MobMemberStatus,
+    },
+}
+
+impl std::fmt::Display for FlowRoleTargetRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RoleNotInFlow { role } => {
+                write!(f, "role '{role}' is not the role of any step of the flow")
+            }
+            Self::RoleUnbound { role } => {
+                write!(f, "role '{role}' is used by the flow but not bound")
+            }
+            Self::QuorumExceedsBoundSet {
+                step_id,
+                required,
+                bound,
+            } => write!(
+                f,
+                "step '{step_id}' needs a quorum of {required} but its role binds {bound} members"
+            ),
+            Self::NotAMember { role, member } => {
+                write!(
+                    f,
+                    "member '{member}' bound to role '{role}' is not a member of this mob"
+                )
+            }
+            Self::RoleMismatch {
+                role,
+                member,
+                member_role,
+            } => write!(
+                f,
+                "member '{member}' bound to role '{role}' holds role '{member_role}'"
+            ),
+            Self::NotActive {
+                role,
+                member,
+                status,
+            } => write!(
+                f,
+                "member '{member}' bound to role '{role}' is not active (status {status:?})"
+            ),
+        }
+    }
+}
+
 /// Errors returned by mob operations.
 ///
 /// Non-exhaustive: a later release can add a refusal without breaking a
@@ -994,6 +1077,31 @@ pub enum MobError {
         step_id: StepId,
         required: u8,
         available: usize,
+    },
+
+    /// Role-targets admission refused a flow run. Nothing was written,
+    /// provisioned or dispatched.
+    #[error("flow '{flow_id}' role targets refused: {refusal}")]
+    FlowRoleTargetsRefused {
+        flow_id: FlowId,
+        refusal: FlowRoleTargetRefusal,
+    },
+
+    /// A step of a role-targeted run can no longer meet its collection policy
+    /// with the bound members of its role that are still Active and still
+    /// hold the role. The run fails before the step dispatches any turn: a
+    /// bound run never substitutes another member and never waits for one.
+    #[error(
+        "bound targets unavailable for step {step_id} of run {run_id}: required {required}, available [{}], unavailable [{}]",
+        format_identities(.available),
+        format_identities(.unavailable)
+    )]
+    BoundFlowTargetsUnavailable {
+        run_id: RunId,
+        step_id: StepId,
+        required: usize,
+        available: Vec<AgentIdentity>,
+        unavailable: Vec<AgentIdentity>,
     },
 
     /// Topology policy denied a dispatch edge.
@@ -2123,6 +2231,14 @@ fn format_diagnostics(diagnostics: &[Diagnostic]) -> String {
         .join("; ")
 }
 
+fn format_identities(identities: &[AgentIdentity]) -> String {
+    identities
+        .iter()
+        .map(AgentIdentity::as_str)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn format_member_restore_target(session_id: Option<&meerkat_core::types::SessionId>) -> String {
     match session_id {
         Some(session_id) => format!("session {session_id}"),
@@ -2276,6 +2392,25 @@ impl MobError {
     pub fn structured_data(&self) -> Option<serde_json::Value> {
         match self {
             Self::MemberSendIdempotency { refusal, .. } => Some(refusal.structured_data()),
+            Self::FlowRoleTargetsRefused { flow_id, refusal } => Some(serde_json::json!({
+                "kind": "flow_role_targets_refused",
+                "flow_id": flow_id.as_str(),
+                "refusal": refusal,
+            })),
+            Self::BoundFlowTargetsUnavailable {
+                run_id,
+                step_id,
+                required,
+                available,
+                unavailable,
+            } => Some(serde_json::json!({
+                "kind": "bound_flow_targets_unavailable",
+                "run_id": run_id.to_string(),
+                "step_id": step_id.as_str(),
+                "required": required,
+                "available": available,
+                "unavailable": unavailable,
+            })),
             Self::SharedRetirementFailure(error) | Self::SharedLifecycleFailure(error) => {
                 error.structured_data()
             }
