@@ -1376,9 +1376,10 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
-    /// Wait, within the hang guard, until the watch's registration ends.
+    /// Wait, within the registration bound, until the watch's registration
+    /// ends.
     fn settled_registration(watch: &SqliteChangeWatch) -> SqliteWatchRegistration {
-        let deadline = Instant::now() + HANG_GUARD;
+        let deadline = Instant::now() + REGISTRATION_BOUND;
         loop {
             let registration = watch.registration();
             if registration != SqliteWatchRegistration::Pending || Instant::now() >= deadline {
@@ -1393,6 +1394,26 @@ mod tests {
             .into_iter()
             .filter(|retained| retained.directory == directory)
             .collect()
+    }
+
+    /// Wait, within the hang guard, for a Changed tick, skipping the sweeps: a
+    /// sweep that ticked while the registration was pending (a macOS FSEvents
+    /// registration can outlast the sweep) comes first. A source that never
+    /// notifies leaves sweeps only, and fails.
+    fn next_changed(tick_rx: &mpsc::Receiver<SqliteWatchTick>) -> Result<(), String> {
+        let deadline = Instant::now() + HANG_GUARD;
+        let mut sweeps = 0_usize;
+        loop {
+            match tick_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(SqliteWatchTick::Changed) => return Ok(()),
+                Ok(SqliteWatchTick::Sweep) => sweeps += 1,
+                Err(error) => {
+                    return Err(format!(
+                        "no Changed tick within the hang guard, {sweeps} sweeps: {error}"
+                    ));
+                }
+            }
+        }
     }
 
     fn assert_database_write_ticks_changed(db: &Path) {
@@ -1410,10 +1431,7 @@ mod tests {
             SqliteWatchRegistration::Registered
         );
         std::fs::write(sidecar_path(db, "-wal"), b"frame").unwrap();
-        let tick = tick_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the write is observed within the hang guard");
-        assert_eq!(tick, SqliteWatchTick::Changed);
+        next_changed(&tick_rx).expect("the write is observed within the hang guard");
     }
 
     #[test]
@@ -1904,6 +1922,11 @@ mod tests {
     /// sweep from ticking, before the test calls it held.
     const HELD_BOUND: Duration = Duration::from_secs(5);
     const HANG_GUARD: Duration = Duration::from_secs(10);
+    /// How long a row waits for a watch to register with the platform: a hang
+    /// guard, not a latency bound. A macOS FSEvents registration can take tens
+    /// of seconds ([`WatchSource::watch`]), so a minute; a registration that
+    /// never returns still fails the row.
+    const REGISTRATION_BOUND: Duration = Duration::from_secs(60);
 
     #[test]
     fn a_held_registration_does_not_hold_the_start() {
@@ -2017,74 +2040,81 @@ mod tests {
     /// the stopped watch ticks no more.
     #[test]
     fn dropping_a_watch_never_waits_for_its_sources_teardown() {
-        let dir = tempfile::tempdir().unwrap();
-        let observed = test_support::observe_registrations_in(dir.path()).unwrap();
-        let db = dir.path().join("store.sqlite3");
-        std::fs::write(&db, b"").unwrap();
-        let first_ticks = Arc::new(AtomicUsize::new(0));
-        let first = start_sqlite_change_watch(&db, "test-teardown-first", SQLITE_WATCH_SWEEP, {
-            let first_ticks = Arc::clone(&first_ticks);
-            move |_| {
-                first_ticks.fetch_add(1, Ordering::SeqCst);
-                SqliteWatchControl::Handled
-            }
-        })
-        .expect("watch starts");
-        assert!(
-            observed.wait_registered(1, HANG_GUARD),
-            "the first registered"
-        );
-        observed.hold_source_drops();
+        // It holds the process's unregister thread: alone in its process.
+        alone_in_child_process(
+            "dropping_a_watch_never_waits_for_its_sources_teardown",
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let observed = test_support::observe_registrations_in(dir.path()).unwrap();
+                let db = dir.path().join("store.sqlite3");
+                std::fs::write(&db, b"").unwrap();
+                let first_ticks = Arc::new(AtomicUsize::new(0));
+                let first =
+                    start_sqlite_change_watch(&db, "test-teardown-first", SQLITE_WATCH_SWEEP, {
+                        let first_ticks = Arc::clone(&first_ticks);
+                        move |_| {
+                            first_ticks.fetch_add(1, Ordering::SeqCst);
+                            SqliteWatchControl::Handled
+                        }
+                    })
+                    .expect("watch starts");
+                assert!(
+                    observed.wait_registered(1, REGISTRATION_BOUND),
+                    "the first registered: {:?}",
+                    first.registration()
+                );
+                observed.hold_source_drops();
 
-        let (dropped_tx, dropped_rx) = mpsc::channel();
-        let dropper = thread::spawn(move || {
-            drop(first);
-            let _ = dropped_tx.send(());
-        });
-        let returned = dropped_rx.recv_timeout(HANG_GUARD).is_ok();
-        if !returned {
-            observed.release_source_drops();
-        }
-        dropper.join().unwrap();
-        assert!(
-            returned,
-            "dropping the watch waited for its source's teardown"
-        );
-        let first_ticked = first_ticks.load(Ordering::SeqCst);
+                let (dropped_tx, dropped_rx) = mpsc::channel();
+                let dropper = thread::spawn(move || {
+                    drop(first);
+                    let _ = dropped_tx.send(());
+                });
+                let returned = dropped_rx.recv_timeout(HANG_GUARD).is_ok();
+                if !returned {
+                    observed.release_source_drops();
+                }
+                dropper.join().unwrap();
+                assert!(
+                    returned,
+                    "dropping the watch waited for its source's teardown"
+                );
+                let first_ticked = first_ticks.load(Ordering::SeqCst);
 
-        // A watch started at once on the same database works while the first
-        // watch's source is still held.
-        let (tick_tx, tick_rx) = mpsc::channel();
-        let second = start_sqlite_change_watch(&db, "test-teardown-second", SQLITE_WATCH_SWEEP, {
-            move |tick| {
-                let _ = tick_tx.send(tick);
-                SqliteWatchControl::Handled
-            }
-        })
-        .expect("watch starts");
-        assert!(
-            observed.wait_registered(2, HANG_GUARD),
-            "the second registered"
-        );
-        assert_eq!(
-            observed.source_drops_finished(),
-            0,
-            "the first source is held"
-        );
-        std::fs::write(sidecar_path(&db, "-wal"), b"frame").unwrap();
-        assert_eq!(
-            tick_rx.recv_timeout(HANG_GUARD),
-            Ok(SqliteWatchTick::Changed)
-        );
-        // The held source still delivers that write, to the stopped watch
-        // only, which ticks no more.
-        assert_eq!(first_ticks.load(Ordering::SeqCst), first_ticked);
+                // A watch started at once on the same database works while the first
+                // watch's source is still held.
+                let (tick_tx, tick_rx) = mpsc::channel();
+                let second =
+                    start_sqlite_change_watch(&db, "test-teardown-second", SQLITE_WATCH_SWEEP, {
+                        move |tick| {
+                            let _ = tick_tx.send(tick);
+                            SqliteWatchControl::Handled
+                        }
+                    })
+                    .expect("watch starts");
+                assert!(
+                    observed.wait_registered(2, REGISTRATION_BOUND),
+                    "the second registered: {:?}",
+                    second.registration()
+                );
+                assert_eq!(
+                    observed.source_drops_finished(),
+                    0,
+                    "the first source is held"
+                );
+                std::fs::write(sidecar_path(&db, "-wal"), b"frame").unwrap();
+                next_changed(&tick_rx).expect("the second watch sees the write");
+                // The held source still delivers that write, to the stopped watch
+                // only, which ticks no more.
+                assert_eq!(first_ticks.load(Ordering::SeqCst), first_ticked);
 
-        drop(second);
-        observed.release_source_drops();
-        assert!(
-            observed.wait_source_drops_finished(2, HANG_GUARD),
-            "both sources are dropped once released"
+                drop(second);
+                observed.release_source_drops();
+                assert!(
+                    observed.wait_source_drops_finished(2, HANG_GUARD),
+                    "both sources are dropped once released"
+                );
+            },
         );
     }
 
@@ -2319,82 +2349,91 @@ mod tests {
     /// thread still drops a source queued after them.
     #[test]
     fn a_panicking_source_drop_leaves_the_unregister_thread_running() {
-        let dir = tempfile::tempdir().unwrap();
-        let observed = test_support::observe_registrations_in(dir.path()).unwrap();
-        let db = dir.path().join("store.sqlite3");
-        std::fs::write(&db, b"").unwrap();
-        let observed_watch = |name: &str| {
-            start_sqlite_change_watch(&db, name, SQLITE_WATCH_SWEEP, |_| {
-                SqliteWatchControl::Handled
-            })
-            .expect("watch starts")
-        };
-        let first = observed_watch("test-unregister-first");
-        assert!(
-            observed.wait_registered(1, HANG_GUARD),
-            "the first registered"
-        );
-        let panicking = start_with_backend(
-            &dir.path().join("panics.sqlite3"),
-            "test-unregister-panics",
-            SQLITE_WATCH_SWEEP,
-            |_| SqliteWatchControl::Handled,
-            |_| Box::new(PanicsOnDropBackend),
-        )
-        .expect("watch starts");
-        assert_eq!(
-            settled_registration(&panicking),
-            SqliteWatchRegistration::Registered
-        );
-        let second = observed_watch("test-unregister-second");
-        assert!(
-            observed.wait_registered(2, HANG_GUARD),
-            "the second registered"
-        );
+        // It holds the process's unregister thread: alone in its process.
+        alone_in_child_process(
+            "a_panicking_source_drop_leaves_the_unregister_thread_running",
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let observed = test_support::observe_registrations_in(dir.path()).unwrap();
+                let db = dir.path().join("store.sqlite3");
+                std::fs::write(&db, b"").unwrap();
+                let observed_watch = |name: &str| {
+                    start_sqlite_change_watch(&db, name, SQLITE_WATCH_SWEEP, |_| {
+                        SqliteWatchControl::Handled
+                    })
+                    .expect("watch starts")
+                };
+                let first = observed_watch("test-unregister-first");
+                assert!(
+                    observed.wait_registered(1, REGISTRATION_BOUND),
+                    "the first registered: {:?}",
+                    first.registration()
+                );
+                let panicking = start_with_backend(
+                    &dir.path().join("panics.sqlite3"),
+                    "test-unregister-panics",
+                    SQLITE_WATCH_SWEEP,
+                    |_| SqliteWatchControl::Handled,
+                    |_| Box::new(PanicsOnDropBackend),
+                )
+                .expect("watch starts");
+                assert_eq!(
+                    settled_registration(&panicking),
+                    SqliteWatchRegistration::Registered
+                );
+                let second = observed_watch("test-unregister-second");
+                assert!(
+                    observed.wait_registered(2, REGISTRATION_BOUND),
+                    "the second registered: {:?}",
+                    second.registration()
+                );
 
-        // Queued in this order behind the first source's held drop.
-        observed.hold_source_drops();
-        drop(first);
-        drop(panicking);
-        drop(second);
-        observed.release_source_drops();
-        assert!(
-            observed.wait_source_drops_finished(2, HANG_GUARD),
-            "both observed sources are dropped around the panicking one"
-        );
+                // Queued in this order behind the first source's held drop.
+                observed.hold_source_drops();
+                drop(first);
+                drop(panicking);
+                drop(second);
+                observed.release_source_drops();
+                assert!(
+                    observed.wait_source_drops_finished(2, HANG_GUARD),
+                    "both observed sources are dropped around the panicking one"
+                );
 
-        // The thread keeps going: a source queued after the panic goes to it,
-        // so its held drop does not hold the dropping thread, and it is
-        // dropped once released.
-        let third = observed_watch("test-unregister-third");
-        assert!(
-            observed.wait_registered(3, HANG_GUARD),
-            "the third registered"
-        );
-        observed.hold_source_drops();
-        let (dropped_tx, dropped_rx) = mpsc::channel();
-        let dropper = thread::spawn(move || {
-            drop(third);
-            let _ = dropped_tx.send(());
-        });
-        let returned = dropped_rx.recv_timeout(HANG_GUARD).is_ok();
-        observed.release_source_drops();
-        dropper.join().unwrap();
-        assert!(
-            returned,
-            "a source queued after the panic went to the unregister thread"
-        );
-        assert!(
-            observed.wait_source_drops_finished(3, HANG_GUARD),
-            "the unregister thread drops a source queued after the panic"
-        );
-        let unregister = UNREGISTER
-            .get()
-            .and_then(Option::as_ref)
-            .expect("the unregister thread started");
-        assert!(
-            !unregister._thread.is_finished(),
-            "the unregister thread runs"
+                // The thread keeps going: a source queued after the panic goes to it,
+                // so its held drop does not hold the dropping thread, and it is
+                // dropped once released.
+                let third = observed_watch("test-unregister-third");
+                assert!(
+                    observed.wait_registered(3, REGISTRATION_BOUND),
+                    "the third registered: {:?}",
+                    third.registration()
+                );
+                observed.hold_source_drops();
+                let (dropped_tx, dropped_rx) = mpsc::channel();
+                let dropper = thread::spawn(move || {
+                    drop(third);
+                    let _ = dropped_tx.send(());
+                });
+                let returned = dropped_rx.recv_timeout(HANG_GUARD).is_ok();
+                observed.release_source_drops();
+                dropper.join().unwrap();
+                assert!(
+                    returned,
+                    "a source queued after the panic went to the unregister thread"
+                );
+                assert!(
+                    observed.wait_source_drops_finished(3, HANG_GUARD),
+                    "the unregister thread drops a source queued after the panic"
+                );
+                let unregister = UNREGISTER
+                    .get()
+                    .and_then(Option::as_ref)
+                    .expect("the unregister thread started");
+                assert!(
+                    !unregister._thread.is_finished(),
+                    "the unregister thread runs"
+                );
+            },
         );
     }
 
