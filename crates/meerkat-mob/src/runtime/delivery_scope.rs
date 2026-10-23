@@ -521,6 +521,7 @@ pub struct MemberBinding {
     state: MemberBindingState,
     role: ProfileName,
     continuity_intent: SpawnContinuityIntent,
+    labels: BTreeMap<String, String>,
     identity_management: MemberIdentityManagement,
 }
 
@@ -562,6 +563,15 @@ impl MemberBinding {
         &self.continuity_intent
     }
 
+    /// The application labels the incarnation was spawned with, as its
+    /// spawn recorded them; a member reset keeps them. Core gives them no
+    /// meaning: a host that labels its own members can tell them from
+    /// members another caller spawned, for example in an offline read of a
+    /// stopped mob's history.
+    pub fn labels(&self) -> &BTreeMap<String, String> {
+        &self.labels
+    }
+
     /// Whether Core holds an identity intent row for the identity, and
     /// whether it reads, read in the same store transaction as the journal.
     pub fn identity_management(&self) -> MemberIdentityManagement {
@@ -587,8 +597,18 @@ impl MemberBinding {
             state,
             role,
             continuity_intent,
+            labels: BTreeMap::new(),
             identity_management,
         }
+    }
+
+    /// Test support: this binding with the spawn `labels` a host's test
+    /// double answers.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn with_labels(mut self, labels: BTreeMap<String, String>) -> Self {
+        self.labels = labels;
+        self
     }
 }
 
@@ -669,6 +689,7 @@ struct JournalIncarnation {
     runtime_id: AgentRuntimeId,
     role: ProfileName,
     continuity_intent: SpawnContinuityIntent,
+    labels: BTreeMap<String, String>,
 }
 
 /// An identity's latest incarnation since the latest mob reset, and the
@@ -719,6 +740,7 @@ impl JournalFold {
                     runtime_id: spawned.agent_runtime_id.clone(),
                     role: spawned.role.clone(),
                     continuity_intent: spawned.continuity_intent.clone(),
+                    labels: spawned.labels.clone(),
                 };
                 let session_id = spawned
                     .bridge_member_ref()
@@ -816,6 +838,7 @@ impl JournalFold {
             state,
             role: incarnation.role.clone(),
             continuity_intent: incarnation.continuity_intent.clone(),
+            labels: incarnation.labels.clone(),
             identity_management: identity_management_of(&intent_rows, identity),
         };
         let session_bindings = self

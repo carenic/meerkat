@@ -122,6 +122,13 @@ them.
 
 ### Added
 
+- `MemberBinding::labels()`: the application labels the incarnation was
+  spawned with, as its spawn recorded them (a member reset keeps them). Every
+  read of the member binding history carries them, the store-level
+  `MobStorage::read_member_binding_history` of a stopped mob included, so a
+  host that labels its own members can tell them from members another caller
+  spawned without running the mob. Core gives the labels no meaning.
+  `MemberBinding::with_labels` sets them on a test double (`test-support`).
 - Hosted MCP OAuth through the host's own `https` callback (#1808), for a
   host whose users' browsers cannot reach its loopback address. The host
   configures one registered redirect base (`rkat-rpc
