@@ -7495,7 +7495,7 @@ mod tests {
         );
     }
 
-    // --- WholeBlob run re-base (UNRUN, Policy v1.1) -----------------------
+    // --- WholeBlob run re-base (unrun until the candidate's validation) -----
 
     fn rebase_assistant(text: &str) -> meerkat_core::types::Message {
         meerkat_core::types::Message::BlockAssistant(meerkat_core::types::BlockAssistantMessage {

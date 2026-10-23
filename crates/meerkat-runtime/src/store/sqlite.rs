@@ -29611,7 +29611,7 @@ ORDER BY runtime_id";
             assert_eq!(catalog.message_count(), stored.messages().len());
         }
 
-        // --- WholeBlob run re-base (UNRUN, Policy v1.1) -------------------
+        // --- WholeBlob run re-base (unrun until the candidate's validation) -
 
         fn rebase_with_cursor(mut session: Session, run_id: &RunId, round: u64) -> Session {
             session
