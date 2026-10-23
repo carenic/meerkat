@@ -2595,9 +2595,18 @@ pub struct ScriptedMaterializeState {
     recorded_first_turns: std::collections::BTreeMap<(String, u64, u64), BridgeAdoptedFirstTurn>,
     /// Replace the adopted first turn of the next ack, whatever its request
     /// asked: a host that contradicts its request.
-    tamper_next_first_turn: Option<Option<BridgeAdoptedFirstTurn>>,
+    tamper_next_first_turn: Option<ScriptedFirstTurnReport>,
     /// Ack the next materialize as a `Fresh` launch, whatever launch it sent.
     fresh_outcome_next: bool,
+}
+
+/// What a tampered materialize ack says about the adopted first turn.
+#[derive(Debug, Clone, Copy)]
+pub enum ScriptedFirstTurnReport {
+    /// The ack carries no report.
+    Omit,
+    /// The ack carries this report.
+    Report(BridgeAdoptedFirstTurn),
 }
 
 /// Ack identity material for one scripted member.
@@ -2718,7 +2727,10 @@ impl ScriptedHostPeer {
     /// The next materialize ack carries `field` as its adopted first turn,
     /// whatever its request asked: a host that contradicts its request.
     pub fn tamper_next_adopted_first_turn(&self, field: Option<BridgeAdoptedFirstTurn>) {
-        self.materialize_state().tamper_next_first_turn = Some(field);
+        self.materialize_state().tamper_next_first_turn = Some(match field {
+            Some(first_turn) => ScriptedFirstTurnReport::Report(first_turn),
+            None => ScriptedFirstTurnReport::Omit,
+        });
     }
 
     /// The next materialize ack reports a `Fresh` launch outcome, whatever
@@ -3034,16 +3046,17 @@ fn scripted_materialize_reply(
                 .get(agent_identity)
                 .copied()
                 .unwrap_or(BridgeAdoptedFirstTurn::Owed);
-            let read = *state
-                .recorded_first_turns
-                .entry(tuple.clone())
-                .or_insert(scripted);
+            let read = *state.recorded_first_turns.entry(tuple).or_insert(scripted);
             payload.report_adopted_first_turn.then_some(read)
         }
         MaterializeLaunchMode::Fresh {} => None,
     };
-    if let Some(field) = state.tamper_next_first_turn.take() {
-        response.adopted_first_turn = field;
+    match state.tamper_next_first_turn.take() {
+        Some(ScriptedFirstTurnReport::Omit) => response.adopted_first_turn = None,
+        Some(ScriptedFirstTurnReport::Report(first_turn)) => {
+            response.adopted_first_turn = Some(first_turn);
+        }
+        None => {}
     }
     if std::mem::take(&mut state.fresh_outcome_next) {
         response.launch_outcome = MaterializeLaunchOutcome::Fresh;
