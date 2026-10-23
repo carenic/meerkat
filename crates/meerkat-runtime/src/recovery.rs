@@ -1459,6 +1459,17 @@ fn materialize_verified_receipts(
     Ok(materialized)
 }
 
+/// Check the candidate run's committed receipts (run identity, dense
+/// sequence, counts within the candidate) and pair each digestless one with
+/// the digest of the candidate prefix it counts.
+///
+/// A crashed run's committed receipts are its mid-run boundary receipts,
+/// which carry message count 0 and no digest
+/// (`mid_run_receipts_carry_no_transcript_count_or_digest`): for them this
+/// flat-prefix check is vacuous and the enrichment is the empty transcript's
+/// digest. A writer that mints a counted receipt before its run's terminal
+/// boundary must first move this check, and [`observe_prior_commits`], to
+/// commit-chain ancestry: an in-run compaction rewrites the prefix it counts.
 fn prepare_receipt_digest_enrichments(
     candidate: &PreparedRecoveryCandidate,
     receipts: &[PreparedRecoveryReceiptSource],
@@ -1523,6 +1534,10 @@ fn prepare_receipt_digest_enrichments(
 /// shorter conversation is not "precedes". Supported-floor digestless rows
 /// reach this function only after [`materialize_verified_receipts`] has paired
 /// them with a sealed store-owned enrichment.
+///
+/// A crashed run's committed receipts are its mid-run boundary receipts
+/// (message count 0, no digest), so this prefix check is vacuous for them; see
+/// [`prepare_receipt_digest_enrichments`] before minting a counted one.
 fn observe_prior_commits(
     committed: &[RunBoundaryReceipt],
     candidate: &Session,
