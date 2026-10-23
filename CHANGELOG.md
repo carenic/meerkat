@@ -1664,6 +1664,18 @@ them.
   the entry as a pending attempt no browser could complete, which a status
   read reported until the attempt expired or a later start retired it.
 
+- `meerkat-core`: a model response that stops at the token limit after reasoning, with no visible text or tool
+  call, now ends the turn with the typed `MaxTokensReached` failure, even when the provider reports the
+  reasoning only in its usage. Before, it was retried as empty output, or accepted as an empty completion after a
+  tool call. Its usage is still charged.
+
+- `meerkat-core`: a compaction summary call that came back with an empty summary, or whose rebuilt history was
+  rejected, is now charged to the session's usage. Before, that provider call was dropped from accounting.
+
+- Python SDK: `compaction_failed` events decode `reason` as the tagged object the runtime sends
+  (`{"kind": ...}`), keeping every field and future reason kinds. Before, valid events were reported as
+  malformed.
+
 ## [0.9.4] - 2026-10-20
 
 ### Breaking

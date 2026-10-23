@@ -3917,9 +3917,11 @@ where
                                     }
                                 };
                                 // A summary call that came back refused,
-                                // filtered or stopped at the context window is
-                                // not committed, but it was real provider
-                                // work: charge it whatever the result.
+                                // filtered or stopped at the context window,
+                                // with an empty summary, or with a rebuild
+                                // that was rejected is not committed, but it
+                                // was real provider work: charge it whatever
+                                // the result.
                                 if let Some(call) = attempt.uncommitted_call {
                                     self.charge_compaction_summary_call(
                                         &call.usage,

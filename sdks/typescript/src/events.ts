@@ -1961,8 +1961,11 @@ export function parseCoreEvent(raw: Record<string, unknown>): AgentEvent {
               ),
             }),
       };
-    case "compaction_failed":
-      return { type, reason: requireRecordField(raw, "reason") };
+    case "compaction_failed": {
+      const reason = requireRecordField(raw, "reason");
+      requireStringField(reason, "kind");
+      return { type, reason };
+    }
 
     // Budget
     case "budget_warning":
