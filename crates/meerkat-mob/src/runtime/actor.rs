@@ -454,6 +454,9 @@ fn is_transcript_revision_conflict(error: &meerkat_core::service::SessionError) 
 /// Classify a session read failure by its typed cause. Durable corruption and
 /// unsupported persistence are permanent observations; transport, I/O, and
 /// unknown failures remain retryable. Display text is diagnostic only.
+/// `Corrupted` is permanent because the `SessionStoreError::Corrupted`
+/// contract makes it deterministic for the same persisted state and request,
+/// never a race with a concurrent writer.
 fn identity_session_load_error_class(
     error: &meerkat_core::service::SessionError,
 ) -> IdentitySessionLoadErrorClass {

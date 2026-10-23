@@ -77,6 +77,16 @@ pub enum SessionStoreError {
     #[error("Session not found: {0}")]
     NotFound(SessionId),
 
+    /// The store cannot serve this read from the session's persisted state:
+    /// the state is inconsistent, or the request asks for what it does not
+    /// hold (such as a range past the committed rows).
+    ///
+    /// The verdict is deterministic for the same persisted state and the same
+    /// request: a re-read returns it again. A store never returns it for a
+    /// race with a concurrent writer; it returns `Io` or a revision conflict
+    /// instead. This binds every [`SessionStore`] and
+    /// [`IncrementalSessionStore`] implementor, and callers rely on it to
+    /// classify the error as permanent.
     #[error("Session corrupted: {0}")]
     Corrupted(SessionId),
 

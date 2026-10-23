@@ -9596,8 +9596,16 @@ impl SessionStore for SqliteSessionStore {
 
     async fn load(&self, id: &SessionId) -> Result<Option<Session>, SessionStoreError> {
         let id = id.clone();
+        #[cfg(test)]
+        let interleaving_path = self.path.clone();
+        // One read transaction: the head row and the rows and metadata it
+        // names come from one snapshot, so a commit that lands between them is
+        // never read half before and half after (`SessionStoreError::Corrupted`
+        // is never a writer race).
         self.in_read_txn(move |tx| {
             if let Some((head, stored_token)) = head_row_in_txn(tx, &id)? {
+                #[cfg(test)]
+                head_read_interleaving::fire(&interleaving_path);
                 // Slim, no history metadata — the O(live) cold-resume contract.
                 return Ok(Some(materialize_slim_in_txn(
                     tx,
@@ -10099,8 +10107,12 @@ impl IncrementalSessionStore for SqliteSessionStore {
 
     async fn load_head(&self, id: &SessionId) -> Result<Option<SessionHead>, SessionStoreError> {
         let id = id.clone();
+        #[cfg(test)]
+        let interleaving_path = self.path.clone();
         self.in_read_txn(move |tx| {
             if let Some((head, token)) = head_row_in_txn(tx, &id)? {
+                #[cfg(test)]
+                head_read_interleaving::fire(&interleaving_path);
                 if session_head_cas_token(&head)? != token {
                     return Err(SessionStoreError::Corrupted(id));
                 }
@@ -11863,6 +11875,48 @@ mod tests {
             successor_token,
             "the concurrent commit landed"
         );
+    }
+
+    /// The same for `load` and `load_head`: a commit that lands between the
+    /// head read and the rows, metadata and token it names is not corruption.
+    /// The `SessionStoreError::Corrupted` contract relies on this: a session
+    /// read never returns it for a race with a writer.
+    #[tokio::test]
+    async fn load_and_load_head_read_one_snapshot_across_a_concurrent_commit() {
+        for read in ["load", "load_head"] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("sessions.sqlite3");
+            let store = SqliteSessionStore::open(&path).unwrap();
+            let (id, successor) = committed_head_with_a_metadata_change(&store).await;
+            let successor_token = successor.successor_head_token().to_string();
+            head_read_interleaving::arm(&path, commit_on_a_second_connection(&path, successor));
+
+            if read == "load" {
+                let loaded = store.load(&id).await;
+                assert!(
+                    loaded.is_ok(),
+                    "{read}: a concurrent commit is not corruption: {:?}",
+                    loaded.as_ref().err()
+                );
+                let loaded = loaded.expect("checked above").expect("the session exists");
+                assert_eq!(loaded.id(), &id);
+            } else {
+                let head = store.load_head(&id).await;
+                assert!(
+                    head.is_ok(),
+                    "{read}: a concurrent commit is not corruption: {:?}",
+                    head.as_ref().err()
+                );
+                let head = head.expect("checked above").expect("the head exists");
+                assert_eq!(head.id, id);
+            }
+            let head = store.load_head(&id).await.unwrap().unwrap();
+            assert_eq!(
+                session_head_cas_token(&head).unwrap(),
+                successor_token,
+                "{read}: the concurrent commit landed"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
