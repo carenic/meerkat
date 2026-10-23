@@ -520,6 +520,7 @@ fn materialized_row_for(
         supervisor_address: "tcp://127.0.0.1:1".to_string(),
         forked_participant_attachment: None,
         prompt_context_fork_digest: None,
+        adopted_first_turn: None,
     }
 }
 

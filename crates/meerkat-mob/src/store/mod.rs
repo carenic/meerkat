@@ -3221,6 +3221,14 @@ pub struct PlacedSpawnCommitRecord {
     pub member_session_id: meerkat_core::SessionId,
     pub member_peer_endpoint: mob_dsl::MemberPeerEndpoint,
     pub ack_engine_version: String,
+    /// The member host reported, on a plain resume's ack, that the adopted
+    /// session's first turn already started: the kickoff the carrier's
+    /// intent describes is waived, and cold recovery repairs no kickoff for
+    /// it. Only an autonomous carrier carries it. Written only when true,
+    /// so every other record keeps its bytes; a binary that does not know
+    /// the key refuses a record that carries it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub adopted_first_turn_started: bool,
 }
 
 impl PlacedSpawnCommitRecord {
@@ -3231,6 +3239,16 @@ impl PlacedSpawnCommitRecord {
         if self.member_session_id.0.is_nil() || self.ack_engine_version.is_empty() {
             return Err(MobStoreError::Internal(
                 "committed placed-spawn carrier has incomplete host ACK facts".to_string(),
+            ));
+        }
+        if self.adopted_first_turn_started
+            && spec.profile.runtime_mode
+                != meerkat_contracts::wire::WireMobRuntimeMode::AutonomousHost
+        {
+            return Err(MobStoreError::Internal(
+                "committed placed-spawn carrier waives the kickoff of a member that is not \
+                 autonomous"
+                    .to_string(),
             ));
         }
 

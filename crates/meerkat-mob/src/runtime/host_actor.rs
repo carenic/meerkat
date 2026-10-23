@@ -61,22 +61,22 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 use meerkat_contracts::wire::supervisor_bridge::{
-    BridgeAck, BridgeBootstrapToken, BridgeCapabilities, BridgeCommand, BridgeCommandDecodeError,
-    BridgeCreateForkedParticipantPayload, BridgeForkedParticipantCreatedResponse,
-    BridgeForkedParticipantRevocationOutcome, BridgeForkedParticipantRevokedResponse,
-    BridgeHostBindPayload, BridgeHostBindResponse, BridgeHostBindingDescriptorIssuedResponse,
-    BridgeHostCapabilityRequirements, BridgeHostFeaturesPayload, BridgeHostFeaturesResponse,
-    BridgeHostMemberRecord, BridgeHostRebindPayload, BridgeHostReboundResponse,
-    BridgeHostRevokePayload, BridgeHostRevokedResponse, BridgeHostRuntimeIncarnation,
-    BridgeHostStatusPayload, BridgeHostStatusResponse, BridgeIssueHostBindingDescriptorPayload,
-    BridgeMaterializePayload, BridgeMaterializedResponse, BridgeMemberReleasedResponse,
-    BridgePeerIdentity, BridgePeerSpec, BridgePeerTrustPayload, BridgePromptContextFork,
-    BridgeProtocolVersion, BridgeRejectionCause, BridgeReleasePayload, BridgeReply,
-    BridgeRevokeForkedParticipantPayload, BridgeTurnOutcomeAck, BridgeTurnOutcomeRecord,
-    HOST_FEATURE_PROMPT_CONTEXT_FORK, MaterializeLaunchMode, MaterializeLaunchOutcome,
-    MemberSessionDisposal as WireMemberSessionDisposal, RuntimeReleaseCause, WireFlowTurnOutcome,
-    WireHostBindingDescriptor, WireHostBindingDescriptorKind, canonicalize_bridge_address,
-    decode_bridge_command,
+    BridgeAck, BridgeAdoptedFirstTurn, BridgeBootstrapToken, BridgeCapabilities, BridgeCommand,
+    BridgeCommandDecodeError, BridgeCreateForkedParticipantPayload,
+    BridgeForkedParticipantCreatedResponse, BridgeForkedParticipantRevocationOutcome,
+    BridgeForkedParticipantRevokedResponse, BridgeHostBindPayload, BridgeHostBindResponse,
+    BridgeHostBindingDescriptorIssuedResponse, BridgeHostCapabilityRequirements,
+    BridgeHostFeaturesPayload, BridgeHostFeaturesResponse, BridgeHostMemberRecord,
+    BridgeHostRebindPayload, BridgeHostReboundResponse, BridgeHostRevokePayload,
+    BridgeHostRevokedResponse, BridgeHostRuntimeIncarnation, BridgeHostStatusPayload,
+    BridgeHostStatusResponse, BridgeIssueHostBindingDescriptorPayload, BridgeMaterializePayload,
+    BridgeMaterializedResponse, BridgeMemberReleasedResponse, BridgePeerIdentity, BridgePeerSpec,
+    BridgePeerTrustPayload, BridgePromptContextFork, BridgeProtocolVersion, BridgeRejectionCause,
+    BridgeReleasePayload, BridgeReply, BridgeRevokeForkedParticipantPayload, BridgeTurnOutcomeAck,
+    BridgeTurnOutcomeRecord, HOST_FEATURE_PROMPT_CONTEXT_FORK, MaterializeLaunchMode,
+    MaterializeLaunchOutcome, MemberSessionDisposal as WireMemberSessionDisposal,
+    RuntimeReleaseCause, WireFlowTurnOutcome, WireHostBindingDescriptor,
+    WireHostBindingDescriptorKind, canonicalize_bridge_address, decode_bridge_command,
 };
 use meerkat_contracts::wire::{
     PortableMemberSpec, WireAuthBindingRef, portable_member_spec_digest,
@@ -828,6 +828,13 @@ pub struct MaterializedMemberRow {
     /// Additive: a row written before it reads as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_context_fork_digest: Option<String>,
+    /// The first turn of the session a `Resume` build adopted, recorded for
+    /// every `Resume` build so a replay at this tuple answers what the build
+    /// read. A replay reports it only when its request asks
+    /// (`report_adopted_first_turn`). Additive: a row written before it, and
+    /// every `Fresh` row, reads as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopted_first_turn: Option<BridgeAdoptedFirstTurn>,
 }
 
 const fn default_generation_start_seq() -> u64 {
@@ -8856,6 +8863,7 @@ impl MobHostActor {
             supervisor_address: payload.supervisor.address.clone(),
             forked_participant_attachment: None,
             prompt_context_fork_digest: recorded_fork_digest,
+            adopted_first_turn: None,
         };
         // Supersession compensation, immediately before the replacement row
         // commits: the old residency has already been quiesced, so its
@@ -12997,6 +13005,7 @@ mod tests {
                         supervisor_address: "tcp://127.0.0.1:1".to_string(),
                         forked_participant_attachment: None,
                         prompt_context_fork_digest: None,
+                        adopted_first_turn: None,
                     },
                 )]),
                 released: BTreeMap::from([(
@@ -13122,6 +13131,7 @@ mod tests {
                         supervisor_address: "tcp://127.0.0.1:7801".to_string(),
                         forked_participant_attachment: None,
                         prompt_context_fork_digest: None,
+                        adopted_first_turn: None,
                     },
                 )]),
                 released: BTreeMap::new(),

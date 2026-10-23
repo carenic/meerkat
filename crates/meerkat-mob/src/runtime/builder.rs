@@ -12433,6 +12433,7 @@ mod tests {
                         signing_key: mob_dsl::PeerSigningKey(signing_key),
                     },
                     ack_engine_version: "placed-recovery-test-engine".to_string(),
+                    adopted_first_turn_started: false,
                 },
             );
         }
@@ -12471,6 +12472,59 @@ mod tests {
             .validate_for_mob(mob_id)
             .expect("valid autonomous placed carrier");
         record
+    }
+
+    /// The kickoff waiver is written only when it waives, so every other
+    /// commit record keeps its bytes; a waiver round-trips; and only an
+    /// autonomous carrier may carry one.
+    #[test]
+    fn a_placed_commit_record_waives_only_an_autonomous_kickoff() {
+        let mob_id = MobId::from("placed-waiver-shape");
+        let identity = AgentIdentity::from("placed-worker");
+        let record = test_autonomous_placed_carrier(&mob_id, &identity);
+        let crate::store::PlacedSpawnCarrierPhase::Committed(commit) = &record.phase else {
+            panic!("the autonomous test carrier is committed");
+        };
+        let unwaived = serde_json::to_value(commit).expect("encode commit record");
+        assert!(
+            unwaived.get("adopted_first_turn_started").is_none(),
+            "a record without a waiver keeps its bytes"
+        );
+
+        let mut waived = record.clone();
+        let crate::store::PlacedSpawnCarrierPhase::Committed(commit) = &mut waived.phase else {
+            panic!("the autonomous test carrier is committed");
+        };
+        commit.adopted_first_turn_started = true;
+        waived
+            .validate_for_mob(&mob_id)
+            .expect("an autonomous carrier may waive its kickoff");
+        let encoded = serde_json::to_value(&waived).expect("encode waived carrier");
+        assert_eq!(
+            encoded["phase"]["commit"]["adopted_first_turn_started"],
+            serde_json::json!(true)
+        );
+        let decoded: crate::store::MobPlacedSpawnCarrierRecord =
+            serde_json::from_value(encoded).expect("decode waived carrier");
+        assert_eq!(decoded, waived);
+
+        let mut turn_driven = test_placed_carrier(
+            &mob_id,
+            &identity,
+            Generation::INITIAL,
+            FenceToken::new(73),
+            crate::ids::PlacedSpawnId::new(),
+            true,
+        );
+        let crate::store::PlacedSpawnCarrierPhase::Committed(commit) = &mut turn_driven.phase
+        else {
+            panic!("the test carrier is committed");
+        };
+        commit.adopted_first_turn_started = true;
+        let error = turn_driven
+            .validate_for_mob(&mob_id)
+            .expect_err("a carrier that is not autonomous may not waive a kickoff");
+        assert!(error.to_string().contains("not autonomous"), "got {error}");
     }
 
     fn test_current_carrier_plan(

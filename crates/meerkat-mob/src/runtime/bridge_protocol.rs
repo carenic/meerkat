@@ -9,7 +9,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 pub use meerkat_contracts::wire::supervisor_bridge::{
-    BridgeAck, BridgeBindPayload, BridgeBindResponse, BridgeBootstrapToken,
+    BridgeAck, BridgeAdoptedFirstTurn, BridgeBindPayload, BridgeBindResponse, BridgeBootstrapToken,
     BridgeBoundedResultSpec, BridgeBoundedTurnResult, BridgeCapabilities, BridgeCommand,
     BridgeCommandDecodeError, BridgeCreateForkedParticipantPayload, BridgeDeliveryOutcome,
     BridgeDeliveryPayload, BridgeDeliveryRejectionCause, BridgeDeliveryResponse,
@@ -46,9 +46,9 @@ pub use meerkat_contracts::wire::supervisor_bridge::{
     BridgeSupervisorRotationTargetReceipt, BridgeTrackedInputCancelOutcome,
     BridgeTrackedInputCancelPayload, BridgeTrackedInputCancelResponse, BridgeTurnCorrelation,
     BridgeTurnDirective, BridgeTurnOutcomeAck, BridgeTurnOutcomeRecord,
-    HOST_FEATURE_PROMPT_CONTEXT_FORK, MaterializeLaunchMode, MaterializeLaunchOutcome,
-    MemberEventCursor, MemberOperatorOp, MemberOperatorOutcome, MemberOperatorReply,
-    MemberOperatorSpawnSpec, MemberSessionDisposal, RuntimeReleaseCause,
+    HOST_FEATURE_ADOPTED_FIRST_TURN, HOST_FEATURE_PROMPT_CONTEXT_FORK, MaterializeLaunchMode,
+    MaterializeLaunchOutcome, MemberEventCursor, MemberOperatorOp, MemberOperatorOutcome,
+    MemberOperatorReply, MemberOperatorSpawnSpec, MemberSessionDisposal, RuntimeReleaseCause,
     SUPERVISOR_BRIDGE_BOOTSTRAP_TOKEN_PARAM, SUPERVISOR_BRIDGE_CURRENT_PROTOCOL_VERSION,
     SUPERVISOR_BRIDGE_DEFAULT_PROTOCOL_VERSION, SUPERVISOR_BRIDGE_INTENT,
     SUPERVISOR_BRIDGE_PROTOCOL_VERSION, SUPERVISOR_BRIDGE_SUPPORTED_PROTOCOL_VERSIONS,

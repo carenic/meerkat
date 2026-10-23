@@ -33264,6 +33264,7 @@ impl MobActor {
                 member_session_id: ack.session_id.clone(),
                 member_peer_endpoint: mob_dsl::MemberPeerEndpoint::from(&ack.member_peer),
                 ack_engine_version: ack.engine_version.clone(),
+                adopted_first_turn_started: false,
             },
         );
         let authority = crate::store::MobPlacedSpawnCommitPersistenceAuthority::from_transition(

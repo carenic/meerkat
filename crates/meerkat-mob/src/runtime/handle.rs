@@ -2333,6 +2333,24 @@ pub(crate) enum AdoptedFirstTurn {
     Started,
 }
 
+impl From<AdoptedFirstTurn> for super::bridge_protocol::BridgeAdoptedFirstTurn {
+    fn from(first_turn: AdoptedFirstTurn) -> Self {
+        match first_turn {
+            AdoptedFirstTurn::Owed => Self::Owed,
+            AdoptedFirstTurn::Started => Self::Started,
+        }
+    }
+}
+
+impl From<super::bridge_protocol::BridgeAdoptedFirstTurn> for AdoptedFirstTurn {
+    fn from(first_turn: super::bridge_protocol::BridgeAdoptedFirstTurn) -> Self {
+        match first_turn {
+            super::bridge_protocol::BridgeAdoptedFirstTurn::Owed => Self::Owed,
+            super::bridge_protocol::BridgeAdoptedFirstTurn::Started => Self::Started,
+        }
+    }
+}
+
 impl AdoptedFirstTurn {
     /// Read the stored session a resume loaded. A deferred-turn state the
     /// session service would refuse reads as `Started`: it never
