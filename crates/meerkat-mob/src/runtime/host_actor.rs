@@ -9334,9 +9334,12 @@ impl MobHostActor {
             return;
         }
         // The same for the prompt-context fork the build carried: the seed
-        // is the source's history AT THE FORK, so the only legitimate
-        // replay is the byte-identical command, and anything else is a
-        // different command under the same key.
+        // is the source's history AT THE FORK, so a replay that carries a
+        // fork must carry the recorded one, and a Fresh replay without it
+        // is a different command under the same key too. A Resume never
+        // carries a fork (the decode refuses one there): it is the
+        // controller's revival of the recorded build, answered from the
+        // row below, which never seeds the child again.
         let replayed_fork_digest = match payload
             .prompt_context_fork
             .as_ref()
@@ -9355,7 +9358,9 @@ impl MobHostActor {
                 return;
             }
         };
-        if replayed_fork_digest != row.prompt_context_fork_digest {
+        let revival = replayed_fork_digest.is_none()
+            && matches!(payload.launch, MaterializeLaunchMode::Resume { .. });
+        if !revival && replayed_fork_digest != row.prompt_context_fork_digest {
             self.send_failure(
                 candidate,
                 BridgeRejectionCause::SpecDigestMismatch,

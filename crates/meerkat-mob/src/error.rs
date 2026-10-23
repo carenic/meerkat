@@ -1506,7 +1506,11 @@ pub enum MobError {
     /// given its fork context failed with `cause` (a timeout, the
     /// transport, admission). Nothing was recorded for the child. A host
     /// that does not know the probe is not a failure: its child gets the
-    /// context as a prefix of its first prompt.
+    /// context as a prefix of its first prompt. It is classified as
+    /// `cause` everywhere: the failure class, the wire code and detail,
+    /// the rejection cause and the structured data are the cause's. A
+    /// spawn-time probe holds no durable resume and refuses no runtime
+    /// effect.
     #[error("HostFeatures probe of member host '{host_id}' failed: {cause}")]
     HostFeaturesProbeFailed {
         host_id: String,
@@ -2297,6 +2301,8 @@ impl MobError {
             Self::SharedRetirementFailure(error) | Self::SharedLifecycleFailure(error) => {
                 error.failure_class()
             }
+            // A failed probe is classified by what failed it.
+            Self::HostFeaturesProbeFailed { cause, .. } => cause.failure_class(),
             Self::MobNotFound(_)
             | Self::ProfileNotFound(_)
             | Self::MemberNotFound(_)

@@ -134,10 +134,13 @@ them.
   within 10 seconds, transport, admission) fails the spawn with the new
   `MobError::HostFeaturesProbeFailed`, before anything is recorded; it
   is classified as its cause. A replayed `MaterializeMember` carrying a
-  different fork than the recorded build is refused with
-  `SpecDigestMismatch`. A fork of a placed source now compares the
-  source's tools, read from its member host: a host of 0.9.4 or earlier
-  gives a notice that says `member_host_unsupported`, and a read that
+  different fork than the recorded build, or a `Fresh` one without it,
+  is refused with `SpecDigestMismatch`; a `Resume` of the same tuple
+  (the controller's revival of a placed fork child) carries no fork and
+  is answered from the recorded build. A fork of a placed source now
+  compares the source's tools, read from its member host: a host of
+  0.9.4 or earlier gives a notice that says `member_host_unsupported`,
+  and a read that
   does not answer within 5 seconds one that says `placed_source`.
   `decode_bridge_command_accepting` decodes a command with a smaller
   version table, as a host of an earlier release does. `meerkat-runtime`:
