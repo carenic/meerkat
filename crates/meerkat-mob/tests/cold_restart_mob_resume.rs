@@ -7687,23 +7687,25 @@ async fn a_member_retired_after_its_runtime_stopped_over_a_cancelled_turns_tail_
     let _ = handle.shutdown().await;
 }
 
-/// A member retired before its runtime is registered again retires, though
-/// its last run was kept open with an input queued behind it.
+/// The archive of a member's session whose kept run never registered again
+/// completes, though that run was kept open with an input queued behind it.
 ///
 /// The member's run commits one tool round and is held at its next model
 /// request; a second input queues behind it; then the host dies. The store
 /// keeps what a stop that keeps a durable run leaves: the run's continuable
-/// tail with its input bound to the run, and the queued input. The next start
-/// refuses the member's restore, so nothing registers its runtime (the start
-/// defers the member). Its retirement then reaches the archive, which ends
+/// tail with its input bound to the run, and the queued input. The next
+/// process archives the member's session before anything registers its
+/// runtime again, through the machine-protocol archive a mob retire and a
+/// surface's archive both reach (a mob retire of a member whose startup
+/// restore was deferred is refused before it gets there). The archive ends
 /// the work the runtime kept for a later start through its lease's driver
 /// (the kept run's input and the queued input, both cancelled) and commits
-/// the tail as interrupted. RED before: the archive's recovery held the
-/// continuable tail beside the queued input and the retirement ended with
-/// `DurableTailHeldForRecovery`. Unrun: written while Cargo is not run.
+/// the tail as interrupted. RED before: nothing ended that work, so the
+/// archive's recovery held the continuable tail beside the queued input and
+/// the archive ended with `DurableTailHeldForRecovery`.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread")]
-async fn a_member_retired_before_its_kept_run_registers_again_retires() {
+async fn an_archive_before_a_kept_run_registers_again_ends_the_work_it_kept() {
     use meerkat_runtime::input_state::{InputAbandonReason, InputTerminalOutcome};
 
     let temp = tempfile::tempdir().expect("temp dir");
@@ -7808,38 +7810,20 @@ async fn a_member_retired_before_its_kept_run_registers_again_retires() {
     .expect("process-loss fixture waits for every old session runtime to be released");
 
     // ---------------- Lifetime 2 ----------------
-    // The member's restore is refused, so nothing registers its runtime.
+    // Nothing registers the member's runtime again before its session is
+    // archived.
     power_store.set_cut(false);
     let (service_2, store_2) = persistent_head_canonical_service(&paths, runtime_store.clone());
-    let customizer = Arc::new(RefuseOneRestore {
-        member: identity.clone(),
-        refusing: std::sync::atomic::AtomicBool::new(true),
-    });
-    let handle_2 = MobBuilder::for_resume(
-        MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage"),
+    let archived = tokio::time::timeout(
+        Duration::from_secs(60),
+        service_2.archive_with_mob_lifecycle_authority(&w1_sid),
     )
-    .with_session_service(service_2.clone())
-    .with_default_llm_client(openai_test_client())
-    .with_spawn_member_customizer(customizer.clone())
-    .notify_orchestrator_on_resume(false)
-    .resume()
     .await
-    .expect("the mob starts and defers the member whose restore was refused");
-
-    let retired = tokio::time::timeout(Duration::from_secs(60), handle_2.retire(identity.clone()))
-        .await
-        .expect("the retirement ends within its bound");
+    .expect("the archive ends within its bound");
     assert!(
-        retired.is_ok(),
-        "a member whose kept run never registered again must retire: {retired:?}"
-    );
-    assert!(
-        handle_2
-            .get_member(&identity)
-            .await
-            .expect("read the roster")
-            .is_none(),
-        "the retired member leaves the roster"
+        archived.is_ok(),
+        "the archive of a session whose kept run never registered again must complete: \
+         {archived:?}"
     );
     assert!(
         runtime_store
@@ -7861,7 +7845,7 @@ async fn a_member_retired_before_its_kept_run_registers_again_retires() {
         .expect("read the member's input rows");
     assert!(
         rows.iter().all(|row| row.seed.terminal_outcome.is_some()),
-        "every input of the retired member is terminal: {rows:?}"
+        "every input of the archived session is terminal: {rows:?}"
     );
     let ended_with = |reason: &InputAbandonReason| {
         rows.iter()
@@ -7880,29 +7864,29 @@ async fn a_member_retired_before_its_kept_run_registers_again_retires() {
     assert_eq!(
         ended_with(&InputAbandonReason::Retired),
         0,
-        "the retire's sweep finds nothing left to abandon: {rows:?}"
+        "the archive's retire sweep finds nothing left to abandon: {rows:?}"
     );
 
-    let retired_session = service_2
+    let archived_session = service_2
         .load_revivable_retired_session(&w1_sid)
         .await
-        .expect("read the member's retired session")
-        .expect("the retirement archived the member's session");
+        .expect("read the member's archived session")
+        .expect("the member's session is archived");
     assert!(
         matches!(
-            retired_session.messages().last(),
+            archived_session.messages().last(),
             Some(meerkat_core::Message::SystemNotice(_))
         ),
         "the kept run is closed with the interrupted notice: {:?}",
-        retired_session.messages().last()
+        archived_session.messages().last()
     );
-    let history = to_string(retired_session.messages()).expect("serialize the retired transcript");
+    let history =
+        to_string(archived_session.messages()).expect("serialize the archived transcript");
     assert_eq!(
         history.matches(HoldingToolLoopClient::LOOP_MARKER).count(),
         1,
-        "the retired session keeps the kept run's prompt exactly once: {history}"
+        "the archived session keeps the kept run's prompt exactly once: {history}"
     );
-    let _ = handle_2.shutdown().await;
 }
 
 /// One destructive reset as Meta's identity reset sends it: an atomic
