@@ -1357,7 +1357,11 @@ Shutdown report such a member's run and run starts as `ReloadRequired` instead
 of failing on it, and a Shutdown holds every member's run starts, reporting the
 first failure in roster order.
 
-Since 0.9.5 a Shutdown can keep queued work for the next start:
+Since 0.9.5 a Shutdown keeps queued work for the next start. A Shutdown that
+does not choose (`MobHandle::shutdown()`, or `ShutdownOptions` without
+`with_queued_inputs`) keeps it for each member whose session is persistent,
+with a 15 minute max age, and stops the others' queued work as in 0.9.4. To
+choose, use
 `ShutdownOptions::default().with_queued_inputs(QueuedInputsOnShutdown::Requeue(max_age))`,
 where `max_age` is a `RequeueMaxAge` (`RequeueMaxAge::new(duration)` refuses
 a bound under one millisecond, zero included, or over 24 hours with
@@ -1385,8 +1389,9 @@ Steer, ephemeral, event, directed and objective-bound inputs that are not
 bound to the running turn's run still end as stopped. A
 member's kickoff is bound to its objective, so a kickoff still queued at a
 requeue Shutdown ends as stopped and is recorded failed, as with `Stop`.
-`QueuedInputsOnShutdown::Stop`, the default, ends every queued input as
-stopped, as in 0.9.4. 0.9.4 cannot open a store that holds a kept input still
+An explicit `QueuedInputsOnShutdown::Stop` ends every queued input as
+stopped, and cancels running turns, as in 0.9.4. A member already retiring
+is stopped either way. 0.9.4 cannot open a store that holds a kept input still
 queued, and cannot read a kept or expired input's row after it ran or expired
 (see [Upgrading](/guides/upgrading)).
 

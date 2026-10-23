@@ -138,6 +138,24 @@ after a crash. Such a stop is an unregister with
 `UnregisterQueuedInputs::Requeue { max_age }`, or a mob Shutdown with
 `ShutdownOptions::with_queued_inputs(QueuedInputsOnShutdown::Requeue(max_age))`.
 
+It is the default. A graceful shutdown that does not choose what happens to
+queued work uses Requeue, with a 15 minute max age, for every durable session,
+and Stop for a session without per-round commits:
+
+- `rkat-rpc`'s own shutdown, when its input ends (as when a client SDK
+  exits), on SIGTERM and on an interrupt;
+- the REST server's shutdown on SIGTERM;
+- a mob Shutdown (`MobHandle::shutdown()`, or `ShutdownOptions` without
+  `with_queued_inputs`), member by member: it suspends a durable member's
+  running turn instead of cancelling it.
+
+A host that chooses explicitly keeps its choice: an unregister with
+`UnregisterQueuedInputs::Stop`, or a Shutdown with
+`with_queued_inputs(QueuedInputsOnShutdown::Stop)`, ends runs in flight as
+before. The suspend does not wait for the round, so a long tool call does
+not hold up a shutdown, and a process killed during it leaves the run as a
+crash would.
+
 - **The stop does not wait for the round.** It stops the turn at once. The
   run continues from its last committed round, and the work since that
   commit is redone: an uncommitted model response is asked for again, and
@@ -152,21 +170,14 @@ after a crash. Such a stop is an unregister with
 - **The max age still applies.** If any input bound to the run is older
   than `max_age`, counted from its admission, when the next start finds it,
   the run's inputs end as `requeue_expired` and the run does not continue.
-  An unregister's `max_age` has no default and lies between 1 millisecond
-  and 24 hours; a mob Shutdown's defaults to 15 minutes
+  An explicit `max_age` lies between 1 millisecond and 24 hours; the default
+  shutdowns above, and a mob Shutdown, use 15 minutes
   (`RequeueMaxAge::DEFAULT`).
 
 Any other way of stopping still ends the run in flight: a graceful stop
-without Requeue, an explicit stop or cancel, retiring, destroying or
+that chooses Stop, an explicit stop or cancel, retiring, destroying or
 resetting the session. A session without per-round commits, such as an
-ephemeral one, has its run cancelled by every stop.
-
-The servers' own shutdowns do not use this stop. `rkat-rpc` unregisters its
-sessions without Requeue when its input ends (as when a client SDK exits),
-on SIGTERM and on an interrupt, and on SIGTERM the REST server cancels the
-input of each request sent with `X-Meerkat-Request-Id`; those runs end as
-before. A host that embeds Meerkat gets the behaviour above by
-unregistering, or shutting down its mobs, with Requeue. A process that is
+ephemeral one, has its run cancelled by every stop. A process that is
 killed leaves its runs as any crash does.
 
 ### When A Run Does Not Continue

@@ -398,10 +398,11 @@ Contract and limits: `docs/guides/durable-runs.mdx`.
   admission; unregister: no default, 1 ms to 24 h; mob: 15 min default) at
   that start, the inputs end `requeue_expired` instead. No Requeue, an
   explicit stop/cancel, retire, destroy, reset, or a session without
-  per-round commits still ends the run. `rkat-rpc` shuts down without
-  Requeue (input end, SIGTERM, interrupt) and REST cancels requests sent
-  with `X-Meerkat-Request-Id` on SIGTERM, so those runs end; embedding hosts
-  opt in.
+  per-round commits still ends the run. Requeue (15 min) is the default
+  of every graceful shutdown that does not choose, for durable sessions:
+  `rkat-rpc` (input end, SIGTERM, interrupt), REST (SIGTERM) and a mob
+  Shutdown without `with_queued_inputs`; an explicit `Stop` keeps 0.9.4
+  behaviour.
 - Durable workers and the mob resume gate: `references/mobs.md`. Realms in a
   host's own database: `references/sessions_runtime_surfaces_storage_config.md`.
 

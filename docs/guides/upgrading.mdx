@@ -327,7 +327,7 @@ WebSocket, and keep WebRTC for sessions that are not mob members.
   at-least-once: deduplicate on `delivery_idempotency_key`. See
   [Executor Lease And Crash Recovery](/guides/scheduling#executor-lease-and-crash-recovery).
 
-- **Queued prompts kept across a graceful stop (opt-in):** a mob Shutdown
+- **Queued prompts kept across a graceful stop:** a mob Shutdown
   with `ShutdownOptions::with_queued_inputs(QueuedInputsOnShutdown::Requeue(max_age))`
   (or an unregister with `UnregisterQueuedInputs::Requeue { max_age }`) keeps
   each input still queued behind the running turn that is a durable prompt
@@ -338,7 +338,10 @@ WebSocket, and keep WebRTC for sessions that are not mob members.
   both with `kind` `requeued_across_stop`. A
   kept input older than `max_age` when a start finds it still queued ends as
   `RequeueExpired` without running; every start that finds it queued checks
-  again. Without the option nothing changes.
+  again. A graceful shutdown that does not choose now uses this option, with
+  a 15 minute max age, for durable sessions: `rkat-rpc`'s and the REST
+  server's own shutdowns, and a mob Shutdown without `with_queued_inputs`.
+  Choose `Stop` explicitly to keep the 0.9.4 behaviour.
   A kept input's row is written as stored input state version 8, and an
   unregister in progress with the requeue disposition as machine lifecycle
   record version 6; every other row and record keeps version 7 and version 5.
@@ -376,7 +379,8 @@ WebSocket, and keep WebRTC for sessions that are not mob members.
   `QueuedInputsOnShutdown::Requeue`, now suspends a durable session's run in
   flight instead of cancelling it: the run continues from its last committed
   round at the next start, or its inputs end as `RequeueExpired` past the
-  max age. See
+  max age. Because a graceful shutdown that does not choose uses Requeue for
+  durable sessions, a deploy no longer cancels their runs in flight. See
   [Durable Runs: graceful stops and deploys](/guides/durable-runs#graceful-stops-and-deploys).
 - **Host stores:** a host can keep a realm's durable state in its own
   database through the host store SPI (`meerkat_core::host_store`), checked
@@ -398,11 +402,13 @@ WebSocket, and keep WebRTC for sessions that are not mob members.
    destroy's report through the SDK accessor, not the error text.
 5. Pass `UnregisterQueuedInputsDisposition::Stop` and `0` where you build
    `BeginUnregisterSession` or `State` of the generated runtime machine.
-6. Before you use `QueuedInputsOnShutdown::Requeue`, note that 0.9.4 cannot
-   open the store while a kept input is still queued, and cannot read a kept
-   or expired input's row after that. Treat `RequeuedAcrossStop` as "runs at
-   the next start" (do not resubmit) and `RequeueExpired` as "resubmit if
-   still wanted".
+6. A graceful shutdown of a durable session now keeps its queued prompts
+   and its run in flight unless you choose `Stop`. 0.9.4 cannot open the
+   store while a kept input is still queued, and cannot read a kept or
+   expired input's row after that, so shut down with an explicit `Stop`
+   before a downgrade. Treat `RequeuedAcrossStop` as "runs at the next
+   start" (do not resubmit) and `RequeueExpired` as "resubmit if still
+   wanted".
 7. Add a wildcard arm where you match `RuntimeBindingsError`, and set
    `custody_deferred` in `MobMemberStatusResult` struct literals.
 8. Custom `SessionCheckpointer` implementations: return a receipt from

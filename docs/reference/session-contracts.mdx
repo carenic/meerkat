@@ -879,7 +879,9 @@ The same stop, like an unregister with `UnregisterQueuedInputs::Requeue`, also
 keeps a persistent session's run in flight: the turn stops at once, the
 run's inputs stay bound to it with the same waiter answer and max age, and
 the run continues from its last committed round at the session's next start
-(see [Durable runs](/guides/durable-runs#graceful-stops-and-deploys)).
+(see [Durable runs](/guides/durable-runs#graceful-stops-and-deploys)). A
+graceful shutdown that does not choose a disposition, a mob Shutdown
+included, uses this stop with a 15 minute max age for persistent sessions.
 
 - The generated wait-failure resolver classes such a wait: session not
   running, reason `requeued_across_stop`, resumable, and the surface's
