@@ -18264,6 +18264,7 @@ mod tests {
             },
             capabilities: meerkat_core::live_adapter::LiveChannelCapabilities::default().into(),
             continuity: WireLiveContinuityMode::Fresh,
+            advisories: Vec::new(),
         }
     }
 

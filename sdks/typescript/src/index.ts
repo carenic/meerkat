@@ -515,6 +515,9 @@ export type {
   WireLiveContinuityModeTranscriptOnly,
   WireLiveContinuityModeDegraded,
   WireLiveContinuityModeProviderNativeResume,
+  // The advisories on `LiveOpenResult`: an open vocabulary, so an unknown
+  // advisory is kept as the string the server sent.
+  WireLiveOpenAdvisory,
   // FIX-SDK-OBS: typed live-adapter observation discriminated union and
   // its supporting wire mirrors (status / degradation reason / error
   // code). Closes the verifier gap that left the R5-4 audio identity

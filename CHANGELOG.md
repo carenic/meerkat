@@ -562,6 +562,15 @@ them.
   `custody_deferred: Option<WireMemberCustodyDeferral>`, absent from the wire
   unless the mob's start deferred the member's custody restore. Code that
   builds the result with a struct literal sets it.
+- `meerkat-contracts`: `LiveOpenResult` gains the field
+  `advisories: Vec<WireLiveOpenAdvisory>`, what a successful `live/open` went
+  ahead without (today `staged_prompt_refused`: a run-start hook refused the
+  session's staged create-time prompt, see Fixed). Code that builds the result
+  with a struct literal sets `advisories: Vec::new()`. The wire stays
+  additive: the field is left out when empty. `WireLiveOpenAdvisory` is an
+  advisory vocabulary that may grow: a value this version does not know reads
+  as `Unknown` with the value as sent and is written back unchanged, and the
+  Python and TypeScript SDKs keep it as the string the server sent.
 
 - `meerkat-mob`: `Profile` gains `durable: bool` (see Added, durable
   workers), and so do its wire forms `meerkat_contracts::WireMobProfile`,
@@ -1443,9 +1452,18 @@ them.
   refusal before the run) leaves the prompt pending, so it lands exactly once,
   also for a session persisted with a staged prompt by an earlier release. A
   turn whose input carries directed interaction custody is refused with the new
-  `AgentError::StagedPromptDirectedTurnRefused` while a prompt is staged. The
-  realtime seed still carries no staged prompt: in a voice-first session it
-  lands with the first later text turn.
+  `AgentError::StagedPromptDirectedTurnRefused` while a prompt is staged. A
+  live open that finds the prompt still staged (a voice-first session)
+  delivers it instead: the run-start hooks a turn carrying it would run admit
+  it, and it is committed as the session's newest user row before the
+  realtime seed is read, so the realtime model receives it once. A later
+  first text turn does not deliver it again, and a prompt a text turn already
+  delivered is never delivered by a later open. A hook that refuses it at the
+  open keeps it staged for the first text turn; the open goes ahead without it
+  and reports `staged_prompt_refused` in the result's new `advisories`. An
+  open that never waits behind a running turn (the mirrored channel and the
+  concurrent summary open) delivers it only when no turn holds the session's
+  turn boundary.
 - `meerkat-mob`: a member retirement whose member session degraded after
   its quiesce stage, for example a retire that waited there on a boundary
   commit that then passed its deadline, no longer sticks at its ingress

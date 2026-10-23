@@ -8510,6 +8510,88 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         Ok(outcome)
     }
 
+    /// Deliver the session's staged create-time prompt for a live open (see
+    /// [`crate::EphemeralSessionService::deliver_staged_prompt_for_live_open`])
+    /// and persist the session before the realtime seed is read. The prompt
+    /// is committed and its consumption made durable in one write; a failed
+    /// write discards the live session, so the durable session keeps the
+    /// prompt staged and nothing is delivered twice. A live session with
+    /// nothing staged answers
+    /// [`crate::StagedPromptLiveOpenDelivery::NothingStaged`] at once, with no
+    /// guard, actor command or store read.
+    pub async fn deliver_staged_prompt_for_live_open(
+        &self,
+        id: &SessionId,
+    ) -> Result<crate::StagedPromptLiveOpenDelivery, SessionError> {
+        if !self.live_session_has_staged_prompt(id).await {
+            return Ok(crate::StagedPromptLiveOpenDelivery::NothingStaged);
+        }
+        let mutation_guard = self.live_persist_mutation_guard(id).await?;
+        self.deliver_staged_prompt_for_live_open_under_guard(id, &mutation_guard)
+            .await
+    }
+
+    /// [`Self::deliver_staged_prompt_for_live_open`] for an open that never
+    /// waits behind a running turn (the mirrored channel and the concurrent
+    /// summary open): the session's turn boundary is only tried, never waited
+    /// for. A held boundary answers
+    /// [`crate::StagedPromptLiveOpenDelivery::TurnBoundaryHeld`] at once and
+    /// asks nothing of the actor: a turn in flight has already consumed a
+    /// staged prompt, and any other holder leaves it staged for the next open
+    /// or the first turn. As there, a live session with nothing staged answers
+    /// [`crate::StagedPromptLiveOpenDelivery::NothingStaged`] before anything
+    /// else, so such an open reads no session body.
+    pub async fn try_deliver_staged_prompt_for_live_open(
+        &self,
+        id: &SessionId,
+    ) -> Result<crate::StagedPromptLiveOpenDelivery, SessionError> {
+        if !self.live_session_has_staged_prompt(id).await {
+            return Ok(crate::StagedPromptLiveOpenDelivery::NothingStaged);
+        }
+        let gate = self.turn_finalization_gate_for_session(id).await;
+        let Ok(turn_finalization_guard) = Arc::clone(&gate).try_lock_owned() else {
+            return Ok(crate::StagedPromptLiveOpenDelivery::TurnBoundaryHeld);
+        };
+        let mutation_guard = self
+            .live_persist_mutation_guard_with_turn_boundary(id, turn_finalization_guard)
+            .await?;
+        self.deliver_staged_prompt_for_live_open_under_guard(id, &mutation_guard)
+            .await
+    }
+
+    /// Whether the live session holds a staged create-time prompt, read from
+    /// its shared deferred-turn state: no actor command and no store read. A
+    /// prompt staged after this read (a refused turn restoring it) is
+    /// delivered by the next open or the first text turn; the delivery
+    /// itself consumes it only under the guard.
+    async fn live_session_has_staged_prompt(&self, id: &SessionId) -> bool {
+        self.inner
+            .deferred_turn_state(id)
+            .await
+            .is_some_and(|state| {
+                state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .pending_initial_prompt()
+                    .is_some()
+            })
+    }
+
+    async fn deliver_staged_prompt_for_live_open_under_guard(
+        &self,
+        id: &SessionId,
+        _mutation_guard: &SessionMutationGuard,
+    ) -> Result<crate::StagedPromptLiveOpenDelivery, SessionError> {
+        let delivery = self.inner.deliver_staged_prompt_for_live_open(id).await?;
+        if matches!(delivery, crate::StagedPromptLiveOpenDelivery::Delivered)
+            && let Err(error) = self.persist_full_session(id).await
+        {
+            let _ = self.discard_live_session_unfenced(id).await;
+            return Err(error);
+        }
+        Ok(delivery)
+    }
+
     pub async fn append_external_user_content(
         &self,
         id: &SessionId,
@@ -12080,6 +12162,17 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         id: &SessionId,
     ) -> Result<SessionMutationGuard, SessionError> {
         let turn_finalization_guard = self.acquire_runtime_turn_finalization_guard(id).await;
+        self.live_persist_mutation_guard_with_turn_boundary(id, turn_finalization_guard)
+            .await
+    }
+
+    /// [`Self::live_persist_mutation_guard`] under a turn boundary the caller
+    /// already holds (taken or only tried).
+    async fn live_persist_mutation_guard_with_turn_boundary(
+        &self,
+        id: &SessionId,
+        turn_finalization_guard: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<SessionMutationGuard, SessionError> {
         let recovery_gate = self.recovery_gate_for_session(id).await;
         let recovery_guard = recovery_gate.lock_owned().await;
         let _ = self

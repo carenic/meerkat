@@ -518,6 +518,7 @@ pub use wire::{
     WireLiveExecutionIdentityVersion,
     WireLiveHotSwapSkip,
     WireLiveHotSwapSkipReason,
+    WireLiveOpenAdvisory,
     WireLiveProviderInputLatency,
     WireLiveProviderInputLatencyReading,
     WireLiveRefreshFailure,

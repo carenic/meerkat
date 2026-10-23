@@ -6607,6 +6607,18 @@ export class MeerkatClient {
       );
     }
 
+    // What the open went ahead without. The server omits the field when
+    // there is nothing to report. The vocabulary may grow: an advisory this
+    // SDK does not know is kept as the string the server sent, so a newer
+    // server never fails the open; a field that is not an array of non-empty
+    // strings is malformed and fails closed.
+    if (result.advisories !== undefined) {
+      result.advisories = MeerkatClient.requireStringArray(
+        result.advisories,
+        `${context}: advisories`,
+      );
+    }
+
     return result as unknown as LiveOpenResult;
   }
 

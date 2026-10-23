@@ -922,6 +922,13 @@ impl SessionAgent for FactoryAgent {
         meerkat_core::pending_continuation::observe_session_tail(self.agent.session().messages())
     }
 
+    async fn admit_staged_prompt_for_live_open(
+        &mut self,
+        prompt: &meerkat_core::types::ContentInput,
+    ) -> Result<(), meerkat_core::error::AgentError> {
+        self.agent.admit_staged_prompt_for_live_open(prompt).await
+    }
+
     fn append_external_user_content(
         &mut self,
         content: meerkat_core::types::ContentInput,

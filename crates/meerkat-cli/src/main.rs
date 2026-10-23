@@ -19637,6 +19637,7 @@ mod mob_typed_exit_tests {
                 provider_native_resume: false,
             },
             continuity: meerkat_contracts::wire::WireLiveContinuityMode::Fresh,
+            advisories: Vec::new(),
         };
 
         let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
