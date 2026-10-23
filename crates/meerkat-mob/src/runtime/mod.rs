@@ -304,8 +304,10 @@ mod member_history_proxy;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod member_instruction;
 mod member_live_proxy;
+mod member_operator_ceiling;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 pub use member_instruction::MemberInstructionActivationError;
+pub use member_operator_ceiling::MemberOperatorAuthorityCeiling;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 pub(crate) mod member_operator_forwarder;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]

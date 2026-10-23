@@ -31652,6 +31652,27 @@ impl MobActor {
         {
             reject_spawn_before_custody!("customize_spawn_spec", error);
         }
+        // A member-initiated spawn is bounded by the authority recorded for the
+        // member that asked for it. The customizer has run: its ceiling, or
+        // the request's, can narrow that bound and never widen it.
+        if let Some(bound) = spec.inherited_operator_authority_bound.take() {
+            spec.operator_authority_ceiling = Some(match spec.operator_authority_ceiling.take() {
+                Some(ceiling) => ceiling.intersect(&bound),
+                None => bound,
+            });
+        }
+        // A ceiling bounds the authority the controlling host records for a
+        // placed member. A local member's operator authority is set by its
+        // own session build, so a ceiling there would be ignored: refuse it.
+        if spec.placement.is_none() && spec.operator_authority_ceiling.is_some() {
+            reject_spawn_before_custody!(
+                "operator_authority_ceiling_placement",
+                MobError::OperatorAuthorityCeilingRefused {
+                    agent_identity: requested_identity.clone(),
+                    reason: crate::error::OperatorAuthorityCeilingRefusal::UnplacedMember,
+                }
+            );
+        }
         // A local preparation for this identity is still running off the
         // actor loop; it owns the identity exactly like a staged pending
         // spawn, on either lane (#1249).
@@ -31835,6 +31856,10 @@ impl MobActor {
             // Refused above: fork seating consumes its inheritance first.
             fork_build_inheritance: _,
             resume_provider_params,
+            // Refused above: a ceiling binds only a placed member.
+            operator_authority_ceiling: _,
+            // Folded into the ceiling above.
+            inherited_operator_authority_bound: _,
         } = spec;
         let agent_identity = AgentIdentity::from(identity.as_str());
         self.inline_step_watchdog
@@ -33944,6 +33969,9 @@ impl MobActor {
             fork_overlay: _,
             fork_build_inheritance: _,
             resume_provider_params: _,
+            operator_authority_ceiling,
+            // Folded into the ceiling before the placed lane.
+            inherited_operator_authority_bound: _,
         } = spec;
         let Some(host) = placement else {
             fail!(MobError::Internal(
@@ -34134,6 +34162,7 @@ impl MobActor {
                 continuity_intent: &continuity_intent,
                 base_prompt: base_prompt.as_deref(),
                 non_portable_disabled: Vec::new(),
+                operator_authority_ceiling: operator_authority_ceiling.as_ref(),
             },
         )
         .await
@@ -35436,6 +35465,9 @@ impl MobActor {
             fork_overlay: _,
             fork_build_inheritance: _,
             resume_provider_params: _,
+            // Nor a ceiling: customizers never run on a policy auto-spawn.
+            operator_authority_ceiling: _,
+            inherited_operator_authority_bound: _,
         } = member_spec;
 
         if agent_identity.is_system_reserved() {
@@ -45837,6 +45869,60 @@ impl MobActor {
         Ok(Some(restrictions))
     }
 
+    /// The operator authority ceiling a placed member being respawned keeps:
+    /// what its exact committed placed-spawn carrier records, read before
+    /// anything is retired. `None` when the member holds the default
+    /// authority, or no operator authority at all. A carrier that cannot be
+    /// read, is not committed, or belongs to another incarnation refuses the
+    /// respawn and keeps the member, since the successor could otherwise gain
+    /// authority its predecessor was denied.
+    async fn recorded_placed_operator_authority_ceiling(
+        &self,
+        agent_identity: &AgentIdentity,
+        snapshot: &RespawnSnapshot,
+    ) -> Result<Option<super::MemberOperatorAuthorityCeiling>, MobError> {
+        let refuse = |reason: String| MobError::RespawnPredecessorRestrictionsUnavailable {
+            agent_identity: agent_identity.to_string(),
+            reason,
+        };
+        let carrier = self
+            .runtime_metadata
+            .load_placed_spawn(&self.definition.id, agent_identity.as_str())
+            .await
+            .map_err(|error| {
+                refuse(format!(
+                    "the placed member's recorded operator authority cannot be read: {error}"
+                ))
+            })?
+            .filter(|carrier| {
+                carrier.generation == snapshot.old_runtime_id.generation.get()
+                    && carrier.fence_token == snapshot.old_fence_token.get()
+                    && matches!(
+                        &carrier.phase,
+                        crate::store::PlacedSpawnCarrierPhase::Committed(_)
+                    )
+            })
+            .ok_or_else(|| {
+                refuse(
+                    "the placed member has no committed placed-spawn record for its current \
+                     incarnation to read its operator authority from; respawn it with an \
+                     operator authority ceiling of its own"
+                        .to_string(),
+                )
+            })?;
+        Ok(carrier
+            .spec
+            .overlay
+            .mob_tool_authority_context
+            .as_ref()
+            .and_then(|facts| {
+                super::MemberOperatorAuthorityCeiling::recorded_in(
+                    facts,
+                    self.definition.id.as_str(),
+                )
+            }))
+    }
+
     async fn handle_respawn(
         &mut self,
         agent_identity: AgentIdentity,
@@ -45998,6 +46084,16 @@ impl MobActor {
                 // A successor starts fresh and carries none, so a later
                 // re-link can never apply the old job's limit to it.
                 replacement_spec.fork_job = None;
+                // A placed member's successor keeps the operator authority
+                // its predecessor recorded, unless the request sets a ceiling
+                // of its own. It is read before the customizer, which sees it
+                // and may replace it.
+                if placed_host.is_some() && replacement_spec.operator_authority_ceiling.is_none() {
+                    replacement_spec.operator_authority_ceiling = self
+                        .recorded_placed_operator_authority_ceiling(&agent_identity, &snapshot)
+                        .await
+                        .map_err(MobRespawnError::from)?;
+                }
         self.customize_spawn_spec(
             super::handle::SpawnSource::Respawn,
             None,
@@ -46054,6 +46150,24 @@ impl MobActor {
                 "spawn customizer cannot bind respawn of placed member '{original_identity}' \
                  to an explicit runtime binding"
             ))));
+        }
+        // The successor's ceiling is checked here, before anything is
+        // retired: the replacement compiles only after the predecessor is
+        // gone, too late to keep the member.
+        if let Some(ceiling) = replacement_spec.operator_authority_ceiling.as_ref() {
+            let refusal = if placed_host.is_none() {
+                Some(crate::error::OperatorAuthorityCeilingRefusal::UnplacedMember)
+            } else {
+                ceiling.check().err()
+            };
+            if let Some(reason) = refusal {
+                return Err(MobRespawnError::from(
+                    MobError::OperatorAuthorityCeilingRefused {
+                        agent_identity: original_identity.clone(),
+                        reason,
+                    },
+                ));
+            }
         }
                 if replacement_spec.placement != placed_host {
             // Placement is the machine `member_placement` fact; a customizer

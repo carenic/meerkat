@@ -1616,6 +1616,46 @@ pub enum MobError {
         reason: String,
         evidence_digest: Option<String>,
     },
+
+    /// A member's operator authority ceiling
+    /// ([`crate::MemberOperatorAuthorityCeiling`]) was refused. Nothing was
+    /// spawned; a refused respawn retired nothing and the member keeps
+    /// running.
+    #[error("operator authority ceiling for member {agent_identity} refused: {reason}")]
+    OperatorAuthorityCeilingRefused {
+        agent_identity: AgentIdentity,
+        reason: OperatorAuthorityCeilingRefusal,
+    },
+}
+
+/// Why a member's operator authority ceiling was refused
+/// ([`MobError::OperatorAuthorityCeilingRefused`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OperatorAuthorityCeilingRefusal {
+    /// The ceiling narrows the spawn profiles and keeps manage scope. Manage
+    /// scope admits every profile, so that narrowing could not hold: narrow
+    /// the spawn profiles without manage scope.
+    SpawnProfilesWithManage,
+    /// The spawn has no placement. A ceiling bounds the authority the
+    /// controlling host records for a placed member; a local member's
+    /// operator authority is set by its own session build.
+    UnplacedMember,
+}
+
+impl std::fmt::Display for OperatorAuthorityCeilingRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SpawnProfilesWithManage => f.write_str(
+                "it narrows the spawn profiles but keeps manage scope, which admits every \
+                 profile; narrow the spawn profiles without manage scope",
+            ),
+            Self::UnplacedMember => f.write_str(
+                "the member is not placed on a member host; a ceiling bounds only a placed \
+                 member's recorded authority",
+            ),
+        }
+    }
 }
 
 /// The stable token of the runtime verdict a member's destination install

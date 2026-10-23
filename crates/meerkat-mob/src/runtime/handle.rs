@@ -2693,6 +2693,11 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         MobError::MemberDestinationNotInstalled { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::WiringError
         }
+        // A refused ceiling is a refused spawn request, like any other spec
+        // the spawn cannot wire.
+        MobError::OperatorAuthorityCeilingRefused { .. } => {
+            mob_dsl::MobSpawnManyFailureObservationKind::WiringError
+        }
         MobError::SupervisorRotationIncomplete { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::SupervisorRotationIncomplete
         }
@@ -6742,6 +6747,17 @@ pub struct SpawnMemberSpec {
     /// by the capability-attached spawn after it proves the inheritance names
     /// the capability's own source.
     pub(crate) fork_build_inheritance: Option<super::ForkBuildInheritance>,
+    /// The most operator authority this placed member may hold, set through
+    /// [`SpawnMemberSpec::with_operator_authority_ceiling`]. `None` keeps the
+    /// default authority, except on a respawn, which keeps the authority its
+    /// predecessor recorded.
+    pub(crate) operator_authority_ceiling: Option<super::MemberOperatorAuthorityCeiling>,
+    /// The upper bound a member-initiated spawn inherits from the member that
+    /// asked for it: that member's recorded operator authority. Set only by
+    /// the member operator upcall lane and never taken from caller-supplied
+    /// arguments; the spawn folds it into `operator_authority_ceiling` after
+    /// the customizer, so nothing can widen past it.
+    pub(crate) inherited_operator_authority_bound: Option<super::MemberOperatorAuthorityCeiling>,
 }
 
 impl std::fmt::Debug for SpawnMemberSpec {
@@ -6790,6 +6806,14 @@ impl std::fmt::Debug for SpawnMemberSpec {
             .field("fork_source", &self.fork_source)
             .field("fork_overlay", &self.fork_overlay)
             .field("fork_build_inheritance", &self.fork_build_inheritance)
+            .field(
+                "operator_authority_ceiling",
+                &self.operator_authority_ceiling,
+            )
+            .field(
+                "inherited_operator_authority_bound",
+                &self.inherited_operator_authority_bound,
+            )
             .finish()
     }
 }
@@ -6850,6 +6874,8 @@ impl SpawnMemberSpec {
             fork_source: None,
             fork_overlay: super::ForkOverlayOrigin::default(),
             fork_build_inheritance: None,
+            operator_authority_ceiling: None,
+            inherited_operator_authority_bound: None,
         }
     }
 
@@ -6881,6 +6907,41 @@ impl SpawnMemberSpec {
     pub fn with_placement(mut self, host: crate::machines::mob_machine::HostId) -> Self {
         self.placement = Some(host);
         self
+    }
+
+    /// Bound the operator authority this placed member is compiled with (see
+    /// [`super::MemberOperatorAuthorityCeiling`]).
+    ///
+    /// The controlling host records the lowered authority with the member and
+    /// admits the member's operator upcalls against it, across restarts. A
+    /// spawn without a placement refuses a ceiling
+    /// ([`crate::OperatorAuthorityCeilingRefusal::UnplacedMember`]).
+    ///
+    /// A respawn of a placed member keeps the authority its predecessor
+    /// recorded. A ceiling set on the respawn request, here or by a spawn
+    /// customizer, replaces it, wider or narrower.
+    #[must_use]
+    pub fn with_operator_authority_ceiling(
+        mut self,
+        ceiling: super::MemberOperatorAuthorityCeiling,
+    ) -> Self {
+        self.operator_authority_ceiling = Some(ceiling);
+        self
+    }
+
+    /// [`Self::with_operator_authority_ceiling`] for a spawn customizer, which
+    /// edits the request in place.
+    pub fn set_operator_authority_ceiling(
+        &mut self,
+        ceiling: super::MemberOperatorAuthorityCeiling,
+    ) {
+        self.operator_authority_ceiling = Some(ceiling);
+    }
+
+    /// The operator authority ceiling this request carries. On a respawn of a
+    /// placed member, a customizer sees the one the predecessor recorded.
+    pub fn operator_authority_ceiling(&self) -> Option<&super::MemberOperatorAuthorityCeiling> {
+        self.operator_authority_ceiling.as_ref()
     }
 
     /// Set the per-member auth binding (deferral §1).
@@ -11455,7 +11516,7 @@ impl MobHandle {
         if let Some(provisioner) = provisioner {
             provisioner().await?;
         }
-        self.ensure_flow_targets_provisioned(&flow_id).await?;
+        self.ensure_flow_targets_provisioned(&flow_id, None).await?;
 
         let run_id = RunId::new();
         let correlation = FlowOperationCorrelation {
@@ -11724,8 +11785,35 @@ impl MobHandle {
         params: serde_json::Value,
         scoped_event_tx: Option<mpsc::Sender<meerkat_core::ScopedAgentEvent>>,
     ) -> Result<RunId, MobError> {
-        self.run_flow_with_stream_and_external_identity(flow_id, params, scoped_event_tx, None)
-            .await
+        self.run_flow_with_stream_and_external_identity(
+            flow_id,
+            params,
+            scoped_event_tx,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::run_flow`] for a member-initiated run: every member the run
+    /// provisions carries `provision_bound`, the requesting member's recorded
+    /// operator authority, as the upper bound of its own (a provision that
+    /// would be local is therefore refused, see
+    /// [`super::MemberOperatorAuthorityCeiling`]).
+    pub(crate) async fn run_flow_with_provision_bound(
+        &self,
+        flow_id: FlowId,
+        params: serde_json::Value,
+        provision_bound: Option<&super::MemberOperatorAuthorityCeiling>,
+    ) -> Result<RunId, MobError> {
+        self.run_flow_with_stream_and_external_identity(
+            flow_id,
+            params,
+            None,
+            None,
+            provision_bound,
+        )
+        .await
     }
 
     /// Start or recover the one durable flow run selected by an external
@@ -11736,7 +11824,7 @@ impl MobHandle {
         params: serde_json::Value,
         identity: &crate::store::MobExternalDeliveryIdentity,
     ) -> Result<RunId, MobError> {
-        self.run_flow_with_stream_and_external_identity(flow_id, params, None, Some(identity))
+        self.run_flow_with_stream_and_external_identity(flow_id, params, None, Some(identity), None)
             .await
     }
 
@@ -11770,7 +11858,7 @@ impl MobHandle {
         if let Some(provisioner) = provisioner {
             provisioner().await?;
         }
-        self.ensure_flow_targets_provisioned(&flow_id).await?;
+        self.ensure_flow_targets_provisioned(&flow_id, None).await?;
 
         let run_id = RunId::for_external_delivery(
             &self.definition.id,
@@ -11816,6 +11904,7 @@ impl MobHandle {
         params: serde_json::Value,
         scoped_event_tx: Option<mpsc::Sender<meerkat_core::ScopedAgentEvent>>,
         identity: Option<&crate::store::MobExternalDeliveryIdentity>,
+        provision_bound: Option<&super::MemberOperatorAuthorityCeiling>,
     ) -> Result<RunId, MobError> {
         self.execute_machine_command(MobMachineCommand::PreviewRunFlowAdmission)
             .await?;
@@ -11833,7 +11922,8 @@ impl MobHandle {
         if let Some(provisioner) = provisioner {
             provisioner().await?;
         }
-        self.ensure_flow_targets_provisioned(&flow_id).await?;
+        self.ensure_flow_targets_provisioned(&flow_id, provision_bound)
+            .await?;
         let run_id = match identity {
             Some(identity) => {
                 identity.validate()?;
@@ -11863,7 +11953,15 @@ impl MobHandle {
         }
     }
 
-    async fn ensure_flow_targets_provisioned(&self, flow_id: &FlowId) -> Result<(), MobError> {
+    /// Provision a member for every role of `flow_id` that has no runnable
+    /// target. A member-initiated run passes its requester's recorded
+    /// operator authority as `provision_bound`, which each provisioned spawn
+    /// folds into its ceiling like a member's own spawn.
+    async fn ensure_flow_targets_provisioned(
+        &self,
+        flow_id: &FlowId,
+        provision_bound: Option<&super::MemberOperatorAuthorityCeiling>,
+    ) -> Result<(), MobError> {
         let Some(flow) = self.definition.flows.get(flow_id) else {
             return Err(MobError::FlowNotFound(flow_id.clone()));
         };
@@ -11889,12 +11987,11 @@ impl MobHandle {
             if self.get_member(&identity).await?.is_some() {
                 continue;
             }
-            self.spawn_spec_internal_with_source(
-                SpawnMemberSpec::new(role, identity)
-                    .with_runtime_mode(crate::MobRuntimeMode::TurnDriven),
-                SpawnSource::FlowProvisioning,
-            )
-            .await?;
+            let mut provision = SpawnMemberSpec::new(role, identity)
+                .with_runtime_mode(crate::MobRuntimeMode::TurnDriven);
+            provision.inherited_operator_authority_bound = provision_bound.cloned();
+            self.spawn_spec_internal_with_source(provision, SpawnSource::FlowProvisioning)
+                .await?;
         }
         Ok(())
     }
