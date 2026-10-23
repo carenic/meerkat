@@ -428,6 +428,7 @@ from .errors import (
     comms_send_error,
     mob_destroy_incomplete_report,
     BinaryIntegrityError,
+    EventSubscriptionError,
     CapabilityUnavailableError,
     HostUnavailableError,
     MULTI_HOST_JSON_RPC_ERROR_CODES,
@@ -894,6 +895,7 @@ __all__ = [
     "TextBlock",
     # Errors
     "MeerkatError",
+    "EventSubscriptionError",
     "WIRE_AUTH_ERROR_DETAILS",
     "WIRE_AUTH_ERROR_REASONS",
     "WireAuthErrorDetail",

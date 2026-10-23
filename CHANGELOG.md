@@ -1188,6 +1188,12 @@ them.
 
 ### Changed
 
+- **Behaviour:** Python and TypeScript event subscriptions now drain queued events and raise a
+  typed `EventSubscriptionError` when an existing stream terminal carries an
+  error, including unknown error codes. Previously those iterators ended
+  normally and required inspecting the separate terminal outcome. Error-free
+  remote ends and explicit closes continue to end normally.
+
 - `meerkat-core`, `meerkat-session`, `meerkat-runtime`: a HeadCanonical run
   that compacts more often than `history_retained_rewrites` keeps now saves an
   intra-run checkpoint at the next model boundary after its own tool results,
@@ -1265,6 +1271,13 @@ them.
   (7) and `stored_input_state_version_for_row` are new.
 
 ### Fixed
+
+- RPC session event subscriptions survive temporary outbound admission or
+  notification-queue overflow. Before subsequent delivery they report lost
+  events through the existing sequence-zero `StreamTruncated(StreamLagged)`
+  marker. An unresolved gap at source end or close uses the reserved error
+  terminal with its dropped count. This remains bounded, best-effort delivery;
+  it does not replay lost events or change mob-stream overflow behavior.
 
 - RPC callback tools accept typed content blocks from SDK handlers, which
   released 0.9.3 and 0.9.4 rejected as non-string results. Mixed text and image
