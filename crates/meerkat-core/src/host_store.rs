@@ -74,9 +74,10 @@
 //!    not after its deletion.
 //!
 //! **Limits:** a batch carries at most [`MAX_BATCH_BYTES`] of heads and
-//! rows, and a row at most [`MAX_ROW_BYTES`]. Core moves larger content to
-//! blobs, by digest, before the commit that references it; an orphaned blob
-//! is garbage, not corruption.
+//! rows, and a row at most [`MAX_ROW_BYTES`]. Core splits larger content
+//! into chunks it keeps in the store itself, as rows or record scopes, and
+//! commits them in batches before the batch that references them; an
+//! orphaned chunk is garbage, not corruption.
 //!
 //! A store meets obligations 4 and 5 either at commit, answering
 //! [`HostStoreError::Conflict`] or [`HostStoreError::FencedOut`], or at

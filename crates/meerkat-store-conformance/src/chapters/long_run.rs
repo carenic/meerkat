@@ -1,33 +1,44 @@
-//! Long run and durable worker chapters: a run killed at any point of a
-//! round resumes from its last durable commit under the same run id, or,
-//! when nothing of it is durable, its input runs again as a new run; either
-//! way the input finishes with every round once and one receipt.
+//! Long run, compacted long run and durable worker chapters: a run killed
+//! at any point of a round resumes from its last durable commit under the
+//! same run id, or, when nothing of it is durable, its input runs again as
+//! a new run; either way the input finishes with every round once and one
+//! receipt.
 //!
 //! Each row runs a scripted run through a [`LongRunHarness`] (or a durable
 //! worker through a [`DurableWorkerHarness`]), kills it at a chosen point,
 //! restarts over the same store, and checks the restart against what the
 //! killed process committed (see [`takes_first_commit`] and [`resumes`]):
-//! - a kill after a round's first commit dispatches the same calls again,
-//!   under the same keys, without calling the model; a started call of an
-//!   unrepeatable tool gets the typed interrupted result instead;
-//! - a kill during a model call, or in a round that takes no first commit
-//!   (after a compaction, a callback batch), asks the model again for that
+//! - a kill after a round's first commit (every tool round takes one,
+//!   round 0 and a callback batch included) dispatches the same calls
+//!   again, under the same keys, without calling the model; a started call
+//!   of an unrepeatable tool gets the typed interrupted result instead;
+//! - a kill during a model call, or in a round whose assistant message
+//!   carries an image (no first commit), asks the model again for that
 //!   round, and its calls carry the same keys again;
-//! - a kill in round 0, before any commit, requeues the input;
+//! - a kill in round 0 before its first commit (during its model call, or
+//!   in an image round) requeues the input;
 //! - a queued input waits for the resumed run; a stop or retire before the
 //!   resume settles the run's inputs, and nothing resumes;
 //! - over a store with fence leases, every restart waits out the killed
 //!   process's lease.
+//!
+//! [`compacted_long_run`] holds the rows with compactions: a compaction
+//! commits the rewritten transcript as the run's new base, so a run killed
+//! after any number of compactions resumes at its last committed round,
+//! never at a round before a compaction. When another writer moves the
+//! session right before a compaction's commit, the run stops dispatching,
+//! and its input runs again as a new run, with nothing lost or duplicated.
 
-use meerkat_core::{RunId, RunResumePoint, ToolCallDedupeKey};
+use meerkat_core::{RunId, ToolCallDedupeKey};
 
 use crate::failure::{ConformanceFailure, Steps};
 use crate::long_run::{
     BeforeResume, DurableWorkerHarness, KillPoint, KilledRun, LongRunHarness, LongRunPlan,
-    RestartReport, ResumeGate, UnrepeatableTool, call_id, resumes, takes_first_commit,
+    RestartReport, ResumeGate, ResumePointKind, RoundSet, UnrepeatableTool, call_id, resumes,
+    takes_first_commit,
 };
 
-/// Rounds of every row's run.
+/// Rounds of every row's run in the long run chapter.
 const ROUNDS: u64 = 5;
 /// Tool calls of each round but the last.
 const CALLS: u32 = 2;
@@ -38,15 +49,9 @@ const fn plan(kill_round: u64, kill_point: KillPoint, before_resume: BeforeResum
         calls_per_round: CALLS,
         kill_round,
         kill_point,
-        compact_in_kill_round: false,
+        compactions: RoundSet::EMPTY,
+        image_rounds: RoundSet::EMPTY,
         before_resume,
-    }
-}
-
-const fn compacting(kill_round: u64, kill_point: KillPoint) -> LongRunPlan {
-    LongRunPlan {
-        compact_in_kill_round: true,
-        ..plan(kill_round, kill_point, BeforeResume::Nothing)
     }
 }
 
@@ -58,6 +63,28 @@ const fn unrepeatable(kill_round: u64, tool: UnrepeatableTool) -> LongRunPlan {
     )
 }
 
+const fn with_image(kill_round: u64, kill_point: KillPoint) -> LongRunPlan {
+    LongRunPlan {
+        image_rounds: RoundSet::EMPTY.with(kill_round),
+        ..plan(kill_round, kill_point, BeforeResume::Nothing)
+    }
+}
+
+/// A run of `rounds` rounds that compacts before each round in
+/// `compactions` and is killed at `kill_point` of `kill_round`.
+const fn compacted(
+    rounds: u64,
+    compactions: RoundSet,
+    kill_round: u64,
+    kill_point: KillPoint,
+) -> LongRunPlan {
+    LongRunPlan {
+        rounds,
+        compactions,
+        ..plan(kill_round, kill_point, BeforeResume::Nothing)
+    }
+}
+
 /// The long run rows, by step name.
 const LONG_RUN_ROWS: [(&str, LongRunPlan); 16] = [
     (
@@ -65,7 +92,7 @@ const LONG_RUN_ROWS: [(&str, LongRunPlan); 16] = [
         plan(0, KillPoint::ModelCall, BeforeResume::Nothing),
     ),
     (
-        "first_round_tools_requeue",
+        "first_round_tools",
         plan(0, KillPoint::DuringTools, BeforeResume::Nothing),
     ),
     (
@@ -100,13 +127,10 @@ const LONG_RUN_ROWS: [(&str, LongRunPlan); 16] = [
         "during_callback_tools",
         plan(2, KillPoint::DuringCallbackTools, BeforeResume::Nothing),
     ),
+    ("image_round_tools", with_image(2, KillPoint::DuringTools)),
     (
-        "compaction_round_model_call",
-        compacting(3, KillPoint::ModelCall),
-    ),
-    (
-        "compaction_round_tools",
-        compacting(3, KillPoint::DuringTools),
+        "first_round_image_tools_requeue",
+        with_image(0, KillPoint::DuringTools),
     ),
     (
         "last_round_model_call",
@@ -126,42 +150,82 @@ const LONG_RUN_ROWS: [(&str, LongRunPlan); 16] = [
     ),
 ];
 
-/// The durable worker rows, by step name.
-const DURABLE_WORKER_ROWS: [(&str, LongRunPlan, ResumeGate); 5] = [
+/// The compacted long run rows, by step name.
+const COMPACTED_ROWS: [(&str, LongRunPlan); 7] = [
     (
-        "worker_resumes",
-        plan(1, KillPoint::DuringTools, BeforeResume::Nothing),
-        ResumeGate::Absent,
+        "five_compactions_then_tools",
+        compacted(
+            10,
+            RoundSet::EMPTY.with(2).with(3).with(4).with(5).with(6),
+            8,
+            KillPoint::DuringTools,
+        ),
     ),
     (
-        "worker_gate_continues",
-        plan(2, KillPoint::BeforeDispatch, BeforeResume::Nothing),
-        ResumeGate::Continue,
+        "kill_right_after_compaction",
+        compacted(6, RoundSet::EMPTY.with(3), 3, KillPoint::ModelCall),
     ),
     (
-        "worker_gate_superseded",
-        plan(1, KillPoint::DuringTools, BeforeResume::Nothing),
-        ResumeGate::Superseded,
+        "compaction_round_tools",
+        compacted(6, RoundSet::EMPTY.with(3), 3, KillPoint::DuringTools),
     ),
     (
-        "worker_gate_unavailable",
-        plan(1, KillPoint::DuringTools, BeforeResume::Nothing),
-        ResumeGate::Unavailable,
+        "kill_rounds_after_compaction",
+        compacted(8, RoundSet::EMPTY.with(2), 5, KillPoint::DuringTools),
     ),
     (
-        "worker_gate_unavailable_once",
-        plan(2, KillPoint::DuringTools, BeforeResume::Nothing),
-        ResumeGate::UnavailableOnce,
+        "four_compactions",
+        compacted(
+            9,
+            RoundSet::EMPTY.with(1).with(3).with(5).with(7),
+            6,
+            KillPoint::BeforeDispatch,
+        ),
+    ),
+    (
+        "kill_after_last_of_four_compactions",
+        compacted(
+            9,
+            RoundSet::EMPTY.with(1).with(3).with(5).with(7),
+            8,
+            KillPoint::ModelCall,
+        ),
+    ),
+    (
+        "compaction_racing_another_writer_requeues",
+        compacted(6, RoundSet::EMPTY.with(3), 3, KillPoint::RebaseRace),
     ),
 ];
 
 /// Long run chapter: every kill point of a round, unrepeatable and callback
-/// tools, compaction rounds, the first and last rounds, a queued input, and
-/// a stop or retire before the resume.
+/// tools, image rounds, the first and last rounds, a queued input, and a
+/// stop or retire before the resume. No row compacts.
 pub async fn long_run(harness: &dyn LongRunHarness) -> Result<(), ConformanceFailure> {
-    let steps = Steps::chapter("long_run");
+    run_rows(harness, Steps::chapter("long_run"), &LONG_RUN_ROWS).await
+}
+
+/// Compacted long run chapter: runs that compact once or several times,
+/// killed right after a compaction, during the tools of the round after
+/// it, rounds later, and after the last of five compactions. Each resumes
+/// at its last committed round, never at a round before a compaction, and
+/// finishes. This is the acceptance row for durable rounds on a host store
+/// whose sessions are whole documents.
+pub async fn compacted_long_run(harness: &dyn LongRunHarness) -> Result<(), ConformanceFailure> {
+    run_rows(
+        harness,
+        Steps::chapter("compacted_long_run"),
+        &COMPACTED_ROWS,
+    )
+    .await
+}
+
+async fn run_rows(
+    harness: &dyn LongRunHarness,
+    steps: Steps,
+    rows: &[(&'static str, LongRunPlan)],
+) -> Result<(), ConformanceFailure> {
     let expect_lease_wait = harness.fence_leases();
-    for (step, plan) in LONG_RUN_ROWS {
+    for (step, plan) in rows.iter().copied() {
         let killed = harness.run_and_kill(&plan).await?;
         check_killed(&steps, step, &plan, &killed)?;
         let report = harness.restart(&plan).await?;
@@ -233,7 +297,10 @@ fn calls_of(plan: &LongRunPlan, round: u64) -> Vec<String> {
 /// without calling the model: the round's first commit is durable and the
 /// kill came after it.
 fn resumes_with_tools_pending(plan: &LongRunPlan) -> bool {
-    plan.kill_point != KillPoint::ModelCall && takes_first_commit(plan, plan.kill_round)
+    !matches!(
+        plan.kill_point,
+        KillPoint::ModelCall | KillPoint::RebaseRace
+    ) && takes_first_commit(plan, plan.kill_round)
 }
 
 /// The kill round's started call that gets the interrupted result instead
@@ -266,7 +333,7 @@ fn check_killed(
         let in_kill_round_too_early = key.round == plan.kill_round
             && matches!(
                 plan.kill_point,
-                KillPoint::ModelCall | KillPoint::BeforeDispatch
+                KillPoint::ModelCall | KillPoint::BeforeDispatch | KillPoint::RebaseRace
             );
         steps.ensure(
             step,
@@ -399,28 +466,21 @@ fn check_restart(
                 resumed.run_id, killed.run_id
             ),
         )?;
-        let point_fits = match &resumed.resume_point {
-            RunResumePoint::ToolsPending { assistant_message } => {
-                tools_pending
-                    && assistant_message
-                        .tool_calls()
-                        .map(|call| call.id.to_string())
-                        .collect::<Vec<_>>()
-                        == calls_of(plan, kill_round)
-            }
-            RunResumePoint::AwaitingModel => !tools_pending,
+        // The cursor's round is the round of the last commit: the round
+        // whose calls are pending, or the round before the one the model is
+        // asked for.
+        let (expected_point, expected_round) = if tools_pending {
+            (ResumePointKind::ToolsPending, Some(kill_round))
+        } else {
+            (ResumePointKind::AwaitingModel, kill_round.checked_sub(1))
         };
         steps.ensure(
             step,
-            point_fits,
+            resumed.resume_point == expected_point && Some(resumed.round) == expected_round,
             format!(
-                "the run resumed at {:?}; expected {} for round {kill_round}",
-                resumed.resume_point,
-                if tools_pending {
-                    "the staged message with that round's calls"
-                } else {
-                    "awaiting the model"
-                }
+                "the run resumed at {:?} of round {}; expected {expected_point:?} of round {expected_round:?}, \
+                 the last committed round",
+                resumed.resume_point, resumed.round
             ),
         )?;
     } else {
@@ -504,10 +564,12 @@ fn check_restart(
     // order, each call's result once, and the input has one receipt.
     let rounds = &report.transcript_rounds;
     let consecutive = rounds.windows(2).all(|pair| pair[1] == pair[0] + 1);
-    let starts_right = match rounds.first() {
-        Some(first) if plan.compact_in_kill_round => *first <= kill_round,
-        Some(first) => *first == 0,
-        None => false,
+    // A compaction may fold the rounds before it into its summary, never the
+    // rounds after the last one.
+    let starts_right = match (rounds.first(), plan.compactions.last()) {
+        (Some(first), Some(last_compaction)) => *first <= last_compaction,
+        (Some(first), None) => *first == 0,
+        (None, _) => false,
     };
     steps.ensure(
         step,
@@ -537,6 +599,15 @@ fn check_restart(
         format!(
             "the input has {} run receipts, expected exactly one",
             report.receipts
+        ),
+    )?;
+    let other_writer_messages = usize::from(plan.kill_point == KillPoint::RebaseRace);
+    steps.ensure(
+        step,
+        report.other_writer_messages == other_writer_messages,
+        format!(
+            "the final transcript holds {} messages of the other writer, expected {other_writer_messages}",
+            report.other_writer_messages
         ),
     )?;
     steps.ensure(

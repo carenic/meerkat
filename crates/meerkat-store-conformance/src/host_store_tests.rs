@@ -17,15 +17,13 @@ use meerkat_core::host_store::{
     HostStoreError, Row, RowIndex, ScopeKind, ScopeName, ScopeRef, ScopeUpdate, ScopeVersion,
     VersionedHead,
 };
-use meerkat_core::{
-    AssistantBlock, BlockAssistantMessage, RunId, RunResumePoint, StopReason, ToolCallDedupeKey,
-};
+use meerkat_core::{RunId, ToolCallDedupeKey};
 use serde_json::value::RawValue;
 
 use crate::long_run::{
     BeforeResume, DurableWorkerHarness, KillPoint, KilledRun, KilledWorker, LongRunHarness,
-    LongRunPlan, RestartReport, RestartedWorker, ResumeGate, ResumedRun, call_id, resumes,
-    takes_first_commit,
+    LongRunPlan, RestartReport, RestartedWorker, ResumeGate, ResumePointKind, ResumedRun, RoundSet,
+    call_id, resumes, takes_first_commit,
 };
 use crate::{ConformanceFailure, HostStoreFactory, InMemoryHostStore, chapters};
 
@@ -522,19 +520,6 @@ impl ScriptedCore {
             .expect("valid arguments")
     }
 
-    fn staged_message(plan: &LongRunPlan, round: u64) -> BlockAssistantMessage {
-        let blocks = Self::calls(plan, round)
-            .into_iter()
-            .map(|id| AssistantBlock::ToolUse {
-                args: Self::arguments(&id),
-                id,
-                name: "scripted_tool".to_string(),
-                meta: None,
-            })
-            .collect();
-        BlockAssistantMessage::new(blocks, StopReason::ToolUse)
-    }
-
     fn kill(&self, plan: &LongRunPlan) -> KilledRun {
         let run_id = RunId::new();
         *self.run_id.lock().unwrap_or_else(PoisonError::into_inner) = Some(run_id.clone());
@@ -572,6 +557,7 @@ impl ScriptedCore {
             transcript_rounds: Vec::new(),
             transcript_results: Vec::new(),
             receipts: 0,
+            other_writer_messages: 0,
             inputs_settled: true,
         }
     }
@@ -591,8 +577,12 @@ impl ScriptedCore {
             .unwrap_or_else(RunId::new);
         let kill_round = plan.kill_round;
         let resumed_run = resumes(plan);
+        let race = plan.kill_point == KillPoint::RebaseRace;
         let tools_pending = resumed_run
-            && plan.kill_point != KillPoint::ModelCall
+            && !matches!(
+                plan.kill_point,
+                KillPoint::ModelCall | KillPoint::RebaseRace
+            )
             && takes_first_commit(plan, kill_round);
         let input_run = if resumed_run {
             killed_run
@@ -621,25 +611,26 @@ impl ScriptedCore {
             .filter(|(_, call)| interrupted.as_ref() != Some(call))
             .map(|(round, call)| Self::key(&input_run, round, call))
             .collect();
-        let first_transcript_round = if plan.compact_in_kill_round {
-            kill_round
-        } else {
-            0
-        };
+        let first_transcript_round = plan.compactions.last().unwrap_or(0);
         let transcript_rounds: Vec<u64> = (first_transcript_round..plan.rounds).collect();
         let transcript_results = transcript_rounds
             .iter()
             .flat_map(|round| Self::calls(plan, *round))
             .collect();
-        let resumed = resumed_run.then(|| ResumedRun {
-            run_id: input_run.clone(),
-            resume_point: if tools_pending {
-                RunResumePoint::ToolsPending {
-                    assistant_message: Self::staged_message(plan, kill_round),
+        let resumed = resumed_run.then(|| {
+            if tools_pending {
+                ResumedRun {
+                    run_id: input_run.clone(),
+                    round: kill_round,
+                    resume_point: ResumePointKind::ToolsPending,
                 }
             } else {
-                RunResumePoint::AwaitingModel
-            },
+                ResumedRun {
+                    run_id: input_run.clone(),
+                    round: kill_round.saturating_sub(1),
+                    resume_point: ResumePointKind::AwaitingModel,
+                }
+            }
         });
         RestartReport {
             resumed,
@@ -651,6 +642,7 @@ impl ScriptedCore {
             transcript_rounds,
             transcript_results,
             receipts: 1,
+            other_writer_messages: usize::from(race),
             inputs_settled: true,
         }
     }
@@ -710,6 +702,9 @@ async fn long_run_chapter_accepts_a_core_that_resumes_as_the_contract_says() {
     chapters::long_run(&ScriptedCore::new(false))
         .await
         .expect("a contract Core passes the long run chapter");
+    chapters::compacted_long_run(&ScriptedCore::new(false))
+        .await
+        .expect("a contract Core passes the compacted long run chapter");
     chapters::durable_worker(&ScriptedCore::new(false))
         .await
         .expect("a contract Core passes the durable worker chapter");
@@ -721,7 +716,7 @@ async fn long_run_chapter_refuses_a_core_that_calls_the_model_again() {
         .await
         .expect_err("calling the model again for a committed round must fail");
     assert_eq!(failure.chapter(), "long_run");
-    assert_eq!(failure.step(), "before_dispatch");
+    assert_eq!(failure.step(), "first_round_tools");
 }
 
 #[test]
@@ -731,26 +726,57 @@ fn first_commit_rule() {
         calls_per_round: 2,
         kill_round: 3,
         kill_point: KillPoint::DuringTools,
-        compact_in_kill_round: false,
+        compactions: RoundSet::EMPTY.with(3),
+        image_rounds: RoundSet::EMPTY,
         before_resume: BeforeResume::Nothing,
     };
-    assert!(!takes_first_commit(&plain, 0));
-    assert!(takes_first_commit(&plain, 1));
+    // Every tool round takes its first commit, round 0, the round after a
+    // compaction and a callback batch included.
+    assert!(takes_first_commit(&plain, 0));
     assert!(takes_first_commit(&plain, 3));
-    let compacted = LongRunPlan {
-        compact_in_kill_round: true,
+    assert!(takes_first_commit(
+        &LongRunPlan {
+            kill_point: KillPoint::DuringCallbackTools,
+            ..plain
+        },
+        3
+    ));
+    // A round whose assistant message carries an image takes none.
+    let image = LongRunPlan {
+        image_rounds: RoundSet::EMPTY.with(3),
         ..plain
     };
-    assert!(!takes_first_commit(&compacted, 3));
-    assert!(takes_first_commit(&compacted, 2));
-    let callbacks = LongRunPlan {
-        kill_point: KillPoint::DuringCallbackTools,
-        ..plain
-    };
-    assert!(!takes_first_commit(&callbacks, 3));
+    assert!(!takes_first_commit(&image, 3));
+    assert!(takes_first_commit(&image, 2));
+    // Round 0 resumes after its first commit; a kill during its model call,
+    // a round 0 image round and a compaction race requeue.
     assert!(resumes(&plain));
-    assert!(!resumes(&LongRunPlan {
+    let first_round = LongRunPlan {
         kill_round: 0,
         ..plain
+    };
+    assert!(resumes(&first_round));
+    assert!(!resumes(&LongRunPlan {
+        kill_point: KillPoint::ModelCall,
+        ..first_round
     }));
+    assert!(!resumes(&LongRunPlan {
+        image_rounds: RoundSet::EMPTY.with(0),
+        ..first_round
+    }));
+    assert!(!resumes(&LongRunPlan {
+        kill_point: KillPoint::RebaseRace,
+        ..plain
+    }));
+}
+
+#[test]
+fn round_sets() {
+    let set = RoundSet::EMPTY.with(2).with(6).with(4);
+    assert!(set.contains(2) && set.contains(4) && set.contains(6));
+    assert!(!set.contains(3) && !set.contains(64));
+    assert_eq!(set.last(), Some(6));
+    assert_eq!(set.len(), 3);
+    assert!(RoundSet::EMPTY.is_empty() && RoundSet::EMPTY.last().is_none());
+    assert_eq!(RoundSet::EMPTY.with(64), RoundSet::EMPTY);
 }

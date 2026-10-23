@@ -19,6 +19,7 @@
 //! | [`artifacts`]                              | `ArtifactStore` |
 //! | [`host_store`]                             | every `meerkat_core::host_store::HostStore` |
 //! | [`long_run`] / [`durable_worker`]          | Core over a store: a killed run or durable worker resumes |
+//! | [`compacted_long_run`]                     | Core over a store: a run killed after compactions resumes at its last committed round |
 
 mod append_only;
 mod artifacts;
@@ -39,5 +40,5 @@ pub use capability::assert_forwards_incremental;
 pub use guarded_projection::guarded_projection;
 pub use host_store::host_store;
 pub use incremental::{incremental, incremental_head_canonical};
-pub use long_run::{durable_worker, long_run};
+pub use long_run::{compacted_long_run, durable_worker, long_run};
 pub use transcript_rewrite::transcript_rewrite;
