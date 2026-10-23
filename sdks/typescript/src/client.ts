@@ -383,6 +383,7 @@ import type {
   MobReconcileOptionsWire as RpcMobReconcileOptionsWire,
   ContentBlock as RpcCommsContentBlock,
   CommsPeerRequestParams as RpcCommsPeerRequestParams,
+  WireMobDestroyReport,
 } from "./generated/types.js";
 import { DeferredSession, Session } from "./session.js";
 import {
@@ -406,6 +407,7 @@ import {
 } from "./mob.js";
 import { parseAgentEventEnvelope } from "./event-envelope.js";
 import { isCommsSendErrorCode } from "./comms-errors.js";
+import { parseMobDestroyReport } from "./mob-destroy-report.js";
 import { EventStream, AsyncQueue } from "./streaming.js";
 import { parseUsage } from "./events.js";
 import type { RealtimeMessageOrigin } from "./events.js";
@@ -3291,11 +3293,15 @@ export class MeerkatClient {
    * Wraps the `mob/destroy` RPC (DELETE_ME C3). Unlike `mob/lifecycle`
    * with `action: "destroy"`, this dedicated endpoint has a predictable
    * response shape that does not require branching on an action string.
+   * A refusal `kind` this SDK does not know reads as `{ kind: "unknown" }`.
+   * A destroy that did not finish rejects with code
+   * `mob_destroy_incomplete`; `mobDestroyIncompleteReport(err)` reads its
+   * report.
    */
   async mobDestroy(mobId: string): Promise<{
     mobId: string;
     ok: boolean;
-    destroyReport: Record<string, unknown>;
+    destroyReport: WireMobDestroyReport;
   }> {
     const result = await this.request("mob/destroy", { mob_id: mobId });
     if (
@@ -3307,6 +3313,13 @@ export class MeerkatClient {
         "Invalid mob/destroy response: missing ok or destroy_report",
       );
     }
+    const destroyReport = parseMobDestroyReport(result.destroy_report);
+    if (destroyReport === undefined) {
+      throw new MeerkatError(
+        "INVALID_RESPONSE",
+        "Invalid mob/destroy response: malformed destroy_report",
+      );
+    }
     return {
       mobId: MeerkatClient.requireStringField(
         result,
@@ -3314,7 +3327,7 @@ export class MeerkatClient {
         "Invalid mob/destroy response: missing mob_id",
       ),
       ok: result.ok,
-      destroyReport: result.destroy_report as Record<string, unknown>,
+      destroyReport,
     };
   }
 

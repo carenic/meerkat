@@ -361,6 +361,7 @@ export type {
   CommsSendRequiredAction,
 } from "./generated/types.js";
 export { COMMS_SEND_ERROR_CODES, commsSendError } from "./comms-errors.js";
+export { mobDestroyIncompleteReport } from "./mob-destroy-report.js";
 export { BinaryIntegrityError } from "./binary-errors.js";
 export type { BinaryIntegrityFailure } from "./binary-errors.js";
 
@@ -595,7 +596,13 @@ export type {
   WireMemberPreviewUnavailable,
   WireMemberRef,
   WireMemberRegistrationHookCall,
+  WireMemberReloadRefusal,
+  WireMemberReloadRefusalRepairBlocked,
+  WireMemberReloadRefusalUnknown,
   WireMobBackendKind,
+  WireMobDestroyIncompleteData,
+  WireMobDestroyMemberRefusal,
+  WireMobDestroyReport,
   WireMobMemberStatus,
   WireMobProfile,
   WireMobRuntimeMode,
