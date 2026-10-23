@@ -623,8 +623,9 @@ them.
   least one renew interval plus twice the store's visibility lag) and its
   longest commit (`FenceTiming::try_with_max_commit_latency`, 2 s by
   default), which bounds how long a fenced write waits for a commit in
-  flight before it backs off; `SelfFence` reports a writer's window. An exclusive acquire refuses typed
-  (`HostStoreError::Held`) while another holder's lease lasts, a takeover's
+  flight before it backs off; `SelfFence` reports a writer's window. An
+  exclusive acquire refuses typed (`HostStoreError::Held`) while another
+  holder's lease lasts, a takeover's
   `FenceGrant` says how long the new writer waits before it dispatches
   anything, and a holder whose renew failed or whose window closed acquires
   again before it resumes.

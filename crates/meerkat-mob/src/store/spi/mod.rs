@@ -196,6 +196,16 @@ const G_STATUS: &str = "st";
 type EntryBytes = Arc<Vec<u8>>;
 type Changes = Vec<(String, Option<EntryBytes>)>;
 
+/// How the in-memory call of a [`Bundle::write_whole`] failed.
+enum WriteFailure {
+    /// An ordinary refusal: whatever the call changed is committed, as
+    /// [`Bundle::write`] commits it.
+    Failed(MobStoreError),
+    /// The call changed only part of a change that must land whole: nothing
+    /// is committed, and every scope the call locked is poisoned.
+    Torn(MobStoreError),
+}
+
 fn write_error(error: SpiError) -> MobStoreError {
     MobStoreError::WriteFailed(format!("host store: {error}"))
 }
@@ -805,6 +815,21 @@ impl Bundle {
     where
         F: Future<Output = Result<T, MobStoreError>>,
     {
+        self.write_whole(
+            touch,
+            async move { write.await.map_err(WriteFailure::Failed) },
+        )
+        .await
+    }
+
+    /// [`Self::write`] for a call that can tell a torn change apart: one
+    /// that answers [`WriteFailure::Torn`] commits nothing and poisons every
+    /// scope it locked, since memory then holds only part of a change that
+    /// must land whole.
+    async fn write_whole<T, F>(self: &Arc<Self>, touch: Touch, write: F) -> Result<T, MobStoreError>
+    where
+        F: Future<Output = Result<T, WriteFailure>>,
+    {
         self.realm.ensure_lease().await.map_err(write_error)?;
         let guards = self.realm.lock_scopes(&self.scope_ids(touch.locks())).await;
         let mut scopes = ArmedScopes::new(Arc::clone(&self.realm), guards);
@@ -816,7 +841,18 @@ impl Bundle {
             .map_err(write_error)?;
         self.realm.ensure_lease().await.map_err(write_error)?;
         scopes.arm();
-        let out = write.await;
+        let out = match write.await {
+            Ok(value) => Ok(value),
+            Err(WriteFailure::Failed(error)) => Err(error),
+            Err(WriteFailure::Torn(error)) => {
+                let cause = error.to_string();
+                for guard in scopes.guards_mut() {
+                    self.realm.poison(guard, &cause);
+                }
+                scopes.disarm();
+                return Err(error);
+            }
+        };
         // Even a failed in-memory call is exported: the journal writes
         // nothing when no bytes changed, and a partial change is never left
         // unwritten.
@@ -1418,8 +1454,9 @@ impl Bundle {
             } else if tag == MOB_STATUS_FAMILY.tag {
                 self.import_statuses(&body).await?;
             }
-            // A load that fails or is dropped discards this fresh bundle,
-            // and the scope stays unloaded until a load completes.
+            // The scope counts as loaded once its import completed. A load
+            // that fails or is dropped discards this fresh bundle, and the
+            // next open loads every scope again.
             guard.mark_loaded();
         }
         let last = self
@@ -1815,7 +1852,8 @@ impl SpiMobStoreHost {
                     .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
             )
         };
-        let _opening = gate.lock().await;
+        // Held until the deletes settled, on the task below when they run.
+        let opening = gate.lock_owned().await;
         if lock_std(&self.inner.open)
             .get(storage_key)
             .is_some_and(|bundle| bundle.strong_count() > 0)
@@ -1846,6 +1884,7 @@ impl SpiMobStoreHost {
         let inner = Arc::clone(&self.inner);
         let storage_key = storage_key.to_string();
         let settle = tokio::spawn(async move {
+            let _opening = opening;
             let mut scopes = scopes;
             scopes.arm();
             let outcome = scopes.commit_in_place(deltas).await;
