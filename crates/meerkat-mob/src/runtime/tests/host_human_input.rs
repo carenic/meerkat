@@ -4545,16 +4545,20 @@ async fn a_crash_mid_drain_leaves_the_queued_input_for_the_restarted_mob() {
     let events_at_crash = stop_events(&root_path, &session_id).await.len();
 
     incarnation.crash().await;
-    // The kill landed: the actor is gone and the drain never returned.
+    // The kill landed: the actor is gone and the drain never returned. Only
+    // the durable runtime store survives a crash: the incarnation's handle,
+    // its runtime adapter and its session service are in-memory state, and
+    // they go with it.
     let StopHost {
         handle,
         runtime_store,
+        adapter,
         service,
     } = host;
     let actor_gone = handle.command_tx.is_closed();
     let drain_cancelled = drain.await.err().is_some_and(|error| error.is_cancelled());
     let mob_id = handle.mob_id().clone();
-    drop((handle, service));
+    drop((handle, adapter, service));
     let inputs: Vec<_> = inputs
         .into_iter()
         .map(|(key, input_id, spec, waiter)| {
