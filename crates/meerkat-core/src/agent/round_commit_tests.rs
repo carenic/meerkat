@@ -1114,4 +1114,9 @@ fn the_dedupe_key_tells_a_reused_call_id_apart() {
         context.tool_call_dedupe_key(view(&other_args)),
         "a reused call id with other arguments has another key"
     );
+    context.clear_round();
+    assert!(
+        context.tool_call_dedupe_key(view(&first_args)).is_none(),
+        "a call dispatched between rounds carries no key"
+    );
 }

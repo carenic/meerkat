@@ -841,7 +841,8 @@ pub struct ToolDispatchContext {
     run_id: Option<crate::RunId>,
     /// Zero-based index of the run's round this dispatch belongs to. Bound
     /// with the run id by the agent loop for every tool round, so a call has
-    /// one dedupe key whether it runs fresh or again after a resume.
+    /// one dedupe key whether it runs fresh or again after a resume, and
+    /// cleared once the round's calls are collected.
     round: Option<u64>,
     streaming: Option<crate::ToolStreamingDispatchContext>,
     live_bridge_admission: Option<LiveBridgeToolDispatchAdmission>,
@@ -2198,6 +2199,12 @@ impl ToolDispatchContext {
 
     pub(crate) fn bind_round(&mut self, round: u64) {
         self.round = Some(round);
+    }
+
+    /// The round's calls are dispatched and their outcomes collected: a call
+    /// the host dispatches outside a round carries no dedupe key.
+    pub(crate) fn clear_round(&mut self) {
+        self.round = None;
     }
 
     /// The deduplication key of one call of this dispatch's round.
