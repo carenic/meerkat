@@ -589,12 +589,15 @@ mount a SQLite runtime companion for runtime authority:
 documents. Queued inputs, run-boundary receipts, ops snapshots, and
 auth-lease/OAuth-flow authority are durable under both backends.
 The `memory` backend is explicit ephemeral storage and does not survive process
-restart.
+restart. Since 0.9.5 a host can also keep a realm's durable state in its own
+database through the [host store SPI](/reference/host-store-spi).
 
 - Completed turns are persisted.
-- Crash during an in-flight turn loses at most the work the intra-turn
-  persistence hook had not yet written; any durable tail it did write is
-  preserved and recovered (see below), never discarded.
+- Since 0.9.5 a run commits after every tool round, and after a crash the
+  run continues from its last committed round under the same run id (see
+  [Durable runs](/guides/durable-runs)). A crash loses at most the round in
+  progress; any durable tail is preserved and recovered (see below), never
+  discarded.
 - SQLite-backed realms are the default persistent mode and support normal same-realm multi-process workflows. Declare `[storage] hosting = "multiprocess"` so each session is hosted by one process and deliveries route to it (see [Realms: multi-process hosting](/concepts/realms#multi-process-hosting)).
 
 Persistent session metadata is the source of truth for resumed durable session behavior unless an interactive surface supplies an explicit typed override.
@@ -705,17 +708,19 @@ an uncertain outcome or failed acknowledgement terminates the actor and
 requires durable reload. At the final boundary the store promotes that exact
 candidate. It does not construct a second document or replay the delta.
 
-A HeadCanonical run that compacts more often than `history_retained_rewrites`
-keeps also saves an intra-run checkpoint at the next model boundary after its
-own tool results, so its durable head covers those rewrites and the live
-history retires to the retention. Such a checkpoint's tail always ends with the
-run's own tool call and its results, never with a compaction summary. Intra-run
-checkpoints never prune stored rewrite rows, so the committed boundary stays
-rebuildable for recovery; the boundary commit that promotes the run applies the
-run's retention cut in the same transaction, never past the promoted head's
-row-lineage anchor. A crash after such a checkpoint recovers the run as
-interrupted (see below): its content up to the checkpoint is kept and its input
-is not run again.
+Since 0.9.5 every tool round's second commit is an intra-run checkpoint (see
+[Durable runs](/guides/durable-runs#what-a-round-commits)); the round's first
+commit stages the model's response in the session's run cursor and writes no
+transcript row. On HeadCanonical each such checkpoint moves the durable head
+over the run's rewrites, so a run that compacts more often than
+`history_retained_rewrites` keeps retires its live history to the retention.
+Such a checkpoint's tail always ends with the run's own tool call and its
+results, never with a compaction summary. Intra-run checkpoints never prune
+stored rewrite rows, so the committed boundary stays rebuildable for recovery;
+the boundary commit that promotes the run applies the run's retention cut in
+the same transaction, never past the promoted head's row-lineage anchor. A
+crash after such a checkpoint continues the run (see below); before 0.9.5 it
+closed the run as interrupted.
 
 A crash or shutdown race can still leave a durable transcript tail — up to and
 including a fully completed turn — whose runtime boundary commit never landed.
@@ -727,6 +732,22 @@ recovery required, or quarantine) instead of a shell comparison.
 The recovery rule is never-discard: every store-proven durable descendant of
 the committed authority is preserved.
 
+- Since 0.9.5 a continuable tail is not closed. A tail is continuable when it
+  carries the run cursor of the open run and agrees with it (after a round's
+  first commit, the staged response is not in the transcript yet), every input
+  bound to the run is still bound to it, and the runtime is not retired. A
+  tail with no assistant row, such as one written by the first commit of a
+  run's first round or of the round after a compaction, is continuable only
+  on that cursor's evidence: it holds no tool result, the cursor names the
+  store-issued run id with none of its staged calls in the tail, and the store
+  proves the tail's descent. Recovery then writes nothing and settles nothing,
+  and the run continues from its last committed round under the same run id
+  (see [Durable runs](/guides/durable-runs#after-a-crash)). A cursor never
+  turns a tail that would otherwise be held into a continuable one, and a
+  cursor inside a committed body never makes a run continuable. A cursor tail
+  whose bound inputs were settled or requeued, whose run has no bound inputs
+  (a direct or machine-service turn), or whose runtime was retired is closed
+  as interrupted.
 - A completed tail (single run, `EndTurn` terminal, structurally coherent) is
   committed as a recovered run boundary in one atomic store transaction:
   recovered snapshot, boundary receipt, and input terminalization land
@@ -753,8 +774,11 @@ whose live tail holds no message of the run (an empty live tail) is held, and
 so is a tail whose rewrite descent the store cannot prove. Both fail resume
 with `SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY`, never with internal-error
 prose, and recovery never closes such a tail on the store-issued run identity
-alone. Meerkat's own checkpoints never write either shape: a checkpoint
-follows a model response, and the writer proves the descent before it writes.
+alone. Meerkat's own checkpoints never write either shape without a run
+cursor: a checkpoint follows a model response, and the writer proves the
+descent before it writes. Since 0.9.5, on HeadCanonical, the first commit of
+the round after a compaction writes an empty live tail with the run's cursor,
+and recovery continues the run from it as described above.
 Such a hold therefore points to a store changed outside Meerkat. The
 session's committed history stays readable and its durable tail is kept
 intact. Keep a copy of the realm's store for diagnosis, and continue the work

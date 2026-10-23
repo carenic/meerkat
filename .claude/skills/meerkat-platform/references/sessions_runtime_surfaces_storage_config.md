@@ -73,6 +73,39 @@ hint):
 | `jsonl` | Inspectable session files; schedules are disabled on this backend |
 | `memory` | Explicitly ephemeral; nothing survives the process |
 
+Since 0.9.5 every tool round of a durable run commits twice (durable runs in
+`references/sessions_runtime_surfaces_sessions.md`). On `sqlite` a commit
+writes the round's rows; on `jsonl` (WholeBlob) it writes the whole session
+document, so long, tool-heavy runs belong on `sqlite`.
+
+Host stores (0.9.5): a Rust host can keep a realm's durable state in its own
+database by implementing `meerkat_core::host_store::HostStore` (`acquire_fence`,
+`renew_fence`, `fence_timing`, `load_head`, `list_heads`, `read_rows`,
+`commit`). Core builds the realm's stores over it and stays its only writer.
+Contract, obligations and conformance: `docs/reference/host-store-spi.mdx`.
+
+- Fence: opening acquires it exclusively, and a live holder makes the open
+  fail with `Held { holder, remaining }`. A takeover supersedes the holder,
+  then waits out what remained of its lease before serving anything. Core
+  renews every renew interval (default 10 s, at least 1 s) under a lease
+  (default 30 s, from 3 intervals to 1 hour) that the store sizes with
+  `fence_timing()`, and writes only while its last successful acquire or
+  renew started less than the lease minus one interval ago. `FencedOut`
+  stops every write until the realm is reopened; another failed renew stops
+  writes until a renew succeeds.
+- Opening lists every head once. A session body loads at open only when
+  recovery must act on it (unsettled inputs, an open run cursor, a current
+  run), otherwise on first use, and stays loaded until the session is
+  archived.
+- Limits: 8 MiB of heads and rows per batch, 1 MiB per row; Core chunks
+  larger values itself. An unknown commit outcome is settled before the
+  scope's next version. A refused batch, or one still unknown after the retry
+  budget, poisons the scopes it touched until the realm is reopened.
+- The runtime store is WholeBlob, with the cost and the post-compaction rule
+  above. An interactive OAuth login in progress is process-local: after a
+  restart or a takeover, start it again; completed credentials are kept.
+- Test a store with the host store chapter of `meerkat-store-conformance`.
+
 On a JSONL realm, if the session index (`sessions_jsonl/session_index.sqlite3`)
 fails to update after a committed save or delete, the write stays committed
 but session listing refuses with `refusing session.list: projection

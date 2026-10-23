@@ -106,7 +106,10 @@ timestamp_ms, payload}`; `payload.type` is the event type.
 - Run: `run_started` (`identity.run_id`), `run_completed` (`result`, `usage`,
   `extraction_required`, `terminal_cause_kind?`), `run_failed`
   (`error_report {class, reason, message}`), `extraction_succeeded`,
-  `extraction_failed`.
+  `extraction_failed`; since 0.9.5 `run_resumed` (`run_id`, `round`,
+  `resume_point` `tools_pending` or `awaiting_model`) when a run continues
+  after a restart (durable runs in
+  `references/sessions_runtime_surfaces_sessions.md`).
 - Model output: `turn_started`, `text_delta`, `text_complete`,
   `reasoning_delta`, `reasoning_complete`, `server_tool_content`,
   `assistant_image_appended`, `turn_completed` (`stop_reason`, `usage?`; once

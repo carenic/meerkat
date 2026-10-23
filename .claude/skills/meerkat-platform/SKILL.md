@@ -12,8 +12,8 @@ Meerkat (`rkat`) is a library-first agent runtime exposed through multiple surfa
 This guide is an overview. The reference documents below carry the detail; read the matching one before answering a detailed question. On a help surface (`rkat help`, JSON-RPC `help/ask`, REST `POST /help`, MCP `meerkat_help`), read a reference with the `skill_read_resource` tool, passing this skill's `source_uuid` and `skill_name` and the reference path as `path`; `skill_list_resources` lists them.
 
 - `references/api_reference.md` - per-surface methods, schemas, examples (CLI, REST, RPC, MCP, Python/TS/Rust SDKs).
-- `references/sessions_runtime_surfaces_sessions.md` - sessions on every surface: create, resume, list, read, history, archive, turn queueing and the attempt cap, interrupt versus `turn/stop_run`, forks, transcript edits, system prompts, events and replay, ATIF export, durable resume holds and tool-process recovery.
-- `references/sessions_runtime_surfaces_storage_config.md` - realm ids and where state lives, backends, multiprocess hosting, SQLite, `rkat storage`, runtime health and shutdown, WorkGraph limits, schedules, `rkat config` and config keys.
+- `references/sessions_runtime_surfaces_sessions.md` - sessions on every surface: create, resume, list, read, history, archive, turn queueing and the attempt cap, interrupt versus `turn/stop_run`, forks, transcript edits, system prompts, events and replay, ATIF export, durable runs (0.9.5 per-round commits, same-run resume, tool reruns), durable resume holds and tool-process recovery.
+- `references/sessions_runtime_surfaces_storage_config.md` - realm ids and where state lives, backends, host stores (0.9.5), multiprocess hosting, SQLite, `rkat storage`, runtime health and shutdown, WorkGraph limits, schedules, `rkat config` and config keys.
 - `references/sessions_runtime_surfaces_api_changes.md` - JSON-RPC methods and REST routes added or renamed since 0.8.40, the `ErrorCode` table with HTTP statuses and `rkat` exit codes, SDK changes, binaries and installs, Rust embedding, removals.
 - `references/providers_and_auth_models.md` - choosing a provider and model, default models and the catalog, capabilities, thinking and effort, `provider_params` and prompt caching, realtime, voice and image models, self-hosted servers, provider errors, refusals and content filters.
 - `references/providers_and_auth_credentials.md` - env-var API keys, realm backends, auth profiles and bindings, base URLs and cloud routes, credential storage and keychain refusals, every `rkat auth` subcommand, `--auth-binding`, auth RPC/REST/SDK methods and errors, connector OAuth clients.
@@ -1454,6 +1454,10 @@ matching. For the lifecycle on every surface (create, resume with
 `rkat run --resume`, interrupt versus `turn/stop_run`, forks, transcript edits,
 archive, history, event replay, ATIF export, recovery holds and
 `rkat session repair-wholeblob`), load `references/sessions_runtime_surfaces_sessions.md`.
+Since 0.9.5 a run in a durable session commits every tool round and, after a
+crash, continues under the same run id from its last committed round; tool
+calls whose results were not committed run again at least once, keyed by a
+dedupe key (same file, durable runs).
 Storage locations, backends and config are in
 `references/sessions_runtime_surfaces_storage_config.md`.
 

@@ -1243,7 +1243,12 @@ intent on a Rust spawn wins over it. A host older than 0.9.5 refuses a profile
 that sets it.
 
 A durable worker restarts like every member of a persisted mob: it is rebuilt
-on its session, and a run it was in continues from its last committed round.
+on its session, and a run it was in continues from its last committed round
+(see [Durable runs](/guides/durable-runs#after-a-crash)). A host that tracks
+work outside the session, such as a work item another worker may have claimed
+meanwhile, can stop such a run from continuing with a resume gate
+(`MobBuilder::with_durable_resume_gate`); see
+[Durable runs: resume gate](/guides/durable-runs#resume-gate).
 
 ### Member binding history (Rust hosts)
 

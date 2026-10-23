@@ -3138,6 +3138,7 @@ live transport's realtime observations. See
 | Event | Description |
 |-------|-------------|
 | `run_started` | Agent execution began |
+| `run_resumed` | Since 0.9.5: a run continued after a restart from its last committed round, under its original run id; carries `run_id`, `round` and `resume_point` (`tools_pending` or `awaiting_model`). See [Durable runs](/guides/durable-runs#after-a-crash) |
 | `run_completed` | Agent run finished |
 | `extraction_succeeded` | Structured-output extraction succeeded after a completed run; `request_usage` has one usage row per extraction request |
 | `extraction_failed` | Structured-output extraction failed after a completed run; `request_usage` has one usage row per answered extraction request |

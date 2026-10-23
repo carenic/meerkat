@@ -450,6 +450,16 @@ creates at that moment is seen whole or not at all, and a delivery whose
 projection failed is retried on the next delivery wake (see
 [durable jobs](/guides/durable-jobs)).
 
+## Write Volume Of Per-Round Commits
+
+Since 0.9.5 a run in a durable session commits twice per tool round (see
+[Durable runs](/guides/durable-runs)). On a `sqlite` realm, a HeadCanonical
+store, each commit writes the rows the round added. A `jsonl` realm's runtime
+store is WholeBlob: each commit writes the whole session document, so the
+bytes a run writes grow with the square of its tool rounds. A realm kept in a
+host's own database through the [host store SPI](/reference/host-store-spi)
+is WholeBlob as well. Choose a `sqlite` realm for long, tool-heavy runs.
+
 ## Operational Runbook
 
 For an unreadable or refused realm:
@@ -473,5 +483,6 @@ For an unreadable or refused realm:
 - [CLI commands](/cli/commands)
 - [Session contracts](/reference/session-contracts)
 - [Durable jobs and monitors](/guides/durable-jobs)
+- [Durable runs and host stores](/guides/durable-runs)
 - [Upgrading](/guides/upgrading) for the one-way schema migrations each
   release performs, and the 0.8.50 SQLite session data note.
