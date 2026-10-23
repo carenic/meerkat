@@ -2553,6 +2553,16 @@ them.
   (`{"kind": ...}`), keeping every field and future reason kinds. Before, valid events were reported as
   malformed.
 
+- Python SDK: a history row or assistant block whose provider metadata is
+  `open_ai_assistant_message` is read instead of refused. Core has stored
+  that metadata on every OpenAI Responses assistant message with an item id
+  since 0.9.0, but the SDK's closed provider-metadata check did not list it,
+  so reading such a session's history failed with `INVALID_RESPONSE`
+  ("unsupported provider metadata"). The check now takes the variant's `id`,
+  its optional `response_id` and its optional `phase` (`commentary` or
+  `final_answer`), and refuses any other phase. The TypeScript and Web SDKs
+  never refused it.
+
 - `meerkat-mob`: a mob start no longer stops when it cannot restore the
   operation binding of a member whose restore already failed at that start
   because another runtime owner hosts the member's session, its hosting claim
