@@ -115,7 +115,11 @@
 //!   meanwhile may have missed its last renew (the store's visibility lag)
 //!   and seen its lease lapse; a renew that then succeeds proves nothing.
 //!   It resumes only after a fresh fenced acquire, which acquires are
-//!   ordered against: a token higher than any acquired before.
+//!   ordered against: a token higher than any acquired before. This rule is
+//!   Core's, not the store's: a store answers a renew of the current token
+//!   even when the holder's recorded lease lapsed, and refuses only a token
+//!   that was superseded or that it never issued
+//!   ([`HostStore::renew_fence`]).
 //! - A holder fences itself on its own clock: it makes no model call and
 //!   dispatches nothing unless its last successful acquire or renew started
 //!   less than [`FenceTiming::self_fence_window`] ago, the lease minus the
@@ -886,6 +890,13 @@ pub trait HostStore: Send + Sync {
     /// Confirm that no token higher than `token` exists, and record a new
     /// lease for its holder from now ([`HostStore::fence_timing`]).
     /// [`HostStoreError::FencedOut`] stops the caller's writes.
+    ///
+    /// A renew of the current token succeeds even when its holder sat idle
+    /// past its recorded lease: the store refuses only a token that was
+    /// superseded or that it never issued. Whether a holder may resume after
+    /// a failed renew or a lapse is Core's rule (it acquires again; see the
+    /// writer rules in the module documentation), not an obligation of the
+    /// store.
     async fn renew_fence(&self, token: FenceToken) -> Result<(), HostStoreError>;
 
     /// The renew interval and the lease the host chose for this store. The
