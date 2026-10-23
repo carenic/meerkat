@@ -1484,6 +1484,39 @@ pub enum MobError {
         refusal: meerkat_core::ForkInstructionRefusal,
     },
 
+    /// A prompt-context fork of `source_member_id` was refused before
+    /// anything was spawned: the newest row of its planned context does not
+    /// fit the fork context budget for the child's model.
+    #[error(
+        "fork of member '{source_member_id}' refused: its newest context row with the \
+         fork context framing needs {required_bytes} bytes, more than the \
+         {max_bytes}-byte fork context budget; fork with last_messages or from a \
+         source with shorter rows"
+    )]
+    ForkContextTooLarge {
+        source_member_id: AgentIdentity,
+        max_bytes: usize,
+        /// The bytes the newest row needs together with the fork context
+        /// framing (header, fork notice and end marker).
+        required_bytes: usize,
+    },
+
+    /// A prompt-context fork placed on member host `host_id` was not
+    /// spawned: the `HostFeatures` probe that decides how the child is
+    /// given its fork context failed with `cause` (a timeout, the
+    /// transport, admission). Nothing was recorded for the child. A host
+    /// that does not know the probe is not a failure: its child gets the
+    /// context as a prefix of its first prompt. It is classified as
+    /// `cause` everywhere: the failure class, the wire code and detail,
+    /// the rejection cause and the structured data are the cause's. A
+    /// spawn-time probe holds no durable resume and refuses no runtime
+    /// effect.
+    #[error("HostFeatures probe of member host '{host_id}' failed: {cause}")]
+    HostFeaturesProbeFailed {
+        host_id: String,
+        cause: Arc<MobError>,
+    },
+
     /// A restored member's host refused its registration at `call`. The
     /// refused registration is gone: removed exactly through the canonical
     /// unregister when the revival did not insert it, so the inputs its
@@ -1862,6 +1895,8 @@ impl MobError {
             Self::SharedRetirementFailure(error) | Self::SharedLifecycleFailure(error) => {
                 error.structured_data()
             }
+            // A failed probe is classified by what failed it.
+            Self::HostFeaturesProbeFailed { cause, .. } => cause.structured_data(),
             Self::SessionError(error) => meerkat_contracts::error::session_error_details(error),
             Self::ForkInstructionRefused {
                 source_member_id,
@@ -1870,6 +1905,16 @@ impl MobError {
                 "kind": meerkat_core::service::SessionError::FORK_INSTRUCTION_REFUSED_KIND,
                 "fork_instruction_refusal": refusal,
                 "source_member_id": source_member_id.as_str(),
+            })),
+            Self::ForkContextTooLarge {
+                source_member_id,
+                max_bytes,
+                required_bytes,
+            } => Some(serde_json::json!({
+                "kind": "fork_context_too_large",
+                "source_member_id": source_member_id.as_str(),
+                "max_bytes": max_bytes,
+                "required_bytes": required_bytes,
             })),
             // A restore failure that IS a typed resume hold projects the hold
             // under meerkat's own key, so a wire caller classifies the Broken
@@ -2123,6 +2168,7 @@ impl MobError {
                 Self::SharedRetirementFailure(error) | Self::SharedLifecycleFailure(error) => {
                     error.wire_error_code()
                 }
+                Self::HostFeaturesProbeFailed { cause, .. } => cause.wire_error_code(),
                 Self::SessionError(
                     meerkat_core::SessionError::RuntimeUnavailable { .. }
                     | meerkat_core::SessionError::HostingUnavailable { .. },
@@ -2167,6 +2213,9 @@ impl MobError {
                 Self::ForkInstructionRefused { .. } => {
                     Some(meerkat_contracts::ErrorCode::ForkInstructionRefused)
                 }
+                Self::ForkContextTooLarge { .. } => {
+                    Some(meerkat_contracts::ErrorCode::InvalidParams)
+                }
                 _ => None,
             })
     }
@@ -2176,6 +2225,7 @@ impl MobError {
             Self::SharedRetirementFailure(error)
             | Self::SharedLifecycleFailure(error)
             | Self::MemberRetirementStuck { cause: error, .. } => error.bridge_rejection_cause(),
+            Self::HostFeaturesProbeFailed { cause, .. } => cause.bridge_rejection_cause(),
             // Cloned: `BridgeRejectionCause` carries payload variants since V4.
             Self::BridgeCommandRejected { cause, .. } => Some(cause.clone()),
             _ => None,
@@ -2251,6 +2301,8 @@ impl MobError {
             Self::SharedRetirementFailure(error) | Self::SharedLifecycleFailure(error) => {
                 error.failure_class()
             }
+            // A failed probe is classified by what failed it.
+            Self::HostFeaturesProbeFailed { cause, .. } => cause.failure_class(),
             Self::MobNotFound(_)
             | Self::ProfileNotFound(_)
             | Self::MemberNotFound(_)
@@ -2362,6 +2414,8 @@ impl MobError {
             Self::SharedRetirementFailure(error) | Self::SharedLifecycleFailure(error) => {
                 error.wire_detail()
             }
+            // A probe that timed out projects the timeout's detail.
+            Self::HostFeaturesProbeFailed { cause, .. } => cause.wire_detail(),
             Self::ScopeDenied(denial) => Some(WireMobErrorDetail::ScopeDenied(
                 WireScopeDeniedDetail::from(denial),
             )),

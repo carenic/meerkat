@@ -4690,6 +4690,17 @@
               "launch": {
                 "$ref": "#/$defs/MaterializeLaunchMode"
               },
+              "prompt_context_fork": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/BridgePromptContextFork"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "V7: the prompt-context fork a `Fresh` launch carries. Carrying it is\na V7 command; a host before V7 refuses it before reading the payload."
+              },
               "protocol_version": {
                 "$ref": "#/$defs/BridgeProtocolVersion"
               },
@@ -5171,6 +5182,76 @@
               "protocol_version",
               "source_member",
               "capability"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "V7 host-addressed probe: the features the host serves that its\ncapability report does not list. It has no effect.",
+            "properties": {
+              "binding_generation": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "command": {
+                "const": "host_features",
+                "type": "string"
+              },
+              "epoch": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "mob_id": {
+                "type": "string"
+              },
+              "protocol_version": {
+                "$ref": "#/$defs/BridgeProtocolVersion"
+              },
+              "supervisor": {
+                "$ref": "#/$defs/BridgePeerSpec"
+              }
+            },
+            "required": [
+              "command",
+              "supervisor",
+              "epoch",
+              "binding_generation",
+              "protocol_version",
+              "mob_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "V7 member-addressed read of the member session's visible tool names\n(a prompt-context fork's source tools).",
+            "properties": {
+              "command": {
+                "const": "read_member_visible_tools",
+                "type": "string"
+              },
+              "epoch": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "expected_member": {
+                "$ref": "#/$defs/BridgeMemberIncarnation"
+              },
+              "protocol_version": {
+                "$ref": "#/$defs/BridgeProtocolVersion"
+              },
+              "supervisor": {
+                "$ref": "#/$defs/BridgePeerSpec"
+              }
+            },
+            "required": [
+              "command",
+              "supervisor",
+              "epoch",
+              "protocol_version",
+              "expected_member"
             ],
             "type": "object"
           }
@@ -5858,6 +5939,19 @@
         ],
         "type": "object"
       },
+      "BridgeHostFeaturesResponse": {
+        "description": "Reply to `HostFeatures`: an open vocabulary. Not `deny_unknown_fields`,\nand a reader ignores a feature it does not know, so a field or feature a\nlater release adds never fails a reader of this release.",
+        "properties": {
+          "features": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
       "BridgeHostMemberRecord": {
         "additionalProperties": false,
         "description": "One materialized-member row in a `HostStatus` reply.",
@@ -6102,6 +6196,21 @@
         ],
         "type": "string"
       },
+      "BridgeMemberVisibleToolsResponse": {
+        "description": "Reply to `ReadMemberVisibleTools`. `names` is absent when the member's\nsession is not live on its host. Not `deny_unknown_fields`.",
+        "properties": {
+          "names": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "BridgeMobPeerOverlayHandoff": {
         "additionalProperties": false,
         "description": "Generated MobMachine peer overlay handoff carried with peer wiring commands.",
@@ -6230,6 +6339,31 @@
           "name",
           "peer_id",
           "address"
+        ],
+        "type": "object"
+      },
+      "BridgePromptContextFork": {
+        "description": "The prompt-context fork a V7 `MaterializeMember` carries. The host\nrecords the child's fork seed ([`Self::recorded_seed`]) on the child's\nsession (`meerkat_core::fork_notice::SESSION_FORK_SEED_KEY`), where the\nchild's first run delivers it, and sets `source` on the child's create\nbuild.\n\nNot `deny_unknown_fields`, and the seed is opaque to the host: a field a\nlater controller adds cannot fail this host's decode.",
+        "properties": {
+          "planned_context": {
+            "description": "The planned context of the fork (the seed's `planned_context`),\ncarried beside the seed so the bridge escapes it once, as it did\nthe prompt prefix it replaces.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "seed": {
+            "$ref": "#/$defs/WireOpaqueJson",
+            "description": "The rest of the child's fork seed\n(`meerkat_core::fork_notice::ForkSeed`), as the controller\nserialized it."
+          },
+          "source": {
+            "$ref": "#/$defs/PromptContextForkSource",
+            "description": "The fork's source, for the child's create build."
+          }
+        },
+        "required": [
+          "seed",
+          "source"
         ],
         "type": "object"
       },
@@ -7581,6 +7715,34 @@
             "required": [
               "result",
               "outcome"
+            ],
+            "type": "object"
+          },
+          {
+            "$ref": "#/$defs/BridgeHostFeaturesResponse",
+            "description": "Reply to [`BridgeCommand::HostFeatures`].",
+            "properties": {
+              "result": {
+                "const": "host_features",
+                "type": "string"
+              }
+            },
+            "required": [
+              "result"
+            ],
+            "type": "object"
+          },
+          {
+            "$ref": "#/$defs/BridgeMemberVisibleToolsResponse",
+            "description": "Reply to [`BridgeCommand::ReadMemberVisibleTools`].",
+            "properties": {
+              "result": {
+                "const": "member_visible_tools",
+                "type": "string"
+              }
+            },
+            "required": [
+              "result"
             ],
             "type": "object"
           }
@@ -9271,6 +9433,92 @@
         ],
         "type": "string"
       },
+      "ForkBoundaryNotice": {
+        "description": "What a fork child was given of its source, by name only: the typed\ncontent of a [`SystemNoticeBlock::ForkBoundary`](crate::types::SystemNoticeBlock)\nnotice. `summary` is the notice as the model reads it; a reader that does\nnot know the block type decodes it as an unknown notice with that summary.",
+        "properties": {
+          "child_session_id": {
+            "description": "The child this notice was delivered to. A copied notice that names\nanother session is history, not the reader's own notice.",
+            "type": "string"
+          },
+          "earlier_rows_omitted": {
+            "description": "Earlier rows of the source left out of the planned context to fit\nits budget.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "fork": {
+            "$ref": "#/$defs/ForkNoticeKind"
+          },
+          "injected_rows_carried": {
+            "description": "Host-injected context rows of the source the child's planned context\ncarries.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "injected_rows_removed": {
+            "description": "Host-injected context rows of the source the child was not given.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "instructions_added": {
+            "description": "Instruction keys the child has that the source did not.",
+            "items": {
+              "$ref": "#/$defs/InstructionKeyRef"
+            },
+            "type": "array"
+          },
+          "instructions_carried": {
+            "description": "Instruction keys whose bodies the child's planned context carries\n(a prompt-context fork under `reactivate_inherited`).",
+            "items": {
+              "$ref": "#/$defs/InstructionKeyRef"
+            },
+            "type": "array"
+          },
+          "instructions_removed": {
+            "description": "Instruction keys the source had that the child does not.",
+            "items": {
+              "$ref": "#/$defs/InstructionKeyRef"
+            },
+            "type": "array"
+          },
+          "skills_carried": {
+            "description": "Skills the source loaded whose bodies the child's planned context\ncarries.",
+            "items": {
+              "$ref": "#/$defs/SkillKey"
+            },
+            "type": "array"
+          },
+          "skills_removed": {
+            "description": "Skills the source loaded with `load_skill` whose bodies the child\nwas not given.",
+            "items": {
+              "$ref": "#/$defs/SkillKey"
+            },
+            "type": "array"
+          },
+          "source": {
+            "$ref": "#/$defs/ForkNoticeSource"
+          },
+          "source_system_prompt": {
+            "$ref": "#/$defs/ForkNoticeSystemPrompt"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "tools": {
+            "$ref": "#/$defs/ForkNoticeTools"
+          }
+        },
+        "required": [
+          "fork",
+          "child_session_id",
+          "source",
+          "source_system_prompt",
+          "tools",
+          "summary"
+        ],
+        "type": "object"
+      },
       "ForkInstructionPolicy": {
         "description": "Host policy for the activation rows a durable fork child inherits.\n\nA fork child holds its source's activation rows as historical context and\nruns no model turn until each inherited key has an origin-local activation\nin the child. The policy says who appends that activation. It belongs to\nthe host (a mob builder, or an RPC fork request) and is never a tool\nargument.",
         "oneOf": [
@@ -9314,6 +9562,19 @@
               "type": "array"
             },
             "type": "array"
+          },
+          "skills": {
+            "description": "The skills a prompt-context fork would carry because its source\nloaded them with the built-in `load_skill` tool, in key order. Empty\nfor every other refusal, and then not serialized.",
+            "items": {
+              "$ref": "#/$defs/SkillKey"
+            },
+            "type": "array"
+          },
+          "unreadable_skill_loads": {
+            "description": "How many `load_skill` calls in a prompt-context fork's source have\narguments that name no skill. Their results count as loaded\nskills, so the fork fails closed on them. Zero for every other\nrefusal, and then not serialized.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
           }
         },
         "required": [
@@ -9399,6 +9660,131 @@
               "kind"
             ],
             "type": "object"
+          }
+        ]
+      },
+      "ForkNoticeKind": {
+        "description": "Which kind of fork a fork notice describes.",
+        "oneOf": [
+          {
+            "const": "transcript",
+            "description": "A durable fork: the child holds the source's rows as copied typed\nhistory.",
+            "type": "string"
+          },
+          {
+            "const": "prompt_context",
+            "description": "A prompt-context fork: the child holds a planned text of the\nsource's history as one injected-context row.",
+            "type": "string"
+          }
+        ]
+      },
+      "ForkNoticeSource": {
+        "description": "The source a fork notice names: the source member when a mob forked one\nof its members, and the source session when the forking side knows it.",
+        "properties": {
+          "member": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/MobMemberBinding"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ForkNoticeSystemPrompt": {
+        "description": "What a fork did with its source's own system prompt and host system\ncontext.",
+        "oneOf": [
+          {
+            "const": "not_carried",
+            "description": "A prompt-context fork never carries them: the child has its own role\nprompt.",
+            "type": "string"
+          },
+          {
+            "const": "not_applicable",
+            "description": "A durable fork keeps its copied system prompt as its own.",
+            "type": "string"
+          }
+        ]
+      },
+      "ForkNoticeTools": {
+        "description": "The tools a fork notice names: the source's visible tool names at the fork\nboundary against the child's at its first model call, by name only.",
+        "oneOf": [
+          {
+            "properties": {
+              "added": {
+                "description": "Tools the child can call that the source could not, sorted.",
+                "items": {
+                  "$ref": "#/$defs/ToolName"
+                },
+                "type": "array"
+              },
+              "comparison": {
+                "const": "compared",
+                "type": "string"
+              },
+              "omitted": {
+                "description": "Names left out of the two lists to keep the notice bounded.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "removed": {
+                "description": "Tools the source could call that the child cannot, sorted.",
+                "items": {
+                  "$ref": "#/$defs/ToolName"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "comparison"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "comparison": {
+                "const": "not_compared",
+                "type": "string"
+              },
+              "reason": {
+                "$ref": "#/$defs/ForkToolsNotComparedReason"
+              }
+            },
+            "required": [
+              "comparison",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "ForkToolsNotComparedReason": {
+        "description": "Why a fork notice does not compare the source's tools with the child's.",
+        "oneOf": [
+          {
+            "const": "source_not_live",
+            "description": "The source session was not live when the child was created, so its\nvisible tools could not be read.",
+            "type": "string"
+          },
+          {
+            "const": "placed_source",
+            "description": "The source runs on a member host whose visible tools were not read.",
+            "type": "string"
+          },
+          {
+            "const": "member_host_unsupported",
+            "description": "The source's member host is too old to report its visible tools.",
+            "type": "string"
           }
         ]
       },
@@ -9710,6 +10096,22 @@
       "InstructionKey": {
         "description": "Application-owned instruction key within one namespace.",
         "type": "string"
+      },
+      "InstructionKeyRef": {
+        "description": "One instruction key a fork notice names.",
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "namespace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace",
+          "key"
+        ],
+        "type": "object"
       },
       "InstructionNamespace": {
         "description": "Application or issuer namespace for one instruction artifact family.",
@@ -11055,6 +11457,26 @@
         ],
         "type": "string"
       },
+      "MobMemberBinding": {
+        "description": "Durable, typed identity of a mob member, carried on\n[`SessionMetadata`](crate::session::SessionMetadata).\n\nThis is the canonical owner of the `(mob_id, role, member)` identity fact\nthat ownership routing (`owns_persisted_bridge_session`) and outbound\npeer-added payloads previously recovered by splitting the untyped\n`comms_name` string and re-deriving the realm by format convention.\n\n`comms_name`/`realm_id`/`peer_meta` remain on the metadata as the transport\nrouting name and discovery metadata — identity and transport are separate\nfacts. Old persisted rows written before this field existed deserialize as\n`None` (the field is `#[serde(default, skip_serializing_if)]` on the\nmetadata), so back-read is safe.",
+        "properties": {
+          "member": {
+            "type": "string"
+          },
+          "mob_id": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "mob_id",
+          "role",
+          "member"
+        ],
+        "type": "object"
+      },
       "ModelFallbackConfig": {
         "additionalProperties": false,
         "description": "Ordered model failover policy used when a turn reaches a recoverable LLM\nfailure boundary.\n\nFallback is off unless explicitly enabled with a nonempty chain. A present\ntable replaces the inherited policy as a whole; a chain never enables it.",
@@ -12058,6 +12480,26 @@
       "ProfileId": {
         "description": "Opaque slug identifying an auth profile override on a connection.",
         "type": "string"
+      },
+      "PromptContextForkSource": {
+        "description": "The source of a prompt-context fork child: the mob member whose history\nwas rendered into the child's first prompt (`MemberLaunchMode::Fork` in\nthe mob runtime).\n\nSet only by the mob runtime, on that child's create build. No standard\nbuild behaviour reads it; a host's build hook may, for example to carry\nthe source's content taint to the child. It is not\n[`ForkBuildSource`], which is durable-fork provenance.",
+        "properties": {
+          "source_member": {
+            "$ref": "#/$defs/MobMemberBinding",
+            "description": "Durable mob-member identity of the source member."
+          },
+          "source_session_id": {
+            "description": "The source member's session the history was read from, when the\ncontroller knows it (a placed source's session lives on its host).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "source_member"
+        ],
+        "type": "object"
       },
       "PromptText": {
         "properties": {
@@ -14271,6 +14713,20 @@
               "spawner",
               "cessation",
               "disposition"
+            ],
+            "type": "object"
+          },
+          {
+            "$ref": "#/$defs/ForkBoundaryNotice",
+            "description": "What a fork child was given of its source, delivered once before its\nfirst input ([`crate::fork_notice`]). Its `summary` is the notice as\nthe model reads it, so a reader that does not know this block type\nstill shows it as an unknown notice.",
+            "properties": {
+              "type": {
+                "const": "fork_boundary",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
             ],
             "type": "object"
           },
@@ -21948,6 +22404,92 @@
         ],
         "type": "string"
       },
+      "ForkBoundaryNotice": {
+        "description": "What a fork child was given of its source, by name only: the typed\ncontent of a [`SystemNoticeBlock::ForkBoundary`](crate::types::SystemNoticeBlock)\nnotice. `summary` is the notice as the model reads it; a reader that does\nnot know the block type decodes it as an unknown notice with that summary.",
+        "properties": {
+          "child_session_id": {
+            "description": "The child this notice was delivered to. A copied notice that names\nanother session is history, not the reader's own notice.",
+            "type": "string"
+          },
+          "earlier_rows_omitted": {
+            "description": "Earlier rows of the source left out of the planned context to fit\nits budget.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "fork": {
+            "$ref": "#/$defs/ForkNoticeKind"
+          },
+          "injected_rows_carried": {
+            "description": "Host-injected context rows of the source the child's planned context\ncarries.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "injected_rows_removed": {
+            "description": "Host-injected context rows of the source the child was not given.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "instructions_added": {
+            "description": "Instruction keys the child has that the source did not.",
+            "items": {
+              "$ref": "#/$defs/InstructionKeyRef"
+            },
+            "type": "array"
+          },
+          "instructions_carried": {
+            "description": "Instruction keys whose bodies the child's planned context carries\n(a prompt-context fork under `reactivate_inherited`).",
+            "items": {
+              "$ref": "#/$defs/InstructionKeyRef"
+            },
+            "type": "array"
+          },
+          "instructions_removed": {
+            "description": "Instruction keys the source had that the child does not.",
+            "items": {
+              "$ref": "#/$defs/InstructionKeyRef"
+            },
+            "type": "array"
+          },
+          "skills_carried": {
+            "description": "Skills the source loaded whose bodies the child's planned context\ncarries.",
+            "items": {
+              "$ref": "#/$defs/SkillKey"
+            },
+            "type": "array"
+          },
+          "skills_removed": {
+            "description": "Skills the source loaded with `load_skill` whose bodies the child\nwas not given.",
+            "items": {
+              "$ref": "#/$defs/SkillKey"
+            },
+            "type": "array"
+          },
+          "source": {
+            "$ref": "#/$defs/ForkNoticeSource"
+          },
+          "source_system_prompt": {
+            "$ref": "#/$defs/ForkNoticeSystemPrompt"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "tools": {
+            "$ref": "#/$defs/ForkNoticeTools"
+          }
+        },
+        "required": [
+          "fork",
+          "child_session_id",
+          "source",
+          "source_system_prompt",
+          "tools",
+          "summary"
+        ],
+        "type": "object"
+      },
       "ForkInstructionPolicy": {
         "description": "Host policy for the activation rows a durable fork child inherits.\n\nA fork child holds its source's activation rows as historical context and\nruns no model turn until each inherited key has an origin-local activation\nin the child. The policy says who appends that activation. It belongs to\nthe host (a mob builder, or an RPC fork request) and is never a tool\nargument.",
         "oneOf": [
@@ -21964,6 +22506,131 @@
           {
             "const": "refuse",
             "description": "A fork whose child would inherit any activation row is refused before\nanything is committed.",
+            "type": "string"
+          }
+        ]
+      },
+      "ForkNoticeKind": {
+        "description": "Which kind of fork a fork notice describes.",
+        "oneOf": [
+          {
+            "const": "transcript",
+            "description": "A durable fork: the child holds the source's rows as copied typed\nhistory.",
+            "type": "string"
+          },
+          {
+            "const": "prompt_context",
+            "description": "A prompt-context fork: the child holds a planned text of the\nsource's history as one injected-context row.",
+            "type": "string"
+          }
+        ]
+      },
+      "ForkNoticeSource": {
+        "description": "The source a fork notice names: the source member when a mob forked one\nof its members, and the source session when the forking side knows it.",
+        "properties": {
+          "member": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/MobMemberBinding"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ForkNoticeSystemPrompt": {
+        "description": "What a fork did with its source's own system prompt and host system\ncontext.",
+        "oneOf": [
+          {
+            "const": "not_carried",
+            "description": "A prompt-context fork never carries them: the child has its own role\nprompt.",
+            "type": "string"
+          },
+          {
+            "const": "not_applicable",
+            "description": "A durable fork keeps its copied system prompt as its own.",
+            "type": "string"
+          }
+        ]
+      },
+      "ForkNoticeTools": {
+        "description": "The tools a fork notice names: the source's visible tool names at the fork\nboundary against the child's at its first model call, by name only.",
+        "oneOf": [
+          {
+            "properties": {
+              "added": {
+                "description": "Tools the child can call that the source could not, sorted.",
+                "items": {
+                  "$ref": "#/$defs/ToolName"
+                },
+                "type": "array"
+              },
+              "comparison": {
+                "const": "compared",
+                "type": "string"
+              },
+              "omitted": {
+                "description": "Names left out of the two lists to keep the notice bounded.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "removed": {
+                "description": "Tools the source could call that the child cannot, sorted.",
+                "items": {
+                  "$ref": "#/$defs/ToolName"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "comparison"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "comparison": {
+                "const": "not_compared",
+                "type": "string"
+              },
+              "reason": {
+                "$ref": "#/$defs/ForkToolsNotComparedReason"
+              }
+            },
+            "required": [
+              "comparison",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "ForkToolsNotComparedReason": {
+        "description": "Why a fork notice does not compare the source's tools with the child's.",
+        "oneOf": [
+          {
+            "const": "source_not_live",
+            "description": "The source session was not live when the child was created, so its\nvisible tools could not be read.",
+            "type": "string"
+          },
+          {
+            "const": "placed_source",
+            "description": "The source runs on a member host whose visible tools were not read.",
+            "type": "string"
+          },
+          {
+            "const": "member_host_unsupported",
+            "description": "The source's member host is too old to report its visible tools.",
             "type": "string"
           }
         ]
@@ -21988,6 +22655,22 @@
         },
         "required": [
           "target_model"
+        ],
+        "type": "object"
+      },
+      "InstructionKeyRef": {
+        "description": "One instruction key a fork notice names.",
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "namespace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace",
+          "key"
         ],
         "type": "object"
       },
@@ -22128,6 +22811,26 @@
           "renewal_required"
         ],
         "type": "string"
+      },
+      "MobMemberBinding": {
+        "description": "Durable, typed identity of a mob member, carried on\n[`SessionMetadata`](crate::session::SessionMetadata).\n\nThis is the canonical owner of the `(mob_id, role, member)` identity fact\nthat ownership routing (`owns_persisted_bridge_session`) and outbound\npeer-added payloads previously recovered by splitting the untyped\n`comms_name` string and re-deriving the realm by format convention.\n\n`comms_name`/`realm_id`/`peer_meta` remain on the metadata as the transport\nrouting name and discovery metadata — identity and transport are separate\nfacts. Old persisted rows written before this field existed deserialize as\n`None` (the field is `#[serde(default, skip_serializing_if)]` on the\nmetadata), so back-read is safe.",
+        "properties": {
+          "member": {
+            "type": "string"
+          },
+          "mob_id": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "mob_id",
+          "role",
+          "member"
+        ],
+        "type": "object"
       },
       "OpenAiAssistantPhase": {
         "description": "Responses assistant-message phase, distinct from reasoning metadata.",
@@ -22679,6 +23382,20 @@
               "spawner",
               "cessation",
               "disposition"
+            ],
+            "type": "object"
+          },
+          {
+            "$ref": "#/$defs/ForkBoundaryNotice",
+            "description": "What a fork child was given of its source, delivered once before its\nfirst input ([`crate::fork_notice`]). Its `summary` is the notice as\nthe model reads it, so a reader that does not know this block type\nstill shows it as an unknown notice.",
+            "properties": {
+              "type": {
+                "const": "fork_boundary",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
             ],
             "type": "object"
           },
@@ -24806,6 +25523,233 @@
         ],
         "type": "string"
       },
+      "ForkBoundaryNotice": {
+        "description": "What a fork child was given of its source, by name only: the typed\ncontent of a [`SystemNoticeBlock::ForkBoundary`](crate::types::SystemNoticeBlock)\nnotice. `summary` is the notice as the model reads it; a reader that does\nnot know the block type decodes it as an unknown notice with that summary.",
+        "properties": {
+          "child_session_id": {
+            "description": "The child this notice was delivered to. A copied notice that names\nanother session is history, not the reader's own notice.",
+            "type": "string"
+          },
+          "earlier_rows_omitted": {
+            "description": "Earlier rows of the source left out of the planned context to fit\nits budget.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "fork": {
+            "$ref": "#/$defs/ForkNoticeKind"
+          },
+          "injected_rows_carried": {
+            "description": "Host-injected context rows of the source the child's planned context\ncarries.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "injected_rows_removed": {
+            "description": "Host-injected context rows of the source the child was not given.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "instructions_added": {
+            "description": "Instruction keys the child has that the source did not.",
+            "items": {
+              "$ref": "#/$defs/InstructionKeyRef"
+            },
+            "type": "array"
+          },
+          "instructions_carried": {
+            "description": "Instruction keys whose bodies the child's planned context carries\n(a prompt-context fork under `reactivate_inherited`).",
+            "items": {
+              "$ref": "#/$defs/InstructionKeyRef"
+            },
+            "type": "array"
+          },
+          "instructions_removed": {
+            "description": "Instruction keys the source had that the child does not.",
+            "items": {
+              "$ref": "#/$defs/InstructionKeyRef"
+            },
+            "type": "array"
+          },
+          "skills_carried": {
+            "description": "Skills the source loaded whose bodies the child's planned context\ncarries.",
+            "items": {
+              "$ref": "#/$defs/SkillKey"
+            },
+            "type": "array"
+          },
+          "skills_removed": {
+            "description": "Skills the source loaded with `load_skill` whose bodies the child\nwas not given.",
+            "items": {
+              "$ref": "#/$defs/SkillKey"
+            },
+            "type": "array"
+          },
+          "source": {
+            "$ref": "#/$defs/ForkNoticeSource"
+          },
+          "source_system_prompt": {
+            "$ref": "#/$defs/ForkNoticeSystemPrompt"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "tools": {
+            "$ref": "#/$defs/ForkNoticeTools"
+          }
+        },
+        "required": [
+          "fork",
+          "child_session_id",
+          "source",
+          "source_system_prompt",
+          "tools",
+          "summary"
+        ],
+        "type": "object"
+      },
+      "ForkNoticeKind": {
+        "description": "Which kind of fork a fork notice describes.",
+        "oneOf": [
+          {
+            "const": "transcript",
+            "description": "A durable fork: the child holds the source's rows as copied typed\nhistory.",
+            "type": "string"
+          },
+          {
+            "const": "prompt_context",
+            "description": "A prompt-context fork: the child holds a planned text of the\nsource's history as one injected-context row.",
+            "type": "string"
+          }
+        ]
+      },
+      "ForkNoticeSource": {
+        "description": "The source a fork notice names: the source member when a mob forked one\nof its members, and the source session when the forking side knows it.",
+        "properties": {
+          "member": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/MobMemberBinding"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ForkNoticeSystemPrompt": {
+        "description": "What a fork did with its source's own system prompt and host system\ncontext.",
+        "oneOf": [
+          {
+            "const": "not_carried",
+            "description": "A prompt-context fork never carries them: the child has its own role\nprompt.",
+            "type": "string"
+          },
+          {
+            "const": "not_applicable",
+            "description": "A durable fork keeps its copied system prompt as its own.",
+            "type": "string"
+          }
+        ]
+      },
+      "ForkNoticeTools": {
+        "description": "The tools a fork notice names: the source's visible tool names at the fork\nboundary against the child's at its first model call, by name only.",
+        "oneOf": [
+          {
+            "properties": {
+              "added": {
+                "description": "Tools the child can call that the source could not, sorted.",
+                "items": {
+                  "$ref": "#/$defs/ToolName"
+                },
+                "type": "array"
+              },
+              "comparison": {
+                "const": "compared",
+                "type": "string"
+              },
+              "omitted": {
+                "description": "Names left out of the two lists to keep the notice bounded.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "removed": {
+                "description": "Tools the source could call that the child cannot, sorted.",
+                "items": {
+                  "$ref": "#/$defs/ToolName"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "comparison"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "comparison": {
+                "const": "not_compared",
+                "type": "string"
+              },
+              "reason": {
+                "$ref": "#/$defs/ForkToolsNotComparedReason"
+              }
+            },
+            "required": [
+              "comparison",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "ForkToolsNotComparedReason": {
+        "description": "Why a fork notice does not compare the source's tools with the child's.",
+        "oneOf": [
+          {
+            "const": "source_not_live",
+            "description": "The source session was not live when the child was created, so its\nvisible tools could not be read.",
+            "type": "string"
+          },
+          {
+            "const": "placed_source",
+            "description": "The source runs on a member host whose visible tools were not read.",
+            "type": "string"
+          },
+          {
+            "const": "member_host_unsupported",
+            "description": "The source's member host is too old to report its visible tools.",
+            "type": "string"
+          }
+        ]
+      },
+      "InstructionKeyRef": {
+        "description": "One instruction key a fork notice names.",
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "namespace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace",
+          "key"
+        ],
+        "type": "object"
+      },
       "InteractionId": {
         "description": "Unique identifier for an interaction.",
         "type": "string"
@@ -24922,6 +25866,26 @@
           "renewal_required"
         ],
         "type": "string"
+      },
+      "MobMemberBinding": {
+        "description": "Durable, typed identity of a mob member, carried on\n[`SessionMetadata`](crate::session::SessionMetadata).\n\nThis is the canonical owner of the `(mob_id, role, member)` identity fact\nthat ownership routing (`owns_persisted_bridge_session`) and outbound\npeer-added payloads previously recovered by splitting the untyped\n`comms_name` string and re-deriving the realm by format convention.\n\n`comms_name`/`realm_id`/`peer_meta` remain on the metadata as the transport\nrouting name and discovery metadata — identity and transport are separate\nfacts. Old persisted rows written before this field existed deserialize as\n`None` (the field is `#[serde(default, skip_serializing_if)]` on the\nmetadata), so back-read is safe.",
+        "properties": {
+          "member": {
+            "type": "string"
+          },
+          "mob_id": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "mob_id",
+          "role",
+          "member"
+        ],
+        "type": "object"
       },
       "PeerId": {
         "description": "Canonical runtime identity for a peer.\n\n`PeerId` is the routing key: the router and trust store key by `PeerId`,\nnever by `PeerName`. Two peers may legitimately share a display `PeerName`\n(per the Wave-B V5 dogma note), but their `PeerId`s never collide — the\nunderlying UUID is globally unique.\n\nConstructed freshly (`PeerId::new`) for a peer minted locally, parsed\nfrom a hyphenated UUID (`PeerId::parse`) when we've been given an identity\nover the wire, or derived from a 32-byte Ed25519 public key when a transport\nstill authenticates by raw signing key.",
@@ -25322,6 +26286,20 @@
               "spawner",
               "cessation",
               "disposition"
+            ],
+            "type": "object"
+          },
+          {
+            "$ref": "#/$defs/ForkBoundaryNotice",
+            "description": "What a fork child was given of its source, delivered once before its\nfirst input ([`crate::fork_notice`]). Its `summary` is the notice as\nthe model reads it, so a reader that does not know this block type\nstill shows it as an unknown notice.",
+            "properties": {
+              "type": {
+                "const": "fork_boundary",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
             ],
             "type": "object"
           },
@@ -40039,6 +41017,217 @@
         ],
         "type": "string"
       },
+      "ForkBoundaryNotice": {
+        "description": "What a fork child was given of its source, by name only: the typed\ncontent of a [`SystemNoticeBlock::ForkBoundary`](crate::types::SystemNoticeBlock)\nnotice. `summary` is the notice as the model reads it; a reader that does\nnot know the block type decodes it as an unknown notice with that summary.",
+        "properties": {
+          "child_session_id": {
+            "description": "The child this notice was delivered to. A copied notice that names\nanother session is history, not the reader's own notice.",
+            "type": "string"
+          },
+          "earlier_rows_omitted": {
+            "description": "Earlier rows of the source left out of the planned context to fit\nits budget.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "fork": {
+            "$ref": "#/$defs/ForkNoticeKind"
+          },
+          "injected_rows_carried": {
+            "description": "Host-injected context rows of the source the child's planned context\ncarries.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "injected_rows_removed": {
+            "description": "Host-injected context rows of the source the child was not given.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "instructions_added": {
+            "description": "Instruction keys the child has that the source did not.",
+            "items": {
+              "$ref": "#/$defs/InstructionKeyRef"
+            },
+            "type": "array"
+          },
+          "instructions_carried": {
+            "description": "Instruction keys whose bodies the child's planned context carries\n(a prompt-context fork under `reactivate_inherited`).",
+            "items": {
+              "$ref": "#/$defs/InstructionKeyRef"
+            },
+            "type": "array"
+          },
+          "instructions_removed": {
+            "description": "Instruction keys the source had that the child does not.",
+            "items": {
+              "$ref": "#/$defs/InstructionKeyRef"
+            },
+            "type": "array"
+          },
+          "skills_carried": {
+            "description": "Skills the source loaded whose bodies the child's planned context\ncarries.",
+            "items": {
+              "$ref": "#/$defs/SkillKey"
+            },
+            "type": "array"
+          },
+          "skills_removed": {
+            "description": "Skills the source loaded with `load_skill` whose bodies the child\nwas not given.",
+            "items": {
+              "$ref": "#/$defs/SkillKey"
+            },
+            "type": "array"
+          },
+          "source": {
+            "$ref": "#/$defs/ForkNoticeSource"
+          },
+          "source_system_prompt": {
+            "$ref": "#/$defs/ForkNoticeSystemPrompt"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "tools": {
+            "$ref": "#/$defs/ForkNoticeTools"
+          }
+        },
+        "required": [
+          "fork",
+          "child_session_id",
+          "source",
+          "source_system_prompt",
+          "tools",
+          "summary"
+        ],
+        "type": "object"
+      },
+      "ForkNoticeKind": {
+        "description": "Which kind of fork a fork notice describes.",
+        "oneOf": [
+          {
+            "const": "transcript",
+            "description": "A durable fork: the child holds the source's rows as copied typed\nhistory.",
+            "type": "string"
+          },
+          {
+            "const": "prompt_context",
+            "description": "A prompt-context fork: the child holds a planned text of the\nsource's history as one injected-context row.",
+            "type": "string"
+          }
+        ]
+      },
+      "ForkNoticeSource": {
+        "description": "The source a fork notice names: the source member when a mob forked one\nof its members, and the source session when the forking side knows it.",
+        "properties": {
+          "member": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/MobMemberBinding"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ForkNoticeSystemPrompt": {
+        "description": "What a fork did with its source's own system prompt and host system\ncontext.",
+        "oneOf": [
+          {
+            "const": "not_carried",
+            "description": "A prompt-context fork never carries them: the child has its own role\nprompt.",
+            "type": "string"
+          },
+          {
+            "const": "not_applicable",
+            "description": "A durable fork keeps its copied system prompt as its own.",
+            "type": "string"
+          }
+        ]
+      },
+      "ForkNoticeTools": {
+        "description": "The tools a fork notice names: the source's visible tool names at the fork\nboundary against the child's at its first model call, by name only.",
+        "oneOf": [
+          {
+            "properties": {
+              "added": {
+                "description": "Tools the child can call that the source could not, sorted.",
+                "items": {
+                  "$ref": "#/$defs/ToolName"
+                },
+                "type": "array"
+              },
+              "comparison": {
+                "const": "compared",
+                "type": "string"
+              },
+              "omitted": {
+                "description": "Names left out of the two lists to keep the notice bounded.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "removed": {
+                "description": "Tools the source could call that the child cannot, sorted.",
+                "items": {
+                  "$ref": "#/$defs/ToolName"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "comparison"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "comparison": {
+                "const": "not_compared",
+                "type": "string"
+              },
+              "reason": {
+                "$ref": "#/$defs/ForkToolsNotComparedReason"
+              }
+            },
+            "required": [
+              "comparison",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "ForkToolsNotComparedReason": {
+        "description": "Why a fork notice does not compare the source's tools with the child's.",
+        "oneOf": [
+          {
+            "const": "source_not_live",
+            "description": "The source session was not live when the child was created, so its\nvisible tools could not be read.",
+            "type": "string"
+          },
+          {
+            "const": "placed_source",
+            "description": "The source runs on a member host whose visible tools were not read.",
+            "type": "string"
+          },
+          {
+            "const": "member_host_unsupported",
+            "description": "The source's member host is too old to report its visible tools.",
+            "type": "string"
+          }
+        ]
+      },
       "GeminiImageMetadata": {
         "properties": {
           "continuity_ref": {
@@ -40059,6 +41248,22 @@
         },
         "required": [
           "target_model"
+        ],
+        "type": "object"
+      },
+      "InstructionKeyRef": {
+        "description": "One instruction key a fork notice names.",
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "namespace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace",
+          "key"
         ],
         "type": "object"
       },
@@ -40199,6 +41404,26 @@
           "renewal_required"
         ],
         "type": "string"
+      },
+      "MobMemberBinding": {
+        "description": "Durable, typed identity of a mob member, carried on\n[`SessionMetadata`](crate::session::SessionMetadata).\n\nThis is the canonical owner of the `(mob_id, role, member)` identity fact\nthat ownership routing (`owns_persisted_bridge_session`) and outbound\npeer-added payloads previously recovered by splitting the untyped\n`comms_name` string and re-deriving the realm by format convention.\n\n`comms_name`/`realm_id`/`peer_meta` remain on the metadata as the transport\nrouting name and discovery metadata — identity and transport are separate\nfacts. Old persisted rows written before this field existed deserialize as\n`None` (the field is `#[serde(default, skip_serializing_if)]` on the\nmetadata), so back-read is safe.",
+        "properties": {
+          "member": {
+            "type": "string"
+          },
+          "mob_id": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "mob_id",
+          "role",
+          "member"
+        ],
+        "type": "object"
       },
       "OpenAiAssistantPhase": {
         "description": "Responses assistant-message phase, distinct from reasoning metadata.",
@@ -40750,6 +41975,20 @@
               "spawner",
               "cessation",
               "disposition"
+            ],
+            "type": "object"
+          },
+          {
+            "$ref": "#/$defs/ForkBoundaryNotice",
+            "description": "What a fork child was given of its source, delivered once before its\nfirst input ([`crate::fork_notice`]). Its `summary` is the notice as\nthe model reads it, so a reader that does not know this block type\nstill shows it as an unknown notice.",
+            "properties": {
+              "type": {
+                "const": "fork_boundary",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
             ],
             "type": "object"
           },

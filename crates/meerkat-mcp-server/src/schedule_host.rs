@@ -354,6 +354,7 @@ impl McpScheduleContext {
                     max_inline_peer_notifications: None,
                     app_context: create.app_context.clone(),
                     fork_source: None,
+                    prompt_context_fork_source: None,
                     additional_instructions: (!create.additional_instructions.is_empty())
                         .then(|| create.additional_instructions.clone()),
                     initial_metadata_entries: std::collections::BTreeMap::new(),

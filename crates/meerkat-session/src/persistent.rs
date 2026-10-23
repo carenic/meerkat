@@ -3825,6 +3825,16 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         self.inner.live_session_actor_registered(id).await
     }
 
+    /// The visible tool names of the live session `id` at a fork boundary,
+    /// read without waiting on a running turn. See
+    /// [`EphemeralSessionService::fork_source_tools`].
+    pub async fn fork_source_tools(
+        &self,
+        id: &SessionId,
+    ) -> meerkat_core::fork_notice::ForkSeedSourceTools {
+        self.inner.fork_source_tools(id).await
+    }
+
     /// Subscribe to the live inner session actor's turn activity, or `None`
     /// when no live actor is registered (no turn can be active). See
     /// [`EphemeralSessionService::session_activity_watch`].
@@ -6826,6 +6836,19 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         let reactivated_instruction_count = forked
             .apply_fork_instruction_policy(&source_session_id, inherited_instructions)
             .map_err(SessionError::ForkInstructionRefused)?;
+        // What the child holds of its source: its effective instruction keys
+        // and, read without waiting on a running turn, its visible tools. The
+        // child's first run turns them into its fork notice.
+        // Only the rows the source activated itself are effective there;
+        // rows it copied from its own source are history.
+        let source_instructions =
+            meerkat_core::fork_notice::effective_instruction_keys(forked.messages(), |origin| {
+                origin == &source_session_id
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+        let source_tools = self.fork_source_tools(&source_session_id).await;
+        let mut source_member = None;
         // Core transcript forks deliberately strip session authority metadata.
         // Rebuild sanitized execution configuration whenever canonical source
         // metadata exists: the metadata, and the build state derived for a
@@ -6851,6 +6874,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 // the same materialization target before either is committed.
                 metadata.apply_llm_identity(cache_identity);
             }
+            source_member = metadata.mob_member_binding.clone();
             let target_binding = target.as_ref().map(|target| target.member_binding.clone());
             metadata.comms_name = target_binding
                 .as_ref()
@@ -6937,6 +6961,34 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 ))));
             }
         }
+        let seed = meerkat_core::fork_notice::ForkSeed {
+            fork: meerkat_core::fork_notice::ForkNoticeKind::Transcript,
+            source: meerkat_core::fork_notice::ForkNoticeSource {
+                member: source_member,
+                session_id: Some(source_session_id.clone()),
+            },
+            planned_context: None,
+            source_instructions,
+            instructions_carried: Vec::new(),
+            skills_removed: Vec::new(),
+            skills_carried: Vec::new(),
+            injected_rows_removed: 0,
+            injected_rows_carried: 0,
+            earlier_rows_omitted: 0,
+            source_tools,
+        };
+        let seed = serde_json::to_value(&seed).map_err(|error| {
+            SessionError::Agent(AgentError::InternalError(format!(
+                "failed to record the fork seed of session {source_session_id}: {error}"
+            )))
+        })?;
+        forked
+            .try_set_metadata(meerkat_core::fork_notice::SESSION_FORK_SEED_KEY, seed)
+            .map_err(|error| {
+                SessionError::Agent(AgentError::InternalError(format!(
+                    "failed to record the fork seed of session {source_session_id}: {error}"
+                )))
+            })?;
         let saved = match self.runtime_store.session_persistence_profile() {
             RuntimeSessionPersistenceProfile::WholeBlobV1 => {
                 self.save_normalized_session(forked).await?

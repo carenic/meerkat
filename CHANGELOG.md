@@ -87,6 +87,82 @@ them.
   an existing session whose first turn already started no longer delivers the
   spawn's `initial_message` (see Fixed). A caller that sent a message with a
   resume to give the member new work sends it after the resume.
+- `meerkat-core`: `service::SessionBuildOptions` gains the field
+  `prompt_context_fork_source: Option<PromptContextForkSource>`, and
+  `meerkat`'s `AgentBuildConfig` gains the same field: the typed source
+  member (and, when the controller knows it, the source session) of a
+  prompt-context fork child, which the mob runtime sets on that child's
+  create build. The standard build pipeline does not read it; a host's
+  build hook may. Code that builds either type with a struct literal sets
+  it, normally to `None`.
+- `meerkat-core`: `SystemNoticeBlock` gains the variant
+  `ForkBoundary(Box<fork_notice::ForkBoundaryNotice>)` (wire block type
+  `fork_boundary`): the typed fork notice a fork child is given once,
+  before its first input (see the behaviour entry below). Code that matches
+  the enum exhaustively adds an arm for it. A 0.9.4 reader decodes the
+  block as `Unknown` with its `summary`, so it still shows the model the
+  notice text, and so does this release for a block holding a fork kind
+  or reason a later release adds.
+- `meerkat-contracts`: `BridgeMaterializePayload` gains
+  `prompt_context_fork: Option<BridgePromptContextFork>`; `meerkat-mob`:
+  `runtime::host_actor::MaterializedMemberRow` gains
+  `prompt_context_fork_digest: Option<String>` and
+  `runtime::host_materialize::MaterializeServingContext` gains
+  `prompt_context_fork: Option<MaterializePromptContextFork>` (see the
+  protocol 7 entry under Added). Code that builds them with a struct
+  literal sets the new field, normally to `None`; a materialized row
+  written before it reads as `None`.
+- `meerkat-runtime`: `meerkat_machine_types::SupervisorBridgeCommandKind`
+  gains the variants `HostFeatures` and `ReadMemberVisibleTools`, appended
+  after `MemberOperatorRequest` (no other discriminant moves), for the
+  protocol 7 commands of the same names. `HostFeatures` is admitted and
+  served by the host daemon (`NotMemberAddressed`, served off the member
+  drain); `ReadMemberVisibleTools` is admitted through the bound-supervisor
+  ladder and served on the member drain. Exhaustive matches must handle
+  both.
+- Not measured by the gate (a wire change): `meerkat-core`:
+  `ForkInstructionRefusal` gains `skills: Box<[SkillKey]>`, the skills a
+  prompt-context fork's source loaded with the built-in `load_skill` tool
+  (see the next entry), and `unreadable_skill_loads: u32`, the number of
+  `load_skill` calls whose arguments name no skill. Each is serialized
+  only when not empty or zero, and only a prompt-context fork
+  refusal sets them; its message names only what the child would
+  inherit. A decoder built from 0.9.4 denies unknown fields on this type
+  and rejects a refusal that names either.
+- Not measured by the gate (a behaviour change): `meerkat-mob`: a
+  prompt-context fork (`MemberLaunchMode::Fork`, which
+  `MobHandle::fork_helper` uses) gives the child only what the mob's fork
+  instruction policy allows of its source's history, decided by each
+  row's type (see Fixed):
+  - the source's system prompt and host system context are never carried;
+  - under the default `require_explicit_activation`, activated instruction
+    bodies, skill bodies the source loaded with `load_skill` and
+    host-injected context rows (per-turn memory recall) are not carried,
+    and each `load_skill` result is replaced by a line naming the skill;
+  - under `refuse`, a fork whose rendered rows hold an activation row or a
+    `load_skill` result is refused with `MobError::ForkInstructionRefused`
+    before anything is spawned;
+  - under `reactivate_inherited`, each activated key's effective
+    instruction, the skill bodies and the host-injected context rows are
+    carried.
+  A child created on this host gets the planned context as one typed
+  injected-context row and a typed fork notice (`fork_boundary` block)
+  before its first input, whoever starts that first turn, instead of a
+  prefix of its first prompt; the notice names the source and, by name
+  only, the instructions, skills and tools the child lost or gained. A
+  child placed on a member host gets them the same way when its host
+  serves prompt-context fork children (supervisor bridge protocol 7, see
+  Added); toward a host of 0.9.4 or earlier it gets the context as a
+  prompt prefix that ends with a `[fork_notice]:` line. A durable fork's
+  child
+  (`fork_member` and the forks built on it) gets the same notice, of kind
+  `transcript`, at its first turn. The rendered rows fit a byte budget,
+  newest first: half the child model's context window at four bytes per
+  token, at most 256 KiB (256 KiB for a model the catalog does not know);
+  the notice counts the older rows it left out. A fork whose newest row
+  alone does not fit is refused before anything is spawned with the new
+  `MobError::ForkContextTooLarge` (code `INVALID_PARAMS`, data kind
+  `fork_context_too_large`).
 
 ### Added
 
@@ -121,6 +197,45 @@ them.
   is seen as gone, never admitted again. The trait default refuses.
   `MeerkatMachine::accept_existing_input_with_completion_for_attachment_and_member_residency`
   is the same for a mob member's attachment.
+
+- `meerkat-mob`: `MobSessionService` gains `fork_source_tools`, the visible
+  tool names a fork notice compares, read from the set the session task
+  publishes at each command and turn boundary, so a source that is in the
+  middle of a turn is read without waiting on it. Its default reports the
+  tools as not compared: a `MobSessionService` decorator forwards it to
+  the service it wraps, as the RPC and CLI services do.
+- Supervisor bridge protocol 7, for prompt-context fork children on
+  member hosts (`meerkat-contracts`): a `Fresh` `MaterializeMember` may
+  carry `prompt_context_fork`, the child's fork seed and typed source,
+  which the member host records on the child's session and create
+  build; the host-addressed `HostFeatures` asks a member host which
+  features it serves beyond its capability report (an open list:
+  `prompt_context_fork`), with no effect; and the member-addressed
+  `ReadMemberVisibleTools` reads a member session's visible tool names
+  for a fork notice. Protocol 7 is decoded but never advertised:
+  capability reports still list 2 to 6 and the current and default
+  versions stay 6, so a 0.9.4 controller still binds, rebinds and reads
+  the status of a member host of this release, and either upgrade order
+  works. A controller asks the target host with `HostFeatures` before it
+  plans a placed prompt-context fork and sends protocol 7 only to a
+  host that lists the feature; a host of 0.9.4 or earlier refuses the
+  probe with `UnsupportedProtocolVersion` before reading it, and its
+  child gets the prompt prefix. A probe that fails otherwise (no answer
+  within 10 seconds, transport, admission) fails the spawn with the new
+  `MobError::HostFeaturesProbeFailed`, before anything is recorded; it
+  is classified as its cause. A replayed `MaterializeMember` carrying a
+  different fork than the recorded build, or a `Fresh` one without it,
+  is refused with `SpecDigestMismatch`; a `Resume` of the same tuple
+  (the controller's revival of a placed fork child) carries no fork and
+  is answered from the recorded build. A fork of a placed source now
+  compares the source's tools, read from its member host: a host of
+  0.9.4 or earlier gives a notice that says `member_host_unsupported`,
+  and a read that
+  does not answer within 5 seconds one that says `placed_source`.
+  `decode_bridge_command_accepting` decodes a command with a smaller
+  version table, as a host of an earlier release does. `meerkat-runtime`:
+  `MemberObservationHost` gains `visible_tool_names`, whose default
+  answers `Unavailable`.
 
 ### Changed
 
@@ -262,6 +377,24 @@ them.
   checkpoint now persists the session's live deferred-turn state, the value an
   export already wrote. A session that carries no deferred-turn state is
   persisted as before.
+- A prompt-context fork no longer hands its source's activated instruction
+  bodies or the skill bodies its source loaded with `load_skill` to the
+  child as plain context under the default fork instruction policy, and
+  the `refuse` policy now refuses such a fork. The renderer copied every
+  System row of the source, its system prompt and activation envelopes
+  included, and every tool result, under every policy. The rows are now
+  decided by their typed activation identity and by the tool call that
+  produced them, never by their text (see Breaking).
+
+- A turn-driven `MobHandle::fork_helper` (the default helper mode) now sees
+  its fork context. The helper is created without an initial message, so
+  the rendered context went into a deferred create request that discards
+  its prompt, and the helper received only its task. The planned context
+  is now recorded on the child's session and delivered before its first
+  input, as a typed row (see Breaking). So does a helper placed on a
+  member host that serves protocol 7 prompt-context forks; a turn-driven
+  fork child placed on a host of 0.9.4 or earlier without an initial
+  message still receives no fork context.
 
 ## [0.9.4] - 2026-10-20
 

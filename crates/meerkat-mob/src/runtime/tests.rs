@@ -1705,6 +1705,10 @@ struct CreateSessionRecord {
     mob_member_binding: Option<meerkat_core::MobMemberBinding>,
     app_context: Option<serde_json::Value>,
     fork_source: Option<meerkat_core::ForkBuildSource>,
+    /// The typed source of a prompt-context fork child the build names.
+    prompt_context_fork_source: Option<meerkat_core::PromptContextForkSource>,
+    /// The session the create seats.
+    session_id: SessionId,
     /// Names of the tools the build's composed `external_tools` surface, in
     /// catalog order (the per-spawn overlay composed with mob-owned tools).
     external_tool_names: Vec<String>,
@@ -4034,6 +4038,11 @@ impl MockSessionService {
                     .build
                     .as_ref()
                     .and_then(|build| build.fork_source.clone()),
+                prompt_context_fork_source: req
+                    .build
+                    .as_ref()
+                    .and_then(|build| build.prompt_context_fork_source.clone()),
+                session_id: session_id.clone(),
                 external_tool_names: req
                     .build
                     .as_ref()
@@ -31789,6 +31798,107 @@ async fn test_fork_helper_tool_access_policy_reaches_session_metadata() {
         gated_policies,
         vec![policy],
         "fork_helper policy must reach exactly the helper's persisted metadata tooling section"
+    );
+}
+
+/// A prompt-context fork child's create request carries its typed source
+/// (`SessionBuildOptions::prompt_context_fork_source`): the source
+/// member's binding and its session. The child's creation stays a spawn
+/// with no durable fork source, and no other create carries one.
+#[tokio::test]
+async fn test_fork_helper_create_carries_the_typed_prompt_context_source() {
+    let mut definition = sample_definition();
+    definition
+        .profiles
+        .get_mut(&ProfileName::from("worker"))
+        .and_then(|binding| binding.as_inline_mut())
+        .expect("worker profile")
+        .external_addressable = true;
+    let (handle, service) = create_test_mob(definition).await;
+    service.set_return_exact_run_result(true);
+    let source_id = AgentIdentity::from("typed-source");
+    handle
+        .spawn_with_options(
+            ProfileName::from("worker"),
+            source_id.clone(),
+            Some("source context".into()),
+            Some(crate::MobRuntimeMode::TurnDriven),
+            None,
+        )
+        .await
+        .expect("spawn source member");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        handle.fork_helper(
+            &source_id,
+            AgentIdentity::from("typed-helper"),
+            "continue",
+            crate::launch::ForkContext::FullHistory,
+            HelperOptions {
+                role_name: Some(ProfileName::from("worker")),
+                runtime_mode: Some(crate::MobRuntimeMode::TurnDriven),
+                ..HelperOptions::default()
+            },
+            "typed-source-result",
+            256,
+        ),
+    )
+    .await
+    .expect("fork_helper must not hang")
+    .expect("fork_helper succeeds");
+
+    let creates = service.recorded_create_requests().await;
+    let create_of = |member: &str| {
+        creates
+            .iter()
+            .find(|record| {
+                record
+                    .mob_member_binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.member == member)
+            })
+            .unwrap_or_else(|| panic!("the create request of {member}"))
+    };
+    let source = create_of("typed-source");
+    let helper = create_of("typed-helper");
+    let typed = helper
+        .prompt_context_fork_source
+        .as_ref()
+        .expect("the helper's create carries its typed source");
+    assert_eq!(
+        Some(&typed.source_member),
+        source.mob_member_binding.as_ref(),
+        "the typed source names the source member's binding"
+    );
+    assert_eq!(
+        typed.source_session_id.as_ref(),
+        Some(&source.session_id),
+        "the typed source names the source member's session"
+    );
+    assert!(helper.fork_source.is_none(), "no durable fork source");
+    assert!(
+        creates
+            .iter()
+            .filter(|record| record.prompt_context_fork_source.is_some())
+            .count()
+            == 1,
+        "only the fork child's create carries a typed source"
+    );
+    // The host forked the helper, so no member's spawn proves its
+    // ancestry; it is never a durable fork.
+    let snapshot = handle
+        .member_creation_for_session(&helper.session_id)
+        .await
+        .expect("the helper's creation reads")
+        .expect("the helper has a creation record");
+    assert_eq!(
+        snapshot.creation.provenance,
+        crate::member_creation::MemberCreationProvenance::Unproven,
+        "a host-forked prompt-context child is not a durable fork"
+    );
+    assert!(
+        snapshot.fork_source.is_none(),
+        "its creation names no fork source"
     );
 }
 
@@ -84114,6 +84224,8 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         }
         MobError::DeliveryInteractionConflict { .. } => "delivery_interaction_conflict".to_string(),
         MobError::ForkInstructionRefused { .. } => "fork_instruction_refused".to_string(),
+        MobError::ForkContextTooLarge { .. } => "fork_context_too_large".to_string(),
+        MobError::HostFeaturesProbeFailed { .. } => "host_features_probe_failed".to_string(),
         MobError::IncarnationInconsistent { .. } => "incarnation_inconsistent".to_string(),
         MobError::IncarnationDestroyed { .. } => "incarnation_destroyed".to_string(),
         MobError::ProvenanceUnavailable { .. } => "provenance_unavailable".to_string(),

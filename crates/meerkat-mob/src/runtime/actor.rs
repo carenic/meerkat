@@ -200,6 +200,10 @@ const MEMBER_LIFECYCLE_HANG_GUARD: Duration = Duration::from_secs(600);
 /// actor behind a slow or wedged session-runtime read. Unknown progress is a
 /// truthful result; delaying lifecycle commands is not.
 const MEMBER_PROGRESS_OBSERVATION_TIMEOUT: Duration = Duration::from_millis(250);
+/// The bound on a placed prompt-context fork's `HostFeatures` probe of its
+/// member host: the bound of the controller's other host-addressed reads
+/// (`HostStatus`). Past it the spawn fails before anything is recorded.
+pub(super) const HOST_FEATURES_BRIDGE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Retirement lifecycle notices are advisory - MobMachine topology and the
 /// generated trust mutations below own the actual cleanup. A retiring
 /// member's comms drain may already be quiescent after `StopHostLoop`, so an
@@ -5556,106 +5560,6 @@ fn mob_bridge_rejection_cause(
     }
 }
 
-/// Render forked conversation rows as a text context block for the new
-/// member. ONE renderer over the ONE page row vocabulary
-/// (`WireSessionMessage`, DEC-P6E-20): the local fork branch projects its
-/// domain page through `WireMemberHistoryPageBody::try_from_history_page` and
-/// the remote branch decodes the bridge page — both render here, so local
-/// and remote fork context are byte-identical by construction.
-fn render_fork_context(
-    source_member_id: &AgentIdentity,
-    rows: &[meerkat_contracts::wire::WireHistoryRow],
-) -> String {
-    use meerkat_contracts::wire::{
-        WireAssistantBlock, WireContentBlock, WireContentInput, WireSessionMessage,
-        WireToolResultContent,
-    };
-
-    fn content_input_text(content: &WireContentInput) -> String {
-        match content {
-            WireContentInput::Text(text) => text.clone(),
-            WireContentInput::Blocks(blocks) => blocks
-                .iter()
-                .filter_map(|block| match block {
-                    WireContentBlock::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join(""),
-        }
-    }
-
-    let mut lines = Vec::new();
-    lines.push(format!(
-        "[Forked conversation context from member '{source_member_id}']"
-    ));
-    for row in rows {
-        match &row.0 {
-            WireSessionMessage::System { content, .. } => {
-                lines.push(format!("[system]: {content}"));
-            }
-            WireSessionMessage::SystemNotice { body, .. } => {
-                lines.push(format!(
-                    "[system_notice]: {}",
-                    body.clone().unwrap_or_default()
-                ));
-            }
-            WireSessionMessage::User { content, .. } => {
-                lines.push(format!("[user]: {}", content_input_text(content)));
-            }
-            WireSessionMessage::BlockAssistant { blocks, .. } => {
-                // Both `Text` (display) and `Transcript` (spoken) lanes
-                // project to the rendered text stream; supervisor sees the
-                // assistant's full visible output regardless of lane.
-                let text: String = blocks
-                    .iter()
-                    .filter_map(|block| match block {
-                        WireAssistantBlock::Text { text, .. }
-                        | WireAssistantBlock::Transcript { text, .. } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("");
-                if !text.is_empty() {
-                    lines.push(format!("[assistant]: {text}"));
-                }
-            }
-            WireSessionMessage::ToolResults { results, .. } => {
-                for result in results {
-                    let text: String = match &result.content {
-                        WireToolResultContent::Text(text) => text.clone(),
-                        WireToolResultContent::Blocks(blocks) => blocks
-                            .iter()
-                            .filter_map(|block| match block {
-                                WireContentBlock::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join(""),
-                    };
-                    if !text.is_empty() {
-                        let preview = if text.len() > 200 {
-                            // Find a valid UTF-8 char boundary at or before byte 200
-                            let end = text
-                                .char_indices()
-                                .map(|(i, _)| i)
-                                .take_while(|&i| i <= 200)
-                                .last()
-                                .unwrap_or(0);
-                            format!("{}...", &text[..end])
-                        } else {
-                            text
-                        };
-                        lines.push(format!("[tool_result({})]: {preview}", result.tool_use_id));
-                    }
-                }
-            }
-        }
-    }
-    lines.push("[End of forked context]".to_string());
-    lines.join("\n")
-}
-
 /// Local branch of the placement-switched member history read (DEC-P6E-20/21):
 /// the SAME serving semantics as the member host's `ReadMemberHistory` arm
 /// (tail addressing, per-page cap) over the local session service, projected
@@ -6144,11 +6048,69 @@ pub(super) struct ForkSourceHistoryRead {
     source_member_id: AgentIdentity,
     fork_context: crate::launch::ForkContext,
     location: ForkSourceHistoryLocation,
+    /// The host's policy, which decides what of the source's history the
+    /// child is given (`super::fork_context`).
+    fork_instruction_policy: meerkat_core::ForkInstructionPolicy,
+    /// The source's typed identity, for the child's create build.
+    prompt_context_source: meerkat_core::PromptContextForkSource,
 }
 
 impl ForkSourceHistoryRead {
-    fn source_member_id(&self) -> &AgentIdentity {
-        &self.source_member_id
+    /// The source's visible tools for the child's fork notice: a local
+    /// source's, read without waiting on a running turn; a placed source's,
+    /// read from its member host within a bound.
+    async fn source_tools(
+        &self,
+        session_service: &dyn MobSessionService,
+    ) -> meerkat_core::fork_notice::ForkSeedSourceTools {
+        match &self.location {
+            ForkSourceHistoryLocation::Local { source_session_id } => {
+                session_service.fork_source_tools(source_session_id).await
+            }
+            ForkSourceHistoryLocation::Remote {
+                supervisor_bridge,
+                peer,
+                expected_member,
+                ..
+            } => {
+                super::member_history_proxy::read_remote_member_visible_tools(
+                    supervisor_bridge,
+                    peer,
+                    expected_member,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Read the source's rows and decide them under the host's fork
+    /// instruction policy, fitted to `max_bytes` (`super::fork_context`).
+    async fn read_plan(
+        &self,
+        session_service: &dyn MobSessionService,
+        max_bytes: usize,
+    ) -> Result<super::fork_context::ForkContextPlan, MobError> {
+        let rows = self.read_rows(session_service).await?;
+        super::fork_context::ForkContextPlan::new(
+            &self.source_member_id,
+            self.source_session().as_ref(),
+            rows,
+            self.fork_instruction_policy,
+            max_bytes,
+        )
+    }
+
+    /// The session the source's history is read from: the local session,
+    /// or the placed member's session on its host.
+    fn source_session(&self) -> Option<SessionId> {
+        match &self.location {
+            ForkSourceHistoryLocation::Local { source_session_id } => {
+                Some(source_session_id.clone())
+            }
+            ForkSourceHistoryLocation::Remote {
+                expected_member, ..
+            } => SessionId::parse(&expected_member.member_session_id).ok(),
+        }
     }
 
     async fn read_rows(
@@ -14305,6 +14267,7 @@ impl MobActor {
                 resume_from_role: None,
             },
             forked_participant_attachment: None,
+            prompt_context_fork: None,
         });
 
         // §19.L5: the ops owner for a placed member is the owner bridge
@@ -32256,21 +32219,6 @@ impl MobActor {
                 )));
             }
 
-            // ---------- Fork path ----------
-            // When fork_spec is set, read source member's session and render
-            // conversation history as context in the initial prompt. §19.L2:
-            // a PLACED source routes through the same placement switch as
-            // `member_history` (the `ReadMemberHistory` proxy) — the phase-3
-            // `RemoteReadUnavailable` shape now means "tried and failed".
-            let fork_context_text = if let Some(read) = fork_source_read {
-                let rows = read
-                    .read_rows(preparation_context.session_service.as_ref())
-                    .await?;
-                Some(render_fork_context(read.source_member_id(), &rows))
-            } else {
-                None
-            };
-
             let external_tools =
                 precomputed_external_tools?;
             tracing::debug!(
@@ -32323,18 +32271,40 @@ impl MobActor {
                 config.auth_binding = Some(cref.clone());
             }
 
-            let base_prompt = initial_message.clone().unwrap_or_else(|| {
+            // ---------- Fork path ----------
+            // When fork_spec is set, read source member's session and render
+            // conversation history as context in the initial prompt, after
+            // the host's fork instruction policy decided what the child is
+            // given and within the budget for the child's model
+            // (`super::fork_context`). §19.L2: a PLACED source routes
+            // through the same placement switch as `member_history` (the
+            // `ReadMemberHistory` proxy) - the phase-3
+            // `RemoteReadUnavailable` shape now means "tried and failed".
+            // The child is not handed the context as a prompt prefix: its
+            // create build records the planned context as a typed fork seed,
+            // which Core delivers once, before the child's first input, as an
+            // injected-context row and a typed fork notice, whoever authors
+            // that first turn.
+            let (fork_seed, prompt_context_source) = if let Some(read) = fork_source_read {
+                let session_service = preparation_context.session_service.as_ref();
+                let budget = super::fork_context::fork_context_budget(&config.model);
+                let plan = read.read_plan(session_service, budget).await?;
+                let source_tools = read.source_tools(session_service).await;
+                let source = meerkat_core::fork_notice::ForkNoticeSource {
+                    member: Some(read.prompt_context_source.source_member.clone()),
+                    session_id: read.prompt_context_source.source_session_id.clone(),
+                };
+                (
+                    Some(plan.seed(source, source_tools)),
+                    Some(read.prompt_context_source.clone()),
+                )
+            } else {
+                (None, None)
+            };
+
+            let prompt = initial_message.clone().unwrap_or_else(|| {
                 ContentInput::from(fallback_prompt.clone())
             });
-            let prompt = if let Some(fork_text) = fork_context_text {
-                let mut blocks = vec![meerkat_core::types::ContentBlock::Text {
-                    text: format!("{fork_text}\n\n"),
-                }];
-                blocks.extend(base_prompt.into_blocks());
-                ContentInput::Blocks(blocks)
-            } else {
-                base_prompt
-            };
             let initial_turn_prompt = initial_message.as_ref().map(|_| prompt.clone());
             let req = build::to_create_session_request(&config, prompt.clone());
             let req = with_spawn_budget_limits(req, budget_limits);
@@ -32347,6 +32317,31 @@ impl MobActor {
             )?;
             let selected_runtime_mode =
                 normalize_runtime_mode_for_binding(selected_runtime_mode, &selected_binding);
+            let mut req = req;
+            if prompt_context_source.is_some() || fork_seed.is_some() {
+                // A fork child's create request always carries a build; a
+                // seed with nowhere to go is an error, never a silent drop.
+                let build = req.build.as_mut().ok_or_else(|| {
+                    MobError::Internal(format!(
+                        "the create request of fork child '{agent_identity}' has no \
+                         build to record its fork seed on"
+                    ))
+                })?;
+                if let Some(source) = prompt_context_source {
+                    build.prompt_context_fork_source = Some(source);
+                }
+                if let Some(seed) = fork_seed {
+                    let seed = serde_json::to_value(&seed).map_err(|error| {
+                        MobError::Internal(format!(
+                            "failed to record the fork seed of member '{agent_identity}': {error}"
+                        ))
+                    })?;
+                    build.initial_metadata_entries.insert(
+                        meerkat_core::fork_notice::SESSION_FORK_SEED_KEY.to_string(),
+                        seed,
+                    );
+                }
+            }
             let peer_name = render_member_comms_name(
                 preparation_context.definition.id.as_str(),
                 profile_name.as_str(),
@@ -33953,20 +33948,63 @@ impl MobActor {
             } => Some((source_member_id, fork_context)),
             _ => None,
         };
-        let fork_context_text = if let Some((source_member_id, fork_context)) = fork_spec {
-            // §19.L2 placement switch: local and remote SOURCE reads share
-            // one proxy + one renderer (DEC-P6E-20).
-            let rows = match self
-                .fork_source_history_rows(&source_member_id, &fork_context)
-                .await
-            {
-                Ok(rows) => rows,
-                Err(error) => fail!(error),
+        let (fork_context_text, prompt_context_fork) =
+            if let Some((source_member_id, fork_context)) = fork_spec {
+                // §19.L2 placement switch: local and remote SOURCE reads share
+                // one proxy + one renderer (DEC-P6E-20).
+                let read = match self
+                    .plan_fork_source_history_read(&source_member_id, fork_context.clone())
+                    .await
+                {
+                    Ok(read) => read,
+                    Err(error) => fail!(error),
+                };
+                // The host's fork instruction policy decides what the child is
+                // given, on the controller, before any placed effect exists.
+                let plan = match read
+                    .read_plan(
+                        self.session_service.as_ref(),
+                        super::fork_context::fork_context_budget(&profile.model),
+                    )
+                    .await
+                {
+                    Ok(plan) => plan,
+                    Err(error) => fail!(error),
+                };
+                // A member host that serves prompt-context fork children (V7)
+                // records the planned context as the child's fork seed, which
+                // the child's first run delivers as typed rows; toward an older
+                // host the context rides the child's first prompt. Asked once
+                // per fork, before anything is recorded.
+                let typed_rows = match self.host_serves_prompt_context_forks(&host).await {
+                    Ok(typed_rows) => typed_rows,
+                    Err(error) => fail!(error),
+                };
+                if typed_rows {
+                    let source_tools = read.source_tools(self.session_service.as_ref()).await;
+                    let source = meerkat_core::fork_notice::ForkNoticeSource {
+                        member: Some(read.prompt_context_source.source_member.clone()),
+                        session_id: read.prompt_context_source.source_session_id.clone(),
+                    };
+                    let seed = match serde_json::to_value(plan.seed(source, source_tools)) {
+                        Ok(seed) => seed,
+                        Err(error) => fail!(MobError::Internal(format!(
+                            "failed to record the fork seed of member '{agent_identity}': {error}"
+                        ))),
+                    };
+                    (
+                        None,
+                        Some(super::bridge_protocol::BridgePromptContextFork::from_seed(
+                            seed,
+                            read.prompt_context_source.clone(),
+                        )),
+                    )
+                } else {
+                    (Some(plan.render()), None)
+                }
+            } else {
+                (None, None)
             };
-            Some(render_fork_context(&source_member_id, &rows))
-        } else {
-            None
-        };
 
         // Compose and persist the exact first-turn material BEFORE the
         // canonical Pending carrier. The carrier is the earliest durable
@@ -34470,7 +34508,11 @@ impl MobActor {
         // keeps its V4 shape, so a pre-V6 host is unaffected; a capability
         // seating declares the version whose shape it actually uses, and the
         // receiving host's minimum-version gate is what proves it.
-        let protocol_version = if forked_participant_attachment.is_some() {
+        // The same for the V7 prompt-context fork, which rides only a Fresh
+        // launch and so never meets the Resume-only V6 attachment.
+        let protocol_version = if prompt_context_fork.is_some() {
+            super::bridge_protocol::BridgeProtocolVersion::V7
+        } else if forked_participant_attachment.is_some() {
             super::forked_participant_routing::FORKED_PARTICIPANT_PROTOCOL_VERSION
         } else {
             super::bridge_protocol::BridgeProtocolVersion::V4
@@ -34486,6 +34528,7 @@ impl MobActor {
             spec_digest: effect_digest,
             launch,
             forked_participant_attachment,
+            prompt_context_fork,
         });
 
         // Callers that don't carry an owner ops context (the embedder
@@ -41063,22 +41106,6 @@ impl MobActor {
         })
     }
 
-    /// §19.L2 fork-context read: ONE placement switch, ONE row vocabulary.
-    /// Placed sources proxy `ReadMemberHistory` (`LastMessages` = a single
-    /// tail-addressed round trip); local sources read the session and
-    /// project through the SAME wire page projection. Runs under spawn
-    /// admission — no `ReadHistory` scope check on this internal path.
-    async fn fork_source_history_rows(
-        &self,
-        source_member_id: &AgentIdentity,
-        fork_context: &crate::launch::ForkContext,
-    ) -> Result<Vec<meerkat_contracts::wire::WireHistoryRow>, MobError> {
-        self.plan_fork_source_history_read(source_member_id, fork_context.clone())
-            .await?
-            .read_rows(self.session_service.as_ref())
-            .await
-    }
-
     /// Resolve WHERE a fork source's history lives from actor-owned state
     /// (machine placement and roster), without reading it. The returned plan
     /// performs the history I/O and can run off the actor loop (#1249).
@@ -41098,7 +41125,7 @@ impl MobActor {
             .member_placement
             .get(&source_dsl)
             .cloned();
-        let location = if let Some(placement) = placement {
+        let (location, source_role, source_session_id) = if let Some(placement) = placement {
             let roster = self.roster.read().await;
             let entry = roster
                 .get(source_member_id)
@@ -41110,12 +41137,19 @@ impl MobActor {
             let expected_member = self
                 .placed_member_incarnation(entry)
                 .map_err(|_| remote_unavailable())?;
-            ForkSourceHistoryLocation::Remote {
-                supervisor_bridge: Arc::clone(&self.supervisor_bridge),
-                peer,
-                placement,
-                expected_member,
-            }
+            // A placed source's session lives on its host: the incarnation
+            // the history is read from names it.
+            let source_session_id = SessionId::parse(&expected_member.member_session_id).ok();
+            (
+                ForkSourceHistoryLocation::Remote {
+                    supervisor_bridge: Arc::clone(&self.supervisor_bridge),
+                    peer,
+                    placement,
+                    expected_member,
+                },
+                entry.role.clone(),
+                source_session_id,
+            )
         } else {
             let roster = self.roster.read().await;
             let source_entry = roster
@@ -41129,12 +41163,28 @@ impl MobActor {
                     source_member_id: source_member_id.to_string(),
                     cause: crate::error::ForkSourceUnavailableCause::NoSession,
                 })?;
-            ForkSourceHistoryLocation::Local { source_session_id }
+            (
+                ForkSourceHistoryLocation::Local {
+                    source_session_id: source_session_id.clone(),
+                },
+                source_entry.role.clone(),
+                Some(source_session_id),
+            )
         };
+        let prompt_context_source = meerkat_core::PromptContextForkSource::new(
+            meerkat_core::MobMemberBinding {
+                mob_id: self.definition.id.to_string(),
+                role: source_role.to_string(),
+                member: source_member_id.to_string(),
+            },
+            source_session_id,
+        );
         Ok(ForkSourceHistoryRead {
             source_member_id: source_member_id.clone(),
             fork_context,
             location,
+            fork_instruction_policy: self.fork_instruction_policy,
+            prompt_context_source,
         })
     }
 
@@ -51646,6 +51696,95 @@ impl MobActor {
             return Err(Self::bridge_rejection_error(rejection));
         }
         super::bridge_protocol::decode_bridge_payload(&command, value, "periodic host status")
+    }
+
+    /// Whether member host `host` serves prompt-context fork children
+    /// (protocol V7), asked with the effect-free `HostFeatures` probe within
+    /// [`HOST_FEATURES_BRIDGE_TIMEOUT`]. Like the periodic `HostStatus`
+    /// poll it rides the trust edge bind installed and changes no state. A
+    /// host before V7 refuses the probe typed before reading it
+    /// (`UnsupportedProtocolVersion`, or `Unsupported`) and gets the prompt
+    /// prefix; any other failure fails the spawn
+    /// ([`MobError::HostFeaturesProbeFailed`]). A host without recorded
+    /// binding facts is not asked: the spawn's own admission refuses it.
+    async fn host_serves_prompt_context_forks(
+        &self,
+        host: &mob_dsl::HostId,
+    ) -> Result<bool, MobError> {
+        let (endpoint, pubkey) = {
+            let state = self.dsl_authority.state();
+            (
+                state.host_endpoints.get(host).cloned(),
+                state.host_public_keys.get(host).copied(),
+            )
+        };
+        let (Some(endpoint), Some(pubkey)) = (endpoint, pubkey) else {
+            return Ok(false);
+        };
+        let Ok(binding_generation) = self.current_host_binding_generation(host) else {
+            return Ok(false);
+        };
+        let probe_failed = |cause: MobError| MobError::HostFeaturesProbeFailed {
+            host_id: host.as_str().to_string(),
+            cause: Arc::new(cause),
+        };
+        let peer = TrustedPeerDescriptor::unsigned_with_pubkey(
+            host.as_str(),
+            host.as_str(),
+            pubkey.0,
+            endpoint.0.as_str(),
+        )
+        .map_err(|error| {
+            probe_failed(MobError::Internal(format!(
+                "bound host '{}' facts do not form a canonical peer descriptor: {error}",
+                host.as_str()
+            )))
+        })?;
+        let authority = self.supervisor_bridge.authority().await;
+        let probe = async {
+            let supervisor_spec = self
+                .supervisor_bridge
+                .supervisor_spec_for_authority_and_recipient(&authority, &peer)
+                .await?;
+            let command = super::bridge_protocol::BridgeCommand::HostFeatures(
+                super::bridge_protocol::BridgeHostFeaturesPayload {
+                    supervisor: supervisor_spec.into(),
+                    epoch: authority.epoch,
+                    binding_generation,
+                    protocol_version: super::bridge_protocol::BridgeProtocolVersion::V7,
+                    mob_id: self.definition.id.to_string(),
+                },
+            );
+            let value = self
+                .supervisor_bridge
+                .send_bridge_command_as_authority(
+                    &authority,
+                    &peer,
+                    &command,
+                    HOST_FEATURES_BRIDGE_TIMEOUT,
+                )
+                .await?;
+            if let Some(rejection) =
+                Self::bridge_rejection_reply(command.protocol_version(), &value)
+            {
+                return Err(Self::bridge_rejection_error(rejection));
+            }
+            super::bridge_protocol::decode_bridge_payload::<
+                super::bridge_protocol::BridgeHostFeaturesResponse,
+            >(&command, value, "host features")
+        };
+        match probe.await {
+            Ok(features) => {
+                Ok(features.serves(super::bridge_protocol::HOST_FEATURE_PROMPT_CONTEXT_FORK))
+            }
+            Err(MobError::BridgeCommandRejected {
+                cause:
+                    super::bridge_protocol::BridgeRejectionCause::UnsupportedProtocolVersion
+                    | super::bridge_protocol::BridgeRejectionCause::Unsupported,
+                ..
+            }) => Ok(false),
+            Err(error) => Err(probe_failed(error)),
+        }
     }
 
     /// W-E orphan reconciliation sweep: read the host's `HostStatus`

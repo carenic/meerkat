@@ -3174,3 +3174,253 @@ async fn second_mob_bind_unblocked_by_member_load() {
 
     fixture.shutdown().await;
 }
+
+// ===========================================================================
+// A replayed V7 materialize at the same tuple keeps
+// the fork recorded at the first build; the same tuple with a different fork
+// is refused; the child's first run holds the original planned context.
+// ===========================================================================
+
+/// The `prompt_context_fork` of a V7 `MaterializeMember`, as wire JSON, with
+/// a planned context of `planned`.
+fn b2_prompt_context_fork_json(mob_id: &str, planned: &str) -> serde_json::Value {
+    let source = serde_json::json!({ "mob_id": mob_id, "role": "worker", "member": "b2r6-source" });
+    let seed = serde_json::json!({
+        "fork": "prompt_context",
+        "source": { "member": source },
+        "planned_context": planned,
+        "source_tools": { "status": "not_read", "reason": "placed_source" },
+    });
+    serde_json::json!({ "seed": seed.to_string(), "source": { "source_member": source } })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replayed_v7_materialize_keeps_its_recorded_fork() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let fixture = member_build_fixture("mat-b2r6-host").await;
+    let probe = spawn_peer_comms_endpoint("mat-b2r6-supervisor", true, None).await;
+    probe.trust(fixture.host_peer_descriptor()).await;
+    let mob_id = format!("mob-b2r6-{}", uuid::Uuid::new_v4().simple());
+    raw_bind(&probe, &fixture, &mob_id, 1).await;
+
+    let payload = sample_materialize_payload(
+        &probe,
+        1,
+        sample_portable_member_spec(&mob_id, "b2r6-child", "worker"),
+        1,
+        1,
+        MaterializeLaunchMode::Fresh {},
+    );
+    let mut command =
+        serde_json::to_value(BridgeCommand::MaterializeMember(payload)).expect("command json");
+    command["protocol_version"] = serde_json::json!(7);
+    command["prompt_context_fork"] = b2_prompt_context_fork_json(&mob_id, "b2r6-original-context");
+    let reply = probe
+        .send_bridge_params_raw(
+            &fixture.host_peer_descriptor(),
+            command.clone(),
+            REPLY_TIMEOUT,
+        )
+        .await
+        .expect("V7 materialize reply");
+    let BridgeReply::MemberMaterialized(first) = reply else {
+        panic!("a V7 materialize carrying a prompt-context fork is served: {reply:?}");
+    };
+
+    let replay = probe
+        .send_bridge_params_raw(
+            &fixture.host_peer_descriptor(),
+            command.clone(),
+            REPLY_TIMEOUT,
+        )
+        .await
+        .expect("byte-identical replay reply");
+    assert!(
+        matches!(&replay, BridgeReply::MemberMaterialized(ack) if ack.session_id == first.session_id),
+        "a byte-identical replay answers the recorded build: {replay:?}"
+    );
+    let mut changed = command.clone();
+    changed["prompt_context_fork"] = b2_prompt_context_fork_json(&mob_id, "b2r6-replayed-context");
+    let refused = probe
+        .send_bridge_params_raw(&fixture.host_peer_descriptor(), changed, REPLY_TIMEOUT)
+        .await
+        .expect("changed-fork replay reply");
+    assert_rejected(&refused, &BridgeRejectionCause::SpecDigestMismatch);
+
+    let member = member_descriptor_from_ack("b2r6-child", &first);
+    let incarnation = member_incarnation_from_ack(&fixture, &mob_id, "b2r6-child", &first, 1, 1, 1);
+    probe.trust(member.clone()).await;
+    let delivery = raw_deliver_member_input_command(
+        &probe,
+        &mob_id,
+        &uuid::Uuid::new_v4().to_string(),
+        "b2r6-first-input",
+        incarnation,
+        None,
+    );
+    let reply = probe
+        .send_bridge_command_raw(&member, &delivery, REPLY_TIMEOUT)
+        .await
+        .expect("first input delivery reply");
+    assert!(matches!(reply, BridgeReply::Delivery(_)), "{reply:?}");
+
+    let session_id = meerkat_core::SessionId::parse(&first.session_id).expect("child session id");
+    let service = fixture.member_session_service();
+    let mut rows = Vec::new();
+    wait_until("the child answers its first input", || {
+        let service = std::sync::Arc::clone(&service);
+        let session_id = session_id.clone();
+        async move {
+            service
+                .load_persisted_session(&session_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|session| {
+                    session
+                        .messages()
+                        .iter()
+                        .any(|row| matches!(row, meerkat_core::types::Message::BlockAssistant(_)))
+                })
+        }
+    })
+    .await;
+    if let Ok(Some(session)) = service.load_persisted_session(&session_id).await {
+        rows = session.messages().to_vec();
+    }
+    let rendered = format!("{rows:?}");
+    assert!(
+        rendered.contains("b2r6-original-context"),
+        "the child holds the planned context recorded at its first build: {rendered}"
+    );
+    assert!(
+        !rendered.contains("b2r6-replayed-context"),
+        "a refused replay changes nothing: {rendered}"
+    );
+    fixture.shutdown().await;
+}
+
+/// A Resume replay of a fork child's tuple carries no fork (the decode
+/// refuses one on a Resume): it is the controller's revival, answered from
+/// the recorded row without seeding the child again. A Fresh replay without
+/// the recorded fork stays a different command under the same key.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fork_childs_resume_replay_is_answered_and_a_forkless_fresh_one_is_refused() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let fixture = member_build_fixture("mat-b2m1-host").await;
+    let probe = spawn_peer_comms_endpoint("mat-b2m1-supervisor", true, None).await;
+    probe.trust(fixture.host_peer_descriptor()).await;
+    let mob_id = format!("mob-b2m1-{}", uuid::Uuid::new_v4().simple());
+    raw_bind(&probe, &fixture, &mob_id, 1).await;
+
+    let forkless_fresh = serde_json::to_value(BridgeCommand::MaterializeMember(
+        sample_materialize_payload(
+            &probe,
+            1,
+            sample_portable_member_spec(&mob_id, "b2m1-child", "worker"),
+            1,
+            1,
+            MaterializeLaunchMode::Fresh {},
+        ),
+    ))
+    .expect("command json");
+    let mut command = forkless_fresh.clone();
+    command["protocol_version"] = serde_json::json!(7);
+    command["prompt_context_fork"] = b2_prompt_context_fork_json(&mob_id, "b2m1-original-context");
+    let reply = probe
+        .send_bridge_params_raw(&fixture.host_peer_descriptor(), command, REPLY_TIMEOUT)
+        .await
+        .expect("V7 materialize reply");
+    let BridgeReply::MemberMaterialized(first) = reply else {
+        panic!("a V7 materialize carrying a prompt-context fork is served: {reply:?}");
+    };
+
+    let refused = probe
+        .send_bridge_params_raw(
+            &fixture.host_peer_descriptor(),
+            forkless_fresh,
+            REPLY_TIMEOUT,
+        )
+        .await
+        .expect("forkless Fresh replay reply");
+    assert_rejected(&refused, &BridgeRejectionCause::SpecDigestMismatch);
+
+    let resume = serde_json::to_value(BridgeCommand::MaterializeMember(
+        sample_materialize_payload(
+            &probe,
+            1,
+            sample_portable_member_spec(&mob_id, "b2m1-child", "worker"),
+            1,
+            1,
+            MaterializeLaunchMode::Resume {
+                session_id: first.session_id.clone(),
+                resume_from_role: None,
+            },
+        ),
+    ))
+    .expect("resume command json");
+    let revived = probe
+        .send_bridge_params_raw(&fixture.host_peer_descriptor(), resume, REPLY_TIMEOUT)
+        .await
+        .expect("Resume replay reply");
+    assert!(
+        matches!(&revived, BridgeReply::MemberMaterialized(ack) if ack.session_id == first.session_id),
+        "a Resume replay of the fork child is answered from its row: {revived:?}"
+    );
+
+    let member = member_descriptor_from_ack("b2m1-child", &first);
+    let incarnation = member_incarnation_from_ack(&fixture, &mob_id, "b2m1-child", &first, 1, 1, 1);
+    probe.trust(member.clone()).await;
+    let delivery = raw_deliver_member_input_command(
+        &probe,
+        &mob_id,
+        &uuid::Uuid::new_v4().to_string(),
+        "b2m1-first-input",
+        incarnation,
+        None,
+    );
+    let reply = probe
+        .send_bridge_command_raw(&member, &delivery, REPLY_TIMEOUT)
+        .await
+        .expect("first input delivery reply");
+    assert!(matches!(reply, BridgeReply::Delivery(_)), "{reply:?}");
+
+    let session_id = meerkat_core::SessionId::parse(&first.session_id).expect("child session id");
+    let service = fixture.member_session_service();
+    wait_until("the child answers its first input", || {
+        let service = std::sync::Arc::clone(&service);
+        let session_id = session_id.clone();
+        async move {
+            service
+                .load_persisted_session(&session_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|session| {
+                    session
+                        .messages()
+                        .iter()
+                        .any(|row| matches!(row, meerkat_core::types::Message::BlockAssistant(_)))
+                })
+        }
+    })
+    .await;
+    let rows = service
+        .load_persisted_session(&session_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|session| session.messages().to_vec())
+        .unwrap_or_default();
+    let rendered = format!("{rows:?}");
+    assert!(
+        rendered.contains("b2m1-original-context"),
+        "the child holds the planned context recorded at its first build: {rendered}"
+    );
+    assert_eq!(
+        rendered.matches("ForkBoundary(").count(),
+        1,
+        "the child was seeded once: {rendered}"
+    );
+    fixture.shutdown().await;
+}

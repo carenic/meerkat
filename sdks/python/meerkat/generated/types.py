@@ -4978,6 +4978,8 @@ class ForkInstructionRefusal:
 No child session exists when this is returned."""
     cause: ForkInstructionRefusalCause
     keys: list[list[Any]]
+    skills: Optional[list[SkillKey]] = None
+    unreadable_skill_loads: Optional[int] = None
 
 
 # Optional typed domain for tool-configuration change payloads.
@@ -7854,6 +7856,87 @@ class ContentBlockSkillContext(TypedDict, total=False):
 
 ContentBlock = ContentBlockText | ContentBlockImageInline | ContentBlockImageBlob | ContentBlockVideoInline | ContentBlockVideoUri | ContentBlockStructured | ContentBlockSkillContext
 
+# Which kind of fork a fork notice describes.
+ForkNoticeKind = Literal['transcript', 'prompt_context']
+
+@dataclass
+class MobMemberBinding:
+    """Durable, typed identity of a mob member, carried on
+[`SessionMetadata`](crate::session::SessionMetadata).
+
+This is the canonical owner of the `(mob_id, role, member)` identity fact
+that ownership routing (`owns_persisted_bridge_session`) and outbound
+peer-added payloads previously recovered by splitting the untyped
+`comms_name` string and re-deriving the realm by format convention.
+
+`comms_name`/`realm_id`/`peer_meta` remain on the metadata as the transport
+routing name and discovery metadata — identity and transport are separate
+facts. Old persisted rows written before this field existed deserialize as
+`None` (the field is `#[serde(default, skip_serializing_if)]` on the
+metadata), so back-read is safe."""
+    member: str
+    mob_id: str
+    role: str
+
+
+@dataclass
+class ForkNoticeSource:
+    """The source a fork notice names: the source member when a mob forked one
+of its members, and the source session when the forking side knows it."""
+    member: Optional[MobMemberBinding] = None
+    session_id: Optional[str] = None
+
+
+# What a fork did with its source's own system prompt and host system
+# context.
+ForkNoticeSystemPrompt = Literal['not_carried', 'not_applicable']
+
+# Why a fork notice does not compare the source's tools with the child's.
+ForkToolsNotComparedReason = Literal['source_not_live', 'placed_source', 'member_host_unsupported']
+
+# The tools a fork notice names: the source's visible tool names at the fork
+# boundary against the child's at its first model call, by name only.
+class ForkNoticeToolsCompared(TypedDict, total=False):
+    added: NotRequired[list[ToolName]]
+    comparison: Required[Literal['compared']]
+    omitted: NotRequired[int]
+    removed: NotRequired[list[ToolName]]
+
+class ForkNoticeToolsNotCompared(TypedDict, total=False):
+    comparison: Required[Literal['not_compared']]
+    reason: Required[ForkToolsNotComparedReason]
+
+ForkNoticeTools = ForkNoticeToolsCompared | ForkNoticeToolsNotCompared
+
+@dataclass
+class InstructionKeyRef:
+    """One instruction key a fork notice names."""
+    key: str
+    namespace: str
+
+
+@dataclass
+class ForkBoundaryNotice:
+    """What a fork child was given of its source, by name only: the typed
+content of a [`SystemNoticeBlock::ForkBoundary`](crate::types::SystemNoticeBlock)
+notice. `summary` is the notice as the model reads it; a reader that does
+not know the block type decodes it as an unknown notice with that summary."""
+    child_session_id: str
+    fork: ForkNoticeKind
+    source: ForkNoticeSource
+    source_system_prompt: ForkNoticeSystemPrompt
+    summary: str
+    tools: ForkNoticeTools
+    earlier_rows_omitted: Optional[int] = None
+    injected_rows_carried: Optional[int] = None
+    injected_rows_removed: Optional[int] = None
+    instructions_added: Optional[list[InstructionKeyRef]] = None
+    instructions_carried: Optional[list[InstructionKeyRef]] = None
+    instructions_removed: Optional[list[InstructionKeyRef]] = None
+    skills_carried: Optional[list[SkillKey]] = None
+    skills_removed: Optional[list[SkillKey]] = None
+
+
 # Unique identifier for an interaction.
 InteractionId = str
 
@@ -8026,12 +8109,29 @@ class SystemNoticeBlockToolProcessInterrupted(TypedDict, total=False):
     tool_call_id: NotRequired[Optional[str]]
     type: Required[Literal['tool_process_interrupted']]
 
+class SystemNoticeBlockForkBoundary(TypedDict, total=False):
+    child_session_id: Required[str]
+    earlier_rows_omitted: NotRequired[int]
+    fork: Required[ForkNoticeKind]
+    injected_rows_carried: NotRequired[int]
+    injected_rows_removed: NotRequired[int]
+    instructions_added: NotRequired[list[InstructionKeyRef]]
+    instructions_carried: NotRequired[list[InstructionKeyRef]]
+    instructions_removed: NotRequired[list[InstructionKeyRef]]
+    skills_carried: NotRequired[list[SkillKey]]
+    skills_removed: NotRequired[list[SkillKey]]
+    source: Required[ForkNoticeSource]
+    source_system_prompt: Required[ForkNoticeSystemPrompt]
+    summary: Required[str]
+    tools: Required[ForkNoticeTools]
+    type: Required[Literal['fork_boundary']]
+
 class SystemNoticeBlockUnknown(TypedDict, total=False):
     payload: NotRequired[Any]
     summary: NotRequired[Optional[str]]
     type: Required[Literal['unknown']]
 
-SystemNoticeBlock = SystemNoticeBlockComms | SystemNoticeBlockExternalEvent | SystemNoticeBlockToolConfig | SystemNoticeBlockMcp | SystemNoticeBlockBackgroundJob | SystemNoticeBlockAuth | SystemNoticeBlockRuntimeNotice | SystemNoticeBlockToolProcessInterrupted | SystemNoticeBlockUnknown
+SystemNoticeBlock = SystemNoticeBlockComms | SystemNoticeBlockExternalEvent | SystemNoticeBlockToolConfig | SystemNoticeBlockMcp | SystemNoticeBlockBackgroundJob | SystemNoticeBlockAuth | SystemNoticeBlockRuntimeNotice | SystemNoticeBlockToolProcessInterrupted | SystemNoticeBlockForkBoundary | SystemNoticeBlockUnknown
 
 # Typed system notice content carried in the transcript.
 SystemNoticeKind = Literal['generic', 'comms', 'external_event', 'mcp_pending', 'mcp', 'background_job', 'tool_scope', 'tool_scope_warning'] | Literal['auth_reauth_required'] | Literal['tool_process_recovery']
@@ -8578,6 +8678,7 @@ class BridgeCommandMaterializeMember(TypedDict, total=False):
     forked_participant_attachment: NotRequired[Optional[dict[str, Any]]]
     generation: Required[int]
     launch: Required[dict[str, Literal['fresh']] | dict[str, Any]]
+    prompt_context_fork: NotRequired[Optional[dict[str, Any]]]
     protocol_version: Required[BridgeProtocolVersion]
     spec: Required[dict[str, Any]]
     spec_digest: Required[str]
@@ -8675,7 +8776,22 @@ class BridgeCommandRevokeForkedParticipant(TypedDict, total=False):
     source_member: Required[BridgeMemberIncarnation]
     supervisor: Required[BridgePeerSpec]
 
-BridgeCommand = BridgeCommandBindMember | BridgeCommandAuthorizeSupervisor | BridgeCommandRevokeSupervisor | BridgeCommandDeliverMemberInput | BridgeCommandObserveMember | BridgeCommandInterruptMember | BridgeCommandHardCancelMember | BridgeCommandCancelTrackedMemberInput | BridgeCommandStopMemberRun | BridgeCommandHoldRunStarts | BridgeCommandReleaseRunStarts | BridgeCommandRetireMember | BridgeCommandDestroyMember | BridgeCommandWireMember | BridgeCommandUnwireMember | BridgeCommandDeclareMemberOutboundTaint | BridgeCommandReadMemberHistory | BridgeCommandPollMemberEvents | BridgeCommandOpenMemberLiveChannel | BridgeCommandCloseMemberLiveChannel | BridgeCommandMemberLiveChannelStatus | BridgeCommandControlMemberLiveChannel | BridgeCommandBindHost | BridgeCommandRebindHost | BridgeCommandRevokeHost | BridgeCommandMaterializeMember | BridgeCommandReleaseMember | BridgeCommandInstallPeerTrust | BridgeCommandRemovePeerTrust | BridgeCommandHostStatus | BridgeCommandIssueHostBindingDescriptor | BridgeCommandMemberOperatorRequest | BridgeCommandObserveSupervisorRotation | BridgeCommandCreateForkedParticipant | BridgeCommandRevokeForkedParticipant
+class BridgeCommandHostFeatures(TypedDict, total=False):
+    binding_generation: Required[int]
+    command: Required[Literal['host_features']]
+    epoch: Required[int]
+    mob_id: Required[str]
+    protocol_version: Required[BridgeProtocolVersion]
+    supervisor: Required[BridgePeerSpec]
+
+class BridgeCommandReadMemberVisibleTools(TypedDict, total=False):
+    command: Required[Literal['read_member_visible_tools']]
+    epoch: Required[int]
+    expected_member: Required[BridgeMemberIncarnation]
+    protocol_version: Required[BridgeProtocolVersion]
+    supervisor: Required[BridgePeerSpec]
+
+BridgeCommand = BridgeCommandBindMember | BridgeCommandAuthorizeSupervisor | BridgeCommandRevokeSupervisor | BridgeCommandDeliverMemberInput | BridgeCommandObserveMember | BridgeCommandInterruptMember | BridgeCommandHardCancelMember | BridgeCommandCancelTrackedMemberInput | BridgeCommandStopMemberRun | BridgeCommandHoldRunStarts | BridgeCommandReleaseRunStarts | BridgeCommandRetireMember | BridgeCommandDestroyMember | BridgeCommandWireMember | BridgeCommandUnwireMember | BridgeCommandDeclareMemberOutboundTaint | BridgeCommandReadMemberHistory | BridgeCommandPollMemberEvents | BridgeCommandOpenMemberLiveChannel | BridgeCommandCloseMemberLiveChannel | BridgeCommandMemberLiveChannelStatus | BridgeCommandControlMemberLiveChannel | BridgeCommandBindHost | BridgeCommandRebindHost | BridgeCommandRevokeHost | BridgeCommandMaterializeMember | BridgeCommandReleaseMember | BridgeCommandInstallPeerTrust | BridgeCommandRemovePeerTrust | BridgeCommandHostStatus | BridgeCommandIssueHostBindingDescriptor | BridgeCommandMemberOperatorRequest | BridgeCommandObserveSupervisorRotation | BridgeCommandCreateForkedParticipant | BridgeCommandRevokeForkedParticipant | BridgeCommandHostFeatures | BridgeCommandReadMemberVisibleTools
 
 # Outcome of a delivery attempt.
 class BridgeDeliveryOutcomeAccepted(TypedDict, total=False):
@@ -9041,7 +9157,15 @@ class BridgeReplyForkedParticipantRevoked(TypedDict, total=False):
     outcome: Required[dict[str, Any] | dict[str, Literal['pending_attached_release']] | dict[str, Literal['converged']]]
     result: Required[Literal['forked_participant_revoked']]
 
-BridgeReply = BridgeReplyBindMember | BridgeReplyAck | BridgeReplyObservation | BridgeReplyDelivery | BridgeReplyTrackedInputCancelled | BridgeReplyMemberRunStopped | BridgeReplyRunStartsHeld | BridgeReplyRetire | BridgeReplyDestroy | BridgeReplySupervisorRotationFound | BridgeReplySupervisorRotationNotFound | BridgeReplyRejected | BridgeReplyBindHost | BridgeReplyHostRebound | BridgeReplyHostRevoked | BridgeReplyMemberHistoryPage | BridgeReplyMemberEventsPage | BridgeReplyMemberMaterialized | BridgeReplyMemberReleased | BridgeReplyHostStatus | BridgeReplyHostBindingDescriptorIssued | BridgeReplyMemberLiveChannelOpened | BridgeReplyMemberLiveChannelClosed | BridgeReplyMemberLiveChannelStatusReport | BridgeReplyMemberLiveChannelControlled | BridgeReplyMemberOperatorReply | BridgeReplyForkedParticipantCreated | BridgeReplyForkedParticipantRevoked
+class BridgeReplyHostFeatures(TypedDict, total=False):
+    features: NotRequired[list[str]]
+    result: Required[Literal['host_features']]
+
+class BridgeReplyMemberVisibleTools(TypedDict, total=False):
+    names: NotRequired[Optional[list[str]]]
+    result: Required[Literal['member_visible_tools']]
+
+BridgeReply = BridgeReplyBindMember | BridgeReplyAck | BridgeReplyObservation | BridgeReplyDelivery | BridgeReplyTrackedInputCancelled | BridgeReplyMemberRunStopped | BridgeReplyRunStartsHeld | BridgeReplyRetire | BridgeReplyDestroy | BridgeReplySupervisorRotationFound | BridgeReplySupervisorRotationNotFound | BridgeReplyRejected | BridgeReplyBindHost | BridgeReplyHostRebound | BridgeReplyHostRevoked | BridgeReplyMemberHistoryPage | BridgeReplyMemberEventsPage | BridgeReplyMemberMaterialized | BridgeReplyMemberReleased | BridgeReplyHostStatus | BridgeReplyHostBindingDescriptorIssued | BridgeReplyMemberLiveChannelOpened | BridgeReplyMemberLiveChannelClosed | BridgeReplyMemberLiveChannelStatusReport | BridgeReplyMemberLiveChannelControlled | BridgeReplyMemberOperatorReply | BridgeReplyForkedParticipantCreated | BridgeReplyForkedParticipantRevoked | BridgeReplyHostFeatures | BridgeReplyMemberVisibleTools
 
 # Input content that can be either a plain text string or multimodal content blocks.
 #

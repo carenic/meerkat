@@ -2453,6 +2453,70 @@ where
             .await
     }
 
+    /// Deliver the fork seed recorded on this session when it was created
+    /// as a fork child ([`crate::fork_notice::ForkSeed`]): the planned
+    /// context of a prompt-context fork as one injected-context row, then the
+    /// typed fork notice, computed against this child's own instruction keys
+    /// and visible tools now. The seed is removed with the delivery, in the
+    /// same session state the run commits.
+    fn deliver_fork_seed(&mut self) -> Result<(), AgentError> {
+        let Some(value) = self
+            .session
+            .metadata()
+            .get(crate::fork_notice::SESSION_FORK_SEED_KEY)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let child = self.session.id().clone();
+        let seed: crate::fork_notice::ForkSeed = match serde_json::from_value(value) {
+            Ok(seed) => seed,
+            Err(error) => {
+                // A seed this release cannot read (for example one a later
+                // release wrote) must not stop the session: it is dropped,
+                // and the child is told once that its fork context is gone.
+                tracing::warn!(
+                    session_id = %child,
+                    %error,
+                    "dropping a fork seed this release cannot read"
+                );
+                self.session.push(Message::SystemNotice(
+                    crate::types::SystemNoticeMessage::new(
+                        crate::types::SystemNoticeKind::Generic,
+                        "Fork notice. You are a fork of another agent, but the fork \
+                         context recorded for you could not be read, so it was not \
+                         given to you.",
+                    ),
+                ));
+                self.session
+                    .remove_metadata(crate::fork_notice::SESSION_FORK_SEED_KEY);
+                return Ok(());
+            }
+        };
+        if !crate::fork_notice::holds_fork_notice_for(self.session.messages(), &child) {
+            let child_instructions =
+                crate::fork_notice::effective_instruction_keys(self.session.messages(), |origin| {
+                    origin == &child
+                });
+            let child_tools = self.tool_scope.visible_tool_names().map_err(|error| {
+                AgentError::InternalError(format!(
+                    "the visible tools of fork child {child} are unreadable: {error}"
+                ))
+            })?;
+            let notice = seed.notice(child, &child_instructions, &child_tools);
+            if let Some(planned) = seed.planned_context {
+                let row = self.stamp_user_message_identity(UserMessage::injected_context(planned));
+                self.session.push(Message::User(row));
+            }
+            self.session.push(Message::SystemNotice(
+                crate::types::SystemNoticeMessage::fork_boundary(notice),
+            ));
+        }
+        self.session
+            .remove_metadata(crate::fork_notice::SESSION_FORK_SEED_KEY);
+        Ok(())
+    }
+
     fn stamp_user_message_identity(&self, mut message: UserMessage) -> UserMessage {
         if let Some(identity) = self.active_transcript_identity.as_ref() {
             message.identity = identity.clone();
@@ -2673,6 +2737,14 @@ where
             .run_started_hooks(&run_prompt_input, event_tx.as_ref())
             .await
         {
+            self.handle_run_failure(&err, event_tx.as_ref()).await;
+            self.clear_runtime_execution_kind();
+            return Err(err);
+        }
+
+        // A fork child is given what its forking side recorded once, before
+        // the first run's own input rows, whoever authored that run.
+        if let Err(err) = self.deliver_fork_seed() {
             self.handle_run_failure(&err, event_tx.as_ref()).await;
             self.clear_runtime_execution_kind();
             return Err(err);
@@ -6507,6 +6579,57 @@ mod skill_activation_effect_tests {
             }
         }
         assert_eq!(failures, 1);
+    }
+
+    /// A fork seed this release cannot read (one a later release wrote,
+    /// read after a downgrade) does not stop the session: the seed is
+    /// dropped, the child is told once that its fork context could not be
+    /// read, and its runs go on.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn an_unreadable_fork_seed_is_dropped_with_one_notice_and_runs_go_on() {
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .build_standalone(
+                Arc::new(StaticLlmClient),
+                Arc::new(NoTools),
+                Arc::new(NoopStore),
+            )
+            .await;
+        agent
+            .session_mut()
+            .try_set_metadata(
+                crate::fork_notice::SESSION_FORK_SEED_KEY,
+                serde_json::json!({"fork": "a_kind_from_a_later_release"}),
+            )
+            .expect("the seed is recorded");
+        for prompt in ["first", "second"] {
+            let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
+            agent
+                .run_with_events(prompt.into(), tx)
+                .await
+                .expect("an unreadable seed does not fail the run");
+        }
+        assert!(
+            agent
+                .session()
+                .metadata()
+                .get(crate::fork_notice::SESSION_FORK_SEED_KEY)
+                .is_none(),
+            "the unreadable seed is dropped"
+        );
+        let notices = agent
+            .session()
+            .messages()
+            .iter()
+            .filter(|message| {
+                matches!(
+                    message,
+                    Message::SystemNotice(notice)
+                        if notice.body.as_deref().is_some_and(|body| body.contains("fork context"))
+                )
+            })
+            .count();
+        assert_eq!(notices, 1, "the child is told once");
     }
 
     /// Without an engine, a turn that selects no skills still runs normally.

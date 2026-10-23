@@ -2520,12 +2520,19 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         MobError::MemberProvisionFailed { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
         }
-        // Durable-fork provisioning and refusal and bounded helper projection
-        // are separate composite operations. None can originate from a
+        // Durable-fork provisioning and bounded helper projection are
+        // separate composite operations that cannot originate from a
         // spawn-many row, so exposing a session/transport classification here
         // would invent a modeled spawn cause that MobMachine never observed.
+        // A spawn-many fork row can be refused before anything is spawned by
+        // the host's fork instruction policy or by the fork context budget;
+        // MobMachine models no spawn cause for either, so they stay Internal
+        // here and the row's typed code and structured data name the refusal.
+        // A failed fork-context probe is classified by what failed it.
+        MobError::HostFeaturesProbeFailed { cause, .. } => spawn_many_failure_observation(cause),
         MobError::ForkMemberProvisionFailed { .. }
         | MobError::ForkInstructionRefused { .. }
+        | MobError::ForkContextTooLarge { .. }
         | MobError::InvalidBoundedHelperResult { .. }
         | MobError::ForkJobOwnerNotSource { .. }
         | MobError::BoundedHelperResultUnavailable { .. }
@@ -19212,6 +19219,30 @@ impl MemberHandle {
 mod tests {
     use super::*;
     use crate::ids::Generation;
+
+    /// A failed fork-context probe is classified by what failed it: a
+    /// probe whose bridge request timed out is a transport failure, as
+    /// the timeout itself is, and `spawn_many` observes it as one.
+    #[test]
+    fn a_probe_failed_by_a_bridge_timeout_is_a_transport_failure() {
+        let timeout = || MobError::BridgeRequestTimedOut {
+            request_envelope_id: "probe-envelope".to_string(),
+            timeout_ms: 10_000,
+        };
+        let failed = MobError::HostFeaturesProbeFailed {
+            host_id: "host-a".to_string(),
+            cause: Arc::new(timeout()),
+        };
+        assert_eq!(
+            failed.failure_class(),
+            crate::error::MobFailureClass::Transport
+        );
+        assert_eq!(failed.failure_class(), timeout().failure_class());
+        assert_eq!(
+            spawn_many_failure_observation(&failed),
+            mob_dsl::MobSpawnManyFailureObservationKind::CommsError
+        );
+    }
 
     /// A scoped retire's refusal travels as a step outcome, so a joiner keeps
     /// seeing a stale fence or a moved session that the actor answered as a

@@ -1851,6 +1851,13 @@ impl meerkat_mob::MobSessionService for RpcMobSessionService {
         self.service.tool_scope_snapshot(session_id).await
     }
 
+    async fn fork_source_tools(
+        &self,
+        session_id: &SessionId,
+    ) -> meerkat_core::fork_notice::ForkSeedSourceTools {
+        self.service.fork_source_tools(session_id).await
+    }
+
     async fn tool_catalog_view(
         &self,
         session_id: &SessionId,

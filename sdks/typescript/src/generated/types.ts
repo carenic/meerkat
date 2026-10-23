@@ -3519,6 +3519,8 @@ export type ForkInstructionRefusalCause = ForkInstructionRefusalCausePolicyRefus
 export interface ForkInstructionRefusal {
   cause: ForkInstructionRefusalCause;
   keys: unknown[][];
+  skills?: SkillKey[];
+  unreadable_skill_loads?: number;
 }
 
 export type ToolConfigChangeDomain = "tool_scope" | "deferred_catalog";
@@ -4789,6 +4791,7 @@ export interface BridgeCommandMaterializeMember {
   forked_participant_attachment?: Record<string, unknown> | null;
   generation: number;
   launch: { mode: "fresh" } | Record<string, unknown>;
+  prompt_context_fork?: Record<string, unknown> | null;
   protocol_version: BridgeProtocolVersion;
   spec: Record<string, unknown>;
   spec_digest: string;
@@ -4896,7 +4899,24 @@ export interface BridgeCommandRevokeForkedParticipant {
   supervisor: BridgePeerSpec;
 }
 
-export type BridgeCommand = BridgeCommandBindMember | BridgeCommandAuthorizeSupervisor | BridgeCommandRevokeSupervisor | BridgeCommandDeliverMemberInput | BridgeCommandObserveMember | BridgeCommandInterruptMember | BridgeCommandHardCancelMember | BridgeCommandCancelTrackedMemberInput | BridgeCommandStopMemberRun | BridgeCommandHoldRunStarts | BridgeCommandReleaseRunStarts | BridgeCommandRetireMember | BridgeCommandDestroyMember | BridgeCommandWireMember | BridgeCommandUnwireMember | BridgeCommandDeclareMemberOutboundTaint | BridgeCommandReadMemberHistory | BridgeCommandPollMemberEvents | BridgeCommandOpenMemberLiveChannel | BridgeCommandCloseMemberLiveChannel | BridgeCommandMemberLiveChannelStatus | BridgeCommandControlMemberLiveChannel | BridgeCommandBindHost | BridgeCommandRebindHost | BridgeCommandRevokeHost | BridgeCommandMaterializeMember | BridgeCommandReleaseMember | BridgeCommandInstallPeerTrust | BridgeCommandRemovePeerTrust | BridgeCommandHostStatus | BridgeCommandIssueHostBindingDescriptor | BridgeCommandMemberOperatorRequest | BridgeCommandObserveSupervisorRotation | BridgeCommandCreateForkedParticipant | BridgeCommandRevokeForkedParticipant;
+export interface BridgeCommandHostFeatures {
+  binding_generation: number;
+  command: "host_features";
+  epoch: number;
+  mob_id: string;
+  protocol_version: BridgeProtocolVersion;
+  supervisor: BridgePeerSpec;
+}
+
+export interface BridgeCommandReadMemberVisibleTools {
+  command: "read_member_visible_tools";
+  epoch: number;
+  expected_member: BridgeMemberIncarnation;
+  protocol_version: BridgeProtocolVersion;
+  supervisor: BridgePeerSpec;
+}
+
+export type BridgeCommand = BridgeCommandBindMember | BridgeCommandAuthorizeSupervisor | BridgeCommandRevokeSupervisor | BridgeCommandDeliverMemberInput | BridgeCommandObserveMember | BridgeCommandInterruptMember | BridgeCommandHardCancelMember | BridgeCommandCancelTrackedMemberInput | BridgeCommandStopMemberRun | BridgeCommandHoldRunStarts | BridgeCommandReleaseRunStarts | BridgeCommandRetireMember | BridgeCommandDestroyMember | BridgeCommandWireMember | BridgeCommandUnwireMember | BridgeCommandDeclareMemberOutboundTaint | BridgeCommandReadMemberHistory | BridgeCommandPollMemberEvents | BridgeCommandOpenMemberLiveChannel | BridgeCommandCloseMemberLiveChannel | BridgeCommandMemberLiveChannelStatus | BridgeCommandControlMemberLiveChannel | BridgeCommandBindHost | BridgeCommandRebindHost | BridgeCommandRevokeHost | BridgeCommandMaterializeMember | BridgeCommandReleaseMember | BridgeCommandInstallPeerTrust | BridgeCommandRemovePeerTrust | BridgeCommandHostStatus | BridgeCommandIssueHostBindingDescriptor | BridgeCommandMemberOperatorRequest | BridgeCommandObserveSupervisorRotation | BridgeCommandCreateForkedParticipant | BridgeCommandRevokeForkedParticipant | BridgeCommandHostFeatures | BridgeCommandReadMemberVisibleTools;
 
 export interface BridgeDeliveryOutcomeAccepted {
   outcome: "accepted";
@@ -5304,7 +5324,17 @@ export interface BridgeReplyForkedParticipantRevoked {
   result: "forked_participant_revoked";
 }
 
-export type BridgeReply = BridgeReplyBindMember | BridgeReplyAck | BridgeReplyObservation | BridgeReplyDelivery | BridgeReplyTrackedInputCancelled | BridgeReplyMemberRunStopped | BridgeReplyRunStartsHeld | BridgeReplyRetire | BridgeReplyDestroy | BridgeReplySupervisorRotationFound | BridgeReplySupervisorRotationNotFound | BridgeReplyRejected | BridgeReplyBindHost | BridgeReplyHostRebound | BridgeReplyHostRevoked | BridgeReplyMemberHistoryPage | BridgeReplyMemberEventsPage | BridgeReplyMemberMaterialized | BridgeReplyMemberReleased | BridgeReplyHostStatus | BridgeReplyHostBindingDescriptorIssued | BridgeReplyMemberLiveChannelOpened | BridgeReplyMemberLiveChannelClosed | BridgeReplyMemberLiveChannelStatusReport | BridgeReplyMemberLiveChannelControlled | BridgeReplyMemberOperatorReply | BridgeReplyForkedParticipantCreated | BridgeReplyForkedParticipantRevoked;
+export interface BridgeReplyHostFeatures {
+  features?: string[];
+  result: "host_features";
+}
+
+export interface BridgeReplyMemberVisibleTools {
+  names?: string[] | null;
+  result: "member_visible_tools";
+}
+
+export type BridgeReply = BridgeReplyBindMember | BridgeReplyAck | BridgeReplyObservation | BridgeReplyDelivery | BridgeReplyTrackedInputCancelled | BridgeReplyMemberRunStopped | BridgeReplyRunStartsHeld | BridgeReplyRetire | BridgeReplyDestroy | BridgeReplySupervisorRotationFound | BridgeReplySupervisorRotationNotFound | BridgeReplyRejected | BridgeReplyBindHost | BridgeReplyHostRebound | BridgeReplyHostRevoked | BridgeReplyMemberHistoryPage | BridgeReplyMemberEventsPage | BridgeReplyMemberMaterialized | BridgeReplyMemberReleased | BridgeReplyHostStatus | BridgeReplyHostBindingDescriptorIssued | BridgeReplyMemberLiveChannelOpened | BridgeReplyMemberLiveChannelClosed | BridgeReplyMemberLiveChannelStatusReport | BridgeReplyMemberLiveChannelControlled | BridgeReplyMemberOperatorReply | BridgeReplyForkedParticipantCreated | BridgeReplyForkedParticipantRevoked | BridgeReplyHostFeatures | BridgeReplyMemberVisibleTools;
 
 export interface ContentBlockText {
   text: string;
@@ -6871,6 +6901,59 @@ export type BackgroundJobTerminalStatus = "completed" | "failed" | "aborted" | "
 
 export type CommsNoticeKind = string;
 
+export type ForkNoticeKind = "transcript" | "prompt_context";
+
+export interface MobMemberBinding {
+  member: string;
+  mob_id: string;
+  role: string;
+}
+
+export interface ForkNoticeSource {
+  member?: MobMemberBinding | null;
+  session_id?: string | null;
+}
+
+export type ForkNoticeSystemPrompt = "not_carried" | "not_applicable";
+
+export type ForkToolsNotComparedReason = "source_not_live" | "placed_source" | "member_host_unsupported";
+
+export interface ForkNoticeToolsCompared {
+  added?: ToolName[];
+  comparison: "compared";
+  omitted?: number;
+  removed?: ToolName[];
+}
+
+export interface ForkNoticeToolsNotCompared {
+  comparison: "not_compared";
+  reason: ForkToolsNotComparedReason;
+}
+
+export type ForkNoticeTools = ForkNoticeToolsCompared | ForkNoticeToolsNotCompared;
+
+export interface InstructionKeyRef {
+  key: string;
+  namespace: string;
+}
+
+export interface ForkBoundaryNotice {
+  child_session_id: string;
+  earlier_rows_omitted?: number;
+  fork: ForkNoticeKind;
+  injected_rows_carried?: number;
+  injected_rows_removed?: number;
+  instructions_added?: InstructionKeyRef[];
+  instructions_carried?: InstructionKeyRef[];
+  instructions_removed?: InstructionKeyRef[];
+  skills_carried?: SkillKey[];
+  skills_removed?: SkillKey[];
+  source: ForkNoticeSource;
+  source_system_prompt: ForkNoticeSystemPrompt;
+  summary: string;
+  tools: ForkNoticeTools;
+}
+
 export type InteractionId = string;
 
 export type InterruptedInputKind = "prompt" | "peer" | "flow_step" | "external_event" | "continuation" | "operation" | "unknown";
@@ -7029,13 +7112,31 @@ export interface SystemNoticeBlockToolProcessInterrupted {
   type: "tool_process_interrupted";
 }
 
+export interface SystemNoticeBlockForkBoundary {
+  child_session_id: string;
+  earlier_rows_omitted?: number;
+  fork: ForkNoticeKind;
+  injected_rows_carried?: number;
+  injected_rows_removed?: number;
+  instructions_added?: InstructionKeyRef[];
+  instructions_carried?: InstructionKeyRef[];
+  instructions_removed?: InstructionKeyRef[];
+  skills_carried?: SkillKey[];
+  skills_removed?: SkillKey[];
+  source: ForkNoticeSource;
+  source_system_prompt: ForkNoticeSystemPrompt;
+  summary: string;
+  tools: ForkNoticeTools;
+  type: "fork_boundary";
+}
+
 export interface SystemNoticeBlockUnknown {
   payload?: unknown;
   summary?: string | null;
   type: "unknown";
 }
 
-export type SystemNoticeBlock = SystemNoticeBlockComms | SystemNoticeBlockExternalEvent | SystemNoticeBlockToolConfig | SystemNoticeBlockMcp | SystemNoticeBlockBackgroundJob | SystemNoticeBlockAuth | SystemNoticeBlockRuntimeNotice | SystemNoticeBlockToolProcessInterrupted | SystemNoticeBlockUnknown;
+export type SystemNoticeBlock = SystemNoticeBlockComms | SystemNoticeBlockExternalEvent | SystemNoticeBlockToolConfig | SystemNoticeBlockMcp | SystemNoticeBlockBackgroundJob | SystemNoticeBlockAuth | SystemNoticeBlockRuntimeNotice | SystemNoticeBlockToolProcessInterrupted | SystemNoticeBlockForkBoundary | SystemNoticeBlockUnknown;
 
 export type SystemNoticeKind = "generic" | "comms" | "external_event" | "mcp_pending" | "mcp" | "background_job" | "tool_scope" | "tool_scope_warning" | "auth_reauth_required" | "tool_process_recovery";
 

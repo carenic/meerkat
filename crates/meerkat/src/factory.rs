@@ -953,6 +953,12 @@ pub struct AgentBuildConfig {
     /// it is for custom `SessionAgentBuilder` implementations (host build
     /// callbacks) and not consumed by the standard build pipeline.
     pub fork_source: Option<meerkat_core::ForkBuildSource>,
+    /// Typed source of a prompt-context fork child, set only by the mob
+    /// runtime on that child's create build (see
+    /// `meerkat_core::PromptContextForkSource`). Like `fork_source`, it is for
+    /// custom `SessionAgentBuilder` implementations and not consumed by the
+    /// standard build pipeline.
+    pub prompt_context_fork_source: Option<meerkat_core::PromptContextForkSource>,
     /// Additional instruction sections appended to the system prompt after skill
     /// assembly, before tool instructions. Order preserved.
     pub additional_instructions: Option<Vec<String>>,
@@ -1164,6 +1170,10 @@ impl std::fmt::Debug for AgentBuildConfig {
             )
             .field("app_context", &self.app_context.is_some())
             .field("fork_source", &self.fork_source)
+            .field(
+                "prompt_context_fork_source",
+                &self.prompt_context_fork_source,
+            )
             .field("additional_instructions", &self.additional_instructions)
             .field("wait_for_mcp", &self.wait_for_mcp)
             .field("mcp_servers", &self.mcp_servers)
@@ -1258,6 +1268,7 @@ impl AgentBuildConfig {
             skill_engine_override: None,
             app_context: None,
             fork_source: None,
+            prompt_context_fork_source: None,
             additional_instructions: None,
             wait_for_mcp: false,
             mcp_servers: Vec::new(),
@@ -1396,6 +1407,7 @@ impl AgentBuildConfig {
         self.max_inline_peer_notifications = build.max_inline_peer_notifications;
         self.app_context = build.app_context.clone();
         self.fork_source = build.fork_source.clone();
+        self.prompt_context_fork_source = build.prompt_context_fork_source.clone();
         self.additional_instructions = build.additional_instructions.clone();
         self.initial_metadata_entries = build.initial_metadata_entries.clone();
         self.initial_tool_filter = build.initial_tool_filter.clone();
@@ -1481,6 +1493,7 @@ impl AgentBuildConfig {
             max_inline_peer_notifications: self.max_inline_peer_notifications,
             app_context: self.app_context.clone(),
             fork_source: self.fork_source.clone(),
+            prompt_context_fork_source: self.prompt_context_fork_source.clone(),
             additional_instructions: self.additional_instructions.clone(),
             initial_metadata_entries: self.initial_metadata_entries.clone(),
             initial_tool_filter: self.initial_tool_filter.clone(),
@@ -21005,6 +21018,37 @@ mod tests {
         assert_eq!(
             rebuilt.auto_compact_threshold_override,
             std::num::NonZeroU64::new(50_000)
+        );
+    }
+
+    /// Both fork sources a build names survive the deferred-session round
+    /// trip through `SessionBuildOptions`.
+    #[test]
+    fn fork_sources_survive_the_session_build_options_round_trip() {
+        let binding = meerkat_core::MobMemberBinding {
+            mob_id: "mob".to_string(),
+            role: "lead".to_string(),
+            member: "source".to_string(),
+        };
+        let source_session = meerkat_core::types::SessionId::new();
+        let options = SessionBuildOptions {
+            fork_source: Some(meerkat_core::ForkBuildSource::new(
+                binding.clone(),
+                source_session.clone(),
+            )),
+            prompt_context_fork_source: Some(meerkat_core::PromptContextForkSource::new(
+                binding,
+                Some(source_session),
+            )),
+            ..SessionBuildOptions::default()
+        };
+        let mut build = AgentBuildConfig::new("claude-sonnet-4-5");
+        build.apply_session_build_options(&options);
+        let round_tripped = build.to_session_build_options();
+        assert_eq!(round_tripped.fork_source, options.fork_source);
+        assert_eq!(
+            round_tripped.prompt_context_fork_source,
+            options.prompt_context_fork_source
         );
     }
 

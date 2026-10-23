@@ -5664,6 +5664,40 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
         })
     }
 
+    /// The visible tool names of the live session `id` at a fork boundary,
+    /// for the child's fork notice ([`meerkat_core::fork_notice`]): the
+    /// tools its session task last published (see
+    /// [`Self::published_live_visible_tool_defs`]). No command is sent, so a
+    /// source in the middle of a turn, such as one forking itself from one
+    /// of its own tool calls, is read as of its last turn boundary instead
+    /// of waiting on that turn.
+    pub async fn fork_source_tools(
+        &self,
+        id: &SessionId,
+    ) -> meerkat_core::fork_notice::ForkSeedSourceTools {
+        use meerkat_core::fork_notice::{ForkSeedSourceTools, ForkToolsNotComparedReason};
+        let published = self
+            .sessions
+            .with_handle(id, |handle| {
+                (!handle.command_tx.is_closed()).then(|| {
+                    handle
+                        .visible_tool_defs_rx
+                        .borrow()
+                        .iter()
+                        .map(|tool| tool.name.clone())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .await
+            .flatten();
+        match published {
+            Some(names) => ForkSeedSourceTools::Read { names },
+            None => ForkSeedSourceTools::NotRead {
+                reason: ForkToolsNotComparedReason::SourceNotLive,
+            },
+        }
+    }
+
     /// How a live session's next model request projects its tool catalog:
     /// the catalog mode and how each catalog entry shows to the model
     /// ([`meerkat_core::ToolCatalogView`]). Read through the session task

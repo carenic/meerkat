@@ -74,6 +74,7 @@ pub mod event;
 pub mod event_injector;
 pub mod event_tap;
 pub mod exact_operation;
+pub mod fork_notice;
 pub mod gateway;
 pub mod generated;
 pub mod governance_config;
@@ -503,10 +504,10 @@ pub use service::{
     DurableForkSourceAdmission, DurableSessionForkTarget, ForkBuildSource, ForkCacheInheritance,
     ForkCacheInheritanceInstall, ForkCacheInheritanceUnavailableReason, ForkPoint, ForkPointError,
     LiveFinalTranscriptCommitAtTurnBoundary, MobToolsBuildArgs, MobToolsFactory,
-    PublicTurnToolOverlay, SessionBuildIntent, SessionBuildOptions, SessionControlError,
-    SessionError, SessionForkAtRequest, SessionForkReplaceRequest, SessionForkResult,
-    SessionHistoryPage, SessionHistoryQuery, SessionInfo, SessionQuery, SessionService,
-    SessionServiceCommsExt, SessionServiceControlExt, SessionServiceHistoryExt,
+    PromptContextForkSource, PublicTurnToolOverlay, SessionBuildIntent, SessionBuildOptions,
+    SessionControlError, SessionError, SessionForkAtRequest, SessionForkReplaceRequest,
+    SessionForkResult, SessionHistoryPage, SessionHistoryQuery, SessionInfo, SessionQuery,
+    SessionService, SessionServiceCommsExt, SessionServiceControlExt, SessionServiceHistoryExt,
     SessionServiceTranscriptEditExt, SessionSummary, SessionTranscriptRestoreRevisionRequest,
     SessionTranscriptRevisionList, SessionTranscriptRevisionListEntry,
     SessionTranscriptRevisionListQuery, SessionTranscriptRevisionPage,
