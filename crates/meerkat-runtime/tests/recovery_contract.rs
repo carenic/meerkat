@@ -1675,6 +1675,111 @@ async fn whole_blob_closing_rebase_after_a_final_compaction_recovers_as_interrup
     );
 }
 
+/// A run settled without resuming repairs its own tail through the
+/// run-guarded drive, as crash recovery would; a guard naming another run
+/// leaves the tail untouched. Unrun.
+#[tokio::test]
+async fn run_guarded_recovery_repairs_only_the_named_runs_tail() {
+    use meerkat_core::lifecycle::core_executor::BoundSessionCommit;
+    use meerkat_core::types::{
+        AssistantBlock, BlockAssistantMessage, Message, StopReason, ToolResult,
+        TranscriptMessageIdentity, UserMessage,
+    };
+    use meerkat_runtime::recovery::{DurableTailRecoveryOutcome, recover_durable_tail_for_run};
+    use meerkat_runtime::store::{PreparedRuntimeSessionCommit, PreparedWholeBlobProvisionalTail};
+
+    let store = InMemoryRuntimeStore::new();
+    let run_id = RunId::new();
+    let mut committed = meerkat_core::Session::new();
+    committed.push(Message::User(UserMessage::text("invoke durable tool")));
+    let session_id = committed.id().clone();
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    let committed_authority = store
+        .commit_prepared_session_boundary(
+            &runtime_id,
+            PreparedRuntimeSessionCommit::snapshot_only(
+                BoundSessionCommit::sealed(Arc::new(committed.clone())).unwrap(),
+            ),
+        )
+        .await
+        .unwrap()
+        .authority()
+        .and_then(|authority| authority.whole_blob())
+        .cloned()
+        .expect("initial boundary returns WholeBlob store authority");
+
+    let mut interrupted = committed;
+    interrupted.push(Message::BlockAssistant(BlockAssistantMessage {
+        blocks: vec![AssistantBlock::ToolUse {
+            id: "durable-call".to_string(),
+            name: "durable_tool".to_string(),
+            args: serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
+            meta: None,
+        }],
+        stop_reason: Some(StopReason::ToolUse),
+        identity: TranscriptMessageIdentity::default().with_run_id(run_id.clone()),
+        created_at: meerkat_core::types::message_timestamp_now(),
+        assistant_message_id: None,
+    }));
+    interrupted.push(Message::tool_results(vec![ToolResult::new(
+        "durable-call".to_string(),
+        "durable result".to_string(),
+        false,
+    )]));
+    let interrupted_message_count = interrupted.messages().len();
+    let candidate = BoundSessionCommit::sealed(Arc::new(interrupted)).unwrap();
+    store
+        .write_prepared_whole_blob_provisional_tail(
+            &runtime_id,
+            PreparedWholeBlobProvisionalTail::prepare(
+                committed_authority,
+                run_id.clone(),
+                1,
+                &candidate,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        recover_durable_tail_for_run(&store, &session_id, &RunId::new())
+            .await
+            .expect("a guard naming another run is not an error")
+            .is_none(),
+        "another run's guard answers None"
+    );
+    assert!(
+        store
+            .load_whole_blob_provisional_tail(&runtime_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "another run's guard leaves the tail untouched"
+    );
+
+    let Some(DurableTailRecoveryOutcome::Committed { recovered, .. }) =
+        recover_durable_tail_for_run(&store, &session_id, &run_id)
+            .await
+            .expect("the named run's tail recovers")
+    else {
+        panic!("the named run's interrupted tail must commit");
+    };
+    assert_eq!(recovered.messages().len(), interrupted_message_count + 1);
+    assert!(matches!(
+        recovered.messages().last(),
+        Some(Message::SystemNotice(_))
+    ));
+    assert!(
+        store
+            .load_whole_blob_provisional_tail(&runtime_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "the repair consumes the named run's tail"
+    );
+}
+
 #[tokio::test]
 async fn whole_blob_recovery_uses_latest_same_run_candidate_sequence() {
     use meerkat_core::lifecycle::core_executor::BoundSessionCommit;

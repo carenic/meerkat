@@ -657,7 +657,13 @@ them.
   registration, which marks the run resumable on the live authority and keeps
   its inputs bound instead of requeueing them. Every recovery commit clears the
   run cursor. New `InputAbandonReason::ResumeRefused` settles a run whose
-  resume was refused.
+  resume was refused. A tail committed as interrupted keeps the calls its last
+  round had staged: recovery writes the staged assistant message into the
+  transcript and answers each call with an outcome-unknown error result
+  (`ToolError::OutcomeUncertain`), so the next turn sees calls that may have
+  run. `recovery::recover_durable_tail_for_run` runs the same recovery for
+  one run's tail and leaves another run's tail untouched; the runtime uses
+  it to commit as interrupted the tail of a run that ends without resuming.
 - `meerkat-core`: per-round commits and resumable runs. A run whose agent has
   a session checkpointer commits every tool round twice:
   - The first commit comes after the model call and before any tool of the
