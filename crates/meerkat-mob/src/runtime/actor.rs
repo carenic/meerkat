@@ -24987,6 +24987,41 @@ impl MobActor {
         }
     }
 
+    /// The `AcquireLease` execution for a lease classified
+    /// `HeldByEndedIncarnation`: release exactly the claim that was read, so
+    /// the ordinary claim that follows takes the lease over. False when the
+    /// stored claim is no longer the one read (renewed, released or taken in
+    /// between); nothing is released then.
+    async fn release_ended_incarnation_lease(
+        &self,
+        identity: &AgentIdentity,
+        observation: &crate::identity::IdentityStoredObservation<
+            crate::identity::IdentityLeaseRecord,
+        >,
+    ) -> Result<bool, MobError> {
+        let crate::identity::IdentityStoredObservation::Valid(record) = observation else {
+            return Ok(false);
+        };
+        let Some(ended) = record.active.as_ref() else {
+            return Ok(false);
+        };
+        let released = self
+            .identity
+            .release_identity_lease(&self.definition.id, identity, ended)
+            .await
+            .map_err(MobError::from)?;
+        if released {
+            tracing::info!(
+                mob_id = %self.definition.id,
+                identity = %identity,
+                ended_incarnation = %ended.incarnation_id,
+                lease_epoch = ended.epoch,
+                "taking over the identity lease of an incarnation whose process has ended"
+            );
+        }
+        Ok(released)
+    }
+
     fn identity_lease_condition(
         &self,
         observation: &crate::identity::IdentityStoredObservation<
@@ -25010,6 +25045,19 @@ impl MobActor {
                 }
                 Some(active) if now_ms >= active.expires_at_ms => {
                     IdentityLeaseCondition::HeldByExpiredIncarnation
+                }
+                // An earlier incarnation of this mob whose process has ended
+                // (this process holds the store's incarnation custody, and
+                // that incarnation was minted under it elsewhere): nothing of
+                // it runs, so the machine takes its lease over at once.
+                Some(active)
+                    if active.holder_id == self.identity_reconcile_holder_id
+                        && super::identity_incarnation_custody::incarnation_process_ended(
+                            &self.identity_reconcile_incarnation_id,
+                            &active.incarnation_id,
+                        ) =>
+                {
+                    IdentityLeaseCondition::HeldByEndedIncarnation
                 }
                 Some(_) => IdentityLeaseCondition::HeldByOtherLiveIncarnation,
             },
@@ -25971,6 +26019,20 @@ impl MobActor {
                 None,
             )
             .await;
+            if lease_condition == IdentityLeaseCondition::HeldByEndedIncarnation
+                && !self
+                    .release_ended_incarnation_lease(identity, &lease_observation)
+                    .await?
+            {
+                // The claim changed after it was read: read and classify it
+                // again on the next pass rather than claim over it.
+                self.schedule_identity_reconcile_wait(
+                    identity,
+                    IdentityReconcileAuthorityKey::from_observation(&intent_observation),
+                    IDENTITY_RECONCILE_LEASE_RECHECK,
+                );
+                return Ok(IdentityReconcilePassDisposition::Outcome(false));
+            }
             let outcome = self
                 .identity
                 .claim_or_renew_identity_lease(
@@ -26035,9 +26097,12 @@ impl MobActor {
                 )
                 .await;
                 if preliminary == IdentityReconcileDecision::AwaitLease {
-                    // Another incarnation holds the lease. A holder that
-                    // crashed never releases it, nor does a Shutdown that
-                    // kept it (a member still unregistering, or whose
+                    // Another incarnation holds the lease, and this process
+                    // cannot prove that incarnation's process has ended
+                    // (a proven one is HeldByEndedIncarnation, taken over
+                    // above). A holder that crashed in a process this one
+                    // cannot prove ended never releases it, nor does a
+                    // Shutdown that kept it (a member still unregistering, or whose
                     // session actor had not exited, at its deadline; a
                     // retiring member). Neither that expiry nor a release
                     // wakes this identity (only the slow safety scan
@@ -32762,6 +32827,20 @@ impl MobActor {
                 reject_spawn_before_custody!("prepare", error);
             }
         };
+        // A durable profile spawns its member with a durable identity, which
+        // a host reads back to re-attach the worker after a restart. That
+        // needs a session service that keeps sessions, so a mob without one
+        // refuses the spawn before anything exists.
+        if profile.durable && !self.session_service.supports_persistent_sessions() {
+            reject_spawn_before_custody!(
+                "durable_profile",
+                MobError::NonDurableService {
+                    member_id: agent_identity.clone(),
+                    profile: profile_name.clone(),
+                }
+            );
+        }
+        let continuity_intent = continuity_intent.for_profile(&profile, &agent_identity);
 
         // ---------- Off-loop preparation (#1249) ----------
         // Everything below reads durable/session state or builds agent config
@@ -34880,6 +34959,11 @@ impl MobActor {
             build::open_profile_tool_categories_for_inherited_filter(&mut profile);
         }
         let selected_runtime_mode = runtime_mode.unwrap_or(profile.runtime_mode);
+        // A durable profile's placed member carries a durable identity too.
+        // Its member host keeps the sessions, so that host's materialize
+        // preflight, not this mob, refuses one without persistent sessions
+        // (a durable identity requires durable sessions there).
+        let continuity_intent = continuity_intent.for_profile(&profile, &agent_identity);
 
         // §4.1(a) resume/fork normalization: the LOCAL resume fast-path is
         // skipped — member-side validation is authoritative (§19.L1). Fork
@@ -36404,6 +36488,16 @@ impl MobActor {
         if let Some(model) = model_override.as_ref() {
             profile.model.clone_from(model);
         }
+        // A policy auto-spawn of a durable profile is a durable worker like
+        // any other spawn of it (see `enqueue_spawn_with_origin`): refused
+        // before anything exists on a mob without persistent sessions.
+        if profile.durable && !self.session_service.supports_persistent_sessions() {
+            return Err(MobError::NonDurableService {
+                member_id: agent_identity.clone(),
+                profile: profile_name.clone(),
+            });
+        }
+        let continuity_intent = continuity_intent.for_profile(&profile, agent_identity);
         super::spec_compiler::apply_tool_category_overrides(&mut profile, tool_category_overrides);
         // ADJ-6: explicit fact captured before the inherited-open mutation.
         let explicit_workgraph = profile.tools.workgraph;

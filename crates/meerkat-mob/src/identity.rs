@@ -2669,6 +2669,11 @@ pub enum IdentityLeaseCondition {
     HeldByCurrentIncarnation,
     HeldByOtherLiveIncarnation,
     HeldByExpiredIncarnation,
+    /// Unexpired, held by an earlier incarnation of this mob whose process
+    /// has ended, proven by this process holding the store's incarnation
+    /// custody. The machine takes such a lease over at once
+    /// ([`IdentityReconcileDecision::AcquireLease`]).
+    HeldByEndedIncarnation,
 }
 
 /// Resource observation condition. `Divergent` means decodable, attributable
@@ -3783,6 +3788,7 @@ pub(crate) fn identity_adoption_fixture(
         max_inline_peer_notifications: None,
         output_schema: None,
         provider_params: None,
+        durable: false,
     };
     let execution = DesiredExecution::ControllingSession;
     let member = IdentityProfileMemberDeclaration {
@@ -4144,6 +4150,7 @@ mod tests {
             IdentityLeaseCondition::HeldByCurrentIncarnation,
             IdentityLeaseCondition::HeldByOtherLiveIncarnation,
             IdentityLeaseCondition::HeldByExpiredIncarnation,
+            IdentityLeaseCondition::HeldByEndedIncarnation,
         ];
         let resources = [
             IdentityResourceCondition::Unavailable,
@@ -4598,6 +4605,24 @@ mod tests {
         assert_eq!(
             classify_identity_reconciliation(facts),
             IdentityReconcileDecision::AcquireLease
+        );
+    }
+
+    /// A lease an ended incarnation holds is taken over at once, while one
+    /// held by an incarnation that may still run is waited out: the machine,
+    /// not the shell, decides the takeover.
+    #[test]
+    fn an_ended_incarnations_lease_is_acquired_and_a_live_one_awaited() {
+        let mut facts = matching_facts();
+        facts.lease = IdentityLeaseCondition::HeldByEndedIncarnation;
+        assert_eq!(
+            classify_identity_reconciliation(facts),
+            IdentityReconcileDecision::AcquireLease
+        );
+        facts.lease = IdentityLeaseCondition::HeldByOtherLiveIncarnation;
+        assert_eq!(
+            classify_identity_reconciliation(facts),
+            IdentityReconcileDecision::AwaitLease
         );
     }
 

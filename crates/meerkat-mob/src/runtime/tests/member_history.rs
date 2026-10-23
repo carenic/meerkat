@@ -154,6 +154,10 @@ impl Fixture {
     }
 
     async fn create(label: &str, base_prompt: Option<&str>) -> Self {
+        Self::create_with(turn_driven_definition(label), base_prompt).await
+    }
+
+    async fn create_with(definition: MobDefinition, base_prompt: Option<&str>) -> Self {
         let root = tempfile::Builder::new()
             .prefix("meerkat-member-history-")
             .tempdir()
@@ -165,7 +169,7 @@ impl Fixture {
         let service = open_service(&root_path);
         let storage =
             MobStorage::persistent(root_path.join("mob.db")).expect("persistent mob storage");
-        let mut builder = MobBuilder::new(turn_driven_definition(label), storage)
+        let mut builder = MobBuilder::new(definition, storage)
             .with_session_service(service.clone())
             .with_default_llm_client(Arc::new(ScriptedClient));
         if let Some(prompt) = base_prompt {
@@ -454,6 +458,100 @@ async fn durable_identity_members_lists_only_live_durable_identity_spawns() {
             .map(|binding| binding.identity().clone())
             .collect::<Vec<_>>(),
         vec![durable]
+    );
+}
+
+// A spawn of a durable profile is a durable-identity member keyed by its
+// identity, with no continuity intent on the spawn; an explicit intent on a
+// spawn of the same profile keeps its own key. The stopped mob's store
+// answers the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_durable_profile_spawns_durable_identity_members() {
+    let mut definition = turn_driven_definition("member-history-durable-profile");
+    let mut worker = definition
+        .profiles
+        .get(&ProfileName::from("lead"))
+        .and_then(ProfileBinding::as_inline)
+        .expect("inline lead")
+        .clone();
+    worker.durable = true;
+    definition.profiles.insert(
+        ProfileName::from("worker"),
+        ProfileBinding::Inline(Box::new(worker)),
+    );
+    let fixture = Fixture::create_with(definition, None).await;
+    let handle = &fixture.handle;
+    let by_profile = unique_identity("by-profile");
+    let explicit = unique_identity("explicit");
+    let plain = unique_identity("plain");
+    handle
+        .spawn_spec(SpawnMemberSpec::new("worker", by_profile.clone()))
+        .await
+        .expect("spawn a member of the durable profile");
+    let mut explicit_spec = SpawnMemberSpec::new("worker", explicit.clone());
+    explicit_spec.continuity_intent = SpawnContinuityIntent::DurableIdentity {
+        continuity_key: "work-item-7".to_string(),
+    };
+    handle
+        .spawn_spec(explicit_spec)
+        .await
+        .expect("spawn the durable profile with an explicit intent");
+    handle
+        .spawn_spec(SpawnMemberSpec::new("lead", plain.clone()))
+        .await
+        .expect("spawn an ordinary member");
+
+    let expected = |history: &crate::runtime::MemberBindingHistory| {
+        let mut durable = history
+            .durable_identity_members()
+            .map(|binding| {
+                (
+                    binding.identity().clone(),
+                    binding.role().clone(),
+                    binding.continuity_intent().clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        durable.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut want = vec![
+            (
+                by_profile.clone(),
+                ProfileName::from("worker"),
+                SpawnContinuityIntent::DurableIdentity {
+                    continuity_key: by_profile.to_string(),
+                },
+            ),
+            (
+                explicit.clone(),
+                ProfileName::from("worker"),
+                SpawnContinuityIntent::DurableIdentity {
+                    continuity_key: "work-item-7".to_string(),
+                },
+            ),
+        ];
+        want.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(durable, want);
+        assert_eq!(
+            history
+                .last_binding(&plain)
+                .expect("a live member has a binding")
+                .continuity_intent(),
+            &SpawnContinuityIntent::Ephemeral
+        );
+    };
+    expected(
+        &handle
+            .member_binding_history()
+            .await
+            .expect("read the history"),
+    );
+
+    let mob_db = fixture.mob_db();
+    let _root = fixture.stop().await;
+    expected(
+        &MobStorage::read_member_binding_history(&mob_db)
+            .await
+            .expect("read the stopped mob's history"),
     );
 }
 

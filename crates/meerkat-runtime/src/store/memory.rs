@@ -3062,6 +3062,126 @@ impl RuntimeStore for InMemoryRuntimeStore {
         Ok(successor)
     }
 
+    async fn commit_prepared_whole_blob_run_rebase(
+        &self,
+        runtime_id: &LogicalRuntimeId,
+        rebase: super::PreparedWholeBlobRunRebaseStoreParts,
+    ) -> Result<super::WholeBlobRunRebaseOutcome, RuntimeStoreError> {
+        let (issued_committed, issued_tail) = rebase.issued_authorities()?;
+        let (
+            rewrite,
+            expected_tail,
+            _run_id,
+            _candidate_blob_sha256,
+            candidate_bytes,
+            conversation_digest,
+            message_count,
+            candidate_catalog_entry,
+            candidate_compaction_intents,
+        ) = rebase.into_parts();
+        let (
+            expected,
+            successor_session_id,
+            _successor_blob_sha256,
+            successor_bytes,
+            mut successor_catalog_entry,
+            compaction_projection_intents,
+        ) = rewrite.into_tuple();
+        if expected.session_id() != &successor_session_id
+            || &LogicalRuntimeId::for_session(&successor_session_id) != runtime_id
+            || candidate_catalog_entry.session_id() != &successor_session_id
+            || candidate_catalog_entry.persistence_profile()
+                != super::RuntimeSessionPersistenceProfile::WholeBlobV1
+            || u64::try_from(candidate_catalog_entry.message_count()).ok() != Some(message_count)
+        {
+            return Err(RuntimeStoreError::SessionPersistenceAuthorityConflict {
+                runtime_id: runtime_id.to_string(),
+                detail: "prepared WholeBlob re-base does not bind this runtime/session".to_string(),
+            });
+        }
+        let mut inner = self.inner.lock().await;
+        let current = inner.session_authorities.get(&runtime_id.0).cloned();
+        let current_tail = inner
+            .whole_blob_provisional_tails
+            .get(&runtime_id.0)
+            .map(|tail| tail.authority.clone());
+        if current.as_ref() == Some(&issued_committed)
+            && current_tail.as_ref() == Some(&issued_tail)
+        {
+            return Ok(super::WholeBlobRunRebaseOutcome::Applied {
+                committed: issued_committed,
+                tail: issued_tail,
+            });
+        }
+        if current.as_ref() != Some(&expected) || current_tail != expected_tail {
+            return Ok(super::WholeBlobRunRebaseOutcome::Stale);
+        }
+        // The re-base is the compaction's boundary: its intents enter the
+        // outbox here, unless the outbox already finalized one or holds it
+        // with other content.
+        if let Some(existing) = inner.compaction_projection_outbox.get(&runtime_id.0) {
+            for intent in &*compaction_projection_intents {
+                if let Some(entry) = existing.get(&intent.projection) {
+                    if entry.finalized {
+                        return Err(RuntimeStoreError::WriteFailed(format!(
+                            "WholeBlob re-base replays finalized compaction intent {}",
+                            intent.projection.revision()
+                        )));
+                    }
+                    if entry.intent != *intent {
+                        return Err(RuntimeStoreError::WriteFailed(format!(
+                            "conflicting compaction outbox intent for rewrite {}",
+                            intent.projection.revision()
+                        )));
+                    }
+                }
+            }
+        }
+        // Everything below is infallible under this lock: the successor, its
+        // outbox rows and the new tail land together or not at all.
+        successor_catalog_entry.set_runtime_state(
+            inner
+                .session_catalog
+                .get(&runtime_id.0)
+                .and_then(super::RuntimeSessionCatalogEntry::runtime_state),
+        );
+        inner.sessions.insert(runtime_id.0.clone(), successor_bytes);
+        inner
+            .session_authorities
+            .insert(runtime_id.0.clone(), issued_committed.clone());
+        inner
+            .session_catalog
+            .insert(runtime_id.0.clone(), successor_catalog_entry);
+        inner.projection_quarantine.remove(&runtime_id.0);
+        let outbox = inner
+            .compaction_projection_outbox
+            .entry(runtime_id.0.clone())
+            .or_default();
+        for intent in &*compaction_projection_intents {
+            outbox
+                .entry(intent.projection.clone())
+                .or_insert(CompactionOutboxEntry {
+                    intent: intent.clone(),
+                    finalized: false,
+                });
+        }
+        inner.whole_blob_provisional_tails.insert(
+            runtime_id.0.clone(),
+            StoredWholeBlobProvisionalTail {
+                authority: issued_tail.clone(),
+                candidate_bytes,
+                conversation_digest,
+                message_count,
+                catalog_entry: candidate_catalog_entry,
+                compaction_projection_intents: candidate_compaction_intents,
+            },
+        );
+        Ok(super::WholeBlobRunRebaseOutcome::Applied {
+            committed: issued_committed,
+            tail: issued_tail,
+        })
+    }
+
     async fn atomic_apply(
         &self,
         runtime_id: &LogicalRuntimeId,
@@ -7437,6 +7557,349 @@ mod tests {
             store.load_session_snapshot(&rid).await.unwrap(),
             Some(Arc::new(second)),
             "length-equal but different content must mint a distinct store-owned authority"
+        );
+    }
+
+    // --- WholeBlob run re-base (UNRUN, Policy v1.1) -----------------------
+
+    fn rebase_assistant(text: &str) -> meerkat_core::types::Message {
+        meerkat_core::types::Message::BlockAssistant(meerkat_core::types::BlockAssistantMessage {
+            blocks: vec![meerkat_core::types::AssistantBlock::Text {
+                text: text.to_string(),
+                meta: None,
+            }],
+            stop_reason: Some(meerkat_core::types::StopReason::EndTurn),
+            identity: meerkat_core::types::TranscriptMessageIdentity::default(),
+            created_at: meerkat_core::types::message_timestamp_now(),
+            assistant_message_id: None,
+        })
+    }
+
+    fn rebase_with_cursor(
+        mut session: meerkat_core::Session,
+        run_id: &RunId,
+        round: u64,
+    ) -> meerkat_core::Session {
+        session
+            .set_run_cursor(&meerkat_core::SessionRunCursor::new(
+                run_id.clone(),
+                Vec::new(),
+                round,
+                meerkat_core::RunResumePoint::AwaitingModel,
+            ))
+            .unwrap();
+        session
+    }
+
+    /// Compact the first two messages of `session` into one summary.
+    fn rebase_compact(
+        session: &meerkat_core::Session,
+    ) -> (meerkat_core::Session, meerkat_core::TranscriptRewriteCommit) {
+        let mut compacted = session.clone();
+        let parent = compacted.transcript_revision().unwrap();
+        let commit = compacted
+            .commit_transcript_rewrite(
+                meerkat_core::TranscriptRewriteSelection::MessageRange { start: 0, end: 2 },
+                vec![meerkat_core::types::Message::User(
+                    meerkat_core::types::UserMessage::compaction_summary("compacted context"),
+                )],
+                meerkat_core::TranscriptRewriteReason::new("compaction"),
+                Some("rebase-test".to_string()),
+                Some(parent),
+            )
+            .unwrap();
+        (compacted, commit)
+    }
+
+    async fn rebase_committed_payload(
+        store: &InMemoryRuntimeStore,
+        runtime_id: &LogicalRuntimeId,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> super::super::VerifiedCommittedWholeBlobPayload {
+        let committed = store
+            .load_committed_whole_blob_snapshot(runtime_id)
+            .await
+            .unwrap()
+            .unwrap();
+        super::super::VerifiedCommittedWholeBlobPayload::from_committed(session_id, committed)
+            .unwrap()
+    }
+
+    /// A committed one-turn base, plus a run that appended a round after it
+    /// and wrote that round as its first provisional tail.
+    async fn rebase_run_with_tail(
+        store: &InMemoryRuntimeStore,
+    ) -> (
+        LogicalRuntimeId,
+        meerkat_core::Session,
+        RunId,
+        WholeBlobStoreAuthority,
+        WholeBlobProvisionalTailAuthority,
+    ) {
+        let mut original = meerkat_core::Session::new();
+        original.push(meerkat_core::types::Message::User(
+            meerkat_core::types::UserMessage::text("hello".to_string()),
+        ));
+        original.push(rebase_assistant("verbose answer"));
+        let runtime_id = LogicalRuntimeId::for_session(original.id());
+        store
+            .commit_session_snapshot(
+                &runtime_id,
+                SerializedSessionSnapshot {
+                    session_snapshot: serde_json::to_vec(&original).unwrap().into(),
+                },
+            )
+            .await
+            .unwrap();
+        let base = rebase_committed_payload(store, &runtime_id, original.id())
+            .await
+            .store_authority()
+            .clone();
+        let run_id = RunId::new();
+        let mut live = original;
+        live.push(meerkat_core::types::Message::User(
+            meerkat_core::types::UserMessage::text("next question".to_string()),
+        ));
+        live.push(rebase_assistant("another verbose answer"));
+        let live = rebase_with_cursor(live, &run_id, 0);
+        let first = super::super::PreparedWholeBlobProvisionalTail::prepare_from_session(
+            base.clone(),
+            run_id.clone(),
+            1,
+            &live,
+        )
+        .unwrap();
+        let tail = store
+            .write_prepared_whole_blob_provisional_tail(&runtime_id, first)
+            .await
+            .unwrap();
+        (runtime_id, live, run_id, base, tail)
+    }
+
+    #[tokio::test]
+    async fn a_run_rebase_commits_the_compacted_base_and_restarts_the_tail_together() {
+        let store = InMemoryRuntimeStore::new();
+        let (runtime_id, live, run_id, base, first_tail) = rebase_run_with_tail(&store).await;
+        // The compaction rewrites rows the run appended after the committed
+        // base: the rewrite proof binds rewrite occurrences only.
+        let (compacted, commit) = rebase_compact(&live);
+        let payload = rebase_committed_payload(&store, &runtime_id, live.id()).await;
+        let rebase = super::super::PreparedWholeBlobRunRebase::prepare(
+            payload,
+            Some(first_tail.clone()),
+            run_id.clone(),
+            compacted.clone(),
+            std::slice::from_ref(&commit),
+        )
+        .unwrap();
+        let outcome = store
+            .commit_prepared_whole_blob_run_rebase(&runtime_id, rebase.store_parts())
+            .await
+            .unwrap();
+        let super::super::WholeBlobRunRebaseOutcome::Applied { committed, tail } = outcome else {
+            unreachable!("the re-base applies");
+        };
+        assert_eq!(committed.store_revision(), base.store_revision() + 1);
+        assert_eq!(tail.base_store_revision(), committed.store_revision());
+        assert_eq!(tail.base_blob_sha256(), committed.blob_sha256());
+        assert_eq!(tail.run_id(), &run_id);
+        assert_eq!(tail.candidate_sequence(), 1);
+        // The committed body carries no cursor; the tail's candidate does.
+        let stored = store
+            .load_committed_whole_blob_snapshot(&runtime_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.authority(), &committed);
+        assert!(stored.session().try_run_cursor().unwrap().is_none());
+        assert_eq!(
+            stored.session().transcript_revision().unwrap(),
+            commit.revision
+        );
+        let loaded = store
+            .load_whole_blob_provisional_tail(&runtime_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.authority(), &tail);
+        let candidate =
+            meerkat_core::Session::from_persisted_bytes(loaded.candidate_bytes()).unwrap();
+        assert_eq!(
+            candidate
+                .try_run_cursor()
+                .unwrap()
+                .map(|cursor| cursor.run_id),
+            Some(run_id.clone())
+        );
+        // An exact replay answers the same pair and writes nothing.
+        let replay = store
+            .commit_prepared_whole_blob_run_rebase(&runtime_id, rebase.store_parts())
+            .await
+            .unwrap();
+        assert_eq!(
+            replay,
+            super::super::WholeBlobRunRebaseOutcome::Applied {
+                committed: committed.clone(),
+                tail: tail.clone(),
+            }
+        );
+        // The next round commit is a strict continuation of the new base.
+        let mut next = compacted;
+        next.push(meerkat_core::types::Message::User(
+            meerkat_core::types::UserMessage::text("after the compaction".to_string()),
+        ));
+        let next = rebase_with_cursor(next, &run_id, 1);
+        let second = super::super::PreparedWholeBlobProvisionalTail::prepare_from_session(
+            committed.clone(),
+            run_id.clone(),
+            2,
+            &next,
+        )
+        .unwrap();
+        let second_tail = store
+            .write_prepared_whole_blob_provisional_tail(&runtime_id, second)
+            .await
+            .unwrap();
+        assert_eq!(
+            second_tail.base_store_revision(),
+            committed.store_revision()
+        );
+        assert_eq!(second_tail.candidate_sequence(), 2);
+        assert_ne!(
+            first_tail.base_store_revision(),
+            second_tail.base_store_revision()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_rebase_is_stale_once_another_writer_moved_the_tail() {
+        let store = InMemoryRuntimeStore::new();
+        let (runtime_id, live, run_id, base, first_tail) = rebase_run_with_tail(&store).await;
+        let (compacted, commit) = rebase_compact(&live);
+        let payload = rebase_committed_payload(&store, &runtime_id, live.id()).await;
+        let rebase = super::super::PreparedWholeBlobRunRebase::prepare(
+            payload,
+            Some(first_tail),
+            run_id.clone(),
+            compacted.clone(),
+            std::slice::from_ref(&commit),
+        )
+        .unwrap();
+        // Another writer advances the tail before the re-base lands.
+        let mut moved = live.clone();
+        moved.push(meerkat_core::types::Message::User(
+            meerkat_core::types::UserMessage::text("a racing round".to_string()),
+        ));
+        let moved = rebase_with_cursor(moved, &run_id, 1);
+        let racing = super::super::PreparedWholeBlobProvisionalTail::prepare_from_session(
+            base.clone(),
+            run_id.clone(),
+            2,
+            &moved,
+        )
+        .unwrap();
+        let racing_tail = store
+            .write_prepared_whole_blob_provisional_tail(&runtime_id, racing)
+            .await
+            .unwrap();
+        let outcome = store
+            .commit_prepared_whole_blob_run_rebase(&runtime_id, rebase.store_parts())
+            .await
+            .unwrap();
+        assert_eq!(outcome, super::super::WholeBlobRunRebaseOutcome::Stale);
+        // Nothing was written: the base and the racing tail stand.
+        let current = store
+            .load_whole_blob_store_authority(&runtime_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current, base);
+        let loaded = store
+            .load_whole_blob_provisional_tail(&runtime_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.authority(), &racing_tail);
+        // A re-base that expects no tail while one exists is stale too.
+        let payload = rebase_committed_payload(&store, &runtime_id, live.id()).await;
+        let expects_none = super::super::PreparedWholeBlobRunRebase::prepare(
+            payload,
+            None,
+            run_id,
+            compacted,
+            std::slice::from_ref(&commit),
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .commit_prepared_whole_blob_run_rebase(&runtime_id, expects_none.store_parts())
+                .await
+                .unwrap(),
+            super::super::WholeBlobRunRebaseOutcome::Stale
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_run_rebase_leaves_the_base_and_the_tail_untouched() {
+        let store = InMemoryRuntimeStore::new();
+        // A session whose compaction intent already went through a boundary
+        // and was finalized.
+        let (session, intent) = session_with_compaction_intent();
+        let runtime_id = LogicalRuntimeId::for_session(session.id());
+        store
+            .atomic_apply(
+                &runtime_id,
+                Some(SerializedSessionSnapshot {
+                    session_snapshot: serde_json::to_vec(&session).unwrap().into(),
+                }),
+                make_receipt(RunId::new(), 0),
+                vec![],
+                Some(session.id().clone()),
+            )
+            .await
+            .unwrap();
+        store
+            .mark_compaction_projection_finalized(&runtime_id, &intent.projection)
+            .await
+            .unwrap();
+        let payload = rebase_committed_payload(&store, &runtime_id, session.id()).await;
+        let base = payload.store_authority().clone();
+        // A run whose live document still carries that finalized intent
+        // compacts again; its re-base must refuse after the CAS matched.
+        let run_id = RunId::new();
+        let mut live = session.clone();
+        live.push(rebase_assistant("a verbose answer"));
+        live.push(meerkat_core::types::Message::User(
+            meerkat_core::types::UserMessage::text("one more".to_string()),
+        ));
+        let live = rebase_with_cursor(live, &run_id, 0);
+        let (compacted, commit) = rebase_compact(&live);
+        let rebase = super::super::PreparedWholeBlobRunRebase::prepare(
+            payload,
+            None,
+            run_id,
+            compacted,
+            std::slice::from_ref(&commit),
+        );
+        // The proof itself may refuse first; either way nothing may land.
+        if let Ok(rebase) = rebase {
+            let outcome = store
+                .commit_prepared_whole_blob_run_rebase(&runtime_id, rebase.store_parts())
+                .await;
+            assert!(outcome.is_err(), "a finalized intent refuses the re-base");
+        }
+        let current = store
+            .load_whole_blob_store_authority(&runtime_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current, base, "never a committed re-base without its tail");
+        assert!(
+            store
+                .load_whole_blob_provisional_tail(&runtime_id)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 }

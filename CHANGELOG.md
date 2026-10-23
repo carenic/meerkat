@@ -521,6 +521,10 @@ them.
   variant and an enum marked non-exhaustive. A downstream match needs a
   wildcard arm; `rejected_before_effect` stays false for the new variant.
 
+- `meerkat-mob`: `IdentityLeaseCondition` gains `HeldByEndedIncarnation`, an
+  unexpired lease of an earlier incarnation of the same mob whose process
+  has ended; the mob machine maps it to `AcquireLease`. Exhaustive matches
+  need an arm (see Fixed).
 - `meerkat`: `LiveOrchestrator` gains the field `session_addressing`
   (`LiveSessionAddressing`: `SessionScoped` or `MobMember`), so code that
   builds it with a struct literal sets it. A surface that opens live channels
@@ -535,6 +539,19 @@ them.
   `custody_deferred: Option<WireMemberCustodyDeferral>`, absent from the wire
   unless the mob's start deferred the member's custody restore. Code that
   builds the result with a struct literal sets it.
+
+- `meerkat-mob`: `Profile` gains `durable: bool` (see Added, durable
+  workers), and so do its wire forms `meerkat_contracts::WireMobProfile`,
+  `MobProfileInput` and `PortableProfile`. A struct literal needs the field;
+  `durable: false` keeps today's behaviour. Serde reads an omitted `durable`
+  as false and writes it only when true, so a stored or sent ordinary profile
+  keeps its bytes, and the adaptive `LayerDecision` schema leaves it out, so
+  packs stay compatible across versions. The wire forms refuse unknown fields,
+  so an older host refuses a profile that sets `durable`. A spawn of a durable
+  profile on a mob whose session service keeps no persistent sessions is
+  refused with the new `MobError::NonDurableService { member_id, profile }`,
+  under the existing `CAPABILITY_UNAVAILABLE` wire code (structured data kind
+  `mob_non_durable_service`).
 
 - Behaviour-only (not measured by the gate): RPC `session/stream_open` and
   `mob/stream_open` now reserve bounded terminal delivery capacity. The process
@@ -594,6 +611,17 @@ them.
   realm is reopened (a lost fence poisons the realm). On such a realm an
   OAuth login in progress is process-local: a restart cancels it and the
   user starts it again. Completed credentials are not affected.
+- `meerkat-runtime`: a WholeBlob run re-bases at a compaction.
+  `PreparedWholeBlobRunRebase::prepare` proves the compacted document's
+  descent from the committed base (the run's own appended rounds included)
+  and prepares the committed successor without the run cursor and the
+  provisional candidate with it; `RuntimeStore::commit_prepared_whole_blob_run_rebase`
+  commits the successor and restarts the run's provisional tail on it (same
+  run, candidate sequence one) in one transaction, comparing both the
+  committed authority and the current tail, and answers
+  `WholeBlobRunRebaseOutcome::Stale` without writing when another writer
+  moved either. The in-memory and SQLite stores implement it; the default
+  answers `Unsupported`.
 - `MemberBinding::labels()`: the application labels the incarnation was
   spawned with, as its spawn recorded them (a member reset keeps them). Every
   read of the member binding history carries them, the store-level
@@ -1155,6 +1183,18 @@ them.
   and Web SDKs surface it as `{"unknown": value}` and ignore a field they do
   not know, instead of failing the read. A `custody_deferred` that is not an
   object, or whose restore or cause is not a string, is still refused.
+
+- Durable workers: a mob profile with `durable = true` spawns its members as
+  durable workers. The spawn records a durable identity
+  (`SpawnContinuityIntent::DurableIdentity`, keyed by the member's identity),
+  so a host can list and re-attach the worker after a restart
+  (`MobHandle::durable_identity_members`). A mob whose session service keeps
+  no persistent sessions refuses the spawn (`MobError::NonDurableService`)
+  instead of spawning a worker that would not survive one. Like every member
+  of a persisted mob, a durable worker is rebuilt on its session after a
+  crash, kill or restart, and a run it was in continues from its last
+  committed round. An explicit continuity intent on the spawn wins over the
+  profile.
 
 ### Changed
 
@@ -1850,6 +1890,20 @@ them.
   restore already failed, is deferred instead (see the entries next to this
   one).
 
+- `meerkat-mob`, `meerkat-store`: a mob restarted after its process crashed,
+  was killed or exited without a Shutdown kept every adopted identity's
+  admission closed (`IdentityConvergenceAdmissionClosed`) until the earlier
+  incarnation's identity reconcile lease expired, up to 30 s. A restart over a
+  persistent store now takes such a lease at once when it can prove that the
+  earlier process ended: a process holds an exclusive lock on
+  `<mob store>.incarnation-custody` from before it mints its first
+  incarnation until it exits, and marks the incarnations it mints under that
+  lock. A restart in the same process, a restart while another process holds
+  the lock, an incarnation minted without the lock (by an earlier version, or
+  while another process held it) and a store without a file wait as before.
+  `rkat storage doctor` lists the lock file as `mob-incarnation-custody-lock`,
+  and `rkat storage prune` never removes it. `MobIdentityStore` gains the
+  provided method `incarnation_custody_store` (default `None`).
 - `meerkat`, `meerkat-rpc`: the session-scoped `live/open`, and the
   projection, refresh-config, identity and precheck reads behind it, restored
   a mob member's session from storage by its session id alone when it was

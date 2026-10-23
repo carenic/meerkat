@@ -3529,6 +3529,7 @@ capabilities = [{capability_values}]
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
+                durable: false,
             })),
         );
         let owner_session_id = meerkat_core::types::SessionId::parse(owner_session_id)

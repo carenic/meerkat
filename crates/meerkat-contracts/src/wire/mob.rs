@@ -587,6 +587,10 @@ pub struct WireMobProfile {
     pub output_schema: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_params: Option<crate::wire::runtime::WireProviderParamsOverride>,
+    /// Spawn this profile's members as durable workers, which a mob without
+    /// persistent sessions refuses. Omitted means false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub durable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -727,6 +731,10 @@ pub struct MobProfileInput {
     /// losing fidelity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_params: Option<crate::wire::runtime::WireProviderParamsOverride>,
+    /// Spawn this profile's members as durable workers, which a mob without
+    /// persistent sessions refuses. Omitted means false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub durable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -26,6 +26,7 @@ pub use test_faults::InputPersistAckLossFault;
 pub use meerkat_core::{HeadCanonicalProvisionalTailAuthority, WholeBlobProvisionalTailAuthority};
 pub use whole_blob_rewrite::{
     PreparedWholeBlobRewriteBoundary, PreparedWholeBlobRewriteStoreParts,
+    PreparedWholeBlobRunRebase, PreparedWholeBlobRunRebaseStoreParts,
     VerifiedCommittedWholeBlobPayload,
 };
 
@@ -9041,6 +9042,19 @@ pub trait DeliveryGenerationReader: Send {
     fn release(&mut self);
 }
 
+/// What [`RuntimeStore::commit_prepared_whole_blob_run_rebase`] answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WholeBlobRunRebaseOutcome {
+    /// The re-base is durable (or was already): the committed successor's
+    /// authority and the run's new provisional tail on it.
+    Applied {
+        committed: WholeBlobStoreAuthority,
+        tail: WholeBlobProvisionalTailAuthority,
+    },
+    /// The committed authority or the tail moved: nothing was written.
+    Stale,
+}
+
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 pub trait RuntimeStore: Send + Sync {
@@ -9682,6 +9696,40 @@ pub trait RuntimeStore: Send + Sync {
         runtime_id: &LogicalRuntimeId,
         boundary: PreparedWholeBlobRewriteStoreParts,
     ) -> Result<WholeBlobStoreAuthority, RuntimeStoreError>;
+
+    /// Re-base a WholeBlob run at a compaction: commit the compacted
+    /// document as the session's committed base and restart the run's
+    /// provisional tail on it, atomically (one transaction, one lock, or one
+    /// host store batch).
+    ///
+    /// The call compares BOTH the current committed authority with
+    /// `rebase.rewrite().expected_authority()` AND the current provisional
+    /// tail with `rebase.expected_tail()` (`None`: no tail exists). When both
+    /// match, it writes the committed successor exactly as
+    /// [`Self::commit_prepared_whole_blob_rewrite_boundary`] does (bytes,
+    /// authority one revision on, catalog entry keeping the runtime state,
+    /// quarantine cleared), records the successor's compaction intents in the
+    /// outbox (the re-base is that compaction's boundary: an intent the outbox
+    /// already finalized, or holds with other content, refuses), drops the
+    /// old tail, and writes the candidate as the new tail: base = the
+    /// committed authority just issued, the same run, candidate sequence one.
+    /// It writes no run boundary receipt, no input row and no receipt row.
+    ///
+    /// When the current committed authority and tail already equal the
+    /// exact successor pair ([`PreparedWholeBlobRunRebaseStoreParts::issued_authorities`]),
+    /// the call answers `Applied` with them and writes nothing. Any other
+    /// current state answers [`WholeBlobRunRebaseOutcome::Stale`] and writes
+    /// nothing: another writer moved the session, and the run fails over.
+    async fn commit_prepared_whole_blob_run_rebase(
+        &self,
+        runtime_id: &LogicalRuntimeId,
+        rebase: PreparedWholeBlobRunRebaseStoreParts,
+    ) -> Result<WholeBlobRunRebaseOutcome, RuntimeStoreError> {
+        let _ = (runtime_id, rebase);
+        Err(RuntimeStoreError::Unsupported(
+            "commit_prepared_whole_blob_run_rebase".into(),
+        ))
+    }
 
     /// Atomically persist session delta + receipt + input state updates.
     ///

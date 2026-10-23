@@ -1160,11 +1160,13 @@ pub use store::{
     PreparedRuntimeSessionCommit, PreparedRuntimeSessionCommitKind,
     PreparedRuntimeSessionCommitOutcome, PreparedRuntimeSessionCommitResult,
     PreparedWholeBlobProvisionalTail, PreparedWholeBlobRewriteBoundary,
-    PreparedWholeBlobRewriteStoreParts, RecoveryCommitStatus, RuntimeDeliveryAuthorityCasOutcome,
+    PreparedWholeBlobRewriteStoreParts, PreparedWholeBlobRunRebase,
+    PreparedWholeBlobRunRebaseStoreParts, RecoveryCommitStatus, RuntimeDeliveryAuthorityCasOutcome,
     RuntimeDeliveryAuthorityRecord, RuntimeDeliveryStoreRecord, RuntimeSessionAuthority,
     RuntimeSessionPersistenceProfile, RuntimeStore, RuntimeStoreError, RuntimeStoreWriteFence,
     RuntimeStoreWriteFenceOutcome, SerializedSessionSnapshot, VerifiedCommittedWholeBlobPayload,
-    WholeBlobCommittedTranscriptFacts, WholeBlobProvisionalTailAuthority, WholeBlobStoreAuthority,
+    WholeBlobCommittedTranscriptFacts, WholeBlobProvisionalTailAuthority,
+    WholeBlobRunRebaseOutcome, WholeBlobStoreAuthority,
     reuse_or_load_committed_whole_blob_snapshot,
 };
 #[cfg(feature = "sqlite-store")]

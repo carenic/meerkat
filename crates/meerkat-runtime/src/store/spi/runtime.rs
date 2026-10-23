@@ -1100,6 +1100,26 @@ impl RuntimeStore for SpiRuntimeStore {
         .await
     }
 
+    /// A run re-base is one in-memory call, so it lands as one host batch
+    /// (plus the chunk pre-batches of its documents): the committed
+    /// successor, its outbox rows, the old tail's removal and the new tail.
+    async fn commit_prepared_whole_blob_run_rebase(
+        &self,
+        runtime_id: &LogicalRuntimeId,
+        rebase: crate::store::PreparedWholeBlobRunRebaseStoreParts,
+    ) -> Result<crate::store::WholeBlobRunRebaseOutcome, RuntimeStoreError> {
+        self.call(
+            Mode::Mutate,
+            vec![runtime_id_scope(runtime_id)],
+            <InMemoryRuntimeStore as RuntimeStore>::commit_prepared_whole_blob_run_rebase(
+                &self.memory,
+                runtime_id,
+                rebase,
+            ),
+        )
+        .await
+    }
+
     async fn atomic_apply(
         &self,
         runtime_id: &LogicalRuntimeId,
