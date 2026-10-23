@@ -8731,9 +8731,13 @@ pub const DEFAULT_COMMIT_OUTCOME_DEADLINE: std::time::Duration =
 ///   presence lock files, and the connection's page cache), and none once its
 ///   store has been quiet this long.
 /// - The store watch ticks a busy shared store up to every 10 ms, and those
-///   reads share the one kept connection. A quiet store's watch sweeps every
-///   5 s, longer than this bound, so its reader closes between sweeps and
-///   each sweep opens it again, as every read did before.
+///   reads share the one kept connection. The reader's own open and close are
+///   no change to the watch (its open creates the WAL and its index, its
+///   close as the last connection removes them), so a quiet store's reader
+///   closes at this bound and stays closed until a commit or the watch's
+///   sweep. The sweep runs every 5 s, longer than this bound, so the reader
+///   closes between sweeps and each sweep opens it again, as every read did
+///   before.
 pub const KEPT_DELIVERY_READER_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A delivery owner's reader of its store's durable delivery generation

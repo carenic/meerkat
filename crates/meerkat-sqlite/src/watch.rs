@@ -1,9 +1,12 @@
 //! Cross-process change watch for one SQLite database file.
 //!
 //! Another process's commit to a database is invisible to this process's
-//! in-memory signals. This watch turns file-system notifications on the
-//! database, its `-wal` and `-shm` sidecars and their directory into
-//! coalesced ticks for a consumer that then reads durable state.
+//! in-memory signals. This watch turns the file-system notifications that can
+//! announce a commit (on the database, its `-wal` sidecar and their
+//! directory) into coalesced ticks for a consumer that then reads durable
+//! state. A connection's own open and close are no change and tick nothing
+//! ([`sqlite_watch_event_relevant`]): otherwise a consumer's own read would
+//! wake it again.
 //!
 //! A notification is a HINT, never a guarantee: SQLite writes WAL frames
 //! before the WAL index makes the commit visible, so a reader woken by an
@@ -531,7 +534,25 @@ fn sqlite_watch_targets(db_path: &Path) -> Result<(PathBuf, Vec<PathBuf>), Strin
     Ok((parent, watched_paths))
 }
 
-/// Whether a notification concerns the database (its files or directory).
+/// Whether a notification can announce a change to the database: a commit,
+/// a checkpoint, or the database file or its directory replaced or removed.
+///
+/// `watched_paths` are the database's paths as [`sqlite_watch_paths`] names
+/// them in its canonical directory `parent`. A connection's own open and
+/// close are no change: the first connection to open a WAL database creates
+/// its `-wal` and `-shm` files and writes the `-shm` (the WAL index), and the
+/// last to close removes both. A commit appends to the WAL (without one, it
+/// writes the database file), and the WAL index changes only through shared
+/// memory, which no notification reports. So nothing on the `-shm` file is
+/// relevant, nor the creation, removal or metadata of the `-wal`. Every
+/// other event on the database file, the `-wal` or the directory itself is
+/// (an unknown kind included), and so is an event that names no path (a
+/// backend's rescan). An access never is.
+///
+/// On macOS, FSEvents can also report the directory itself when a file in
+/// it is created or removed. The directory stays relevant, since its own
+/// removal or rename matters, so there a connection's own open or close may
+/// still tick.
 pub fn sqlite_watch_event_relevant(
     event: &notify::Event,
     parent: &Path,
@@ -544,13 +565,52 @@ pub fn sqlite_watch_event_relevant(
         return true;
     }
     event.paths.iter().any(|path| {
-        path == parent
-            || watched_paths.iter().any(|watched| {
-                path == watched
-                    || (path.parent() == watched.parent()
-                        && path.file_name() == watched.file_name())
-            })
+        if path == parent {
+            return true;
+        }
+        let Some(watched) = watched_paths.iter().find(|watched| {
+            path == *watched
+                || (path.parent() == watched.parent() && path.file_name() == watched.file_name())
+        }) else {
+            return false;
+        };
+        match WatchedFile::of(watched, watched_paths) {
+            WatchedFile::Database => true,
+            WatchedFile::Wal => !matches!(
+                event.kind,
+                notify::EventKind::Create(_)
+                    | notify::EventKind::Remove(_)
+                    | notify::EventKind::Modify(notify::event::ModifyKind::Metadata(_))
+            ),
+            WatchedFile::WalIndex => false,
+        }
     })
+}
+
+/// Which of a database's watched files a watched path is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchedFile {
+    Database,
+    /// The `-wal` file, which commits append to.
+    Wal,
+    /// The `-shm` file, the WAL index, which changes through shared memory.
+    WalIndex,
+}
+
+impl WatchedFile {
+    /// `watched`'s place among `watched_paths`: the `-wal` or `-shm` sidecar
+    /// of another watched path, or a database.
+    fn of(watched: &Path, watched_paths: &[PathBuf]) -> Self {
+        for database in watched_paths {
+            if sidecar_path(database, "-wal") == watched {
+                return Self::Wal;
+            }
+            if sidecar_path(database, "-shm") == watched {
+                return Self::WalIndex;
+            }
+        }
+        Self::Database
+    }
 }
 
 /// The directory a watch registers, and the database files whose changes in
@@ -1212,9 +1272,8 @@ mod tests {
         for path in &watched_paths {
             assert!(!path.exists());
         }
-        let [database, wal, _index] = watched_paths.as_slice() else {
-            panic!("the database and its two sidecars: {watched_paths:?}");
-        };
+        let [database, wal, _index] = <&[PathBuf; 3]>::try_from(watched_paths.as_slice())
+            .expect("the database and its two sidecars");
         for kind in [
             notify::EventKind::Create(notify::event::CreateKind::File),
             notify::EventKind::Remove(notify::event::RemoveKind::File),
