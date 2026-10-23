@@ -2234,6 +2234,7 @@ mod tests {
                 .unwrap();
         assert!(admission.is_some(), "admission fence must be released");
         drop(admission);
+        foreign.unlock().unwrap();
         drop(foreign);
 
         // With the foreign lock gone, full acquisition succeeds.
