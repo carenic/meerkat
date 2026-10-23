@@ -613,6 +613,17 @@ them.
     boundary binds to the run too, and the cursor lists them all.
     `Budget::resume_turn` and `Budget::turn_elapsed` carry the turn horizon
     across a resume.
+  - A WholeBlob session is recovered only from a strict continuation of its
+    committed transcript, which a compaction breaks. So a WholeBlob run's
+    first round commit after a compaction is a re-base: one store call
+    commits the compacted session, without its cursor, as the session's
+    committed base, and restarts the run's provisional tail on it with the
+    cursor (`SessionCheckpointer::rebases_runs` and
+    `SessionCheckpointer::rebase_run`; the session service's checkpointer
+    does it for WholeBlob, and publishes the rewrites' audit receipt). The
+    run's later round commits continue the new base. A checkpointer that
+    does not re-base (the default) takes no round commit after the run's
+    first rewrite.
   - `SessionCheckpointer::dispatch_fence_check` lets a checkpointer over a
     host store refuse dispatch once its writer's self-fence window has
     closed. The agent asks right before each model request and right after a
@@ -1958,12 +1969,10 @@ them.
 
 - A durable run that resumes asks the model again for a round that took no
   first commit: the round of a message that carries an image (the cursor
-  rides the session head, which media externalization does not reach), and,
-  in a session without a durable HeadCanonical head (WholeBlob), every round
-  after the run's first transcript rewrite. A provider that mints fresh call
-  ids for the repeated request (OpenAI, Anthropic) gives the repeated calls
-  new dedupe keys; only a call with the same id, name and arguments meets the
-  same key.
+  rides the session head, which media externalization does not reach). A
+  provider that mints fresh call ids for the repeated request (OpenAI,
+  Anthropic) gives the repeated calls new dedupe keys; only a call with the
+  same id, name and arguments meets the same key.
 - The usage of a model call that a restart interrupted is not recorded,
   although the provider bills it. Asynchronous operations a resumed run was
   waiting for ended with the restart: the run does not wait for them, and the

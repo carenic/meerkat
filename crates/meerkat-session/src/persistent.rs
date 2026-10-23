@@ -79,9 +79,10 @@ use meerkat_runtime::{
     ArchivedSessionActorMaterializationAuthorization, HeadCanonicalProvisionalTailAuthority,
     HeadCanonicalStoreAuthority, MachineSessionControlAuthority, MeerkatMachine,
     PreparedArchivedResumeCommitLease, PreparedHeadCanonicalProvisionalTail,
-    PreparedSessionMaterialization, PreparedWholeBlobRewriteBoundary, RuntimeSessionAuthority,
-    RuntimeSessionPersistenceProfile, RuntimeState, RuntimeStore, RuntimeStoreError,
-    RuntimeStoreWriteFence, VerifiedCommittedWholeBlobPayload, WholeBlobStoreAuthority,
+    PreparedSessionMaterialization, PreparedWholeBlobRewriteBoundary, PreparedWholeBlobRunRebase,
+    RuntimeSessionAuthority, RuntimeSessionPersistenceProfile, RuntimeState, RuntimeStore,
+    RuntimeStoreError, RuntimeStoreWriteFence, VerifiedCommittedWholeBlobPayload,
+    WholeBlobRunRebaseOutcome, WholeBlobStoreAuthority,
 };
 use meerkat_store::{SessionFilter, SessionStore, SessionStoreError};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1024,6 +1025,13 @@ struct CheckpointerGate {
     cancelled: Mutex<bool>,
 }
 
+/// Where a run re-base publishes the transcript-rewrite audit receipt its
+/// rewrites owe, as a rewrite boundary of the session service does.
+struct RewriteAuditSink {
+    event_store: Arc<dyn EventStore>,
+    projector: Option<Arc<SessionProjector>>,
+}
+
 /// Checkpointer that saves sessions to a [`SessionStore`].
 ///
 /// Used by keep-alive agents to persist the session after each interaction
@@ -1062,6 +1070,9 @@ struct StoreCheckpointer {
     /// Set once a checkpoint of a session carrying deferred-turn state ran
     /// before the live state was attached, so that warning is logged once.
     unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool,
+    /// Where a WholeBlob run re-base publishes its rewrite audit receipt;
+    /// `None` when the service keeps no event store.
+    rewrite_audit: Option<RewriteAuditSink>,
 }
 
 struct HeadCanonicalProvisionalIntent<'a> {
@@ -1604,6 +1615,54 @@ async fn append_transcript_rewrite_receipt_for_commits(
     .await
 }
 
+/// The rewrite commits `live` holds beyond its committed base `base`, in
+/// order: the suffix a run re-base proves and publishes.
+fn rewrite_commits_since_base(
+    base: &Session,
+    live: &Session,
+) -> Result<Vec<meerkat_core::TranscriptRewriteCommit>, AgentError> {
+    let base_count = base
+        .validated_transcript_history_state()
+        .map_err(|error| {
+            AgentError::InternalError(format!(
+                "the committed base of session {} has an invalid transcript graph: {error}",
+                base.id()
+            ))
+        })?
+        .map_or(0, |history| history.state().commit_count());
+    let history = live
+        .validated_transcript_history_state()
+        .map_err(|error| {
+            AgentError::InternalError(format!(
+                "the live transcript graph of session {} is invalid: {error}",
+                live.id()
+            ))
+        })?
+        .ok_or_else(|| {
+            AgentError::InternalError(format!(
+                "session {} has no transcript rewrite to re-base on",
+                live.id()
+            ))
+        })?;
+    let state = history.state();
+    if state.commit_count() <= base_count {
+        return Err(AgentError::InternalError(format!(
+            "session {} has no transcript rewrite beyond its committed base to re-base on",
+            live.id()
+        )));
+    }
+    (base_count..state.commit_count())
+        .map(|index| {
+            state.commit(index).cloned().ok_or_else(|| {
+                AgentError::InternalError(format!(
+                    "the transcript graph of session {} lacks rewrite occurrence {index}",
+                    live.id()
+                ))
+            })
+        })
+        .collect()
+}
+
 impl StoreCheckpointer {
     /// The live graph's retention cut the run's last checkpoint recorded,
     /// for the promotion of that run's provisional chain.
@@ -1981,6 +2040,190 @@ impl StoreCheckpointer {
             )));
         }
         Ok(())
+    }
+
+    /// Re-base a WholeBlob run on its rewritten session, in one store call
+    /// (`RuntimeStore::commit_prepared_whole_blob_run_rebase`): the session,
+    /// without its run cursor, becomes the committed base, and the run's tail
+    /// restarts on it as the same document with the cursor, at candidate
+    /// sequence 1. Then the rewrites' audit receipt is published, as a
+    /// rewrite boundary publishes it; a crash before it is repaired by the
+    /// receipt-only replay of the rewrite proof.
+    ///
+    /// The committed base must still be this actor's: a store that moved
+    /// (`Stale`) or any error fails the round commit with the
+    /// teardown-required class, so the live actor reloads.
+    async fn rebase_whole_blob_run(
+        &self,
+        session: &mut Session,
+        run_id: &RunId,
+        previous: Option<&RunCheckpointReceipt>,
+    ) -> Result<RunCheckpointReceipt, AgentError> {
+        let id = session.id().clone();
+        let reload = |detail: String| {
+            AgentError::session_durable_projection_authority_unknown(format!(
+                "{detail}; live actor reload required"
+            ))
+        };
+        let expected_tail = previous
+            .map(|receipt| {
+                receipt.whole_blob().cloned().ok_or_else(|| {
+                    AgentError::InternalError(format!(
+                        "WholeBlob re-base for session {id} received a HeadCanonical provisional receipt"
+                    ))
+                })
+            })
+            .transpose()?;
+        if let Some(previous) = expected_tail.as_ref()
+            && (previous.session_id() != &id || previous.run_id() != run_id)
+        {
+            return Err(AgentError::InternalError(format!(
+                "WholeBlob re-base for session {id} received a provisional receipt for another session/run"
+            )));
+        }
+        let committed_authority = self
+            .whole_blob_base_authority
+            .lock()
+            .map_err(|_| {
+                AgentError::InternalError(format!(
+                    "WholeBlob actor base authority lock is poisoned for session {id}"
+                ))
+            })?
+            .clone()
+            .ok_or_else(|| {
+                reload(format!(
+                    "WholeBlob actor for session {id} has no exact materialization authority to re-base from"
+                ))
+            })?;
+        let runtime_id = LogicalRuntimeId::for_session(&id);
+        let committed_snapshot = self
+            .runtime_store
+            .load_committed_whole_blob_snapshot(&runtime_id)
+            .await
+            .map_err(|error| {
+                reload(format!(
+                    "failed to load the committed WholeBlob base to re-base session {id}: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                reload(format!(
+                    "committed WholeBlob authority disappeared before the re-base of session {id}"
+                ))
+            })?;
+        if committed_snapshot.authority() != &committed_authority {
+            return Err(reload(format!(
+                "WholeBlob committed authority differs from the live actor base for session {id}"
+            )));
+        }
+        let expected_runtime =
+            VerifiedCommittedWholeBlobPayload::from_committed(&id, committed_snapshot).map_err(
+                |error| {
+                    reload(format!(
+                        "failed to verify the committed WholeBlob base of session {id}: {error}"
+                    ))
+                },
+            )?;
+        let commits = rewrite_commits_since_base(expected_runtime.session(), session)?;
+        session
+            .externalize_media(self.blob_store.as_ref(), 0)
+            .await
+            .map_err(|error| {
+                AgentError::InternalError(format!(
+                    "WholeBlob re-base media externalization failed for session {id}: {error}"
+                ))
+            })?;
+        if let Some(mut state) = self.deferred_turn_state_for_checkpoint(session) {
+            externalize_deferred_turn_state(self.blob_store.as_ref(), &mut state)
+                .await
+                .map_err(|error| {
+                    AgentError::InternalError(format!(
+                        "WholeBlob re-base deferred-turn externalization failed for session {id}: {error}"
+                    ))
+                })?;
+            session.set_deferred_turn_state(state).map_err(|error| {
+                AgentError::InternalError(format!(
+                    "WholeBlob re-base deferred-turn projection failed for session {id}: {error}"
+                ))
+            })?;
+        }
+        let conversation_digest = session.transcript_content_digest().map_err(|error| {
+            AgentError::InternalError(format!(
+                "failed to derive the re-based tail's conversation digest for session {id}: {error}"
+            ))
+        })?;
+        let message_count = u64::try_from(session.messages().len()).map_err(|_| {
+            AgentError::InternalError(format!(
+                "the re-based tail's message count exceeds the durable range for session {id}"
+            ))
+        })?;
+        let rebase = PreparedWholeBlobRunRebase::prepare(
+            expected_runtime,
+            expected_tail,
+            run_id.clone(),
+            session.clone(),
+            &commits,
+        )
+        .map_err(|error| {
+            AgentError::InternalError(format!(
+                "failed to prepare the WholeBlob re-base of session {id}: {error}"
+            ))
+        })?;
+        let outcome = self
+            .runtime_store
+            .commit_prepared_whole_blob_run_rebase(&runtime_id, rebase.store_parts())
+            .await
+            .map_err(|error| {
+                reload(format!(
+                    "the WholeBlob re-base of session {id} failed: {error}"
+                ))
+            })?;
+        let (committed, tail) = match outcome {
+            WholeBlobRunRebaseOutcome::Applied { committed, tail } => (committed, tail),
+            WholeBlobRunRebaseOutcome::Stale => {
+                return Err(reload(format!(
+                    "another writer moved session {id} before its run re-based"
+                )));
+            }
+        };
+        if tail.session_id() != &id
+            || tail.run_id() != run_id
+            || tail.candidate_sequence() != 1
+            || tail.base_store_revision() != committed.store_revision()
+            || tail.base_blob_sha256() != committed.blob_sha256()
+        {
+            return Err(reload(format!(
+                "the WholeBlob store acknowledged a re-base other than the prepared one for session {id}"
+            )));
+        }
+        *self.whole_blob_base_authority.lock().map_err(|_| {
+            AgentError::InternalError(format!(
+                "WholeBlob actor base authority lock is poisoned for session {id}"
+            ))
+        })? = Some(committed);
+        if let Some(audit) = self.rewrite_audit.as_ref() {
+            append_transcript_rewrite_receipt_for_commits(
+                Some(&audit.event_store),
+                audit.projector.as_ref(),
+                session,
+                &commits,
+            )
+            .await
+            .map_err(|error| {
+                reload(format!(
+                    "session {id} re-based, but its rewrite audit receipt was not published: {error}"
+                ))
+            })?;
+        }
+        RunCheckpointReceipt::issued(
+            RunCheckpointAuthority::WholeBlob(tail),
+            conversation_digest,
+            message_count,
+        )
+        .map_err(|error| {
+            AgentError::InternalError(format!(
+                "failed to bind the re-based tail's receipt facts for session {id}: {error}"
+            ))
+        })
     }
 
     async fn checkpoint_head_canonical(
@@ -2510,6 +2753,43 @@ impl meerkat_core::SessionCheckpointer for StoreCheckpointer {
         if let Ok(mut slot) = self.latest_run_transcript_retirement.lock() {
             *slot = Some((run_id.clone(), retired_occurrences));
         }
+    }
+
+    fn rebases_runs(&self) -> bool {
+        self.runtime_store.session_persistence_profile()
+            == RuntimeSessionPersistenceProfile::WholeBlobV1
+    }
+
+    async fn rebase_run(
+        &self,
+        session: &mut Session,
+        run_id: &RunId,
+        previous: Option<&RunCheckpointReceipt>,
+    ) -> Result<RunCheckpointReceipt, AgentError> {
+        let guard = self.gate.cancelled.lock().await;
+        if *guard {
+            return Err(AgentError::session_durable_projection_authority_unknown(
+                format!(
+                    "checkpoint gate is cancelled for session {}; the run re-base was not attempted; live actor reload required",
+                    session.id()
+                ),
+            ));
+        }
+        if !self.rebases_runs() {
+            return Err(AgentError::InternalError(format!(
+                "a run re-base is a WholeBlob operation, not one of session {}'s profile",
+                session.id()
+            )));
+        }
+        let result = self.rebase_whole_blob_run(session, run_id, previous).await;
+        if let Ok(receipt) = result.as_ref() {
+            *self.latest_run_checkpoint_receipt.lock().await = Some(receipt.clone());
+            if let Ok(mut slot) = self.latest_run_transcript_retirement.lock() {
+                *slot = None;
+            }
+        }
+        drop(guard);
+        result
     }
 }
 
@@ -13781,6 +14061,13 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             latest_run_transcript_retirement: std::sync::Mutex::new(None),
             live_deferred_turn_state: std::sync::OnceLock::new(),
             unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
+            rewrite_audit: self
+                .event_store
+                .clone()
+                .map(|event_store| RewriteAuditSink {
+                    event_store,
+                    projector: self.projector.clone(),
+                }),
         });
         let requested_resume_session_id = req
             .build
@@ -18193,6 +18480,7 @@ mod tests {
             latest_run_transcript_retirement: std::sync::Mutex::new(None),
             live_deferred_turn_state: std::sync::OnceLock::new(),
             unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
+            rewrite_audit: None,
         };
         (runtime_store, session, checkpointer)
     }
@@ -18344,6 +18632,7 @@ mod tests {
             latest_run_transcript_retirement: std::sync::Mutex::new(None),
             live_deferred_turn_state: std::sync::OnceLock::new(),
             unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
+            rewrite_audit: None,
         };
         assert!(
             checkpointer
@@ -18519,6 +18808,7 @@ mod tests {
             latest_run_transcript_retirement: std::sync::Mutex::new(None),
             live_deferred_turn_state: std::sync::OnceLock::new(),
             unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
+            rewrite_audit: None,
         };
 
         let mut successor = session;
@@ -29933,6 +30223,7 @@ mod tests {
             latest_run_transcript_retirement: std::sync::Mutex::new(None),
             live_deferred_turn_state: std::sync::OnceLock::new(),
             unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
+            rewrite_audit: None,
         };
         let mut provisional = committed.clone();
         provisional.push(user_message("provisional context is not committed"));
@@ -30200,6 +30491,7 @@ mod tests {
             latest_run_transcript_retirement: std::sync::Mutex::new(None),
             live_deferred_turn_state: std::sync::OnceLock::new(),
             unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
+            rewrite_audit: None,
         };
         let mut provisional = committed;
         provisional.push(user_message("physical provisional successor"));
@@ -30280,6 +30572,7 @@ mod tests {
             latest_run_transcript_retirement: std::sync::Mutex::new(None),
             live_deferred_turn_state: std::sync::OnceLock::new(),
             unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
+            rewrite_audit: None,
         };
         (directory, service, checkpointer, committed)
     }
@@ -30915,6 +31208,7 @@ mod tests {
             latest_run_transcript_retirement: std::sync::Mutex::new(None),
             live_deferred_turn_state: std::sync::OnceLock::new(),
             unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
+            rewrite_audit: None,
         };
         let mut session = recovered;
         let run_id = RunId::new();
@@ -40523,6 +40817,7 @@ mod tests {
             latest_run_transcript_retirement: std::sync::Mutex::new(None),
             live_deferred_turn_state: std::sync::OnceLock::new(),
             unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
+            rewrite_audit: None,
         });
         service
             .live_checkpointers
