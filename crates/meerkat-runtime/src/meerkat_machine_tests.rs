@@ -5800,6 +5800,13 @@ async fn mixed_directed_max_attempt_failure_terminalizes_only_exhausted_contribu
         .await
         .expect("accept first max-attempt input");
 
+    // The initial attempt fails while it is the only queued work, so the loop
+    // keeps draining: it rolls the input back to its queue and retries it at
+    // once. An observer on a loaded host may read only once that retry began.
+    tokio::time::timeout(STEP_BOUND, second_apply_started.notified())
+        .await
+        .expect("the runtime retries the rolled-back first input by itself");
+
     tokio::time::timeout(STEP_BOUND, async {
         loop {
             let first = machine
