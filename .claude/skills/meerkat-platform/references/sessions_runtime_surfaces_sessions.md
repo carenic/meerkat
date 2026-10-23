@@ -411,11 +411,13 @@ Contract and limits: `docs/guides/durable-runs.mdx`.
   every graceful shutdown that does not choose, for sessions with per-round
   commits: `rkat-rpc` (input end, SIGTERM, interrupt; its client sees a
   shutdown error, not `requeued_across_stop`), REST (SIGTERM, interrupt,
-  after its open requests finish, so a run attached to an open request is
-  not suspended) and a mob Shutdown without `with_queued_inputs` (its
-  default `QueuedInputsOnShutdown::RequeueDurable`, per member); an explicit
-  `Stop` keeps 0.9.4 behaviour, and a host's own unregister without a
-  disposition stops (`UnregisterQueuedInputs::default()` is `Stop`).
+  before its HTTP drain: a run in flight at the signal is suspended and a
+  request waiting on it is answered `409` `requeued_across_stop`; a run that
+  a request starts after the signal is drained, not suspended) and a mob
+  Shutdown without `with_queued_inputs` (its default
+  `QueuedInputsOnShutdown::RequeueDurable`, per member); an explicit `Stop`
+  keeps 0.9.4 behaviour, and a host's own unregister without a disposition
+  stops (`UnregisterQueuedInputs::default()` is `Stop`).
 - Durable workers and the mob resume gate: `references/mobs.md`. Realms in a
   host's own database: `references/sessions_runtime_surfaces_storage_config.md`.
 

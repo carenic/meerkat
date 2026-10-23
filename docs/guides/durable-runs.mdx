@@ -149,10 +149,10 @@ per-round commits, and Stop for any other session:
 
 - `rkat-rpc`'s own shutdown, when its input ends (as when a client SDK
   exits), on SIGTERM and on an interrupt;
-- the REST server's shutdown on SIGTERM or an interrupt, once its open
-  requests have finished: a run attached to an open request, such as a turn
-  whose request still waits for its answer, runs to its end, or, if the
-  process is killed first, continues at the next open as after a crash;
+- the REST server's shutdown on SIGTERM or an interrupt, before it drains
+  its open requests: a run in flight when the signal arrives is suspended
+  even when an open request waits on it, and that request is answered `409`
+  `SESSION_NOT_RUNNING` with `details.kind` `requeued_across_stop`;
 - a mob Shutdown (`MobHandle::shutdown()`, or `ShutdownOptions` without
   `with_queued_inputs`, whose default is
   `QueuedInputsOnShutdown::RequeueDurable`), member by member: it suspends
@@ -482,15 +482,16 @@ Before you run a host store in production, run the host store chapter of the
   the compaction, recovery commits such a run as completed.
 - A client of `rkat-rpc` whose turn on a session with per-round commits is
   in flight when the server shuts down gracefully gets a shutdown error, not
-  the typed `requeued_across_stop` answer: the server stops answering before
-  it suspends the run. The server keeps the run and continues it at the
-  session's next start. Read the run's status, for example with
-  `session/input_status`, before you retry: resubmitting the input runs it
-  again.
-- The REST server's graceful shutdown waits for its open requests before it
-  keeps any work, so it does not suspend a run attached to an open request:
-  that run ends normally, or, if the process is killed first, continues at
-  the next open as after a crash.
+  the typed `requeued_across_stop` answer a REST client gets: the server
+  stops answering before it suspends the run. The server keeps the run and
+  continues it at the session's next start. Read the run's status, for
+  example with `session/input_status`, before you retry: resubmitting the
+  input runs it again.
+- The REST server keeps accepting requests until its shutdown has suspended
+  the runs in flight at the signal. A run that a request accepted in that
+  window starts is not suspended: the server's drain waits for it, so it
+  ends normally, or, if the process is killed first, continues at the next
+  open as after a crash.
 - A run that resumes after a crash during structured-output extraction asks
   the model again from its last round commit, so it publishes `RunCompleted`
   with `extraction_required` a second time under the same run id.
