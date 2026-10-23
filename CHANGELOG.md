@@ -269,6 +269,22 @@ them.
 
 ### Fixed
 
+- Streamed model text keeps a character that a network chunk boundary split
+  intact. The OpenAI Responses, OpenAI-compatible Chat Completions, OpenAI
+  streamed image, Anthropic and Gemini stream readers decoded every network
+  chunk on its own before splitting it into lines, so a multi-byte character
+  (a typographic apostrophe, an emoji) that straddled two chunks became
+  U+FFFD in the streamed text, the live events and the stored history. The
+  readers now keep the bytes until a line is complete and decode each
+  complete line strictly (`meerkat_llm_core::streaming::Utf8LineBuffer`). A
+  complete line that is not valid UTF-8 fails the stream as a stream parse
+  error instead of being replaced; after an OpenAI-compatible stream's finish
+  it ends the stream, like any other undecodable line there. Bytes after the
+  last line break are treated as before: the Anthropic reader still reads
+  them as a last line, now decoded as strictly, and an OpenAI-compatible
+  stream that ends inside a line before its finish is still an incomplete
+  response, also when it ends inside a character.
+
 - A graceful mob Shutdown releases a member's identity reconcile lease once
   it has unregistered the member's runtime and the member's session actor has
   exited, so the next incarnation takes that identity at once. Before, every
