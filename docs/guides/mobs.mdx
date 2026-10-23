@@ -619,8 +619,10 @@ A resume of an existing session (a `resume` launch mode) delivers that first
 turn only while the session's first turn has never started, and then once.
 Otherwise the resume runs no kickoff and does not deliver `initial_message`: the
 transcript already holds the member's start, and a first turn that started and
-was interrupted is not re-run. Placed members (`placement` set) are not covered
-yet; their resume still runs the kickoff.
+was interrupted is not re-run. A placed member (`placement` set) follows the
+same rule: its member host reports whether the adopted session's first turn
+started. A member host of 0.9.4 or earlier reports nothing, and a resume there
+still runs the first turn.
 
 ### Trusted Rust member build overrides
 

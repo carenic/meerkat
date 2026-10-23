@@ -6486,8 +6486,10 @@ pub struct SpawnMemberSpec {
     /// once. Otherwise the resume runs no kickoff and does not deliver this
     /// message: the session's transcript already holds the member's start,
     /// and a first turn that started and was interrupted is not re-run.
-    /// Placed members (`placement` set) are not covered yet: their resume
-    /// still runs the kickoff.
+    /// A placed member (`placement` set) follows the same rule: its member
+    /// host reports whether the adopted session's first turn started. A
+    /// member host of 0.9.4 or earlier reports nothing, and a resume there
+    /// still runs the first turn.
     pub initial_message: Option<ContentInput>,
     pub runtime_mode: Option<crate::MobRuntimeMode>,
     pub backend: Option<MobBackendKind>,

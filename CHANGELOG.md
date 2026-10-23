@@ -83,6 +83,16 @@ them.
   and so does the `PartialOrd` order of `OccurrenceLifecycleEffectVariant::*`
   and `OccurrenceLifecycleInputVariant::*`; match them by variant name, not
   by numeric cast or position.
+- `meerkat-contracts`: `BridgeMaterializePayload` gains
+  `report_adopted_first_turn: bool` and `BridgeMaterializedResponse` gains
+  `adopted_first_turn: Option<BridgeAdoptedFirstTurn>` (see the protocol 7
+  report under Added); `meerkat-mob`:
+  `runtime::host_actor::MaterializedMemberRow` and
+  `runtime::host_materialize::MaterializedBuildOutcome` gain
+  `adopted_first_turn: Option<BridgeAdoptedFirstTurn>`, and
+  `store::PlacedSpawnCommitRecord` gains `adopted_first_turn_started: bool`.
+  Code that builds them with a struct literal sets the new field, normally
+  to `false` or `None`.
 - Behaviour-only (not measured by the gate): `meerkat-mob`: a resume spawn of
   an existing session whose first turn already started no longer delivers the
   spawn's `initial_message` (see Fixed). A caller that sent a message with a
@@ -236,6 +246,15 @@ them.
   version table, as a host of an earlier release does. `meerkat-runtime`:
   `MemberObservationHost` gains `visible_tool_names`, whose default
   answers `Unavailable`.
+- Supervisor bridge protocol 7 (`meerkat-contracts`): a `Resume`
+  `MaterializeMember` may set `report_adopted_first_turn`. The member host
+  then reports on the ack whether the session it adopted had already
+  started its first turn (`adopted_first_turn`: `owed` or `started`), from
+  its recorded build when it answers a retried command. A `Fresh` launch
+  that sets it is refused at decode. A host lists the report in its
+  `HostFeatures` answer as `adopted_first_turn`; `meerkat-mob` re-exports
+  `BridgeAdoptedFirstTurn` and `HOST_FEATURE_ADOPTED_FIRST_TURN` from
+  `runtime::bridge_protocol`.
 
 ### Changed
 
@@ -365,8 +384,8 @@ them.
   runs no kickoff and does not deliver `initial_message`, and it logs the
   undelivered message at info. A first turn that started and was interrupted
   is not re-run. Fresh spawns, fork seatings and identity reconciliation are
-  unchanged. Placed members (`placement` set) get the same rule in a
-  separate fix in this release. `meerkat-core` adds
+  unchanged. Placed members (`placement` set) get the same rule (see the
+  placed resume entry below). `meerkat-core` adds
   `Session::is_deferred_template`, the one predicate the session service and
   the mob read for a deferred template.
 - `meerkat-session`: a session resumed while its first turn was still pending
@@ -377,6 +396,31 @@ them.
   checkpoint now persists the session's live deferred-turn state, the value an
   export already wrote. A session that carries no deferred-turn state is
   persisted as before.
+- `meerkat-mob`: a placed member's resume (`placement` set with a `Resume`
+  launch) no longer runs the member's first turn again; it follows the rule
+  of the resume entry above. Only the member host can read the adopted
+  session, so the controller first asks the host with `HostFeatures`, before
+  anything is recorded, and sends a host that lists `adopted_first_turn` the
+  resume as protocol 7 with `report_adopted_first_turn`; the ack reports
+  whether the session's first turn started. A started first turn waives the
+  kickoff: an autonomous member's committed placed-spawn carrier records the
+  waiver (`adopted_first_turn_started`), so cold recovery repairs no kickoff
+  for it, and a turn-driven member's initial message is not delivered and
+  not recorded. An ack that omits a report its request asked for, reports
+  one it did not ask for, or names a launch outcome that contradicts its
+  launch fails the spawn with `MobError::WiringError`, and the member is
+  released. A probe that fails for another reason than an old host (no
+  answer within 10 seconds, transport, admission) fails the resume with
+  `MobError::HostFeaturesProbeFailed` before anything is recorded. Fork
+  seatings, including the capability-attached seating, keep their kickoff.
+  Mixed fleet: a member host of 0.9.4 or earlier refuses the probe and
+  reports nothing, so a resume there still runs the first turn until that
+  host is upgraded. Downgrade: only a waived carrier record carries the new
+  key, and a 0.9.4 controller refuses it (`deny_unknown_fields`): it does
+  not restore a mob that holds such a member, and `MobBuilder::resume`
+  fails with `MobError::StorageError` (a serialization error that names
+  `adopted_first_turn_started`). A 0.9.4 member host reads a materialized
+  member row that carries the new `adopted_first_turn` key and ignores it.
 - `meerkat-mob`: a turn-driven placed spawn (`placement` set) with an
   `initial_message` no longer always fails. The member was materialized and
   committed on its host, then the spawn refused to admit its first turn
