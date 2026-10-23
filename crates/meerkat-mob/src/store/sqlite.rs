@@ -16388,6 +16388,37 @@ mod identity_fence_contention_tests {
         assert!(machine.contains_session(&session_id).await);
     }
 
+    /// How late a fence call can return on a heavily loaded host: SQLite's
+    /// busy wait counts the sleeps it asked for, not the wall time they took.
+    const LATE_RETURN: Duration = Duration::from_secs(1);
+
+    /// Wraps a fence whose calls return `delay` after the inner fence
+    /// answered.
+    struct ReturnsLate {
+        inner: Arc<dyn RuntimeStoreWriteFence>,
+        delay: Duration,
+    }
+
+    impl RuntimeStoreWriteFence for ReturnsLate {
+        fn execute_if_current(
+            &self,
+            operation: Box<dyn FnOnce() -> Result<(), RuntimeStoreError> + '_>,
+        ) -> Result<RuntimeStoreWriteFenceOutcome, RuntimeStoreError> {
+            let outcome = self.inner.execute_if_current(operation);
+            std::thread::sleep(self.delay);
+            outcome
+        }
+
+        fn execute_if_current_blocking(
+            &self,
+            operation: Box<dyn FnOnce() -> Result<(), RuntimeStoreError> + '_>,
+        ) -> Result<RuntimeStoreWriteFenceOutcome, RuntimeStoreError> {
+            let outcome = self.inner.execute_if_current_blocking(operation);
+            std::thread::sleep(self.delay);
+            outcome
+        }
+    }
+
     /// A fence call through the bounded-wait entry on a blocking thread, as
     /// the SQLite runtime store makes it: the outcome, whether the operation
     /// ran, and how long the call took.
@@ -16493,6 +16524,11 @@ mod identity_fence_contention_tests {
         let bound = IDENTITY_RUNTIME_WRITE_FENCE_WAIT;
         let adopted = adopted_identity().await;
         let fence = adopted.runtime_fence(&cold_observation(&adopted.session.session_id).await);
+        // The call returns late, as on a loaded host.
+        let fence: Arc<dyn RuntimeStoreWriteFence> = Arc::new(ReturnsLate {
+            inner: fence,
+            delay: LATE_RETURN,
+        });
         let holder = hold_mob_db(&adopted.path, Duration::from_millis(3500));
         let (outcome, ran, took) = blocking_fence_call(fence).await;
         holder.join().unwrap();
