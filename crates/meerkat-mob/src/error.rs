@@ -1594,6 +1594,57 @@ pub enum MobError {
         agent_identity: String,
         reason: String,
     },
+
+    /// The mob's startup could not restore `restore` for member `member_id`'s
+    /// session `session_id` (for example while another runtime owner on the
+    /// realm hosts the session), so it deferred that restore instead of
+    /// failing the whole start, and an operation that acts on the member
+    /// re-attempted it first. `cause` is the typed failure of that
+    /// re-attempt, and every typed classifier answers as for the cause.
+    /// Nothing acted on the member's session. The mob re-attempts the restore
+    /// on its own backoff, and the operation can pass once the cause clears
+    /// (for a session another runtime owner hosts, once that owner stops or
+    /// releases it).
+    #[error(
+        "member {member_id} session {session_id} has its {restore} deferred until it can be restored: {cause}"
+    )]
+    MemberCustodyDeferred {
+        member_id: AgentIdentity,
+        session_id: meerkat_core::types::SessionId,
+        restore: MemberCustodyRestore,
+        cause: Arc<MobError>,
+    },
+}
+
+/// Which startup restore of a member's custody was deferred (see
+/// [`MobError::MemberCustodyDeferred`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MemberCustodyRestore {
+    /// The member's operation binding, restored for a member whose restore
+    /// failed at this start.
+    StartupBinding,
+    /// A retiring member's local cleanup delivery custody.
+    CleanupDelivery,
+}
+
+impl MemberCustodyRestore {
+    /// Stable token in structured data.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::StartupBinding => "startup_binding",
+            Self::CleanupDelivery => "cleanup_delivery",
+        }
+    }
+}
+
+impl std::fmt::Display for MemberCustodyRestore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::StartupBinding => "operation binding restore",
+            Self::CleanupDelivery => "cleanup delivery restore",
+        })
+    }
 }
 
 /// The stable token of the runtime verdict a member's destination install
@@ -1958,6 +2009,37 @@ impl MobError {
                 "content_retained": true,
                 "retryable": false,
             })),
+            // As for a startup recovery failure: the member, its session and
+            // the deferred restore are this variant's own facts; the cause
+            // keeps its structured data under "cause_data" (when it has some)
+            // and its durable resume hold is lifted to the top level.
+            Self::MemberCustodyDeferred {
+                member_id,
+                session_id,
+                restore,
+                cause,
+            } => {
+                let mut data = serde_json::json!({
+                    "kind": "mob_member_custody_deferred",
+                    "member_id": member_id.as_str(),
+                    "session_id": session_id.to_string(),
+                    "restore": restore.as_str(),
+                    "cause": cause.to_string(),
+                });
+                if let Some(object) = data.as_object_mut() {
+                    if let Some(cause_data) = cause.structured_data() {
+                        object.insert("cause_data".to_string(), cause_data);
+                    }
+                    if let Some(hold) = cause.durable_resume_hold() {
+                        object.insert(
+                            meerkat_core::service::SessionError::DURABLE_RESUME_HOLD_KEY
+                                .to_string(),
+                            serde_json::Value::from(hold.as_str()),
+                        );
+                    }
+                }
+                Some(data)
+            }
             Self::MemberRegistrationRefused {
                 member_id,
                 session_id,
@@ -2192,6 +2274,7 @@ impl MobError {
             Self::SharedRetirementFailure(error)
             | Self::SharedLifecycleFailure(error)
             | Self::MemberRetirementStuck { cause: error, .. }
+            | Self::MemberCustodyDeferred { cause: error, .. }
             | Self::MemberStartupRecoveryFailed { cause: error, .. } => error.durable_resume_hold(),
             other => other
                 .structured_data()
@@ -2211,6 +2294,7 @@ impl MobError {
             .or_else(|| match self {
                 Self::SharedRetirementFailure(error)
                 | Self::SharedLifecycleFailure(error)
+                | Self::MemberCustodyDeferred { cause: error, .. }
                 | Self::MemberStartupRecoveryFailed { cause: error, .. } => error.wire_error_code(),
                 Self::SessionError(
                     meerkat_core::SessionError::RuntimeUnavailable { .. }
@@ -2265,6 +2349,7 @@ impl MobError {
             Self::SharedRetirementFailure(error)
             | Self::SharedLifecycleFailure(error)
             | Self::MemberRetirementStuck { cause: error, .. }
+            | Self::MemberCustodyDeferred { cause: error, .. }
             | Self::MemberStartupRecoveryFailed { cause: error, .. } => {
                 error.bridge_rejection_cause()
             }
@@ -2293,6 +2378,7 @@ impl MobError {
             Self::SharedRetirementFailure(error)
             | Self::SharedLifecycleFailure(error)
             | Self::MemberRetirementStuck { cause: error, .. }
+            | Self::MemberCustodyDeferred { cause: error, .. }
             | Self::MemberStartupRecoveryFailed { cause: error, .. } => {
                 error.is_closed_runtime_effect_refusal()
             }
@@ -2343,6 +2429,7 @@ impl MobError {
         match self {
             Self::SharedRetirementFailure(error)
             | Self::SharedLifecycleFailure(error)
+            | Self::MemberCustodyDeferred { cause: error, .. }
             | Self::MemberStartupRecoveryFailed { cause: error, .. } => error.failure_class(),
             Self::MobNotFound(_)
             | Self::ProfileNotFound(_)
@@ -2458,6 +2545,7 @@ impl MobError {
         match self {
             Self::SharedRetirementFailure(error)
             | Self::SharedLifecycleFailure(error)
+            | Self::MemberCustodyDeferred { cause: error, .. }
             | Self::MemberStartupRecoveryFailed { cause: error, .. } => error.wire_detail(),
             Self::ScopeDenied(denial) => Some(WireMobErrorDetail::ScopeDenied(
                 WireScopeDeniedDetail::from(denial),
@@ -2793,6 +2881,109 @@ mod tests {
         }
     }
 
+    /// A deferred member custody restore classifies as its cause on every
+    /// typed classifier, as a startup recovery failure does. Its structured
+    /// data names the member, its session and the deferred restore, keeps the
+    /// cause's data when it has some and lifts the cause's hold; whether a
+    /// retry can pass is the cause's. It is no retirement in progress.
+    #[test]
+    fn a_deferred_member_custody_classifies_as_its_cause() {
+        use meerkat_core::service::SessionError;
+        let session_id = meerkat_core::types::SessionId::new();
+        type MakeCause = fn(&meerkat_core::types::SessionId) -> SessionError;
+        let causes: [MakeCause; 3] = [
+            |id| SessionError::ServedElsewhere { id: id.clone() },
+            |id| SessionError::HostingUnavailable { id: id.clone() },
+            |id| SessionError::DurableTailHeldForRecovery { id: id.clone() },
+        ];
+        for make_cause in causes {
+            let bare = MobError::SessionError(make_cause(&session_id));
+            let deferred = MobError::MemberCustodyDeferred {
+                member_id: AgentIdentity::from("w-1"),
+                session_id: session_id.clone(),
+                restore: MemberCustodyRestore::CleanupDelivery,
+                cause: Arc::new(MobError::SessionError(make_cause(&session_id))),
+            };
+            assert_eq!(deferred.durable_resume_hold(), bare.durable_resume_hold());
+            assert_eq!(deferred.wire_error_code(), bare.wire_error_code());
+            assert_eq!(deferred.failure_class(), bare.failure_class());
+            assert_eq!(
+                format!("{:?}", deferred.wire_detail()),
+                format!("{:?}", bare.wire_detail())
+            );
+            assert_eq!(
+                format!("{:?}", deferred.bridge_rejection_cause()),
+                format!("{:?}", bare.bridge_rejection_cause())
+            );
+            assert_eq!(
+                deferred.is_closed_runtime_effect_refusal(),
+                bare.is_closed_runtime_effect_refusal()
+            );
+            assert!(!deferred.is_retirement_in_progress());
+            let data = deferred.structured_data().expect("structured data");
+            assert_eq!(data["kind"], "mob_member_custody_deferred");
+            assert_eq!(data["member_id"], "w-1");
+            assert_eq!(data["session_id"], session_id.to_string());
+            assert_eq!(data["restore"], "cleanup_delivery");
+            assert!(
+                data.get("retryable").is_none(),
+                "whether a retry can pass is the cause's: {data}"
+            );
+            assert_eq!(data["cause"], bare.to_string());
+            assert_eq!(
+                data.get("cause_data"),
+                bare.structured_data().as_ref(),
+                "the cause's data, only when it has some"
+            );
+            let hold_key = SessionError::DURABLE_RESUME_HOLD_KEY;
+            assert_eq!(
+                data.get(hold_key).and_then(serde_json::Value::as_str),
+                bare.durable_resume_hold().map(|hold| hold.as_str()),
+                "the top-level hold is the cause's"
+            );
+            let rendered = deferred.to_string();
+            assert!(
+                rendered.contains("w-1")
+                    && rendered.contains(&session_id.to_string())
+                    && rendered.contains("cleanup delivery restore"),
+                "the message names the member, its session and the restore: {rendered}"
+            );
+        }
+        // A durable tail its recovery kept unprovable: the deferral carries
+        // its hold and its failure class, and its data as `cause_data`.
+        let unprovable_tail = || MobError::MemberDurableTailUnprovable {
+            member_id: AgentIdentity::from("w-1"),
+            session_id: session_id.clone(),
+        };
+        let unprovable = unprovable_tail();
+        let deferred = MobError::MemberCustodyDeferred {
+            member_id: AgentIdentity::from("w-1"),
+            session_id: session_id.clone(),
+            restore: MemberCustodyRestore::CleanupDelivery,
+            cause: Arc::new(unprovable_tail()),
+        };
+        assert_eq!(
+            deferred.durable_resume_hold(),
+            Some(meerkat_core::service::DurableResumeHold::TailHeldForRecovery)
+        );
+        assert_eq!(deferred.failure_class(), unprovable.failure_class());
+        assert_eq!(deferred.wire_error_code(), unprovable.wire_error_code());
+        let data = deferred.structured_data().expect("structured data");
+        assert_eq!(
+            data.get("cause_data"),
+            unprovable.structured_data().as_ref()
+        );
+        let untyped = MobError::MemberCustodyDeferred {
+            member_id: AgentIdentity::from("w-1"),
+            session_id,
+            restore: MemberCustodyRestore::StartupBinding,
+            cause: Arc::new(MobError::Internal("restore failed".to_string())),
+        };
+        let data = untyped.structured_data().expect("structured data");
+        assert_eq!(data["restore"], "startup_binding");
+        assert!(data.get("cause_data").is_none(), "{data}");
+    }
+
     /// A member's startup recovery failure, shared with every handle,
     /// classifies exactly as its bare cause on every typed classifier, for a
     /// hosting refusal and for a cause that carries a durable resume hold.
@@ -3004,6 +3195,12 @@ mod tests {
             MobError::RespawnPredecessorRestrictionsUnavailable {
                 agent_identity: "worker".to_string(),
                 reason: "no inherited tool restriction evidence".to_string(),
+            },
+            MobError::MemberCustodyDeferred {
+                member_id: AgentIdentity::from("m"),
+                session_id: meerkat_core::types::SessionId::new(),
+                restore: MemberCustodyRestore::CleanupDelivery,
+                cause: Arc::new(MobError::Internal("deferred".to_string())),
             },
             MobError::MemberReloadTimedOut {
                 session_id: meerkat_core::types::SessionId::new(),
