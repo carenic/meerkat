@@ -132,6 +132,18 @@ them.
 - `meerkat-contracts`: `WireMobLifecycleFailure`, why a listed mob's actor has
   stopped: `cause`, `message`, `code` and `structured_data`, the fields of a
   failed `mob/spawn_many` row.
+- `meerkat-mob`: `MobError::DurabilityFailStop { mob_id, cause }`, the record
+  a mob actor leaves when it fail-stops because a durable mutation's outcome
+  stayed uncertain: `cause` is that mutation's own error (the first one when
+  several stayed uncertain). It classifies as the admission close it stands
+  for (`AdmissionClosed` with `MobAdmissionCloseReason::DurabilityFailStop`):
+  no wire code, wire detail or bridge rejection cause, failure class
+  `MobRejected`, spawn-many cause `Internal`. Its structured data has kind
+  `mob_durability_fail_stop`, the reason, and the cause's own data under
+  `cause_data`. It carries no durable resume hold, even when its cause does:
+  the mob needs a restart, not a parked member.
+  `MobError::without_shared_lifecycle_wrapper` reads through
+  `SharedLifecycleFailure` to the error it shares.
 
 ### Changed
 
@@ -141,6 +153,12 @@ them.
   (inherited_instructions on a session fork call) to reactivate_inherited".
   It said only that `reactivate_inherited` carries them into the child. The
   cause, the keys and the error code are unchanged.
+- `meerkat-mob`: the error a command gets when its durable mutation's outcome
+  stays uncertain, and the mob's actor fail-stops, can now arrive shared in
+  `MobError::SharedLifecycleFailure`: it is the error the actor records as the
+  fail-stop's cause. Its Display, wire code, failure class and structured
+  data are the error's own, as before; a match on its Rust variant reads
+  through `MobError::without_shared_lifecycle_wrapper`.
 
 ### Fixed
 
@@ -264,9 +282,8 @@ them.
   `ActorCommandChannelClosed`, and `MobBuilder::resume` still returns the
   handle before startup recovery runs: read `MobHandle::status` for the
   reason. An actor that stops later because a durable mutation's outcome
-  stayed uncertain reports that the same way, as `MobError::AdmissionClosed`
-  with `MobAdmissionCloseReason::DurabilityFailStop`; the mutation itself is
-  still named only in the error log where it failed.
+  stayed uncertain reports that the same way, as the new
+  `MobError::DurabilityFailStop`, whose cause is that mutation's own error.
 
 - `meerkat-mob-mcp`, `meerkat-rpc`, `meerkat-web-runtime`: a mob whose actor
   has stopped (it fail-stopped, or its task ended while the mob was live) is

@@ -8493,8 +8493,8 @@ impl MobHandle {
     /// [`MobError::SharedLifecycleFailure`]: for a failed startup recovery of
     /// a member's session, a [`MobError::MemberStartupRecoveryFailed`] naming
     /// the member, its session and the cause; for an uncertain durable
-    /// mutation, [`MobError::AdmissionClosed`] with
-    /// `MobAdmissionCloseReason::DurabilityFailStop`.
+    /// mutation, a [`MobError::DurabilityFailStop`] whose cause is that
+    /// mutation's own error.
     pub async fn status(&self) -> Result<MobState, MobError> {
         match self
             .send_actor_command(|reply_tx| MobCommand::QueryPhase { reply_tx })

@@ -394,7 +394,7 @@ fn an_uncertain_durable_mutation_fail_stops_only_through_its_record() {
     assert!(
         misuses.is_empty(),
         "{} use(s) of the fail-stop field bypass its record (a site records its cause with \
-         fail_stop_on_uncertain_durability or its unreplied form):\n{}",
+         the field's record or record_unreplied):\n{}",
         misuses.len(),
         misuses
             .iter()

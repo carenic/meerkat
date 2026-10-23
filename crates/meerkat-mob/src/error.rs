@@ -2309,20 +2309,23 @@ impl MobError {
     }
 
     /// This error as a retirement topology cleanup failure: one already is
-    /// comes back unchanged, any other is wrapped with its rendering.
+    /// comes back unchanged, also when it arrives as a fail-stop's shared
+    /// reply (the same shared cause, one prefix); any other is wrapped with
+    /// its rendering.
     pub(crate) fn into_retirement_topology_incomplete(self) -> MobError {
-        match self {
+        match self.without_shared_lifecycle_wrapper() {
             Self::RetirementTopologyIncomplete(_) => self,
-            other => Self::RetirementTopologyIncomplete(other.to_string()),
+            _ => Self::RetirementTopologyIncomplete(self.to_string()),
         }
     }
 
     /// This error as a wiring failure: one already is comes back unchanged,
-    /// any other is wrapped with its rendering.
+    /// also when it arrives as a fail-stop's shared reply (the same shared
+    /// cause, one prefix); any other is wrapped with its rendering.
     pub(crate) fn into_wiring_error(self) -> MobError {
-        match self {
+        match self.without_shared_lifecycle_wrapper() {
             Self::WiringError(_) => self,
-            other => Self::WiringError(other.to_string()),
+            _ => Self::WiringError(self.to_string()),
         }
     }
 
