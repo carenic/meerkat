@@ -29786,6 +29786,58 @@ ORDER BY runtime_id";
         }
 
         #[tokio::test]
+        async fn sqlite_closing_save_rebase_shares_one_body_and_keeps_it_for_the_base() {
+            let (_dir, store) = temp_store();
+            let (runtime_id, live, run_id, _base, first_tail) = rebase_run_with_tail(&store).await;
+            let (mut compacted, commit) = rebase_compact(&live);
+            compacted.clear_run_cursor();
+            let payload = rebase_payload(&store, &runtime_id, live.id()).await;
+            let rebase = crate::store::PreparedWholeBlobRunRebase::prepare(
+                payload,
+                Some(first_tail),
+                run_id.clone(),
+                compacted.clone(),
+                std::slice::from_ref(&commit),
+            )
+            .unwrap();
+            let outcome = store
+                .commit_prepared_whole_blob_run_rebase(&runtime_id, rebase.store_parts())
+                .await
+                .unwrap();
+            let crate::store::WholeBlobRunRebaseOutcome::Applied { committed, tail } = outcome
+            else {
+                unreachable!("the closing save re-bases");
+            };
+            // The base and the candidate are one body.
+            assert_eq!(tail.candidate_blob_sha256(), committed.blob_sha256());
+            // Replacing the tail drops its candidate body only when nothing
+            // names it: the committed base still does.
+            let mut next = compacted;
+            next.push(Message::User(UserMessage::text(
+                "after the closing save".to_string(),
+            )));
+            let next = rebase_with_cursor(next, &run_id, 1);
+            let second = PreparedWholeBlobProvisionalTail::prepare_from_session(
+                committed.clone(),
+                run_id,
+                2,
+                &next,
+            )
+            .unwrap();
+            store
+                .write_prepared_whole_blob_provisional_tail(&runtime_id, second)
+                .await
+                .unwrap();
+            let stored = store
+                .load_committed_whole_blob_snapshot(&runtime_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.authority(), &committed);
+            assert!(stored.session().try_run_cursor().unwrap().is_none());
+        }
+
+        #[tokio::test]
         async fn sqlite_run_rebase_is_stale_once_another_writer_moved_the_tail() {
             let (_dir, store) = temp_store();
             let (runtime_id, live, run_id, base, first_tail) = rebase_run_with_tail(&store).await;

@@ -472,6 +472,12 @@ impl PreparedWholeBlobRewriteStoreParts {
 ///   metadata-only tail whose resume point is the one the run holds at the
 ///   compaction. The store mints its authority on the just-issued committed
 ///   authority, for the same run, at candidate sequence one.
+/// - A closing save re-bases too: a run whose last rewrite has no round
+///   commit after it (a compaction at its final boundary, a closing write
+///   after a turn cap or a hard failure) saves a document without a run
+///   cursor, as a committed boundary never carries one. The committed
+///   successor and the candidate are then the same document, and the tail
+///   (equal to its base, with no cursor) is the run's closing save.
 ///
 /// Like the rewrite boundary, the typed documents never reach the backend:
 /// it receives only [`PreparedWholeBlobRunRebaseStoreParts`].
@@ -502,13 +508,13 @@ impl PreparedWholeBlobRunRebase {
     /// its last re-base); `expected_tail` is the run's current provisional
     /// tail on that base, or `None` when the run has written none yet;
     /// `compacted` is the run's live session after the compaction, carrying
-    /// the run cursor of `run_id`; `commits` is the exact rewrite suffix since
-    /// the committed base.
+    /// the run cursor of `run_id`, or no cursor for a closing save; `commits`
+    /// is the exact rewrite suffix since the committed base.
     ///
     /// # Errors
-    /// The compacted document carries no cursor for `run_id`, the expected
-    /// tail does not belong to this base and run, or the rewrite proof
-    /// refuses the committed successor.
+    /// The compacted document's cursor is malformed or names another run,
+    /// the expected tail does not belong to this base and run, or the
+    /// rewrite proof refuses the committed successor.
     pub fn prepare(
         expected_runtime: VerifiedCommittedWholeBlobPayload,
         expected_tail: Option<WholeBlobProvisionalTailAuthority>,
@@ -524,18 +530,15 @@ impl PreparedWholeBlobRunRebase {
                 actual: compacted.id().clone(),
             });
         }
-        let cursor = compacted
-            .try_run_cursor()
-            .map_err(|error| {
-                rebase_conflict(
-                    &session_id,
-                    format!("WholeBlob re-base candidate run cursor is malformed: {error}"),
-                )
-            })?
-            .ok_or_else(|| {
-                rebase_conflict(&session_id, "WholeBlob re-base candidate has no run cursor")
-            })?;
-        if cursor.run_id != run_id {
+        // A closing save carries no cursor; a cursor, when present, must
+        // name this run.
+        let cursor = compacted.try_run_cursor().map_err(|error| {
+            rebase_conflict(
+                &session_id,
+                format!("WholeBlob re-base candidate run cursor is malformed: {error}"),
+            )
+        })?;
+        if cursor.is_some_and(|cursor| cursor.run_id != run_id) {
             return Err(rebase_conflict(
                 &session_id,
                 "WholeBlob re-base candidate cursor names another run",
