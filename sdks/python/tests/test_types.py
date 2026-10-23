@@ -8356,6 +8356,27 @@ async def test_member_status_rejects_malformed_progress(progress) -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_mobs_keeps_a_stopped_mobs_typed_failure() -> None:
+    client = MeerkatClient()
+    failure = {
+        "cause": "internal",
+        "message": "the mob's actor stopped",
+        "code": "INTERNAL_ERROR",
+        "structured_data": {"kind": "durability_fail_stop"},
+    }
+
+    async def fake_request(_method, _params):
+        return {"mobs": [{"mob_id": "mob-1", "status": "Running", "failure": failure}]}
+
+    client._request = fake_request  # type: ignore[method-assign]
+    client.require_capability = lambda _cap: None  # type: ignore[method-assign]
+
+    assert await client.list_mobs() == [
+        {"mob_id": "mob-1", "status": "Running", "failure": failure}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_list_mobs_rejects_non_list_mobs() -> None:
     client = MeerkatClient()
 

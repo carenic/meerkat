@@ -2239,10 +2239,25 @@ class MobListResult:
 
 
 @dataclass
+class WireMobLifecycleFailure:
+    """Why a mob's actor has stopped, on a `mob/list` row: the fields a failed
+`mob/spawn_many` row carries."""
+    cause: MobSpawnManyFailureCause
+    message: str
+    code: Optional[Literal['SESSION_NOT_FOUND', 'SCHEDULE_NOT_FOUND', 'SESSION_BUSY', 'SESSION_NOT_RUNNING', 'REQUEST_CANCELLED', 'PROVIDER_ERROR', 'BUDGET_EXHAUSTED', 'HOOK_DENIED', 'AGENT_ERROR', 'CAPABILITY_UNAVAILABLE', 'SKILL_NOT_FOUND', 'SKILL_RESOLUTION_FAILED', 'INVALID_PARAMS', 'INTERNAL_ERROR', 'DUPLICATE_INPUT', 'SUPERVISOR_ROTATION_INCOMPLETE'] | Literal['SCOPE_DENIED'] | Literal['HOST_UNAVAILABLE'] | Literal['STALE_CURSOR'] | Literal['STALE_FENCE'] | Literal['MEMBER_RELOAD_REQUIRED'] | Literal['INPUT_REFUSED'] | Literal['INPUT_NOT_READY'] | Literal['SESSION_RUNTIME_UNAVAILABLE'] | Literal['APPROVAL_STORE_UNAVAILABLE'] | Literal['APPROVAL_CONFLICT'] | Literal['APPROVAL_COMMIT_UNKNOWN'] | Literal['STALE_DELIVERY_SCOPE'] | Literal['FORK_INSTRUCTION_REFUSED']] = None
+    structured_data: Optional[Any] = None
+
+
+@dataclass
 class MobStatusResult:
-    """One active mob row returned by `mob/list`."""
+    """One active mob row returned by `mob/list`.
+
+`failure` present means the mob's actor has stopped; `status` is the last
+machine phase. The actor admits no command until a restart recovers the
+mob from its durable state."""
     mob_id: str
     status: Literal['Creating', 'Running', 'Stopped', 'Completed', 'Destroyed']
+    failure: Optional[WireMobLifecycleFailure] = None
 
 
 @dataclass

@@ -125,6 +125,16 @@ them.
   naming a server follows the registry's server for its model, in the
   factory and in a mob member's merge alike, instead of the durable server.
 
+- `meerkat-mob-mcp`: `MobMcpState::mob_list` returns each managed mob with
+  its `MobLifecycleObservation` instead of its `MobState` (see Fixed, a
+  listed mob whose actor has stopped); the phase is the observation's
+  `phase`.
+
+- `meerkat-contracts`: `MobStatusResult` gains the field
+  `failure: Option<WireMobLifecycleFailure>`, so code that builds it as a
+  struct literal sets `failure: None`. The wire stays additive: the field is
+  left out when absent.
+
 ### Added
 
 - Hosted MCP OAuth through the host's own `https` callback (#1808), for a
@@ -262,6 +272,15 @@ them.
   compositions and on ungoverned machines. The `ServiceOccurrence` a
   request carries is host-asserted audit data, not authority. Additive:
   no wire, contract or persistence change.
+
+- `meerkat-mob`: `MobLifecycleObservation`, a mob's lifecycle as its
+  handles observe it without asking its actor: the last phase the actor
+  published and, once the actor has stopped, why (`failure`). Read it with
+  `MobHandle::lifecycle_observation` or `MobReadHandle::lifecycle_observation`.
+
+- `meerkat-contracts`: `WireMobLifecycleFailure`, why a listed mob's actor has
+  stopped: `cause`, `message`, `code` and `structured_data`, the fields of a
+  failed `mob/spawn_many` row.
 
 ### Changed
 
@@ -559,6 +578,17 @@ them.
   attempt now tells that case apart. This covers a loopback MCP login and a
   provider browser login; a completion for another provider keeps its
   lifecycle rejection.
+
+- `meerkat-mob-mcp`, `meerkat-rpc`, `meerkat-web-runtime`: a mob whose actor
+  has stopped (it fail-stopped, or its task ended while the mob was live) is
+  no longer listed as if it ran. `mob/list`, the MCP `meerkat_mob_list` and
+  agent `mob_list` tools, the Web runtime's `listMobs` and the TypeScript
+  SDK's `listMobs` give its row a typed `failure`: present means the mob's
+  actor has stopped; `status` is the last machine phase. The Python SDK's
+  `list_mobs` returns the row as it is. Before, the row read `Running` and
+  nothing else, while `mob/status` reported the failure.
+  `MobHandle::status_observation_snapshot` is still the phase alone; its
+  documentation now says so and points to `lifecycle_observation`.
 
 ## [0.9.4] - 2026-10-20
 

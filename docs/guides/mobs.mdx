@@ -1205,6 +1205,17 @@ with `DurabilityFailStop` the same way. Before 0.9.5, `status` reported only
 "mob actor reply channel closed", and the cause reached only the host's error
 log.
 
+`MobHandle::lifecycle_observation()` (and the same method on `MobReadHandle`)
+reads that answer without asking the actor: the last phase the actor
+published and, once the actor has stopped, `failure`. That is the cause
+`status` reports or, for an actor task that ended while the mob was live and
+recorded no cause, the closed-actor error. `status_observation_snapshot()` is
+the phase alone and keeps a stopped actor's last live phase. `mob/list`, the
+MCP `meerkat_mob_list` tool and the SDKs' mob listings give such a mob's row a
+typed `failure` (`cause`, `message`, `code`, `structured_data`): present
+means the mob's actor has stopped; `status` is the last machine phase. Before
+0.9.5 the row read `Running`.
+
 While a Shutdown drains, a command the close refuses (spawn, respawn, work, a
 flow run, wiring, a host bind, a live commit, resume, reset or reload) fails
 with `AdmissionClosed`, and every other request the actor answers (stop,

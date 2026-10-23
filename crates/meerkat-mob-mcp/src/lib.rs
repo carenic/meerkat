@@ -5262,7 +5262,11 @@ impl MobMcpState {
         self.ensure_restored().await?;
         // A destroyed mob (its phase flips when the destroy is admitted) is
         // not handed out: a clone taken now would keep observing the
-        // database its destroy's storage cleanup drains.
+        // database its destroy's storage cleanup drains. A mob whose actor
+        // has stopped keeps its last live phase and is handed out: hiding it
+        // would make its failure silently absent from the surfaces built on
+        // this snapshot, which read why from the handle
+        // (`lifecycle_observation`, `status`).
         Ok(self
             .mobs
             .read()
@@ -5275,7 +5279,11 @@ impl MobMcpState {
             .collect())
     }
 
-    pub async fn mob_list(&self) -> Result<Vec<(MobId, MobState)>, MobError> {
+    /// Every managed mob, with its lifecycle as observed without asking its
+    /// actor (see [`meerkat_mob::MobLifecycleObservation`]).
+    pub async fn mob_list(
+        &self,
+    ) -> Result<Vec<(MobId, meerkat_mob::MobLifecycleObservation)>, MobError> {
         // The gate of `mob_handles_snapshot` (cross-mob enumeration is
         // Owner-only), but every managed mob is listed: a destroyed mob still
         // managed, such as the retry anchor of a destroy whose native part
@@ -5288,7 +5296,7 @@ impl MobMcpState {
             .read()
             .await
             .iter()
-            .map(|(id, managed)| (id.clone(), managed.handle.status_observation_snapshot()))
+            .map(|(id, managed)| (id.clone(), managed.handle.lifecycle_observation()))
             .collect())
     }
 
@@ -9592,6 +9600,33 @@ pub fn wire_mob_lifecycle_status(state: MobState) -> WireMobLifecycleStatus {
     }
 }
 
+/// Why a listed mob's actor has stopped, on the wire: the fields a failed
+/// `mob/spawn_many` row carries, from the same typed error.
+pub fn wire_mob_lifecycle_failure(error: &MobError) -> meerkat_contracts::WireMobLifecycleFailure {
+    meerkat_contracts::WireMobLifecycleFailure {
+        cause: meerkat_mob::mob_error_wire_code(error),
+        message: error.to_string(),
+        code: error.wire_error_code(),
+        structured_data: error.structured_data(),
+    }
+}
+
+/// One listed mob on the wire: its last machine phase and, once its actor
+/// has stopped, why. Every surface that lists mobs projects through this.
+pub fn wire_mob_status_row(
+    mob_id: &MobId,
+    observation: &meerkat_mob::MobLifecycleObservation,
+) -> meerkat_contracts::MobStatusResult {
+    meerkat_contracts::MobStatusResult {
+        mob_id: mob_id.to_string(),
+        status: wire_mob_lifecycle_status(observation.phase),
+        failure: observation
+            .failure
+            .as_deref()
+            .map(wire_mob_lifecycle_failure),
+    }
+}
+
 impl WireActionArgs {
     fn resolve(
         self,
@@ -9744,7 +9779,7 @@ impl AgentToolDispatcher for MobMcpDispatcher {
                         .map_err(|e| map_mob_err(call, e))?;
                     encode(
                         call,
-                        json!({"mobs": mobs.into_iter().map(|(id, status)| json!({"mob_id": id, "status": wire_mob_lifecycle_status(status)})).collect::<Vec<_>>() }),
+                        json!({"mobs": mobs.iter().map(|(id, observation)| wire_mob_status_row(id, observation)).collect::<Vec<_>>() }),
                     )
                 }
             }
@@ -19297,12 +19332,106 @@ mod tests {
             .await
             .expect("owner list")
             .into_iter()
+            .map(|(mob_id, observation)| (mob_id, observation.phase))
             .collect();
         assert_eq!(
             listed.keys().cloned().collect::<Vec<_>>(),
             vec![destroyed.clone(), kept]
         );
         assert_eq!(listed[&destroyed], meerkat_mob::MobState::Destroyed);
+    }
+
+    /// A managed mob whose actor fail-stopped in its startup recovery, with
+    /// the cause `status()` reports for it.
+    async fn managed_mob_whose_actor_fail_stopped_at_start(
+        state: &Arc<MobMcpState>,
+        mob_id: &str,
+    ) -> (MobId, Arc<MobError>) {
+        let mob_id = MobId::from(mob_id);
+        meerkat_mob::fail_stop_next_actor_start_for_test(&mob_id);
+        let created = state
+            .mob_create_definition(explicit_definition(mob_id.as_str()))
+            .await
+            .expect("create the mob");
+        assert_eq!(created, mob_id);
+        let handle = state.handle_for(&mob_id).await.expect("the mob's handle");
+        assert_eq!(
+            handle.actor_task_watch().wait().await,
+            meerkat_mob::MobActorTaskWait::Returned,
+            "the actor fail-stops in its startup recovery"
+        );
+        match handle.status().await {
+            Err(MobError::SharedLifecycleFailure(cause)) => (mob_id, cause),
+            other => panic!("a fail-stopped actor reports why, typed: {other:?}"),
+        }
+    }
+
+    /// `mob_list` lists a mob whose actor fail-stopped with why it stopped,
+    /// the cause `status()` reports; its phase stays the last one the actor
+    /// published.
+    #[tokio::test]
+    async fn mob_list_lists_a_fail_stopped_mob_with_why_its_actor_stopped() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = persistent_destroy_state(&svc, root.path());
+        let live = state
+            .mob_create_definition(explicit_definition("listed-live"))
+            .await
+            .expect("create the live mob");
+        let (stopped, reported) =
+            managed_mob_whose_actor_fail_stopped_at_start(&state, "listed-fail-stopped").await;
+
+        let listed: BTreeMap<MobId, meerkat_mob::MobLifecycleObservation> = state
+            .mob_list()
+            .await
+            .expect("owner list")
+            .into_iter()
+            .collect();
+        assert!(
+            listed[&live].failure.is_none(),
+            "a live mob is listed without a failure: {:?}",
+            listed[&live]
+        );
+        let observation = &listed[&stopped];
+        assert!(
+            matches!(
+                observation.phase,
+                meerkat_mob::MobState::Creating | meerkat_mob::MobState::Running
+            ),
+            "the phase stays the last one the actor published: {observation:?}"
+        );
+        let failure = observation.failure.as_ref().unwrap_or_else(|| {
+            panic!("a fail-stopped mob is listed with why its actor stopped: {observation:?}")
+        });
+        assert!(
+            Arc::ptr_eq(failure, &reported),
+            "the listed failure is the cause status() reports: {failure:?} vs {reported:?}"
+        );
+    }
+
+    /// `mob_handles_snapshot` still hands out a mob whose actor fail-stopped:
+    /// hiding it would make the failure silently absent from the observation
+    /// surfaces built on the snapshot, which read why from the handle.
+    #[tokio::test]
+    async fn mob_handles_snapshot_still_hands_out_a_fail_stopped_mob() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = persistent_destroy_state(&svc, root.path());
+        let (stopped, _reported) =
+            managed_mob_whose_actor_fail_stopped_at_start(&state, "snapshot-fail-stopped").await;
+
+        let snapshot = state.mob_handles_snapshot().await.expect("owner snapshot");
+        let (_, handle) = snapshot
+            .iter()
+            .find(|(mob_id, _)| *mob_id == stopped)
+            .expect("the fail-stopped mob's handle is handed out");
+        assert!(
+            matches!(
+                handle.status().await,
+                Err(MobError::SharedLifecycleFailure(_))
+            ),
+            "a reader of the handed-out handle gets why its actor stopped"
+        );
     }
 
     /// A host's create hook is asked before anything of a new mob exists, on

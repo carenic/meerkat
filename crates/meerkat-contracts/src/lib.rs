@@ -561,6 +561,7 @@ pub use wire::{
     WireMobError,
     WireMobErrorDetail,
     WireMobLifecycleAction,
+    WireMobLifecycleFailure,
     WireMobLifecycleStatus,
     WireMobMemberStatus,
     WireMobProfile,
