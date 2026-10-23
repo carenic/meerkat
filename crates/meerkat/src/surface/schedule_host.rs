@@ -358,8 +358,11 @@ pub trait SurfaceScheduleSessionHost: Send + Sync {
     /// Whether this host decides a redelivery's existing-only admission
     /// ([`ExistingDelivery`]): its [`Self::deliver_prompt`] and
     /// [`Self::deliver_event`] admit through
-    /// [`accept_schedule_runtime_input_with_reconciliation`], on the task
-    /// that calls them, with the runtime they admit through. The adapter then
+    /// [`accept_schedule_runtime_input_with_reconciliation`] (or, when their
+    /// admission is fenced,
+    /// [`accept_fenced_schedule_runtime_input_with_reconciliation`] under
+    /// that fence), on the task that calls them, with the runtime they admit
+    /// through. The adapter then
     /// runs a redelivery inside a redelivery scope that helper reads, so the
     /// runtime only finds the earlier admission and never admits the
     /// delivery fresh; a host that declares this and admits any other way is
@@ -3109,6 +3112,11 @@ pub async fn runtime_delivery_dispatch_from_admission(
 /// may return an ordinary pre-admission error; a committed binding or an
 /// unavailable reconciliation read remains reclaimable as
 /// `DeliveryRepairDeferred`.
+///
+/// `accept` must admit without an attachment or member-residency fence; a
+/// host whose admission is fenced uses
+/// [`accept_fenced_schedule_runtime_input_with_reconciliation`], so that a
+/// redelivery's existing-only admission keeps the same fence.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub async fn accept_schedule_runtime_input_with_reconciliation<F, Fut, E>(
     runtime_adapter: &MeerkatMachine,
@@ -3117,6 +3125,70 @@ pub async fn accept_schedule_runtime_input_with_reconciliation<F, Fut, E>(
     identity: &ScheduleDeliveryIdentity,
     input: meerkat_runtime::Input,
     materialized_session_id: Option<SessionId>,
+    accept: F,
+) -> Result<DeliveryDispatch, ScheduleDomainError>
+where
+    F: FnMut(meerkat_runtime::Input) -> Fut,
+    Fut: std::future::Future<
+            Output = Result<
+                (
+                    meerkat_runtime::AcceptOutcome,
+                    Option<meerkat_runtime::CompletionHandle>,
+                ),
+                E,
+            >,
+        >,
+    E: std::fmt::Display,
+{
+    accept_fenced_schedule_runtime_input_with_reconciliation(
+        runtime_adapter,
+        session_id,
+        occurrence,
+        identity,
+        input,
+        materialized_session_id,
+        ScheduleAdmissionFence::Unfenced,
+        accept,
+    )
+    .await
+}
+
+/// The fence a session host admits a scheduled input under. A redelivery's
+/// existing-only admission runs under the same fence as the host's ordinary
+/// admission ([`accept_fenced_schedule_runtime_input_with_reconciliation`]).
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum ScheduleAdmissionFence<'a> {
+    /// The runtime's admission with no attachment or member-residency fence.
+    Unfenced,
+    /// A mob member's session, admitted as
+    /// [`MeerkatMachine::accept_input_with_completion_for_attachment_and_member_residency`]
+    /// admits: only through this exact executor attachment, and only while
+    /// the member's residency is `expected_member` (`None` is a peer-only
+    /// member, never a vacant placement).
+    AttachmentAndMemberResidency {
+        attachment: &'a meerkat_runtime::RuntimeExecutorAttachmentWitness,
+        expected_member:
+            Option<&'a meerkat_contracts::wire::supervisor_bridge::BridgeMemberIncarnation>,
+    },
+}
+
+/// [`accept_schedule_runtime_input_with_reconciliation`] for a host whose
+/// `accept` admits under `fence`. A redelivery's existing-only admission
+/// runs under the same fence, so it never answers from an attachment or a
+/// member incarnation the host's ordinary admission would refuse; a fence
+/// refusal there says nothing about the earlier admission and leaves the
+/// occurrence reclaimable, as any other runtime error does.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub async fn accept_fenced_schedule_runtime_input_with_reconciliation<F, Fut, E>(
+    runtime_adapter: &MeerkatMachine,
+    session_id: &SessionId,
+    occurrence: &Occurrence,
+    identity: &ScheduleDeliveryIdentity,
+    input: meerkat_runtime::Input,
+    materialized_session_id: Option<SessionId>,
+    fence: ScheduleAdmissionFence<'_>,
     mut accept: F,
 ) -> Result<DeliveryDispatch, ScheduleDomainError>
 where
@@ -3162,6 +3234,7 @@ where
             input,
             materialized_session_id,
             existing,
+            fence,
         )
         .await;
     }
@@ -3244,8 +3317,14 @@ where
 /// - No earlier admission of an unproven late redelivery: the adapter answers
 ///   that the target never admitted it, and the occurrence ends misfired.
 /// - Any other error says nothing about the earlier admission: the
-///   occurrence stays reclaimable (`DeliveryRepairDeferred`).
+///   occurrence stays reclaimable (`DeliveryRepairDeferred`). A refusal of
+///   the host's `fence` is one: the lookup did not run, and the next attempt
+///   takes the host's attachment and member residency afresh.
+///
+/// The admission runs under the host's `fence`, as its ordinary admission
+/// does.
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
 async fn accept_existing_schedule_runtime_input(
     runtime_adapter: &MeerkatMachine,
     session_id: &SessionId,
@@ -3254,11 +3333,28 @@ async fn accept_existing_schedule_runtime_input(
     input: meerkat_runtime::Input,
     materialized_session_id: Option<SessionId>,
     scope: ExistingAdmissionScope,
+    fence: ScheduleAdmissionFence<'_>,
 ) -> Result<DeliveryDispatch, ScheduleDomainError> {
-    match runtime_adapter
-        .accept_existing_input_with_completion(session_id, input)
-        .await
-    {
+    let admitted = match fence {
+        ScheduleAdmissionFence::Unfenced => {
+            runtime_adapter
+                .accept_existing_input_with_completion(session_id, input)
+                .await
+        }
+        ScheduleAdmissionFence::AttachmentAndMemberResidency {
+            attachment,
+            expected_member,
+        } => {
+            runtime_adapter
+                .accept_existing_input_with_completion_for_attachment_and_member_residency(
+                    attachment,
+                    input,
+                    expected_member,
+                )
+                .await
+        }
+    };
+    match admitted {
         Ok((outcome, handle)) => {
             runtime_delivery_dispatch_from_admission(
                 runtime_adapter,
@@ -3301,6 +3397,7 @@ async fn accept_existing_schedule_runtime_input(
 
 /// Browser builds run no schedule driver, so nothing redelivers there.
 #[cfg(target_arch = "wasm32")]
+#[allow(clippy::too_many_arguments)]
 async fn accept_existing_schedule_runtime_input(
     _runtime_adapter: &MeerkatMachine,
     _session_id: &SessionId,
@@ -3309,6 +3406,7 @@ async fn accept_existing_schedule_runtime_input(
     _input: meerkat_runtime::Input,
     _materialized_session_id: Option<SessionId>,
     scope: std::convert::Infallible,
+    _fence: ScheduleAdmissionFence<'_>,
 ) -> Result<DeliveryDispatch, ScheduleDomainError> {
     match scope {}
 }

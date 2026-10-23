@@ -574,7 +574,10 @@ them.
   `SurfaceScheduleSessionHost` gains the defaulted
   `decides_existing_admission` (default `false`): a host that returns `true`
   admits its prompt and event deliveries through
-  `accept_schedule_runtime_input_with_reconciliation` on the calling task, so
+  `accept_schedule_runtime_input_with_reconciliation` on the calling task (a
+  host whose admission is fenced through
+  `accept_fenced_schedule_runtime_input_with_reconciliation` with its
+  `ScheduleAdmissionFence`, so the redelivery keeps that fence), so
   a redelivery through it only replays the earlier input, and a host that
   declares it but admits another way is logged as an incident. With the
   default the adapter answers an unproven late redelivery not admitted
@@ -1167,7 +1170,10 @@ them.
     receipt): the occurrence is reclaimed, also past its misfire deadline, for
     up to five attempts. The redelivery uses the runtime's deduplicate-only
     admission, so it finds the admitted input and never admits it again, and
-    the occurrence records that input's outcome. A target still busy with
+    the occurrence records that input's outcome. For a mob member's session
+    that admission is fenced like the first delivery's, to the member's
+    executor attachment and residency; a refused fence admits nothing and
+    leaves the occurrence to its next reclaim. A target still busy with
     that input does not end the redelivery under `skip_if_running`, since a
     redelivery starts no new run. After five lost executors it ends
     `delivery_failed` with `lease_lost`; an input the runtime no longer knows
