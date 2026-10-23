@@ -1168,6 +1168,7 @@ pub fn agent_event_type(event: &AgentEvent) -> &'static str {
         AgentEvent::TurnUsageAccountingIdentityDisputed { .. } => {
             "turn_usage_accounting_identity_disputed"
         }
+        AgentEvent::RunResumed { .. } => "run_resumed",
     }
 }
 
@@ -3147,6 +3148,47 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         outcome: Option<crate::lifecycle::run_primitive::ReasoningLoweringOutcome>,
     },
+    /// A durable run resumed from its run cursor after a restart, in place of
+    /// `run_started`: the same run continues under its run id, and its
+    /// terminal follows as for any run.
+    ///
+    /// At `tools_pending` the run takes the round's staged assistant message
+    /// as the model's response and dispatches its tool calls again under
+    /// their call ids; nothing is published again for the staged message (no
+    /// `tool_call_requested`, no `turn_completed`). At `awaiting_model` the
+    /// run continues with its next model call, after the last committed
+    /// round.
+    RunResumed {
+        session_id: SessionId,
+        run_id: crate::lifecycle::RunId,
+        /// The cursor's round: at `tools_pending` the round whose calls are
+        /// dispatched again, at `awaiting_model` the last committed round.
+        round: u64,
+        resume_point: RunResumePointKind,
+    },
+}
+
+/// Where a resumed run continues, as [`AgentEvent::RunResumed`] reports it.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RunResumePointKind {
+    /// The round's first commit staged its assistant message; its tool calls
+    /// are dispatched again.
+    ToolsPending,
+    /// The round's second commit landed; the run continues with its next
+    /// model call.
+    AwaitingModel,
+}
+
+impl From<&crate::session::RunResumePoint> for RunResumePointKind {
+    fn from(point: &crate::session::RunResumePoint) -> Self {
+        match point {
+            crate::session::RunResumePoint::ToolsPending { .. } => Self::ToolsPending,
+            crate::session::RunResumePoint::AwaitingModel => Self::AwaitingModel,
+        }
+    }
 }
 
 /// Exact negative application fact projected from durable boundary join resolution.
@@ -3601,6 +3643,38 @@ fn truncate_str(s: &str, max_bytes: usize) -> &str {
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// A resumed run's announcement carries its run, its cursor's round and
+    /// where it continues, under its own wire name, and reads back unchanged.
+    #[test]
+    fn run_resumed_has_its_own_wire_name_and_round_trips() {
+        let run_id = crate::lifecycle::RunId::new();
+        let event = AgentEvent::RunResumed {
+            session_id: SessionId::new(),
+            run_id: run_id.clone(),
+            round: 2,
+            resume_point: RunResumePointKind::ToolsPending,
+        };
+        assert_eq!(agent_event_type(&event), "run_resumed");
+        let wire = serde_json::to_value(&event).unwrap();
+        assert_eq!(wire["type"], "run_resumed");
+        assert_eq!(wire["round"], 2);
+        assert_eq!(wire["resume_point"], "tools_pending");
+        let parsed: AgentEvent = serde_json::from_value(wire).unwrap();
+        assert!(matches!(
+            parsed,
+            AgentEvent::RunResumed {
+                run_id: parsed_run,
+                round: 2,
+                resume_point: RunResumePointKind::ToolsPending,
+                ..
+            } if parsed_run == run_id
+        ));
+        assert_eq!(
+            serde_json::to_value(RunResumePointKind::AwaitingModel).unwrap(),
+            "awaiting_model"
+        );
+    }
 
     /// A completion recorded before the summary source existed still reads,
     /// with no source, and writes back to the same bytes; a current one

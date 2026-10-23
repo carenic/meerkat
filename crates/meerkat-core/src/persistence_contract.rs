@@ -341,6 +341,14 @@ pub trait SessionCheckpointer: Send + Sync {
     /// The actor removes its retained copy before awaiting and installs only a
     /// successfully returned successor, so cancellation or error cannot promote
     /// stale physical state.
+    ///
+    /// The agent calls it twice in every tool round of a run (the round's
+    /// commits, which carry the session's run cursor), once more when the run
+    /// ends without an end-of-run save (a closing checkpoint without the
+    /// cursor), and for its end-of-run save. `Ok(None)` means nothing was
+    /// made durable: a round's first commit that gets it fails the round
+    /// before any of its tools runs. Only a session that never committed a
+    /// boundary has no base to chain a provisional tail from.
     async fn checkpoint_run(
         &self,
         session: &mut crate::Session,
