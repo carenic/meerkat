@@ -1862,14 +1862,18 @@ mod tests {
             .discard_live_session(&session_id)
             .await
             .expect("discard the live member session");
-        let refused = scoped
-            .recover_live_session_for_realtime_open(&session_id)
-            .await
-            .expect_err("a session-scoped recovery refuses a cold member session");
-        assert!(
-            refused.is_mob_member_session_addressed_by_id(),
-            "{refused:?}"
-        );
+        // Twice: a first refusal that had restored the session would leave
+        // it live, and the second attempt would then find it instead.
+        for attempt in 0..2 {
+            let refused = scoped
+                .recover_live_session_for_realtime_open(&session_id)
+                .await
+                .expect_err("a session-scoped recovery refuses a cold member session");
+            assert!(
+                refused.is_mob_member_session_addressed_by_id(),
+                "attempt {attempt}: {refused:?}"
+            );
+        }
         if let Err(error) = member_host
             .recover_live_session_for_realtime_open(&session_id)
             .await
