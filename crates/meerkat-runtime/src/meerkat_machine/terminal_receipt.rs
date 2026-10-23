@@ -34,6 +34,13 @@ impl MeerkatMachine {
     /// that the selected registration is Draining or its teardown has joined,
     /// then check each input's canonical terminal receipt. Reused sessions
     /// also require the caller's exact start baseline to scope its workflow.
+    /// Input ids are stable across the boundary: a requeue across a graceful
+    /// stop, a replay of a failed run and a retry keep an input's id. A
+    /// requeued input, or one bound to a run a graceful stop suspended, is not
+    /// finalized at shutdown: it finalizes at the next start, or as
+    /// `RequeueExpired` past the stop's max age. A coalesced or superseded
+    /// input names the newer admitted input of the same session that carries
+    /// its outcome.
     /// The returned source identifies the read path, not a close receipt.
     ///
     /// A known empty session returns an empty observation. An unregistered
