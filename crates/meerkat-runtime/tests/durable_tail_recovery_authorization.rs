@@ -1298,23 +1298,22 @@ fn operator_repair_is_refused_over_live_run_facts_and_non_quiescent_phases() {
         ),
         refused
     );
-    for (phase, state) in [
-        (
-            mm_dsl::MeerkatPhase::Initializing,
+    for phase in [
+        mm_dsl::MeerkatPhase::Initializing,
+        mm_dsl::MeerkatPhase::Attached,
+        mm_dsl::MeerkatPhase::Stopped,
+    ] {
+        // Built per phase, not as an array of states: the machine state is
+        // large enough that three of them overflow clippy's stack-array
+        // bound.
+        let state = if phase == mm_dsl::MeerkatPhase::Initializing {
             mm_dsl::MeerkatMachineState {
                 lifecycle_phase: mm_dsl::MeerkatPhase::Initializing,
                 ..Default::default()
-            },
-        ),
-        (
-            mm_dsl::MeerkatPhase::Attached,
-            quiescent_state(mm_dsl::MeerkatPhase::Attached),
-        ),
-        (
-            mm_dsl::MeerkatPhase::Stopped,
-            quiescent_state(mm_dsl::MeerkatPhase::Stopped),
-        ),
-    ] {
+            }
+        } else {
+            quiescent_state(phase)
+        };
         let mut authority = mm_dsl::MeerkatMachineAuthority::recover_from_state(state)
             .expect("a non-quiescent phase state must be recoverable");
         assert_eq!(
