@@ -1500,7 +1500,8 @@ fn build_wasm_tool_dispatcher() -> Result<Arc<dyn meerkat_core::AgentToolDispatc
 ///
 /// `mobpack_bytes`: tar.gz mobpack archive. Verified via the canonical
 /// [`meerkat_mob_pack::trust`] authority under the host-supplied
-/// `mobpack_trust` configuration ([`TrustPolicy::Strict`] + empty trust store
+/// `mobpack_trust` configuration
+/// ([`TrustPolicy::Strict`](meerkat_mob_pack::trust::TrustPolicy::Strict) + empty trust store
 /// when omitted) — an unsigned or unknown-signer pack fails closed with a
 /// typed error unless the host registered the signer (or explicitly opted in
 /// to `permissive`).
@@ -3109,7 +3110,7 @@ fn register_subscription(inner: SubscriptionInner) -> String {
 
 /// Subscribe to a mob member's session event stream.
 ///
-/// Returns a canonical `stream_id` string ([`StreamRef`] wire form). Use
+/// Returns a canonical `stream_id` string (`StreamRef` wire form). Use
 /// `poll_subscription(stream_id)` to drain buffered events. Each call returns
 /// all events since the last poll.
 ///
@@ -3149,12 +3150,13 @@ pub async fn mob_member_subscribe(mob_id: &str, agent_identity: &str) -> Result<
 
 /// Subscribe to mob-wide events (all members, continuously updated).
 ///
-/// Returns a canonical `stream_id` string ([`StreamRef`] wire form). Use
+/// Returns a canonical `stream_id` string (`StreamRef` wire form). Use
 /// `poll_subscription(stream_id)` to drain buffered events. Each call returns
 /// all events since the last poll.
 ///
 /// Unlike `mob_member_subscribe` which streams a single member's agent events,
-/// this streams [`AttributedEvent`]s tagged with source runtime identity and role
+/// this streams [`AttributedEvent`](meerkat_mob::AttributedEvent)s tagged with source
+/// runtime identity and role
 /// for every member in the mob, automatically tracking roster changes.
 #[wasm_bindgen]
 pub async fn mob_subscribe_events(mob_id: &str) -> Result<String, JsValue> {
