@@ -7707,17 +7707,22 @@ pub(crate) fn machine_staged_directed_interaction_ids(
 
 pub(crate) fn machine_validate_run_failed(
     driver: &DriverEntry,
+    run_id: &RunId,
     contributing_work_ids: &[InputId],
 ) -> Result<(), RuntimeDriverError> {
     if contributing_work_ids.is_empty() {
         return Err(RuntimeDriverError::Internal(
-            "run failed requires at least one staged contributor".to_string(),
+            "run failed requires at least one contributor".to_string(),
         ));
     }
 
     for work_id in contributing_work_ids {
         let lifecycle = driver.as_driver().input_phase(work_id);
-        if lifecycle != Some(InputLifecycleState::Staged) {
+        // A resumed run's contributor can already be applied by one of the
+        // run's committed rounds; it still belongs to this run.
+        if lifecycle != Some(InputLifecycleState::Staged)
+            && !driver.input_bound_to_open_run(work_id, run_id)
+        {
             return Err(RuntimeDriverError::Internal(format!(
                 "run failed requires staged contributors, but {work_id:?} is {lifecycle:?}"
             )));
@@ -7725,6 +7730,31 @@ pub(crate) fn machine_validate_run_failed(
     }
 
     Ok(())
+}
+
+/// The contributors a replayed failed run returns to its work lanes: every
+/// staged contributor, then each input one of `run_id`'s committed rounds
+/// already applied that is still bound to the run.
+///
+/// Only a resumed run holds applied contributors. Left applied, they would
+/// stay bound to a run that ended, and a later registration would find that
+/// run open and resumable again; the failed-run realization replays them
+/// through the generated `ReplayAppliedRunContributor` with the staged ones.
+fn machine_replayed_failed_run_contributors(
+    driver: &DriverEntry,
+    run_id: &RunId,
+    staged_input_ids: &[InputId],
+) -> Vec<InputId> {
+    let mut contributors = staged_input_ids.to_vec();
+    contributors.extend(
+        driver
+            .resumed_run_bound_input_ids(run_id)
+            .into_iter()
+            .filter(|input_id| {
+                driver.as_driver().input_phase(input_id) != Some(InputLifecycleState::Staged)
+            }),
+    );
+    contributors
 }
 
 pub(crate) fn machine_validate_run_cancelled(
@@ -11175,7 +11205,17 @@ async fn fail_runtime_loop_run_inner(
     let mut driver = driver.lock().await;
     let failed_run_id = run_id.clone();
     let staged_input_ids = machine_staged_contributors(&driver);
-    machine_validate_run_failed(&driver, &staged_input_ids)
+    // A replayed failure returns the inputs a resumed run's committed rounds
+    // already applied with the staged ones; the other dispositions dispose of
+    // staged contributors only.
+    let contributing_input_ids = match contributor_disposition {
+        FailedRunContributorDisposition::Replayed => {
+            machine_replayed_failed_run_contributors(&driver, &failed_run_id, &staged_input_ids)
+        }
+        FailedRunContributorDisposition::Consumed
+        | FailedRunContributorDisposition::Terminalized => staged_input_ids.clone(),
+    };
+    machine_validate_run_failed(&driver, &failed_run_id, &contributing_input_ids)
         .map_err(RuntimeLoopRunFailError::Rejected)?;
     if machine_terminal_failure_observed != machine_terminal_error.is_some() {
         return Err(RuntimeLoopRunFailError::Rejected(
@@ -11343,7 +11383,7 @@ async fn fail_runtime_loop_run_inner(
             return Err(RuntimeLoopRunFailError::Rejected(error));
         }
     };
-    let replay_plan = machine_build_replay_plan(&driver, &staged_input_ids, "RunFailed");
+    let replay_plan = machine_build_replay_plan(&driver, &contributing_input_ids, "RunFailed");
     if let Err(err) = machine_apply_run_return_projection(
         &mut driver,
         &failed_run_id,
@@ -11362,7 +11402,7 @@ async fn fail_runtime_loop_run_inner(
     let persistence = match driver
         .machine_realize_run_failed(MachineRunFailureRealization {
             run_id: failed_run_id.clone(),
-            contributing_input_ids: staged_input_ids,
+            contributing_input_ids,
             replay_plan,
             terminal_error,
             runtime_apply_failure,
