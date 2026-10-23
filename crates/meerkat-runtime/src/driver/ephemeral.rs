@@ -8083,6 +8083,53 @@ mod tests {
         }
     }
 
+    /// The stop's mark stays on a kept input until it runs or expires, so
+    /// every attachment that still finds it queued checks its age again: a
+    /// check within the bound leaves it queued and marked, and a later one,
+    /// past the bound, selects it for expiry.
+    #[tokio::test]
+    async fn every_attachment_that_finds_a_kept_input_queued_checks_its_age_again() {
+        let (mut driver, durable_id, _, _) =
+            stop_classification_fixture("stop-requeue-age-rechecked").await;
+        begin_unregister_with(
+            &mut driver,
+            mm_dsl::UnregisterQueuedInputsDisposition::Requeue,
+            900_000,
+        );
+        let active = driver.active_input_ids();
+        let before_exit = driver.stop_retained_input_ids(&active).unwrap();
+        assert_eq!(
+            driver.stop_non_terminal_inputs(&before_exit).unwrap(),
+            vec![durable_id.clone()]
+        );
+        let admitted_at = driver
+            .ledger
+            .get(&durable_id)
+            .and_then(|state| state.persisted_input.as_ref())
+            .expect("a kept input keeps its payload")
+            .header()
+            .timestamp;
+
+        let within = admitted_at + chrono::Duration::milliseconds(900_000);
+        assert!(crate::input_state::expired_stop_requeued_inputs(&driver, within).is_empty());
+        assert!(
+            driver
+                .ledger
+                .get(&durable_id)
+                .is_some_and(|state| state.stop_requeue.is_some()),
+            "a check within the bound leaves the mark"
+        );
+        assert_eq!(
+            driver.input_phase(&durable_id),
+            Some(InputLifecycleState::Queued)
+        );
+        let past = admitted_at + chrono::Duration::milliseconds(900_001);
+        assert_eq!(
+            crate::input_state::expired_stop_requeued_inputs(&driver, past),
+            vec![durable_id]
+        );
+    }
+
     /// Under the requeue disposition a durable prompt bound to an objective
     /// is not kept, even when queued in the queue lane: it ends as stopped
     /// and unmarked, as under the stop disposition. A member's kickoff has

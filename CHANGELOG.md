@@ -232,10 +232,10 @@ them.
   with `CompletionWaitError::RequeuedAcrossStop { stopped_at }`
   (`BoundedTurnFailure::RequeuedAcrossStop` for a mob member), and the next
   start runs it once, in admission order, before new work. An input older
-  than `max_age`, measured from its admission, when the next start recovers
-  it ends as abandoned with `InputAbandonReason::RequeueExpired` instead and
-  never runs (`BoundedTurnFailure::RequeueExpired` for a member; resubmit it
-  if it is still wanted). An admission time ahead of the clock is not
+  than `max_age`, measured from its admission, when a start finds it still
+  queued ends as abandoned with `InputAbandonReason::RequeueExpired` instead
+  and never runs (`BoundedTurnFailure::RequeueExpired` for a member; resubmit
+  it if it is still wanted). Every start that finds it queued checks again. An admission time ahead of the clock is not
   expired. The generated runtime machine decides each input, and the
   unregister records its disposition durably, so an unregister that a crash
   interrupts converges with the same one. The default, `Stop`, and every stop

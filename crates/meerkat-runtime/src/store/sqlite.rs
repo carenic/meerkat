@@ -9267,7 +9267,11 @@ ORDER BY runtime_id";
     /// release left pending could never be finalized. Such a row is compared as
     /// the current typed decoder reads it, re-encoded. A row at the current
     /// version is compared exactly as stored, and a row that does not decode
-    /// stays as stored, so any other difference is still stale.
+    /// stays as stored, so any other difference is still stale. A row this
+    /// binary writes without a requeue fact keeps the baseline stamp, below
+    /// the current version, and is re-encoded too: the stamp cannot tell it
+    /// from an earlier release's row of that version, whose bytes may differ,
+    /// and its own re-encoding is the same bytes.
     fn input_row_in_current_encoding(stored: Vec<u8>) -> Vec<u8> {
         use meerkat_core::generated::session_persistence_version_authority as version_authority;
 

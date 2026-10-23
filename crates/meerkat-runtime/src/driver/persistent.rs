@@ -3808,6 +3808,123 @@ mod tests {
         }
     }
 
+    /// A kept input stays a durable queued row until a start runs it. A
+    /// session retired, archived or destroyed before then ends it terminal as
+    /// any other queued input: retire and archive abandon their pending
+    /// inputs as retired, destroy as destroyed. So it never runs: the row is
+    /// terminal, and a later recovery finds nothing of it to serve.
+    #[tokio::test]
+    async fn a_kept_input_ends_terminal_when_its_session_retires_or_is_destroyed_before_it_runs() {
+        use crate::input_state::{InputAbandonReason, InputLifecycleState, InputTerminalOutcome};
+        use crate::meerkat_machine::dsl as mm_dsl;
+
+        for destroy in [false, true] {
+            let store = Arc::new(crate::store::InMemoryRuntimeStore::new());
+            let runtime_store: Arc<dyn RuntimeStore> = store.clone();
+            let blobs: Arc<dyn BlobStore> = Arc::new(meerkat_store::MemoryBlobStore::new());
+            let session_id = SessionId::new();
+            let runtime_id = LogicalRuntimeId::for_session(&session_id);
+
+            // The stopping process keeps the queued prompt.
+            let mut stopping = PersistentRuntimeDriver::new(
+                runtime_id.clone(),
+                Arc::clone(&runtime_store),
+                Arc::clone(&blobs),
+            );
+            recover_after_registration_authority(store.as_ref(), &session_id, &mut stopping).await;
+            let kept = make_prompt("kept across the stop");
+            let kept_id = kept.id().clone();
+            assert!(stopping.accept_input(kept).await.unwrap().is_accepted());
+            {
+                let authority = stopping.inner_ref().shared_dsl_authority();
+                let mut authority = authority
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let state = authority.state().clone();
+                mm_dsl::MeerkatMachineMutator::apply(
+                    &mut *authority,
+                    mm_dsl::MeerkatMachineInput::BeginUnregisterSession {
+                        session_id: state.session_id.clone().expect("the session is registered"),
+                        agent_runtime_id: state.active_runtime_id.clone(),
+                        fence_token: state.active_fence_token,
+                        generation: state.active_runtime_generation,
+                        runtime_epoch_id: state.active_runtime_epoch_id.clone(),
+                        queued_inputs: mm_dsl::UnregisterQueuedInputsDisposition::Requeue,
+                        requeue_max_age_ms: 900_000,
+                    },
+                )
+                .expect("the unregister drain opens with the requeue disposition");
+            }
+            let active = stopping.active_input_ids();
+            let before_exit = stopping
+                .inner_mut()
+                .stop_retained_input_ids(&active)
+                .unwrap();
+            stopping
+                .finalize_runtime_executor_exit(&before_exit)
+                .await
+                .expect("the requeue stop commits");
+            drop(stopping);
+
+            // The next process recovers it queued and marked, and the session
+            // retires or is destroyed before any start serves it.
+            let mut next = PersistentRuntimeDriver::new(
+                runtime_id.clone(),
+                Arc::clone(&runtime_store),
+                Arc::clone(&blobs),
+            );
+            recover_after_registration_authority(store.as_ref(), &session_id, &mut next).await;
+            assert_eq!(
+                next.input_phase(&kept_id),
+                Some(InputLifecycleState::Queued),
+                "destroy={destroy}"
+            );
+            let reason = if destroy {
+                let (changed_input_ids, _report) = next
+                    .prepare_destroy_lifecycle()
+                    .expect("the destroy prepares");
+                let mut runless_terminal =
+                    crate::meerkat_machine::RunlessTerminalAnnouncement::default();
+                next.commit_prepared_destroy_lifecycle(changed_input_ids, &mut runless_terminal)
+                    .await
+                    .expect("the destroy commits");
+                InputAbandonReason::Destroyed
+            } else {
+                next.abandon_pending_inputs(InputAbandonReason::Retired)
+                    .await
+                    .expect("the retirement abandons its pending inputs");
+                InputAbandonReason::Retired
+            };
+            drop(next);
+
+            let row = store
+                .load_input_state(&runtime_id, &kept_id)
+                .await
+                .unwrap()
+                .expect("the row stays");
+            assert_eq!(
+                (row.seed.phase, row.seed.terminal_outcome),
+                (
+                    InputLifecycleState::Abandoned,
+                    Some(InputTerminalOutcome::Abandoned { reason })
+                ),
+                "destroy={destroy}"
+            );
+            if !destroy {
+                let mut later = PersistentRuntimeDriver::new(
+                    runtime_id.clone(),
+                    Arc::clone(&runtime_store),
+                    Arc::clone(&blobs),
+                );
+                recover_after_registration_authority(store.as_ref(), &session_id, &mut later).await;
+                assert!(
+                    !later.active_input_ids().contains(&kept_id),
+                    "a later recovery finds nothing of it to serve"
+                );
+            }
+        }
+    }
+
     #[test]
     fn completed_unregister_commit_preserves_captured_live_bridge_recovery_image() {
         let store = Arc::new(crate::store::InMemoryRuntimeStore::new());

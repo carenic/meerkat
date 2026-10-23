@@ -1240,7 +1240,8 @@ stays in the member's input store, its waiter ends with
 once, in admission order, before new work; a same-key replay after the
 restart re-attaches to its result. Do not resubmit it. The cancelled
 turn's user message is not in what the kept input's turn sees. If it is older than
-`max_age`, measured from its admission, when the next start recovers it, it
+`max_age`, measured from its admission, when a start finds it still queued
+(every such start checks again), it
 ends as abandoned (`requeue_expired`) without running, and a same-key replay
 answers `BoundedTurnFailure::RequeueExpired`: resubmit it if it is still
 wanted. The running turn's own input still ends cancelled, and steer,

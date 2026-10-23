@@ -3875,27 +3875,8 @@ impl PendingRuntimeExecutorAttachment {
             .await?;
         let expired = {
             let mut driver = driver.lock().await;
-            let candidates: Vec<InputId> = driver
-                .as_driver()
-                .active_input_ids()
-                .into_iter()
-                .filter(|input_id| {
-                    driver
-                        .as_driver()
-                        .input_state(input_id)
-                        .is_some_and(|state| {
-                            let admitted_at = state
-                                .persisted_input
-                                .as_ref()
-                                .map_or(state.created_at, |input| input.header().timestamp);
-                            crate::input_state::stop_requeue_expired(
-                                state.stop_requeue.as_ref(),
-                                admitted_at,
-                                now,
-                            )
-                        })
-                })
-                .collect();
+            let candidates =
+                crate::input_state::expired_stop_requeued_inputs(driver.as_driver(), now);
             let mut expired = Vec::with_capacity(candidates.len());
             for input_id in candidates {
                 if driver

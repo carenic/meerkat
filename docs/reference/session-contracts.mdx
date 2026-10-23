@@ -803,7 +803,11 @@ completion waiters of the inputs it keeps with
 `CompletionWaitError::RequeuedAcrossStop`. Such an input is neither failed nor
 consumed: it stays durably queued, and the session's next start runs it, or
 ends it abandoned with reason `requeue_expired` when it is older than the
-Shutdown's max age by then. Do not resubmit it; after the restart, the same
+Shutdown's max age by then. Every start that still finds it queued (after a
+crash before it ran, say) checks its age again. Retiring, archiving or
+destroying the session before a start runs it ends it as any other queued
+input: abandoned with reason `retired` (retire, archive) or `destroyed`. Do
+not resubmit it; after the restart, the same
 idempotency key re-attaches to it. Only a durable prompt in the queue lane
 that is neither directed nor bound to an objective is kept: a member's kickoff,
 and any other objective-bound input, ends as stopped, as without the option.

@@ -2227,6 +2227,31 @@ pub(crate) fn stop_requeue_expired(
     age_ms > mark.max_age_ms
 }
 
+/// The active inputs an attachment at `now` ends as expired: every input an
+/// earlier graceful stop kept queued whose age at `now`, measured from its
+/// admission, is over its stop's max age ([`stop_requeue_expired`]). The
+/// stop's mark stays on a kept input until it runs or expires, so every
+/// attachment that still finds it queued checks it again: one that finds it
+/// within the bound leaves it queued and marked, and a later one can end it.
+pub(crate) fn expired_stop_requeued_inputs(
+    driver: &dyn crate::traits::RuntimeDriver,
+    now: DateTime<Utc>,
+) -> Vec<InputId> {
+    driver
+        .active_input_ids()
+        .into_iter()
+        .filter(|input_id| {
+            driver.input_state(input_id).is_some_and(|state| {
+                let admitted_at = state
+                    .persisted_input
+                    .as_ref()
+                    .map_or(state.created_at, |input| input.header().timestamp);
+                stop_requeue_expired(state.stop_requeue.as_ref(), admitted_at, now)
+            })
+        })
+        .collect()
+}
+
 /// Whether the row carries a fact only stored input state v8 can hold: a
 /// stop's requeue mark or the requeue-expired abandon reason. Such a row is
 /// written as v8; every other row stays v7, so a host that never requeues
