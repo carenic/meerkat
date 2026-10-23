@@ -66,7 +66,8 @@ fn core_does_not_depend_on_meerkat_models() {
 ///   `"anthropic/claude-opus-5"`, `"models/gemini-3-pro"`;
 /// - the open-weight `gpt-oss` family anywhere in the id;
 /// - an open-weight parameter count as a segment of the id:
-///   `"...-30b"`, `"...-1.5b"`, `"...-8b-instruct"`, `".../...-8B-Instruct"`.
+///   `"...-30b"`, `"...-1.5b"`, `"...-8b-instruct"`, `".../...-8B-Instruct"`,
+///   `"...:31b"`.
 ///
 /// Families outside these shapes and provider-qualified ids of other
 /// families are out of scope unless they carry a parameter count.
@@ -112,9 +113,9 @@ fn family_shape(text: &str) -> Option<&'static str> {
 }
 
 /// An id without whitespace, at most 64 chars and not a UUID, with a segment
-/// after its first (split on `-` and `/`) that is `<digits>b` or
+/// after its first (split on `-`, `/` and `:`) that is `<digits>b` or
 /// `<digits>.<digits>b` (either case), the way open-weight model ids name
-/// their size.
+/// their size (`name-30b`, `org/Name-8B-Instruct`, `name:31b`).
 fn has_parameter_count_segment(literal: &str) -> bool {
     if literal.is_empty()
         || literal.len() > 64
@@ -124,7 +125,7 @@ fn has_parameter_count_segment(literal: &str) -> bool {
         return false;
     }
     let digits = |part: &str| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit());
-    literal.split(['-', '/']).skip(1).any(|segment| {
+    literal.split(['-', '/', ':']).skip(1).any(|segment| {
         let Some(count) = segment
             .strip_suffix('b')
             .or_else(|| segment.strip_suffix('B'))
@@ -241,6 +242,10 @@ fn the_ban_recognises_each_model_name_shape() {
             "let model = \"open-org/Mixer-3.1-8B-Instruct\";",
             "an open-weight parameter count",
         ),
+        (
+            "let model = \"mixer3:31b\";",
+            "an open-weight parameter count",
+        ),
     ] {
         let found = first_violation(text);
         assert!(
@@ -262,6 +267,7 @@ fn the_ban_recognises_each_model_name_shape() {
         "let id = \"0190e1b2-123b-7b5e-9f2a-3c4d5e6f7a8b\";",
         "let path = \"crates/meerkat-core/src\";",
         "let model = \"models/test-model\";",
+        "let url = \"http://127.0.0.1:11434\";",
     ] {
         assert_eq!(first_violation(text), None, "{text} is not a model name");
     }
