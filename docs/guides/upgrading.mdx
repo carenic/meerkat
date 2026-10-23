@@ -120,18 +120,22 @@ them; a redelivery through such a host only replays the earlier input.
 `MobDestroyResult.destroy_report` is a `WireMobDestroyReport` instead of a
 `serde_json::Value`, and `MobLifecycleResult.destroy_report` an
 `Option<WireMobDestroyReport>` instead of an `Option<serde_json::Value>`. The
-JSON each surface sends is unchanged.
+JSON value each surface sends is unchanged. Inside `destroy_report`, the
+members of the JSON-RPC `mob/destroy` and `mob/lifecycle` results and of the
+`@rkat/web` `Mob.lifecycle()` result now follow the report's field order, as
+the domain report serializes, instead of alphabetical order; the
+`mob_destroy_incomplete` data keeps its bytes.
 
-**Do:** in Rust, read `destroy_report`'s fields (`errors`,
-`member_reload_refusals` and the rest) instead of matching a `Value`, and
-convert a `meerkat_mob::MobDestroyReport` with
-`WireMobDestroyReport::from(&report)` where you build a result. In
+**Do:** compare those results as JSON values, not as bytes. In Rust, read
+`destroy_report`'s fields (`errors`, `member_reload_refusals` and the rest)
+instead of matching a `Value`, and convert a `meerkat_mob::MobDestroyReport`
+with `WireMobDestroyReport::from(&report)` where you build a result. In
 TypeScript, `mobDestroy()` returns `destroyReport` as a
 `WireMobDestroyReport`. In `@rkat/web`, `Mob.lifecycle()` rejects with a
-`MeerkatError` instead of the runtime's JSON error string: read the report
-of a destroy that did not finish with `mobDestroyIncompleteReport(error)`
-(in Python, `mob_destroy_incomplete_report(error)`) rather than parsing the
-error text.
+`MeerkatError` instead of the runtime's JSON error string: read the report of
+a destroy that did not finish with `mobDestroyIncompleteReport(error)` (in
+Python, `mob_destroy_incomplete_report(error)`) rather than parsing the error
+text.
 
 ### Other behaviour changes
 

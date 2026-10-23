@@ -87,9 +87,13 @@ them.
   `MobDestroyResult.destroy_report` changes from `serde_json::Value` to
   `WireMobDestroyReport`, and `MobLifecycleResult.destroy_report` from
   `Option<serde_json::Value>` to `Option<WireMobDestroyReport>` (see
-  Added). The JSON value each surface sends is unchanged. Code that read the
-  field as a `Value` reads the struct's fields instead; code that builds a
-  result converts a `meerkat_mob::MobDestroyReport` with
+  Added). The JSON value each surface sends is unchanged. Inside
+  `destroy_report`, the members of the JSON-RPC `mob/destroy` and
+  `mob/lifecycle` results and of the `@rkat/web` `Mob.lifecycle()` result now
+  follow the report's field order, as the domain report serializes, instead
+  of alphabetical order; the `mob_destroy_incomplete` data keeps its bytes.
+  Code that read the field as a `Value` reads the struct's fields instead;
+  code that builds a result converts a `meerkat_mob::MobDestroyReport` with
   `WireMobDestroyReport::from(&report)`.
 - TypeScript and Web SDKs (not measured by the gate): `@rkat/sdk`'s
   `MeerkatClient.mobDestroy()` returns `destroyReport` as
