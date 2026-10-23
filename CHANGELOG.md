@@ -497,6 +497,10 @@ them.
   data are the error's own, as before; a match on its Rust variant reads
   through `MobError::without_shared_lifecycle_wrapper`.
 
+- `meerkat-core`: the shipped config template's commented
+  `[[model_fallback.chain]]` example names a placeholder model
+  (`model = "<model-id>"`) instead of a real model id.
+
 ### Fixed
 
 - `meerkat-core`, `meerkat-session`, `meerkat-runtime`, `meerkat-store`: a

@@ -9689,7 +9689,7 @@ mod tests {
         messages: &[Message],
         message_count: u64,
     ) -> crate::ProviderCacheBreakpointClaim {
-        anthropic_agent_claim_for_model("claude-opus-5", messages, message_count)
+        anthropic_agent_claim_for_model("test-anthropic-model", messages, message_count)
     }
 
     fn anthropic_agent_claim_for_model(
@@ -9705,7 +9705,7 @@ mod tests {
             ttl: crate::ProviderCacheTtl::ProviderDefault,
             rendered_prefix: br#"{"renderer_mode":"agent-test"}"#,
             lowered_request_encoding: crate::LoweredRequestEncoding::AnthropicMessagesJson,
-            lowered_request_body: br#"{"model":"claude-opus-5"}"#,
+            lowered_request_body: br#"{"model":"test-anthropic-model"}"#,
         })
         .expect("agent test claim shape")
     }
@@ -9809,7 +9809,7 @@ mod tests {
         }
 
         fn model(&self) -> &'static str {
-            "claude-opus-5"
+            "test-anthropic-model"
         }
     }
 

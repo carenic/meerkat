@@ -1545,7 +1545,7 @@ mod tests {
     fn build_recovered_session_model_override_clears_persisted_self_hosted_binding() {
         let mut session = sample_session();
         let mut metadata = session.session_metadata().expect("session metadata");
-        metadata.model = "gemma-4-e2b".to_string();
+        metadata.model = "test-self-hosted-edge".to_string();
         metadata.provider = Provider::SelfHosted;
         metadata.self_hosted_server_id = Some("local".to_string());
         session
@@ -1555,14 +1555,14 @@ mod tests {
         let recovered = build_recovered_session(
             session,
             &SurfaceSessionRecoveryOverrides {
-                model: Some("gemma-4-31b".to_string()),
+                model: Some("test-self-hosted-large".to_string()),
                 ..Default::default()
             },
             SurfaceSessionRecoveryContext::default(),
         )
         .expect("recovered session with model override");
 
-        assert_eq!(recovered.model, "gemma-4-31b");
+        assert_eq!(recovered.model, "test-self-hosted-large");
         assert_eq!(
             recovered.build.provider, None,
             "model-only overrides should recompute provider from the new model"
