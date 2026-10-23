@@ -2281,8 +2281,8 @@ pub struct MobHostCapabilityRecord {
 /// second-roster prohibition).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MobHostAuthorityRecord {
-    /// Identity-first host id: the host's canonical comms `PeerId` string
-    /// (D1 — never a display name).
+    /// Identity-first host id: the host's canonical comms `PeerId` string,
+    /// never a display name.
     pub host_id: String,
     /// Canonical comms peer id used to address the host. Identity and
     /// transport addressing are separate facts even though host ids ARE
