@@ -68,14 +68,16 @@ mod emulated_cas;
 mod factory;
 mod failure;
 pub mod fixtures;
+mod host_store_memory;
 mod wrappers;
 
 pub use emulated_cas::EmulatedCasSessionStore;
 pub use factory::{
     ArtifactStoreFactory, BlobStoreFactory, FnArtifactStoreFactory, FnBlobStoreFactory,
-    FnSessionStoreFactory, SessionStoreFactory,
+    FnSessionStoreFactory, HostStoreFactory, SessionStoreFactory,
 };
 pub use failure::ConformanceFailure;
+pub use host_store_memory::InMemoryHostStore;
 pub use wrappers::{
     DefaultRangeVerbIncrementalStore, ForwardingSessionStore, SwallowingSessionStore,
 };
