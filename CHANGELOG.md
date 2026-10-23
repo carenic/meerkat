@@ -650,6 +650,40 @@ them.
   reserved namespace (`HostJobSourceError::ReservedNamespace`, see
   Breaking).
 
+- `meerkat-mob`: a controlling host can narrow the operator authority it
+  records for a placed member. `SpawnMemberSpec::with_operator_authority_ceiling`
+  (and `set_operator_authority_ceiling`, for a `SpawnMemberCustomizer`) sets a
+  `MemberOperatorAuthorityCeiling` on a placed spawn. `without_manage()` drops
+  manage scope: the member then spawns only the profiles it holds
+  (`with_spawn_profiles`), never with a privileged spawn argument (a runtime
+  mode, a launch mode or a requested tool access policy), and is refused
+  `list_members`, `retire_member` and the other operator tools that need
+  manage scope. `without_create()` and `without_mutate()` drop create and
+  profile-mutation authority. The lowered facts are recorded with the member,
+  so they hold across controlling restarts, and a respawn keeps them unless
+  its request (or the spawn customizer) sets a ceiling of its own; a respawn
+  whose recorded facts cannot be read is refused before anything is retired.
+  A member's own spawns (`spawn_member`, `spawn_many_members`) inherit its
+  recorded authority as an upper bound: a ceiling on the child's request, or
+  one the spawn customizer sets, can narrow it but never widen it. A flow run
+  such a member starts is refused before it starts when the flow would
+  provision a member (flow provisions are local, and no ceiling can bound a
+  local member); its flows whose roles already have members still run.
+  With no ceiling nothing changes: a placed member keeps manage scope over its
+  mob, including the privileged spawn arguments, and records the same facts as
+  before. A ceiling that narrows the spawn profiles but keeps manage scope, or
+  one on a spawn without a placement, is refused with the new
+  `MobError::OperatorAuthorityCeilingRefused` (`OperatorAuthorityCeilingRefusal`).
+  This is Rust host API only; the JSON-RPC, REST and SDK spawn surfaces are
+  unchanged.
+- `meerkat`: a restored mob member whose settled build holds mob operator
+  authority that the authority recorded with its session did not hold (a
+  spawn profile, manage scope, create or profile mutation) now logs one
+  warning per restore build. It names the mob, the member, the session and the
+  regained facts, and says that a host that narrows a member must narrow every
+  build of it, restores included. The recorded authority is unsealed and
+  advisory, so the warning is a hint: the build itself is unchanged. It also
+  shows once for a profile the mob gained since the member's previous build.
 - Queued prompts kept across a graceful stop. `meerkat-mob`:
   `ShutdownOptions::with_queued_inputs(QueuedInputsOnShutdown::Requeue(max_age))`
   with a `RequeueMaxAge` (default 15 minutes; a bound under one millisecond,
@@ -1196,6 +1230,11 @@ them.
   instead of entering its body. A call waiting for a dispatch slot whose
   deadline passed in the same scheduler turn the slot came free (a starved
   runtime notices both at once) was admitted and ran.
+
+- `meerkat-sqlite`: on macOS, dropping a SQLite store watch no longer blocks
+  the dropping thread on file-system event service round trips. A stopped
+  watch's FSEvents source is dropped on the process's one unregister thread;
+  sources stopped together wait in its queue.
 
 ## [0.9.4] - 2026-10-20
 

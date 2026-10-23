@@ -85205,6 +85205,9 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         MobError::MemberDestinationNotInstalled { .. } => {
             "member_destination_not_installed".to_string()
         }
+        MobError::OperatorAuthorityCeilingRefused { reason, .. } => {
+            format!("operator_authority_ceiling_refused:{reason:?}")
+        }
     }
 }
 

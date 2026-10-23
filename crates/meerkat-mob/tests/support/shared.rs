@@ -3921,6 +3921,19 @@ pub async fn create_controlling_mob_with_definition(
     create_controlling_mob_composed(label, None, None, mutate_definition, |builder| builder).await
 }
 
+/// [`create_controlling_mob_with_definition`] with an optional spawn
+/// customizer.
+pub async fn create_controlling_mob_with_customizer_and_definition(
+    label: &str,
+    customizer: Option<Arc<dyn meerkat_mob::runtime::SpawnMemberCustomizer>>,
+    mutate_definition: impl FnOnce(&mut meerkat_mob::MobDefinition),
+) -> ControllingMob {
+    create_controlling_mob_composed(label, customizer, None, mutate_definition, |builder| {
+        builder
+    })
+    .await
+}
+
 /// Phase 6b (T-C14): a controlling mob whose LOCAL live branch routes
 /// through an injected `meerkat_runtime::member_live::MemberLiveHost` — the
 /// ADJ-P6B-1 builder knob (`MobBuilder::with_member_live_host`).

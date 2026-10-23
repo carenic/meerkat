@@ -1449,6 +1449,72 @@ not a controller-local `session/*` handle. Drive the member by
 session history, transcript revision, and transcript edit operations are not
 proxied across hosts in v1.
 
+### Placed-member operator authority
+
+A placed member's mob operator tools (`spawn_member`, `list_members`,
+`retire_member` and the rest) are upcalls to the controlling host, which
+admits each one against the operator authority it recorded when it compiled
+the member. A session build hook on the member host does not change that
+authority.
+
+A placed member whose profile enables mob tools and that has no ceiling keeps
+manage scope over its mob, including the privileged spawn arguments: it can
+spawn any profile of the mob, with a runtime mode, a launch mode or a
+requested tool access policy, and it can list and retire every member. That
+is more than a local member gets by default, which holds no manage scope.
+
+Controllers narrow a placed member by setting a ceiling on its spawn request.
+In a Rust host, set it with `SpawnMemberSpec::with_operator_authority_ceiling`,
+or from a `SpawnMemberCustomizer` with `set_operator_authority_ceiling`:
+
+```rust
+use meerkat_mob::MemberOperatorAuthorityCeiling;
+
+let spec = SpawnMemberSpec::new("analyst", "west-analyst-1")
+    .with_placement(host_id)
+    .with_operator_authority_ceiling(
+        MemberOperatorAuthorityCeiling::unrestricted()
+            .without_manage()
+            .with_spawn_profiles(["worker"]),
+    );
+```
+
+A ceiling only lowers the default authority:
+
+- `without_manage()` drops manage scope. The member then spawns only the
+  profiles it holds, never with a privileged spawn argument, and it is refused
+  the operator tools that need manage scope, such as `list_members` and
+  `retire_member`.
+- `with_spawn_profiles(...)` keeps only the listed profiles (a profile the mob
+  does not define is ignored). It needs `without_manage()`, because manage
+  scope admits every profile: a ceiling with both is refused with
+  `MobError::OperatorAuthorityCeilingRefused` (`SpawnProfilesWithManage`).
+- `without_create()` and `without_mutate()` drop create and profile-mutation
+  authority.
+
+The controlling host records the lowered authority with the member, so it
+holds across controlling restarts and member revivals. A respawn (`respawn` or
+`respawn_with_successor_spec`) keeps it: a spawn customizer sees the recorded
+ceiling on the respawn request, and a ceiling set on that request replaces it.
+When the record cannot be read, the respawn is refused before anything is
+retired.
+
+A ceiling also bounds every member that member spawns itself (its
+`spawn_member` and `spawn_many_members` calls): the child is compiled with at
+most the authority recorded for the member that asked for it. A ceiling on the
+child's own spawn request, or one a spawn customizer sets, can narrow that
+bound but never widen it, so a narrowed member cannot regain authority through
+a member it spawns, and the bound holds across the child's restarts and
+respawns. A member without a ceiling bounds its children by nothing more than
+the default. A flow run needs manage scope. When a member that has it but
+carries a ceiling starts a flow that would provision a member, the run is
+refused before it starts: flow provisions are local, and no ceiling can bound
+a local member. Its flows whose roles already have members still run.
+
+A ceiling on a spawn without a placement is refused (`UnplacedMember`), since
+a local member's operator authority is set by its own session build. The
+JSON-RPC, REST and SDK spawn surfaces do not carry a ceiling.
+
 ### Placed-member portability
 
 Remote placement compiles one digest-covered `PortableMemberSpec`. Admission
