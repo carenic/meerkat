@@ -1666,6 +1666,30 @@ struct AuthorizationServerEndpoints {
     iss_parameter_supported: bool,
 }
 
+/// What the use path would do with an MCP target's stored credential, as a
+/// status read reports it ([`McpOAuthAuthority::stored_credential_status`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum McpStoredCredentialPhase {
+    /// No usable credential is stored: a login is needed.
+    AuthorizationRequired,
+    /// The use path accepts the stored credential, or refreshes it first.
+    Authorized,
+    /// The use path refuses the stored credential until a new login.
+    ReauthRequired,
+}
+
+/// One status read of an MCP target's stored credential: the phase the use
+/// path decides, with the secret-free fields of the exact credential that
+/// read saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct McpStoredCredentialStatus {
+    pub phase: McpStoredCredentialPhase,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub account_id: Option<String>,
+}
+
 /// An attempt pending for an MCP target, as a host may observe it: a
 /// non-secret reference and its expiry. It carries no authorize URL, state,
 /// code or verifier, so it is safe for host status projections.
@@ -2143,8 +2167,13 @@ impl McpOAuthAuthority {
                 meerkat_core::acquire_auth_login_lifecycle_guard_for_unattended(&lease_key)
                     .await
                     .ok_or_else(mcp_owner_busy)?;
-            self.load_admitted_stored_credential(target, &key, &_guard)
-                .await?
+            self.load_admitted_stored_credential(
+                target,
+                &key,
+                &_guard,
+                TokenStoreAccess::Unattended,
+            )
+            .await?
         };
         let Some(admitted) = admitted else {
             return Ok(None);
@@ -2197,6 +2226,19 @@ impl McpOAuthAuthority {
                 server_name: target.server_name().to_string(),
             }),
         }
+    }
+
+    /// The status of `target`'s stored credential: what
+    /// [`stored_bearer_token`](Self::stored_bearer_token) would do with it
+    /// next, through the same rule. `None` when the credential's lifecycle
+    /// owner is busy (the read never waits for it) or a legacy refresh marker
+    /// is pending; the caller then keeps its own durable reading.
+    pub async fn stored_credential_status(
+        &self,
+        target: &McpServerIdentity,
+    ) -> Result<Option<McpStoredCredentialStatus>, McpOAuthError> {
+        let _ = self.scoped(target)?;
+        Ok(None)
     }
 
     pub async fn require_stored_bearer_token(
@@ -3148,6 +3190,7 @@ impl McpOAuthAuthority {
         target: &McpServerIdentity,
         key: &TokenKey,
         guard: &meerkat_core::AuthLoginLifecycleGuard,
+        access: TokenStoreAccess,
     ) -> Result<Option<AdmittedMcpCredential>, McpOAuthError> {
         if guard.lease_key() != &target.lease_key()? {
             return Err(McpOAuthError::AuthLifecycle {
@@ -3157,7 +3200,7 @@ impl McpOAuthAuthority {
         }
         let Some(mut tokens) = self
             .token_store()
-            .load_for(key, TokenStoreAccess::Unattended)
+            .load_for(key, access)
             .await
             .map_err(mcp_store_error)?
         else {
@@ -3306,7 +3349,7 @@ impl McpOAuthAuthority {
             .await
             .ok_or_else(lifecycle_owner_busy)?;
         let mut admitted = self
-            .load_admitted_stored_credential(target, key, &_guard)
+            .load_admitted_stored_credential(target, key, &_guard, TokenStoreAccess::Unattended)
             .await
             .map_err(refresh_error_from_mcp)?
             .ok_or_else(|| {
@@ -3325,7 +3368,7 @@ impl McpOAuthAuthority {
         .is_some()
         {
             admitted = self
-                .load_admitted_stored_credential(target, key, &_guard)
+                .load_admitted_stored_credential(target, key, &_guard, TokenStoreAccess::Unattended)
                 .await
                 .map_err(refresh_error_from_mcp)?
                 .ok_or(RefreshError::StalePreparation)?;

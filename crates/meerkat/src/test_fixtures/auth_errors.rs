@@ -377,6 +377,20 @@ pub fn reason_examples() -> Vec<(HostAuthError, R)> {
             R::CommitUnsettled,
         ),
         (
+            HostAuthError::CredentialMutation(CredentialMutationError::RollbackFailed(
+                INTERNAL_DETAIL_CANARY.into(),
+            )),
+            R::CommitUnsettled,
+        ),
+        (
+            HostAuthError::CredentialMutation(CredentialMutationError::Cancelled),
+            R::CommitUnsettled,
+        ),
+        (
+            HostAuthError::Connector(ConnectorLoginError::CommitUnsettled),
+            R::CommitUnsettled,
+        ),
+        (
             HostAuthError::Connector(ConnectorLoginError::CredentialAccess {
                 refusal: TokenStoreRefusal::Denied,
                 detail: "the user denied keychain access".into(),

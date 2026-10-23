@@ -6029,4 +6029,47 @@ mod tests {
             assert_locked_newer_publication(true).await;
         }
     }
+
+    /// Every credential-mutation error reaches a refresh caller through a
+    /// named arm. A failed publication rollback and a lost owner cannot reach
+    /// this path today (its mutation never compensates through a publication
+    /// rollback); they keep the refresh failure text they had.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn resolver_maps_every_mutation_error_explicitly() {
+        assert!(matches!(
+            refresh_error_from_mutation(CredentialMutationError::StalePreparation),
+            RefreshError::StalePreparation
+        ));
+        assert!(matches!(
+            refresh_error_from_mutation(CredentialMutationError::CredentialAccess {
+                refusal: meerkat_core::auth::TokenStoreRefusal::Pending,
+                detail: "busy".into(),
+            }),
+            RefreshError::CredentialAccess {
+                refusal: meerkat_core::auth::TokenStoreRefusal::Pending,
+                ..
+            }
+        ));
+        for error in [
+            CredentialMutationError::Operation("operation".into()),
+            CredentialMutationError::TokenStore("store".into()),
+            CredentialMutationError::AuthLifecycle("lifecycle".into()),
+            CredentialMutationError::LockFailed("lock".into()),
+            CredentialMutationError::SlotRefused(
+                meerkat_core::auth::token_store::CredentialSlotRefusal::Occupied,
+            ),
+            CredentialMutationError::Cancelled,
+            CredentialMutationError::RollbackFailed("rollback".into()),
+        ] {
+            let text = error.to_string();
+            assert!(
+                matches!(
+                    refresh_error_from_mutation(error),
+                    RefreshError::Refresh(ref reason) if *reason == text
+                ),
+                "{text}"
+            );
+        }
+    }
 }

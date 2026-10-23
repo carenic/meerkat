@@ -86,6 +86,15 @@ fn host_auth_target(
     })
 }
 
+/// The response for a failed credential commit (a profile's secret or a
+/// provisioned key).
+fn credential_commit_error_response(
+    id: Option<RpcId>,
+    error_value: CredentialMutationError,
+) -> RpcResponse {
+    RpcResponse::error(id, error::INTERNAL_ERROR, error_value.to_string())
+}
+
 fn host_auth_error_response(id: Option<RpcId>, error_value: meerkat::HostAuthError) -> RpcResponse {
     let code = match &error_value {
         meerkat::HostAuthError::Target(_)
@@ -1480,7 +1489,7 @@ pub async fn handle_auth_profile_create(
     )
     .await
     {
-        return RpcResponse::error(id, error::INTERNAL_ERROR, error_value.to_string());
+        return credential_commit_error_response(id, error_value);
     }
     tracing::info!(
         target: "meerkat::auth::audit",
@@ -2224,7 +2233,7 @@ pub async fn handle_auth_login_provision_api_key(
                 )
                 .await
             {
-                return RpcResponse::error(id, error::INTERNAL_ERROR, error_value.to_string());
+                return credential_commit_error_response(id, error_value);
             }
             RpcResponse::success(
                 id,
@@ -3385,6 +3394,105 @@ mod tests {
 
         fn backend_name(&self) -> &'static str {
             "save_counting"
+        }
+    }
+
+    /// Store whose save and clear both fail: a commit fails to save, and its
+    /// rollback then fails to clear.
+    struct SaveAndRollbackFailingTokenStore;
+
+    #[async_trait::async_trait]
+    impl TokenStore for SaveAndRollbackFailingTokenStore {
+        async fn load(
+            &self,
+            _key: &TokenKey,
+        ) -> Result<Option<PersistedTokens>, meerkat_providers::auth_store::TokenStoreError>
+        {
+            Ok(None)
+        }
+
+        async fn save(
+            &self,
+            _key: &TokenKey,
+            _tokens: &PersistedTokens,
+        ) -> Result<(), meerkat_providers::auth_store::TokenStoreError> {
+            Err(meerkat_providers::auth_store::TokenStoreError::Io(
+                "private-store-detail-canary-1045 save".into(),
+            ))
+        }
+
+        async fn clear(
+            &self,
+            _key: &TokenKey,
+        ) -> Result<(), meerkat_providers::auth_store::TokenStoreError> {
+            Err(meerkat_providers::auth_store::TokenStoreError::Io(
+                "private-store-detail-canary-1045 clear".into(),
+            ))
+        }
+
+        async fn list(
+            &self,
+        ) -> Result<Vec<TokenKey>, meerkat_providers::auth_store::TokenStoreError> {
+            Ok(Vec::new())
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "save_and_rollback_failing"
+        }
+    }
+
+    /// A profile whose secret commit fails and cannot be rolled back answers
+    /// with the typed reason commit_unsettled and the fixed public text,
+    /// never the store's own text.
+    #[tokio::test]
+    async fn rpc_profile_create_commit_failure_carries_a_typed_reason() {
+        let realm = "rpc-profile-create-unsettled";
+        let runtime = test_runtime_with_config_and_token_store(
+            in_own_realm(config_with_openai_managed_store_binding(), realm),
+            Arc::new(SaveAndRollbackFailingTokenStore),
+        );
+        let params = raw_params(serde_json::json!({
+            "realm_id": realm,
+            "binding_id": "default_openai",
+            "auth_method": "api_key",
+            "secret": "sk-test"
+        }));
+        let create =
+            handle_auth_profile_create(Some(RpcId::Num(1)), Some(params.as_ref()), &runtime).await;
+        let error = create
+            .error
+            .as_ref()
+            .expect("a commit whose save and rollback fail is an error");
+        assert_eq!(error.code, crate::error::INTERNAL_ERROR);
+        assert!(
+            !error.message.contains("private-store-detail-canary-1045"),
+            "{}",
+            error.message
+        );
+        assert_eq!(auth_error_data(&create)["reason"], "commit_unsettled");
+    }
+
+    /// Every credential commit failure (a profile's secret, a provisioned
+    /// key) carries a typed reason and withholds its store detail.
+    #[test]
+    fn credential_commit_errors_carry_a_typed_reason_and_withhold_their_detail() {
+        const DETAIL: &str = "private-store-detail-canary-1045";
+        for (failure, reason) in [
+            (
+                CredentialMutationError::RollbackFailed(DETAIL.into()),
+                "commit_unsettled",
+            ),
+            (CredentialMutationError::Cancelled, "commit_unsettled"),
+            (
+                CredentialMutationError::Operation(DETAIL.into()),
+                "infrastructure",
+            ),
+        ] {
+            let response = credential_commit_error_response(Some(RpcId::Num(1)), failure);
+            let error = response.error.as_ref().expect("an error response");
+            assert_eq!(error.code, crate::error::INTERNAL_ERROR);
+            assert!(!error.message.contains(DETAIL), "{}", error.message);
+            assert_eq!(auth_error_data(&response)["reason"], reason);
         }
     }
 

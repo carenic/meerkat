@@ -638,6 +638,12 @@ pub enum ConnectorLoginError {
     /// does not hold. Nothing was sent; a stored credential is kept.
     #[error("connector client '{profile}' has no client secret configured")]
     ClientSecretUnavailable { profile: String },
+    /// The credential commit's outcome is unknown: its owner ended before it
+    /// reported after the attempt was consumed, or it failed and could not
+    /// restore the previous credential. Read the status later; never a
+    /// success and never a clean failure.
+    #[error("connector OAuth credential commit's outcome is unknown; read the status later")]
+    CommitUnsettled,
 }
 
 impl ConnectorLoginError {
@@ -661,7 +667,8 @@ impl ConnectorLoginError {
             | Self::HttpClientUnavailable(_)
             | Self::ClientConfig(_)
             | Self::ClientSecretUnavailable { .. }
-            | Self::AuthLifecycle(_) => false,
+            | Self::AuthLifecycle(_)
+            | Self::CommitUnsettled => false,
         }
     }
 }

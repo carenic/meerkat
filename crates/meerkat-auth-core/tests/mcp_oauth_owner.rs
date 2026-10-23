@@ -23,7 +23,7 @@ use meerkat_auth_core::mcp_oauth::{
     McpOAuthAttemptCleanup, McpOAuthAuthority, McpOAuthBrowserLaunch, McpOAuthCallback,
     McpOAuthCeremonyContext, McpOAuthError, McpOAuthListenerCleanup, McpOAuthLoginDisposition,
     McpOAuthLoginStart, McpOAuthLoopbackBegin, McpOAuthPendingLogin, McpOAuthRegisteredCallback,
-    McpRegisteredRedirectBase, McpServerIdentity,
+    McpRegisteredRedirectBase, McpServerIdentity, McpStoredCredentialPhase,
 };
 use meerkat_auth_core::oauth_flow::OAuthFlowError;
 use meerkat_core::generated::auth_lease_durable_lifecycle_marker as durable_marker;
@@ -7906,4 +7906,178 @@ async fn a_login_commit_whose_rollback_succeeds_stays_terminal_and_publishes_not
         Some(meerkat_core::handles::AuthLeasePhase::Valid),
         "the acquired lifecycle was rolled back with the save"
     );
+}
+
+// --- A status read runs the use rule ------------------------------------------
+
+/// One logged-in MCP target, its store, its lifecycle and its fixture.
+struct StatusShape {
+    authority: FixtureAuthority,
+    store: Arc<EphemeralTokenStore>,
+    auth_lease: TestAuthAuthority,
+    target: McpServerIdentity,
+    state: Arc<TestState>,
+}
+
+impl StatusShape {
+    async fn logged_in() -> Self {
+        let (base, state) = spawn_oauth_fixture().await;
+        let store = Arc::new(EphemeralTokenStore::new());
+        let auth_lease = test_auth_lease();
+        let authority = FixtureAuthority::with_fixture_http(
+            ProviderAuthPersistence::new(store.clone(), Arc::new(InMemoryCoordinator::new())),
+            recording_browser(Arc::clone(&state)),
+            Client::new(),
+            auth_lease.clone(),
+        );
+        let target = McpServerIdentity::from_server_config("status-shape", format!("{base}/mcp"))
+            .with_expected_account("fixture-account-42")
+            .unwrap();
+        authority.interactive_login(&target, None).await.unwrap();
+        Self {
+            authority,
+            store,
+            auth_lease,
+            target,
+            state,
+        }
+    }
+
+    /// The same store read by a fresh process: a new lifecycle owner that
+    /// holds no lease for the credential.
+    fn in_a_fresh_process(self) -> Self {
+        let auth_lease = test_auth_lease();
+        let authority = FixtureAuthority::with_fixture_http(
+            ProviderAuthPersistence::new(self.store.clone(), Arc::new(InMemoryCoordinator::new())),
+            recording_browser(Arc::clone(&self.state)),
+            Client::new(),
+            auth_lease.clone(),
+        );
+        Self {
+            authority,
+            auth_lease,
+            ..self
+        }
+    }
+
+    async fn edit_stored(&self, edit: impl FnOnce(&mut PersistedTokens)) {
+        let key = self.target.token_key().unwrap();
+        let mut tokens = self.store.load(&key).await.unwrap().unwrap();
+        edit(&mut tokens);
+        self.store.save(&key, &tokens).await.unwrap();
+    }
+}
+
+/// What a use does with the credential, in the status vocabulary.
+fn use_outcome(used: &Result<Option<String>, McpOAuthError>) -> McpStoredCredentialPhase {
+    match used {
+        Ok(Some(_)) => McpStoredCredentialPhase::Authorized,
+        Ok(None) => McpStoredCredentialPhase::AuthorizationRequired,
+        Err(McpOAuthError::ReauthRequired { .. }) => McpStoredCredentialPhase::ReauthRequired,
+        Err(other) => panic!("a use ended outside the status vocabulary: {other:?}"),
+    }
+}
+
+/// A status read reports what the use path does next with the stored
+/// credential, for every shape a stored credential can take: one rule, not a
+/// projection beside it.
+#[tokio::test]
+async fn stored_credential_status_agrees_with_use_for_every_stored_shape() {
+    let mut shapes: Vec<(&str, StatusShape, McpStoredCredentialPhase)> = Vec::new();
+
+    let normal = StatusShape::logged_in().await;
+    shapes.push((
+        "a normal login",
+        normal,
+        McpStoredCredentialPhase::Authorized,
+    ));
+
+    let released = StatusShape::logged_in().await;
+    released
+        .auth_lease
+        .release_credential_lifecycle(&released.target.lease_key().unwrap())
+        .unwrap();
+    shapes.push((
+        "a released lease over the durable predecessor",
+        released,
+        McpStoredCredentialPhase::ReauthRequired,
+    ));
+
+    let invalid_marker = StatusShape::logged_in().await;
+    invalid_marker
+        .edit_stored(|tokens| {
+            tokens.expires_at = tokens.expires_at.map(|at| at + chrono::Duration::hours(1));
+        })
+        .await;
+    shapes.push((
+        "an invalid marker payload",
+        invalid_marker,
+        McpStoredCredentialPhase::ReauthRequired,
+    ));
+
+    let fresh = StatusShape::logged_in().await.in_a_fresh_process();
+    shapes.push((
+        "a fresh process rehydrates the durable marker",
+        fresh,
+        McpStoredCredentialPhase::Authorized,
+    ));
+
+    let reauth_marker = StatusShape::logged_in().await;
+    reauth_marker
+        .edit_stored(|tokens| {
+            tokens.metadata["meerkat_auth_lifecycle"]["phase"] =
+                serde_json::Value::String("reauth_required".into());
+        })
+        .await;
+    let reauth_marker = reauth_marker.in_a_fresh_process();
+    shapes.push((
+        "a durable marker that rehydrates into reauth",
+        reauth_marker,
+        McpStoredCredentialPhase::ReauthRequired,
+    ));
+
+    let expired = StatusShape::logged_in().await;
+    republish_stored_tokens(
+        &expired.authority,
+        expired.store.as_ref(),
+        &expired.target,
+        |tokens| {
+            tokens.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
+            tokens.refresh_token = None;
+        },
+    )
+    .await;
+    shapes.push((
+        "an expired credential without a refresh token",
+        expired,
+        McpStoredCredentialPhase::ReauthRequired,
+    ));
+
+    let emptied = StatusShape::logged_in().await;
+    emptied
+        .store
+        .clear(&emptied.target.token_key().unwrap())
+        .await
+        .unwrap();
+    shapes.push((
+        "an empty store over a live lease",
+        emptied,
+        McpStoredCredentialPhase::AuthorizationRequired,
+    ));
+
+    for (name, shape, expected) in shapes {
+        let status = shape
+            .authority
+            .stored_credential_status(&shape.target)
+            .await
+            .unwrap_or_else(|error| panic!("{name}: status failed: {error:?}"))
+            .unwrap_or_else(|| panic!("{name}: status read nothing"));
+        let used = shape.authority.stored_bearer_token(&shape.target).await;
+        assert_eq!(status.phase, expected, "{name}: status");
+        assert_eq!(
+            use_outcome(&used),
+            status.phase,
+            "{name}: use after status {used:?}"
+        );
+    }
 }
