@@ -1629,6 +1629,37 @@ mod tests {
         );
     }
 
+    // The spawn labels belong to the incarnation: a member reset and a
+    // recovered binding carry them on, and the session the member moved
+    // off answers them too.
+    #[test]
+    fn a_member_reset_and_a_recovered_binding_keep_the_spawn_labels() {
+        let member = AgentIdentity::from("member");
+        let first = SessionId::new();
+        let second = SessionId::new();
+        let labels = BTreeMap::from([("team".to_owned(), "north".to_owned())]);
+        let MobEventKind::MemberSpawned(mut event) = spawned(&member, 0, Some(&first), false)
+        else {
+            unreachable!("spawned builds a spawn event");
+        };
+        event.labels = labels.clone();
+        let mut journal = Journal::new();
+        journal.push(MobEventKind::MemberSpawned(event));
+        journal.push(member_reset(&member, 0, 1));
+        journal.push(recovered(&member, 1, &second));
+        let history = journal.history(&[]);
+        let live = history.last_binding(&member).expect("binding");
+        assert_eq!(
+            (live.generation(), live.session_id(), live.labels()),
+            (Generation::new(1), Some(&second), &labels)
+        );
+        let moved = history.binding_for_session(&first).expect("binding");
+        assert_eq!(
+            (moved.state(), moved.labels()),
+            (MemberBindingState::Moved, &labels)
+        );
+    }
+
     // A mob reset ends every membership. Last bindings and durable members
     // count only spawns after it; sessions bound before it still resolve.
     #[test]
