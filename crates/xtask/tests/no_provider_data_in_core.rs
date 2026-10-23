@@ -57,32 +57,152 @@ fn core_does_not_depend_on_meerkat_models() {
     );
 }
 
+/// The shape that makes a quoted literal a provider model name, if any:
+/// - a provider family and a version: `"gpt-5`, `"claude-4`, `"gemini-3`,
+///   `"gemma-4`;
+/// - an Anthropic model family: `"claude-opus`, `"claude-sonnet`,
+///   `"claude-haiku`, `"claude-fable`;
+/// - the open-weight `gpt-oss` family anywhere in the id;
+/// - an open-weight parameter count closing the id: `"...-30b"`, `"...-1.5b"`.
+///
+/// `rest` runs from just after the opening quote; `literal` stops at the
+/// closing quote or line end.
+fn model_name_shape(rest: &str, literal: &str) -> Option<&'static str> {
+    for prefix in ["gpt-", "claude-", "gemini-", "gemma-"] {
+        if let Some(tail) = rest.strip_prefix(prefix)
+            && tail.chars().next().is_some_and(|c| c.is_ascii_digit())
+        {
+            return Some("a provider family and a version");
+        }
+    }
+    if let Some(tail) = rest.strip_prefix("claude-")
+        && ["opus", "sonnet", "haiku", "fable"]
+            .iter()
+            .any(|family| tail.starts_with(family))
+    {
+        return Some("an Anthropic model family");
+    }
+    if literal.contains("gpt-oss") {
+        return Some("the gpt-oss model family");
+    }
+    if is_parameter_count_id(literal) {
+        return Some("an open-weight parameter count");
+    }
+    None
+}
+
+/// An id without whitespace that ends in `-<digits>b` or
+/// `-<digits>.<digits>b`, the way open-weight model ids name their size.
+fn is_parameter_count_id(literal: &str) -> bool {
+    if literal.is_empty() || literal.len() > 64 || literal.contains(char::is_whitespace) {
+        return false;
+    }
+    let Some(body) = literal.strip_suffix('b') else {
+        return false;
+    };
+    let Some((_, count)) = body.rsplit_once('-') else {
+        return false;
+    };
+    let (whole, fraction) = match count.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (count, None),
+    };
+    let digits = |part: &str| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit());
+    digits(whole) && fraction.is_none_or(digits)
+}
+
+/// The first provider model-name literal in `text`, with its line and shape.
+/// Without regex dependencies: each double quote opens a candidate literal
+/// that runs to the next double quote or line end.
+fn first_violation(text: &str) -> Option<String> {
+    for (idx, _) in text.match_indices('"') {
+        let rest = &text[idx + 1..];
+        let literal = rest.split(['"', '\n']).next().unwrap_or_default();
+        if let Some(shape) = model_name_shape(rest, literal) {
+            let line = text[..idx].lines().count();
+            let snippet: String = literal.chars().take(64).collect();
+            return Some(format!("line {line}: \"{snippet}\" ({shape})"));
+        }
+    }
+    None
+}
+
+/// Each shape the ban recognises, and the synthetic ids it leaves alone.
+#[test]
+fn the_ban_recognises_each_model_name_shape() {
+    for (text, shape) in [
+        ("let model = \"gpt-5\";", "a provider family and a version"),
+        (
+            "let model = \"claude-4-x\";",
+            "a provider family and a version",
+        ),
+        (
+            "let model = \"gemini-3-flash\";",
+            "a provider family and a version",
+        ),
+        (
+            "let model = \"gemma-4-e2b\";",
+            "a provider family and a version",
+        ),
+        (
+            "let model = \"claude-opus-5\";",
+            "an Anthropic model family",
+        ),
+        (
+            "let model = \"claude-sonnet-4-5\";",
+            "an Anthropic model family",
+        ),
+        (
+            "let model = \"claude-haiku-5-5\";",
+            "an Anthropic model family",
+        ),
+        (
+            "let model = \"claude-fable-5\";",
+            "an Anthropic model family",
+        ),
+        (
+            "let model = \"cerebras-gpt-oss-120b\";",
+            "the gpt-oss model family",
+        ),
+        (
+            "let model = \"muse-glimmer-30b\";",
+            "an open-weight parameter count",
+        ),
+        (
+            "let model = \"local-mixer-1.5b\";",
+            "an open-weight parameter count",
+        ),
+    ] {
+        let found = first_violation(text);
+        assert!(
+            found
+                .as_deref()
+                .is_some_and(|found| found.ends_with(&format!("({shape})"))),
+            "{text} must be flagged as {shape}: {found:?}"
+        );
+    }
+    for text in [
+        "let model = \"test-anthropic-default\";",
+        "let model = \"test-self-hosted-large\";",
+        "# model = \"<model-id>\"",
+        "let note = \"a context of 30b tokens\";",
+        "let name = \"claude-code\";",
+        "let name = \"gemma\";",
+        "let name = \"gpt-like\";",
+        "let name = \"abc-b\";",
+    ] {
+        assert_eq!(first_violation(text), None, "{text} is not a model name");
+    }
+}
+
 /// (b) No file under crates/meerkat-core/src may contain a provider model-name
-/// literal (`"gpt-…"`, `"claude-…"`, `"gemini-…"`). This is a
-/// tombstone-class textual ban: the presence of such a literal anywhere in
-/// core IS the violation, regardless of context — real model names are
-/// provider data and belong in meerkat-models (tests included; core tests
-/// use the synthetic `model_profile::test_catalog` fixture).
+/// literal (the shapes of [`model_name_shape`]). This is a tombstone-class
+/// textual ban: the presence of such a literal anywhere in core IS the
+/// violation, regardless of context - real model names are provider data and
+/// belong in meerkat-models (tests included; core tests use the synthetic
+/// `model_profile::test_catalog` fixture).
 #[test]
 fn core_sources_contain_no_provider_model_literals() {
-    // `"(gpt|claude|gemini)-[0-9]` without regex dependencies: a literal
-    // opening quote, a provider prefix, a dash, then an ASCII digit.
-    fn first_violation(text: &str) -> Option<String> {
-        for (idx, _) in text.match_indices('"') {
-            let rest = &text[idx + 1..];
-            for prefix in ["gpt-", "claude-", "gemini-"] {
-                if let Some(tail) = rest.strip_prefix(prefix)
-                    && tail.chars().next().is_some_and(|c| c.is_ascii_digit())
-                {
-                    let line = text[..idx].lines().count();
-                    let snippet: String = text[idx..].chars().take(40).collect();
-                    return Some(format!("line {line}: {snippet}"));
-                }
-            }
-        }
-        None
-    }
-
     let src_root = repo_root().join("crates/meerkat-core/src");
     let mut files = Vec::new();
     collect_files(&src_root, &mut files);
