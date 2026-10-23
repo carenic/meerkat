@@ -1237,11 +1237,13 @@ impl ScheduleTargetDelivery for SharedScheduleTargetAdapter {
 
     /// Redeliver a reclaimed occurrence whose earlier attempt recorded its
     /// dispatch. Nothing is materialized or created first: an on-demand
-    /// session target that was never bound has no earlier admission. A
-    /// session target's runtime admission may only deduplicate against the
-    /// earlier input (the runtime's deduplicate-only admission, decided where
-    /// it decides deduplication); mob targets and mob-owned identities go to
-    /// the mob host.
+    /// session target the occurrence holds unbound is looked for only where an
+    /// earlier attempt could have admitted it
+    /// ([`Self::deliver_existing_unbound_session`]). A session target's
+    /// runtime admission may only deduplicate against the earlier input (the
+    /// runtime's deduplicate-only admission, decided where it decides
+    /// deduplication); mob targets and mob-owned identities go to the mob
+    /// host.
     #[cfg(not(target_arch = "wasm32"))]
     async fn deliver_existing_occurrence(
         &self,
@@ -1266,7 +1268,16 @@ impl ScheduleTargetDelivery for SharedScheduleTargetAdapter {
                     SessionTargetBinding::MaterializeOnDemandSession {
                         bound_session_id: None,
                         ..
-                    } => return Ok(existing_delivery_unknown(occurrence, identity, existing)),
+                    } => {
+                        return self
+                            .deliver_existing_unbound_session(
+                                occurrence,
+                                identity,
+                                binding.action(),
+                                existing,
+                            )
+                            .await;
+                    }
                 };
                 let materialized_session_id = bound_target_session_id(&occurrence.target_snapshot);
                 let resolved = ResolvedScheduledSession {
@@ -1371,6 +1382,83 @@ fn existing_admission_scope() -> Option<ExistingAdmissionScope> {
 }
 
 impl SharedScheduleTargetAdapter {
+    /// Redeliver to an on-demand session target the occurrence holds unbound.
+    ///
+    /// Nothing is materialized. The binding is read again first, as the
+    /// ordinary delivery does before it materializes: another attempt may
+    /// have committed it since this occurrence was claimed. Without one, the
+    /// occurrence's own deterministic session
+    /// ([`Occurrence::materialized_session_id`]) is probed read-only, since an
+    /// earlier attempt that materialized and admitted into it while no bind
+    /// reached this occurrence left the admission only there. A session that
+    /// does not exist, or a probe that cannot read it, holds no admission this
+    /// redelivery can find.
+    ///
+    /// The dispatch reports the probed session as materialized only when the
+    /// runtime found the earlier admission in it (deduplicated), so the
+    /// driver binds and records it exactly as it does for an ordinary
+    /// dispatch; a failure, or nothing admitted, binds nothing.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn deliver_existing_unbound_session(
+        &self,
+        occurrence: &Occurrence,
+        identity: &ScheduleDeliveryIdentity,
+        action: &ScheduledSessionAction,
+        existing: ExistingDelivery,
+    ) -> Result<ExistingDeliveryAnswer, ScheduleDomainError> {
+        if let Some(bound) = self.authoritative_bound_session_id(occurrence).await {
+            let resolved = ResolvedScheduledSession {
+                session_id: bound.clone(),
+                materialized_session_id: Some(bound),
+            };
+            return self
+                .deliver_existing_session_action(occurrence, identity, resolved, action, existing)
+                .await;
+        }
+        let session_id = occurrence.materialized_session_id();
+        let probe = SessionTargetBinding::ExactSession {
+            session_id: session_id.clone(),
+            action: action.clone(),
+        };
+        match self.session_host.probe_session_target(&probe).await {
+            Ok(TargetProbeOutcome::Ready | TargetProbeOutcome::Busy { .. }) => {}
+            Ok(TargetProbeOutcome::Missing { .. }) => {
+                return Ok(existing_delivery_unknown(occurrence, identity, existing));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    occurrence_id = %occurrence.occurrence_id,
+                    %session_id,
+                    %error,
+                    "a redelivery could not probe its occurrence's own session; it finds no earlier admission"
+                );
+                return Ok(existing_delivery_unknown(occurrence, identity, existing));
+            }
+        }
+        let resolved = ResolvedScheduledSession {
+            session_id: session_id.clone(),
+            materialized_session_id: None,
+        };
+        let answer = self
+            .deliver_existing_session_action(occurrence, identity, resolved, action, existing)
+            .await?;
+        let mut dispatch = match answer {
+            ExistingDeliveryAnswer::Dispatch(dispatch) => dispatch,
+            not_dispatched => return Ok(not_dispatched),
+        };
+        let found_earlier_admission = dispatch.receipt.stage
+            == DeliveryReceiptStage::DispatchAccepted
+            && matches!(
+                dispatch.receipt.runtime_outcome,
+                Some(meerkat_schedule::RuntimeDeliveryOutcome::AdmissionDeduplicated)
+            );
+        if found_earlier_admission {
+            dispatch.materialized_session_id = Some(session_id.clone());
+            dispatch.receipt.materialized_session_id = Some(session_id);
+        }
+        Ok(ExistingDeliveryAnswer::Dispatch(dispatch))
+    }
+
     /// Deliver a session action as a redelivery that may only find the
     /// earlier admission.
     ///
@@ -4864,16 +4952,22 @@ mod tests {
     }
 
     /// A redelivery never materializes a session: an on-demand target that
-    /// was never bound holds no earlier admission. An admitted redelivery
-    /// ends delivery_failed with nothing admitted, and an unproven late one
-    /// answers that the target never admitted it.
+    /// was never bound, and whose own deterministic session does not exist,
+    /// holds no earlier admission. The redelivery probes that session
+    /// read-only. An admitted redelivery ends delivery_failed with nothing
+    /// admitted, and an unproven late one answers that the target never
+    /// admitted it.
     #[tokio::test]
     async fn redelivery_of_an_unbound_on_demand_target_materializes_nothing() {
         let store =
             Arc::new(meerkat_schedule::MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>;
         let service = ScheduleService::new(store);
         let materialize_calls = Arc::new(AtomicUsize::new(0));
-        let session_host: Arc<dyn SurfaceScheduleSessionHost> = Arc::new(PanicOnMaterializeHost {
+        let probes = Arc::new(AtomicUsize::new(0));
+        let session_host: Arc<dyn SurfaceScheduleSessionHost> = Arc::new(OwnSessionHost {
+            runtime: Arc::new(MeerkatMachine::ephemeral()),
+            present: None,
+            probes: Arc::clone(&probes),
             materialize_calls: Arc::clone(&materialize_calls),
         });
         let mob_host: Arc<dyn SurfaceScheduleMobHost> =
@@ -4939,6 +5033,369 @@ mod tests {
             materialize_calls.load(Ordering::SeqCst),
             0,
             "a redelivery materializes nothing"
+        );
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            2,
+            "each redelivery probes the occurrence's own session"
+        );
+    }
+
+    /// A session host whose sessions are the runtime's: it holds exactly the
+    /// session `present` (every other exact session probes missing), decides
+    /// a redelivery's existing-only admission, admits through
+    /// [`accept_schedule_runtime_input_with_reconciliation`], and never
+    /// materializes.
+    struct OwnSessionHost {
+        runtime: Arc<MeerkatMachine>,
+        present: Option<SessionId>,
+        probes: Arc<AtomicUsize>,
+        materialize_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl SurfaceScheduleSessionHost for OwnSessionHost {
+        fn decides_existing_admission(&self) -> bool {
+            true
+        }
+
+        async fn probe_session_target(
+            &self,
+            binding: &SessionTargetBinding,
+        ) -> Result<TargetProbeOutcome, ScheduleDomainError> {
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            match binding.resolved_session_id() {
+                Some(session_id) if self.present.as_ref() != Some(session_id) => {
+                    Ok(TargetProbeOutcome::Missing {
+                        detail: Some(format!("session not found: {session_id}")),
+                    })
+                }
+                _ => Ok(TargetProbeOutcome::Ready),
+            }
+        }
+
+        async fn materialize_session(
+            &self,
+            _occurrence: &Occurrence,
+            _create: &SessionMaterializationSpec,
+        ) -> Result<SessionId, ScheduleDomainError> {
+            self.materialize_calls.fetch_add(1, Ordering::SeqCst);
+            Err(ScheduleDomainError::Internal(
+                "this host never materializes".to_string(),
+            ))
+        }
+
+        async fn deliver_prompt(
+            &self,
+            session_id: &SessionId,
+            occurrence: &Occurrence,
+            identity: &ScheduleDeliveryIdentity,
+            dispatch: ScheduledPromptDispatch,
+        ) -> Result<DeliveryDispatch, ScheduleDomainError> {
+            let mut prompt =
+                meerkat_runtime::PromptInput::from_content_input(dispatch.prompt, None);
+            prompt.header.idempotency_key = Some(meerkat_runtime::IdempotencyKey::new(
+                identity.idempotency_key.clone(),
+            ));
+            prompt.header.correlation_id = Some(schedule_runtime_correlation_id(identity)?);
+            accept_schedule_runtime_input_with_reconciliation(
+                &self.runtime,
+                session_id,
+                occurrence,
+                identity,
+                meerkat_runtime::Input::Prompt(prompt),
+                dispatch.materialized_session_id,
+                |input| self.runtime.accept_input_with_completion(session_id, input),
+            )
+            .await
+        }
+
+        async fn deliver_event(
+            &self,
+            _session_id: &SessionId,
+            _occurrence: &Occurrence,
+            _identity: &ScheduleDeliveryIdentity,
+            _dispatch: ScheduledEventDispatch,
+        ) -> Result<DeliveryDispatch, ScheduleDomainError> {
+            Err(ScheduleDomainError::Internal(
+                "this host delivers prompts only".to_string(),
+            ))
+        }
+    }
+
+    /// The planned occurrences of a new schedule whose target is an unbound
+    /// on-demand session, earliest first.
+    async fn unbound_on_demand_occurrences(
+        service: &ScheduleService,
+        name: &str,
+        occurrences: u32,
+    ) -> Vec<Occurrence> {
+        let schedule = service
+            .create(meerkat_schedule::CreateScheduleRequest {
+                name: Some(name.to_string()),
+                description: None,
+                trigger: meerkat_schedule::TriggerSpec::Interval(
+                    meerkat_schedule::IntervalTriggerSpec {
+                        start_at_utc: chrono::Utc::now(),
+                        every_seconds: 60,
+                        end_at_utc: None,
+                    },
+                ),
+                target: materialize_on_demand_target(),
+                misfire_policy: meerkat_schedule::MisfirePolicy::Skip,
+                overlap_policy: meerkat_schedule::OverlapPolicy::AllowConcurrent,
+                missing_target_policy: meerkat_schedule::MissingTargetPolicy::Skip,
+                labels: BTreeMap::new(),
+                planning_horizon_days: Some(1),
+                planning_horizon_occurrences: Some(occurrences),
+            })
+            .await
+            .expect("schedule create should plan its occurrences");
+        let mut planned = service
+            .list_occurrences(&schedule.schedule_id)
+            .await
+            .expect("list occurrences");
+        planned.sort_by_key(|occurrence| occurrence.due_at_utc);
+        assert_eq!(planned.len(), occurrences as usize);
+        planned
+    }
+
+    /// The prompt an on-demand target's occurrence dispatches, as its first
+    /// attempt does before any bind reaches the occurrence.
+    fn unbound_prompt_dispatch() -> ScheduledPromptDispatch {
+        ScheduledPromptDispatch {
+            prompt: ContentInput::Text("scheduled prompt".to_string()),
+            transient_turn_context: None,
+            system_prompt: None,
+            render_metadata: None,
+            skill_refs: Vec::new(),
+            additional_instructions: Vec::new(),
+            materialized_session_id: None,
+        }
+    }
+
+    /// Constructed state. No sequence at this base leaves an occurrence that
+    /// is unbound at its redelivery holding an admission in its own
+    /// deterministic session: the ordinary delivery binds what it
+    /// materialized before it admits, a failed bind admits nothing, a bind
+    /// skipped because the schedule moved to another revision or went away
+    /// supersedes the occurrence or fails its reclaim, and the reclaim copies
+    /// the schedule's binding onto the occurrence before it redelivers. The
+    /// redelivery still looks there, read-only, as a defensive step: a late
+    /// one finds the earlier admission instead of misfiring a delivery that
+    /// ran, admits nothing new, and reports the session as materialized so
+    /// the driver binds and records it. Before, it answered not admitted
+    /// without a read.
+    #[tokio::test]
+    async fn a_late_redelivery_finds_an_earlier_admission_in_the_occurrences_own_session() {
+        let service = ScheduleService::new(
+            Arc::new(meerkat_schedule::MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>
+        );
+        let occurrence = unbound_on_demand_occurrences(&service, "redelivery-own-session", 1)
+            .await
+            .remove(0);
+        let session_id = occurrence.materialized_session_id();
+        let runtime = Arc::new(MeerkatMachine::ephemeral());
+        runtime
+            .register_session(session_id.clone())
+            .await
+            .expect("register the occurrence's own session");
+        let probes = Arc::new(AtomicUsize::new(0));
+        let materialize_calls = Arc::new(AtomicUsize::new(0));
+        let host = Arc::new(OwnSessionHost {
+            runtime: Arc::clone(&runtime),
+            present: Some(session_id.clone()),
+            probes: Arc::clone(&probes),
+            materialize_calls: Arc::clone(&materialize_calls),
+        });
+        let identity = ScheduleDeliveryIdentity::for_occurrence(&occurrence);
+        let earlier = host
+            .deliver_prompt(
+                &session_id,
+                &occurrence,
+                &identity,
+                unbound_prompt_dispatch(),
+            )
+            .await
+            .expect("the earlier attempt admits into the occurrence's own session");
+        assert_eq!(
+            earlier.receipt.runtime_outcome,
+            Some(meerkat_schedule::RuntimeDeliveryOutcome::AdmissionAccepted)
+        );
+        let mob_host: Arc<dyn SurfaceScheduleMobHost> =
+            Arc::new(NoopScheduleMobHost::new("mob targets unused here"));
+        let adapter = SharedScheduleTargetAdapter::new(service, host, mob_host);
+
+        let answer = adapter
+            .deliver_existing_occurrence(&occurrence, &identity, ExistingDelivery::UnprovenLate)
+            .await
+            .expect("the unproven late redelivery answers");
+        let ExistingDeliveryAnswer::Dispatch(dispatch) = answer else {
+            panic!("the redelivery finds the earlier admission: {answer:?}");
+        };
+        assert_eq!(
+            dispatch.receipt.stage,
+            DeliveryReceiptStage::DispatchAccepted
+        );
+        assert_eq!(
+            dispatch.receipt.runtime_outcome,
+            Some(meerkat_schedule::RuntimeDeliveryOutcome::AdmissionDeduplicated)
+        );
+        assert_eq!(dispatch.materialized_session_id, Some(session_id.clone()));
+        assert_eq!(
+            dispatch.receipt.materialized_session_id,
+            Some(session_id.clone())
+        );
+        assert_eq!(
+            admitted_input_count(&runtime, &session_id).await,
+            1,
+            "the redelivery admits nothing new"
+        );
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+        assert_eq!(materialize_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// The occurrence's own session exists but holds no admission of it: an
+    /// admitted redelivery ends delivery_failed and an unproven late one
+    /// answers not admitted, nothing is admitted, and neither reports the
+    /// session, so the driver binds nothing.
+    #[tokio::test]
+    async fn a_redelivery_into_its_own_session_without_the_admission_binds_nothing() {
+        let service = ScheduleService::new(
+            Arc::new(meerkat_schedule::MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>
+        );
+        let occurrence = unbound_on_demand_occurrences(&service, "redelivery-own-empty", 1)
+            .await
+            .remove(0);
+        let session_id = occurrence.materialized_session_id();
+        let runtime = Arc::new(MeerkatMachine::ephemeral());
+        runtime
+            .register_session(session_id.clone())
+            .await
+            .expect("register the occurrence's own session");
+        let host = Arc::new(OwnSessionHost {
+            runtime: Arc::clone(&runtime),
+            present: Some(session_id.clone()),
+            probes: Arc::new(AtomicUsize::new(0)),
+            materialize_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let mob_host: Arc<dyn SurfaceScheduleMobHost> =
+            Arc::new(NoopScheduleMobHost::new("mob targets unused here"));
+        let adapter = SharedScheduleTargetAdapter::new(service, host, mob_host);
+        let identity = ScheduleDeliveryIdentity::for_occurrence(&occurrence);
+
+        let admitted = adapter
+            .deliver_existing_occurrence(&occurrence, &identity, ExistingDelivery::Admitted)
+            .await
+            .expect("the admitted redelivery answers");
+        let ExistingDeliveryAnswer::Dispatch(dispatch) = admitted else {
+            panic!("an admitted redelivery answers with a dispatch: {admitted:?}");
+        };
+        assert_eq!(dispatch.materialized_session_id, None);
+        assert_eq!(dispatch.receipt.materialized_session_id, None);
+        let terminal = dispatch.completion.await.expect("the failure terminal");
+        assert_eq!(terminal.phase, OccurrencePhase::DeliveryFailed);
+
+        let unproven = adapter
+            .deliver_existing_occurrence(&occurrence, &identity, ExistingDelivery::UnprovenLate)
+            .await
+            .expect("the unproven redelivery answers");
+        assert!(
+            matches!(unproven, ExistingDeliveryAnswer::NotAdmittedPastDeadline),
+            "{unproven:?}"
+        );
+        assert_eq!(admitted_input_count(&runtime, &session_id).await, 0);
+    }
+
+    /// The binding a redelivery's found admission leads to is the ordinary
+    /// one: the driver binds the reported session for the schedule and its
+    /// pending occurrences (the same bind as an ordinary dispatch), so a
+    /// later ordinary occurrence delivers into it and materializes nothing;
+    /// and that bind never overwrites a binding another occurrence committed
+    /// first.
+    #[tokio::test]
+    async fn a_found_admission_binds_its_session_for_later_occurrences_and_never_rebinds() {
+        let service = ScheduleService::new(
+            Arc::new(meerkat_schedule::MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>
+        );
+        let planned = unbound_on_demand_occurrences(&service, "redelivery-binds", 2).await;
+        let (first, later) = (&planned[0], &planned[1]);
+        let session_id = first.materialized_session_id();
+        let runtime = Arc::new(MeerkatMachine::ephemeral());
+        runtime
+            .register_session(session_id.clone())
+            .await
+            .expect("register the first occurrence's own session");
+        let materialize_calls = Arc::new(AtomicUsize::new(0));
+        let host = Arc::new(OwnSessionHost {
+            runtime: Arc::clone(&runtime),
+            present: Some(session_id.clone()),
+            probes: Arc::new(AtomicUsize::new(0)),
+            materialize_calls: Arc::clone(&materialize_calls),
+        });
+        let first_identity = ScheduleDeliveryIdentity::for_occurrence(first);
+        host.deliver_prompt(
+            &session_id,
+            first,
+            &first_identity,
+            unbound_prompt_dispatch(),
+        )
+        .await
+        .expect("the earlier attempt admits");
+        let mob_host: Arc<dyn SurfaceScheduleMobHost> =
+            Arc::new(NoopScheduleMobHost::new("mob targets unused here"));
+        let adapter = SharedScheduleTargetAdapter::new(
+            service.clone(),
+            Arc::clone(&host) as Arc<dyn SurfaceScheduleSessionHost>,
+            mob_host,
+        );
+        let answer = adapter
+            .deliver_existing_occurrence(first, &first_identity, ExistingDelivery::UnprovenLate)
+            .await
+            .expect("the redelivery answers");
+        let ExistingDeliveryAnswer::Dispatch(dispatch) = answer else {
+            panic!("the redelivery finds the earlier admission: {answer:?}");
+        };
+        let reported = dispatch
+            .materialized_session_id
+            .clone()
+            .expect("the found admission reports its session");
+        // What the driver does with a dispatch that reports its session.
+        service
+            .bind_materialized_session_for_occurrence(first, &reported)
+            .await
+            .expect("the driver's bind");
+
+        let later = service
+            .list_occurrences(&later.schedule_id)
+            .await
+            .expect("list occurrences")
+            .into_iter()
+            .find(|occurrence| occurrence.occurrence_id == later.occurrence_id)
+            .expect("the later occurrence is still planned");
+        let later_dispatch = adapter
+            .deliver_occurrence(&later, &ScheduleDeliveryIdentity::for_occurrence(&later))
+            .await
+            .expect("the later occurrence delivers");
+        assert_eq!(
+            later_dispatch.materialized_session_id,
+            Some(session_id.clone())
+        );
+        assert_eq!(admitted_input_count(&runtime, &session_id).await, 2);
+        assert_eq!(materialize_calls.load(Ordering::SeqCst), 0);
+
+        service
+            .bind_materialized_session_for_occurrence(first, &SessionId::new())
+            .await
+            .expect("a second bind answers");
+        let schedule = service.get(&first.schedule_id).await.expect("the schedule");
+        let TargetBinding::Session(binding) = &schedule.target else {
+            panic!("a session target");
+        };
+        assert_eq!(
+            binding.resolved_session_id(),
+            Some(&session_id),
+            "a bind never overwrites the committed binding"
         );
     }
 
