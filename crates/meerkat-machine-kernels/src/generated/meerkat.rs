@@ -10682,12 +10682,15 @@ pub enum RuntimeCompletionWaitFailureObservation {
     ChannelClosed,
     #[serde(rename = "AuthorityUnavailable")]
     AuthorityUnavailable,
+    #[serde(rename = "RequeuedAcrossStop")]
+    RequeuedAcrossStop,
 }
 impl RuntimeCompletionWaitFailureObservation {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::ChannelClosed => "ChannelClosed",
             Self::AuthorityUnavailable => "AuthorityUnavailable",
+            Self::RequeuedAcrossStop => "RequeuedAcrossStop",
         }
     }
 }
@@ -10697,6 +10700,7 @@ impl std::convert::TryFrom<&str> for RuntimeCompletionWaitFailureObservation {
         match value {
             "ChannelClosed" => Ok(Self::ChannelClosed),
             "AuthorityUnavailable" => Ok(Self::AuthorityUnavailable),
+            "RequeuedAcrossStop" => Ok(Self::RequeuedAcrossStop),
             other => Err(format!(
                 "invalid RuntimeCompletionWaitFailureObservation value `{other}`"
             )),
@@ -10732,11 +10736,14 @@ pub enum RuntimeCompletionWaitFailurePublicErrorClass {
     #[default]
     #[serde(rename = "InternalError")]
     InternalError,
+    #[serde(rename = "SessionNotRunning")]
+    SessionNotRunning,
 }
 impl RuntimeCompletionWaitFailurePublicErrorClass {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::InternalError => "InternalError",
+            Self::SessionNotRunning => "SessionNotRunning",
         }
     }
 }
@@ -10745,6 +10752,7 @@ impl std::convert::TryFrom<&str> for RuntimeCompletionWaitFailurePublicErrorClas
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         match value {
             "InternalError" => Ok(Self::InternalError),
+            "SessionNotRunning" => Ok(Self::SessionNotRunning),
             other => Err(format!(
                 "invalid RuntimeCompletionWaitFailurePublicErrorClass value `{other}`"
             )),
@@ -10782,12 +10790,15 @@ pub enum RuntimeCompletionWaitFailurePublicReason {
     CompletionChannelClosed,
     #[serde(rename = "CompletionAuthorityUnavailable")]
     CompletionAuthorityUnavailable,
+    #[serde(rename = "RequeuedAcrossStop")]
+    RequeuedAcrossStop,
 }
 impl RuntimeCompletionWaitFailurePublicReason {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::CompletionChannelClosed => "CompletionChannelClosed",
             Self::CompletionAuthorityUnavailable => "CompletionAuthorityUnavailable",
+            Self::RequeuedAcrossStop => "RequeuedAcrossStop",
         }
     }
 }
@@ -10797,6 +10808,7 @@ impl std::convert::TryFrom<&str> for RuntimeCompletionWaitFailurePublicReason {
         match value {
             "CompletionChannelClosed" => Ok(Self::CompletionChannelClosed),
             "CompletionAuthorityUnavailable" => Ok(Self::CompletionAuthorityUnavailable),
+            "RequeuedAcrossStop" => Ok(Self::RequeuedAcrossStop),
             other => Err(format!(
                 "invalid RuntimeCompletionWaitFailurePublicReason value `{other}`"
             )),
@@ -25387,6 +25399,12 @@ pub enum TransitionId {
     ResolveTurnSurfaceResultBudgetExhaustedFailureIdle,
     ResolveTurnSurfaceResultTimeBudgetExceededHardFailureIdle,
     ResolveTurnSurfaceResultStructuredOutputValidationFailedHardFailureIdle,
+    ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopInitializing,
+    ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopIdle,
+    ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopAttached,
+    ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopRunning,
+    ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopRetired,
+    ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopStopped,
     RegisterSessionRefusedUnregisterDrainingIdle,
     RegisterSessionRefusedUnregisterDrainingAttached,
     RegisterSessionRefusedUnregisterDrainingRunning,

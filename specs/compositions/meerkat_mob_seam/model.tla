@@ -77910,6 +77910,132 @@ meerkat_ClassifyStopInputDispositionAbandonStopped(arg_input_id, arg_durability,
        /\ model_step_count' = model_step_count + 1
 
 
+meerkat_ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopInitializing(arg_session_id, arg_failure) ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "meerkat"
+       /\ packet.variant = "ResolveRuntimeCompletionWaitFailure"
+       /\ packet.payload.session_id = arg_session_id
+       /\ packet.payload.failure = arg_failure
+       /\ ~HigherPriorityReady("meerkat_kernel")
+       /\ meerkat_phase = "Initializing"
+       /\ (packet.payload.failure = "RequeuedAcrossStop")
+       /\ meerkat_phase' = "Initializing"
+       /\ UnchangedFrame_7bfdd371605c8ec8
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "RuntimeCompletionWaitFailureResolved", payload |-> [failure |-> packet.payload.failure, pre_admission_action |-> "ReleasePreAdmission", public_error_class |-> "SessionNotRunning", public_reason |-> "RequeuedAcrossStop", resumable |-> TRUE, session_id |-> packet.payload.session_id], effect_id |-> (model_step_count + 1), source_transition |-> "ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopInitializing"] }
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopInitializing", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Initializing"]}
+       /\ UnchangedFrame_d2e65ac0b2ee17fd
+       /\ model_step_count' = model_step_count + 1
+
+
+meerkat_ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopIdle(arg_session_id, arg_failure) ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "meerkat"
+       /\ packet.variant = "ResolveRuntimeCompletionWaitFailure"
+       /\ packet.payload.session_id = arg_session_id
+       /\ packet.payload.failure = arg_failure
+       /\ ~HigherPriorityReady("meerkat_kernel")
+       /\ meerkat_phase = "Idle"
+       /\ (packet.payload.failure = "RequeuedAcrossStop")
+       /\ meerkat_phase' = "Idle"
+       /\ UnchangedFrame_7bfdd371605c8ec8
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "RuntimeCompletionWaitFailureResolved", payload |-> [failure |-> packet.payload.failure, pre_admission_action |-> "ReleasePreAdmission", public_error_class |-> "SessionNotRunning", public_reason |-> "RequeuedAcrossStop", resumable |-> TRUE, session_id |-> packet.payload.session_id], effect_id |-> (model_step_count + 1), source_transition |-> "ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopIdle"] }
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopIdle", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Idle"]}
+       /\ UnchangedFrame_d2e65ac0b2ee17fd
+       /\ model_step_count' = model_step_count + 1
+
+
+meerkat_ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopAttached(arg_session_id, arg_failure) ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "meerkat"
+       /\ packet.variant = "ResolveRuntimeCompletionWaitFailure"
+       /\ packet.payload.session_id = arg_session_id
+       /\ packet.payload.failure = arg_failure
+       /\ ~HigherPriorityReady("meerkat_kernel")
+       /\ meerkat_phase = "Attached"
+       /\ (packet.payload.failure = "RequeuedAcrossStop")
+       /\ meerkat_phase' = "Attached"
+       /\ UnchangedFrame_7bfdd371605c8ec8
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "RuntimeCompletionWaitFailureResolved", payload |-> [failure |-> packet.payload.failure, pre_admission_action |-> "ReleasePreAdmission", public_error_class |-> "SessionNotRunning", public_reason |-> "RequeuedAcrossStop", resumable |-> TRUE, session_id |-> packet.payload.session_id], effect_id |-> (model_step_count + 1), source_transition |-> "ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopAttached"] }
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopAttached", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Attached"]}
+       /\ UnchangedFrame_d2e65ac0b2ee17fd
+       /\ model_step_count' = model_step_count + 1
+
+
+meerkat_ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopRunning(arg_session_id, arg_failure) ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "meerkat"
+       /\ packet.variant = "ResolveRuntimeCompletionWaitFailure"
+       /\ packet.payload.session_id = arg_session_id
+       /\ packet.payload.failure = arg_failure
+       /\ ~HigherPriorityReady("meerkat_kernel")
+       /\ meerkat_phase = "Running"
+       /\ (packet.payload.failure = "RequeuedAcrossStop")
+       /\ meerkat_phase' = "Running"
+       /\ UnchangedFrame_7bfdd371605c8ec8
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "RuntimeCompletionWaitFailureResolved", payload |-> [failure |-> packet.payload.failure, pre_admission_action |-> "ReleasePreAdmission", public_error_class |-> "SessionNotRunning", public_reason |-> "RequeuedAcrossStop", resumable |-> TRUE, session_id |-> packet.payload.session_id], effect_id |-> (model_step_count + 1), source_transition |-> "ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopRunning"] }
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopRunning", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Running"]}
+       /\ UnchangedFrame_d2e65ac0b2ee17fd
+       /\ model_step_count' = model_step_count + 1
+
+
+meerkat_ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopRetired(arg_session_id, arg_failure) ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "meerkat"
+       /\ packet.variant = "ResolveRuntimeCompletionWaitFailure"
+       /\ packet.payload.session_id = arg_session_id
+       /\ packet.payload.failure = arg_failure
+       /\ ~HigherPriorityReady("meerkat_kernel")
+       /\ meerkat_phase = "Retired"
+       /\ (packet.payload.failure = "RequeuedAcrossStop")
+       /\ meerkat_phase' = "Retired"
+       /\ UnchangedFrame_7bfdd371605c8ec8
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "RuntimeCompletionWaitFailureResolved", payload |-> [failure |-> packet.payload.failure, pre_admission_action |-> "ReleasePreAdmission", public_error_class |-> "SessionNotRunning", public_reason |-> "RequeuedAcrossStop", resumable |-> TRUE, session_id |-> packet.payload.session_id], effect_id |-> (model_step_count + 1), source_transition |-> "ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopRetired"] }
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopRetired", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Retired"]}
+       /\ UnchangedFrame_d2e65ac0b2ee17fd
+       /\ model_step_count' = model_step_count + 1
+
+
+meerkat_ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopStopped(arg_session_id, arg_failure) ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "meerkat"
+       /\ packet.variant = "ResolveRuntimeCompletionWaitFailure"
+       /\ packet.payload.session_id = arg_session_id
+       /\ packet.payload.failure = arg_failure
+       /\ ~HigherPriorityReady("meerkat_kernel")
+       /\ meerkat_phase = "Stopped"
+       /\ (packet.payload.failure = "RequeuedAcrossStop")
+       /\ meerkat_phase' = "Stopped"
+       /\ UnchangedFrame_7bfdd371605c8ec8
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "RuntimeCompletionWaitFailureResolved", payload |-> [failure |-> packet.payload.failure, pre_admission_action |-> "ReleasePreAdmission", public_error_class |-> "SessionNotRunning", public_reason |-> "RequeuedAcrossStop", resumable |-> TRUE, session_id |-> packet.payload.session_id], effect_id |-> (model_step_count + 1), source_transition |-> "ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopStopped"] }
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopStopped", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Stopped"]}
+       /\ UnchangedFrame_d2e65ac0b2ee17fd
+       /\ model_step_count' = model_step_count + 1
+
+
 meerkat_live_delegation_steer_records_are_authorized_and_single == ((DOMAIN meerkat_live_delegation_steer_digest_by_continuation = DOMAIN meerkat_live_delegation_steer_operation_by_continuation) /\ (DOMAIN meerkat_live_delegation_steer_reconciliation_by_continuation = DOMAIN meerkat_live_delegation_steer_operation_by_continuation) /\ (\A continuation_id \in DOMAIN meerkat_live_delegation_steer_delivered_by_continuation : (continuation_id \in DOMAIN meerkat_live_delegation_steer_operation_by_continuation)))
 meerkat_live_media_health_budget_and_verdicts_are_consistent == ((\A budget_session \in DOMAIN meerkat_live_media_fault_reopens_by_session : ((IF "value" \in DOMAIN (IF (budget_session \in DOMAIN meerkat_live_media_fault_reopens_by_session) THEN Some((IF budget_session \in DOMAIN meerkat_live_media_fault_reopens_by_session THEN meerkat_live_media_fault_reopens_by_session[budget_session] ELSE 0)) ELSE None) THEN (IF (budget_session \in DOMAIN meerkat_live_media_fault_reopens_by_session) THEN Some((IF budget_session \in DOMAIN meerkat_live_media_fault_reopens_by_session THEN meerkat_live_media_fault_reopens_by_session[budget_session] ELSE 0)) ELSE None)["value"] ELSE None) <= 1)) /\ (\A verdict_channel \in DOMAIN meerkat_live_media_fault_reopen_recommended_by_channel : (IF (verdict_channel \in meerkat_live_media_health_judged_channels) THEN TRUE ELSE (verdict_channel \in DOMAIN meerkat_live_close_status_by_channel))) /\ (\A judged_channel \in meerkat_live_media_health_judged_channels : (judged_channel \in DOMAIN meerkat_live_media_health_requested_output_by_channel)) /\ (IF (meerkat_session_id # None) THEN TRUE ELSE ((meerkat_live_media_health_requested_output_by_channel = [x \in {} |-> None]) /\ (meerkat_live_media_health_judged_channels = {}) /\ (meerkat_live_media_fault_reopen_recommended_by_channel = [x \in {} |-> None]) /\ (meerkat_live_media_fault_reopens_by_session = [x \in {} |-> None]))))
 meerkat_fence_requires_bound_runtime == (IF (meerkat_active_fence_token = None) THEN TRUE ELSE (meerkat_active_runtime_id # None))
@@ -120213,6 +120339,12 @@ EntryPacketAdmissible_meerkat(packet) ==
     \/ /\ (packet.variant = "ClassifyStopInputDisposition") /\ (meerkat_phase = "Running") /\ (((IF ~((meerkat_registration_phase = "Draining")) THEN TRUE ELSE (IF ~((meerkat_unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((packet.payload.input_id \in DOMAIN meerkat_input_phases)) THEN TRUE ELSE (packet.payload.input_id \in DOMAIN meerkat_input_phases)))) /\ ~(((meerkat_registration_phase = "Draining") /\ (meerkat_unregister_queued_inputs = "Requeue") /\ (packet.payload.input_id \in DOMAIN meerkat_input_phases) /\ ((meerkat_input_phases)[packet.payload.input_id] = "Queued") /\ ((IF (packet.payload.input_id \in DOMAIN meerkat_input_lane) THEN Some((IF packet.payload.input_id \in DOMAIN meerkat_input_lane THEN meerkat_input_lane[packet.payload.input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (packet.payload.input_id \in DOMAIN meerkat_input_is_prompt) THEN Some((IF packet.payload.input_id \in DOMAIN meerkat_input_is_prompt THEN meerkat_input_is_prompt[packet.payload.input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (packet.payload.directed = FALSE) /\ (packet.payload.objective_bound = FALSE) /\ (packet.payload.durability = "Durable")))))
     \/ /\ (packet.variant = "ClassifyStopInputDisposition") /\ (meerkat_phase = "Retired") /\ (((IF ~((meerkat_registration_phase = "Draining")) THEN TRUE ELSE (IF ~((meerkat_unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((packet.payload.input_id \in DOMAIN meerkat_input_phases)) THEN TRUE ELSE (packet.payload.input_id \in DOMAIN meerkat_input_phases)))) /\ ~(((meerkat_registration_phase = "Draining") /\ (meerkat_unregister_queued_inputs = "Requeue") /\ (packet.payload.input_id \in DOMAIN meerkat_input_phases) /\ ((meerkat_input_phases)[packet.payload.input_id] = "Queued") /\ ((IF (packet.payload.input_id \in DOMAIN meerkat_input_lane) THEN Some((IF packet.payload.input_id \in DOMAIN meerkat_input_lane THEN meerkat_input_lane[packet.payload.input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (packet.payload.input_id \in DOMAIN meerkat_input_is_prompt) THEN Some((IF packet.payload.input_id \in DOMAIN meerkat_input_is_prompt THEN meerkat_input_is_prompt[packet.payload.input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (packet.payload.directed = FALSE) /\ (packet.payload.objective_bound = FALSE) /\ (packet.payload.durability = "Durable")))))
     \/ /\ (packet.variant = "ClassifyStopInputDisposition") /\ (meerkat_phase = "Stopped") /\ (((IF ~((meerkat_registration_phase = "Draining")) THEN TRUE ELSE (IF ~((meerkat_unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((packet.payload.input_id \in DOMAIN meerkat_input_phases)) THEN TRUE ELSE (packet.payload.input_id \in DOMAIN meerkat_input_phases)))) /\ ~(((meerkat_registration_phase = "Draining") /\ (meerkat_unregister_queued_inputs = "Requeue") /\ (packet.payload.input_id \in DOMAIN meerkat_input_phases) /\ ((meerkat_input_phases)[packet.payload.input_id] = "Queued") /\ ((IF (packet.payload.input_id \in DOMAIN meerkat_input_lane) THEN Some((IF packet.payload.input_id \in DOMAIN meerkat_input_lane THEN meerkat_input_lane[packet.payload.input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (packet.payload.input_id \in DOMAIN meerkat_input_is_prompt) THEN Some((IF packet.payload.input_id \in DOMAIN meerkat_input_is_prompt THEN meerkat_input_is_prompt[packet.payload.input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (packet.payload.directed = FALSE) /\ (packet.payload.objective_bound = FALSE) /\ (packet.payload.durability = "Durable")))))
+    \/ /\ (packet.variant = "ResolveRuntimeCompletionWaitFailure") /\ (meerkat_phase = "Initializing") /\ ((packet.payload.failure = "RequeuedAcrossStop"))
+    \/ /\ (packet.variant = "ResolveRuntimeCompletionWaitFailure") /\ (meerkat_phase = "Idle") /\ ((packet.payload.failure = "RequeuedAcrossStop"))
+    \/ /\ (packet.variant = "ResolveRuntimeCompletionWaitFailure") /\ (meerkat_phase = "Attached") /\ ((packet.payload.failure = "RequeuedAcrossStop"))
+    \/ /\ (packet.variant = "ResolveRuntimeCompletionWaitFailure") /\ (meerkat_phase = "Running") /\ ((packet.payload.failure = "RequeuedAcrossStop"))
+    \/ /\ (packet.variant = "ResolveRuntimeCompletionWaitFailure") /\ (meerkat_phase = "Retired") /\ ((packet.payload.failure = "RequeuedAcrossStop"))
+    \/ /\ (packet.variant = "ResolveRuntimeCompletionWaitFailure") /\ (meerkat_phase = "Stopped") /\ ((packet.payload.failure = "RequeuedAcrossStop"))
 
 mob__entry_packet__identity_reconcile_decision(intent, lease, replacement, external_binding_required, initial_delivery_required, session_creation_receipt, retirement_receipt, session, runtime, member, external_binding_receipt, external_trust, external_ceremony, initial_delivery_receipt, initial_delivery, wiring) == (IF (replacement = "AdmissionOpen") THEN "CloseMemberAdmission" ELSE (IF (replacement = "Draining") THEN "AwaitMemberDrain" ELSE (IF (replacement = "DrainBlocked") THEN "DrainBlocked" ELSE (IF (replacement = "CancelActive") THEN "CancelActiveMember" ELSE (IF (replacement = "Ready") THEN "RetireMemberMaterialization" ELSE (IF (intent = "Unavailable") THEN "Backoff" ELSE (IF (IF (intent = "Missing") THEN TRUE ELSE (intent = "Malformed")) THEN "RepairBlocked" ELSE (IF (lease = "Unavailable") THEN "Backoff" ELSE (IF (IF (lease = "Missing") THEN TRUE ELSE (lease = "HeldByExpiredIncarnation")) THEN "AcquireLease" ELSE (IF (lease = "Malformed") THEN "RepairBlocked" ELSE (IF (lease = "HeldByOtherLiveIncarnation") THEN "AwaitLease" ELSE (IF (intent = "Absent") THEN (IF (wiring = "Unavailable") THEN "Backoff" ELSE (IF (wiring = "Malformed") THEN "RepairBlocked" ELSE (IF (IF (wiring = "Matching") THEN TRUE ELSE (wiring = "Divergent")) THEN "ReconcileWiring" ELSE (IF (member = "Unavailable") THEN "Backoff" ELSE (IF (member = "Malformed") THEN "RepairBlocked" ELSE (IF (IF (member = "Matching") THEN TRUE ELSE (member = "Divergent")) THEN "RetireMemberMaterialization" ELSE (IF (runtime = "Unavailable") THEN "Backoff" ELSE (IF (runtime = "Malformed") THEN "RepairBlocked" ELSE (IF (IF (runtime = "Matching") THEN TRUE ELSE (runtime = "Divergent")) THEN "RetireRuntimeRegistration" ELSE (IF (session = "Unavailable") THEN "Backoff" ELSE (IF (IF (session = "Malformed") THEN TRUE ELSE (session = "AmbiguousDivergence")) THEN "RepairBlocked" ELSE (IF (IF (session = "Matching") THEN TRUE ELSE (IF (session = "RecoverableDivergence") THEN TRUE ELSE (session = "IrrecoverablyCorrupt"))) THEN "ReleaseSessionAuthority" ELSE (IF (retirement_receipt = "Unavailable") THEN "Backoff" ELSE (IF (retirement_receipt = "Missing") THEN "SealRetirementProven" ELSE (IF (retirement_receipt = "Matching") THEN "Tombstoned" ELSE "RepairBlocked"))))))))))))))) ELSE (IF (session = "Unavailable") THEN "Backoff" ELSE (IF (IF (session = "Malformed") THEN TRUE ELSE (IF (session = "IrrecoverablyCorrupt") THEN TRUE ELSE (IF (session = "AmbiguousDivergence") THEN TRUE ELSE ((session = "Missing") /\ (intent = "PresentRequireExisting"))))) THEN (IF (wiring = "Unavailable") THEN "Backoff" ELSE (IF (wiring = "Malformed") THEN "RepairBlocked" ELSE (IF (IF (wiring = "Matching") THEN TRUE ELSE (wiring = "Divergent")) THEN "ReconcileWiring" ELSE (IF (member = "Unavailable") THEN "Backoff" ELSE (IF (member = "Malformed") THEN "RepairBlocked" ELSE (IF (IF (member = "Matching") THEN TRUE ELSE (member = "Divergent")) THEN "RetireMemberMaterialization" ELSE (IF (runtime = "Unavailable") THEN "Backoff" ELSE (IF (runtime = "Malformed") THEN "RepairBlocked" ELSE (IF (IF (runtime = "Matching") THEN TRUE ELSE (runtime = "Divergent")) THEN "RetireRuntimeRegistration" ELSE (IF (session = "IrrecoverablyCorrupt") THEN "Quarantined" ELSE "RepairBlocked")))))))))) ELSE (IF (IF (session = "Missing") THEN TRUE ELSE (session = "RecoverableDivergence")) THEN (IF ((intent = "PresentCreateIfAbsent") /\ (session_creation_receipt = "Unavailable")) THEN "Backoff" ELSE (IF ((intent = "PresentCreateIfAbsent") /\ (IF (session_creation_receipt = "Conflicting") THEN TRUE ELSE (IF (session_creation_receipt = "Malformed") THEN TRUE ELSE (session_creation_receipt = "NotRequired")))) THEN "RepairBlocked" ELSE (IF ((intent = "PresentCreateIfAbsent") /\ (session_creation_receipt = "Matching") /\ (session = "Missing")) THEN "RepairBlocked" ELSE (IF ((intent = "PresentCreateIfAbsent") /\ (IF (session_creation_receipt = "Missing") THEN TRUE ELSE (session_creation_receipt = "Matching"))) THEN "EnsureSessionAuthority" ELSE (IF ((intent = "PresentRequireExisting") /\ (session_creation_receipt = "NotRequired")) THEN "EnsureSessionAuthority" ELSE (IF ((intent = "PresentRequireExisting") /\ (session_creation_receipt = "Unavailable")) THEN "Backoff" ELSE "RepairBlocked")))))) ELSE (IF ((intent = "PresentCreateIfAbsent") /\ (session_creation_receipt = "Unavailable")) THEN "Backoff" ELSE (IF ((intent = "PresentCreateIfAbsent") /\ (session_creation_receipt = "Missing")) THEN "SealSessionCreationConsumed" ELSE (IF ~((IF ((intent = "PresentCreateIfAbsent") /\ (session_creation_receipt = "Matching")) THEN TRUE ELSE ((intent = "PresentRequireExisting") /\ (session_creation_receipt = "NotRequired")))) THEN "RepairBlocked" ELSE (IF (runtime = "Unavailable") THEN "Backoff" ELSE (IF (runtime = "Malformed") THEN "RepairBlocked" ELSE (IF (IF (runtime = "Missing") THEN TRUE ELSE (runtime = "Divergent")) THEN "EnsureRuntimeRegistration" ELSE (IF (external_binding_required = TRUE) THEN (IF (external_binding_receipt = "Unavailable") THEN "Backoff" ELSE (IF (external_binding_receipt = "Missing") THEN "EnsureExternalBindingReceipt" ELSE (IF (IF (external_binding_receipt = "Conflicting") THEN TRUE ELSE (IF (external_binding_receipt = "Malformed") THEN TRUE ELSE (external_binding_receipt = "NotRequired"))) THEN "RepairBlocked" ELSE (IF (external_trust = "Unavailable") THEN "Backoff" ELSE (IF (external_trust = "Absent") THEN (IF (external_ceremony = "FreshAvailable") THEN "EnsureExternalBinding" ELSE (IF (external_ceremony = "AwaitFresh") THEN "AwaitExternalBindingCeremony" ELSE (IF (external_ceremony = "TemporarilyUnavailable") THEN "Backoff" ELSE "RepairBlocked"))) ELSE (IF (IF (external_trust = "Contradictory") THEN TRUE ELSE (IF (external_trust = "Indeterminate") THEN TRUE ELSE (IF (external_trust = "Malformed") THEN TRUE ELSE (external_trust = "NotRequired")))) THEN "RepairBlocked" ELSE (IF (member = "Unavailable") THEN "Backoff" ELSE (IF (IF (member = "Malformed") THEN TRUE ELSE (member = "Divergent")) THEN "RepairBlocked" ELSE (IF (member = "Missing") THEN "EnsureMemberMaterialization" ELSE (IF (initial_delivery_required = TRUE) THEN (IF (initial_delivery_receipt = "Unavailable") THEN "Backoff" ELSE (IF (initial_delivery_receipt = "Missing") THEN "EnsureInitialDeliveryReceipt" ELSE (IF (IF (initial_delivery_receipt = "Conflicting") THEN TRUE ELSE (IF (initial_delivery_receipt = "Malformed") THEN TRUE ELSE (initial_delivery_receipt = "NotRequired"))) THEN "RepairBlocked" ELSE (IF (initial_delivery = "Unavailable") THEN "Backoff" ELSE (IF (initial_delivery = "ProvenAbsent") THEN "EnsureInitialDelivery" ELSE (IF (initial_delivery = "AcceptedPendingExact") THEN "AwaitInitialDelivery" ELSE (IF (IF (initial_delivery = "ContentOnlyMatch") THEN TRUE ELSE (IF (initial_delivery = "OperationCollision") THEN TRUE ELSE (IF (initial_delivery = "Contradictory") THEN TRUE ELSE (IF (initial_delivery = "Indeterminate") THEN TRUE ELSE (IF (initial_delivery = "Malformed") THEN TRUE ELSE (initial_delivery = "NotRequired")))))) THEN "RepairBlocked" ELSE (IF (retirement_receipt # "NotRequired") THEN "RepairBlocked" ELSE (IF (wiring = "Unavailable") THEN "Backoff" ELSE (IF (wiring = "Malformed") THEN "RepairBlocked" ELSE (IF (IF (wiring = "Missing") THEN TRUE ELSE (wiring = "Divergent")) THEN "ReconcileWiring" ELSE "Converged"))))))))))) ELSE (IF (IF (initial_delivery_receipt # "NotRequired") THEN TRUE ELSE (initial_delivery # "NotRequired")) THEN "RepairBlocked" ELSE (IF (retirement_receipt # "NotRequired") THEN "RepairBlocked" ELSE (IF (wiring = "Unavailable") THEN "Backoff" ELSE (IF (wiring = "Malformed") THEN "RepairBlocked" ELSE (IF (IF (wiring = "Missing") THEN TRUE ELSE (wiring = "Divergent")) THEN "ReconcileWiring" ELSE "Converged"))))))))))))))) ELSE (IF (IF (external_binding_receipt # "NotRequired") THEN TRUE ELSE (IF (external_trust # "NotRequired") THEN TRUE ELSE (external_ceremony # "NotRequired"))) THEN "RepairBlocked" ELSE (IF (member = "Unavailable") THEN "Backoff" ELSE (IF (IF (member = "Malformed") THEN TRUE ELSE (member = "Divergent")) THEN "RepairBlocked" ELSE (IF (member = "Missing") THEN "EnsureMemberMaterialization" ELSE (IF (initial_delivery_required = TRUE) THEN (IF (initial_delivery_receipt = "Unavailable") THEN "Backoff" ELSE (IF (initial_delivery_receipt = "Missing") THEN "EnsureInitialDeliveryReceipt" ELSE (IF (IF (initial_delivery_receipt = "Conflicting") THEN TRUE ELSE (IF (initial_delivery_receipt = "Malformed") THEN TRUE ELSE (initial_delivery_receipt = "NotRequired"))) THEN "RepairBlocked" ELSE (IF (initial_delivery = "Unavailable") THEN "Backoff" ELSE (IF (initial_delivery = "ProvenAbsent") THEN "EnsureInitialDelivery" ELSE (IF (initial_delivery = "AcceptedPendingExact") THEN "AwaitInitialDelivery" ELSE (IF (IF (initial_delivery = "ContentOnlyMatch") THEN TRUE ELSE (IF (initial_delivery = "OperationCollision") THEN TRUE ELSE (IF (initial_delivery = "Contradictory") THEN TRUE ELSE (IF (initial_delivery = "Indeterminate") THEN TRUE ELSE (IF (initial_delivery = "Malformed") THEN TRUE ELSE (initial_delivery = "NotRequired")))))) THEN "RepairBlocked" ELSE (IF (retirement_receipt # "NotRequired") THEN "RepairBlocked" ELSE (IF (wiring = "Unavailable") THEN "Backoff" ELSE (IF (wiring = "Malformed") THEN "RepairBlocked" ELSE (IF (IF (wiring = "Missing") THEN TRUE ELSE (wiring = "Divergent")) THEN "ReconcileWiring" ELSE "Converged"))))))))))) ELSE (IF (IF (initial_delivery_receipt # "NotRequired") THEN TRUE ELSE (initial_delivery # "NotRequired")) THEN "RepairBlocked" ELSE (IF (retirement_receipt # "NotRequired") THEN "RepairBlocked" ELSE (IF (wiring = "Unavailable") THEN "Backoff" ELSE (IF (wiring = "Malformed") THEN "RepairBlocked" ELSE (IF (IF (wiring = "Missing") THEN TRUE ELSE (wiring = "Divergent")) THEN "ReconcileWiring" ELSE "Converged"))))))))))))))))))))))))))))))))
 
@@ -125392,6 +125524,12 @@ CoreNext ==
     \/ \E arg_input_id \in StringValues : \E arg_durability \in InputDurabilityKindValues : \E arg_directed \in BOOLEAN : \E arg_objective_bound \in BOOLEAN : meerkat_ClassifyStopInputDispositionAbandonRunning(arg_input_id, arg_durability, arg_directed, arg_objective_bound)
     \/ \E arg_input_id \in StringValues : \E arg_durability \in InputDurabilityKindValues : \E arg_directed \in BOOLEAN : \E arg_objective_bound \in BOOLEAN : meerkat_ClassifyStopInputDispositionAbandonRetired(arg_input_id, arg_durability, arg_directed, arg_objective_bound)
     \/ \E arg_input_id \in StringValues : \E arg_durability \in InputDurabilityKindValues : \E arg_directed \in BOOLEAN : \E arg_objective_bound \in BOOLEAN : meerkat_ClassifyStopInputDispositionAbandonStopped(arg_input_id, arg_durability, arg_directed, arg_objective_bound)
+    \/ \E arg_session_id \in SessionIdValues : \E arg_failure \in RuntimeCompletionWaitFailureObservationValues : meerkat_ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopInitializing(arg_session_id, arg_failure)
+    \/ \E arg_session_id \in SessionIdValues : \E arg_failure \in RuntimeCompletionWaitFailureObservationValues : meerkat_ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopIdle(arg_session_id, arg_failure)
+    \/ \E arg_session_id \in SessionIdValues : \E arg_failure \in RuntimeCompletionWaitFailureObservationValues : meerkat_ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopAttached(arg_session_id, arg_failure)
+    \/ \E arg_session_id \in SessionIdValues : \E arg_failure \in RuntimeCompletionWaitFailureObservationValues : meerkat_ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopRunning(arg_session_id, arg_failure)
+    \/ \E arg_session_id \in SessionIdValues : \E arg_failure \in RuntimeCompletionWaitFailureObservationValues : meerkat_ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopRetired(arg_session_id, arg_failure)
+    \/ \E arg_session_id \in SessionIdValues : \E arg_failure \in RuntimeCompletionWaitFailureObservationValues : meerkat_ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopStopped(arg_session_id, arg_failure)
     \/ \E arg_run_id \in RunIdValues : \E arg_status \in FlowRunStatusValues : mob_ClassifyFlowRunTerminalityTerminalRunning(arg_run_id, arg_status)
     \/ \E arg_run_id \in RunIdValues : \E arg_status \in FlowRunStatusValues : mob_ClassifyFlowRunTerminalityNonTerminalRunning(arg_run_id, arg_status)
     \/ \E arg_run_id \in RunIdValues : \E arg_step_id \in StepIdValues : \E arg_status \in StepRunStatusValues : mob_ClassifyFlowStepTerminalityTerminalRunning(arg_run_id, arg_step_id, arg_status)

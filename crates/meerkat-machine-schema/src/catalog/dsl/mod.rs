@@ -2643,15 +2643,23 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
             ),
             NamedTypeBinding::string_enum(
                 "RuntimeCompletionWaitFailureObservation",
-                &["ChannelClosed", "AuthorityUnavailable"],
+                &[
+                    "ChannelClosed",
+                    "AuthorityUnavailable",
+                    "RequeuedAcrossStop",
+                ],
             ),
             NamedTypeBinding::string_enum(
                 "RuntimeCompletionWaitFailurePublicErrorClass",
-                &["InternalError"],
+                &["InternalError", "SessionNotRunning"],
             ),
             NamedTypeBinding::string_enum(
                 "RuntimeCompletionWaitFailurePublicReason",
-                &["CompletionChannelClosed", "CompletionAuthorityUnavailable"],
+                &[
+                    "CompletionChannelClosed",
+                    "CompletionAuthorityUnavailable",
+                    "RequeuedAcrossStop",
+                ],
             ),
             NamedTypeBinding::string_enum(
                 "RuntimeOpsLifecycleDurabilityAction",

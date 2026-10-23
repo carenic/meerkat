@@ -1236,6 +1236,7 @@ pub(crate) use session_management::{
 };
 
 pub use composition::{MeerkatCompositionSignalDispatcher, MeerkatConsumerSurface};
+pub use runtime_control::RuntimeCompletionWaitFailureAuthority;
 
 pub use comms_drain::{
     CommsDrainMode, CommsDrainPhase, DrainExitReason, PeerEndpointStageError, PeerIngressOwner,
@@ -8389,6 +8390,15 @@ impl MeerkatMachine {
         context: &str,
     ) -> Result<Vec<dsl::MeerkatMachineEffect>, String> {
         let authority = self.session_dsl_authority(session_id).await?;
+        Self::preview_dsl_input_on_shared_authority(&authority, input, context)
+    }
+
+    /// Preview `input` on a fork of one session's live authority.
+    fn preview_dsl_input_on_shared_authority(
+        authority: &std::sync::Mutex<dsl::MeerkatMachineAuthority>,
+        input: dsl::MeerkatMachineInput,
+        context: &str,
+    ) -> Result<Vec<dsl::MeerkatMachineEffect>, String> {
         let preview = match authority.lock() {
             Ok(authority) => Ok(authority.fork()),
             Err(poisoned) => {

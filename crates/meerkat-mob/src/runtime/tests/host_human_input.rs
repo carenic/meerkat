@@ -2931,6 +2931,24 @@ async fn requeue_shutdown_expires_a_queued_human_input_older_than_the_bound_at_r
         ),
         "a requeued input past its bound at restart ends as expired and never runs"
     );
+    // The input-status read, what `session/input_status` serves from, names
+    // the expiry typed.
+    let status = {
+        use meerkat_runtime::service_ext::SessionServiceRuntimeExt as _;
+        restarted
+            .adapter
+            .input_state(&session_id, &input_id)
+            .await
+            .expect("input-status read")
+            .expect("the expired input keeps its status")
+    };
+    assert_eq!(
+        status.seed.terminal_outcome,
+        Some(meerkat_runtime::InputTerminalOutcome::Abandoned {
+            reason: meerkat_runtime::InputAbandonReason::RequeueExpired,
+        }),
+        "the input-status read carries the typed expiry"
+    );
 
     // Once the expiry has committed, the row is terminal: the next start
     // serves nothing, and the row stays expired. (The process stops
@@ -3263,6 +3281,225 @@ async fn requeue_shutdown_does_not_keep_an_objective_bound_input_queued_behind_t
             0
         ),
         "an objective-bound input is not requeued: terminal at the stop, never run after the restart"
+    );
+    tokio::time::timeout(WAIT, restarted.handle.shutdown())
+        .await
+        .expect("mob shutdown finishes")
+        .expect("mob shutdown");
+}
+
+const KEPT_OUT_EVENT: &str = "requeue-kept-out-event";
+const DIRECTED_STEP: &str = "A directed flow step, queued behind the running turn.";
+const BARRIER_HUMAN: &str = "New work after the restart.";
+
+/// An input a requeue Shutdown does not keep, admitted straight into the
+/// member's runtime: its waiter, the row the stopping process leaves, and
+/// what the restarted process does with it.
+#[derive(Debug, PartialEq)]
+struct NotKeptAcrossStop {
+    waiter: String,
+    phase: meerkat_runtime::input_state::InputLifecycleState,
+    outcome: serde_json::Value,
+    payload_kept: bool,
+    requeue_mark: bool,
+    carrier: bool,
+    row_unchanged_by_restart: bool,
+    requests_after_restart: usize,
+}
+
+/// How the waiter of an input admitted straight into the runtime ended.
+async fn runtime_waiter_answer(waiter: meerkat_runtime::completion::CompletionHandle) -> String {
+    match tokio::time::timeout(WAIT, waiter.try_wait()).await {
+        Err(_) => "unresolved".to_owned(),
+        Ok(Ok(meerkat_runtime::completion::CompletionOutcome::RuntimeTerminated { .. })) => {
+            "runtime_terminated".to_owned()
+        }
+        Ok(Ok(other)) => format!("completed: {other:?}"),
+        Ok(Err(error)) if error.is_requeued_across_stop() => "requeued_across_stop".to_owned(),
+        Ok(Err(error)) => format!("wait failed: {error}"),
+    }
+}
+
+/// Interaction failures the log recorded for `interaction_id`.
+fn interaction_failures_for(events: &[AgentEvent], interaction_id: InteractionId) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                AgentEvent::InteractionFailed { interaction_id: failed, .. }
+                    if *failed == interaction_id
+            )
+        })
+        .count()
+}
+
+/// Under a requeue Shutdown only a queued prompt is kept. A durable external
+/// event and a directed flow step queued behind the running turn end as
+/// stopped and unmarked, as a Stop Shutdown ends them: the event's waiter
+/// ends with the runtime's termination and its payload is retired, the
+/// directed step keeps its interaction carrier and its interaction fails
+/// exactly once, and the restarted process runs neither (new work admitted
+/// after the restart runs, and anything kept would have run before it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requeue_shutdown_does_not_keep_a_queued_event_or_a_directed_step() {
+    use meerkat_runtime::input_state::InputLifecycleState;
+
+    let (_root, root_path) = stop_root();
+    let client = ScriptedClient::new(true);
+    let host = open_stop_host(&root_path, &client, Some("host-human-requeue-event-step")).await;
+    let mob_id = host.handle.mob_id().clone();
+    let (identity, session_id, entry) = spawn_stop_member(&host).await;
+
+    client.block();
+    let requests_before = client.requests().len();
+    let running = start_stop_input(
+        &host,
+        &entry,
+        WorkSpec::new(HUMAN, WorkOrigin::External),
+        HandlingMode::Queue,
+        &delivery("requeue-event-step-running"),
+    )
+    .await
+    .expect("running human admission");
+    client.wait_for_requests(requests_before + 1).await;
+
+    let event = meerkat_runtime::Input::ExternalEvent(meerkat_runtime::input::ExternalEventInput {
+        header: meerkat_runtime::input::InputHeader {
+            ingress_context: None,
+            retained_resume: None,
+            authority_association: None,
+            id: meerkat_core::lifecycle::InputId::new(),
+            timestamp: chrono::Utc::now(),
+            source: meerkat_runtime::input::InputOrigin::External {
+                source_name: "webhook".into(),
+            },
+            durability: meerkat_runtime::input::InputDurability::Durable,
+            visibility: meerkat_runtime::input::InputVisibility::default(),
+            idempotency_key: None,
+            supersession_key: None,
+            correlation_id: None,
+        },
+        event_type: "build".into(),
+        payload: serde_json::json!({ "status": KEPT_OUT_EVENT }),
+        blocks: None,
+        handling_mode: HandlingMode::Queue,
+        render_metadata: None,
+        objective_id: None,
+    });
+    let event_id = event.id().clone();
+    let directed_interaction = InteractionId(Uuid::now_v7());
+    let directed = meerkat_runtime::mob_adapter::create_tracked_flow_step_input(
+        "requeue-directed",
+        meerkat_core::types::ContentInput::Text(DIRECTED_STEP.to_owned()),
+        "requeue-flow",
+        None,
+        &directed_interaction.0.to_string(),
+    )
+    .expect("tracked flow step");
+    let directed_id = directed.id().clone();
+    let mut waiters = Vec::new();
+    for input in [event, directed] {
+        let (outcome, waiter) = host
+            .adapter
+            .accept_input_with_completion(&session_id, input)
+            .await
+            .expect("admitted behind the running turn");
+        assert!(outcome.is_accepted(), "{outcome:?}");
+        waiters.push(waiter.expect("an admitted input has a waiter"));
+    }
+    for queued in [&event_id, &directed_id] {
+        let (stored, _) = row_image(&host.runtime_store, &session_id, queued).await;
+        assert_eq!(stored.seed.phase, InputLifecycleState::Queued, "{queued}");
+    }
+
+    tokio::time::timeout(
+        WAIT,
+        host.handle
+            .shutdown_with_report(requeue_options(crate::RequeueMaxAge::DEFAULT)),
+    )
+    .await
+    .expect("the requeue stop finishes")
+    .expect("requeue stop");
+    let _ = stop_answer(running, &session_id).await;
+    let mut answers = Vec::new();
+    for waiter in waiters {
+        answers.push(runtime_waiter_answer(waiter).await);
+    }
+    let mut at_exit = Vec::new();
+    for input_id in [&event_id, &directed_id] {
+        at_exit.push(row_image(&host.runtime_store, &session_id, input_id).await);
+    }
+    let failures_at_exit = interaction_failures_for(
+        &stop_events(&root_path, &session_id).await,
+        directed_interaction,
+    );
+    drop(host);
+    await_supervisor_route_release(&mob_id).await;
+
+    let restarted_client = ScriptedClient::new(true);
+    let restarted = open_stop_host(&root_path, &restarted_client, None).await;
+    let entry = restarted
+        .handle
+        .get_member(&identity)
+        .await
+        .expect("roster read")
+        .expect("the member survives the restart");
+    let barrier = start_stop_input(
+        &restarted,
+        &entry,
+        WorkSpec::new(BARRIER_HUMAN, WorkOrigin::External),
+        HandlingMode::Queue,
+        &delivery("requeue-event-step-barrier"),
+    )
+    .await
+    .expect("new work after the restart");
+    assert_eq!(
+        stop_answer(barrier, &session_id).await,
+        StopAnswer::Succeeded
+    );
+    let requests = restarted_client.requests();
+    assert_eq!(requests_carrying(&requests, BARRIER_HUMAN), 1);
+    let mut observed = Vec::new();
+    for ((input_id, waiter), ((stored, image), text)) in [&event_id, &directed_id]
+        .into_iter()
+        .zip(answers)
+        .zip(at_exit.into_iter().zip([KEPT_OUT_EVENT, DIRECTED_STEP]))
+    {
+        let after = row_image(&restarted.runtime_store, &session_id, input_id)
+            .await
+            .1;
+        observed.push(NotKeptAcrossStop {
+            waiter,
+            phase: stored.seed.phase,
+            outcome: serde_json::to_value(&stored.seed.terminal_outcome)
+                .expect("terminal outcome wire image"),
+            payload_kept: stored.state.persisted_input.is_some(),
+            requeue_mark: !image["stop_requeue"].is_null(),
+            carrier: !image["interaction_terminal_outbox"].is_null(),
+            row_unchanged_by_restart: after == image,
+            requests_after_restart: requests_carrying(&requests, text),
+        });
+    }
+    let failures_after_restart = interaction_failures_for(
+        &stop_events(&root_path, &session_id).await,
+        directed_interaction,
+    );
+    let stopped = |carrier: bool| NotKeptAcrossStop {
+        waiter: "runtime_terminated".to_owned(),
+        phase: InputLifecycleState::Abandoned,
+        outcome: serde_json::json!({"outcome_type": "abandoned", "reason": "stopped"}),
+        payload_kept: false,
+        requeue_mark: false,
+        carrier,
+        row_unchanged_by_restart: true,
+        requests_after_restart: 0,
+    };
+    assert_eq!(
+        (observed, failures_at_exit, failures_after_restart),
+        (vec![stopped(false), stopped(true)], 1, 1),
+        "an event and a directed step are not requeued: stopped at the stop, the directed \
+         interaction failed once, neither run after the restart"
     );
     tokio::time::timeout(WAIT, restarted.handle.shutdown())
         .await

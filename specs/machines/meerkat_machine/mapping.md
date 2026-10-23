@@ -7892,6 +7892,24 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `ClassifyStopInputDispositionAbandonStopped`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopInitializing`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 
 ### Effects
 - `RuntimeBound`

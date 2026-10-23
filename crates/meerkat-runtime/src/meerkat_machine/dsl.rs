@@ -2382,6 +2382,10 @@ pub enum RuntimeCompletionWaitFailureObservation {
     #[default]
     ChannelClosed,
     AuthorityUnavailable,
+    /// A graceful stop kept the waited input durably queued for the
+    /// session's next start (`ClassifyStopInputDisposition` answered
+    /// `Retain`). The input is not terminal.
+    RequeuedAcrossStop,
 }
 
 /// Generated public error class for mechanical runtime completion waiter
@@ -2390,6 +2394,8 @@ pub enum RuntimeCompletionWaitFailureObservation {
 pub enum RuntimeCompletionWaitFailurePublicErrorClass {
     #[default]
     InternalError,
+    /// The session is not running: its waited input runs on the next start.
+    SessionNotRunning,
 }
 
 /// Generated public reason classifier for mechanical runtime completion waiter
@@ -2399,6 +2405,7 @@ pub enum RuntimeCompletionWaitFailurePublicReason {
     #[default]
     CompletionChannelClosed,
     CompletionAuthorityUnavailable,
+    RequeuedAcrossStop,
 }
 
 /// Generated durability action for runtime-owned ops lifecycle snapshots.

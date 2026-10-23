@@ -5016,34 +5016,19 @@ async fn completion_wait_error_to_api_error(
             format_session_ref(realm, session_id)
         ));
     }
-    // Not a failure either: a graceful stop kept the input durably queued,
-    // and the session's runtime runs it on its next start.
-    if let Some(requeued) =
-        requeued_across_stop_api_error(&error, session_id, input_id, realm, session_created)
-    {
-        return requeued;
-    }
     match state
         .runtime_adapter
         .resolve_runtime_completion_wait_failure(session_id, &error)
         .await
     {
-        Ok(authority) => match authority.public_error_class {
-            meerkat_runtime::meerkat_machine::dsl::RuntimeCompletionWaitFailurePublicErrorClass::InternalError => {
-                ApiError::InternalWithData {
-                    message: format!("runtime completion waiter failed: {error}"),
-                    code: runtime_completion_wait_failure_api_code(authority.public_reason)
-                        .to_string(),
-                    details: json!({
-                        "session_id": session_id.to_string(),
-                        "session_ref": format_session_ref(realm, session_id),
-                        "session_created": session_created,
-                        "public_error_class": format!("{:?}", authority.public_error_class),
-                        "resumable": authority.resumable,
-                    }),
-                }
-            }
-        },
+        Ok(authority) => runtime_completion_wait_failure_api_error(
+            &error,
+            authority,
+            session_id,
+            input_id,
+            realm,
+            session_created,
+        ),
         Err(authority_error) => ApiError::InternalWithData {
             message: format!(
                 "runtime completion waiter failed without generated failure authority: {error}"
@@ -5059,35 +5044,72 @@ async fn completion_wait_error_to_api_error(
     }
 }
 
-/// The typed answer to a wait a graceful stop ended by keeping the input
-/// durably queued for the session's next start: `503`
-/// `SESSION_RUNTIME_UNAVAILABLE` with `details.kind` `requeued_across_stop`,
-/// never the generated wait-failure authority's internal class. Do not
-/// resubmit the input; the same idempotency key after the restart re-attaches
-/// to it. `None` for any other wait failure.
-fn requeued_across_stop_api_error(
+/// The REST answer of a waiter failure, from its generated resolution.
+///
+/// An internal failure answers `500` with the generated reason's code and
+/// whether the input is resumable. A session that is not running answers
+/// `409` `SESSION_NOT_RUNNING`: a graceful stop kept the input durably queued
+/// for the session's next start, and `details` names the input, the stop's
+/// time and `kind` and `reason` `requeued_across_stop`. It is no retryable
+/// unavailability: do not resubmit such an input; the same idempotency key
+/// after the restart re-attaches to it.
+fn runtime_completion_wait_failure_api_error(
     error: &meerkat_runtime::completion::CompletionWaitError,
+    authority: meerkat_runtime::meerkat_machine::RuntimeCompletionWaitFailureAuthority,
     session_id: &SessionId,
     input_id: Option<&meerkat_core::lifecycle::InputId>,
     realm: &meerkat_core::RealmId,
     session_created: bool,
-) -> Option<ApiError> {
-    let meerkat_runtime::completion::CompletionWaitError::RequeuedAcrossStop { stopped_at } = error
-    else {
-        return None;
-    };
-    Some(ApiError::SessionRuntimeUnavailable {
-        message: format!("session {}: {error}", format_session_ref(realm, session_id)),
-        details: json!({
-            "kind": "requeued_across_stop",
-            "reason": "requeued_across_stop",
-            "session_id": session_id.to_string(),
-            "session_ref": format_session_ref(realm, session_id),
-            "session_created": session_created,
-            "input_id": input_id.map(ToString::to_string),
-            "stopped_at": stopped_at,
-        }),
-    })
+) -> ApiError {
+    match authority.public_error_class {
+        meerkat_runtime::meerkat_machine::dsl::RuntimeCompletionWaitFailurePublicErrorClass::InternalError => {
+            ApiError::InternalWithData {
+                message: format!("runtime completion waiter failed: {error}"),
+                code: runtime_completion_wait_failure_api_code(authority.public_reason)
+                    .to_string(),
+                details: json!({
+                    "session_id": session_id.to_string(),
+                    "session_ref": format_session_ref(realm, session_id),
+                    "session_created": session_created,
+                    "public_error_class": format!("{:?}", authority.public_error_class),
+                    "resumable": authority.resumable,
+                }),
+            }
+        }
+        meerkat_runtime::meerkat_machine::dsl::RuntimeCompletionWaitFailurePublicErrorClass::SessionNotRunning => {
+            let kind = runtime_completion_wait_failure_api_kind(authority.public_reason);
+            ApiError::SessionNotRunningWithData {
+                message: format!("session {}: {error}", format_session_ref(realm, session_id)),
+                details: json!({
+                    "kind": kind,
+                    "reason": kind,
+                    "session_id": session_id.to_string(),
+                    "session_ref": format_session_ref(realm, session_id),
+                    "session_created": session_created,
+                    "input_id": input_id.map(ToString::to_string),
+                    "stopped_at": error.requeued_stopped_at(),
+                    "resumable": authority.resumable,
+                }),
+            }
+        }
+    }
+}
+
+/// The `details.kind` of a waiter failure's generated reason.
+fn runtime_completion_wait_failure_api_kind(
+    public_reason: meerkat_runtime::meerkat_machine::dsl::RuntimeCompletionWaitFailurePublicReason,
+) -> &'static str {
+    match public_reason {
+        meerkat_runtime::meerkat_machine::dsl::RuntimeCompletionWaitFailurePublicReason::CompletionChannelClosed => {
+            "completion_channel_closed"
+        }
+        meerkat_runtime::meerkat_machine::dsl::RuntimeCompletionWaitFailurePublicReason::CompletionAuthorityUnavailable => {
+            "completion_authority_unavailable"
+        }
+        meerkat_runtime::meerkat_machine::dsl::RuntimeCompletionWaitFailurePublicReason::RequeuedAcrossStop => {
+            "requeued_across_stop"
+        }
+    }
 }
 
 fn runtime_completion_wait_failure_api_code(
@@ -5099,6 +5121,9 @@ fn runtime_completion_wait_failure_api_code(
         }
         meerkat_runtime::meerkat_machine::dsl::RuntimeCompletionWaitFailurePublicReason::CompletionAuthorityUnavailable => {
             "RUNTIME_COMPLETION_AUTHORITY_UNAVAILABLE"
+        }
+        meerkat_runtime::meerkat_machine::dsl::RuntimeCompletionWaitFailurePublicReason::RequeuedAcrossStop => {
+            "RUNTIME_COMPLETION_REQUEUED_ACROSS_STOP"
         }
     }
 }
@@ -8753,6 +8778,14 @@ pub enum ApiError {
         message: String,
         details: Value,
     },
+    /// `SESSION_NOT_RUNNING` (409) with typed details, e.g. a wait a graceful
+    /// stop ended by keeping its input queued for the session's next start.
+    /// Not a retryable unavailability: resubmitting would run the input
+    /// twice.
+    SessionNotRunningWithData {
+        message: String,
+        details: Value,
+    },
 }
 
 /// `ApiError::SessionBusyWithData` for a typed retryable runtime teardown
@@ -8808,6 +8841,7 @@ fn api_error_message(error: &ApiError) -> String {
         ApiError::BadRequestWithData { message, .. }
         | ApiError::InternalWithData { message, .. }
         | ApiError::SessionBusyWithData { message, .. }
+        | ApiError::SessionNotRunningWithData { message, .. }
         | ApiError::SessionRuntimeUnavailable { message, .. } => message.clone(),
         ApiError::DuplicateInput { existing_id } => {
             format!("duplicate input: {existing_id}")
@@ -8947,6 +8981,12 @@ impl IntoResponse for ApiError {
                 message,
                 Some(details),
             ),
+            ApiError::SessionNotRunningWithData { message, details } => (
+                StatusCode::CONFLICT,
+                "SESSION_NOT_RUNNING".to_string(),
+                message,
+                Some(details),
+            ),
         };
 
         let body = Json(ErrorResponse {
@@ -8979,39 +9019,94 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use tempfile::TempDir;
 
-    /// A wait a graceful stop ended by keeping the input queued for the
-    /// next start answers 503 with `details.kind` `requeued_across_stop`, the
-    /// input and the stop time, never the internal wait-failure class; every
-    /// other wait failure keeps its own answer.
-    #[test]
-    fn a_wait_requeued_across_a_stop_answers_its_typed_kind() {
+    /// A wait a graceful stop ended by keeping the input queued for the next
+    /// start answers what the generated wait-failure authority resolves, the
+    /// same before and after its session is gone: the pre-admission is
+    /// released, and the answer is `409` `SESSION_NOT_RUNNING` (not a
+    /// retryable `503`) with `details.kind` `requeued_across_stop`, the input,
+    /// the stop time and `resumable`. A closed waiter keeps its internal class.
+    #[tokio::test]
+    async fn a_wait_requeued_across_a_stop_answers_its_generated_class() {
+        let adapter = meerkat_runtime::MeerkatMachine::ephemeral();
         let session_id = SessionId::new();
         let input_id = meerkat_core::lifecycle::InputId::new();
         let realm = meerkat_core::RealmId::parse("requeue-realm").expect("realm");
         let stopped_at = Utc::now();
         let requeued =
             meerkat_runtime::completion::CompletionWaitError::RequeuedAcrossStop { stopped_at };
-        match requeued_across_stop_api_error(&requeued, &session_id, Some(&input_id), &realm, false)
-        {
-            Some(ApiError::SessionRuntimeUnavailable { details, .. }) => {
-                assert_eq!(details["kind"], "requeued_across_stop");
-                assert_eq!(details["reason"], "requeued_across_stop");
-                assert_eq!(details["input_id"], input_id.to_string());
-                assert_eq!(details["session_id"], session_id.to_string());
-                assert_eq!(details["stopped_at"], json!(stopped_at));
+        for registered in [false, true] {
+            if registered {
+                adapter
+                    .prepare_bindings(session_id.clone())
+                    .await
+                    .expect("session should prepare runtime bindings");
             }
-            other => panic!("expected the typed requeued answer, got {other:?}"),
-        }
-        assert!(
-            requeued_across_stop_api_error(
-                &meerkat_runtime::completion::CompletionWaitError::ChannelClosed,
+            let authority = adapter
+                .resolve_runtime_completion_wait_failure(&session_id, &requeued)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("registered={registered}: a kept input's wait must resolve: {error:?}")
+                });
+            assert!(
+                authority.releases_pre_admission(),
+                "registered={registered}"
+            );
+            let response = runtime_completion_wait_failure_api_error(
+                &requeued,
+                authority,
                 &session_id,
                 Some(&input_id),
                 &realm,
                 false,
             )
-            .is_none()
-        );
+            .into_response();
+            assert_eq!(
+                response.status(),
+                StatusCode::CONFLICT,
+                "registered={registered}"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                body["code"], "SESSION_NOT_RUNNING",
+                "registered={registered}"
+            );
+            assert_eq!(
+                body["details"],
+                json!({
+                    "kind": "requeued_across_stop",
+                    "reason": "requeued_across_stop",
+                    "session_id": session_id.to_string(),
+                    "session_ref": format_session_ref(&realm, &session_id),
+                    "session_created": false,
+                    "input_id": input_id.to_string(),
+                    "stopped_at": stopped_at,
+                    "resumable": true,
+                }),
+                "registered={registered}"
+            );
+        }
+
+        let closed = meerkat_runtime::completion::CompletionWaitError::ChannelClosed;
+        let authority = adapter
+            .resolve_runtime_completion_wait_failure(&session_id, &closed)
+            .await
+            .expect("a registered session resolves a closed waiter");
+        match runtime_completion_wait_failure_api_error(
+            &closed,
+            authority,
+            &session_id,
+            None,
+            &realm,
+            false,
+        ) {
+            ApiError::InternalWithData { code, .. } => {
+                assert_eq!(code, "RUNTIME_COMPLETION_CHANNEL_CLOSED");
+            }
+            other => panic!("a closed waiter keeps its internal class, got {other:?}"),
+        }
     }
 
     struct FailDeleteOpsLifecycleOnceStore {

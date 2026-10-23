@@ -1352,6 +1352,10 @@ pub enum RuntimeCompletionWaitFailureObservation {
     #[default]
     ChannelClosed,
     AuthorityUnavailable,
+    /// A graceful stop kept the waited input durably queued for the
+    /// session's next start (`ClassifyStopInputDisposition` answered
+    /// `Retain`). The input is not terminal.
+    RequeuedAcrossStop,
 }
 
 /// Generated public error class for mechanical runtime completion waiter
@@ -1360,6 +1364,8 @@ pub enum RuntimeCompletionWaitFailureObservation {
 pub enum RuntimeCompletionWaitFailurePublicErrorClass {
     #[default]
     InternalError,
+    /// The session is not running: its waited input runs on the next start.
+    SessionNotRunning,
 }
 
 /// Generated public reason classifier for mechanical runtime completion waiter
@@ -1370,6 +1376,7 @@ pub enum RuntimeCompletionWaitFailurePublicReason {
     #[default]
     CompletionChannelClosed,
     CompletionAuthorityUnavailable,
+    RequeuedAcrossStop,
 }
 
 /// Generated durability action for runtime-owned ops lifecycle snapshots.
@@ -38577,6 +38584,30 @@ macro_rules! meerkat_catalog_machine_dsl {
                 input_id: input_id,
                 disposition: StopInputDisposition::Abandon,
                 requeue_max_age_ms: 0
+            }
+        }
+
+        // 16c, appended. ResolveRuntimeCompletionWaitFailure for an input a
+        // graceful stop kept durably queued (26c-stop's Retain). Its waiter is
+        // answered while the session unregisters, so this arm reads no
+        // session state: a surface may resolve it after the session is gone,
+        // on a fresh authority. The input is not terminal and runs on the
+        // next start, where a same-key replay re-attaches to it (resumable);
+        // the session is not running for it until then. The surface's
+        // pre-admission is released, as for every other answered waiter.
+        transition ResolveRuntimeCompletionWaitFailureRequeuedAcrossStop {
+            per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
+            on input ResolveRuntimeCompletionWaitFailure { session_id, failure }
+            guard "requeued_across_stop" { failure == RuntimeCompletionWaitFailureObservation::RequeuedAcrossStop }
+            update {}
+            to Idle
+            emit RuntimeCompletionWaitFailureResolved {
+                session_id: session_id,
+                failure: failure,
+                pre_admission_action: RuntimeCompletionPreAdmissionAction::ReleasePreAdmission,
+                public_error_class: RuntimeCompletionWaitFailurePublicErrorClass::SessionNotRunning,
+                public_reason: RuntimeCompletionWaitFailurePublicReason::RequeuedAcrossStop,
+                resumable: true
             }
         }
     }

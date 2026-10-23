@@ -36836,6 +36836,54 @@ ClassifyStopInputDispositionAbandonStopped(input_id, durability, directed, objec
     /\ UnchangedFrame_741e27c6cf983c4d
 
 
+ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopInitializing(arg_session_id, failure) ==
+    /\ phase = "Initializing"
+    /\ (failure = "RequeuedAcrossStop")
+    /\ phase' = "Initializing"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_741e27c6cf983c4d
+
+
+ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopIdle(arg_session_id, failure) ==
+    /\ phase = "Idle"
+    /\ (failure = "RequeuedAcrossStop")
+    /\ phase' = "Idle"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_741e27c6cf983c4d
+
+
+ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopAttached(arg_session_id, failure) ==
+    /\ phase = "Attached"
+    /\ (failure = "RequeuedAcrossStop")
+    /\ phase' = "Attached"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_741e27c6cf983c4d
+
+
+ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopRunning(arg_session_id, failure) ==
+    /\ phase = "Running"
+    /\ (failure = "RequeuedAcrossStop")
+    /\ phase' = "Running"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_741e27c6cf983c4d
+
+
+ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopRetired(arg_session_id, failure) ==
+    /\ phase = "Retired"
+    /\ (failure = "RequeuedAcrossStop")
+    /\ phase' = "Retired"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_741e27c6cf983c4d
+
+
+ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopStopped(arg_session_id, failure) ==
+    /\ phase = "Stopped"
+    /\ (failure = "RequeuedAcrossStop")
+    /\ phase' = "Stopped"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_741e27c6cf983c4d
+
+
 Next ==
     \/ Initialize
     \/ (phase = "Idle") /\ \E arg_session_id \in SessionIdValues : \E candidate_id \in StringValues : \E candidate_run_id \in RunIdValues : \E class \in DurableTailRecoveryClassValues : \E observed_lifecycle \in DurableRecoveryObservedLifecycleValues : \E observed_current_run \in DurableRecoveryObservedRunValues : \E last_committed_sequence \in 0..2 : \E prior_commit \in DurableRecoveryPriorCommitValues : \E input_evidence \in DurableRecoveryInputEvidenceValues : AuthorizeDurableTailRecoveryCommitIdle(arg_session_id, candidate_id, candidate_run_id, class, observed_lifecycle, observed_current_run, last_committed_sequence, prior_commit, input_evidence)
@@ -39459,6 +39507,12 @@ Next ==
     \/ (phase = "Running") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : \E directed \in BOOLEAN : \E objective_bound \in BOOLEAN : ClassifyStopInputDispositionAbandonRunning(input_id, durability, directed, objective_bound)
     \/ (phase = "Retired") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : \E directed \in BOOLEAN : \E objective_bound \in BOOLEAN : ClassifyStopInputDispositionAbandonRetired(input_id, durability, directed, objective_bound)
     \/ (phase = "Stopped") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : \E directed \in BOOLEAN : \E objective_bound \in BOOLEAN : ClassifyStopInputDispositionAbandonStopped(input_id, durability, directed, objective_bound)
+    \/ (phase = "Initializing") /\ \E arg_session_id \in SessionIdValues : \E failure \in RuntimeCompletionWaitFailureObservationValues : ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopInitializing(arg_session_id, failure)
+    \/ (phase = "Idle") /\ \E arg_session_id \in SessionIdValues : \E failure \in RuntimeCompletionWaitFailureObservationValues : ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopIdle(arg_session_id, failure)
+    \/ (phase = "Attached") /\ \E arg_session_id \in SessionIdValues : \E failure \in RuntimeCompletionWaitFailureObservationValues : ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopAttached(arg_session_id, failure)
+    \/ (phase = "Running") /\ \E arg_session_id \in SessionIdValues : \E failure \in RuntimeCompletionWaitFailureObservationValues : ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopRunning(arg_session_id, failure)
+    \/ (phase = "Retired") /\ \E arg_session_id \in SessionIdValues : \E failure \in RuntimeCompletionWaitFailureObservationValues : ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopRetired(arg_session_id, failure)
+    \/ (phase = "Stopped") /\ \E arg_session_id \in SessionIdValues : \E failure \in RuntimeCompletionWaitFailureObservationValues : ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopStopped(arg_session_id, failure)
     \/ TerminalStutter
 
 live_delegation_steer_records_are_authorized_and_single == ((DOMAIN live_delegation_steer_digest_by_continuation = DOMAIN live_delegation_steer_operation_by_continuation) /\ (DOMAIN live_delegation_steer_reconciliation_by_continuation = DOMAIN live_delegation_steer_operation_by_continuation) /\ (\A continuation_id \in DOMAIN live_delegation_steer_delivered_by_continuation : (continuation_id \in DOMAIN live_delegation_steer_operation_by_continuation)))

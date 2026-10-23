@@ -2,19 +2,21 @@
 
 A graceful mob Shutdown that keeps a queued input answers its waiting
 ``turn/start`` with JSON-RPC ``-32003`` (session not running) and
-``error.data.reason`` ``"requeued_across_stop"``. The SDK has no accessor of
-its own for that reason, so the error keeps its code and the whole data
-payload, and no typed accessor misreads it.
+``error.data.kind`` and ``reason`` ``"requeued_across_stop"``. The SDK has no
+accessor of its own for that reason, so the error keeps its code and the
+whole data payload, and no typed accessor misreads it.
 """
 
 from meerkat import MeerkatError, auth_error_reason, comms_send_error
 from meerkat.errors import meerkat_error_from_jsonrpc_code
 
 REQUEUED = {
+    "kind": "requeued_across_stop",
+    "reason": "requeued_across_stop",
     "session_id": "01936f8b-0000-7000-8000-000000000001",
     "input_id": "01936f8b-0000-7000-8000-000000000002",
-    "reason": "requeued_across_stop",
     "stopped_at": "2026-10-22T22:00:00Z",
+    "resumable": True,
 }
 
 

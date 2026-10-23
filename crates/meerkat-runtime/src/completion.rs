@@ -106,9 +106,11 @@ impl CompletionWaitError {
             Self::AttachmentReplaced
             | Self::AuthorityUnavailable(_)
             | Self::BoundaryRolledBack { .. }
-            | Self::DurableOutcomeUnknown { .. }
-            | Self::RequeuedAcrossStop { .. } => Some(
+            | Self::DurableOutcomeUnknown { .. } => Some(
                 crate::meerkat_machine::dsl::RuntimeCompletionWaitFailureObservation::AuthorityUnavailable,
+            ),
+            Self::RequeuedAcrossStop { .. } => Some(
+                crate::meerkat_machine::dsl::RuntimeCompletionWaitFailureObservation::RequeuedAcrossStop,
             ),
             Self::DisclosureRefused { .. } => None,
         }
@@ -146,6 +148,17 @@ impl CompletionWaitError {
     #[must_use]
     pub const fn is_requeued_across_stop(&self) -> bool {
         matches!(self, Self::RequeuedAcrossStop { .. })
+    }
+
+    /// When the stop kept the input queued, for a
+    /// [`RequeuedAcrossStop`](Self::RequeuedAcrossStop) answer; `None` for
+    /// every other failure.
+    #[must_use]
+    pub fn requeued_stopped_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        match self {
+            Self::RequeuedAcrossStop { stopped_at } => Some(*stopped_at),
+            _ => None,
+        }
     }
 }
 
@@ -2562,6 +2575,68 @@ mod tests {
             crate::meerkat_machine::dsl::RuntimeCompletionWaitFailurePublicReason::CompletionAuthorityUnavailable
         );
         assert!(!authority.resumable);
+    }
+
+    /// A graceful stop answers a kept input's waiter while its session
+    /// unregisters. The generated arm for that failure reads no session
+    /// state, so it answers the same before and after the session is gone:
+    /// release the pre-admission, session not running, requeued across the
+    /// stop, resumable. The waiter's error carries the stop's time.
+    #[tokio::test]
+    async fn wait_failure_authority_resolves_a_kept_input_with_or_without_its_session() {
+        use crate::meerkat_machine::dsl::{
+            RuntimeCompletionWaitFailureObservation, RuntimeCompletionWaitFailurePublicErrorClass,
+            RuntimeCompletionWaitFailurePublicReason,
+        };
+
+        let adapter = crate::meerkat_machine::MeerkatMachine::ephemeral();
+        let session_id = SessionId::new();
+        let stopped_at = chrono::Utc::now();
+        let requeued = CompletionWaitError::RequeuedAcrossStop { stopped_at };
+        assert_eq!(
+            requeued.wait_failure_observation(),
+            Some(RuntimeCompletionWaitFailureObservation::RequeuedAcrossStop)
+        );
+        assert_eq!(requeued.requeued_stopped_at(), Some(stopped_at));
+        assert_eq!(
+            CompletionWaitError::ChannelClosed.requeued_stopped_at(),
+            None
+        );
+
+        for registered in [false, true] {
+            if registered {
+                adapter
+                    .prepare_bindings(session_id.clone())
+                    .await
+                    .expect("session should prepare runtime bindings");
+            }
+            let authority = adapter
+                .resolve_runtime_completion_wait_failure(&session_id, &requeued)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("registered={registered}: a kept input's wait must resolve: {error:?}")
+                });
+            assert!(
+                authority.releases_pre_admission(),
+                "registered={registered}"
+            );
+            assert_eq!(
+                authority.failure,
+                RuntimeCompletionWaitFailureObservation::RequeuedAcrossStop,
+                "registered={registered}"
+            );
+            assert_eq!(
+                authority.public_error_class,
+                RuntimeCompletionWaitFailurePublicErrorClass::SessionNotRunning,
+                "registered={registered}"
+            );
+            assert_eq!(
+                authority.public_reason,
+                RuntimeCompletionWaitFailurePublicReason::RequeuedAcrossStop,
+                "registered={registered}"
+            );
+            assert!(authority.resumable, "registered={registered}");
+        }
     }
 
     #[tokio::test]

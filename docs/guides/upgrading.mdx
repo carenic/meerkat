@@ -127,7 +127,15 @@ classifier behind the new requeue option of a graceful stop:
   `StopInputDispositionClassified` and its per-phase transitions, and
   `InputAbandonReason` gains `RequeueExpired`, each appended last;
 - `meerkat-runtime`'s `MeerkatMachineRuntimeInternalInput` gains
-  `ClassifyStopInputDisposition`, appended last.
+  `ClassifyStopInputDisposition`, appended last;
+- the wait-failure enums gain a kept input's answer, appended last:
+  `RuntimeCompletionWaitFailureObservation::RequeuedAcrossStop`,
+  `RuntimeCompletionWaitFailurePublicErrorClass::SessionNotRunning` and
+  `RuntimeCompletionWaitFailurePublicReason::RequeuedAcrossStop` (also in
+  `meerkat-runtime`'s `meerkat_machine::dsl`), with the per-phase transitions
+  `ResolveRuntimeCompletionWaitFailureRequeuedAcrossStop*`;
+- `meerkat-rest`'s `ApiError` gains `SessionNotRunningWithData`, appended
+  last.
 
 **Do:** where you build `BeginUnregisterSession` or `State` literals, pass
 `UnregisterQueuedInputsDisposition::Stop` and `0`, the 0.9.4 behaviour, and
@@ -155,7 +163,9 @@ add the arms (or a wildcard) where you match these enums exhaustively.
   each input still queued behind the running turn that is a durable prompt
   in the queue lane, neither directed nor bound to an objective (so never a
   member's kickoff). Its waiter ends with
-  `RequeuedAcrossStop`, and the next start runs it once, before new work. A
+  `RequeuedAcrossStop`, and the next start runs it once, before new work.
+  JSON-RPC answers such a wait `-32003` and REST `409` `SESSION_NOT_RUNNING`,
+  both with `kind` `requeued_across_stop`. A
   kept input older than `max_age` when the next start recovers it ends as
   `RequeueExpired` without running. Without the option nothing changes.
   A kept input's row is written as stored input state version 8, and an

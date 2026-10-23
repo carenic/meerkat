@@ -7270,10 +7270,25 @@ impl MeerkatMachine {
                 session_id: crate::meerkat_machine::dsl::SessionId::from_domain(session_id),
                 failure,
             };
-        let effects = self
-            .preview_session_dsl_input(session_id, input, "ResolveRuntimeCompletionWaitFailure")
-            .await
-            .map_err(|reason| RuntimeDriverError::ValidationFailed { reason })?;
+        let effects = match self.session_dsl_authority(session_id).await {
+            Ok(authority) => Self::preview_dsl_input_on_shared_authority(
+                &authority,
+                input,
+                "ResolveRuntimeCompletionWaitFailure",
+            ),
+            // A graceful stop answers a kept input's waiter while the session
+            // unregisters, so the session may be gone by the time its surface
+            // asks. The generated arm for that failure reads no session state
+            // and answers on a fresh authority; every session-scoped arm
+            // refuses there, and the refusal stays the missing session's.
+            Err(missing) => Self::preview_dsl_input_on_authority(
+                crate::meerkat_machine::dsl::MeerkatMachineAuthority::new(),
+                input,
+                "ResolveRuntimeCompletionWaitFailure",
+            )
+            .map_err(|_| missing),
+        }
+        .map_err(|reason| RuntimeDriverError::ValidationFailed { reason })?;
         runtime_completion_wait_failure_authority_from_effects(session_id, failure, &effects)
     }
 

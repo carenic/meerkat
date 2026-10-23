@@ -258,13 +258,10 @@ fn wrap_mcp_runtime_pre_admission_cleanup(
             Err(error) if error.is_attachment_replaced() => {
                 McpRuntimeCompletionCleanup::StaleAttachment { error }
             }
-            // A graceful stop kept the input durably queued: a later start's
-            // attachment runs it, never this one, so this attachment's
-            // request-local admission is released. The input itself is not
-            // failed and is not abandoned here.
-            Err(error) if error.is_requeued_across_stop() => McpRuntimeCompletionCleanup::Current {
-                release_pre_admission: true,
-            },
+            // The generated wait-failure authority resolves whether this
+            // attachment's request-local admission is released, for an input
+            // a graceful stop kept durably queued too: a later start's
+            // attachment runs that input, never this one.
             Err(error) => {
                 let release_pre_admission = context
                     .runtime_wait_failure_releases_pre_admission(&session_id, &error)
