@@ -959,6 +959,34 @@ them.
   failure, and the mob host's tracked-turn watcher keeps the turn pending
   for the next start.
 
+- A failed MCP login start says what it left of the attempt it tried to
+  admit, so a host can report a clean cleanup exactly.
+  `McpOAuthAuthority::login_start_with_admission` and
+  `login_start_registered_with_admission`, and
+  `HostAuthService::mcp_login_start_with_admission` and
+  `mcp_login_start_registered_with_admission`, return what the existing
+  starts return; a failure carries the same error beside an
+  `OAuthStartAdmission` (`McpOAuthStartFailure`, `HostMcpStartFailure`):
+  `NotAdmitted` (this call admitted nothing), `Retired` (it admitted an
+  attempt and retired it, durable state included),
+  `RetirementUnconfirmed { attempt_ref }` (the attempt could not be proven
+  retired; a cancel by that reference retires it) or `Unknown` (a host's
+  own flow owner that does not answer). `NotAdmitted` speaks of this call
+  only: another attempt for the target can still be pending, such as one
+  another start admitted or the one this start would have joined, and a
+  status read or a logout answers for those. Every refusal before the flow
+  owner's start (account selection, redirect, discovery, preflight, client
+  registration, the descriptor checks, a join that fails) is
+  `NotAdmitted`. The runtime flow owner probes the attempt's own fresh
+  state, never the error kind: `Retired` needs a read of its durable
+  snapshot that finds no entry, since a failed write can still have
+  committed, and a failed start retries its retirement once before it
+  names the attempt. `OAuthFlowAuthority` gains the provided methods
+  `start_with_admission` (by default `Unknown`) and
+  `retire_unpayloaded_browser_attempts` (by default retiring none), and
+  `OAuthFlowRegistry` gains `holds_browser_payload`. The existing methods
+  keep their signatures and errors; nothing changes on the wire.
+
 ### Changed
 
 - `meerkat-core`, `meerkat-session`, `meerkat-runtime`: a HeadCanonical run
@@ -1568,6 +1596,20 @@ them.
   program, and that copy kept a lock released by the close alone, so a
   single-try claim right after the release could be refused as held (for
   example, a governed MCP decision refused as not current).
+
+- An MCP cancel by attempt reference
+  (`McpOAuthAuthority::cancel_attempt_by_ref`,
+  `HostAuthService::mcp_login_cancel_by_attempt_ref`) retires an attempt
+  the flow owner holds without its payload, such as one a failed start
+  could not retire, with any durable entry for it. It answered `Missing`
+  while the attempt stayed admitted, holding the slot's flow capacity until
+  a logout or a restart. `Missing` now means nothing with that reference is
+  held.
+
+- A failed MCP login start whose durable write failed after it committed no
+  longer leaves the attempt's durable entry behind. The next read restored
+  the entry as a pending attempt no browser could complete, which a status
+  read reported until the attempt expired or a later start retired it.
 
 ## [0.9.4] - 2026-10-20
 
