@@ -4089,7 +4089,7 @@ pub fn mob_machine_schema_metadata() -> MachineSchemaMetadata {
             NamedTypeBinding::string_enum("MobMemberState", &["Active", "Retiring"]),
             NamedTypeBinding::string_enum(
                 "AutonomousShutdownMemberActionKind",
-                &["Interrupt", "SkipTerminalRetirementAnchor"],
+                &["Interrupt", "SkipTerminalRetirementAnchor", "KeepForResume"],
             ),
             NamedTypeBinding::string_enum(
                 "MemberWaitClassificationKind",

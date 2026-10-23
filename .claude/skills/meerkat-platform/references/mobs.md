@@ -139,8 +139,9 @@ since 0.9.5 the default `QueuedInputsOnShutdown::RequeueDurable`, also what
 `shutdown()` takes, keeps a member's work for the next start when its session
 commits each round durably (`Requeue(RequeueMaxAge::DEFAULT)`, 15 minutes;
 `Stop` for other members): its running turn is suspended at its last
-committed round and resumes at the next start (an autonomous member's turn is
-still cancelled), and durable queued prompts that are neither directed nor
+committed round and resumes at the next start (a durable autonomous member's
+kickoff stays open and resumes under its objective), and durable queued
+prompts that are neither directed nor
 bound to an objective (never a member's kickoff) run after it. Their waiters
 get `BoundedTurnFailure::RequeuedAcrossStop`, or `RequeueExpired` when older
 than `max_age` at that start.

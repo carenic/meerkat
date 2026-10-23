@@ -85,24 +85,19 @@ impl MobActor {
             // The Shutdown's choice applies to every unregister it begins for
             // a member it keeps: a bound member's session. Its default
             // resolves per session: a session that commits each round keeps
-            // its running turn and eligible queued inputs for the next start.
-            // A persistent session service gives each session a checkpointer,
-            // so its runs commit each round, and a runtime with a persistence
-            // store keeps their inputs and resume points; every session this
-            // teardown unregisters lives on the mob's own service and runtime.
-            // A run that commits no rounds (a live bridge run) is still
-            // cancelled by the runtime stop. A retiring member's session is
-            // not expected to resume, so
-            // its queued inputs end stopped, as its retirement would end
-            // them. An unregister an earlier Shutdown left with its
-            // coordinator keeps the choice it began with; this one's applies
-            // only if that coordinator ends without unregistering and the
-            // unregister is begun again.
-            let commits_per_round = self.session_service.supports_persistent_sessions()
-                && adapter.has_runtime_persistence();
+            // its running turn and eligible queued inputs for the next start
+            // (`member_sessions_commit_each_round`; every session this
+            // teardown unregisters lives on the mob's own service and
+            // runtime). A run that commits no rounds (a live bridge run) is
+            // still cancelled by the runtime stop. A retiring member's session
+            // is not expected to resume, so its queued inputs end stopped, as
+            // its retirement would end them. An unregister an earlier Shutdown
+            // left with its coordinator keeps the choice it began with; this
+            // one's applies only if that coordinator ends without
+            // unregistering and the unregister is begun again.
             let requested = self
                 .shutdown_queued_inputs
-                .unregister_queued_inputs(commits_per_round);
+                .unregister_queued_inputs(self.member_sessions_commit_each_round());
             let targets = targets
                 .into_iter()
                 .map(|(session_id, retained)| {

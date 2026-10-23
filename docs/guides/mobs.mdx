@@ -1376,9 +1376,11 @@ its running turn: the member's runtime stop suspends a run that commits each
 round at its last committed round, as a crash leaves it, and the mob's next
 start resumes that run, redoing the work since that commit. The run's waiter
 ends with `BoundedTurnFailure::RequeuedAcrossStop`. The runtime stop still
-cancels a run that commits no rounds, such as a live bridge run, and an
-autonomous member's running turn is still cancelled at once, since the
-Shutdown ends its kickoff. A member
+cancels a run that commits no rounds, such as a live bridge run. A durable
+autonomous member keeps its kickoff open: the next start resumes its run under
+the same objective, and the kickoff resolves when that run ends (an autonomous
+member that is not durable still has its kickoff closed and its run cancelled
+at once). A member
 input still queued behind the running turn is kept when it is a durable
 prompt in the queue lane that is neither directed nor bound to an objective,
 as a host human input submitted with `HandlingMode::Queue` is. It

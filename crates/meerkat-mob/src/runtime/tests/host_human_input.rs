@@ -2765,10 +2765,11 @@ async fn a_default_shutdown_keeps_a_queued_human_input_as_a_requeue_shutdown_doe
 /// behind a running turn stays durably queued: its waiter is told it was
 /// requeued, its row keeps its payload, its replay identity and a requeue
 /// mark, it has no terminal completion and no carrier, and nothing ran it.
-/// The running input is still cancelled and is not run again. After the
-/// restart the requeued input runs exactly once, its first model request
-/// does not carry the cancelled turn's user message, and a same-key replay
-/// re-attaches to its result.
+/// The member is a durable autonomous member, so the Shutdown keeps its
+/// running turn too: that input's waiter is told it was kept, and after the
+/// restart it runs to its end before the requeued input, which runs exactly
+/// once, its first model request carrying the running turn's user message,
+/// and a same-key replay re-attaches to its result.
 async fn keeps_a_queued_human_input_across_the_shutdown(
     mob_name: &str,
     options: crate::ShutdownOptions,
@@ -2794,6 +2795,7 @@ async fn keeps_a_queued_human_input_across_the_shutdown(
     .await
     .expect("running human admission");
     client.wait_for_requests(requests_before + 1).await;
+    let running_id = admitted_input_id(&host.runtime_store, &session_id, &running_key).await;
     let key = delivery("requeue-queued-behind");
     let interaction_id = interaction(&key);
     let spec = WorkSpec::new(QUEUED_HUMAN, WorkOrigin::External);
@@ -2828,28 +2830,35 @@ async fn keeps_a_queued_human_input_across_the_shutdown(
         QUEUED_HUMAN,
     )
     .await;
-    let running_runs = runs_started_for(
-        &stop_events(&root_path, &session_id).await,
-        interaction(&running_key),
+    // The kept running turn ran to its end after the restart, before the
+    // requeued input, whose replay above waited for it.
+    let running_phase = stop_row(
+        &restarted.runtime_store,
+        &session_id,
+        &running_key,
+        &running_id,
     )
-    .len();
+    .await
+    .stored
+    .seed
+    .phase;
     // The kept input's first model request after the restart shows whether
-    // the cancelled turn's user message is still in the transcript.
+    // the running turn's user message is in the transcript before it.
     let restart_requests = restarted_client.requests();
-    let first_kept_request_carries_cancelled_text = restart_requests
+    let first_kept_request_carries_running_text = restart_requests
         .iter()
         .find(|request| requests_carrying(std::slice::from_ref(*request), QUEUED_HUMAN) == 1)
         .map(|request| requests_carrying(std::slice::from_ref(request), HUMAN) == 1);
     assert_eq!(
-        first_kept_request_carries_cancelled_text,
-        Some(false),
-        "the kept input's first request after the restart does not carry the \
-         cancelled turn's user message"
+        first_kept_request_carries_running_text,
+        Some(true),
+        "the kept input's first request after the restart carries the kept running \
+         turn's user message"
     );
     assert_eq!(
-        (running_answer, at_stop, after_restart, running_runs),
+        (running_answer, at_stop, after_restart, running_phase),
         (
-            StopAnswer::Cancelled,
+            StopAnswer::RequeuedAcrossStop(running_id.clone()),
             RequeuedAtStop {
                 waiter: StopAnswer::RequeuedAcrossStop(input_id.clone()),
                 phase: InputLifecycleState::Queued,
@@ -2870,10 +2879,10 @@ async fn keeps_a_queued_human_input_across_the_shutdown(
                 requests_carrying: 1,
                 runs_started: 1,
             },
-            1,
+            InputLifecycleState::Consumed,
         ),
-        "the requeued input stays queued across the stop and runs once after the restart; \
-         the cancelled running input is not run again"
+        "the requeued input stays queued across the stop and runs once after the restart, \
+         after the kept running turn"
     );
     tokio::time::timeout(WAIT, restarted.handle.shutdown())
         .await
@@ -3153,8 +3162,8 @@ async fn requeue_shutdown_runs_requeued_inputs_in_admission_order_before_new_wor
 }
 
 /// Requeue keeps only eligible inputs: a Steer-mode input queued behind the
-/// running turn targets the cancelled run, so it is not requeued and never
-/// runs after the restart.
+/// running turn, not yet joined to its run, is not requeued and never runs
+/// after the restart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn requeue_shutdown_does_not_keep_a_steer_input_queued_behind_the_running_turn() {
     use meerkat_runtime::input_state::InputLifecycleState;
@@ -4803,8 +4812,8 @@ async fn a_plain_stop_still_cancels_an_autonomous_members_in_flight_turn() {
 /// An autonomous member whose current run is its kickoff, its model call
 /// held, when the host stops with `StopOptions::leave_runs_running`: the
 /// Stop leaves the kickoff run running, the drain reports it still running
-/// once its bound has passed, and the Shutdown that follows cancels it as it
-/// would without a drain.
+/// once its bound has passed, and the Shutdown that follows, an explicit
+/// `QueuedInputsOnShutdown::Stop`, cancels it as it would without a drain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_kickoff_run_still_running_at_the_drain_bound_is_cancelled_by_the_shutdown() {
     use meerkat_core::event::AgentErrorClass;
@@ -4834,7 +4843,7 @@ async fn a_kickoff_run_still_running_at_the_drain_bound_is_cancelled_by_the_shut
         .expect("the drain returns at its bound")
         .expect("drain a stopped mob");
     let waited = started.elapsed();
-    tokio::time::timeout(WAIT, host.handle.shutdown())
+    tokio::time::timeout(WAIT, host.handle.shutdown_with_report(stop_options()))
         .await
         .expect("the graceful stop finishes")
         .expect("graceful stop");
@@ -4875,5 +4884,149 @@ async fn a_kickoff_run_still_running_at_the_drain_bound_is_cancelled_by_the_shut
             1,
         ),
         "the kickoff run outlives the drain's bound and the Shutdown cancels it"
+    );
+}
+
+/// A durable autonomous member caught mid-turn by the default Shutdown keeps
+/// its work for the next start: the Shutdown neither closes its kickoff nor
+/// cancels its run (no run outcome in the report, no failure in the log), and
+/// after the restart the run comes back and the kickoff resolves as started
+/// under the same objective, its prompt asked of the model once more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_default_shutdown_keeps_a_durable_autonomous_members_kickoff_for_the_next_start() {
+    let (_root, root_path) = stop_root();
+    let client = ScriptedClient::new(false);
+    let host = open_stop_host(&root_path, &client, Some("kickoff-kept")).await;
+    let mob_id = host.handle.mob_id().clone();
+    let identity = AgentIdentity::from(format!("host-human-stop-{}", Uuid::new_v4().simple()));
+    let session_id = host
+        .handle
+        .spawn(
+            ProfileName::from("lead"),
+            identity.clone(),
+            Some(KEPT_KICKOFF.into()),
+        )
+        .await
+        .expect("spawn autonomous member")
+        .bridge_session_id()
+        .expect("local session member")
+        .clone();
+    client.wait_for_requests(1).await;
+    let before = host
+        .handle
+        .get_member(&identity)
+        .await
+        .expect("roster read")
+        .expect("the member is in the roster")
+        .kickoff
+        .expect("the member has a kickoff");
+
+    let report = tokio::time::timeout(
+        WAIT,
+        host.handle
+            .shutdown_with_report(crate::ShutdownOptions::default()),
+    )
+    .await
+    .expect("the graceful stop finishes")
+    .expect("graceful stop");
+    let events = stop_events(&root_path, &session_id).await;
+    let kickoff_run = events.iter().find_map(|event| match event {
+        AgentEvent::RunStarted { identity, .. } => identity.run_id.clone(),
+        _ => None,
+    });
+    let failures_at_stop = kickoff_run
+        .as_ref()
+        .map(|run_id| run_failures(&events, run_id).len());
+    drop(host);
+    await_supervisor_route_release(&mob_id).await;
+
+    let restarted_client = ScriptedClient::new(true);
+    let restarted = open_stop_host(&root_path, &restarted_client, None).await;
+    tokio::time::timeout(WAIT, restarted.handle.wait_for_kickoff_complete(Some(WAIT)))
+        .await
+        .expect("the kept kickoff resolves after the restart")
+        .expect("kickoff wait");
+    let after = restarted
+        .handle
+        .get_member(&identity)
+        .await
+        .expect("roster read")
+        .expect("the member survives the restart")
+        .kickoff
+        .expect("the member keeps its kickoff");
+    assert_eq!(
+        (
+            report.runs.get(&identity).cloned(),
+            failures_at_stop,
+            after.phase,
+            after.objective_id == before.objective_id,
+            requests_carrying(&restarted_client.requests(), KEPT_KICKOFF),
+        ),
+        (
+            None,
+            Some(0),
+            crate::roster::MobMemberKickoffPhase::Started,
+            true,
+            1,
+        ),
+        "the Shutdown keeps the kickoff and its run; the restart resumes it under the same \
+         objective"
+    );
+    tokio::time::timeout(WAIT, restarted.handle.shutdown())
+        .await
+        .expect("mob shutdown finishes")
+        .expect("mob shutdown");
+}
+
+/// The kickoff prompt of the kept-kickoff row.
+const KEPT_KICKOFF: &str = "A kickoff a deploy keeps for the next start.";
+
+/// The same member under an explicit `QueuedInputsOnShutdown::Stop`: the
+/// Shutdown closes its kickoff and cancels its run, as before 0.9.5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_explicit_stop_shutdown_still_ends_a_durable_autonomous_members_kickoff() {
+    let (_root, root_path) = stop_root();
+    let client = ScriptedClient::new(false);
+    let host = open_stop_host(&root_path, &client, Some("kickoff-stopped")).await;
+    let identity = AgentIdentity::from(format!("host-human-stop-{}", Uuid::new_v4().simple()));
+    let session_id = host
+        .handle
+        .spawn(
+            ProfileName::from("lead"),
+            identity.clone(),
+            Some(KEPT_KICKOFF.into()),
+        )
+        .await
+        .expect("spawn autonomous member")
+        .bridge_session_id()
+        .expect("local session member")
+        .clone();
+    client.wait_for_requests(1).await;
+
+    let report = tokio::time::timeout(WAIT, host.handle.shutdown_with_report(stop_options()))
+        .await
+        .expect("the graceful stop finishes")
+        .expect("graceful stop");
+    let events = stop_events(&root_path, &session_id).await;
+    let kickoff_run = events.iter().find_map(|event| match event {
+        AgentEvent::RunStarted { identity, .. } => identity.run_id.clone(),
+        _ => None,
+    });
+    assert!(
+        matches!(
+            report.runs.get(&identity),
+            Some(crate::MemberStopRun::CancelledByShutdown { .. })
+        ),
+        "an explicit Stop cancels the kickoff run: {report:?}"
+    );
+    assert_eq!(
+        kickoff_run.as_ref().map(|run_id| {
+            run_failures(&events, run_id)
+                .into_iter()
+                .map(|report| report.class)
+                .collect::<Vec<_>>()
+        }),
+        Some(vec![meerkat_core::event::AgentErrorClass::Cancelled]),
+        "the kickoff run ends cancelled"
     );
 }

@@ -444,36 +444,15 @@ impl SpawnActivationWorkerContext {
                     "autonomous prompt admission failed for '{agent_identity}': {e}"
                 ))
             })?;
-        let log_id = agent_identity.clone();
-        let completion_command_tx = self.command_tx.clone();
-        let handle = tokio::spawn(async move {
-            if let Some(h) = completion_handle {
-                let outcome = h.wait().await;
-                let (ack_tx, ack_rx) = oneshot::channel();
-                if completion_command_tx
-                    .send(RoutedMobCommand::internal(
-                        MobCommand::KickoffOutcomeResolved {
-                            agent_identity: log_id.clone(),
-                            outcome,
-                            ack_tx,
-                        },
-                    ))
-                    .await
-                    .is_err()
-                {
-                    tracing::warn!(
-                        agent_identity = %log_id,
-                        "mob actor dropped before kickoff outcome could be recorded"
-                    );
-                } else {
-                    let _ = ack_rx.await;
-                }
-            }
-        });
+        let waiter = super::spawn_kickoff_outcome_waiter(
+            self.command_tx.clone(),
+            agent_identity.clone(),
+            completion_handle,
+        );
         self.autonomous_initial_turns
             .lock()
             .await
-            .insert(agent_identity.clone(), InitialTurnHandle { handle });
+            .insert(agent_identity.clone(), waiter);
         tracing::debug!(agent_identity = %agent_identity, "autonomous member started");
         Ok(())
     }
@@ -2807,7 +2786,11 @@ impl MobActor {
                 source: meerkat_runtime::InputOrigin::Operator,
                 durability: meerkat_runtime::InputDurability::Durable,
                 visibility: meerkat_runtime::InputVisibility::default(),
-                idempotency_key: None,
+                // One per incarnation: a start after a Shutdown that kept
+                // this kickoff's run finds the input by it.
+                idempotency_key: Some(super::local_kickoff_idempotency_key(
+                    &state.agent_runtime_id,
+                )),
                 supersession_key: None,
                 correlation_id: None,
             },

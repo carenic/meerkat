@@ -733,10 +733,13 @@ pub enum QueuedInputsOnShutdown {
     /// start resumes that run, redoing the work since that commit. The
     /// waiters of the run's inputs are answered
     /// [`RequeuedAcrossStop`](super::BoundedTurnFailure::RequeuedAcrossStop).
-    /// An autonomous member's running turn is still cancelled at once,
-    /// since the Shutdown ends its kickoff, and the runtime stop cancels a
-    /// run that commits no rounds (a live bridge run, or any run of a
-    /// session without a checkpointer).
+    /// An autonomous member whose session commits each round keeps its
+    /// kickoff open too: the next start resumes its run under the same
+    /// objective, and the kickoff resolves when that run ends. Any other
+    /// autonomous member's kickoff is closed and its run cancelled at once,
+    /// as under [`Self::Stop`]. The runtime stop cancels a run that commits
+    /// no rounds (a live bridge run, or any run of a session without a
+    /// checkpointer).
     ///
     /// Eligible queued inputs: a durable prompt in the queue lane that is
     /// still queued when the member's runtime stops, is not a directed

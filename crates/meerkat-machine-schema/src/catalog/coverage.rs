@@ -686,7 +686,7 @@ pub fn canonical_machine_coverage_manifests() -> Vec<MachineCoverageManifest> {
                     "mob_actor_authority",
                     "MobMachine",
                     "crates/meerkat-mob/src/runtime/actor.rs",
-                    "MobMachine actor authority and command execution for wire, unwire, spawn, ensure member, reconcile, observe runtime, submit work, retire, recover durable incarnations, complete, mark completed, stop/stopped, resume, force cancel, subscribe events, shutdown, classify exact autonomous shutdown interruption versus terminal retirement anchors, destroy, terminalized member, record operator action provenance, flow, run, create frame seed, create loop seed, project frame phase, project loop state, orchestrator, coordinator, cleanup, append failure ledger, escalate supervisor, peer, progress, notices, kickoff pending/replay and resolve started/callback pending/failed/clear, wiring graph, and session binding",
+                    "MobMachine actor authority and command execution for wire, unwire, spawn, ensure member, reconcile, observe runtime, submit work, retire, recover durable incarnations, complete, mark completed, stop/stopped, resume, force cancel, subscribe events, shutdown, classify exact autonomous shutdown interruption versus terminal retirement anchors and kept durable runs, destroy, terminalized member, record operator action provenance, flow, run, create frame seed, create loop seed, project frame phase, project loop state, orchestrator, coordinator, cleanup, append failure ledger, escalate supervisor, peer, progress, notices, kickoff pending/replay and resolve started/callback pending/failed/clear, wiring graph, and session binding",
                     CoverageClaims::none()
                         .transitions(&[
                             "ReconcileStopped",
@@ -738,6 +738,9 @@ pub fn canonical_machine_coverage_manifests() -> Vec<MachineCoverageManifest> {
                             "ResolveAutonomousShutdownMemberActionInterruptRunning",
                             "ResolveAutonomousShutdownMemberActionInterruptStopped",
                             "ResolveAutonomousShutdownMemberActionInterruptCompleted",
+                            "ResolveAutonomousShutdownMemberActionKeepForResumeRunning",
+                            "ResolveAutonomousShutdownMemberActionKeepForResumeStopped",
+                            "ResolveAutonomousShutdownMemberActionKeepForResumeCompleted",
                         ])
                         .effects(&[
                             "AppendOperatorActionProvenance",

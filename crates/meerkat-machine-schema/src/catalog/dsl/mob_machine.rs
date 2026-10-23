@@ -1403,13 +1403,18 @@ macro_rules! mob_catalog_machine_dsl {
             Shutdown,
             // Shutdown observes mechanical session/runtime carriers for one
             // exact autonomous roster incarnation. MobMachine owns the
-            // semantic choice: interrupt a live member, or skip a
+            // semantic choice: interrupt a live member, keep a live durable
+            // member's running turn for the next start, or skip a
             // disposal-complete Retiring row retained only to retry terminal
             // journal publication. Disposal may be either a Mob-owned archive
             // or a host-owned runtime release. Placed release completion is an
             // exact durable event observation supplied by the shell; peer-only
             // completion is already represented in machine-owned checkpoint
-            // and supervisor-revocation markers.
+            // and supervisor-revocation markers. `keeps_durable_run` is the
+            // shell's observation that this Shutdown unregisters the member's
+            // local session with a requeue and that the session commits each
+            // round, so the runtime stop suspends its running turn instead of
+            // ending it.
             ResolveAutonomousShutdownMemberAction {
                 agent_identity: AgentIdentity,
                 agent_runtime_id: AgentRuntimeId,
@@ -1421,6 +1426,7 @@ macro_rules! mob_catalog_machine_dsl {
                 runtime_residue_present: bool,
                 archive_authority_known: bool,
                 placed_release_confirmed: bool,
+                keeps_durable_run: bool,
             },
             ForceCancel { agent_identity: AgentIdentity },
             KickoffMarkPending { member_id: AgentIdentity, objective_id: String },
@@ -4013,8 +4019,12 @@ macro_rules! mob_catalog_machine_dsl {
         // carriers. A peer-only member needs machine-owned remote-retired and
         // supervisor-revoked markers. A placed member needs its retained exact
         // carrier plus the shell's current-epoch exact release terminal. These
-        // are terminal-journal retry anchors; all other current incarnations
-        // remain interruptible. A stale identity incarnation or runtime mode
+        // are terminal-journal retry anchors. Every other current incarnation
+        // is interrupted, unless the Shutdown keeps a durable member's run for
+        // the next start (`keeps_durable_run`) and the member is not Retiring:
+        // that member is kept, its kickoff left open and its running turn left
+        // to the runtime stop, which suspends it. A Retiring member is still
+        // interrupted. A stale identity incarnation or runtime mode
         // no-matches; incomplete carrier observations fail closed to
         // Interrupt.
         transition ResolveAutonomousShutdownMemberActionLocalTerminalRetryAnchor {
@@ -4029,7 +4039,8 @@ macro_rules! mob_catalog_machine_dsl {
                 session_projection_visible,
                 runtime_residue_present,
                 archive_authority_known,
-                placed_release_confirmed
+                placed_release_confirmed,
+                keeps_durable_run
             }
             guard "exact_runtime" {
                 self.identity_to_runtime.get_cloned(agent_identity) == Some(agent_runtime_id)
@@ -4099,7 +4110,8 @@ macro_rules! mob_catalog_machine_dsl {
                 session_projection_visible,
                 runtime_residue_present,
                 archive_authority_known,
-                placed_release_confirmed
+                placed_release_confirmed,
+                keeps_durable_run
             }
             guard "exact_runtime" {
                 self.identity_to_runtime.get_cloned(agent_identity) == Some(agent_runtime_id)
@@ -4162,7 +4174,8 @@ macro_rules! mob_catalog_machine_dsl {
                 session_projection_visible,
                 runtime_residue_present,
                 archive_authority_known,
-                placed_release_confirmed
+                placed_release_confirmed,
+                keeps_durable_run
             }
             guard "exact_runtime" {
                 self.identity_to_runtime.get_cloned(agent_identity) == Some(agent_runtime_id)
@@ -4226,7 +4239,8 @@ macro_rules! mob_catalog_machine_dsl {
                 session_projection_visible,
                 runtime_residue_present,
                 archive_authority_known,
-                placed_release_confirmed
+                placed_release_confirmed,
+                keeps_durable_run
             }
             guard "exact_runtime" {
                 self.identity_to_runtime.get_cloned(agent_identity) == Some(agent_runtime_id)
@@ -4297,10 +4311,114 @@ macro_rules! mob_catalog_machine_dsl {
                 || self.runtime_retire_pending_sessions.contains_key(agent_runtime_id) == true
                 || placed_release_confirmed == false
             }
+            guard "not_kept_for_resume" {
+                keeps_durable_run == false
+                || self.member_state_markers.get_cloned(agent_runtime_id) == Some(MobMemberState::Retiring)
+            }
             update {}
             to Running
             emit AutonomousShutdownMemberActionResolved {
                 action: AutonomousShutdownMemberActionKind::Interrupt,
+                agent_identity: agent_identity,
+                agent_runtime_id: agent_runtime_id,
+                fence_token: fence_token,
+                generation: generation,
+                session_id: session_id,
+            }
+        }
+
+        transition ResolveAutonomousShutdownMemberActionKeepForResume {
+            per_phase [Running, Stopped, Completed]
+            on input ResolveAutonomousShutdownMemberAction {
+                agent_identity,
+                agent_runtime_id,
+                fence_token,
+                generation,
+                session_id,
+                session_has_live_actor,
+                session_projection_visible,
+                runtime_residue_present,
+                archive_authority_known,
+                placed_release_confirmed,
+                keeps_durable_run
+            }
+            guard "exact_runtime" {
+                self.identity_to_runtime.get_cloned(agent_identity) == Some(agent_runtime_id)
+            }
+            guard "exact_generation" {
+                self.identity_runtime_generations.get_copied(agent_identity) == Some(generation)
+            }
+            guard "exact_fence" {
+                self.identity_runtime_fence_tokens.get_copied(agent_identity) == Some(fence_token)
+            }
+            guard "autonomous_member" {
+                self.member_runtime_modes.get_cloned(agent_identity) == Some(SpawnPolicyRuntimeMode::AutonomousHost)
+            }
+            guard "not_local_terminal_retry_anchor" {
+                self.member_state_markers.get_cloned(agent_runtime_id) != Some(MobMemberState::Retiring)
+                || self.live_runtime_ids.contains(agent_runtime_id) == true
+                || self.pending_session_ingress_detach_runtime_ids.contains(agent_runtime_id) == true
+                || self.member_kickoff_pending.contains(agent_identity)
+                || self.member_kickoff_starting.contains(agent_identity)
+                || self.member_kickoff_callback_pending.contains(agent_identity)
+                || !mob_machine_placed_kickoff_custody_absent_for_identity(
+                    self.pending_placed_kickoff_outcomes,
+                    self.resolved_placed_kickoff_outcomes,
+                    agent_identity)
+                || session_id == None
+                || self.runtime_retire_pending_sessions.get_cloned(agent_runtime_id) != session_id
+                || (self.member_session_bindings.contains_key(agent_identity) == true
+                    && self.member_session_bindings.get_cloned(agent_identity) != session_id)
+                || session_has_live_actor == true
+                || runtime_residue_present == true
+                || (archive_authority_known == true
+                    && session_projection_visible == true)
+            }
+            guard "not_peer_only_terminal_retry_anchor" {
+                self.member_state_markers.get_cloned(agent_runtime_id) != Some(MobMemberState::Retiring)
+                || self.pending_session_ingress_detach_runtime_ids.contains(agent_runtime_id) == true
+                || self.member_kickoff_pending.contains(agent_identity)
+                || self.member_kickoff_starting.contains(agent_identity)
+                || self.member_kickoff_callback_pending.contains(agent_identity)
+                || !mob_machine_placed_kickoff_custody_absent_for_identity(
+                    self.pending_placed_kickoff_outcomes,
+                    self.resolved_placed_kickoff_outcomes,
+                    agent_identity)
+                || session_id != None
+                || self.member_session_bindings.contains_key(agent_identity) == true
+                || self.member_placement.contains_key(agent_identity) == true
+                || self.runtime_retire_pending_sessions.contains_key(agent_runtime_id) == true
+                || self.remote_runtime_retired_ids.contains(agent_runtime_id) == false
+                || self.remote_supervisor_revoked_ids.contains(agent_runtime_id) == false
+            }
+            guard "not_placed_terminal_retry_anchor" {
+                self.member_state_markers.get_cloned(agent_runtime_id) != Some(MobMemberState::Retiring)
+                || self.pending_session_ingress_detach_runtime_ids.contains(agent_runtime_id) == true
+                || self.member_kickoff_pending.contains(agent_identity)
+                || self.member_kickoff_starting.contains(agent_identity)
+                || self.member_kickoff_callback_pending.contains(agent_identity)
+                || !mob_machine_placed_kickoff_custody_absent_for_identity(
+                    self.pending_placed_kickoff_outcomes,
+                    self.resolved_placed_kickoff_outcomes,
+                    agent_identity)
+                || session_id == None
+                || self.member_session_bindings.get_cloned(agent_identity) != session_id
+                || self.member_placement.contains_key(agent_identity) == false
+                || self.current_placed_spawn_ids.contains_key(agent_identity) == false
+                || !mob_machine_placed_cleanup_absent_for_identity(
+                    self.pending_placed_carrier_cleanup,
+                    agent_identity)
+                || self.runtime_retire_pending_sessions.contains_key(agent_runtime_id) == true
+                || placed_release_confirmed == false
+            }
+            guard "kept_for_resume" {
+                keeps_durable_run == true
+                && self.member_state_markers.get_cloned(agent_runtime_id) != Some(MobMemberState::Retiring)
+            }
+            update {}
+            to Running
+            emit AutonomousShutdownMemberActionResolved {
+                action: AutonomousShutdownMemberActionKind::KeepForResume,
                 agent_identity: agent_identity,
                 agent_runtime_id: agent_runtime_id,
                 fence_token: fence_token,
@@ -24485,12 +24603,16 @@ pub enum MobMemberState {
 /// Machine-owned shutdown action for one exact autonomous member
 /// incarnation. The fail-closed default keeps interruption enabled; skipping
 /// is reserved for a machine-proven terminal retirement retry anchor after
-/// either Mob-owned archive or host-owned runtime release.
+/// either Mob-owned archive or host-owned runtime release. Keeping is
+/// reserved for a live, non-retiring member whose Shutdown unregisters its
+/// durable session with a requeue: its kickoff stays open and the runtime
+/// stop suspends its running turn for the next start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum AutonomousShutdownMemberActionKind {
     #[default]
     Interrupt,
     SkipTerminalRetirementAnchor,
+    KeepForResume,
 }
 
 /// Typed public wait-admission result for member waits. MobMachine emits this

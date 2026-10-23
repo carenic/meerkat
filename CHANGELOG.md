@@ -1216,9 +1216,14 @@ them.
   Shutdown holds the member's run starts and does not cancel its running
   turn: the runtime stop suspends a run that commits each round at its last
   committed round, and the next start resumes it; a run that commits no
-  rounds (a live bridge run) is still cancelled. An autonomous member's
-  running turn is still cancelled at once. An explicit `with_queued_inputs`
-  choice applies as given, an explicit `Stop` included;
+  rounds (a live bridge run) is still cancelled. A durable autonomous member
+  keeps its kickoff open too: the Shutdown neither records it cancelled nor
+  cancels its run, and the next start resumes the run under the same
+  objective and resolves the kickoff when it ends. A local autonomous
+  kickoff input now carries the Core idempotency key
+  `mob-kickoff:<member runtime id>`, by which that start finds it again.
+  An explicit `with_queued_inputs` choice applies as given, an explicit
+  `Stop` included;
   `with_queued_inputs(QueuedInputsOnShutdown::Stop)` keeps the 0.9.4
   behavior, and is the Shutdown to use before a downgrade, since 0.9.4 cannot
   open a store that holds a kept input or run.
