@@ -360,13 +360,7 @@ struct RetirementArchiveObservationSource {
 
 impl RetirementArchiveObservationSource {
     async fn already_complete(&self, session: &SessionId) -> Result<bool, MobError> {
-        if self.service.has_live_session(session).await?
-            || self
-                .service
-                .load_persisted_session(session)
-                .await?
-                .is_some()
-        {
+        if super::member_session_present(self.service.as_ref(), session).await? {
             return Ok(false);
         }
         #[cfg(feature = "runtime-adapter")]
@@ -3191,9 +3185,7 @@ impl MobActor {
                             exact_local_target_quiescent: false,
                         });
                     };
-                    if service.has_live_session(&session).await?
-                        || service.load_persisted_session(&session).await?.is_some()
-                    {
+                    if super::member_session_present(service.as_ref(), &session).await? {
                         // A host-refused member keeps its durable session for
                         // the archive below, but its runtime may hold nothing
                         // to route a retire to.

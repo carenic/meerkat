@@ -457,6 +457,36 @@ fn is_transcript_revision_conflict(error: &meerkat_core::service::SessionError) 
     )
 }
 
+/// Whether a member's session is still present, live or durable, as read by
+/// a step that decides whether the member's session archive is still owed.
+///
+/// A turn stopped between its end-of-run checkpoint and its runtime boundary
+/// commit leaves a durable tail ahead of the runtime boundary, and every
+/// committed read of the session refuses with the typed
+/// `TranscriptRevisionConflict` until something settles that tail. The
+/// refusal itself proves the session is present and not archived. Only the
+/// session archive settles the tail, under the turn boundary and recovery
+/// gate it holds (or ends typed when the tail is held or refused), so a
+/// retirement, a destroy or a disposal goes on to that archive instead of
+/// ending on the refusal here. Nothing settles in this read, and every other
+/// read failure is returned.
+async fn member_session_present(
+    service: &dyn MobSessionService,
+    session: &SessionId,
+) -> Result<bool, MobError> {
+    match service.has_live_session(session).await {
+        Ok(true) => return Ok(true),
+        Ok(false) => {}
+        Err(error) if is_transcript_revision_conflict(&error) => return Ok(true),
+        Err(error) => return Err(error.into()),
+    }
+    match service.load_persisted_session(session).await {
+        Ok(persisted) => Ok(persisted.is_some()),
+        Err(error) if is_transcript_revision_conflict(&error) => Ok(true),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Classify a session read failure by its typed cause. Durable corruption and
 /// unsupported persistence are permanent observations; transport, I/O, and
 /// unknown failures remain retryable. Display text is diagnostic only.
@@ -46162,13 +46192,7 @@ impl MobActor {
         &mut self,
         session_id: &SessionId,
     ) -> Result<bool, MobError> {
-        if self.session_service.has_live_session(session_id).await?
-            || self
-                .session_service
-                .load_persisted_session(session_id)
-                .await?
-                .is_some()
-        {
+        if member_session_present(self.session_service.as_ref(), session_id).await? {
             return Ok(false);
         }
         #[cfg(feature = "runtime-adapter")]
