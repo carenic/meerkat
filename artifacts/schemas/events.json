@@ -2740,7 +2740,7 @@
         "description": "A Meerkat-native JSON schema."
       },
       "MobMemberBinding": {
-        "description": "Durable, typed identity of a mob member, carried on\n[`SessionMetadata`](crate::session::SessionMetadata).\n\nThis is the canonical owner of the `(mob_id, role, member)` identity fact\nthat ownership routing (`owns_persisted_bridge_session`) and outbound\npeer-added payloads previously recovered by splitting the untyped\n`comms_name` string and re-deriving the realm by format convention.\n\n`comms_name`/`realm_id`/`peer_meta` remain on the metadata as the transport\nrouting name and discovery metadata — identity and transport are separate\nfacts. Old persisted rows written before this field existed deserialize as\n`None` (the field is `#[serde(default, skip_serializing_if)]` on the\nmetadata), so back-read is safe.",
+        "description": "Durable, typed identity of a mob member, carried on\n[`SessionMetadata`](crate::session::SessionMetadata).\n\nThis is the canonical owner of the `(mob_id, role, member)` identity fact\nthat ownership routing (`owns_persisted_bridge_session`) and outbound\npeer-added payloads previously recovered by splitting the untyped\n`comms_name` string and re-deriving the realm by format convention.\n\n`comms_name`/`realm_id`/`peer_meta` remain on the metadata as the transport\nrouting name and discovery metadata - identity and transport are separate\nfacts. Old persisted rows written before this field existed deserialize as\n`None` (the field is `#[serde(default, skip_serializing_if)]` on the\nmetadata), so back-read is safe.",
         "properties": {
           "member": {
             "type": "string"
@@ -12115,7 +12115,7 @@
         "description": "A Meerkat-native JSON schema."
       },
       "MobMemberBinding": {
-        "description": "Durable, typed identity of a mob member, carried on\n[`SessionMetadata`](crate::session::SessionMetadata).\n\nThis is the canonical owner of the `(mob_id, role, member)` identity fact\nthat ownership routing (`owns_persisted_bridge_session`) and outbound\npeer-added payloads previously recovered by splitting the untyped\n`comms_name` string and re-deriving the realm by format convention.\n\n`comms_name`/`realm_id`/`peer_meta` remain on the metadata as the transport\nrouting name and discovery metadata — identity and transport are separate\nfacts. Old persisted rows written before this field existed deserialize as\n`None` (the field is `#[serde(default, skip_serializing_if)]` on the\nmetadata), so back-read is safe.",
+        "description": "Durable, typed identity of a mob member, carried on\n[`SessionMetadata`](crate::session::SessionMetadata).\n\nThis is the canonical owner of the `(mob_id, role, member)` identity fact\nthat ownership routing (`owns_persisted_bridge_session`) and outbound\npeer-added payloads previously recovered by splitting the untyped\n`comms_name` string and re-deriving the realm by format convention.\n\n`comms_name`/`realm_id`/`peer_meta` remain on the metadata as the transport\nrouting name and discovery metadata - identity and transport are separate\nfacts. Old persisted rows written before this field existed deserialize as\n`None` (the field is `#[serde(default, skip_serializing_if)]` on the\nmetadata), so back-read is safe.",
         "properties": {
           "member": {
             "type": "string"
