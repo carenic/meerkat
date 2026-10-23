@@ -35,6 +35,8 @@ them.
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-10-23
+
 ### Breaking
 
 - `meerkat-runtime`, `meerkat-core`, `meerkat-machine-schema`,
@@ -34337,7 +34339,8 @@ tag, so its comparison link uses v0.3.0 as the exact ancestry base.
 
 Initial development release.
 
-[Unreleased]: https://github.com/lukacf/meerkat/compare/v0.9.4...HEAD
+[Unreleased]: https://github.com/lukacf/meerkat/compare/v0.9.5...HEAD
+[0.9.5]: https://github.com/lukacf/meerkat/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/lukacf/meerkat/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/lukacf/meerkat/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/lukacf/meerkat/compare/v0.9.1...v0.9.2
