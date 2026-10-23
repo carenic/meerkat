@@ -7687,6 +7687,224 @@ async fn a_member_retired_after_its_runtime_stopped_over_a_cancelled_turns_tail_
     let _ = handle.shutdown().await;
 }
 
+/// A member retired before its runtime is registered again retires, though
+/// its last run was kept open with an input queued behind it.
+///
+/// The member's run commits one tool round and is held at its next model
+/// request; a second input queues behind it; then the host dies. The store
+/// keeps what a stop that keeps a durable run leaves: the run's continuable
+/// tail with its input bound to the run, and the queued input. The next start
+/// refuses the member's restore, so nothing registers its runtime (the start
+/// defers the member). Its retirement then reaches the archive, which ends
+/// the work the runtime kept for a later start through its lease's driver
+/// (the kept run's input and the queued input, both cancelled) and commits
+/// the tail as interrupted. RED before: the archive's recovery held the
+/// continuable tail beside the queued input and the retirement ended with
+/// `DurableTailHeldForRecovery`. Unrun: written while Cargo is not run.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_retired_before_its_kept_run_registers_again_retires() {
+    use meerkat_runtime::input_state::{InputAbandonReason, InputTerminalOutcome};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let power_store = Arc::new(PowerCutRuntimeStore::new(&paths.realm_db_path));
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = power_store.clone();
+
+    // ---------------- Lifetime 1 ----------------
+    let client_1 = Arc::new(HoldingToolLoopClient::new(2));
+    let (service_1, store_1) = persistent_head_canonical_service_with(
+        &paths,
+        runtime_store.clone(),
+        Config::default(),
+        client_1.clone(),
+    );
+    let handle_1 = MobBuilder::new(
+        mob_definition(MobRuntimeMode::TurnDriven),
+        MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage"),
+    )
+    .with_session_service(service_1.clone())
+    .with_default_llm_client(client_1.clone())
+    .create()
+    .await
+    .expect("create persistent mob");
+    handle_1
+        .spawn_spec(SpawnMemberSpec::new("lead", AgentIdentity::from("lead-1")))
+        .await
+        .expect("spawn lead");
+    handle_1
+        .spawn_spec(SpawnMemberSpec::new("worker", AgentIdentity::from("w-1")))
+        .await
+        .expect("spawn worker");
+    let identity = AgentIdentity::from("w-1");
+    let w1_sid = handle_1
+        .resolve_bridge_session_id(&identity)
+        .await
+        .expect("w1 session id");
+    let lead_sid = handle_1
+        .resolve_bridge_session_id(&AgentIdentity::from("lead-1"))
+        .await
+        .expect("lead session id");
+    let mut runtime_release_witnesses = Vec::new();
+    for session_id in [&lead_sid, &w1_sid] {
+        let runtime = service_1
+            .comms_runtime(session_id)
+            .await
+            .unwrap_or_else(|| panic!("comms runtime missing for {session_id}"));
+        runtime_release_witnesses.push(Arc::downgrade(&runtime));
+    }
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&w1_sid);
+
+    let member = handle_1.member(&identity).await.expect("member handle");
+    member
+        .send(
+            format!("{} token-kept", HoldingToolLoopClient::LOOP_MARKER),
+            HandlingMode::Queue,
+        )
+        .await
+        .expect("the run's input is admitted");
+    tokio::time::timeout(Duration::from_secs(30), client_1.wait_until_holding())
+        .await
+        .expect("the run commits its tool round and reaches its held model request");
+    assert!(
+        runtime_store
+            .load_head_canonical_provisional_tail(&runtime_id)
+            .await
+            .expect("load the provisional tail")
+            .is_some(),
+        "the run's committed round left a provisional tail"
+    );
+    member
+        .send(
+            "QUEUED_BEHIND_THE_KEPT_RUN token-queued".to_string(),
+            HandlingMode::Queue,
+        )
+        .await
+        .expect("an input queues behind the held run");
+
+    // The host dies: nothing the run would still write reaches the store.
+    power_store.set_cut(true);
+    handle_1
+        .crash_stop_preserving_durable_work_for_test()
+        .await
+        .expect("crash-stop lifetime-1 actor");
+    service_1
+        .try_shutdown()
+        .await
+        .expect("shutdown first session service");
+    drop(member);
+    drop(handle_1);
+    drop(service_1);
+    drop(store_1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runtime_release_witnesses
+            .iter()
+            .any(|runtime| runtime.upgrade().is_some())
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("process-loss fixture waits for every old session runtime to be released");
+
+    // ---------------- Lifetime 2 ----------------
+    // The member's restore is refused, so nothing registers its runtime.
+    power_store.set_cut(false);
+    let (service_2, store_2) = persistent_head_canonical_service(&paths, runtime_store.clone());
+    let customizer = Arc::new(RefuseOneRestore {
+        member: identity.clone(),
+        refusing: std::sync::atomic::AtomicBool::new(true),
+    });
+    let handle_2 = MobBuilder::for_resume(
+        MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage"),
+    )
+    .with_session_service(service_2.clone())
+    .with_default_llm_client(openai_test_client())
+    .with_spawn_member_customizer(customizer.clone())
+    .notify_orchestrator_on_resume(false)
+    .resume()
+    .await
+    .expect("the mob starts and defers the member whose restore was refused");
+
+    let retired = tokio::time::timeout(Duration::from_secs(60), handle_2.retire(identity.clone()))
+        .await
+        .expect("the retirement ends within its bound");
+    assert!(
+        retired.is_ok(),
+        "a member whose kept run never registered again must retire: {retired:?}"
+    );
+    assert!(
+        handle_2
+            .get_member(&identity)
+            .await
+            .expect("read the roster")
+            .is_none(),
+        "the retired member leaves the roster"
+    );
+    assert!(
+        runtime_store
+            .load_head_canonical_provisional_tail(&runtime_id)
+            .await
+            .expect("load the provisional tail")
+            .is_none(),
+        "the archive settled the kept run's tail"
+    );
+    assert_eq!(
+        committed_head_token(runtime_store.as_ref(), &w1_sid).await,
+        physical_head_token(&store_2, &w1_sid).await,
+        "the runtime authority names the physical head"
+    );
+
+    let rows = runtime_store
+        .load_input_states_strict(&runtime_id)
+        .await
+        .expect("read the member's input rows");
+    assert!(
+        rows.iter().all(|row| row.seed.terminal_outcome.is_some()),
+        "every input of the retired member is terminal: {rows:?}"
+    );
+    let ended_with = |reason: &InputAbandonReason| {
+        rows.iter()
+            .filter(|row| {
+                matches!(
+                    &row.seed.terminal_outcome,
+                    Some(InputTerminalOutcome::Abandoned { reason: ended }) if ended == reason
+                )
+            })
+            .count()
+    };
+    assert!(
+        ended_with(&InputAbandonReason::Cancelled) >= 2,
+        "the kept run's input and the queued input end cancelled: {rows:?}"
+    );
+    assert_eq!(
+        ended_with(&InputAbandonReason::Retired),
+        0,
+        "the retire's sweep finds nothing left to abandon: {rows:?}"
+    );
+
+    let retired_session = service_2
+        .load_revivable_retired_session(&w1_sid)
+        .await
+        .expect("read the member's retired session")
+        .expect("the retirement archived the member's session");
+    assert!(
+        matches!(
+            retired_session.messages().last(),
+            Some(meerkat_core::Message::SystemNotice(_))
+        ),
+        "the kept run is closed with the interrupted notice: {:?}",
+        retired_session.messages().last()
+    );
+    let history = to_string(retired_session.messages()).expect("serialize the retired transcript");
+    assert_eq!(
+        history.matches(HoldingToolLoopClient::LOOP_MARKER).count(),
+        1,
+        "the retired session keeps the kept run's prompt exactly once: {history}"
+    );
+    let _ = handle_2.shutdown().await;
+}
+
 /// One destructive reset as Meta's identity reset sends it: an atomic
 /// successor respawn onto a fresh session, with no parent auto-wiring.
 async fn destructive_reset(handle: &MobHandle, identity: &AgentIdentity) -> Result<(), String> {

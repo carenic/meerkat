@@ -6281,7 +6281,9 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// recovery commits the tail as interrupted instead of holding it beside
     /// a queued input, and finds nothing left to terminalize that the driver
     /// still holds. A nonterminal content input that is neither (bound to
-    /// another run) still holds the tail, typed.
+    /// another run) still holds the tail, typed. That work ends before the
+    /// recovery's verdict: a tail held or refused for another reason leaves
+    /// it cancelled, as a live retire's quiesce would.
     async fn settle_durable_tail_under_archive_gates(
         &self,
         id: &SessionId,
