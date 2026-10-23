@@ -542,7 +542,77 @@ them.
   `BUDGET_EXHAUSTED` until capacity is released. Terminal diagnostic details are
   limited to 1 KiB of UTF-8 text, preserving a 16 KiB terminal wire bound.
 
+- `meerkat-core`: `AgentEvent` gains the variant `RunResumed { session_id,
+  run_id, round, resume_point }`, wire type `run_resumed`, with the new enum
+  `RunResumePointKind` (`tools_pending`, `awaiting_model`; non-exhaustive).
+  A run resumed from its run cursor publishes it in place of `RunStarted`
+  (see Added, per-round commits). `AgentEvent` is non-exhaustive, so a Rust
+  match already has a wildcard arm; the published event catalog
+  (`meerkat_contracts::KNOWN_AGENT_EVENT_TYPES`) lists the new type, and the
+  generated SDK inventories with it. An SDK of this version surfaces the event
+  as its unknown-event form; an older SDK refuses the unknown type, as for any
+  newer contract.
+- Behaviour-only (not measured by the gate): `meerkat-core`: a
+  `SessionCheckpointer` whose `checkpoint_run` returns `Ok(None)` (no receipt)
+  for a run's first round commit now fails that tool round before any of its
+  tools runs: a round whose first commit is not durable dispatches nothing.
+  Before, `Ok(None)` was accepted at every checkpoint. The session layer's
+  checkpointer returns no receipt only for a session that has never committed
+  a boundary, and runtime-backed sessions commit their first boundary at
+  creation.
+
 ### Added
+
+- `meerkat-core`: per-round commits and resumable runs. A run whose agent has
+  a session checkpointer commits every tool round twice:
+  - The first commit comes after the model call and before any tool of the
+    round is admitted. It stages the round's assistant message in the
+    session's run cursor (`SessionRunCursor`, resume point `ToolsPending`)
+    and writes no transcript row.
+  - The second commit comes after the tools. It writes the message and its
+    results into the transcript together and moves the cursor to the next
+    model call (`AwaitingModel`).
+
+  A committed transcript therefore never ends in a tool call without its
+  result, and the run's end-of-run save removes the cursor. The cursor also
+  carries what a resumed run restores: its bound inputs, round, turn and tool
+  counters, the turn horizon it had used, its usage account, a staged
+  permanent model-routing request, and the asynchronous operations the round
+  started. Under WholeBlob every commit writes the whole session document, so
+  a long WholeBlob session pays two such writes per tool round; HeadCanonical
+  writes the new rows only. An ephemeral session has no checkpointer and
+  writes nothing per round.
+  - `Agent::resume_run(cursor, receipt, event_tx, work_authorization,
+    interrupted_calls)` continues a run after a restart from the cursor of the
+    provisional tail the session layer adopted. The run keeps its run id,
+    bound inputs, round and counters, and publishes `RunResumed` in place of
+    `RunStarted`. At `ToolsPending` the staged message is the round's model
+    response: the model is not asked again, and its tool calls are dispatched
+    again under their call ids through full admission (pre-tool hooks,
+    visibility, review; no earlier approval is reused), with nothing published
+    again for the message itself. At `AwaitingModel` the run makes its next
+    model call.
+  - Delivery is at least once. Every dispatch of an agent-loop round carries
+    the round in its `ToolDispatchContext`, and
+    `ToolDispatchContext::tool_call_dedupe_key(call)` gives a call the same
+    `ToolCallDedupeKey` (run, round, call id, call digest) fresh and after a
+    resume, so a tool whose effects must not repeat deduplicates on it.
+  - Three kinds of call get an outcome-uncertain result instead of running
+    again: a call whose process custody shows its process may have run before
+    the restart, a call to one of Core's comms tools that sends to another
+    agent, and a call whose plan is Detached under a runner that cannot resume
+    or repeat it.
+  - A first commit that fails or returns no receipt fails its round before any
+    tool runs. A run that ends without an end-of-run save (a failure, a
+    cancellation, a callback suspension, a turn or budget cap) writes one more
+    checkpoint without the cursor, so a committed boundary never carries one.
+    At a callback suspension that write is required, because the suspension's
+    boundary commits it as the suspended state.
+  - `Agent::set_run_start_input_ids` stages the inputs a runtime batch binds
+    to the next run; each steer or peer input written into a running turn at a
+    boundary binds to the run too, and the cursor lists them all.
+    `Budget::resume_turn` and `Budget::turn_elapsed` carry the turn horizon
+    across a resume.
 
 - `meerkat_core::host_store`: the host store SPI, a small storage interface
   a host implements so that Core can keep a realm's durable state in the
@@ -1142,17 +1212,17 @@ them.
 
 ### Changed
 
-- `meerkat-core`, `meerkat-session`, `meerkat-runtime`: a HeadCanonical run
-  that compacts more often than `history_retained_rewrites` keeps now saves an
-  intra-run checkpoint at the next model boundary after its own tool results,
-  then retires its compaction history to the retention (see Fixed). A host
-  that stops after such a checkpoint and before the run's boundary commit (a
-  crash, a forced kill, an out-of-memory kill) now recovers the run on resume
-  as interrupted: its content up to the checkpoint is kept, the typed recovery
-  notice is appended, and its input is terminalized and not run again. Before,
-  such a stop lost the run's progress back to the committed boundary. Runs
-  without a checkpointer, WholeBlob sessions and live bridge runs that commit
-  nothing take no such checkpoint.
+- `meerkat-core`, `meerkat-session`, `meerkat-runtime`: a HeadCanonical run's
+  round commits (see Added, per-round commits) move its durable head over the
+  run's compaction rewrites, and the run retires its compaction history to
+  `history_retained_rewrites` after each of them (see Fixed). A host that stops
+  after such a commit and before the run's boundary commit (a crash, a forced
+  kill, an out-of-memory kill) keeps the run's content up to that commit: the
+  run continues from it on resume, or, when its inputs were already settled,
+  recovery commits it as interrupted with the typed recovery notice and its
+  input is not run again. Before, such a stop lost the run's progress back to
+  the committed boundary. Runs without a checkpointer and live bridge runs that
+  commit nothing take no round commit.
 
 - `meerkat-core`: the `FORK_INSTRUCTION_REFUSED` message for a fork the
   policy refuses (cause `policy_refuses`) names the setting that changes it:
@@ -1257,11 +1327,11 @@ them.
   long run of a HeadCanonical session kept every compaction's transcript
   rewrite in memory until the run ended, because retirement may not pass the
   durable head and the run saved only at its end; the committed session then
-  kept every rewrite of the run too. The run now moves its durable head with an
-  intra-run checkpoint once its history exceeds the retention (see Changed),
-  so it keeps at most one rewrite beyond `history_retained_rewrites` in
-  memory, and the committed session keeps no more than the retention.
-  Intra-run checkpoints no longer prune stored rewrite rows: the committed
+  kept every rewrite of the run too. The run now moves its durable head at
+  each of its round commits (see Changed), so it keeps at most one rewrite
+  beyond `history_retained_rewrites` in memory, and the committed session
+  keeps no more than the retention. Round commits prune no stored rewrite
+  rows: the committed
   boundary stays rebuildable for recovery until the boundary commit that
   promotes the run, which applies the run's retention cut in its own
   transaction and never past the promoted head's row-lineage anchor. Before, a
@@ -1878,6 +1948,24 @@ them.
   notification when ordinary outbound byte or message admission is saturated.
   Reserved capacity follows the stream through close races, pending delivery and
   transport disconnect, without blocking the agent event producer.
+
+### Known limitations
+
+- A durable run that resumes asks the model again for a round that took no
+  first commit: the round of a message that carries an image (the cursor
+  rides the session head, which media externalization does not reach), and,
+  in a session without a durable HeadCanonical head (WholeBlob), every round
+  after the run's first transcript rewrite. A provider that mints fresh call
+  ids for the repeated request (OpenAI, Anthropic) gives the repeated calls
+  new dedupe keys; only a call with the same id, name and arguments meets the
+  same key.
+- The usage of a model call that a restart interrupted is not recorded,
+  although the provider bills it. Asynchronous operations a resumed run was
+  waiting for ended with the restart: the run does not wait for them, and the
+  model is told their results will not arrive. The tools of a resumed run see
+  no current-turn content, as for a pending continuation, and the agent's
+  lifetime budget counters restart with the agent, as for any session a host
+  materializes after a restart.
 
 ## [0.9.4] - 2026-10-20
 

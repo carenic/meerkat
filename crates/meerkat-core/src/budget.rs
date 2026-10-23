@@ -887,6 +887,28 @@ mod tests {
         assert_eq!(budget.remaining_duration(), Some(Duration::ZERO));
     }
 
+    /// A run resumed after a restart continues its turn horizon from the
+    /// time the run had already used: only the rest of the limit remains, and
+    /// the time the host was down is not charged.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test(start_paused = true)]
+    async fn a_resumed_turn_continues_the_horizon_its_run_had_used() {
+        let mut budget =
+            Budget::new(BudgetLimits::default().with_max_turn_duration(Duration::from_secs(10)));
+        budget.resume_turn(Duration::from_secs(8));
+
+        assert_eq!(budget.turn_elapsed(), Duration::from_secs(8));
+        assert_eq!(budget.observe(), BudgetObservation::WithinLimit);
+        assert_eq!(budget.remaining_duration(), Some(Duration::from_secs(2)));
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let exceeded = budget
+            .observe()
+            .exceeded()
+            .expect("the resumed horizon expires at the rest of its limit");
+        assert_eq!(exceeded.dimension, BudgetDimension::Time);
+    }
+
     /// `begin_turn` re-arms the turn horizon and ONLY the turn horizon. This
     /// is the fact the agent-lifetime horizon cannot express: its epoch is
     /// agent construction, so on a long-lived agent it measures the session,

@@ -3644,6 +3644,38 @@ fn truncate_str(s: &str, max_bytes: usize) -> &str {
 mod tests {
     use super::*;
 
+    /// A resumed run's announcement carries its run, its cursor's round and
+    /// where it continues, under its own wire name, and reads back unchanged.
+    #[test]
+    fn run_resumed_has_its_own_wire_name_and_round_trips() {
+        let run_id = crate::lifecycle::RunId::new();
+        let event = AgentEvent::RunResumed {
+            session_id: SessionId::new(),
+            run_id: run_id.clone(),
+            round: 2,
+            resume_point: RunResumePointKind::ToolsPending,
+        };
+        assert_eq!(agent_event_type(&event), "run_resumed");
+        let wire = serde_json::to_value(&event).unwrap();
+        assert_eq!(wire["type"], "run_resumed");
+        assert_eq!(wire["round"], 2);
+        assert_eq!(wire["resume_point"], "tools_pending");
+        let parsed: AgentEvent = serde_json::from_value(wire).unwrap();
+        assert!(matches!(
+            parsed,
+            AgentEvent::RunResumed {
+                run_id: parsed_run,
+                round: 2,
+                resume_point: RunResumePointKind::ToolsPending,
+                ..
+            } if parsed_run == run_id
+        ));
+        assert_eq!(
+            serde_json::to_value(RunResumePointKind::AwaitingModel).unwrap(),
+            "awaiting_model"
+        );
+    }
+
     /// A completion recorded before the summary source existed still reads,
     /// with no source, and writes back to the same bytes; a current one
     /// carries the typed source on the wire.

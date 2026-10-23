@@ -20,6 +20,8 @@ mod hook_impl;
 #[cfg(all(test, feature = "workspace-tests"))]
 mod hooks_behavior_tests;
 pub(crate) mod reasoning_preference;
+#[cfg(all(test, feature = "workspace-tests"))]
+mod round_commit_tests;
 mod runner;
 pub mod skills;
 mod state;
