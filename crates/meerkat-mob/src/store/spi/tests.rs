@@ -806,12 +806,12 @@ async fn the_identity_write_fence_declares_the_hosts_longest_commit() {
     assert_eq!(fence.backoff_retry_bound(), Duration::from_secs(10));
     let held = bundle.realm.cell(&bundle.identity_scope).lock_owned().await;
     assert!(matches!(
-        fence.execute_if_current(Box::new(|| Ok(()))),
+        fence.execute_if_current(Box::new(|| Ok::<(), RuntimeStoreError>(()))),
         Ok(RuntimeStoreWriteFenceOutcome::Backoff { .. })
     ));
     drop(held);
     assert!(matches!(
-        fence.execute_if_current(Box::new(|| Ok(()))),
+        fence.execute_if_current(Box::new(|| Ok::<(), RuntimeStoreError>(()))),
         Ok(RuntimeStoreWriteFenceOutcome::Applied)
     ));
 }
