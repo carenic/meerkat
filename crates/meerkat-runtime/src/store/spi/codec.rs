@@ -63,7 +63,7 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 }
 
 pub(crate) fn unhex(text: &str) -> Result<Vec<u8>, SpiError> {
-    if text.len() % 2 != 0 || !text.is_ascii() {
+    if !text.len().is_multiple_of(2) || !text.is_ascii() {
         return Err(SpiError::Corrupt("malformed hex".into()));
     }
     (0..text.len())

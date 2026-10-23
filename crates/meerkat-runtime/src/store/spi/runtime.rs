@@ -598,7 +598,7 @@ impl SpiRuntimeStore {
             scopes.arm();
             let outcome = scopes.commit_in_place(deltas).await;
             if outcome.is_ok() {
-                apply(&mut *lock_records(&records));
+                apply(&mut lock_records(&records));
             }
             outcome
         });
@@ -1796,7 +1796,9 @@ impl RuntimeStore for SpiRuntimeStore {
         next_json: &[u8],
     ) -> Result<bool, RuntimeStoreError> {
         let binding = mob_host_binding_scope(mob_id);
-        let scopes = self.mob_host_scopes(&[binding.clone()], true).await?;
+        let scopes = self
+            .mob_host_scopes(std::slice::from_ref(&binding), true)
+            .await?;
         let matches = lock_records(&self.mob_host)
             .bindings
             .get(mob_id)
@@ -1820,7 +1822,9 @@ impl RuntimeStore for SpiRuntimeStore {
         expected_json: &[u8],
     ) -> Result<bool, RuntimeStoreError> {
         let binding = mob_host_binding_scope(mob_id);
-        let scopes = self.mob_host_scopes(&[binding.clone()], true).await?;
+        let scopes = self
+            .mob_host_scopes(std::slice::from_ref(&binding), true)
+            .await?;
         let matches = lock_records(&self.mob_host)
             .bindings
             .get(mob_id)

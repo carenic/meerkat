@@ -4646,10 +4646,8 @@ impl EphemeralRuntimeDriver {
         let non_terminal_ids: Vec<InputId> = self
             .ledger
             .iter()
-            .filter_map(|(id, _)| {
-                self.input_is_non_terminal_by_authority(id)
-                    .then(|| id.clone())
-            })
+            .filter(|&(id, _)| self.input_is_non_terminal_by_authority(id))
+            .map(|(id, _)| id.clone())
             .collect();
         let mut verdicts = Vec::with_capacity(non_terminal_ids.len());
         for id in non_terminal_ids {
