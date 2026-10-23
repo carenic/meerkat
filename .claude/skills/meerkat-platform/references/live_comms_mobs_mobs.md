@@ -50,7 +50,10 @@ live_comms_mobs_live.md and comms in live_comms_mobs_comms.md.
   the background; wait for `MobStopped`.
 - Rust `MobHandle::stop()` returns a `MobStopReport`.
   `shutdown_with_report(ShutdownOptions)` cancels in-flight runs immediately
-  and reports each member. Since 0.9.4 an admitted Shutdown closes admission
+  and reports each member, except that since 0.9.5 its default
+  (`QueuedInputsOnShutdown::RequeueDurable`) suspends the running turn of a
+  member whose session commits every round for the next start (see
+  `references/mobs.md`). Since 0.9.4 an admitted Shutdown closes admission
   first (reason `Shutdown`): while it runs, commands the close refuses fail
   with `AdmissionClosed` and every other request (stop, destroy, complete,
   retirement, reads, `status()`) gets the retryable
