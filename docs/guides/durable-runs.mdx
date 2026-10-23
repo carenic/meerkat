@@ -144,7 +144,7 @@ and Stop for a session without per-round commits:
 
 - `rkat-rpc`'s own shutdown, when its input ends (as when a client SDK
   exits), on SIGTERM and on an interrupt;
-- the REST server's shutdown on SIGTERM;
+- the REST server's shutdown on SIGTERM or an interrupt;
 - a mob Shutdown (`MobHandle::shutdown()`, or `ShutdownOptions` without
   `with_queued_inputs`), member by member: it suspends a durable member's
   running turn instead of cancelling it.
@@ -152,9 +152,10 @@ and Stop for a session without per-round commits:
 A host that chooses explicitly keeps its choice: an unregister with
 `UnregisterQueuedInputs::Stop`, or a Shutdown with
 `with_queued_inputs(QueuedInputsOnShutdown::Stop)`, ends runs in flight as
-before. The suspend does not wait for the round, so a long tool call does
-not hold up a shutdown, and a process killed during it leaves the run as a
-crash would.
+before. An embedding host's own unregister without a disposition still
+stops: `UnregisterQueuedInputs::default()` is `Stop`. The suspend does not
+wait for the round, so a long tool call does not hold up a shutdown, and a
+process killed during it leaves the run as a crash would.
 
 - **The stop does not wait for the round.** It stops the turn at once. The
   run continues from its last committed round, and the work since that
@@ -176,9 +177,10 @@ crash would.
 
 Any other way of stopping still ends the run in flight: a graceful stop
 that chooses Stop, an explicit stop or cancel, retiring, destroying or
-resetting the session. A session without per-round commits, such as an
-ephemeral one, has its run cancelled by every stop. A process that is
-killed leaves its runs as any crash does.
+resetting the session. So does a requeue stop that arrives while a steer is
+being written into the running turn. A session without per-round commits,
+such as an ephemeral one, has its run cancelled by every stop. A process
+that is killed leaves its runs as any crash does.
 
 ### When A Run Does Not Continue
 
@@ -232,18 +234,23 @@ Core delivers the key to every kind of tool, unchanged:
   host metadata uses that name, so the server always gets Core's key.
 - A callback tool answered by a client receives it as `dedupe_key`, an
   object with the four fields: in the JSON-RPC `tool/execute` request, and
-  in each pending call when a run suspends on callback tools
-  (`pending_tool_calls`, the `interaction_callback_pending` event and the
-  REST `CALLBACK_PENDING` details). The SDKs pass it to your handler as a
-  `ToolCallDedupeKey`: in Python to a handler that declares a `dedupe_key`
-  parameter, and in TypeScript and the Web SDK as the handler's optional
-  second argument. A missing or malformed key is no key; the call still
-  runs.
+  in each pending call when a run suspends on callback tools (the MCP
+  server's `pending_tool_calls`, the `interaction_callback_pending` event,
+  the REST `CALLBACK_PENDING` details, the CLI's pending output, and the
+  data of the JSON-RPC error a turn answers then: `data.dedupe_key` for one
+  call, `data.pending_tool_calls[].dedupe_key` for several). The SDKs pass
+  it to your handler as a `ToolCallDedupeKey`: in Python to a handler that
+  declares a `dedupe_key` parameter, and in TypeScript and the Web SDK as
+  the handler's optional second argument. A callback registered directly
+  with the Web runtime's `register_tool_callback` gets it as a JSON string
+  in its second argument, which `parseToolCallDedupeKey` reads. A missing
+  or malformed key is no key; the call still runs.
 
-A call made outside a run's tool round carries no key. Neither does a
-callback tool that runs as a detached job: the job deduplicates by its own
-submission key. For example, the parameters of an MCP `tools/call` request
-made in round 2, the run's third round:
+A call made outside a run's tool round carries no key, such as a call the
+host dispatches itself between rounds. Neither does a callback tool that
+runs as a detached job: the job deduplicates by its own submission key. For
+example, the parameters of an MCP `tools/call` request made in round 2, the
+run's third round:
 
 ```json
 {
@@ -370,20 +377,23 @@ fence:
   In the steady state this is a clock read, with no store request added to a
   round.
 
-The store sets the renew interval, the lease and the self-fence margin with
-`HostStore::fence_timing`:
+The store sets the renew interval, the lease, the self-fence margin and
+its longest commit with `HostStore::fence_timing`:
 
 | Setting | Default | Bounds |
 |---------|---------|--------|
 | Renew interval | 10 s | At least 1 s |
 | Lease | 30 s | At least 3 renew intervals, at most 1 hour |
 | Self-fence margin | One renew interval | At least 1 renew interval, and the lease minus the margin at least 2 renew intervals |
+| Longest commit | 2 s | Longer than zero, at most the lease |
 
 A shorter lease shortens the wait for the next process after a holder died,
 and at a takeover. A longer renew interval renews less often. The margin must
 be at least one renew interval plus twice the time your store may take to
 make a write visible to other readers, so declare a larger one for a store
-whose writes can lag.
+whose writes can lag. A write that meets another commit still in flight
+waits up to the longest commit before it backs off, so declare a longer one
+for a store whose commits are slow.
 
 ### Loading
 

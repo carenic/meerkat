@@ -397,12 +397,14 @@ Contract and limits: `docs/guides/durable-runs.mdx`.
   the kept queued prompts; if a bound input is older than `max_age` (from
   admission; unregister: no default, 1 ms to 24 h; mob: 15 min default) at
   that start, the inputs end `requeue_expired` instead. No Requeue, an
-  explicit stop/cancel, retire, destroy, reset, or a session without
-  per-round commits still ends the run. Requeue (15 min) is the default
-  of every graceful shutdown that does not choose, for durable sessions:
-  `rkat-rpc` (input end, SIGTERM, interrupt), REST (SIGTERM) and a mob
+  explicit stop/cancel, retire, destroy, reset, a requeue stop that meets a
+  steer being written into the turn, or a session without per-round
+  commits still ends the run. Requeue (15 min) is the default of every
+  graceful shutdown that does not choose, for durable sessions: `rkat-rpc`
+  (input end, SIGTERM, interrupt), REST (SIGTERM, interrupt) and a mob
   Shutdown without `with_queued_inputs`; an explicit `Stop` keeps 0.9.4
-  behaviour.
+  behaviour, and a host's own unregister without a disposition stops
+  (`UnregisterQueuedInputs::default()` is `Stop`).
 - Durable workers and the mob resume gate: `references/mobs.md`. Realms in a
   host's own database: `references/sessions_runtime_surfaces_storage_config.md`.
 

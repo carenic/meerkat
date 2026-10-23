@@ -94,7 +94,10 @@ Contract, obligations and conformance: `docs/reference/host-store-spi.mdx`.
   lease minus the self-fence margin ago. The margin defaults to one interval;
   a store declares its own with `FenceTiming::try_with_margin`, at least
   `renew interval + 2 x visibility lag`, and the window must stay at least
-  two intervals. `FencedOut` stops every write until the realm is reopened;
+  two intervals. A store also declares its longest commit
+  (`try_with_max_commit_latency`, default 2 s, at most the lease): a fenced
+  write that meets a commit in flight waits up to that long before it backs
+  off. `FencedOut` stops every write until the realm is reopened;
   after any other failed renew, or a lease that ran out, the holder writes
   and dispatches nothing until it re-acquires the fence, which it does by
   itself before its next write (a later renew never restores it); if

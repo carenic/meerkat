@@ -225,7 +225,12 @@ a crash (see [Durable Runs](/guides/durable-runs)). Integrations see:
     `SuspendRunForStop`, and `NormalizeRecoveredInputLifecycle` gains
     `bound_run_resumable`; `MeerkatMachineEffect` gains `ResumableRunMarked`,
     `ResumedRunAuthorized`, `ResumableRunReleased`, `ResumableRunSettled`
-    and `RunSuspendedForStop`.
+    and `RunSuspendedForStop`;
+  - the generated transition enums gain the per-phase transitions of these
+    inputs, among them the `SuspendRunForStop` arms,
+    `ClassifyDurableTailContinuable` and
+    `ClassifyStopInputDispositionRetainResumable`. Every new enum value is
+    appended last.
 
 **Do:** return a receipt from `checkpoint_run` once the checkpoint is
 durable, and an error when it cannot be made durable. A custom checkpointer
@@ -273,6 +278,11 @@ changes below):
 
 On the wire the field is optional and omitted when absent, so readers that
 ignore unknown fields are unaffected.
+
+A pending callback call stored with a dedupe key cannot be finalized after
+a downgrade to a runtime without the field, such as 0.9.4: its stored digest
+no longer verifies there. A call stored without a key keeps its bytes (see
+[Downgrading to 0.9.4](#downgrading-to-0-9-4)).
 
 **Do:** name the field (`dedupe_key: None` for a call outside an agent-loop
 round) where you build these with struct literals, add it or `..` to
@@ -403,12 +413,10 @@ WebSocket, and keep WebRTC for sessions that are not mob members.
 5. Pass `UnregisterQueuedInputsDisposition::Stop` and `0` where you build
    `BeginUnregisterSession` or `State` of the generated runtime machine.
 6. A graceful shutdown of a durable session now keeps its queued prompts
-   and its run in flight unless you choose `Stop`. 0.9.4 cannot open the
-   store while a kept input is still queued, and cannot read a kept or
-   expired input's row after that, so shut down with an explicit `Stop`
-   before a downgrade. Treat `RequeuedAcrossStop` as "runs at the next
-   start" (do not resubmit) and `RequeueExpired` as "resubmit if still
-   wanted".
+   and its run in flight unless you choose `Stop`. Before a downgrade,
+   follow [Downgrading to 0.9.4](#downgrading-to-0-9-4). Treat
+   `RequeuedAcrossStop` as "runs at the next start" (do not resubmit) and
+   `RequeueExpired` as "resubmit if still wanted".
 7. Add a wildcard arm where you match `RuntimeBindingsError`, and set
    `custody_deferred` in `MobMemberStatusResult` struct literals.
 8. Custom `SessionCheckpointer` implementations: return a receipt from
@@ -429,6 +437,35 @@ WebSocket, and keep WebRTC for sessions that are not mob members.
     described in [Durable Runs](/guides/durable-runs#the-dedupe-key).
 15. On `jsonl` or host-store realms, check the write volume of long,
     tool-heavy runs.
+
+### Downgrading to 0.9.4
+
+Some state that 0.9.5 writes does not carry back to 0.9.4:
+
+- **Runs in flight.** 0.9.4 never continues a run. It closes a run that was
+  in flight when 0.9.5 last stopped (a crash, a kill, or a graceful stop
+  that kept the run) as interrupted, and ends the run's inputs without
+  running them again. Some of these sessions, such as one whose run stopped
+  in its first round or right after a compaction, do not open in 0.9.4 at
+  all until 0.9.5 has settled the run.
+- **Kept inputs.** 0.9.4 cannot open a store while an input that a
+  requeue stop kept is still queued, and cannot read a kept or expired
+  input's row after that (see Other behaviour changes above).
+- **Pending callback calls.** 0.9.4 cannot finalize a pending callback
+  call stored with a dedupe key: its stored digest no longer verifies there.
+
+Before you start 0.9.4 on a state root that 0.9.5 used:
+
+1. On 0.9.5, open each session that had a run in flight at the last stop,
+   and let the run end. Deliver the results of its pending callback calls,
+   or cancel the run.
+2. Shut down with an explicit `Stop` (an unregister with
+   `UnregisterQueuedInputs::Stop`, or a mob Shutdown with
+   `with_queued_inputs(QueuedInputsOnShutdown::Stop)`), so that no run and
+   no queued input is kept. For `rkat-rpc` and the REST server, whose own
+   shutdown keeps durable sessions' work, stop sending work and let every
+   run and queued input finish before you stop them.
+3. Then start 0.9.4.
 
 ## Upgrading to 0.9.4
 

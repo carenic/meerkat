@@ -65,8 +65,10 @@ and the run's inputs end abandoned as cancelled, not retried. A persistent
 session drops the run's uncommitted work; the next turn continues from the
 last committed transcript. Interrupt and stop do not target background shell
 jobs (use `jobs/cancel` or the `shell_job_cancel` tool). `rkat-rpc` on
-SIGTERM, Ctrl-C or stdin EOF cancels tracked in-flight requests after a short
-drain, then exits.
+SIGTERM, Ctrl-C or stdin EOF cancels the tracked in-flight requests of
+sessions without per-round commits after a short drain; a durable session's
+run in flight is suspended and continues at the session's next open (see the
+durable runs guide). Then it exits.
 
 ## Agent loop behaviour
 

@@ -205,13 +205,15 @@ own clock saw it, and the holder counts as live while it lasts.
 The host sizes the timing for its backend with `HostStore::fence_timing`,
 built with `FenceTiming::try_new(renew_interval, lease)` or, to declare the
 self-fence margin, `FenceTiming::try_with_margin(renew_interval, lease,
-self_fence_margin)`:
+self_fence_margin)`, and then, to declare the longest commit,
+`.try_with_max_commit_latency(max_commit_latency)`:
 
 | Setting | Default | Bounds |
 |---------|---------|--------|
 | Renew interval | 10 s (`FENCE_RENEW_INTERVAL_SECS`) | At least 1 s (`FenceTiming::MIN_RENEW_INTERVAL`) |
 | Lease | 30 s (`FENCE_LEASE_SECS`) | At least 3 renew intervals (`FENCE_MIN_LEASE_RENEWALS`), at most 1 hour (`FenceTiming::MAX_LEASE`) |
 | Self-fence margin | One renew interval (`try_new`) | At least 1 renew interval, and the lease minus the margin at least 2 renew intervals |
+| Longest commit | 2 s (`FENCE_MAX_COMMIT_LATENCY_SECS`) | Longer than zero, at most the lease |
 
 `FenceTiming::self_fence_window` is the lease minus the self-fence margin,
 and `try_with_margin` refuses a margin below one renew interval or a window
@@ -225,13 +227,20 @@ margin larger by twice that. A shorter lease shortens the wait for the next
 process after a holder died, and at a takeover. A longer renew interval
 renews less often.
 
+The longest commit is how long one `commit` can take on your backend
+(`FenceTiming::max_commit_latency`). A fenced write of Core's that meets a
+commit still in flight on the fence it checks waits up to that long before
+it reports the write as backed off, so a store whose commits are slower
+declares a longer bound instead of failing those writes.
+
 ### Core's Writer Rules
 
 The store relies on Core keeping these rules:
 
 - **Exclusive acquire.** Core acquires with `AcquireMode::Exclusive`, so two
-  processes never fence each other back and forth. Only an explicit takeover
-  uses `AcquireMode::Takeover`. Core also takes over its own recorded lease
+  processes never fence each other back and forth. Apart from Core taking
+  over its own recorded lease (below), only an explicit takeover uses
+  `AcquireMode::Takeover`. Core takes over its own recorded lease
   when a stopped holder re-acquires and an exclusive acquire answers `Held`
   with its own token.
 - **Renewing.** The holder renews once per renew interval. After a failed
