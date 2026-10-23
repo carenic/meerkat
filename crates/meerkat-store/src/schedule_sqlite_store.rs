@@ -2881,12 +2881,13 @@ fn resolve_due_terminal_in_txn(
 
 /// What one row's receipt history proves about its earlier attempts' target
 /// admission ([`AdmissionEvidence::from_receipt_stages`]). The receipts have
-/// no stage column, so this decodes each receipt of the occurrence through
-/// the tolerant JSON column codec (TEXT or BLOB), read through the
-/// `(occurrence_id, recorded_at_ms)` index inside the claim transaction. A
-/// row that was never claimed (`attempt_count == 0`) has no dispatch receipt
-/// and is not read. A receipt that does not decode is the row's typed fault
-/// (`Ok(Err(fault))`), never skipped; a store read failure returns `Err`.
+/// no stage column, so this decodes the stage of each receipt of the
+/// occurrence ([`StoredReceiptStage`]) through the tolerant JSON column codec
+/// (TEXT or BLOB), read through the `(occurrence_id, recorded_at_ms)` index
+/// inside the claim transaction. A row that was never claimed
+/// (`attempt_count == 0`) has no dispatch receipt and is not read. A receipt
+/// whose stage does not decode is the row's typed fault (`Ok(Err(fault))`),
+/// never skipped; a store read failure returns `Err`.
 fn read_admission_evidence_in_txn(
     tx: &rusqlite::Transaction<'_>,
     occurrence: &Occurrence,
@@ -2903,7 +2904,7 @@ fn read_admission_evidence_in_txn(
     let mut stages = Vec::new();
     for row in rows {
         let bytes = row?;
-        match serde_json::from_slice::<DeliveryReceipt>(&bytes) {
+        match serde_json::from_slice::<StoredReceiptStage>(&bytes) {
             Ok(receipt) => stages.push(receipt.stage),
             Err(error) => {
                 return Ok(Err(claim_row_fault(
@@ -2915,6 +2916,16 @@ fn read_admission_evidence_in_txn(
         }
     }
     Ok(Ok(AdmissionEvidence::from_receipt_stages(stages)))
+}
+
+/// The one field of a stored [`DeliveryReceipt`] the admission evidence
+/// reads. Its other fields are skipped unread, so a receipt whose other
+/// fields this build cannot decode (a newer release's variant, a corrupt
+/// timestamp) still yields its stage and no longer pins its row as a fault;
+/// a stage that does not decode still does.
+#[derive(serde::Deserialize)]
+struct StoredReceiptStage {
+    stage: meerkat_schedule::DeliveryReceiptStage,
 }
 
 fn write_receipt_in_txn(
