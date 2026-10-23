@@ -418,3 +418,91 @@ async fn a_long_run_without_a_checkpointer_keeps_what_its_durable_head_lacks() {
         "nothing the durable head lacks is retired without a checkpoint"
     );
 }
+
+/// Retirement after a checkpoint works only on the graph this process holds
+/// validated, for a session with a durable HeadCanonical head. A session
+/// without one (WholeBlob) keeps its graph as it is, so the first turn after a
+/// resume neither retires nor validates a graph its run did not change. A
+/// graph held only as unverified bytes is not parsed there, and the checkpoint
+/// still refuses it. A held graph the durable head covers retires to the
+/// retention.
+#[tokio::test]
+async fn retirement_after_a_checkpoint_needs_a_durable_head_and_a_held_graph() {
+    let retention =
+        TranscriptHistoryRetention::from_count(RETAINED_REWRITES).expect("non-zero retention");
+
+    let mut whole_blob = run_long_compacting_run(None, None).await;
+    let before = whole_blob
+        .transcript_history_state()
+        .expect("graph decodes")
+        .expect("graph present");
+    assert_eq!(
+        whole_blob
+            .retire_transcript_history_after_checkpoint(retention)
+            .expect("no error"),
+        None,
+        "a session without a durable head retires after each compaction instead"
+    );
+    let after = whole_blob
+        .transcript_history_state()
+        .expect("graph decodes")
+        .expect("graph present");
+    assert_eq!(
+        (after.commit_count(), after.retired_count()),
+        (before.commit_count(), before.retired_count())
+    );
+
+    let held = run_long_compacting_run(Some(0), None).await;
+    let graph = held
+        .transcript_history_state()
+        .expect("graph decodes")
+        .expect("graph present");
+    assert_eq!(
+        (graph.commit_count(), graph.retired_count()),
+        (TOOL_TURNS, 0),
+        "the durable head held every body back"
+    );
+
+    // The same graph as bytes without verified authority: retirement does not
+    // parse it, and every checkpoint still refuses it.
+    let mut unverified = held.clone();
+    unverified.note_durable_transcript_rewrites(TOOL_TURNS as u64);
+    unverified.set_metadata_unchecked_for_test(
+        crate::session::SESSION_TRANSCRIPT_HISTORY_STATE_KEY,
+        serde_json::to_value(&graph).expect("graph value"),
+    );
+    assert_eq!(
+        unverified
+            .retire_transcript_history_after_checkpoint(retention)
+            .expect("no error"),
+        None,
+        "a graph this process does not hold validated is left alone"
+    );
+    assert!(
+        unverified.validated_transcript_history_state().is_err(),
+        "a HeadCanonical checkpoint's graph read still refuses an unverified graph"
+    );
+    assert!(
+        unverified.to_persisted_bytes().is_err(),
+        "a WholeBlob checkpoint still refuses an unverified graph"
+    );
+
+    let mut covered = held.clone();
+    covered.note_durable_transcript_rewrites(TOOL_TURNS as u64);
+    assert_eq!(
+        covered
+            .retire_transcript_history_after_checkpoint(retention)
+            .expect("no error"),
+        Some(TOOL_TURNS - RETAINED_REWRITES),
+        "a held graph the durable head covers retires to the retention"
+    );
+    let retired = covered
+        .transcript_history_state()
+        .expect("graph decodes")
+        .expect("graph present");
+    assert_eq!(
+        (retired.commit_count(), retired.retired_count()),
+        (TOOL_TURNS, TOOL_TURNS - RETAINED_REWRITES),
+        "retirement keeps every commit and drops only the bodies past the retention"
+    );
+}
