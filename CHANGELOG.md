@@ -37,11 +37,16 @@ them.
 
 ### Breaking
 
-- `meerkat-contracts`: `WireProviderMeta` gains the
-  `GeminiFunctionCall { id, thought_signature }` variant, serialized with
-  `provider: "gemini_function_call"`. Downstream exhaustive Rust matches
-  and wire decoders must handle this metadata for provider-issued Gemini
-  call IDs. The existing signature-only `Gemini` variant is unchanged.
+- `meerkat-core::ProviderMeta` and `meerkat-contracts::WireProviderMeta` gain
+  the `GeminiFunctionCall { provider_id, thought_signature }` variant,
+  serialized with `provider: "gemini_function_call"` and required
+  `provider_id`. This replaces the unreleased variant's `id` field;
+  downstream exhaustive Rust matches and wire decoders must handle this
+  metadata for provider-issued Gemini call IDs. Persisted transcripts using
+  this metadata cannot be read after downgrading to a runtime or SDK that
+  lacks the variant or its required `provider_id` field. The existing
+  signature-only `Gemini` variant and Gemini's HTTP `functionCall.id` and
+  `functionResponse.id` fields are unchanged.
 
 - `meerkat-schedule`: the occurrence lifecycle carries the admission evidence
   of an occurrence's receipt history (see Fixed, scheduled delivery after a
@@ -516,13 +521,63 @@ them.
   variant and an enum marked non-exhaustive. A downstream match needs a
   wildcard arm; `rejected_before_effect` stays false for the new variant.
 
+- `meerkat`: `LiveOrchestrator` gains the field `session_addressing`
+  (`LiveSessionAddressing`: `SessionScoped` or `MobMember`), so code that
+  builds it with a struct literal sets it. A surface that opens live channels
+  by session id passes `SessionScoped`; the member live host passes
+  `MobMember` (see Fixed).
+- `meerkat-rpc`: WebRTC to a mob member is not available in 0.9.5. The
+  session-scoped `live/open` and `live/webrtc/answer` flow refuses a mob
+  member's session with `INVALID_PARAMS` and data kind
+  `mob_member_session_addressed_by_id` (see Fixed), and
+  `mob/member_live_open`, the route for a member, is WebSocket only.
 - `meerkat-contracts`: `MobMemberStatusResult` gains the field
   `custody_deferred: Option<WireMemberCustodyDeferral>`, absent from the wire
   unless the mob's start deferred the member's custody restore. Code that
   builds the result with a struct literal sets it.
 
+- Behaviour-only (not measured by the gate): RPC `session/stream_open` and
+  `mob/stream_open` now reserve bounded terminal delivery capacity. The process
+  admits at most 4096 active or queued terminal obligations; further opens return
+  `BUDGET_EXHAUSTED` until capacity is released. Terminal diagnostic details are
+  limited to 1 KiB of UTF-8 text, preserving a 16 KiB terminal wire bound.
+
 ### Added
 
+- `meerkat_core::host_store`: the host store SPI, a small storage interface
+  a host implements so that Core can keep a realm's durable state in the
+  host's own database, an append only store such as BigQuery included. A
+  host store holds scopes (a kind, a name, a versioned head and ordered
+  rows) and answers six operations: `acquire_fence`, `renew_fence`,
+  `load_head`, `list_heads` (listing, and the bulk load of heads at boot and
+  failover), `read_rows`, and `commit` of a `CommitBatch` over one or more
+  scopes (at most 8 MiB, each row at most 1 MiB). The module documentation
+  states the nine obligations and the valid ways to meet each, at commit or
+  at load. The host sizes the fence renew interval and lease through
+  `HostStore::fence_timing` (`FenceTiming`, by default 10 s and 30 s): an
+  exclusive acquire refuses typed (`HostStoreError::Held`) while another
+  holder's lease lasts, and a takeover's `FenceGrant` says how long the new
+  writer waits before it dispatches anything.
+- `meerkat-store-conformance`: `chapters::host_store` checks a host store
+  against those obligations through a `HostStoreFactory`, whose every open
+  stands for a new process: reopen; a kill before, during and after a commit;
+  stale fences, leases and takeovers, with a commit of unknown outcome; two
+  batches for one version; retries; rows, removal and listing over 210 scopes;
+  a batch at the size limits; 210 scopes committing concurrently; and a commit
+  held in flight on one scope, which must not block a commit on another. Where
+  a store may meet an obligation at commit or at load, the chapter accepts
+  both. `InMemoryHostStore`, the reference host store, passes it, meeting the
+  obligations at commit; its fence leases run on a manual clock or an outside
+  one. `chapters::long_run` and `chapters::durable_worker` drive Core through
+  a `LongRunHarness` or `DurableWorkerHarness` and kill a run or a durable
+  worker at each point of a round. A run resumes from its last durable commit
+  under the same run id: after a round's first commit it dispatches that
+  round's calls again under the same dedupe keys without asking the model, and
+  a started call of an unrepeatable tool gets the typed interrupted result
+  instead; otherwise the model is asked again for the round. A kill in round 0
+  before any commit requeues the input as a new run. Either way the input
+  finishes with every round once and one receipt, and over a store with fence
+  leases every restart waits out the killed process's lease.
 - `MemberBinding::labels()`: the application labels the incarnation was
   spawned with, as its spawn recorded them (a member reset keeps them). Every
   read of the member binding history carries them, the store-level
@@ -1779,6 +1834,21 @@ them.
   restore already failed, is deferred instead (see the entries next to this
   one).
 
+- `meerkat`, `meerkat-rpc`: the session-scoped `live/open`, and the
+  projection, refresh-config, identity and precheck reads behind it, restored
+  a mob member's session from storage by its session id alone when it was
+  not live, outside its mob (a member whose custody restore was deferred
+  stays down), and the open went ahead on a member session that was live,
+  with none of the checks the member's mob makes first (a member that is
+  retiring, in cleanup or revoke, or whose restore failed). Both are now
+  refused with `INVALID_PARAMS` (-32602) and data kind
+  `mob_member_session_addressed_by_id` (with the session, mob and member):
+  nothing is opened or restored, and `mob/member_live_open` opens the member
+  through its mob. A member therefore has no WebRTC channel (see Breaking).
+  The reads behind a channel that already exists find a live member session
+  as before.
+  `SessionError::mob_member_session_addressed_by_id` and
+  `SessionError::is_mob_member_session_addressed_by_id` name the refusal.
 - `meerkat-mob`: a mob restarted while another runtime owner on the realm
   hosts a retiring member's session now starts and runs. The start restores
   the retiring member's local cleanup delivery, which settles the session's
@@ -1795,6 +1865,19 @@ them.
   on its own, on the identity reconcile's backoff (250 ms doubling to 60 s),
   and once it succeeds the member's started retirement is re-driven and
   completes. Any other restore failure still fails the start.
+- `meerkat`: an agent built from an `AgentBuildConfig` whose mob tools are
+  disabled (`override_mob` `Disable`) while it carries a generated mob
+  operator authority context no longer mounts the factory's mob tool surface.
+  Only an embedder that builds the config directly can set both (session
+  build options resolve `Disable` to no authority context). The build's
+  external mob operator tools were already bound to no authority, hidden and
+  denying every call; the factory's own mob tools (`delegate`,
+  `mob_spawn_member` and the rest) still mounted beside them.
+
+- RPC session and mob streams retain their machine-authorized terminal
+  notification when ordinary outbound byte or message admission is saturated.
+  Reserved capacity follows the stream through close races, pending delivery and
+  transport disconnect, without blocking the agent event producer.
 
 ## [0.9.4] - 2026-10-20
 

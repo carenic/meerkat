@@ -3538,7 +3538,11 @@ impl SessionRunCursor {
 /// of the model again, and a provider may reuse a call id for a different
 /// call; the digest of the call's tool name and arguments keeps such calls
 /// apart, so a repeat is only a call with the same name and arguments.
+///
+/// Build it with [`ToolCallDedupeKey::new`], which computes the digest, so
+/// every producer derives the same key for the same call.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ToolCallDedupeKey {
     /// The run the call belongs to.
     pub run_id: RunId,
@@ -3546,8 +3550,130 @@ pub struct ToolCallDedupeKey {
     pub round: u64,
     /// Provider tool call id.
     pub call_id: String,
-    /// Digest of the call's tool name and canonical arguments.
+    /// [`tool_call_digest`] of the call's tool name and arguments: 64
+    /// lowercase hex characters.
     pub call_digest: String,
+}
+
+impl ToolCallDedupeKey {
+    /// The key of the call `call_id` to `tool_name` with `arguments`, in
+    /// round `round` of run `run_id`. Arguments that are not valid JSON are
+    /// an error.
+    pub fn new(
+        run_id: RunId,
+        round: u64,
+        call_id: impl Into<String>,
+        tool_name: &str,
+        arguments: &serde_json::value::RawValue,
+    ) -> Result<Self, serde_json::Error> {
+        Ok(Self {
+            run_id,
+            round,
+            call_id: call_id.into(),
+            call_digest: tool_call_digest(tool_name, arguments)?,
+        })
+    }
+}
+
+/// Domain prefix of [`tool_call_digest`]: it names the digest and its
+/// version, so no other digest Core computes can collide with it.
+const TOOL_CALL_DIGEST_DOMAIN: &[u8] = b"meerkat.tool_call_digest.v1\0";
+
+/// The digest [`ToolCallDedupeKey::call_digest`] carries for one call.
+///
+/// Byte for byte, it is the lowercase hex SHA-256 of, in order:
+/// 1. the ASCII bytes `meerkat.tool_call_digest.v1` and one zero byte;
+/// 2. the tool name's UTF-8 bytes;
+/// 3. one zero byte;
+/// 4. the arguments' canonical JSON: the same JSON value written without
+///    insignificant whitespace, with every object's keys sorted by their
+///    bytes, strings escaped as `serde_json` writes them and numbers as
+///    `serde_json` prints them. This is the form the transcript persists tool
+///    arguments in.
+///
+/// Canonical JSON never contains a raw zero byte, so the name and the
+/// arguments cannot shift into each other. Arguments that are not valid JSON
+/// are an error.
+pub fn tool_call_digest(
+    tool_name: &str,
+    arguments: &serde_json::value::RawValue,
+) -> Result<String, serde_json::Error> {
+    use std::fmt::Write as _;
+
+    let canonical = crate::types::canonicalize_raw_json(arguments)?;
+    let mut hasher = Sha256::new();
+    hasher.update(TOOL_CALL_DIGEST_DOMAIN);
+    hasher.update(tool_name.as_bytes());
+    hasher.update([0_u8]);
+    hasher.update(canonical.get().as_bytes());
+    let digest: [u8; 32] = hasher.finalize().into();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Ok(hex)
+}
+
+#[cfg(test)]
+mod tool_call_dedupe_key_tests {
+    use super::*;
+
+    fn raw(json: &str) -> Box<serde_json::value::RawValue> {
+        serde_json::value::RawValue::from_string(json.to_string()).unwrap()
+    }
+
+    // Unrun until the candidate's validation: the policy forbids Cargo while
+    // the batch is implemented.
+    #[test]
+    fn digest_matches_the_documented_bytes() {
+        // sha256(b"meerkat.tool_call_digest.v1\0" + b"search" + b"\0" +
+        //        b"{\"a\":\"x\",\"b\":1}"), computed outside Rust.
+        assert_eq!(
+            tool_call_digest("search", &raw(r#"{ "b": 1, "a": "x" }"#)).unwrap(),
+            "38b1125ea162352a034af675380c760044701e87c5f410996c40011108edaea9"
+        );
+    }
+
+    #[test]
+    fn key_order_and_whitespace_do_not_change_the_digest() {
+        assert_eq!(
+            tool_call_digest("search", &raw(r#"{"a":"x","b":1}"#)).unwrap(),
+            tool_call_digest("search", &raw(r#"{ "b" : 1 , "a" : "x" }"#)).unwrap()
+        );
+    }
+
+    #[test]
+    fn name_and_arguments_each_change_the_digest() {
+        let base = tool_call_digest("search", &raw(r#"{"a":"x","b":1}"#)).unwrap();
+        assert_eq!(
+            tool_call_digest("search", &raw(r#"{"a":"x","b":2}"#)).unwrap(),
+            "4c4b76e5b56910cab7d1a55f45dafc4a2a975b6886964503339567f67336dea3"
+        );
+        assert_ne!(
+            base,
+            tool_call_digest("fetch", &raw(r#"{"a":"x","b":1}"#)).unwrap()
+        );
+    }
+
+    #[test]
+    fn new_binds_the_digest() {
+        let run_id = RunId::new();
+        let key = ToolCallDedupeKey::new(
+            run_id.clone(),
+            3,
+            "call-1",
+            "search",
+            &raw(r#"{"b":1,"a":"x"}"#),
+        )
+        .unwrap();
+        assert_eq!(key.run_id, run_id);
+        assert_eq!(key.round, 3);
+        assert_eq!(key.call_id, "call-1");
+        assert_eq!(
+            key.call_digest,
+            "38b1125ea162352a034af675380c760044701e87c5f410996c40011108edaea9"
+        );
+    }
 }
 
 /// Durable control state for deferred first-turn prompt and staged callback tool results.

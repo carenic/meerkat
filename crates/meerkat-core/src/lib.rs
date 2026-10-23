@@ -570,7 +570,7 @@ pub use session::{
     resolve_resumed_session_auth_binding, resolve_resumed_session_llm_identity,
     resolve_session_auth_binding, resolve_session_llm_identity_override,
     session_metadata_document_from_slice, session_metadata_schema_version, session_version,
-    transcript_history_full_body_materializations, transcript_messages_digest,
+    tool_call_digest, transcript_history_full_body_materializations, transcript_messages_digest,
     transcript_rewrite_prefix_digest, try_lifecycle_terminal_from_map,
     try_session_metadata_from_map, try_tool_visibility_state_from_map,
     validate_current_persisted_transcript_history_slice,

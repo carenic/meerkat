@@ -17,6 +17,8 @@
 //! | [`assert_forwards_incremental`]            | `SessionStore`→`SessionStore` delegating wrappers |
 //! | [`blobs`] / [`dangling_blob_reference`]    | `BlobStore` (+ a `SessionStore` for the dangling shape) |
 //! | [`artifacts`]                              | `ArtifactStore` |
+//! | [`host_store`]                             | every `meerkat_core::host_store::HostStore` |
+//! | [`long_run`] / [`durable_worker`]          | Core over a store: a killed run or durable worker resumes |
 
 mod append_only;
 mod artifacts;
@@ -24,7 +26,9 @@ mod baseline;
 mod blobs;
 mod capability;
 mod guarded_projection;
+mod host_store;
 mod incremental;
+mod long_run;
 mod transcript_rewrite;
 
 pub use append_only::append_only;
@@ -33,5 +37,7 @@ pub use baseline::baseline;
 pub use blobs::{blobs, dangling_blob_reference};
 pub use capability::assert_forwards_incremental;
 pub use guarded_projection::guarded_projection;
+pub use host_store::host_store;
 pub use incremental::{incremental, incremental_head_canonical};
+pub use long_run::{durable_worker, long_run};
 pub use transcript_rewrite::transcript_rewrite;
