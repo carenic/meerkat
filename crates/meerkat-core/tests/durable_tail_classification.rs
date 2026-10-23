@@ -593,9 +593,7 @@ fn run_cursor_classification_is_total_disjoint_and_matches_the_truth_table() {
                                         && orphans == 0
                                         && !after_terminal
                                         && cursor != DurableTailRunCursor::Disagrees;
-                                    let expected = if !coherent {
-                                        DurableTailRecoveryClass::Ambiguous
-                                    } else {
+                                    let expected = if coherent {
                                         match (stop, cursor) {
                                             (
                                                 DurableTailStopReason::EndTurn,
@@ -618,6 +616,8 @@ fn run_cursor_classification_is_total_disjoint_and_matches_the_truth_table() {
                                             }
                                             _ => DurableTailRecoveryClass::Ambiguous,
                                         }
+                                    } else {
+                                        DurableTailRecoveryClass::Ambiguous
                                     };
                                     assert_eq!(
                                         got, expected,
