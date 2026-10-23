@@ -1019,6 +1019,17 @@ them.
   advisory, so the warning is a hint: the build itself is unchanged. It also
   shows once for a profile the mob gained since the member's previous build.
 
+- `meerkat-core`: `CoreExecutor::acknowledge_compaction_finalization` and
+  `SessionService::acknowledge_runtime_compaction_finalization` adopt the
+  runtime's HeadCanonical compaction-outbox finalization (a store-owned,
+  metadata-only head commit) on the live actor, and
+  `Session::acknowledge_head_canonical_compaction_finalization` rebases the
+  actor's metadata baseline over the compaction intents key. Both trait
+  methods refuse by default; the store-backed executors and session services
+  implement them. `meerkat-session`:
+  `SessionAgent::acknowledge_head_canonical_compaction_finalization` (refusing
+  by default) and `PersistentSessionService::acknowledge_runtime_compaction_finalization`.
+
 - `meerkat-mob`: `MobSessionService` gains `fork_source_tools`, the visible
   tool names a fork notice compares, read from the set the session task
   publishes at each command and turn boundary, so a source that is in the
@@ -1185,17 +1196,6 @@ them.
   and Web SDKs surface it as `{"unknown": value}` and ignore a field they do
   not know, instead of failing the read. A `custody_deferred` that is not an
   object, or whose restore or cause is not a string, is still refused.
-
-- `meerkat-core`: `CoreExecutor::acknowledge_compaction_finalization` and
-  `SessionService::acknowledge_runtime_compaction_finalization` adopt the
-  runtime's HeadCanonical compaction-outbox finalization (a store-owned,
-  metadata-only head commit) on the live actor, and
-  `Session::acknowledge_head_canonical_compaction_finalization` rebases the
-  actor's metadata baseline over the compaction intents key. Both trait
-  methods refuse by default; the store-backed executors and session services
-  implement them. `meerkat-session`:
-  `SessionAgent::acknowledge_head_canonical_compaction_finalization` (refusing
-  by default) and `PersistentSessionService::acknowledge_runtime_compaction_finalization`.
 
 ### Changed
 

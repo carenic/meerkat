@@ -1170,43 +1170,6 @@ impl PersistentRuntimeDriver {
             })
     }
 
-    /// The committed HeadCanonical head this runtime's store holds, as the
-    /// bounded authority an executor acknowledges: after a compaction-outbox
-    /// finalization it names the store-owned, metadata-only head commit the
-    /// live actor must adopt.
-    pub(crate) async fn committed_head_canonical_authority(
-        &self,
-    ) -> Result<meerkat_core::CommittedSessionBoundaryAuthority, RuntimeDriverError> {
-        let authority = self
-            .store
-            .load_session_boundary_authority(&self.runtime_id)
-            .await
-            .map_err(|error| {
-                RuntimeDriverError::Internal(format!(
-                    "failed to load the committed HeadCanonical authority of {}: {error}",
-                    self.runtime_id
-                ))
-            })?
-            .ok_or_else(|| {
-                RuntimeDriverError::Internal(format!(
-                    "{} holds no committed session authority after a compaction finalization",
-                    self.runtime_id
-                ))
-            })?;
-        let head = authority.head_canonical().ok_or_else(|| {
-            RuntimeDriverError::Internal(format!(
-                "{} holds a WholeBlob authority where a HeadCanonical compaction finalization committed",
-                self.runtime_id
-            ))
-        })?;
-        Ok(
-            meerkat_core::CommittedSessionBoundaryAuthority::HeadCanonical {
-                session_id: head.session_id().clone(),
-                committed_head_token: head.committed_head_token().to_string(),
-            },
-        )
-    }
-
     pub(crate) async fn load_compaction_checkpoint_snapshot(
         &self,
     ) -> Result<Option<Arc<Vec<u8>>>, RuntimeDriverError> {
@@ -1253,6 +1216,43 @@ impl PersistentRuntimeDriver {
                     "failed to load authoritative compaction checkpoint snapshot: {error}"
                 ))
             })
+    }
+
+    /// The committed HeadCanonical head this runtime's store holds, as the
+    /// bounded authority an executor acknowledges: after a compaction-outbox
+    /// finalization it names the store-owned, metadata-only head commit the
+    /// live actor must adopt.
+    pub(crate) async fn committed_head_canonical_authority(
+        &self,
+    ) -> Result<meerkat_core::CommittedSessionBoundaryAuthority, RuntimeDriverError> {
+        let authority = self
+            .store
+            .load_session_boundary_authority(&self.runtime_id)
+            .await
+            .map_err(|error| {
+                RuntimeDriverError::Internal(format!(
+                    "failed to load the committed HeadCanonical authority of {}: {error}",
+                    self.runtime_id
+                ))
+            })?
+            .ok_or_else(|| {
+                RuntimeDriverError::Internal(format!(
+                    "{} holds no committed session authority after a compaction finalization",
+                    self.runtime_id
+                ))
+            })?;
+        let head = authority.head_canonical().ok_or_else(|| {
+            RuntimeDriverError::Internal(format!(
+                "{} holds a WholeBlob authority where a HeadCanonical compaction finalization committed",
+                self.runtime_id
+            ))
+        })?;
+        Ok(
+            meerkat_core::CommittedSessionBoundaryAuthority::HeadCanonical {
+                session_id: head.session_id().clone(),
+                committed_head_token: head.committed_head_token().to_string(),
+            },
+        )
     }
 
     pub(crate) async fn commit_compaction_checkpoint_snapshot(

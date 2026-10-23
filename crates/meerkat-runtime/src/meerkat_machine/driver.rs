@@ -4414,6 +4414,15 @@ impl DriverEntry {
         }
     }
 
+    pub(crate) async fn load_compaction_checkpoint_snapshot(
+        &self,
+    ) -> Result<Option<Arc<Vec<u8>>>, RuntimeDriverError> {
+        match self {
+            DriverEntry::Ephemeral(_) => Ok(None),
+            DriverEntry::Persistent(driver) => driver.load_compaction_checkpoint_snapshot().await,
+        }
+    }
+
     /// The committed HeadCanonical head authority; see
     /// `PersistentRuntimeDriver::committed_head_canonical_authority`.
     pub(crate) async fn committed_head_canonical_authority(
@@ -4424,15 +4433,6 @@ impl DriverEntry {
                 "ephemeral runtime holds no committed HeadCanonical authority".to_string(),
             )),
             DriverEntry::Persistent(driver) => driver.committed_head_canonical_authority().await,
-        }
-    }
-
-    pub(crate) async fn load_compaction_checkpoint_snapshot(
-        &self,
-    ) -> Result<Option<Arc<Vec<u8>>>, RuntimeDriverError> {
-        match self {
-            DriverEntry::Ephemeral(_) => Ok(None),
-            DriverEntry::Persistent(driver) => driver.load_compaction_checkpoint_snapshot().await,
         }
     }
 
