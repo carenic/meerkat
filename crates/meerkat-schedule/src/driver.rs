@@ -656,6 +656,21 @@ impl ScheduleDriver {
                         ));
                     }
                 }
+                // An admitted delivery whose reclaims are used up ends
+                // delivery_failed (lease_lost) in the scan itself.
+                OccurrencePhase::DeliveryFailed => {
+                    if !commit
+                        .effects()
+                        .iter()
+                        .any(|effect| matches!(effect, OccurrenceLifecycleEffect::DeliveryFailed))
+                    {
+                        return Err(claim_scan_contract_violation(
+                            "claim scan committed a DeliveryFailed successor without a DeliveryFailed effect"
+                                .to_string(),
+                            first_fault.as_ref(),
+                        ));
+                    }
+                }
                 OccurrencePhase::Pending => {
                     if !commit
                         .effects()
@@ -5408,6 +5423,85 @@ mod tests {
         assert_eq!(misfired.attempt_count, 1, "no reclaim");
         assert!(delivery.existing_calls.lock().await.is_empty());
         assert!(delivery.keyed.admissions.lock().await.is_empty());
+        Ok(())
+    }
+
+    /// An admitted delivery whose executors keep dying is reclaimed past its
+    /// misfire deadline until its attempts reach the cap. The tick that
+    /// expires the last lapsed lease ends it delivery_failed with lease_lost
+    /// and reports no fault. Before, that tick reported the refused reclaim
+    /// as a row fault, and the next tick failed: its claim scan returned the
+    /// exhausted occurrence's DeliveryFailed successor, which the driver took
+    /// for a broken store contract, leaving the rest of that tick's claims
+    /// undelivered.
+    #[tokio::test]
+    async fn an_admitted_delivery_that_used_up_its_reclaims_ends_lease_lost_in_one_clean_tick()
+    -> Result<(), ScheduleDomainError> {
+        let store = Arc::new(MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>;
+        let service = ScheduleService::new(store.clone());
+        let delivery = Arc::new(ExistingOnlyKeyedDelivery::default());
+        let (schedule_id, _identity) = first_attempt_died_past_the_deadline(
+            &store,
+            &service,
+            &delivery.keyed,
+            FirstAttemptEnd::AdmissionRecorded,
+            "admitted-reclaims-used-up",
+        )
+        .await?;
+        // Every later executor dies too: each reclaim up to the cap lapses.
+        for attempt in 2..=crate::lifecycle::ADMITTED_RECLAIM_ATTEMPT_CAP {
+            let executor_lease = test_executor_lease(&store).await;
+            let reclaimed = store
+                .claim_due_occurrences(
+                    &executor_lease,
+                    ClaimDueRequest {
+                        owner_id: "dying-process".into(),
+                        limit: 1,
+                        lease_duration: Duration::milliseconds(25),
+                    },
+                )
+                .await?;
+            store.release_executor_lease(executor_lease).await?;
+            assert!(
+                reclaimed.row_faults.is_empty(),
+                "{:?}",
+                reclaimed.row_faults
+            );
+            assert_eq!(
+                the_occurrence(&service, &schedule_id).await?.attempt_count,
+                attempt
+            );
+            sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let driver = restarted_driver(&service, &store, delivery.clone());
+        let report = driver.tick_once().await?;
+        assert_eq!(
+            report.fault_count(),
+            0,
+            "the refused reclaim at the cap is no incident"
+        );
+        let ended = the_occurrence(&service, &schedule_id).await?;
+        assert_eq!(
+            (ended.phase, ended.failure_class),
+            (
+                OccurrencePhase::DeliveryFailed,
+                Some(OccurrenceFailureClass::LeaseLost)
+            )
+        );
+        assert_eq!(
+            ended.attempt_count,
+            crate::lifecycle::ADMITTED_RECLAIM_ATTEMPT_CAP
+        );
+        assert!(
+            delivery.existing_calls.lock().await.is_empty(),
+            "nothing is redelivered past the cap"
+        );
+        assert_eq!(
+            delivery.keyed.admissions.lock().await.as_slice(),
+            &[RuntimeDeliveryOutcome::AdmissionAccepted],
+            "only the first attempt was admitted"
+        );
         Ok(())
     }
 
