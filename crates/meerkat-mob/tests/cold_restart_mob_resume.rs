@@ -3881,9 +3881,7 @@ impl DeferredRetiringMember {
             "the deferred member stays Retiring"
         );
         assert!(
-            members
-                .iter()
-                .any(|entry| entry.agent_identity == AgentIdentity::from("lead-1")),
+            members.iter().any(|entry| entry.agent_identity == "lead-1"),
             "the healthy lead is still listed: {members:?}"
         );
         assert_eq!(
