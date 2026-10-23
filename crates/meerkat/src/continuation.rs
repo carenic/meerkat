@@ -2565,10 +2565,12 @@ fn check_bound_host_original(
 /// 4. The session is prepared (never made live here: liveness is the
 ///    host's), and the owner's binder binds Core's exact input fresh for it;
 ///    Core checks the bound input.
-/// 5. A fresh id is reserved, and native admission settles the host's
-///    custody: promoted only on an accepted admission of the bound id,
-///    dropped when nothing was admitted or a replay deduplicated, retained
-///    unresolved otherwise.
+/// 5. A fresh id is reserved, and the address is observed again
+///    ([`observe_after_reservation`]): retired since the pass resolved it,
+///    the reservation is released and the custody dropped. Then native
+///    admission settles the host's custody: promoted only on an accepted
+///    admission of the bound id, dropped when nothing was admitted or a
+///    replay deduplicated, retained unresolved otherwise.
 async fn admit_host_original(
     target: &AdmissionTarget<'_>,
     record: &meerkat_runtime::RuntimeDeliveryRecord,
@@ -2792,6 +2794,14 @@ async fn admit_host_original(
         })
         .await?;
     }
+    // Reserve, then observe, as for every continuation: the pass resolved
+    // the address before the binder bound, and it may have retired since.
+    // Nothing has reached native admission, so dropping the custody
+    // withdraws it, as for a bound input that fails its checks.
+    if let Err(error) = observe_after_reservation(target, delivery_id, &input_id).await {
+        drop(settlement);
+        return Err(error);
+    }
     let recorded = Arc::new(std::sync::Mutex::new(None));
     let result = sink
         .admit_governed(
@@ -2909,7 +2919,7 @@ async fn admit_continuation(
         address,
         sink,
         session,
-        observer,
+        observer: _,
     } = *target;
     let delivery_id = record.submission.delivery_id();
     let admission_key = delivery.admission_key(delivery_id);
@@ -2994,35 +3004,7 @@ async fn admit_continuation(
             input_id
         }
     };
-    // Reserve, then observe: the pass resolved the address before this
-    // reservation, and it may have retired since. A status read answers
-    // stranded only after it observed the retirement and found no entry, so
-    // a drain that now finds the address retired releases its reservation
-    // and admits nothing, and one that reserved first is seen by that read.
-    if let Some(observer) = observer {
-        match observer.observe_address(address).await {
-            Ok(AddressObservation::MayServe) => {}
-            Ok(AddressObservation::Retired) => {
-                transition_admission(
-                    inbox,
-                    address,
-                    delivery_id,
-                    ContinuationAdmissionTransition::Release {
-                        session_id: session.clone(),
-                        input_id,
-                    },
-                )
-                .await?;
-                return Err(ContinuationAdmitError::AddressRetired);
-            }
-            Err(error) => {
-                return Err(ContinuationAdmitError::Failed(format!(
-                    "delivery address {address} could not be observed after its reservation: \
-                     {error}"
-                )));
-            }
-        }
-    }
+    observe_after_reservation(target, delivery_id, &input_id).await?;
     let input = continuation_input(&delivery, &admission_key, input_id.clone());
     let admitted = match retained.as_ref() {
         Some(identity) => {
@@ -3076,6 +3058,43 @@ async fn admit_continuation(
     )
     .await?;
     Ok(())
+}
+
+/// Reserve, then observe: the pass resolved `target`'s address before the
+/// reservation `input_id` holds in its session, and it may have retired
+/// since. A status read answers stranded only after it observed the
+/// retirement and found no entry, so a drain that now finds the address
+/// retired releases its reservation and admits nothing
+/// ([`ContinuationAdmitError::AddressRetired`]), and one that reserved first
+/// is seen by that read. Without an observer nothing is observed.
+async fn observe_after_reservation(
+    target: &AdmissionTarget<'_>,
+    delivery_id: &RuntimeDeliveryId,
+    input_id: &InputId,
+) -> Result<(), ContinuationAdmitError> {
+    let Some(observer) = target.observer else {
+        return Ok(());
+    };
+    match observer.observe_address(target.address).await {
+        Ok(AddressObservation::MayServe) => Ok(()),
+        Ok(AddressObservation::Retired) => {
+            transition_admission(
+                target.inbox,
+                target.address,
+                delivery_id,
+                ContinuationAdmissionTransition::Release {
+                    session_id: target.session.clone(),
+                    input_id: input_id.clone(),
+                },
+            )
+            .await?;
+            Err(ContinuationAdmitError::AddressRetired)
+        }
+        Err(error) => Err(ContinuationAdmitError::Failed(format!(
+            "delivery address {} could not be observed after its reservation: {error}",
+            target.address
+        ))),
+    }
 }
 
 /// The input `delivery` admits as `input_id`, under `admission_key`
@@ -3139,6 +3158,43 @@ async fn exact_admission(
     Ok(Some(row.state.input_id))
 }
 
+/// The admission `session` holds for the host original `delivery`, read as
+/// its drain recovers it: by the reserved id `reserved_input` first (a
+/// governed admission is indexed under its qualified key, so a raw-key read
+/// misses it), then by the raw admission key (an ungoverned admission, made
+/// before the runtime was governed or through the plain fallback). Either
+/// row stands for this original only as its exact admission, verified with
+/// the row's own id and recorded association
+/// ([`verify_admitted_host_original`]); never by key alone.
+///
+/// # Errors
+/// A read failed (a sink that cannot read by input id fails here, so the
+/// reservation stays), or the row under the id or key is not this
+/// original's admission.
+async fn host_original_admission(
+    sink: &dyn ContinuationDeliverySink,
+    session: &SessionId,
+    delivery: &ContinuationDelivery,
+    admission_key: &str,
+    reserved_input: &InputId,
+) -> Result<Option<InputId>, String> {
+    let stored = match sink.admitted_input_by_id(session, reserved_input).await? {
+        Some(stored) => Some(stored),
+        None => sink.admitted_input(session, admission_key).await?,
+    };
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    verify_admitted_host_original(
+        &stored.state,
+        delivery,
+        admission_key,
+        &stored.state.input_id,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(Some(stored.state.input_id))
+}
+
 /// What settling a reservation on a retired address did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RetiredReservation {
@@ -3157,6 +3213,22 @@ pub(crate) enum RetiredReservation {
 /// and the ledger's answer is final. The inbox row stays pending: a retired
 /// address is never drained.
 ///
+/// A host original ([`ContinuationOwnerService::submit_host_original`]) is
+/// read as its drain recovers it ([`host_original_admission`]): by the
+/// reserved id, then by the raw admission key. One corner reads stranded
+/// although the session holds the original: native admission deduplicated a
+/// governed retry onto an input another admission holds under the
+/// original's qualified key, the attempt crashed before it applied that
+/// input's id, and the address retired before a restarted drain bound the
+/// original again (which would find the replay again and apply it). Only a
+/// fresh bind derives that qualified key, and a retired address is never
+/// bound again, so the reservation is released. The guard is the host's own
+/// custody of the original: the admission that holds the existing input
+/// promoted it (or the host settled it from the native record), so a host
+/// that reads its custody does not resend the original under a new key.
+/// Keeping the reservation instead would leave every governed reservation
+/// whose input never reached the session pending forever.
+///
 /// # Errors
 /// The session holds another input under the admission key, which is never
 /// this delivery by key alone, so the reservation stays; or a read or a
@@ -3172,13 +3244,19 @@ pub(crate) async fn settle_retired_reservation(
     let delivery_id = record.submission.delivery_id();
     let row: ContinuationRow = serde_json::from_slice(record.submission.payload())
         .map_err(|error| format!("continuation delivery payload is invalid: {error}"))?;
-    let retained_work = if sink.governs_work_authority() {
-        row.retained_work.as_ref()
-    } else {
-        None
-    };
     let admission_key = row.delivery.admission_key(delivery_id);
-    match exact_admission(sink, session, &row.delivery, &admission_key, retained_work).await? {
+    let admitted = if row.host_original {
+        host_original_admission(sink, session, &row.delivery, &admission_key, reserved_input)
+            .await?
+    } else {
+        let retained_work = if sink.governs_work_authority() {
+            row.retained_work.as_ref()
+        } else {
+            None
+        };
+        exact_admission(sink, session, &row.delivery, &admission_key, retained_work).await?
+    };
+    match admitted {
         Some(input_id) => {
             transition_admission(
                 inbox,

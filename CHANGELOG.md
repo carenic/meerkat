@@ -649,7 +649,12 @@ them.
   a resend under a new key is the only delivery. A host's
   `RuntimeDeliveryHost::observe_address` must agree on Retired with the
   continuation status read; both shipped hosts delegate to the bound
-  resolver.
+  resolver. A governed host original follows the same rules: its drain
+  observes the address after the binder bound it and before native
+  admission, and on a retired address releases the reservation and
+  withdraws the binder's custody; the owner settles its reservation on a
+  retired address by the reserved input id, since a governed admission is
+  indexed under its qualified key.
 
 - `meerkat`: a host that composes consent notices no longer refuses a
   retained completion of another producer drained before it binds its
