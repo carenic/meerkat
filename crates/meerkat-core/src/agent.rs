@@ -2904,7 +2904,7 @@ fn staging_wait_site(boundary: crate::authorization::OperationEntryBoundary) -> 
 ///
 /// An operation refusal met before the dispatcher is invoked is certified
 /// [`crate::authorization::RefusalDispatch::NotDispatched`] at this entry's
-/// one boundary ([`FencedOutcome`]). What the dispatcher returns is
+/// one boundary (`FencedOutcome`). What the dispatcher returns is
 /// forwarded unchanged: its tool code may have produced an effect before a
 /// later governed step refused.
 ///

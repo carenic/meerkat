@@ -6826,7 +6826,7 @@ impl Session {
     /// Retire transcript-history occurrences beyond `retention`.
     ///
     /// Applies the graph owner's one re-anchoring transition
-    /// ([`TranscriptHistoryState::retire_occurrences_beyond`]) and installs
+    /// (`TranscriptHistoryState::retire_occurrences_beyond`) and installs
     /// the result. Commits and rolling prefix digests are unchanged, so every
     /// rewrite authority that binds the graph still verifies; only the bodies
     /// of retired occurrences go. Returns how many occurrences this call

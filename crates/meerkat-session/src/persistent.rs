@@ -6466,8 +6466,9 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// turn finalizes. The fork then observes the committed transcript under
     /// that same guard, so a runtime lap queued behind the caller cannot take
     /// the gate between the wait and the branch. A source still running when
-    /// `bound` elapses yields [`DurableForkAtTurnBoundary::SourceBusy`] and
-    /// nothing is forked. `target.source_admission` must be `Quiescent`: the
+    /// `bound` elapses yields
+    /// [`DurableForkAtTurnBoundary::SourceBusy`](meerkat_core::service::DurableForkAtTurnBoundary::SourceBusy)
+    /// and nothing is forked. `target.source_admission` must be `Quiescent`: the
     /// caller does not own the running turn.
     ///
     /// `bound` covers the two waits this path can block on, the turn boundary

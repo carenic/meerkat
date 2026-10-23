@@ -10673,7 +10673,7 @@
             "type": "string"
           },
           "kind": {
-            "description": "Opaque provenance/display label for the evidence. It is parsed into the\ntyped confirmation classification at the ingress boundary only (see\n[`WorkEvidenceRef::confirmation_classification`]); no completion-policy\nsatisfaction decision re-reads this string. The typed\n[`WorkEvidenceRef::confirmation_kind`] is the authoritative carrier.",
+            "description": "Opaque provenance/display label for the evidence. It is parsed into the\ntyped confirmation classification at the ingress boundary only; no\ncompletion-policy satisfaction decision re-reads this string. The typed\n[`WorkEvidenceRef::confirmation_kind`] is the authoritative carrier.",
             "type": "string"
           },
           "label": {
@@ -11628,7 +11628,7 @@
             "type": "string"
           },
           "kind": {
-            "description": "Opaque provenance/display label for the evidence. It is parsed into the\ntyped confirmation classification at the ingress boundary only (see\n[`WorkEvidenceRef::confirmation_classification`]); no completion-policy\nsatisfaction decision re-reads this string. The typed\n[`WorkEvidenceRef::confirmation_kind`] is the authoritative carrier.",
+            "description": "Opaque provenance/display label for the evidence. It is parsed into the\ntyped confirmation classification at the ingress boundary only; no\ncompletion-policy satisfaction decision re-reads this string. The typed\n[`WorkEvidenceRef::confirmation_kind`] is the authoritative carrier.",
             "type": "string"
           },
           "label": {
@@ -11998,7 +11998,7 @@
             "type": "string"
           },
           "kind": {
-            "description": "Opaque provenance/display label for the evidence. It is parsed into the\ntyped confirmation classification at the ingress boundary only (see\n[`WorkEvidenceRef::confirmation_classification`]); no completion-policy\nsatisfaction decision re-reads this string. The typed\n[`WorkEvidenceRef::confirmation_kind`] is the authoritative carrier.",
+            "description": "Opaque provenance/display label for the evidence. It is parsed into the\ntyped confirmation classification at the ingress boundary only; no\ncompletion-policy satisfaction decision re-reads this string. The typed\n[`WorkEvidenceRef::confirmation_kind`] is the authoritative carrier.",
             "type": "string"
           },
           "label": {
@@ -102108,7 +102108,7 @@
             "type": "string"
           },
           "kind": {
-            "description": "Opaque provenance/display label for the evidence. It is parsed into the\ntyped confirmation classification at the ingress boundary only (see\n[`WorkEvidenceRef::confirmation_classification`]); no completion-policy\nsatisfaction decision re-reads this string. The typed\n[`WorkEvidenceRef::confirmation_kind`] is the authoritative carrier.",
+            "description": "Opaque provenance/display label for the evidence. It is parsed into the\ntyped confirmation classification at the ingress boundary only; no\ncompletion-policy satisfaction decision re-reads this string. The typed\n[`WorkEvidenceRef::confirmation_kind`] is the authoritative carrier.",
             "type": "string"
           },
           "label": {
@@ -103174,7 +103174,7 @@
             "type": "string"
           },
           "kind": {
-            "description": "Opaque provenance/display label for the evidence. It is parsed into the\ntyped confirmation classification at the ingress boundary only (see\n[`WorkEvidenceRef::confirmation_classification`]); no completion-policy\nsatisfaction decision re-reads this string. The typed\n[`WorkEvidenceRef::confirmation_kind`] is the authoritative carrier.",
+            "description": "Opaque provenance/display label for the evidence. It is parsed into the\ntyped confirmation classification at the ingress boundary only; no\ncompletion-policy satisfaction decision re-reads this string. The typed\n[`WorkEvidenceRef::confirmation_kind`] is the authoritative carrier.",
             "type": "string"
           },
           "label": {
@@ -132685,7 +132685,7 @@
             "type": "string"
           },
           "kind": {
-            "description": "Opaque provenance/display label for the evidence. It is parsed into the\ntyped confirmation classification at the ingress boundary only (see\n[`WorkEvidenceRef::confirmation_classification`]); no completion-policy\nsatisfaction decision re-reads this string. The typed\n[`WorkEvidenceRef::confirmation_kind`] is the authoritative carrier.",
+            "description": "Opaque provenance/display label for the evidence. It is parsed into the\ntyped confirmation classification at the ingress boundary only; no\ncompletion-policy satisfaction decision re-reads this string. The typed\n[`WorkEvidenceRef::confirmation_kind`] is the authoritative carrier.",
             "type": "string"
           },
           "label": {
@@ -137926,7 +137926,7 @@
             "type": "string"
           },
           "kind": {
-            "description": "Opaque provenance/display label for the evidence. It is parsed into the\ntyped confirmation classification at the ingress boundary only (see\n[`WorkEvidenceRef::confirmation_classification`]); no completion-policy\nsatisfaction decision re-reads this string. The typed\n[`WorkEvidenceRef::confirmation_kind`] is the authoritative carrier.",
+            "description": "Opaque provenance/display label for the evidence. It is parsed into the\ntyped confirmation classification at the ingress boundary only; no\ncompletion-policy satisfaction decision re-reads this string. The typed\n[`WorkEvidenceRef::confirmation_kind`] is the authoritative carrier.",
             "type": "string"
           },
           "label": {

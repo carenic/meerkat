@@ -226,7 +226,7 @@ pub enum McpAuthMode {
 /// identity — not re-hashed independently at every key-derivation site. The
 /// `<slug>-<digest>` binding slug is the single owned projection of the
 /// `(server_name, server_url)` pair; `token_key` and `lease_key` both delegate
-/// to [`binding_slug`](Self::binding_slug) so the token realm key and the
+/// to `binding_slug` so the token realm key and the
 /// `AuthMachine` lease key are guaranteed structurally identical for the same
 /// server.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -4312,7 +4312,7 @@ fn verify_stored_account(
     }
 }
 
-/// See [`verify_stored_account`]. Hosts use it to project status from a
+/// See `verify_stored_account`. Hosts use it to project status from a
 /// stored credential without admitting it.
 pub fn stored_credential_matches_selection(
     target: &McpServerIdentity,
