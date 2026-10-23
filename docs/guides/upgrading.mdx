@@ -234,8 +234,9 @@ a crash (see [Durable Runs](/guides/durable-runs)). Integrations see:
   - the generated transition enums gain the per-phase transitions of these
     inputs, among them the `SuspendRunForStop` arms,
     `ClassifyDurableTailContinuable` and
-    `ClassifyStopInputDispositionRetainResumable`. Every new enum value is
-    appended last.
+    `ClassifyStopInputDispositionRetainResumable`. Every new value of the
+    string enums and of the generated kernel enums (`InputKind`,
+    `EffectKind`, `TransitionId`) is appended last.
 
 **Do:** return a receipt from `checkpoint_run` once the checkpoint is
 durable, and an error when it cannot be made durable. A custom checkpointer
