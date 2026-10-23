@@ -630,8 +630,10 @@ them.
   run, candidate sequence one) in one transaction, comparing both the
   committed authority and the current tail, and answers
   `WholeBlobRunRebaseOutcome::Stale` without writing when another writer
-  moved either. The in-memory and SQLite stores implement it; the default
-  answers `Unsupported`.
+  moved either. A run's closing save after its last rewrite re-bases too:
+  its document carries no run cursor, and the successor and the candidate
+  are that one document. The in-memory and SQLite stores implement it; the
+  default answers `Unsupported`.
 - `MemberBinding::labels()`: the application labels the incarnation was
   spawned with, as its spawn recorded them (a member reset keeps them). Every
   read of the member binding history carries them, the store-level

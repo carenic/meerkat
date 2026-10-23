@@ -7636,7 +7636,7 @@ mod tests {
         );
     }
 
-    // --- WholeBlob run re-base (UNRUN, Policy v1.1) -----------------------
+    // --- WholeBlob run re-base (unrun until the candidate's validation) -----
 
     fn rebase_assistant(text: &str) -> meerkat_core::types::Message {
         meerkat_core::types::Message::BlockAssistant(meerkat_core::types::BlockAssistantMessage {
@@ -7845,6 +7845,59 @@ mod tests {
             first_tail.base_store_revision(),
             second_tail.base_store_revision()
         );
+    }
+
+    #[tokio::test]
+    async fn a_closing_save_rebases_one_cursorless_document_as_base_and_tail() {
+        let store = InMemoryRuntimeStore::new();
+        let (runtime_id, live, run_id, base, first_tail) = rebase_run_with_tail(&store).await;
+        // The run's last rewrite has no round commit after it: its closing
+        // save carries no cursor.
+        let (mut compacted, commit) = rebase_compact(&live);
+        compacted.clear_run_cursor();
+        // A cursor for another run is still refused.
+        let foreign = rebase_with_cursor(compacted.clone(), &RunId::new(), 0);
+        let payload = rebase_committed_payload(&store, &runtime_id, live.id()).await;
+        assert!(
+            super::super::PreparedWholeBlobRunRebase::prepare(
+                payload,
+                Some(first_tail.clone()),
+                run_id.clone(),
+                foreign,
+                std::slice::from_ref(&commit),
+            )
+            .is_err()
+        );
+        let payload = rebase_committed_payload(&store, &runtime_id, live.id()).await;
+        let rebase = super::super::PreparedWholeBlobRunRebase::prepare(
+            payload,
+            Some(first_tail),
+            run_id.clone(),
+            compacted,
+            std::slice::from_ref(&commit),
+        )
+        .unwrap();
+        let outcome = store
+            .commit_prepared_whole_blob_run_rebase(&runtime_id, rebase.store_parts())
+            .await
+            .unwrap();
+        let super::super::WholeBlobRunRebaseOutcome::Applied { committed, tail } = outcome else {
+            unreachable!("the closing save re-bases");
+        };
+        assert_eq!(committed.store_revision(), base.store_revision() + 1);
+        assert_eq!(tail.run_id(), &run_id);
+        assert_eq!(tail.candidate_sequence(), 1);
+        // One document: the tail's candidate is its base.
+        assert_eq!(tail.base_blob_sha256(), committed.blob_sha256());
+        assert_eq!(tail.candidate_blob_sha256(), committed.blob_sha256());
+        let loaded = store
+            .load_whole_blob_provisional_tail(&runtime_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let candidate =
+            meerkat_core::Session::from_persisted_bytes(loaded.candidate_bytes()).unwrap();
+        assert!(candidate.try_run_cursor().unwrap().is_none());
     }
 
     #[tokio::test]
