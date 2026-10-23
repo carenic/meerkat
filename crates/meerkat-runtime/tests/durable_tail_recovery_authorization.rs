@@ -1036,6 +1036,9 @@ fn requeue_stop_suspends_a_durable_in_flight_run() {
         pre_run_phase: Some(mm_dsl::PreRunPhase::Idle),
         registration_phase: mm_dsl::RegistrationPhase::Draining,
         unregister_queued_inputs: mm_dsl::UnregisterQueuedInputsDisposition::Requeue,
+        // A requeue always records its max age (`BeginUnregisterSession`
+        // refuses one without); this is the graceful shutdown's default.
+        unregister_requeue_max_age_ms: 900_000,
         ..Default::default()
     };
 
