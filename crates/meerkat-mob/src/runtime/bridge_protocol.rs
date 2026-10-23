@@ -1099,6 +1099,7 @@ mod tests {
             launch: MaterializeLaunchMode::Fresh {},
             forked_participant_attachment: None,
             prompt_context_fork: None,
+            report_adopted_first_turn: false,
         }))
     }
 
@@ -1113,6 +1114,7 @@ mod tests {
             engine_version: "0.7.22".to_string(),
             launch_outcome: MaterializeLaunchOutcome::Fresh,
             resolved_auth_binding: None,
+            adopted_first_turn: None,
         });
         let value = serde_json::to_value(&reply).expect("serialize materialized reply");
         let ack: BridgeMaterializedResponse =

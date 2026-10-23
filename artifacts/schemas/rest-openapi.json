@@ -2541,6 +2541,21 @@
         ],
         "type": "object"
       },
+      "BridgeAdoptedFirstTurn": {
+        "description": "The first turn of the session a `Resume` launch adopted, as its member\nhost read it from the stored session\n([`BridgeMaterializedResponse::adopted_first_turn`]).",
+        "oneOf": [
+          {
+            "const": "owed",
+            "description": "The session's first turn never started: the resume still owes it.",
+            "type": "string"
+          },
+          {
+            "const": "started",
+            "description": "The session's first turn already started: the resume delivers no\nfirst turn.",
+            "type": "string"
+          }
+        ]
+      },
       "BridgeBootstrapToken": {
         "description": "One-time bootstrap proof exchanged between a mob supervisor and a\nmember runtime on initial bind.\n\nTransparent over the wire (`#[serde(transparent)]` — a bare JSON string),\nbut carries a redacting `Debug` impl and has no `Display` impl so the\nraw secret cannot accidentally land in logs or panic messages. Treat it\nlike an API key: read `as_str()` only at the comms/transport boundary.",
         "type": "string"
@@ -3900,6 +3915,10 @@
               },
               "protocol_version": {
                 "$ref": "#/components/schemas/BridgeProtocolVersion"
+              },
+              "report_adopted_first_turn": {
+                "description": "V7: ask the host to report, on this `Resume` launch's ack, whether\nthe adopted session's first turn already started\n([`BridgeMaterializedResponse::adopted_first_turn`]). Setting it is a\nV7 command, refused on a `Fresh` launch; a host before V7 refuses it\nbefore reading the payload.",
+                "type": "boolean"
               },
               "spec": {
                 "$ref": "#/components/schemas/PortableMemberSpec"
@@ -6668,6 +6687,17 @@
             "additionalProperties": false,
             "description": "Response to `MaterializeMember`. Replayed verbatim on idempotency-tuple\nduplicates, including the recorded `launch_outcome`.",
             "properties": {
+              "adopted_first_turn": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/BridgeAdoptedFirstTurn"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Whether the session a `Resume` launch adopted had already started its\nfirst turn, as its member host read it from the stored session.\nPresent only when the request set `report_adopted_first_turn`\n(V7), on a replay too; absent on every other ack."
+              },
               "advertised_address": {
                 "type": "string"
               },

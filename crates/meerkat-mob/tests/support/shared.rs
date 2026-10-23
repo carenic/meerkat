@@ -2775,6 +2775,7 @@ impl ScriptedHostPeer {
             engine_version: "scripted-host-test".to_string(),
             launch_outcome: MaterializeLaunchOutcome::Fresh,
             resolved_auth_binding: None,
+            adopted_first_turn: None,
         };
         let replaced = self
             .materialize_state()
@@ -2980,6 +2981,7 @@ fn scripted_materialize_reply(
             engine_version: engine_version_default.to_string(),
             launch_outcome,
             resolved_auth_binding: None,
+            adopted_first_turn: None,
         };
         state.recorded.insert(tuple, fresh.clone());
         fresh
@@ -4796,6 +4798,7 @@ pub fn sample_materialize_payload(
         launch,
         forked_participant_attachment: None,
         prompt_context_fork: None,
+        report_adopted_first_turn: false,
     })
 }
 

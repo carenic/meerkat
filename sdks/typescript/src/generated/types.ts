@@ -4793,6 +4793,7 @@ export interface BridgeCommandMaterializeMember {
   launch: { mode: "fresh" } | Record<string, unknown>;
   prompt_context_fork?: Record<string, unknown> | null;
   protocol_version: BridgeProtocolVersion;
+  report_adopted_first_turn?: boolean;
   spec: Record<string, unknown>;
   spec_digest: string;
   supervisor: BridgePeerSpec;
@@ -5257,6 +5258,7 @@ export interface BridgeReplyMemberEventsPage {
 }
 
 export interface BridgeReplyMemberMaterialized {
+  adopted_first_turn?: "owed" | "started" | null;
   advertised_address: string;
   engine_version: string;
   launch_outcome: "fresh" | "resumed_live" | "resumed_from_snapshot";

@@ -9214,6 +9214,7 @@ impl MobHostActor {
             engine_version: meerkat_contracts::ContractVersion::CURRENT.to_string(),
             launch_outcome: outcome.launch_outcome,
             resolved_auth_binding: outcome.resolved_auth_binding,
+            adopted_first_turn: None,
         });
         self.send_reply(
             candidate,
@@ -9530,6 +9531,7 @@ impl MobHostActor {
             engine_version: row.engine_version_at_build,
             launch_outcome: row.launch_outcome,
             resolved_auth_binding: row.resolved_auth_binding,
+            adopted_first_turn: None,
         });
         self.send_reply(
             candidate,

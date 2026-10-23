@@ -92,10 +92,14 @@ impl BridgeProtocolVersion {
     /// Prompt-context fork children on member hosts: a `MaterializeMember`
     /// that carries a prompt-context fork, the host-addressed
     /// `HostFeatures` probe and the member-addressed
-    /// `ReadMemberVisibleTools`. Accepted on decode and used per command,
-    /// by shape, but never advertised: a 0.9.4 controller cannot decode a
-    /// capability report that lists it, so a controller asks a host with
-    /// `HostFeatures` instead ([`HOST_FEATURE_PROMPT_CONTEXT_FORK`]).
+    /// `ReadMemberVisibleTools`. A `MaterializeMember` that asks the host to
+    /// report an adopted session's first turn
+    /// (`report_adopted_first_turn`) is a V7 command too. Accepted on decode
+    /// and used per command, by shape, but never advertised: a 0.9.4
+    /// controller cannot decode a capability report that lists it, so a
+    /// controller asks a host with `HostFeatures` instead
+    /// ([`HOST_FEATURE_PROMPT_CONTEXT_FORK`],
+    /// [`HOST_FEATURE_ADOPTED_FIRST_TURN`]).
     pub const V7: Self = Self(7);
     /// Current protocol version implemented by this bridge contract.
     pub const CURRENT: Self = Self::V6;
@@ -329,8 +333,11 @@ impl<'de> Deserialize<'de> for BridgeProtocolVersion {
 ///   of that reference's exact fork session. V2-V5 peers reject these fields
 ///   and commands with a typed minimum-version failure.
 /// - `7`: a `Fresh` `MaterializeMember` may carry `prompt_context_fork`, the
-///   child's fork seed and typed source; the host-addressed `HostFeatures`
-///   probe and the member-addressed `ReadMemberVisibleTools` are new. V7 is
+///   child's fork seed and typed source, and a `Resume` `MaterializeMember`
+///   may set `report_adopted_first_turn`, asking the host to report whether
+///   the adopted session's first turn already started; the host-addressed
+///   `HostFeatures` probe and the member-addressed `ReadMemberVisibleTools`
+///   are new. V7 is
 ///   accepted but never advertised, and `CURRENT` and `DEFAULT` stay V6, so
 ///   a 0.9.4 controller still binds, rebinds and reads the status of a host
 ///   of this release. A controller sends V7 only to a host whose
@@ -655,6 +662,7 @@ pub fn decode_bridge_command_accepting(
     let command = serde_json::from_value(value).map_err(BridgeCommandDecodeError::Invalid)?;
     validate_v6_capability_shape(&command)?;
     validate_v7_prompt_context_fork_shape(&command)?;
+    validate_v7_adopted_first_turn_shape(&command)?;
     Ok(command)
 }
 
@@ -706,6 +714,27 @@ fn validate_v7_prompt_context_fork_shape(
     )))
 }
 
+/// Only a `Resume` launch adopts an existing session, so only a `Resume`
+/// launch may ask the host to report that session's first turn.
+fn validate_v7_adopted_first_turn_shape(
+    command: &BridgeCommand,
+) -> Result<(), BridgeCommandDecodeError> {
+    let BridgeCommand::MaterializeMember(payload) = command else {
+        return Ok(());
+    };
+    if !payload.report_adopted_first_turn
+        || matches!(payload.launch, MaterializeLaunchMode::Resume { .. })
+    {
+        return Ok(());
+    }
+    Err(BridgeCommandDecodeError::Invalid(serde_json::Error::io(
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "reporting an adopted session's first turn requires a Resume launch",
+        ),
+    )))
+}
+
 /// Minimum wire version for every command family whose shape or semantics was
 /// introduced after V2. This check intentionally runs on the tagged JSON
 /// envelope before payload deserialization, so an old V3 HardCancel shape is
@@ -721,7 +750,11 @@ fn bridge_command_minimum_protocol(
         "materialize_member"
             if value
                 .get("prompt_context_fork")
-                .is_some_and(|fork| !fork.is_null()) =>
+                .is_some_and(|fork| !fork.is_null())
+                || value
+                    .get("report_adopted_first_turn")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true) =>
         {
             BridgeProtocolVersion::V7
         }
@@ -1159,6 +1192,13 @@ pub struct BridgeMaterializePayload {
     /// a V7 command; a host before V7 refuses it before reading the payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_context_fork: Option<BridgePromptContextFork>,
+    /// V7: ask the host to report, on this `Resume` launch's ack, whether
+    /// the adopted session's first turn already started
+    /// ([`BridgeMaterializedResponse::adopted_first_turn`]). Setting it is a
+    /// V7 command, refused on a `Fresh` launch; a host before V7 refuses it
+    /// before reading the payload.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub report_adopted_first_turn: bool,
 }
 
 /// The prompt-context fork a V7 `MaterializeMember` carries. The host
@@ -1446,6 +1486,10 @@ pub struct BridgeHostFeaturesPayload {
 /// The `HostFeatures` feature that serves prompt-context fork children: a
 /// `MaterializeMember` carrying `prompt_context_fork`.
 pub const HOST_FEATURE_PROMPT_CONTEXT_FORK: &str = "prompt_context_fork";
+
+/// The `HostFeatures` feature that reports an adopted session's first turn:
+/// a `Resume` `MaterializeMember` setting `report_adopted_first_turn`.
+pub const HOST_FEATURE_ADOPTED_FIRST_TURN: &str = "adopted_first_turn";
 
 /// Reply to `HostFeatures`: an open vocabulary. Not `deny_unknown_fields`,
 /// and a reader ignores a feature it does not know, so a field or feature a
@@ -2329,6 +2373,26 @@ pub struct BridgeMaterializedResponse {
     pub launch_outcome: MaterializeLaunchOutcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_auth_binding: Option<WireAuthBindingRef>,
+    /// Whether the session a `Resume` launch adopted had already started its
+    /// first turn, as its member host read it from the stored session.
+    /// Present only when the request set `report_adopted_first_turn`
+    /// (V7), on a replay too; absent on every other ack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopted_first_turn: Option<BridgeAdoptedFirstTurn>,
+}
+
+/// The first turn of the session a `Resume` launch adopted, as its member
+/// host read it from the stored session
+/// ([`BridgeMaterializedResponse::adopted_first_turn`]).
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BridgeAdoptedFirstTurn {
+    /// The session's first turn never started: the resume still owes it.
+    Owed,
+    /// The session's first turn already started: the resume delivers no
+    /// first turn.
+    Started,
 }
 
 /// Response to `ReleaseMember` — the disposal class is a typed fact, never
@@ -6351,6 +6415,7 @@ mod tests {
                 },
                 forked_participant_attachment: None,
                 prompt_context_fork: None,
+                report_adopted_first_turn: false,
             })),
             BridgeCommand::ReleaseMember(BridgeReleasePayload {
                 supervisor: sample_peer_spec(),
@@ -6627,6 +6692,7 @@ mod tests {
             launch: MaterializeLaunchMode::Fresh {},
             forked_participant_attachment: None,
             prompt_context_fork: None,
+            report_adopted_first_turn: false,
         }));
         let mut value = serde_json::to_value(&cmd).expect("serialize command");
         value
@@ -6658,6 +6724,7 @@ mod tests {
             launch: MaterializeLaunchMode::Fresh {},
             forked_participant_attachment: None,
             prompt_context_fork: None,
+            report_adopted_first_turn: false,
         }));
         let mut value = serde_json::to_value(&cmd).expect("serialize command");
         value
@@ -7352,6 +7419,7 @@ mod tests {
                 engine_version: "0.7.22".to_string(),
                 launch_outcome: MaterializeLaunchOutcome::ResumedFromSnapshot,
                 resolved_auth_binding: None,
+                adopted_first_turn: None,
             }),
             BridgeReply::MemberReleased(BridgeMemberReleasedResponse {
                 disposal: MemberSessionDisposal::RuntimeReleasedOnly {
@@ -7743,6 +7811,7 @@ mod tests {
             },
             forked_participant_attachment: Some(attachment.clone()),
             prompt_context_fork: None,
+            report_adopted_first_turn: false,
         };
         let v5 = serde_json::to_value(BridgeCommand::MaterializeMember(Box::new(payload)))
             .expect("serialize V5 materialize");
@@ -7763,6 +7832,7 @@ mod tests {
             fence_token: 1,
             spec: crate::wire::portable_spec::sample_portable_member_spec(),
             spec_digest: "d".repeat(64),
+            report_adopted_first_turn: false,
         };
         assert!(matches!(
             decode_bridge_command(
@@ -7799,6 +7869,7 @@ mod tests {
                 seed: WireOpaqueJson::from_value(&serde_json::json!({ "fork": "prompt_context" })),
                 source,
             }),
+            report_adopted_first_turn: false,
         };
         serde_json::to_value(BridgeCommand::MaterializeMember(Box::new(payload)))
             .expect("serialize materialize")
@@ -7998,5 +8069,133 @@ mod tests {
                 names: Some(vec!["shell".to_string()]),
             })
         );
+    }
+
+    /// A materialize stamped `version` that asks for its adopted first turn.
+    fn adopted_first_turn_materialize(
+        version: BridgeProtocolVersion,
+        launch: MaterializeLaunchMode,
+    ) -> serde_json::Value {
+        let payload = BridgeMaterializePayload {
+            supervisor: sample_peer_spec(),
+            epoch: 1,
+            binding_generation: 1,
+            protocol_version: version,
+            generation: 1,
+            fence_token: 1,
+            spec: crate::wire::portable_spec::sample_portable_member_spec(),
+            spec_digest: "d".repeat(64),
+            launch,
+            forked_participant_attachment: None,
+            prompt_context_fork: None,
+            report_adopted_first_turn: true,
+        };
+        serde_json::to_value(BridgeCommand::MaterializeMember(Box::new(payload)))
+            .expect("serialize materialize")
+    }
+
+    fn resume_launch() -> MaterializeLaunchMode {
+        MaterializeLaunchMode::Resume {
+            session_id: "session-1".to_string(),
+            resume_from_role: None,
+        }
+    }
+
+    /// Asking for the adopted first turn is a V7 Resume command: refused
+    /// typed below V7, refused by a host before V7 before it reads it, and
+    /// refused on a Fresh launch, which adopts nothing.
+    #[test]
+    fn asking_for_the_adopted_first_turn_is_a_v7_resume_command() {
+        let decoded = decode_bridge_command(adopted_first_turn_materialize(
+            BridgeProtocolVersion::V7,
+            resume_launch(),
+        ))
+        .expect("a V7 resume that asks decodes");
+        let BridgeCommand::MaterializeMember(payload) = decoded else {
+            panic!("a materialize command");
+        };
+        assert!(payload.report_adopted_first_turn);
+        match decode_bridge_command(adopted_first_turn_materialize(
+            BridgeProtocolVersion::V6,
+            resume_launch(),
+        )) {
+            Err(BridgeCommandDecodeError::UnsupportedProtocolVersion(error)) => assert_eq!(
+                error,
+                UnsupportedBridgeProtocolVersion {
+                    raw: 6,
+                    command: Some("MaterializeMember"),
+                    minimum: Some(7),
+                }
+            ),
+            other => panic!("a V6 stamp must be refused typed: {other:?}"),
+        }
+        match decode_bridge_command_accepting(
+            adopted_first_turn_materialize(BridgeProtocolVersion::V7, resume_launch()),
+            BridgeProtocolVersion::V6,
+        ) {
+            Err(BridgeCommandDecodeError::UnsupportedProtocolVersion(error)) => assert_eq!(
+                error,
+                UnsupportedBridgeProtocolVersion {
+                    raw: 7,
+                    command: None,
+                    minimum: None,
+                }
+            ),
+            other => panic!("a V6 table must refuse a V7 envelope typed: {other:?}"),
+        }
+        assert!(matches!(
+            decode_bridge_command(adopted_first_turn_materialize(
+                BridgeProtocolVersion::V7,
+                MaterializeLaunchMode::Fresh {},
+            )),
+            Err(BridgeCommandDecodeError::Invalid(_))
+        ));
+    }
+
+    /// A request that does not ask and an ack that reports nothing keep
+    /// their bytes: neither carries the new key. An ack that reports
+    /// round-trips its value.
+    #[test]
+    fn the_adopted_first_turn_is_absent_unless_asked_and_reported() {
+        let mut request =
+            adopted_first_turn_materialize(BridgeProtocolVersion::V4, resume_launch());
+        request
+            .as_object_mut()
+            .expect("command object")
+            .remove("report_adopted_first_turn");
+        let decoded = decode_bridge_command(request.clone()).expect("a V4 resume decodes");
+        let BridgeCommand::MaterializeMember(payload) = &decoded else {
+            panic!("a materialize command");
+        };
+        assert!(!payload.report_adopted_first_turn);
+        assert_eq!(
+            serde_json::to_value(&decoded).expect("re-encode"),
+            request,
+            "a request that does not ask keeps its bytes"
+        );
+
+        let ack = |adopted_first_turn| BridgeMaterializedResponse {
+            member_pubkey: "ed25519:key".to_string(),
+            member_peer_id: "peer".to_string(),
+            advertised_address: "tcp://127.0.0.1:1".to_string(),
+            session_id: "session-1".to_string(),
+            spec_digest: "d".repeat(64),
+            engine_version: "0.9.5".to_string(),
+            launch_outcome: MaterializeLaunchOutcome::ResumedFromSnapshot,
+            resolved_auth_binding: None,
+            adopted_first_turn,
+        };
+        let unreported = serde_json::to_value(ack(None)).expect("encode ack");
+        assert!(unreported.get("adopted_first_turn").is_none());
+        for (first_turn, wire) in [
+            (BridgeAdoptedFirstTurn::Owed, "owed"),
+            (BridgeAdoptedFirstTurn::Started, "started"),
+        ] {
+            let reported = serde_json::to_value(ack(Some(first_turn))).expect("encode ack");
+            assert_eq!(reported["adopted_first_turn"], serde_json::json!(wire));
+            let decoded: BridgeMaterializedResponse =
+                serde_json::from_value(reported).expect("decode ack");
+            assert_eq!(decoded.adopted_first_turn, Some(first_turn));
+        }
     }
 }

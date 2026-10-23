@@ -8680,6 +8680,7 @@ class BridgeCommandMaterializeMember(TypedDict, total=False):
     launch: Required[dict[str, Literal['fresh']] | dict[str, Any]]
     prompt_context_fork: NotRequired[Optional[dict[str, Any]]]
     protocol_version: Required[BridgeProtocolVersion]
+    report_adopted_first_turn: NotRequired[bool]
     spec: Required[dict[str, Any]]
     spec_digest: Required[str]
     supervisor: Required[BridgePeerSpec]
@@ -9101,6 +9102,7 @@ class BridgeReplyMemberEventsPage(TypedDict, total=False):
     watermark: Required[int]
 
 class BridgeReplyMemberMaterialized(TypedDict, total=False):
+    adopted_first_turn: NotRequired[Optional[Literal['owed', 'started']]]
     advertised_address: Required[str]
     engine_version: Required[str]
     launch_outcome: Required[Literal['fresh', 'resumed_live', 'resumed_from_snapshot']]

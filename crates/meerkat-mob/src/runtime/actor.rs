@@ -14268,6 +14268,7 @@ impl MobActor {
             },
             forked_participant_attachment: None,
             prompt_context_fork: None,
+            report_adopted_first_turn: false,
         });
 
         // §19.L5: the ops owner for a placed member is the owner bridge
@@ -34529,6 +34530,7 @@ impl MobActor {
             launch,
             forked_participant_attachment,
             prompt_context_fork,
+            report_adopted_first_turn: false,
         });
 
         // Callers that don't carry an owner ops context (the embedder

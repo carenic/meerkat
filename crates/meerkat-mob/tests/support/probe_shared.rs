@@ -597,6 +597,7 @@ pub fn raw_materialize_member_command(
         launch,
         forked_participant_attachment: None,
         prompt_context_fork: None,
+        report_adopted_first_turn: false,
     }))
 }
 
