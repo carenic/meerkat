@@ -190,6 +190,11 @@ them.
 
 ### Fixed
 
+- `meerkat-core`: a tool call admitted after its deadline now times out
+  instead of entering its body. A call waiting for a dispatch slot whose
+  deadline passed in the same scheduler turn the slot came free (a starved
+  runtime notices both at once) was admitted and ran.
+
 - A graceful mob Shutdown releases a member's identity reconcile lease once
   it has unregistered the member's runtime and the member's session actor has
   exited, so the next incarnation takes that identity at once. Before, every

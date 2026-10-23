@@ -9447,6 +9447,20 @@ fn dispatch_tool_calls_boxed<T: AgentToolDispatcher + ?Sized + 'static>(
                     let admitted_dispatch = async {
                         match dispatch_semaphore.acquire().await {
                             Ok(_permit) => {
+                                // The timeout below polls this future before its
+                                // own timer, and a starved runtime notices a freed
+                                // slot and a passed deadline in the same turn: a
+                                // call admitted after its deadline times out here,
+                                // without entering its body.
+                                if matches!(
+                                    effective_timeout,
+                                    Some(timeout) if start.elapsed() >= timeout
+                                ) {
+                                    return Err(ToolError::timeout(
+                                        tc.name.clone(),
+                                        advertised_timeout_ms,
+                                    ));
+                                }
                                 crate::dispatch_tool_execution_plan_fenced(
                                     &tools_ref,
                                     tc.as_view(),
