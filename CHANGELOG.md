@@ -521,6 +521,11 @@ them.
   builds it with a struct literal sets it. A surface that opens live channels
   by session id passes `SessionScoped`; the member live host passes
   `MobMember` (see Fixed).
+- `meerkat-rpc`: WebRTC to a mob member is not available in 0.9.5. The
+  session-scoped `live/open` and `live/webrtc/answer` flow refuses a mob
+  member's session with `INVALID_PARAMS` and data kind
+  `mob_member_session_addressed_by_id` (see Fixed), and
+  `mob/member_live_open`, the route for a member, is WebSocket only.
 - `meerkat-contracts`: `MobMemberStatusResult` gains the field
   `custody_deferred: Option<WireMemberCustodyDeferral>`, absent from the wire
   unless the mob's start deferred the member's custody restore. Code that

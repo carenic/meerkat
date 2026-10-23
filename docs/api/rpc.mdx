@@ -2021,7 +2021,8 @@ inferring support from generic `mobs` or the server version.
 `mob/member_live_open` supports WebSocket transport only for both local and
 placed members. A request for `transport: "webrtc"` is rejected, and the
 session-scoped `live/open` and `live/webrtc/answer` flow below refuses a
-member's session, so a mob member has no WebRTC channel. In multi-host v1,
+member's session, so WebRTC to a mob member is not available in 0.9.5:
+`mob/member_live_open` over WebSocket is the route. In multi-host v1,
 controller `session/*` methods do not proxy a placed member's host-local
 session either.
 
