@@ -119,6 +119,15 @@ part of a mob definition:
   key that was effective in the source, and the child runs at once.
 - `refuse`: every fork whose child would inherit an activation is refused.
 
+A durable fork child's model never reads the body of an activation it
+copied: it sees a line naming the key, and reads a body only from the
+child's own activation. Skills the source loaded with `load_skill`, or was
+given as per-turn skill context, follow the same policy as the host set it:
+under the default each copied skill is named without its body, under
+`refuse` the fork is refused, and under `reactivate_inherited` they are
+carried. A fork that leaves no activation window applies this as set, so
+under the default it strips the skills instead of refusing.
+
 `fork_helper` (a member spawned with `MemberLaunchMode::Fork`) starts a
 fresh session instead and gives it the source's recent conversation as
 context. The same policy decides what of it the child gets, by each row's

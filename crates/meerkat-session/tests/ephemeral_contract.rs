@@ -418,6 +418,7 @@ fn filtered_tool_names(overlay: &Option<TurnToolOverlay>) -> Vec<String> {
 fn rendered_system_prompts(session: &Session) -> Vec<String> {
     session
         .messages_for_model_boundary()
+        .unwrap()
         .iter()
         .filter_map(|message| match message {
             meerkat_core::types::Message::System(system) => Some(system.content.clone()),

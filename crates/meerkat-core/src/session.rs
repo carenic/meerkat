@@ -4806,6 +4806,36 @@ impl SessionDeferredTurnState {
     }
 }
 
+/// A session's transcript cannot be projected for a model request: one of
+/// its rows does not hold the bytes its typed identity names. No model
+/// request is built from the session until its transcript is repaired.
+///
+/// Every session in memory passed the checks this projection repeats (on
+/// decode, construction and rewrite), so this names a broken invariant;
+/// the projection fails closed instead of passing the bytes on.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "session {session_id} cannot be projected for a model request: {reason}; \
+     the transcript needs a repair"
+)]
+#[non_exhaustive]
+pub struct ModelBoundaryProjectionError {
+    /// The session whose transcript failed.
+    pub session_id: SessionId,
+    /// What the projection found.
+    pub reason: String,
+}
+
+/// A turn refused because its transcript cannot be projected is refused
+/// by its malformed instruction activation history.
+impl From<ModelBoundaryProjectionError> for crate::error::AgentError {
+    fn from(error: ModelBoundaryProjectionError) -> Self {
+        Self::InstructionActivation(crate::InstructionActivationError::MalformedHistory(
+            error.to_string(),
+        ))
+    }
+}
+
 /// Failure when appending an identity-bearing System message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SystemMessageAppendError {
@@ -6429,8 +6459,20 @@ impl Session {
     /// only the latest version is selected. No request-local System message is
     /// synthesized or repositioned at this boundary. Protocol-owned tool-result
     /// host metadata remains durable but is omitted from the model projection.
-    pub fn messages_for_model_boundary(&self) -> Vec<Message> {
-        Self::project_model_boundary(self.id(), self.messages())
+    ///
+    /// A fork child's copied rows are projected for the child: an activation
+    /// row it copied names its key without the body, a skill body it copied
+    /// is named unless its fork notice carries the skill, and a fork notice
+    /// it copied from an earlier fork reads as history.
+    ///
+    /// # Errors
+    ///
+    /// [`ModelBoundaryProjectionError`] when a row does not hold the bytes
+    /// its typed identity names: the projection fails closed.
+    pub fn messages_for_model_boundary(
+        &self,
+    ) -> Result<Vec<Message>, ModelBoundaryProjectionError> {
+        self.project_model_boundary(self.messages())
     }
 
     /// [`Self::messages_for_model_boundary`] over the first `count` live
@@ -6450,17 +6492,31 @@ impl Session {
                 self.messages.len()
             ))
         })?;
-        Ok(Self::project_model_boundary(self.id(), messages))
+        self.project_model_boundary(messages)
+            .map_err(|error| <serde_json::Error as serde::ser::Error>::custom(error.to_string()))
     }
 
-    fn project_model_boundary(id: &SessionId, messages: &[Message]) -> Vec<Message> {
+    /// The model's view of `messages`, a prefix of this session's rows.
+    fn project_model_boundary(
+        &self,
+        messages: &[Message],
+    ) -> Result<Vec<Message>, ModelBoundaryProjectionError> {
+        let copied = crate::fork_notice::CopiedForkRows::of(
+            self.messages(),
+            self.id(),
+            self.metadata()
+                .get(crate::fork_notice::SESSION_FORK_SEED_KEY),
+        );
+        let forked = crate::fork_notice::project_fork_rows(self.id(), messages, copied.as_ref());
+        let messages = forked.as_deref().unwrap_or(messages);
         let prompts = crate::types::materialize_latest_system_prompt_versions(messages);
-        let mut projected = match materialize_instruction_activation_messages(id, &prompts) {
-            Ok(messages) => messages,
-            Err(_) => prompts,
-        };
+        let mut projected = materialize_instruction_activation_messages(self.id(), &prompts)
+            .map_err(|reason| ModelBoundaryProjectionError {
+                session_id: self.id().clone(),
+                reason,
+            })?;
         crate::types::strip_tool_result_host_metadata(&mut projected);
-        projected
+        Ok(projected)
     }
 
     /// The text [`Session::last_assistant_text`] returns, paired with the
@@ -17247,7 +17303,7 @@ mod tests {
         let bytes = serde_json::to_vec(&session).expect("serialize session");
         let resumed: Session = serde_json::from_slice(&bytes).expect("deserialize session");
         assert_eq!(resumed.messages(), expected.as_slice());
-        assert_eq!(resumed.messages_for_model_boundary(), expected);
+        assert_eq!(resumed.messages_for_model_boundary().unwrap(), expected);
     }
     #[test]
     fn system_control_idempotency_is_explicit_and_does_not_coalesce_keyless_rows() {
@@ -17975,11 +18031,11 @@ mod tests {
         let count = session.messages().len();
         assert_eq!(
             session.messages_for_model_boundary_prefix(count).unwrap(),
-            session.messages_for_model_boundary()
+            session.messages_for_model_boundary().unwrap()
         );
         assert_eq!(
             session.messages_for_model_boundary_prefix(2).unwrap(),
-            session.fork_at(2).messages_for_model_boundary()
+            session.fork_at(2).messages_for_model_boundary().unwrap()
         );
         assert!(
             session
@@ -18033,7 +18089,7 @@ mod tests {
             panic!("expected persisted result row");
         };
         assert_eq!(results[0], result);
-        let projected = restored.messages_for_model_boundary();
+        let projected = restored.messages_for_model_boundary().unwrap();
         let Message::ToolResults { results, .. } = &projected[1] else {
             panic!("expected model result row");
         };

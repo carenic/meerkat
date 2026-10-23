@@ -262,6 +262,7 @@ mod planned_identity_fork_inheritance {
                 None,
                 meerkat_core::ForkInstructionPolicy::default()
                     .effective(meerkat_core::ActivationWindow::None),
+                meerkat_core::ForkInstructionPolicy::default(),
             )
             .await
             .expect("planned fork");

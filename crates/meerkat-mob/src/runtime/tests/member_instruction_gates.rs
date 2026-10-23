@@ -1195,6 +1195,7 @@ async fn planned_child_evidence_measures_the_prefix_without_the_reactivation_row
             planned_child_session_id: planned.clone(),
             prefix_message_count: None,
             inherited_instructions: meerkat_core::ForkInstructionPolicy::ReactivateInherited,
+            declared_instructions: meerkat_core::ForkInstructionPolicy::ReactivateInherited,
         },
     )
     .await

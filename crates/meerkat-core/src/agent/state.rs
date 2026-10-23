@@ -3638,7 +3638,7 @@ where
                 let provider_request_pressure = self.pending_compaction_request_pressure.take();
                 let request_context_budget = self.pending_compaction_request_budget.take();
                 if let Some(compactor) = self.compactor.clone() {
-                    let model_messages = self.session.messages_for_model_boundary();
+                    let model_messages = self.session.messages_for_model_boundary()?;
                     let last_guarded_boundary = [
                         self.compaction_cadence.last_compaction_boundary_index,
                         self.compaction_cadence
@@ -3936,10 +3936,14 @@ where
                             let mut history_tokens_after = None;
                             let compacted_session = match prepared_rewrite {
                                 Ok(Some(commit)) => {
-                                    history_tokens_after =
-                                        crate::agent::compact::estimated_history_tokens(
-                                            &compacted_session.messages_for_model_boundary(),
-                                        );
+                                    history_tokens_after = compacted_session
+                                        .messages_for_model_boundary()
+                                        .ok()
+                                        .and_then(|messages| {
+                                            crate::agent::compact::estimated_history_tokens(
+                                                &messages,
+                                            )
+                                        });
                                     Some((compacted_session, commit))
                                 }
                                 Ok(None) => {
@@ -3949,9 +3953,14 @@ where
                                     // reports 0 for a transcript it could
                                     // not measure.
                                     self.compaction_cadence.last_rewrite_history_tokens =
-                                        crate::agent::compact::estimated_history_tokens(
-                                            &compacted_session.messages_for_model_boundary(),
-                                        );
+                                        compacted_session
+                                            .messages_for_model_boundary()
+                                            .ok()
+                                            .and_then(|messages| {
+                                                crate::agent::compact::estimated_history_tokens(
+                                                    &messages,
+                                                )
+                                            });
                                     let error =
                                         crate::agent::compact::CompactionError::InvalidRebuild(
                                             "compactor produced a no-op transcript rewrite"
@@ -14571,7 +14580,7 @@ mod tests {
         let profile = registry
             .profile_witness_for_provider(crate::Provider::OpenAI, "primary")
             .expect("the test registry owns the active model profile");
-        let preserved_messages = agent.session().messages_for_model_boundary();
+        let preserved_messages = agent.session().messages_for_model_boundary().unwrap();
         let history_only =
             crate::context_budget_fact_for_messages(&preserved_messages, &[], 0, &profile)
                 .expect("the preserved transcript must be measurable");

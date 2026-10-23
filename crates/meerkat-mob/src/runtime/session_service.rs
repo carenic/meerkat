@@ -4243,6 +4243,7 @@ where
                 None,
                 None,
                 request.inherited_instructions,
+                request.declared_instructions,
             )
             .await?;
         Ok(crate::forked_participant::PlannedForkOutcome {

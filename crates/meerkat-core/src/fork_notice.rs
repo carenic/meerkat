@@ -11,7 +11,7 @@
 //! notice that names the source and, by name only, the instructions, skills
 //! and tools the child lost or gained.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -293,13 +293,30 @@ impl ForkSeed {
 }
 
 impl ForkBoundaryNotice {
-    /// The notice as the model reads it: names only.
-    fn render_summary(&self) -> String {
-        let source = match (&self.source.member, &self.source.session_id) {
+    /// The source as a notice names it.
+    fn source_name(&self) -> String {
+        match (&self.source.member, &self.source.session_id) {
             (Some(member), _) => format!("member '{}'", member.member),
             (None, Some(session_id)) => format!("session {session_id}"),
             (None, None) => "another agent".to_string(),
-        };
+        }
+    }
+
+    /// The notice as a later fork of the session it was delivered to
+    /// reads it: it describes that session, not the reader, so the
+    /// reader's model gets its header only.
+    #[must_use]
+    pub fn historical_summary(&self) -> String {
+        format!(
+            "Earlier fork notice, kept as history: session {} was created as a fork of {}.",
+            self.child_session_id,
+            self.source_name()
+        )
+    }
+
+    /// The notice as the model reads it: names only.
+    fn render_summary(&self) -> String {
+        let source = self.source_name();
         let mut lines = vec![format!("Fork notice. You are a fork of {source}.")];
         lines.push(match self.fork {
             ForkNoticeKind::PromptContext => "The context above is a planned excerpt of its \
@@ -445,11 +462,417 @@ pub fn holds_fork_notice_for(messages: &[crate::types::Message], session_id: &Se
     })
 }
 
+/// The fork notice delivered to `session_id` in `messages`, with its index:
+/// the boundary between the rows that session copied from its source and
+/// its own.
+#[must_use]
+pub fn own_fork_notice<'a>(
+    messages: &'a [crate::types::Message],
+    session_id: &SessionId,
+) -> Option<(usize, &'a ForkBoundaryNotice)> {
+    messages.iter().enumerate().find_map(|(index, message)| {
+        let crate::types::Message::SystemNotice(notice) = message else {
+            return None;
+        };
+        notice.blocks.iter().find_map(|block| match block {
+            crate::types::SystemNoticeBlock::ForkBoundary(fork)
+                if &fork.child_session_id == session_id =>
+            {
+                Some((index, &**fork))
+            }
+            _ => None,
+        })
+    })
+}
+
+/// The skills whose bodies a session's rows hold: results of the built-in
+/// `load_skill` tool, matched by tool-use id to the typed call that named
+/// the skill, and per-turn skill context blocks. A durable fork whose copied
+/// rows hold any applies its fork instruction policy to them, as it does to
+/// copied activation rows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SkillLoads {
+    /// The skills named, in key order.
+    pub skills: BTreeSet<crate::skills::SkillKey>,
+    /// `load_skill` results whose call's arguments name no skill. No notice
+    /// can carry them by name, so a fork fails closed on them.
+    pub unreadable: u32,
+}
+
+impl SkillLoads {
+    /// Whether the rows hold no skill body.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.skills.is_empty() && self.unreadable == 0
+    }
+}
+
+/// The skill a `load_skill` call's typed arguments name.
+#[derive(Deserialize)]
+struct LoadSkillArgs {
+    source_uuid: String,
+    skill_name: String,
+}
+
+/// The `load_skill` calls in `messages`, by tool-use id, each with the skill
+/// its arguments name (`None` when they name none).
+fn load_skill_calls(
+    messages: &[crate::types::Message],
+) -> BTreeMap<String, Option<crate::skills::SkillKey>> {
+    let mut calls = BTreeMap::new();
+    for message in messages {
+        let crate::types::Message::BlockAssistant(assistant) = message else {
+            continue;
+        };
+        for block in &assistant.blocks {
+            if let crate::types::AssistantBlock::ToolUse { id, name, args, .. } = block
+                && name == crate::skills::LOAD_SKILL_TOOL_NAME
+            {
+                let key = serde_json::from_str::<LoadSkillArgs>(args.get())
+                    .ok()
+                    .and_then(|args| {
+                        Some(crate::skills::SkillKey::new(
+                            crate::skills::SourceUuid::parse(&args.source_uuid).ok()?,
+                            crate::skills::SkillName::parse(&args.skill_name).ok()?,
+                        ))
+                    });
+                calls.insert(id.clone(), key);
+            }
+        }
+    }
+    calls
+}
+
+/// The skills whose bodies `messages` hold (see [`SkillLoads`]).
+#[must_use]
+pub fn skill_loads(messages: &[crate::types::Message]) -> SkillLoads {
+    let calls = load_skill_calls(messages);
+    let mut loads = SkillLoads::default();
+    for message in messages {
+        match message {
+            crate::types::Message::ToolResults { results, .. } => {
+                for result in results {
+                    match calls.get(&result.tool_use_id) {
+                        Some(Some(key)) => {
+                            loads.skills.insert(key.clone());
+                        }
+                        Some(None) => loads.unreadable = loads.unreadable.saturating_add(1),
+                        None => {}
+                    }
+                }
+            }
+            crate::types::Message::User(user) => {
+                for block in &user.content {
+                    if let crate::types::ContentBlock::SkillContext { skill_key, .. } = block {
+                        loads.skills.insert(skill_key.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    loads
+}
+
+/// The skills whose bodies were effective in session `session_id`, whose
+/// rows are `messages`: for a fork child, those it loaded after its fork
+/// notice and those its notice says the copied rows carry; for any other
+/// session, every skill its rows loaded.
+#[must_use]
+pub fn skills_effective_in(
+    messages: &[crate::types::Message],
+    session_id: &SessionId,
+) -> BTreeSet<crate::skills::SkillKey> {
+    match own_fork_notice(messages, session_id) {
+        Some((index, notice)) => {
+            let mut skills = skill_loads(&messages[index + 1..]).skills;
+            skills.extend(notice.skills_carried.iter().cloned());
+            skills
+        }
+        None => skill_loads(messages).skills,
+    }
+}
+
+/// The rows a fork child copied from its source (those before its own fork
+/// notice, or all of them while its fork seed is undelivered) and the
+/// skills whose copied bodies that notice or seed carries.
+#[derive(Debug, Clone)]
+pub(crate) struct CopiedForkRows {
+    end: usize,
+    carried_skills: BTreeSet<crate::skills::SkillKey>,
+}
+
+impl CopiedForkRows {
+    /// The copied rows of session `session_id`, whose rows are `messages`
+    /// and whose undelivered fork seed, if any, is `seed`. `None` for a
+    /// session that is not a fork child.
+    pub(crate) fn of(
+        messages: &[crate::types::Message],
+        session_id: &SessionId,
+        seed: Option<&serde_json::Value>,
+    ) -> Option<Self> {
+        if let Some((end, notice)) = own_fork_notice(messages, session_id) {
+            return Some(Self {
+                end,
+                carried_skills: notice.skills_carried.iter().cloned().collect(),
+            });
+        }
+        // A seed this release cannot read carries nothing.
+        let carried_skills = serde_json::from_value::<ForkSeed>(seed?.clone())
+            .map(|seed| seed.skills_carried.into_iter().collect())
+            .unwrap_or_default();
+        Some(Self {
+            end: messages.len(),
+            carried_skills,
+        })
+    }
+}
+
+/// What a session's model reads of the rows it copied as a fork child and
+/// of the fork notices it copied:
+/// - a copied `load_skill` result or per-turn skill context of a skill the
+///   child's notice does not carry names the skill, without its body;
+/// - a copied fork notice delivered to another session is history: the
+///   model reads its header only.
+///
+/// `None` when no row changes.
+pub(crate) fn project_fork_rows(
+    session_id: &SessionId,
+    rows: &[crate::types::Message],
+    copied: Option<&CopiedForkRows>,
+) -> Option<Vec<crate::types::Message>> {
+    let copied_end = copied.map_or(0, |copied| copied.end.min(rows.len()));
+    let calls = load_skill_calls(&rows[..copied_end]);
+    let carried = |key: Option<&crate::skills::SkillKey>| {
+        copied.is_some_and(|copied| key.is_some_and(|key| copied.carried_skills.contains(key)))
+    };
+    let mut projected: Option<Vec<crate::types::Message>> = None;
+    for (index, row) in rows.iter().enumerate() {
+        let replacement = match row {
+            crate::types::Message::ToolResults {
+                results,
+                created_at,
+            } if index < copied_end
+                && results.iter().any(|result| {
+                    calls
+                        .get(&result.tool_use_id)
+                        .is_some_and(|key| !carried(key.as_ref()))
+                }) =>
+            {
+                let mut results = results.clone();
+                for result in &mut results {
+                    if let Some(key) = calls.get(&result.tool_use_id)
+                        && !carried(key.as_ref())
+                    {
+                        let skill = key
+                            .as_ref()
+                            .map_or_else(|| "unknown skill".to_string(), ToString::to_string);
+                        result.content = crate::types::ContentBlock::text_vec(format!(
+                            "skill {skill} was loaded here; its body is not carried into this fork"
+                        ));
+                    }
+                }
+                Some(crate::types::Message::ToolResults {
+                    results,
+                    created_at: *created_at,
+                })
+            }
+            crate::types::Message::User(user)
+                if index < copied_end
+                    && user.content.iter().any(|block| {
+                        matches!(
+                            block,
+                            crate::types::ContentBlock::SkillContext { skill_key, .. }
+                                if !carried(Some(skill_key))
+                        )
+                    }) =>
+            {
+                let mut user = user.clone();
+                for block in &mut user.content {
+                    if let crate::types::ContentBlock::SkillContext { skill_key, text } = block
+                        && !carried(Some(&*skill_key))
+                    {
+                        *text = format!(
+                            "skill {skill_key} context was given here; its body is not carried \
+                             into this fork"
+                        );
+                    }
+                }
+                Some(crate::types::Message::User(user))
+            }
+            crate::types::Message::SystemNotice(notice)
+                if notice.blocks.iter().any(|block| {
+                    matches!(
+                        block,
+                        crate::types::SystemNoticeBlock::ForkBoundary(fork)
+                            if &fork.child_session_id != session_id
+                    )
+                }) =>
+            {
+                let mut notice = notice.clone();
+                for block in &mut notice.blocks {
+                    if let crate::types::SystemNoticeBlock::ForkBoundary(fork) = block
+                        && &fork.child_session_id != session_id
+                    {
+                        fork.summary = fork.historical_summary();
+                    }
+                }
+                Some(crate::types::Message::SystemNotice(notice))
+            }
+            _ => None,
+        };
+        if let Some(replacement) = replacement {
+            projected.get_or_insert_with(|| rows.to_vec())[index] = replacement;
+        }
+    }
+    projected
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::types::SystemNoticeBlock;
+
+    fn skill(name: &str) -> crate::skills::SkillKey {
+        crate::skills::SkillKey::new(
+            crate::skills::SourceUuid::parse("6f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a4b").unwrap(),
+            crate::skills::SkillName::parse(name).unwrap(),
+        )
+    }
+
+    fn load_call(id: &str, args: &str) -> crate::types::Message {
+        crate::types::Message::BlockAssistant(crate::types::BlockAssistantMessage::new(
+            vec![crate::types::AssistantBlock::ToolUse {
+                id: id.to_string(),
+                name: crate::skills::LOAD_SKILL_TOOL_NAME.to_string(),
+                args: serde_json::value::RawValue::from_string(args.to_string()).unwrap(),
+                meta: None,
+            }],
+            crate::types::StopReason::ToolUse,
+        ))
+    }
+
+    fn load_result(id: &str, body: &str) -> crate::types::Message {
+        crate::types::Message::ToolResults {
+            results: vec![crate::types::ToolResult::new(
+                id.to_string(),
+                body.to_string(),
+                false,
+            )],
+            created_at: crate::types::message_timestamp_now(),
+        }
+    }
+
+    fn named(name: &str) -> String {
+        serde_json::json!({
+            "source_uuid": "6f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a4b",
+            "skill_name": name,
+        })
+        .to_string()
+    }
+
+    /// `load_skill` results count by the skill their call named, results of
+    /// a call that names none count as unreadable, and a skill's per-turn
+    /// context counts as its skill.
+    #[test]
+    fn skill_loads_name_each_loaded_skill_and_count_the_unreadable() {
+        let mut context = crate::types::UserMessage::text("turn");
+        context
+            .content
+            .push(crate::types::ContentBlock::SkillContext {
+                skill_key: skill("context-skill"),
+                text: "body".to_string(),
+            });
+        let rows = vec![
+            load_call("a", &named("loaded-skill")),
+            load_result("a", "body"),
+            load_call("b", r#"{"skill":"nameless"}"#),
+            load_result("b", "body"),
+            crate::types::Message::User(context),
+        ];
+        let loads = skill_loads(&rows);
+        assert_eq!(
+            loads.skills.into_iter().collect::<Vec<_>>(),
+            vec![skill("context-skill"), skill("loaded-skill")]
+        );
+        assert_eq!(loads.unreadable, 1);
+        assert!(
+            skill_loads(&rows[..1]).is_empty(),
+            "a call without its result loads nothing"
+        );
+    }
+
+    /// In a fork child, the skills effective there are those it loaded after
+    /// its notice and those its notice carried.
+    #[test]
+    fn skills_effective_in_a_fork_child_follow_its_notice() {
+        let child = SessionId::new();
+        let mut carried = seed(
+            ForkNoticeKind::Transcript,
+            ForkSeedSourceTools::NotRead {
+                reason: ForkToolsNotComparedReason::SourceNotLive,
+            },
+        );
+        carried.skills_carried = vec![skill("carried-skill")];
+        carried.skills_removed = vec![skill("removed-skill")];
+        let notice = carried.notice(child.clone(), &BTreeSet::new(), &BTreeSet::new());
+        let rows = vec![
+            load_call("a", &named("removed-skill")),
+            load_result("a", "body"),
+            load_call("b", &named("carried-skill")),
+            load_result("b", "body"),
+            crate::types::Message::SystemNotice(crate::types::SystemNoticeMessage::fork_boundary(
+                notice,
+            )),
+            load_call("c", &named("own-skill")),
+            load_result("c", "body"),
+        ];
+        assert_eq!(
+            skills_effective_in(&rows, &child)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![skill("carried-skill"), skill("own-skill")]
+        );
+        assert_eq!(
+            skills_effective_in(&rows, &SessionId::new()).len(),
+            3,
+            "a session that holds no notice of its own counts every load"
+        );
+    }
+
+    /// A copied notice delivered to another session reads as history, and a
+    /// session that is not a fork child keeps its rows.
+    #[test]
+    fn a_copied_notice_of_another_session_reads_as_history() {
+        let earlier = SessionId::new();
+        let notice = seed(
+            ForkNoticeKind::Transcript,
+            ForkSeedSourceTools::NotRead {
+                reason: ForkToolsNotComparedReason::SourceNotLive,
+            },
+        )
+        .notice(earlier.clone(), &BTreeSet::new(), &BTreeSet::new());
+        let rows = vec![crate::types::Message::SystemNotice(
+            crate::types::SystemNoticeMessage::fork_boundary(notice),
+        )];
+        let reader = SessionId::new();
+        let projected = project_fork_rows(&reader, &rows, None).expect("the copied notice changes");
+        let crate::types::Message::SystemNotice(projected) = &projected[0] else {
+            panic!("the notice row");
+        };
+        let text = projected.model_projection_text();
+        assert!(
+            text.contains("Earlier fork notice, kept as history")
+                && text.contains(&earlier.to_string())
+                && !text.contains("You are a fork of"),
+            "{text}"
+        );
+        assert!(
+            project_fork_rows(&earlier, &rows, None).is_none(),
+            "the notice's own session reads it as written"
+        );
+    }
 
     fn key(name: &str) -> InstructionKeyRef {
         InstructionKeyRef::new(

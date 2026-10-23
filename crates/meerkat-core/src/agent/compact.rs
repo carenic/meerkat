@@ -1321,7 +1321,7 @@ mod tests {
         let session = session_with_unmeasured_voice();
         let encoded = serde_json::to_vec(&session).unwrap();
         let reloaded: Session = serde_json::from_slice(&encoded).unwrap();
-        let projected = reloaded.messages_for_model_boundary();
+        let projected = reloaded.messages_for_model_boundary().unwrap();
         assert_eq!(
             reloaded.messages().len(),
             3,
@@ -1334,10 +1334,13 @@ mod tests {
         ));
         assert_eq!(projected[0], reloaded.messages()[0]);
         assert_eq!(projected[2], reloaded.messages()[2]);
-        assert_eq!(projected, session.messages_for_model_boundary());
+        assert_eq!(projected, session.messages_for_model_boundary().unwrap());
         let mut ordinary = Session::new();
         ordinary.push(Message::User(UserMessage::text("Plain text.")));
-        assert_eq!(ordinary.messages_for_model_boundary(), ordinary.messages());
+        assert_eq!(
+            ordinary.messages_for_model_boundary().unwrap(),
+            ordinary.messages()
+        );
     }
 
     struct ObservationCompactor;
@@ -1497,7 +1500,7 @@ mod tests {
         session: &Session,
         client: &C,
     ) -> CompactionAttempt {
-        let model_messages = session.messages_for_model_boundary();
+        let model_messages = session.messages_for_model_boundary().unwrap();
         let compactor: Arc<dyn Compactor> = Arc::new(ObservationCompactor);
         run_compaction(
             client,
@@ -1582,7 +1585,7 @@ mod tests {
         let reloaded: Session =
             serde_json::from_slice(&serde_json::to_vec(&session).unwrap()).unwrap();
         assert!(
-            matches!(&reloaded.messages_for_model_boundary()[0], Message::User(user)
+            matches!(&reloaded.messages_for_model_boundary().unwrap()[0], Message::User(user)
                 if user.text_content().contains("Blueprint review")
                     && user.text_content().contains("UNMEASURED"))
         );
@@ -1791,7 +1794,7 @@ mod tests {
     #[tokio::test]
     async fn compaction_integrates_voice_observations_before_rebase_and_reload() {
         let mut session = session_with_unmeasured_voice();
-        let model_messages = session.messages_for_model_boundary();
+        let model_messages = session.messages_for_model_boundary().unwrap();
         let compactor: Arc<dyn Compactor> = Arc::new(ObservationCompactor);
         let curator: Arc<dyn CompactionCurator> = Arc::new(ObservationCurator);
         let outcome = run_compaction(
@@ -1844,13 +1847,13 @@ mod tests {
         );
         let reloaded: Session =
             serde_json::from_slice(&serde_json::to_vec(&session).unwrap()).unwrap();
-        let projected = reloaded.messages_for_model_boundary();
+        let projected = reloaded.messages_for_model_boundary().unwrap();
         assert_eq!(projected.len(), 1);
         assert!(matches!(&projected[0], Message::User(user)
             if user.transcript_role.is_compaction_summary()
                 && user.text_content().contains("blueprint review")
                 && user.text_content().contains("UNMEASURED")));
-        assert_eq!(projected, reloaded.messages_for_model_boundary());
+        assert_eq!(projected, reloaded.messages_for_model_boundary().unwrap());
     }
 
     /// These two cases used to fail the compaction closed. They are now

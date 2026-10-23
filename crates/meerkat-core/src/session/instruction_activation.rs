@@ -535,10 +535,13 @@ fn render_origin_v1(identity: &InstructionActivationIdentity, body: &str) -> Str
     )
 }
 
-fn render_inherited_v1(
+/// An activation row a fork child copied, as the child's model reads it:
+/// a header that names the key and the row, never the body, which is
+/// effective only in the session that activated it.
+fn render_inherited_v2(
     identity: &InstructionActivationIdentity,
     child_session_id: &SessionId,
-    body: &str,
+    body_bytes: usize,
 ) -> String {
     let supersedes = identity
         .supersedes
@@ -546,7 +549,7 @@ fn render_inherited_v1(
         .map(|value| json_string(value.as_str()))
         .unwrap_or_else(|| "null".to_string());
     format!(
-        "[meerkat-inherited-instruction-v1]\nnamespace={}\nkey={}\nrevision={}\nactivation={}\nsupersedes={}\norigin_session_id={}\nchild_session_id={}\ncontent_sha256={}\nstatus=historical_only_not_active_in_child\nbody_bytes={}\n\n{}",
+        "[meerkat-inherited-instruction-v2]\nnamespace={}\nkey={}\nrevision={}\nactivation={}\nsupersedes={}\norigin_session_id={}\nchild_session_id={}\ncontent_sha256={}\nstatus=not_active_in_child\nbody_bytes={}",
         json_string(identity.revision.namespace.as_str()),
         json_string(identity.revision.key.as_str()),
         json_string(identity.revision.revision_id.as_str()),
@@ -555,8 +558,7 @@ fn render_inherited_v1(
         json_string(&identity.origin_session_id.to_string()),
         json_string(&child_session_id.to_string()),
         identity.revision.content_sha256,
-        body.len(),
-        body,
+        body_bytes,
     )
 }
 
@@ -654,7 +656,9 @@ pub fn validate_instruction_activation_messages(messages: &[Message]) -> Result<
     Ok(())
 }
 
-/// Project inherited rows as historical-only envelopes while preserving order.
+/// Project inherited rows as headers without their bodies, preserving
+/// order. A row whose bytes are not the envelope its identity names fails
+/// the projection.
 pub fn materialize_instruction_activation_messages(
     session_id: &SessionId,
     messages: &[Message],
@@ -673,7 +677,7 @@ pub fn materialize_instruction_activation_messages(
                 return Ok(message.clone());
             }
             let mut inherited = system.clone();
-            inherited.content = render_inherited_v1(identity, session_id, body);
+            inherited.content = render_inherited_v2(identity, session_id, body.len());
             Ok(Message::System(inherited))
         })
         .collect()
@@ -713,7 +717,12 @@ impl Session {
     ///
     /// The child holds the activation rows it copied with its prefix as
     /// history only. [`ForkInstructionPolicy::Refuse`] refuses a child that
-    /// inherits any. [`ForkInstructionPolicy::RequireExplicitActivation`]
+    /// inherits any, or whose copied rows hold a loaded skill (a
+    /// `load_skill` result or per-turn skill context; see
+    /// [`crate::fork_notice::SkillLoads`]). The other two policies leave
+    /// those skills to the child's fork notice, which carries them under
+    /// [`ForkInstructionPolicy::ReactivateInherited`] only.
+    /// [`ForkInstructionPolicy::RequireExplicitActivation`]
     /// leaves them for the host to activate; callers resolve it first for
     /// forks that leave no window for that ([`ForkInstructionPolicy::effective`]).
     /// [`ForkInstructionPolicy::ReactivateInherited`] appends, through the
@@ -728,22 +737,56 @@ impl Session {
         source_session_id: &SessionId,
         policy: ForkInstructionPolicy,
     ) -> Result<usize, ForkInstructionRefusal> {
+        self.apply_fork_instruction_policies(source_session_id, policy, policy)
+    }
+
+    /// [`Self::apply_fork_instruction_policy`] with the copied activation rows
+    /// under `activations`, the policy resolved for the fork's activation
+    /// window ([`ForkInstructionPolicy::effective`]), and the skills the
+    /// copied rows loaded under `skills`, the host's policy as declared: a
+    /// child runs without activating a skill, so a fork that leaves no
+    /// activation window does not refuse its skills under the default. A
+    /// refusal names what each policy refused.
+    pub fn apply_fork_instruction_policies(
+        &mut self,
+        source_session_id: &SessionId,
+        activations: ForkInstructionPolicy,
+        skills: ForkInstructionPolicy,
+    ) -> Result<usize, ForkInstructionRefusal> {
         let heads = self.inherited_activation_heads().map_err(|error| {
             ForkInstructionRefusal::new(
                 ForkInstructionRefusalCause::Activation { code: error.code() },
                 Vec::new(),
             )
         })?;
+        let skill_loads = crate::fork_notice::skill_loads(self.messages());
+        let refuse_keys = activations == ForkInstructionPolicy::Refuse && !heads.is_empty();
+        let refuse_skills = skills == ForkInstructionPolicy::Refuse && !skill_loads.is_empty();
+        if refuse_keys || refuse_skills {
+            let keys = if refuse_keys {
+                heads.keys().cloned().collect()
+            } else {
+                Vec::new()
+            };
+            let refusal =
+                ForkInstructionRefusal::new(ForkInstructionRefusalCause::PolicyRefuses, keys);
+            return Err(if refuse_skills {
+                refusal
+                    .with_skills(skill_loads.skills.into_iter().collect())
+                    .with_unreadable_skill_loads(skill_loads.unreadable)
+            } else {
+                refusal
+            });
+        }
         if heads.is_empty() {
             return Ok(0);
         }
         let keys = heads.keys().cloned().collect::<Vec<_>>();
-        match policy {
-            ForkInstructionPolicy::RequireExplicitActivation => Ok(0),
-            ForkInstructionPolicy::Refuse => Err(ForkInstructionRefusal::new(
-                ForkInstructionRefusalCause::PolicyRefuses,
-                keys,
-            )),
+        match activations {
+            // A `refuse` fork with inherited keys was refused above.
+            ForkInstructionPolicy::RequireExplicitActivation | ForkInstructionPolicy::Refuse => {
+                Ok(0)
+            }
             ForkInstructionPolicy::ReactivateInherited => {
                 let not_effective = heads
                     .iter()
@@ -1274,7 +1317,9 @@ mod tests {
         assert!(matches!(
             &projected[0],
             Message::System(system)
-                if system.content.starts_with("[meerkat-inherited-instruction-v1]")
+                if system.content.starts_with("[meerkat-inherited-instruction-v2]")
+                    && system.content.ends_with("status=not_active_in_child\nbody_bytes=10")
+                    && !system.content.contains("policy one")
         ));
         assert_eq!(
             inherited_instruction_keys_requiring_activation(child.id(), child.messages()).len(),
@@ -1868,7 +1913,7 @@ mod tests {
             })
             .count();
         assert_eq!(activation_rows, 1);
-        let projected = session.messages_for_model_boundary();
+        let projected = session.messages_for_model_boundary().unwrap();
         assert!(matches!(
             &projected[0],
             Message::System(system)
@@ -2192,6 +2237,42 @@ mod tests {
             refusal.skills.as_ref(),
             [skill_key()].as_slice(),
             "the per-turn context still names its skill"
+        );
+    }
+
+    /// The projection's refusal is typed and names the session, and a turn
+    /// reads it as malformed activation history.
+    #[test]
+    fn a_malformed_activation_row_fails_the_projection_typed() {
+        let mut session = Session::new();
+        session
+            .activate_instruction(request(
+                "policy one",
+                "act-1",
+                InstructionActivationExpectation::Absent,
+                None,
+            ))
+            .unwrap();
+        let mut rows = session.messages().to_vec();
+        let Some(Message::System(system)) = rows.iter_mut().find(
+            |row| matches!(row, Message::System(system) if system.instruction_activation.is_some()),
+        ) else {
+            panic!("the activation row");
+        };
+        system.content = system.content.replace("policy one", "policy edited");
+        session.messages = crate::session::TranscriptMessages::from_vec(rows);
+        let error = session
+            .messages_for_model_boundary()
+            .expect_err("the projection fails closed");
+        assert_eq!(&error.session_id, session.id());
+        assert!(
+            matches!(
+                crate::error::AgentError::from(error),
+                crate::error::AgentError::InstructionActivation(
+                    InstructionActivationError::MalformedHistory(_)
+                )
+            ),
+            "a turn reads the refusal as malformed activation history"
         );
     }
 }
