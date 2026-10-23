@@ -39,7 +39,10 @@
 //! 3. **Idempotent retry.** A commit id sent twice acts once. A store may
 //!    refuse the duplicate or collapse it at load; answering `Ok` to a retry
 //!    of a batch that already landed is the usual way. Core never reuses a
-//!    commit id for another batch.
+//!    commit id for different content, and never commits a scope's next
+//!    version while an earlier commit touching that scope has an unknown
+//!    outcome: it settles the unknown first, by retrying the same batch or
+//!    by loading the head.
 //! 4. **One version chain per scope.** Core never sends two batches for one
 //!    version of a scope, so no atomic precheck is required. If two exist
 //!    anyway (a fenced out writer, a bug), every load must resolve them the
@@ -47,13 +50,16 @@
 //!    ([`HostStoreError::Conflict`]); fail the load with a typed conflict;
 //!    pick one by a fixed rule, such as the lowest commit id, decided per
 //!    batch, so that a batch that loses in one scope is invisible in all of
-//!    them.
+//!    them. Whatever the rule, a batch carrying a lower fence token never
+//!    beats one carrying a higher token at the same version.
 //! 5. **Fencing.** After a token is acquired, a batch carrying a lower token
 //!    that is committed later never becomes visible, and everything
-//!    acknowledged before the acquire stays visible. Valid ways: refuse the
-//!    batch at commit ([`HostStoreError::FencedOut`]); at load, ignore every
-//!    batch whose token is below the highest token acquired before its
-//!    commit point (for example its marker's commit time).
+//!    acknowledged before the acquire stays visible: a load after the
+//!    acquire shows it. Valid ways: refuse the batch at commit
+//!    ([`HostStoreError::FencedOut`]); at load, ignore every batch whose
+//!    token is below the highest token acquired before its commit point.
+//!    The commit point is the store's own server assigned commit order (for
+//!    example its marker's commit time), never a writer's clock.
 //! 6. **Logical removal.** Truncate, drop and delete take effect for loads
 //!    together with their batch. Physical cleanup may come later or never;
 //!    tombstones are fine.
@@ -74,6 +80,22 @@
 //! [`HostStoreError::Conflict`] or [`HostStoreError::FencedOut`], or at
 //! load, by the fixed rules above. Core treats both the same way: the
 //! fenced or conflicting batch is not part of the realm.
+//!
+//! # Writer rules (Core's side)
+//!
+//! - A writer acquires with [`AcquireMode::Exclusive`]; a live holder makes
+//!   that answer [`HostStoreError::Held`], so two processes never fence each
+//!   other back and forth. Only an explicit takeover uses
+//!   [`AcquireMode::Takeover`].
+//! - A holder renews at least every [`FENCE_RENEW_INTERVAL_SECS`] and stops
+//!   writing as soon as a renew fails. A holder counts as live for
+//!   [`FENCE_LEASE_SECS`] after its last acquire or renew.
+//! - After an acquire that supersedes a holder (a takeover, or a holder
+//!   whose lease ran out), the new writer waits one renew interval before it
+//!   dispatches anything, so the old writer has failed a renew and stopped.
+//!   There is no fence check on the per-round path.
+//! - The bulk load of heads ([`HostStore::list_heads`]) runs after the
+//!   acquire and before the first commit, so it observes one cut.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -93,6 +115,23 @@ pub const MAX_SCOPE_NAME_BYTES: usize = 512;
 
 /// The most bytes of a commit id.
 pub const MAX_COMMIT_ID_BYTES: usize = 128;
+
+/// How often a fence holder renews its token, in seconds.
+pub const FENCE_RENEW_INTERVAL_SECS: u64 = 10;
+
+/// How long a fence holder counts as live after its last acquire or renew,
+/// in seconds.
+pub const FENCE_LEASE_SECS: u64 = 30;
+
+/// How [`HostStore::acquire_fence`] treats a live holder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AcquireMode {
+    /// Refuse with [`HostStoreError::Held`] while another holder's lease is
+    /// live.
+    Exclusive,
+    /// Supersede any holder, live or not.
+    Takeover,
+}
 
 /// What a scope holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -409,8 +448,9 @@ pub struct ScopeUpdate {
     /// where it was.
     pub drop_before: Option<RowIndex>,
     /// Delete the scope with its head and rows. Nothing else may be set.
-    /// A later batch may create the scope again, from
-    /// [`ScopeVersion::FIRST`].
+    /// Core never creates a deleted scope's name again: names are unique per
+    /// incarnation. A store may refuse such a create as
+    /// [`HostStoreError::Invalid`].
     pub delete: bool,
 }
 
@@ -578,6 +618,10 @@ pub enum HostStoreError {
     /// applied.
     #[error("unavailable: {0}")]
     Unavailable(String),
+    /// An exclusive acquire found a live holder: `holder` renewed within
+    /// [`FENCE_LEASE_SECS`]. Nothing was acquired.
+    #[error("the fence is held by token {holder}")]
+    Held { holder: FenceToken },
 }
 
 /// The storage interface a host implements for one realm. Core is the only
@@ -587,8 +631,10 @@ pub enum HostStoreError {
 pub trait HostStore: Send + Sync {
     /// Acquire the realm's fence: answer a token higher than any acquired
     /// before, durably, so that batches carrying lower tokens committed from
-    /// now on never become visible (obligation 5).
-    async fn acquire_fence(&self) -> Result<FenceToken, HostStoreError>;
+    /// now on never become visible, and loads from now on show every batch
+    /// acknowledged before (obligation 5). With [`AcquireMode::Exclusive`],
+    /// a live holder makes it answer [`HostStoreError::Held`].
+    async fn acquire_fence(&self, mode: AcquireMode) -> Result<FenceToken, HostStoreError>;
 
     /// Confirm that no token higher than `token` exists, and extend a lease
     /// if the store uses one. [`HostStoreError::FencedOut`] stops the
