@@ -21,12 +21,13 @@ use meerkat_core::{ContentInput, SessionId};
 use meerkat_schedule::{
     ADMITTED_RECLAIM_ATTEMPT_CAP, AcquireScheduleExecutorLeaseOutcome,
     AcquireScheduleExecutorLeaseRequest, AdmissionEvidence, ClaimDueRequest, ClaimDueResult,
-    CreateScheduleRequest, DeliveryAdmissionOutcome, IntervalTriggerSpec, MemoryScheduleStore,
-    MisfirePolicy, MissingTargetPolicy, Occurrence, OccurrenceFailureClass, OccurrenceId,
-    OccurrenceLifecycleEffect, OccurrenceLifecycleInput, OccurrenceOrdinal, OccurrencePhase,
-    OverlapPolicy, RuntimeDeliveryOutcome, Schedule, ScheduleFilter, ScheduleLifecycleInput,
-    SchedulePhase, ScheduleService, ScheduleStore, ScheduleStoreRowFaultKind,
-    ScheduledSessionAction, SessionTargetBinding, TargetBinding, TriggerSpec,
+    CreateScheduleRequest, DeliveryAdmissionOutcome, DeliveryReceiptStage, IntervalTriggerSpec,
+    MemoryScheduleStore, MisfirePolicy, MissingTargetPolicy, Occurrence, OccurrenceFailureClass,
+    OccurrenceId, OccurrenceLifecycleEffect, OccurrenceLifecycleInput, OccurrenceOrdinal,
+    OccurrencePhase, OverlapPolicy, RuntimeDeliveryOutcome, Schedule, ScheduleFilter,
+    ScheduleLifecycleInput, SchedulePhase, ScheduleService, ScheduleStore,
+    ScheduleStoreRowFaultKind, ScheduledSessionAction, SessionTargetBinding, TargetBinding,
+    TriggerSpec,
 };
 use meerkat_store::SqliteScheduleStore;
 use rusqlite::{Connection, params};
@@ -960,6 +961,9 @@ async fn both_stores_derive_the_same_admission_evidence_from_the_receipt_history
 /// An admitted occurrence is reclaimed past its misfire deadline once per
 /// lapsed lease until its attempts reach the cap; then it ends
 /// delivery_failed with lease_lost and the exhausted detail, never misfired.
+/// The scan that expires the last lapsed lease resolves the exhaustion
+/// itself, with no row fault: the refused reclaim at the cap is the
+/// machine's design, not a row incident.
 #[tokio::test]
 async fn an_admitted_occurrence_that_used_up_its_reclaims_ends_lease_lost() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -978,25 +982,54 @@ async fn an_admitted_occurrence_that_used_up_its_reclaims_ends_lease_lost() {
             assert_eq!(occurrence.attempt_count, attempt);
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        // At the cap the lapsed lease is not reclaimed again, and the
-        // exhaustion resolves within the next scans.
-        let mut occurrence = current_occurrence(store, &occurrence_id).await;
-        for _ in 0..3 {
-            let _ = claim_due_in(store, Duration::seconds(60)).await;
-            occurrence = current_occurrence(store, &occurrence_id).await;
-            assert!(
-                occurrence.attempt_count <= ADMITTED_RECLAIM_ATTEMPT_CAP,
-                "never a reclaim past the cap"
-            );
-            assert_ne!(occurrence.phase, OccurrencePhase::Misfired);
-            if occurrence.phase == OccurrencePhase::DeliveryFailed {
-                break;
-            }
-        }
+        // At the cap one scan expires the lapsed lease and resolves the
+        // exhaustion: no reclaim past the cap, and no row fault for the
+        // refused reclaim.
+        let result = claim_due_in(store, Duration::seconds(60)).await;
+        assert!(
+            result.row_faults.is_empty(),
+            "{:?}: {:?}",
+            store.kind(),
+            result.row_faults
+        );
+        let effects: Vec<OccurrenceLifecycleEffect> = result
+            .transitions
+            .iter()
+            .filter(|commit| commit.successor().occurrence_id == occurrence_id)
+            .flat_map(|commit| commit.effects().iter().cloned())
+            .collect();
+        assert!(
+            effects.contains(&OccurrenceLifecycleEffect::LeaseExpired),
+            "{:?}: {effects:?}",
+            store.kind()
+        );
+        assert!(
+            effects.contains(&OccurrenceLifecycleEffect::DeliveryFailed),
+            "{:?}: {effects:?}",
+            store.kind()
+        );
+        let occurrence = current_occurrence(store, &occurrence_id).await;
         assert_eq!(
             occurrence.phase,
             OccurrencePhase::DeliveryFailed,
             "{:?}",
+            store.kind()
+        );
+        assert_eq!(occurrence.attempt_count, ADMITTED_RECLAIM_ATTEMPT_CAP);
+        // The last attempt keeps both receipts: its lease expiry and the
+        // exhaustion.
+        let last_attempt: Vec<DeliveryReceiptStage> = store
+            .list_receipts(&occurrence_id)
+            .await
+            .expect("list receipts")
+            .into_iter()
+            .filter(|receipt| receipt.attempt == ADMITTED_RECLAIM_ATTEMPT_CAP)
+            .map(|receipt| receipt.stage)
+            .collect();
+        assert!(
+            last_attempt.contains(&DeliveryReceiptStage::LeaseExpired)
+                && last_attempt.contains(&DeliveryReceiptStage::DeliveryFailed),
+            "{:?}: {last_attempt:?}",
             store.kind()
         );
         assert_eq!(
