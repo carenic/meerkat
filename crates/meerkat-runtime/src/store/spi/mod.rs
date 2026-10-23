@@ -23,7 +23,7 @@
 //! [`realm::INLINE_VALUE_LIMIT`] live in chunk scopes, written before the
 //! batch that references them. See [`codec`] for the durable formats.
 //!
-//! # Boot and memory (D2)
+//! # Boot and memory
 //!
 //! A boot lists every head once. The pinned entries of every runtime are
 //! imported, so listings, the delivery authority listing and the controller
@@ -49,8 +49,8 @@
 //!   so a council that requires durable custody is refused and a
 //!   process-bound one does not survive a restart.
 //! - The WholeBlob candidate document is written whole at every per-round
-//!   commit, so the bytes a run writes grow with the square of its rounds
-//!   (S1). Its chunks are replaced, not accumulated.
+//!   commit, so the bytes a run writes grow with the square of its rounds.
+//!   Its chunks are replaced, not accumulated.
 
 #![cfg(not(target_arch = "wasm32"))]
 

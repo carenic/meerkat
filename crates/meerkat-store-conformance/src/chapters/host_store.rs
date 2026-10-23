@@ -718,7 +718,7 @@ async fn stale_fence(chapter: &mut Chapter<'_>, a: Writer) -> Result<Writer, Con
                 current: grant.token,
             }),
         format!(
-            "the lapsed holder's renew must answer FencedOut with token {}, got {renewed:?}",
+            "the superseded holder's renew must answer FencedOut with token {}, got {renewed:?}",
             grant.token
         ),
     )?;

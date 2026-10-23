@@ -661,7 +661,7 @@ async fn a_host_declared_self_fence_margin_bounds_the_write_window() {
     assert_eq!(fence.window().window, Duration::from_secs(18));
 }
 
-// Unrun until the candidate's validation. The K3 re-acquire rule, with the
+// Unrun until the candidate's validation. The re-acquire rule, with the
 // visibility-lag counterexample: renews fail from some point, the lease
 // lapses, another process acquires, and the old writer's connection comes
 // back. A renew that now succeeded would prove nothing (the new acquire may
