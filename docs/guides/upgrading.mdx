@@ -123,11 +123,16 @@ them; a redelivery through such a host only replays the earlier input.
   `SessionError::ServedElsewhere` or `SessionError::HostingUnavailable`
   instead of a `PrepareFailed` message.
 - `meerkat-contracts`: `MobMemberStatusResult` gains the field
-  `custody_deferred: Option<WireMemberCustodyDeferral>`.
+  `custody_deferred: Option<WireMemberCustodyDeferral>`. Its restore and
+  cause vocabularies may grow: `WireMemberCustodyRestore` and
+  `WireMemberCustodyDeferralCause` have an `Unknown(String)` variant for a
+  value this version does not know, and the SDKs report such a value as
+  `{"unknown": value}` instead of failing the read.
 
 **Do:** add a wildcard arm to any exhaustive match on `RuntimeBindingsError`,
-and set `custody_deferred` (`None`) where you build `MobMemberStatusResult`
-with a struct literal.
+set `custody_deferred` (`None`) where you build `MobMemberStatusResult` with a
+struct literal, and handle the `Unknown` case where you read a custody
+restore or cause.
 
 ### Other behaviour changes
 

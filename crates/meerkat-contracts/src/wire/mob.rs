@@ -2825,7 +2825,9 @@ pub struct MobMemberStatusResult {
 }
 
 /// A member's custody restore a mob start deferred, as its status shows it.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// Advisory: its vocabularies may grow, and a reader surfaces a value it does
+/// not know instead of refusing it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WireMemberCustodyDeferral {
     /// The deferred restore.
@@ -2834,21 +2836,57 @@ pub struct WireMemberCustodyDeferral {
     pub cause: WireMemberCustodyDeferralCause,
 }
 
-/// Which startup restore of a member's custody a mob start deferred.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(rename_all = "snake_case")]
+/// Which startup restore of a member's custody a mob start deferred. The
+/// vocabulary may grow: a restore this version does not know reads as
+/// [`Self::Unknown`] with the value as it was sent, and is written back the
+/// same.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(from = "String", into = "String")]
 pub enum WireMemberCustodyRestore {
     /// The operation binding of a member whose restore failed at the start.
     StartupBinding,
     /// A retiring member's local cleanup delivery custody.
     CleanupDelivery,
+    /// A restore this version does not know, as it was sent.
+    Unknown(String),
 }
 
-/// The cause a deferred member custody restore last met.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(rename_all = "snake_case")]
+impl WireMemberCustodyRestore {
+    /// The value on the wire.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::StartupBinding => "startup_binding",
+            Self::CleanupDelivery => "cleanup_delivery",
+            Self::Unknown(raw) => raw,
+        }
+    }
+}
+
+impl From<String> for WireMemberCustodyRestore {
+    fn from(raw: String) -> Self {
+        match raw.as_str() {
+            "startup_binding" => Self::StartupBinding,
+            "cleanup_delivery" => Self::CleanupDelivery,
+            _ => Self::Unknown(raw),
+        }
+    }
+}
+
+impl From<WireMemberCustodyRestore> for String {
+    fn from(restore: WireMemberCustodyRestore) -> Self {
+        match restore {
+            WireMemberCustodyRestore::Unknown(raw) => raw,
+            known => known.as_str().to_owned(),
+        }
+    }
+}
+
+/// The cause a deferred member custody restore last met. The vocabulary may
+/// grow: a cause this version does not know reads as [`Self::Unknown`] with
+/// the value as it was sent, and is written back the same.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(from = "String", into = "String")]
 pub enum WireMemberCustodyDeferralCause {
     /// Another runtime owner on the realm hosts the member's session.
     ServedElsewhere,
@@ -2857,6 +2895,101 @@ pub enum WireMemberCustodyDeferralCause {
     /// The member's durable tail could not be proven, and its recovery kept
     /// it.
     DurableTailUnprovable,
+    /// A cause this version does not know, as it was sent.
+    Unknown(String),
+}
+
+impl WireMemberCustodyDeferralCause {
+    /// The value on the wire.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::ServedElsewhere => "served_elsewhere",
+            Self::HostingUnavailable => "hosting_unavailable",
+            Self::DurableTailUnprovable => "durable_tail_unprovable",
+            Self::Unknown(raw) => raw,
+        }
+    }
+}
+
+impl From<String> for WireMemberCustodyDeferralCause {
+    fn from(raw: String) -> Self {
+        match raw.as_str() {
+            "served_elsewhere" => Self::ServedElsewhere,
+            "hosting_unavailable" => Self::HostingUnavailable,
+            "durable_tail_unprovable" => Self::DurableTailUnprovable,
+            _ => Self::Unknown(raw),
+        }
+    }
+}
+
+impl From<WireMemberCustodyDeferralCause> for String {
+    fn from(cause: WireMemberCustodyDeferralCause) -> Self {
+        match cause {
+            WireMemberCustodyDeferralCause::Unknown(raw) => raw,
+            known => known.as_str().to_owned(),
+        }
+    }
+}
+
+/// The schema of the advisory custody vocabularies: the values this version
+/// knows. A reader accepts any other string as unknown.
+#[cfg(feature = "schema")]
+mod custody_deferral_schema {
+    /// Which startup restore of a member's custody a mob start deferred. The
+    /// vocabulary may grow: a reader surfaces a restore it does not know
+    /// instead of refusing it.
+    #[derive(schemars::JsonSchema)]
+    #[schemars(rename_all = "snake_case")]
+    #[allow(dead_code)]
+    pub(super) enum WireMemberCustodyRestore {
+        /// The operation binding of a member whose restore failed at the start.
+        StartupBinding,
+        /// A retiring member's local cleanup delivery custody.
+        CleanupDelivery,
+    }
+
+    /// The cause a deferred member custody restore last met. The vocabulary
+    /// may grow: a reader surfaces a cause it does not know instead of
+    /// refusing it.
+    #[derive(schemars::JsonSchema)]
+    #[schemars(rename_all = "snake_case")]
+    #[allow(dead_code)]
+    pub(super) enum WireMemberCustodyDeferralCause {
+        /// Another runtime owner on the realm hosts the member's session.
+        ServedElsewhere,
+        /// The member session's hosting claim cannot be taken on this realm.
+        HostingUnavailable,
+        /// The member's durable tail could not be proven, and its recovery kept
+        /// it.
+        DurableTailUnprovable,
+    }
+}
+
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for WireMemberCustodyRestore {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "WireMemberCustodyRestore".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        <custody_deferral_schema::WireMemberCustodyRestore as schemars::JsonSchema>::json_schema(
+            generator,
+        )
+    }
+}
+
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for WireMemberCustodyDeferralCause {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "WireMemberCustodyDeferralCause".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        <custody_deferral_schema::WireMemberCustodyDeferralCause as schemars::JsonSchema>::json_schema(
+            generator,
+        )
+    }
 }
 
 /// The member registration hook call that refused a restored member's
@@ -4798,8 +4931,12 @@ mod tests {
                     "durable_tail_unprovable",
                 ),
             ] {
+                let deferral = WireMemberCustodyDeferral {
+                    restore: restore.clone(),
+                    cause,
+                };
                 let mut status = minimal_member_status();
-                status.custody_deferred = Some(WireMemberCustodyDeferral { restore, cause });
+                status.custody_deferred = Some(deferral.clone());
                 let value = serde_json::to_value(&status).expect("serialize member status");
                 assert_eq!(
                     value["custody_deferred"],
@@ -4807,12 +4944,40 @@ mod tests {
                 );
                 let decoded: MobMemberStatusResult =
                     serde_json::from_value(value).expect("the deferral decodes");
-                assert_eq!(
-                    decoded.custody_deferred,
-                    Some(WireMemberCustodyDeferral { restore, cause })
-                );
+                assert_eq!(decoded.custody_deferred, Some(deferral));
             }
         }
+    }
+
+    /// The advisory custody vocabularies may grow: a restore or a cause this
+    /// version does not know decodes as unknown with the value as sent, and
+    /// is written back unchanged. A value that is not a string still fails.
+    #[test]
+    fn member_status_custody_deferred_reads_an_unknown_value_as_unknown() {
+        let mut status = serde_json::to_value(minimal_member_status()).expect("serialize");
+        status["custody_deferred"] =
+            serde_json::json!({ "restore": "warm_handoff", "cause": "quota_paused" });
+        let decoded: MobMemberStatusResult =
+            serde_json::from_value(status.clone()).expect("unknown values decode");
+        assert_eq!(
+            decoded.custody_deferred,
+            Some(WireMemberCustodyDeferral {
+                restore: WireMemberCustodyRestore::Unknown("warm_handoff".to_string()),
+                cause: WireMemberCustodyDeferralCause::Unknown("quota_paused".to_string()),
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&decoded).expect("serialize again")["custody_deferred"],
+            status["custody_deferred"],
+            "an unknown value is written back as it was read"
+        );
+
+        status["custody_deferred"] =
+            serde_json::json!({ "restore": 7, "cause": "served_elsewhere" });
+        assert!(
+            serde_json::from_value::<MobMemberStatusResult>(status).is_err(),
+            "a restore that is not a string is malformed"
+        );
     }
 
     /// The preview-unavailable marker is a closed snake_case vocabulary at

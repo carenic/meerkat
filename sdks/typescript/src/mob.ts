@@ -38,7 +38,8 @@ import type {
   WireMemberLifecycleCapabilities,
   WireMemberPreviewUnavailable,
   WireMemberRegistrationHookCall,
-  WireMemberCustodyDeferral,
+  WireMemberCustodyDeferralCause,
+  WireMemberCustodyRestore,
   WireMobMemberStatus,
   WireMobBackendKind,
   WireMobRuntimeMode,
@@ -153,7 +154,22 @@ export interface MobMemberSnapshot {
    * failing the whole start: the restore and the cause its last attempt met.
    * Every operation on the member re-attempts it first.
    */
-  custodyDeferred?: WireMemberCustodyDeferral;
+  custodyDeferred?: MobMemberCustodyDeferral;
+}
+
+/**
+ * A custody restore or cause this SDK does not know, as the server sent it:
+ * the deferral vocabularies may grow, and an unknown value is surfaced, not
+ * refused.
+ */
+export interface MobMemberCustodyUnknown {
+  unknown: string;
+}
+
+/** A member's custody restore a mob start deferred, and the cause its last attempt met. */
+export interface MobMemberCustodyDeferral {
+  restore: WireMemberCustodyRestore | MobMemberCustodyUnknown;
+  cause: WireMemberCustodyDeferralCause | MobMemberCustodyUnknown;
 }
 
 export interface MobKickoffWaitOptions {
@@ -179,7 +195,7 @@ export interface MobKickoffMemberSnapshot {
   /** As on {@link MobMemberSnapshot.registrationRefusal}. */
   registrationRefusal?: WireMemberRegistrationHookCall;
   /** As on {@link MobMemberSnapshot.custodyDeferred}. */
-  custodyDeferred?: WireMemberCustodyDeferral;
+  custodyDeferred?: MobMemberCustodyDeferral;
 }
 
 export type MobReadyWaitOptions = MobKickoffWaitOptions;

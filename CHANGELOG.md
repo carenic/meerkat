@@ -290,8 +290,12 @@ them.
   and `MobMemberSnapshot::custody_deferred`, which carries it for a member
   whose custody restore the mob's start deferred. `meerkat-contracts` mirrors
   them as `WireMemberCustodyDeferral`, `WireMemberCustodyRestore` and
-  `WireMemberCustodyDeferralCause`, and the Python, TypeScript and Web SDKs
-  parse `custody_deferred` as closed vocabularies.
+  `WireMemberCustodyDeferralCause`. The field is advisory and its vocabularies
+  may grow: the wire enums read a restore or cause they do not know as
+  `Unknown(value)` and write it back unchanged, and the Python, TypeScript
+  and Web SDKs surface it as `{"unknown": value}` and ignore a field they do
+  not know, instead of failing the read. A `custody_deferred` that is not an
+  object, or whose restore or cause is not a string, is still refused.
 
 ### Changed
 

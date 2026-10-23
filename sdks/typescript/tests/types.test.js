@@ -5141,12 +5141,13 @@ describe("Mob surface fail-closed status parsing (DOGMA Rule 6)", () => {
       }
     });
 
-    it("rejects a custody_deferred outside its closed vocabularies", async () => {
+    it("rejects a malformed custody_deferred", async () => {
       for (const deferral of [
         "startup_binding",
-        { restore: "StartupBinding", cause: "served_elsewhere" },
-        { restore: "startup_binding", cause: "busy" },
-        { restore: "startup_binding", cause: "served_elsewhere", attempts: 2 },
+        ["startup_binding"],
+        { restore: 7, cause: "served_elsewhere" },
+        { restore: "startup_binding", cause: { kind: "busy" } },
+        { cause: "served_elsewhere" },
       ]) {
         const client = memberStatusClient(
           validResponse({ status: "broken", custody_deferred: deferral }),
@@ -5158,6 +5159,72 @@ describe("Mob surface fail-closed status parsing (DOGMA Rule 6)", () => {
             error.code === "INVALID_RESPONSE" &&
             /custody_deferred/.test(String(error.message)),
         );
+      }
+    });
+
+    it("reads an unknown custody_deferred restore as unknown", async () => {
+      const client = memberStatusClient(
+        validResponse({
+          status: "broken",
+          custody_deferred: { restore: "warm_handoff", cause: "served_elsewhere" },
+        }),
+      );
+      const result = await client.mobMemberStatus("mob-1", "worker-1");
+      assert.deepEqual(result.custodyDeferred, {
+        restore: { unknown: "warm_handoff" },
+        cause: "served_elsewhere",
+      });
+    });
+
+    it("reads an unknown custody_deferred cause as unknown", async () => {
+      const client = memberStatusClient(
+        validResponse({
+          status: "broken",
+          custody_deferred: { restore: "startup_binding", cause: "quota_paused" },
+        }),
+      );
+      const result = await client.mobMemberStatus("mob-1", "worker-1");
+      assert.deepEqual(result.custodyDeferred, {
+        restore: "startup_binding",
+        cause: { unknown: "quota_paused" },
+      });
+    });
+
+    it("ignores a custody_deferred field it does not know", async () => {
+      const client = memberStatusClient(
+        validResponse({
+          status: "broken",
+          custody_deferred: { restore: "startup_binding", cause: "served_elsewhere", attempts: 2 },
+        }),
+      );
+      const result = await client.mobMemberStatus("mob-1", "worker-1");
+      assert.deepEqual(result.custodyDeferred, {
+        restore: "startup_binding",
+        cause: "served_elsewhere",
+      });
+    });
+
+    it("reads an unknown custody_deferral on wait_kickoff and wait_ready members", async () => {
+      const client = new MeerkatClient();
+      client.request = async () => ({
+        members: [
+          {
+            agent_identity: "lead",
+            status: "broken",
+            tokens_used: 0,
+            is_final: false,
+            custody_deferred: { restore: "warm_handoff", cause: "quota_paused" },
+          },
+        ],
+      });
+      for (const members of [
+        await client.waitMobKickoff("mob-1"),
+        await client.waitMobReady("mob-1"),
+      ]) {
+        assert.deepEqual(members[0].custodyDeferred, {
+          restore: { unknown: "warm_handoff" },
+          cause: { unknown: "quota_paused" },
+        });
       }
     });
 

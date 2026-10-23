@@ -1211,7 +1211,8 @@ hosting claim cannot be taken, or its durable tail could not be proven. The
 start defers that member's custody restore: the mob runs, the member stays
 Broken with its session untouched, and `MobHandle::member_status` shows the
 deferral as `custody_deferred` (the restore and the cause its last attempt
-met). A respawn, retire or destroy of the member re-attempts the restore first
+met; both vocabularies may grow, and the SDKs report a value they do not know
+as unknown instead of failing the read). A respawn, retire or destroy of the member re-attempts the restore first
 and answers `MobError::MemberCustodyDeferred` while it still cannot restore;
 an explicit resume re-attempts it once and still succeeds. The mob also
 re-attempts the restore on its own, and once it succeeds a respawn rebuilds

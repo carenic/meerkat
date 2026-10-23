@@ -24,6 +24,7 @@ import type {
   ContentBlock,
   MemberDeliveryReceipt,
   MobRespawnResult,
+  MobMemberCustodyDeferral,
   MobMemberSnapshot,
   MobPeerConnectivity,
   MobPeerConnectivitySnapshot,
@@ -51,7 +52,6 @@ import type {
   WireMemberPreviewUnavailable,
   WireMemberProgressSnapshot,
   WireMemberRegistrationHookCall,
-  WireMemberCustodyDeferral,
   WireMemberCustodyDeferralCause,
   WireMemberCustodyRestore,
   WireNonPortableResourceKind,
@@ -808,10 +808,13 @@ const WIRE_MEMBER_CUSTODY_DEFERRAL_CAUSE_VALUES: readonly WireMemberCustodyDefer
 /**
  * The member's custody restore a mob start deferred: which restore, and the
  * cause its last attempt met. Absent (or `null`) means no restore is
- * deferred; a restore or cause outside its closed vocabulary, or an unknown
- * field, fails closed.
+ * deferred. The field is advisory and its vocabularies may grow: a restore or
+ * cause this SDK does not know reads as `{ unknown: <value> }`, and a field
+ * it does not know is ignored, so a newer server never fails the read. A
+ * value that is not an object, or a restore or cause that is not a string,
+ * is malformed and fails closed.
  */
-function parseWireMemberCustodyDeferral(raw: unknown): WireMemberCustodyDeferral | undefined {
+function parseWireMemberCustodyDeferral(raw: unknown): MobMemberCustodyDeferral | undefined {
   if (raw == null) {
     return undefined;
   }
@@ -820,32 +823,24 @@ function parseWireMemberCustodyDeferral(raw: unknown): WireMemberCustodyDeferral
   }
   const record = raw as Record<string, unknown>;
   const restore = record.restore;
-  if (
-    typeof restore !== 'string' ||
-    !WIRE_MEMBER_CUSTODY_RESTORE_VALUES.includes(restore as WireMemberCustodyRestore)
-  ) {
+  if (typeof restore !== 'string') {
     throw new Error(
-      'Invalid mob member_status response: custody_deferred.restore must be a valid custody restore',
+      'Invalid mob member_status response: custody_deferred.restore must be a string',
     );
   }
   const cause = record.cause;
-  if (
-    typeof cause !== 'string' ||
-    !WIRE_MEMBER_CUSTODY_DEFERRAL_CAUSE_VALUES.includes(cause as WireMemberCustodyDeferralCause)
-  ) {
-    throw new Error(
-      'Invalid mob member_status response: custody_deferred.cause must be a valid deferral cause',
-    );
-  }
-  const unknown = Object.keys(record).find((key) => key !== 'restore' && key !== 'cause');
-  if (unknown !== undefined) {
-    throw new Error(
-      `Invalid mob member_status response: unknown custody_deferred field ${unknown}`,
-    );
+  if (typeof cause !== 'string') {
+    throw new Error('Invalid mob member_status response: custody_deferred.cause must be a string');
   }
   return {
-    restore: restore as WireMemberCustodyRestore,
-    cause: cause as WireMemberCustodyDeferralCause,
+    restore: WIRE_MEMBER_CUSTODY_RESTORE_VALUES.includes(restore as WireMemberCustodyRestore)
+      ? (restore as WireMemberCustodyRestore)
+      : { unknown: restore },
+    cause: WIRE_MEMBER_CUSTODY_DEFERRAL_CAUSE_VALUES.includes(
+      cause as WireMemberCustodyDeferralCause,
+    )
+      ? (cause as WireMemberCustodyDeferralCause)
+      : { unknown: cause },
   };
 }
 

@@ -160,7 +160,6 @@ import {
   type WireNonPortableResourceKind,
   type WireMemberPreviewUnavailable,
   type WireMemberRegistrationHookCall,
-  type WireMemberCustodyDeferral,
   type WireMemberCustodyDeferralCause,
   type WireMemberCustodyRestore,
   type WireReachability,
@@ -398,6 +397,7 @@ import {
   type MobHelperResult,
   type MobHelperOptions,
   type MobKickoffMemberSnapshot,
+  type MobMemberCustodyDeferral,
   type MobKickoffWaitOptions,
   type MobMemberSnapshot,
   type MobPeerConnectivity,
@@ -6143,13 +6143,16 @@ export class MeerkatClient {
   /**
    * Parse the member's custody restore a mob start deferred: which restore,
    * and the cause its last attempt met. Absent (or `null`) means no restore
-   * is deferred; a restore or cause outside its closed vocabulary, or an
-   * unknown field, fails closed.
+   * is deferred. The field is advisory and its vocabularies may grow: a
+   * restore or cause this SDK does not know reads as `{ unknown: <value> }`,
+   * and a field it does not know is ignored, so a newer server never fails
+   * the read. A value that is not an object, or a restore or cause that is
+   * not a string, is malformed and fails closed.
    */
   private static parseWireMemberCustodyDeferral(
     raw: unknown,
     context: string,
-  ): WireMemberCustodyDeferral | undefined {
+  ): MobMemberCustodyDeferral | undefined {
     if (raw == null) {
       return undefined;
     }
@@ -6170,32 +6173,26 @@ export class MeerkatClient {
       "durable_tail_unprovable",
     ];
     const restore = record.restore;
-    if (
-      typeof restore !== "string" ||
-      !restores.includes(restore as WireMemberCustodyRestore)
-    ) {
+    if (typeof restore !== "string") {
       throw new MeerkatError(
         "INVALID_RESPONSE",
-        `${context}: custody_deferred.restore must be a valid custody restore`,
+        `${context}: custody_deferred.restore must be a string`,
       );
     }
     const cause = record.cause;
-    if (typeof cause !== "string" || !causes.includes(cause as WireMemberCustodyDeferralCause)) {
+    if (typeof cause !== "string") {
       throw new MeerkatError(
         "INVALID_RESPONSE",
-        `${context}: custody_deferred.cause must be a valid deferral cause`,
-      );
-    }
-    const unknown = Object.keys(record).find((key) => key !== "restore" && key !== "cause");
-    if (unknown !== undefined) {
-      throw new MeerkatError(
-        "INVALID_RESPONSE",
-        `${context}: unknown custody_deferred field ${unknown}`,
+        `${context}: custody_deferred.cause must be a string`,
       );
     }
     return {
-      restore: restore as WireMemberCustodyRestore,
-      cause: cause as WireMemberCustodyDeferralCause,
+      restore: restores.includes(restore as WireMemberCustodyRestore)
+        ? (restore as WireMemberCustodyRestore)
+        : { unknown: restore },
+      cause: causes.includes(cause as WireMemberCustodyDeferralCause)
+        ? (cause as WireMemberCustodyDeferralCause)
+        : { unknown: cause },
     };
   }
 
