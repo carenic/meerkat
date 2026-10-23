@@ -542,6 +542,16 @@ them.
   `BUDGET_EXHAUSTED` until capacity is released. Terminal diagnostic details are
   limited to 1 KiB of UTF-8 text, preserving a 16 KiB terminal wire bound.
 
+- `meerkat-runtime`: `RuntimeSessionQuiescentClose` is now
+  `#[non_exhaustive]` and gains `ClosedOrphanedDrain`.
+  `MeerkatMachine::unregister_session_registration_until_terminal_if_quiescent`
+  returns that variant after completing an orphaned drain or pending
+  finalization, which may abandon held inputs with reason `Stopped`.
+  `Closed` now identifies only a genuinely quiescent close. Downstream
+  matches must handle the new variant and include a wildcard for future
+  variants; callers requiring non-interruption must not treat
+  `ClosedOrphanedDrain` as `Closed`.
+
 ### Added
 
 - `meerkat_core::host_store`: the host store SPI, a small storage interface
