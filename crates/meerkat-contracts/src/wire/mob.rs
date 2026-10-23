@@ -5171,26 +5171,30 @@ mod destroy_report_tests {
     use super::{WireMemberReloadRefusal, WireMobDestroyIncompleteData, WireMobDestroyReport};
 
     #[test]
-    fn an_unknown_member_reload_refusal_kind_parses_as_unknown() {
+    fn an_unknown_member_reload_refusal_kind_parses_as_unknown() -> Result<(), serde_json::Error> {
         let report: WireMobDestroyReport = serde_json::from_value(serde_json::json!({
             "member_reload_refusals": [
                 {"member": "m", "refusal": {"kind": "a_later_kind", "detail": 1}}
             ]
-        }))
-        .expect("a report with an unknown refusal kind parses");
+        }))?;
         assert_eq!(
-            report.member_reload_refusals[0].refusal,
-            WireMemberReloadRefusal::Unknown
+            report
+                .member_reload_refusals
+                .iter()
+                .map(|refused| &refused.refusal)
+                .collect::<Vec<_>>(),
+            [&WireMemberReloadRefusal::Unknown]
         );
+        Ok(())
     }
 
     #[test]
-    fn incomplete_destroy_data_carries_its_code_and_is_retryable() {
+    fn incomplete_destroy_data_carries_its_code_and_is_retryable() -> Result<(), serde_json::Error>
+    {
         assert_eq!(
             serde_json::to_value(WireMobDestroyIncompleteData::new(
                 WireMobDestroyReport::default()
-            ))
-            .expect("incomplete data serializes"),
+            ))?,
             serde_json::json!({
                 "code": "mob_destroy_incomplete",
                 "destroy_report": {
@@ -5202,5 +5206,6 @@ mod destroy_report_tests {
                 "retryable": true,
             })
         );
+        Ok(())
     }
 }
