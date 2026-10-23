@@ -123,14 +123,17 @@ them.
   keeps its error type and fails the same way. Callers that read the
   vector handle the error.
 - `meerkat-core`: `DurableSessionForkTarget` gains
-  `declared_instructions: ForkInstructionPolicy`, `meerkat-mob`:
-  `forked_participant::PlannedForkRequest` gains the same field, and
-  `meerkat-session`: `PersistentSessionService::fork_durable_session_with_planned_identity`
-  gains a `declared_instructions` parameter: the host's fork instruction
-  policy before it is resolved for the fork's activation window. The
-  skills a durable fork copies follow it (see the next entry). Code that
-  builds these types sets it, normally to the policy it resolved
-  `inherited_instructions` from.
+  `declared_instructions: ForkInstructionPolicy`, and `meerkat-mob`:
+  `forked_participant::PlannedForkRequest` gains the same field: the
+  host's fork instruction policy before it is resolved for the fork's
+  activation window. The skills a durable fork copies follow it (see the
+  next entry). Code that builds these types sets it, normally to the
+  policy it resolved `inherited_instructions` from. `meerkat-session`:
+  `PersistentSessionService::fork_durable_session_with_planned_identity`
+  takes the fork instruction policies of a fork without a target as one
+  new `ForkInstructionPolicies { inherited, declared }` in place of its
+  `inherited_instructions` parameter; `inherited` is that parameter's
+  value.
 - Not measured by the gate (a behaviour change): `meerkat-core`: a durable
   fork child (`fork_member` and the forks built on it, `fork_off`,
   council participants, and the session `fork_at` and `fork_replace`
