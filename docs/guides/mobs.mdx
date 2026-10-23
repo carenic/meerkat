@@ -1413,8 +1413,10 @@ child's own spawn request, or one a spawn customizer sets, can narrow that
 bound but never widen it, so a narrowed member cannot regain authority through
 a member it spawns, and the bound holds across the child's restarts and
 respawns. A member without a ceiling bounds its children by nothing more than
-the default. A flow run needs manage scope, so a member without it cannot
-provision members through a flow either.
+the default. A flow run needs manage scope. When a member that has it but
+carries a ceiling starts a flow that would provision a member, the run is
+refused before it starts: flow provisions are local, and no ceiling can bound
+a local member. Its flows whose roles already have members still run.
 
 A ceiling on a spawn without a placement is refused (`UnplacedMember`), since
 a local member's operator authority is set by its own session build. The

@@ -26,6 +26,7 @@ use meerkat_mob::runtime::bridge_protocol::{
 use meerkat_mob::runtime::{SpawnCustomizationContext, SpawnMemberCustomizer, SpawnMemberSpec};
 use support::{
     MemberOperatorRequesterResidency, REAL_COMMS_TEST_LOCK, create_controlling_mob_with_customizer,
+    create_controlling_mob_with_customizer_and_definition, create_controlling_mob_with_definition,
     member_identity_of, placed_spawn_spec, raw_member_operator_command_at,
     spawn_peer_comms_endpoint, spawn_scripted_host_peer, spawn_scripted_member_turn_responder,
 };
@@ -86,8 +87,17 @@ async fn upcall_harness_composed(
     customizer: Option<std::sync::Arc<dyn SpawnMemberCustomizer>>,
     shape: impl FnOnce(SpawnMemberSpec) -> SpawnMemberSpec,
 ) -> UpcallHarness {
-    let scripted = spawn_scripted_host_peer(&format!("{label}-scripted")).await;
     let controlling = create_controlling_mob_with_customizer(label, customizer).await;
+    upcall_harness_on(label, controlling, shape).await
+}
+
+/// [`upcall_harness_composed`] over a controlling mob the row built itself.
+async fn upcall_harness_on(
+    label: &str,
+    controlling: support::ControllingMob,
+    shape: impl FnOnce(SpawnMemberSpec) -> SpawnMemberSpec,
+) -> UpcallHarness {
+    let scripted = spawn_scripted_host_peer(&format!("{label}-scripted")).await;
     let report = controlling.bind_scripted(&scripted).await;
 
     // The probe endpoint is the member identity the scripted ack advertises.
@@ -957,6 +967,12 @@ mod ceiling_api {
         spec.with_operator_authority_ceiling(unrestricted().without_create())
     }
 
+    /// An explicit ceiling that keeps manage scope but drops profile-mutation
+    /// authority.
+    pub fn manage_without_mutate(spec: SpawnMemberSpec) -> SpawnMemberSpec {
+        spec.with_operator_authority_ceiling(unrestricted().without_mutate())
+    }
+
     /// `ceiling` without create authority.
     pub fn without_create(ceiling: Ceiling) -> Ceiling {
         ceiling.without_create()
@@ -991,7 +1007,8 @@ mod ceiling_api {
 }
 
 use ceiling_api::{
-    manage_without_create, narrowed, narrowed_keeping_mob_tools, profiles_with_manage,
+    manage_without_create, manage_without_mutate, narrowed, narrowed_keeping_mob_tools,
+    profiles_with_manage,
 };
 
 /// Every profile of the fixture mob, in the recorded (sorted) order.
@@ -1997,5 +2014,201 @@ async fn inherited_bound_survives_the_childs_respawn() {
         .expect("c1 respawns");
     responder.shutdown_and_join().await;
     assert_child_is_bounded(&harness, &child, "bound-respawn").await;
+    harness.scripted.shutdown();
+}
+
+// ===========================================================================
+// A member-initiated flow run provisions members bounded like the member's own
+// spawns: a placed provision records at most the requester's recorded
+// authority, a provision that would be local is refused before the run starts,
+// and a flow whose roles already have members runs with nothing provisioned.
+// ===========================================================================
+
+/// `flow-worker` is a profile with mob tools that no member holds. Flow
+/// `provision` has a step on it, so running it provisions a member; flow
+/// `existing` has a step on `worker`, which b2 already is.
+fn with_provisioning_flows(definition: &mut meerkat_mob::MobDefinition) {
+    let worker = definition
+        .profiles
+        .get(&meerkat_mob::ProfileName::from("worker"))
+        .cloned()
+        .expect("the fixture defines worker");
+    definition
+        .profiles
+        .insert(meerkat_mob::ProfileName::from("flow-worker"), worker);
+    definition.flows.insert(
+        meerkat_mob::FlowId::from("provision"),
+        support::single_step_flow("flow-worker", "provisioned by a flow"),
+    );
+    definition.flows.insert(
+        meerkat_mob::FlowId::from("existing"),
+        support::single_step_flow("worker", "run on an existing member"),
+    );
+}
+
+const PROVISIONED: &str = "__flow_flow-worker_provision";
+
+/// Places every member a flow run provisions on the scripted host.
+#[derive(Default)]
+struct PlaceFlowProvisions {
+    host: std::sync::Mutex<Option<String>>,
+}
+
+impl SpawnMemberCustomizer for PlaceFlowProvisions {
+    fn customize_spawn(
+        &self,
+        ctx: &SpawnCustomizationContext,
+        spec: &mut SpawnMemberSpec,
+    ) -> Result<(), meerkat_mob::MobError> {
+        if ctx.spawn_source == meerkat_mob::runtime::SpawnSource::FlowProvisioning
+            && let Some(host) = self
+                .host
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        {
+            spec.placement = Some(meerkat_mob::machines::mob_machine::HostId(host));
+        }
+        Ok(())
+    }
+}
+
+async fn run_flow_upcall(harness: &UpcallHarness, request_id: &str, flow: &str) -> BridgeReply {
+    upcall(
+        harness,
+        request_id,
+        MemberOperatorOp::MobRunFlow {
+            flow_id: flow.to_string(),
+            params: None,
+        },
+    )
+    .await
+}
+
+async fn flow_runs(harness: &UpcallHarness, flow: &str) -> usize {
+    harness
+        .controlling
+        .storage_runs
+        .list_runs(
+            &harness.controlling.mob_id,
+            Some(&meerkat_mob::FlowId::from(flow)),
+        )
+        .await
+        .expect("flow runs read")
+        .len()
+}
+
+/// b2 keeps manage scope (a flow run needs it) but its ceiling drops create or
+/// mutate. The flow's provision would be a local member with its profile's
+/// full authority, and no ceiling can bound a local member, so the run is
+/// refused, typed, before it starts: no member, no run.
+async fn bounded_flow_provision_is_refused_row(
+    label: &str,
+    shape: fn(SpawnMemberSpec) -> SpawnMemberSpec,
+) {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let controlling = create_controlling_mob_with_definition(label, with_provisioning_flows).await;
+    let harness = upcall_harness_on(label, controlling, shape).await;
+    let reply = run_flow_upcall(&harness, &format!("req-{label}-run"), "provision").await;
+    let outcome = tool_outcome(&reply);
+    assert!(
+        !has_member(&harness.controlling, PROVISIONED).await,
+        "a member whose ceiling drops create or mutate must not provision, through a flow, a \
+         member that holds them; the flow run replied {outcome}"
+    );
+    assert!(
+        outcome["kind"] == "tool_error"
+            && outcome["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("operator authority ceiling")),
+        "the flow run is refused for the provision's ceiling, got {outcome}"
+    );
+    assert_eq!(
+        flow_runs(&harness, "provision").await,
+        0,
+        "the refusal comes before the run starts"
+    );
+    harness.scripted.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn flow_provision_for_a_member_without_create_is_refused_before_the_run() {
+    bounded_flow_provision_is_refused_row("flow-create", manage_without_create).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn flow_provision_for_a_member_without_mutate_is_refused_before_the_run() {
+    bounded_flow_provision_is_refused_row("flow-mutate", manage_without_mutate).await;
+}
+
+/// A flow provision is never placed: the placed lane refuses the reserved
+/// flow identity, so a customizer that places one fails the run, ceiling or
+/// not. Every provision a flow makes is therefore local.
+#[tokio::test(flavor = "multi_thread")]
+async fn flow_provision_is_never_placed() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let place = std::sync::Arc::new(PlaceFlowProvisions::default());
+    let controlling = create_controlling_mob_with_customizer_and_definition(
+        "flow-placed",
+        Some(place.clone() as std::sync::Arc<dyn SpawnMemberCustomizer>),
+        with_provisioning_flows,
+    )
+    .await;
+    let harness = upcall_harness_on("flow-placed", controlling, |spec| spec).await;
+    *place
+        .host
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(harness.host_id.clone());
+    let reply = run_flow_upcall(&harness, "req-flow-placed-run", "provision").await;
+    let outcome = tool_outcome(&reply);
+    assert!(
+        outcome["kind"] == "tool_error"
+            && outcome["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("reserved system identifier namespace")),
+        "a placed flow provision is refused for its reserved identity, got {outcome}"
+    );
+    assert!(!has_member(&harness.controlling, PROVISIONED).await);
+    harness.scripted.shutdown();
+}
+
+/// A member without a ceiling runs a flow as before: the provision is local
+/// and admitted.
+#[tokio::test(flavor = "multi_thread")]
+async fn default_members_flow_provisions_as_before() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let controlling =
+        create_controlling_mob_with_definition("flow-default", with_provisioning_flows).await;
+    let harness = upcall_harness_on("flow-default", controlling, |spec| spec).await;
+    let reply = run_flow_upcall(&harness, "req-flow-default-run", "provision").await;
+    assert_admitted(&reply, "a default member's flow run");
+    assert!(
+        has_member(&harness.controlling, PROVISIONED).await,
+        "the flow provisioned its member"
+    );
+    harness.scripted.shutdown();
+}
+
+/// When every role of the flow already has a member, the narrowed member's
+/// flow runs and provisions nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn narrowed_members_flow_with_existing_targets_runs_unprovisioned() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let controlling =
+        create_controlling_mob_with_definition("flow-existing", with_provisioning_flows).await;
+    let harness = upcall_harness_on("flow-existing", controlling, manage_without_create).await;
+    let reply = run_flow_upcall(&harness, "req-flow-existing-run", "existing").await;
+    assert_admitted(&reply, "the narrowed member's flow run on existing targets");
+    assert!(
+        !harness
+            .controlling
+            .handle
+            .list_members()
+            .await
+            .iter()
+            .any(|entry| entry.agent_identity.as_str().starts_with("__flow_")),
+        "nothing was provisioned"
+    );
+    assert_eq!(flow_runs(&harness, "existing").await, 1, "the run started");
     harness.scripted.shutdown();
 }

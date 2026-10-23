@@ -11288,7 +11288,7 @@ impl MobHandle {
         if let Some(provisioner) = provisioner {
             provisioner().await?;
         }
-        self.ensure_flow_targets_provisioned(&flow_id).await?;
+        self.ensure_flow_targets_provisioned(&flow_id, None).await?;
 
         let run_id = RunId::new();
         let correlation = FlowOperationCorrelation {
@@ -11557,8 +11557,35 @@ impl MobHandle {
         params: serde_json::Value,
         scoped_event_tx: Option<mpsc::Sender<meerkat_core::ScopedAgentEvent>>,
     ) -> Result<RunId, MobError> {
-        self.run_flow_with_stream_and_external_identity(flow_id, params, scoped_event_tx, None)
-            .await
+        self.run_flow_with_stream_and_external_identity(
+            flow_id,
+            params,
+            scoped_event_tx,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::run_flow`] for a member-initiated run: every member the run
+    /// provisions carries `provision_bound`, the requesting member's recorded
+    /// operator authority, as the upper bound of its own (a provision that
+    /// would be local is therefore refused, see
+    /// [`super::MemberOperatorAuthorityCeiling`]).
+    pub(crate) async fn run_flow_with_provision_bound(
+        &self,
+        flow_id: FlowId,
+        params: serde_json::Value,
+        provision_bound: Option<&super::MemberOperatorAuthorityCeiling>,
+    ) -> Result<RunId, MobError> {
+        self.run_flow_with_stream_and_external_identity(
+            flow_id,
+            params,
+            None,
+            None,
+            provision_bound,
+        )
+        .await
     }
 
     /// Start or recover the one durable flow run selected by an external
@@ -11569,7 +11596,7 @@ impl MobHandle {
         params: serde_json::Value,
         identity: &crate::store::MobExternalDeliveryIdentity,
     ) -> Result<RunId, MobError> {
-        self.run_flow_with_stream_and_external_identity(flow_id, params, None, Some(identity))
+        self.run_flow_with_stream_and_external_identity(flow_id, params, None, Some(identity), None)
             .await
     }
 
@@ -11603,7 +11630,7 @@ impl MobHandle {
         if let Some(provisioner) = provisioner {
             provisioner().await?;
         }
-        self.ensure_flow_targets_provisioned(&flow_id).await?;
+        self.ensure_flow_targets_provisioned(&flow_id, None).await?;
 
         let run_id = RunId::for_external_delivery(
             &self.definition.id,
@@ -11649,6 +11676,7 @@ impl MobHandle {
         params: serde_json::Value,
         scoped_event_tx: Option<mpsc::Sender<meerkat_core::ScopedAgentEvent>>,
         identity: Option<&crate::store::MobExternalDeliveryIdentity>,
+        provision_bound: Option<&super::MemberOperatorAuthorityCeiling>,
     ) -> Result<RunId, MobError> {
         self.execute_machine_command(MobMachineCommand::PreviewRunFlowAdmission)
             .await?;
@@ -11666,7 +11694,8 @@ impl MobHandle {
         if let Some(provisioner) = provisioner {
             provisioner().await?;
         }
-        self.ensure_flow_targets_provisioned(&flow_id).await?;
+        self.ensure_flow_targets_provisioned(&flow_id, provision_bound)
+            .await?;
         let run_id = match identity {
             Some(identity) => {
                 identity.validate()?;
@@ -11696,7 +11725,15 @@ impl MobHandle {
         }
     }
 
-    async fn ensure_flow_targets_provisioned(&self, flow_id: &FlowId) -> Result<(), MobError> {
+    /// Provision a member for every role of `flow_id` that has no runnable
+    /// target. A member-initiated run passes its requester's recorded
+    /// operator authority as `provision_bound`, which each provisioned spawn
+    /// folds into its ceiling like a member's own spawn.
+    async fn ensure_flow_targets_provisioned(
+        &self,
+        flow_id: &FlowId,
+        provision_bound: Option<&super::MemberOperatorAuthorityCeiling>,
+    ) -> Result<(), MobError> {
         let Some(flow) = self.definition.flows.get(flow_id) else {
             return Err(MobError::FlowNotFound(flow_id.clone()));
         };
@@ -11722,12 +11759,11 @@ impl MobHandle {
             if self.get_member(&identity).await?.is_some() {
                 continue;
             }
-            self.spawn_spec_internal_with_source(
-                SpawnMemberSpec::new(role, identity)
-                    .with_runtime_mode(crate::MobRuntimeMode::TurnDriven),
-                SpawnSource::FlowProvisioning,
-            )
-            .await?;
+            let mut provision = SpawnMemberSpec::new(role, identity)
+                .with_runtime_mode(crate::MobRuntimeMode::TurnDriven);
+            provision.inherited_operator_authority_bound = provision_bound.cloned();
+            self.spawn_spec_internal_with_source(provision, SpawnSource::FlowProvisioning)
+                .await?;
         }
         Ok(())
     }

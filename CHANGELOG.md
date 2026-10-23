@@ -194,7 +194,10 @@ them.
   whose recorded facts cannot be read is refused before anything is retired.
   A member's own spawns (`spawn_member`, `spawn_many_members`) inherit its
   recorded authority as an upper bound: a ceiling on the child's request, or
-  one the spawn customizer sets, can narrow it but never widen it.
+  one the spawn customizer sets, can narrow it but never widen it. A flow run
+  such a member starts is refused before it starts when the flow would
+  provision a member (flow provisions are local, and no ceiling can bound a
+  local member); its flows whose roles already have members still run.
   With no ceiling nothing changes: a placed member keeps manage scope over its
   mob, including the privileged spawn arguments, and records the same facts as
   before. A ceiling that narrows the spawn profiles but keeps manage scope, or
