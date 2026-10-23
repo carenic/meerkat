@@ -353,15 +353,16 @@ call without its result, and holds the tail rather than guess what happened
 (see [Session contracts: durable-tail recovery](/reference/session-contracts#durable-tail-recovery)).
 Since 0.9.5 an operator can resolve such a hold:
 
-1. Stop the host that serves the session. The repair is refused while the
-   runtime is live or has a current run.
+1. Stop every host of the session. The repair is refused while the runtime
+   is not quiescent (live, or with a current run), and a refusal is never
+   retried.
 2. Run the command without `--apply`. This dry run writes nothing and
    reports the candidate and its run, the facts that made the tail
-   ambiguous (its run rows, the last stop reason, dangling calls, orphan
-   results, rows after the terminal reply, the run cursor and whether its
-   inputs are still bound), the messages it keeps, the calls it would
-   answer, the inputs it would end, whether the runtime is quiescent, and
-   the verdict.
+   ambiguous (its run rows, the last stop reason, the calls without a
+   result, results that answer no call, rows after the terminal reply, the
+   run cursor and whether its inputs are still bound), the messages it
+   keeps, the calls it would answer, the inputs it would end, whether the
+   runtime is quiescent, and the verdict.
 3. Apply it.
 
 ```bash
@@ -371,9 +372,19 @@ rkat session resolve-held-tail <session-id>
 # Apply: commit the held tail as interrupted.
 rkat session resolve-held-tail <session-id> --apply
 
-# A runtime database named directly needs the full session UUID.
+# A runtime database named directly (a sqlite realm's sessions.sqlite3, a
+# jsonl realm's runtime.sqlite3, or a host's own runtime file) needs the
+# full session UUID.
 rkat session resolve-held-tail <session-uuid> --runtime-store <state_dir>/runtime.sqlite --apply
 ```
+
+Without `--runtime-store`, the command opens the runtime store of the realm
+it is scoped to (`--state-root`, `--realm`): a `sqlite` realm's
+`sessions.sqlite3` or a `jsonl` realm's `runtime.sqlite3`. It refuses a
+memory realm and a realm kept in a host's own database, and it refuses a
+missing database, or one with another schema version than the `rkat`
+binary's, without creating or migrating anything. `--json` prints the report
+as one JSON object.
 
 Applied, the repair commits the held tail as interrupted, through the same
 recovery commit as a crash:
@@ -392,30 +403,34 @@ recovery commit as a crash:
 The recovery record names the operator's disposition and the candidate.
 The session then opens and serves as usual.
 
-The command answers in one of these ways:
+The command answers in one of these ways (`resolution` in the JSON report):
 
-| Answer | Meaning |
-|--------|---------|
-| Nothing held | The session has no held tail |
-| Not held | The tail is not held as ambiguous; ordinary recovery resolves it at the next resume, and nothing is written |
-| Held otherwise | The tail is held for a reason this command does not resolve: the store cannot prove an exact recovery source or boundary, or that the tail descends from the committed head (an unproven rewrite); an incomplete HeadCanonical intent, which ordinary recovery rolls back at the next resume; or a recovery of this exact tail that has already committed |
-| Ambiguous | The repair report, with the verdict `WouldRepair` (a dry run), `Refused` (nothing written) or `Repaired` |
+| Answer | Meaning | Exit |
+|--------|---------|------|
+| `no_tail` | The session has no held tail | 0 |
+| `not_held` | The tail is not held as ambiguous; ordinary recovery resolves it at the next resume, and nothing is written | 0 |
+| `held_otherwise` | The tail is held for a reason this command does not resolve: the store cannot prove an exact recovery source or boundary, or that the tail descends from the committed head (an unproven rewrite); an incomplete HeadCanonical intent, which ordinary recovery rolls back at the next resume; or a recovery of this exact tail that has already committed | Error |
+| `ambiguous` | The repair report, with the verdict `would_repair` (a dry run), `refused` (nothing written) or `repaired` (with the boundary sequence it committed) | 0, or an error for `refused` |
 
-`Refused` means the runtime is not quiescent (stop the host first), a
-commit already covers or contradicts the tail, or an input cannot be
-attributed to the run. An error means the evidence could not be verified,
-and the session stays held. A call without a result anywhere but in the
-tail's last assistant message is such an error: the repair only appends,
-and a result must follow its call.
+A refusal means the runtime is not quiescent (stop every host of the
+session and run the command again), a commit already covers or contradicts
+the tail, or an input cannot be attributed to the run. An error means the
+evidence could not be verified, and the session stays held. A call without
+a result anywhere but in the tail's last assistant message is such an
+error: the repair only appends, and a result must follow its call. An
+answer this version of `rkat` does not know also exits with an error. With
+`--json`, the report still prints to standard output when the command exits
+with an error, and the error's message goes to standard error.
 
 Only this hold has an operator path. A session answering
 `SESSION_DURABLE_EVIDENCE_QUARANTINED` stays quarantined;
 `SESSION_DURABLE_TAIL_RECOVERY_REFUSED` clears when the conflicting runtime
 quiesces; `SESSION_WHOLEBLOB_AUDITED_ENDPOINT_DIVERGENCE` is repaired with
-`rkat session repair-wholeblob` (above). Hosts that embed the runtime call
-`meerkat_runtime::recovery::resolve_held_durable_tail(store, session_id,
-apply)`, which answers `HeldTailResolution`; it works on any runtime store,
-a host store included.
+`rkat session repair-wholeblob` (above). Hosts that embed the runtime,
+including any host that keeps a realm in its own database, call
+`meerkat_runtime::recovery::resolve_held_durable_tail` with the store, the
+session id and whether to apply. It answers `HeldTailResolution` and works
+on any runtime store, a host store included.
 
 ## Blob Digests In Meerkat And Meta
 

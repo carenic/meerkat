@@ -446,7 +446,8 @@ WebSocket, and keep WebRTC for sessions that are not mob members.
 - **An operator path for a held durable tail:** a session held as
   `SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY` with ambiguous evidence, such as a
   transcript that ends in a tool call without its result, can be resolved
-  with `rkat session resolve-held-tail <id> [--apply] [--runtime-store <FILE>]`
+  with
+  `rkat session resolve-held-tail <id> [--apply] [--runtime-store <FILE>] [--json]`
   or `meerkat_runtime::recovery::resolve_held_durable_tail`. The dry run is
   the default; applied, it commits the tail as interrupted with every row
   kept and each call without a result answered `outcome_uncertain`, while
