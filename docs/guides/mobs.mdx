@@ -1197,21 +1197,27 @@ When a mob start's durable recovery fails before the actor admits a command
 (`DurabilityFailStop`), `MobHandle::status` and `MobHandle::resume` return the
 failure, typed, as `MobError::SharedLifecycleFailure`. For a member's session
 it is `MobError::MemberStartupRecoveryFailed`, which names the member, its
-session and the cause, for example `SessionError::ServedElsewhere` while
-another runtime owner on the realm hosts the session. Other commands fail with
+session and the cause, for example a store error while the start restores a
+retiring member's cleanup delivery. Other commands fail with
 `ActorCommandChannelClosed`. An actor that fail-stops later, on a durable
 mutation whose outcome stayed uncertain, reports `MobError::AdmissionClosed`
 with `DurabilityFailStop` the same way. Before 0.9.5, `status` reported only
 "mob actor reply channel closed", and the cause reached only the host's error
 log.
 
-A retiring member whose session another runtime owner on the realm hosts does
-not fail the start. The start defers that member's cleanup delivery custody:
-the mob runs, the member stays Retiring with its session untouched, and an
-operation on it (retire, `redrive_retirement`, respawn, destroy) re-attempts
-the restore first and answers `MobError::MemberCustodyDeferred` while the
-session is still hosted elsewhere. The mob also re-attempts the restore on its
-own, and once it succeeds the member's retirement completes.
+A member the start cannot restore because another runtime owner on the realm
+hosts its session, its hosting claim cannot be taken, or its durable tail could
+not be proven does not fail the start when it is retiring, or when its restore
+already failed (it is Broken). The start defers that member's custody restore:
+the mob runs, the member stays Retiring or Broken with its session untouched,
+and `MobHandle::member_status` shows the deferral as `custody_deferred` (the
+restore and the cause its last attempt met). A retire, `redrive_retirement`,
+respawn or destroy of the member re-attempts the restore first and answers
+`MobError::MemberCustodyDeferred` while it still cannot restore; an explicit
+resume re-attempts it once and still succeeds. The mob also re-attempts the
+restore on its own: once it succeeds, a retiring member's retirement
+completes, and a respawn rebuilds a Broken member. Any other restore failure
+still stops the start.
 
 While a Shutdown drains, a command the close refuses (spawn, respawn, work, a
 flow run, wiring, a host bind, a live commit, resume, reset or reload) fails

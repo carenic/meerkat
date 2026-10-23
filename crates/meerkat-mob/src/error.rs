@@ -1618,7 +1618,8 @@ pub enum MobError {
 
 /// Which startup restore of a member's custody was deferred (see
 /// [`MobError::MemberCustodyDeferred`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum MemberCustodyRestore {
     /// The member's operation binding, restored for a member whose restore
@@ -1644,6 +1645,73 @@ impl std::fmt::Display for MemberCustodyRestore {
             Self::StartupBinding => "operation binding restore",
             Self::CleanupDelivery => "cleanup delivery restore",
         })
+    }
+}
+
+/// The cause a member's deferred custody restore last met: the reason it
+/// stays deferred. Only these causes defer a restore; any other failure
+/// fails the operation that re-attempted it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MemberCustodyDeferralCause {
+    /// Another runtime owner on the realm hosts the member's session.
+    ServedElsewhere,
+    /// The member session's hosting claim cannot be taken on this realm.
+    HostingUnavailable,
+    /// The member's durable tail could not be proven, and its recovery kept
+    /// it ([`MobError::MemberDurableTailUnprovable`]).
+    DurableTailUnprovable,
+}
+
+impl MemberCustodyDeferralCause {
+    /// The deferral cause `error` is, if a failed custody restore may be
+    /// deferred for it: the typed hosting refusals and the unprovable durable
+    /// tail. `None` for any other failure.
+    #[must_use]
+    pub fn of(error: &MobError) -> Option<Self> {
+        match error {
+            MobError::SessionError(meerkat_core::SessionError::ServedElsewhere { .. }) => {
+                Some(Self::ServedElsewhere)
+            }
+            MobError::SessionError(meerkat_core::SessionError::HostingUnavailable { .. }) => {
+                Some(Self::HostingUnavailable)
+            }
+            MobError::MemberDurableTailUnprovable { .. } => Some(Self::DurableTailUnprovable),
+            _ => None,
+        }
+    }
+
+    /// Stable token in structured data and on the wire.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ServedElsewhere => "served_elsewhere",
+            Self::HostingUnavailable => "hosting_unavailable",
+            Self::DurableTailUnprovable => "durable_tail_unprovable",
+        }
+    }
+}
+
+/// A member's custody restore a mob start deferred instead of failing the
+/// whole start, as the member's status shows it: which restore, and the cause
+/// its last attempt met. Every operation on the member re-attempts the
+/// restore first, and the deferral clears once one succeeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[non_exhaustive]
+pub struct MemberCustodyDeferral {
+    /// The deferred restore.
+    pub restore: MemberCustodyRestore,
+    /// The cause its last attempt met.
+    pub cause: MemberCustodyDeferralCause,
+}
+
+impl MemberCustodyDeferral {
+    /// The deferral of `restore` whose last attempt met `cause`, when the
+    /// cause may defer a restore.
+    #[must_use]
+    pub fn new(restore: MemberCustodyRestore, cause: &MobError) -> Option<Self> {
+        MemberCustodyDeferralCause::of(cause).map(|cause| Self { restore, cause })
     }
 }
 
@@ -2243,6 +2311,15 @@ impl MobError {
         }
     }
 
+    /// Whether a member's custody restore at mob start failed for a cause
+    /// that can clear without this owner acting: another runtime owner hosts
+    /// the session, its hosting claim is unavailable, or its durable tail is
+    /// kept unprovable. Only these causes let the start defer that member
+    /// instead of failing; every other cause stays fatal.
+    pub(crate) fn is_deferrable_custody_cause(&self) -> bool {
+        MemberCustodyDeferralCause::of(self).is_some()
+    }
+
     /// meerkat's typed durable resume hold carried by this error, if any:
     /// the session is intact and withheld (a held tail, a refused recovery,
     /// quarantined evidence, or a WholeBlob document that needs the
@@ -2252,21 +2329,6 @@ impl MobError {
     /// structured `durable_resume_hold` wire token; never off display text.
     /// Hosts classify on this instead of parsing prose (Meta parks the
     /// member with the exact repair commands on `AuditedEndpointDivergence`).
-    /// Whether a member's custody restore at mob start failed for a cause
-    /// that can clear without this owner acting: another runtime owner hosts
-    /// the session, its hosting claim is unavailable, or its durable tail is
-    /// kept unprovable. Only these causes let the start defer that member
-    /// instead of failing; every other cause stays fatal.
-    pub(crate) fn is_deferrable_custody_cause(&self) -> bool {
-        matches!(
-            self,
-            Self::SessionError(
-                meerkat_core::SessionError::ServedElsewhere { .. }
-                    | meerkat_core::SessionError::HostingUnavailable { .. }
-            ) | Self::MemberDurableTailUnprovable { .. }
-        )
-    }
-
     pub fn durable_resume_hold(&self) -> Option<meerkat_core::service::DurableResumeHold> {
         match self {
             Self::SessionError(error) => error.durable_resume_hold(),

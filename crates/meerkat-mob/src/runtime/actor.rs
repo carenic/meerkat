@@ -952,9 +952,42 @@ pub(super) struct DeferredMemberCustody {
 #[derive(Debug, Default)]
 pub(super) struct DeferredMemberCustodyRegistry {
     entries: BTreeMap<AgentIdentity, DeferredMemberCustody>,
+    /// What member status reads see of each entry: its restore and the
+    /// cause its last attempt met. Shared with the mob's handles; kept in
+    /// step with `entries` by every change below.
+    view: super::handle::MemberCustodyDeferrals,
 }
 
 impl DeferredMemberCustodyRegistry {
+    /// An empty registry that publishes its entries to `view`.
+    pub(super) fn publishing(view: super::handle::MemberCustodyDeferrals) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            view,
+        }
+    }
+
+    /// The view member status reads see this registry's entries through.
+    pub(super) fn view(&self) -> super::handle::MemberCustodyDeferrals {
+        Arc::clone(&self.view)
+    }
+
+    /// Publish `identity`'s deferral (or its absence) to member status reads.
+    fn publish(&self, identity: &AgentIdentity, deferral: Option<crate::MemberCustodyDeferral>) {
+        let mut view = match self.view.write() {
+            Ok(view) => view,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match deferral {
+            Some(deferral) => {
+                view.insert(identity.clone(), deferral);
+            }
+            None => {
+                view.remove(identity);
+            }
+        }
+    }
+
     /// Record `identity`'s deferred `restore` for `session` after its first
     /// failed attempt; its next attempt is backed off from `now`.
     pub(super) fn defer(
@@ -965,6 +998,10 @@ impl DeferredMemberCustodyRegistry {
         cause: MobError,
         now: Instant,
     ) {
+        self.publish(
+            &identity,
+            crate::MemberCustodyDeferral::new(restore, &cause),
+        );
         self.entries.insert(
             identity,
             DeferredMemberCustody {
@@ -1016,6 +1053,7 @@ impl DeferredMemberCustodyRegistry {
         let error = match outcome {
             Ok(()) => {
                 self.entries.remove(identity);
+                self.publish(identity, None);
                 return Ok(());
             }
             Err(error) => error,
@@ -1032,12 +1070,15 @@ impl DeferredMemberCustodyRegistry {
         }
         let cause = Arc::new(error);
         entry.cause = Arc::clone(&cause);
-        Err(MobError::MemberCustodyDeferred {
+        let deferred = MobError::MemberCustodyDeferred {
             member_id: identity.clone(),
             session_id: entry.session.clone(),
             restore: entry.restore,
-            cause,
-        })
+            cause: Arc::clone(&cause),
+        };
+        let deferral = crate::MemberCustodyDeferral::new(entry.restore, cause.as_ref());
+        self.publish(identity, deferral);
+        Err(deferred)
     }
 
     /// The time from `now` until the earliest entry is due, `None` with none.
@@ -1768,6 +1809,66 @@ mod deferred_member_custody_tests {
             entry.cause.as_ref(),
             MobError::SessionError(meerkat_core::SessionError::ServedElsewhere { .. })
         ));
+    }
+
+    /// Member status reads see each deferral as the registry holds it: its
+    /// restore and the cause its last attempt met, the newest deferrable
+    /// cause after a re-attempt, the same deferral after a failure that
+    /// defers nothing, and nothing once the restore succeeds.
+    #[test]
+    fn the_published_deferral_follows_the_registry() {
+        let view = super::super::handle::MemberCustodyDeferrals::default();
+        let mut registry = DeferredMemberCustodyRegistry::publishing(view.clone());
+        let member = AgentIdentity::from("member");
+        let session = SessionId::new();
+        let now = Instant::now();
+        let published = || {
+            view.read()
+                .expect("the published view")
+                .get(&member)
+                .copied()
+        };
+        assert_eq!(published(), None);
+        registry.defer(
+            member.clone(),
+            session.clone(),
+            MemberCustodyRestore::StartupBinding,
+            served_elsewhere(&session),
+            now,
+        );
+        assert_eq!(
+            published(),
+            Some(crate::MemberCustodyDeferral {
+                restore: MemberCustodyRestore::StartupBinding,
+                cause: crate::MemberCustodyDeferralCause::ServedElsewhere,
+            })
+        );
+        let _ = registry.settle(&member, Err(hosting_unavailable(&session)), now);
+        assert_eq!(
+            published(),
+            Some(crate::MemberCustodyDeferral {
+                restore: MemberCustodyRestore::StartupBinding,
+                cause: crate::MemberCustodyDeferralCause::HostingUnavailable,
+            }),
+            "the newest deferrable cause is shown"
+        );
+        let _ = registry.settle(
+            &member,
+            Err(MobError::Internal("store read failed".to_string())),
+            now,
+        );
+        assert_eq!(
+            published(),
+            Some(crate::MemberCustodyDeferral {
+                restore: MemberCustodyRestore::StartupBinding,
+                cause: crate::MemberCustodyDeferralCause::HostingUnavailable,
+            }),
+            "a failure that defers nothing leaves the deferral as it was"
+        );
+        registry
+            .settle(&member, Ok(()), now)
+            .expect("a restored custody answers Ok");
+        assert_eq!(published(), None, "a restored custody clears the deferral");
     }
 }
 
@@ -14913,6 +15014,7 @@ impl MobActor {
             #[cfg(feature = "runtime-adapter")]
             runtime_adapter: self.runtime_adapter.clone(),
             restore_diagnostics: self.restore_diagnostics.clone(),
+            custody_deferrals: self.deferred_member_custody.view(),
             supervisor_bridge: self.supervisor_bridge.clone(),
             machine_state_watch_rx: self.machine_state_watch_tx.subscribe(),
             reachability_observations: Arc::clone(&self.reachability_observations),
@@ -31225,11 +31327,16 @@ impl MobActor {
                 .await
         })
         .await
-        .map_err(|error| {
-            MobError::Internal(format!(
+        .map_err(|error| match error {
+            // Another runtime owner hosts the session, or its claim cannot be
+            // taken: the typed hosting refusal, never an internal error.
+            meerkat_runtime::RuntimeBindingsError::Hosting(_, cause) => {
+                MobError::SessionError(cause)
+            }
+            error => MobError::Internal(format!(
                 "restore operation owner binding failed for member '{}': {error}",
                 entry.agent_identity
-            ))
+            )),
         })?;
         if bindings.session_id() != &generated_owner_session_id {
             return Err(MobError::Internal(format!(
@@ -31376,7 +31483,11 @@ impl MobActor {
             #[cfg(any(test, feature = "test-support"))]
             let entry = {
                 let mut entry = entry;
-                super::apply_restore_tuple_fault_for_test(&self.definition.id, &mut entry);
+                super::apply_restore_tuple_fault_for_test(
+                    &self.definition.id,
+                    crate::MemberCustodyRestore::CleanupDelivery,
+                    &mut entry,
+                );
                 entry
             };
             let identity = mob_dsl::AgentIdentity::from_domain(&entry.agent_identity);
@@ -31476,8 +31587,13 @@ impl MobActor {
             .adapter
             .prepare_local_session_bindings(session.clone())
             .await
-            .map_err(|error| {
-                MobError::Internal(format!("prepare local cleanup delivery: {error}"))
+            .map_err(|error| match error {
+                // Another runtime owner hosts the session, or its claim cannot
+                // be taken: the typed hosting refusal, never an internal error.
+                meerkat_runtime::RuntimeBindingsError::Hosting(_, cause) => {
+                    MobError::SessionError(cause)
+                }
+                error => MobError::Internal(format!("prepare local cleanup delivery: {error}")),
             })?;
         // A cold start can re-register a session whose runtime already
         // stopped, which clears its member binding; the unbound endpoint
@@ -31803,6 +31919,16 @@ impl MobActor {
         };
         let entries = self.roster.read().await.list().cloned().collect::<Vec<_>>();
         for entry in entries {
+            #[cfg(any(test, feature = "test-support"))]
+            let entry = {
+                let mut entry = entry;
+                super::apply_restore_tuple_fault_for_test(
+                    &self.definition.id,
+                    crate::MemberCustodyRestore::StartupBinding,
+                    &mut entry,
+                );
+                entry
+            };
             // A member whose host refused its registration at this boot keeps
             // no registration and no owner context until a host-approved
             // materialization: the refusal removed the registration it was
@@ -31811,16 +31937,49 @@ impl MobActor {
             if self.member_registration_refused(&entry.agent_identity) {
                 continue;
             }
-            if let Some(plan) = self.prepare_restored_member_operation_binding(entry)? {
-                Self::realize_restored_member_operation_binding(
-                    io.clone(),
-                    plan,
-                    RestoredOperationBindingSeam::ActorStartup,
-                )
-                .await?;
+            let Some(plan) = self.prepare_restored_member_operation_binding(entry)? else {
+                continue;
+            };
+            let identity = plan.entry.agent_identity.clone();
+            let session = plan.owner_session_id.clone();
+            let deferrable = plan.placed_operation.is_none() && self.member_is_broken(&identity);
+            match Self::realize_restored_member_operation_binding(
+                io.clone(),
+                plan,
+                RestoredOperationBindingSeam::ActorStartup,
+            )
+            .await
+            {
+                Ok(()) => {}
+                // A local member whose restore already failed at this start
+                // (it is Broken) does not stop the whole mob when its session
+                // is hosted by another runtime owner, its hosting claim
+                // cannot be taken, or its durable tail could not be proven:
+                // its custody restore is deferred, and every operation on the
+                // member re-attempts it first. Any other failure still stops
+                // the start.
+                Err(cause) if deferrable && cause.is_deferrable_custody_cause() => {
+                    self.defer_member_custody(
+                        identity,
+                        session,
+                        crate::MemberCustodyRestore::StartupBinding,
+                        cause,
+                    );
+                }
+                Err(error) => return Err(error),
             }
         }
         Ok(())
+    }
+
+    /// Whether MobMachine records `agent_identity` Broken: its restore failed.
+    #[cfg(feature = "runtime-adapter")]
+    fn member_is_broken(&self, agent_identity: &AgentIdentity) -> bool {
+        self.dsl_authority
+            .state()
+            .member_lifecycle_for_identity(&mob_dsl::AgentIdentity::from_domain(agent_identity))
+            .status
+            == mob_dsl::MobMemberLifecycleStatus::Broken
     }
 
     #[cfg(not(feature = "runtime-adapter"))]

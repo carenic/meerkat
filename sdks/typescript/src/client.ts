@@ -160,6 +160,9 @@ import {
   type WireNonPortableResourceKind,
   type WireMemberPreviewUnavailable,
   type WireMemberRegistrationHookCall,
+  type WireMemberCustodyDeferral,
+  type WireMemberCustodyDeferralCause,
+  type WireMemberCustodyRestore,
   type WireReachability,
   type ToolDispatchAdmissionSource,
   type ToolDispatchSettlementFailure,
@@ -3250,6 +3253,13 @@ export class MeerkatClient {
     if (registrationRefusal !== undefined) {
       snapshot.registrationRefusal = registrationRefusal;
     }
+    const custodyDeferred = MeerkatClient.parseWireMemberCustodyDeferral(
+      result.custody_deferred,
+      "Invalid mob/member_status response",
+    );
+    if (custodyDeferred !== undefined) {
+      snapshot.custodyDeferred = custodyDeferred;
+    }
     return snapshot;
   }
 
@@ -3517,6 +3527,10 @@ export class MeerkatClient {
         member.registration_refusal,
         "Invalid mob/wait_kickoff response",
       );
+      const custodyDeferred = MeerkatClient.parseWireMemberCustodyDeferral(
+        member.custody_deferred,
+        "Invalid mob/wait_kickoff response",
+      );
       return {
         agentIdentity,
         status,
@@ -3531,6 +3545,7 @@ export class MeerkatClient {
         ),
         ...(previewUnavailable !== undefined ? { previewUnavailable } : {}),
         ...(registrationRefusal !== undefined ? { registrationRefusal } : {}),
+        ...(custodyDeferred !== undefined ? { custodyDeferred } : {}),
       };
     });
   }
@@ -3582,6 +3597,10 @@ export class MeerkatClient {
         member.registration_refusal,
         "Invalid mob/wait_ready response",
       );
+      const custodyDeferred = MeerkatClient.parseWireMemberCustodyDeferral(
+        member.custody_deferred,
+        "Invalid mob/wait_ready response",
+      );
       return {
         agentIdentity,
         status,
@@ -3596,6 +3615,7 @@ export class MeerkatClient {
         ),
         ...(previewUnavailable !== undefined ? { previewUnavailable } : {}),
         ...(registrationRefusal !== undefined ? { registrationRefusal } : {}),
+        ...(custodyDeferred !== undefined ? { custodyDeferred } : {}),
       };
     });
   }
@@ -6118,6 +6138,65 @@ export class MeerkatClient {
       "INVALID_RESPONSE",
       `${context}: registration_refusal must be a valid registration hook call`,
     );
+  }
+
+  /**
+   * Parse the member's custody restore a mob start deferred: which restore,
+   * and the cause its last attempt met. Absent (or `null`) means no restore
+   * is deferred; a restore or cause outside its closed vocabulary, or an
+   * unknown field, fails closed.
+   */
+  private static parseWireMemberCustodyDeferral(
+    raw: unknown,
+    context: string,
+  ): WireMemberCustodyDeferral | undefined {
+    if (raw == null) {
+      return undefined;
+    }
+    if (typeof raw !== "object" || Array.isArray(raw)) {
+      throw new MeerkatError(
+        "INVALID_RESPONSE",
+        `${context}: custody_deferred must be an object`,
+      );
+    }
+    const record = raw as Record<string, unknown>;
+    const restores: readonly WireMemberCustodyRestore[] = [
+      "startup_binding",
+      "cleanup_delivery",
+    ];
+    const causes: readonly WireMemberCustodyDeferralCause[] = [
+      "served_elsewhere",
+      "hosting_unavailable",
+      "durable_tail_unprovable",
+    ];
+    const restore = record.restore;
+    if (
+      typeof restore !== "string" ||
+      !restores.includes(restore as WireMemberCustodyRestore)
+    ) {
+      throw new MeerkatError(
+        "INVALID_RESPONSE",
+        `${context}: custody_deferred.restore must be a valid custody restore`,
+      );
+    }
+    const cause = record.cause;
+    if (typeof cause !== "string" || !causes.includes(cause as WireMemberCustodyDeferralCause)) {
+      throw new MeerkatError(
+        "INVALID_RESPONSE",
+        `${context}: custody_deferred.cause must be a valid deferral cause`,
+      );
+    }
+    const unknown = Object.keys(record).find((key) => key !== "restore" && key !== "cause");
+    if (unknown !== undefined) {
+      throw new MeerkatError(
+        "INVALID_RESPONSE",
+        `${context}: unknown custody_deferred field ${unknown}`,
+      );
+    }
+    return {
+      restore: restore as WireMemberCustodyRestore,
+      cause: cause as WireMemberCustodyDeferralCause,
+    };
   }
 
   private static parseMobPeerConnectivitySnapshot(

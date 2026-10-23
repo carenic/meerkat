@@ -5121,6 +5121,70 @@ describe("Mob surface fail-closed status parsing (DOGMA Rule 6)", () => {
       }
     });
 
+    for (const restore of ["startup_binding", "cleanup_delivery"]) {
+      for (const cause of ["served_elsewhere", "hosting_unavailable", "durable_tail_unprovable"]) {
+        it(`surfaces custody_deferred ${restore}/${cause}`, async () => {
+          const client = memberStatusClient(
+            validResponse({ status: "broken", custody_deferred: { restore, cause } }),
+          );
+          const result = await client.mobMemberStatus("mob-1", "worker-1");
+          assert.deepEqual(result.custodyDeferred, { restore, cause });
+          assert.equal(result.status, "broken");
+        });
+      }
+    }
+
+    it("omits custodyDeferred when the wire omits or nulls it", async () => {
+      for (const response of [validResponse(), validResponse({ custody_deferred: null })]) {
+        const result = await memberStatusClient(response).mobMemberStatus("mob-1", "worker-1");
+        assert.equal(Object.prototype.hasOwnProperty.call(result, "custodyDeferred"), false);
+      }
+    });
+
+    it("rejects a custody_deferred outside its closed vocabularies", async () => {
+      for (const deferral of [
+        "startup_binding",
+        { restore: "StartupBinding", cause: "served_elsewhere" },
+        { restore: "startup_binding", cause: "busy" },
+        { restore: "startup_binding", cause: "served_elsewhere", attempts: 2 },
+      ]) {
+        const client = memberStatusClient(
+          validResponse({ status: "broken", custody_deferred: deferral }),
+        );
+        await assert.rejects(
+          () => client.mobMemberStatus("mob-1", "worker-1"),
+          (error) =>
+            error instanceof MeerkatError &&
+            error.code === "INVALID_RESPONSE" &&
+            /custody_deferred/.test(String(error.message)),
+        );
+      }
+    });
+
+    it("carries custody_deferred on wait_kickoff and wait_ready members", async () => {
+      const deferral = { restore: "startup_binding", cause: "served_elsewhere" };
+      const client = new MeerkatClient();
+      client.request = async () => ({
+        members: [
+          {
+            agent_identity: "lead",
+            status: "broken",
+            tokens_used: 0,
+            is_final: false,
+            custody_deferred: deferral,
+          },
+          { agent_identity: "writer", status: "active", tokens_used: 7, is_final: false },
+        ],
+      });
+      for (const members of [
+        await client.waitMobKickoff("mob-1"),
+        await client.waitMobReady("mob-1"),
+      ]) {
+        assert.deepEqual(members[0].custodyDeferred, deferral);
+        assert.equal(Object.prototype.hasOwnProperty.call(members[1], "custodyDeferred"), false);
+      }
+    });
+
     it("rejects an absent status instead of fabricating 'unknown'", async () => {
       const response = validResponse();
       delete response.status;

@@ -2381,6 +2381,13 @@ class WireMemberProgressSnapshot:
 
 
 @dataclass
+class WireMemberCustodyDeferral:
+    """A member's custody restore a mob start deferred, as its status shows it."""
+    cause: WireMemberCustodyDeferralCause
+    restore: WireMemberCustodyRestore
+
+
+@dataclass
 class WireMobToolConfig:
     """Tool configuration embedded in a wire mob profile override."""
     builtins: Optional[bool] = None
@@ -2963,6 +2970,7 @@ class MobMemberStatusResult:
     comms_reachability: Optional[WireReachability] = None
     control_reachability: Optional[WireReachability] = None
     current_session_id: Optional[str] = None
+    custody_deferred: Optional[WireMemberCustodyDeferral] = None
     detached_jobs: Optional[dict[str, Any]] = None
     error: Optional[str] = None
     external_member: Optional[Any] = None
@@ -6960,6 +6968,12 @@ WireMemberPreviewUnavailable = Literal['observation_deadline', 'read_failed', 's
 # The member registration hook call that refused a restored member's
 # registration.
 WireMemberRegistrationHookCall = Literal['select_destination', 'select_agent_mandate', 'prepare_member_surface', 'verify_member_surface']
+
+# Which startup restore of a member's custody a mob start deferred.
+WireMemberCustodyRestore = Literal['startup_binding', 'cleanup_delivery']
+
+# The cause a deferred member custody restore last met.
+WireMemberCustodyDeferralCause = Literal['served_elsewhere', 'hosting_unavailable', 'durable_tail_unprovable']
 
 # Lifecycle status of a flow run on the wire. Mirrors
 # `meerkat_mob::MobRunStatus` so consumers branch on a closed type rather than
