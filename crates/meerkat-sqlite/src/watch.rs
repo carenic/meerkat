@@ -1051,6 +1051,15 @@ pub mod test_support {
         changed: Condvar,
         /// Report a database's WAL created or removed also as modified.
         wal_lifecycle_as_modified: AtomicBool,
+        drops: Mutex<SourceDrops>,
+        drops_changed: Condvar,
+    }
+
+    /// The observed sources' drops, while a test holds them.
+    #[derive(Default)]
+    struct SourceDrops {
+        held: bool,
+        finished: usize,
     }
 
     /// Observes the notification registrations of the watches on databases
@@ -1094,6 +1103,43 @@ pub mod test_support {
                 .store(true, Ordering::SeqCst);
         }
 
+        /// From now on, dropping an observed source blocks until
+        /// [`Self::release_source_drops`], as a macOS FSEvents watcher's drop
+        /// waits on the file-system event service.
+        pub fn hold_source_drops(&self) {
+            lock(&self.observation.drops).held = true;
+        }
+
+        /// Let every held source drop, and every later one at once.
+        pub fn release_source_drops(&self) {
+            lock(&self.observation.drops).held = false;
+            self.observation.drops_changed.notify_all();
+        }
+
+        /// Observed sources dropped so far.
+        pub fn source_drops_finished(&self) -> usize {
+            lock(&self.observation.drops).finished
+        }
+
+        /// Wait, at most `bound`, until `count` observed sources have been
+        /// dropped. Whether they had.
+        pub fn wait_source_drops_finished(&self, count: usize, bound: Duration) -> bool {
+            let deadline = Instant::now() + bound;
+            let mut drops = lock(&self.observation.drops);
+            while drops.finished < count {
+                let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                    return false;
+                };
+                drops = self
+                    .observation
+                    .drops_changed
+                    .wait_timeout(drops, left)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+            true
+        }
+
         /// Wait, at most `bound`, until `count` registrations have
         /// registered. Whether they had.
         pub fn wait_registered(&self, count: usize, bound: Duration) -> bool {
@@ -1117,6 +1163,7 @@ pub mod test_support {
     impl Drop for ObservedRegistrations {
         fn drop(&mut self) {
             lock(observations()).remove(&self.directory);
+            self.release_source_drops();
         }
     }
 
@@ -1141,7 +1188,7 @@ pub mod test_support {
                 super::NotifyBackend.create(targets, wake)?
             };
             Ok(Box::new(ObservedSource {
-                inner,
+                inner: Some(inner),
                 observation: Arc::clone(&self.0),
             }))
         }
@@ -1186,16 +1233,36 @@ pub mod test_support {
     }
 
     struct ObservedSource {
-        inner: Box<dyn WatchSource>,
+        /// `None` once dropped.
+        inner: Option<Box<dyn WatchSource>>,
         observation: Arc<Observation>,
     }
 
     impl WatchSource for ObservedSource {
         fn watch(&mut self, directory: &Path) -> Result<(), String> {
-            self.inner.watch(directory)?;
+            if let Some(inner) = self.inner.as_mut() {
+                inner.watch(directory)?;
+            }
             *lock(&self.observation.registered) += 1;
             self.observation.changed.notify_all();
             Ok(())
+        }
+    }
+
+    impl Drop for ObservedSource {
+        fn drop(&mut self) {
+            let mut drops = lock(&self.observation.drops);
+            while drops.held {
+                drops = self
+                    .observation
+                    .drops_changed
+                    .wait(drops)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            drop(drops);
+            drop(self.inner.take());
+            lock(&self.observation.drops).finished += 1;
+            self.observation.drops_changed.notify_all();
         }
     }
 }
@@ -1839,6 +1906,83 @@ mod tests {
         .expect("a failed notification registration leaves the watch on its sweep");
         assert_eq!(tick_rx.recv_timeout(HANG_GUARD), Ok(SqliteWatchTick::Sweep));
         drop(watch);
+    }
+
+    /// Dropping a watch never waits for its notification source's teardown,
+    /// which on macOS waits on the file-system event service; a watch started
+    /// at once on the same database registers and sees a write meanwhile, and
+    /// the stopped watch ticks no more.
+    #[test]
+    fn dropping_a_watch_never_waits_for_its_sources_teardown() {
+        let dir = tempfile::tempdir().unwrap();
+        let observed = test_support::observe_registrations_in(dir.path()).unwrap();
+        let db = dir.path().join("store.sqlite3");
+        std::fs::write(&db, b"").unwrap();
+        let first_ticks = Arc::new(AtomicUsize::new(0));
+        let first = start_sqlite_change_watch(&db, "test-teardown-first", SQLITE_WATCH_SWEEP, {
+            let first_ticks = Arc::clone(&first_ticks);
+            move |_| {
+                first_ticks.fetch_add(1, Ordering::SeqCst);
+                SqliteWatchControl::Handled
+            }
+        })
+        .expect("watch starts");
+        assert!(
+            observed.wait_registered(1, HANG_GUARD),
+            "the first registered"
+        );
+        observed.hold_source_drops();
+
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let dropper = thread::spawn(move || {
+            drop(first);
+            let _ = dropped_tx.send(());
+        });
+        let returned = dropped_rx.recv_timeout(HANG_GUARD).is_ok();
+        if !returned {
+            observed.release_source_drops();
+        }
+        dropper.join().unwrap();
+        assert!(
+            returned,
+            "dropping the watch waited for its source's teardown"
+        );
+        let first_ticked = first_ticks.load(Ordering::SeqCst);
+
+        // A watch started at once on the same database works while the first
+        // watch's source is still held.
+        let (tick_tx, tick_rx) = mpsc::channel();
+        let second = start_sqlite_change_watch(&db, "test-teardown-second", SQLITE_WATCH_SWEEP, {
+            move |tick| {
+                let _ = tick_tx.send(tick);
+                SqliteWatchControl::Handled
+            }
+        })
+        .expect("watch starts");
+        assert!(
+            observed.wait_registered(2, HANG_GUARD),
+            "the second registered"
+        );
+        assert_eq!(
+            observed.source_drops_finished(),
+            0,
+            "the first source is held"
+        );
+        std::fs::write(sidecar_path(&db, "-wal"), b"frame").unwrap();
+        assert_eq!(
+            tick_rx.recv_timeout(HANG_GUARD),
+            Ok(SqliteWatchTick::Changed)
+        );
+        // The held source still delivers that write, to the stopped watch
+        // only, which ticks no more.
+        assert_eq!(first_ticks.load(Ordering::SeqCst), first_ticked);
+
+        drop(second);
+        observed.release_source_drops();
+        assert!(
+            observed.wait_source_drops_finished(2, HANG_GUARD),
+            "both sources are dropped once released"
+        );
     }
 
     #[test]
