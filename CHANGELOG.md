@@ -613,6 +613,11 @@ them.
     boundary binds to the run too, and the cursor lists them all.
     `Budget::resume_turn` and `Budget::turn_elapsed` carry the turn horizon
     across a resume.
+  - `SessionCheckpointer::dispatch_fence_check` lets a checkpointer over a
+    host store refuse dispatch once its writer's self-fence window has
+    closed. The agent asks right before each model request and right after a
+    tool round's first commit, before any tool runs; a refusal stops the run
+    as a refused commit does, and the run writes nothing more.
 
 - `meerkat_core::host_store`: the host store SPI, a small storage interface
   a host implements so that Core can keep a realm's durable state in the
