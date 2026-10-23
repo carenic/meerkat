@@ -27,7 +27,7 @@ use meerkat_core::{
 use serde_json::json;
 use tokio::sync::mpsc;
 
-const MODEL: &str = "claude-opus-5";
+const MODEL: &str = "test-anthropic-model";
 
 /// One scripted provider reply, its accounting, and how long it takes.
 struct ScriptedReply {

@@ -419,6 +419,7 @@ impl MaterializePreflightProbe for FactoryProviderPresenceProbe {
     async fn preflight_llm_identity(
         &self,
         identity: &meerkat_core::SessionLlmIdentity,
+        resume_prior: Option<&meerkat_core::SessionLlmIdentity>,
         custom_models: &std::collections::BTreeMap<String, meerkat_core::config::CustomModelConfig>,
         preferred_realm: Option<&RealmId>,
         auth_lease_handle: &meerkat_core::handles::GeneratedAuthLeaseHandle,
@@ -426,9 +427,10 @@ impl MaterializePreflightProbe for FactoryProviderPresenceProbe {
         Ok(
             match self
                 .factory
-                .preflight_llm_identity(
+                .preflight_resumed_llm_identity(
                     &self.config,
                     identity,
+                    resume_prior,
                     custom_models,
                     preferred_realm,
                     Some(auth_lease_handle.clone()),
@@ -440,7 +442,10 @@ impl MaterializePreflightProbe for FactoryProviderPresenceProbe {
                     tracing::warn!(detail = %error, "member materialization model preflight rejected locally");
                     MaterializeLlmPreflightOutcome::ModelUnresolvable
                 }
-                Err(error @ LlmIdentityPreflightError::BindingUnresolvable { .. }) => {
+                Err(
+                    error @ (LlmIdentityPreflightError::BindingUnresolvable { .. }
+                    | LlmIdentityPreflightError::BindingSelection { .. }),
+                ) => {
                     // The diagnostic may contain command stderr or backend
                     // detail. Keep it local; the bridge carries only the stable
                     // typed rejection and a sanitized reason.

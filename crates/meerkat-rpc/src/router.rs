@@ -8528,6 +8528,294 @@ mod tests {
         }
     }
 
+    /// JSON-RPC surface: `session/create` with
+    /// `initial_turn: "deferred"` keeps its create-time prompt in the staged
+    /// slot; the `live/open` projection promotes the slot into the live
+    /// service with `DeferredPromptPolicy::Stage`; the first later
+    /// `turn/start` is runtime-routed (typed appends author the turn). The
+    /// create-time prompt must reach the provider request and the durable
+    /// transcript.
+    #[tokio::test]
+    async fn router_deferred_create_prompt_survives_live_open_promotion_and_turn_start() {
+        let _projection_guard = crate::session_runtime::realtime_open_projection_test_guard().await;
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let (router, _notif_rx) =
+            test_router_with_llm(Arc::new(RecordingMockLlmClient::new(Arc::clone(&requests))))
+                .await;
+
+        let create_resp = router
+            .dispatch(make_request(
+                "session/create",
+                serde_json::json!({
+                    "prompt": "Remember the codeword ORBIT-7 for later.",
+                    "initial_turn": "deferred"
+                }),
+            ))
+            .await
+            .expect("session/create response");
+        assert!(
+            create_resp.error.is_none(),
+            "session/create should succeed: {create_resp:?}"
+        );
+        let create_result = result_value(&create_resp);
+        let session_id = create_result["session_id"].as_str().expect("session_id");
+        let session_id = SessionId::parse(session_id).expect("created session id should parse");
+
+        router
+            .runtime
+            .live_open_config_for_session(
+                &session_id,
+                meerkat_contracts::RealtimeTurningMode::ProviderManaged,
+            )
+            .await
+            .expect("live/open projection should materialize the deferred session");
+
+        let turn_resp = router
+            .dispatch(make_request(
+                "turn/start",
+                serde_json::json!({
+                    "session_id": session_id.to_string(),
+                    "prompt": "What is the codeword?"
+                }),
+            ))
+            .await
+            .expect("turn/start response");
+        assert!(
+            turn_resp.error.is_none(),
+            "turn/start should succeed: {turn_resp:?}"
+        );
+
+        let recorded = requests
+            .lock()
+            .expect("recorded requests lock poisoned")
+            .clone();
+        let request_dump = format!("{recorded:?}");
+        let session = router
+            .runtime
+            .load_persisted_session(&session_id)
+            .await
+            .expect("load persisted session")
+            .expect("session persisted");
+        let user_texts = session
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(user) => Some(user.text_content()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let llm_request_has_staged = request_dump.contains("ORBIT-7");
+        let transcript_has_staged = user_texts.iter().any(|text| text.contains("ORBIT-7"));
+        assert!(
+            llm_request_has_staged && transcript_has_staged,
+            "deferred create prompt lost after live/open promotion: \
+             llm_request_contains={llm_request_has_staged} \
+             transcript_contains={transcript_has_staged}; \
+             transcript_user_messages={user_texts:?}; llm_requests={}",
+            recorded.len()
+        );
+    }
+
+    /// Full JSON-RPC surface, no internal seam: the SDK flow
+    /// `create_deferred_session(prompt)` then `live.open()` then a text
+    /// turn. `live/open` promotes the deferred session with
+    /// `DeferredPromptPolicy::Stage`; `live/close` ends the voice channel;
+    /// the next `turn/start` is runtime-routed. The create-time prompt must
+    /// reach the provider request and the durable transcript.
+    #[cfg(feature = "comms")]
+    #[tokio::test]
+    async fn router_live_open_close_then_turn_start_delivers_deferred_create_prompt() {
+        struct OpenAiRecordingLlmClient {
+            requests: Arc<StdMutex<Vec<Vec<Message>>>>,
+        }
+
+        #[async_trait]
+        impl LlmClient for OpenAiRecordingLlmClient {
+            fn project_replay_messages(
+                &self,
+                messages: &[meerkat_core::Message],
+            ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+                Ok(messages.to_vec())
+            }
+
+            fn stream<'a>(
+                &'a self,
+                request: &'a meerkat_client::LlmRequest,
+            ) -> Pin<
+                Box<
+                    dyn futures::Stream<Item = Result<meerkat_client::LlmEvent, LlmError>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                self.requests
+                    .lock()
+                    .expect("recorded requests lock poisoned")
+                    .push(request.messages.clone());
+                Box::pin(stream::iter(vec![
+                    Ok(meerkat_client::LlmEvent::TextDelta {
+                        delta: "recorded".to_string(),
+                        meta: None,
+                    }),
+                    Ok(meerkat_client::LlmEvent::UsageUpdate {
+                        usage: meerkat_core::TurnUsage::host_declared(
+                            meerkat_core::Provider::OpenAI,
+                            &request.model,
+                            meerkat_core::Usage::default(),
+                        ),
+                    }),
+                    Ok(meerkat_client::LlmEvent::Done {
+                        outcome: meerkat_client::LlmDoneOutcome::success(StopReason::EndTurn),
+                    }),
+                ]))
+            }
+
+            fn provider(&self) -> meerkat_core::Provider {
+                meerkat_core::Provider::OpenAI
+            }
+
+            async fn health_check(&self) -> Result<(), LlmError> {
+                Ok(())
+            }
+        }
+
+        let _projection_guard = crate::session_runtime::realtime_open_projection_test_guard().await;
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let (router, _notif_rx) = test_router_with_llm_for_config(
+            openai_live_test_config(),
+            Arc::new(OpenAiRecordingLlmClient {
+                requests: Arc::clone(&requests),
+            }),
+        )
+        .await;
+        let host = Arc::new(meerkat_live::LiveAdapterHost::new(Arc::new(
+            meerkat_live::NoOpProjectionSink,
+        )));
+        let close_feedback: Arc<dyn meerkat_live::LiveChannelCloseFeedback> = Arc::new(
+            crate::live_projection_sink::SessionServiceProjectionSink::new(Arc::clone(
+                &router.runtime,
+            )),
+        );
+        let status_feedback: Arc<dyn meerkat_live::LiveChannelStatusFeedback> = Arc::new(
+            crate::live_projection_sink::SessionServiceProjectionSink::new(Arc::clone(
+                &router.runtime,
+            )),
+        );
+        let token_authority: Arc<dyn meerkat_live::LiveWsTokenAuthority> = Arc::new(
+            crate::live_projection_sink::SessionServiceProjectionSink::new(Arc::clone(
+                &router.runtime,
+            )),
+        );
+        let live_ws = Arc::new(meerkat_live::LiveWsState::new(
+            host,
+            close_feedback,
+            status_feedback,
+            token_authority,
+        ));
+        let router = router
+            .with_live_ws(live_ws, "ws://127.0.0.1:0".to_string())
+            .with_live_session_factory(Arc::new(RecordingLiveFactory {
+                log: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            }));
+
+        let create_resp = router
+            .dispatch(make_request(
+                "session/create",
+                serde_json::json!({
+                    "prompt": "Remember the codeword ORBIT-7 for later.",
+                    "initial_turn": "deferred",
+                    "model": "gpt-realtime-2",
+                    "provider": "openai"
+                }),
+            ))
+            .await
+            .expect("session/create response");
+        assert!(
+            create_resp.error.is_none(),
+            "session/create should succeed: {create_resp:?}"
+        );
+        let session_id = result_value(&create_resp)["session_id"]
+            .as_str()
+            .expect("session_id")
+            .to_string();
+
+        let open_resp = router
+            .dispatch(make_request(
+                "live/open",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "transport": "websocket"
+                }),
+            ))
+            .await
+            .expect("live/open response");
+        assert!(
+            open_resp.error.is_none(),
+            "live/open should succeed: {open_resp:?}"
+        );
+        let channel_id = result_value(&open_resp)["channel_id"]
+            .as_str()
+            .expect("channel_id")
+            .to_string();
+        let close_resp = router
+            .dispatch(make_request(
+                "live/close",
+                serde_json::json!({ "channel_id": channel_id }),
+            ))
+            .await
+            .expect("live/close response");
+        assert!(
+            close_resp.error.is_none(),
+            "live/close should succeed: {close_resp:?}"
+        );
+
+        let turn_resp = router
+            .dispatch(make_request(
+                "turn/start",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "prompt": "What is the codeword?"
+                }),
+            ))
+            .await
+            .expect("turn/start response");
+        assert!(
+            turn_resp.error.is_none(),
+            "turn/start should succeed: {turn_resp:?}"
+        );
+
+        let recorded = requests
+            .lock()
+            .expect("recorded requests lock poisoned")
+            .clone();
+        let request_dump = format!("{recorded:?}");
+        let session_id = SessionId::parse(&session_id).expect("created session id should parse");
+        let session = router
+            .runtime
+            .load_persisted_session(&session_id)
+            .await
+            .expect("load persisted session")
+            .expect("session persisted");
+        let user_texts = session
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(user) => Some(user.text_content()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let llm_request_has_staged = request_dump.contains("ORBIT-7");
+        let transcript_has_staged = user_texts.iter().any(|text| text.contains("ORBIT-7"));
+        assert!(
+            llm_request_has_staged && transcript_has_staged,
+            "deferred create prompt lost after live/open + live/close: \
+             llm_request_contains={llm_request_has_staged} \
+             transcript_contains={transcript_has_staged}; \
+             transcript_user_messages={user_texts:?}; llm_requests={}",
+            recorded.len()
+        );
+    }
+
     #[cfg(feature = "comms")]
     #[tokio::test]
     async fn router_created_deferred_live_session_exposes_comms_tools_before_peers_exist() {

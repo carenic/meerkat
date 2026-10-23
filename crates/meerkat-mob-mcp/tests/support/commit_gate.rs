@@ -8,7 +8,9 @@
 //! pass it) for that runtime stop before the commit, reports it was entered, and
 //! continues when released. That opens, deterministically, the window in which a turn is
 //! terminal in its live agent but its rows have not reached the durable
-//! store: the window a restart re-link must never read an outcome from.
+//! store: the window a restart re-link must never read an outcome from. The
+//! store keeps the run of the commit it held
+//! ([`CommitGateRuntimeStore::held_run`]).
 //!
 //! Armed to fail instead ([`CommitGateRuntimeStore::arm_failure`]), the next
 //! such commit for that runtime fails once with a store write error, after
@@ -43,6 +45,7 @@ pub struct CommitGateRuntimeStore {
     fail_next: Mutex<Option<LogicalRuntimeId>>,
     failed: watch::Sender<bool>,
     hold: watch::Sender<CommitHold>,
+    held_run: Mutex<Option<meerkat_core::lifecycle::RunId>>,
     failing_observations: Mutex<Option<LogicalRuntimeId>>,
     failing_reads: Mutex<Option<LogicalRuntimeId>>,
     failing_recovery_reads: Mutex<Option<LogicalRuntimeId>>,
@@ -62,6 +65,7 @@ impl CommitGateRuntimeStore {
             fail_next: Mutex::new(None),
             failed: watch::channel(false).0,
             hold: watch::channel(CommitHold::Idle).0,
+            held_run: Mutex::new(None),
             failing_observations: Mutex::new(None),
             failing_reads: Mutex::new(None),
             failing_recovery_reads: Mutex::new(None),
@@ -171,7 +175,17 @@ impl CommitGateRuntimeStore {
         self.hold.send_replace(CommitHold::Released);
     }
 
-    async fn pause_if_gated(&self, runtime_id: &LogicalRuntimeId) {
+    /// The run of the boundary commit the gate held last, from the commit's
+    /// receipt.
+    pub fn held_run(&self) -> Option<meerkat_core::lifecycle::RunId> {
+        self.held_run.lock().expect("commit gate lock").clone()
+    }
+
+    async fn pause_if_gated(
+        &self,
+        runtime_id: &LogicalRuntimeId,
+        request: &meerkat_runtime::store::PreparedRuntimeSessionCommit,
+    ) {
         let armed = self
             .armed
             .lock()
@@ -181,6 +195,8 @@ impl CommitGateRuntimeStore {
         if !armed {
             return;
         }
+        *self.held_run.lock().expect("commit gate lock") =
+            request.receipt().map(|receipt| receipt.run_id.clone());
         let mut hold = self.hold.subscribe();
         self.hold.send_replace(CommitHold::Entered);
         hold.wait_for(|state| *state == CommitHold::Released)
@@ -221,7 +237,7 @@ impl meerkat_runtime::RuntimeStore for CommitGateRuntimeStore {
         meerkat_runtime::store::PreparedRuntimeSessionCommitResult,
         meerkat_runtime::RuntimeStoreError,
     > {
-        self.pause_if_gated(runtime_id).await;
+        self.pause_if_gated(runtime_id, &request).await;
         self.fail_if_armed(runtime_id)?;
         self.inner
             .commit_prepared_session_boundary(runtime_id, request)
@@ -851,7 +867,7 @@ impl meerkat_runtime::RuntimeStore for CommitGateRuntimeStore {
         meerkat_runtime::store::FencedPreparedRuntimeSessionCommitOutcome,
         meerkat_runtime::RuntimeStoreError,
     > {
-        self.pause_if_gated(runtime_id).await;
+        self.pause_if_gated(runtime_id, &request).await;
         self.fail_if_armed(runtime_id)?;
         self.inner
             .commit_prepared_session_boundary_with_fence(runtime_id, request, write_fence)

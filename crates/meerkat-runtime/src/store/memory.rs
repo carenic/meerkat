@@ -563,7 +563,7 @@ struct OpsLifecycleState {
 
 /// In-memory runtime store. Thread-safe via `tokio::sync::Mutex`, except the
 /// ops lifecycle state, which is behind its own std mutex (see
-/// [`OpsLifecycleState`]).
+/// `OpsLifecycleState`).
 #[derive(Debug, Clone)]
 pub struct InMemoryRuntimeStore {
     // Created once with the actual shared memory backend. Derived Clone keeps

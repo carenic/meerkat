@@ -1623,6 +1623,16 @@ impl meerkat_mob::MobSessionService for RpcMobSessionService {
         <PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::discard_live_session_under_runtime_turn_boundary(&self.service, session_id).await
     }
 
+    /// The wrapped persistent service owns the session actors, so the exit
+    /// of a removed one is awaited there.
+    async fn await_removed_actor_exit(&self, session_id: &SessionId) {
+        <PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::await_removed_actor_exit(
+            self.service.as_ref(),
+            session_id,
+        )
+        .await;
+    }
+
     fn supports_persistent_sessions(&self) -> bool {
         true
     }
@@ -2588,6 +2598,9 @@ pub struct SessionRuntime {
     /// Connector client-auth profiles the embedding host installed from its
     /// own configuration.
     connector_client_auth_profiles: StdRwLock<Vec<meerkat::ConnectorClientAuthProfile>>,
+    /// The host's registered `https` redirect base for MCP logins, from host
+    /// configuration (`rkat-rpc --mcp-oauth-redirect-base`).
+    mcp_registered_redirect_base: StdRwLock<Option<meerkat::McpRegisteredRedirectBase>>,
     /// Wire-admitted MCP login attempts this runtime started and has not
     /// seen reach a terminal disposition, keyed by their state. Shutdown
     /// retires what is left through the flow owner.
@@ -2758,6 +2771,50 @@ impl meerkat::ContinuationDeliverySink for SessionRuntimeContinuationSink {
                 .await
                 .map(|(outcome, _completion)| outcome),
         )
+    }
+
+    fn admits_governed(&self) -> bool {
+        true
+    }
+
+    /// A cold session's crash-window provisional tail is settled first, as
+    /// for a retained resume. A governed session is never made live here: the
+    /// host's own governed recovery does that, binding its destination before
+    /// the agent is constructed, and its executor attachment wakes the drain.
+    async fn prepare_governed(
+        &self,
+        session: &SessionId,
+    ) -> Result<(), meerkat::ContinuationAdmitError> {
+        self.runtime
+            .prepare_cold_attach(session)
+            .await
+            .map_err(|error| meerkat::ContinuationAdmitError::Failed(error.message))
+    }
+
+    async fn admit_governed(
+        &self,
+        session: &SessionId,
+        input: meerkat_runtime::Input,
+        custody: Box<dyn meerkat_runtime::input_admission_custody::NativeInputAdmissionCustody>,
+    ) -> Result<meerkat::GovernedAdmissionOutcome, meerkat_runtime::RuntimeDriverError> {
+        self.runtime
+            .runtime_adapter
+            .accept_input_with_completion_and_custody(session, input, custody)
+            .await
+            .map(|(outcome, _completion)| outcome.into())
+    }
+
+    async fn admitted_input_by_id(
+        &self,
+        session: &SessionId,
+        input_id: &meerkat_core::lifecycle::InputId,
+    ) -> Result<Option<meerkat_runtime::input_state::StoredInputState>, String> {
+        use meerkat_runtime::SessionServiceRuntimeExt as _;
+        self.runtime
+            .runtime_adapter
+            .input_state(session, input_id)
+            .await
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -3609,6 +3666,7 @@ impl SessionRuntime {
             #[cfg(feature = "mcp")]
             mcp_attachment_identity_key_custody: None,
             connector_client_auth_profiles: StdRwLock::new(Vec::new()),
+            mcp_registered_redirect_base: StdRwLock::new(None),
             mcp_wire_attempts: Arc::new(StdMutex::new(BTreeMap::new())),
             mcp_attempt_admission: Arc::new(RwLock::new(false)),
             mcp_shutting_down: Arc::new(AtomicBool::new(false)),
@@ -3782,6 +3840,7 @@ impl SessionRuntime {
             #[cfg(feature = "mcp")]
             mcp_attachment_identity_key_custody: None,
             connector_client_auth_profiles: StdRwLock::new(Vec::new()),
+            mcp_registered_redirect_base: StdRwLock::new(None),
             mcp_wire_attempts: Arc::new(StdMutex::new(BTreeMap::new())),
             mcp_attempt_admission: Arc::new(RwLock::new(false)),
             mcp_shutting_down: Arc::new(AtomicBool::new(false)),
@@ -4975,6 +5034,26 @@ impl SessionRuntime {
 
     pub fn connector_client_auth_profiles(&self) -> Vec<meerkat::ConnectorClientAuthProfile> {
         self.connector_client_auth_profiles
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Install the host's registered `https` redirect base for MCP logins
+    /// (host configuration; a request never supplies it). Each MCP target's
+    /// exact redirect is derived from it.
+    pub fn set_mcp_registered_redirect_base(
+        &self,
+        base: Option<meerkat::McpRegisteredRedirectBase>,
+    ) {
+        *self
+            .mcp_registered_redirect_base
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = base;
+    }
+
+    pub fn mcp_registered_redirect_base(&self) -> Option<meerkat::McpRegisteredRedirectBase> {
+        self.mcp_registered_redirect_base
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -12890,6 +12969,14 @@ impl SessionRuntime {
     /// A connection aborted `count` request handlers at its drain bound.
     pub(crate) fn note_unsettled_requests(&self, count: usize) {
         self.unsettled_requests.fetch_add(count, Ordering::AcqRel);
+    }
+
+    /// An MCP login completion stopped observing its credential commit
+    /// before the commit reported (`CommitUnsettled`). Like an aborted
+    /// handler's, that work may still publish, so the shutdown sweep never
+    /// reports its absent attempt as resolved.
+    pub(crate) fn note_unsettled_credential_commit(&self) {
+        self.unsettled_requests.fetch_add(1, Ordering::AcqRel);
     }
 
     /// The wire attempt admitted under `state` reached a terminal disposition
@@ -26343,6 +26430,336 @@ mod tests {
         );
     }
 
+    /// The same deferred `session/create` prompt as
+    /// `runtime_routed_pending_first_turn_preserves_deferred_prompt_and_injected_context`,
+    /// but the session is first materialized by the `live/open` projection
+    /// (`realtime_session_open_config` reaches
+    /// `materialize_staged_session_for_realtime_open`, which creates the live
+    /// session with `DeferredPromptPolicy::Stage`). The first later turn is
+    /// the ordinary runtime-routed `turn/start`, whose typed appends author
+    /// the turn transcript. The staged prompt must still reach the durable
+    /// transcript and the provider request.
+    #[tokio::test]
+    async fn realtime_open_staged_prompt_reaches_first_runtime_routed_turn() {
+        let _projection_guard = realtime_open_projection_test_guard().await;
+        let temp = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(RecordingMessagesLlmClient::default());
+        let build_config = AgentBuildConfig {
+            llm_client_override: Some(recorder.clone()),
+            ..AgentBuildConfig::new("claude-sonnet-4-5")
+        };
+        let runtime = make_runtime(temp_factory(&temp), 10);
+
+        let session_id = runtime
+            .create_session(
+                build_config,
+                None,
+                Some(ContentInput::Text(
+                    "Remember the codeword ORBIT-7 for later.".to_string(),
+                )),
+                Vec::new(),
+            )
+            .await
+            .expect("create deferred session");
+        assert!(
+            runtime.staged_sessions.contains(&session_id).await,
+            "deferred create must stage the session in the facade registry"
+        );
+
+        // The `live/open` projection step promotes the staged slot into the
+        // live service map with the create-time prompt staged in the
+        // session's deferred-turn state.
+        let open_config = runtime
+            .realtime_session_open_config(
+                &session_id,
+                meerkat_contracts::RealtimeTurningMode::ProviderManaged,
+            )
+            .await
+            .expect("live/open projection materializes the staged session");
+        // Diagnostic only: whether the realtime seed carries the prompt.
+        let realtime_seed_has_staged =
+            format!("{:?}", open_config.seed_messages()).contains("ORBIT-7");
+        drop(open_config);
+        assert!(
+            !runtime.staged_sessions.contains(&session_id).await,
+            "live/open projection must promote the staged slot"
+        );
+        // Diagnostic only: where the create-time prompt sits before the turn.
+        let staged_before_turn = runtime
+            .load_persisted_session(&session_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|session| session.try_deferred_turn_state().ok().flatten())
+            .and_then(|state| {
+                state
+                    .pending_initial_prompt()
+                    .map(|staged| staged.prompt.text_content())
+            });
+
+        // Diagnostic only: the session's own event stream carries the
+        // agent's `RunStarted` (the turn's `mcp_event_tx` does not).
+        let mut session_events = runtime
+            .service
+            .subscribe_session_events(&session_id)
+            .await
+            .expect("subscribe session events");
+        let (event_tx, _event_rx) = mpsc::channel(100);
+        runtime
+            .start_turn_via_runtime(
+                &session_id,
+                "What is the codeword?".into(),
+                Vec::new(),
+                event_tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("runtime-routed first turn");
+
+        let mut run_started_inputs = Vec::new();
+        while let Ok(Some(envelope)) =
+            tokio::time::timeout(Duration::from_millis(500), session_events.next()).await
+        {
+            if let AgentEvent::RunStarted { input, .. } = envelope.payload {
+                run_started_inputs.push(format!("{input:?}"));
+            }
+        }
+        let requests = recorder.requests();
+        let request_dump = format!("{requests:?}");
+        let session = runtime
+            .load_persisted_session(&session_id)
+            .await
+            .expect("load persisted session")
+            .expect("session persisted");
+        let users = user_channel_messages(&session);
+        let llm_request_has_staged = request_dump.contains("ORBIT-7");
+        let transcript_has_staged = users.iter().any(|(_, text)| text.contains("ORBIT-7"));
+        let run_started_has_staged = run_started_inputs
+            .iter()
+            .any(|input| input.contains("ORBIT-7"));
+        assert!(
+            llm_request_has_staged && transcript_has_staged,
+            "staged create-time prompt lost on the first runtime-routed turn: \
+             llm_request_contains={llm_request_has_staged} \
+             transcript_contains={transcript_has_staged} \
+             run_started_contains={run_started_has_staged}; \
+             realtime_seed_contains={realtime_seed_has_staged}; \
+             staged_before_turn={staged_before_turn:?}; \
+             transcript_user_messages={users:?}; llm_requests={}; \
+             run_started_inputs={run_started_inputs:?}",
+            requests.len()
+        );
+    }
+
+    /// Count the persisted user-channel rows that carry `needle`.
+    fn user_rows_containing(session: &Session, needle: &str) -> usize {
+        user_channel_messages(session)
+            .iter()
+            .filter(|(_, text)| text.contains(needle))
+            .count()
+    }
+
+    /// Whether the persisted deferred-turn state still stages a prompt.
+    fn persisted_staged_prompt(session: &Session) -> Option<String> {
+        session
+            .try_deferred_turn_state()
+            .expect("decode persisted deferred-turn state")
+            .and_then(|state| {
+                state
+                    .pending_initial_prompt()
+                    .map(|staged| staged.prompt.text_content())
+            })
+    }
+
+    /// Drop the live actor and the runtime registration, as a process restart
+    /// does; the next turn recovers the session from durable state.
+    async fn restart_session(runtime: &Arc<SessionRuntime>, session_id: &SessionId) {
+        runtime
+            .service
+            .discard_live_session(session_id)
+            .await
+            .expect("discard live session");
+        runtime
+            .runtime_adapter
+            .unregister_session(session_id)
+            .await
+            .expect("runtime session should unregister cleanly");
+    }
+
+    async fn runtime_turn(runtime: &Arc<SessionRuntime>, session_id: &SessionId, prompt: &str) {
+        let (event_tx, _event_rx) = mpsc::channel(100);
+        runtime
+            .start_turn_via_runtime(
+                session_id,
+                prompt.into(),
+                Vec::new(),
+                event_tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("runtime-routed turn");
+    }
+
+    /// The staged prompt is consumed only with the first turn's own
+    /// checkpoint. After that checkpoint the persisted pending flag is clear,
+    /// and a restart does not deliver the prompt again: the transcript keeps
+    /// exactly one staged row.
+    #[tokio::test]
+    async fn realtime_open_staged_prompt_is_delivered_once_across_a_restart() {
+        let _projection_guard = realtime_open_projection_test_guard().await;
+        let temp = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(RecordingMessagesLlmClient::default());
+        let build_config = AgentBuildConfig {
+            llm_client_override: Some(recorder.clone()),
+            ..AgentBuildConfig::new("claude-sonnet-4-5")
+        };
+        let runtime = make_runtime(temp_factory(&temp), 10);
+        // A restart rebuilds the agent from durable state, which does not
+        // carry the build's client override: recovery uses the default one.
+        runtime.set_default_llm_client(Some(recorder.clone()));
+        let session_id = runtime
+            .create_session(
+                build_config,
+                None,
+                Some(ContentInput::Text(
+                    "Remember the codeword ORBIT-7 for later.".to_string(),
+                )),
+                Vec::new(),
+            )
+            .await
+            .expect("create deferred session");
+        drop(
+            runtime
+                .realtime_session_open_config(
+                    &session_id,
+                    meerkat_contracts::RealtimeTurningMode::ProviderManaged,
+                )
+                .await
+                .expect("live/open projection materializes the staged session"),
+        );
+
+        runtime_turn(&runtime, &session_id, "What is the codeword?").await;
+        let after_first = runtime
+            .load_persisted_session(&session_id)
+            .await
+            .expect("load persisted session")
+            .expect("session persisted");
+        let first_rows = user_rows_containing(&after_first, "ORBIT-7");
+        let staged_after_first = persisted_staged_prompt(&after_first);
+
+        restart_session(&runtime, &session_id).await;
+        runtime_turn(&runtime, &session_id, "And after the restart?").await;
+        let after_restart = runtime
+            .load_persisted_session(&session_id)
+            .await
+            .expect("load persisted session")
+            .expect("session persisted");
+        let restart_rows = user_rows_containing(&after_restart, "ORBIT-7");
+        let requests = recorder.requests();
+        let last_request_mentions = requests
+            .last()
+            .map(|request| format!("{request:?}").matches("ORBIT-7").count());
+        assert!(
+            first_rows == 1
+                && staged_after_first.is_none()
+                && restart_rows == 1
+                && last_request_mentions == Some(1),
+            "staged prompt must be delivered exactly once across a restart: \
+             rows_after_first_turn={first_rows} \
+             persisted_staged_after_first_turn={staged_after_first:?} \
+             rows_after_restart_turn={restart_rows} \
+             last_request_mentions={last_request_mentions:?}; \
+             transcript_user_messages={:?}",
+            user_channel_messages(&after_restart)
+        );
+    }
+
+    /// In a voice-first session the staged prompt lands with the first
+    /// later text turn, after the live rows, and a restart does not deliver
+    /// it again (the live row commit re-syncs the actor from durable state,
+    /// which still stages the prompt).
+    #[tokio::test]
+    async fn voice_first_session_delivers_the_staged_prompt_with_the_first_text_turn() {
+        let _projection_guard = realtime_open_projection_test_guard().await;
+        let temp = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(RecordingMessagesLlmClient::default());
+        let build_config = AgentBuildConfig {
+            llm_client_override: Some(recorder.clone()),
+            ..AgentBuildConfig::new("claude-sonnet-4-5")
+        };
+        let runtime = make_runtime(temp_factory(&temp), 10);
+        // A restart rebuilds the agent from durable state, which does not
+        // carry the build's client override: recovery uses the default one.
+        runtime.set_default_llm_client(Some(recorder.clone()));
+        let session_id = runtime
+            .create_session(
+                build_config,
+                None,
+                Some(ContentInput::Text(
+                    "Remember the codeword ORBIT-7 for later.".to_string(),
+                )),
+                Vec::new(),
+            )
+            .await
+            .expect("create deferred session");
+        drop(
+            runtime
+                .realtime_session_open_config(
+                    &session_id,
+                    meerkat_contracts::RealtimeTurningMode::ProviderManaged,
+                )
+                .await
+                .expect("live/open projection materializes the staged session"),
+        );
+        for event in [
+            meerkat_core::RealtimeTranscriptEvent::ItemObserved {
+                item_id: "voice-item-1".to_string(),
+                previous_item_id: None,
+                role: meerkat_core::RealtimeTranscriptRole::User,
+                response_id: None,
+            },
+            meerkat_core::RealtimeTranscriptEvent::UserTranscriptFinal {
+                item_id: "voice-item-1".to_string(),
+                previous_item_id: None,
+                content_index: 0,
+                text: "a spoken hello".to_string(),
+            },
+        ] {
+            runtime
+                .append_realtime_transcript_event(&session_id, event)
+                .await
+                .expect("live user transcript commits");
+        }
+
+        runtime_turn(&runtime, &session_id, "What is the codeword?").await;
+        restart_session(&runtime, &session_id).await;
+        runtime_turn(&runtime, &session_id, "And after the restart?").await;
+
+        let session = runtime
+            .load_persisted_session(&session_id)
+            .await
+            .expect("load persisted session")
+            .expect("session persisted");
+        let users = user_channel_messages(&session);
+        let spoken = users
+            .iter()
+            .position(|(_, text)| text.contains("a spoken hello"));
+        let staged = users.iter().position(|(_, text)| text.contains("ORBIT-7"));
+        let staged_rows = user_rows_containing(&session, "ORBIT-7");
+        assert!(
+            spoken.is_some() && staged.is_some() && spoken < staged && staged_rows == 1,
+            "voice-first: the staged prompt must land once, with the first text turn, after \
+             the live rows: spoken_row={spoken:?} staged_row={staged:?} \
+             staged_rows={staged_rows}; transcript_user_messages={users:?}"
+        );
+    }
+
     /// Project a persisted session's user-channel messages as
     /// `(is_injected_context, text)` pairs, in transcript order.
     fn user_channel_messages(session: &Session) -> Vec<(bool, String)> {
@@ -38499,5 +38916,1045 @@ fn mcp_live_add_rpc_error(error: meerkat::surface::McpLiveAddError) -> RpcError 
         code,
         message: error.to_string(),
         data: None,
+    }
+}
+
+/// The RPC continuation sink on a governed runtime: a host original bound by
+/// its namespace owner's binder with `bind_scoped_original` (Core's admission
+/// key as its event key) lands in a live session; a cold standalone session
+/// waits, typed and holding nothing, until the host's own recovery makes it
+/// live, then lands once; and a native refusal settles as it does on the
+/// machine sink. The delivery host is the RPC host's own.
+#[cfg(all(test, feature = "local-authorization"))]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+mod governed_host_original_tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use super::*;
+    use meerkat_authorization::grant_policy::{
+        AdmittedWorkPolicyOwner, ControllerAdmissionAllowance, OperationPolicyOwner,
+        WorkOwnerAllowance,
+    };
+    use meerkat_authorization::grants::{LocalGrantAuthority, LocalGrantConfiguration};
+    use meerkat_authorization::policy::{
+        LocalOperationValues, LocalPolicyAllowance, LocalPolicyPurpose,
+    };
+    use meerkat_authorization::publication::LocalAuthorizationPublication;
+    use meerkat_authorization::work::HostAuthorizationClock;
+    use meerkat_authorization_contracts::constraints::{
+        ActionRef, AudienceRef, DomainRestriction, ExactRestriction, ExecutionRestrictions,
+        ProcessorRef, ResourceDomain,
+    };
+    use meerkat_authorization_contracts::evidence::{
+        EvidenceDigest, EvidenceId, HistoricalEvidenceRef,
+    };
+    use meerkat_authorization_contracts::protocol::ContractRequirements;
+    use meerkat_authorization_contracts::resource::ResourceRef;
+    use meerkat_authorization_contracts::work_association::{
+        GrantLineageRef, InputAuthorityAssociation, InputAuthorityAssociationCandidate,
+        NativeWorkTarget, OriginalWorkRef, QualifiedIngressNamespace, WorkAuthorityBasis,
+    };
+    use meerkat_core::authorization::{
+        AuthorizationOperation, ControllerReadinessFailure, ModelAuthorizationFacts,
+        ModelAuthorizationUse, OperationObservedOutcome, OperationRefusalKind, OperationRefused,
+        PreparedAuthorizationBinding,
+    };
+    use meerkat_core::connection::{AuthCredentialIdentity, RealmId};
+    use meerkat_core::{
+        ControllerModelSelection, PrincipalKind, PrincipalRef, Provider, SessionLlmIdentity,
+        StopReason, TrustDomainId,
+    };
+    use meerkat_llm_core::{
+        LlmDoneOutcome, LlmError, LlmEvent, LlmRequest, LlmStream, PreparedLlmRequest,
+    };
+    use meerkat_runtime::input::Input;
+    use meerkat_runtime::input_authority::{NativeAdmissionError, NativeIngressContext};
+    use meerkat_runtime::meerkat_machine::NativeGrantWorkConfiguration;
+
+    const MODEL: &str = "claude-sonnet-4-5";
+    const ENDPOINT: &str = "https://governed-rpc.invalid/messages";
+    const NAMESPACE: &str = "app.ingest";
+    const OBSERVATION: &str = "observation-1";
+    const OBSERVATION_KEY: &str = "ingest:observation-1";
+    const BODY: &str = "a new item arrived";
+    const WAIT: Duration = Duration::from_secs(30);
+
+    fn id(value: &str) -> EvidenceId {
+        EvidenceId::new(value).expect("bounded fixture identifier")
+    }
+
+    fn principal(value: &str) -> PrincipalRef {
+        PrincipalRef::in_domain(
+            PrincipalKind::ServiceAccount,
+            value,
+            TrustDomainId::new("governed-rpc").expect("domain"),
+        )
+        .expect("qualified fixture principal")
+    }
+
+    fn denied() -> OperationRefused {
+        OperationRefused::new(OperationRefusalKind::Denied)
+    }
+
+    fn evidence(value: &str) -> HistoricalEvidenceRef {
+        HistoricalEvidenceRef {
+            resource: ResourceRef {
+                domain: ResourceDomain {
+                    authority: principal("ingress"),
+                    namespace: "observations".into(),
+                },
+                resource_id: value.into(),
+            },
+            revision: id("revision-1"),
+            digest: EvidenceDigest::from_array([7; 32]),
+        }
+    }
+
+    fn realm() -> RealmId {
+        RealmId::parse("governed-rpc").expect("realm")
+    }
+
+    fn identity() -> SessionLlmIdentity {
+        SessionLlmIdentity {
+            model: MODEL.into(),
+            provider: Provider::Anthropic,
+            self_hosted_server_id: None,
+            provider_params: None,
+            auth_binding: None,
+        }
+    }
+
+    fn credential() -> AuthCredentialIdentity {
+        serde_json::from_value(
+            serde_json::json!({"realm": "governed-rpc", "account": "scripted-controller"}),
+        )
+        .expect("nonsecret identity of the fixture transport")
+    }
+
+    fn selection() -> ControllerModelSelection {
+        ControllerModelSelection::new(
+            identity(),
+            credential(),
+            "scripted-profile".into(),
+            "scripted-transport".into(),
+        )
+    }
+
+    fn model_facts() -> ModelAuthorizationFacts {
+        ModelAuthorizationFacts {
+            identity: Arc::new(identity()),
+            wire_model: MODEL.into(),
+            hosted_capabilities: Arc::from([]),
+            backend_profile_id: Some("scripted-profile".into()),
+            backend_kind: "scripted-transport".into(),
+            endpoint: ENDPOINT.into(),
+            credential: Some(credential()),
+            usage: ModelAuthorizationUse::ControllerInference,
+            live_channel: None,
+        }
+    }
+
+    fn action(value: &str) -> ActionRef {
+        ActionRef {
+            feature: "governed-rpc".into(),
+            action: value.into(),
+        }
+    }
+
+    fn domain() -> ResourceDomain {
+        ResourceDomain {
+            authority: principal("resource-owner"),
+            namespace: "records".into(),
+        }
+    }
+
+    fn ceiling(action_name: &str) -> ExecutionRestrictions {
+        let mut bounds = ExecutionRestrictions::unrestricted();
+        bounds.actions = ExactRestriction::exact([action(action_name)]);
+        bounds.resource_domains = DomainRestriction::exact([domain()]);
+        bounds.processors = ExactRestriction::exact([ProcessorRef::Principal {
+            principal: principal("executor"),
+        }]);
+        bounds.audiences = ExactRestriction::exact([AudienceRef::Principal {
+            principal: principal("requester"),
+        }]);
+        bounds
+    }
+
+    fn values(verb: &str) -> LocalOperationValues {
+        LocalOperationValues {
+            action: action(verb),
+            resource_domain: domain(),
+            processor: ProcessorRef::Principal {
+                principal: principal("executor"),
+            },
+            audience: AudienceRef::Principal {
+                principal: principal("requester"),
+            },
+        }
+    }
+
+    /// The scripted controller's inference only.
+    struct ControllerOwner;
+    impl OperationPolicyOwner for ControllerOwner {
+        fn authorize_controller_admission(
+            &self,
+            _: &InputAuthorityAssociation,
+            facts: &meerkat_core::ControllerModelFacts,
+            _: u64,
+        ) -> Result<ControllerAdmissionAllowance, meerkat_core::OperationAuthorizationError>
+        {
+            if facts.selection() != &selection()
+                || facts.endpoint() != ENDPOINT
+                || facts.wire_model() != MODEL
+            {
+                return Err(denied().into());
+            }
+            Ok(ControllerAdmissionAllowance {
+                operation_values: vec![values("infer")],
+                restrictions: ExecutionRestrictions::unrestricted(),
+            })
+        }
+
+        fn authorize_operation(
+            &self,
+            _: &InputAuthorityAssociation,
+            binding: &PreparedAuthorizationBinding,
+            purpose: LocalPolicyPurpose,
+            now_ms: u64,
+        ) -> Result<LocalPolicyAllowance, meerkat_core::OperationAuthorizationError> {
+            match &binding.facts().operation {
+                AuthorizationOperation::Model(facts)
+                    if purpose == LocalPolicyPurpose::Controller
+                        && selection().matches_model_facts(facts)
+                        && facts.endpoint.as_ref() == ENDPOINT
+                        && facts.wire_model.as_ref() == MODEL => {}
+                _ => return Err(denied().into()),
+            }
+            Ok(LocalPolicyAllowance {
+                operation_values: vec![values("infer")],
+                restrictions: ExecutionRestrictions::unrestricted(),
+                expires_at_ms: now_ms + 60_000,
+                review_tier: meerkat_core::authorization::OperationReviewTier::R1,
+            })
+        }
+    }
+
+    /// The host's invocation policy: the fixture requester's work.
+    struct Invocation;
+    impl AdmittedWorkPolicyOwner for Invocation {
+        fn authorize_admitted_work(
+            &self,
+            association: &InputAuthorityAssociation,
+            _: &PreparedAuthorizationBinding,
+            _: LocalPolicyPurpose,
+            now_ms: u64,
+        ) -> Result<WorkOwnerAllowance, meerkat_core::OperationAuthorizationError> {
+            if association.candidate().requester != principal("requester") {
+                return Err(denied().into());
+            }
+            Ok(WorkOwnerAllowance {
+                restrictions: ExecutionRestrictions::unrestricted(),
+                expires_at_ms: now_ms + 60_000,
+            })
+        }
+    }
+
+    /// The scripted controller transport: authorizes its request natively
+    /// and answers.
+    struct GovernedProvider;
+
+    #[async_trait::async_trait]
+    impl meerkat_llm_core::LlmClient for GovernedProvider {
+        fn plain_model_route(
+            &self,
+            logical_model: &str,
+        ) -> Result<meerkat_llm_core::PlainModelRoute, meerkat_core::ControllerFactsUnavailable>
+        {
+            if logical_model != MODEL {
+                return Err(meerkat_core::ControllerFactsUnavailable);
+            }
+            meerkat_llm_core::PlainModelRoute::new(ENDPOINT, MODEL)
+        }
+
+        fn controller_model_selection(&self) -> Option<ControllerModelSelection> {
+            Some(selection())
+        }
+
+        fn project_replay_messages(
+            &self,
+            messages: &[meerkat_core::Message],
+        ) -> Result<Vec<meerkat_core::Message>, LlmError> {
+            Ok(messages.to_vec())
+        }
+
+        fn stream<'a>(&'a self, _: &'a LlmRequest) -> LlmStream<'a> {
+            Box::pin(futures::stream::iter([Ok(LlmEvent::Done {
+                outcome: LlmDoneOutcome::success(StopReason::EndTurn),
+            })]))
+        }
+
+        fn stream_prepared<'a>(&'a self, request: &'a PreparedLlmRequest) -> LlmStream<'a> {
+            if let Some(authorization) = request.authorization()
+                && let Ok(prepared) = authorization.prepare(model_facts())
+                && let Ok(check) = prepared.current()
+            {
+                let _ = check.observe_entry(meerkat_core::OperationEntryBoundary::ModelRequest);
+                let _ =
+                    check.observe_outcome(OperationObservedOutcome::HttpResponse { status: 200 });
+            }
+            Box::pin(futures::stream::iter([
+                Ok(LlmEvent::TextDelta {
+                    delta: "governed answer".into(),
+                    meta: None,
+                }),
+                Ok(LlmEvent::Done {
+                    outcome: LlmDoneOutcome::success(StopReason::EndTurn),
+                }),
+            ]))
+        }
+
+        fn provider(&self) -> Provider {
+            Provider::Anthropic
+        }
+
+        async fn health_check(&self) -> Result<(), LlmError> {
+            Ok(())
+        }
+    }
+
+    /// The stores a governed RPC runtime is opened over, kept across a
+    /// process restart.
+    #[derive(Clone)]
+    struct Stores {
+        session: Arc<dyn meerkat::SessionStore>,
+        runtime: Arc<dyn meerkat_runtime::RuntimeStore>,
+        blob: Arc<dyn meerkat_core::BlobStore>,
+    }
+
+    impl Stores {
+        fn new() -> Self {
+            Self {
+                session: Arc::new(meerkat::MemoryStore::new()),
+                runtime: Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
+                blob: Arc::new(meerkat_store::MemoryBlobStore::new()),
+            }
+        }
+    }
+
+    /// One process's governed RPC runtime with its grant lineages.
+    struct Governed {
+        runtime: Arc<SessionRuntime>,
+        controller: GrantLineageRef,
+        operation: GrantLineageRef,
+    }
+
+    /// Open a governed RPC runtime over `stores`. Its host's ingress check
+    /// refuses every input while `deny` is set.
+    async fn governed(
+        temp: &tempfile::TempDir,
+        stores: &Stores,
+        deny: Arc<AtomicBool>,
+    ) -> Governed {
+        let grants = Arc::new(
+            LocalGrantAuthority::new(
+                LocalGrantConfiguration {
+                    root: principal("grant-owner"),
+                    namespace: id("governed-rpc-grants"),
+                    generation: 1,
+                },
+                LocalAuthorizationPublication::new(),
+                Arc::new(HostAuthorizationClock),
+            )
+            .expect("grant owner"),
+        );
+        let controller = grants
+            .issue_root(
+                &principal("grant-owner"),
+                id("controller"),
+                principal("executor"),
+                None,
+                ceiling("infer"),
+            )
+            .expect("controller lineage");
+        let operation = grants
+            .issue_root(
+                &principal("grant-owner"),
+                id("read-only"),
+                principal("executor"),
+                None,
+                ceiling("read"),
+            )
+            .expect("operation grant");
+        let configuration = NativeGrantWorkConfiguration {
+            retained_resume: None,
+            require_scoped_destination: false,
+            grants,
+            ingress: Arc::new(move |_, _, ingress: &NativeIngressContext, _| {
+                if deny.load(Ordering::SeqCst) || ingress.requester() != &principal("requester") {
+                    return Err(NativeAdmissionError::Refused(denied()));
+                }
+                Ok(())
+            }),
+            invocation_owner: Arc::new(Invocation),
+            operation_owner: Arc::new(ControllerOwner),
+            configured_mcp_attachment: None,
+        };
+        let bundle = meerkat::PersistenceBundle::new_with_local_grant_authorization(
+            Arc::clone(&stores.session),
+            Arc::clone(&stores.runtime),
+            Arc::clone(&stores.blob),
+            configuration,
+        )
+        .expect("governed persistence");
+        let runtime = Arc::new(
+            SessionRuntime::new(
+                AgentFactory::new(temp.path().join("sessions")),
+                Config::default(),
+                10,
+                bundle,
+                crate::router::NotificationSink::noop(),
+            )
+            .expect("compose the governed RPC session runtime"),
+        );
+        runtime.set_default_llm_client(Some(Arc::new(GovernedProvider)));
+        meerkat_core::publish_token_lifecycle_acquired_for_identity_within(
+            &runtime.runtime_adapter.generated_auth_lease_handle(),
+            &credential(),
+            &meerkat_core::auth::PersistedTokens::api_key("synthetic-governed-rpc-credential"),
+            tokio::time::Instant::now() + WAIT,
+        )
+        .await
+        .expect("controller credential before native admission");
+        Governed {
+            runtime,
+            controller,
+            operation,
+        }
+    }
+
+    fn build_config() -> AgentBuildConfig {
+        AgentBuildConfig {
+            llm_client_override: Some(Arc::new(GovernedProvider)),
+            ..AgentBuildConfig::new(MODEL)
+        }
+    }
+
+    /// The host makes `session` live (a new one when `None`) through its own
+    /// no-turn materialization, then attaches its executor: the recovery a
+    /// governed host runs, here without a destination binding (this runtime
+    /// requires no scoped destination).
+    async fn host_makes_live(governed: &Governed, session: Option<SessionId>) -> SessionId {
+        let session = governed
+            .runtime
+            .create_or_resume_session_without_turn_bound(
+                build_config(),
+                session,
+                None,
+                SurfaceSessionRecoveryOverrides::default(),
+                None,
+                None,
+            )
+            .await
+            .expect("the host materializes the session without a turn");
+        governed
+            .runtime
+            .ensure_runtime_executor(&session)
+            .await
+            .expect("the host attaches the session's executor");
+        session
+    }
+
+    fn observation() -> meerkat::ContinuationDelivery {
+        meerkat::ContinuationDelivery {
+            key: meerkat::ContinuationKey::new(OBSERVATION_KEY).expect("key"),
+            result: meerkat::ContinuationResultRef {
+                producer: meerkat::ContinuationProducer::Host {
+                    namespace: NAMESPACE.into(),
+                },
+                producer_id: OBSERVATION.into(),
+                result_digest: "sha256:observation-1".into(),
+                summary: None,
+            },
+            body: BODY.into(),
+            handling: meerkat::ContinuationHandling::Queue,
+        }
+    }
+
+    fn original_work() -> OriginalWorkRef {
+        OriginalWorkRef {
+            authority: principal("source-owner"),
+            work: id(OBSERVATION),
+        }
+    }
+
+    fn claims(
+        session: &SessionId,
+        controller: GrantLineageRef,
+        operation: GrantLineageRef,
+        selected: ControllerModelSelection,
+        original_work: OriginalWorkRef,
+    ) -> InputAuthorityAssociationCandidate {
+        InputAuthorityAssociationCandidate {
+            requester: principal("requester"),
+            ingress_actor: principal("ingress"),
+            represented_subject: None,
+            original_authentication: evidence("original-authentication"),
+            logical_executor: principal("executor"),
+            target: NativeWorkTarget {
+                logical_owner: principal("native-owner"),
+                logical_runtime: id(
+                    &meerkat_runtime::LogicalRuntimeId::for_session(session).to_string()
+                ),
+                context: id("native-context"),
+                context_generation: 1,
+                audience: AudienceRef::Principal {
+                    principal: principal("requester"),
+                },
+            },
+            original_work,
+            root_event: evidence("original-event"),
+            contributing_work: Vec::new(),
+            authority_basis: WorkAuthorityBasis::GrantLineage {
+                lineage: vec![operation],
+            },
+            controller_grant_lineage: vec![controller],
+            controller_model: Some(selected),
+            controller_ceiling: ceiling("infer"),
+            admitted_ceiling: ExecutionRestrictions::unrestricted(),
+            source_observations: Vec::new(),
+            ingress_namespace: QualifiedIngressNamespace {
+                realm: realm(),
+                ingress: ResourceDomain {
+                    authority: principal("ingress"),
+                    namespace: "prompts".into(),
+                },
+                occurrence_scope: id("occurrence-1"),
+            },
+            contract: ContractRequirements::local_governed_v1(),
+        }
+    }
+
+    /// The host's custody record of the settlements it handed over.
+    #[derive(Default)]
+    struct Custody {
+        accepted: StdMutex<Vec<meerkat::HostOriginalAdmission>>,
+        dropped: AtomicUsize,
+    }
+
+    struct Settlement {
+        custody: Arc<Custody>,
+        settled: bool,
+    }
+
+    impl meerkat::HostOriginalSettlement for Settlement {
+        fn accepted(
+            mut self: Box<Self>,
+            admission: &meerkat::HostOriginalAdmission,
+        ) -> Result<(), String> {
+            self.settled = true;
+            self.custody
+                .accepted
+                .lock()
+                .expect("custody")
+                .push(admission.clone());
+            Ok(())
+        }
+    }
+
+    impl Drop for Settlement {
+        fn drop(&mut self) {
+            if !self.settled {
+                self.custody.dropped.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// The trusted host's binder: it pins the live actor's controller without
+    /// waiting and binds Core's input with `bind_scoped_original`, Core's
+    /// admission key as the event key.
+    struct Binder {
+        runtime: Arc<SessionRuntime>,
+        controller: GrantLineageRef,
+        operation: GrantLineageRef,
+        custody: Arc<Custody>,
+        /// Answer `NotReady` while set (a host that cannot bind now).
+        not_ready: AtomicBool,
+        /// Every bind asked, the binds that found no live actor, and every
+        /// custody handed back unresolved.
+        binds: AtomicUsize,
+        not_live: AtomicUsize,
+        unresolved: AtomicUsize,
+        bound: StdMutex<Vec<InputAuthorityAssociation>>,
+    }
+
+    #[async_trait::async_trait]
+    impl meerkat::HostOriginalBinder for Binder {
+        async fn bind(
+            &self,
+            original: &meerkat::HostOriginalRef,
+            session: &SessionId,
+            input: Input,
+        ) -> Result<meerkat::BoundHostOriginal, meerkat::HostOriginalRefusal> {
+            self.binds.fetch_add(1, Ordering::SeqCst);
+            if self.not_ready.load(Ordering::SeqCst) {
+                return Err(meerkat::HostOriginalRefusal::NotReady(
+                    ControllerReadinessFailure::TurnBoundaryHeld,
+                ));
+            }
+            let Some(witness) = self
+                .runtime
+                .service
+                .live_session_actor_witness(session)
+                .await
+            else {
+                self.not_live.fetch_add(1, Ordering::SeqCst);
+                return Err(meerkat::HostOriginalRefusal::NotReady(
+                    ControllerReadinessFailure::ExecutorUnavailable,
+                ));
+            };
+            let pin = match self
+                .runtime
+                .service
+                .try_pin_controller_client_for_actor(&witness)
+                .await
+            {
+                Ok(pin) => pin,
+                Err(meerkat_session::TryPinControllerError::TurnBoundaryHeld) => {
+                    return Err(meerkat::HostOriginalRefusal::NotReady(
+                        ControllerReadinessFailure::TurnBoundaryHeld,
+                    ));
+                }
+                Err(error) => {
+                    return Err(meerkat::HostOriginalRefusal::Unavailable(error.to_string()));
+                }
+            };
+            let key = input
+                .header()
+                .idempotency_key
+                .clone()
+                .expect("Core's admission key");
+            let association = InputAuthorityAssociation::new(claims(
+                session,
+                self.controller.clone(),
+                self.operation.clone(),
+                pin.selection().clone(),
+                original.original_work.clone(),
+            ))
+            .expect("well-formed claims");
+            self.bound.lock().expect("bound").push(association.clone());
+            let bound = meerkat_runtime::meerkat_machine::bind_scoped_original(
+                input,
+                association,
+                key,
+                principal("requester"),
+                principal("ingress"),
+                realm(),
+                evidence("original-authentication"),
+                pin,
+            )
+            .map_err(|error| meerkat::HostOriginalRefusal::Unavailable(error.to_string()))?;
+            Ok(meerkat::BoundHostOriginal::new(
+                bound,
+                Box::new(Settlement {
+                    custody: Arc::clone(&self.custody),
+                    settled: false,
+                }),
+            ))
+        }
+
+        async fn readiness(
+            &self,
+            _namespace: &str,
+            _owner: &meerkat::ContinuationOwner,
+        ) -> meerkat::HostOriginalBinderReadiness {
+            meerkat::HostOriginalBinderReadiness::Ready
+        }
+
+        fn retain_unresolved(
+            &self,
+            _settlement: Box<dyn meerkat::HostOriginalSettlement>,
+            _detail: &str,
+        ) {
+            self.unresolved.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// The committed owner of the ingest namespace: it holds the observation
+    /// owed to one session and offers the binder.
+    struct NamespaceOwner {
+        facts: meerkat::HostOriginalFacts,
+        binder: Arc<Binder>,
+    }
+
+    #[async_trait::async_trait]
+    impl meerkat::RetainedJobSource for NamespaceOwner {
+        async fn retained_job(
+            &self,
+            _producer: &meerkat::ContinuationProducer,
+            _job_id: &str,
+        ) -> meerkat::RetainedJobLookup {
+            meerkat::RetainedJobLookup::Absent
+        }
+
+        async fn host_original(
+            &self,
+            namespace: &str,
+            producer_id: &str,
+        ) -> meerkat::HostOriginalLookup {
+            if namespace == NAMESPACE && producer_id == OBSERVATION {
+                meerkat::HostOriginalLookup::Found(self.facts.clone())
+            } else {
+                meerkat::HostOriginalLookup::Absent
+            }
+        }
+
+        fn host_original_binder(
+            &self,
+            namespace: &str,
+        ) -> Option<Arc<dyn meerkat::HostOriginalBinder>> {
+            (namespace == NAMESPACE)
+                .then(|| Arc::clone(&self.binder) as Arc<dyn meerkat::HostOriginalBinder>)
+        }
+    }
+
+    /// The observation committed for `session`, its namespace owner bound
+    /// into the runtime's continuation services, and the RPC host's own
+    /// delivery owner armed over the runtime's inbox.
+    struct Delivering {
+        continuations: meerkat::ContinuationOwnerService,
+        owner: meerkat::ContinuationOwner,
+        binder: Arc<Binder>,
+        custody: Arc<Custody>,
+        passes: tokio::sync::watch::Receiver<meerkat::RuntimeDeliveryPass>,
+        _handle: meerkat::RuntimeDeliveryOwnerHandle,
+        _binding: meerkat::ContinuationBinding,
+    }
+
+    async fn deliver(governed: &Governed, session: &SessionId) -> Delivering {
+        let runtime = &governed.runtime;
+        let owner = meerkat::ContinuationOwner::Session {
+            session_id: session.clone(),
+        };
+        let custody = Arc::new(Custody::default());
+        let binder = Arc::new(Binder {
+            runtime: Arc::clone(runtime),
+            controller: governed.controller.clone(),
+            operation: governed.operation.clone(),
+            custody: Arc::clone(&custody),
+            not_ready: AtomicBool::new(false),
+            binds: AtomicUsize::new(0),
+            not_live: AtomicUsize::new(0),
+            unresolved: AtomicUsize::new(0),
+            bound: StdMutex::new(Vec::new()),
+        });
+        let source = Arc::new(NamespaceOwner {
+            facts: meerkat::HostOriginalFacts::new(owner.clone(), observation(), original_work()),
+            binder: Arc::clone(&binder),
+        });
+        let continuations = meerkat::ContinuationOwnerService::new(
+            runtime.runtime_delivery_inbox(),
+            Arc::new(meerkat::SessionAddressResolver),
+            Arc::clone(&runtime.runtime_adapter),
+        );
+        let record =
+            meerkat::HostOriginalRecord::from_owner(source.as_ref(), NAMESPACE, OBSERVATION)
+                .await
+                .expect("read the namespace owner")
+                .expect("the namespace owner holds the observation");
+        continuations
+            .submit_host_original(&owner, observation(), &record, 1)
+            .await
+            .expect("a governed runtime commits the host original");
+        let binding = runtime
+            .continuation_bindings()
+            .bind(Arc::new(meerkat::SessionAddressResolver), source)
+            .expect("bind the namespace owner");
+        let handle = meerkat::RuntimeDeliveryOwner::new(
+            runtime.job_store.clone(),
+            runtime.runtime_delivery_inbox(),
+        )
+        // The only wake: the runtime's executor attachment commits.
+        .with_attachment_commits(runtime.runtime_adapter.subscribe_attachment_commits())
+        .arm(Arc::new(SessionRuntimeDeliveryHost {
+            runtime: Arc::downgrade(runtime),
+            realm_id: "governed-rpc".into(),
+        }))
+        .expect("arm the RPC host's delivery owner");
+        Delivering {
+            continuations,
+            owner,
+            binder,
+            custody,
+            passes: handle.subscribe_passes(),
+            _handle: handle,
+            _binding: binding,
+        }
+    }
+
+    impl Delivering {
+        async fn status(&self) -> meerkat::ContinuationStatus {
+            self.continuations
+                .continuation_status(
+                    &self.owner,
+                    &meerkat::ContinuationKey::new(OBSERVATION_KEY).expect("key"),
+                )
+                .await
+                .expect("status")
+        }
+
+        /// The observation's status once it is applied or settled.
+        async fn settled(&mut self) -> meerkat::ContinuationStatus {
+            let outcome = tokio::time::timeout(WAIT, async {
+                loop {
+                    let status = self.status().await;
+                    if matches!(
+                        status,
+                        meerkat::ContinuationStatus::Applied { .. }
+                            | meerkat::ContinuationStatus::Refused { .. }
+                    ) {
+                        return status;
+                    }
+                    self.passes.changed().await.expect("owner pass channel");
+                }
+            })
+            .await;
+            match outcome {
+                Ok(status) => status,
+                Err(elapsed) => panic!(
+                    "the host original was neither applied nor settled ({elapsed}); last pass \
+                     {:?}; binds {}, without a live actor {}",
+                    self.passes.borrow().clone(),
+                    self.binder.binds.load(Ordering::SeqCst),
+                    self.binder.not_live.load(Ordering::SeqCst),
+                ),
+            }
+        }
+
+        /// The first pass that reports the observation blocked.
+        async fn blocked(&mut self) -> meerkat::RuntimeDeliveryPass {
+            tokio::time::timeout(
+                WAIT,
+                self.passes
+                    .wait_for(|pass| pass.refused > 0 || !pass.blocked_runtimes.is_empty()),
+            )
+            .await
+            .expect("the observation blocks")
+            .expect("owner pass channel")
+            .clone()
+        }
+    }
+
+    /// The input `session` admitted for the applied observation carries the
+    /// association its binder bound, and the host's custody was promoted
+    /// once, for that admission.
+    async fn admitted_once_with_its_binding(
+        governed: &Governed,
+        delivering: &Delivering,
+        session: &SessionId,
+        status: meerkat::ContinuationStatus,
+    ) {
+        let meerkat::ContinuationStatus::Applied {
+            session: applied,
+            input,
+            ..
+        } = status
+        else {
+            panic!("the host original lands, got {status:?}");
+        };
+        assert_eq!(&applied, session);
+        let stored = governed
+            .runtime
+            .runtime_adapter
+            .input_state(session, &input)
+            .await
+            .expect("native row query")
+            .expect("the session holds the admitted input");
+        assert_eq!(stored.state.authority_contributors.len(), 1);
+        let bound = delivering.binder.bound.lock().expect("bound").clone();
+        assert!(
+            bound.last() == Some(stored.state.authority_contributors[0].association()),
+            "the admitted row retains exactly the association its binder bound"
+        );
+        let accepted = delivering.custody.accepted.lock().expect("custody").clone();
+        assert_eq!(accepted.len(), 1, "custody promoted once");
+        assert_eq!(accepted[0].input, input);
+        assert!(!accepted[0].deduplicated);
+    }
+
+    /// On the RPC sink a host original for a live session is bound by
+    /// its namespace owner's binder and admitted once, carrying the bound
+    /// association, with the host's custody promoted once.
+    #[tokio::test]
+    async fn the_rpc_sink_admits_a_host_original_into_a_live_session() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let stores = Stores::new();
+        let governed = governed(&temp, &stores, Arc::new(AtomicBool::new(false))).await;
+        let session = host_makes_live(&governed, None).await;
+        let mut delivering = deliver(&governed, &session).await;
+        let status = delivering.settled().await;
+        admitted_once_with_its_binding(&governed, &delivering, &session, status).await;
+        assert_eq!(
+            delivering.binder.binds.load(Ordering::SeqCst),
+            1,
+            "bound once"
+        );
+    }
+
+    /// Refusal parity: the host's native ingress refuses the bound
+    /// input, which settles the observation `AuthorityDenied` as on the
+    /// machine sink; nothing is admitted and the custody is dropped.
+    #[tokio::test]
+    async fn the_rpc_sink_settles_a_native_refusal_as_the_machine_sink_does() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let stores = Stores::new();
+        let deny = Arc::new(AtomicBool::new(false));
+        let governed = governed(&temp, &stores, Arc::clone(&deny)).await;
+        let session = host_makes_live(&governed, None).await;
+        deny.store(true, Ordering::SeqCst);
+        let mut delivering = deliver(&governed, &session).await;
+        let status = delivering.settled().await;
+        assert!(
+            matches!(
+                status,
+                meerkat::ContinuationStatus::Refused {
+                    reason: meerkat_runtime::RuntimeDeliveryRefusalReason::AuthorityDenied,
+                    ..
+                }
+            ),
+            "{status:?}"
+        );
+        assert!(
+            delivering
+                .custody
+                .accepted
+                .lock()
+                .expect("custody")
+                .is_empty()
+        );
+        assert_eq!(
+            delivering.custody.dropped.load(Ordering::SeqCst),
+            1,
+            "the custody is dropped"
+        );
+        assert!(
+            governed
+                .runtime
+                .runtime_adapter
+                .list_active_inputs(&session)
+                .await
+                .expect("active inputs")
+                .is_empty(),
+            "nothing was admitted"
+        );
+    }
+
+    /// Restart the governed RPC runtime over the same stores: `session` is
+    /// then a cold standalone session, with no executor and no live actor.
+    async fn restarted_cold(
+        temp: &tempfile::TempDir,
+        stores: &Stores,
+        governed: Governed,
+        session: &SessionId,
+    ) -> Governed {
+        governed.runtime.shutdown().await;
+        drop(governed);
+        let restarted = self::governed(temp, stores, Arc::new(AtomicBool::new(false))).await;
+        assert!(
+            !restarted
+                .runtime
+                .runtime_adapter
+                .session_has_executor(session)
+                .await
+                .expect("executor read"),
+            "a cold session after the restart"
+        );
+        assert!(
+            restarted
+                .runtime
+                .service
+                .live_session_actor_witness(session)
+                .await
+                .is_none(),
+            "no live actor after the restart"
+        );
+        restarted
+    }
+
+    /// A cold standalone session (after a restart over the same stores)
+    /// is not made live by Core. The binder finds no live actor, so the
+    /// observation stays pending, typed, and holds nothing: no custody, no
+    /// executor registered by Core. Once the host's own recovery makes the
+    /// session live, its executor attachment commit (the only wake armed
+    /// here) retries the observation, which is bound once and admitted once.
+    #[tokio::test]
+    async fn a_cold_standalone_session_waits_for_the_hosts_recovery_then_admits_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let stores = Stores::new();
+        let governed = governed(&temp, &stores, Arc::new(AtomicBool::new(false))).await;
+        let session = host_makes_live(&governed, None).await;
+        let governed = restarted_cold(&temp, &stores, governed, &session).await;
+        let mut delivering = deliver(&governed, &session).await;
+        let pass = delivering.blocked().await;
+        assert_eq!(pass.refused, 0, "never refused: {:?}", pass.failures);
+        assert!(
+            pass.failures
+                .iter()
+                .any(|line| line.contains("NotReady(ExecutorUnavailable)")),
+            "{:?}",
+            pass.failures
+        );
+        assert!(matches!(
+            delivering.status().await,
+            meerkat::ContinuationStatus::Pending { admitted: None, .. }
+        ));
+        assert!(delivering.binder.not_live.load(Ordering::SeqCst) >= 1);
+        assert!(
+            delivering.binder.bound.lock().expect("bound").is_empty()
+                && delivering
+                    .custody
+                    .accepted
+                    .lock()
+                    .expect("custody")
+                    .is_empty()
+                && delivering.custody.dropped.load(Ordering::SeqCst) == 0
+                && delivering.binder.unresolved.load(Ordering::SeqCst) == 0,
+            "nothing was bound, settled or retained"
+        );
+        assert!(
+            !governed
+                .runtime
+                .runtime_adapter
+                .contains_session(&session)
+                .await,
+            "Core registered nothing for the cold session"
+        );
+        assert!(
+            !governed
+                .runtime
+                .runtime_adapter
+                .session_has_executor(&session)
+                .await
+                .expect("executor read"),
+            "Core made nothing live"
+        );
+        let binds_while_cold = delivering.binder.binds.load(Ordering::SeqCst);
+
+        // The host's own recovery; its executor attachment commit is the
+        // only wake this owner has.
+        host_makes_live(&governed, Some(session.clone())).await;
+        let status = delivering.settled().await;
+        admitted_once_with_its_binding(&governed, &delivering, &session, status).await;
+        assert_eq!(
+            delivering.binder.binds.load(Ordering::SeqCst),
+            binds_while_cold + 1,
+            "one bind after the host's recovery"
+        );
+        assert_eq!(
+            delivering.binder.bound.lock().expect("bound").len(),
+            1,
+            "bound once"
+        );
+        assert_eq!(delivering.binder.unresolved.load(Ordering::SeqCst), 0);
     }
 }

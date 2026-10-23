@@ -2585,3 +2585,163 @@ async fn a_registration_replaced_by_a_lookalike_parameter_refuses_the_completion
     let status = fx.authority.status(&work).await.expect("status");
     assert_eq!(status.phase, ConnectorAuthPhase::AuthorizationRequired);
 }
+
+// --- A credential commit whose outcome is unknown ----------------------------
+
+/// Fails every save and every clear: a first login's commit fails to save,
+/// and its rollback then fails to clear.
+struct FailSaveAndRollbackStore(EphemeralTokenStore);
+
+#[async_trait]
+impl TokenStore for FailSaveAndRollbackStore {
+    async fn load(&self, key: &TokenKey) -> Result<Option<PersistedTokens>, TokenStoreError> {
+        self.0.load(key).await
+    }
+    async fn save(
+        &self,
+        _key: &TokenKey,
+        _tokens: &PersistedTokens,
+    ) -> Result<(), TokenStoreError> {
+        Err(TokenStoreError::Io("injected save failure".into()))
+    }
+    async fn clear(&self, _key: &TokenKey) -> Result<(), TokenStoreError> {
+        Err(TokenStoreError::Io("injected clear failure".into()))
+    }
+    async fn list(&self) -> Result<Vec<TokenKey>, TokenStoreError> {
+        self.0.list().await
+    }
+    fn backend_name(&self) -> &'static str {
+        "fail-save-and-rollback"
+    }
+}
+
+/// Runs a credential mutation (or never starts it), then answers that the
+/// mutation's owner was lost: what a caller sees when the coordinator's work
+/// task ends before it reports.
+struct OwnerLostCoordinator {
+    inner: InMemoryCoordinator,
+    run_mutation: bool,
+}
+
+#[async_trait]
+impl RefreshCoordinator for OwnerLostCoordinator {
+    async fn with_exclusive_mutation(
+        &self,
+        _key: TokenKey,
+        mutation_fn: meerkat_auth_core::auth_store::CredentialMutationFn,
+    ) -> Result<meerkat_auth_core::auth_store::CredentialMutationOutcome, CredentialMutationError>
+    {
+        if self.run_mutation {
+            let _ = mutation_fn().await;
+        }
+        Err(CredentialMutationError::Cancelled)
+    }
+
+    async fn with_refresh(
+        &self,
+        key: TokenKey,
+        refresh_fn: meerkat_auth_core::auth_store::RefreshFn,
+    ) -> Result<PersistedTokens, meerkat_auth_core::auth_store::RefreshError> {
+        self.inner.with_refresh(key, refresh_fn).await
+    }
+}
+
+/// A connector commit that fails after the consume and cannot restore the
+/// previous state leaves what is stored unknown: CommitUnsettled, never a
+/// clean lifecycle failure.
+#[tokio::test]
+async fn connector_commit_whose_rollback_fails_is_unsettled() {
+    let fx = fixture_with(
+        Arc::new(FailSaveAndRollbackStore(EphemeralTokenStore::new())),
+        Arc::new(InMemoryCoordinator::new()),
+    )
+    .await;
+    let work = slot("tenant-a", "rollback-fails");
+    fx.grant("code-r", "access-r", "subject-r", Some("files.read"));
+    let error = fx
+        .login(&work, AccountSelection::Discover, "code-r")
+        .await
+        .expect_err("a commit whose save and rollback fail never succeeds");
+    assert!(
+        matches!(error, ConnectorLoginError::CommitUnsettled),
+        "a failed rollback leaves the outcome unknown: {error:?}"
+    );
+    assert!(!error.is_refusal());
+    assert_eq!(fx.stored(&work).await, None);
+}
+
+/// The commit's owner ended after it consumed the attempt (here, after it
+/// saved): whether the credential landed is unknown to the caller, so the
+/// answer is CommitUnsettled. The consumed attempt never completes again.
+#[tokio::test]
+async fn connector_commit_whose_owner_is_lost_after_the_consume_is_unsettled() {
+    let fx = fixture_with(
+        Arc::new(EphemeralTokenStore::new()),
+        Arc::new(OwnerLostCoordinator {
+            inner: InMemoryCoordinator::new(),
+            run_mutation: true,
+        }),
+    )
+    .await;
+    let work = slot("tenant-a", "owner-lost-after");
+    fx.grant("code-l", "access-l", "subject-l", Some("files.read"));
+    let target = fx.target(&work, AccountSelection::Discover);
+    let (state, _) = fx.start(&target, 41001).await;
+    let error = fx
+        .complete(&work, &state, "code-l", 41001)
+        .await
+        .expect_err("a lost commit owner is never a success");
+    assert!(
+        matches!(error, ConnectorLoginError::CommitUnsettled),
+        "a consumed attempt whose owner was lost is unsettled: {error:?}"
+    );
+    assert_eq!(
+        fx.stored(&work)
+            .await
+            .and_then(|tokens| tokens.primary_secret),
+        Some("access-l".to_owned()),
+        "here the commit did land: only a later read can tell"
+    );
+    assert!(
+        fx.complete(&work, &state, "code-l", 41001).await.is_err(),
+        "the consumed attempt never completes again"
+    );
+}
+
+/// The commit's owner ended before it consumed the attempt: the flow owner
+/// still retires the attempt, so nothing is or can be published, and the
+/// answer is the typed pending refusal.
+#[tokio::test]
+async fn connector_commit_whose_owner_is_lost_before_the_consume_publishes_nothing() {
+    let fx = fixture_with(
+        Arc::new(EphemeralTokenStore::new()),
+        Arc::new(OwnerLostCoordinator {
+            inner: InMemoryCoordinator::new(),
+            run_mutation: false,
+        }),
+    )
+    .await;
+    let work = slot("tenant-a", "owner-lost-before");
+    fx.grant("code-b", "access-b", "subject-b", Some("files.read"));
+    let target = fx.target(&work, AccountSelection::Discover);
+    let (state, _) = fx.start(&target, 41001).await;
+    let error = fx
+        .complete(&work, &state, "code-b", 41001)
+        .await
+        .expect_err("a lost commit owner is never a success");
+    assert!(
+        matches!(
+            error,
+            ConnectorLoginError::CredentialAccess {
+                refusal: TokenStoreRefusal::Pending,
+                ..
+            }
+        ),
+        "an attempt retired before its consume is a pending refusal: {error:?}"
+    );
+    assert_eq!(fx.stored(&work).await, None, "nothing was published");
+    assert!(
+        fx.complete(&work, &state, "code-b", 41001).await.is_err(),
+        "the retired attempt never completes"
+    );
+}

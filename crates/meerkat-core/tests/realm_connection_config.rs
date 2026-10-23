@@ -43,12 +43,12 @@ source = { kind = "env", env = "ANTHROPIC_API_KEY" }
 [realm.dev.binding.default_openai]
 backend_profile = "openai_default"
 auth_profile = "openai_api_key"
-default_model = "gpt-5.1"
+default_model = "test-openai-second"
 
 [realm.dev.binding.default_anthropic]
 backend_profile = "anthropic_default"
 auth_profile = "anthropic_api_key"
-default_model = "claude-opus-4-8"
+default_model = "test-anthropic-configured"
 
 [realm.dev]
 default_binding = "default_openai"
@@ -131,7 +131,7 @@ fn from_config_happy_path_resolves_binding() {
         .expect("default_anthropic is a valid binding in the fixture");
     assert_eq!(
         anthropic_binding.default_model.as_deref(),
-        Some("claude-opus-4-8")
+        Some("test-anthropic-configured")
     );
     assert_eq!(anthropic_backend.provider, Provider::Anthropic);
     assert_eq!(anthropic_auth.provider, Provider::Anthropic);
@@ -141,7 +141,7 @@ fn check_openai_default(binding: &ProviderBinding, backend: &BackendProfile) {
     assert_eq!(binding.id, "default_openai");
     assert_eq!(binding.backend_profile, "openai_default");
     assert_eq!(binding.auth_profile, "openai_api_key");
-    assert_eq!(binding.default_model.as_deref(), Some("gpt-5.1"));
+    assert_eq!(binding.default_model.as_deref(), Some("test-openai-second"));
     assert_eq!(backend.provider, Provider::OpenAI);
     assert_eq!(backend.backend_kind, "openai_api");
     assert_eq!(backend.base_url.as_deref(), Some("https://api.openai.com"));

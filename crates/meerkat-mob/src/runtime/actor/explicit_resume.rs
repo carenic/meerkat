@@ -19,7 +19,10 @@ impl MobActor {
             )
         }) else {
             tracing::error!("settled resume member work lost its rebuilding continuation");
-            self.durable_uncertainty_fail_stop = true;
+            self.durable_uncertainty_fail_stop
+                .record_unreplied(MobError::Internal(
+                    "settled resume member work lost its rebuilding continuation".to_string(),
+                ));
             return;
         };
         let PendingResumeLifecycle {
@@ -30,10 +33,9 @@ impl MobActor {
             ..
         } = pending;
         let ResumeLifecyclePhase::RebuildingMembers { post_commit_error } = phase else {
-            let _ = reply_tx.send(Err(MobError::Internal(
-                "resume continuation was not rebuilding members".to_string(),
+            let _ = reply_tx.send(Err(self.durable_uncertainty_fail_stop.record(
+                MobError::Internal("resume continuation was not rebuilding members".to_string()),
             )));
-            self.durable_uncertainty_fail_stop = true;
             return;
         };
         if self.dsl_authority.state().explicit_resume_cancel_requested {
@@ -127,7 +129,10 @@ impl MobActor {
             }
             _ => {
                 tracing::error!(%error, "resume error lost its rebuilding continuation");
-                self.durable_uncertainty_fail_stop = true;
+                self.durable_uncertainty_fail_stop
+                    .record_unreplied(MobError::Internal(format!(
+                        "resume error lost its rebuilding continuation: {error}"
+                    )));
             }
         }
     }
@@ -176,7 +181,11 @@ impl MobActor {
                 mob_dsl::MemberLiveMaterializationObservationKind::DurableSnapshotPresent
             }
             ExplicitResumeLiveObservation::AlreadyLive => {
-                self.durable_uncertainty_fail_stop = true;
+                self.durable_uncertainty_fail_stop
+                    .record_unreplied(MobError::Internal(format!(
+                        "resume member '{}' was observed live after its live observation was handled",
+                        work.rebuild.entry.agent_identity
+                    )));
                 return;
             }
         };
@@ -240,7 +249,11 @@ impl MobActor {
             }
             Some(mob_dsl::MemberRevivalVerdictKind::ReviveAuthorized) => {
                 let ExplicitResumeLiveObservation::DurablePresent { profile } = observation else {
-                    self.durable_uncertainty_fail_stop = true;
+                    self.durable_uncertainty_fail_stop
+                        .record_unreplied(MobError::Internal(
+                            "resume revival authorization disagrees with durable observation"
+                                .to_string(),
+                        ));
                     tracing::error!(
                         "resume revival authorization disagrees with durable observation"
                     );
@@ -263,7 +276,10 @@ impl MobActor {
             }
             None => {
                 tracing::error!("resume member classification emitted no matching verdict");
-                self.durable_uncertainty_fail_stop = true;
+                self.durable_uncertainty_fail_stop
+                    .record_unreplied(MobError::Internal(
+                        "resume member classification emitted no matching verdict".to_string(),
+                    ));
             }
         }
     }
@@ -441,7 +457,10 @@ impl MobActor {
         };
         if decision_tx.send(decision).is_err() {
             tracing::error!("resume custody owner disappeared before its ownership decision");
-            self.durable_uncertainty_fail_stop = true;
+            self.durable_uncertainty_fail_stop
+                .record_unreplied(MobError::Internal(
+                    "resume custody owner disappeared before its ownership decision".to_string(),
+                ));
         }
     }
 

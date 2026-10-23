@@ -2609,7 +2609,7 @@ mod tests {
         const DOCUMENT_090: &str = r#"max_tokens = 4096
 
 [agent]
-model = "claude-opus-4-8"
+model = "test-anthropic-configured"
 
 [tools]
 shell_enabled = true
@@ -3783,7 +3783,7 @@ auth_profile = "anonymous"
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("config.toml");
-        let original = "[agent]\nmodel = \"claude-sonnet-4-5\"\n";
+        let original = "[agent]\nmodel = \"test-anthropic-third\"\n";
         tokio::fs::write(&path, original).await?;
         let store = FileConfigStore::new(
             path.clone(),
@@ -3922,7 +3922,7 @@ auth_profile = "anonymous"
         let path = temp.path().join("config.toml");
         let original = "# Operator notes for this realm.\n\
             max_tokens = 100 # per-turn cap\n\n\
-            [agent]\n# pinned for the review team\nmodel = \"claude-sonnet-4-5\"\n\n\
+            [agent]\n# pinned for the review team\nmodel = \"test-anthropic-third\"\n\n\
             [tools]\nmax_concurrent = 4   # keep low on this host\nshell_enabled = true\n";
         tokio::fs::write(&path, original).await?;
         let store = FileConfigStore::new(
@@ -3942,7 +3942,7 @@ auth_profile = "anonymous"
             written,
             "# Operator notes for this realm.\n\
             max_tokens = 200 # per-turn cap\n\n\
-            [agent]\n# pinned for the review team\nmodel = \"claude-sonnet-4-5\"\n\n\
+            [agent]\n# pinned for the review team\nmodel = \"test-anthropic-third\"\n\n\
             [tools]\nmax_concurrent = 4   # keep low on this host\nshell_enabled = false\n",
             "only the patched values change"
         );
@@ -4064,7 +4064,7 @@ tier = \"r2\"\n";
             serde_json::json!({ "governance": { "review": null } }),
             serde_json::json!({ "governance": { "review": { "rules": [] } } }),
             serde_json::json!({ "governance": { "review": { "reviewer": {
-                "identity": { "model": "claude-sonnet-5-5", "provider": "anthropic" },
+                "identity": { "model": "test-anthropic-second", "provider": "anthropic" },
                 "max_output_tokens": 64
             } } } }),
         ] {

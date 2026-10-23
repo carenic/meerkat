@@ -1908,11 +1908,32 @@ pub struct HelperOptionsSpec {
 }
 
 impl HelperOptionsSpec {
+    /// Refuse a runtime mode a bounded helper cannot run under.
+    ///
+    /// A scheduled helper runs one tracked turn and returns its result, and
+    /// autonomous host inbox delivery has no tracked turn completion. Schedule
+    /// create and update refuse `autonomous_host` through
+    /// [`Self::validate_public_api`]; the mob schedule host refuses it again at
+    /// fire time, before any spawn, for a schedule stored before this check.
+    pub fn validate_bounded_runtime_mode(&self) -> Result<(), String> {
+        if self.runtime_mode == Some(ScheduledMobRuntimeMode::AutonomousHost) {
+            return Err(
+                "scheduled mob helpers run one tracked turn, which runtime_mode autonomous_host \
+                 cannot complete; use turn_driven or leave runtime_mode unset"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// Validate that the tooling mode is acceptable for public schedule APIs.
     ///
     /// `InheritParent` and `Minimal` require an active parent agent context and
     /// are only valid when created through agent tools. Public APIs must reject them.
+    /// The runtime mode must be one a bounded helper can run under
+    /// ([`Self::validate_bounded_runtime_mode`]).
     pub fn validate_public_api(&self) -> Result<(), String> {
+        self.validate_bounded_runtime_mode()?;
         if self.resolved_spawn_snapshot.is_some() {
             return Err(
                 "resolved spawn snapshots are trusted internal schedule state and cannot be \

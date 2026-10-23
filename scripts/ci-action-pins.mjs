@@ -58,14 +58,10 @@ const OPAQUE_KEY = new RegExp(
 const DIGEST = /@sha256:[0-9a-f]{64}$/;
 // A `container:` or `image:` key with an inline value.
 const IMAGE_KEY = /^\s*(?:-\s*)?(container|image):\s*(\S.*?)\s*$/;
-// Image references this check accepts without a digest, and why.
-export const UNPINNED_IMAGES = new Map([
-  [
-    "docker://europe-west1-docker.pkg.dev/king-dnn-training-dev/meerkat-ci/meerkat-ci-rust:1.94.0",
-    "the self-hosted CI image is in a private registry: its digest gets pinned once registry read access " +
-      "exists (the repository variable MEERKAT_BUILDBUDDY_CI_IMAGE, which overrides it at run time, too)",
-  ],
-]);
+// Image references this check accepts without a digest, and why. None today:
+// the self-hosted CI platform names no image; its image comes from the
+// digest-pinned repository variable MEERKAT_BUILDBUDDY_CI_IMAGE at run time.
+export const UNPINNED_IMAGES = new Map([]);
 // Actions that would resolve a moving "latest" at run time unless an input
 // names an exact release, and that input.
 export const PINNED_INPUTS = new Map([["mozilla-actions/sccache-action", { input: "version", value: /^v\d+\.\d+\.\d+$/ }]]);

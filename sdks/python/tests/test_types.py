@@ -2412,6 +2412,25 @@ def test_live_mcp_contract_types_exported():
     assert response.applied_at_turn == 5
 
 
+def test_mcp_stdio_config_carries_an_optional_cwd():
+    from meerkat import McpStdioConfig, McpStdioServerConfig
+
+    assert McpStdioConfig(command="npx").cwd is None
+    assert McpStdioConfig(command="srv", cwd="/opt/github").cwd == "/opt/github"
+    assert "cwd" in McpStdioServerConfig.__optional_keys__
+    assert get_type_hints(McpStdioServerConfig)["cwd"] is str
+    add = McpAddParams(
+        session_id="s1",
+        server_config={
+            "name": "github",
+            "command": "/opt/github/bin/github-mcp-server",
+            "args": ["stdio"],
+            "cwd": "/opt/github",
+        },
+    )
+    assert add.server_config["cwd"] == "/opt/github"
+
+
 def test_capability_available():
     cap = Capability(id="sessions", description="Session lifecycle", status="Available")
     assert cap.available is True
@@ -8353,6 +8372,27 @@ async def test_member_status_rejects_malformed_progress(progress) -> None:
     with pytest.raises(MeerkatError) as excinfo:
         await client.mob_member_status("mob-1", "worker-1")
     assert excinfo.value.code == "INVALID_RESPONSE"
+
+
+@pytest.mark.asyncio
+async def test_list_mobs_keeps_a_stopped_mobs_typed_failure() -> None:
+    client = MeerkatClient()
+    failure = {
+        "cause": "internal",
+        "message": "the mob's actor stopped",
+        "code": "INTERNAL_ERROR",
+        "structured_data": {"kind": "durability_fail_stop"},
+    }
+
+    async def fake_request(_method, _params):
+        return {"mobs": [{"mob_id": "mob-1", "status": "Running", "failure": failure}]}
+
+    client._request = fake_request  # type: ignore[method-assign]
+    client.require_capability = lambda _cap: None  # type: ignore[method-assign]
+
+    assert await client.list_mobs() == [
+        {"mob_id": "mob-1", "status": "Running", "failure": failure}
+    ]
 
 
 @pytest.mark.asyncio

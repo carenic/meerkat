@@ -1572,6 +1572,9 @@ pub(super) enum MobCommand {
         reply_tx: oneshot::Sender<Result<super::event_pump::MemberEventTap, MobError>>,
     },
     Stop {
+        /// Leave every member's current run running
+        /// ([`super::stop_report::StopOptions::leave_runs_running`]).
+        leave_runs_running: bool,
         reply_tx: oneshot::Sender<Result<super::stop_report::MobStopReport, MobError>>,
     },
     ResumeLifecycle {
@@ -1737,6 +1740,12 @@ pub(super) enum MobCommand {
     /// #13, #17).
     QueryPhase {
         reply_tx: oneshot::Sender<Result<MobState, MobError>>,
+    },
+    /// The members of a Stopped mob as a drain of its runs starts
+    /// ([`super::run_drain`]), atomic with the Stopped check.
+    #[cfg(feature = "runtime-adapter")]
+    DrainRunsSnapshot {
+        reply_tx: oneshot::Sender<Result<super::run_drain::DrainSnapshot, MobError>>,
     },
     /// Close admission if the mob is idle (D67). Decided on the serialized
     /// admission path in the same step that closes.
@@ -2090,6 +2099,8 @@ impl MobCommand {
             #[cfg(any(test, feature = "test-support"))]
             Self::RebindMemberSessionForTest { .. } => ShutdownAnswerClass::CallerRequest,
             Self::QueryPhase { .. } => ShutdownAnswerClass::CallerRequest,
+            #[cfg(feature = "runtime-adapter")]
+            Self::DrainRunsSnapshot { .. } => ShutdownAnswerClass::CallerRequest,
             Self::CloseIfIdle { .. } => ShutdownAnswerClass::CallerRequest,
             Self::CloseAdmission { .. } => ShutdownAnswerClass::CallerRequest,
         }
@@ -2302,6 +2313,8 @@ impl MobCommand {
             #[cfg(any(test, feature = "test-support"))]
             Self::RebindMemberSessionForTest { .. } => "RebindMemberSessionForTest",
             Self::QueryPhase { .. } => "QueryPhase",
+            #[cfg(feature = "runtime-adapter")]
+            Self::DrainRunsSnapshot { .. } => "DrainRunsSnapshot",
             Self::CloseIfIdle { .. } => "CloseIfIdle",
             Self::CloseAdmission { .. } => "CloseAdmission",
         }

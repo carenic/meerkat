@@ -938,6 +938,20 @@ pub enum ConnectionTargetError {
         provider: Provider,
         bindings: CredentialAccountBindingCandidates,
     },
+    /// A session whose binding is backed by credential `account` switches to
+    /// `provider`, and no route for that provider shares the account. The
+    /// switch keeps the session's account or refuses: it never moves the
+    /// session onto another account's credential.
+    #[error(
+        "provider switch to '{}' has no route sharing credential account '{}:{}'; set auth_binding explicitly to change accounts",
+        .provider.as_str(),
+        .account.realm,
+        .account.account
+    )]
+    NoCredentialAccountRoute {
+        provider: Provider,
+        account: CredentialAccountRef,
+    },
     #[error(transparent)]
     RealmChain(#[from] RealmChainError),
 }

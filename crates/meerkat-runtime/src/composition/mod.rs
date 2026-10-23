@@ -381,14 +381,14 @@ impl From<String> for ConsumerError {
 /// A consumer (e.g. the `meerkat` machine instance when mob routes
 /// `RequestRuntimeBinding` at it) implements this trait and registers an
 /// instance at composition wire-up. The dispatcher invokes it exactly once
-/// per resolved [`RoutedInput`]. The implementation is responsible for
+/// per resolved [`RoutedInputDescriptor`]. The implementation is responsible for
 /// materializing the consumer-side typed input — the dispatcher only moves
 /// typed data across the seam.
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait ConsumerSurface: Send + Sync {
     /// Instance id this surface serves. The dispatcher matches against
-    /// [`RoutedInput::instance_id`] to pick the right surface.
+    /// [`RoutedInputDescriptor::instance_id`] to pick the right surface.
     fn instance_id(&self) -> &MachineInstanceId;
 
     /// Apply a typed routed input. `projected_fields` carries the per-

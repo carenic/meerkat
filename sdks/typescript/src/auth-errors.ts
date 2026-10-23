@@ -1,4 +1,4 @@
-import type { WireAuthErrorReason } from "./generated/types.js";
+import type { WireAuthErrorDetail, WireAuthErrorReason } from "./generated/types.js";
 
 /** Every typed auth error reason, as the server's closed vocabulary. */
 export const WIRE_AUTH_ERROR_REASONS: readonly WireAuthErrorReason[] = [
@@ -36,6 +36,7 @@ export const WIRE_AUTH_ERROR_REASONS: readonly WireAuthErrorReason[] = [
   "credential_access_pending",
   "credential_store_unavailable",
   "infrastructure",
+  "commit_unsettled",
 ];
 
 /**
@@ -51,5 +52,35 @@ export function authErrorReason(error: unknown): WireAuthErrorReason | undefined
   return typeof reason === "string" &&
     (WIRE_AUTH_ERROR_REASONS as readonly string[]).includes(reason)
     ? (reason as WireAuthErrorReason)
+    : undefined;
+}
+
+/** Every stable auth refusal sub-kind (`error.data.detail`). */
+export const WIRE_AUTH_ERROR_DETAILS: readonly WireAuthErrorDetail[] = [
+  "remote_custody_required",
+  "upstream_timeout",
+  "upstream_timeout_after_code",
+];
+
+/**
+ * The stable sub-kind of an auth error, beside its reason (`auth/*` RPC
+ * methods carry it in `error.data.detail`). For example
+ * `remote_custody_required` (reason `invalid_target`): an MCP login started
+ * on the host's registered https callback was completed without its
+ * `host_attempt_handle`, for example after a restart; cancel the attempt by
+ * its reference and start again. `upstream_timeout` and
+ * `upstream_timeout_after_code` (reason `upstream_failure`): a network stage
+ * of an MCP login got no answer within its bound, before or after the
+ * authorization code was sent; nothing was published, so start again.
+ * `undefined` when absent.
+ */
+export function authErrorDetail(error: unknown): WireAuthErrorDetail | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  const details = (error as { details?: unknown }).details;
+  if (typeof details !== "object" || details === null) return undefined;
+  const detail = (details as { detail?: unknown }).detail;
+  return typeof detail === "string" &&
+    (WIRE_AUTH_ERROR_DETAILS as readonly string[]).includes(detail)
+    ? (detail as WireAuthErrorDetail)
     : undefined;
 }

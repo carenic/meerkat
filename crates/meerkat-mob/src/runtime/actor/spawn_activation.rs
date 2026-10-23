@@ -960,7 +960,7 @@ impl MobActor {
         if self.retained_spawn_activation_cleanups.is_empty() {
             return;
         }
-        if self.durable_uncertainty_fail_stop {
+        if self.durable_uncertainty_fail_stop.is_set() {
             // Cold recovery owns every durable anchor; a live compensation
             // here could certify cleanup this incarnation cannot prove.
             return;
@@ -1226,7 +1226,14 @@ impl MobActor {
             .iter_mut()
             .find(|entry| entry.custody == *custody)
         else {
-            self.durable_uncertainty_fail_stop = true;
+            self.durable_uncertainty_fail_stop
+                .record_unreplied(MobError::Internal(format!(
+                    "a spawn rollback attempt settled with no retained cleanup for its custody{}",
+                    result
+                        .err()
+                        .map(|error| format!(": {error}"))
+                        .unwrap_or_default()
+                )));
             return;
         };
         entry.rollback_owner = owner;
@@ -1353,7 +1360,7 @@ impl MobActor {
         agent_identity: &AgentIdentity,
         intent: &str,
     ) -> Result<(), MobError> {
-        if self.durable_uncertainty_fail_stop {
+        if self.durable_uncertainty_fail_stop.is_set() {
             return Err(MobError::Internal(format!(
                 "{intent} for '{agent_identity}' refused: the actor is fail-stopped for cold recovery"
             )));
@@ -2026,12 +2033,11 @@ impl MobActor {
             {
                 Ok(()) => Err(reply_error),
                 Err(abandon_error) => {
-                    self.durable_uncertainty_fail_stop = true;
                     self.respawn_topology_reply_withheld = true;
                     may_reply = false;
-                    Err(MobError::Internal(format!(
+                    Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                         "{reply_error}; durable respawn-topology abandonment failed and the actor is fail-stopping for cold recovery: {abandon_error}"
-                    )))
+                    ))))
                 }
             },
             (reply, _) => reply,
@@ -2455,10 +2461,7 @@ impl MobActor {
                     // contract was violated: surface the failure so the
                     // caller can compensate (asserted by
                     // `test_role_wiring_failure_is_returned_to_spawn_caller`).
-                    return Err(match wire_error {
-                        MobError::WiringError(_) => wire_error,
-                        other => MobError::WiringError(other.to_string()),
-                    });
+                    return Err(wire_error.into_wiring_error());
                 }
             }
         }

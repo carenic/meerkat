@@ -578,7 +578,10 @@ impl From<&AgentError> for AgentErrorClass {
             | AgentError::ClientModelChangeRequiresHotSwap { .. }
             // A turn refused by instruction activation history keeps the
             // config class of its previous `ConfigError` representation.
-            | AgentError::InstructionActivation(_) => Self::Config,
+            | AgentError::InstructionActivation(_)
+            // A directed turn refused while a staged prompt is pending is a
+            // precondition refusal of the same class.
+            | AgentError::StagedPromptDirectedTurnRefused => Self::Config,
         }
     }
 }

@@ -529,7 +529,7 @@ pub struct PeerInput {
     /// When present on Message/Request/no-convention, overrides kind-based
     /// policy defaults. Forbidden on ResponseProgress; ResponseTerminal may
     /// carry a typed override for requester reaction urgency (enforced by
-    /// [`validate_peer_handling_mode`]).
+    /// [`validate_peer_handling_mode`](crate::peer_handling_mode::validate_peer_handling_mode)).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handling_mode: Option<HandlingMode>,
     /// Sender-declared content taint carried inside the signed comms

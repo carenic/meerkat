@@ -4387,6 +4387,7 @@ model = "custom-model"
                     args: Vec::new(),
                     env: std::collections::HashMap::new(),
                     secret_env: std::collections::BTreeSet::new(),
+                    cwd: None,
                 },
             ),
             connect_timeout_secs: None,
@@ -4785,23 +4786,27 @@ base_url = "http://127.0.0.1:11434"
         .expect("base self-hosted server");
         base.merge_toml_str(
             r#"
-[self_hosted.models.gemma-4-e2b]
+[self_hosted.models.test-self-hosted-edge]
 server = "local"
-remote_model = "gemma4:e2b"
-display_name = "Gemma 4 E2B"
-family = "gemma-4"
+remote_model = "test-remote-edge"
+display_name = "Test Edge Model"
+family = "test-self-hosted-family"
 "#,
         )
         .expect("overlay self-hosted model");
 
         assert!(base.self_hosted.servers.contains_key("local"));
-        assert!(base.self_hosted.models.contains_key("gemma-4-e2b"));
+        assert!(
+            base.self_hosted
+                .models
+                .contains_key("test-self-hosted-edge")
+        );
         let registry = base
             .model_registry(*crate::model_profile::test_catalog::TEST_CATALOG)
             .expect("merged self-hosted registry");
         assert_eq!(
             registry
-                .entry("gemma-4-e2b")
+                .entry("test-self-hosted-edge")
                 .and_then(|entry| entry.self_hosted.as_ref())
                 .map(|server| server.server_id.as_str()),
             Some("local")
@@ -4985,7 +4990,7 @@ max_output_tokens = 100
             .merge_toml_str(
                 r#"
 [self_hosted]
-default_model = "gemma-4-e4b"
+default_model = "test-self-hosted-medium"
 
 [self_hosted.servers.local]
 base_url = "http://127.0.0.1:11434"
@@ -4993,17 +4998,17 @@ base_url = "http://127.0.0.1:11434"
 [self_hosted.servers.backup]
 base_url = "http://127.0.0.1:11435"
 
-[self_hosted.models.gemma-4-e2b]
+[self_hosted.models.test-self-hosted-edge]
 server = "local"
-remote_model = "gemma4:e2b"
-display_name = "Gemma 4 E2B"
-family = "gemma-4"
+remote_model = "test-remote-edge"
+display_name = "Test Edge Model"
+family = "test-self-hosted-family"
 
-[self_hosted.models.gemma-4-e4b]
+[self_hosted.models.test-self-hosted-medium]
 server = "backup"
-remote_model = "gemma4:e4b"
-display_name = "Gemma 4 E4B"
-family = "gemma-4"
+remote_model = "test-remote-medium"
+display_name = "Test Medium Model"
+family = "test-self-hosted-family"
 "#,
             )
             .expect("base self-hosted config");
@@ -5017,13 +5022,18 @@ api_style = "responses"
             .expect("overlay self-hosted config");
 
         assert!(config.self_hosted.servers.contains_key("backup"));
-        assert!(config.self_hosted.models.contains_key("gemma-4-e4b"));
+        assert!(
+            config
+                .self_hosted
+                .models
+                .contains_key("test-self-hosted-medium")
+        );
         let registry = config
             .model_registry(*crate::model_profile::test_catalog::TEST_CATALOG)
             .expect("registry should remain valid");
         assert_eq!(
             registry
-                .entry("gemma-4-e4b")
+                .entry("test-self-hosted-medium")
                 .and_then(|entry| entry.self_hosted.as_ref())
                 .map(|server| server.server_id.as_str()),
             Some("backup")
@@ -5039,11 +5049,11 @@ api_style = "responses"
 [self_hosted.servers.local]
 base_url = "http://127.0.0.1:11434"
 
-[self_hosted.models.gemma-4-e2b]
+[self_hosted.models.test-self-hosted-edge]
 server = "local"
-remote_model = "gemma4:e2b"
-display_name = "Gemma 4 E2B"
-family = "gemma-4"
+remote_model = "test-remote-edge"
+display_name = "Test Edge Model"
+family = "test-self-hosted-family"
 "#,
             )
             .expect("base self-hosted config");

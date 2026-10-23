@@ -215,7 +215,7 @@ if awk '
   grep -Fq '[[ "${windows_cross_result}" == "success" && "${windows_verify_result}" == "success" ]] || exit 1' "${release_workflow}" &&
   ! grep -Eq 'runs-on: *"?windows-latest"?.*target' "${release_workflow}" &&
   ! grep -Fq '"runs-on":"windows-latest","target":"x86_64-pc-windows-msvc"' "${release_workflow}" &&
-  ! grep -Fq 'king.europe.buildbuddy.io' "${release_workflow}"; then
+  ! grep -Eq '[[:alnum:]-]+\.europe\.buildbuddy\.io' "${release_workflow}"; then
   pass "Release workflow cross-compiles Windows binaries on Linux, verifies them on the pinned windows-2025-vs2026 runner, and gates on both"
 else
   bad "Release workflow should cross-compile Windows binaries on Linux (build_binaries_windows_cross using build-windows-cross from the workflow-ref tooling checkout), verify them on the pinned windows-2025-vs2026 runner (verify_windows_binaries), keep the artifact name meerkat-x86_64-pc-windows-msvc-windows-latest, and gate on both jobs"
