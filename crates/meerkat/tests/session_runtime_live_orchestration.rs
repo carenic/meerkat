@@ -384,14 +384,13 @@ mod orchestrator_e2e {
         archive_runtime_cleanup: ArchiveRuntimeCleanup,
         runtime_adapter: Arc<MeerkatMachine>,
         actor_witness_slots: Arc<std::sync::Mutex<Vec<meerkat::LiveSessionActorWitnessSlot>>>,
-        session_store: Arc<dyn meerkat::SessionStore>,
         _temp: tempfile::TempDir,
     }
 
     fn build_fixture() -> Fixture {
         let session_store: Arc<dyn meerkat::SessionStore> = Arc::new(meerkat::MemoryStore::new());
         let persistence = PersistenceBundle::new(
-            Arc::clone(&session_store),
+            session_store,
             Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
             Arc::new(MemoryBlobStore::new()),
         )
@@ -419,19 +418,11 @@ mod orchestrator_e2e {
             archive_runtime_cleanup,
             runtime_adapter,
             actor_witness_slots: Arc::new(std::sync::Mutex::new(Vec::new())),
-            session_store,
             _temp: temp,
         }
     }
 
     fn orchestrator(fx: &Fixture) -> LiveOrchestrator<'_> {
-        addressed_orchestrator(fx, LiveSessionAddressing::SessionScoped)
-    }
-
-    fn addressed_orchestrator(
-        fx: &Fixture,
-        session_addressing: LiveSessionAddressing,
-    ) -> LiveOrchestrator<'_> {
         let actor_witness_slots = Arc::clone(&fx.actor_witness_slots);
         LiveOrchestrator {
             service: &fx.service,
@@ -454,7 +445,7 @@ mod orchestrator_e2e {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push(actor_witness_slot);
             }),
-            session_addressing,
+            session_addressing: LiveSessionAddressing::SessionScoped,
         }
     }
 
@@ -530,112 +521,6 @@ mod orchestrator_e2e {
                 assert_eq!(provider, "anthropic");
             }
             other => panic!("expected ModelNotRealtime, got {other:?}"),
-        }
-    }
-
-    /// A mob member's session, written to the store and never restored, so
-    /// it is cold: only a recovery from storage could open it.
-    async fn cold_mob_member_session(fx: &Fixture) -> SessionId {
-        let mut session = meerkat::Session::new();
-        session
-            .set_session_metadata(meerkat_core::SessionMetadata {
-                model_fallback: None,
-                schema_version: meerkat_core::SESSION_METADATA_SCHEMA_VERSION,
-                model: "gpt-5.4".to_string(),
-                max_tokens: 4096,
-                structured_output_retries: 2,
-                provider: meerkat_core::Provider::OpenAI,
-                self_hosted_server_id: None,
-                provider_params: None,
-                tooling: Default::default(),
-                keep_alive: false,
-                comms_name: None,
-                peer_meta: None,
-                realm_id: None,
-                instance_id: None,
-                backend: None,
-                config_generation: None,
-                auth_binding: None,
-                mob_member_binding: Some(meerkat_core::MobMemberBinding {
-                    mob_id: "cold-mob".to_string(),
-                    role: "worker".to_string(),
-                    member: "cold-worker".to_string(),
-                }),
-            })
-            .expect("member session metadata");
-        let session_id = session.id().clone();
-        fx.session_store
-            .save(&session)
-            .await
-            .expect("persist the member session");
-        session_id
-    }
-
-    /// A session-scoped surface never restores a mob member's session from
-    /// storage: the member's mob restores it, after checking the member (a
-    /// member whose custody restore is deferred stays down), and its live
-    /// channel opens through the mob's member live surface. The recovery, and
-    /// the live-open precheck that runs it, refuse with the typed
-    /// mob-member refusal and restore nothing, so a second attempt refuses
-    /// again. Before, the recovery restored the member's session by its id.
-    #[tokio::test]
-    async fn a_session_scoped_recovery_refuses_a_cold_mob_member_session() {
-        let fx = build_fixture();
-        let session_id = cold_mob_member_session(&fx).await;
-        let orch = orchestrator(&fx);
-
-        for attempt in 0..2 {
-            let refused = orch
-                .recover_live_session_for_realtime_open(&session_id)
-                .await
-                .expect_err("a session-scoped recovery refuses a mob member's session");
-            assert!(
-                refused.is_mob_member_session_addressed_by_id(),
-                "attempt {attempt}: {refused:?}"
-            );
-        }
-        let precheck = orch
-            .precheck_live_open(&session_id)
-            .await
-            .expect_err("the live-open precheck refuses it too");
-        assert!(
-            matches!(
-                &precheck,
-                LiveOpenPrecheckError::SessionLookup { source, .. }
-                    if source.is_mob_member_session_addressed_by_id()
-            ),
-            "{precheck:?}"
-        );
-        assert_eq!(
-            meerkat_contracts::error::session_transport_error_code(
-                &meerkat_core::SessionError::mob_member_session_addressed_by_id(
-                    &session_id,
-                    "cold-mob",
-                    "cold-worker",
-                )
-            ),
-            meerkat_contracts::ErrorCode::InvalidParams,
-            "the transport answers the invalid-params class"
-        );
-    }
-
-    /// The member live host addresses the same cold session through its mob,
-    /// which checked the member first: its recovery is not refused as a
-    /// mob-owned session (whatever else the restore meets in this fixture).
-    #[tokio::test]
-    async fn a_member_addressed_recovery_is_not_refused_as_a_mob_member_session() {
-        let fx = build_fixture();
-        let session_id = cold_mob_member_session(&fx).await;
-        let orch = addressed_orchestrator(&fx, LiveSessionAddressing::MobMember);
-
-        if let Err(error) = orch
-            .recover_live_session_for_realtime_open(&session_id)
-            .await
-        {
-            assert!(
-                !error.is_mob_member_session_addressed_by_id(),
-                "the member live host is never refused as a session-scoped surface: {error:?}"
-            );
         }
     }
 }

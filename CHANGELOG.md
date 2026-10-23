@@ -526,10 +526,21 @@ them.
   builds it with a struct literal sets it. A surface that opens live channels
   by session id passes `SessionScoped`; the member live host passes
   `MobMember` (see Fixed).
+- `meerkat-rpc`: WebRTC to a mob member is not available in 0.9.5. The
+  session-scoped `live/open` and `live/webrtc/answer` flow refuses a mob
+  member's session with `INVALID_PARAMS` and data kind
+  `mob_member_session_addressed_by_id` (see Fixed), and
+  `mob/member_live_open`, the route for a member, is WebSocket only.
 - `meerkat-contracts`: `MobMemberStatusResult` gains the field
   `custody_deferred: Option<WireMemberCustodyDeferral>`, absent from the wire
   unless the mob's start deferred the member's custody restore. Code that
   builds the result with a struct literal sets it.
+
+- Behaviour-only (not measured by the gate): RPC `session/stream_open` and
+  `mob/stream_open` now reserve bounded terminal delivery capacity. The process
+  admits at most 4096 active or queued terminal obligations; further opens return
+  `BUDGET_EXHAUSTED` until capacity is released. Terminal diagnostic details are
+  limited to 1 KiB of UTF-8 text, preserving a 16 KiB terminal wire bound.
 
 ### Added
 
@@ -1792,12 +1803,16 @@ them.
 - `meerkat`, `meerkat-rpc`: the session-scoped `live/open`, and the
   projection, refresh-config, identity and precheck reads behind it, restored
   a mob member's session from storage by its session id alone when it was
-  not live. That registered the member's session outside its mob, which
-  restores a member only after checking it (a member whose custody restore
-  was deferred stays down). It now refuses with `INVALID_PARAMS` (-32602) and
-  data kind `mob_member_session_addressed_by_id` (with the session, mob and
-  member) and restores nothing; `mob/member_live_open` opens the member
-  through its mob. A member session that is live opens as before.
+  not live, outside its mob (a member whose custody restore was deferred
+  stays down), and the open went ahead on a member session that was live,
+  with none of the checks the member's mob makes first (a member that is
+  retiring, in cleanup or revoke, or whose restore failed). Both are now
+  refused with `INVALID_PARAMS` (-32602) and data kind
+  `mob_member_session_addressed_by_id` (with the session, mob and member):
+  nothing is opened or restored, and `mob/member_live_open` opens the member
+  through its mob. A member therefore has no WebRTC channel (see Breaking).
+  The reads behind a channel that already exists find a live member session
+  as before.
   `SessionError::mob_member_session_addressed_by_id` and
   `SessionError::is_mob_member_session_addressed_by_id` name the refusal.
 - `meerkat-mob`: a mob restarted while another runtime owner on the realm
@@ -1824,6 +1839,11 @@ them.
   external mob operator tools were already bound to no authority, hidden and
   denying every call; the factory's own mob tools (`delegate`,
   `mob_spawn_member` and the rest) still mounted beside them.
+
+- RPC session and mob streams retain their machine-authorized terminal
+  notification when ordinary outbound byte or message admission is saturated.
+  Reserved capacity follows the stream through close races, pending delivery and
+  transport disconnect, without blocking the agent event producer.
 
 ## [0.9.4] - 2026-10-20
 
