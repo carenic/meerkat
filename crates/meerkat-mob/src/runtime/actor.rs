@@ -2465,6 +2465,19 @@ enum PendingAutonomousStopKind {
     Shutdown,
 }
 
+/// Which autonomous members a stop keeps for the next start: their kickoff
+/// origin stays open and their running turn is not interrupted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutonomousStopKeep {
+    /// None: a Stop that interrupts runs closes every kickoff origin.
+    Nothing,
+    /// Every local member whose session commits each round: a Stop that
+    /// leaves runs running leaves their kickoff to the Shutdown that follows.
+    DurableMembers,
+    /// The members whose durable run the Shutdown in progress keeps.
+    ShutdownChoice,
+}
+
 /// What one stop does with one autonomous member, as MobMachine resolves it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AutonomousStopMemberAction {
@@ -19060,8 +19073,8 @@ impl MobActor {
     }
 
     /// MobMachine's action for one autonomous member of a stop.
-    /// `keeps_durable_run` says this is a Shutdown that keeps the member's
-    /// durable run for the next start ([`Self::shutdown_keeps_durable_run`]).
+    /// `keeps_durable_run` says this stop keeps the member's durable run for
+    /// the next start ([`Self::stop_keeps_durable_run`]).
     async fn autonomous_shutdown_member_action(
         &mut self,
         entry: &RosterEntry,
@@ -19271,27 +19284,33 @@ impl MobActor {
                 .is_some_and(|adapter| adapter.has_runtime_persistence())
     }
 
-    /// Whether the Shutdown in progress keeps `entry`'s durable run for the
-    /// next start: the member's session is local to this mob's runtime, and
-    /// the Shutdown's choice resolves to a requeue for it, which a session
-    /// that commits each round gets by default.
-    fn shutdown_keeps_durable_run(&self, entry: &RosterEntry) -> bool {
+    /// Whether a stop that keeps `keep` keeps `entry`'s durable run for the
+    /// next start. The member's session must be local to this mob's runtime.
+    /// A Stop that leaves runs running keeps it when the session commits each
+    /// round; a Shutdown keeps it when its choice resolves to a requeue for
+    /// the session, which a session that commits each round gets by default.
+    fn stop_keeps_durable_run(&self, entry: &RosterEntry, keep: AutonomousStopKeep) -> bool {
         #[cfg(feature = "runtime-adapter")]
         {
-            entry.member_ref.bridge_session_id().is_some()
+            let local_session = entry.member_ref.bridge_session_id().is_some()
                 && !super::member_runtime_is_host_owned(
                     self.dsl_authority.state(),
                     &entry.agent_identity,
-                )
-                && matches!(
-                    self.shutdown_queued_inputs
-                        .unregister_queued_inputs(self.member_sessions_commit_each_round()),
-                    meerkat_runtime::UnregisterQueuedInputs::Requeue { .. }
-                )
+                );
+            local_session
+                && match keep {
+                    AutonomousStopKeep::Nothing => false,
+                    AutonomousStopKeep::DurableMembers => self.member_sessions_commit_each_round(),
+                    AutonomousStopKeep::ShutdownChoice => matches!(
+                        self.shutdown_queued_inputs
+                            .unregister_queued_inputs(self.member_sessions_commit_each_round()),
+                        meerkat_runtime::UnregisterQueuedInputs::Requeue { .. }
+                    ),
+                }
         }
         #[cfg(not(feature = "runtime-adapter"))]
         {
-            let _ = entry;
+            let _ = (entry, keep);
             false
         }
     }
@@ -19548,9 +19567,11 @@ impl MobActor {
         &mut self,
         kind: PendingAutonomousStopKind,
     ) -> Result<Vec<(AgentIdentity, AutonomousStopInterrupted)>, MobError> {
-        let entries = self
-            .close_all_autonomous_kickoff_origins(kind == PendingAutonomousStopKind::Shutdown)
-            .await?;
+        let keep = match kind {
+            PendingAutonomousStopKind::Stop => AutonomousStopKeep::Nothing,
+            PendingAutonomousStopKind::Shutdown => AutonomousStopKeep::ShutdownChoice,
+        };
+        let entries = self.close_all_autonomous_kickoff_origins(keep).await?;
         if entries.is_empty() {
             return Ok(Vec::new());
         }
@@ -19579,13 +19600,14 @@ impl MobActor {
     /// Phase 1 of every autonomous stop, for each autonomous member MobMachine
     /// says to interrupt: durably close its kickoff origin, then refuse while
     /// placed kickoff cleanup is pending. Returns those members; a Stop that
-    /// leaves runs running interrupts none of them. A Shutdown
-    /// (`shutdown` true) keeps a member whose durable run it keeps for the
-    /// next start: that member's kickoff origin stays open and its running
-    /// turn is left to the runtime stop, which suspends it.
+    /// leaves runs running interrupts none of them. A member whose durable
+    /// run the stop keeps (`keep`) is left out: its kickoff origin stays open
+    /// and its running turn is left running, to the Shutdown that follows a
+    /// Stop that leaves runs running, or to the runtime stop of a Shutdown,
+    /// which suspends it.
     async fn close_all_autonomous_kickoff_origins(
         &mut self,
-        shutdown: bool,
+        keep: AutonomousStopKeep,
     ) -> Result<Vec<RosterEntry>, MobError> {
         let entries = {
             let roster = self.roster.read().await;
@@ -19601,7 +19623,7 @@ impl MobActor {
         // not infer whether a row is live or a publication-only retry anchor.
         let mut interruptible_entries = Vec::with_capacity(entries.len());
         for entry in entries {
-            let keeps_durable_run = shutdown && self.shutdown_keeps_durable_run(&entry);
+            let keeps_durable_run = self.stop_keeps_durable_run(&entry, keep);
             match self
                 .autonomous_shutdown_member_action(&entry, keeps_durable_run)
                 .await?
@@ -21291,6 +21313,20 @@ impl MobActor {
                 first_error.get_or_insert(error);
                 continue;
             }
+            // A kickoff a Shutdown kept in flight: its run resumes on this
+            // start (once a Stopped mob resumes, its held run starts release),
+            // and its waiter is re-attached at the first readiness pass that
+            // observes the member's runtime.
+            #[cfg(feature = "runtime-adapter")]
+            if stage == super::state::LifecycleProgressStage::AutonomousRuntimeReadiness
+                && self
+                    .dsl_authority
+                    .state()
+                    .member_kickoff_starting
+                    .contains(&mob_dsl::AgentIdentity::from_domain(&entry.agent_identity))
+            {
+                self.rearm_kept_kickoff(&entry).await;
+            }
             if stage != super::state::LifecycleProgressStage::AutonomousRuntimeReadiness
                 || self.state() != MobState::Running
             {
@@ -21316,17 +21352,6 @@ impl MobActor {
                     "failed publishing autonomous runtime startup readiness"
                 );
                 first_error.get_or_insert(error);
-            }
-            // A kickoff a requeue Shutdown kept in flight: its run resumes on
-            // this start, and its waiter is re-attached here.
-            #[cfg(feature = "runtime-adapter")]
-            if self
-                .dsl_authority
-                .state()
-                .member_kickoff_starting
-                .contains(&mob_dsl::AgentIdentity::from_domain(&entry.agent_identity))
-            {
-                self.rearm_kept_kickoff(&entry).await;
             }
         }
         first_error.map_or(Ok(()), Err)
@@ -29547,7 +29572,9 @@ impl MobActor {
                                     self.inline_step_watchdog
                                         .set_stop_stage(StopInlineStage::AutonomousStops);
                                     if let Err(error) = Box::pin(
-                                        self.close_all_autonomous_kickoff_origins(false),
+                                        self.close_all_autonomous_kickoff_origins(
+                                            AutonomousStopKeep::DurableMembers,
+                                        ),
                                     )
                                     .await
                                     {

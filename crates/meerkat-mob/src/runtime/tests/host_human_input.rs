@@ -5030,3 +5030,115 @@ async fn an_explicit_stop_shutdown_still_ends_a_durable_autonomous_members_kicko
         "the kickoff run ends cancelled"
     );
 }
+
+/// A draining deploy over a durable autonomous member whose kickoff run is
+/// in flight: a Stop that leaves runs running, a drain that reaches its
+/// bound, then the default Shutdown. The Stop leaves the kickoff open for the
+/// Shutdown to decide, and the Shutdown keeps it with its run. After the
+/// restart and the mob's resume, the run comes back and the kickoff resolves
+/// as started under the same objective, its prompt asked of the model once
+/// more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_draining_deploy_keeps_a_durable_autonomous_members_kickoff_for_the_next_start() {
+    let (_root, root_path) = stop_root();
+    let client = ScriptedClient::new(false);
+    let host = open_stop_host(&root_path, &client, Some("drain-kickoff-kept")).await;
+    let mob_id = host.handle.mob_id().clone();
+    let identity = AgentIdentity::from(format!("host-human-stop-{}", Uuid::new_v4().simple()));
+    let session_id = host
+        .handle
+        .spawn(
+            ProfileName::from("lead"),
+            identity.clone(),
+            Some(KEPT_KICKOFF.into()),
+        )
+        .await
+        .expect("spawn autonomous member")
+        .bridge_session_id()
+        .expect("local session member")
+        .clone();
+    client.wait_for_requests(1).await;
+    let before = host
+        .handle
+        .get_member(&identity)
+        .await
+        .expect("roster read")
+        .expect("the member is in the roster")
+        .kickoff
+        .expect("the member has a kickoff");
+
+    let stop = stop_leaving_runs_running(&host).await;
+    let started = std::time::Instant::now();
+    let drain = tokio::time::timeout(WAIT, host.handle.drain_stopped_runs(started + DRAIN_BOUND))
+        .await
+        .expect("the drain returns at its bound")
+        .expect("drain a stopped mob");
+    let report = tokio::time::timeout(
+        WAIT,
+        host.handle
+            .shutdown_with_report(crate::ShutdownOptions::default()),
+    )
+    .await
+    .expect("the graceful stop finishes")
+    .expect("graceful stop");
+    let events = stop_events(&root_path, &session_id).await;
+    let kickoff_run = events.iter().find_map(|event| match event {
+        AgentEvent::RunStarted { identity, .. } => identity.run_id.clone(),
+        _ => None,
+    });
+    let failures_at_stop = kickoff_run
+        .as_ref()
+        .map(|run_id| run_failures(&events, run_id).len());
+    drop(host);
+    await_supervisor_route_release(&mob_id).await;
+
+    let restarted_client = ScriptedClient::new(true);
+    let (restarted, restored) = reopen_stopped_host(&root_path, &restarted_client).await;
+    tokio::time::timeout(WAIT, restarted.handle.wait_for_kickoff_complete(Some(WAIT)))
+        .await
+        .expect("the kept kickoff resolves after the restart")
+        .expect("kickoff wait");
+    let after = restarted
+        .handle
+        .get_member(&identity)
+        .await
+        .expect("roster read")
+        .expect("the member survives the restart")
+        .kickoff
+        .expect("the member keeps its kickoff");
+    assert_eq!(
+        (
+            stop.members
+                .get(&identity)
+                .map(|outcome| outcome.run.clone()),
+            drain.members.get(&identity).cloned(),
+            report.runs.get(&identity).cloned(),
+            failures_at_stop,
+            restored,
+            after.phase,
+            after.objective_id == before.objective_id,
+            requests_carrying(&restarted_client.requests(), KEPT_KICKOFF),
+        ),
+        (
+            kickoff_run
+                .clone()
+                .map(|run_id| crate::MemberStopRun::LeftRunning { run_id }),
+            kickoff_run.map(|run_id| crate::MemberRunDrainOutcome {
+                run: crate::MemberRunDrain::StillRunning { run_id },
+                starts: Some(crate::MemberRunStarts::Held),
+            }),
+            None,
+            Some(0),
+            MobState::Stopped,
+            crate::roster::MobMemberKickoffPhase::Started,
+            true,
+            1,
+        ),
+        "the Stop leaves the kickoff open, the default Shutdown keeps it with its run, and the \
+         restart resumes it under the same objective"
+    );
+    tokio::time::timeout(WAIT, restarted.handle.shutdown())
+        .await
+        .expect("mob shutdown finishes")
+        .expect("mob shutdown");
+}

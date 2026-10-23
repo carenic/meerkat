@@ -1219,9 +1219,12 @@ them.
   rounds (a live bridge run) is still cancelled. A durable autonomous member
   keeps its kickoff open too: the Shutdown neither records it cancelled nor
   cancels its run, and the next start resumes the run under the same
-  objective and resolves the kickoff when it ends. A local autonomous
-  kickoff input now carries the Core idempotency key
-  `mob-kickoff:<member runtime id>`, by which that start finds it again.
+  objective and resolves the kickoff when it ends. A Stop that leaves runs
+  running (`StopOptions::leave_runs_running`) no longer closes such a
+  member's kickoff either: the Shutdown that follows decides. A plain Stop
+  still closes it. A local autonomous kickoff input now carries the Core
+  idempotency key `mob-kickoff:<member runtime id>`, by which that start
+  finds it again.
   An explicit `with_queued_inputs` choice applies as given, an explicit
   `Stop` included;
   `with_queued_inputs(QueuedInputsOnShutdown::Stop)` keeps the 0.9.4
