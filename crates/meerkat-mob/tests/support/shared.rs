@@ -5760,6 +5760,8 @@ struct ScriptedMemberTurnState {
     silence_next_deliveries_before_admission: u32,
     reject_next_deliver_unavailable: u32,
     reject_next_deliver_decode: bool,
+    /// Refuse the next delivery with a typed internal delivery cause.
+    refuse_next_delivery: Option<String>,
     received: Vec<meerkat_mob::runtime::bridge_protocol::BridgeDeliveryPayload>,
     admitted: u64,
     /// Dedup memory keyed on `input_id`: a replayed delivery returns
@@ -5819,6 +5821,12 @@ impl ScriptedMemberTurnResponder {
     /// `deny_unknown_fields` receiver refusing a directive-bearing payload).
     pub fn reject_next_deliver_decode(&self) {
         self.state().reject_next_deliver_decode = true;
+    }
+
+    /// The next delivery is refused with a typed internal delivery cause
+    /// (`BridgeDeliveryOutcome::Rejected`): the member admitted nothing.
+    pub fn refuse_next_delivery(&self, detail: &str) {
+        self.state().refuse_next_delivery = Some(detail.to_string());
     }
 
     /// Every `BridgeDeliveryPayload` received, in order (attempt counting +
@@ -5945,6 +5953,22 @@ pub fn spawn_scripted_member_turn_responder(
                                         .to_string(),
                                 })
                                 .expect("decode rejection"),
+                            )
+                        } else if let Some(detail) = guard.refuse_next_delivery.take() {
+                            Some(
+                                serde_json::to_value(BridgeReply::Delivery(
+                                    BridgeDeliveryResponse {
+                                        input_id: payload.input_id.clone(),
+                                        canonical_input_id: None,
+                                        outcome: BridgeDeliveryOutcome::Rejected {
+                                            cause: meerkat_mob::runtime::bridge_protocol::BridgeDeliveryRejectionCause::Internal {
+                                                detail: detail.clone(),
+                                            },
+                                            reason: detail,
+                                        },
+                                    },
+                                ))
+                                .expect("refused delivery reply"),
                             )
                         } else {
                             guard.admitted += 1;

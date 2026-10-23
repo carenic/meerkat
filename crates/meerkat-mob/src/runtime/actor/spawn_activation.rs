@@ -586,6 +586,9 @@ pub(in crate::runtime) struct SpawnActivationQuiescence {
     pub(in crate::runtime) inflight_stages: usize,
     pub(in crate::runtime) deferred_outcomes: usize,
     pub(in crate::runtime) members: Vec<AgentIdentity>,
+    /// Compensations retained unsettled after a failed activation. They are
+    /// not activation custody, but they block graph-scoped controls too.
+    pub(in crate::runtime) retained_cleanups: usize,
 }
 
 /// A compensation that could not be completed by the failing owner.
@@ -733,6 +736,7 @@ impl MobActor {
     pub(in crate::runtime) fn spawn_activation_quiescence(&self) -> SpawnActivationQuiescence {
         let mut census = SpawnActivationQuiescence {
             total: self.pending_spawn_activations.len(),
+            retained_cleanups: self.retained_spawn_activation_cleanups.len(),
             ..SpawnActivationQuiescence::default()
         };
         for pending in self.pending_spawn_activations.values() {
@@ -799,6 +803,7 @@ impl MobActor {
             custody_inflight_stages = census.inflight_stages,
             custody_deferred_outcomes = census.deferred_outcomes,
             custody_members = ?census.members,
+            retained_cleanups = census.retained_cleanups,
             "parking spawn activation while a graph-scoped control owns the mob"
         );
     }

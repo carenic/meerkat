@@ -92004,6 +92004,58 @@ fn placement_fixture_uses_local_mob_authority_types() {
         "shared unit fixtures must not import the separately compiled self-dev-dependency",
     );
 }
+/// A turn-driven placed spawn with an initial message settles its activation
+/// without retaining a cleanup that would block graph-scoped controls.
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+#[tokio::test(flavor = "multi_thread")]
+async fn turn_driven_placed_spawn_with_initial_message_retains_no_activation_cleanup() {
+    let _guard = placement_support::REAL_COMMS_TEST_LOCK.lock().await;
+    let scripted = placement_support::spawn_scripted_host_peer("td-cleanup-host").await;
+    let member_endpoint = Arc::new(
+        placement_support::spawn_peer_comms_endpoint("td-cleanup-member", true, None).await,
+    );
+    let member =
+        placement_support::spawn_scripted_member_turn_responder(Arc::clone(&member_endpoint));
+    scripted.script_member_identity(
+        "td-cleanup",
+        placement_support::member_identity_of(&member_endpoint),
+    );
+    scripted.bind_member_endpoint("td-cleanup", member_endpoint);
+    let controlling = placement_support::create_controlling_mob("td-cleanup").await;
+    let report = controlling.bind_scripted(&scripted).await;
+    let spec = placement_support::placed_spawn_spec("worker", "td-cleanup", &report.host_id)
+        .with_runtime_mode(crate::MobRuntimeMode::TurnDriven)
+        .with_initial_message("PLACED_INITIAL_MESSAGE token-tau".to_string());
+    let spawned =
+        tokio::time::timeout(Duration::from_secs(10), controlling.handle.spawn_spec(spec))
+            .await
+            .expect("the placed spawn settles");
+
+    let reply_rx = controlling
+        .handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::SpawnActivationCustodyProbe {
+            reply_tx,
+        })
+        .await
+        .expect("custody probe enqueue");
+    let census = tokio::time::timeout(Duration::from_secs(2), reply_rx)
+        .await
+        .expect("custody probe answers")
+        .expect("custody probe reply");
+    assert!(
+        spawned.is_ok(),
+        "the spawn commits: {spawned:?}; retained cleanups {}",
+        census.retained_cleanups
+    );
+    assert_eq!(census.total, 0, "no activation holds custody");
+    assert_eq!(
+        census.retained_cleanups, 0,
+        "no activation cleanup is retained to block graph-scoped controls"
+    );
+    assert_eq!(member.admitted_delivery_count(), 1);
+    member.shutdown();
+    scripted.shutdown();
+}
 /// D67: public ownership and the Closing admission state.
 mod admission_close;
 /// #1497 member continuations resolve through the mob roster.
