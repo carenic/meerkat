@@ -6908,19 +6908,13 @@ class MeerkatClient:
                 )
         elif provider == "open_ai_assistant_message":
             MeerkatClient._require_present_string_field(meta, "id", context)
-            MeerkatClient._validate_nullable_response_string(
-                meta,
-                "response_id",
-                context,
-            )
-            phase = meta.get("phase")
-            if phase is not None and (
-                not isinstance(phase, str)
-                or phase not in {"commentary", "final_answer"}
-            ):
-                raise MeerkatError(
-                    "INVALID_RESPONSE",
-                    f"{context}: unsupported assistant message phase {phase!r}",
+            # The phase is advisory: a phase this SDK does not know is kept
+            # as given, never refused.
+            for field in ("phase", "response_id"):
+                MeerkatClient._validate_nullable_response_string(
+                    meta,
+                    field,
+                    context,
                 )
         elif provider != "unknown":
             raise MeerkatError(

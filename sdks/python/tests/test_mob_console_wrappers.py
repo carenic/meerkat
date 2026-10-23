@@ -565,6 +565,7 @@ def test_history_validator_does_not_widen_non_nullable_fields(
             "response_id": None,
         },
         {"provider": "open_ai_assistant_message", "id": "msg-1", "phase": None},
+        {"provider": "open_ai_assistant_message", "id": "msg-1", "phase": "analysis"},
         {"provider": "unknown"},
     ],
 )
@@ -615,7 +616,6 @@ def test_assistant_validator_rejects_invalid_gemini_call_metadata(meta: dict[str
     {"provider": "open_ai_assistant_message"},
     {"provider": "open_ai_assistant_message", "id": None},
     {"provider": "open_ai_assistant_message", "id": 7},
-    {"provider": "open_ai_assistant_message", "id": "msg-1", "phase": "analysis"},
     {"provider": "open_ai_assistant_message", "id": "msg-1", "phase": 7},
     {"provider": "open_ai_assistant_message", "id": "msg-1", "phase": ["commentary"]},
     {"provider": "open_ai_assistant_message", "id": "msg-1", "response_id": 7},
