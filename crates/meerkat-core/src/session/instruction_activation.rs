@@ -1984,4 +1984,214 @@ mod tests {
         assert_eq!(duplicate.activation_ordinal, appended.activation_ordinal);
         assert_eq!(duplicate.projection_witness, read.projection_witness);
     }
+
+    const SKILL_SOURCE: &str = "6f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a4b";
+    const LOADED_BODY: &str = "LOADED-SKILL-BODY-MARKER";
+    const CONTEXT_BODY: &str = "PER-TURN-SKILL-CONTEXT-MARKER";
+
+    fn skill_key() -> crate::skills::SkillKey {
+        crate::skills::SkillKey::new(
+            crate::skills::SourceUuid::parse(SKILL_SOURCE).unwrap(),
+            crate::skills::SkillName::parse("pdf-processing").unwrap(),
+        )
+    }
+
+    fn load_args() -> String {
+        serde_json::json!({"source_uuid": SKILL_SOURCE, "skill_name": "pdf-processing"}).to_string()
+    }
+
+    /// A session that loaded a skill with the built-in `load_skill` tool
+    /// (the call named by `args`) and was given the same skill's per-turn
+    /// context in a later user row.
+    fn source_that_loaded_a_skill(args: &str) -> Session {
+        let mut source = Session::new();
+        source.push(Message::User(UserMessage::text("load the skill")));
+        source.push(Message::BlockAssistant(
+            crate::types::BlockAssistantMessage::new(
+                vec![crate::types::AssistantBlock::ToolUse {
+                    id: "load-1".to_string(),
+                    name: crate::skills::LOAD_SKILL_TOOL_NAME.to_string(),
+                    args: serde_json::value::RawValue::from_string(args.to_string()).unwrap(),
+                    meta: None,
+                }],
+                crate::types::StopReason::ToolUse,
+            ),
+        ));
+        source.push(Message::ToolResults {
+            results: vec![crate::types::ToolResult::new(
+                "load-1".to_string(),
+                LOADED_BODY.to_string(),
+                false,
+            )],
+            created_at: crate::types::message_timestamp_now(),
+        });
+        let mut with_context = UserMessage::text("a turn with skill context");
+        with_context
+            .content
+            .push(crate::types::ContentBlock::SkillContext {
+                skill_key: skill_key(),
+                text: CONTEXT_BODY.to_string(),
+            });
+        source.push(Message::User(with_context));
+        source
+    }
+
+    /// The durable fork child of `source` after its first run delivered its
+    /// fork notice, which removed or carried the source's skill.
+    fn durable_child_with_notice(source: &Session, carried: bool) -> Session {
+        let mut child = source.fork();
+        let seed = crate::fork_notice::ForkSeed {
+            fork: crate::fork_notice::ForkNoticeKind::Transcript,
+            source: crate::fork_notice::ForkNoticeSource {
+                member: None,
+                session_id: Some(source.id().clone()),
+            },
+            planned_context: None,
+            source_instructions: Vec::new(),
+            instructions_carried: Vec::new(),
+            skills_removed: if carried {
+                Vec::new()
+            } else {
+                vec![skill_key()]
+            },
+            skills_carried: if carried {
+                vec![skill_key()]
+            } else {
+                Vec::new()
+            },
+            injected_rows_removed: 0,
+            injected_rows_carried: 0,
+            earlier_rows_omitted: 0,
+            source_tools: crate::fork_notice::ForkSeedSourceTools::NotRead {
+                reason: crate::fork_notice::ForkToolsNotComparedReason::SourceNotLive,
+            },
+        };
+        let notice = seed.notice(child.id().clone(), &BTreeSet::new(), &BTreeSet::new());
+        child.push(Message::SystemNotice(
+            crate::types::SystemNoticeMessage::fork_boundary(notice),
+        ));
+        child.push(Message::User(UserMessage::text("the child's task")));
+        child
+    }
+
+    /// What the model reads of `session`, as wire JSON.
+    fn model_boundary_json(session: &Session) -> String {
+        serde_json::to_string(
+            &session
+                .messages_for_model_boundary_prefix(session.messages().len())
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// A model request never carries an activation row that does not hold the
+    /// body its identity names: the projection fails closed and names the
+    /// session, instead of passing the stored bytes on.
+    #[test]
+    fn a_malformed_activation_projection_refuses_the_model_request() {
+        let mut session = Session::new();
+        session
+            .activate_instruction(request(
+                "policy one",
+                "act-1",
+                InstructionActivationExpectation::Absent,
+                None,
+            ))
+            .unwrap();
+        let mut rows = session.messages().to_vec();
+        let Some(Message::System(system)) = rows.iter_mut().find(
+            |row| matches!(row, Message::System(system) if system.instruction_activation.is_some()),
+        ) else {
+            panic!("the activation row");
+        };
+        system.content = system.content.replace("policy one", "policy edited");
+        let count = rows.len();
+        session.messages = crate::session::TranscriptMessages::from_vec(rows);
+        let error = session
+            .messages_for_model_boundary_prefix(count)
+            .expect_err("the projection refuses a row that does not hold its body");
+        assert!(
+            error.to_string().contains(&session.id().to_string()),
+            "the refusal names the session: {error}"
+        );
+    }
+
+    /// Under the default policy a durable fork child's model reads neither
+    /// the body of a skill its source loaded with `load_skill` nor the
+    /// source's per-turn skill context: each copied row names the skill.
+    /// The source still reads both.
+    #[test]
+    fn a_durable_fork_child_projection_carries_no_copied_skill_body_by_default() {
+        let source = source_that_loaded_a_skill(&load_args());
+        let child = durable_child_with_notice(&source, false);
+        let projected = model_boundary_json(&child);
+        assert!(
+            !projected.contains(LOADED_BODY) && !projected.contains(CONTEXT_BODY),
+            "no copied skill body reaches the child's model: {projected}"
+        );
+        assert!(
+            projected.contains(&format!(
+                "skill {} was loaded here; its body is not carried into this fork",
+                skill_key()
+            )),
+            "the copied result names the skill: {projected}"
+        );
+        let source_projected = model_boundary_json(&source);
+        assert!(
+            source_projected.contains(LOADED_BODY) && source_projected.contains(CONTEXT_BODY),
+            "the source keeps its own skill bodies: {source_projected}"
+        );
+    }
+
+    /// Under `reactivate_inherited` the notice carries the skill, and the
+    /// child's model reads the copied bodies.
+    #[test]
+    fn reactivate_inherited_keeps_copied_skill_bodies_in_a_durable_fork_child() {
+        let source = source_that_loaded_a_skill(&load_args());
+        let child = durable_child_with_notice(&source, true);
+        let projected = model_boundary_json(&child);
+        assert!(
+            projected.contains(LOADED_BODY) && projected.contains(CONTEXT_BODY),
+            "a carried skill keeps its bodies: {projected}"
+        );
+    }
+
+    /// Under `refuse` a durable fork whose copied rows hold a loaded skill is
+    /// refused like one that copied an activation, naming the skill, and the
+    /// child is left as it was.
+    #[test]
+    fn the_refuse_policy_refuses_a_durable_fork_that_copied_a_skill_load() {
+        let source = source_that_loaded_a_skill(&load_args());
+        let mut child = source.fork();
+        let before = child.messages().to_vec();
+        let refusal = child
+            .apply_fork_instruction_policy(source.id(), crate::ForkInstructionPolicy::Refuse)
+            .expect_err("a copied skill load is refused under refuse");
+        assert_eq!(refusal.cause, ForkInstructionRefusalCause::PolicyRefuses);
+        assert!(refusal.keys.is_empty(), "{refusal:?}");
+        assert_eq!(refusal.skills.as_ref(), [skill_key()].as_slice());
+        assert_eq!(refusal.unreadable_skill_loads, 0);
+        assert_eq!(
+            child.messages(),
+            before.as_slice(),
+            "a refusal changes nothing"
+        );
+    }
+
+    /// A copied `load_skill` call whose arguments name no skill still counts
+    /// under `refuse`: the fork fails closed on it.
+    #[test]
+    fn the_refuse_policy_counts_a_copied_skill_load_that_names_no_skill() {
+        let source = source_that_loaded_a_skill(r#"{"skill":"nameless"}"#);
+        let mut child = source.fork();
+        let refusal = child
+            .apply_fork_instruction_policy(source.id(), crate::ForkInstructionPolicy::Refuse)
+            .expect_err("an unreadable copied skill load is refused under refuse");
+        assert_eq!(refusal.unreadable_skill_loads, 1, "{refusal:?}");
+        assert_eq!(
+            refusal.skills.as_ref(),
+            [skill_key()].as_slice(),
+            "the per-turn context still names its skill"
+        );
+    }
 }
