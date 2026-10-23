@@ -40,6 +40,7 @@ from .generated.types import (
     WireReachability,
     WireMemberPreviewUnavailable,
     WireMemberRegistrationHookCall,
+    WireMemberCustodyDeferral,
     WireRuntimeBinding,
     WireToolAccessPolicy,
     WireToolFilter,
@@ -209,6 +210,10 @@ MobMemberSnapshot = TypedDict(
         # hook call that refused it. The member stays broken until an
         # explicit repair.
         "registration_refusal": NotRequired[WireMemberRegistrationHookCall],
+        # Set when a mob start deferred the member's custody restore instead
+        # of failing the whole start: the restore and the cause its last
+        # attempt met. Every operation on the member re-attempts it first.
+        "custody_deferred": NotRequired[WireMemberCustodyDeferral],
     },
 )
 
@@ -229,6 +234,7 @@ MobKickoffMemberSnapshot = TypedDict(
         # As on MobMemberSnapshot.
         "preview_unavailable": NotRequired[WireMemberPreviewUnavailable],
         "registration_refusal": NotRequired[WireMemberRegistrationHookCall],
+        "custody_deferred": NotRequired[WireMemberCustodyDeferral],
     },
 )
 

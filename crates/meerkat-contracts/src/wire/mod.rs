@@ -206,6 +206,7 @@ pub use mob::{
     WireIdentityConvergenceCondition, WireIdentityConvergenceMode,
     WireIdentityConvergenceResolutionOutcome, WireIdentityConvergenceStatus,
     WireIdentityProfileMemberDeclaration, WireIdentityReconcileDecision, WireIdentityWiringCustody,
+    WireMemberCustodyDeferral, WireMemberCustodyDeferralCause, WireMemberCustodyRestore,
     WireMemberHealthClass, WireMemberHistoryPageBody, WireMemberLaunchMode,
     WireMemberLifecycleCapabilities, WireMemberPreviewUnavailable, WireMemberProgressEvent,
     WireMemberProgressSnapshot, WireMemberRef, WireMemberRefError, WireMemberRegistrationHookCall,

@@ -123,9 +123,10 @@ pub use definition::{
 pub use error::{
     FlowStepDispatchRejectKind, ForkSourceUnavailableCause, ForkedParticipantLeaseOperation,
     ForkedParticipantOwnerHostRejection, ForkedParticipantSourceRejection,
-    IncarnationInconsistency, MemberCustodyRestore, MemberProvisionFailureCause,
-    MemberRegistrationHookCall, MemberRuntimeDetachment, MobDefinitionProjectionMismatchKind,
-    MobError, MobFailureClass, RuntimeEffectKind,
+    IncarnationInconsistency, MemberCustodyDeferral, MemberCustodyDeferralCause,
+    MemberCustodyRestore, MemberProvisionFailureCause, MemberRegistrationHookCall,
+    MemberRuntimeDetachment, MobDefinitionProjectionMismatchKind, MobError, MobFailureClass,
+    RuntimeEffectKind,
 };
 pub use event::{
     AttributedEvent, FlowCancelClass, ForkJobTerminalEvent, MemberWireEdge, MobEvent, MobEventKind,

@@ -51,6 +51,9 @@ import type {
   WireMemberPreviewUnavailable,
   WireMemberProgressSnapshot,
   WireMemberRegistrationHookCall,
+  WireMemberCustodyDeferral,
+  WireMemberCustodyDeferralCause,
+  WireMemberCustodyRestore,
   WireNonPortableResourceKind,
   WireReachability,
   WireResolvedModelCapabilities,
@@ -791,6 +794,61 @@ function parseWireMemberRegistrationRefusal(
   );
 }
 
+const WIRE_MEMBER_CUSTODY_RESTORE_VALUES: readonly WireMemberCustodyRestore[] = [
+  'startup_binding',
+  'cleanup_delivery',
+];
+
+const WIRE_MEMBER_CUSTODY_DEFERRAL_CAUSE_VALUES: readonly WireMemberCustodyDeferralCause[] = [
+  'served_elsewhere',
+  'hosting_unavailable',
+  'durable_tail_unprovable',
+];
+
+/**
+ * The member's custody restore a mob start deferred: which restore, and the
+ * cause its last attempt met. Absent (or `null`) means no restore is
+ * deferred; a restore or cause outside its closed vocabulary, or an unknown
+ * field, fails closed.
+ */
+function parseWireMemberCustodyDeferral(raw: unknown): WireMemberCustodyDeferral | undefined {
+  if (raw == null) {
+    return undefined;
+  }
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('Invalid mob member_status response: custody_deferred must be an object');
+  }
+  const record = raw as Record<string, unknown>;
+  const restore = record.restore;
+  if (
+    typeof restore !== 'string' ||
+    !WIRE_MEMBER_CUSTODY_RESTORE_VALUES.includes(restore as WireMemberCustodyRestore)
+  ) {
+    throw new Error(
+      'Invalid mob member_status response: custody_deferred.restore must be a valid custody restore',
+    );
+  }
+  const cause = record.cause;
+  if (
+    typeof cause !== 'string' ||
+    !WIRE_MEMBER_CUSTODY_DEFERRAL_CAUSE_VALUES.includes(cause as WireMemberCustodyDeferralCause)
+  ) {
+    throw new Error(
+      'Invalid mob member_status response: custody_deferred.cause must be a valid deferral cause',
+    );
+  }
+  const unknown = Object.keys(record).find((key) => key !== 'restore' && key !== 'cause');
+  if (unknown !== undefined) {
+    throw new Error(
+      `Invalid mob member_status response: unknown custody_deferred field ${unknown}`,
+    );
+  }
+  return {
+    restore: restore as WireMemberCustodyRestore,
+    cause: cause as WireMemberCustodyDeferralCause,
+  };
+}
+
 function parseWireReachability(raw: unknown, field: string): WireReachability | undefined {
   if (raw == null) {
     return undefined;
@@ -1070,6 +1128,10 @@ function parseMobMemberSnapshot(raw: unknown): MobMemberSnapshot {
   const registrationRefusal = parseWireMemberRegistrationRefusal(snapshot.registration_refusal);
   if (registrationRefusal !== undefined) {
     result.registration_refusal = registrationRefusal;
+  }
+  const custodyDeferred = parseWireMemberCustodyDeferral(snapshot.custody_deferred);
+  if (custodyDeferred !== undefined) {
+    result.custody_deferred = custodyDeferred;
   }
   return result;
 }

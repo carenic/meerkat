@@ -7,6 +7,7 @@ import type {
   WireMemberPreviewUnavailable,
   WireMemberProgressSnapshot,
   WireMemberRegistrationHookCall,
+  WireMemberCustodyDeferral,
   WireMobMemberStatus,
   WireNonPortableResourceKind,
   WireReachability,
@@ -20,6 +21,9 @@ export type {
   WireMemberPreviewUnavailable,
   WireMemberProgressSnapshot,
   WireMemberRegistrationHookCall,
+  WireMemberCustodyDeferral,
+  WireMemberCustodyDeferralCause,
+  WireMemberCustodyRestore,
 } from './generated/mob.js';
 
 // ─── Bootstrap / session config (generated wire parity) ─────────
@@ -453,6 +457,12 @@ export interface MobMemberSnapshot {
    * call that refused it. The member stays broken until an explicit repair.
    */
   registration_refusal?: WireMemberRegistrationHookCall;
+  /**
+   * Set when a mob start deferred the member's custody restore instead of
+   * failing the whole start: the restore and the cause its last attempt met.
+   * Every operation on the member re-attempts it first.
+   */
+  custody_deferred?: WireMemberCustodyDeferral;
 }
 
 /** Result envelope for helper-style mob flows. */

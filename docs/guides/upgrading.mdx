@@ -114,8 +114,31 @@ deduplication.
 `accept_schedule_runtime_input_with_reconciliation` on the task that calls
 them; a redelivery through such a host only replays the earlier input.
 
+#### Member custody at a mob start
+
+- `meerkat-runtime`: `RuntimeBindingsError` gains the variant
+  `Hosting(SessionId, SessionError)` and is now `#[non_exhaustive]`. Binding
+  preparation for a session another runtime owner hosts, or whose hosting
+  claim cannot be taken, returns it with the typed
+  `SessionError::ServedElsewhere` or `SessionError::HostingUnavailable`
+  instead of a `PrepareFailed` message.
+- `meerkat-contracts`: `MobMemberStatusResult` gains the field
+  `custody_deferred: Option<WireMemberCustodyDeferral>`.
+
+**Do:** add a wildcard arm to any exhaustive match on `RuntimeBindingsError`,
+and set `custody_deferred` (`None`) where you build `MobMemberStatusResult`
+with a struct literal.
+
 ### Other behaviour changes
 
+- **A Broken member no longer stops a mob start:** when a member whose
+  restore already failed at a start cannot have its custody restored because
+  another runtime owner hosts its session, its hosting claim cannot be taken,
+  or its durable tail could not be proven, the start defers that restore and
+  the mob runs. The member stays Broken, its status shows `custody_deferred`,
+  and a respawn, retire or destroy of it answers
+  `MobError::MemberCustodyDeferred` until the restore succeeds. 0.9.4 stopped
+  the whole mob. See [Mobs](/guides/mobs).
 - **Crash recovery of scheduled deliveries:** a delivery whose executor died
   after an earlier attempt recorded its dispatch is reclaimed, also past its
   misfire deadline (up to five attempts), and redelivered without a fresh
@@ -141,6 +164,8 @@ them; a redelivery through such a host only replays the earlier input.
 3. Custom `SurfaceScheduleSessionHost` implementations: return `true` from
    `decides_existing_admission` only if they admit through
    `accept_schedule_runtime_input_with_reconciliation` on the calling task.
+4. Add a wildcard arm where you match `RuntimeBindingsError`, and set
+   `custody_deferred` in `MobMemberStatusResult` struct literals.
 
 ## Upgrading to 0.9.4
 
