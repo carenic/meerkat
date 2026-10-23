@@ -587,15 +587,128 @@ impl ContinuationOwnerService {
         if self.runtime.has_native_work_authorization_host() {
             return Err(ContinuationSubmitError::NoAdmissibleWorkBinding);
         }
-        self.commit(owner, delivery, None, committed_at_ms).await
+        self.commit(owner, delivery, None, committed_at_ms, None)
+            .await
     }
 
+    /// [`Self::submit`] for a member owner, bound only to the member's mob
+    /// incarnation `incarnation`. A handle kept from an earlier incarnation of
+    /// the mob (one whose actor stopped, while the host now holds a mob
+    /// created again under its id) commits nothing for the current
+    /// incarnation's member.
+    ///
+    /// The incarnation is checked inside the commit, on the address the commit
+    /// binds, so no destroy and re-create can slip between the check and the
+    /// commit:
+    /// - the key is not bound yet: it binds only while the owner's current
+    ///   address names `incarnation`, and is
+    ///   [`ContinuationSubmitError::OwnerRetired`] otherwise;
+    /// - the key is bound at `incarnation`: replayed, or a conflict, as for
+    ///   [`Self::submit`];
+    /// - the key is bound at another incarnation:
+    ///   [`ContinuationSubmitError::OwnerRetired`] while the current address
+    ///   does not name `incarnation` (this caller is stale); replayed, or a
+    ///   conflict, as for [`Self::submit`], while it does (the current
+    ///   incarnation reusing a key an earlier one bound).
+    ///
+    /// A [`ContinuationOwner::Session`] owner has no mob incarnation and is
+    /// unchanged: for it this is [`Self::submit`].
+    pub async fn submit_for_member_incarnation(
+        &self,
+        owner: &ContinuationOwner,
+        incarnation: MobIncarnationId,
+        delivery: ContinuationDelivery,
+        committed_at_ms: u64,
+    ) -> Result<ContinuationReceipt, ContinuationSubmitError> {
+        if self.runtime.has_native_work_authorization_host() {
+            return Err(ContinuationSubmitError::NoAdmissibleWorkBinding);
+        }
+        self.commit(
+            owner,
+            delivery,
+            None,
+            committed_at_ms,
+            Self::member_incarnation(owner, incarnation),
+        )
+        .await
+    }
+
+    /// The incarnation a member owner's commit is bound to; `None` for a
+    /// session owner, which has none.
+    fn member_incarnation(
+        owner: &ContinuationOwner,
+        incarnation: MobIncarnationId,
+    ) -> Option<MobIncarnationId> {
+        match owner {
+            ContinuationOwner::Member { .. } => Some(incarnation),
+            ContinuationOwner::Session { .. } => None,
+        }
+    }
+
+    /// Whether `address` is a member address of mob incarnation `incarnation`.
+    /// An address minted before 0.9.4 names no incarnation, so it names none
+    /// a caller expects.
+    fn address_names_incarnation(
+        address: &LogicalRuntimeId,
+        incarnation: MobIncarnationId,
+    ) -> Result<bool, ContinuationSubmitError> {
+        address
+            .member_address()
+            .map(|member| member.is_some_and(|member| member.incarnation == Some(incarnation)))
+            .map_err(|error| ContinuationSubmitError::Invalid(error.to_string()))
+    }
+
+    /// Whether the owner's current address names `incarnation`. An owner with
+    /// no current address names none.
+    async fn current_address_names_incarnation(
+        &self,
+        owner: &ContinuationOwner,
+        incarnation: MobIncarnationId,
+    ) -> Result<bool, ContinuationSubmitError> {
+        match self
+            .resolver
+            .current_address(owner)
+            .await
+            .map_err(ContinuationSubmitError::Unavailable)?
+        {
+            Some(address) => Self::address_names_incarnation(&address, incarnation),
+            None => Ok(false),
+        }
+    }
+
+    /// A key already bound: replayed, or a conflict, as for [`Self::submit`].
+    /// For a commit bound to `expected`, a binding at another incarnation is
+    /// [`ContinuationSubmitError::OwnerRetired`] unless the owner's current
+    /// address names `expected` (see [`Self::submit_for_member_incarnation`]).
+    async fn replay_bound_key(
+        &self,
+        owner: &ContinuationOwner,
+        key: &ContinuationKey,
+        binding: &meerkat_runtime::ContinuationKeyBinding,
+        digest: &str,
+        expected: Option<MobIncarnationId>,
+    ) -> Result<ContinuationReceipt, ContinuationSubmitError> {
+        if let Some(expected) = expected
+            && !Self::address_names_incarnation(&binding.address, expected)?
+            && !self
+                .current_address_names_incarnation(owner, expected)
+                .await?
+        {
+            return Err(ContinuationSubmitError::OwnerRetired);
+        }
+        Self::replay_or_conflict(owner, key, binding, digest)
+    }
+
+    /// `expected`: the mob incarnation a member owner's commit is bound to
+    /// (see [`Self::submit_for_member_incarnation`]); `None` binds whatever
+    /// the owner's current address names.
     async fn commit(
         &self,
         owner: &ContinuationOwner,
         delivery: ContinuationDelivery,
         retained_work: Option<meerkat_core::retained_work::RetainedWorkIdentity>,
         committed_at_ms: u64,
+        expected: Option<MobIncarnationId>,
     ) -> Result<ContinuationReceipt, ContinuationSubmitError> {
         let ledger_owner = owner.ledger_owner();
         let digest = Self::submission_digest(owner, &delivery, retained_work.as_ref())?;
@@ -605,7 +718,9 @@ impl ContinuationOwnerService {
             .await
             .map_err(unavailable)?
         {
-            return Self::replay_or_conflict(owner, &delivery.key, &binding, &digest);
+            return self
+                .replay_bound_key(owner, &delivery.key, &binding, &digest, expected)
+                .await;
         }
         let Some(address) = self
             .resolver
@@ -615,6 +730,11 @@ impl ContinuationOwnerService {
         else {
             return Err(ContinuationSubmitError::OwnerRetired);
         };
+        if let Some(expected) = expected
+            && !Self::address_names_incarnation(&address, expected)?
+        {
+            return Err(ContinuationSubmitError::OwnerRetired);
+        }
         let delivery_id = Self::delivery_id(&address, &delivery.key)?;
         let key = delivery.key.clone();
         let source = match &delivery.result.producer {
@@ -655,7 +775,8 @@ impl ContinuationOwnerService {
                 Ok(Self::receipt(owner, &key, &binding))
             }
             KeyedSubmitOutcome::AlreadyBound(binding) => {
-                Self::replay_or_conflict(owner, &key, &binding, &digest)
+                self.replay_bound_key(owner, &key, &binding, &digest, expected)
+                    .await
             }
         }
     }
@@ -684,6 +805,49 @@ impl ContinuationOwnerService {
         job: &RetainedJobRecord,
         committed_at_ms: u64,
     ) -> Result<ContinuationReceipt, ContinuationSubmitError> {
+        self.check_retained_completion(owner, &delivery, job)?;
+        self.commit(
+            owner,
+            delivery,
+            job.facts.retained_work.clone(),
+            committed_at_ms,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::submit_retained_completion`] for a member owner, bound only to
+    /// the member's mob incarnation `incarnation`, exactly as
+    /// [`Self::submit_for_member_incarnation`] binds a submission. A
+    /// [`ContinuationOwner::Session`] owner is unchanged: for it this is
+    /// [`Self::submit_retained_completion`].
+    pub async fn submit_retained_completion_for_member_incarnation(
+        &self,
+        owner: &ContinuationOwner,
+        incarnation: MobIncarnationId,
+        delivery: ContinuationDelivery,
+        job: &RetainedJobRecord,
+        committed_at_ms: u64,
+    ) -> Result<ContinuationReceipt, ContinuationSubmitError> {
+        self.check_retained_completion(owner, &delivery, job)?;
+        self.commit(
+            owner,
+            delivery,
+            job.facts.retained_work.clone(),
+            committed_at_ms,
+            Self::member_incarnation(owner, incarnation),
+        )
+        .await
+    }
+
+    /// The delivery names exactly `job`'s committed outcome, owed to `owner`,
+    /// and a governed runtime can admit it.
+    fn check_retained_completion(
+        &self,
+        owner: &ContinuationOwner,
+        delivery: &ContinuationDelivery,
+        job: &RetainedJobRecord,
+    ) -> Result<(), ContinuationSubmitError> {
         let owed_elsewhere = match owner {
             ContinuationOwner::Session { session_id } => &job.facts.owner_session_id != session_id,
             ContinuationOwner::Member { .. } => false,
@@ -700,13 +864,7 @@ impl ContinuationOwnerService {
         if self.runtime.has_native_work_authorization_host() && job.facts.retained_work.is_none() {
             return Err(ContinuationSubmitError::NoAdmissibleWorkBinding);
         }
-        self.commit(
-            owner,
-            delivery,
-            job.facts.retained_work.clone(),
-            committed_at_ms,
-        )
-        .await
+        Ok(())
     }
 
     /// Read-only: whether the expected retained completion (`delivery` with

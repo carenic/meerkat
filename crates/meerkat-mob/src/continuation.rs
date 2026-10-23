@@ -263,7 +263,11 @@ impl MobHandle {
     /// this host's mobs (for example with [`MobContinuationResolver`]). A
     /// handle of a destroyed mob submits nothing and answers
     /// [`meerkat::ContinuationSubmitError::OwnerRetired`], even once a mob is
-    /// created again under its id.
+    /// created again under its id. The commit is bound to this handle's mob
+    /// incarnation
+    /// ([`meerkat::ContinuationOwnerService::submit_for_member_incarnation`]),
+    /// so a handle of a mob whose actor stopped commits nothing for a mob
+    /// the host holds again under its id, and answers `OwnerRetired` too.
     pub async fn submit_continuation(
         &self,
         continuations: &meerkat::ContinuationOwnerService,
@@ -273,11 +277,12 @@ impl MobHandle {
     ) -> Result<meerkat::ContinuationReceipt, meerkat::ContinuationSubmitError> {
         self.require_undestroyed_continuation_owner()?;
         continuations
-            .submit(
+            .submit_for_member_incarnation(
                 &ContinuationOwner::Member {
                     mob_id: self.mob_id().as_str().to_string(),
                     identity: identity.as_str().to_string(),
                 },
+                self.incarnation(),
                 delivery,
                 committed_at_ms,
             )
@@ -287,8 +292,8 @@ impl MobHandle {
     /// Submit a Meerkat producer job's outcome for one of this mob's members,
     /// carrying the job's retained work (see
     /// [`meerkat::ContinuationOwnerService::submit_retained_completion`]). A
-    /// handle of a destroyed mob submits nothing, as for
-    /// [`Self::submit_continuation`].
+    /// handle of a destroyed mob submits nothing, and the commit is bound to
+    /// this handle's mob incarnation, as for [`Self::submit_continuation`].
     pub async fn submit_retained_continuation(
         &self,
         continuations: &meerkat::ContinuationOwnerService,
@@ -299,11 +304,12 @@ impl MobHandle {
     ) -> Result<meerkat::ContinuationReceipt, meerkat::ContinuationSubmitError> {
         self.require_undestroyed_continuation_owner()?;
         continuations
-            .submit_retained_completion(
+            .submit_retained_completion_for_member_incarnation(
                 &ContinuationOwner::Member {
                     mob_id: self.mob_id().as_str().to_string(),
                     identity: identity.as_str().to_string(),
                 },
+                self.incarnation(),
                 delivery,
                 job,
                 committed_at_ms,

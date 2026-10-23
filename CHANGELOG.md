@@ -294,6 +294,13 @@ them.
   `MobError::without_shared_lifecycle_wrapper` reads through
   `SharedLifecycleFailure` to the error it shares.
 
+- `meerkat`: `ContinuationOwnerService::submit_for_member_incarnation` and
+  `submit_retained_completion_for_member_incarnation`, a submission bound to
+  the member's mob incarnation. A new key binds only while the owner's
+  current address names that incarnation. A key bound at another
+  incarnation is `OwnerRetired` for a stale caller, and replays as before
+  for a caller of the current incarnation. A session owner is unchanged.
+
 ### Changed
 
 - `meerkat-core`, `meerkat-session`, `meerkat-runtime`: a HeadCanonical run
@@ -606,6 +613,14 @@ them.
   nothing else, while `mob/status` reported the failure.
   `MobHandle::status_observation_snapshot` is still the phase alone; its
   documentation now says so and points to `lifecycle_observation`.
+
+- `meerkat-mob`: a handle of a mob whose actor stopped no longer binds a
+  continuation for a mob the host holds again under the same id.
+  `MobHandle::submit_continuation` and `submit_retained_continuation` bind
+  to the handle's own mob incarnation, so such a handle answers
+  `OwnerRetired` and commits nothing for the new mob's member. Before, only
+  a destroyed mob's handle was refused, because a stopped actor's handle
+  keeps its last live phase.
 
 ## [0.9.4] - 2026-10-20
 
