@@ -396,9 +396,10 @@ opens it, and refuses one whose switch to another storage profile is still
 in progress instead of completing it. As for `repair-wholeblob`, the only
 writes an open can make are SQLite's own: the `.mfence` lock sibling, the
 WAL sidecars, and the journal-mode conversion to WAL for a database not
-already in WAL mode. Open a database it refuses this way once with the host
-that owns it, then run the command again. `--json` prints the report as one
-JSON object.
+already in WAL mode. A database whose schema is older than the binary's, or
+whose storage profile switch is still pending, is opened once with the host
+that owns it; then run the command again. A newer schema needs a matching or
+newer `rkat`. `--json` prints the report as one JSON object.
 
 Applied, the repair commits the held tail as interrupted, through the same
 recovery commit as a crash:
