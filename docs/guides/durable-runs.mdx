@@ -298,14 +298,15 @@ fence:
   new holder then waits out what remained of the old holder's lease before
   the realm serves anything, and by then the old holder has stopped itself.
 - **Renewing.** Core renews the fence once per renew interval, in the
-  background. A renew answered `FencedOut` stops the realm's writes until it
-  is opened again; any other failed renew stops writes until a renew
-  succeeds.
+  background. After a failed renew, or once its lease has run out, the
+  holder writes nothing and dispatches nothing until it acquires the fence
+  again with a new token; a later renew never restores it. A renew answered
+  `FencedOut` means another process holds the fence, and the realm stops
+  until it is opened again.
 - **Self-fencing.** The holder makes no model call, dispatches no tool and
   commits nothing unless its last successful acquire or renew started less
   than the self-fence window ago. The window is the lease minus the store's
   self-fence margin, so a paused process stops itself before its lease ends.
-  Past the window, Core renews first and goes on only if the renew succeeds.
   In the steady state this is a clock read, with no store request added to a
   round.
 
@@ -316,12 +317,13 @@ The store sets the renew interval, the lease and the self-fence margin with
 |---------|---------|--------|
 | Renew interval | 10 s | At least 1 s |
 | Lease | 30 s | At least 3 renew intervals, at most 1 hour |
-| Self-fence margin | One renew interval | More than 0 and less than the lease |
+| Self-fence margin | One renew interval | At least 1 renew interval, and the lease minus the margin at least 2 renew intervals |
 
 A shorter lease shortens the wait for the next process after a holder died,
 and at a takeover. A longer renew interval renews less often. The margin must
-exceed the time your store may take to make a write visible to other
-readers, so declare a larger one for a store whose writes can lag.
+be at least one renew interval plus twice the time your store may take to
+make a write visible to other readers, so declare a larger one for a store
+whose writes can lag.
 
 ### Loading
 

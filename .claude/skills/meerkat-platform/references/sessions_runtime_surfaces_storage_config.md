@@ -91,10 +91,13 @@ Contract, obligations and conformance: `docs/reference/host-store-spi.mdx`.
   (default 30 s, from 3 intervals to 1 hour) that the store sizes with
   `fence_timing()`. It makes no model call, dispatches nothing and writes
   nothing unless its last successful acquire or renew started less than the
-  lease minus the self-fence margin ago (one interval by default; a store
-  with lagging visibility declares more with `FenceTiming::try_with_margin`).
-  `FencedOut` stops every write until the realm is reopened; another failed
-  renew stops writes until a renew succeeds.
+  lease minus the self-fence margin ago. The margin defaults to one interval;
+  a store declares its own with `FenceTiming::try_with_margin`, at least
+  `renew interval + 2 x visibility lag`, and the window must stay at least
+  two intervals. `FencedOut` stops every write until the realm is reopened;
+  after any other failed renew, or a lease that ran out, the holder writes
+  and dispatches nothing until a fresh acquire (a later renew never restores
+  it).
 - Opening lists every head once. A session body loads at open only when
   recovery must act on it (unsettled inputs, an open run cursor, a current
   run), otherwise on first use, and stays loaded until the session is

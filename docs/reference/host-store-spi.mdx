@@ -211,15 +211,19 @@ self_fence_margin)`:
 |---------|---------|--------|
 | Renew interval | 10 s (`FENCE_RENEW_INTERVAL_SECS`) | At least 1 s (`FenceTiming::MIN_RENEW_INTERVAL`) |
 | Lease | 30 s (`FENCE_LEASE_SECS`) | At least 3 renew intervals (`FENCE_MIN_LEASE_RENEWALS`), at most 1 hour (`FenceTiming::MAX_LEASE`) |
-| Self-fence margin | One renew interval (`try_new`) | More than 0 and less than the lease |
+| Self-fence margin | One renew interval (`try_new`) | At least 1 renew interval, and the lease minus the margin at least 2 renew intervals |
 
-`FenceTiming::self_fence_window` is the lease minus the self-fence margin.
-The margin must exceed your store's visibility lag: a renew written just
-before a takeover can stay invisible to the new holder for that long, so the
-new holder's wait can end that much before the old holder's real lease, and
-the old holder must have stopped itself by then. A store whose writes become
-visible after a few seconds declares a margin larger than that. A shorter lease shortens the wait for the next process after a
-holder died, and at a takeover. A longer renew interval renews less often.
+`FenceTiming::self_fence_window` is the lease minus the self-fence margin,
+and `try_with_margin` refuses a margin below one renew interval or a window
+below two renew intervals. The margin must be at least the renew interval
+plus twice your store's visibility lag. A renew written just before a
+takeover can stay invisible to the new holder for up to that lag, and the
+holder renews only once per interval, so the new holder's wait can end
+before the old holder's real lease; the margin makes the old holder stop
+first. A store whose writes become visible after a few seconds declares a
+margin larger by twice that. A shorter lease shortens the wait for the next
+process after a holder died, and at a takeover. A longer renew interval
+renews less often.
 
 ### Core's Writer Rules
 
@@ -228,8 +232,10 @@ The store relies on Core keeping these rules:
 - **Exclusive acquire.** Core acquires with `AcquireMode::Exclusive`, so two
   processes never fence each other back and forth. Only an explicit takeover
   uses `AcquireMode::Takeover`.
-- **Renewing.** The holder renews once per renew interval and stops writing
-  when a renew fails.
+- **Renewing.** The holder renews once per renew interval. After a failed
+  renew, or once its lease has run out, it stops every write and dispatch,
+  and goes on only through a fresh acquire, with a new token; it never
+  resumes on a later renew.
 - **Self-fencing.** The holder fences itself on its own clock: it makes no
   model call, dispatches nothing and commits nothing unless its last
   successful acquire or renew started less than the self-fence window ago.
