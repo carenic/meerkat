@@ -34,7 +34,7 @@ use meerkat_core::{
 };
 use tokio::sync::mpsc;
 
-const MODEL: &str = "claude-opus-5";
+const MODEL: &str = "test-anthropic-model";
 
 /// How one scripted provider call accounts for itself.
 #[derive(Clone, Copy)]

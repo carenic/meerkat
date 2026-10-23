@@ -38,7 +38,7 @@ use tokio::sync::mpsc;
 /// The resolved model of every documented call. The loop rejects turn usage
 /// whose accounting identity disagrees with the client, so this is also the
 /// client's model.
-const DOCUMENTED_MODEL: &str = "claude-opus-5";
+const DOCUMENTED_MODEL: &str = "test-anthropic-model";
 
 /// One Anthropic-shaped provider call of the documented worked example.
 ///
@@ -466,7 +466,7 @@ fn legacy_session_totals_normalize_to_the_invariant_and_stay_monotone() {
             cache_read_tokens: Some(4000),
             ..Default::default()
         },
-        crate::ProviderTokenAccounting::anthropic("claude-opus-5", 300, 0, 4000),
+        crate::ProviderTokenAccounting::anthropic("test-anthropic-model", 300, 0, 4000),
     ));
     let live = crate::CumulativeUsage::from_usage(session.total_usage()).into_inner();
     let delta = live

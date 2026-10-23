@@ -18924,13 +18924,13 @@ mod tests {
         let claim =
             crate::provider_cache_breakpoint_claim(crate::ProviderCacheBreakpointClaimRequest {
                 provider: crate::Provider::Anthropic,
-                model: "claude-opus-5",
+                model: "test-anthropic-model",
                 messages,
                 boundary: crate::CacheBreakpointBoundary::TranscriptAfter { message_count },
                 ttl: crate::ProviderCacheTtl::ProviderDefault,
                 rendered_prefix: br#"{"renderer_mode":"session-test"}"#,
                 lowered_request_encoding: crate::LoweredRequestEncoding::AnthropicMessagesJson,
-                lowered_request_body: br#"{"model":"claude-opus-5"}"#,
+                lowered_request_body: br#"{"model":"test-anthropic-model"}"#,
             })
             .expect("test claim shape");
         crate::AuthoredCacheBreakpoint::from_provider_claim(claim)
@@ -19035,7 +19035,7 @@ mod tests {
             crate::CacheBreakpointDiscardReason::CanonicalPrefixMoved
         ));
         let identity = discard.identity().expect("a decoded proof has an identity");
-        assert_eq!(identity.model, "claude-opus-5");
+        assert_eq!(identity.model, "test-anthropic-model");
         assert_eq!(identity.provider, crate::Provider::Anthropic);
     }
 

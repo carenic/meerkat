@@ -260,6 +260,10 @@ them.
 
 ### Changed
 
+- `meerkat-core`: the shipped config template's commented
+  `[[model_fallback.chain]]` example names a placeholder model
+  (`model = "<model-id>"`) instead of a real model id.
+
 - `meerkat-core`: the `FORK_INSTRUCTION_REFUSED` message for a fork the
   policy refuses (cause `policy_refuses`) names the setting that changes it:
   "to carry them into the child, set the host's fork_instruction_policy
