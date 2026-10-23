@@ -2157,7 +2157,10 @@ impl MeerkatMachine {
     /// Every input commits through the lease's own driver. The archive's
     /// recovery then finds them terminal, so its commit terminalizes nothing
     /// this driver still holds, and the retire under the same lease does not
-    /// write over them.
+    /// write over them. The runless-terminal hint is told when this returns,
+    /// while the archive still holds M: it is a pure signal to a delivery
+    /// owner, which waits for M if it needs it, and the terminals it
+    /// announces are durable by then.
     pub async fn end_unresumed_work_with_archive_lease_before(
         &self,
         lease: &super::MachineSessionArchiveLease,
