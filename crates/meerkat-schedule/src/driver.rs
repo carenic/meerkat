@@ -4927,6 +4927,27 @@ mod tests {
         end: FirstAttemptEnd,
         name: &str,
     ) -> Result<(crate::ScheduleId, ScheduleDeliveryIdentity), ScheduleDomainError> {
+        first_attempt_died_past_the_deadline_under(
+            store,
+            service,
+            keyed,
+            end,
+            name,
+            MissingTargetPolicy::MarkMisfired,
+        )
+        .await
+    }
+
+    /// [`first_attempt_died_past_the_deadline`] for a schedule with
+    /// `missing_target_policy`.
+    async fn first_attempt_died_past_the_deadline_under(
+        store: &Arc<dyn ScheduleStore>,
+        service: &ScheduleService,
+        keyed: &KeyedInputDelivery,
+        end: FirstAttemptEnd,
+        name: &str,
+        missing_target_policy: MissingTargetPolicy,
+    ) -> Result<(crate::ScheduleId, ScheduleDeliveryIdentity), ScheduleDomainError> {
         let schedule = service
             .create(CreateScheduleRequest {
                 name: Some(name.into()),
@@ -4937,7 +4958,7 @@ mod tests {
                 target: materialize_on_demand_target("scheduled prompt"),
                 misfire_policy: MisfirePolicy::CatchUpWithin { window_seconds: 1 },
                 overlap_policy: OverlapPolicy::SkipIfRunning,
-                missing_target_policy: MissingTargetPolicy::MarkMisfired,
+                missing_target_policy,
                 labels: BTreeMap::new(),
                 planning_horizon_days: Some(1),
                 planning_horizon_occurrences: Some(1),
@@ -5341,6 +5362,142 @@ mod tests {
             delivery.keyed.admissions.lock().await.is_empty(),
             "nothing is admitted"
         );
+        Ok(())
+    }
+
+    /// A redelivery claimed after the first attempt ended as `end`, onto a
+    /// target whose probe answers Missing, under `missing_target_policy`: one
+    /// restarted tick. Returns the ended occurrence, the stages of its
+    /// receipts, and the delivery.
+    async fn redelivery_onto_a_missing_target(
+        end: FirstAttemptEnd,
+        missing_target_policy: MissingTargetPolicy,
+        name: &str,
+    ) -> Result<
+        (
+            Occurrence,
+            Vec<DeliveryReceiptStage>,
+            Arc<ExistingOnlyKeyedDelivery>,
+        ),
+        ScheduleDomainError,
+    > {
+        let store = Arc::new(MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>;
+        let service = ScheduleService::new(store.clone());
+        let delivery = Arc::new(ExistingOnlyKeyedDelivery::default());
+        let (schedule_id, _identity) = first_attempt_died_past_the_deadline_under(
+            &store,
+            &service,
+            &delivery.keyed,
+            end,
+            name,
+            missing_target_policy,
+        )
+        .await?;
+
+        let driver = ScheduleDriver::new(
+            service.clone(),
+            store.clone(),
+            Arc::new(StaticProbe(TargetProbeOutcome::Missing {
+                detail: Some("the target session is gone".to_string()),
+            })),
+            delivery.clone(),
+            "restarted-owner",
+            ScheduleDriverConfig {
+                claim_limit: 8,
+                lease_duration: Duration::seconds(30),
+            },
+        );
+        let report = driver.tick_once().await?;
+        assert_eq!(report.fault_count(), 0);
+        let ended = the_occurrence(&service, &schedule_id).await?;
+        let stages = store
+            .list_receipts(&ended.occurrence_id)
+            .await?
+            .into_iter()
+            .map(|receipt| receipt.stage)
+            .collect();
+        Ok((ended, stages, delivery))
+    }
+
+    /// An admitted redelivery whose target is gone follows the missing-target
+    /// policy, as any claim does: skip ends it Skipped and mark_misfired ends
+    /// it Misfired, both with target_missing, and the target is never asked
+    /// for the earlier admission. The receipts keep the first attempt's
+    /// admission, so a Skipped ending does not read as a delivery that never
+    /// ran.
+    #[tokio::test]
+    async fn an_admitted_redelivery_onto_a_missing_target_follows_the_missing_target_policy()
+    -> Result<(), ScheduleDomainError> {
+        for (policy, phase) in [
+            (MissingTargetPolicy::Skip, OccurrencePhase::Skipped),
+            (MissingTargetPolicy::MarkMisfired, OccurrencePhase::Misfired),
+        ] {
+            let (ended, stages, delivery) = redelivery_onto_a_missing_target(
+                FirstAttemptEnd::AdmissionRecorded,
+                policy.clone(),
+                &format!("admitted-redelivery-missing-target-{policy:?}"),
+            )
+            .await?;
+            assert_eq!(
+                (ended.phase, ended.failure_class),
+                (phase, Some(OccurrenceFailureClass::TargetMissing)),
+                "{policy:?}"
+            );
+            assert_eq!(ended.attempt_count, 2, "{policy:?}");
+            assert!(
+                delivery.existing_calls.lock().await.is_empty(),
+                "{policy:?}: the probe ends the redelivery before the target is asked"
+            );
+            assert_eq!(
+                delivery.keyed.admissions.lock().await.as_slice(),
+                &[RuntimeDeliveryOutcome::AdmissionAccepted],
+                "{policy:?}: only the first attempt was admitted"
+            );
+            assert!(
+                stages.contains(&DeliveryReceiptStage::DispatchAccepted),
+                "{policy:?}: the receipts keep the first attempt's admission: {stages:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// An unproven late redelivery whose target is gone follows the
+    /// missing-target policy too: under skip it ends Skipped with
+    /// target_missing, not Misfired as a target that answers not admitted
+    /// would end it. Nothing is admitted.
+    #[tokio::test]
+    async fn an_unproven_late_redelivery_onto_a_missing_target_follows_the_missing_target_policy()
+    -> Result<(), ScheduleDomainError> {
+        for (policy, phase) in [
+            (MissingTargetPolicy::Skip, OccurrencePhase::Skipped),
+            (MissingTargetPolicy::MarkMisfired, OccurrencePhase::Misfired),
+        ] {
+            let (ended, stages, delivery) = redelivery_onto_a_missing_target(
+                FirstAttemptEnd::DispatchStarted,
+                policy.clone(),
+                &format!("unproven-late-missing-target-{policy:?}"),
+            )
+            .await?;
+            assert_eq!(
+                (ended.phase, ended.failure_class),
+                (phase, Some(OccurrenceFailureClass::TargetMissing)),
+                "{policy:?}"
+            );
+            assert_eq!(ended.attempt_count, 2, "{policy:?}");
+            assert!(
+                delivery.existing_calls.lock().await.is_empty(),
+                "{policy:?}: the probe ends the redelivery before the target is asked"
+            );
+            assert!(
+                delivery.keyed.admissions.lock().await.is_empty(),
+                "{policy:?}: nothing is admitted"
+            );
+            assert!(
+                stages.contains(&DeliveryReceiptStage::DispatchStarted)
+                    && !stages.contains(&DeliveryReceiptStage::DispatchAccepted),
+                "{policy:?}: {stages:?}"
+            );
+        }
         Ok(())
     }
 
