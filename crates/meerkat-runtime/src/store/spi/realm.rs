@@ -1217,7 +1217,7 @@ impl SpiRealm {
             ));
         }
         self.check_realm()?;
-        for state in scopes.iter() {
+        for state in &*scopes {
             self.check_scope(state)?;
             if state.body != Body::Loaded {
                 return Err(SpiError::Misuse(format!(

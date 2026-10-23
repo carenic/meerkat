@@ -717,7 +717,7 @@ impl Bundle {
     /// Refuse, and poison the scope, when its in-memory state changed since
     /// its last commit without a holder of its lock.
     async fn check_witnesses(&self, guards: &mut [ScopeGuard]) -> Result<(), SpiError> {
-        for guard in guards.iter_mut() {
+        for guard in &mut *guards {
             let tag = guard.id().family.tag;
             let now = self.witness(tag).await;
             let recorded = lock_std(&self.witnesses).get(tag).cloned();
@@ -813,7 +813,7 @@ impl Bundle {
         let outcome = self.export_and_commit(touch, guards).await;
         if let Err(error) = &outcome {
             let cause = error.to_string();
-            for guard in guards.iter_mut() {
+            for guard in &mut *guards {
                 self.realm.poison(&mut **guard, &cause);
             }
         }
@@ -826,7 +826,7 @@ impl Bundle {
         guards: &mut [ScopeGuard],
     ) -> Result<(), MobStoreError> {
         let mut deltas = Vec::with_capacity(guards.len());
-        for guard in guards.iter() {
+        for guard in &*guards {
             let tag = guard.id().family.tag;
             let full = guard.wants_full_image();
             let delta = if tag == MOB_FAMILY.tag {
@@ -955,7 +955,7 @@ impl Bundle {
         )?);
         {
             let requests = metadata.member_operator_requests.read().await;
-            for ((mob_id, key), record) in requests.iter() {
+            for ((mob_id, key), record) in &*requests {
                 let stored_key = OperatorRequestKeyV1::new(mob_id, key);
                 out.push((
                     hashed_name(G_OPERATOR_REQUEST, &stored_key)?,
@@ -993,7 +993,7 @@ impl Bundle {
         )?);
         {
             let verifiers = metadata.callback_claim_verifiers.read().await;
-            for (mob_id, verifier) in verifiers.iter() {
+            for (mob_id, verifier) in &*verifiers {
                 out.push((
                     hashed_name(G_CLAIM_VERIFIER, mob_id)?,
                     encode_keyed(mob_id, &hex(verifier.as_bytes()))?,
@@ -1299,7 +1299,7 @@ impl Bundle {
         }
         {
             let intents = self.runs.remote_turn_intents.read().await;
-            for (key, value) in intents.iter() {
+            for (key, value) in &*intents {
                 image.insert(
                     run_turn_name(G_TURN_INTENT, &key.0, key.1)?,
                     encode_keyed(key, value)?,
@@ -1308,7 +1308,7 @@ impl Bundle {
         }
         {
             let receipts = self.runs.remote_turn_receipts.read().await;
-            for (key, value) in receipts.iter() {
+            for (key, value) in &*receipts {
                 image.insert(
                     run_turn_name(G_TURN_RECEIPT, &key.0, key.1)?,
                     encode_keyed(key, value)?,
@@ -1371,7 +1371,7 @@ impl Bundle {
     /// host opens the storage).
     async fn load(&self) -> Result<(), MobStoreError> {
         let mut guards = self.realm.lock_scopes(&self.all_scope_ids()).await;
-        for guard in guards.iter_mut() {
+        for guard in &mut guards {
             self.realm.check_scope(guard).map_err(read_error)?;
             let mut body = self
                 .realm
