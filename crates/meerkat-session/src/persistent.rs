@@ -25247,6 +25247,81 @@ mod tests {
         }
     }
 
+    /// A test builder whose agents keep the checkpointer the service installs
+    /// in them, as a production agent does: the factory hands
+    /// `build.checkpointer` to `AgentBuilder::with_checkpointer`. The service
+    /// keeps only a weak reference (`live_checkpointers`), and the dummy
+    /// agents drop theirs, so a dummy actor has no live checkpointer: a
+    /// resumed dispatch finds none, and a row cannot reach the checkpointer
+    /// its actor was built with. This builder holds each checkpointer it is
+    /// handed for its own life, which outlasts each actor; rows still reach
+    /// the live one through the service's registry.
+    struct CheckpointerHoldingBuilder<B> {
+        inner: B,
+        held: std::sync::Mutex<Vec<Arc<dyn meerkat_core::SessionCheckpointer>>>,
+    }
+
+    impl<B> CheckpointerHoldingBuilder<B> {
+        fn new(inner: B) -> Self {
+            Self {
+                inner,
+                held: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn hold(&self, req: &CreateSessionRequest) {
+            if let Some(checkpointer) = req
+                .build
+                .as_ref()
+                .and_then(|build| build.checkpointer.clone())
+            {
+                self.held
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(checkpointer);
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<B: SessionAgentBuilder> SessionAgentBuilder for CheckpointerHoldingBuilder<B> {
+        type Agent = B::Agent;
+
+        async fn model_supports_inline_video(
+            &self,
+            identity: &meerkat_core::SessionLlmIdentity,
+        ) -> Option<bool> {
+            self.inner.model_supports_inline_video(identity).await
+        }
+
+        async fn build_agent(
+            &self,
+            req: &CreateSessionRequest,
+            event_tx: tokio::sync::mpsc::Sender<meerkat_core::event::AgentEvent>,
+        ) -> Result<Self::Agent, SessionError> {
+            self.hold(req);
+            self.inner.build_agent(req, event_tx).await
+        }
+
+        async fn build_agent_taking_tools(
+            &self,
+            req: &mut CreateSessionRequest,
+            event_tx: tokio::sync::mpsc::Sender<meerkat_core::event::AgentEvent>,
+        ) -> Result<Self::Agent, SessionError> {
+            self.hold(req);
+            self.inner.build_agent_taking_tools(req, event_tx).await
+        }
+
+        async fn abort_absent_session_compaction_stages(
+            &self,
+            session_id: &SessionId,
+        ) -> Result<(), SessionError> {
+            self.inner
+                .abort_absent_session_compaction_stages(session_id)
+                .await
+        }
+    }
+
     #[tokio::test]
     async fn shutdown_preserves_legacy_unit_return() {
         let service = PersistentSessionService::new(
@@ -37021,7 +37096,7 @@ mod tests {
     #[tokio::test]
     async fn test_apply_runtime_turn_resume_run_without_a_seeded_receipt_is_refused() {
         let service = PersistentSessionService::new(
-            DummyBuilder,
+            CheckpointerHoldingBuilder::new(DummyBuilder),
             4,
             Arc::new(MemoryStore::new()),
             Arc::new(InMemoryRuntimeStore::new()),
@@ -37073,7 +37148,7 @@ mod tests {
     #[tokio::test]
     async fn test_apply_runtime_turn_resume_run_passes_the_seeded_receipt_and_run_inputs() {
         let service = PersistentSessionService::new(
-            DummyBuilder,
+            CheckpointerHoldingBuilder::new(DummyBuilder),
             4,
             Arc::new(MemoryStore::new()),
             Arc::new(InMemoryRuntimeStore::new()),
@@ -37147,7 +37222,7 @@ mod tests {
     async fn test_apply_runtime_turn_resume_run_on_a_diverged_image_is_refused_before_the_agent_runs()
      {
         let service = PersistentSessionService::new(
-            DummyBuilder,
+            CheckpointerHoldingBuilder::new(DummyBuilder),
             4,
             Arc::new(MemoryStore::new()),
             Arc::new(InMemoryRuntimeStore::new()),
@@ -37221,7 +37296,7 @@ mod tests {
     #[tokio::test]
     async fn test_apply_runtime_turn_resume_run_tolerates_a_message_appended_after_the_tail() {
         let service = PersistentSessionService::new(
-            DummyBuilder,
+            CheckpointerHoldingBuilder::new(DummyBuilder),
             4,
             Arc::new(MemoryStore::new()),
             Arc::new(InMemoryRuntimeStore::new()),
@@ -37290,7 +37365,7 @@ mod tests {
 
         let runtime_store = Arc::new(InMemoryRuntimeStore::new());
         let service = PersistentSessionService::new(
-            FailingRunBuilder,
+            CheckpointerHoldingBuilder::new(FailingRunBuilder),
             4,
             Arc::new(MemoryStore::new()),
             runtime_store.clone(),
@@ -37364,8 +37439,8 @@ mod tests {
         );
     }
 
-    fn fresh_store_checkpointer(
-        service: &PersistentSessionService<DummyBuilder>,
+    fn fresh_store_checkpointer<B: SessionAgentBuilder + 'static>(
+        service: &PersistentSessionService<B>,
     ) -> StoreCheckpointer {
         StoreCheckpointer {
             runtime_store: Arc::clone(&service.runtime_store),
@@ -37685,7 +37760,7 @@ mod tests {
     async fn a_rebased_runs_failure_is_consumed_or_stops_never_replayed() {
         let runtime_store = Arc::new(InMemoryRuntimeStore::new());
         let service = PersistentSessionService::new(
-            FailingRunBuilder,
+            CheckpointerHoldingBuilder::new(FailingRunBuilder),
             4,
             Arc::new(MemoryStore::new()),
             runtime_store,
@@ -37772,7 +37847,7 @@ mod tests {
         use meerkat_core::SessionCheckpointer as _;
 
         let service = PersistentSessionService::new(
-            FailingRunBuilder,
+            CheckpointerHoldingBuilder::new(FailingRunBuilder),
             4,
             Arc::new(MemoryStore::new()),
             Arc::new(InMemoryRuntimeStore::new()),
@@ -37866,7 +37941,7 @@ mod tests {
 
         let runtime_store = Arc::new(InMemoryRuntimeStore::new());
         let service = PersistentSessionService::new(
-            MachineTerminalRunBuilder,
+            CheckpointerHoldingBuilder::new(MachineTerminalRunBuilder),
             4,
             Arc::new(MemoryStore::new()),
             runtime_store.clone(),
@@ -37963,7 +38038,7 @@ mod tests {
     async fn an_unknown_rebase_outcome_is_settled_from_the_store() {
         let runtime_store = Arc::new(InMemoryRuntimeStore::new());
         let service = PersistentSessionService::new(
-            DummyBuilder,
+            CheckpointerHoldingBuilder::new(DummyBuilder),
             4,
             Arc::new(MemoryStore::new()),
             runtime_store.clone(),
@@ -38217,7 +38292,7 @@ mod tests {
         use meerkat_core::SessionCheckpointer as _;
 
         let service = PersistentSessionService::new(
-            DummyBuilder,
+            CheckpointerHoldingBuilder::new(DummyBuilder),
             4,
             Arc::new(MemoryStore::new()),
             Arc::new(InMemoryRuntimeStore::new()),
