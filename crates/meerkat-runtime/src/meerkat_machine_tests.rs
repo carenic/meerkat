@@ -1072,6 +1072,91 @@ fn memory_blob_store() -> Arc<dyn meerkat_core::BlobStore> {
     Arc::new(meerkat_store::MemoryBlobStore::new())
 }
 
+/// A graceful process shutdown that names no disposition (rkat-rpc's and the
+/// REST server's) requeues on a runtime with a persistence store, with the
+/// 15 minute default max age recorded exactly, and stops on a runtime
+/// without one. Its until-terminal unregister entry point refuses a
+/// disposition it cannot record before it starts anything, as the other
+/// entry points do, and with the ephemeral default it unregisters the exact
+/// registration to terminal.
+#[tokio::test]
+async fn a_graceful_shutdown_requeues_on_a_persistent_runtime_and_stops_on_an_ephemeral_one() {
+    use crate::meerkat_machine::{UnregisterQueuedInputs, UnregisterQueuedInputsError};
+
+    let store: Arc<dyn crate::store::RuntimeStore> =
+        Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let persistent =
+        MeerkatMachine::persistent(store, memory_blob_store()).expect("persistent machine");
+    let ephemeral = MeerkatMachine::ephemeral();
+    assert_eq!(
+        UnregisterQueuedInputs::DEFAULT_MAX_AGE,
+        Duration::from_mins(15)
+    );
+    assert_eq!(
+        persistent.graceful_shutdown_queued_inputs(),
+        UnregisterQueuedInputs::Requeue {
+            max_age: UnregisterQueuedInputs::DEFAULT_MAX_AGE
+        }
+    );
+    assert_eq!(
+        persistent
+            .graceful_shutdown_queued_inputs()
+            .recorded()
+            .map(|disposition| disposition.dsl_disposition()),
+        Ok((
+            crate::meerkat_machine::dsl::UnregisterQueuedInputsDisposition::Requeue,
+            900_000
+        ))
+    );
+    assert_eq!(
+        ephemeral.graceful_shutdown_queued_inputs(),
+        UnregisterQueuedInputs::Stop
+    );
+
+    let session_id = SessionId::new();
+    ephemeral
+        .register_session(session_id.clone())
+        .await
+        .expect("register the session");
+    let registration = ephemeral
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("the registered session exposes its exact registration");
+    let refused = ephemeral
+        .unregister_session_registration_until_terminal_with_queued_inputs_if_current(
+            &registration,
+            UnregisterQueuedInputs::Requeue {
+                max_age: Duration::ZERO,
+            },
+        )
+        .await
+        .expect_err("an unrecordable disposition is refused");
+    assert!(
+        matches!(
+            refused,
+            RuntimeDriverError::QueuedInputsRefused(
+                UnregisterQueuedInputsError::MaxAgeUnderOneMillisecond { .. }
+            )
+        ),
+        "{refused}"
+    );
+    assert!(
+        ephemeral.contains_session(&session_id).await,
+        "a refused disposition starts no unregister"
+    );
+    let unregistered = ephemeral
+        .unregister_session_registration_until_terminal_with_queued_inputs_if_current(
+            &registration,
+            ephemeral.graceful_shutdown_queued_inputs(),
+        )
+        .await
+        .expect("the shutdown unregister completes");
+    assert!(
+        unregistered && !ephemeral.contains_session(&session_id).await,
+        "the exact registration is torn down to terminal"
+    );
+}
+
 #[derive(Clone)]
 struct SequencedRuntimeWriteFence {
     outcomes: Arc<std::sync::Mutex<VecDeque<crate::store::RuntimeStoreWriteFenceOutcome>>>,

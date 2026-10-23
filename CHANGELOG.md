@@ -1469,6 +1469,26 @@ them.
   or cancel, retire, destroy and reset still end the run as before, and a run
   whose turn has already ended (completed, failed or cancelled) is never
   suspended.
+- `rkat-rpc` and `rkat-rest`: a graceful shutdown keeps a durable session's
+  work for its next start instead of cancelling it. `rkat-rpc`'s shutdown
+  (when its input ends, on SIGTERM or on an interrupt) and the REST server's
+  (on SIGTERM or Ctrl+C) unregister every session with the runtime's graceful
+  disposition, `MeerkatMachine::graceful_shutdown_queued_inputs`:
+  `UnregisterQueuedInputs::Requeue` with a 15 minute max age
+  (`UnregisterQueuedInputs::DEFAULT_MAX_AGE`) on a runtime with a persistence
+  store, and `Stop` on one without, as before. Eligible queued prompts stay
+  queued, their waiters answered `requeued_across_stop`, and the run in
+  flight of a session that commits each round is suspended for the session's
+  next open (the requeue stop above). Both servers now shut the runtime down
+  before they cancel the requests still in flight (with `--tcp`, each
+  connection keeps its tracked requests until the shared runtime has shut
+  down), so a tracked request's cancellation no longer ends its run first,
+  and the REST server now unregisters its sessions at shutdown, which it did
+  not. An unregister that names no disposition still stops. `meerkat-runtime`
+  adds
+  `MeerkatMachine::unregister_session_registration_until_terminal_with_queued_inputs_if_current`
+  and `meerkat-rest` adds `unregister_runtime_sessions_for_shutdown`, the
+  entry points the two shutdowns use.
 - `meerkat-core`, `meerkat-session`, `meerkat-runtime`: a HeadCanonical run's
   round commits (see Added, per-round commits) move its durable head over the
   run's compaction rewrites, and the run retires its compaction history to

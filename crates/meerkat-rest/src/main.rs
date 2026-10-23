@@ -265,7 +265,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
-    // Cancel in-flight requests and abort stragglers.
+    // Stop schedule delivery first, so no occurrence admits work into a
+    // session the shutdown tears down.
+    shutdown_state.shutdown_schedule_host().await;
+
+    // Unregister the runtime's sessions before cancelling the requests still
+    // tracked: on a runtime with a persistence store the unregisters requeue,
+    // keeping the run in flight of a session that commits each round for its
+    // next start, where cancelling its request first would cancel the run.
+    meerkat_rest::unregister_runtime_sessions_for_shutdown(&shutdown_state).await;
+
+    // Cancel the requests still tracked and abort stragglers.
     shutdown_state
         .request_executor
         .shutdown_and_abort_stragglers()
@@ -274,8 +284,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Shut down all live MCP adapters to close connections cleanly.
     #[cfg(feature = "mcp")]
     meerkat_rest::shutdown_all_mcp_sessions(&shutdown_state).await;
-
-    shutdown_state.shutdown_schedule_host().await;
 
     tracing::info!("Server shutdown complete");
     Ok(())
