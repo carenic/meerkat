@@ -2795,7 +2795,9 @@ them.
 
 ### Security
 
-- tokio updated to 1.53.3 for RUSTSEC-2026-0386.
+- tokio updated to 1.53.3 for RUSTSEC-2026-0386. The workspace still
+  accepts tokio 1.43 and later, so update tokio to >= 1.53.3 in your
+  lockfile (RUSTSEC-2026-0386).
 
 ### Upgrade notes
 
