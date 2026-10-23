@@ -1773,6 +1773,14 @@ them.
   on its own, on the identity reconcile's backoff (250 ms doubling to 60 s),
   and once it succeeds the member's started retirement is re-driven and
   completes. Any other restore failure still fails the start.
+- `meerkat`: an agent built from an `AgentBuildConfig` whose mob tools are
+  disabled (`override_mob` `Disable`) while it carries a generated mob
+  operator authority context no longer mounts the factory's mob tool surface.
+  Only an embedder that builds the config directly can set both (session
+  build options resolve `Disable` to no authority context). The build's
+  external mob operator tools were already bound to no authority, hidden and
+  denying every call; the factory's own mob tools (`delegate`,
+  `mob_spawn_member` and the rest) still mounted beside them.
 
 ## [0.9.4] - 2026-10-20
 

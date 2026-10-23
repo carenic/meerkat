@@ -8648,13 +8648,18 @@ impl AgentFactory {
         );
 
         // 9d. Compose tools with mob surface (after comms/scheduler/WorkGraph, so mob
-        // gateway wraps the already-composed base capability stack).
-        let effective_mob = build_config
-            .mob_tool_authority_context
-            .as_ref()
-            .is_some_and(
-                meerkat_core::service::MobToolAuthorityContext::is_generated_authority_context,
-            );
+        // gateway wraps the already-composed base capability stack). A build
+        // with mob tools disabled mounts no mob surface even when it carries a
+        // generated authority context (an embedder can set both directly):
+        // the mob operator dispatchers in its external tools were bound to no
+        // authority above, so they hide and deny, and this surface agrees.
+        let effective_mob = !matches!(build_config.override_mob, ToolCategoryOverride::Disable)
+            && build_config
+                .mob_tool_authority_context
+                .as_ref()
+                .is_some_and(
+                    meerkat_core::service::MobToolAuthorityContext::is_generated_authority_context,
+                );
         let mob_factory = build_config
             .mob_tools
             .take()
@@ -22311,6 +22316,69 @@ mod prompt_tests {
         assert_eq!(
             operator_spawn.description, OPERATOR_SPAWN_DESCRIPTION,
             "the operator tool definition keeps its full description"
+        );
+    }
+
+    /// A build with mob tools disabled mounts no mob surface, even when it
+    /// carries a generated mob operator authority context: only an embedder
+    /// that builds the config directly can set both (session build options
+    /// resolve Disable to no context). Its external mob operator tools are
+    /// bound to no authority, so the factory's mob surface must not mount
+    /// either. Before, the surface keyed on the context alone and mounted.
+    /// The control build, the same config with mob tools not disabled, mounts
+    /// it.
+    #[tokio::test]
+    async fn disabled_mob_tools_mount_no_mob_surface_even_with_a_generated_authority() {
+        async fn build_with(override_mob: ToolCategoryOverride) -> Vec<String> {
+            let temp = tempfile::tempdir().unwrap();
+            let mut build_config = external_only_build_config();
+            build_config.override_mob = override_mob;
+            build_config.mob_tool_authority_context = Some(
+                meerkat_runtime::mob_operator_authority::create_only_mob_operator_authority()
+                    .expect("generated create-only mob authority"),
+            );
+            let agent = AgentFactory::new(temp.path().join("sessions"))
+                .builtins(false)
+                .mob(true)
+                .mob_tools_factory(Arc::new(StaticMobToolsFactory {
+                    dispatcher: Arc::new(UsageTestDispatcher {
+                        tools: mob_surface_tools(&[
+                            ("delegate", "Run one bounded helper task."),
+                            ("mob_spawn_member", "Spawn a member into a mob."),
+                        ]),
+                        exact_catalog: false,
+                        may_require_control_plane: false,
+                        pending_sources: Arc::from([]),
+                    }),
+                }))
+                .build_agent(build_config, &Config::default())
+                .await
+                .unwrap();
+            agent
+                .tool_scope()
+                .visible_tools()
+                .iter()
+                .map(|tool| tool.name.as_str().to_string())
+                .collect()
+        }
+
+        let disabled = build_with(ToolCategoryOverride::Disable).await;
+        assert!(
+            !disabled
+                .iter()
+                .any(|name| name == "delegate" || name == "mob_spawn_member"),
+            "a build with mob tools disabled mounts no mob surface: {disabled:?}"
+        );
+        assert!(
+            disabled.iter().any(|name| name == "visible"),
+            "the build's other tools stay: {disabled:?}"
+        );
+
+        let enabled = build_with(ToolCategoryOverride::Inherit).await;
+        assert!(
+            enabled.iter().any(|name| name == "delegate")
+                && enabled.iter().any(|name| name == "mob_spawn_member"),
+            "the same build with mob tools not disabled mounts the surface: {enabled:?}"
         );
     }
 
