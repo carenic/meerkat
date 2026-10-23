@@ -45,6 +45,46 @@ fn hold_next_decision(state_path: &Path) -> (mpsc::Receiver<()>, mpsc::Sender<()
     (entered_rx, release_tx)
 }
 
+/// Set in the child process [`alone_in_child_process`] runs a row in.
+const ALONE_CHILD: &str = "MEERKAT_READ_CUSTODY_ROW_ALONE";
+/// Printed by that child once the row's body has passed.
+const ALONE_CHILD_DONE: &str = "read custody row passed alone";
+
+/// Run `body`, the body of this module's row `row`, alone in a child process
+/// of the test binary, and require it to pass there.
+///
+/// Custody is a `flock`, which belongs to the open file description. A
+/// process that another test of this binary spawns holds a copy of every
+/// descriptor this process has open until it executes its program, so the
+/// custody the fixture took and released while installing can still be held
+/// by such a copy when a row takes custody with a single try. Those rows run
+/// where no other test spawns anything.
+async fn alone_in_child_process(row: &str, body: impl std::future::Future<Output = ()>) {
+    if std::env::var_os(ALONE_CHILD).is_some() {
+        body.await;
+        println!("\n{ALONE_CHILD_DONE}");
+        return;
+    }
+    #[allow(clippy::disallowed_methods)] // the row re-runs its own test binary
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            &format!("governed_realm::read_custody_tests::{row}"),
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(ALONE_CHILD, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains(ALONE_CHILD_DONE),
+        "{row} failed alone in its child process ({}):\n{stdout}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn ceilinged_server() -> McpServerConfig {
     let mut server = McpServerConfig::stdio("reader", "true", Vec::new(), HashMap::new());
     server.access = Some(meerkat_core::McpServerAccess::allowing(["echo"]));
@@ -95,57 +135,62 @@ impl Installed {
 
 #[tokio::test]
 async fn an_overlapping_decision_passes_while_one_holds_read_custody() {
-    let fixture = Installed::new().await;
-    let (entered, release) = hold_next_decision(&fixture.state_path());
-    let first = {
-        let installed = Arc::clone(&fixture.installed);
-        let server = fixture.server.clone();
-        std::thread::spawn(move || installed.check(&server))
-    };
-    entered
-        .recv_timeout(Duration::from_secs(10))
-        .expect("the first decision holds its read custody");
+    alone_in_child_process(
+        "an_overlapping_decision_passes_while_one_holds_read_custody",
+        async {
+            let fixture = Installed::new().await;
+            let (entered, release) = hold_next_decision(&fixture.state_path());
+            let first = {
+                let installed = Arc::clone(&fixture.installed);
+                let server = fixture.server.clone();
+                std::thread::spawn(move || installed.check(&server))
+            };
+            entered
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the first decision holds its read custody");
 
-    // While the first decision holds its custody, before it read anything:
-    // a second decision reads the actual document and passes, and a writer
-    // is excluded.
-    assert_eq!(fixture.installed.check(&fixture.server), Ok(()));
-    assert!(
-        ConfigWriterLock::try_hold(&fixture.lock_path())
-            .unwrap()
-            .is_none(),
-        "a held read excludes writers"
-    );
+            // While the first decision holds its custody, before it read anything:
+            // a second decision reads the actual document and passes, and a writer
+            // is excluded.
+            assert_eq!(fixture.installed.check(&fixture.server), Ok(()));
+            assert!(
+                ConfigWriterLock::try_hold(&fixture.lock_path())
+                    .unwrap()
+                    .is_none(),
+                "a held read excludes writers"
+            );
 
-    release.send(()).unwrap();
-    assert_eq!(first.join().unwrap(), Ok(()));
-    assert!(
-        ConfigWriterLock::try_hold(&fixture.lock_path())
-            .unwrap()
-            .is_some(),
-        "a writer proceeds once the reads released"
-    );
+            release.send(()).unwrap();
+            assert_eq!(first.join().unwrap(), Ok(()));
+            assert!(
+                ConfigWriterLock::try_hold(&fixture.lock_path())
+                    .unwrap()
+                    .is_some(),
+                "a writer proceeds once the reads released"
+            );
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn a_held_writer_refuses_the_decision_until_it_releases() {
-    let fixture = Installed::new().await;
-    // A process another test spawns holds a copy of every descriptor this
-    // process has open until it executes its program. This lock stands for
-    // such a copy of the writer custody the fixture took and released while
-    // installing.
-    let inherited = std::fs::File::open(fixture.lock_path()).unwrap();
-    inherited.lock().unwrap();
-    let writer = ConfigWriterLock::try_hold(&fixture.lock_path())
-        .unwrap()
-        .expect("writer custody");
-    assert_eq!(
-        fixture.installed.check(&fixture.server),
-        Err(McpAttachmentRefusal::NotCurrent)
-    );
-    drop(writer);
-    assert_eq!(fixture.installed.check(&fixture.server), Ok(()));
-    drop(inherited);
+    alone_in_child_process(
+        "a_held_writer_refuses_the_decision_until_it_releases",
+        async {
+            let fixture = Installed::new().await;
+            let writer = ConfigWriterLock::try_hold(&fixture.lock_path())
+                .unwrap()
+                .expect("writer custody");
+            assert_eq!(
+                fixture.installed.check(&fixture.server),
+                Err(McpAttachmentRefusal::NotCurrent)
+            );
+            drop(writer);
+            assert_eq!(fixture.installed.check(&fixture.server), Ok(()));
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -186,19 +231,26 @@ async fn a_replaced_or_removed_installation_at_an_unchanged_generation_is_refuse
 
 #[tokio::test]
 async fn an_administrative_hold_on_the_snapshot_stays_exclusive() {
-    let fixture = Installed::new().await;
-    let Ok((hold, installed)) = installation_under_writer_exclusion(&fixture.paths, "reader")
-    else {
-        panic!("the administrative hold");
-    };
-    assert_eq!(installed, Some(fixture.server.clone()));
-    // While an administrative command acts on the snapshot, decisions and
-    // other administrative holds are refused.
-    assert_eq!(
-        fixture.installed.check(&fixture.server),
-        Err(McpAttachmentRefusal::NotCurrent)
-    );
-    assert!(installation_under_writer_exclusion(&fixture.paths, "reader").is_err());
-    drop(hold);
-    assert_eq!(fixture.installed.check(&fixture.server), Ok(()));
+    alone_in_child_process(
+        "an_administrative_hold_on_the_snapshot_stays_exclusive",
+        async {
+            let fixture = Installed::new().await;
+            let Ok((hold, installed)) =
+                installation_under_writer_exclusion(&fixture.paths, "reader")
+            else {
+                panic!("the administrative hold");
+            };
+            assert_eq!(installed, Some(fixture.server.clone()));
+            // While an administrative command acts on the snapshot, decisions and
+            // other administrative holds are refused.
+            assert_eq!(
+                fixture.installed.check(&fixture.server),
+                Err(McpAttachmentRefusal::NotCurrent)
+            );
+            assert!(installation_under_writer_exclusion(&fixture.paths, "reader").is_err());
+            drop(hold);
+            assert_eq!(fixture.installed.check(&fixture.server), Ok(()));
+        },
+    )
+    .await;
 }
