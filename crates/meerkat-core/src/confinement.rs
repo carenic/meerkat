@@ -932,6 +932,14 @@ mod tests {
             markers.push(marker);
         }
         let search_path = std::env::join_paths([&writable, &trusted]).unwrap();
+        // A process another test spawns holds a copy of every descriptor this
+        // process has open until it executes its program. This handle stands
+        // for such a copy of the trusted opener's write descriptor, taken
+        // while the row wrote it and still open when the row runs it.
+        let inherited = std::fs::OpenOptions::new()
+            .write(true)
+            .open(trusted.join("xdg-open"))
+            .unwrap();
         let untrusted = move |path: &Path, _: bool| path.starts_with(&writable);
 
         let environment = || vec![(std::ffi::OsString::from("PATH"), search_path.clone())];
@@ -954,6 +962,7 @@ mod tests {
             "a program only an untrusted directory holds is not found"
         );
         assert!(!markers[2].exists());
+        drop(inherited);
     }
 
     /// Where neither `/bin/stty` nor `/usr/bin/stty` exists (NixOS keeps
