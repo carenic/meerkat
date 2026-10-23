@@ -1332,15 +1332,7 @@ where
         ) {
             return Ok(());
         }
-        let held = self
-            .session
-            .durable_head_holds_retirement(retention)
-            .map_err(|error| {
-                AgentError::InternalError(format!(
-                    "failed to read the retained transcript history: {error}"
-                ))
-            })?;
-        if !held {
+        if !self.session.durable_head_holds_retirement(retention) {
             return Ok(());
         }
         let Some(run_id) = self.runtime_turn_authority_snapshot()?.active_run_id else {
@@ -1419,23 +1411,21 @@ where
                 // run made, so the live history retires to the retention now
                 // instead of at the next compaction. The boundary commit that
                 // promotes the run applies the same cut to the stored rows.
-                if let Some(compactor) = self.compactor.clone() {
-                    self.session
-                        .retire_transcript_history(compactor.transcript_history_retention())
+                // Only a session with a durable HeadCanonical head whose graph
+                // this process holds validated does any work here; an
+                // unchanged graph is not parsed or validated again.
+                if let Some(compactor) = self.compactor.clone()
+                    && let Some(retired) = self
+                        .session
+                        .retire_transcript_history_after_checkpoint(
+                            compactor.transcript_history_retention(),
+                        )
                         .map_err(|error| {
                             AgentError::InternalError(format!(
                                 "failed to retire transcript history after its checkpoint: {error}"
                             ))
-                        })?;
-                    let retired = self
-                        .session
-                        .validated_transcript_history_state()
-                        .map_err(|error| {
-                            AgentError::InternalError(format!(
-                                "failed to read the retained transcript history: {error}"
-                            ))
                         })?
-                        .map_or(0, |history| history.state().retired_count());
+                {
                     checkpointer.note_run_transcript_retirement(
                         run_id,
                         u64::try_from(retired).unwrap_or(u64::MAX),
