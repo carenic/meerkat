@@ -2130,6 +2130,16 @@ them.
   terminal with its dropped count. This remains bounded, best-effort delivery;
   it does not replay lost events or change mob-stream overflow behavior.
 
+- `meerkat-gemini`: a tool result's `functionResponse.response` uses
+  Gemini's documented keys. A successful call's text is sent as
+  `{"output": text}` and a failed call's as `{"error": text}`. Every result
+  was sent as `{"content": text, "error": <is_error>}`, which names an
+  `error` key even on success and no `output`, so the model could take a
+  successful call as one that produced no output. The function response's
+  `name` and `id`, the image parts that follow it and its lack of a thought
+  signature are unchanged. The request bytes of every Gemini tool
+  continuation change, so a resumed session takes one prompt-cache miss.
+
 ### Known limitations
 
 - `meerkat-mob`: role-target admission and each step's choice of targets are
