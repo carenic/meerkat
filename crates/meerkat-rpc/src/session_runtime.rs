@@ -17,7 +17,7 @@ mod schedule_host;
 #[path = "session_runtime/governed.rs"]
 mod governed;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock, Weak};
@@ -138,6 +138,35 @@ pub(crate) async fn realtime_open_projection_test_guard() -> tokio::sync::OwnedM
 struct RuntimePreAdmissionEntry {
     input_id: InputId,
     admission: RpcRuntimePreAdmission,
+}
+
+/// Per session, the inputs whose admitting request opted out of its turn's
+/// `session/event` copies.
+type TurnSessionEventOptOuts = Arc<StdMutex<HashMap<SessionId, HashSet<InputId>>>>;
+
+/// A request's opt-out of its turn's `session/event` copies, held while the
+/// request runs. Dropping it forgets the input, whether or not its turn ran:
+/// a turn no request waits on (a resumed run, a requeued input) writes its
+/// events as usual.
+pub(crate) struct TurnSessionEventsOptOut {
+    opt_outs: TurnSessionEventOptOuts,
+    session_id: SessionId,
+    input_id: InputId,
+}
+
+impl Drop for TurnSessionEventsOptOut {
+    fn drop(&mut self) {
+        let mut opt_outs = self
+            .opt_outs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(inputs) = opt_outs.get_mut(&self.session_id) {
+            inputs.remove(&self.input_id);
+            if inputs.is_empty() {
+                opt_outs.remove(&self.session_id);
+            }
+        }
+    }
 }
 
 pub(crate) struct RpcRuntimePreAdmission {
@@ -2525,6 +2554,10 @@ pub struct SessionRuntime {
     /// materialized into live session handles.
     staged_capacity_admissions: StagedCapacityAdmissions,
     runtime_pre_admissions: Arc<StdMutex<HashMap<SessionId, Vec<RuntimePreAdmissionEntry>>>>,
+    /// The inputs whose admitting request asked that its turn's events not
+    /// be written as `session/event` notifications, while that request runs
+    /// (see [`TurnSessionEventsOptOut`]).
+    turn_session_event_opt_outs: TurnSessionEventOptOuts,
     runtime_registration_locks: Arc<StdMutex<HashMap<SessionId, Weak<Mutex<()>>>>>,
     runtime_actor_witness_slots:
         Arc<StdRwLock<HashMap<SessionId, meerkat::LiveSessionActorWitnessSlot>>>,
@@ -3634,6 +3667,7 @@ impl SessionRuntime {
             pending_session_event_streams,
             staged_capacity_admissions,
             runtime_pre_admissions: Arc::new(StdMutex::new(HashMap::new())),
+            turn_session_event_opt_outs: TurnSessionEventOptOuts::default(),
             runtime_registration_locks: Arc::new(StdMutex::new(HashMap::new())),
             commissioned_config_store: None,
             runtime_actor_witness_slots: Arc::new(StdRwLock::new(HashMap::new())),
@@ -3808,6 +3842,7 @@ impl SessionRuntime {
             pending_session_event_streams,
             staged_capacity_admissions,
             runtime_pre_admissions: Arc::new(StdMutex::new(HashMap::new())),
+            turn_session_event_opt_outs: TurnSessionEventOptOuts::default(),
             runtime_registration_locks: Arc::new(StdMutex::new(HashMap::new())),
             commissioned_config_store: None,
             runtime_actor_witness_slots: Arc::new(StdRwLock::new(HashMap::new())),
@@ -4197,6 +4232,52 @@ impl SessionRuntime {
 
     fn discard_staged_capacity_admission(&self, session_id: &SessionId) {
         admission_discard_staged_capacity(&self.staged_capacity_admissions, session_id);
+    }
+
+    /// Record, before `input_id` is admitted, that its request asked for its
+    /// turn's events not to be written as `session/event` notifications. The
+    /// record lasts as long as the returned guard.
+    fn record_turn_session_events_opt_out(
+        &self,
+        session_id: &SessionId,
+        input_id: &InputId,
+    ) -> TurnSessionEventsOptOut {
+        self.turn_session_event_opt_outs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(session_id.clone())
+            .or_default()
+            .insert(input_id.clone());
+        TurnSessionEventsOptOut {
+            opt_outs: Arc::clone(&self.turn_session_event_opt_outs),
+            session_id: session_id.clone(),
+            input_id: input_id.clone(),
+        }
+    }
+
+    /// Whether the turn applying `input_ids` writes its events as
+    /// `session/event` notifications: yes unless every one of its inputs was
+    /// admitted by a request that opted out. A turn whose inputs no request
+    /// started (queued work, comms, schedules, a resumed run), or that also
+    /// carries the input of a request that wants the events, writes them.
+    pub(crate) fn turn_writes_session_events(
+        &self,
+        session_id: &SessionId,
+        input_ids: &[InputId],
+    ) -> bool {
+        if input_ids.is_empty() {
+            return true;
+        }
+        let opt_outs = self
+            .turn_session_event_opt_outs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match opt_outs.get(session_id) {
+            Some(opted_out) => !input_ids
+                .iter()
+                .all(|input_id| opted_out.contains(input_id)),
+            None => true,
+        }
     }
 
     pub(crate) fn take_runtime_pre_admission(
@@ -8338,6 +8419,7 @@ impl SessionRuntime {
             additional_instructions,
             overrides,
             None,
+            true,
         )
         .await
     }
@@ -8347,6 +8429,11 @@ impl SessionRuntime {
     /// Before admission, cancellation is request-local because no session run
     /// belongs to the request. Once the runtime accepts an exact input, the
     /// action is upgraded to cancel only that accepted input.
+    ///
+    /// `session_events: false` is the request's opt-out of its turn's
+    /// `session/event` copies: the turn applying this request's input writes
+    /// none, unless another input of the same turn wants them (see
+    /// [`Self::turn_writes_session_events`]).
     #[allow(clippy::too_many_arguments, unused_variables)]
     pub async fn start_turn_via_runtime_with_request_context(
         self: &Arc<Self>,
@@ -8359,6 +8446,7 @@ impl SessionRuntime {
         additional_instructions: Option<Vec<String>>,
         overrides: Option<crate::handlers::turn::TurnOverrides>,
         request_context: Option<RequestContext>,
+        session_events: bool,
     ) -> Result<RunResult, RpcError> {
         use meerkat_runtime::accept::AcceptOutcome;
         use meerkat_runtime::input::{Input, PromptInput};
@@ -8463,6 +8551,10 @@ impl SessionRuntime {
                 .with_injected_context(injected_context),
         );
         let input_id = input.id().clone();
+        // Recorded before the input is admitted, so the executor that applies
+        // it already sees the opt-out; held until this request returns.
+        let _session_events_opt_out = (!session_events)
+            .then(|| self.record_turn_session_events_opt_out(session_id, &input_id));
 
         if let Err(primary) = self.ensure_runtime_executor(session_id).await {
             return Err(self
@@ -15764,6 +15856,37 @@ mod tests {
     /// - A registered catalog model with no provider resolves to the catalog
     ///   owner.
     /// - An explicit provider that contradicts the catalog owner is rejected.
+    /// A turn writes its `session/event` copies unless every one of its
+    /// inputs was admitted by a request that opted out, and a request's
+    /// opt-out ends with the request.
+    #[tokio::test]
+    async fn a_turn_writes_session_events_unless_every_input_opted_out() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = make_runtime(temp_factory(&temp), 4);
+        let session = SessionId::new();
+        let opted_out = InputId::new();
+        let wants = InputId::new();
+        let request = runtime.record_turn_session_events_opt_out(&session, &opted_out);
+
+        assert!(!runtime.turn_writes_session_events(&session, std::slice::from_ref(&opted_out)));
+        assert!(
+            runtime.turn_writes_session_events(&session, &[opted_out.clone(), wants.clone()]),
+            "another input of the same turn wants the events"
+        );
+        assert!(runtime.turn_writes_session_events(&session, std::slice::from_ref(&wants)));
+        assert!(
+            runtime.turn_writes_session_events(&SessionId::new(), std::slice::from_ref(&opted_out)),
+            "the opt-out is per session"
+        );
+        assert!(runtime.turn_writes_session_events(&session, &[]));
+
+        drop(request);
+        assert!(
+            runtime.turn_writes_session_events(&session, std::slice::from_ref(&opted_out)),
+            "the opt-out ends with its request"
+        );
+    }
+
     #[tokio::test]
     async fn create_provider_resolves_through_registered_owner_fail_closed() {
         let temp = tempfile::tempdir().expect("tempdir");

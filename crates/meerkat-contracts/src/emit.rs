@@ -2319,6 +2319,7 @@ mod tests {
             "structured_output_retries",
             "provider_params",
             "auth_binding",
+            "session_events",
         ] {
             assert!(
                 properties.contains_key(field),

@@ -570,6 +570,18 @@ them.
   role_targets, and an in-flight bound run canceled by an older runtime loses
   it; a gate must treat a missing binding as not authorized.
 
+- `meerkat-core`: `AgentEvent::ToolExecutionCompleted`
+  (`tool_execution_completed`) no longer carries the tool result body: its
+  `content` field is removed, and the event is `{ id, name, is_error,
+  duration_ms }`. `AgentEvent::ToolResultReceived` (`tool_result_received`)
+  for the same `id` is the only event that carries the body; read it there.
+  Each tool result body is now written once per event stream instead of
+  twice. A stored event that still has `content` decodes, and the field is
+  ignored. SDKs before 0.9.5 reading a 0.9.5 server: the Python SDK requires
+  `content` on `tool_execution_completed`, so it parses the event as a
+  malformed `UnknownEvent` (`malformed_event`); the TypeScript SDK parses it
+  with an empty `content` list.
+
 ### Added
 
 - `MeerkatMachine::session_input_states` exposes the existing strict input
@@ -1250,6 +1262,17 @@ them.
   `ExecutionCustodyLost` like any other run; its binding stays on the record
   and nothing reuses it, so the next run is admitted afresh.
 
+- `rkat-rpc`: `turn/start`, `session/create` (for its first turn) and
+  `mob/turn_start` take `session_events`. With `false`, the turn's events are
+  not written as `session/event` notifications; absent or `true` keeps them.
+  A caller that reads the turn's events from a `session/stream_open`
+  subscription, or reads only the run result, sends it so each event reaches
+  it once. A turn that also carries the input of a request that wants the
+  events still writes them, and turns that no turn-starting request admitted
+  (external events, comms, schedules, resumed runs) are unchanged. A server
+  before 0.9.5 refuses the field on `turn/start` and `mob/turn_start` and
+  ignores it on `session/create`.
+
 ### Changed
 
 - `meerkat-core`, `meerkat-session`, `meerkat-runtime`: a HeadCanonical run
@@ -1327,6 +1350,14 @@ them.
   compare-and-swap over it. In `meerkat-core`'s generated version authority,
   `STORED_INPUT_STATE_VERSION` is 8, and `STORED_INPUT_STATE_BASELINE_VERSION`
   (7) and `stored_input_state_version_for_row` are new.
+
+- Python and TypeScript SDKs: calls that do not stream their turn
+  (`create_session` / `createSession`, a session's `turn`, and
+  `mob_turn_start` / `mobTurnStart`) send `session_events: false` to a server
+  whose contract is 0.9.5 or later. The server then writes each of the turn's
+  events once, on a subscription if one is open, instead of also writing a
+  `session/event` copy that the SDK parsed and dropped. Streaming calls are
+  unchanged.
 
 ### Fixed
 
@@ -2054,6 +2085,11 @@ them.
   member facts; the mob machine does not decide them itself. The role-wide
   target choice every flow step already used works the same way. The 0.9.6
   line moves both into the mob machine.
+
+- `rkat-rpc`: a session subscription that overflowed reports its gap (the
+  `stream_lagged` marker, and a typed SDK error when the stream ends with the
+  gap open) but does not refill it. Take a run's token accounting from its
+  run result, not from the streamed events.
 
 ## [0.9.4] - 2026-10-20
 

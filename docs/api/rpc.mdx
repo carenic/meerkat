@@ -1274,6 +1274,16 @@ arrives while another turn on the same session is running is queued behind
 it: it runs once the running turn finishes, and the call returns its own
 result. It is not refused with `-32002` (`SESSION_BUSY`).
 
+Since 0.9.5, `"session_events": false` asks that the turn's events not be
+written as `session/event` notifications. A caller that reads them from a
+`session/stream_open` subscription, or reads only the run result, sends it so
+each event reaches it once. Absent or `true` keeps them. A turn that also
+carries the input of another request that wants them still writes them.
+`session/create` (for its first turn) and `mob/turn_start` take the same
+field. A server before 0.9.5 refuses it on `turn/start` and `mob/turn_start`,
+so the Python and TypeScript SDKs send it, from calls that do not stream
+their turn, only to a server whose contract version is 0.9.5 or later.
+
 A turn that fails returns the JSON-RPC code of its typed cause, as the
 [session error mapping](/reference/capability-matrix#error-codes) does for the
 same causes: `-32010` (provider error) for `llm_failure` and
