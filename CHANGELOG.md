@@ -563,6 +563,13 @@ them.
 
 ### Added
 
+- `MeerkatMachine::session_input_states` exposes the existing strict input
+  witness observation through the selected machine. It includes pending and
+  terminal rows, fails on corrupt durable rows, and reads unregistered sessions
+  without restoring them. It does not fence ingress or establish settlement;
+  hosts must separately establish the close boundary and inspect each input's
+  canonical terminal receipt.
+
 - `meerkat_core::host_store`: the host store SPI, a small storage interface
   a host implements so that Core can keep a realm's durable state in the
   host's own database, an append only store such as BigQuery included. A
