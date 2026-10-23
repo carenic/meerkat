@@ -24382,20 +24382,24 @@ macro_rules! meerkat_catalog_machine_dsl {
 
         // A graceful requeue stop (a deploy) keeps a durable session's
         // in-flight run resumable at its last committed round, exactly as a
-        // crash does (A28). The shell has already stopped the turn without a
+        // crash does. The shell has already stopped the turn without a
         // closing save or a boundary. The run stops being current, the
         // pre-run phase is restored, and the run is marked resumable, so the
         // stop classifier keeps its bound inputs bound and the stored cursor
         // resumes it at the next start. No turn terminal is recorded and no
-        // input changes. A run of a Retired runtime, a session without
-        // per-round commits, a stop that does not requeue, or a run with a
-        // published live-boundary join is not suspended: the shell cancels it
-        // as before.
+        // input changes. A run of a Retired runtime, a run whose turn
+        // terminal is already published (completed, failed or cancelled), a
+        // session without per-round commits, a stop that does not requeue,
+        // or a run with a published live-boundary join is not suspended: the
+        // shell ends it as before.
         transition SuspendRunForStopRunningToIdle {
             on input SuspendRunForStop { run_id, durable_session }
             guard { self.lifecycle_phase == Phase::Running }
             guard "pre_run_phase_matches_idle" { self.pre_run_phase == Some(PreRunPhase::Idle) }
             guard "current_run_id_matches_binding" { self.current_run_id == Some(run_id) }
+            // A run whose turn terminal is published has ended: it is never
+            // marked resumable (it would resume after its own outcome).
+            guard "run_turn_not_terminal" { self.turn_terminal_run_id != Some(run_id) }
             guard "requeue_stop" {
                 self.registration_phase == RegistrationPhase::Draining
                 && self.unregister_queued_inputs == UnregisterQueuedInputsDisposition::Requeue
@@ -24425,6 +24429,9 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard { self.lifecycle_phase == Phase::Running }
             guard "pre_run_phase_matches_attached" { self.pre_run_phase == Some(PreRunPhase::Attached) }
             guard "current_run_id_matches_binding" { self.current_run_id == Some(run_id) }
+            // A run whose turn terminal is published has ended: it is never
+            // marked resumable (it would resume after its own outcome).
+            guard "run_turn_not_terminal" { self.turn_terminal_run_id != Some(run_id) }
             guard "requeue_stop" {
                 self.registration_phase == RegistrationPhase::Draining
                 && self.unregister_queued_inputs == UnregisterQueuedInputsDisposition::Requeue

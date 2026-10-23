@@ -1460,7 +1460,9 @@ them.
   mark, their waiters are answered `RequeuedAcrossStop`, and the next start
   resumes the run from its last committed round, or ends its inputs as
   `RequeueExpired` past the max age. A stop without Requeue, an explicit stop
-  or cancel, retire, destroy and reset still end the run as before.
+  or cancel, retire, destroy and reset still end the run as before, and a run
+  whose turn has already ended (completed, failed or cancelled) is never
+  suspended.
 - `meerkat-core`, `meerkat-session`, `meerkat-runtime`: a HeadCanonical run's
   round commits (see Added, per-round commits) move its durable head over the
   run's compaction rewrites, and the run retires its compaction history to

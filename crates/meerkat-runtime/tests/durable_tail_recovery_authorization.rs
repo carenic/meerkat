@@ -1014,9 +1014,10 @@ fn marked_run_resumes_exclusively_through_prepare_then_resume_run() {
     assert_eq!(authority.state().current_run_id, Some(marked));
 }
 
-/// A graceful requeue stop suspends a durable session's in-flight run (A28):
-/// the run stops being current, the pre-run phase returns, and the run is
-/// marked resumable, with no turn terminal. Unrun.
+/// A graceful requeue stop suspends a durable session's in-flight run: the
+/// run stops being current, the pre-run phase returns, and the run is marked
+/// resumable, with no turn terminal. A run whose turn terminal is already
+/// published is never suspended. Unrun.
 #[test]
 fn requeue_stop_suspends_a_durable_in_flight_run() {
     let run = mm_dsl::RunId("run-in-flight".to_string());
@@ -1043,6 +1044,26 @@ fn requeue_stop_suspends_a_durable_in_flight_run() {
         .is_err(),
         "a session without per-round commits is cancelled, not suspended"
     );
+
+    let mut ended =
+        mm_dsl::MeerkatMachineAuthority::recover_from_state(mm_dsl::MeerkatMachineState {
+            turn_terminal_run_id: Some(run.clone()),
+            terminal_outcome: Some(mm_dsl::TurnTerminalOutcome::Completed),
+            ..draining_running()
+        })
+        .expect("a draining running state with a published terminal must be recoverable");
+    assert!(
+        mm_dsl::MeerkatMachineMutator::apply(
+            &mut ended,
+            mm_dsl::MeerkatMachineInput::SuspendRunForStop {
+                run_id: run.clone(),
+                durable_session: true,
+            },
+        )
+        .is_err(),
+        "a run whose turn terminal is published ended; it is never marked resumable"
+    );
+    assert_eq!(ended.state().resumable_run_id, None);
 
     let mut durable = mm_dsl::MeerkatMachineAuthority::recover_from_state(draining_running())
         .expect("a draining running state must be recoverable");

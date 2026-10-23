@@ -15,7 +15,7 @@
 # whole bounded space once (safety), then reruns it once per reachability
 # witness with that witness's negation as an extra invariant and requires
 # TLC to report exactly that violation, so the invariants are not vacuous.
-# With --mutants it then seeds fifteen defects into a copy of the generated
+# With --mutants it then seeds seventeen defects into a copy of the generated
 # model (or, for the serve-before-settle control, into the audit's settlement
 # order) and requires TLC to refuse each with the invariant it breaks: a
 # verdict that ignores the phase and lane, one that reads a fact the
@@ -23,9 +23,11 @@
 # skips staged inputs, an expiry abandon that keeps the input queued,
 # serving before the settlement, a verdict without the disposition, four
 # verdicts each without one eligibility conjunct, an Abandon arm that
-# overlaps Retain, and a requeued wait-failure arm that writes state, is
-# guarded on the session or answers any failure. An anchor this script
-# expects but cannot find fails the run.
+# overlaps Retain, a requeued wait-failure arm that writes state, is
+# guarded on the session or answers any failure, a suspend of a run whose
+# turn terminal is published, and a staged-row normalization that requeues
+# the suspended run's input. An anchor this script expects but cannot find
+# fails the run.
 set -euo pipefail
 
 usage="usage: requeue_across_stop_audit.sh <max-steps> [--mutants] [extra tlc args...]"
@@ -120,6 +122,8 @@ write_cfg() {
   AuditRequeuedWaitAnswerChangesNothing
 INVARIANTS
   AuditRetainedNeverRunBeforeRestart
+  AuditSuspendedRunNeverRestaged
+  AuditSuspendedRunNotTerminal
   AuditRetainedGetsNoCarrier
   AuditStoppedInputGetsItsCarrier
   AuditOneRunAcrossStopAndRestart
@@ -171,7 +175,8 @@ if [[ "${tlc_status}" != "0" ]] \
 fi
 
 for witness in RetainedRunsAfterGracefulStop RetainedRunsAfterCrash ExpiredSettled \
-  StagedNotRetained StopAbandonsEligible PlainStopAbandons RequeuedWaitAnswered; do
+  StagedNotRetained StopAbandonsEligible PlainStopAbandons RequeuedWaitAnswered \
+  SuspendedRunResumes; do
   cfg="${work_dir}/witness-${witness}.cfg"
   write_cfg "${cfg}" TRUE "
   NotAuditWitness${witness}"
@@ -404,6 +409,41 @@ for arm in os.environ["ARMS"].split():
     assert len(hits) == 1, f"expected one queued-prompt guard line in {arm}, found {len(hits)}"
     lines[hits[0]] = "    /\\ TRUE"
     text = text[:start] + "\n".join(lines) + text[end:]
+open(path, "w").write(text)
+PY
+
+  # The suspend refuses a run whose turn terminal is published: without that
+  # guard, a run cancelled before the requeue stop is marked resumable.
+  mutate suspends_terminal_run AuditSuspendedRunNotTerminal TRUE <<'PY'
+import os
+path = os.environ["MODEL"]
+text = open(path).read()
+for arm in ("SuspendRunForStopRunningToIdle", "SuspendRunForStopRunningToAttached"):
+    start = text.index("\n" + arm + "(") + 1
+    end = text.index("\n\n", start)
+    block = text[start:end]
+    old = "    /\\ (turn_terminal_run_id # Some(run_id))\n"
+    assert block.count(old) == 1, f"turn terminal guard not found in {arm}"
+    text = text[:start] + block.replace(old, "") + text[end:]
+open(path, "w").write(text)
+PY
+
+  # The staged-row normalization requeues only a row the marked run does not
+  # bind: without that guard, the suspended run's input can be queued again
+  # and staged into a run of process 2. That state also breaks P3 (A ran in
+  # process 1); the config lists this invariant first, so TLC names it.
+  mutate requeues_bound_staged_row AuditSuspendedRunNeverRestaged TRUE <<'PY'
+import os
+path = os.environ["MODEL"]
+text = open(path).read()
+for arm_phase in ("Initializing", "Idle", "Attached", "Running", "Retired", "Stopped"):
+    arm = "NormalizeRecoveredInputStaged" + arm_phase
+    start = text.index("\n" + arm + "(") + 1
+    end = text.index("\n\n", start)
+    block = text[start:end]
+    old = "    /\\ (bound_run_resumable = FALSE)\n"
+    assert block.count(old) == 1, f"bound guard not found in {arm}"
+    text = text[:start] + block.replace(old, "") + text[end:]
 open(path, "w").write(text)
 PY
 

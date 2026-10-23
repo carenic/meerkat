@@ -6373,8 +6373,8 @@ pub(crate) fn machine_begin_resumed_run(
     Ok(ResumedRunStart::Started { input_ids })
 }
 
-/// Suspend the current run for a graceful requeue stop (A28): the run stops
-/// being current and is marked resumable, with no turn terminal and no input
+/// Suspend the current run for a graceful requeue stop: the run stops being
+/// current and is marked resumable, with no turn terminal and no input
 /// change, so the stop keeps its bound inputs and the next start resumes it
 /// from its last committed round. The caller has already stopped the turn
 /// without a closing save or a boundary. `durable_session` is the caller's
@@ -6382,8 +6382,9 @@ pub(crate) fn machine_begin_resumed_run(
 ///
 /// `Ok(false)`, with nothing changed, when the machine refuses: the stop does
 /// not requeue, the session is not durable, a live-boundary join is still
-/// published, the runtime is retiring, or `run_id` is not the current run.
-/// The caller then cancels the run as before.
+/// published, the runtime is retiring, `run_id` is not the current run, or
+/// the run's turn terminal is already published. The caller then ends the
+/// run as before.
 pub(crate) fn machine_suspend_run_for_stop(
     driver: &mut DriverEntry,
     run_id: &RunId,

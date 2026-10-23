@@ -18,8 +18,10 @@
 \* it, then admits an input B behind that run with every combination of kind
 \* (Prompt, ExternalEvent), durability, directedness and objective binding (a
 \* member's kickoff carries its objective id). It begins an unregister with
-\* either disposition, or none at all, and either cancels A's run (the run
-\* cancel ends A Abandoned(Cancelled)) or leaves it running, then stops the
+\* either disposition, or none at all, and cancels A's run (the run cancel
+\* ends A Abandoned(Cancelled)), leaves it running, or, under Requeue,
+\* suspends it (SuspendRunForStop: the run stops being current and is marked
+\* resumable, so the stop keeps A Staged and bound to it), then stops the
 \* runtime. The stop classifies each non-terminal input twice, as the shell
 \* does: once for the carriers before the exit and once for the cleanup after
 \* it (the shell refuses a stop whose two answers differ). After the stop it
@@ -31,13 +33,25 @@
 \* requeue_across_stop_audit.sh), and each durable non-terminal row is
 \* recovered through the generated recovery arms (the durability and
 \* normalization classifiers, RecoverAdmittedInput, RecoverInputLifecycle).
-\* Then each marked row is settled before the serving gate, with the shell's
-\* expired observation either value, the executor attaches and the runtime
-\* loop runs. Properties (all invariants):
+\* A suspended run is marked resumable when process 2 registers, before any
+\* row is normalized (the audit takes its tail as committed: a round of the
+\* run committed before the stop), and the generated normalization verdict
+\* keeps A Staged and bound to it. Then each marked row is settled before
+\* the serving gate, with the shell's expired observation either value (an
+\* expired suspended run first ends its mark with SettleResumableRun), the
+\* executor attaches and the runtime loop runs: a run marked resumable
+\* starts under its own id and resumes (Prepare, then ResumeRun). Properties
+\* (all invariants):
 \*
-\*   AuditRetainedNeverRunBeforeRestart (P1): no input answered Retain was
-\*     ever staged into a run of process 1, and it stays Queued until the
-\*     restart.
+\*   AuditRetainedNeverRunBeforeRestart (P1): no queued input answered
+\*     Retain was ever staged into a run of process 1, and it stays Queued
+\*     until the restart; the suspended run's input, staged before the stop,
+\*     stays Staged.
+\*   AuditSuspendedRunNeverRestaged: the suspended run's input is never
+\*     staged again: process 2 resumes the run it stays bound to.
+\*   AuditSuspendedRunNotTerminal: a run marked resumable never has a
+\*     published turn terminal, so a run that completed, failed or was
+\*     cancelled is never suspended.
 \*   AuditRetainedGetsNoCarrier (P2): no input a stop kept is in the carrier
 \*     set of any stop transaction of process 1, the first or a replay.
 \*   AuditStoppedInputGetsItsCarrier (P2, converse): every input a stop
@@ -55,7 +69,9 @@
 \*     stop outside an unregister every input is answered Abandon: today's
 \*     blanket abandon.
 \*   AuditRetainOnlyEligible: a kept input is a Queue-lane Prompt, durable
-\*     and not directed, by the facts its admission recorded.
+\*     and not directed, by the facts its admission recorded. (The
+\*     suspended run's arm keeps any input bound to that run; A is a durable
+\*     undirected prompt, so this property says nothing about that arm.)
 \*   AuditRetainNeverObjectiveBound: a kept input is never objective-bound,
 \*     so a kickoff the stopping process records failed is never run later.
 \*   AuditStopVerdictIsAFunction: during a stop transaction exactly one of
@@ -69,7 +85,7 @@
 \*
 \* AuditWitness* operators are reachability goals the runner checks as
 \* expected violations, so the invariants are not vacuous. The runner's
-\* --mutants mode seeds eleven defects, at least one per invariant, into a
+\* --mutants mode seeds seventeen defects, at least one per invariant, into a
 \* copy of the generated model (or, for the serve-before-settle control, the
 \* audit's settlement order) and requires TLC to refuse each with the
 \* invariant it breaks.
@@ -114,7 +130,9 @@ VARIABLES
     audit_rows,            \* the durable non-terminal rows process 2 recovers
     audit_recovery,        \* each recovered row's progress through recovery
     audit_settled,         \* kept rows the pre-serve settlement handled
-    audit_expired          \* kept rows the settlement ended RequeueExpired
+    audit_expired,         \* kept rows the settlement ended RequeueExpired
+    audit_suspended,       \* process 1's requeue stop suspended A's run
+    audit_resumed          \* process 2 resumed the suspended run
 
 setupVars == <<audit_facts, audit_disposition, audit_attempts>>
 regionVars == <<audit_pending, audit_pre_verdict, audit_post_verdict, audit_abandoned>>
@@ -122,8 +140,9 @@ historyVars == <<audit_retained, audit_replay_retained, audit_carriers, audit_st
                  audit_unregistered>>
 runVars == <<audit_staged_p1, audit_staged_p2, audit_runs>>
 restartVars == <<audit_rows, audit_recovery, audit_settled, audit_expired>>
+resumeVars == <<audit_suspended, audit_resumed>>
 auditVars == <<audit_stage, setupVars, regionVars, historyVars, runVars, restartVars,
-              audit_wait_answered>>
+              audit_wait_answered, resumeVars>>
 
 AuditSession == "sessionid_1"
 AuditA == "input_1"
@@ -145,8 +164,8 @@ Answered(verdicts, v) == {i \in DOMAIN verdicts : verdicts[i] = v}
 \* ---- generated arms, one disjunct per phase ----
 
 \* The Retain verdict has two arms per phase: an eligible queued prompt, and
-\* an input of a run marked resumable (never enabled here: this audit marks
-\* no run resumable, so it only keeps the verdict a function over all arms).
+\* an input bound to a run marked resumable (here, the in-flight run a
+\* requeue stop suspended).
 RetainArm(i, d, dir, obj) ==
     \/ ClassifyStopInputDispositionRetainInitializing(i, d, dir, obj)
     \/ ClassifyStopInputDispositionRetainIdle(i, d, dir, obj)
@@ -226,7 +245,7 @@ AuditSetup ==
           /\ audit_runs' = [audit_runs EXCEPT ![AuditA] = @ + 1]
           /\ UNCHANGED <<audit_stage, setupVars, regionVars, historyVars, audit_staged_p2,
                          restartVars,
-                   audit_wait_answered>>
+                   audit_wait_answered, resumeVars>>
        \/ model_step_count = 7
           /\ \E kind \in AuditKinds, d \in InputDurabilityKindValues, dir \in BOOLEAN,
                 obj \in BOOLEAN :
@@ -236,12 +255,12 @@ AuditSetup ==
                                                              objective_bound |-> obj])
           /\ UNCHANGED <<audit_stage, audit_disposition, audit_attempts, regionVars,
                          historyVars, runVars, restartVars,
-                   audit_wait_answered>>
+                   audit_wait_answered, resumeVars>>
        \/ model_step_count = 8
           /\ QueueAcceptedRunning(AuditB)
           /\ audit_stage' = "P1"
           /\ UNCHANGED <<setupVars, regionVars, historyVars, runVars, restartVars,
-                   audit_wait_answered>>
+                   audit_wait_answered, resumeVars>>
 
 \* The host begins its unregister, before the stop or after a plain stop.
 AuditBeginUnregister ==
@@ -252,7 +271,7 @@ AuditBeginUnregister ==
           /\ audit_disposition' = disp
     /\ UNCHANGED <<audit_stage, audit_facts, audit_attempts, regionVars, historyVars,
                    runVars, restartVars,
-                   audit_wait_answered>>
+                   audit_wait_answered, resumeVars>>
 
 \* The run cancel: A's run ends cancelled and its staged input ends
 \* Abandoned(Cancelled).
@@ -267,6 +286,18 @@ AuditCancelRun ==
           /\ AbandonAny(AuditA, "Cancelled", Attempts(AuditA))
     /\ KeepAudit
 
+\* The graceful requeue stop of a durable session suspends the in-flight run
+\* instead of cancelling it, before the stop's first classification. A's run
+\* stops being current and is marked resumable, so the stop keeps A Staged
+\* and bound to it (ClassifyStopInputDispositionRetainResumable).
+AuditSuspendRun ==
+    /\ audit_stage = "P1"
+    /\ ~audit_suspended
+    /\ SuspendRunForStopRunningToAttached(AuditRun, TRUE)
+    /\ audit_suspended' = TRUE
+    /\ UNCHANGED <<audit_stage, setupVars, regionVars, historyVars, runVars, restartVars,
+                   audit_resumed, audit_wait_answered>>
+
 \* A stop transaction: the first stop of the runtime, or a replay of it from
 \* Stopped (once). The open step is the shell taking the driver lock.
 AuditOpenStop ==
@@ -279,7 +310,7 @@ AuditOpenStop ==
     /\ audit_abandoned' = {}
     /\ UNCHANGED vars
     /\ UNCHANGED <<setupVars, historyVars, runVars, restartVars,
-                   audit_wait_answered>>
+                   audit_wait_answered, resumeVars>>
 
 \* Before the exit: the inputs answered Abandon get the runless carrier.
 AuditClassifyForCarriers ==
@@ -292,7 +323,7 @@ AuditClassifyForCarriers ==
     /\ UNCHANGED <<audit_stage, setupVars, audit_post_verdict, audit_abandoned,
                    audit_retained, audit_replay_retained, audit_stopped,
                    audit_unregistered, runVars, restartVars,
-                   audit_wait_answered>>
+                   audit_wait_answered, resumeVars>>
 
 AuditStopExit ==
     /\ audit_stage = "PreExit"
@@ -302,7 +333,7 @@ AuditStopExit ==
     /\ audit_pending' = NonTerminalInputs
     /\ UNCHANGED <<setupVars, audit_pre_verdict, audit_post_verdict, audit_abandoned,
                    historyVars, runVars, restartVars,
-                   audit_wait_answered>>
+                   audit_wait_answered, resumeVars>>
 
 \* After the exit: the cleanup classifies again and ends the Abandon set.
 AuditClassifyForCleanup ==
@@ -312,7 +343,7 @@ AuditClassifyForCleanup ==
           /\ audit_pending' = audit_pending \ {i}
     /\ UNCHANGED <<audit_stage, setupVars, audit_pre_verdict, audit_abandoned,
                    historyVars, runVars, restartVars,
-                   audit_wait_answered>>
+                   audit_wait_answered, resumeVars>>
 
 AuditStopAbandon ==
     /\ audit_stage = "PostExit"
@@ -323,7 +354,7 @@ AuditStopAbandon ==
     /\ UNCHANGED <<audit_stage, setupVars, audit_pending, audit_pre_verdict,
                    audit_post_verdict, audit_retained, audit_replay_retained,
                    audit_carriers, audit_unregistered, runVars, restartVars,
-                   audit_wait_answered>>
+                   audit_wait_answered, resumeVars>>
 
 AuditCommitStop ==
     /\ audit_stage = "PostExit"
@@ -339,7 +370,7 @@ AuditCommitStop ==
     /\ UNCHANGED vars
     /\ UNCHANGED <<audit_facts, audit_disposition, regionVars, audit_carriers,
                    audit_stopped, audit_unregistered, runVars, restartVars,
-                   audit_wait_answered>>
+                   audit_wait_answered, resumeVars>>
 
 AuditUnregisterDrain ==
     /\ audit_stage = "P1Stopped"
@@ -352,7 +383,7 @@ AuditUnregisterDrain ==
           /\ UNCHANGED <<audit_stage, setupVars, regionVars, audit_retained,
                          audit_replay_retained, audit_carriers, audit_stopped, runVars,
                          restartVars,
-                   audit_wait_answered>>
+                   audit_wait_answered, resumeVars>>
 
 \* The stopping process answers a kept input's waiter from the generated
 \* wait-failure class (once here; the arm repeats freely).
@@ -362,7 +393,8 @@ AuditAnswerRequeuedWait ==
     /\ ~audit_wait_answered
     /\ ResolveWaitAny(AuditSession, "RequeuedAcrossStop")
     /\ audit_wait_answered' = TRUE
-    /\ UNCHANGED <<audit_stage, setupVars, regionVars, historyVars, runVars, restartVars>>
+    /\ UNCHANGED <<audit_stage, setupVars, regionVars, historyVars, runVars, restartVars,
+                   resumeVars>>
 
 \* ---- the restart: a new process ----
 
@@ -385,7 +417,7 @@ AuditRestart ==
     /\ audit_stage' = "P2Start"
     /\ UNCHANGED <<setupVars, regionVars, historyVars, runVars, audit_settled,
                    audit_expired,
-                   audit_wait_answered>>
+                   audit_wait_answered, resumeVars>>
 
 AuditStartProcess2 ==
     /\ audit_stage = "P2Start"
@@ -393,23 +425,57 @@ AuditStartProcess2 ==
        \/ /\ RegisterSessionIdle(AuditSession, None, {})
           /\ audit_stage' = "P2Recover"
           /\ UNCHANGED <<setupVars, regionVars, historyVars, runVars, restartVars,
-                   audit_wait_answered>>
+                   audit_wait_answered, resumeVars>>
 
-\* No run is marked resumable in this audit, so no row is bound to one.
-NormalizeArm(i, p) ==
-    \/ p = "Queued" /\ NormalizeRecoveredInputQueuedIdle(i, p, None, FALSE)
-    \/ p = "Staged" /\ NormalizeRecoveredInputStagedIdle(i, p, None, FALSE)
+\* The registration of process 2 finds the suspended run's continuable tail
+\* and marks the run resumable before any row is normalized. The audit takes
+\* the tail as committed: a round of the run committed before the stop (a
+\* run with no committed round leaves no tail, and its input is requeued as
+\* on any restart).
+SuspendedRunContinues ==
+    /\ audit_suspended
+    /\ AuditA \in DOMAIN audit_rows
+    /\ audit_rows[AuditA].phase = "Staged"
+
+AuditMarkSuspendedRun ==
+    /\ audit_stage = "P2Recover"
+    /\ SuspendedRunContinues
+    /\ resumable_run_id = None
+    /\ \A i \in DOMAIN audit_recovery : audit_recovery[i] = "Durability"
+    /\ MarkRunResumableIdle(AuditRun)
+    /\ KeepAudit
+
+\* The shell's normalization observation: the stored cursor binds the row to
+\* the run the registration marked (the suspended run's Staged input).
+BoundToResumableRun(i) ==
+    /\ audit_suspended
+    /\ i = AuditA
+    /\ resumable_run_id = Some(AuditRun)
 
 RecoveryStep(i, next) ==
     /\ audit_recovery' = [audit_recovery EXCEPT ![i] = next]
     /\ UNCHANGED <<audit_stage, setupVars, regionVars, historyVars, runVars, audit_rows,
                    audit_settled, audit_expired,
-                   audit_wait_answered>>
+                   audit_wait_answered, resumeVars>>
+
+\* The generated normalization verdict decides how a row is recovered: kept
+\* Staged and bound to the marked run, or Queued again.
+NormalizeArm(i, p, bound) ==
+    \/ /\ p = "Queued"
+       /\ NormalizeRecoveredInputQueuedIdle(i, p, None, bound)
+       /\ RecoveryStep(i, "Admit")
+    \/ /\ p = "Staged"
+       /\ NormalizeRecoveredInputStagedIdle(i, p, None, bound)
+       /\ RecoveryStep(i, "Admit")
+    \/ /\ p = "Staged"
+       /\ NormalizeRecoveredInputStagedResumableIdle(i, p, None, bound)
+       /\ RecoveryStep(i, "AdmitBound")
 
 \* Cold recovery of each durable non-terminal row through the generated
 \* arms: the durability classifier (an Ephemeral row is discarded), the
 \* normalization classifier for the row's phase, then the admitted input and
-\* its lifecycle, Queued (a staged row is queued again).
+\* its lifecycle: Queued (a staged row is queued again), or Staged and bound
+\* to the marked run when the verdict kept it bound.
 AuditRecoverRow ==
     /\ audit_stage = "P2Recover"
     /\ \E i \in DOMAIN audit_recovery :
@@ -422,15 +488,22 @@ AuditRecoverRow ==
                 \/ ClassifyRecoveredInputDurabilityDiscardEphemeralIdle(i, f.durability)
                    /\ RecoveryStep(i, "Discarded")
           \/ /\ audit_recovery[i] = "Normalize"
-             /\ NormalizeArm(i, r.phase)
-             /\ RecoveryStep(i, "Admit")
-          \/ /\ audit_recovery[i] = "Admit"
+             /\ (SuspendedRunContinues => resumable_run_id = Some(AuditRun))
+             /\ NormalizeArm(i, r.phase, BoundToResumableRun(i))
+          \/ /\ audit_recovery[i] \in {"Admit", "AdmitBound"}
              /\ RecoverAdmittedInputIdle(i, f.kind, r.boundary, r.exec, None, r.lane)
-             /\ RecoveryStep(i, "Lifecycle")
+             /\ RecoveryStep(i, IF audit_recovery[i] = "Admit" THEN "Lifecycle"
+                                                              ELSE "LifecycleBound")
           \/ /\ audit_recovery[i] = "Lifecycle"
              /\ RecoverInputLifecycleIdle(i, "Queued", None, None, None, None, 0,
                    r.attempts, None, None, Some(r.seq), None, Some(r.lane),
                    Some(r.lane), Some(r.boundary), Some(r.exec), None, r.is_prompt)
+             /\ RecoveryStep(i, "Recovered")
+          \* A row the verdict kept bound stays Staged, associated with its run.
+          \/ /\ audit_recovery[i] = "LifecycleBound"
+             /\ RecoverInputLifecycleIdle(i, "Staged", None, None, None, None, 0,
+                   r.attempts, Some(AuditRun), None, Some(r.seq), None, Some(r.lane),
+                   None, None, None, None, FALSE)
              /\ RecoveryStep(i, "Recovered")
 
 RecoveredRows == {i \in DOMAIN audit_recovery : audit_recovery[i] = "Recovered"}
@@ -442,7 +515,7 @@ AuditRecoveryDone ==
     /\ audit_stage' = "P2Settle"
     /\ UNCHANGED vars
     /\ UNCHANGED <<setupVars, regionVars, historyVars, runVars, restartVars,
-                   audit_wait_answered>>
+                   audit_wait_answered, resumeVars>>
 
 \* The pre-serve settlement: the shell observes each marked row's age, and
 \* an expired row ends with the generated AbandonInput(RequeueExpired).
@@ -451,14 +524,31 @@ SettleStages == IF AuditSettleBeforeServe THEN {"P2Settle"} ELSE {"P2Settle", "P
 AuditSettle ==
     /\ audit_stage \in SettleStages
     /\ \E i \in MarkedRows \ audit_settled :
-          /\ \/ /\ AbandonAny(i, "RequeueExpired", Attempts(i))
+          /\ \/ /\ \/ ~audit_suspended
+                   \/ i # AuditA
+                   \/ resumable_run_id = None
+                /\ AbandonAny(i, "RequeueExpired", Attempts(i))
                 /\ audit_expired' = audit_expired \cup {i}
-             \/ /\ UNCHANGED vars
+             \/ /\ \/ ~audit_suspended
+                   \/ i # AuditA
+                   \/ resumable_run_id = Some(AuditRun)
+                /\ UNCHANGED vars
                 /\ UNCHANGED audit_expired
           /\ audit_settled' = audit_settled \cup {i}
     /\ UNCHANGED <<audit_stage, setupVars, regionVars, historyVars, runVars, audit_rows,
                    audit_recovery,
-                   audit_wait_answered>>
+                   audit_wait_answered, resumeVars>>
+
+\* An expired suspended run: the settlement first ends the run's mark
+\* (SettleResumableRun), then abandons its input RequeueExpired (AuditSettle).
+AuditSettleSuspendedRun ==
+    /\ audit_stage \in SettleStages
+    /\ audit_suspended
+    /\ AuditA \in MarkedRows \ audit_settled
+    /\ resumable_run_id = Some(AuditRun)
+    /\ \/ SettleResumableRunIdle(AuditRun, "RequeueExpired")
+       \/ SettleResumableRunAttached(AuditRun, "RequeueExpired")
+    /\ KeepAudit
 
 \* The serving gate: the executor attaches once the settlement is done.
 AuditServeGate ==
@@ -467,23 +557,28 @@ AuditServeGate ==
     /\ EnsureSessionWithExecutorIdle(AuditSession)
     /\ audit_stage' = "P2Serve"
     /\ UNCHANGED <<setupVars, regionVars, historyVars, runVars, restartVars,
-                   audit_wait_answered>>
+                   audit_wait_answered, resumeVars>>
 
 AuditServe ==
     /\ audit_stage = "P2Serve"
     /\ \/ PrepareAttached(AuditSession, AuditRun) /\ KeepAudit
+       \/ /\ ResumeRunRunning(AuditRun)
+          /\ audit_resumed' = TRUE
+          /\ UNCHANGED <<audit_stage, setupVars, regionVars, historyVars, runVars,
+                         restartVars, audit_suspended, audit_wait_answered>>
        \/ \E i \in AuditInputs :
              /\ StageForRunRunning(i, AuditRun)
              /\ audit_staged_p2' = audit_staged_p2 \cup {i}
              /\ audit_runs' = [audit_runs EXCEPT ![i] = @ + 1]
              /\ UNCHANGED <<audit_stage, setupVars, regionVars, historyVars,
                             audit_staged_p1, restartVars,
-                   audit_wait_answered>>
+                   audit_wait_answered, resumeVars>>
 
 AuditNext ==
     \/ AuditSetup
     \/ AuditBeginUnregister
     \/ AuditCancelRun
+    \/ AuditSuspendRun
     \/ AuditOpenStop
     \/ AuditClassifyForCarriers
     \/ AuditStopExit
@@ -494,9 +589,11 @@ AuditNext ==
     \/ AuditAnswerRequeuedWait
     \/ AuditRestart
     \/ AuditStartProcess2
+    \/ AuditMarkSuspendedRun
     \/ AuditRecoverRow
     \/ AuditRecoveryDone
     \/ AuditSettle
+    \/ AuditSettleSuspendedRun
     \/ AuditServeGate
     \/ AuditServe
 
@@ -524,6 +621,8 @@ AuditInit ==
     /\ audit_recovery = [x \in {} |-> "Durability"]
     /\ audit_settled = {}
     /\ audit_expired = {}
+    /\ audit_suspended = FALSE
+    /\ audit_resumed = FALSE
 
 AuditSpec == AuditInit /\ [][AuditNext]_<<vars, auditVars>>
 
@@ -534,9 +633,25 @@ AuditStateConstraint == model_step_count <= AuditMaxSteps
 Process1Stages == {"P1", "PreExit", "PostExit", "P1Stopped"}
 OpenRetains == Answered(audit_pre_verdict, "Retain") \cup Answered(audit_post_verdict, "Retain")
 
+\* A kept input is a queued prompt, or the input of the run the stop
+\* suspended, which was staged before the stop.
+SuspendedRetains == IF audit_suspended THEN audit_retained \cap {AuditA} ELSE {}
+QueuedRetains == audit_retained \ SuspendedRetains
+
 AuditRetainedNeverRunBeforeRestart ==
-    /\ audit_retained \cap audit_staged_p1 = {}
-    /\ audit_stage \in Process1Stages => \A i \in audit_retained : PhaseOf(i) = "Queued"
+    /\ QueuedRetains \cap audit_staged_p1 = {}
+    /\ audit_stage \in Process1Stages => \A i \in QueuedRetains : PhaseOf(i) = "Queued"
+    /\ audit_stage \in Process1Stages => \A i \in SuspendedRetains : PhaseOf(i) = "Staged"
+
+\* The suspended run's input is never staged into a run again: process 2
+\* resumes the run it is bound to.
+AuditSuspendedRunNeverRestaged ==
+    audit_suspended => AuditA \notin audit_staged_p2
+
+\* A run marked resumable has no published turn terminal: a run that
+\* completed, failed or was cancelled is never suspended or resumed.
+AuditSuspendedRunNotTerminal ==
+    resumable_run_id # None => turn_terminal_run_id # resumable_run_id
 
 AuditRetainedGetsNoCarrier ==
     audit_retained \cap audit_carriers = {}
@@ -619,6 +734,13 @@ AuditWitnessPlainStopAbandons ==
 \* The stopping process answers a kept input's waiter as requeued.
 AuditWitnessRequeuedWaitAnswered == audit_wait_answered
 
+\* The requeue stop suspends A's in-flight run, keeps A, and process 2
+\* resumes the run without staging A again.
+AuditWitnessSuspendedRunResumes ==
+    /\ audit_suspended
+    /\ AuditA \in audit_retained
+    /\ audit_resumed
+
 NotAuditWitnessRetainedRunsAfterGracefulStop == ~AuditWitnessRetainedRunsAfterGracefulStop
 NotAuditWitnessRequeuedWaitAnswered == ~AuditWitnessRequeuedWaitAnswered
 NotAuditWitnessRetainedRunsAfterCrash == ~AuditWitnessRetainedRunsAfterCrash
@@ -626,4 +748,5 @@ NotAuditWitnessExpiredSettled == ~AuditWitnessExpiredSettled
 NotAuditWitnessStagedNotRetained == ~AuditWitnessStagedNotRetained
 NotAuditWitnessStopAbandonsEligible == ~AuditWitnessStopAbandonsEligible
 NotAuditWitnessPlainStopAbandons == ~AuditWitnessPlainStopAbandons
+NotAuditWitnessSuspendedRunResumes == ~AuditWitnessSuspendedRunResumes
 ====
