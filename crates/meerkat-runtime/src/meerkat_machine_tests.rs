@@ -56646,14 +56646,15 @@ async fn binding_preparation_for_a_session_another_owner_hosts_refuses_typed() {
         .prepare_bindings(session_id.clone())
         .await
         .expect_err("another runtime owner's bindings are refused");
-    let materialization = other
+    let Err(materialization) = other
         .prepare_local_session_materialization_with_mode(
             session_id.clone(),
             crate::LocalSessionMaterializationMode::Ordinary,
         )
         .await
-        .err()
-        .expect("another runtime owner's materialization is refused");
+    else {
+        panic!("another runtime owner's materialization is refused");
+    };
     for (seam, error) in [
         ("local bindings", &local),
         ("bindings", &authoritative),
