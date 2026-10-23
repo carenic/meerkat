@@ -2147,16 +2147,6 @@ impl StoreCheckpointer {
                 ))
             })?;
         }
-        let conversation_digest = session.transcript_content_digest().map_err(|error| {
-            AgentError::InternalError(format!(
-                "failed to derive the re-based tail's conversation digest for session {id}: {error}"
-            ))
-        })?;
-        let message_count = u64::try_from(session.messages().len()).map_err(|_| {
-            AgentError::InternalError(format!(
-                "the re-based tail's message count exceeds the durable range for session {id}"
-            ))
-        })?;
         let rebase = PreparedWholeBlobRunRebase::prepare(
             expected_runtime,
             expected_tail,
@@ -2202,11 +2192,13 @@ impl StoreCheckpointer {
             ))
         })? = Some(committed);
         if let Some(audit) = self.rewrite_audit.as_ref() {
-            append_transcript_rewrite_receipt_for_commits(
+            let final_assistant_text = rebase.rewrite().successor().last_assistant_text();
+            append_prepared_transcript_rewrite_receipt(
                 Some(&audit.event_store),
                 audit.projector.as_ref(),
-                session,
-                &commits,
+                &id,
+                rebase.rewrite().audit_receipt(),
+                final_assistant_text.as_deref(),
             )
             .await
             .map_err(|error| {
@@ -2217,8 +2209,8 @@ impl StoreCheckpointer {
         }
         RunCheckpointReceipt::issued(
             RunCheckpointAuthority::WholeBlob(tail),
-            conversation_digest,
-            message_count,
+            rebase.conversation_digest().to_string(),
+            rebase.message_count(),
         )
         .map_err(|error| {
             AgentError::InternalError(format!(
