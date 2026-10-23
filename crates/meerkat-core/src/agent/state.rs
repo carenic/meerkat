@@ -26337,6 +26337,9 @@ mod tests {
         activity: std::sync::atomic::AtomicU64,
         interval: Duration,
         ticks: u32,
+        /// How long each read of the stream activity count keeps the
+        /// caller's thread busy.
+        probe_delay: Duration,
     }
 
     impl SlowButAliveClient {
@@ -26346,6 +26349,17 @@ mod tests {
                 activity: std::sync::atomic::AtomicU64::new(0),
                 interval,
                 ticks,
+                probe_delay: Duration::ZERO,
+            }
+        }
+
+        /// As [`Self::new`], each read of the stream activity count keeping
+        /// the caller's thread busy for `probe_delay`, as on a starved
+        /// runtime.
+        fn with_probe_delay(interval: Duration, ticks: u32, probe_delay: Duration) -> Self {
+            Self {
+                probe_delay,
+                ..Self::new(interval, ticks)
             }
         }
 
@@ -26390,6 +26404,9 @@ mod tests {
         }
 
         fn stream_activity_count(&self) -> Option<u64> {
+            if !self.probe_delay.is_zero() {
+                std::thread::sleep(self.probe_delay);
+            }
             Some(self.activity.load(std::sync::atomic::Ordering::SeqCst))
         }
     }
@@ -27937,6 +27954,40 @@ mod tests {
             .run("stay alive".to_string().into())
             .await
             .expect("alive stream must not be classified as stalled");
+        assert_eq!(result.text, "slow but alive");
+        assert_eq!(client.calls(), 1, "no retry for a live stream");
+    }
+
+    /// A live stream is never stalled by a starved read of its activity:
+    /// each read keeps the thread busy for 150 ms, past the 100 ms window,
+    /// and the watchdog counts inactivity only across a wait it measured
+    /// with the call polled.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn a_starved_activity_read_does_not_trip_the_watchdog() {
+        use crate::retry::RetryPolicy;
+
+        let client = Arc::new(SlowButAliveClient::with_probe_delay(
+            Duration::from_millis(10),
+            20,
+            Duration::from_millis(150),
+        ));
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .retry_policy(RetryPolicy {
+                max_retries: 0,
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(1),
+                multiplier: 1.0,
+                call_timeout: None,
+                stream_inactivity_timeout: Some(Duration::from_millis(100)),
+            })
+            .build_standalone(client.clone(), Arc::new(NoTools), Arc::new(NoopStore))
+            .await;
+
+        let result = agent
+            .run("stay alive".to_string().into())
+            .await
+            .expect("a starved activity read must not classify a live stream as stalled");
         assert_eq!(result.text, "slow but alive");
         assert_eq!(client.calls(), 1, "no retry for a live stream");
     }
