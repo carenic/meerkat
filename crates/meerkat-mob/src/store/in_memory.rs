@@ -5773,7 +5773,7 @@ mod tests {
         );
 
         // Revoke: delete requires the exact expected record + a revoke
-        // witness; other mobs' rows survive (A14 isolation).
+        // witness; other mobs' rows survive, as each mob's rows are isolated.
         let deletion =
             crate::store::mob_host_authority_deletion_authority_for_record(&host_b_rebound)
                 .unwrap();
