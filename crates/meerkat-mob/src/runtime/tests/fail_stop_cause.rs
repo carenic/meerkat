@@ -473,7 +473,8 @@ fn the_fail_stop_scans_see_writes_reads_and_constructions() {
 }
 
 // The comment and literal blanking and test-item removal below are the
-// facade's host launch scan's (`crates/meerkat/tests/host_launch_sites.rs`).
+// facade's host launch scan's (the host_launch_sites test of the meerkat
+// crate).
 
 /// `source` with comments and literals blanked and every test-only item
 /// (`#[cfg(test)]`, `#[cfg(all(test, ..))]`, `#[test]` and `#[*::test]`)

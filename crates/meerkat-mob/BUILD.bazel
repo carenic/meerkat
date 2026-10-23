@@ -272,8 +272,6 @@ rust_test(
         "//crates/meerkat-rpc:package_runfiles",
         "//crates/meerkat-runtime:cargo_manifest",
         "//crates/meerkat-runtime:package_runfiles",
-        "//crates/meerkat:cargo_manifest",
-        "//crates/meerkat:package_runfiles",
         ":package_runfiles",
     ],
     env = {
