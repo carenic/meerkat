@@ -352,6 +352,34 @@ async fn refused_member_runtime_released(
             .map_err(|error| MobError::Internal(error.to_string()))?)
 }
 
+/// Whether the retiring member's session is still present, live or durable.
+///
+/// A turn stopped between its end-of-run checkpoint and its runtime boundary
+/// commit leaves a durable tail ahead of the runtime boundary, and every
+/// committed read of the session refuses with the typed
+/// `TranscriptRevisionConflict` until something settles that tail. The
+/// refusal itself proves the session is present and not archived. Only the
+/// session archive settles the tail, under the turn boundary and recovery
+/// gate it holds (or ends typed when the tail is held or refused), so these
+/// presence reads let the retirement reach it instead of ending it here.
+/// Every other read failure still ends the stage.
+async fn retiring_session_present(
+    service: &dyn MobSessionService,
+    session: &SessionId,
+) -> Result<bool, MobError> {
+    match service.has_live_session(session).await {
+        Ok(true) => return Ok(true),
+        Ok(false) => {}
+        Err(error) if super::is_transcript_revision_conflict(&error) => return Ok(true),
+        Err(error) => return Err(error.into()),
+    }
+    match service.load_persisted_session(session).await {
+        Ok(persisted) => Ok(persisted.is_some()),
+        Err(error) if super::is_transcript_revision_conflict(&error) => Ok(true),
+        Err(error) => Err(error.into()),
+    }
+}
+
 struct RetirementArchiveObservationSource {
     service: Arc<dyn MobSessionService>,
     #[cfg(feature = "runtime-adapter")]
@@ -360,13 +388,7 @@ struct RetirementArchiveObservationSource {
 
 impl RetirementArchiveObservationSource {
     async fn already_complete(&self, session: &SessionId) -> Result<bool, MobError> {
-        if self.service.has_live_session(session).await?
-            || self
-                .service
-                .load_persisted_session(session)
-                .await?
-                .is_some()
-        {
+        if retiring_session_present(self.service.as_ref(), session).await? {
             return Ok(false);
         }
         #[cfg(feature = "runtime-adapter")]
@@ -3191,9 +3213,7 @@ impl MobActor {
                             exact_local_target_quiescent: false,
                         });
                     };
-                    if service.has_live_session(&session).await?
-                        || service.load_persisted_session(&session).await?.is_some()
-                    {
+                    if retiring_session_present(service.as_ref(), &session).await? {
                         // A host-refused member keeps its durable session for
                         // the archive below, but its runtime may hold nothing
                         // to route a retire to.
