@@ -326,7 +326,10 @@ them.
   its store-owned recovery kept (it could not prove the tail) is reported as
   `MobError::MemberDurableTailUnprovable`, naming the member and its session
   and carrying the `tail_held_for_recovery` resume hold, instead of a bare
-  transcript revision conflict. The start still refuses in both cases.
+  transcript revision conflict. Where the start still fails on such a
+  member, that typed cause is what it reports; a retiring member, or one whose
+  restore already failed, is deferred instead (see the entries next to this
+  one).
 - `meerkat-mob`: a mob restarted while another runtime owner on the realm
   hosts a retiring member's session now starts and runs. The start restores
   the retiring member's local cleanup delivery, which settles the session's

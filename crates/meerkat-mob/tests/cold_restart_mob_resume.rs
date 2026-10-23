@@ -4848,56 +4848,16 @@ async fn retiring_member_after_a_crash(
     w1_sid
 }
 
-/// The refused start's error, whether the builder refused or handed back a
-/// handle whose status reports the refusal.
-#[cfg(feature = "test-support")]
-async fn refused_start_error(
-    refused: Result<meerkat_mob::MobHandle, meerkat_mob::MobError>,
-) -> meerkat_mob::MobError {
-    match refused {
-        Err(error) => error,
-        Ok(handle) => {
-            let status = handle.status().await;
-            let _ = handle.shutdown().await;
-            match status {
-                Err(error) => error,
-                Ok(state) => panic!("the start must be refused, not {state:?}"),
-            }
-        }
-    }
-}
-
-/// The member's startup recovery failure inside a refused start's error.
-#[cfg(feature = "test-support")]
-fn startup_recovery_cause(
-    error: &meerkat_mob::MobError,
-) -> (
-    &AgentIdentity,
-    &meerkat_core::types::SessionId,
-    &meerkat_mob::MobError,
-) {
-    let failure = match error {
-        meerkat_mob::MobError::SharedLifecycleFailure(failure) => failure.as_ref(),
-        other => other,
-    };
-    let meerkat_mob::MobError::MemberStartupRecoveryFailed {
-        member_id,
-        session_id,
-        cause,
-    } = failure
-    else {
-        panic!("a refused start must report the member's startup recovery failure: {error:?}");
-    };
-    (member_id, session_id, cause.as_ref())
-}
-
 /// A retiring member whose session another runtime owner hosts, with no
-/// durable tail, is refused where the start prepares its cleanup delivery's
-/// runtime bindings. The refusal's cause is the typed hosting refusal for
-/// that session, not an internal preparation error.
+/// durable tail, meets the typed hosting refusal where the start prepares its
+/// cleanup delivery's runtime bindings. That refusal can clear, so the start
+/// defers the member instead of failing: the mob runs, a retire refuses with
+/// the deferral carrying the typed hosting refusal (not an internal
+/// preparation error, which would still fail the start), and once the other
+/// owner lets go the retire completes.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread")]
-async fn a_mob_start_names_the_hosting_refusal_for_a_retiring_member_without_a_tail() {
+async fn a_mob_start_defers_a_retiring_member_without_a_tail_another_owner_hosts() {
     let temp = tempfile::tempdir().expect("temp dir");
     let paths = Paths::new(temp.path());
     let power_store = Arc::new(PowerCutRuntimeStore::with_hosting_root(
@@ -4914,40 +4874,55 @@ async fn a_mob_start_names_the_hosting_refusal_for_a_retiring_member_without_a_t
         capability,
         meerkat_runtime::HostingOwner::mint(),
     );
-    let _other_owner_claim = other_owner
+    let other_owner_claim = other_owner
         .grant(&w1_sid)
         .expect("another runtime owner takes the retiring member's hosting claim");
     let (service_2, _store_2) = persistent_head_canonical_service(&paths, runtime_store.clone());
-    let refused = MobBuilder::for_resume(
+    let handle = MobBuilder::for_resume(
         MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage"),
     )
     .with_session_service(service_2.clone())
     .with_default_llm_client(openai_test_client())
     .notify_orchestrator_on_resume(false)
     .resume()
-    .await;
-    let error = refused_start_error(refused).await;
-    let (member, session, cause) = startup_recovery_cause(&error);
-    assert_eq!(member, &AgentIdentity::from("w-1"));
-    assert_eq!(session, &w1_sid);
+    .await
+    .unwrap_or_else(|error| {
+        panic!("the start defers the hosted retiring member and runs: {error}")
+    });
+    let status = handle.status().await;
     assert!(
-        matches!(
-            cause,
-            meerkat_mob::MobError::SessionError(
-                meerkat_core::service::SessionError::ServedElsewhere { id }
-            ) if id == &w1_sid
-        ),
-        "the cause is the typed hosting refusal, not an internal preparation error: {cause:?}"
+        matches!(status, Ok(meerkat_mob::MobState::Running)),
+        "{status:?}"
     );
+    let identity = AgentIdentity::from("w-1");
+    let error = handle
+        .retire(identity.clone())
+        .await
+        .expect_err("a retire while another runtime owner hosts the session refuses");
+    assert_custody_deferred_for_the_hosted_member(&error, &identity, &w1_sid);
+
+    drop(other_owner_claim);
+    handle
+        .retire(identity.clone())
+        .await
+        .expect("once the other owner lets go, the retire completes");
+    let members = handle.list_members_including_retiring().await;
+    assert!(
+        !members.iter().any(|entry| entry.agent_identity == identity),
+        "the member's retirement completed: {members:?}"
+    );
+    let _ = handle.shutdown().await;
 }
 
 /// A retiring member whose durable tail its recovery keeps (the store-owned
-/// recovery could not prove it) is refused with the typed unprovable-tail
-/// error naming the member and its session; the tail stays as the crash
+/// recovery could not prove it) meets the typed unprovable-tail error at
+/// start. A later recovery can still prove the tail, so the start defers the
+/// member instead of failing: the mob runs, a retire refuses with the
+/// deferral carrying the unprovable tail, and the tail stays as the crash
 /// left it.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread")]
-async fn a_mob_start_names_a_retiring_members_unprovable_durable_tail() {
+async fn a_mob_start_defers_a_retiring_members_unprovable_durable_tail() {
     let temp = tempfile::tempdir().expect("temp dir");
     let paths = Paths::new(temp.path());
     let power_store = Arc::new(PowerCutRuntimeStore::new(&paths.realm_db_path));
@@ -4963,36 +4938,66 @@ async fn a_mob_start_names_a_retiring_members_unprovable_durable_tail() {
     let persistent_owner: Arc<dyn MobSessionService> = service_2.clone();
     let keeping_tails = FailingOnceSessionService::new(persistent_owner, None, None, 0, false);
     keeping_tails.keep_durable_tails_unsettled();
-    let refused = MobBuilder::for_resume(
+    let handle = MobBuilder::for_resume(
         MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage"),
     )
     .with_session_service(keeping_tails)
     .with_default_llm_client(openai_test_client())
     .notify_orchestrator_on_resume(false)
     .resume()
-    .await;
-    let error = refused_start_error(refused).await;
-    let (member, session, cause) = startup_recovery_cause(&error);
-    assert_eq!(member, &AgentIdentity::from("w-1"));
-    assert_eq!(session, &w1_sid);
+    .await
+    .unwrap_or_else(|error| panic!("the start defers the retiring member and runs: {error}"));
+    let status = handle.status().await;
+    assert!(
+        matches!(status, Ok(meerkat_mob::MobState::Running)),
+        "{status:?}"
+    );
+    let identity = AgentIdentity::from("w-1");
+    let error = handle
+        .retire(identity.clone())
+        .await
+        .expect_err("a retire while the member's tail stays unprovable refuses");
+    let deferral = match &error {
+        meerkat_mob::MobError::SharedRetirementFailure(shared) => shared.as_ref(),
+        other => other,
+    };
     assert!(
         matches!(
-            cause,
-            meerkat_mob::MobError::MemberDurableTailUnprovable { member_id, session_id }
-                if member_id == &AgentIdentity::from("w-1") && session_id == &w1_sid
+            deferral,
+            meerkat_mob::MobError::MemberCustodyDeferred {
+                member_id,
+                session_id,
+                restore: meerkat_mob::MemberCustodyRestore::CleanupDelivery,
+                cause,
+            } if member_id == &identity
+                && session_id == &w1_sid
+                && matches!(
+                    cause.as_ref(),
+                    meerkat_mob::MobError::MemberDurableTailUnprovable { member_id, session_id }
+                        if member_id == &identity && session_id == &w1_sid
+                )
         ),
-        "the cause is the typed unprovable tail: {cause:?}"
+        "the retire refuses with the deferral carrying the typed unprovable tail: {error:?}"
+    );
+    let members = handle.list_members_including_retiring().await;
+    assert!(
+        members
+            .iter()
+            .any(|entry| entry.agent_identity == identity
+                && entry.status == MobMemberStatus::Retiring),
+        "the deferred member stays Retiring: {members:?}"
     );
     let head_after = store_2
         .load_head(&w1_sid)
         .await
-        .expect("load the physical head after the refusal")
+        .expect("load the physical head after the deferred retire")
         .expect("the physical head still exists");
     assert_eq!(
         meerkat_core::session_store::session_head_cas_token(&head_after).unwrap(),
         meerkat_core::session_store::session_head_cas_token(&head_before).unwrap(),
-        "the refused start leaves the tail as the crash left it"
+        "the deferred start and retire leave the tail as the crash left it"
     );
+    let _ = handle.shutdown().await;
 }
 
 /// The operation binding restore an operation on a Broken member refused
