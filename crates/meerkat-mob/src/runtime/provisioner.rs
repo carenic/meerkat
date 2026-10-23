@@ -10113,6 +10113,27 @@ pub(super) async fn prepare_prepared_runtime_session_state(
 mod tests {
     use super::session_turn_error_to_mob_error;
 
+    /// A hosting refusal is not a proven no-effect refusal: the provision
+    /// ledger keeps its cleanup open, as for any preparation failure. Only
+    /// the two registration verdicts are proven pre-effect.
+    #[test]
+    fn a_hosting_refusal_keeps_provision_cleanup_open() {
+        let session_id = meerkat_core::types::SessionId::new();
+        let hosting = meerkat_runtime::RuntimeBindingsError::Hosting(
+            session_id.clone(),
+            meerkat_core::SessionError::ServedElsewhere {
+                id: session_id.clone(),
+            },
+        );
+        assert!(super::PreEffectRefusal::from_bindings_error(&hosting).is_none());
+        assert!(!hosting.rejected_before_effect());
+        let owned = meerkat_runtime::RuntimeBindingsError::RegistrationOwned(session_id);
+        assert_eq!(
+            super::PreEffectRefusal::from_bindings_error(&owned),
+            Some(super::PreEffectRefusal::RegistrationOwned)
+        );
+    }
+
     /// A retried input is still worked while a run holds it, however long
     /// that run takes, or while it gains attempts; requeued with no new
     /// attempt since the last read, it is parked.

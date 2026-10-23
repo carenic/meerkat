@@ -30904,11 +30904,16 @@ impl MobActor {
                 .await
         })
         .await
-        .map_err(|error| {
-            MobError::Internal(format!(
+        .map_err(|error| match error {
+            // Another runtime owner hosts the session, or its claim cannot be
+            // taken: the typed hosting refusal, never an internal error.
+            meerkat_runtime::RuntimeBindingsError::Hosting(_, cause) => {
+                MobError::SessionError(cause)
+            }
+            error => MobError::Internal(format!(
                 "restore operation owner binding failed for member '{}': {error}",
                 entry.agent_identity
-            ))
+            )),
         })?;
         if bindings.session_id() != &generated_owner_session_id {
             return Err(MobError::Internal(format!(
@@ -31124,8 +31129,13 @@ impl MobActor {
             .adapter
             .prepare_local_session_bindings(session.clone())
             .await
-            .map_err(|error| {
-                MobError::Internal(format!("prepare local cleanup delivery: {error}"))
+            .map_err(|error| match error {
+                // Another runtime owner hosts the session, or its claim cannot
+                // be taken: the typed hosting refusal, never an internal error.
+                meerkat_runtime::RuntimeBindingsError::Hosting(_, cause) => {
+                    MobError::SessionError(cause)
+                }
+                error => MobError::Internal(format!("prepare local cleanup delivery: {error}")),
             })?;
         // A cold start can re-register a session whose runtime already
         // stopped, which clears its member binding; the unbound endpoint

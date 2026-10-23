@@ -2161,15 +2161,6 @@ impl MobError {
         }
     }
 
-    /// meerkat's typed durable resume hold carried by this error, if any:
-    /// the session is intact and withheld (a held tail, a refused recovery,
-    /// quarantined evidence, or a WholeBlob document that needs the
-    /// sanctioned audited-endpoint repair), not faulted. Read typed off the
-    /// in-process `SessionError` carrier, through the shared retirement /
-    /// lifecycle failure wrappers a joined observer receives, or off the
-    /// structured `durable_resume_hold` wire token; never off display text.
-    /// Hosts classify on this instead of parsing prose (Meta parks the
-    /// member with the exact repair commands on `AuditedEndpointDivergence`).
     /// Whether a member's custody restore at mob start failed for a cause
     /// that can clear without this owner acting: another runtime owner hosts
     /// the session, its hosting claim is unavailable, or its durable tail is
@@ -2185,6 +2176,15 @@ impl MobError {
         )
     }
 
+    /// meerkat's typed durable resume hold carried by this error, if any:
+    /// the session is intact and withheld (a held tail, a refused recovery,
+    /// quarantined evidence, or a WholeBlob document that needs the
+    /// sanctioned audited-endpoint repair), not faulted. Read typed off the
+    /// in-process `SessionError` carrier, through the shared retirement /
+    /// lifecycle failure wrappers a joined observer receives, or off the
+    /// structured `durable_resume_hold` wire token; never off display text.
+    /// Hosts classify on this instead of parsing prose (Meta parks the
+    /// member with the exact repair commands on `AuditedEndpointDivergence`).
     pub fn durable_resume_hold(&self) -> Option<meerkat_core::service::DurableResumeHold> {
         match self {
             Self::SessionError(error) => error.durable_resume_hold(),
