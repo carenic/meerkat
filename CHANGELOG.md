@@ -186,6 +186,18 @@ them.
 
 ### Changed
 
+- `meerkat-core`, `meerkat-session`, `meerkat-runtime`: a HeadCanonical run
+  that compacts more often than `history_retained_rewrites` keeps now saves an
+  intra-run checkpoint at the next model boundary after its own tool results,
+  then retires its compaction history to the retention (see Fixed). A host
+  that stops after such a checkpoint and before the run's boundary commit (a
+  crash, a forced kill, an out-of-memory kill) now recovers the run on resume
+  as interrupted: its content up to the checkpoint is kept, the typed recovery
+  notice is appended, and its input is terminalized and not run again. Before,
+  such a stop lost the run's progress back to the committed boundary. Runs
+  without a checkpointer, WholeBlob sessions and live bridge runs that commit
+  nothing take no such checkpoint.
+
 - `meerkat-core`: the `FORK_INSTRUCTION_REFUSED` message for a fork the
   policy refuses (cause `policy_refuses`) names the setting that changes it:
   "to carry them into the child, set the host's fork_instruction_policy
@@ -194,6 +206,22 @@ them.
   cause, the keys and the error code are unchanged.
 
 ### Fixed
+
+- `meerkat-core`, `meerkat-session`, `meerkat-runtime`, `meerkat-store`: a
+  long run of a HeadCanonical session kept every compaction's transcript
+  rewrite in memory until the run ended, because retirement may not pass the
+  durable head and the run saved only at its end; the committed session then
+  kept every rewrite of the run too. The run now moves its durable head with an
+  intra-run checkpoint once its history exceeds the retention (see Changed),
+  so it keeps at most one rewrite beyond `history_retained_rewrites` in
+  memory, and the committed session keeps no more than the retention.
+  Intra-run checkpoints no longer prune stored rewrite rows: the committed
+  boundary stays rebuildable for recovery until the boundary commit that
+  promotes the run, which applies the run's retention cut in its own
+  transaction and never past the promoted head's row-lineage anchor. Before, a
+  run that retired rewrites between two of its checkpoints could prune rows
+  its committed boundary still needed, and a crash before the boundary commit
+  then left a session that recovery could not rebuild.
 
 - `meerkat-runtime`, `meerkat-store`, `meerkat-core`: a crash tail of a
   HeadCanonical session that had compacted at least once could not be

@@ -705,6 +705,18 @@ an uncertain outcome or failed acknowledgement terminates the actor and
 requires durable reload. At the final boundary the store promotes that exact
 candidate. It does not construct a second document or replay the delta.
 
+A HeadCanonical run that compacts more often than `history_retained_rewrites`
+keeps also saves an intra-run checkpoint at the next model boundary after its
+own tool results, so its durable head covers those rewrites and the live
+history retires to the retention. Such a checkpoint's tail always ends with the
+run's own tool call and its results, never with a compaction summary. Intra-run
+checkpoints never prune stored rewrite rows, so the committed boundary stays
+rebuildable for recovery; the boundary commit that promotes the run applies the
+run's retention cut in the same transaction, never past the promoted head's
+row-lineage anchor. A crash after such a checkpoint recovers the run as
+interrupted (see below): its content up to the checkpoint is kept and its input
+is not run again.
+
 A crash or shutdown race can still leave a durable transcript tail — up to and
 including a fully completed turn — whose runtime boundary commit never landed.
 Durable is not the same as runtime-committed, and neither view is silently

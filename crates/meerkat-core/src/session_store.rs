@@ -5112,6 +5112,21 @@ impl PreparedHeadCanonicalRewriteMutation {
         self.transcript_retired_count
     }
 
+    /// The same mutation, with no store-side retirement.
+    ///
+    /// An intra-run checkpoint writes a provisional successor while the
+    /// committed runtime boundary must stay rebuildable: recovery, a
+    /// provisional discard and promotion's descent check all replay it from
+    /// its own row-lineage anchor, and a retirement cut above that anchor
+    /// would delete the rows they need. So such a write keeps every rewrite
+    /// row; the boundary commit that promotes the run applies the deferred
+    /// cut ([`Self::transcript_retired_count`] of the live graph then).
+    #[must_use]
+    pub fn without_store_retirement(mut self) -> Self {
+        self.transcript_retired_count = 0;
+        self
+    }
+
     #[must_use]
     pub fn session_id(&self) -> &SessionId {
         self.common.session_id()

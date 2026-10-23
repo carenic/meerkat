@@ -1305,6 +1305,59 @@ where
             .await
     }
 
+    /// Persist the rewrites a run's compactions kept past the retention, then
+    /// retire down to it.
+    ///
+    /// A session a durable HeadCanonical head describes keeps every rewrite
+    /// occurrence that head does not cover yet: the next checkpoint proves
+    /// the pending rewrite suffix from it. The agent checkpoints at the end
+    /// of a run, so inside one long run its compactions' bodies would pile up
+    /// until then. At a model boundary that follows tool results, before that
+    /// boundary decides whether to compact, take the intra-run checkpoint (it
+    /// moves the durable head over those rewrites) and retire to the bound.
+    /// Never right after a compaction: a durable tail must hold a row the
+    /// run wrote after its last rewrite, or recovery cannot attribute it.
+    /// Sessions without a checkpointer, without a durable head, or in a live
+    /// bridge run that commits nothing keep today's behaviour.
+    async fn checkpoint_history_held_by_durable_head(
+        &mut self,
+        retention: crate::TranscriptHistoryRetention,
+    ) -> Result<(), AgentError> {
+        if self.checkpointer.is_none() || self.noncommitting_live_bridge_run {
+            return Ok(());
+        }
+        if !matches!(
+            self.session.messages().last(),
+            Some(Message::ToolResults { .. })
+        ) {
+            return Ok(());
+        }
+        let held = self
+            .session
+            .durable_head_holds_retirement(retention)
+            .map_err(|error| {
+                AgentError::InternalError(format!(
+                    "failed to read the retained transcript history: {error}"
+                ))
+            })?;
+        if !held {
+            return Ok(());
+        }
+        let Some(run_id) = self.runtime_turn_authority_snapshot()?.active_run_id else {
+            return Ok(());
+        };
+        self.save_session_with_durability(&run_id, SessionSaveDurability::BestEffort)
+            .await?;
+        self.session
+            .retire_transcript_history(retention)
+            .map_err(|error| {
+                AgentError::InternalError(format!(
+                    "failed to retire transcript history after its checkpoint: {error}"
+                ))
+            })?;
+        Ok(())
+    }
+
     async fn save_session_with_durability(
         &mut self,
         run_id: &RunId,
@@ -1362,6 +1415,32 @@ where
                     ));
                 }
                 self.latest_run_checkpoint_receipt = Some(next);
+                // The checkpoint moved the durable head over every rewrite the
+                // run made, so the live history retires to the retention now
+                // instead of at the next compaction. The boundary commit that
+                // promotes the run applies the same cut to the stored rows.
+                if let Some(compactor) = self.compactor.clone() {
+                    self.session
+                        .retire_transcript_history(compactor.transcript_history_retention())
+                        .map_err(|error| {
+                            AgentError::InternalError(format!(
+                                "failed to retire transcript history after its checkpoint: {error}"
+                            ))
+                        })?;
+                    let retired = self
+                        .session
+                        .validated_transcript_history_state()
+                        .map_err(|error| {
+                            AgentError::InternalError(format!(
+                                "failed to read the retained transcript history: {error}"
+                            ))
+                        })?
+                        .map_or(0, |history| history.state().retired_count());
+                    checkpointer.note_run_transcript_retirement(
+                        run_id,
+                        u64::try_from(retired).unwrap_or(u64::MAX),
+                    );
+                }
             } else if previous.is_some() {
                 return Err(AgentError::InternalError(
                     "session checkpointer dropped an existing provisional receipt".to_string(),
@@ -3638,6 +3717,10 @@ where
                 let provider_request_pressure = self.pending_compaction_request_pressure.take();
                 let request_context_budget = self.pending_compaction_request_budget.take();
                 if let Some(compactor) = self.compactor.clone() {
+                    self.checkpoint_history_held_by_durable_head(
+                        compactor.transcript_history_retention(),
+                    )
+                    .await?;
                     let model_messages = self.session.messages_for_model_boundary();
                     let last_guarded_boundary = [
                         self.compaction_cadence.last_compaction_boundary_index,

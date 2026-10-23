@@ -1051,6 +1051,10 @@ struct StoreCheckpointer {
     /// promotion. Keeping the handoff on the checkpointer avoids exporting
     /// and cloning the accumulated Session merely to recover authority.
     latest_run_checkpoint_receipt: Mutex<Option<RunCheckpointReceipt>>,
+    /// The live graph's retention cut when that receipt's checkpoint wrote
+    /// its successor. An intra-run checkpoint prunes no store rows (the
+    /// committed boundary must stay rebuildable); the promotion applies it.
+    latest_run_transcript_retirement: std::sync::Mutex<Option<(RunId, u64)>>,
 }
 
 struct HeadCanonicalProvisionalIntent<'a> {
@@ -1559,6 +1563,17 @@ async fn append_transcript_rewrite_receipt_for_commits(
 }
 
 impl StoreCheckpointer {
+    /// The live graph's retention cut the run's last checkpoint recorded,
+    /// for the promotion of that run's provisional chain.
+    fn run_transcript_retirement(&self, run_id: &RunId) -> Option<u64> {
+        self.latest_run_transcript_retirement
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .filter(|(recorded_run, _)| recorded_run == run_id)
+            .map(|(_, retired)| retired)
+    }
+
     async fn run_checkpoint_receipt(
         &self,
         session_id: &SessionId,
@@ -2111,6 +2126,9 @@ impl StoreCheckpointer {
             })?;
         match route {
             meerkat_core::session_store::PreparedHeadCanonicalMutationRoute::Rewrite(mutation) => {
+                // The committed boundary must stay rebuildable until the run's
+                // boundary commit promotes this chain: prune nothing here.
+                let mutation = mutation.without_store_retirement();
                 let provisional = self
                     .write_head_canonical_provisional_intent(
                         &runtime_id,
@@ -2401,9 +2419,26 @@ impl meerkat_core::SessionCheckpointer for StoreCheckpointer {
         };
         if let Ok(receipt) = result.as_ref() {
             *self.latest_run_checkpoint_receipt.lock().await = receipt.clone();
+            let retired = receipt.as_ref().map(|_| {
+                let retired = session
+                    .validated_transcript_history_state()
+                    .ok()
+                    .flatten()
+                    .map_or(0, |history| history.state().retired_count());
+                (run_id.clone(), u64::try_from(retired).unwrap_or(u64::MAX))
+            });
+            if let Ok(mut slot) = self.latest_run_transcript_retirement.lock() {
+                *slot = retired;
+            }
         }
         drop(guard);
         result
+    }
+
+    fn note_run_transcript_retirement(&self, run_id: &RunId, retired_occurrences: u64) {
+        if let Ok(mut slot) = self.latest_run_transcript_retirement.lock() {
+            *slot = Some((run_id.clone(), retired_occurrences));
+        }
     }
 }
 
@@ -12282,6 +12317,9 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 .get(id)
                 .cloned()
                 .and_then(|checkpointer| checkpointer.upgrade());
+            let deferred_transcript_retirement = checkpointer
+                .as_ref()
+                .and_then(|checkpointer| checkpointer.run_transcript_retirement(expected_run_id));
             if let Some(receipt) = match checkpointer {
                 Some(checkpointer) => checkpointer
                     .run_checkpoint_receipt(id, expected_run_id)
@@ -12317,7 +12355,8 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                     authority_token,
                 };
                 return Ok(PreparedRuntimeBoundary {
-                    committed: BoundSessionCommit::provisional_promotion(receipt),
+                    committed: BoundSessionCommit::provisional_promotion(receipt)
+                        .with_deferred_transcript_retirement(deferred_transcript_retirement),
                     identity,
                     conversation_digest,
                     message_count,
@@ -13544,6 +13583,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             gate: Arc::clone(&gate),
             whole_blob_base_authority: std::sync::Mutex::new(None),
             latest_run_checkpoint_receipt: Mutex::new(None),
+            latest_run_transcript_retirement: std::sync::Mutex::new(None),
         });
         let requested_resume_session_id = req
             .build
@@ -17948,6 +17988,7 @@ mod tests {
             }),
             whole_blob_base_authority: std::sync::Mutex::new(Some(authority)),
             latest_run_checkpoint_receipt: Mutex::new(None),
+            latest_run_transcript_retirement: std::sync::Mutex::new(None),
         };
         (runtime_store, session, checkpointer)
     }
@@ -18090,6 +18131,7 @@ mod tests {
             }),
             whole_blob_base_authority: std::sync::Mutex::new(Some(initial_authority.clone())),
             latest_run_checkpoint_receipt: Mutex::new(None),
+            latest_run_transcript_retirement: std::sync::Mutex::new(None),
         };
 
         let mut successor = session;
@@ -29424,6 +29466,7 @@ mod tests {
                     .unwrap(),
             ),
             latest_run_checkpoint_receipt: Mutex::new(None),
+            latest_run_transcript_retirement: std::sync::Mutex::new(None),
         };
         let mut provisional = committed.clone();
         provisional.push(user_message("provisional context is not committed"));
@@ -29688,6 +29731,7 @@ mod tests {
             }),
             whole_blob_base_authority: std::sync::Mutex::new(None),
             latest_run_checkpoint_receipt: Mutex::new(None),
+            latest_run_transcript_retirement: std::sync::Mutex::new(None),
         };
         let mut provisional = committed;
         provisional.push(user_message("physical provisional successor"));
@@ -29765,6 +29809,7 @@ mod tests {
             }),
             whole_blob_base_authority: std::sync::Mutex::new(None),
             latest_run_checkpoint_receipt: Mutex::new(None),
+            latest_run_transcript_retirement: std::sync::Mutex::new(None),
         };
         (directory, service, checkpointer, committed)
     }
@@ -29909,6 +29954,540 @@ mod tests {
         }
         assert_eq!(physical_rewrite_count(&service, &id).await, 6);
         assert_eq!(retired_rewrites(&session), 2);
+    }
+
+    /// The anchor floor of a stored head: the oldest rewrite generation its
+    /// cold materialization replays rows from.
+    fn anchor_floor(head: &meerkat_core::session_store::SessionHead) -> u64 {
+        head.row_lineage_anchor.as_ref().map_or(
+            0,
+            meerkat_core::session_store::SessionRowLineageAnchor::rewrite_count,
+        )
+    }
+
+    /// The committed boundary's head and the session a cold host rebuilds
+    /// from it: a host that restarted materializes the boundary from the
+    /// rows the store kept.
+    async fn rebuild_committed_boundary(
+        directory: &std::path::Path,
+        id: &SessionId,
+    ) -> (meerkat_core::session_store::SessionHead, Session) {
+        let restarted = reopen_retention_fixture(directory);
+        let authority = restarted
+            .runtime_store
+            .load_session_boundary_authority(&LogicalRuntimeId::for_session(id))
+            .await
+            .unwrap()
+            .expect("committed boundary authority");
+        let head = authority
+            .head_canonical()
+            .expect("HeadCanonical boundary")
+            .boundary_head()
+            .clone();
+        let session = restarted
+            .load_committed_runtime_session_for_body(id, "cold boundary rebuild")
+            .await
+            .expect("the committed boundary rebuilds from the rows the store kept")
+            .expect("committed boundary session");
+        (head, session)
+    }
+
+    /// The committed boundary a cold host's recovery rebuilds while a crash
+    /// tail sits on top of it: the store replays the boundary from its own
+    /// anchor over the rows it kept, so this fails once a cut removed rows,
+    /// or strands, the boundary needs.
+    async fn boundary_rebuilt_for_recovery(
+        directory: &std::path::Path,
+        id: &SessionId,
+    ) -> meerkat_core::session_store::SessionHead {
+        let restarted = reopen_retention_fixture(directory);
+        let runtime_id = LogicalRuntimeId::for_session(id);
+        assert!(
+            restarted
+                .runtime_store
+                .load_durable_tail_recovery_source(&runtime_id)
+                .await
+                .expect("the committed boundary rebuilds from the rows the store kept")
+                .is_some(),
+            "a durable tail awaits recovery"
+        );
+        restarted
+            .runtime_store
+            .load_session_boundary_authority(&runtime_id)
+            .await
+            .unwrap()
+            .expect("committed boundary authority")
+            .head_canonical()
+            .expect("HeadCanonical boundary")
+            .boundary_head()
+            .clone()
+    }
+
+    /// One long run: more compactions than the retention keeps, a
+    /// checkpoint, another compaction that retires rewrites in memory once the
+    /// durable head covers them, then the run's own tool call and results and
+    /// a second checkpoint. The host dies before the boundary commit. The
+    /// checkpoints pruned no rewrite rows, so the committed boundary (at
+    /// generation 0) still rebuilds, and recovery closes the run as
+    /// interrupted from it. The recovery prunes nothing either.
+    #[tokio::test]
+    async fn a_run_that_retired_rewrites_between_its_checkpoints_recovers_from_its_boundary() {
+        let (directory, service, checkpointer, committed) = retention_checkpoint_fixture().await;
+        let id = committed.id().clone();
+        let boundary_messages = committed.messages().len();
+        let retention = meerkat_core::TranscriptHistoryRetention::from_count(4).unwrap();
+        let mut session = committed;
+        for compaction in 0..6 {
+            compact_and_retire(&mut session, compaction, retention);
+        }
+        let run_id = RunId::new();
+        let receipt = meerkat_core::SessionCheckpointer::checkpoint_run(
+            &checkpointer,
+            &mut session,
+            &run_id,
+            None,
+        )
+        .await
+        .expect("the first checkpoint persists six compactions")
+        .expect("a provisional successor");
+        compact_and_retire(&mut session, 6, retention);
+        assert_eq!(
+            retired_rewrites(&session),
+            3,
+            "the durable head covers six rewrites, so memory retires three"
+        );
+        interrupted_after_compaction(&mut session, &run_id);
+        meerkat_core::SessionCheckpointer::checkpoint_run(
+            &checkpointer,
+            &mut session,
+            &run_id,
+            Some(&receipt),
+        )
+        .await
+        .expect("the second checkpoint")
+        .expect("the next provisional successor");
+        assert_eq!(physical_rewrite_count(&service, &id).await, 7);
+        drop(service);
+
+        let boundary_head = boundary_rebuilt_for_recovery(directory.path(), &id).await;
+        assert_eq!(boundary_head.rewrite_count, 0);
+        assert_eq!(boundary_head.message_count, boundary_messages as u64);
+
+        let restarted = reopen_retention_fixture(directory.path());
+        let recovery = restarted
+            .recover_committed_boundary(&id)
+            .await
+            .expect("the run's crash tail is recoverable from its boundary");
+        assert!(
+            matches!(
+                recovery,
+                CommittedBoundaryRecovery::Recovered { message_count }
+                    if message_count == session.messages().len() + 1
+            ),
+            "every durable row plus the recovery notice: {recovery:?}"
+        );
+        drop(restarted);
+        let (recovered_head, recovered) = rebuild_committed_boundary(directory.path(), &id).await;
+        assert_eq!(recovered_head.rewrite_count, 7);
+        assert!(
+            matches!(recovered.messages().last(), Some(Message::SystemNotice(_))),
+            "the interrupted run ends with the typed recovery notice"
+        );
+        let graph = recovered
+            .transcript_history_state()
+            .unwrap()
+            .expect("the recovered graph");
+        assert_eq!(
+            graph.retired_count(),
+            0,
+            "a recovery promotion carries no retention cut"
+        );
+    }
+
+    /// The same run over a committed boundary that was itself compacted past
+    /// the retention, so its anchor floor sits below its rewrite count. The
+    /// run's checkpoints retire rewrites in memory beyond that floor; had they
+    /// pruned the store to the live cut (or to anything above the boundary's
+    /// anchor floor), the boundary could no longer rebuild. It does, and
+    /// recovery closes the run as interrupted from it.
+    #[tokio::test]
+    async fn a_run_over_a_boundary_compacted_past_its_retention_recovers_from_it() {
+        let (directory, service, checkpointer, committed) = retention_checkpoint_fixture().await;
+        let id = committed.id().clone();
+        let retention = meerkat_core::TranscriptHistoryRetention::from_count(4).unwrap();
+        let mut session = committed;
+        for compaction in 0..6 {
+            compact_and_retire(&mut session, compaction, retention);
+        }
+        let mut session = service
+            .persist_detached_head_canonical_session(session, "the boundary")
+            .await
+            .expect("an earlier run commits six compactions as the boundary");
+        let incremental = service.incremental.as_ref().unwrap();
+        let boundary_at_commit = incremental
+            .load_head(&id)
+            .await
+            .unwrap()
+            .expect("boundary head");
+        let boundary_floor = anchor_floor(&boundary_at_commit);
+        assert!(
+            boundary_floor < boundary_at_commit.rewrite_count,
+            "the boundary's anchor floor ({boundary_floor}) must sit below its rewrite count ({})",
+            boundary_at_commit.rewrite_count
+        );
+
+        let run_id = RunId::new();
+        compact_and_retire(&mut session, 6, retention);
+        assert!(
+            retired_rewrites(&session) as u64 > boundary_floor,
+            "the run retires past the boundary's anchor floor in memory"
+        );
+        let receipt = meerkat_core::SessionCheckpointer::checkpoint_run(
+            &checkpointer,
+            &mut session,
+            &run_id,
+            None,
+        )
+        .await
+        .expect("the run's first checkpoint")
+        .expect("a provisional successor");
+        compact_and_retire(&mut session, 7, retention);
+        interrupted_after_compaction(&mut session, &run_id);
+        meerkat_core::SessionCheckpointer::checkpoint_run(
+            &checkpointer,
+            &mut session,
+            &run_id,
+            Some(&receipt),
+        )
+        .await
+        .expect("the run's second checkpoint")
+        .expect("the next provisional successor");
+        drop(service);
+
+        let boundary_head = boundary_rebuilt_for_recovery(directory.path(), &id).await;
+        assert_eq!(boundary_head, boundary_at_commit);
+
+        let restarted = reopen_retention_fixture(directory.path());
+        let recovery = restarted
+            .recover_committed_boundary(&id)
+            .await
+            .expect("the run's crash tail is recoverable from its boundary");
+        assert!(
+            matches!(
+                recovery,
+                CommittedBoundaryRecovery::Recovered { message_count }
+                    if message_count == session.messages().len() + 1
+            ),
+            "every durable row plus the recovery notice: {recovery:?}"
+        );
+    }
+
+    /// The runtime boundary commit that promotes a run's provisional chain,
+    /// built as the runtime driver builds it from the run's last checkpoint
+    /// receipt, carrying `deferred` as the run's retention cut.
+    fn promotion_commit(
+        checkpoint: &meerkat_core::RunCheckpointReceipt,
+        run_id: &RunId,
+        id: &SessionId,
+        deferred: Option<u64>,
+    ) -> meerkat_runtime::store::PreparedRuntimeSessionCommit {
+        let receipt = meerkat_core::lifecycle::RunBoundaryReceipt {
+            run_id: run_id.clone(),
+            boundary: RunApplyBoundary::Immediate,
+            contributing_input_ids: Vec::new(),
+            conversation_digest: Some(checkpoint.conversation_digest().to_string()),
+            message_count: usize::try_from(checkpoint.message_count()).unwrap(),
+            sequence: 1,
+            owner_contributions: Vec::new(),
+        };
+        meerkat_runtime::store::PreparedRuntimeSessionCommit::promote_head_canonical_success(
+            meerkat_runtime::store::PreparedHeadCanonicalProvisionalPromotion::prepare(
+                checkpoint.clone(),
+                run_id,
+            )
+            .unwrap()
+            .with_deferred_transcript_retirement(deferred),
+            receipt,
+            Vec::new(),
+            id.clone(),
+        )
+        .unwrap()
+    }
+
+    /// The retention cut the store holds for `head`'s session, as a cold
+    /// materialization of that exact head reads it.
+    async fn stored_retention_cut(
+        service: &PersistentSessionService<DummyBuilder>,
+        head: &meerkat_core::session_store::SessionHead,
+    ) -> usize {
+        service
+            .incremental
+            .as_ref()
+            .unwrap()
+            .materialize_head(head)
+            .await
+            .expect("the head materializes from the rows the store kept")
+            .session()
+            .transcript_history_state()
+            .unwrap()
+            .expect("a rewritten head materializes its graph")
+            .retired_count()
+    }
+
+    /// A run whose checkpoints left more rewrites than the retention keeps:
+    /// six compactions, a checkpoint, a seventh compaction that retires three
+    /// in memory, the run's answer and its last checkpoint. Returns the run,
+    /// its last checkpoint receipt, its live cut and the physical head.
+    async fn run_with_a_deferred_cut(
+        service: &PersistentSessionService<DummyBuilder>,
+        checkpointer: &StoreCheckpointer,
+        committed: Session,
+    ) -> (
+        RunId,
+        meerkat_core::RunCheckpointReceipt,
+        u64,
+        meerkat_core::session_store::SessionHead,
+    ) {
+        let id = committed.id().clone();
+        let retention = meerkat_core::TranscriptHistoryRetention::from_count(4).unwrap();
+        let mut session = committed;
+        for compaction in 0..6 {
+            compact_and_retire(&mut session, compaction, retention);
+        }
+        let run_id = RunId::new();
+        let first = meerkat_core::SessionCheckpointer::checkpoint_run(
+            checkpointer,
+            &mut session,
+            &run_id,
+            None,
+        )
+        .await
+        .expect("the first checkpoint")
+        .expect("a provisional successor");
+        compact_and_retire(&mut session, 6, retention);
+        let live_cut = retired_rewrites(&session) as u64;
+        completed_after_compaction(&mut session, &run_id);
+        let last = meerkat_core::SessionCheckpointer::checkpoint_run(
+            checkpointer,
+            &mut session,
+            &run_id,
+            Some(&first),
+        )
+        .await
+        .expect("the last checkpoint")
+        .expect("the next provisional successor");
+        let physical = service
+            .incremental
+            .as_ref()
+            .unwrap()
+            .load_head(&id)
+            .await
+            .unwrap()
+            .expect("physical head");
+        (run_id, last, live_cut, physical)
+    }
+
+    /// The run's checkpoints prune no rewrite rows. The boundary commit that
+    /// promotes the run applies the run's retention cut in its own
+    /// transaction, once: a retried promotion cuts nothing more.
+    #[tokio::test]
+    async fn the_promotion_applies_the_runs_deferred_retention_cut_once() {
+        let (_directory, service, checkpointer, committed) = retention_checkpoint_fixture().await;
+        let id = committed.id().clone();
+        let (run_id, last, live_cut, physical) =
+            run_with_a_deferred_cut(&service, &checkpointer, committed).await;
+        assert_eq!(live_cut, 3);
+        assert_eq!(
+            stored_retention_cut(&service, &physical).await,
+            0,
+            "the run's checkpoints pruned no rewrite rows"
+        );
+        let expected = live_cut
+            .min(anchor_floor(&physical))
+            .min(physical.rewrite_count - 1);
+        assert!(
+            expected > 0,
+            "the promoted head admits a cut: live {live_cut}, anchor floor {}",
+            anchor_floor(&physical)
+        );
+
+        let runtime_id = LogicalRuntimeId::for_session(&id);
+        let applied = checkpointer
+            .runtime_store
+            .commit_prepared_session_boundary(
+                &runtime_id,
+                promotion_commit(&last, &run_id, &id, Some(live_cut)),
+            )
+            .await
+            .expect("the promotion commits");
+        assert_eq!(
+            applied.outcome(),
+            meerkat_runtime::store::PreparedRuntimeSessionCommitOutcome::Applied
+        );
+        assert_eq!(
+            stored_retention_cut(&service, &physical).await as u64,
+            expected,
+            "the promotion applies the run's cut"
+        );
+
+        let retried = checkpointer
+            .runtime_store
+            .commit_prepared_session_boundary(
+                &runtime_id,
+                promotion_commit(&last, &run_id, &id, Some(live_cut)),
+            )
+            .await
+            .expect("an exact retry converges");
+        assert_eq!(
+            retried.outcome(),
+            meerkat_runtime::store::PreparedRuntimeSessionCommitOutcome::AlreadyAppliedExact
+        );
+        assert_eq!(
+            stored_retention_cut(&service, &physical).await as u64,
+            expected,
+            "a retried promotion cuts nothing more"
+        );
+    }
+
+    /// The cut a promotion carries comes from the live session, not the
+    /// store. Even an over-large one stops at the promoted head's anchor
+    /// floor (and below its rewrite count), so it cannot strand the new
+    /// boundary.
+    #[tokio::test]
+    async fn an_over_large_deferred_cut_stops_at_the_promoted_heads_anchor_floor() {
+        let (directory, service, checkpointer, committed) = retention_checkpoint_fixture().await;
+        let id = committed.id().clone();
+        let (run_id, last, _live_cut, physical) =
+            run_with_a_deferred_cut(&service, &checkpointer, committed).await;
+        checkpointer
+            .runtime_store
+            .commit_prepared_session_boundary(
+                &LogicalRuntimeId::for_session(&id),
+                promotion_commit(&last, &run_id, &id, Some(u64::MAX)),
+            )
+            .await
+            .expect("the promotion commits");
+        assert_eq!(
+            stored_retention_cut(&service, &physical).await as u64,
+            anchor_floor(&physical).min(physical.rewrite_count - 1)
+        );
+        drop(service);
+        let (boundary_head, _boundary) = rebuild_committed_boundary(directory.path(), &id).await;
+        assert_eq!(
+            boundary_head, physical,
+            "the promoted head is the new boundary"
+        );
+    }
+
+    /// After a recovery, which cuts nothing, the next run's checkpoints still
+    /// prune no rewrite rows, and the cut its promotion applies stays at the
+    /// new boundary's anchor floor or below.
+    #[tokio::test]
+    async fn after_a_recovery_the_next_run_prunes_only_at_its_promotion() {
+        let (directory, service, checkpointer, committed) = retention_checkpoint_fixture().await;
+        let id = committed.id().clone();
+        let retention = meerkat_core::TranscriptHistoryRetention::from_count(4).unwrap();
+        let mut session = committed;
+        for compaction in 0..6 {
+            compact_and_retire(&mut session, compaction, retention);
+        }
+        let crashed_run = RunId::new();
+        interrupted_after_compaction(&mut session, &crashed_run);
+        meerkat_core::SessionCheckpointer::checkpoint_run(
+            &checkpointer,
+            &mut session,
+            &crashed_run,
+            None,
+        )
+        .await
+        .expect("the crashed run's checkpoint")
+        .expect("a provisional successor");
+        drop(checkpointer);
+        drop(service);
+
+        let restarted = reopen_retention_fixture(directory.path());
+        let recovery = restarted
+            .recover_committed_boundary(&id)
+            .await
+            .expect("the crashed run recovers");
+        assert!(
+            matches!(recovery, CommittedBoundaryRecovery::Recovered { .. }),
+            "{recovery:?}"
+        );
+        let recovered = restarted
+            .load_committed_runtime_session_for_body(&id, "after recovery")
+            .await
+            .unwrap()
+            .expect("the recovered boundary");
+        let recovered_head = restarted
+            .incremental
+            .as_ref()
+            .unwrap()
+            .load_head(&id)
+            .await
+            .unwrap()
+            .expect("the recovered head");
+        assert_eq!(
+            stored_retention_cut(&restarted, &recovered_head).await,
+            0,
+            "the recovery prunes no rewrite rows"
+        );
+
+        let checkpointer = StoreCheckpointer {
+            runtime_store: restarted.runtime_store.clone(),
+            incremental: restarted.incremental.clone(),
+            blob_store: memory_blob_store(),
+            gate: Arc::new(CheckpointerGate {
+                cancelled: Mutex::new(false),
+            }),
+            whole_blob_base_authority: std::sync::Mutex::new(None),
+            latest_run_checkpoint_receipt: Mutex::new(None),
+            latest_run_transcript_retirement: std::sync::Mutex::new(None),
+        };
+        let mut session = recovered;
+        let run_id = RunId::new();
+        compact_and_retire(&mut session, 6, retention);
+        let live_cut = retired_rewrites(&session) as u64;
+        assert!(live_cut > 0, "the next run retires in memory");
+        completed_after_compaction(&mut session, &run_id);
+        let last = meerkat_core::SessionCheckpointer::checkpoint_run(
+            &checkpointer,
+            &mut session,
+            &run_id,
+            None,
+        )
+        .await
+        .expect("the next run's checkpoint")
+        .expect("a provisional successor");
+        let physical = restarted
+            .incremental
+            .as_ref()
+            .unwrap()
+            .load_head(&id)
+            .await
+            .unwrap()
+            .expect("the next run's physical head");
+        assert_eq!(
+            stored_retention_cut(&restarted, &physical).await,
+            0,
+            "the next run's checkpoint prunes no rewrite rows"
+        );
+
+        checkpointer
+            .runtime_store
+            .commit_prepared_session_boundary(
+                &LogicalRuntimeId::for_session(&id),
+                promotion_commit(&last, &run_id, &id, Some(live_cut)),
+            )
+            .await
+            .expect("the next run's promotion commits");
+        let cut = stored_retention_cut(&restarted, &physical).await as u64;
+        assert!(cut > 0, "the promotion applies the next run's cut");
+        assert!(
+            cut <= anchor_floor(&physical),
+            "the cut {cut} stays at or below the new boundary's anchor floor {}",
+            anchor_floor(&physical)
+        );
     }
 
     /// Retirement goes exactly as far as the durable head and no further:
@@ -39200,6 +39779,7 @@ mod tests {
             }),
             whole_blob_base_authority: std::sync::Mutex::new(None),
             latest_run_checkpoint_receipt: Mutex::new(None),
+            latest_run_transcript_retirement: std::sync::Mutex::new(None),
         });
         service
             .live_checkpointers

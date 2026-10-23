@@ -9322,6 +9322,26 @@ fn retire_head_canonical_rows_in_txn(
     collect_unreachable_strands_in_txn(tx, head)
 }
 
+/// Apply a deferred transcript retention cut to the rows of `head`, the
+/// physical head a runtime boundary commit has just promoted, inside that
+/// co-tenant runtime transaction.
+///
+/// An intra-run checkpoint writes its provisional successor without pruning
+/// rewrite rows, so the committed boundary stays rebuildable until the run's
+/// boundary commit promotes the successor; the promotion then applies the
+/// live graph's cut here. The cut is clamped to `head`'s own row-lineage
+/// anchor floor and below its rewrite count, and a cut at or below the stored
+/// one is a no-op, so an over-large target cannot strand the promoted head
+/// and a retried promotion cuts nothing twice.
+#[doc(hidden)]
+pub fn retire_head_canonical_rows_for_runtime_in_txn(
+    tx: &Transaction<'_>,
+    head: &SessionHead,
+    target: u64,
+) -> Result<(), SessionStoreError> {
+    retire_head_canonical_rows_in_txn(tx, head, target)
+}
+
 /// Delete strands no retained authority can reach.
 ///
 /// Roots are the head strand, the head's row-lineage anchor strand, and both

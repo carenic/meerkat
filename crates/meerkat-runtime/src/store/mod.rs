@@ -1219,6 +1219,7 @@ impl PreparedWholeBlobRecoveryPromotion {
 pub struct PreparedHeadCanonicalProvisionalPromotion {
     checkpoint: meerkat_core::RunCheckpointReceipt,
     authority: HeadCanonicalProvisionalTailAuthority,
+    deferred_transcript_retirement: Option<u64>,
 }
 
 impl PreparedHeadCanonicalProvisionalPromotion {
@@ -1242,7 +1243,23 @@ impl PreparedHeadCanonicalProvisionalPromotion {
         Ok(Self {
             checkpoint,
             authority,
+            deferred_transcript_retirement: None,
         })
+    }
+
+    /// The same promotion, applying the store-side retention cut the run's
+    /// intra-run checkpoints deferred (the live graph's retired count at its
+    /// last checkpoint). The store clamps it to the promoted head, so it can
+    /// never strand the new boundary.
+    #[must_use]
+    pub fn with_deferred_transcript_retirement(mut self, retired: Option<u64>) -> Self {
+        self.deferred_transcript_retirement = retired;
+        self
+    }
+
+    #[must_use]
+    pub const fn deferred_transcript_retirement(&self) -> Option<u64> {
+        self.deferred_transcript_retirement
     }
 
     #[must_use]
