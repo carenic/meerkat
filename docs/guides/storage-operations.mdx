@@ -367,7 +367,7 @@ operator can resolve a hold over ambiguous evidence:
    result, results that answer no call, rows after the terminal reply, the
    run cursor and whether its inputs are still bound), the messages it
    keeps, the calls it would answer, the inputs it would end, whether the
-   runtime is quiescent, and the verdict.
+   persisted lifecycle is quiescent, and the verdict.
 3. Apply it.
 
 ```bash
@@ -396,7 +396,9 @@ opens it, and refuses one whose switch to another storage profile is still
 in progress instead of completing it. As for `repair-wholeblob`, the only
 writes an open can make are SQLite's own: the `.mfence` lock sibling, the
 WAL sidecars, and the journal-mode conversion to WAL for a database not
-already in WAL mode. `--json` prints the report as one JSON object.
+already in WAL mode. Open a database it refuses this way once with the host
+that owns it, then run the command again. `--json` prints the report as one
+JSON object.
 
 Applied, the repair commits the held tail as interrupted, through the same
 recovery commit as a crash:
