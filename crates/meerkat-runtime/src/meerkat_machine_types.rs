@@ -919,6 +919,7 @@ meerkat_machine_runtime_internal_inputs!(
         ResolveUnstageableQueuedInput,
         RetryRequested,
         RollbackStaged,
+        ReplayAppliedRunContributor,
         StageForRun,
         StartConversationRun,
         StartImmediateAppend,
@@ -1297,6 +1298,14 @@ meerkat_machine_runtime_internal_inputs!(
     // positions.
     InputQueueLifecycle => [
         ClassifyStopInputDisposition,
+    ],
+    // Same-run resume after a restart.
+    RunExecutionLifecycle => [
+        MarkRunResumable,
+        ResumeRun,
+        ReleaseResumableRun,
+        SettleResumableRun,
+        SuspendRunForStop,
     ],
 );
 

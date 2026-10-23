@@ -40,7 +40,7 @@
 //! started and redelivering it is correct. Content matching must never be used
 //! to manufacture consumption identity.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::identifiers::LogicalRuntimeId;
@@ -61,13 +61,16 @@ use meerkat_core::lifecycle::core_executor::BoundSessionCommit;
 use meerkat_core::lifecycle::run_primitive::RunApplyBoundary;
 use meerkat_core::lifecycle::run_receipt::RunBoundaryReceipt;
 use meerkat_core::session_document::{
-    DurableHeadRelation, DurableTailRecoveryClass as ClassifiedRecoveryClass,
+    DurableHeadRelation, DurableTailRecoveryClass as ClassifiedRecoveryClass, DurableTailRunCursor,
     DurableTailStopReason, RunIdCardinality, SessionDocumentEffect, SessionDocumentKey,
     SessionDocumentMachineAuthority,
 };
 use meerkat_core::session_store::PreparedHeadCanonicalMutation;
 use meerkat_core::types::SessionId;
-use meerkat_core::{Message, RunId, Session, StopReason, SystemNoticeKind, SystemNoticeMessage};
+use meerkat_core::{
+    Message, RunCheckpointAuthority, RunCheckpointReceipt, RunId, RunResumePoint, Session,
+    StopReason, SystemNoticeKind, SystemNoticeMessage,
+};
 use sha2::{Digest, Sha256};
 
 pub use mm_dsl::{DurableTailRecoveryClass, DurableTailRecoveryDisposition};
@@ -89,6 +92,11 @@ struct DurableTailObservation {
     dangling_tool_use_ids: Vec<String>,
     orphan_tool_result_count: u64,
     messages_after_terminal: bool,
+    /// What the tail's run cursor says against its transcript; `Absent`
+    /// until the source preparation observes the cursor.
+    run_cursor: DurableTailRunCursor,
+    /// Whether every input the run cursor binds is still bound to its run.
+    cursor_inputs_open: bool,
 }
 
 /// Fully evidence-bound recovery candidate.
@@ -126,6 +134,19 @@ struct PreparedRecoveryCandidate {
     document: Option<BoundSessionCommit>,
     conversation_digest: String,
     message_count: usize,
+    /// For a ContinuableCandidate only: what continuing its run needs.
+    /// `recovered` and `document` then hold the interrupted repair a retired
+    /// runtime commits instead.
+    continuation: Option<PreparedContinuation>,
+}
+
+/// What continuing a ContinuableCandidate's run needs: the provisional tail
+/// itself, run cursor included, and the receipt its next checkpoint chains
+/// from.
+#[derive(Debug)]
+struct PreparedContinuation {
+    candidate: Arc<Session>,
+    receipt: RunCheckpointReceipt,
 }
 
 enum RecoveryCandidatePreparation {
@@ -155,6 +176,7 @@ fn observe_durable_tail(authority_len: usize, head: &Session) -> DurableTailObse
     let mut last_assistant_stop: Option<DurableTailStopReason> = None;
     let mut terminal_seen = false;
     let mut messages_after_terminal = false;
+    let mut run_rows = false;
     for message in tail {
         // No typed transcript fact distinguishes a generated structured-output
         // continuation prompt from an ordinary User message. Fail closed:
@@ -166,6 +188,7 @@ fn observe_durable_tail(authority_len: usize, head: &Session) -> DurableTailObse
         }
         match message {
             Message::BlockAssistant(assistant) => {
+                run_rows = true;
                 match assistant.identity.run_id.as_ref() {
                     Some(run_id) => {
                         run_ids.insert(run_id.to_string());
@@ -197,6 +220,7 @@ fn observe_durable_tail(authority_len: usize, head: &Session) -> DurableTailObse
                     && effective_stop != DurableTailStopReason::ToolUse;
             }
             Message::ToolResults { results, .. } => {
+                run_rows = true;
                 for result in results {
                     if let Some(position) = open_call_ids
                         .iter()
@@ -213,6 +237,10 @@ fn observe_durable_tail(authority_len: usize, head: &Session) -> DurableTailObse
     }
     let terminal_stop_reason = last_assistant_stop.unwrap_or(DurableTailStopReason::Absent);
     let run_id_cardinality = match (run_ids.len(), assistant_without_run_id) {
+        // No assistant message and no tool result: no row could carry a run
+        // id. The classifier decides whether the store-issued provisional
+        // binding, or an agreeing run cursor, attributes the tail.
+        (0, _) if !run_rows => RunIdCardinality::NoRunRows,
         (0, _) => RunIdCardinality::NoRunId,
         (1, false) => RunIdCardinality::SingleRunId,
         _ => RunIdCardinality::MultipleRunIds,
@@ -224,7 +252,109 @@ fn observe_durable_tail(authority_len: usize, head: &Session) -> DurableTailObse
         dangling_tool_use_ids: open_call_ids,
         orphan_tool_result_count,
         messages_after_terminal,
+        run_cursor: DurableTailRunCursor::Absent,
+        cursor_inputs_open: false,
     }
+}
+
+/// Mechanical run-cursor evidence of a durable tail: whether the tail
+/// carries a run cursor, whether that cursor agrees with the transcript, and
+/// whether every input it binds is still bound to its run. The generated
+/// classifier assigns the meaning.
+///
+/// The provisional tail and its cursor are written by one checkpoint of one
+/// run, so a readable cursor that names another run than the store-issued
+/// provisional run contradicts the store and is invalid evidence.
+///
+/// A cursor agrees when it names the provisional run and, while its round's
+/// tool calls are pending, the staged assistant message is absent from the
+/// tail (the second commit of a round puts the message and its results into
+/// the transcript together). The staged message is matched by its own
+/// assistant message id, never by its call ids: providers repeat call ids
+/// across responses (Gemini numbers each response's calls from `fc_0`), so an
+/// earlier round of the same run can carry the staged calls' ids. A staged
+/// message without an id cannot be told apart and disagrees. A cursor
+/// awaiting the model agrees by its run alone: resuming it asks the model
+/// again and dispatches nothing. An unreadable cursor disagrees.
+///
+/// Its inputs are bound when the cursor binds at least one input and every
+/// one of them is Staged, Applied or AppliedPendingConsumption in the store
+/// with that run as its last run. An empty bound set never resumes (direct and
+/// machine-service turns), and a requeued or terminal input ends the run's
+/// continuation.
+fn observe_run_cursor(
+    head: &Session,
+    tail_base: usize,
+    candidate_run_id: &RunId,
+    bound_input_runs: &HashMap<InputId, RunId>,
+) -> Result<(DurableTailRunCursor, bool), DurableTailRecoveryError> {
+    let cursor = match head.try_run_cursor() {
+        Ok(None) => return Ok((DurableTailRunCursor::Absent, false)),
+        Ok(Some(cursor)) => cursor,
+        Err(_) => return Ok((DurableTailRunCursor::Disagrees, false)),
+    };
+    if &cursor.run_id != candidate_run_id {
+        return Err(DurableTailRecoveryError::InvalidEvidence(format!(
+            "run cursor names run {}, not the store-issued provisional run {candidate_run_id}",
+            cursor.run_id
+        )));
+    }
+    if let RunResumePoint::ToolsPending { assistant_message } = &cursor.resume_point {
+        let Some(staged_message_id) = assistant_message.assistant_message_id.as_ref() else {
+            return Ok((DurableTailRunCursor::Disagrees, false));
+        };
+        if !assistant_message.has_tool_calls() {
+            return Ok((DurableTailRunCursor::Disagrees, false));
+        }
+        let tail = &head.messages()[tail_base.min(head.messages().len())..];
+        let staged_in_tail = tail.iter().any(|message| {
+            matches!(
+                message,
+                Message::BlockAssistant(assistant)
+                    if assistant.assistant_message_id.as_ref() == Some(staged_message_id)
+            )
+        });
+        if staged_in_tail {
+            return Ok((DurableTailRunCursor::Disagrees, false));
+        }
+    }
+    let inputs_bound = !cursor.bound_input_ids.is_empty()
+        && cursor
+            .bound_input_ids
+            .iter()
+            .all(|input_id| bound_input_runs.get(input_id) == Some(&cursor.run_id));
+    Ok((DurableTailRunCursor::Agrees, inputs_bound))
+}
+
+fn durable_tail_run_cursor_name(cursor: DurableTailRunCursor) -> &'static str {
+    match cursor {
+        DurableTailRunCursor::Absent => "absent",
+        DurableTailRunCursor::Agrees => "agrees",
+        DurableTailRunCursor::Disagrees => "disagrees",
+    }
+}
+
+/// Bind the run-cursor evidence into a candidate id. A tail without a cursor
+/// adds nothing, so the candidate ids of tails written without run cursors
+/// do not change.
+fn hash_run_cursor_observation(hasher: &mut Sha256, observation: &DurableTailObservation) {
+    if observation.run_cursor == DurableTailRunCursor::Absent {
+        return;
+    }
+    hash_part(
+        hasher,
+        "run_cursor",
+        durable_tail_run_cursor_name(observation.run_cursor).as_bytes(),
+    );
+    hash_part(
+        hasher,
+        "cursor_inputs_open",
+        if observation.cursor_inputs_open {
+            b"true"
+        } else {
+            b"false"
+        },
+    );
 }
 
 fn hash_part(hasher: &mut Sha256, label: &str, value: &[u8]) {
@@ -239,6 +369,7 @@ fn run_id_cardinality_name(cardinality: RunIdCardinality) -> &'static str {
         RunIdCardinality::NoRunId => "no_run_id",
         RunIdCardinality::SingleRunId => "single_run_id",
         RunIdCardinality::MultipleRunIds => "multiple_run_ids",
+        RunIdCardinality::NoRunRows => "no_run_rows",
     }
 }
 
@@ -334,6 +465,7 @@ fn exact_candidate_id(
             b"false"
         },
     );
+    hash_run_cursor_observation(&mut hasher, observation);
     format!("sha256:{:x}", hasher.finalize())
 }
 
@@ -401,6 +533,7 @@ fn exact_whole_blob_candidate_id(
             b"false"
         },
     );
+    hash_run_cursor_observation(&mut hasher, observation);
     format!("sha256:{:x}", hasher.finalize())
 }
 
@@ -424,6 +557,8 @@ fn generated_recovery_classification(
             observation.dangling_tool_use_ids.len() as u64,
             observation.orphan_tool_result_count,
             observation.messages_after_terminal,
+            observation.run_cursor,
+            observation.cursor_inputs_open,
         )
         .map_err(|error| {
             DurableTailRecoveryError::Authority(format!(
@@ -459,6 +594,9 @@ fn runtime_recovery_class(
             DurableTailRecoveryClass::InterruptedRepairableCandidate
         }
         ClassifiedRecoveryClass::Ambiguous => DurableTailRecoveryClass::Ambiguous,
+        ClassifiedRecoveryClass::ContinuableCandidate => {
+            DurableTailRecoveryClass::ContinuableCandidate
+        }
         // Fail closed against a stale generated artifact while the 0.8.10
         // floor removal propagates through generated code. This is not a
         // mapping or adoption path; the variant disappears at regeneration.
@@ -558,6 +696,7 @@ fn physical_history_witness_mismatch(
 
 fn prepare_head_canonical_recovery_candidate(
     source: &PreparedDurableTailRecoverySource,
+    bound_input_runs: &HashMap<InputId, RunId>,
 ) -> Result<RecoveryCandidatePreparation, DurableTailRecoveryError> {
     let runtime_authority = source.runtime_authority();
     let committed_authority = source.committed_session().as_ref();
@@ -650,7 +789,10 @@ fn prepare_head_canonical_recovery_candidate(
     let relation = classifier_relation(source.relation());
     let tail_base = match source.relation() {
         DurableTailSourceRelation::StrictContinuation => {
-            if physical_head.messages().len() <= committed_authority.messages().len()
+            // Equal transcripts are a metadata-only tail (a round's first
+            // commit with no new row, or a run's closing save); the tail
+            // observation below decides whether anything attributes it.
+            if physical_head.messages().len() < committed_authority.messages().len()
                 || !physical_head
                     .messages()
                     .starts_with(committed_authority.messages())
@@ -675,13 +817,26 @@ fn prepare_head_canonical_recovery_candidate(
 
     let derived_physical_head_token = source.physical_head_cas_token().to_string();
 
-    let observation = observe_durable_tail(tail_base, physical_head);
+    let mut observation = observe_durable_tail(tail_base, physical_head);
+    let (run_cursor, cursor_inputs_open) = observe_run_cursor(
+        physical_head,
+        tail_base,
+        provisional.run_id(),
+        bound_input_runs,
+    )?;
+    observation.run_cursor = run_cursor;
+    observation.cursor_inputs_open = cursor_inputs_open;
     // Rewrite occurrences carry no run identity, so a rewritten tail with no
     // run-stamped assistant row after its final rewrite has no transcript
-    // evidence of its run: the machine classifies it, and holds it.
+    // evidence of its run: the machine classifies it, and holds it. A tail
+    // with no run rows at all is the machine's to attribute too: the
+    // store-issued provisional binding of this exact physical head does on a
+    // strict continuation, and only an agreeing run cursor does on a rewrite.
     let unattributed_rewrite = relation != DurableHeadRelation::VerifiedStrictDescendant
         && observation.run_id_cardinality == RunIdCardinality::NoRunId;
+    let no_run_rows = observation.run_id_cardinality == RunIdCardinality::NoRunRows;
     if !unattributed_rewrite
+        && !no_run_rows
         && (observation.tail_run_id.as_ref() != Some(provisional.run_id())
             || observation.run_id_cardinality != RunIdCardinality::SingleRunId)
     {
@@ -739,7 +894,8 @@ fn prepare_head_canonical_recovery_candidate(
         DurableTailRecoveryClass::CompletedCandidate => {
             // The exact physical transcript is already the completed boundary.
         }
-        DurableTailRecoveryClass::InterruptedRepairableCandidate => {
+        DurableTailRecoveryClass::InterruptedRepairableCandidate
+        | DurableTailRecoveryClass::ContinuableCandidate => {
             let durable_tail_timestamp = physical_head
                 .messages()
                 .last()
@@ -766,6 +922,9 @@ fn prepare_head_canonical_recovery_candidate(
     // durable timestamp and all non-recovery-owned state. Completed recovery
     // is already byte-for-byte the physical materialization; applying this
     // uniformly keeps the field-ownership rule in one place.
+    // Adopting the head also drops its run cursor: a committed body never
+    // carries one (D3), so every recovery commit closes the run it
+    // attributes, whatever the class.
     recovered
         .adopt_recovered_head_state(physical_head)
         .map_err(DurableTailRecoveryError::InvalidEvidence)?;
@@ -817,6 +976,14 @@ fn prepare_head_canonical_recovery_candidate(
         ))
     })?;
     let message_count = recovered.messages().len();
+    let continuation = if class == DurableTailRecoveryClass::ContinuableCandidate {
+        Some(prepared_continuation(
+            source.physical_session(),
+            RunCheckpointAuthority::HeadCanonical(provisional.clone()),
+        )?)
+    } else {
+        None
+    };
 
     Ok(RecoveryCandidatePreparation::Prepared(
         PreparedRecoveryCandidate {
@@ -835,13 +1002,44 @@ fn prepare_head_canonical_recovery_candidate(
             document: Some(document),
             conversation_digest,
             message_count,
+            continuation,
         },
     ))
+}
+
+/// The continuation of a ContinuableCandidate: the provisional tail itself
+/// and the receipt its next checkpoint chains from, bound to the same
+/// store-issued provisional authority the tail was written under.
+fn prepared_continuation(
+    candidate: &Arc<Session>,
+    authority: RunCheckpointAuthority,
+) -> Result<PreparedContinuation, DurableTailRecoveryError> {
+    let conversation_digest = candidate.transcript_content_digest().map_err(|error| {
+        DurableTailRecoveryError::InvalidEvidence(format!(
+            "continuable tail transcript digest failed: {error}"
+        ))
+    })?;
+    let message_count = u64::try_from(candidate.messages().len()).map_err(|_| {
+        DurableTailRecoveryError::InvalidEvidence(
+            "continuable tail message count exceeds the receipt range".to_string(),
+        )
+    })?;
+    let receipt = RunCheckpointReceipt::issued(authority, conversation_digest, message_count)
+        .map_err(|error| {
+            DurableTailRecoveryError::InvalidEvidence(format!(
+                "continuable tail checkpoint receipt is invalid: {error}"
+            ))
+        })?;
+    Ok(PreparedContinuation {
+        candidate: Arc::clone(candidate),
+        receipt,
+    })
 }
 
 fn prepare_whole_blob_recovery_candidate(
     committed: CommittedWholeBlobSnapshot,
     provisional: Option<CommittedWholeBlobProvisionalTail>,
+    bound_input_runs: &HashMap<InputId, RunId>,
 ) -> Result<RecoveryCandidatePreparation, DurableTailRecoveryError> {
     let committed_snapshot = committed.clone();
     let (committed_session, _committed_bytes, committed_authority) = committed.into_parts();
@@ -879,7 +1077,10 @@ fn prepare_whole_blob_recovery_candidate(
             "WholeBlob provisional tail changes immutable session identity".to_string(),
         ));
     }
-    if candidate_session.messages().len() <= committed_session.messages().len()
+    // Equal transcripts are a metadata-only tail: a round's first commit
+    // with no new row, a run's closing save, or the tail a run re-base
+    // restarts on its compacted snapshot.
+    if candidate_session.messages().len() < committed_session.messages().len()
         || !candidate_session
             .messages()
             .starts_with(committed_session.messages())
@@ -888,9 +1089,21 @@ fn prepare_whole_blob_recovery_candidate(
             "WholeBlob provisional tail is not an exact strict transcript continuation".to_string(),
         ));
     }
-    let observation = observe_durable_tail(committed_session.messages().len(), &candidate_session);
-    if observation.tail_run_id.as_ref() != Some(provisional_authority.run_id())
-        || observation.run_id_cardinality != RunIdCardinality::SingleRunId
+    let mut observation =
+        observe_durable_tail(committed_session.messages().len(), &candidate_session);
+    let (run_cursor, cursor_inputs_open) = observe_run_cursor(
+        &candidate_session,
+        committed_session.messages().len(),
+        provisional_authority.run_id(),
+        bound_input_runs,
+    )?;
+    observation.run_cursor = run_cursor;
+    observation.cursor_inputs_open = cursor_inputs_open;
+    // A tail with no run rows is attributed by the store-issued provisional
+    // binding of this exact candidate; the classifier decides.
+    if observation.run_id_cardinality != RunIdCardinality::NoRunRows
+        && (observation.tail_run_id.as_ref() != Some(provisional_authority.run_id())
+            || observation.run_id_cardinality != RunIdCardinality::SingleRunId)
     {
         return Err(DurableTailRecoveryError::InvalidEvidence(
             "WholeBlob provisional transcript contradicts its store-issued run identity"
@@ -920,7 +1133,8 @@ fn prepare_whole_blob_recovery_candidate(
     let mut recovered = candidate_session;
     match class {
         DurableTailRecoveryClass::CompletedCandidate => {}
-        DurableTailRecoveryClass::InterruptedRepairableCandidate => {
+        DurableTailRecoveryClass::InterruptedRepairableCandidate
+        | DurableTailRecoveryClass::ContinuableCandidate => {
             let durable_tail_timestamp = recovered
                 .messages()
                 .last()
@@ -942,16 +1156,26 @@ fn prepare_whole_blob_recovery_candidate(
             ));
         }
     }
+    // Adopting the envelope also drops its run cursor (D3).
     recovered
         .adopt_recovered_head_state(&physical_envelope)
         .map_err(DurableTailRecoveryError::InvalidEvidence)?;
+    let continuation = if class == DurableTailRecoveryClass::ContinuableCandidate {
+        Some(prepared_continuation(
+            &Arc::new(physical_envelope),
+            RunCheckpointAuthority::WholeBlob(provisional_authority.clone()),
+        )?)
+    } else {
+        None
+    };
     let recovered = Arc::new(recovered);
     let (document, recovered_blob_sha256) = match class {
         DurableTailRecoveryClass::CompletedCandidate => (
             None,
             provisional_authority.candidate_blob_sha256().to_string(),
         ),
-        DurableTailRecoveryClass::InterruptedRepairableCandidate => {
+        DurableTailRecoveryClass::InterruptedRepairableCandidate
+        | DurableTailRecoveryClass::ContinuableCandidate => {
             let document = BoundSessionCommit::sealed(Arc::clone(&recovered)).map_err(|error| {
                 DurableTailRecoveryError::InvalidEvidence(format!(
                     "failed to seal repaired WholeBlob document: {error}"
@@ -999,6 +1223,7 @@ fn prepare_whole_blob_recovery_candidate(
             document,
             conversation_digest,
             message_count,
+            continuation,
         },
     ))
 }
@@ -1265,6 +1490,77 @@ pub enum DurableTailRecoveryOutcome {
     /// conflicting run facts, or durable receipts that already cover — or
     /// contradict — this candidate).
     Refused,
+    /// The tail is a durable session's open run at a committed round, and
+    /// the machine authorized continuing it. Nothing was written:
+    /// `candidate` is the provisional tail itself, its run cursor included,
+    /// `run_id` the run to resume, and `receipt` the provisional receipt the
+    /// resumed run's next checkpoint chains from.
+    Continue {
+        candidate: Box<Session>,
+        run_id: RunId,
+        receipt: RunCheckpointReceipt,
+    },
+}
+
+/// What registration needs to keep a resumable run's inputs bound: the run a
+/// continuable tail's cursor names and the inputs the cursor binds to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumableRunObservation {
+    /// The run the stored cursor names.
+    pub run_id: RunId,
+    /// The inputs the cursor binds to that run.
+    pub bound_input_ids: Vec<InputId>,
+}
+
+/// Observe whether the session's durable tail is a continuable open run,
+/// with the same source preparation and classifier the recovery drive uses.
+///
+/// This only observes. The drive's machine verdict at materialization
+/// decides; a run marked resumable from this observation is released to
+/// ordinary requeue when that verdict is not Continue.
+pub async fn observe_resumable_run(
+    store: &dyn RuntimeStore,
+    session_id: &SessionId,
+) -> Result<Option<ResumableRunObservation>, DurableTailRecoveryError> {
+    let runtime_id = LogicalRuntimeId::for_session(session_id);
+    // Most registrations find no provisional tail: answer them without
+    // loading the committed document and the input rows.
+    // A store that cannot load provisional tails holds none to continue.
+    let has_provisional_tail = match store.session_persistence_profile() {
+        RuntimeSessionPersistenceProfile::HeadCanonicalV1 => store
+            .load_head_canonical_provisional_tail(&runtime_id)
+            .await
+            .map(|tail| tail.is_some()),
+        RuntimeSessionPersistenceProfile::WholeBlobV1 => store
+            .load_whole_blob_provisional_tail(&runtime_id)
+            .await
+            .map(|tail| tail.is_some()),
+    };
+    match has_provisional_tail {
+        Ok(true) => {}
+        Ok(false) | Err(RuntimeStoreError::Unsupported(_)) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let RecoveryCandidatePreparation::Prepared(candidate) =
+        load_recovery_preparation(store, &runtime_id, session_id).await?
+    else {
+        return Ok(None);
+    };
+    if candidate.class != DurableTailRecoveryClass::ContinuableCandidate {
+        return Ok(None);
+    }
+    let Some(continuation) = candidate.continuation.as_ref() else {
+        return Ok(None);
+    };
+    let cursor = continuation.candidate.try_run_cursor().map_err(|error| {
+        DurableTailRecoveryError::InvalidEvidence(format!(
+            "continuable tail run cursor is unreadable: {error}"
+        ))
+    })?;
+    Ok(cursor.map(|cursor| ResumableRunObservation {
+        run_id: candidate.candidate_run_id.clone(),
+        bound_input_ids: cursor.bound_input_ids,
+    }))
 }
 
 /// Typed error: authorization/commit mechanics failed (as opposed to the
@@ -1611,11 +1907,47 @@ fn observe_prior_commits(
     }
 }
 
+/// The run each input is still bound to, for every non-terminal input the
+/// store holds in Staged, Applied or AppliedPendingConsumption with a last
+/// run. A store that cannot list its input rows proves nothing bound: a cursor
+/// tail then classifies as an ordinary interrupted tail, never as continuable.
+async fn load_bound_input_runs(
+    store: &dyn RuntimeStore,
+    runtime_id: &LogicalRuntimeId,
+) -> Result<HashMap<InputId, RunId>, DurableTailRecoveryError> {
+    let snapshot = match store.load_input_states_with_versions(runtime_id).await {
+        Ok(snapshot) => snapshot,
+        Err(RuntimeStoreError::Unsupported(_)) => return Ok(HashMap::new()),
+        Err(error) => return Err(error.into()),
+    };
+    if snapshot.runtime_id() != runtime_id {
+        return Err(DurableTailRecoveryError::Authority(format!(
+            "store returned an input snapshot for {}, not {runtime_id}",
+            snapshot.runtime_id()
+        )));
+    }
+    let (rows, _revision, _token) = snapshot.into_parts();
+    Ok(rows
+        .into_iter()
+        .filter_map(|(bundle, _digest)| {
+            let bound_phase = matches!(
+                bundle.seed.phase,
+                InputLifecycleState::Staged
+                    | InputLifecycleState::Applied
+                    | InputLifecycleState::AppliedPendingConsumption
+            );
+            let run_id = bundle.seed.last_run_id?;
+            bound_phase.then_some((bundle.state.input_id, run_id))
+        })
+        .collect())
+}
+
 async fn load_recovery_preparation(
     store: &dyn RuntimeStore,
     runtime_id: &LogicalRuntimeId,
     session_id: &SessionId,
 ) -> Result<RecoveryCandidatePreparation, DurableTailRecoveryError> {
+    let bound_input_runs = load_bound_input_runs(store, runtime_id).await?;
     match store.session_persistence_profile() {
         RuntimeSessionPersistenceProfile::HeadCanonicalV1 => {
             let source = match store.load_durable_tail_recovery_source(runtime_id).await {
@@ -1634,7 +1966,7 @@ async fn load_recovery_preparation(
                     source.runtime_authority().session_id()
                 )));
             }
-            prepare_head_canonical_recovery_candidate(&source)
+            prepare_head_canonical_recovery_candidate(&source, &bound_input_runs)
         }
         RuntimeSessionPersistenceProfile::WholeBlobV1 => {
             let committed = store
@@ -1652,7 +1984,7 @@ async fn load_recovery_preparation(
                 )));
             }
             let provisional = store.load_whole_blob_provisional_tail(runtime_id).await?;
-            prepare_whole_blob_recovery_candidate(committed, provisional)
+            prepare_whole_blob_recovery_candidate(committed, provisional, &bound_input_runs)
         }
     }
 }
@@ -1947,6 +2279,39 @@ async fn recover_durable_tail_capturing(
                     )));
                 }
             }
+        }
+        (None, Some(DurableTailRecoveryDisposition::ContinueRun)) => {
+            let PreparedRecoveryCandidate {
+                candidate_run_id,
+                recovered,
+                document,
+                continuation,
+                ..
+            } = candidate;
+            drop(document);
+            drop(recovered);
+            let continuation = continuation.ok_or_else(|| {
+                DurableTailRecoveryError::Authority(
+                    "machine authorized continuing a candidate prepared without its continuation"
+                        .to_string(),
+                )
+            })?;
+            tracing::info!(
+                %session_id,
+                %candidate_run_id,
+                "durable-tail recovery continues the open run from its last committed round"
+            );
+            let PreparedContinuation {
+                candidate: continued,
+                receipt,
+            } = continuation;
+            let continued =
+                Arc::try_unwrap(continued).unwrap_or_else(|shared| shared.as_ref().clone());
+            return Ok(DurableTailRecoveryOutcome::Continue {
+                candidate: Box::new(continued),
+                run_id: candidate_run_id,
+                receipt,
+            });
         }
         (None, Some(other)) => {
             return Err(DurableTailRecoveryError::Authority(format!(
@@ -2509,7 +2874,7 @@ mod store_authority_tests {
         let (committed, provisional) = whole_blob_recovery_fixture(run_id.clone(), run_id.clone());
 
         let RecoveryCandidatePreparation::Prepared(candidate) =
-            prepare_whole_blob_recovery_candidate(committed, Some(provisional))
+            prepare_whole_blob_recovery_candidate(committed, Some(provisional), &HashMap::new())
                 .expect("store-issued WholeBlob tail prepares")
         else {
             panic!("valid WholeBlob provisional tail must prepare");
@@ -2537,9 +2902,403 @@ mod store_authority_tests {
         let (committed, provisional) = whole_blob_recovery_fixture(RunId::new(), RunId::new());
 
         assert!(matches!(
-            prepare_whole_blob_recovery_candidate(committed, Some(provisional)),
+            prepare_whole_blob_recovery_candidate(committed, Some(provisional), &HashMap::new()),
             Err(DurableTailRecoveryError::InvalidEvidence(detail))
                 if detail.contains("store-issued run identity")
+        ));
+    }
+
+    // Run-cursor rows (A15, A17, C2, C3). Unrun until the candidate's
+    // validation: the policy forbids Cargo while the batch is implemented.
+
+    /// A committed WholeBlob document, and a provisional candidate that is
+    /// that document plus `rows`, carrying `cursor` when one is given.
+    fn whole_blob_cursor_fixture(
+        authority_run: RunId,
+        rows: Vec<Message>,
+        cursor: Option<meerkat_core::SessionRunCursor>,
+    ) -> (
+        CommittedWholeBlobSnapshot,
+        CommittedWholeBlobProvisionalTail,
+    ) {
+        let mut committed = Session::new();
+        committed.push(Message::User(UserMessage::text("committed input")));
+        let session_id = committed.id().clone();
+        let committed_bytes = Arc::new(committed.to_persisted_bytes().unwrap());
+        let committed_sha = format!("row-sha256:{:x}", Sha256::digest(committed_bytes.as_ref()));
+        let committed_authority =
+            WholeBlobStoreAuthority::issued(session_id.clone(), 7, committed_sha.clone()).unwrap();
+
+        let mut candidate = committed;
+        for row in rows {
+            candidate.push(row);
+        }
+        if let Some(cursor) = cursor.as_ref() {
+            candidate.set_run_cursor(cursor).unwrap();
+        }
+        let candidate_bytes = Arc::new(candidate.to_persisted_bytes().unwrap());
+        let candidate_sha = format!("row-sha256:{:x}", Sha256::digest(candidate_bytes.as_ref()));
+        let provisional_authority = WholeBlobProvisionalTailAuthority::issued(
+            session_id,
+            7,
+            committed_sha,
+            authority_run,
+            candidate_sha,
+            1,
+        )
+        .unwrap();
+        (
+            CommittedWholeBlobSnapshot::new(committed_bytes, committed_authority).unwrap(),
+            CommittedWholeBlobProvisionalTail::new(provisional_authority, candidate_bytes),
+        )
+    }
+
+    fn assistant_message_id(uuid: &str) -> meerkat_core::types::AssistantMessageId {
+        serde_json::from_value(serde_json::Value::String(uuid.to_string())).unwrap()
+    }
+
+    fn tool_call_message(run_id: &RunId, call_id: &str, message_id: &str) -> BlockAssistantMessage {
+        BlockAssistantMessage {
+            blocks: vec![AssistantBlock::ToolUse {
+                id: call_id.to_string(),
+                name: "search".to_string(),
+                args: serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
+                meta: None,
+            }],
+            stop_reason: Some(StopReason::ToolUse),
+            identity: TranscriptMessageIdentity::default().with_run_id(run_id.clone()),
+            created_at: message_timestamp_now(),
+            assistant_message_id: Some(assistant_message_id(message_id)),
+        }
+    }
+
+    fn staged_tool_call_message(run_id: &RunId) -> BlockAssistantMessage {
+        tool_call_message(
+            run_id,
+            "call-staged",
+            "0190b5f0-0000-7000-8000-000000000002",
+        )
+    }
+
+    fn cursor(
+        run_id: &RunId,
+        bound_input_ids: Vec<InputId>,
+        resume_point: RunResumePoint,
+    ) -> meerkat_core::SessionRunCursor {
+        meerkat_core::SessionRunCursor::new(run_id.clone(), bound_input_ids, 0, resume_point)
+    }
+
+    fn bound(run_id: &RunId, input_ids: &[InputId]) -> HashMap<InputId, RunId> {
+        input_ids
+            .iter()
+            .map(|input_id| (input_id.clone(), run_id.clone()))
+            .collect()
+    }
+
+    /// Round zero's first commit with no new row: the staged message lives
+    /// only in the cursor, the store binding attributes the tail, and the
+    /// run continues from the provisional tail itself.
+    #[test]
+    fn metadata_only_tools_pending_tail_continues() {
+        let run_id = RunId::new();
+        let input_id = InputId::new();
+        let (committed, provisional) = whole_blob_cursor_fixture(
+            run_id.clone(),
+            Vec::new(),
+            Some(cursor(
+                &run_id,
+                vec![input_id.clone()],
+                RunResumePoint::ToolsPending {
+                    assistant_message: staged_tool_call_message(&run_id),
+                },
+            )),
+        );
+        let RecoveryCandidatePreparation::Prepared(candidate) =
+            prepare_whole_blob_recovery_candidate(
+                committed,
+                Some(provisional),
+                &bound(&run_id, &[input_id]),
+            )
+            .expect("a metadata-only cursor tail prepares")
+        else {
+            panic!("a metadata-only cursor tail must prepare a candidate");
+        };
+        assert_eq!(
+            candidate.class,
+            DurableTailRecoveryClass::ContinuableCandidate
+        );
+        let continuation = candidate
+            .continuation
+            .as_ref()
+            .expect("a continuable candidate carries its continuation");
+        assert!(continuation.candidate.try_run_cursor().unwrap().is_some());
+        assert!(
+            candidate.recovered.try_run_cursor().unwrap().is_none(),
+            "the interrupted repair a retired runtime would commit carries no cursor"
+        );
+    }
+
+    /// A provider that numbers each response's calls from `fc_0` (Gemini)
+    /// repeats call ids across rounds: an earlier committed round's `fc_0`
+    /// in the tail must not make the staged round's `fc_0` disagree. The
+    /// staged message is matched by its message id.
+    #[test]
+    fn repeated_provider_call_ids_across_rounds_still_agree() {
+        let run_id = RunId::new();
+        let input_id = InputId::new();
+        let earlier = tool_call_message(&run_id, "fc_0", "0190b5f0-0000-7000-8000-000000000001");
+        let earlier_results = Message::ToolResults {
+            results: vec![meerkat_core::types::ToolResult::new(
+                "fc_0".to_string(),
+                "done".to_string(),
+                false,
+            )],
+            created_at: message_timestamp_now(),
+        };
+        let staged = tool_call_message(&run_id, "fc_0", "0190b5f0-0000-7000-8000-000000000003");
+        let (committed, provisional) = whole_blob_cursor_fixture(
+            run_id.clone(),
+            vec![Message::BlockAssistant(earlier), earlier_results],
+            Some(cursor(
+                &run_id,
+                vec![input_id.clone()],
+                RunResumePoint::ToolsPending {
+                    assistant_message: staged,
+                },
+            )),
+        );
+        let RecoveryCandidatePreparation::Prepared(candidate) =
+            prepare_whole_blob_recovery_candidate(
+                committed,
+                Some(provisional),
+                &bound(&run_id, &[input_id]),
+            )
+            .expect("a two-round tail prepares")
+        else {
+            panic!("a two-round tail must prepare a candidate");
+        };
+        assert_eq!(
+            candidate.class,
+            DurableTailRecoveryClass::ContinuableCandidate
+        );
+    }
+
+    /// The staged message already in the tail means the round's second
+    /// commit landed: a ToolsPending cursor then disagrees and holds.
+    #[test]
+    fn staged_message_already_in_the_tail_disagrees() {
+        let run_id = RunId::new();
+        let input_id = InputId::new();
+        let staged = staged_tool_call_message(&run_id);
+        let (committed, provisional) = whole_blob_cursor_fixture(
+            run_id.clone(),
+            vec![Message::BlockAssistant(staged.clone())],
+            Some(cursor(
+                &run_id,
+                vec![input_id.clone()],
+                RunResumePoint::ToolsPending {
+                    assistant_message: staged,
+                },
+            )),
+        );
+        assert!(matches!(
+            prepare_whole_blob_recovery_candidate(
+                committed,
+                Some(provisional),
+                &bound(&run_id, &[input_id]),
+            ),
+            Ok(RecoveryCandidatePreparation::Held)
+        ));
+    }
+
+    /// The tail a WholeBlob run re-base restarts on its compacted snapshot:
+    /// metadata only, with a cursor awaiting the model.
+    #[test]
+    fn rebase_tail_awaiting_the_model_continues() {
+        let run_id = RunId::new();
+        let input_id = InputId::new();
+        let (committed, provisional) = whole_blob_cursor_fixture(
+            run_id.clone(),
+            Vec::new(),
+            Some(cursor(
+                &run_id,
+                vec![input_id.clone()],
+                RunResumePoint::AwaitingModel,
+            )),
+        );
+        let RecoveryCandidatePreparation::Prepared(candidate) =
+            prepare_whole_blob_recovery_candidate(
+                committed,
+                Some(provisional),
+                &bound(&run_id, &[input_id]),
+            )
+            .expect("a re-base tail prepares")
+        else {
+            panic!("a re-base tail must prepare a candidate");
+        };
+        assert_eq!(
+            candidate.class,
+            DurableTailRecoveryClass::ContinuableCandidate
+        );
+    }
+
+    /// A cursor naming another run than the store-issued provisional run
+    /// contradicts the store.
+    #[test]
+    fn cursor_naming_another_run_is_invalid_evidence() {
+        let run_id = RunId::new();
+        let other_run = RunId::new();
+        let input_id = InputId::new();
+        let (committed, provisional) = whole_blob_cursor_fixture(
+            run_id.clone(),
+            Vec::new(),
+            Some(cursor(
+                &other_run,
+                vec![input_id.clone()],
+                RunResumePoint::AwaitingModel,
+            )),
+        );
+        assert!(matches!(
+            prepare_whole_blob_recovery_candidate(
+                committed,
+                Some(provisional),
+                &bound(&other_run, &[input_id]),
+            ),
+            Err(DurableTailRecoveryError::InvalidEvidence(detail))
+                if detail.contains("run cursor names run")
+        ));
+    }
+
+    /// Direct and machine-service turns write cursors with no bound inputs:
+    /// such a tail never continues, it is repaired as interrupted (C3).
+    #[test]
+    fn cursor_with_no_bound_inputs_is_repaired_not_continued() {
+        let run_id = RunId::new();
+        let (committed, provisional) = whole_blob_cursor_fixture(
+            run_id.clone(),
+            vec![Message::User(UserMessage::text("direct turn"))],
+            Some(cursor(&run_id, Vec::new(), RunResumePoint::AwaitingModel)),
+        );
+        let RecoveryCandidatePreparation::Prepared(candidate) =
+            prepare_whole_blob_recovery_candidate(committed, Some(provisional), &HashMap::new())
+                .expect("an empty-set cursor tail prepares")
+        else {
+            panic!("an empty-set cursor tail must prepare a candidate");
+        };
+        assert_eq!(
+            candidate.class,
+            DurableTailRecoveryClass::InterruptedRepairableCandidate
+        );
+        assert!(candidate.continuation.is_none());
+        assert!(candidate.recovered.try_run_cursor().unwrap().is_none());
+    }
+
+    /// A bound input that is no longer bound to the run (requeued, or
+    /// terminal) ends the continuation: the tail is repaired (C2).
+    #[test]
+    fn cursor_whose_inputs_are_no_longer_bound_is_repaired() {
+        let run_id = RunId::new();
+        let input_id = InputId::new();
+        let (committed, provisional) = whole_blob_cursor_fixture(
+            run_id.clone(),
+            vec![Message::User(UserMessage::text("started the run"))],
+            Some(cursor(
+                &run_id,
+                vec![input_id],
+                RunResumePoint::AwaitingModel,
+            )),
+        );
+        let RecoveryCandidatePreparation::Prepared(candidate) =
+            prepare_whole_blob_recovery_candidate(committed, Some(provisional), &HashMap::new())
+                .expect("a cursor tail with settled inputs prepares")
+        else {
+            panic!("a cursor tail with settled inputs must prepare a candidate");
+        };
+        assert_eq!(
+            candidate.class,
+            DurableTailRecoveryClass::InterruptedRepairableCandidate
+        );
+    }
+
+    /// A run's closing save before any assistant row (no run rows, no
+    /// cursor) is attributed by the store binding and repaired.
+    #[test]
+    fn closing_save_without_run_rows_is_repaired() {
+        let run_id = RunId::new();
+        let (committed, provisional) = whole_blob_cursor_fixture(
+            run_id,
+            vec![Message::User(UserMessage::text("the run's input"))],
+            None,
+        );
+        let RecoveryCandidatePreparation::Prepared(candidate) =
+            prepare_whole_blob_recovery_candidate(committed, Some(provisional), &HashMap::new())
+                .expect("a closing save prepares")
+        else {
+            panic!("a closing save must prepare a candidate");
+        };
+        assert_eq!(
+            candidate.class,
+            DurableTailRecoveryClass::InterruptedRepairableCandidate
+        );
+    }
+
+    /// An unstamped assistant row is not the no-run-rows shape: it stays
+    /// invalid evidence on a strict continuation, cursor or not.
+    #[test]
+    fn unstamped_assistant_row_with_a_cursor_is_invalid_evidence() {
+        let run_id = RunId::new();
+        let input_id = InputId::new();
+        let mut unstamped = staged_tool_call_message(&run_id);
+        unstamped.identity = TranscriptMessageIdentity::default();
+        unstamped.blocks = vec![AssistantBlock::Text {
+            text: "unstamped".to_string(),
+            meta: None,
+        }];
+        unstamped.stop_reason = None;
+        let (committed, provisional) = whole_blob_cursor_fixture(
+            run_id.clone(),
+            vec![Message::BlockAssistant(unstamped)],
+            Some(cursor(
+                &run_id,
+                vec![input_id.clone()],
+                RunResumePoint::AwaitingModel,
+            )),
+        );
+        assert!(matches!(
+            prepare_whole_blob_recovery_candidate(
+                committed,
+                Some(provisional),
+                &bound(&run_id, &[input_id]),
+            ),
+            Err(DurableTailRecoveryError::InvalidEvidence(detail))
+                if detail.contains("store-issued run identity")
+        ));
+    }
+
+    /// A committed body never makes a run resumable (D3): with no
+    /// provisional tail the source is aligned, whatever its metadata holds.
+    #[test]
+    fn committed_body_with_a_stale_cursor_is_aligned_not_continued() {
+        let run_id = RunId::new();
+        let mut committed = Session::new();
+        committed.push(Message::User(UserMessage::text("committed input")));
+        committed
+            .set_run_cursor(&cursor(
+                &run_id,
+                vec![InputId::new()],
+                RunResumePoint::AwaitingModel,
+            ))
+            .unwrap();
+        let session_id = committed.id().clone();
+        let committed_bytes = Arc::new(committed.to_persisted_bytes().unwrap());
+        let committed_sha = format!("row-sha256:{:x}", Sha256::digest(committed_bytes.as_ref()));
+        let committed_authority =
+            WholeBlobStoreAuthority::issued(session_id, 7, committed_sha).unwrap();
+        let snapshot =
+            CommittedWholeBlobSnapshot::new(committed_bytes, committed_authority).unwrap();
+        assert!(matches!(
+            prepare_whole_blob_recovery_candidate(snapshot, None, &HashMap::new()),
+            Ok(RecoveryCandidatePreparation::AlreadyAligned { .. })
         ));
     }
 }

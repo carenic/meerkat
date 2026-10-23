@@ -54,6 +54,10 @@ pub enum DurableTailRecoveryClass {
     InterruptedRepairableCandidate,
     #[default]
     Ambiguous,
+    /// A durable session's open run at a committed round, with a cursor that
+    /// agrees with the transcript and bound inputs that are all still open.
+    /// Declared last so the earlier variants keep their positions.
+    ContinuableCandidate,
 }
 
 /// Typed projection of the PERSISTED machine-lifecycle row observed at the
@@ -175,6 +179,11 @@ pub enum DurableTailRecoveryDisposition {
     /// Ambiguous evidence: hold intact, block autonomous execution, clear only
     /// through reconciliation.
     HoldIntact,
+    /// Continue the open run from its last committed round. Nothing is
+    /// written and nothing is terminalized: the live authority keeps the
+    /// run's inputs bound and resumes the run. Declared last so the earlier
+    /// variants keep their positions.
+    ContinueRun,
 }
 
 impl RunId {
@@ -2439,6 +2448,11 @@ pub enum InputAbandonReason {
     /// found it older than that stop's max age, so it ended without running.
     /// Resolves to the public `Abandoned` class.
     RequeueExpired,
+    /// The input's run was resumable after a restart, and its resume was
+    /// refused: the host's resume gate answered that the run was superseded,
+    /// or kept failing, so the run ended without continuing. Resolves to the
+    /// public `Abandoned` class.
+    ResumeRefused,
 }
 
 /// Typed work-lane assignment for admitted inputs. Replaces the former
@@ -2785,6 +2799,9 @@ pub enum RecoveredInputNormalizationReasonKind {
     RollbackStaged,
     BoundaryReceiptCommitted,
     MissingBoundaryReceipt,
+    /// The input stays bound to its run because the run resumes from its
+    /// last committed round.
+    ResumableRun,
 }
 
 /// Typed persisted input kind carried by recovered-admission witnesses.
@@ -3730,6 +3747,13 @@ macro_rules! meerkat_catalog_machine_dsl {
             // never collide with (or falsely reorder against) receipts an
             // interrupted tool loop already committed.
             recovered_boundary_sequence: u64,
+            // The run this live authority resumes after a restart. Set at
+            // registration from the stored run cursor, before input
+            // normalization keeps the run's inputs bound; cleared by
+            // ResumeRun, ReleaseResumableRun or SettleResumableRun. Never
+            // persisted: every open derives it again from the durable tail.
+            // While it is set, no queued batch starts a run.
+            resumable_run_id: Option<RunId>,
             terminal_outcome: Option<Enum<TurnTerminalOutcome>>,
             terminal_cause_kind: Option<Enum<TurnTerminalCauseKind>>,
             last_runtime_apply_failure_cause: Option<Enum<RuntimeApplyFailureCause>>,
@@ -4607,6 +4631,7 @@ macro_rules! meerkat_catalog_machine_dsl {
             boundary_cancel_dispatch_generation = 0,
             turn_terminal_run_id = None,
             recovered_boundary_sequence = 0,
+            resumable_run_id = None,
             terminal_outcome = None,
             terminal_cause_kind = None,
             last_runtime_apply_failure_cause = None,
@@ -5611,7 +5636,25 @@ macro_rules! meerkat_catalog_machine_dsl {
                 input_id: String,
                 phase: Enum<RecoveredInputObservedPhase>,
                 applied_boundary_committed: Option<bool>,
+                // True only for an input the stored run cursor binds to the
+                // run this registration resumes (its ledger run association
+                // names that run). Such an input stays bound, not requeued.
+                bound_run_resumable: bool,
             },
+            // Same-run resume after a restart. Registration marks the run its
+            // stored cursor names; the runtime then resumes it (ResumeRun),
+            // releases it to ordinary requeue when recovery does not continue
+            // it (ReleaseResumableRun), or settles it when it must end
+            // (SettleResumableRun: stop, retire, destroy, reset, unregister,
+            // or a refused resume).
+            MarkRunResumable { run_id: RunId },
+            ResumeRun { run_id: RunId },
+            ReleaseResumableRun { run_id: RunId },
+            SettleResumableRun { run_id: RunId, reason: Enum<InputAbandonReason> },
+            // A graceful requeue stop keeps a durable session's in-flight run
+            // resumable (A28). `durable_session` is the shell's observation
+            // that the session commits every round (a persistent driver).
+            SuspendRunForStop { run_id: RunId, durable_session: bool },
             ClassifyRecoveredInputDurability {
                 input_id: String,
                 durability: Enum<InputDurabilityKind>,
@@ -5832,6 +5875,10 @@ macro_rules! meerkat_catalog_machine_dsl {
             StageForRun { input_id: String, run_id: RunId },
             IncrementAttemptCount { input_id: String },
             RollbackStaged { input_id: String, lane: Enum<InputLane> },
+            // An Applied or AppliedPendingConsumption contributor of `run_id`
+            // returns to `lane`: a failed run's replayed contributor, or a
+            // kept input of a resumable run that is released.
+            ReplayAppliedRunContributor { input_id: String, run_id: RunId, lane: Enum<InputLane> },
             ResolveStagedRollback { input_id: String, lane: Enum<InputLane> },
             ResolveUnstageableQueuedInput { input_id: String, lane: Enum<InputLane> },
             MarkApplied { input_id: String },
@@ -7368,6 +7415,19 @@ macro_rules! meerkat_catalog_machine_dsl {
                 requeued: bool,
                 history_reason: Option<Enum<RecoveredInputNormalizationReasonKind>>,
             },
+            ResumableRunMarked { run_id: RunId },
+            // The runtime starts exactly this run, with exactly the inputs
+            // bound to it, ahead of every queued input.
+            ResumedRunAuthorized { run_id: RunId },
+            // The shell normalizes the run's kept inputs again with the
+            // registration-time observations and bound_run_resumable false:
+            // a Staged input and an Applied input with a missing receipt
+            // requeue, as today.
+            ResumableRunReleased { run_id: RunId },
+            // The shell abandons the run's bound inputs with `reason`.
+            ResumableRunSettled { run_id: RunId, reason: Enum<InputAbandonReason> },
+            // A graceful requeue stop left the in-flight run resumable.
+            RunSuspendedForStop { run_id: RunId },
             RecoveredInputDurabilityClassified {
                 input_id: String,
                 disposition: Enum<RecoveredInputRecoveryDisposition>,
@@ -10451,6 +10511,19 @@ macro_rules! meerkat_catalog_machine_dsl {
         //   4. the same as 3 with input_evidence == AllBoundOrInert
         //      -> `...Commit` (CompletedCandidate) xor `...Repair`
         //      (InterruptedRepairableCandidate).
+        //   5. class == ContinuableCandidate: cut 2 refuses it and cut 3's
+        //      Unfenceable branch holds it, as for the other commit-seeking
+        //      classes. With prior_commit admitting recovery and
+        //      input_evidence in {AllBoundOrInert, UnboundContentInput}:
+        //      a runtime that is not retired (in-process Idle and a
+        //      persisted lifecycle other than Retired) -> `...Continue`
+        //      (write nothing, keep the run open; an unbound row stays
+        //      queued as in the retain-inputs commit); a retired runtime
+        //      (in-process Retired, or a persisted Retired lifecycle under
+        //      the fresh Idle authority the drive uses) takes the
+        //      interrupted cuts -> AllBoundOrInert
+        //      `...RepairContinuableRetired`, UnboundContentInput
+        //      `...HoldContinuableRetired`.
         // Each dimension is split into complementary variant sets of a closed
         // enum, so cuts 2/3/4 cover A minus the Ambiguous slice exactly once.
         // Both hold-producing dispositions are minted HERE: no shell may
@@ -10696,6 +10769,7 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "commit_seeking_class" {
                 class == DurableTailRecoveryClass::CompletedCandidate
                 || class == DurableTailRecoveryClass::InterruptedRepairableCandidate
+                || class == DurableTailRecoveryClass::ContinuableCandidate
             }
             guard "prior_commit_conflict" {
                 prior_commit == DurableRecoveryPriorCommit::MatchesCandidate
@@ -10743,6 +10817,7 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "commit_seeking_class" {
                 class == DurableTailRecoveryClass::CompletedCandidate
                 || class == DurableTailRecoveryClass::InterruptedRepairableCandidate
+                || class == DurableTailRecoveryClass::ContinuableCandidate
             }
             guard "prior_commit_admits_recovery" {
                 prior_commit == DurableRecoveryPriorCommit::NoPriorCommit
@@ -10765,6 +10840,169 @@ macro_rules! meerkat_catalog_machine_dsl {
             }
             update {}
             to Idle
+            emit DurableTailRecoveryAuthorized {
+                candidate_id: candidate_id,
+                disposition: DurableTailRecoveryDisposition::HoldIntact
+            }
+        }
+
+        // Continue: a durable session's open run at a committed round. Only
+        // from Idle: a Retired runtime never resumes a run (it repairs or
+        // holds below). Like the retain-inputs commit, an unbound content
+        // row is a distinct pending input that never started, so it stays
+        // queued for ordinary redelivery while the run continues. Nothing is
+        // written and nothing is terminalized here; the live authority keeps
+        // the run's inputs bound (MarkRunResumable at registration) and
+        // resumes it.
+        transition AuthorizeDurableTailRecoveryContinue {
+            per_phase [Idle]
+            on input AuthorizeDurableTailRecovery {
+                session_id,
+                candidate_id,
+                candidate_run_id,
+                class,
+                observed_lifecycle,
+                observed_current_run,
+                last_committed_sequence,
+                prior_commit,
+                input_evidence
+            }
+            guard "no_current_run" { self.current_run_id == None }
+            guard "candidate_run_not_terminalized" {
+                self.turn_terminal_run_id != Some(candidate_run_id)
+            }
+            guard "persisted_quiescent" {
+                observed_lifecycle == DurableRecoveryObservedLifecycle::MissingRow
+                || observed_lifecycle == DurableRecoveryObservedLifecycle::Idle
+                || observed_lifecycle == DurableRecoveryObservedLifecycle::Retired
+            }
+            guard "persisted_no_current_run" {
+                observed_current_run == DurableRecoveryObservedRun::NoRun
+            }
+            guard "prior_commit_admits_recovery" {
+                prior_commit == DurableRecoveryPriorCommit::NoPriorCommit
+                || prior_commit == DurableRecoveryPriorCommit::PrecedesCandidate
+            }
+            guard "inputs_continuable" {
+                input_evidence == DurableRecoveryInputEvidence::AllBoundOrInert
+                || input_evidence == DurableRecoveryInputEvidence::UnboundContentInput
+            }
+            guard "continuable_class" {
+                class == DurableTailRecoveryClass::ContinuableCandidate
+            }
+            // The drive authorizes on a freshly registered (Idle) authority,
+            // so a retired runtime shows in the persisted lifecycle: a run of
+            // a retired runtime never resumes.
+            guard "runtime_not_retired" {
+                observed_lifecycle != DurableRecoveryObservedLifecycle::Retired
+            }
+            update {}
+            to Idle
+            emit DurableTailRecoveryAuthorized {
+                candidate_id: candidate_id,
+                disposition: DurableTailRecoveryDisposition::ContinueRun
+            }
+        }
+
+        // A Retired runtime never resumes a run: a continuable tail follows
+        // the interrupted cuts there. With every input bound or inert it is
+        // repaired and committed as interrupted, exactly as the Repair arm
+        // does for an interrupted shape.
+        transition AuthorizeDurableTailRecoveryRepairContinuableRetired {
+            per_phase [Idle, Retired]
+            on input AuthorizeDurableTailRecovery {
+                session_id,
+                candidate_id,
+                candidate_run_id,
+                class,
+                observed_lifecycle,
+                observed_current_run,
+                last_committed_sequence,
+                prior_commit,
+                input_evidence
+            }
+            guard "no_current_run" { self.current_run_id == None }
+            guard "candidate_run_not_terminalized" {
+                self.turn_terminal_run_id != Some(candidate_run_id)
+            }
+            guard "persisted_quiescent" {
+                observed_lifecycle == DurableRecoveryObservedLifecycle::MissingRow
+                || observed_lifecycle == DurableRecoveryObservedLifecycle::Idle
+                || observed_lifecycle == DurableRecoveryObservedLifecycle::Retired
+            }
+            guard "persisted_no_current_run" {
+                observed_current_run == DurableRecoveryObservedRun::NoRun
+            }
+            guard "prior_commit_admits_recovery" {
+                prior_commit == DurableRecoveryPriorCommit::NoPriorCommit
+                || prior_commit == DurableRecoveryPriorCommit::PrecedesCandidate
+            }
+            guard "inputs_attributable" {
+                input_evidence == DurableRecoveryInputEvidence::AllBoundOrInert
+            }
+            guard "continuable_class" {
+                class == DurableTailRecoveryClass::ContinuableCandidate
+            }
+            guard "retired_runtime" {
+                self.lifecycle_phase == Phase::Retired
+                || observed_lifecycle == DurableRecoveryObservedLifecycle::Retired
+            }
+            update {
+                self.recovered_boundary_sequence = last_committed_sequence + 1;
+                self.turn_terminal_run_id = Some(candidate_run_id);
+            }
+            to Retired
+            emit DurableTailRecoveryCommitAuthorized {
+                candidate_id: candidate_id,
+                disposition: DurableTailRecoveryDisposition::RepairAndCommitInterrupted,
+                boundary_sequence: self.recovered_boundary_sequence
+            }
+        }
+
+        // In Retired an unbound content row next to a continuable tail holds,
+        // as it does next to an interrupted shape: the repaired boundary does
+        // not requeue the run's input, and the unbound row may be that input.
+        transition AuthorizeDurableTailRecoveryHoldContinuableRetired {
+            per_phase [Idle, Retired]
+            on input AuthorizeDurableTailRecovery {
+                session_id,
+                candidate_id,
+                candidate_run_id,
+                class,
+                observed_lifecycle,
+                observed_current_run,
+                last_committed_sequence,
+                prior_commit,
+                input_evidence
+            }
+            guard "no_current_run" { self.current_run_id == None }
+            guard "candidate_run_not_terminalized" {
+                self.turn_terminal_run_id != Some(candidate_run_id)
+            }
+            guard "persisted_quiescent" {
+                observed_lifecycle == DurableRecoveryObservedLifecycle::MissingRow
+                || observed_lifecycle == DurableRecoveryObservedLifecycle::Idle
+                || observed_lifecycle == DurableRecoveryObservedLifecycle::Retired
+            }
+            guard "persisted_no_current_run" {
+                observed_current_run == DurableRecoveryObservedRun::NoRun
+            }
+            guard "prior_commit_admits_recovery" {
+                prior_commit == DurableRecoveryPriorCommit::NoPriorCommit
+                || prior_commit == DurableRecoveryPriorCommit::PrecedesCandidate
+            }
+            guard "unbound_content_input" {
+                input_evidence == DurableRecoveryInputEvidence::UnboundContentInput
+            }
+            guard "continuable_class" {
+                class == DurableTailRecoveryClass::ContinuableCandidate
+            }
+            guard "retired_runtime" {
+                self.lifecycle_phase == Phase::Retired
+                || observed_lifecycle == DurableRecoveryObservedLifecycle::Retired
+            }
+            update {}
+            to Retired
             emit DurableTailRecoveryAuthorized {
                 candidate_id: candidate_id,
                 disposition: DurableTailRecoveryDisposition::HoldIntact
@@ -10850,6 +11088,81 @@ macro_rules! meerkat_catalog_machine_dsl {
                 candidate_id: candidate_id,
                 disposition: DurableTailRecoveryDisposition::RefuseRecovery
             }
+        }
+
+        // Same-run resume after a restart, on the LIVE session authority (the
+        // durable-tail drive above authorizes on its own fresh authority and
+        // only reports a verdict). Registration marks the run the stored
+        // cursor names before input normalization keeps its inputs bound;
+        // while the mark is set no queued batch starts a run. The runtime
+        // then resumes the run, releases it to ordinary requeue when
+        // recovery does not continue it, or settles it when it must end.
+        transition MarkRunResumable {
+            per_phase [Initializing, Idle, Attached]
+            on input MarkRunResumable { run_id }
+            guard "no_current_run" { self.current_run_id == None }
+            guard "no_other_resumable_run" {
+                self.resumable_run_id == None
+                || self.resumable_run_id == Some(run_id)
+            }
+            update {
+                self.resumable_run_id = Some(run_id);
+            }
+            to Idle
+            emit ResumableRunMarked { run_id: run_id }
+        }
+
+        // The exclusive resume step, ahead of every queued batch. The runtime
+        // starts the marked run with the ordinary Prepare under its own run
+        // id (run-start holds and completion correlation as for any run) and
+        // then, under the same authority lock, applies ResumeRun: the run is
+        // current again and stops being resumable. Its batch is exactly the
+        // inputs bound to it, which stay Staged or Applied; nothing is staged
+        // again.
+        transition ResumeRun {
+            per_phase [Running]
+            on input ResumeRun { run_id }
+            guard "run_is_current" { self.current_run_id == Some(run_id) }
+            guard "run_is_resumable" { self.resumable_run_id == Some(run_id) }
+            update {
+                self.resumable_run_id = None;
+            }
+            to Running
+            emit ResumedRunAuthorized { run_id: run_id }
+        }
+
+        // Recovery did not continue the marked run (hold, refuse, commit or
+        // repair, or an error): its kept inputs are normalized again as if
+        // the run were not resumable.
+        transition ReleaseResumableRun {
+            per_phase [Initializing, Idle, Attached, Retired, Stopped]
+            on input ReleaseResumableRun { run_id }
+            guard "run_is_resumable" { self.resumable_run_id == Some(run_id) }
+            update {
+                self.resumable_run_id = None;
+            }
+            to Idle
+            emit ResumableRunReleased { run_id: run_id }
+        }
+
+        // The marked run ends without resuming: a refused resume, a stop
+        // that cancels, an expired requeue mark, or a retire, destroy or
+        // reset before ResumeRun. The mark clears and the run is recorded
+        // terminal. This transition changes no input: the shell then abandons
+        // the run's bound inputs with `reason` (a settle, which also discards
+        // the run's provisional tail), or leaves them to the lifecycle path's
+        // own sweep (retire, destroy, reset). A graceful requeue stop does not
+        // settle: it keeps the run resumable.
+        transition SettleResumableRun {
+            per_phase [Initializing, Idle, Attached, Retired, Stopped]
+            on input SettleResumableRun { run_id, reason }
+            guard "run_is_resumable" { self.resumable_run_id == Some(run_id) }
+            update {
+                self.resumable_run_id = None;
+                self.turn_terminal_run_id = Some(run_id);
+            }
+            to Idle
+            emit ResumableRunSettled { run_id: run_id, reason: reason }
         }
 
         // Transition declaration order is runtime semantics: the production
@@ -16871,7 +17184,7 @@ macro_rules! meerkat_catalog_machine_dsl {
         // to turn an accepted row into a terminal fact.
         transition NormalizeRecoveredInputAcceptedQueue {
             per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
-            on input NormalizeRecoveredInputLifecycle { input_id, phase, applied_boundary_committed }
+            on input NormalizeRecoveredInputLifecycle { input_id, phase, applied_boundary_committed, bound_run_resumable }
             guard "accepted_phase" { phase == RecoveredInputObservedPhase::Accepted }
             update {}
             to Idle
@@ -16888,8 +17201,9 @@ macro_rules! meerkat_catalog_machine_dsl {
 
         transition NormalizeRecoveredInputStaged {
             per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
-            on input NormalizeRecoveredInputLifecycle { input_id, phase, applied_boundary_committed }
+            on input NormalizeRecoveredInputLifecycle { input_id, phase, applied_boundary_committed, bound_run_resumable }
             guard "staged_phase" { phase == RecoveredInputObservedPhase::Staged }
+            guard "run_not_resumable" { bound_run_resumable == false }
             update {}
             to Idle
             emit RecoveredInputLifecycleNormalized {
@@ -16903,9 +17217,29 @@ macro_rules! meerkat_catalog_machine_dsl {
             }
         }
 
+        // A staged input of the run this registration resumes stays staged
+        // and bound: the run continues from its last committed round.
+        transition NormalizeRecoveredInputStagedResumable {
+            per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
+            on input NormalizeRecoveredInputLifecycle { input_id, phase, applied_boundary_committed, bound_run_resumable }
+            guard "staged_phase" { phase == RecoveredInputObservedPhase::Staged }
+            guard "run_resumable" { bound_run_resumable == true }
+            update {}
+            to Idle
+            emit RecoveredInputLifecycleNormalized {
+                input_id: input_id,
+                phase: InputPhase::Staged,
+                terminal_kind: None,
+                recovered: true,
+                abandoned: false,
+                requeued: false,
+                history_reason: Some(RecoveredInputNormalizationReasonKind::ResumableRun)
+            }
+        }
+
         transition NormalizeRecoveredInputAppliedCommitted {
             per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
-            on input NormalizeRecoveredInputLifecycle { input_id, phase, applied_boundary_committed }
+            on input NormalizeRecoveredInputLifecycle { input_id, phase, applied_boundary_committed, bound_run_resumable }
             guard "applied_phase" {
                 phase == RecoveredInputObservedPhase::Applied
                 || phase == RecoveredInputObservedPhase::AppliedPendingConsumption
@@ -16929,7 +17263,7 @@ macro_rules! meerkat_catalog_machine_dsl {
 
         transition NormalizeRecoveredInputAppliedMissingReceipt {
             per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
-            on input NormalizeRecoveredInputLifecycle { input_id, phase, applied_boundary_committed }
+            on input NormalizeRecoveredInputLifecycle { input_id, phase, applied_boundary_committed, bound_run_resumable }
             guard "applied_phase" {
                 phase == RecoveredInputObservedPhase::Applied
                 || phase == RecoveredInputObservedPhase::AppliedPendingConsumption
@@ -16938,6 +17272,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 applied_boundary_committed != None
                 && applied_boundary_committed.get("value") == false
             }
+            guard "run_not_resumable" { bound_run_resumable == false }
             update {}
             to Idle
             emit RecoveredInputLifecycleNormalized {
@@ -16951,9 +17286,37 @@ macro_rules! meerkat_catalog_machine_dsl {
             }
         }
 
+        // An applied input of the run this registration resumes, whose run
+        // boundary has not committed, stays applied and bound: the run
+        // continues from its last committed round.
+        transition NormalizeRecoveredInputAppliedResumable {
+            per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
+            on input NormalizeRecoveredInputLifecycle { input_id, phase, applied_boundary_committed, bound_run_resumable }
+            guard "applied_phase" {
+                phase == RecoveredInputObservedPhase::Applied
+                || phase == RecoveredInputObservedPhase::AppliedPendingConsumption
+            }
+            guard "boundary_missing_observed" {
+                applied_boundary_committed != None
+                && applied_boundary_committed.get("value") == false
+            }
+            guard "run_resumable" { bound_run_resumable == true }
+            update {}
+            to Idle
+            emit RecoveredInputLifecycleNormalized {
+                input_id: input_id,
+                phase: if phase == RecoveredInputObservedPhase::Applied { InputPhase::Applied } else { InputPhase::AppliedPendingConsumption },
+                terminal_kind: None,
+                recovered: true,
+                abandoned: false,
+                requeued: false,
+                history_reason: Some(RecoveredInputNormalizationReasonKind::ResumableRun)
+            }
+        }
+
         transition NormalizeRecoveredInputAppliedUnobservedReceipt {
             per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
-            on input NormalizeRecoveredInputLifecycle { input_id, phase, applied_boundary_committed }
+            on input NormalizeRecoveredInputLifecycle { input_id, phase, applied_boundary_committed, bound_run_resumable }
             guard "applied_phase" {
                 phase == RecoveredInputObservedPhase::Applied
                 || phase == RecoveredInputObservedPhase::AppliedPendingConsumption
@@ -16974,7 +17337,7 @@ macro_rules! meerkat_catalog_machine_dsl {
 
         transition NormalizeRecoveredInputQueued {
             per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
-            on input NormalizeRecoveredInputLifecycle { input_id, phase, applied_boundary_committed }
+            on input NormalizeRecoveredInputLifecycle { input_id, phase, applied_boundary_committed, bound_run_resumable }
             guard "queued_phase" { phase == RecoveredInputObservedPhase::Queued }
             update {}
             to Idle
@@ -20849,6 +21212,10 @@ macro_rules! meerkat_catalog_machine_dsl {
                 || self.runtime_completion_result_resolved == true
             }
             guard "run_starts_not_held" { self.run_start_holds == EmptySet }
+            // While a run waits to resume, only that run may start.
+            guard "no_other_resumable_run" {
+                self.resumable_run_id == None || self.resumable_run_id == Some(run_id)
+            }
             update {
                 self.current_run_id = Some(run_id);
                 if self.run_stop_requested != Some(run_id) {
@@ -20871,6 +21238,9 @@ macro_rules! meerkat_catalog_machine_dsl {
                 && self.runtime_completion_result_resolved == false
             }
             guard "run_starts_not_held" { self.run_start_holds == EmptySet }
+            guard "no_other_resumable_run" {
+                self.resumable_run_id == None || self.resumable_run_id == Some(run_id)
+            }
             update {
                 self.current_run_id = Some(run_id);
                 if self.run_stop_requested != Some(run_id) {
@@ -20900,6 +21270,9 @@ macro_rules! meerkat_catalog_machine_dsl {
                 || self.runtime_completion_result_resolved == true
             }
             guard "run_starts_not_held" { self.run_start_holds == EmptySet }
+            guard "no_other_resumable_run" {
+                self.resumable_run_id == None || self.resumable_run_id == Some(run_id)
+            }
             update {
                 self.current_run_id = Some(run_id);
                 if self.run_stop_requested != Some(run_id) {
@@ -20922,6 +21295,9 @@ macro_rules! meerkat_catalog_machine_dsl {
                 && self.runtime_completion_result_resolved == false
             }
             guard "run_starts_not_held" { self.run_start_holds == EmptySet }
+            guard "no_other_resumable_run" {
+                self.resumable_run_id == None || self.resumable_run_id == Some(run_id)
+            }
             update {
                 self.current_run_id = Some(run_id);
                 if self.run_stop_requested != Some(run_id) {
@@ -23999,6 +24375,76 @@ macro_rules! meerkat_catalog_machine_dsl {
             to Retired
         }
 
+        // A graceful requeue stop (a deploy) keeps a durable session's
+        // in-flight run resumable at its last committed round, exactly as a
+        // crash does (A28). The shell has already stopped the turn without a
+        // closing save or a boundary. The run stops being current, the
+        // pre-run phase is restored, and the run is marked resumable, so the
+        // stop classifier keeps its bound inputs bound and the stored cursor
+        // resumes it at the next start. No turn terminal is recorded and no
+        // input changes. A run of a Retired runtime, a session without
+        // per-round commits, a stop that does not requeue, or a run with a
+        // published live-boundary join is not suspended: the shell cancels it
+        // as before.
+        transition SuspendRunForStopRunningToIdle {
+            on input SuspendRunForStop { run_id, durable_session }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "pre_run_phase_matches_idle" { self.pre_run_phase == Some(PreRunPhase::Idle) }
+            guard "current_run_id_matches_binding" { self.current_run_id == Some(run_id) }
+            guard "requeue_stop" {
+                self.registration_phase == RegistrationPhase::Draining
+                && self.unregister_queued_inputs == UnregisterQueuedInputsDisposition::Requeue
+            }
+            guard "durable_session" { durable_session == true }
+            guard "no_other_resumable_run" { self.resumable_run_id == None }
+            guard "live_boundary_joins_retained_and_applied" {
+                for_all(joined_input_id in self.input_live_boundary_join_phase.keys(),
+                    self.input_live_boundary_join_phase.get_cloned(joined_input_id)
+                        == Some(LiveBoundaryJoinPhase::Retained)
+                    && (self.input_phases.get_cloned(joined_input_id) == Some(InputPhase::Applied)
+                        || self.input_phases.get_cloned(joined_input_id)
+                            == Some(InputPhase::AppliedPendingConsumption)))
+            }
+            update {
+                self.input_live_boundary_join_run = EmptyMap;
+                self.input_live_boundary_join_phase = EmptyMap;
+                self.current_run_id = None;
+                self.pre_run_phase = None;
+                self.resumable_run_id = Some(run_id);
+            }
+            to Idle
+            emit RunSuspendedForStop { run_id: run_id }
+        }
+        transition SuspendRunForStopRunningToAttached {
+            on input SuspendRunForStop { run_id, durable_session }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "pre_run_phase_matches_attached" { self.pre_run_phase == Some(PreRunPhase::Attached) }
+            guard "current_run_id_matches_binding" { self.current_run_id == Some(run_id) }
+            guard "requeue_stop" {
+                self.registration_phase == RegistrationPhase::Draining
+                && self.unregister_queued_inputs == UnregisterQueuedInputsDisposition::Requeue
+            }
+            guard "durable_session" { durable_session == true }
+            guard "no_other_resumable_run" { self.resumable_run_id == None }
+            guard "live_boundary_joins_retained_and_applied" {
+                for_all(joined_input_id in self.input_live_boundary_join_phase.keys(),
+                    self.input_live_boundary_join_phase.get_cloned(joined_input_id)
+                        == Some(LiveBoundaryJoinPhase::Retained)
+                    && (self.input_phases.get_cloned(joined_input_id) == Some(InputPhase::Applied)
+                        || self.input_phases.get_cloned(joined_input_id)
+                            == Some(InputPhase::AppliedPendingConsumption)))
+            }
+            update {
+                self.input_live_boundary_join_run = EmptyMap;
+                self.input_live_boundary_join_phase = EmptyMap;
+                self.current_run_id = None;
+                self.pre_run_phase = None;
+                self.resumable_run_id = Some(run_id);
+            }
+            to Attached
+            emit RunSuspendedForStop { run_id: run_id }
+        }
+
         // 34. Recycle: from Idle/Retired → Idle, from Attached → Attached.
         // Recycling discards the PLACEMENT triple (the recycled runtime is
         // re-placed by the next binding preparation) and PRESERVES the
@@ -24567,6 +25013,37 @@ macro_rules! meerkat_catalog_machine_dsl {
             per_phase [Idle, Attached, Running, Retired, Stopped]
             on input RollbackStaged { input_id, lane }
             guard "input_tracked" { self.input_phases.contains_key(input_id) }
+            guard "input_not_live_boundary_joined" {
+                !self.input_live_boundary_join_run.contains_key(input_id)
+            }
+            update {
+                self.input_phases.insert(input_id, InputPhase::Queued);
+                self.input_run_associations.remove(input_id);
+                self.input_lane.insert(input_id, lane);
+                self.input_recovery_lanes.insert(input_id, lane);
+                self.input_live_boundary_delivery.remove(input_id);
+            }
+            to Idle
+            emit InputLifecycleNotice
+        }
+
+        // ReplayAppliedRunContributor: return an applied contributor of one
+        // exact run to its lane. A failed run whose contributors are replayed
+        // (its provisional tail already discarded) and a released resumable
+        // run both send Applied and AppliedPendingConsumption inputs back to
+        // Queued. Named apart from RollbackStaged so the phase and the run the
+        // input belongs to are guarded here, not left to a missing guard.
+        transition ReplayAppliedRunContributor {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input ReplayAppliedRunContributor { input_id, run_id, lane }
+            guard "input_applied" {
+                self.input_phases.get_cloned(input_id) == Some(InputPhase::Applied)
+                || self.input_phases.get_cloned(input_id)
+                    == Some(InputPhase::AppliedPendingConsumption)
+            }
+            guard "input_bound_to_run" {
+                self.input_run_associations.get_cloned(input_id) == Some(run_id)
+            }
             guard "input_not_live_boundary_joined" {
                 !self.input_live_boundary_join_run.contains_key(input_id)
             }
@@ -38564,6 +39041,34 @@ macro_rules! meerkat_catalog_machine_dsl {
             }
         }
 
+        // A graceful requeue stop keeps the inputs of a run marked resumable:
+        // a run left open by a restart and not resumed yet (A15), or the
+        // in-flight run the stop just suspended (A28). They keep their Staged
+        // or Applied phase and their run, and the stored cursor marks the run
+        // again at the next registration.
+        transition ClassifyStopInputDispositionRetainResumable {
+            per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
+            on input ClassifyStopInputDisposition { input_id, durability, directed, objective_bound }
+            guard "resumable_run_input" {
+                self.unregister_queued_inputs == UnregisterQueuedInputsDisposition::Requeue
+                && self.resumable_run_id != None
+                && self.input_run_associations.get_cloned(input_id) == self.resumable_run_id
+                && self.input_phases.contains_key(input_id)
+                && (self.input_phases.get(input_id).get("value") == InputPhase::Staged
+                    || self.input_phases.get(input_id).get("value") == InputPhase::Applied
+                    || self.input_phases.get(input_id).get("value")
+                        == InputPhase::AppliedPendingConsumption)
+                && self.registration_phase == RegistrationPhase::Draining
+            }
+            update {}
+            to Idle
+            emit StopInputDispositionClassified {
+                input_id: input_id,
+                disposition: StopInputDisposition::Retain,
+                requeue_max_age_ms: self.unregister_requeue_max_age_ms
+            }
+        }
+
         transition ClassifyStopInputDispositionAbandon {
             per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
             on input ClassifyStopInputDisposition { input_id, durability, directed, objective_bound }
@@ -38577,6 +39082,17 @@ macro_rules! meerkat_catalog_machine_dsl {
                     && directed == false
                     && objective_bound == false
                     && durability == InputDurabilityKind::Durable)
+            }
+            guard "not_resumable_run_input" {
+                !(self.unregister_queued_inputs == UnregisterQueuedInputsDisposition::Requeue
+                    && self.resumable_run_id != None
+                    && self.input_run_associations.get_cloned(input_id) == self.resumable_run_id
+                    && self.input_phases.contains_key(input_id)
+                    && (self.input_phases.get(input_id).get("value") == InputPhase::Staged
+                        || self.input_phases.get(input_id).get("value") == InputPhase::Applied
+                        || self.input_phases.get(input_id).get("value")
+                            == InputPhase::AppliedPendingConsumption)
+                    && self.registration_phase == RegistrationPhase::Draining)
             }
             update {}
             to Idle
@@ -38683,6 +39199,11 @@ macro_rules! meerkat_catalog_machine_dsl {
                 pub fn authorize_runtime_loop_batch_from_state(
                     state: &MeerkatMachineState,
                 ) -> Option<RuntimeLoopBatchPlan> {
+                    // While a run waits to resume, no queued batch starts:
+                    // the resumed run goes first, through ResumeRun.
+                    if state.resumable_run_id.is_some() {
+                        return None;
+                    }
                     runtime_loop_batch_from_state(
                         state,
                         InputLane::Steer,
@@ -38721,6 +39242,75 @@ macro_rules! meerkat_catalog_machine_dsl {
                     source: RuntimeLoopBatchSource,
                 ) -> Option<StageForRunPlan> {
                     runtime_stage_for_run_from_state(state, input_ids, run_id, source)
+                }
+            }
+
+            #[must_use = "generated resumed-run plan must be consumed by the exclusive resume start"]
+            #[derive(Debug, PartialEq, Eq)]
+            pub struct ResumedRunPlan {
+                resume_capability: AuthorizedResumedRun,
+                input_ids: Vec<String>,
+            }
+
+            impl ResumedRunPlan {
+                pub fn into_parts(self) -> (AuthorizedResumedRun, Vec<String>) {
+                    (self.resume_capability, self.input_ids)
+                }
+            }
+
+            #[must_use = "generated command capability `AuthorizedResumedRun` must be consumed by the shell action it authorizes"]
+            #[derive(Debug, PartialEq, Eq)]
+            pub struct AuthorizedResumedRun {
+                _sealed: private::Sealed,
+            }
+
+            impl AuthorizedResumedRun {
+                #[doc(hidden)]
+                #[allow(dead_code)]
+                pub(crate) fn mint_from_generated_command_plan() -> Self {
+                    Self {
+                        _sealed: private::Sealed,
+                    }
+                }
+
+                /// The marked run and exactly the inputs bound to it (staged
+                /// or applied, associated with the run), in admission order.
+                /// `None` unless `run_id` is the marked resumable run, no run
+                /// is current, and at least one input is bound to it.
+                #[must_use]
+                pub fn authorize_resumed_run_from_state(
+                    state: &MeerkatMachineState,
+                    run_id: &RunId,
+                ) -> Option<ResumedRunPlan> {
+                    if state.resumable_run_id.as_ref() != Some(run_id) || state.current_run_id.is_some() {
+                        return None;
+                    }
+                    let mut input_ids: Vec<String> = state
+                        .input_run_associations
+                        .iter()
+                        .filter(|(input_id, associated)| {
+                            *associated == run_id
+                                && matches!(
+                                    state.input_phases.get(*input_id),
+                                    Some(
+                                        InputPhase::Staged
+                                            | InputPhase::Applied
+                                            | InputPhase::AppliedPendingConsumption
+                                    )
+                                )
+                        })
+                        .map(|(input_id, _)| input_id.clone())
+                        .collect();
+                    if input_ids.is_empty() {
+                        return None;
+                    }
+                    input_ids.sort_by_key(|input_id| {
+                        state.input_admission_seq.get(input_id).copied().unwrap_or(u64::MAX)
+                    });
+                    Some(ResumedRunPlan {
+                        resume_capability: AuthorizedResumedRun::mint_from_generated_command_plan(),
+                        input_ids,
+                    })
                 }
             }
 

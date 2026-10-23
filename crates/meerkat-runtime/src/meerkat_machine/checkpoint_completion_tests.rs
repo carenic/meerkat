@@ -250,7 +250,9 @@ impl Fixture {
             Arc::new(meerkat_store::MemoryBlobStore::new()),
         );
         driver.inner_mut().ensure_contract_session_authority()?;
-        driver.recover_inputs_after_runtime_authority(None).await?;
+        driver
+            .recover_inputs_after_runtime_authority(None, None)
+            .await?;
         Ok(Arc::new(Mutex::new(DriverEntry::Persistent(driver))))
     }
 

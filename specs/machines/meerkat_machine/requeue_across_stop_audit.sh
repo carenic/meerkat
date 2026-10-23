@@ -272,8 +272,14 @@ for arm, guard in (("ClassifyStopInputDispositionRetainStopped", "FALSE"),
     start = text.index("\n" + arm + "(") + 1
     end = text.index("\n\n", start)
     lines = text[start:end].split("\n")
-    hits = [i for i, line in enumerate(lines) if line.startswith("    /\\ ") and "registration_phase" in line]
-    assert len(hits) == 1, f"expected one guard line in {arm}, found {len(hits)}"
+    # The queued-prompt guard line; an Abandon arm's resumable-run guard
+    # keeps a line of its own.
+    hits = [
+        i
+        for i, line in enumerate(lines)
+        if line.startswith("    /\\ ") and "registration_phase" in line and '"Queued"' in line
+    ]
+    assert len(hits) == 1, f"expected one queued-prompt guard line in {arm}, found {len(hits)}"
     lines[hits[0]] = "    /\\ " + guard
     text = text[:start] + "\n".join(lines) + text[end:]
 open(path, "w").write(text)
@@ -388,8 +394,14 @@ for arm in os.environ["ARMS"].split():
     start = text.index("\n" + arm + "(") + 1
     end = text.index("\n\n", start)
     lines = text[start:end].split("\n")
-    hits = [i for i, line in enumerate(lines) if line.startswith("    /\\ ") and "registration_phase" in line]
-    assert len(hits) == 1, f"expected one guard line in {arm}, found {len(hits)}"
+    # The queued-prompt guard line; an Abandon arm's resumable-run guard
+    # keeps a line of its own.
+    hits = [
+        i
+        for i, line in enumerate(lines)
+        if line.startswith("    /\\ ") and "registration_phase" in line and '"Queued"' in line
+    ]
+    assert len(hits) == 1, f"expected one queued-prompt guard line in {arm}, found {len(hits)}"
     lines[hits[0]] = "    /\\ TRUE"
     text = text[:start] + "\n".join(lines) + text[end:]
 open(path, "w").write(text)

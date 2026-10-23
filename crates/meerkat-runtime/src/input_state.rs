@@ -79,6 +79,12 @@ pub enum InputAbandonReason {
     /// it older than that stop's max age, so it ended without running.
     /// Resubmitting it is now correct.
     RequeueExpired,
+    /// The input's run was left open when its host stopped, and the run was
+    /// not resumed: the host's resumed-run admission refused it, or the
+    /// runtime ended before the resume. Settled without a receipt, like
+    /// [`Self::ToolProcessInterrupted`]. Resubmitting it is correct only when
+    /// the host knows the work was not done elsewhere.
+    ResumeRefused,
 }
 
 /// Terminal outcome for an input.
@@ -1500,6 +1506,9 @@ pub(crate) fn input_terminal_completion_outcome(
 /// - `Abandoned { RequeueExpired }`: the same pre-serve settlement ends an
 ///   input a graceful stop kept queued once it is older than the stop's max
 ///   age (`PendingRuntimeExecutorAttachment::settle_expired_stop_requeued_inputs`).
+/// - `Abandoned { ResumeRefused }` (and the receipt-less `Cancelled` and
+///   `RequeueExpired` of the same path): a run left open by a restart that is
+///   settled instead of resumed (`DriverEntry::settle_resumable_run`).
 ///
 /// `Cancelled` and `MaxAttemptsExhausted` are also reached with a receipt
 /// (tracked cancel, attachment replacement, a failed run's batch); a row of
@@ -1529,7 +1538,8 @@ pub(crate) fn receipt_less_terminal(
             InputAbandonReason::Cancelled
             | InputAbandonReason::MaxAttemptsExhausted { .. }
             | InputAbandonReason::ToolProcessInterrupted
-            | InputAbandonReason::RequeueExpired => true,
+            | InputAbandonReason::RequeueExpired
+            | InputAbandonReason::ResumeRefused => true,
             InputAbandonReason::Retired
             | InputAbandonReason::Reset
             | InputAbandonReason::Stopped

@@ -269,6 +269,7 @@ impl PersistentRuntimeDriver {
     async fn recover_and_prepare_input_mutations(
         &mut self,
         recovered_unregister_progress: Option<&crate::store::MachineUnregisterProgressSnapshot>,
+        resumable_run: Option<&crate::recovery::ResumableRunObservation>,
     ) -> Result<
         (
             RecoveryReport,
@@ -347,6 +348,7 @@ impl PersistentRuntimeDriver {
             &mut self.inner,
             observed,
             recovered_unregister_progress,
+            resumable_run,
         )
         .await?;
 
@@ -389,9 +391,17 @@ impl PersistentRuntimeDriver {
         Ok((report, input_set_revision, mutations))
     }
 
+    /// Recover durable input work into this driver's live authority.
+    ///
+    /// `resumable_run` is the registration's observation of a continuable
+    /// durable tail (`crate::recovery::observe_resumable_run`): the run its
+    /// cursor names is marked resumable before any input is normalized, and
+    /// the inputs the cursor keeps bound stay Staged or Applied instead of
+    /// requeueing. `None` recovers every input as today.
     pub(crate) async fn recover_inputs_after_runtime_authority(
         &mut self,
         recovered_unregister_progress: Option<&crate::store::MachineUnregisterProgressSnapshot>,
+        resumable_run: Option<&crate::recovery::ResumableRunObservation>,
     ) -> Result<RecoveryReport, RuntimeDriverError> {
         match self.store.input_state_batch_cas_implementation_profile() {
             InputStateBatchCasImplementationProfile::MultiWriter => {}
@@ -413,7 +423,7 @@ impl PersistentRuntimeDriver {
         }
 
         let (report, input_set_revision, mutations) = self
-            .recover_and_prepare_input_mutations(recovered_unregister_progress)
+            .recover_and_prepare_input_mutations(recovered_unregister_progress, resumable_run)
             .await?;
 
         match self
@@ -441,9 +451,10 @@ impl PersistentRuntimeDriver {
         &mut self,
         recovered_unregister_progress: Option<&crate::store::MachineUnregisterProgressSnapshot>,
         write_fence: Arc<dyn RuntimeStoreWriteFence>,
+        resumable_run: Option<&crate::recovery::ResumableRunObservation>,
     ) -> Result<RecoveryReport, RuntimeDriverError> {
         let (report, input_set_revision, mutations) = self
-            .recover_and_prepare_input_mutations(recovered_unregister_progress)
+            .recover_and_prepare_input_mutations(recovered_unregister_progress, resumable_run)
             .await?;
 
         match self.store.input_state_batch_cas_implementation_profile() {
@@ -2466,6 +2477,99 @@ impl PersistentRuntimeDriver {
         Ok(true)
     }
 
+    /// Release the resumable run `run_id` to ordinary requeue and commit the
+    /// requeued inputs. See
+    /// [`crate::driver::ephemeral::EphemeralRuntimeDriver::release_resumable_run_inputs`]
+    /// for when releasing is safe.
+    pub(crate) async fn release_resumable_run(
+        &mut self,
+        run_id: &meerkat_core::lifecycle::RunId,
+    ) -> Result<Vec<meerkat_core::lifecycle::InputId>, RuntimeDriverError> {
+        self.require_durability_ready()?;
+        let checkpoint = self.persistence_rollback_checkpoint();
+        let requeued = match self.inner.release_resumable_run_inputs(run_id) {
+            Ok(requeued) => requeued,
+            Err(error) => {
+                return Err(self.post_transition_failure(
+                    checkpoint,
+                    "release_resumable_run",
+                    error.to_string(),
+                ));
+            }
+        };
+        if requeued.is_empty() {
+            return Ok(requeued);
+        }
+        let (checkpoint, input_states, commit) = self.lifecycle_persistence_payload_with_rollback(
+            checkpoint,
+            &requeued,
+            "resumable run release",
+        )?;
+        if let Err(error) = self
+            .store
+            .commit_machine_lifecycle(&self.runtime_id, commit, &input_states)
+            .await
+        {
+            return Err(self.post_transition_failure(
+                checkpoint,
+                "release_resumable_run_commit",
+                format!("resumable run release persist failed: {error}"),
+            ));
+        }
+        Ok(requeued)
+    }
+
+    /// Settle the resumable run `run_id`, abandoning the inputs it still
+    /// holds with `reason` (receipt-less reasons only), and commit them.
+    pub(crate) async fn settle_resumable_run(
+        &mut self,
+        run_id: &meerkat_core::lifecycle::RunId,
+        reason: InputAbandonReason,
+    ) -> Result<Vec<meerkat_core::lifecycle::InputId>, RuntimeDriverError> {
+        self.require_durability_ready()?;
+        let checkpoint = self.persistence_rollback_checkpoint();
+        let abandoned = match self.inner.settle_resumable_run_inputs(run_id, reason) {
+            Ok(abandoned) => abandoned,
+            Err(error) => {
+                return Err(self.post_transition_failure(
+                    checkpoint,
+                    "settle_resumable_run",
+                    error.to_string(),
+                ));
+            }
+        };
+        if abandoned.is_empty() {
+            return Ok(abandoned);
+        }
+        let (checkpoint, input_states, commit) = self.lifecycle_persistence_payload_with_rollback(
+            checkpoint,
+            &abandoned,
+            "resumable run settlement",
+        )?;
+        if let Err(error) = self
+            .store
+            .commit_machine_lifecycle(&self.runtime_id, commit, &input_states)
+            .await
+        {
+            return Err(self.post_transition_failure(
+                checkpoint,
+                "settle_resumable_run_commit",
+                format!("resumable run settlement persist failed: {error}"),
+            ));
+        }
+        if let Err(error) = self
+            .inner
+            .archive_archivable_terminal_inputs_after_durable_commit(&abandoned)
+        {
+            return Err(self.post_transition_failure(
+                None,
+                "settle_resumable_run_archive",
+                error.to_string(),
+            ));
+        }
+        Ok(abandoned)
+    }
+
     /// The archival that follows the durable commit of
     /// [`Self::abandon_queued_input`].
     fn archive_queued_abandonment_after_durable_commit(
@@ -3714,7 +3818,7 @@ mod tests {
             .inner_mut()
             .replace_runtime_authority(recovery.authority);
         driver
-            .recover_inputs_after_runtime_authority(recovery.unregister_progress.as_ref())
+            .recover_inputs_after_runtime_authority(recovery.unregister_progress.as_ref(), None)
             .await
             .expect("registration-authorized input recovery must commit by exact batch CAS")
     }

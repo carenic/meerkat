@@ -5641,6 +5641,15 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 );
                 false
             }
+            // An open run continues; nothing was committed, so the store still
+            // names no settled boundary for this live session.
+            Ok((meerkat_runtime::recovery::DurableTailRecoveryOutcome::Continue { .. }, _)) => {
+                tracing::info!(
+                    session_id = %id,
+                    "durable-tail recovery found an open run to continue on a live session whose turn ended without its boundary commit"
+                );
+                false
+            }
             Err(error) => {
                 tracing::warn!(
                     session_id = %id,
@@ -16883,6 +16892,17 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 CommittedBoundaryRecovery::Unprovable {
                     reason: format!(
                         "the durable tail for session {id} was refused by machine authority because persisted runtime facts contradict or already supersede the candidate; every durable copy is retained for operator reconciliation"
+                    ),
+                },
+                None,
+            )),
+            // Placeholder until the actor seeding from the continued candidate
+            // lands (slice 4 replaces this arm): an open run is held rather
+            // than served from a body that would drop its uncommitted rounds.
+            meerkat_runtime::recovery::DurableTailRecoveryOutcome::Continue { run_id, .. } => Ok((
+                CommittedBoundaryRecovery::Unprovable {
+                    reason: format!(
+                        "the durable tail for session {id} is the open run {run_id} at a committed round; this build cannot continue it yet, and every durable copy is retained"
                     ),
                 },
                 None,

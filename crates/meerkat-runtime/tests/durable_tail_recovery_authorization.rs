@@ -820,6 +820,7 @@ fn no_disposition_value_discards_the_durable_tail() {
         mm_dsl::DurableTailRecoveryDisposition::RepairAndCommitInterrupted,
         mm_dsl::DurableTailRecoveryDisposition::CommitCompletedRetainInputs,
         mm_dsl::DurableTailRecoveryDisposition::HoldIntact,
+        mm_dsl::DurableTailRecoveryDisposition::ContinueRun,
     ];
     for disposition in all {
         let retains_every_durable_message = match disposition {
@@ -836,10 +837,225 @@ fn no_disposition_value_discards_the_durable_tail() {
             mm_dsl::DurableTailRecoveryDisposition::CommitCompletedRetainInputs => true,
             // Held intact, readable, blocked from resume.
             mm_dsl::DurableTailRecoveryDisposition::HoldIntact => true,
+            // Nothing is written: the tail IS the open run, which continues
+            // from its last committed round.
+            mm_dsl::DurableTailRecoveryDisposition::ContinueRun => true,
         };
         assert!(
             retains_every_durable_message,
             "{disposition:?} must retain the durable tail"
         );
     }
+}
+
+// Same-run resume after a restart (A13, A15). Unrun until the candidate's
+// validation: the policy forbids Cargo while the batch is implemented.
+
+/// A durable session's open run at a committed round continues from an Idle
+/// authority: the verdict writes nothing, mints no sequence, and leaves the
+/// turn terminal unset.
+#[test]
+fn idle_continuable_candidate_continues_the_run() {
+    let mut authority = mm_dsl::MeerkatMachineAuthority::recover_from_state(quiescent_state(
+        mm_dsl::MeerkatPhase::Idle,
+    ))
+    .expect("idle quiescent state must be recoverable");
+    let (candidate_id, verdict) = authorize_quiescent(
+        &mut authority,
+        "candidate-continue",
+        "run-continue",
+        mm_dsl::DurableTailRecoveryClass::ContinuableCandidate,
+    );
+    assert_eq!(candidate_id, "candidate-continue");
+    assert_eq!(
+        verdict,
+        Verdict::NonCommit(mm_dsl::DurableTailRecoveryDisposition::ContinueRun)
+    );
+    assert_eq!(authority.state().turn_terminal_run_id, None);
+}
+
+/// The recovery drive authorizes on a fresh Idle authority, so a runtime the
+/// persisted lifecycle shows Retired is visible only there: it never
+/// continues, it repairs and commits as interrupted.
+#[test]
+fn persisted_retired_continuable_candidate_repairs_instead_of_continuing() {
+    let mut authority = mm_dsl::MeerkatMachineAuthority::recover_from_state(quiescent_state(
+        mm_dsl::MeerkatPhase::Idle,
+    ))
+    .expect("idle quiescent state must be recoverable");
+    let (prior_commit, input_evidence) = admitting_evidence();
+    let (_, verdict) = authorize(
+        &mut authority,
+        "candidate-retired",
+        "run-retired",
+        mm_dsl::DurableTailRecoveryClass::ContinuableCandidate,
+        mm_dsl::DurableRecoveryObservedLifecycle::Retired,
+        mm_dsl::DurableRecoveryObservedRun::NoRun,
+        0,
+        prior_commit,
+        input_evidence,
+    );
+    assert_eq!(
+        verdict,
+        Verdict::Commit(
+            mm_dsl::DurableTailRecoveryDisposition::RepairAndCommitInterrupted,
+            1
+        )
+    );
+}
+
+/// Unfenceable input evidence holds a continuable candidate like any other.
+#[test]
+fn unfenceable_continuable_candidate_holds() {
+    let mut authority = mm_dsl::MeerkatMachineAuthority::recover_from_state(quiescent_state(
+        mm_dsl::MeerkatPhase::Idle,
+    ))
+    .expect("idle quiescent state must be recoverable");
+    let (lifecycle, run) = quiescent_observation();
+    let (_, verdict) = authorize(
+        &mut authority,
+        "candidate-unfenceable",
+        "run-unfenceable",
+        mm_dsl::DurableTailRecoveryClass::ContinuableCandidate,
+        lifecycle,
+        run,
+        0,
+        mm_dsl::DurableRecoveryPriorCommit::NoPriorCommit,
+        mm_dsl::DurableRecoveryInputEvidence::Unfenceable,
+    );
+    assert_eq!(
+        verdict,
+        Verdict::NonCommit(mm_dsl::DurableTailRecoveryDisposition::HoldIntact)
+    );
+}
+
+/// A receipt that already covers the candidate refuses it: a continuable
+/// candidate is never continued over a prior commit.
+#[test]
+fn prior_commit_refuses_a_continuable_candidate() {
+    let mut authority = mm_dsl::MeerkatMachineAuthority::recover_from_state(quiescent_state(
+        mm_dsl::MeerkatPhase::Idle,
+    ))
+    .expect("idle quiescent state must be recoverable");
+    let (lifecycle, run) = quiescent_observation();
+    let (_, verdict) = authorize(
+        &mut authority,
+        "candidate-prior",
+        "run-prior",
+        mm_dsl::DurableTailRecoveryClass::ContinuableCandidate,
+        lifecycle,
+        run,
+        1,
+        mm_dsl::DurableRecoveryPriorCommit::MatchesCandidate,
+        mm_dsl::DurableRecoveryInputEvidence::AllBoundOrInert,
+    );
+    assert_eq!(
+        verdict,
+        Verdict::NonCommit(mm_dsl::DurableTailRecoveryDisposition::RefuseRecovery)
+    );
+}
+
+/// The live resume lifecycle: a marked run blocks every other run start and
+/// every queued batch, starts through the ordinary Prepare under its own id,
+/// and ResumeRun clears the mark only while it is the current run.
+#[test]
+fn marked_run_resumes_exclusively_through_prepare_then_resume_run() {
+    let mut authority = mm_dsl::MeerkatMachineAuthority::recover_from_state(quiescent_state(
+        mm_dsl::MeerkatPhase::Idle,
+    ))
+    .expect("idle quiescent state must be recoverable");
+    let marked = mm_dsl::RunId("run-marked".to_string());
+    let other = mm_dsl::RunId("run-other".to_string());
+    mm_dsl::MeerkatMachineMutator::apply(
+        &mut authority,
+        mm_dsl::MeerkatMachineInput::MarkRunResumable {
+            run_id: marked.clone(),
+        },
+    )
+    .expect("an idle authority with no current run marks the run");
+    assert_eq!(authority.state().resumable_run_id, Some(marked.clone()));
+    assert!(
+        mm_dsl::MeerkatMachineMutator::apply(
+            &mut authority,
+            mm_dsl::MeerkatMachineInput::ResumeRun {
+                run_id: marked.clone(),
+            },
+        )
+        .is_err(),
+        "ResumeRun applies only to the current run"
+    );
+    assert!(
+        mm_dsl::MeerkatMachineMutator::apply(
+            &mut authority,
+            mm_dsl::MeerkatMachineInput::Prepare {
+                session_id: mm_dsl::SessionId("session-recovery".to_string()),
+                run_id: other,
+            },
+        )
+        .is_err(),
+        "no other run starts while a run is marked resumable"
+    );
+    mm_dsl::MeerkatMachineMutator::apply(
+        &mut authority,
+        mm_dsl::MeerkatMachineInput::Prepare {
+            session_id: mm_dsl::SessionId("session-recovery".to_string()),
+            run_id: marked.clone(),
+        },
+    )
+    .expect("the marked run starts under its own id");
+    mm_dsl::MeerkatMachineMutator::apply(
+        &mut authority,
+        mm_dsl::MeerkatMachineInput::ResumeRun {
+            run_id: marked.clone(),
+        },
+    )
+    .expect("the current marked run resumes");
+    assert_eq!(authority.state().resumable_run_id, None);
+    assert_eq!(authority.state().current_run_id, Some(marked));
+}
+
+/// A graceful requeue stop suspends a durable session's in-flight run (A28):
+/// the run stops being current, the pre-run phase returns, and the run is
+/// marked resumable, with no turn terminal. Unrun.
+#[test]
+fn requeue_stop_suspends_a_durable_in_flight_run() {
+    let run = mm_dsl::RunId("run-in-flight".to_string());
+    let draining_running = || mm_dsl::MeerkatMachineState {
+        lifecycle_phase: mm_dsl::MeerkatPhase::Running,
+        session_id: Some(mm_dsl::SessionId("session-recovery".to_string())),
+        current_run_id: Some(run.clone()),
+        pre_run_phase: Some(mm_dsl::PreRunPhase::Idle),
+        registration_phase: mm_dsl::RegistrationPhase::Draining,
+        unregister_queued_inputs: mm_dsl::UnregisterQueuedInputsDisposition::Requeue,
+        ..Default::default()
+    };
+
+    let mut not_durable = mm_dsl::MeerkatMachineAuthority::recover_from_state(draining_running())
+        .expect("a draining running state must be recoverable");
+    assert!(
+        mm_dsl::MeerkatMachineMutator::apply(
+            &mut not_durable,
+            mm_dsl::MeerkatMachineInput::SuspendRunForStop {
+                run_id: run.clone(),
+                durable_session: false,
+            },
+        )
+        .is_err(),
+        "a session without per-round commits is cancelled, not suspended"
+    );
+
+    let mut durable = mm_dsl::MeerkatMachineAuthority::recover_from_state(draining_running())
+        .expect("a draining running state must be recoverable");
+    mm_dsl::MeerkatMachineMutator::apply(
+        &mut durable,
+        mm_dsl::MeerkatMachineInput::SuspendRunForStop {
+            run_id: run.clone(),
+            durable_session: true,
+        },
+    )
+    .expect("a durable session's run is suspended");
+    assert_eq!(durable.state().lifecycle_phase, mm_dsl::MeerkatPhase::Idle);
+    assert_eq!(durable.state().current_run_id, None);
+    assert_eq!(durable.state().resumable_run_id, Some(run));
+    assert_eq!(durable.state().turn_terminal_run_id, None);
 }

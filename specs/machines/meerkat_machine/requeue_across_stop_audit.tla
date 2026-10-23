@@ -144,6 +144,9 @@ Answered(verdicts, v) == {i \in DOMAIN verdicts : verdicts[i] = v}
 
 \* ---- generated arms, one disjunct per phase ----
 
+\* The Retain verdict has two arms per phase: an eligible queued prompt, and
+\* an input of a run marked resumable (never enabled here: this audit marks
+\* no run resumable, so it only keeps the verdict a function over all arms).
 RetainArm(i, d, dir, obj) ==
     \/ ClassifyStopInputDispositionRetainInitializing(i, d, dir, obj)
     \/ ClassifyStopInputDispositionRetainIdle(i, d, dir, obj)
@@ -151,6 +154,12 @@ RetainArm(i, d, dir, obj) ==
     \/ ClassifyStopInputDispositionRetainRunning(i, d, dir, obj)
     \/ ClassifyStopInputDispositionRetainRetired(i, d, dir, obj)
     \/ ClassifyStopInputDispositionRetainStopped(i, d, dir, obj)
+    \/ ClassifyStopInputDispositionRetainResumableInitializing(i, d, dir, obj)
+    \/ ClassifyStopInputDispositionRetainResumableIdle(i, d, dir, obj)
+    \/ ClassifyStopInputDispositionRetainResumableAttached(i, d, dir, obj)
+    \/ ClassifyStopInputDispositionRetainResumableRunning(i, d, dir, obj)
+    \/ ClassifyStopInputDispositionRetainResumableRetired(i, d, dir, obj)
+    \/ ClassifyStopInputDispositionRetainResumableStopped(i, d, dir, obj)
 
 AbandonArm(i, d, dir, obj) ==
     \/ ClassifyStopInputDispositionAbandonInitializing(i, d, dir, obj)
@@ -386,9 +395,10 @@ AuditStartProcess2 ==
           /\ UNCHANGED <<setupVars, regionVars, historyVars, runVars, restartVars,
                    audit_wait_answered>>
 
+\* No run is marked resumable in this audit, so no row is bound to one.
 NormalizeArm(i, p) ==
-    \/ p = "Queued" /\ NormalizeRecoveredInputQueuedIdle(i, p, None)
-    \/ p = "Staged" /\ NormalizeRecoveredInputStagedIdle(i, p, None)
+    \/ p = "Queued" /\ NormalizeRecoveredInputQueuedIdle(i, p, None, FALSE)
+    \/ p = "Staged" /\ NormalizeRecoveredInputStagedIdle(i, p, None, FALSE)
 
 RecoveryStep(i, next) ==
     /\ audit_recovery' = [audit_recovery EXCEPT ![i] = next]

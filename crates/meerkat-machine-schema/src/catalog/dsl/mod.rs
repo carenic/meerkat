@@ -477,6 +477,26 @@ fn meerkat_queue_to_run_command_plans() -> Vec<CommandPlanSchema> {
             effect_closures: vec![],
         },
         CommandPlanSchema {
+            name: "AuthorizedResumedRun".to_owned(),
+            authority_type: "AuthorizedResumedRun".to_owned(),
+            source_inputs: vec![
+                input_variant_id("MarkRunResumable"),
+                input_variant_id("ResumeRun"),
+            ],
+            source_signals: vec![],
+            transitions: vec![
+                transition_id("MarkRunResumableInitializing"),
+                transition_id("MarkRunResumableIdle"),
+                transition_id("MarkRunResumableAttached"),
+                transition_id("ResumeRunRunning"),
+            ],
+            effects: vec![
+                effect_variant_id("ResumableRunMarked"),
+                effect_variant_id("ResumedRunAuthorized"),
+            ],
+            effect_closures: vec![],
+        },
+        CommandPlanSchema {
             name: "AuthorizedRuntimeLoopRunCommit".to_owned(),
             authority_type: "AuthorizedRuntimeLoopRunCommit".to_owned(),
             source_inputs: vec![
@@ -991,7 +1011,7 @@ pub fn session_document_schema_metadata() -> MachineSchemaMetadata {
             ),
             NamedTypeBinding::string_enum(
                 "RunIdCardinality",
-                &["NoRunId", "SingleRunId", "MultipleRunIds"],
+                &["NoRunId", "SingleRunId", "MultipleRunIds", "NoRunRows"],
             ),
             NamedTypeBinding::string_enum(
                 "DurableTailStopReason",
@@ -1003,7 +1023,12 @@ pub fn session_document_schema_metadata() -> MachineSchemaMetadata {
                     "CompletedCandidate",
                     "InterruptedRepairableCandidate",
                     "Ambiguous",
+                    "ContinuableCandidate",
                 ],
+            ),
+            NamedTypeBinding::string_enum(
+                "DurableTailRunCursor",
+                &["Disagrees", "Absent", "Agrees"],
             ),
             NamedTypeBinding::string_enum(
                 "DurableHeadRelation",
@@ -1538,6 +1563,7 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
                     "CompletedCandidate",
                     "InterruptedRepairableCandidate",
                     "Ambiguous",
+                    "ContinuableCandidate",
                 ],
             ),
             NamedTypeBinding::string_enum(
@@ -1548,6 +1574,7 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
                     "RepairAndCommitInterrupted",
                     "CommitCompletedRetainInputs",
                     "HoldIntact",
+                    "ContinueRun",
                 ],
             ),
             // Typed projections of the persisted machine-lifecycle row and
@@ -1849,6 +1876,7 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
                     "RollbackStaged",
                     "BoundaryReceiptCommitted",
                     "MissingBoundaryReceipt",
+                    "ResumableRun",
                 ],
             ),
             NamedTypeBinding::string_enum(
@@ -1863,6 +1891,7 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
                     "NeverExecuted",
                     "ToolProcessInterrupted",
                     "RequeueExpired",
+                    "ResumeRefused",
                 ],
             ),
             NamedTypeBinding::string_enum("InputLane", &["Queue", "Steer"]),
@@ -3106,6 +3135,7 @@ runtime_internal_inputs!(
         RollbackRun,
         RollbackUnreturnedOp,
         RollbackStaged,
+        ReplayAppliedRunContributor,
         RunCancelled,
         RunCompleted,
         RunFailed,
@@ -3316,6 +3346,14 @@ runtime_internal_inputs!(
         BindLiveContextRecoveryChannel,
         CancelLiveRecoveryObligation,
         RecordLiveWebrtcAnswerAcceptedAndBindExecution,
+        // Same-run resume after a restart: the runtime marks, resumes,
+        // releases or settles the run a stored cursor names. No caller can
+        // ask for any of them.
+        MarkRunResumable,
+        ResumeRun,
+        ReleaseResumableRun,
+        SettleResumableRun,
+        SuspendRunForStop,
     ]
 );
 

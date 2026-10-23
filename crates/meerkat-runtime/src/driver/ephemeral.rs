@@ -1904,6 +1904,7 @@ impl EphemeralRuntimeDriver {
                     mm_dsl::InputAbandonReason::RequeueExpired => {
                         InputAbandonReason::RequeueExpired
                     }
+                    mm_dsl::InputAbandonReason::ResumeRefused => InputAbandonReason::ResumeRefused,
                 };
                 Some(InputTerminalOutcome::Abandoned { reason })
             }
@@ -3445,6 +3446,7 @@ impl EphemeralRuntimeDriver {
         let delta = crate::meerkat_machine::driver::machine_apply_recovered_input_normalization(
             &mut bundle,
             None,
+            false,
         )?;
         let input_id = bundle.state.input_id.clone();
         if self.ledger.get(&input_id).is_some() {
@@ -4463,9 +4465,10 @@ impl EphemeralRuntimeDriver {
     /// End the non-terminal inputs of a runtime stop. The generated stop
     /// classifier decides each one: an input it retains (the unregister
     /// began with the requeue disposition, and the input is an eligible
-    /// queued prompt) stays queued with its payload and is durably marked
-    /// with the stop's time and max age; every other input ends as stopped.
-    /// Returns the retained inputs.
+    /// queued prompt, or an input of a run marked resumable and not resumed
+    /// yet, which stays Staged or Applied and bound to its run) keeps its
+    /// phase and payload and is durably marked with the stop's time and max
+    /// age; every other input ends as stopped. Returns the retained inputs.
     ///
     /// `retained_before_exit` is the set the classifier retained before the
     /// executor's exit, for which no runless carrier was staged. The stop
@@ -5913,6 +5916,202 @@ impl EphemeralRuntimeDriver {
                 },
             )));
         Ok(true)
+    }
+
+    /// Mark `run_id` resumable (`MarkRunResumable`). False, with nothing
+    /// changed, when the machine refuses it: no Initializing, Idle or
+    /// Attached phase, a current run, or another run already marked.
+    pub(crate) fn mark_run_resumable(&mut self, run_id: &RunId) -> bool {
+        self.dsl_apply(
+            mm_dsl::MeerkatMachineInput::MarkRunResumable {
+                run_id: mm_dsl::RunId::from_domain(run_id),
+            },
+            "MarkRunResumable",
+        )
+        .is_ok()
+    }
+
+    /// The inputs `run_id` still holds: associated with it and Staged,
+    /// Applied or AppliedPendingConsumption, with their phases, in admission
+    /// order.
+    fn resumable_run_kept_inputs(&self, run_id: &RunId) -> Vec<(InputId, InputLifecycleState)> {
+        let run = mm_dsl::RunId::from_domain(run_id);
+        let mut kept: Vec<(u64, String, InputId, InputLifecycleState)> =
+            self.with_dsl_state(|state| {
+                self.admission_order
+                    .iter()
+                    .filter_map(|input_id| {
+                        let key = Self::dsl_key(input_id);
+                        if state.input_run_associations.get(&key) != Some(&run) {
+                            return None;
+                        }
+                        let phase =
+                            Self::input_phase_to_lifecycle(state.input_phases.get(&key).copied()?);
+                        matches!(
+                            phase,
+                            InputLifecycleState::Staged
+                                | InputLifecycleState::Applied
+                                | InputLifecycleState::AppliedPendingConsumption
+                        )
+                        .then(|| {
+                            let seq = state
+                                .input_admission_seq
+                                .get(&key)
+                                .copied()
+                                .unwrap_or(u64::MAX);
+                            (seq, key, input_id.clone(), phase)
+                        })
+                    })
+                    .collect()
+            });
+        kept.sort_by(|(left_seq, left_key, ..), (right_seq, right_key, ..)| {
+            left_seq
+                .cmp(right_seq)
+                .then_with(|| left_key.cmp(right_key))
+        });
+        kept.into_iter()
+            .map(|(_, _, input_id, phase)| (input_id, phase))
+            .collect()
+    }
+
+    /// Release the resumable run `run_id` to ordinary requeue
+    /// (`ReleaseResumableRun`): every input it still holds returns to Queued
+    /// in its recovery lane, a Staged one through `RollbackStaged` and an
+    /// Applied or AppliedPendingConsumption one through
+    /// `ReplayAppliedRunContributor`. Returns the requeued inputs.
+    ///
+    /// Requeueing an applied input cannot run an input whose boundary
+    /// committed: a run is resumable only while the store holds a provisional
+    /// tail whose cursor names it and whose bound inputs are all still bound,
+    /// and a boundary commit drops the provisional tail in the same
+    /// transaction that consumes the inputs (HeadCanonical:
+    /// `store/sqlite.rs` around line 6066; WholeBlob:
+    /// `promote_whole_blob_provisional_in_txn`; the SPI runtime store keeps
+    /// both in one batch). Callers release only while the durable rows are
+    /// unchanged since registration (recovery held or refused the tail, or
+    /// no recovery ran); after a recovery commit the registration is stale
+    /// and takes the durability-reload path instead.
+    pub(crate) fn release_resumable_run_inputs(
+        &mut self,
+        run_id: &RunId,
+    ) -> Result<Vec<InputId>, RuntimeDriverError> {
+        let dsl_run_id = mm_dsl::RunId::from_domain(run_id);
+        self.dsl_apply(
+            mm_dsl::MeerkatMachineInput::ReleaseResumableRun {
+                run_id: dsl_run_id.clone(),
+            },
+            "ReleaseResumableRun",
+        )?;
+        let kept = self.resumable_run_kept_inputs(run_id);
+        let mut requeued = Vec::with_capacity(kept.len());
+        for (input_id, from) in kept {
+            let lane = self.input_recovery_lane(&input_id).ok_or_else(|| {
+                RuntimeDriverError::Internal(format!(
+                    "generated recovery lane missing for released resumable input '{input_id}'"
+                ))
+            })?;
+            if from == InputLifecycleState::Staged {
+                self.dsl_apply(
+                    mm_dsl::MeerkatMachineInput::RollbackStaged {
+                        input_id: Self::dsl_key(&input_id),
+                        lane: mm_dsl::InputLane::from(lane),
+                    },
+                    "RollbackStaged(ReleaseResumableRun)",
+                )?;
+            } else {
+                self.dsl_apply(
+                    mm_dsl::MeerkatMachineInput::ReplayAppliedRunContributor {
+                        input_id: Self::dsl_key(&input_id),
+                        run_id: dsl_run_id.clone(),
+                        lane: mm_dsl::InputLane::from(lane),
+                    },
+                    "ReplayAppliedRunContributor(ReleaseResumableRun)",
+                )?;
+            }
+            let now = Utc::now();
+            if let Some(state) = self.ledger.get_mut(&input_id) {
+                state.history.push(InputStateHistoryEntry {
+                    timestamp: now,
+                    from,
+                    to: InputLifecycleState::Queued,
+                    reason: Some("ReleaseResumableRun".into()),
+                });
+                state.updated_at = now;
+            }
+            requeued.push(input_id);
+        }
+        Ok(requeued)
+    }
+
+    /// End the resumable run `run_id` without resuming it and without
+    /// touching its inputs (`SettleResumableRun`): the mark is cleared and
+    /// the run is recorded terminal. For retire, destroy and reset, whose own
+    /// sweeps terminalize the inputs with their receipts.
+    pub(crate) fn end_resumable_run(
+        &mut self,
+        run_id: &RunId,
+        reason: &InputAbandonReason,
+    ) -> Result<(), RuntimeDriverError> {
+        self.dsl_apply(
+            mm_dsl::MeerkatMachineInput::SettleResumableRun {
+                run_id: mm_dsl::RunId::from_domain(run_id),
+                reason: mm_dsl::InputAbandonReason::from(reason),
+            },
+            "SettleResumableRun",
+        )
+    }
+
+    /// Settle the resumable run `run_id` (`SettleResumableRun`) and abandon
+    /// every input it still holds with `reason`, without a receipt. Only the
+    /// reasons the input reader accepts without a receipt are allowed:
+    /// `ResumeRefused`, `Cancelled` and `RequeueExpired`; use
+    /// [`Self::end_resumable_run`] where the caller's own sweep terminalizes
+    /// the inputs. Returns the abandoned inputs.
+    pub(crate) fn settle_resumable_run_inputs(
+        &mut self,
+        run_id: &RunId,
+        reason: InputAbandonReason,
+    ) -> Result<Vec<InputId>, RuntimeDriverError> {
+        if !matches!(
+            reason,
+            InputAbandonReason::ResumeRefused
+                | InputAbandonReason::Cancelled
+                | InputAbandonReason::RequeueExpired
+        ) {
+            return Err(RuntimeDriverError::Internal(format!(
+                "a resumable run settles its inputs without a receipt only as ResumeRefused, \
+                 Cancelled or RequeueExpired, not {reason:?}"
+            )));
+        }
+        self.end_resumable_run(run_id, &reason)?;
+        let kept = self.resumable_run_kept_inputs(run_id);
+        let mut abandoned = Vec::with_capacity(kept.len());
+        for (input_id, from) in kept {
+            let attempt_count = u64::from(self.input_attempt_count(&input_id));
+            self.dsl_apply(
+                mm_dsl::MeerkatMachineInput::AbandonInput {
+                    input_id: Self::dsl_key(&input_id),
+                    reason: mm_dsl::InputAbandonReason::from(&reason),
+                    attempt_count,
+                },
+                "AbandonInput(SettleResumableRun)",
+            )?;
+            self.sync_terminal_projection_from_machine(
+                &input_id,
+                from,
+                InputLifecycleState::Abandoned,
+                "SettleResumableRun",
+            )?;
+            self.events
+                .push(self.make_envelope(RuntimeEvent::InputLifecycle(
+                    InputLifecycleEvent::Abandoned {
+                        input_id: input_id.clone(),
+                        reason: reason.clone(),
+                    },
+                )));
+            abandoned.push(input_id);
+        }
+        Ok(abandoned)
     }
 
     pub(crate) fn abandon_pending_inputs(
@@ -8517,5 +8716,95 @@ mod tests {
         assert_eq!(projected.policy().wake_mode, WakeMode::WakeIfIdle);
         assert!(!flags.interrupt_yielding);
         assert!(!flags.request_immediate_processing);
+    }
+
+    // Resumable-run primitives (A15, A18). Unrun until the candidate's
+    // validation: the policy forbids Cargo while the batch is implemented.
+
+    #[test]
+    fn settle_refuses_a_reason_that_needs_a_receipt() {
+        let mut driver = EphemeralRuntimeDriver::new(LogicalRuntimeId::new("settle-reasons"));
+        for reason in [
+            InputAbandonReason::Retired,
+            InputAbandonReason::Reset,
+            InputAbandonReason::Stopped,
+            InputAbandonReason::Destroyed,
+            InputAbandonReason::NeverExecuted,
+        ] {
+            let error = driver
+                .settle_resumable_run_inputs(&RunId::new(), reason.clone())
+                .expect_err("a reason that needs a receipt is refused");
+            assert!(
+                error.to_string().contains("without a receipt only"),
+                "{reason:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn primitives_refuse_a_run_that_is_not_marked() {
+        let mut driver = EphemeralRuntimeDriver::new(LogicalRuntimeId::new("unmarked-run"));
+        let run_id = RunId::new();
+        assert!(driver.release_resumable_run_inputs(&run_id).is_err());
+        assert!(
+            driver
+                .settle_resumable_run_inputs(&run_id, InputAbandonReason::ResumeRefused)
+                .is_err()
+        );
+        assert!(
+            driver
+                .end_resumable_run(&run_id, &InputAbandonReason::Retired)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_marked_run_ends_once_and_records_its_terminal() {
+        let mut driver = EphemeralRuntimeDriver::new(LogicalRuntimeId::new("marked-run"));
+        let run_id = RunId::new();
+        let other = RunId::new();
+        assert!(driver.mark_run_resumable(&run_id));
+        assert!(
+            !driver.mark_run_resumable(&other),
+            "one run is resumable at a time"
+        );
+        assert_eq!(
+            driver.with_dsl_state(|state| state.resumable_run_id.clone()),
+            Some(mm_dsl::RunId::from_domain(&run_id))
+        );
+        driver
+            .end_resumable_run(&run_id, &InputAbandonReason::Retired)
+            .expect("the marked run ends");
+        assert_eq!(
+            driver.with_dsl_state(|state| state.resumable_run_id.clone()),
+            None
+        );
+        assert_eq!(
+            driver.with_dsl_state(|state| state.turn_terminal_run_id.clone()),
+            Some(mm_dsl::RunId::from_domain(&run_id))
+        );
+        assert!(
+            driver
+                .end_resumable_run(&run_id, &InputAbandonReason::Retired)
+                .is_err(),
+            "an ended run is no longer resumable"
+        );
+    }
+
+    #[test]
+    fn releasing_a_marked_run_without_kept_inputs_requeues_nothing() {
+        let mut driver = EphemeralRuntimeDriver::new(LogicalRuntimeId::new("release-empty"));
+        let run_id = RunId::new();
+        assert!(driver.mark_run_resumable(&run_id));
+        assert_eq!(
+            driver
+                .release_resumable_run_inputs(&run_id)
+                .expect("the marked run is released"),
+            Vec::<InputId>::new()
+        );
+        assert_eq!(
+            driver.with_dsl_state(|state| state.resumable_run_id.clone()),
+            None
+        );
     }
 }

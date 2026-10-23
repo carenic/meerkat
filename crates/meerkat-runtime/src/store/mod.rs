@@ -3001,6 +3001,9 @@ fn recovery_class_name(
             "interrupted_repairable_candidate"
         }
         DurableTailRecoveryClass::Ambiguous => "ambiguous",
+        // A retired runtime commits a continuable tail as interrupted, so a
+        // committed recovery can carry this class.
+        DurableTailRecoveryClass::ContinuableCandidate => "continuable_candidate",
     }
 }
 
@@ -3015,6 +3018,7 @@ fn recovery_class_from_name(
             Ok(DurableTailRecoveryClass::InterruptedRepairableCandidate)
         }
         "ambiguous" => Ok(DurableTailRecoveryClass::Ambiguous),
+        "continuable_candidate" => Ok(DurableTailRecoveryClass::ContinuableCandidate),
         other => Err(RuntimeStoreError::ReadFailed(format!(
             "unknown committed recovery class '{other}'"
         ))),
@@ -3035,6 +3039,9 @@ fn recovery_disposition_name(
             "commit_completed_retain_inputs"
         }
         DurableTailRecoveryDisposition::HoldIntact => "hold_intact",
+        // Never committed: continuing a run writes nothing, so no committed
+        // recovery names it and `recovery_disposition_from_name` refuses it.
+        DurableTailRecoveryDisposition::ContinueRun => "continue_run",
     }
 }
 

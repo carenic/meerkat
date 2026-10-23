@@ -37,6 +37,29 @@ them.
 
 ### Breaking
 
+- `meerkat-runtime`, `meerkat-core`, `meerkat-machine-schema`,
+  `meerkat-machine-kernels`: same-run resume after a restart changes the
+  durable-tail recovery and MeerkatMachine vocabularies.
+  `meerkat_runtime::recovery::DurableTailRecoveryOutcome` gains `Continue {
+  candidate, run_id, receipt }`. The machine enums gain
+  `DurableTailRecoveryClass::ContinuableCandidate`,
+  `DurableTailRecoveryDisposition::ContinueRun`,
+  `RecoveredInputNormalizationReasonKind::ResumableRun`,
+  `InputAbandonReason::ResumeRefused` (the `meerkat_machine::dsl` bridge copies
+  and the catalog and kernel types). The session document vocabulary gains
+  `RunIdCardinality::NoRunRows` and the `DurableTailRunCursor` type, and
+  `SessionDocumentInput::ClassifyDurableTail` and
+  `SessionDocumentMachineAuthority::classify_durable_tail` take `run_cursor`
+  and `cursor_inputs_open`. `MeerkatMachineState` gains `resumable_run_id`;
+  `MeerkatMachineInput` gains `MarkRunResumable`, `ResumeRun`,
+  `ReleaseResumableRun`, `SettleResumableRun`, `SuspendRunForStop { run_id,
+  durable_session }` and `ReplayAppliedRunContributor`, and
+  `NormalizeRecoveredInputLifecycle` gains `bound_run_resumable`;
+  `MeerkatMachineEffect` gains `ResumableRunMarked`, `ResumedRunAuthorized`,
+  `ResumableRunReleased`, `ResumableRunSettled` and `RunSuspendedForStop {
+  run_id }`.
+  Behaviour: while a run is marked resumable, `Prepare` for any other run is
+  refused and no queued batch is authorized.
 - `meerkat-core::ProviderMeta` and `meerkat-contracts::WireProviderMeta` gain
   the `GeminiFunctionCall { provider_id, thought_signature }` variant,
   serialized with `provider: "gemini_function_call"` and required
@@ -571,6 +594,20 @@ them.
 
 ### Added
 
+- `meerkat-runtime`: a durable session whose process stopped inside a run
+  resumes the same run from its last committed round. Durable-tail recovery
+  classifies a provisional tail whose run cursor agrees with it, and whose
+  bound inputs are all still bound to the run, as continuable and continues it
+  without writing anything (`DurableTailRecoveryOutcome::Continue`); a
+  retired runtime commits it as interrupted instead. A tail with no assistant
+  message and no tool result is attributed to its run by the store-issued
+  provisional binding on a strict continuation (round zero's first commit, or
+  a run's closing save), and by an agreeing cursor after a rewrite.
+  `recovery::observe_resumable_run` observes a continuable tail for
+  registration, which marks the run resumable on the live authority and keeps
+  its inputs bound instead of requeueing them. Every recovery commit clears the
+  run cursor. New `InputAbandonReason::ResumeRefused` settles a run whose
+  resume was refused.
 - `meerkat_core::host_store`: the host store SPI, a small storage interface
   a host implements so that Core can keep a realm's durable state in the
   host's own database, an append only store such as BigQuery included. A
@@ -1206,6 +1243,13 @@ them.
 
 ### Changed
 
+- `meerkat-runtime`: a graceful stop that requeues (`UnregisterQueuedInputs::Requeue`,
+  for example a deploy) now suspends a durable session's in-flight run instead
+  of cancelling it. The run keeps its inputs bound with the stop's requeue
+  mark, their waiters are answered `RequeuedAcrossStop`, and the next start
+  resumes the run from its last committed round, or ends its inputs as
+  `RequeueExpired` past the max age. A stop without Requeue, an explicit stop
+  or cancel, retire, destroy and reset still end the run as before.
 - `meerkat-core`, `meerkat-session`, `meerkat-runtime`: a HeadCanonical run
   that compacts more often than `history_retained_rewrites` keeps now saves an
   intra-run checkpoint at the next model boundary after its own tool results,

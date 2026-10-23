@@ -2983,12 +2983,14 @@ impl MeerkatMachine {
                         .recover_inputs_after_runtime_authority_with_fence(
                             recovered_unregister_progress.as_ref(),
                             write_fence,
+                            None,
                         )
                         .await
                 } else {
                     driver
                         .recover_inputs_after_runtime_authority(
                             recovered_unregister_progress.as_ref(),
+                            None,
                         )
                         .await
                 }
@@ -4979,6 +4981,7 @@ impl MeerkatMachine {
                         driver
                             .recover_inputs_after_runtime_authority(
                                 recovery.unregister_progress.as_ref(),
+                                None,
                             )
                             .await
                     }
@@ -6821,6 +6824,10 @@ impl MeerkatMachine {
                 })? {
                 crate::recovery::DurableTailRecoveryOutcome::Committed { .. }
                 | crate::recovery::DurableTailRecoveryOutcome::AlreadyAligned { .. } => {}
+                // The tail is a durable session's open run at a committed
+                // round. Continuing writes nothing: the cold registration
+                // below observes the same tail and keeps the run resumable.
+                crate::recovery::DurableTailRecoveryOutcome::Continue { .. } => {}
                 crate::recovery::DurableTailRecoveryOutcome::Held => {
                     return Err(RuntimeDriverError::RecoveryRepairBlocked {
                         evidence_digest: None,

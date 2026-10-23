@@ -8189,6 +8189,11 @@ impl Session {
                 }
             }
         }
+        // A recovered document is committed, and a committed body never
+        // carries a run cursor: recovery closes the run it attributes. The
+        // head's timestamp is restored below, so the removal stays
+        // deterministic.
+        self.remove_metadata_unchecked(SESSION_RUN_CURSOR_KEY);
         self.mark_content_mutated(*head_updated_at);
         Ok(())
     }

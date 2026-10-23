@@ -104,6 +104,9 @@ pub enum DurableTailRecoveryClass {
     InterruptedRepairableCandidate,
     #[default]
     Ambiguous,
+    /// A durable session's open run at a committed round. Declared last,
+    /// as in the catalog.
+    ContinuableCandidate,
 }
 
 /// The machine's recovery verdict. Bridging copy of the catalog type. Nothing
@@ -116,6 +119,9 @@ pub enum DurableTailRecoveryDisposition {
     RepairAndCommitInterrupted,
     CommitCompletedRetainInputs,
     HoldIntact,
+    /// Continue the open run from its last committed round; nothing is
+    /// written. Declared last, as in the catalog.
+    ContinueRun,
 }
 
 /// Typed projection of the PERSISTED machine-lifecycle row observed at
@@ -3684,6 +3690,9 @@ pub enum InputAbandonReason {
     /// A graceful stop kept the input queued for the next start, and the next
     /// start found it older than that stop's max age.
     RequeueExpired,
+    /// The input's run was left open by a restart and was not resumed: the
+    /// host's resumed-run admission refused it.
+    ResumeRefused,
 }
 
 impl From<&crate::input_state::InputAbandonReason> for InputAbandonReason {
@@ -3702,6 +3711,7 @@ impl From<&crate::input_state::InputAbandonReason> for InputAbandonReason {
                 Self::ToolProcessInterrupted
             }
             crate::input_state::InputAbandonReason::RequeueExpired => Self::RequeueExpired,
+            crate::input_state::InputAbandonReason::ResumeRefused => Self::ResumeRefused,
         }
     }
 }
@@ -3721,6 +3731,7 @@ impl InputAbandonReason {
             Self::NeverExecuted => "never_executed",
             Self::ToolProcessInterrupted => "tool_process_interrupted",
             Self::RequeueExpired => "requeue_expired",
+            Self::ResumeRefused => "resume_refused",
         }
     }
 }
@@ -4136,6 +4147,8 @@ pub enum RecoveredInputNormalizationReasonKind {
     RollbackStaged,
     BoundaryReceiptCommitted,
     MissingBoundaryReceipt,
+    /// The input stays bound to the run this registration resumes.
+    ResumableRun,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]

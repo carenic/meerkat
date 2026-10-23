@@ -954,6 +954,7 @@ fn input_terminality_parts(
                     dsl::InputAbandonReason::ToolProcessInterrupted
                 }
                 InputAbandonReason::RequeueExpired => dsl::InputAbandonReason::RequeueExpired,
+                InputAbandonReason::ResumeRefused => dsl::InputAbandonReason::ResumeRefused,
             }),
         ),
     }
