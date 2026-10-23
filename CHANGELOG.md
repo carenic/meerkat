@@ -62,6 +62,11 @@ them.
   run_id }`.
   Behaviour: while a run is marked resumable, `Prepare` for any other run is
   refused and no queued batch is authorized.
+- `meerkat-machine-kernels` (`generated::session_turn_admission`) and
+  `meerkat-machine-schema` (`catalog::dsl::session_turn_admission`):
+  `StartTurnExecutionKind` and `StartTurnDisposition` gain `ResumeRun`,
+  appended last, so every 0.9.4 variant keeps its position. The enums are
+  exhaustive, so a `match` outside the crate needs the arm.
 - `meerkat-machine-schema`, `meerkat-mob`, `meerkat-machine-kernels`:
   MobMachine's `ResolveAutonomousShutdownMemberAction` input (the schema's
   and meerkat-mob's `MobMachineInput` variant and the kernel's input struct)
