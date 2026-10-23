@@ -3,7 +3,7 @@
 //!
 //! Each handle holds an `Arc<std::sync::Mutex<mm_dsl::MeerkatMachineAuthority>>`
 //! that points at the **session's real DSL authority** — the same instance
-//! stored on [`crate::meerkat_machine::RuntimeSessionEntry::dsl_authority`].
+//! held by the session's runtime entry (`RuntimeSessionEntry`).
 //! All 5 handles for a given session share the same `Arc`, so transitions
 //! fired through any handle land on the session's canonical DSL state.
 //!
@@ -86,10 +86,9 @@ pub use turn_state::RuntimeTurnStateHandle;
 
 /// Shared handle over a session's real `MeerkatMachineAuthority`.
 ///
-/// Constructed from the session's
-/// [`crate::meerkat_machine::RuntimeSessionEntry::dsl_authority`] `Arc`; cloned
-/// into each of the 5 handle impls so all routes mutate the same underlying
-/// authority.
+/// Constructed from the `Arc` of the DSL authority held by the session's
+/// runtime entry (`RuntimeSessionEntry`); cloned into each of the 5 handle
+/// impls so all routes mutate the same underlying authority.
 ///
 /// A standalone ephemeral constructor ([`HandleDslAuthority::ephemeral`]) is
 /// also provided for tests and minimal hosts that explicitly need
@@ -215,7 +214,8 @@ impl HandleDslAuthority {
     /// `CompositionDispatcher` (the cross-machine seam closed by
     /// wave-c C-6c) is not applicable here. Routed inputs delivered by
     /// the `meerkat_mob_seam` dispatcher enter through
-    /// [`crate::meerkat_machine::composition::MeerkatConsumerSurface::apply_routed_input`],
+    /// [`ConsumerSurface::apply_routed_input`](crate::composition::ConsumerSurface::apply_routed_input)
+    /// on [`MeerkatConsumerSurface`](crate::meerkat_machine::composition::MeerkatConsumerSurface),
     /// not through this method.
     pub fn apply_input(
         &self,

@@ -1370,7 +1370,10 @@ async fn stop_waits_for_warm_construction_without_blocking_query_progress() {
     peer_progresses(&mob).await;
     let mut stop = mob
         .handle
-        .enqueue_actor_command_for_test(|reply_tx| MobCommand::Stop { reply_tx })
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::Stop {
+            leave_runs_running: false,
+            reply_tx,
+        })
         .await
         .expect("enqueue Stop");
     mob.probe(Duration::from_secs(1))

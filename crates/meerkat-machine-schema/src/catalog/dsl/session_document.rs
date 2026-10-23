@@ -458,6 +458,15 @@ pub enum DurableHeadRelation {
     Diverged,
     /// The relation could not be established from available evidence.
     Unverifiable,
+    /// The row descends from the authority through store-proven transcript
+    /// rewrite occurrences. The store-issued provisional names the authority,
+    /// the persisted rewrite rows bridge both rewrite prefixes, and the
+    /// authority's exact row prefix chains into the first post-authority
+    /// occurrence. A rewrite replaced rows, so it is not a message-prefix
+    /// extension.
+    ///
+    /// Declared last so the earlier variants keep their positions.
+    VerifiedRewriteDescendant,
 }
 
 // ---------------------------------------------------------------------------
@@ -4411,7 +4420,10 @@ machine! {
 
         // ===============================================================
         // Durable-tail classification region. Total and disjoint over the
-        // observation:
+        // observation. A verified descendant is either a verified strict
+        // descendant (the row extends the authority's exact message prefix)
+        // or a verified rewrite descendant (store-proven rewrite occurrences
+        // bridge the authority to the row); both pass the same shape checks.
         //   Completed:  verified descendant, single run, EndTurn, no
         //               dangling calls, no orphan results, nothing after
         //               the terminal.
@@ -4426,6 +4438,9 @@ machine! {
         //               non-descendant relations, zero or multiple runs,
         //               orphan results, content after the terminal, Other
         //               stop shapes, or ANY dangling tool_use call).
+        //               Rewrite rows carry no run identity, so a rewrite
+        //               descendant whose live tail holds no run-stamped
+        //               message has no run id and is held here too.
         // No class authorizes discarding; Ambiguous is held intact. For a
         // dangling call that means held for reconciliation: readable, never
         // executed against, until an idempotency/reconciliation witness or
@@ -4445,7 +4460,8 @@ machine! {
             }
             guard {
                 self.lifecycle_phase == Phase::Ready
-                && relation == DurableHeadRelation::VerifiedStrictDescendant
+                && (relation == DurableHeadRelation::VerifiedStrictDescendant
+                    || relation == DurableHeadRelation::VerifiedRewriteDescendant)
                 && run_id_cardinality == RunIdCardinality::SingleRunId
                 && terminal_stop_reason == DurableTailStopReason::EndTurn
                 && dangling_tool_use_count == 0
@@ -4473,7 +4489,8 @@ machine! {
             }
             guard {
                 self.lifecycle_phase == Phase::Ready
-                && relation == DurableHeadRelation::VerifiedStrictDescendant
+                && (relation == DurableHeadRelation::VerifiedStrictDescendant
+                    || relation == DurableHeadRelation::VerifiedRewriteDescendant)
                 && run_id_cardinality == RunIdCardinality::SingleRunId
                 && dangling_tool_use_count == 0
                 && orphan_tool_result_count == 0
@@ -4502,7 +4519,8 @@ machine! {
             }
             guard {
                 self.lifecycle_phase == Phase::Ready
-                && (relation != DurableHeadRelation::VerifiedStrictDescendant
+                && ((relation != DurableHeadRelation::VerifiedStrictDescendant
+                        && relation != DurableHeadRelation::VerifiedRewriteDescendant)
                     || run_id_cardinality != RunIdCardinality::SingleRunId
                     || orphan_tool_result_count != 0
                     || messages_after_terminal == true

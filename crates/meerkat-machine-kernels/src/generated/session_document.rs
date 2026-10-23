@@ -39,6 +39,8 @@ pub enum DurableHeadRelation {
     Diverged,
     #[serde(rename = "Unverifiable")]
     Unverifiable,
+    #[serde(rename = "VerifiedRewriteDescendant")]
+    VerifiedRewriteDescendant,
 }
 impl DurableHeadRelation {
     pub fn as_str(&self) -> &'static str {
@@ -48,6 +50,7 @@ impl DurableHeadRelation {
             Self::VerifiedStrictDescendant => "VerifiedStrictDescendant",
             Self::Diverged => "Diverged",
             Self::Unverifiable => "Unverifiable",
+            Self::VerifiedRewriteDescendant => "VerifiedRewriteDescendant",
         }
     }
 }
@@ -60,6 +63,7 @@ impl std::convert::TryFrom<&str> for DurableHeadRelation {
             "VerifiedStrictDescendant" => Ok(Self::VerifiedStrictDescendant),
             "Diverged" => Ok(Self::Diverged),
             "Unverifiable" => Ok(Self::Unverifiable),
+            "VerifiedRewriteDescendant" => Ok(Self::VerifiedRewriteDescendant),
             other => Err(format!("invalid DurableHeadRelation value `{other}`")),
         }
     }

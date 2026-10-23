@@ -692,10 +692,7 @@ pub async fn handle_public_tools_call(
                 .await
                 .map_err(|err| McpToolError::from_mob(&err))?
                 .into_iter()
-                .map(|(mob_id, status)| meerkat_contracts::MobStatusResult {
-                    mob_id: mob_id.to_string(),
-                    status: crate::wire_mob_lifecycle_status(status),
-                })
+                .map(|(mob_id, observation)| crate::wire_mob_status_row(&mob_id, &observation))
                 .collect::<Vec<_>>();
             Ok(json!(meerkat_contracts::MobListResult { mobs }))
         }
@@ -706,9 +703,12 @@ pub async fn handle_public_tools_call(
                 .mob_status(&mob_id)
                 .await
                 .map_err(|err| McpToolError::from_mob(&err))?;
+            // A mob whose actor has stopped answers its typed failure as the
+            // error above, so a status row carries none.
             Ok(json!(meerkat_contracts::MobStatusResult {
                 mob_id: mob_id.to_string(),
                 status: crate::wire_mob_lifecycle_status(status),
+                failure: None,
             }))
         }
         "meerkat_mob_lifecycle" => {
@@ -720,12 +720,8 @@ pub async fn handle_public_tools_call(
                 .map_err(|err| McpToolError::from_mob_destroy(&err))?;
             let destroy_report = reports
                 .destroy_report
-                .map(|report| {
-                    serde_json::to_value(&report).map_err(|err| {
-                        McpToolError::internal(format!("destroy report serialize: {err}"))
-                    })
-                })
-                .transpose()?;
+                .as_ref()
+                .map(meerkat_contracts::WireMobDestroyReport::from);
             let stop_report = reports
                 .stop_report
                 .map(|report| {

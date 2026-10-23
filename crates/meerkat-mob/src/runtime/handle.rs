@@ -2207,11 +2207,199 @@ pub struct MobDestroyReport {
     /// retirement recorded what became of that input.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reloaded_members: Vec<AgentIdentity>,
+    /// Members whose durability reload the runtime refused, typed. A
+    /// `repair_blocked` refusal is retryable: the same destroy can complete
+    /// once the runtime's evidence settles, for example once a boundary
+    /// commit past its outcome deadline has reported its outcome. Each
+    /// member here also has its entry in `errors`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub member_reload_refusals: Vec<MobDestroyMemberRefusal>,
+}
+
+/// A member whose durability reload the runtime refused during a destroy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct MobDestroyMemberRefusal {
+    /// The member the destroy could not reload.
+    pub member: AgentIdentity,
+    /// The runtime's typed refusal.
+    pub refusal: MemberReloadRefusal,
+}
+
+/// The runtime's typed refusal of a member's durability reload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MemberReloadRefusal {
+    /// The runtime's recovery is repair-blocked for now
+    /// (`RuntimeDriverError::RecoveryRepairBlocked`): retry later.
+    RepairBlocked {
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence_digest: Option<String>,
+    },
+}
+
+impl From<&MobDestroyReport> for meerkat_contracts::WireMobDestroyReport {
+    fn from(report: &MobDestroyReport) -> Self {
+        // Every field, with no `..`: a new report field does not compile
+        // until the wire report carries it.
+        let MobDestroyReport {
+            force_destroyed_members,
+            orphaned_remote_members,
+            remote_cleanup_deadline_exceeded,
+            metadata_scrubbed,
+            events_cleared,
+            namespace_cleaned,
+            errors,
+            reloaded_members,
+            member_reload_refusals,
+        } = report;
+        let members = |members: &[AgentIdentity]| -> Vec<String> {
+            members.iter().map(ToString::to_string).collect()
+        };
+        Self {
+            force_destroyed_members: members(force_destroyed_members),
+            orphaned_remote_members: members(orphaned_remote_members),
+            remote_cleanup_deadline_exceeded: *remote_cleanup_deadline_exceeded,
+            metadata_scrubbed: *metadata_scrubbed,
+            events_cleared: *events_cleared,
+            namespace_cleaned: *namespace_cleaned,
+            errors: errors.clone(),
+            reloaded_members: members(reloaded_members),
+            member_reload_refusals: member_reload_refusals.iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<&MobDestroyMemberRefusal> for meerkat_contracts::WireMobDestroyMemberRefusal {
+    fn from(refusal: &MobDestroyMemberRefusal) -> Self {
+        let MobDestroyMemberRefusal { member, refusal } = refusal;
+        Self {
+            member: member.to_string(),
+            refusal: refusal.into(),
+        }
+    }
+}
+
+impl From<&MemberReloadRefusal> for meerkat_contracts::WireMemberReloadRefusal {
+    fn from(refusal: &MemberReloadRefusal) -> Self {
+        // Exhaustive within this crate: a new refusal kind does not compile
+        // until it is mapped, and nothing maps to the wire's `Unknown`.
+        match refusal {
+            MemberReloadRefusal::RepairBlocked {
+                reason,
+                evidence_digest,
+            } => Self::RepairBlocked {
+                reason: reason.clone(),
+                evidence_digest: evidence_digest.clone(),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod destroy_report_wire_tests {
+    use super::{AgentIdentity, MemberReloadRefusal, MobDestroyMemberRefusal, MobDestroyReport};
+    use meerkat_contracts::WireMobDestroyReport;
+
+    fn assert_wire_matches_domain(report: &MobDestroyReport) {
+        let wire = WireMobDestroyReport::from(report);
+        let domain_json = serde_json::to_string(report).expect("domain report serializes");
+        assert_eq!(
+            serde_json::to_string(&wire).expect("wire report serializes"),
+            domain_json
+        );
+        assert_eq!(
+            serde_json::from_str::<WireMobDestroyReport>(&domain_json)
+                .expect("the domain JSON parses as the wire report"),
+            wire
+        );
+    }
+
+    #[test]
+    fn the_wire_destroy_report_serializes_byte_identical_to_the_domain_report() {
+        assert_wire_matches_domain(&MobDestroyReport::default());
+        assert_wire_matches_domain(&MobDestroyReport {
+            force_destroyed_members: vec![AgentIdentity::from("forced")],
+            orphaned_remote_members: vec![AgentIdentity::from("orphaned")],
+            remote_cleanup_deadline_exceeded: true,
+            metadata_scrubbed: true,
+            events_cleared: true,
+            namespace_cleaned: true,
+            errors: vec!["cleanup failed".to_string()],
+            reloaded_members: vec![AgentIdentity::from("reloaded")],
+            member_reload_refusals: vec![
+                MobDestroyMemberRefusal {
+                    member: AgentIdentity::from("refused"),
+                    refusal: MemberReloadRefusal::RepairBlocked {
+                        reason: "commit outcome not reported".to_string(),
+                        evidence_digest: Some("digest".to_string()),
+                    },
+                },
+                MobDestroyMemberRefusal {
+                    member: AgentIdentity::from("refused-without-digest"),
+                    refusal: MemberReloadRefusal::RepairBlocked {
+                        reason: "commit outcome not reported".to_string(),
+                        evidence_digest: None,
+                    },
+                },
+            ],
+        });
+    }
+}
+
+#[cfg(feature = "runtime-adapter")]
+impl MemberReloadRefusal {
+    /// The refusal a destroy report keeps typed for the runtime's `error`:
+    /// only a repair-blocked recovery. Every other error stays text only.
+    pub(crate) fn from_runtime_refusal(
+        error: &meerkat_runtime::RuntimeDriverError,
+    ) -> Option<Self> {
+        match error {
+            meerkat_runtime::RuntimeDriverError::RecoveryRepairBlocked {
+                evidence_digest,
+                reason,
+            } => Some(Self::RepairBlocked {
+                reason: reason.clone(),
+                evidence_digest: evidence_digest.clone(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// A member's durability reload that failed during a destroy: its entry in
+/// the report's `errors` and, when the runtime refused the reload typed, that
+/// refusal.
+#[cfg(feature = "runtime-adapter")]
+#[derive(Debug)]
+pub(crate) struct MemberReloadFailure {
+    pub(crate) message: String,
+    pub(crate) refusal: Option<MemberReloadRefusal>,
 }
 
 impl MobDestroyReport {
     pub(crate) fn push_error(&mut self, error: impl Into<String>) {
         self.errors.push(error.into());
+    }
+
+    /// Record `member`'s failed reload: its text in `errors` and, when the
+    /// runtime refused it typed, the refusal in `member_reload_refusals`.
+    #[cfg(feature = "runtime-adapter")]
+    pub(crate) fn push_member_reload_failure(
+        &mut self,
+        member: &AgentIdentity,
+        failure: MemberReloadFailure,
+    ) {
+        let MemberReloadFailure { message, refusal } = failure;
+        self.errors.push(message);
+        if let Some(refusal) = refusal {
+            self.member_reload_refusals.push(MobDestroyMemberRefusal {
+                member: member.clone(),
+                refusal,
+            });
+        }
     }
 
     fn error_summary(&self) -> String {
@@ -2442,7 +2630,7 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         MobError::NotExternallyAddressable(_) => {
             mob_dsl::MobSpawnManyFailureObservationKind::NotExternallyAddressable
         }
-        MobError::InvalidTransition { .. } => {
+        MobError::InvalidTransition { .. } | MobError::DrainRequiresStoppedMob { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::InvalidTransition
         }
         MobError::MemberRoleMigrationRequired { .. }
@@ -2547,6 +2735,7 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         | MobError::MemberInputRequeueExpired { .. }
         | MobError::ActorCommandTimedOut { .. }
         | MobError::MemberReloadRefused { .. }
+        | MobError::MemberReloadRepairBlocked { .. }
         | MobError::MemberReloadTimedOut { .. }
         | MobError::HeldSpawnUnsupported { .. }
         | MobError::HeldSpawnAborted { .. }
@@ -2679,6 +2868,8 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         }
         // A closed mob refuses the whole batch before any row is provisioned.
         MobError::AdmissionClosed { .. } => mob_dsl::MobSpawnManyFailureObservationKind::Internal,
+        // The close's answer, not the cause's.
+        MobError::DurabilityFailStop { .. } => mob_dsl::MobSpawnManyFailureObservationKind::Internal,
         // So does a shutting-down one.
         MobError::ShutdownInProgress { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
@@ -8084,9 +8275,12 @@ impl MobHandle {
                 .await??;
                 Ok(MobMachineCommandResult::Unit)
             }
-            MobMachineCommand::Stop => {
+            MobMachineCommand::Stop { leave_runs_running } => {
                 let report = self
-                    .send_actor_command(|reply_tx| MobCommand::Stop { reply_tx })
+                    .send_actor_command(|reply_tx| MobCommand::Stop {
+                        leave_runs_running,
+                        reply_tx,
+                    })
                     .await??;
                 Ok(MobMachineCommandResult::Stopped(report))
             }
@@ -8564,8 +8758,8 @@ impl MobHandle {
     /// [`MobError::SharedLifecycleFailure`]: for a failed startup recovery of
     /// a member's session, a [`MobError::MemberStartupRecoveryFailed`] naming
     /// the member, its session and the cause; for an uncertain durable
-    /// mutation, [`MobError::AdmissionClosed`] with
-    /// `MobAdmissionCloseReason::DurabilityFailStop`.
+    /// mutation, a [`MobError::DurabilityFailStop`] whose cause is that
+    /// mutation's own error.
     pub async fn status(&self) -> Result<MobState, MobError> {
         match self
             .send_actor_command(|reply_tx| MobCommand::QueryPhase { reply_tx })
@@ -8612,8 +8806,42 @@ impl MobHandle {
     /// Observation-only surfaces use this when they must remain live while the
     /// mob actor is awaiting an in-flight member turn. Control paths that need
     /// the authoritative current phase must keep using [`Self::status`].
+    ///
+    /// This is the phase alone: an actor that has stopped (it fail-stopped,
+    /// or its task ended) keeps its last live phase here. An observation
+    /// surface that reports the mob reads [`Self::lifecycle_observation`],
+    /// which also says whether the actor has stopped, and why.
     pub fn status_observation_snapshot(&self) -> MobState {
         *self.phase_watch_rx.borrow()
+    }
+
+    /// The mob's lifecycle as observed without asking its actor: the last
+    /// phase the actor published and, once the actor has stopped, why. See
+    /// [`MobLifecycleObservation`](super::MobLifecycleObservation).
+    ///
+    /// The failure is the cause the actor recorded when it fail-stopped,
+    /// which [`Self::status`] reports in
+    /// [`MobError::SharedLifecycleFailure`]; or, for an actor task that ended
+    /// while its last phase was live and recorded no cause, the closed-actor
+    /// error `status` reports.
+    pub fn lifecycle_observation(&self) -> super::MobLifecycleObservation {
+        // The task's end is read before the phase: once the task has ended,
+        // the phase it last published is final, so a live phase read after
+        // the end is the stopped actor's, not a stale read of a lifecycle
+        // exit (Shutdown, Complete, Destroy) that published its phase first.
+        let task_ended =
+            self.lifecycle_observations.actor_task_end() != super::ActorTaskEnd::Running;
+        let phase = self.status_observation_snapshot();
+        let failure = match self.lifecycle_observations.fail_stop_cause() {
+            Some(cause) => Some(cause),
+            None if task_ended => {
+                Self::status_from_closed_actor(MobError::ActorCommandChannelClosed, phase)
+                    .err()
+                    .map(Arc::new)
+            }
+            None => None,
+        };
+        super::MobLifecycleObservation::new(phase, failure)
     }
 
     /// Access the mob definition.
@@ -10510,7 +10738,7 @@ impl MobHandle {
 
     /// List all members including those in `Retiring` state.
     ///
-    /// The `state` field on each [`RosterEntry`] is projected from
+    /// The `state` field on each `RosterEntry` is projected from
     /// `MobMachineState`, not from the event roster's compatibility mirror.
     pub async fn list_all_members(&self) -> Vec<RosterEntry> {
         self.project_all_roster_entries_from_machine_state().await
@@ -10769,8 +10997,8 @@ impl MobHandle {
     /// Application code acting on a mob should prefer the identity-native
     /// [`MobHandle`] APIs: [`MobHandle::member`] to acquire a
     /// capability-bearing handle, [`MemberHandle::internal_turn`] to deliver
-    /// content without the RPC turn-start dance, [`MobHandle::peer_send`]
-    /// / [`MobHandle::member_send`] for peer comms, etc. Those hide the
+    /// content without the RPC turn-start dance, [`MobHandle::send_peer_message`]
+    /// / [`MemberHandle::send_peer_message`] for peer comms, etc. Those hide the
     /// session_id entirely.
     ///
     /// # Dogma fit (A8)
@@ -11207,7 +11435,7 @@ impl MobHandle {
     /// Subscribe to agent events for all active members (point-in-time snapshot).
     ///
     /// Returns one stream per active member that has a live bridge binding. Members
-    /// spawned after this call are not included — use [`subscribe_mob_events`]
+    /// spawned after this call are not included - use [`Self::subscribe_mob_events`]
     /// for a continuously updated view.
     pub async fn subscribe_all_agent_events(
         &self,
@@ -11233,7 +11461,7 @@ impl MobHandle {
     /// Subscribe to a continuously-updated, mob-level event bus.
     ///
     /// Spawns an independent task that merges per-member session streams,
-    /// tags each event with [`AttributedEvent`], and tracks roster changes
+    /// tags each event with [`AttributedEvent`](crate::AttributedEvent), and tracks roster changes
     /// (spawns/retires) automatically. Drop the returned handle to stop
     /// the router.
     pub async fn subscribe_mob_events(
@@ -14077,7 +14305,7 @@ impl MobHandle {
     /// context: the member reads it as a typed injected-context message, and
     /// no conversational user row is synthesized, so nothing downstream (a
     /// live channel's mirror, a transcript view) mistakes it for human input.
-    /// Exact runtime-input custody like [`Self::start_runtime_work_with_delivery_identity_bounded`];
+    /// Exact runtime-input custody like `Self::start_runtime_work_with_delivery_identity_bounded`;
     /// retry only with the SAME delivery identity.
     #[cfg(feature = "runtime-adapter")]
     pub async fn start_injected_context_work_for_identity_bounded(
@@ -14782,10 +15010,26 @@ impl MobHandle {
     /// starts are held; a member that cannot be held is reported, never
     /// hidden behind `Ok`.
     pub async fn stop(&self) -> Result<super::stop_report::MobStopReport, MobError> {
+        self.stop_with_options(super::stop_report::StopOptions::default())
+            .await
+    }
+
+    /// [`Self::stop`] with `options`, for example
+    /// [`StopOptions::leave_runs_running`](super::stop_report::StopOptions::leave_runs_running)
+    /// before a drain.
+    pub async fn stop_with_options(
+        &self,
+        options: super::stop_report::StopOptions,
+    ) -> Result<super::stop_report::MobStopReport, MobError> {
         let hang_guard = tokio::time::Instant::now() + DEFAULT_KICKOFF_WAIT_TIMEOUT;
         let mut lifecycle_watch = None;
         loop {
-            match self.execute_machine_command(MobMachineCommand::Stop).await {
+            match self
+                .execute_machine_command(MobMachineCommand::Stop {
+                    leave_runs_running: options.leave_runs_running,
+                })
+                .await
+            {
                 Ok(MobMachineCommandResult::Stopped(report)) => return Ok(report),
                 Ok(_) => {
                     return Err(MobError::Internal(
@@ -14798,6 +15042,57 @@ impl MobHandle {
                 }
             }
         }
+    }
+
+    /// Wait, bounded by `until`, for the run each member of this Stopped mob
+    /// had when the call started, and report every member.
+    ///
+    /// A graceful shutdown that lets in-flight turns finish runs Stop, then
+    /// this, then Shutdown. The drain cancels nothing and writes nothing
+    /// durable: a run still current at `until` is reported `StillRunning` and
+    /// keeps running, and the Shutdown that follows cancels it as it would
+    /// without a drain. An `until` already past returns at once.
+    ///
+    /// - Refused with [`MobError::DrainRequiresStoppedMob`] unless the mob is
+    ///   Stopped, so that its members' run starts are held.
+    /// - Only runs current when the call starts are drained. A member whose
+    ///   run starts are not held (see [`MemberRunDrainOutcome::starts`]) may
+    ///   start more, which are neither waited for nor reported.
+    /// - A member whose session has an open live channel at the start is
+    ///   reported `LiveChannelOpen` at once and not waited on. A channel
+    ///   opened later is not detected, and that member's run is bounded by
+    ///   `until` like any other.
+    /// - Placed and remote members are `NotLocal`: their host owns their runs.
+    /// - It drains this mob only, not its child mobs, and it does not stop
+    ///   identity reconciliation: a host that wants none in the window
+    ///   quiesces it before Stop.
+    /// - A drained turn runs under a Stopped mob. Mob-mutating tool calls
+    ///   (spawn, delegate or fork, wiring) are refused, typed, and the model
+    ///   sees the error. A peer message is admitted but queued behind the
+    ///   recipient's held run starts, and ends `Abandoned{Stopped}` at the
+    ///   Shutdown. A turn that waits on another member's new run cannot
+    ///   finish, so it is `StillRunning` at the bound.
+    /// - A concurrent Resume leaves the drain waiting only for the runs it
+    ///   captured; runs started after it are not reported.
+    ///
+    /// [`MemberRunDrainOutcome::starts`]: super::stop_report::MemberRunDrainOutcome::starts
+    #[cfg(feature = "runtime-adapter")]
+    pub async fn drain_stopped_runs(
+        &self,
+        until: meerkat_core::time_compat::Instant,
+    ) -> Result<super::stop_report::MobRunDrainReport, MobError> {
+        let snapshot = self.drain_runs_snapshot().await?;
+        Ok(super::run_drain::drain(snapshot, until).await)
+    }
+
+    /// The actor's drain snapshot, atomic with its Stopped check: the first
+    /// half of [`Self::drain_stopped_runs`].
+    #[cfg(feature = "runtime-adapter")]
+    pub(super) async fn drain_runs_snapshot(
+        &self,
+    ) -> Result<super::run_drain::DrainSnapshot, MobError> {
+        self.send_actor_command(|reply_tx| MobCommand::DrainRunsSnapshot { reply_tx })
+            .await?
     }
 
     /// A Stop or Shutdown the actor refused because an operation it owns is

@@ -154,32 +154,19 @@ fn preserve_credential_account_affinity(
     {
         return Ok(());
     }
-    let Some(meerkat_core::AuthCredentialIdentity::Account(account)) =
-        AgentFactory::credential_identity_for_llm_identity(config, current).map_err(|error| {
-            RuntimeDriverError::ValidationFailed {
-                reason: error.to_string(),
-            }
-        })?
-    else {
-        return Ok(());
-    };
-    let route = meerkat_core::resolve_credential_account_binding_for_provider(
-        config,
-        target.provider,
-        &account,
-    )
-    .map_err(|error| RuntimeDriverError::ValidationFailed {
-        reason: error.to_string(),
-    })?
-    .ok_or_else(|| RuntimeDriverError::ValidationFailed {
-        reason: format!(
-            "provider switch to '{}' has no route sharing credential account '{}:{}'; set auth_binding explicitly to change accounts",
-            target.provider.as_str(),
-            account.realm,
-            account.account
-        ),
-    })?;
-    target.auth_binding = Some(route.auth_binding);
+    // The one account-affinity rule a resumed build and the member-host
+    // preflight apply too.
+    if let Some(route) =
+        AgentFactory::credential_account_route_for_provider_switch(config, current, target.provider)
+            .map_err(|error| RuntimeDriverError::ValidationFailed {
+                reason: match error {
+                    crate::FactoryError::ConnectionTarget(source) => source.to_string(),
+                    other => other.to_string(),
+                },
+            })?
+    {
+        target.auth_binding = Some(route);
+    }
     Ok(())
 }
 

@@ -560,11 +560,11 @@ mod tests {
         config
             .self_hosted
             .models
-            .insert("muse-glimmer-30b".to_string(), model("muse_vllm"));
+            .insert("test-muse-model".to_string(), model("muse_vllm"));
         config
             .self_hosted
             .models
-            .insert("cerebras-gpt-oss-120b".to_string(), model("cerebras"));
+            .insert("test-cerebras-model".to_string(), model("cerebras"));
         config
     }
 
@@ -649,7 +649,7 @@ mod tests {
             "ws",
             "mixed",
             Some("muse_vllm"),
-            Some("cerebras-gpt-oss-120b"),
+            Some("test-cerebras-model"),
             true,
         );
         let realm_set = RealmConnectionSet::from_config("ws", &config.realm["ws"]).unwrap();
@@ -748,14 +748,14 @@ mod tests {
             resolve_self_hosted_binding_for_server(&config, "cerebras", Some(&realm("ws")))
                 .expect("its own server resolves");
 
-        validate_explicit_self_hosted_target(&config, &target, "cerebras", "cerebras-gpt-oss-120b")
+        validate_explicit_self_hosted_target(&config, &target, "cerebras", "test-cerebras-model")
             .expect("matching server passes");
 
         let err =
-            validate_explicit_self_hosted_target(&config, &target, "muse_vllm", "muse-glimmer-30b")
+            validate_explicit_self_hosted_target(&config, &target, "muse_vllm", "test-muse-model")
                 .expect_err("a declared other server must be rejected");
         let message = err.to_string();
-        for expected in ["muse_vllm", "cerebras", "muse-glimmer-30b"] {
+        for expected in ["muse_vllm", "cerebras", "test-muse-model"] {
             assert!(
                 message.contains(expected),
                 "message must contain {expected}: {message}"
@@ -817,18 +817,18 @@ mod tests {
             "ws",
             "helper",
             None,
-            Some("cerebras-gpt-oss-120b"),
+            Some("test-cerebras-model"),
             true,
         );
         run_credential_command(&mut derived, "ws", "helper");
 
         for (case, config, server, model) in [
-            ("undeclared", &undeclared, "muse_vllm", "muse-glimmer-30b"),
+            ("undeclared", &undeclared, "muse_vllm", "test-muse-model"),
             (
                 "derived from its default model",
                 &derived,
                 "cerebras",
-                "cerebras-gpt-oss-120b",
+                "test-cerebras-model",
             ),
         ] {
             let implicit =
@@ -863,7 +863,7 @@ mod tests {
         let target =
             resolve_self_hosted_binding_for_server(&declared, "muse_vllm", Some(&realm("ws")))
                 .expect("its declared server resolves");
-        validate_explicit_self_hosted_target(&declared, &target, "muse_vllm", "muse-glimmer-30b")
+        validate_explicit_self_hosted_target(&declared, &target, "muse_vllm", "test-muse-model")
             .expect("its declared server passes");
         assert!(
             resolve_self_hosted_binding_for_server(&declared, "cerebras", Some(&realm("ws")))
@@ -874,7 +874,7 @@ mod tests {
                 &declared,
                 &target,
                 "cerebras",
-                "cerebras-gpt-oss-120b"
+                "test-cerebras-model"
             )
             .is_err()
         );
@@ -887,7 +887,7 @@ mod tests {
         let target =
             resolve_self_hosted_binding_for_server(&config, "cerebras", Some(&realm("ws")))
                 .expect("unconstrained binding resolves");
-        validate_explicit_self_hosted_target(&config, &target, "muse_vllm", "muse-glimmer-30b")
+        validate_explicit_self_hosted_target(&config, &target, "muse_vllm", "test-muse-model")
             .expect("an unconstrained binding remains the operator's escape hatch");
     }
 }

@@ -42,6 +42,13 @@ intentionally own the lifecycle.** Direct core builder usage means you own
 composition, persistence, event handling, and any drift from the standard
 runtime-backed path.
 
+A non-runtime service, such as `build_ephemeral_service()` or an
+`AgentFactory` given a store through `session_store()`, must not share a
+realm's SQLite session store: it saves sessions whole, without the canonical
+head a runtime-backed host commits through, so a runtime-backed host that
+opens the realm later cannot adopt them. Their first runtime commit is refused
+and their data stays intact.
+
 <Warning>
 `build_persistent_service()` returns only the low-level persistent service
 half. Direct `start_turn`, `interrupt`, and `archive` calls on that service

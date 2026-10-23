@@ -262,6 +262,7 @@ export interface AuthGrant {
 export interface McpStdioConfig {
   args?: string[];
   command: string;
+  cwd?: string | null;
   env?: Record<string, string>;
   secret_env?: string[];
 }
@@ -566,9 +567,9 @@ export interface WireScopeEvidenceRetainedOnRefresh {
 
 export type WireScopeEvidence = WireScopeEvidenceTokenEndpointResponse | WireScopeEvidenceRetainedOnRefresh;
 
-export type WireAuthErrorReason = "realm_not_found" | "binding_not_found" | "mcp_server_not_configured" | "account_selection_required" | "unknown_strategy" | "device_poll_in_progress" | "device_code_already_admitted" | "device_expiry_invalid" | "missing_scopes" | "slot_occupied" | "slot_account_mismatch" | "slot_context_mismatch" | "slot_mode_mismatch" | "unverified_connector_publication" | "reauth_required" | "configuration_invalid" | "credential_access_denied" | "credential_interaction_required" | "credential_access_pending" | "credential_store_unavailable" | "invalid_target" | "binding_invalid" | "binding_inherited" | "flow_unsupported" | "mcp_server_mismatch" | "attempt_missing" | "attempt_mismatch" | "account_mismatch" | "credential_mismatch" | "verification_unavailable" | "authorization_required" | "callback_unavailable" | "upstream_failure" | "infrastructure";
+export type WireAuthErrorReason = "realm_not_found" | "binding_not_found" | "mcp_server_not_configured" | "account_selection_required" | "unknown_strategy" | "device_poll_in_progress" | "device_code_already_admitted" | "device_expiry_invalid" | "missing_scopes" | "slot_occupied" | "slot_account_mismatch" | "slot_context_mismatch" | "slot_mode_mismatch" | "unverified_connector_publication" | "reauth_required" | "configuration_invalid" | "credential_access_denied" | "credential_interaction_required" | "credential_access_pending" | "credential_store_unavailable" | "invalid_target" | "binding_invalid" | "binding_inherited" | "flow_unsupported" | "mcp_server_mismatch" | "attempt_missing" | "attempt_mismatch" | "account_mismatch" | "credential_mismatch" | "verification_unavailable" | "authorization_required" | "callback_unavailable" | "upstream_failure" | "infrastructure" | "commit_unsettled";
 
-export type WireAuthErrorDetail = "remote_custody_required";
+export type WireAuthErrorDetail = "remote_custody_required" | "upstream_timeout" | "upstream_timeout_after_code";
 
 export interface WireAuthErrorData {
   detail?: WireAuthErrorDetail | null;
@@ -1719,7 +1720,15 @@ export interface MobListResult {
   mobs: Record<string, unknown>[];
 }
 
+export interface WireMobLifecycleFailure {
+  cause: MobSpawnManyFailureCause;
+  code?: "SESSION_NOT_FOUND" | "SCHEDULE_NOT_FOUND" | "SESSION_BUSY" | "SESSION_NOT_RUNNING" | "REQUEST_CANCELLED" | "PROVIDER_ERROR" | "BUDGET_EXHAUSTED" | "HOOK_DENIED" | "AGENT_ERROR" | "CAPABILITY_UNAVAILABLE" | "SKILL_NOT_FOUND" | "SKILL_RESOLUTION_FAILED" | "INVALID_PARAMS" | "INTERNAL_ERROR" | "DUPLICATE_INPUT" | "SUPERVISOR_ROTATION_INCOMPLETE" | "SCOPE_DENIED" | "HOST_UNAVAILABLE" | "STALE_CURSOR" | "STALE_FENCE" | "MEMBER_RELOAD_REQUIRED" | "INPUT_REFUSED" | "INPUT_NOT_READY" | "SESSION_RUNTIME_UNAVAILABLE" | "APPROVAL_STORE_UNAVAILABLE" | "APPROVAL_CONFLICT" | "APPROVAL_COMMIT_UNKNOWN" | "STALE_DELIVERY_SCOPE" | "FORK_INSTRUCTION_REFUSED" | null;
+  message: string;
+  structured_data?: unknown;
+}
+
 export interface MobStatusResult {
+  failure?: WireMobLifecycleFailure | null;
   mob_id: string;
   status: "Creating" | "Running" | "Stopped" | "Completed" | "Destroyed";
 }
@@ -1729,9 +1738,32 @@ export interface MobLifecycleParams {
   mob_id: string;
 }
 
+export interface WireMobDestroyMemberRefusal {
+  member: string;
+  refusal: WireMemberReloadRefusal;
+}
+
+export interface WireMobDestroyReport {
+  errors?: string[];
+  events_cleared?: boolean;
+  force_destroyed_members?: string[];
+  member_reload_refusals?: WireMobDestroyMemberRefusal[];
+  metadata_scrubbed?: boolean;
+  namespace_cleaned?: boolean;
+  orphaned_remote_members?: string[];
+  reloaded_members?: string[];
+  remote_cleanup_deadline_exceeded?: boolean;
+}
+
+export interface WireMobDestroyIncompleteData {
+  code: string;
+  destroy_report: WireMobDestroyReport;
+  retryable: boolean;
+}
+
 export interface MobLifecycleResult {
   action: "stop" | "resume" | "complete" | "reset" | "destroy";
-  destroy_report?: unknown;
+  destroy_report?: WireMobDestroyReport | null;
   mob_id: string;
   ok: boolean;
   stop_report?: unknown;
@@ -2276,7 +2308,7 @@ export interface MobSnapshotResult {
 }
 
 export interface MobDestroyResult {
-  destroy_report: unknown;
+  destroy_report: WireMobDestroyReport;
   mob_id: string;
   ok: boolean;
 }
@@ -3744,6 +3776,18 @@ export type WireToolFilter = "All" | { Allow: string[] } | { Deny: string[] };
 export type WireMemberState = unknown;
 
 export type WireMobMemberStatus = "active" | "retiring" | "broken" | "completed" | "unknown";
+
+export interface WireMemberReloadRefusalRepairBlocked {
+  evidence_digest?: string | null;
+  kind: "repair_blocked";
+  reason: string;
+}
+
+export interface WireMemberReloadRefusalUnknown {
+  kind: "unknown";
+}
+
+export type WireMemberReloadRefusal = WireMemberReloadRefusalRepairBlocked | WireMemberReloadRefusalUnknown;
 
 export type WireMobRuntimeMode = "autonomous_host" | "turn_driven";
 

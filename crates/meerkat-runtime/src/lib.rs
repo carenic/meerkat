@@ -605,6 +605,10 @@ pub use input_state::{
     InputTerminalOutcome, PolicySnapshot, ReconstructionSource, verify_exact_replay,
     verify_exact_resume_replay,
 };
+/// The source-owned original work a governed input's authority association
+/// names, re-exported so a host or the facade can name it without its own
+/// dependency on the authorization contracts crate.
+pub use meerkat_authorization_contracts::work_association::OriginalWorkRef;
 pub use meerkat_core::types::HandlingMode;
 pub use meerkat_machine::McpObservationRefusal;
 #[cfg(not(target_arch = "wasm32"))]

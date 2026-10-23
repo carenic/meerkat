@@ -325,6 +325,51 @@ impl SessionProviderAuthFailure {
     }
 }
 
+/// Stable structured cause carried when a resumed or hot-swapped session
+/// switches provider and no route for the new provider shares the session's
+/// credential account.
+///
+/// The switch keeps the account or refuses: it never moves the session onto
+/// another account's credential. Hosts can tell the operator which account
+/// needs a route for `provider` without parsing `Display` text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "jsonschema", derive(schemars::JsonSchema))]
+pub struct SessionCredentialAccountRouteFailure {
+    pub provider: Provider,
+    pub realm_id: crate::RealmId,
+    pub account: crate::CredentialAccountId,
+}
+
+impl SessionCredentialAccountRouteFailure {
+    /// Stable secret-free payload for session, Meta, RPC, and MCP surfaces.
+    pub fn structured_data(&self) -> serde_json::Value {
+        let mut data = serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(data) = data.as_object_mut() {
+            data.insert(
+                SessionError::AGENT_BUILD_FAILURE_CAUSE_KEY.to_string(),
+                serde_json::Value::String(
+                    SessionError::LLM_IDENTITY_UNRESOLVABLE_CAUSE.to_string(),
+                ),
+            );
+            data.insert(
+                SessionError::PROVIDER_AUTH_CAUSE_KEY.to_string(),
+                serde_json::Value::String(SessionError::CREDENTIAL_ACCOUNT_ROUTE_CAUSE.to_string()),
+            );
+        }
+        data
+    }
+
+    /// Stable public message containing typed routing facts only.
+    pub fn public_message(&self) -> String {
+        format!(
+            "provider switch to '{}' has no route sharing credential account '{}:{}'; set auth_binding explicitly to change accounts",
+            self.provider.as_str(),
+            self.realm_id,
+            self.account
+        )
+    }
+}
+
 impl SessionError {
     /// The original failure, independent of tool settlement diagnostics.
     #[must_use]
@@ -389,6 +434,7 @@ impl SessionError {
     const LLM_IDENTITY_UNRESOLVABLE_CAUSE: &'static str = "LlmIdentityUnresolvable";
     const PROVIDER_AUTH_CAUSE_KEY: &'static str = "cause";
     const PROVIDER_AUTH_CAUSE: &'static str = "provider_auth";
+    const CREDENTIAL_ACCOUNT_ROUTE_CAUSE: &'static str = "credential_account_route";
     /// Structured-data key carrying [`DurableResumeHold`] across every surface.
     pub const DURABLE_RESUME_HOLD_KEY: &'static str = "durable_resume_hold";
 
@@ -423,6 +469,35 @@ impl SessionError {
             message: failure.public_message(),
             data: failure.structured_data(),
         }
+    }
+
+    /// Preserve a typed credential-account route refusal across the generic
+    /// session-builder and Meta/RPC boundaries. It stays an
+    /// [`Self::is_build_llm_identity_unresolvable`] build failure.
+    pub fn credential_account_route_failure(failure: SessionCredentialAccountRouteFailure) -> Self {
+        Self::FailedWithData {
+            message: failure.public_message(),
+            data: failure.structured_data(),
+        }
+    }
+
+    /// Read the typed credential-account route refusal, if this session error
+    /// carries one. Unknown or malformed structured data fails closed as
+    /// `None`.
+    pub fn credential_account_route_failure_data(
+        &self,
+    ) -> Option<SessionCredentialAccountRouteFailure> {
+        let Self::FailedWithData { data, .. } = self.primary_error() else {
+            return None;
+        };
+        if data
+            .get(Self::PROVIDER_AUTH_CAUSE_KEY)
+            .and_then(serde_json::Value::as_str)
+            != Some(Self::CREDENTIAL_ACCOUNT_ROUTE_CAUSE)
+        {
+            return None;
+        }
+        serde_json::from_value(data.clone()).ok()
     }
 
     /// Read the typed provider-auth projection, if this session error carries

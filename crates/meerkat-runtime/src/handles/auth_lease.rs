@@ -1105,6 +1105,37 @@ impl RuntimeAuthLeaseHandle {
             .is_some_and(|authority| authority.state().oauth_browser_flow_ids.contains(flow_id))
     }
 
+    /// Whether the AuthMachine holds browser flow `flow_id` for `target`
+    /// admitted under `provider` (its binding key) with a redirect other
+    /// than `redirect_uri`: a completion its redirect guard refuses once
+    /// its provider guard has passed.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn oauth_browser_flow_admits_other_redirect(
+        &self,
+        target: &AuthCredentialIdentity,
+        flow_id: &str,
+        provider: &str,
+        redirect_uri: &str,
+    ) -> bool {
+        let lease_key = LeaseKey::from_credential_identity(target);
+        self.machines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .authorities
+            .get(&lease_key)
+            .is_some_and(|authority| {
+                let state = authority.state();
+                state
+                    .oauth_browser_flow_providers
+                    .get(flow_id)
+                    .is_some_and(|admitted| admitted == provider)
+                    && state
+                        .oauth_browser_flow_redirect_uris
+                        .get(flow_id)
+                        .is_some_and(|admitted| admitted != redirect_uri)
+            })
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn has_oauth_device_flow(
         &self,

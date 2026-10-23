@@ -252,6 +252,12 @@ impl MemberLifecycleObservations {
         self.actor_task.subscribe()
     }
 
+    /// How the actor task has ended so far: `Running` until its spawn
+    /// wrapper records the end.
+    pub(crate) fn actor_task_end(&self) -> ActorTaskEnd {
+        *self.actor_task.borrow()
+    }
+
     pub(crate) fn subscribe(&self, identity: &AgentIdentity) -> Option<RetirementSettlementWatch> {
         self.members()
             .get(identity)

@@ -4,7 +4,7 @@ description: "JSON-RPC 2.0 protocol for Meta runtime operations: gating, memory,
 icon: "plug"
 ---
 
-*Mirrored from MobKit main at [982c76ab266e](https://github.com/lukacf/meerkat-meta/commit/982c76ab266ef73f028c1ba7dce9e021fa6587e0) on 2026-10-22; MobKit workspace version 0.9.4 at that commit.*
+*Mirrored from MobKit main at [39d8833a14a3](https://github.com/lukacf/meerkat-meta/commit/39d8833a14a30c9d7cb196543d793a05af02a156) on 2026-10-23; MobKit workspace version 0.9.4 at that commit.*
 
 Meta exposes its operational API over JSON-RPC 2.0. SDK gateways use JSON lines over stdio, while the embedded console uses `POST /console/rpc` for console-specific methods and explicitly implemented runtime operations. The HTTP dispatcher is not a general stdio passthrough; check `meta/capabilities` on the surface you use.
 
@@ -70,7 +70,7 @@ not opt in never receives `accepted`.
        "init_id": "init-6f1c...",
        "provider_callback_timeout_ms": 130000,
        "stdio_shutdown_handshake": true,
-       "stdio_shutdown_horizon_ms": 392000
+       "stdio_shutdown_horizon_ms": 432000
      }
    }
    ```
@@ -275,6 +275,16 @@ durable hold Core names in `durable_resume_hold` or
 `resume_unavailable_reason`). The identity's `wake_refusal` names the way
 out. The lease codes `-32003` (no active lease) and `-32005` (lease lost) are
 no longer answered; `-32005` is never reused.
+
+An identity whose held member a held pass did not publish (a held roster
+bootstrap or a held member add that aborted, or whose activation expired)
+owes its host a held completion. Every wake, reset or delivery outside a held
+pass that covers it answers `-32603` with structured data
+`{kind: "held_completion_owed", identity}`, and a refused
+`meta/reconcile_identity` outcome carries the same `error.data`. The identity
+waits for a held pass to publish it; it has not failed. Both SDKs surface the
+data on a plain `RpcError` (see
+[Adding one held member to a running roster](/mobkit/guides/unified-runtime#adding-one-held-member-to-a-running-roster)).
 
 The `-32010` constant is exported from both SDKs as
 `MOB_EVENTS_STALE_CURSOR_CODE`. The Python and TypeScript SDKs auto-
@@ -2005,7 +2015,42 @@ Meerkat's `InstructionActivationReadPage`; naming one exact `namespace` and
 `key` also returns its `key_state`, including the `next_expectation` for the
 next activation.
 
-## Scheduling migration
+## Scheduling
+
+### `meta/schedule/tools`
+
+Lists the definitions of Meerkat's durable schedule tools, the
+`meerkat_schedule_{create,get,list,update,pause,resume,delete,occurrences}`
+tools that a member whose profile sets `tools.schedule = true` is given. The
+result is Meerkat's own `schedule/tools` result, unchanged, so a client can
+read the authoring and readback schemas from the gateway it talks to.
+
+The answer is static. The gateway serves it from Meerkat's definitions without
+opening a schedule store or starting a schedule host, and it ignores params,
+as Meerkat's `schedule/tools` does. These are the base definitions: inside a
+member's session, `meerkat_schedule_create` and `meerkat_schedule_update` also
+accept a session target of `type: "current_session"`, which the tool host
+resolves to a durable target before it persists the schedule. Whether this
+gateway attached the schedule tools is a separate fact, reported by the
+`schedule` slot of the `storage` summary in `meta/status` and
+`meta/capabilities`.
+
+Available on the unified stdio and console (`POST /console/rpc`, read method,
+no grant) surfaces. The module-only surface, the aggregator-only console and
+the Flow Editor do not serve it. Additive method, no `contract_version` bump.
+The SDKs read it with `MobHandle.schedule_tools()` (Python) and
+`MobHandle.scheduleTools()` (TypeScript).
+
+<Accordion title="Result">
+| Field | Type | Description |
+|-------|------|-------------|
+| `tools` | `array` | One entry per schedule tool, in Meerkat's order |
+| `tools[].name` | `string` | The tool name, for example `meerkat_schedule_create` |
+| `tools[].description` | `string` | Meerkat's model-facing description |
+| `tools[].inputSchema` | `object` | The tool's JSON input schema |
+</Accordion>
+
+### Scheduling migration
 
 Contract 0.5.0 removed `meta/scheduling/evaluate` and
 `meta/scheduling/dispatch`. Both names now return the standard `-32601`

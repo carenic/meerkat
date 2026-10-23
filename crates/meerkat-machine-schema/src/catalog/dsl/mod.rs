@@ -1013,6 +1013,7 @@ pub fn session_document_schema_metadata() -> MachineSchemaMetadata {
                     "VerifiedStrictDescendant",
                     "Diverged",
                     "Unverifiable",
+                    "VerifiedRewriteDescendant",
                 ],
             ),
             NamedTypeBinding::string_enum(

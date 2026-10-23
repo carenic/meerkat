@@ -114,6 +114,29 @@ deduplication.
 `accept_schedule_runtime_input_with_reconciliation` on the task that calls
 them; a redelivery through such a host only replays the earlier input.
 
+#### Typed mob destroy report
+
+`meerkat-contracts` types the mob destroy report on the wire:
+`MobDestroyResult.destroy_report` is a `WireMobDestroyReport` instead of a
+`serde_json::Value`, and `MobLifecycleResult.destroy_report` an
+`Option<WireMobDestroyReport>` instead of an `Option<serde_json::Value>`. The
+JSON value each surface sends is unchanged. Inside `destroy_report`, the
+members of the JSON-RPC `mob/destroy` and `mob/lifecycle` results and of the
+`@rkat/web` `Mob.lifecycle()` result now follow the report's field order, as
+the domain report serializes, instead of alphabetical order; the
+`mob_destroy_incomplete` data keeps its bytes.
+
+**Do:** compare those results as JSON values, not as bytes. In Rust, read
+`destroy_report`'s fields (`errors`, `member_reload_refusals` and the rest)
+instead of matching a `Value`, and convert a `meerkat_mob::MobDestroyReport`
+with `WireMobDestroyReport::from(&report)` where you build a result. In
+TypeScript, `mobDestroy()` returns `destroyReport` as a
+`WireMobDestroyReport`. In `@rkat/web`, `Mob.lifecycle()` rejects with a
+`MeerkatError` instead of the runtime's JSON error string: read the report of
+a destroy that did not finish with `mobDestroyIncompleteReport(error)` (in
+Python, `mob_destroy_incomplete_report(error)`) rather than parsing the error
+text.
+
 #### Queued inputs kept across a graceful stop
 
 The generated runtime machine (`meerkat-machine-kernels`,
@@ -192,9 +215,11 @@ add the arms (or a wildcard) where you match these enums exhaustively.
 3. Custom `SurfaceScheduleSessionHost` implementations: return `true` from
    `decides_existing_admission` only if they admit through
    `accept_schedule_runtime_input_with_reconciliation` on the calling task.
-4. Pass `UnregisterQueuedInputsDisposition::Stop` and `0` where you build
+4. Read a mob destroy report as `WireMobDestroyReport` in Rust, and a failed
+   destroy's report through the SDK accessor, not the error text.
+5. Pass `UnregisterQueuedInputsDisposition::Stop` and `0` where you build
    `BeginUnregisterSession` or `State` of the generated runtime machine.
-5. Before you use `QueuedInputsOnShutdown::Requeue`, note that 0.9.4 cannot
+6. Before you use `QueuedInputsOnShutdown::Requeue`, note that 0.9.4 cannot
    open the store while a kept input is still queued, and cannot read a kept
    or expired input's row after that. Treat `RequeuedAcrossStop` as "runs at
    the next start" (do not resubmit) and `RequeueExpired` as "resubmit if

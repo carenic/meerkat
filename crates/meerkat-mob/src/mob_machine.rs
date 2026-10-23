@@ -100,7 +100,11 @@ pub(crate) enum MobMachineCommand {
         runtime_id: AgentRuntimeId,
         fence_token: FenceToken,
     },
-    Stop,
+    Stop {
+        /// Leave every member's current run running
+        /// ([`crate::StopOptions::leave_runs_running`]).
+        leave_runs_running: bool,
+    },
     Resume {
         deadline: meerkat_core::time_compat::Instant,
     },

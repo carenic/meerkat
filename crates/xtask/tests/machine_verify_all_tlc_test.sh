@@ -457,6 +457,30 @@ if run_part audits-b; then
   TLC_WORKERS="${tlc_workers}" "${member_lifecycle_audit}" --mutants
 fi
 
+# The SessionDocumentMachine durable-tail classification (Completed,
+# Repairable, Ambiguous, by the store's durable head relation, the tail's
+# run-id count, terminal stop reason, dangling tool uses, orphan results and
+# messages after the terminal) has three arms whose guards must partition the
+# observations: the DSL declares state invariants only and the generated Next
+# is a disjunction, so the ci sweep never checks it. A hand-written audit over
+# the same generated model checks, with ENABLED at the initial state over all
+# 1296 observation tuples, that exactly one arm answers each tuple, that a
+# store-proven rewrite descendant classifies exactly like a strict one, and
+# that it holds as Ambiguous without exactly one run id. It first checks on
+# the generated model that the three arms read no state but phase, so the
+# initial state stands for every state, and requires its witness reached.
+# --mutants refuses fourteen seeded defects, each by the invariant it
+# targets. It needs no step bound.
+durable_tail_classification_audit="${workspace_root}/specs/machines/session_document/durable_tail_classification_audit.sh"
+if [[ ! -x "${durable_tail_classification_audit}" ]]; then
+  echo "error: durable-tail classification audit runner is missing from workspace runfiles: ${durable_tail_classification_audit}" >&2
+  exit 1
+fi
+if run_part audits-b; then
+  echo "running bounded durable-tail classification TLC audit"
+  TLC_WORKERS="${tlc_workers}" "${durable_tail_classification_audit}" --mutants
+fi
+
 # Broad composition full-TLC skips are CI-time/memory-budget exceptions, NOT
 # codegen defects. `machine-verify` still validates drift and the generated
 # ci.cfg structural-invariant contract before honoring these skips. The earlier
@@ -516,7 +540,10 @@ run_machine_verify() {
 # 100-200 s): about 540-680 s (234 s for the shard locally);
 # plus the member lifecycle audit with --mutants (58 s on a loaded local
 # 4-worker run, fourteen small runs over each run's whole space; not yet
-# hosted, expect 90-180 s);
+# hosted, expect 90-180 s), plus the durable-tail classification audit
+# with --mutants (20 s on a local 4-worker run, sixteen runs of one state;
+# not yet hosted, expect 30-60 s; the lightest shard by a local run of all
+# three on 10-22: a 394 s, b 314 s, c 352 s);
 # audits-c = run-start hold (239 s), live media health (155 s),
 # live-context causal-tail batch with --mutants (112 s): 506 s; plus the
 # generation high-water audit with --mutants (30 s on a local 4-worker run,

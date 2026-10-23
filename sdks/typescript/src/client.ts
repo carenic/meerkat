@@ -383,6 +383,7 @@ import type {
   MobReconcileOptionsWire as RpcMobReconcileOptionsWire,
   ContentBlock as RpcCommsContentBlock,
   CommsPeerRequestParams as RpcCommsPeerRequestParams,
+  WireMobDestroyReport,
 } from "./generated/types.js";
 import { DeferredSession, Session } from "./session.js";
 import {
@@ -406,6 +407,7 @@ import {
 } from "./mob.js";
 import { parseAgentEventEnvelope } from "./event-envelope.js";
 import { isCommsSendErrorCode } from "./comms-errors.js";
+import { parseMobDestroyReport } from "./mob-destroy-report.js";
 import { EventStream, AsyncQueue } from "./streaming.js";
 import { parseUsage } from "./events.js";
 import type { RealtimeMessageOrigin } from "./events.js";
@@ -453,6 +455,7 @@ import type {
   MobProfileDeleteResult,
   MobProfileLookupResult,
   MobRunResult as PublicMobRunResult,
+  MobLifecycleFailure,
   MobSpawnResult,
   MobStatus,
   MobSummary,
@@ -979,6 +982,20 @@ function normalizeMobWireMembersBatchEdge(
 // close before its exit is settled anyway.
 const CHILD_EXIT_PIPE_GRACE_MS = 1_000;
 
+// How much of a child's stderr an error message carries, in UTF-16 units.
+const CHILD_STDERR_TAIL_UNITS = 8_192;
+
+/**
+ * The last `CHILD_STDERR_TAIL_UNITS` units of a child's stderr, never starting
+ * with the second half of a surrogate pair that the cut split.
+ */
+function childStderrTail(text: string): string {
+  if (text.length <= CHILD_STDERR_TAIL_UNITS) return text;
+  const tail = text.slice(-CHILD_STDERR_TAIL_UNITS);
+  const first = tail.charCodeAt(0);
+  return first >= 0xdc00 && first <= 0xdfff ? tail.slice(1) : tail;
+}
+
 export class MeerkatClient {
   private process: ChildProcess | null = null;
   // Permanent transport-failed state: once the JSONL framing is untrustworthy
@@ -1174,8 +1191,11 @@ export class MeerkatClient {
     this.transportFault = null;
     const child = this.process;
     this.processStderr = "";
-    child.stderr?.on("data", (chunk: string | Buffer) => {
-      this.processStderr = (this.processStderr + String(chunk)).slice(-8192);
+    // Decoded as one stream: a character split across two pipe reads stays
+    // whole instead of becoming U+FFFD.
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk: string) => {
+      this.processStderr = childStderrTail(this.processStderr + chunk);
     });
     child.once("error", (error) => {
       if (this.process === child) {
@@ -2301,14 +2321,46 @@ export class MeerkatClient {
     const result = await this.request("mob/list", {});
     const mobs = MeerkatClient.requireRecordArray(result.mobs, "Invalid mob/list response");
     const context = "Invalid mob/list response entry";
-    return mobs.map((mob) => ({
-      mobId: MeerkatClient.requireStringField(mob, "mob_id", context),
-      status: MeerkatClient.requireStringField(
-        mob,
-        "status",
-        context,
-      ),
-    }));
+    return mobs.map((mob) => {
+      const summary: MobSummary = {
+        mobId: MeerkatClient.requireStringField(mob, "mob_id", context),
+        status: MeerkatClient.requireStringField(
+          mob,
+          "status",
+          context,
+        ),
+      };
+      const failure = MeerkatClient.parseMobLifecycleFailure(mob.failure, context);
+      return failure === undefined ? summary : { ...summary, failure };
+    });
+  }
+
+  /**
+   * The typed failure of a `mob/list` row. Present means the mob's actor has
+   * stopped; `status` is the last machine phase. Absent or `null` yields
+   * `undefined`.
+   */
+  private static parseMobLifecycleFailure(
+    raw: unknown,
+    context: string,
+  ): MobLifecycleFailure | undefined {
+    if (raw === undefined || raw === null) {
+      return undefined;
+    }
+    const failureContext = `${context}: failure`;
+    const record = MeerkatClient.requireRecord(raw, "failure", context);
+    const code = record.code;
+    if (code !== undefined && code !== null && typeof code !== "string") {
+      throw new MeerkatError("INVALID_RESPONSE", `${failureContext}: code must be a string`);
+    }
+    return {
+      cause: MeerkatClient.requireStringField(record, "cause", failureContext),
+      message: MeerkatClient.requirePresentStringField(record, "message", failureContext),
+      ...(typeof code === "string" ? { code } : {}),
+      ...(record.structured_data === undefined || record.structured_data === null
+        ? {}
+        : { structuredData: record.structured_data }),
+    };
   }
 
   async mobStatus(mobId: string): Promise<{ mobId: string; status: string }> {
@@ -3291,11 +3343,15 @@ export class MeerkatClient {
    * Wraps the `mob/destroy` RPC (DELETE_ME C3). Unlike `mob/lifecycle`
    * with `action: "destroy"`, this dedicated endpoint has a predictable
    * response shape that does not require branching on an action string.
+   * A refusal `kind` this SDK does not know reads as `{ kind: "unknown" }`.
+   * A destroy that did not finish rejects with code
+   * `mob_destroy_incomplete`; `mobDestroyIncompleteReport(err)` reads its
+   * report.
    */
   async mobDestroy(mobId: string): Promise<{
     mobId: string;
     ok: boolean;
-    destroyReport: Record<string, unknown>;
+    destroyReport: WireMobDestroyReport;
   }> {
     const result = await this.request("mob/destroy", { mob_id: mobId });
     if (
@@ -3307,6 +3363,13 @@ export class MeerkatClient {
         "Invalid mob/destroy response: missing ok or destroy_report",
       );
     }
+    const destroyReport = parseMobDestroyReport(result.destroy_report);
+    if (destroyReport === undefined) {
+      throw new MeerkatError(
+        "INVALID_RESPONSE",
+        "Invalid mob/destroy response: malformed destroy_report",
+      );
+    }
     return {
       mobId: MeerkatClient.requireStringField(
         result,
@@ -3314,7 +3377,7 @@ export class MeerkatClient {
         "Invalid mob/destroy response: missing mob_id",
       ),
       ok: result.ok,
-      destroyReport: result.destroy_report as Record<string, unknown>,
+      destroyReport,
     };
   }
 
@@ -8611,7 +8674,9 @@ export class MeerkatClient {
       const options: SpawnOptions = { stdio: ["ignore", "inherit", "pipe"] };
       const proc = spawn(command, args, options);
       let stderr = "";
-      proc.stderr?.on("data", (chunk: string | Buffer) => { stderr += String(chunk); });
+      // Decoded as one stream, so a character split across two reads stays whole.
+      proc.stderr?.setEncoding("utf8");
+      proc.stderr?.on("data", (chunk: string) => { stderr += chunk; });
       proc.on("error", (error: Error) => { reject(error); });
       proc.on("close", (code: number | null) => {
         if (code === 0) { resolve(); return; }

@@ -36,7 +36,10 @@ async fn enqueue_stop(
     handle: &MobHandle,
 ) -> oneshot::Receiver<Result<crate::MobStopReport, MobError>> {
     handle
-        .enqueue_actor_command_for_test(|reply_tx| MobCommand::Stop { reply_tx })
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::Stop {
+            leave_runs_running: false,
+            reply_tx,
+        })
         .await
         .expect("enqueue stop")
 }
@@ -595,7 +598,7 @@ async fn refuse_next_stop(
         .await
         .expect("the handle sends Stop")
         .expect("command channel open");
-    let MobCommand::Stop { reply_tx } = routed.cmd else {
+    let MobCommand::Stop { reply_tx, .. } = routed.cmd else {
         panic!("expected Stop, got {}", routed.cmd.kind());
     };
     let _ = reply_tx.send(Err(refusal));
@@ -644,7 +647,7 @@ async fn a_stop_refused_on_placed_completion_cleanup_reissues_once_when_it_drain
         drained_at,
         "the drain re-issued the Stop, not a timer"
     );
-    let MobCommand::Stop { reply_tx } = routed.cmd else {
+    let MobCommand::Stop { reply_tx, .. } = routed.cmd else {
         panic!("expected Stop, got {}", routed.cmd.kind());
     };
     let _ = reply_tx.send(Ok(crate::MobStopReport::default()));
@@ -725,7 +728,7 @@ async fn a_stop_refused_on_a_pending_lifecycle_operation_reissues_on_the_next_co
         .expect("Stop is re-issued on the next commit")
         .expect("command channel open");
     assert_eq!(tokio::time::Instant::now(), committed_at);
-    let MobCommand::Stop { reply_tx } = routed.cmd else {
+    let MobCommand::Stop { reply_tx, .. } = routed.cmd else {
         panic!("expected Stop, got {}", routed.cmd.kind());
     };
     let _ = reply_tx.send(Ok(crate::MobStopReport::default()));
@@ -750,7 +753,7 @@ async fn a_stop_whose_blocker_never_settles_returns_the_refusal_at_the_hang_guar
     let refuser_stops = Arc::clone(&stops);
     let refuser = tokio::spawn(async move {
         while let Some(routed) = commands.recv().await {
-            if let MobCommand::Stop { reply_tx } = routed.cmd {
+            if let MobCommand::Stop { reply_tx, .. } = routed.cmd {
                 refuser_stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let _ = reply_tx.send(Err(MobError::PlacedCompletionCleanupPending {
                     pending: 1,

@@ -319,12 +319,6 @@ impl AssemblyConsequencePolicy {
     }
 }
 
-/// The resources a construction started that must be settled if it is not
-/// finished, armed from the moment the construction first owns each (before
-/// any of its startup awaits) until a finished agent owns them. Dropped while
-/// armed, it spawns each owner's shutdown on the runtime the construction
-/// armed it on; [`Self::settle`] awaits that shutdown and stays armed until it
-/// completes, so a settle that is itself abandoned still hands it on.
 /// A trusted host's composition of one construction's own MCP router adapter.
 ///
 /// Called once per construction that creates a router for its configured MCP
@@ -391,6 +385,12 @@ pub trait McpAdapterCustody: Send + Sync {
 #[error("MCP adapter custody is closed")]
 pub struct McpAdapterCustodyClosed;
 
+/// The resources a construction started that must be settled if it is not
+/// finished, armed from the moment the construction first owns each (before
+/// any of its startup awaits) until a finished agent owns them. Dropped while
+/// armed, it spawns each owner's shutdown on the runtime the construction
+/// armed it on; [`Self::settle`] awaits that shutdown and stays armed until it
+/// completes, so a settle that is itself abandoned still hands it on.
 #[derive(Default)]
 struct ConstructionCleanup {
     #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
@@ -1666,6 +1666,15 @@ pub enum LlmIdentityPreflightError {
     ModelUnresolvable { detail: String },
     #[error("provider binding or client is not resolvable on this host: {detail}")]
     BindingUnresolvable { detail: String },
+    /// The identity switches provider and the binding it must keep cannot be
+    /// selected, for example
+    /// [`meerkat_core::ConnectionTargetError::NoCredentialAccountRoute`] when
+    /// no route for the new provider shares the session's credential account.
+    /// The build refuses with the same typed connection error.
+    #[error("provider binding is not resolvable on this host: {source}")]
+    BindingSelection {
+        source: meerkat_core::ConnectionTargetError,
+    },
 }
 
 #[cfg(feature = "comms")]
@@ -2005,6 +2014,7 @@ impl CreateSessionModelResolutionError {
             }
             | meerkat_core::ConnectionTargetError::ProviderMismatch { .. }
             | meerkat_core::ConnectionTargetError::AmbiguousCredentialAccountBindings { .. }
+            | meerkat_core::ConnectionTargetError::NoCredentialAccountRoute { .. }
             | meerkat_core::ConnectionTargetError::RealmChain(_) => true,
         }
     }
@@ -5197,33 +5207,34 @@ impl AgentFactory {
 
         let mask = build_config.resume_override_mask;
 
-        if !mask.model {
-            build_config.model = metadata.model.clone();
-        }
         if !mask.max_tokens {
             build_config.max_tokens = Some(metadata.max_tokens);
         }
         if !mask.structured_output_retries {
             build_config.structured_output_retries = Some(metadata.structured_output_retries);
         }
-        if !mask.provider {
-            build_config.provider = Some(metadata.provider);
-        }
-        if !mask.model && !mask.provider && !mask.self_hosted_server_id {
-            build_config.self_hosted_server_id = metadata.self_hosted_server_id.clone();
-        }
-        if !mask.provider_params {
-            build_config.provider_params = metadata.provider_params.clone();
-        }
-        // Phase 3: propagate persisted auth_binding so resume re-resolves
-        // through the same realm binding. The caller keeps precedence —
-        // if build_config already carries an auth binding reference, leave it.
-        if !mask.auth_binding && build_config.auth_binding.is_none() {
-            build_config.auth_binding = metadata
-                .auth_binding
-                .clone()
-                .filter(|auth_binding| !auth_binding.is_env_default());
-        }
+        // The resumed LLM identity follows the one Core rule every resume
+        // merge uses. A build that claims the provider without naming one
+        // recomputes it from the model; `assemble_agent` then settles the
+        // binding against the provider the registry resolves.
+        let recompute_provider = mask.provider && build_config.provider.is_none();
+        let durable = metadata.llm_identity();
+        let resumed = meerkat_core::resolve_resumed_session_llm_identity(
+            SessionLlmIdentity {
+                model: build_config.model.clone(),
+                provider: build_config.provider.unwrap_or(durable.provider),
+                self_hosted_server_id: build_config.self_hosted_server_id.clone(),
+                provider_params: build_config.provider_params.clone(),
+                auth_binding: build_config.auth_binding.clone(),
+            },
+            &durable,
+            &mask,
+        );
+        build_config.model = resumed.model;
+        build_config.provider = (!recompute_provider).then_some(resumed.provider);
+        build_config.self_hosted_server_id = resumed.self_hosted_server_id;
+        build_config.provider_params = resumed.provider_params;
+        build_config.auth_binding = resumed.auth_binding;
         if !mask.override_builtins {
             build_config.override_builtins = metadata.tooling.builtins;
         }
@@ -5544,6 +5555,56 @@ impl AgentFactory {
         preferred_realm: Option<&RealmId>,
         auth_lease_handle: Option<meerkat_core::handles::GeneratedAuthLeaseHandle>,
     ) -> Result<(), LlmIdentityPreflightError> {
+        self.preflight_resumed_llm_identity(
+            config,
+            identity,
+            None,
+            custom_models,
+            preferred_realm,
+            auth_lease_handle,
+        )
+        .await
+    }
+
+    /// [`Self::preflight_llm_identity`] for a resumed session whose durable
+    /// identity is `resume_prior`.
+    ///
+    /// `identity` is the resume merge's identity. When it switches provider
+    /// without naming a binding, the preflight applies the account-affinity
+    /// rule the build applies, so the preflight and the build reach the same
+    /// route or the same typed refusal.
+    pub async fn preflight_resumed_llm_identity(
+        &self,
+        config: &Config,
+        identity: &SessionLlmIdentity,
+        resume_prior: Option<&SessionLlmIdentity>,
+        custom_models: &BTreeMap<String, meerkat_core::config::CustomModelConfig>,
+        preferred_realm: Option<&RealmId>,
+        auth_lease_handle: Option<meerkat_core::handles::GeneratedAuthLeaseHandle>,
+    ) -> Result<(), LlmIdentityPreflightError> {
+        let mut switched;
+        let identity = match resume_prior {
+            Some(prior)
+                if identity.auth_binding.is_none() && identity.provider != prior.provider =>
+            {
+                switched = identity.clone();
+                switched.auth_binding = Self::credential_account_route_for_provider_switch(
+                    config,
+                    prior,
+                    identity.provider,
+                )
+                .map_err(|error| match error {
+                    FactoryError::ConnectionTarget(source) => {
+                        LlmIdentityPreflightError::BindingSelection { source }
+                    }
+                    other => LlmIdentityPreflightError::BindingUnresolvable {
+                        detail: other.to_string(),
+                    },
+                })?;
+                &switched
+            }
+            _ => identity,
+        };
         let registry = if custom_models.is_empty() {
             self.model_registry(config).map_err(|error| {
                 LlmIdentityPreflightError::ModelUnresolvable {
@@ -5790,6 +5851,43 @@ impl AgentFactory {
                 |binding| binding.credential_identity(auth_binding),
             ),
         ))
+    }
+
+    /// The route a session that switches to `target_provider` keeps its
+    /// credential account on. One account-affinity rule for the hot swap, a
+    /// resumed build and the member-host preflight.
+    ///
+    /// `Ok(None)` when the session's binding is not account-backed: the new
+    /// provider then resolves its own route. An account-backed binding moves
+    /// only to the `target_provider` route that shares its account, and
+    /// refuses with [`meerkat_core::ConnectionTargetError::NoCredentialAccountRoute`]
+    /// when none does. A provider switch never moves a session onto another
+    /// account's credential.
+    pub(crate) fn credential_account_route_for_provider_switch(
+        config: &Config,
+        current: &SessionLlmIdentity,
+        target_provider: Provider,
+    ) -> Result<Option<AuthBindingRef>, FactoryError> {
+        let Some(meerkat_core::AuthCredentialIdentity::Account(account)) =
+            Self::credential_identity_for_llm_identity(config, current)?
+        else {
+            return Ok(None);
+        };
+        let route = meerkat_core::resolve_credential_account_binding_for_provider(
+            config,
+            target_provider,
+            &account,
+        )
+        .map_err(FactoryError::ConnectionTarget)?;
+        match route {
+            Some(route) => Ok(Some(route.auth_binding)),
+            None => Err(FactoryError::ConnectionTarget(
+                meerkat_core::ConnectionTargetError::NoCredentialAccountRoute {
+                    provider: target_provider,
+                    account,
+                },
+            )),
+        }
     }
 
     fn credential_identity_for_client_override(
@@ -6916,6 +7014,9 @@ impl AgentFactory {
 
         let explicit_mob_override =
             !matches!(build_config.override_mob, ToolCategoryOverride::Inherit);
+        // The binding the caller named, before the resume merge fills one in:
+        // the resumed binding is settled against the registry's provider below.
+        let caller_auth_binding = build_config.auth_binding.clone();
         let resumed_session_metadata = Self::apply_resumed_session_metadata(&mut build_config)?;
         self.validate_runtime_profile(&build_config, config)?;
         let mut session =
@@ -7041,9 +7142,6 @@ impl AgentFactory {
         };
 
         // 2. Resolve provider and any self-hosted server binding.
-        let resumed_self_hosted_server_id = resumed_session_metadata
-            .as_ref()
-            .and_then(|metadata| metadata.self_hosted_server_id.clone());
         let (provider, resolved_self_hosted_server_id) =
             self.resolve_provider_from_registry(&registry, &build_config)?;
         // Durable agent construction is the single fail-closed chokepoint for
@@ -7065,6 +7163,38 @@ impl AgentFactory {
                 },
             ));
         }
+        // A resumed build seats its binding against the provider the registry
+        // settled, by the same Core rule as the merge (a provider the merge
+        // recomputes from the model is first known here). A provider switch
+        // with no binding named keeps the session's credential account, or
+        // refuses typed; otherwise the new provider resolves its own route
+        // from the session's realm as a fresh session would.
+        let resumed_provider_switch = if let Some(metadata) = resumed_session_metadata.as_ref() {
+            let durable = metadata.llm_identity();
+            build_config.auth_binding = meerkat_core::resolve_resumed_session_auth_binding(
+                &durable,
+                provider,
+                caller_auth_binding.as_ref(),
+                build_config.resume_override_mask.auth_binding,
+            );
+            // A client override bypasses credential resolution, so it needs no
+            // route either.
+            let resolves_credentials = build_config.llm_client_override.is_none()
+                && build_config.agent_llm_client_override.is_none();
+            if resolves_credentials
+                && build_config.auth_binding.is_none()
+                && caller_auth_binding.is_none()
+                && !build_config.resume_override_mask.auth_binding
+                && provider != durable.provider
+            {
+                build_config.auth_binding =
+                    Self::credential_account_route_for_provider_switch(config, &durable, provider)
+                        .map_err(BuildAgentError::LlmClient)?;
+            }
+            (provider != durable.provider).then_some(durable)
+        } else {
+            None
+        };
         if let Some(client) = build_config.llm_client_override.as_ref() {
             let claimed_provider = client.provider();
             if !matches!(claimed_provider, Provider::Other) && claimed_provider != provider {
@@ -7193,11 +7323,14 @@ impl AgentFactory {
         {
             profile.require(meerkat_capabilities::RuntimeProfileCapability::FallbackWebSearch)?;
         }
+        // A resumed session's server is already settled by the resume rule
+        // (`apply_resumed_session_metadata`): the durable server when the build
+        // claims neither model, provider nor server, and the build's own
+        // otherwise. A build naming none follows the registry for its model.
         let self_hosted_server_id = if matches!(provider, Provider::SelfHosted) {
             build_config
                 .self_hosted_server_id
                 .clone()
-                .or(resumed_self_hosted_server_id)
                 .or(resolved_self_hosted_server_id)
         } else {
             None
@@ -7335,6 +7468,17 @@ impl AgentFactory {
         };
         #[cfg(any(not(feature = "session-store"), target_arch = "wasm32"))]
         let resolved_llm_client_phase = primary_llm_client_phase?;
+        if let Some(durable) = resumed_provider_switch.as_ref() {
+            // Binding refs only, never credential material.
+            tracing::info!(
+                session_id = %session.id(),
+                from_provider = durable.provider.as_str(),
+                from_binding = ?durable.auth_binding,
+                to_provider = provider.as_str(),
+                to_binding = ?build_config.auth_binding,
+                "resumed session switched provider"
+            );
+        }
         let llm_client = resolved_llm_client_phase.llm_client;
         // The selected account's own output limit, when its provider states
         // one: an unspecified per-turn budget never asks for more.
@@ -10435,6 +10579,9 @@ mod brain_swap_runtime_loop_ab_tests;
 #[cfg(all(test, feature = "session-compaction", not(target_arch = "wasm32")))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod compaction_summary_budget_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod resume_provider_override_binding_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -14622,6 +14769,18 @@ mod tests {
         }
     }
 
+    /// Each test that resolves a sticky-fallback binding has a realm of its
+    /// own. A fallback rotation releases the primary binding's lease, which
+    /// refuses with `release_lease::Busy` while another test of the process
+    /// holds that binding's credential lifecycle, and plain `cargo test` runs
+    /// these tests at once in one process.
+    const FALLBACK_REALM_SESSION_OWNED: &str = "fallback_session_owned";
+    const FALLBACK_REALM_UNBOUND_SOURCE: &str = "fallback_unbound_source";
+    const FALLBACK_REALM_CHATGPT_BOUND: &str = "fallback_chatgpt_bound";
+    const FALLBACK_REALM_CHATGPT_UNBOUND: &str = "fallback_chatgpt_unbound";
+    const FALLBACK_REALM_RELOAD: &str = "fallback_reload";
+    const FALLBACK_REALM_HEAD_CANONICAL: &str = "fallback_head_canonical";
+
     fn inline_realm_section(entries: &[(&str, &str)]) -> RealmConfigSection {
         RealmConfigSection::from_inline_api_keys(entries)
     }
@@ -14817,13 +14976,17 @@ mod tests {
     }
 
     #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
-    fn sticky_fallback_test_config(backup_model: &str, backup_binding: AuthBindingRef) -> Config {
+    fn sticky_fallback_test_config(
+        realm: &str,
+        backup_model: &str,
+        backup_binding: AuthBindingRef,
+    ) -> Config {
         let mut config = Config {
             max_tokens: Some(1024),
             ..Default::default()
         };
         config.realm.insert(
-            "fallback_test".to_string(),
+            realm.to_string(),
             inline_realm_section(&[
                 ("anthropic", "test-primary-key"),
                 ("openai", "test-backup-key"),
@@ -14860,6 +15023,7 @@ mod tests {
 
     #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
     fn sticky_fallback_runtime_request(
+        realm: &str,
         primary_model: &str,
         external_tools: Arc<dyn AgentToolDispatcher>,
     ) -> CreateSessionRequest {
@@ -14876,7 +15040,7 @@ mod tests {
             deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
             build: Some(SessionBuildOptions {
                 provider: Some(Provider::Anthropic),
-                realm_id: Some(RealmId::parse("fallback_test").expect("test realm")),
+                realm_id: Some(RealmId::parse(realm).expect("test realm")),
                 external_tools: Some(external_tools),
                 override_builtins: ToolCategoryOverride::Disable,
                 ..Default::default()
@@ -14993,8 +15157,10 @@ mod tests {
 
         let primary_model = "claude-sonnet-4-5";
         let backup_model = "custom-text-only-backup";
-        let primary_binding = configured_auth_binding("fallback_test", "default_anthropic");
-        let backup_binding = configured_auth_binding("fallback_test", "default_openai");
+        let primary_binding =
+            configured_auth_binding(FALLBACK_REALM_SESSION_OWNED, "default_anthropic");
+        let backup_binding =
+            configured_auth_binding(FALLBACK_REALM_SESSION_OWNED, "default_openai");
         let primary_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let backup_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let primary_client: Arc<dyn LlmClient> = Arc::new(ScriptedStickyFallbackClient {
@@ -15026,7 +15192,7 @@ mod tests {
 
         let mut config = Config::default();
         config.realm.insert(
-            "fallback_test".to_string(),
+            FALLBACK_REALM_SESSION_OWNED.to_string(),
             inline_realm_section(&[
                 ("anthropic", "test-primary-key"),
                 ("openai", "test-backup-key"),
@@ -15069,7 +15235,7 @@ mod tests {
         let mut build = AgentBuildConfig::new(primary_model);
         build.max_tokens = Some(1024);
         build.provider = Some(Provider::Anthropic);
-        build.realm_id = Some(RealmId::parse("fallback_test").expect("test realm"));
+        build.realm_id = Some(RealmId::parse(FALLBACK_REALM_SESSION_OWNED).expect("test realm"));
         build.auth_binding = Some(primary_binding.clone());
         build.resume_session = Some(session);
         build.runtime_build_mode = RuntimeBuildMode::SessionOwned(bindings.clone());
@@ -15145,7 +15311,8 @@ mod tests {
     async fn fallback_from_an_unbound_source_names_the_resolved_default_binding() {
         let primary_model = "claude-sonnet-4-5";
         let backup_model = "custom-text-only-backup";
-        let backup_binding = configured_auth_binding("fallback_test", "default_openai");
+        let backup_binding =
+            configured_auth_binding(FALLBACK_REALM_UNBOUND_SOURCE, "default_openai");
         let primary_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let backup_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let temp = tempfile::tempdir().unwrap();
@@ -15175,7 +15342,7 @@ mod tests {
         // Only the fallback's provider has a configured binding.
         let mut config = Config::default();
         config.realm.insert(
-            "fallback_test".to_string(),
+            FALLBACK_REALM_UNBOUND_SOURCE.to_string(),
             inline_realm_section(&[("openai", "test-backup-key")]),
         );
         config.models.custom.insert(
@@ -15214,7 +15381,7 @@ mod tests {
         let mut build = AgentBuildConfig::new(primary_model);
         build.max_tokens = Some(1024);
         build.provider = Some(Provider::Anthropic);
-        build.realm_id = Some(RealmId::parse("fallback_test").expect("test realm"));
+        build.realm_id = Some(RealmId::parse(FALLBACK_REALM_UNBOUND_SOURCE).expect("test realm"));
         build.resume_session = Some(session);
         build.runtime_build_mode = RuntimeBuildMode::SessionOwned(bindings.clone());
         build.override_builtins = ToolCategoryOverride::Disable;
@@ -15265,20 +15432,21 @@ mod tests {
     }
 
     /// Run one sticky fallback from an Anthropic source onto `gpt-5.5`
-    /// through realm `fallback_test`, whose OpenAI binding is the private
+    /// through realm `realm_name` (the caller's own), whose OpenAI binding is the private
     /// ChatGPT backend, and return the session's resolved capability surface
     /// afterwards. `bound` names that binding on both the source and the
     /// fallback target; otherwise neither names one, and the target is served
     /// by the binding its client resolution selects (the ChatGPT one).
     #[cfg(not(target_arch = "wasm32"))]
     async fn chatgpt_backend_sticky_fallback_capabilities(
+        realm_name: &str,
         bound: bool,
     ) -> meerkat_runtime::SessionLlmCapabilitySurface {
         use meerkat_runtime::SessionServiceRuntimeExt as _;
 
         let primary_model = "claude-sonnet-4-5";
         let backup_model = "gpt-5.5";
-        let backup_binding = configured_auth_binding("fallback_test", "default_openai");
+        let backup_binding = configured_auth_binding(realm_name, "default_openai");
         let primary_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let backup_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let temp = tempfile::tempdir().unwrap();
@@ -15326,7 +15494,7 @@ mod tests {
             .get_mut("default_openai")
             .expect("OpenAI auth")
             .auth_method = "managed_chatgpt_oauth".to_string();
-        config.realm.insert("fallback_test".to_string(), realm);
+        config.realm.insert(realm_name.to_string(), realm);
         config.model_fallback.enabled = Some(true);
         config.model_fallback.policy.cross_provider = true;
         config.model_fallback.policy.trigger_after_attempts = 1;
@@ -15351,12 +15519,9 @@ mod tests {
         let mut build = AgentBuildConfig::new(primary_model);
         build.max_tokens = Some(1024);
         build.provider = Some(Provider::Anthropic);
-        build.realm_id = Some(RealmId::parse("fallback_test").expect("test realm"));
+        build.realm_id = Some(RealmId::parse(realm_name).expect("test realm"));
         if bound {
-            build.auth_binding = Some(configured_auth_binding(
-                "fallback_test",
-                "default_anthropic",
-            ));
+            build.auth_binding = Some(configured_auth_binding(realm_name, "default_anthropic"));
         }
         build.resume_session = Some(session);
         build.runtime_build_mode = RuntimeBuildMode::SessionOwned(bindings);
@@ -15404,7 +15569,8 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn sticky_fallback_onto_a_chatgpt_binding_records_its_backend_capability() {
-        let capabilities = chatgpt_backend_sticky_fallback_capabilities(true).await;
+        let capabilities =
+            chatgpt_backend_sticky_fallback_capabilities(FALLBACK_REALM_CHATGPT_BOUND, true).await;
         assert!(
             !capabilities.supports_mid_conversation_system_messages,
             "the ChatGPT backend refuses a later System row; the fallback must not \
@@ -15418,7 +15584,9 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn unbound_fallback_target_is_judged_by_the_binding_it_resolves() {
-        let capabilities = chatgpt_backend_sticky_fallback_capabilities(false).await;
+        let capabilities =
+            chatgpt_backend_sticky_fallback_capabilities(FALLBACK_REALM_CHATGPT_UNBOUND, false)
+                .await;
         assert!(
             !capabilities.supports_mid_conversation_system_messages,
             "the target resolves the ChatGPT-backend binding; the row's capability \
@@ -15438,9 +15606,13 @@ mod tests {
         const EXTERNAL_TOOL: &str = "known_external_tool";
         const ORIGINAL_PROMPT: &str = "persist this exact user prompt";
 
-        let primary_binding = configured_auth_binding("fallback_test", "default_anthropic");
-        let backup_binding = configured_auth_binding("fallback_test", "default_openai");
-        let config = sticky_fallback_test_config(BACKUP_MODEL, backup_binding.clone());
+        let primary_binding = configured_auth_binding(FALLBACK_REALM_RELOAD, "default_anthropic");
+        let backup_binding = configured_auth_binding(FALLBACK_REALM_RELOAD, "default_openai");
+        let config = sticky_fallback_test_config(
+            FALLBACK_REALM_RELOAD,
+            BACKUP_MODEL,
+            backup_binding.clone(),
+        );
         let temp = tempfile::tempdir().expect("persistent fallback tempdir");
         let sqlite_store = Arc::new(
             meerkat_store::SqliteSessionStore::open(temp.path().join("sessions.sqlite3"))
@@ -15479,6 +15651,7 @@ mod tests {
             session_id = session.id().clone();
             runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&session_id);
             let request = sticky_fallback_runtime_request(
+                FALLBACK_REALM_RELOAD,
                 PRIMARY_MODEL,
                 sticky_fallback_visibility_dispatcher(EXTERNAL_TOOL),
             );
@@ -15683,6 +15856,7 @@ mod tests {
             ORIGINAL_PROMPT,
         );
         let restart_request = sticky_fallback_runtime_request(
+            FALLBACK_REALM_RELOAD,
             PRIMARY_MODEL,
             sticky_fallback_visibility_dispatcher(EXTERNAL_TOOL),
         );
@@ -15795,8 +15969,13 @@ mod tests {
         const EXTERNAL_TOOL: &str = "known_external_tool";
         const ORIGINAL_PROMPT: &str = "persist this exact user prompt";
 
-        let backup_binding = configured_auth_binding("fallback_test", "default_openai");
-        let config = sticky_fallback_test_config(BACKUP_MODEL, backup_binding.clone());
+        let backup_binding =
+            configured_auth_binding(FALLBACK_REALM_HEAD_CANONICAL, "default_openai");
+        let config = sticky_fallback_test_config(
+            FALLBACK_REALM_HEAD_CANONICAL,
+            BACKUP_MODEL,
+            backup_binding.clone(),
+        );
         let temp = tempfile::tempdir().expect("head-canonical fallback tempdir");
         let sqlite_path = temp.path().join("sessions.sqlite3");
         let sqlite_store = Arc::new(
@@ -15834,6 +16013,7 @@ mod tests {
         let session_id = session.id().clone();
         let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&session_id);
         let request = sticky_fallback_runtime_request(
+            FALLBACK_REALM_HEAD_CANONICAL,
             PRIMARY_MODEL,
             sticky_fallback_visibility_dispatcher(EXTERNAL_TOOL),
         );
@@ -15859,6 +16039,17 @@ mod tests {
             .await
             .expect("stage known external visibility filter");
 
+        // A sibling test (the reload test, which plain `cargo test` runs at
+        // once in this process) holds its primary binding's credential
+        // lifecycle while this turn falls back. The rotation releases this
+        // test's own primary lease, never a sibling's binding.
+        let _sibling = meerkat_core::auth::acquire_auth_login_lifecycle_guard(
+            &meerkat_core::handles::LeaseKey::from_auth_binding(&configured_auth_binding(
+                FALLBACK_REALM_RELOAD,
+                "default_anthropic",
+            )),
+        )
+        .await;
         let (_accept, completion) = adapter
             .accept_input_with_completion(
                 &session_id,

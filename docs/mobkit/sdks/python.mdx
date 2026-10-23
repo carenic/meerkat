@@ -4,7 +4,7 @@ description: "Meta Python SDK — typed builder API, async runtime, and streamin
 icon: "python"
 ---
 
-*Mirrored from MobKit main at [982c76ab266e](https://github.com/lukacf/meerkat-meta/commit/982c76ab266ef73f028c1ba7dce9e021fa6587e0) on 2026-10-22; MobKit workspace version 0.9.4 at that commit.*
+*Mirrored from MobKit main at [39d8833a14a3](https://github.com/lukacf/meerkat-meta/commit/39d8833a14a30c9d7cb196543d793a05af02a156) on 2026-10-23; MobKit workspace version 0.9.4 at that commit.*
 
 The Meta Python SDK provides a typed host API for launching and operating
 Meerkat mobs through the SDK-facing gateway. Apps own policy. Meerkat and
@@ -1046,6 +1046,7 @@ Most apps should use `send`, `subscribe_agent`/`subscribe_mob`, and `status`/`re
 | `spawn(spec: DiscoverySpec)` | `SpawnResult` | Spawn a member from a discovery spec |
 | `spawn_member(module_id)` | `SpawnResult` | Spawn a member by module ID |
 | `capabilities()` | `CapabilitiesResult` | List available RPC methods |
+| `schedule_tools()` | `ScheduleToolsResult` | Meerkat's durable schedule tool definitions ([`meta/schedule/tools`](/mobkit/api/rpc#meta%2Fschedule%2Ftools)) |
 | `subscribe_events(scope, ...)` | `SubscribeResult` | Low-level event subscription |
 | `resolve_routing(recipient)` | `RoutingResolution` | Resolve delivery routing |
 | `send_delivery(...)` | `DeliveryResult` | Send via delivery module |

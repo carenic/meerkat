@@ -570,6 +570,11 @@ pub enum MobError {
     #[error("invalid state transition: {from} -> {to}")]
     InvalidTransition { from: MobState, to: MobState },
 
+    /// [`MobHandle::drain_stopped_runs`](crate::MobHandle::drain_stopped_runs)
+    /// runs only on a Stopped mob, whose members' run starts are held.
+    #[error("draining runs requires a stopped mob, but the mob is {state}")]
+    DrainRequiresStoppedMob { state: MobState },
+
     /// A wiring operation failed.
     #[error("wiring error: {0}")]
     WiringError(String),
@@ -641,7 +646,9 @@ pub enum MobError {
     /// The member's retirement durably started and then stopped at `stage`
     /// with the typed `cause`. The member stays `Retiring`, owned by the mob
     /// actor's stuck-retirement registry. Retrying a plain retirement does not
-    /// drive it; `MobHandle::redrive_retirement` or a mob resume does.
+    /// drive it; `MobHandle::redrive_retirement` or a mob resume does. Its
+    /// structured data carries the cause's text as `cause` and, when the
+    /// cause has structured data, that data as `cause_data`.
     #[error("member retirement for '{member_id}' is stuck at {stage}: {cause}")]
     MemberRetirementStuck {
         member_id: AgentIdentity,
@@ -752,6 +759,19 @@ pub enum MobError {
         session_id: meerkat_core::types::SessionId,
         cause: Arc<MobError>,
     },
+
+    /// The mob's actor fail-stopped because the outcome of a durable mutation
+    /// stayed uncertain: `cause` is that mutation's own error (the first one,
+    /// when several stayed uncertain). The actor closed its admission with
+    /// [`MobAdmissionCloseReason::DurabilityFailStop`](crate::runtime::MobAdmissionCloseReason::DurabilityFailStop)
+    /// and admits no command until a restart replays the mob's durable state.
+    ///
+    /// It classifies as that close, not as its cause: the actionable fact is
+    /// that the mob needs a restart. It carries no durable resume hold, even
+    /// when its cause does, so a host does not park a member on a hold that
+    /// only the restart releases.
+    #[error("mob '{mob_id}' fail-stopped after an uncertain durable mutation: {cause}")]
+    DurabilityFailStop { mob_id: MobId, cause: Arc<MobError> },
 
     /// The member's runtime registration is durability-degraded: a durable
     /// commit could not be reconciled with the live shell, so the runtime
@@ -1576,6 +1596,27 @@ pub enum MobError {
         reason: String,
     },
 
+    /// A member retirement's durability reload of the member session was
+    /// refused by the runtime as repair-blocked
+    /// (`RuntimeDriverError::RecoveryRepairBlocked`), for example while a
+    /// boundary commit past its deadline has not reported its durable
+    /// outcome. Retryable: once the runtime's evidence settles, a redrive of
+    /// the retirement reloads the member and continues. A retirement's
+    /// ingress detach that the runtime refuses as repair-blocked, because the
+    /// member session degraded after the stage's reload check, answers it
+    /// too, with the refusal's own fields. The retire path answers it,
+    /// usually as the cause of a stuck retirement;
+    /// `MobHandle::reload_member_registration` answers
+    /// [`MobError::MemberReloadRefused`] for the same runtime refusal, and a
+    /// caller treats both alike. The fields mirror the destroy report's
+    /// `MemberReloadRefusal::RepairBlocked`.
+    #[error("member session {session_id} reload is repair-blocked: {reason}")]
+    MemberReloadRepairBlocked {
+        session_id: meerkat_core::types::SessionId,
+        reason: String,
+        evidence_digest: Option<String>,
+    },
+
     /// A graceful Shutdown kept the member input durably queued: it runs on
     /// the mob's next start. It is not failed. Do not resubmit it; a
     /// same-key replay after the restart re-attaches to it.
@@ -1887,6 +1928,33 @@ impl MobError {
         }
     }
 
+    /// Structured-data `kind` of [`Self::MemberReloadRepairBlocked`].
+    pub(crate) const MEMBER_RELOAD_REPAIR_BLOCKED_KIND: &'static str =
+        "mob_member_reload_repair_blocked";
+
+    /// The structured data of [`Self::MemberReloadRepairBlocked`]. A
+    /// retirement stage carries the refusal across its `SessionError`
+    /// boundary as this data, and the retirement maps it back to the
+    /// variant.
+    pub(crate) fn member_reload_repair_blocked_data(
+        session_id: &meerkat_core::types::SessionId,
+        reason: &str,
+        evidence_digest: Option<&str>,
+    ) -> serde_json::Value {
+        let mut data = serde_json::json!({
+            "kind": Self::MEMBER_RELOAD_REPAIR_BLOCKED_KIND,
+            "session_id": session_id.to_string(),
+            "reason": reason,
+            "retryable": true,
+            "authority_retained": true,
+            "live_shell_discarded": false,
+        });
+        if let (Some(digest), Some(fields)) = (evidence_digest, data.as_object_mut()) {
+            fields.insert("evidence_digest".to_string(), digest.into());
+        }
+        data
+    }
+
     /// Structured data carried by an underlying domain error.
     ///
     /// Session materialization failures use this to preserve typed
@@ -1926,6 +1994,17 @@ impl MobError {
             // meerkat's own key, so a reader of that key classifies the
             // failure exactly as it would the cause alone. Every typed
             // classifier above and below delegates to the cause.
+            // The close's reason and the cause's own data. The cause's hold
+            // is deliberately NOT lifted to the top-level key, which
+            // `durable_resume_hold` reads: a fail-stop parks nothing.
+            Self::DurabilityFailStop { mob_id, cause } => Some(serde_json::json!({
+                "kind": "mob_durability_fail_stop",
+                "mob_id": mob_id.as_str(),
+                "reason": "durability_fail_stop",
+                "cause": cause.to_string(),
+                "cause_data": cause.structured_data(),
+                "actor_stopped": true,
+            })),
             Self::MemberStartupRecoveryFailed {
                 member_id,
                 session_id,
@@ -2011,15 +2090,25 @@ impl MobError {
                 member_id,
                 stage,
                 cause,
-            } => Some(serde_json::json!({
-                "kind": "mob_retirement_stuck",
-                "member_id": member_id.as_str(),
-                "stage": stage,
-                "cause": cause.to_string(),
-                "retryable": false,
-                "redrive": true,
-                "authority_retained": true,
-            })),
+            } => {
+                let mut data = serde_json::json!({
+                    "kind": "mob_retirement_stuck",
+                    "member_id": member_id.as_str(),
+                    "stage": stage,
+                    "cause": cause.to_string(),
+                    "retryable": false,
+                    "redrive": true,
+                    "authority_retained": true,
+                });
+                // The cause's own data, so a client routes on its kind
+                // rather than on the cause's text.
+                if let (Some(cause_data), Some(fields)) =
+                    (cause.structured_data(), data.as_object_mut())
+                {
+                    fields.insert("cause_data".to_string(), cause_data);
+                }
+                Some(data)
+            }
             Self::MemberRetirementAdmissionPending { member_id, stage } => {
                 Some(serde_json::json!({
                     "kind": "mob_retirement_admission_pending",
@@ -2107,6 +2196,15 @@ impl MobError {
                 "authority_retained": true,
                 "live_shell_discarded": false,
             })),
+            Self::MemberReloadRepairBlocked {
+                session_id,
+                reason,
+                evidence_digest,
+            } => Some(Self::member_reload_repair_blocked_data(
+                session_id,
+                reason,
+                evidence_digest.as_deref(),
+            )),
             Self::MemberReloadTimedOut { session_id, stage } => Some(serde_json::json!({
                 "kind": "mob_member_reload_timed_out",
                 "session_id": session_id.to_string(),
@@ -2169,6 +2267,9 @@ impl MobError {
             | Self::SharedLifecycleFailure(error)
             | Self::MemberRetirementStuck { cause: error, .. }
             | Self::MemberStartupRecoveryFailed { cause: error, .. } => error.durable_resume_hold(),
+            // Restart, do not park: the cause's hold belongs to a mutation
+            // the stopped actor never retries.
+            Self::DurabilityFailStop { .. } => None,
             other => other
                 .structured_data()
                 .as_ref()
@@ -2188,6 +2289,8 @@ impl MobError {
                 Self::SharedRetirementFailure(error)
                 | Self::SharedLifecycleFailure(error)
                 | Self::MemberStartupRecoveryFailed { cause: error, .. } => error.wire_error_code(),
+                // The close's answer (AdmissionClosed carries no code).
+                Self::DurabilityFailStop { .. } => None,
                 Self::SessionError(
                     meerkat_core::SessionError::RuntimeUnavailable { .. }
                     | meerkat_core::SessionError::HostingUnavailable { .. },
@@ -2214,6 +2317,7 @@ impl MobError {
                 | Self::MemberAdmissionBacklogFull { .. }
                 | Self::ActorCommandTimedOut { .. }
                 | Self::MemberReloadRefused { .. }
+                | Self::MemberReloadRepairBlocked { .. }
                 | Self::MemberReloadTimedOut { .. } => {
                     Some(meerkat_contracts::ErrorCode::SessionBusy)
                 }
@@ -2244,6 +2348,7 @@ impl MobError {
             | Self::MemberStartupRecoveryFailed { cause: error, .. } => {
                 error.bridge_rejection_cause()
             }
+            Self::DurabilityFailStop { .. } => None,
             // Cloned: `BridgeRejectionCause` carries payload variants since V4.
             Self::BridgeCommandRejected { cause, .. } => Some(cause.clone()),
             _ => None,
@@ -2272,6 +2377,7 @@ impl MobError {
             | Self::MemberStartupRecoveryFailed { cause: error, .. } => {
                 error.is_closed_runtime_effect_refusal()
             }
+            Self::DurabilityFailStop { .. } => false,
             _ => false,
         }
     }
@@ -2285,6 +2391,38 @@ impl MobError {
                 cause.retirement_root_cause()
             }
             other => other,
+        }
+    }
+
+    /// This error with [`Self::SharedLifecycleFailure`] peeled: the error a
+    /// shared lifecycle failure carries (through nested ones), or this error
+    /// itself. A match on a variant that a fail-stop's triggering reply can
+    /// arrive wrapped in reads through this.
+    pub fn without_shared_lifecycle_wrapper(&self) -> &MobError {
+        match self {
+            Self::SharedLifecycleFailure(error) => error.without_shared_lifecycle_wrapper(),
+            other => other,
+        }
+    }
+
+    /// This error as a retirement topology cleanup failure: one already is
+    /// comes back unchanged, also when it arrives as a fail-stop's shared
+    /// reply (the same shared cause, one prefix); any other is wrapped with
+    /// its rendering.
+    pub(crate) fn into_retirement_topology_incomplete(self) -> MobError {
+        match self.without_shared_lifecycle_wrapper() {
+            Self::RetirementTopologyIncomplete(_) => self,
+            _ => Self::RetirementTopologyIncomplete(self.to_string()),
+        }
+    }
+
+    /// This error as a wiring failure: one already is comes back unchanged,
+    /// also when it arrives as a fail-stop's shared reply (the same shared
+    /// cause, one prefix); any other is wrapped with its rendering.
+    pub(crate) fn into_wiring_error(self) -> MobError {
+        match self.without_shared_lifecycle_wrapper() {
+            Self::WiringError(_) => self,
+            _ => Self::WiringError(self.to_string()),
         }
     }
 
@@ -2320,6 +2458,8 @@ impl MobError {
             Self::SharedRetirementFailure(error)
             | Self::SharedLifecycleFailure(error)
             | Self::MemberStartupRecoveryFailed { cause: error, .. } => error.failure_class(),
+            // The close's answer: AdmissionClosed falls to MobRejected.
+            Self::DurabilityFailStop { .. } => MobFailureClass::MobRejected,
             Self::MobNotFound(_)
             | Self::ProfileNotFound(_)
             | Self::MemberNotFound(_)
@@ -2367,6 +2507,7 @@ impl MobError {
             | Self::BridgeRequestTimedOut { .. }
             | Self::ActorCommandTimedOut { .. }
             | Self::MemberReloadRefused { .. }
+            | Self::MemberReloadRepairBlocked { .. }
             | Self::MemberReloadTimedOut { .. }
             | Self::FlowTurnTimedOut
             // The input aged out before it ran: nothing was delivered, and
@@ -2437,6 +2578,7 @@ impl MobError {
             Self::SharedRetirementFailure(error)
             | Self::SharedLifecycleFailure(error)
             | Self::MemberStartupRecoveryFailed { cause: error, .. } => error.wire_detail(),
+            Self::DurabilityFailStop { .. } => None,
             Self::ScopeDenied(denial) => Some(WireMobErrorDetail::ScopeDenied(
                 WireScopeDeniedDetail::from(denial),
             )),
@@ -2753,6 +2895,114 @@ mod tests {
     }
 
     #[test]
+    fn member_reload_repair_blocked_projects_typed_retryable_data() {
+        let session_id = meerkat_core::types::SessionId::new();
+        let refused = MobError::MemberReloadRepairBlocked {
+            session_id: session_id.clone(),
+            reason: "commit outcome not reported".to_string(),
+            evidence_digest: None,
+        };
+        assert_eq!(
+            refused.to_string(),
+            format!(
+                "member session {session_id} reload is repair-blocked: commit outcome not reported"
+            )
+        );
+        assert_eq!(
+            refused.structured_data(),
+            Some(serde_json::json!({
+                "kind": "mob_member_reload_repair_blocked",
+                "session_id": session_id.to_string(),
+                "reason": "commit outcome not reported",
+                "retryable": true,
+                "authority_retained": true,
+                "live_shell_discarded": false,
+            }))
+        );
+        assert_eq!(
+            refused.wire_error_code(),
+            Some(meerkat_contracts::ErrorCode::SessionBusy)
+        );
+        assert_eq!(refused.failure_class(), MobFailureClass::Transport);
+        assert!(!refused.is_retirement_in_progress());
+        let with_digest = MobError::MemberReloadRepairBlocked {
+            session_id,
+            reason: "commit outcome not reported".to_string(),
+            evidence_digest: Some("digest".to_string()),
+        };
+        assert_eq!(
+            with_digest
+                .structured_data()
+                .and_then(|data| data.get("evidence_digest").cloned()),
+            Some(serde_json::json!("digest"))
+        );
+    }
+
+    /// A stuck retirement's wire data carries its cause's structured data
+    /// beside the cause's text, so a client tells "redrive later" from
+    /// "reload the member, then redrive" without parsing text. A cause
+    /// without structured data adds no key, and the rest is unchanged.
+    #[test]
+    fn a_stuck_retirement_carries_its_typed_cause_data_beside_its_text() {
+        let member_id = AgentIdentity::from("member");
+        let typed_causes = [
+            MobError::MemberReloadRepairBlocked {
+                session_id: meerkat_core::types::SessionId::new(),
+                reason: "commit outcome not reported".to_string(),
+                evidence_digest: None,
+            },
+            MobError::MemberReloadRequired {
+                member_id: member_id.clone(),
+                reason: "durability reload required".to_string(),
+            },
+        ];
+        for cause in typed_causes {
+            let cause_text = cause.to_string();
+            let cause_data = cause
+                .structured_data()
+                .expect("a typed cause has structured data");
+            let stuck = MobError::MemberRetirementStuck {
+                member_id: member_id.clone(),
+                stage: "retire-ingress-detach".to_string(),
+                cause: Arc::new(cause),
+            };
+            assert_eq!(
+                stuck.structured_data(),
+                Some(serde_json::json!({
+                    "kind": "mob_retirement_stuck",
+                    "member_id": "member",
+                    "stage": "retire-ingress-detach",
+                    "cause": cause_text,
+                    "cause_data": cause_data,
+                    "retryable": false,
+                    "redrive": true,
+                    "authority_retained": true,
+                }))
+            );
+        }
+        let untyped = MobError::Internal("failed to detach peer ingress".to_string());
+        let cause_text = untyped.to_string();
+        let stuck = MobError::MemberRetirementStuck {
+            member_id,
+            stage: "retire-ingress-detach".to_string(),
+            cause: Arc::new(untyped),
+        };
+        assert_eq!(
+            stuck.structured_data(),
+            Some(serde_json::json!({
+                "kind": "mob_retirement_stuck",
+                "member_id": "member",
+                "stage": "retire-ingress-detach",
+                "cause": cause_text,
+                "retryable": false,
+                "redrive": true,
+                "authority_retained": true,
+            })),
+            "a cause without structured data adds no cause_data key"
+        );
+    }
+
+    #[test]
     fn actor_command_timeout_projects_observation_without_execution_or_retry_verdict() {
         for stage in ["actor_command_admission", "actor_command_reply"] {
             let error = MobError::ActorCommandTimedOut {
@@ -2831,6 +3081,240 @@ mod tests {
         }
     }
 
+    /// A durability fail-stop record wrapping `cause`, and the admission
+    /// close whose answers the record gives.
+    fn fail_stop_record_and_close(cause: MobError) -> (MobError, MobError) {
+        let mob_id = MobId::from("fail-stopped");
+        (
+            MobError::DurabilityFailStop {
+                mob_id: mob_id.clone(),
+                cause: Arc::new(cause),
+            },
+            MobError::AdmissionClosed {
+                mob_id,
+                reason: crate::runtime::MobAdmissionCloseReason::DurabilityFailStop,
+            },
+        )
+    }
+
+    /// Restart, do not park: a hold in the cause belongs to a mutation the
+    /// stopped actor never retries, so the record has none, and its data
+    /// keeps the cause's under `cause_data` without lifting the hold.
+    #[test]
+    fn a_durability_fail_stop_parks_nothing_on_its_causes_hold() {
+        use meerkat_core::service::SessionError;
+        let session_id = meerkat_core::types::SessionId::new();
+        let bare = MobError::SessionError(SessionError::DurableTailHeldForRecovery {
+            id: session_id.clone(),
+        });
+        assert!(bare.durable_resume_hold().is_some(), "the cause holds");
+        let (record, close) = fail_stop_record_and_close(MobError::SessionError(
+            SessionError::DurableTailHeldForRecovery { id: session_id },
+        ));
+        assert_eq!(record.durable_resume_hold(), close.durable_resume_hold());
+        assert!(record.durable_resume_hold().is_none());
+        let data = record.structured_data().expect("structured data");
+        assert_eq!(data["kind"], "mob_durability_fail_stop");
+        assert_eq!(data["mob_id"], "fail-stopped");
+        assert_eq!(data["reason"], "durability_fail_stop");
+        assert_eq!(data["actor_stopped"], true);
+        assert_eq!(
+            data["cause_data"],
+            bare.structured_data().unwrap_or(serde_json::Value::Null)
+        );
+        assert!(
+            data.get(SessionError::DURABLE_RESUME_HOLD_KEY).is_none(),
+            "the cause's hold is not lifted to the top-level key: {data}"
+        );
+    }
+
+    #[test]
+    fn a_durability_fail_stop_has_the_close_wire_code() {
+        let session_id = meerkat_core::types::SessionId::new();
+        let bare =
+            MobError::SessionError(meerkat_core::service::SessionError::HostingUnavailable {
+                id: session_id.clone(),
+            });
+        assert!(bare.wire_error_code().is_some(), "the cause has a code");
+        let (record, close) = fail_stop_record_and_close(MobError::SessionError(
+            meerkat_core::service::SessionError::HostingUnavailable { id: session_id },
+        ));
+        assert_eq!(record.wire_error_code(), close.wire_error_code());
+    }
+
+    #[test]
+    fn a_durability_fail_stop_has_the_close_failure_class() {
+        let bare = MobError::Internal("append outcome unknown".to_string());
+        let (record, close) =
+            fail_stop_record_and_close(MobError::Internal("append outcome unknown".to_string()));
+        assert_ne!(
+            bare.failure_class(),
+            close.failure_class(),
+            "the cause's class differs"
+        );
+        assert_eq!(record.failure_class(), close.failure_class());
+        assert_eq!(record.failure_class(), MobFailureClass::MobRejected);
+    }
+
+    #[test]
+    fn a_durability_fail_stop_has_the_close_wire_detail() {
+        let stale = || MobError::StaleEventCursor {
+            after_cursor: 3,
+            latest_cursor: 7,
+        };
+        assert!(stale().wire_detail().is_some(), "the cause has a detail");
+        let (record, close) = fail_stop_record_and_close(stale());
+        assert_eq!(
+            format!("{:?}", record.wire_detail()),
+            format!("{:?}", close.wire_detail())
+        );
+        assert!(record.wire_detail().is_none());
+    }
+
+    #[test]
+    fn a_durability_fail_stop_has_the_close_bridge_rejection_cause() {
+        let rejected = || MobError::BridgeCommandRejected {
+            cause: BridgeRejectionCause::StaleFence,
+            reason: "stale fence".to_string(),
+        };
+        assert!(
+            rejected().bridge_rejection_cause().is_some(),
+            "the cause is a rejection"
+        );
+        let (record, close) = fail_stop_record_and_close(rejected());
+        assert_eq!(
+            record.bridge_rejection_cause().is_some(),
+            close.bridge_rejection_cause().is_some()
+        );
+        assert!(record.bridge_rejection_cause().is_none());
+    }
+
+    #[test]
+    fn a_durability_fail_stop_is_the_close_not_a_runtime_effect_refusal() {
+        let refused = || MobError::RuntimeEffectRefused {
+            kind: RuntimeEffectKind::RuntimeBinding,
+            session_id: meerkat_core::types::SessionId::new(),
+            refusal_code: "refused".to_string(),
+            reason: "the runtime refused".to_string(),
+        };
+        assert!(
+            refused().is_closed_runtime_effect_refusal(),
+            "the cause is a refusal"
+        );
+        let (record, close) = fail_stop_record_and_close(refused());
+        assert_eq!(
+            record.is_closed_runtime_effect_refusal(),
+            close.is_closed_runtime_effect_refusal()
+        );
+        assert!(!record.is_closed_runtime_effect_refusal());
+    }
+
+    /// The spawn-many failure cause, which mob/list's failure carries.
+    #[test]
+    fn a_durability_fail_stop_has_the_close_spawn_many_cause() {
+        let bare = MobError::SupervisorEscalation("escalated".to_string());
+        let (record, close) =
+            fail_stop_record_and_close(MobError::SupervisorEscalation("escalated".to_string()));
+        assert_ne!(
+            crate::mob_error_wire_code(&bare),
+            crate::mob_error_wire_code(&close),
+            "the cause's own differs"
+        );
+        assert_eq!(
+            crate::mob_error_wire_code(&record),
+            crate::mob_error_wire_code(&close)
+        );
+    }
+
+    #[test]
+    fn a_durability_fail_stop_renders_its_mob_and_its_cause() {
+        let (record, _close) =
+            fail_stop_record_and_close(MobError::Internal("append outcome unknown".to_string()));
+        assert_eq!(
+            record.to_string(),
+            "mob 'fail-stopped' fail-stopped after an uncertain durable mutation: \
+             internal error: append outcome unknown"
+        );
+    }
+
+    /// A fail-stop's reply can arrive wrapped in a shared lifecycle failure:
+    /// the retirement topology mapper reads through it, so a topology
+    /// failure keeps its one prefix and the shared cause it carries.
+    #[test]
+    fn the_retirement_topology_mapper_reads_through_a_shared_lifecycle_failure() {
+        let inner = Arc::new(MobError::RetirementTopologyIncomplete(
+            "edge a-b".to_string(),
+        ));
+        let mapped = MobError::SharedLifecycleFailure(Arc::clone(&inner))
+            .into_retirement_topology_incomplete();
+        match &mapped {
+            MobError::SharedLifecycleFailure(shared) => assert!(
+                Arc::ptr_eq(shared, &inner),
+                "the same shared cause comes back: {mapped:?}"
+            ),
+            other => panic!("a shared topology failure comes back unchanged: {other:?}"),
+        }
+        assert_eq!(
+            mapped.to_string(),
+            "retirement topology cleanup incomplete: edge a-b"
+        );
+
+        let bare = MobError::RetirementTopologyIncomplete("edge c-d".to_string())
+            .into_retirement_topology_incomplete();
+        assert!(
+            matches!(&bare, MobError::RetirementTopologyIncomplete(reason) if reason == "edge c-d"),
+            "a bare topology failure comes back unchanged: {bare:?}"
+        );
+        for other in [
+            MobError::Internal("unwire refused".to_string()),
+            MobError::SharedLifecycleFailure(Arc::new(MobError::Internal(
+                "unwire refused".to_string(),
+            ))),
+        ] {
+            let rendered = other.to_string();
+            let mapped = other.into_retirement_topology_incomplete();
+            assert!(
+                matches!(&mapped, MobError::RetirementTopologyIncomplete(reason) if *reason == rendered),
+                "any other error is wrapped once with its rendering: {mapped:?}"
+            );
+        }
+    }
+
+    /// The spawn wiring mapper reads through a shared lifecycle failure too:
+    /// a wiring failure keeps its one prefix and the shared cause it carries.
+    #[test]
+    fn the_wiring_mapper_reads_through_a_shared_lifecycle_failure() {
+        let inner = Arc::new(MobError::WiringError("peer a-b".to_string()));
+        let mapped = MobError::SharedLifecycleFailure(Arc::clone(&inner)).into_wiring_error();
+        match &mapped {
+            MobError::SharedLifecycleFailure(shared) => assert!(
+                Arc::ptr_eq(shared, &inner),
+                "the same shared cause comes back: {mapped:?}"
+            ),
+            other => panic!("a shared wiring failure comes back unchanged: {other:?}"),
+        }
+        assert_eq!(mapped.to_string(), inner.to_string());
+
+        let bare = MobError::WiringError("peer c-d".to_string()).into_wiring_error();
+        assert!(
+            matches!(&bare, MobError::WiringError(reason) if reason == "peer c-d"),
+            "a bare wiring failure comes back unchanged: {bare:?}"
+        );
+        for other in [
+            MobError::Internal("trust install refused".to_string()),
+            MobError::SharedLifecycleFailure(Arc::new(MobError::Internal(
+                "trust install refused".to_string(),
+            ))),
+        ] {
+            let rendered = other.to_string();
+            let mapped = other.into_wiring_error();
+            assert!(
+                matches!(&mapped, MobError::WiringError(reason) if *reason == rendered),
+                "any other error is wrapped once with its rendering: {mapped:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_all_variants_exist() {
         // Ensures all variants are constructible.
@@ -2875,6 +3359,10 @@ mod tests {
                 session_id: meerkat_core::types::SessionId::new(),
                 cause: Arc::new(MobError::Internal("restore failed".to_string())),
             },
+            MobError::DurabilityFailStop {
+                mob_id: MobId::from("mob"),
+                cause: Arc::new(MobError::Internal("append outcome unknown".to_string())),
+            },
             MobError::KickoffWaitTimedOut {
                 pending_member_ids: vec![AgentIdentity::from("m")],
             },
@@ -2893,6 +3381,11 @@ mod tests {
             MobError::MemberReloadRefused {
                 session_id: meerkat_core::types::SessionId::new(),
                 reason: "durable authority unreadable".to_string(),
+            },
+            MobError::MemberReloadRepairBlocked {
+                session_id: meerkat_core::types::SessionId::new(),
+                reason: "commit outcome not reported".to_string(),
+                evidence_digest: None,
             },
             MobError::RespawnPredecessorRestrictionsUnavailable {
                 agent_identity: "worker".to_string(),

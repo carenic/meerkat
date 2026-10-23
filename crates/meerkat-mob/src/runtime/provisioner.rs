@@ -2920,6 +2920,43 @@ async fn run_pre_boundary_step_test_gate(session_id: &SessionId) {
     }
 }
 
+/// Test hook: the next durability reload the turn-finalization boundary of a
+/// session's disposal asks for answers the runtime's repair-blocked refusal,
+/// once.
+#[cfg(test)]
+pub(crate) mod disposal_reload_test_hooks {
+    use meerkat_core::types::SessionId;
+    use std::sync::{Mutex, PoisonError};
+
+    static REFUSED_BOUNDARY_RELOADS: Mutex<Vec<SessionId>> = Mutex::new(Vec::new());
+
+    /// The reason of the refusal [`refuse_next_boundary_reload`] arms.
+    pub(crate) const INJECTED_REFUSAL: &str =
+        "injected repair-blocked refusal of the disposal's reload";
+
+    /// The next reload the disposal of `session` asks for at its
+    /// turn-finalization boundary is refused as repair-blocked, once.
+    pub(crate) fn refuse_next_boundary_reload(session: &SessionId) {
+        REFUSED_BOUNDARY_RELOADS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(session.clone());
+    }
+
+    pub(super) fn take_boundary_reload_refusal(session: &SessionId) -> bool {
+        let mut armed = REFUSED_BOUNDARY_RELOADS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match armed.iter().position(|candidate| candidate == session) {
+            Some(index) => {
+                armed.remove(index);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 #[cfg(test)]
 fn recovered_ops_after_hook_test_gates()
 -> &'static std::sync::Mutex<HashMap<SessionId, (oneshot::Sender<()>, oneshot::Receiver<()>)>> {
@@ -3031,6 +3068,75 @@ pub(super) enum DegradedUnregisterStep {
     TimedOut,
     /// The discard failed.
     Failed(String),
+}
+
+/// Why a durability reload
+/// ([`MemberSessionDisposalArc::reload_durability_degraded_registration_until`])
+/// did not settle.
+#[cfg(feature = "runtime-adapter")]
+#[derive(Debug)]
+pub(super) enum DurabilityReloadFailure {
+    /// The runtime answered the reload with this refusal.
+    Refused(meerkat_runtime::RuntimeDriverError),
+    /// The reload was not asked, or not answered within the deadline.
+    Session(SessionError),
+}
+
+#[cfg(feature = "runtime-adapter")]
+impl From<SessionError> for DurabilityReloadFailure {
+    fn from(error: SessionError) -> Self {
+        Self::Session(error)
+    }
+}
+
+#[cfg(feature = "runtime-adapter")]
+impl DurabilityReloadFailure {
+    /// The runtime's refusal, when it refused the reload.
+    pub(super) fn runtime_refusal(&self) -> Option<&meerkat_runtime::RuntimeDriverError> {
+        match self {
+            Self::Refused(error) => Some(error),
+            Self::Session(_) => None,
+        }
+    }
+
+    /// The session error a retirement reports for this failure of
+    /// `session_id`'s reload.
+    pub(super) fn into_session_error(self, session_id: &SessionId) -> SessionError {
+        match self {
+            Self::Refused(error) => MemberSessionDisposalArc::runtime_archive_error(format!(
+                "durability-reload disposal failed for {session_id}: {error}"
+            )),
+            Self::Session(error) => error,
+        }
+    }
+
+    /// The session error a retirement stage reports for this failure of
+    /// `session_id`'s reload: a repair-blocked refusal carries
+    /// [`MobError::MemberReloadRepairBlocked`]'s data, which
+    /// [`MemberSessionDisposalArc::map_runtime_retirement_error`] maps back to
+    /// that variant; any other failure is [`Self::into_session_error`].
+    pub(super) fn into_retire_error(self, session_id: &SessionId) -> SessionError {
+        let refusal = self
+            .runtime_refusal()
+            .and_then(super::handle::MemberReloadRefusal::from_runtime_refusal);
+        match (self, refusal) {
+            (
+                Self::Refused(error),
+                Some(super::handle::MemberReloadRefusal::RepairBlocked {
+                    reason,
+                    evidence_digest,
+                }),
+            ) => SessionError::FailedWithData {
+                message: format!("durability-reload disposal failed for {session_id}: {error}"),
+                data: MobError::member_reload_repair_blocked_data(
+                    session_id,
+                    &reason,
+                    evidence_digest.as_deref(),
+                ),
+            },
+            (failure, _) => failure.into_session_error(session_id),
+        }
+    }
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -3654,9 +3760,41 @@ impl MemberSessionDisposalArc {
                 session_id: session_id.clone(),
                 stage,
             }
+        } else if let Some(refused) = Self::runtime_member_reload_repair_blocked(session_id, &error)
+        {
+            refused
         } else {
             MobError::from(error)
         }
+    }
+
+    /// Read back the repair-blocked reload refusal
+    /// [`DurabilityReloadFailure::into_retire_error`] carries for
+    /// `session_id`, from its stable data fields.
+    fn runtime_member_reload_repair_blocked(
+        session_id: &SessionId,
+        error: &SessionError,
+    ) -> Option<MobError> {
+        let SessionError::FailedWithData { data, .. } = error else {
+            return None;
+        };
+        if data.get("kind").and_then(serde_json::Value::as_str)
+            != Some(MobError::MEMBER_RELOAD_REPAIR_BLOCKED_KIND)
+            || data.get("session_id").and_then(serde_json::Value::as_str)
+                != Some(session_id.to_string().as_str())
+        {
+            return None;
+        }
+        let reason = data.get("reason")?.as_str()?.to_string();
+        let evidence_digest = match data.get("evidence_digest") {
+            Some(digest) => Some(digest.as_str()?.to_string()),
+            None => None,
+        };
+        Some(MobError::MemberReloadRepairBlocked {
+            session_id: session_id.clone(),
+            reason,
+            evidence_digest,
+        })
     }
 
     /// Classify the session owner's structured retained-retirement outcome.
@@ -4016,6 +4154,16 @@ impl MemberSessionDisposalArc {
                     )?;
                     recovered_cold_successor = Some((registration, existing_ops_binding));
                 } else {
+                    #[cfg(test)]
+                    if disposal_reload_test_hooks::take_boundary_reload_refusal(session_id) {
+                        return Err(DurabilityReloadFailure::Refused(
+                            meerkat_runtime::RuntimeDriverError::RecoveryRepairBlocked {
+                                evidence_digest: None,
+                                reason: disposal_reload_test_hooks::INJECTED_REFUSAL.to_string(),
+                            },
+                        )
+                        .into_retire_error(session_id));
+                    }
                     let prior_ops_binding = Self::recoverable_ops_binding_witness(
                         self.ops_adapter.as_ref(),
                         session_id,
@@ -4042,9 +4190,7 @@ impl MemberSessionDisposalArc {
                         )
                     })?
                     .map_err(|error| {
-                        Self::runtime_archive_error(format!(
-                            "durability-reload disposal failed for {session_id}: {error}"
-                        ))
+                        DurabilityReloadFailure::Refused(error).into_retire_error(session_id)
                     })?;
                     if matches!(
                         disposition,
@@ -4239,14 +4385,44 @@ impl MemberSessionDisposalArc {
     /// boundary commit consumed only in memory is pending there again, so the
     /// retirement that follows records its fate instead of losing it with
     /// the in-memory run. A registration that is not degraded, or no longer
-    /// current, is left untouched (`NotDegraded`, `NotCurrent`).
+    /// current, is left untouched (`NotDegraded`, `NotCurrent`). A refusal
+    /// from the runtime stays typed ([`DurabilityReloadFailure::Refused`]).
     pub(super) async fn reload_durability_degraded_registration_until(
         adapter: &Arc<MeerkatMachine>,
         ops_adapter: Option<&Arc<super::ops_adapter::MobOpsAdapter>>,
         registration: &RuntimeSessionRegistrationWitness,
         session_id: &SessionId,
         deadline: Instant,
-    ) -> Result<meerkat_runtime::ReloadRequiredRegistrationDisposition, SessionError> {
+    ) -> Result<meerkat_runtime::ReloadRequiredRegistrationDisposition, DurabilityReloadFailure>
+    {
+        Self::reload_durability_degraded_registration_settlement_until(
+            adapter,
+            ops_adapter,
+            registration,
+            session_id,
+            deadline,
+        )
+        .await
+        .map(|settlement| settlement.disposition())
+    }
+
+    /// [`Self::reload_durability_degraded_registration_until`], answering
+    /// with the reload's settlement: `Discarded` carries the exact successor
+    /// the reload published. A caller that acts on the successor follows
+    /// that witness, never the session's registration read after the reload
+    /// returned, which can already be a later owner's.
+    pub(super) async fn reload_durability_degraded_registration_settlement_until(
+        adapter: &Arc<MeerkatMachine>,
+        ops_adapter: Option<&Arc<super::ops_adapter::MobOpsAdapter>>,
+        registration: &RuntimeSessionRegistrationWitness,
+        session_id: &SessionId,
+        deadline: Instant,
+    ) -> Result<meerkat_runtime::ReloadRequiredRegistrationSettlement, DurabilityReloadFailure>
+    {
+        use meerkat_runtime::{
+            ReloadRequiredRegistrationSettlement as Settlement,
+            ReloadRequiredRegistrationUseSettlement as UseSettlement,
+        };
         // A reload-required discard atomically replaces the registration
         // with a cold successor. The exact bound operation identity must
         // ride that replacement as a durable retention request so the
@@ -4255,10 +4431,11 @@ impl MemberSessionDisposalArc {
         let prior_ops_binding = Self::recoverable_ops_binding_witness(ops_adapter, session_id)?;
         let remaining =
             Self::retirement_remaining(session_id, deadline, "durability_reload_discard")?;
-        tokio::time::timeout(
+        let settlement = tokio::time::timeout(
             remaining,
-            adapter.recover_or_discard_reload_required_registration_with_operation_if_current(
+            adapter.reload_required_registration_settlement_if_current(
                 registration,
+                None,
                 prior_ops_binding
                     .as_ref()
                     .map(|witness| witness.retention_request()),
@@ -4266,11 +4443,18 @@ impl MemberSessionDisposalArc {
         )
         .await
         .map_err(|_| Self::runtime_retirement_in_progress(session_id, "durability_reload_discard"))?
-        .map_err(|error| {
-            Self::runtime_archive_error(format!(
-                "durability-reload disposal failed for {session_id}: {error}"
-            ))
-        })
+        .map_err(DurabilityReloadFailure::Refused)?;
+        match settlement {
+            UseSettlement::NotCurrent => Ok(Settlement::NotCurrent),
+            UseSettlement::NotDegraded => Ok(Settlement::NotDegraded),
+            UseSettlement::Discarded { successor, .. } => Ok(Settlement::Discarded { successor }),
+            // A reload asked without an expected use is never `Changed`.
+            other => Err(DurabilityReloadFailure::Session(
+                Self::runtime_archive_error(format!(
+                    "durability reload of {session_id}, asked without an expected use, answered {other:?}"
+                )),
+            )),
+        }
     }
 
     /// Before an exact unregister: discard `registration` first when its
@@ -4381,7 +4565,8 @@ impl MemberSessionDisposalArc {
                 session_id,
                 deadline,
             )
-            .await?;
+            .await
+            .map_err(|failure| failure.into_retire_error(session_id))?;
             if matches!(
                 disposition,
                 meerkat_runtime::ReloadRequiredRegistrationDisposition::Discarded
@@ -10247,6 +10432,72 @@ pub(super) async fn prepare_prepared_runtime_session_state(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::session_turn_error_to_mob_error;
+
+    /// A retirement stage carries the runtime's repair-blocked refusal of a
+    /// member reload as typed data, which the retirement maps to
+    /// `MobError::MemberReloadRepairBlocked` for that session only; any other
+    /// reload refusal maps as before.
+    #[cfg(feature = "runtime-adapter")]
+    #[test]
+    fn a_retire_maps_only_a_repair_blocked_reload_refusal_to_the_typed_error() {
+        use super::{DurabilityReloadFailure, MemberSessionDisposalArc};
+        use crate::MobError;
+        use meerkat_core::service::SessionError;
+        use meerkat_runtime::RuntimeDriverError;
+        let session_id = meerkat_core::types::SessionId::new();
+        let repair_blocked = || RuntimeDriverError::RecoveryRepairBlocked {
+            evidence_digest: Some("digest".to_string()),
+            reason: "commit outcome not reported".to_string(),
+        };
+        let carried =
+            DurabilityReloadFailure::Refused(repair_blocked()).into_retire_error(&session_id);
+        assert_eq!(
+            carried.to_string(),
+            format!(
+                "durability-reload disposal failed for {session_id}: {}",
+                repair_blocked()
+            ),
+            "the carrier keeps the reload failure's text"
+        );
+        match MemberSessionDisposalArc::map_runtime_retirement_error(&session_id, carried) {
+            MobError::MemberReloadRepairBlocked {
+                session_id: refused,
+                reason,
+                evidence_digest,
+            } => {
+                assert_eq!(refused, session_id);
+                assert_eq!(reason, "commit outcome not reported");
+                assert_eq!(evidence_digest.as_deref(), Some("digest"));
+            }
+            other => panic!("expected the typed repair-blocked refusal, got {other:?}"),
+        }
+
+        let other_session = meerkat_core::types::SessionId::new();
+        let carried =
+            DurabilityReloadFailure::Refused(repair_blocked()).into_retire_error(&session_id);
+        assert!(
+            matches!(
+                MemberSessionDisposalArc::map_runtime_retirement_error(&other_session, carried),
+                MobError::SessionError(SessionError::FailedWithData { .. })
+            ),
+            "another session's refusal is not typed as this one's"
+        );
+
+        let validation = || RuntimeDriverError::ValidationFailed {
+            reason: "not a reload refusal".to_string(),
+        };
+        let carried = DurabilityReloadFailure::Refused(validation()).into_retire_error(&session_id);
+        assert_eq!(
+            carried.to_string(),
+            DurabilityReloadFailure::Refused(validation())
+                .into_session_error(&session_id)
+                .to_string()
+        );
+        assert!(matches!(
+            MemberSessionDisposalArc::map_runtime_retirement_error(&session_id, carried),
+            MobError::SessionError(SessionError::Agent(_))
+        ));
+    }
 
     /// A retried input is still worked while a run holds it, however long
     /// that run takes, or while it gains attempts; requeued with no new

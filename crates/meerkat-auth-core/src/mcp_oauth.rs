@@ -52,6 +52,167 @@ const CLIENT_NAME: &str = "Meerkat rkat";
 pub const MCP_INTERACTIVE_LOGIN_TIMEOUT: Duration =
     crate::connector_oauth::CONNECTOR_BROWSER_LOGIN_WINDOW;
 
+/// Default bound of one network stage of an MCP OAuth start, completion or
+/// refresh ([`McpOAuthNetworkStage`]): every request of the stage, from its
+/// first send to its last body byte. Shorter than
+/// [`crate::auth_oauth::CREDENTIAL_REQUEST_TIMEOUT`], so a stall ends as this
+/// owner's typed stage outcome.
+pub const MCP_OAUTH_STAGE_BOUND: Duration = Duration::from_secs(20);
+
+/// Default bound of a start's network stages together (resource and
+/// authorization-server discovery, account preflight, client registration).
+pub const MCP_OAUTH_START_BOUND: Duration = Duration::from_secs(60);
+
+/// Default bound of a completion's network stages together (issuer metadata,
+/// token exchange, account evidence). It never extends past the attempt's own
+/// validity: a result after that would be refused anyway.
+pub const MCP_OAUTH_COMPLETION_BOUND: Duration = Duration::from_secs(60);
+
+/// Default time a completion observes its credential commit before the flow
+/// owner decides which side of the attempt's consume the commit is on. Longer
+/// than a refresh holds the credential (two stages), so a login queued behind
+/// a stalled refresh lands once that refresh has failed.
+pub const MCP_OAUTH_COMMIT_OBSERVATION_BOUND: Duration = Duration::from_secs(60);
+
+/// One network stage of an MCP OAuth start or completion, as named by
+/// [`McpOAuthError::NetworkTimedOut`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum McpOAuthNetworkStage {
+    /// The protected resource's metadata: its well-known probes and the
+    /// metadata document. A start stage.
+    ResourceMetadata,
+    /// The authorization server's metadata (RFC 8414 or OpenID Connect
+    /// discovery). A start stage, and the first completion stage: the code
+    /// has not been sent.
+    AuthorizationServerMetadata,
+    /// The account strategy's preflight of the issuer. A start stage.
+    AccountPreflight,
+    /// Dynamic client registration. A start stage.
+    ClientRegistration,
+    /// The authorization-code exchange: the code was sent and no answer
+    /// arrived, so it may be spent at the provider. A completion stage.
+    TokenExchange,
+    /// The account strategy's evidence for the exchanged token: the code was
+    /// redeemed and the tokens were discarded unpublished. A completion stage.
+    AccountEvidence,
+}
+
+impl McpOAuthNetworkStage {
+    /// Whether the authorization code had been sent when this stage ended.
+    /// Either way nothing was published and the code is never replayed.
+    pub fn code_sent(self) -> bool {
+        matches!(self, Self::TokenExchange | Self::AccountEvidence)
+    }
+}
+
+impl std::fmt::Display for McpOAuthNetworkStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ResourceMetadata => "protected resource metadata discovery",
+            Self::AuthorizationServerMetadata => "authorization server metadata discovery",
+            Self::AccountPreflight => "account strategy preflight",
+            Self::ClientRegistration => "dynamic client registration",
+            Self::TokenExchange => "authorization-code exchange",
+            Self::AccountEvidence => "account evidence",
+        })
+    }
+}
+
+/// The deadline `bound` from now. A bound too large to add (a host passing
+/// `Duration::MAX` to mean "no bound") saturates to a deadline about 30 years
+/// out instead of panicking, as `tokio::time::timeout` does.
+fn deadline_after(bound: Duration) -> tokio::time::Instant {
+    const FAR_FUTURE: Duration = Duration::from_secs(86_400 * 365 * 30);
+    let now = tokio::time::Instant::now();
+    now.checked_add(bound).unwrap_or_else(|| now + FAR_FUTURE)
+}
+
+/// How long the MCP OAuth owner waits on the network.
+///
+/// Each network stage ([`McpOAuthNetworkStage`], and a refresh's token
+/// request and subject re-observation) is bounded by `stage`; one bound covers
+/// all of a stage's sequential requests (the up to three well-known probes and
+/// the resource metadata document; the two or three authorization-server
+/// candidates), so a slow provider spends one bound across them. A start's
+/// stages together are bounded by `start`, and a completion's by `completion`,
+/// never past the attempt's own validity. A completion observes its credential
+/// commit for `commit_observation`, then the flow owner decides: an attempt it
+/// can still retire publishes nothing, one it cannot is
+/// [`McpOAuthError::CommitUnsettled`]. The defaults are
+/// [`MCP_OAUTH_STAGE_BOUND`], [`MCP_OAUTH_START_BOUND`],
+/// [`MCP_OAUTH_COMPLETION_BOUND`] and [`MCP_OAUTH_COMMIT_OBSERVATION_BOUND`].
+/// Any bound is accepted: one too large to add to the current time, such as
+/// `Duration::MAX`, saturates and never panics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct McpOAuthNetworkBounds {
+    stage: Duration,
+    start: Duration,
+    completion: Duration,
+    commit_observation: Duration,
+}
+
+impl Default for McpOAuthNetworkBounds {
+    fn default() -> Self {
+        Self {
+            stage: MCP_OAUTH_STAGE_BOUND,
+            start: MCP_OAUTH_START_BOUND,
+            completion: MCP_OAUTH_COMPLETION_BOUND,
+            commit_observation: MCP_OAUTH_COMMIT_OBSERVATION_BOUND,
+        }
+    }
+}
+
+impl McpOAuthNetworkBounds {
+    /// The bound of one network stage.
+    #[must_use]
+    pub fn with_stage(mut self, bound: Duration) -> Self {
+        self.stage = bound;
+        self
+    }
+
+    /// The bound of a start's network stages together.
+    #[must_use]
+    pub fn with_start(mut self, bound: Duration) -> Self {
+        self.start = bound;
+        self
+    }
+
+    /// The bound of a completion's network stages together.
+    #[must_use]
+    pub fn with_completion(mut self, bound: Duration) -> Self {
+        self.completion = bound;
+        self
+    }
+
+    /// How long a completion observes its credential commit.
+    #[must_use]
+    pub fn with_commit_observation(mut self, bound: Duration) -> Self {
+        self.commit_observation = bound;
+        self
+    }
+
+    /// The bound of one network stage.
+    pub fn stage(&self) -> Duration {
+        self.stage
+    }
+
+    /// The bound of a start's network stages together.
+    pub fn start(&self) -> Duration {
+        self.start
+    }
+
+    /// The bound of a completion's network stages together.
+    pub fn completion(&self) -> Duration {
+        self.completion
+    }
+
+    /// How long a completion observes its credential commit.
+    pub fn commit_observation(&self) -> Duration {
+        self.commit_observation
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McpAuthMode {
     Stored,
@@ -65,7 +226,7 @@ pub enum McpAuthMode {
 /// identity — not re-hashed independently at every key-derivation site. The
 /// `<slug>-<digest>` binding slug is the single owned projection of the
 /// `(server_name, server_url)` pair; `token_key` and `lease_key` both delegate
-/// to [`binding_slug`](Self::binding_slug) so the token realm key and the
+/// to `binding_slug` so the token realm key and the
 /// `AuthMachine` lease key are guaranteed structurally identical for the same
 /// server.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -654,16 +815,22 @@ fn verification_send_error(error: reqwest::Error) -> ConnectorOAuthRefusal {
     )
 }
 
-/// A failed OAuth request of the credential owner: the egress profile's own
-/// resolver refusal is the typed egress outcome; anything else is
-/// `otherwise`.
+/// A failed OAuth request of the credential owner during `stage`: the egress
+/// profile's own resolver refusal is the typed egress outcome, a request that
+/// passed its client's bound is the stage's typed timeout, and anything else
+/// is `otherwise`.
 fn oauth_send_error(
     target: &McpServerIdentity,
+    stage: McpOAuthNetworkStage,
     error: reqwest::Error,
     otherwise: impl FnOnce(reqwest::Error) -> McpOAuthError,
 ) -> McpOAuthError {
     match crate::http_egress::egress_refusal_in(&error) {
         Some(refusal) => McpOAuthError::from_egress(target, HttpEgressError::Refused(refusal)),
+        None if error.is_timeout() => McpOAuthError::NetworkTimedOut {
+            server_name: target.server_name().to_owned(),
+            stage,
+        },
         None => otherwise(error),
     }
 }
@@ -929,9 +1096,11 @@ impl McpOAuthPendingLogin {
     /// it polls the callback and drain once before the window is consulted.
     ///
     /// A confirmed retirement of the attempt (cancel by state or reference,
-    /// logout, a [`cancel_handle`](Self::cancel_handle)) ends the wait with
-    /// [`McpOAuthError::AttemptRetired`], carrying this login's
-    /// [`close`](Self::close) receipt: the listener is joined first.
+    /// logout, a [`cancel_handle`](Self::cancel_handle)) ends the wait, or the
+    /// completion it entered, with [`McpOAuthError::AttemptRetired`], carrying
+    /// this login's [`close`](Self::close) receipt: the listener is joined
+    /// first. The completion after delivery is bounded by the authority's
+    /// [`McpOAuthNetworkBounds`].
     pub async fn complete(self, timeout: Duration) -> Result<McpOAuthLoginComplete, McpOAuthError> {
         let mut pending = self;
         let server_name = pending.start.target.server_name().to_owned();
@@ -968,7 +1137,21 @@ impl McpOAuthPendingLogin {
                 Err(error) => McpOAuthListenerCleanup::Failed(error),
             });
         }
-        pending.run_completion(outcome).await
+        match pending.run_completion(outcome).await {
+            // The entered completion observed a confirmed retirement: the
+            // consuming wait carries its receipt, as for a retired wait.
+            Err(McpOAuthError::AttemptRetired {
+                server_name,
+                cleanup: None,
+            }) => {
+                let cleanup = pending.close().await;
+                Err(McpOAuthError::AttemptRetired {
+                    server_name,
+                    cleanup: Some(Box::new(cleanup)),
+                })
+            }
+            completed => completed,
+        }
     }
 
     /// Borrowed completion. The callback wait is bounded by `deadline` and
@@ -977,13 +1160,18 @@ impl McpOAuthPendingLogin {
     /// listener and the attempt stay with this login for an explicit
     /// [`close`](Self::close).
     ///
-    /// The deadline bounds only the callback wait. It neither extends the
-    /// attempt's validity nor bounds the completion after delivery (issuer
-    /// discovery, token exchange, account observation, credential commit),
-    /// which has no timeout of its own. Dropping this future while the token
-    /// exchange is outstanding prevents local publication by this completion;
-    /// once the credential commit was handed to its owner, that owner may
-    /// still finish after the drop. The authorization code is never replayed.
+    /// The deadline bounds only the callback wait and never extends the
+    /// attempt's validity. The completion after delivery (issuer discovery,
+    /// token exchange, account observation, credential commit) is bounded by
+    /// the authority's [`McpOAuthNetworkBounds`], never past the attempt's
+    /// validity, and a confirmed retirement of the attempt ends it at once
+    /// with [`McpOAuthError::AttemptRetired`]. A commit not observed within
+    /// its bound ends as [`McpOAuthError::CommitUnsettled`] when the flow owner
+    /// can no longer retire the attempt; its owner finishes on its own.
+    /// Dropping this future while the token exchange is outstanding prevents
+    /// local publication by this completion; once the credential commit was
+    /// handed to its owner, that owner may still finish after the drop. The
+    /// authorization code is never replayed.
     pub async fn complete_until(
         &mut self,
         deadline: tokio::time::Instant,
@@ -1043,10 +1231,16 @@ impl McpOAuthPendingLogin {
                 Some(self.guard_retirement.clone()),
             )
             .await;
-        self.completion = if completed.is_ok() {
-            PendingCompletion::Consumed
-        } else {
-            PendingCompletion::Failed
+        self.completion = match &completed {
+            Ok(_) => PendingCompletion::Consumed,
+            // The commit's owner may still publish: its result is unobserved.
+            Err(McpOAuthError::CommitUnsettled { .. }) => PendingCompletion::Unobserved,
+            Err(McpOAuthError::AttemptRetired { .. }) => {
+                // The flow owner confirmed the retirement the completion saw.
+                self.confirmed_retired = true;
+                PendingCompletion::Failed
+            }
+            Err(_) => PendingCompletion::Failed,
         };
         completed
     }
@@ -1377,6 +1571,70 @@ struct AttemptRetireGuard {
     /// Where a pending login that handed the code over reads this guard's
     /// own retirement result.
     observed: Option<RetireObserver>,
+    /// The completion's wake-up: a confirmed retirement of the attempt (by
+    /// state or reference, a cancel handle, a logout) ends it at once.
+    wake: AttemptWakeRegistration,
+}
+
+/// The detail of a commit this completion stopped observing before it
+/// consumed the attempt: nothing was published.
+const COMMIT_NOT_ADMITTED: &str = "the credential commit was not admitted in time: earlier credential work for this key is still running";
+
+impl AttemptRetireGuard {
+    /// `work`, unless the flow owner confirms this attempt's retirement
+    /// first: then [`McpOAuthError::AttemptRetired`] at once, and `work`, an
+    /// in-flight request included, is dropped. Safe at any point before the
+    /// commit consumes the attempt: the flow owner never consumes a retired
+    /// attempt, so nothing can be published from it.
+    async fn unless_retired<T>(
+        &mut self,
+        target: &McpServerIdentity,
+        work: impl std::future::Future<Output = Result<T, McpOAuthError>>,
+    ) -> Result<T, McpOAuthError> {
+        tokio::select! {
+            biased;
+            () = self.wake.retired() => {
+                // Already retired by the flow owner: nothing is left to retire.
+                self.armed = false;
+                Err(McpOAuthError::AttemptRetired {
+                    server_name: target.server_name().to_owned(),
+                    cleanup: None,
+                })
+            }
+            result = work => result,
+        }
+    }
+
+    /// The end of a commit this completion stopped observing (its bound
+    /// passed, or its owner was lost before it reported). The flow owner
+    /// linearizes the commit's consume against this retirement: an attempt it
+    /// still retires was never consumed and now cannot be, so nothing is
+    /// published; one it cannot retire was consumed, or may have been, so the
+    /// outcome is [`McpOAuthError::CommitUnsettled`] until the commit settles.
+    fn settle_unobserved_commit(&mut self, target: &McpServerIdentity) -> McpOAuthError {
+        self.armed = false;
+        let retired = retire_attempt(
+            self.authority.as_ref(),
+            &self.state,
+            &self.target,
+            self.identity.clone(),
+            &self.redirect_uri,
+        );
+        match retired {
+            Ok(()) => {
+                if let Some(observed) = &self.observed {
+                    *observed.lock() = Some(Ok(()));
+                }
+                McpOAuthError::CredentialAccess {
+                    refusal: meerkat_core::auth::TokenStoreRefusal::Pending,
+                    detail: COMMIT_NOT_ADMITTED.into(),
+                }
+            }
+            Err(_) => McpOAuthError::CommitUnsettled {
+                server_name: target.server_name().to_owned(),
+            },
+        }
+    }
 }
 
 impl Drop for AttemptRetireGuard {
@@ -1406,6 +1664,30 @@ struct AuthorizationServerEndpoints {
     offline_access: bool,
     /// The server says its authorization responses carry `iss` (RFC 9207).
     iss_parameter_supported: bool,
+}
+
+/// What the use path would do with an MCP target's stored credential, as a
+/// status read reports it ([`McpOAuthAuthority::stored_credential_status`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum McpStoredCredentialPhase {
+    /// No usable credential is stored: a login is needed.
+    AuthorizationRequired,
+    /// The use path accepts the stored credential, or refreshes it first.
+    Authorized,
+    /// The use path refuses the stored credential until a new login.
+    ReauthRequired,
+}
+
+/// One status read of an MCP target's stored credential: the phase the use
+/// path decides, with the secret-free fields of the exact credential that
+/// read saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct McpStoredCredentialStatus {
+    pub phase: McpStoredCredentialPhase,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub account_id: Option<String>,
 }
 
 /// An attempt pending for an MCP target, as a host may observe it: a
@@ -1547,6 +1829,30 @@ pub enum McpOAuthError {
         server_name: String,
         reason: HttpEgressUnavailable,
     },
+    /// A network stage of a start or completion got no answer within its
+    /// bound ([`McpOAuthNetworkBounds`]). Nothing was published: a start
+    /// admitted no attempt, and a completion's attempt was retired. Retry with
+    /// a new login; the authorization code is never replayed.
+    /// [`McpOAuthNetworkStage::code_sent`] tells whether the code had been
+    /// sent (and may be spent at the provider).
+    #[error("MCP OAuth {stage} for '{server_name}' got no answer within its bound")]
+    NetworkTimedOut {
+        server_name: String,
+        stage: McpOAuthNetworkStage,
+    },
+    /// The credential commit consumed the attempt, or may have, and its
+    /// outcome is unknown: it did not report within its observation bound,
+    /// its owner was lost, or it failed after the consume and could not
+    /// restore the previous credential and lifecycle. A commit still running
+    /// keeps running to its end; once the in-flight credential mutations
+    /// settle ([`crate::auth_store::settle_in_flight_credential_mutations`],
+    /// re-exported by the `meerkat` facade), a status read
+    /// ([`McpOAuthAuthority::stored_credential_status`]) reports what a use of
+    /// the stored credential does. Never a success and never a clean failure.
+    #[error(
+        "MCP OAuth login for '{server_name}': whether the credential landed is unknown until the credential commit settles"
+    )]
+    CommitUnsettled { server_name: String },
 }
 
 impl McpOAuthError {
@@ -1584,7 +1890,9 @@ impl McpOAuthError {
             | Self::MissingStoredMetadata { .. }
             | Self::HttpClientUnavailable(_)
             | Self::EgressUnavailable { .. }
-            | Self::AuthLifecycle { .. } => false,
+            | Self::AuthLifecycle { .. }
+            | Self::NetworkTimedOut { .. }
+            | Self::CommitUnsettled { .. } => false,
         }
     }
 
@@ -1629,6 +1937,8 @@ pub struct McpOAuthAuthority {
     /// The host egress profile every OAuth request of this authority is
     /// admitted by; a required profile also supplies its client.
     egress: HttpEgressProfile,
+    /// How long this authority waits on the network.
+    bounds: McpOAuthNetworkBounds,
 }
 
 impl McpOAuthAuthority {
@@ -1662,6 +1972,7 @@ impl McpOAuthAuthority {
             interactive: None,
             realm: None,
             egress: HttpEgressProfile::trusted_host(),
+            bounds: McpOAuthNetworkBounds::default(),
         }
     }
 
@@ -1679,6 +1990,7 @@ impl McpOAuthAuthority {
             interactive: None,
             realm: None,
             egress: HttpEgressProfile::trusted_host(),
+            bounds: McpOAuthNetworkBounds::default(),
         }
     }
 
@@ -1693,6 +2005,43 @@ impl McpOAuthAuthority {
     pub fn with_http_egress(mut self, profile: &HttpEgressProfile) -> Self {
         self.egress = profile.clone();
         self
+    }
+
+    /// Wait on the network at most `bounds` (see [`McpOAuthNetworkBounds`]).
+    /// They hold for every client this authority uses, a host-supplied one
+    /// and the egress profile's included, and for its account strategy's
+    /// calls.
+    #[must_use]
+    pub fn with_network_bounds(mut self, bounds: McpOAuthNetworkBounds) -> Self {
+        self.bounds = bounds;
+        self
+    }
+
+    /// The network bounds this authority waits within.
+    pub fn network_bounds(&self) -> McpOAuthNetworkBounds {
+        self.bounds
+    }
+
+    /// Run one network `stage` for `target`, bounded by the stage bound from
+    /// now and by `phase_deadline`. A stage past its bound ends as
+    /// [`McpOAuthError::NetworkTimedOut`]; its unfinished requests are
+    /// dropped.
+    async fn bounded_stage<T>(
+        &self,
+        target: &McpServerIdentity,
+        stage: McpOAuthNetworkStage,
+        phase_deadline: tokio::time::Instant,
+        work: impl std::future::Future<Output = Result<T, McpOAuthError>>,
+    ) -> Result<T, McpOAuthError> {
+        let deadline = phase_deadline.min(deadline_after(self.bounds.stage));
+        tokio::time::timeout_at(deadline, work)
+            .await
+            .unwrap_or_else(|_| {
+                Err(McpOAuthError::NetworkTimedOut {
+                    server_name: target.server_name().to_owned(),
+                    stage,
+                })
+            })
     }
 
     /// The required egress profile this authority enforces for all of its
@@ -1818,8 +2167,13 @@ impl McpOAuthAuthority {
                 meerkat_core::acquire_auth_login_lifecycle_guard_for_unattended(&lease_key)
                     .await
                     .ok_or_else(mcp_owner_busy)?;
-            self.load_admitted_stored_credential(target, &key, &_guard)
-                .await?
+            self.load_admitted_stored_credential(
+                target,
+                &key,
+                &_guard,
+                TokenStoreAccess::Unattended,
+            )
+            .await?
         };
         let Some(admitted) = admitted else {
             return Ok(None);
@@ -1872,6 +2226,70 @@ impl McpOAuthAuthority {
                 server_name: target.server_name().to_string(),
             }),
         }
+    }
+
+    /// The status of `target`'s stored credential: what
+    /// [`stored_bearer_token`](Self::stored_bearer_token) would do with it
+    /// next, through the same rule. `None` when the credential's lifecycle
+    /// owner is busy (the read never waits for it) or a legacy refresh marker
+    /// is pending; the caller then keeps its own durable reading.
+    pub async fn stored_credential_status(
+        &self,
+        target: &McpServerIdentity,
+    ) -> Result<Option<McpStoredCredentialStatus>, McpOAuthError> {
+        let target = &self.scoped(target)?;
+        if self.interactive.is_some() && !target.is_selected() {
+            return Ok(None);
+        }
+        let key = target.token_key()?;
+        let lease_key = target.lease_key()?;
+        // A status read never waits for the lifecycle owner.
+        let Some(guard) = meerkat_core::try_acquire_auth_login_lifecycle_guard(&lease_key) else {
+            return Ok(None);
+        };
+        let admitted = match self
+            .load_admitted_stored_credential(target, &key, &guard, TokenStoreAccess::Status)
+            .await
+        {
+            Ok(admitted) => admitted,
+            Err(McpOAuthError::ReauthRequired { .. }) => {
+                let stored = self
+                    .token_store()
+                    .load_for(&key, TokenStoreAccess::Status)
+                    .await
+                    .map_err(mcp_store_error)?
+                    .filter(|tokens| tokens.auth_mode == PersistedAuthMode::McpOauth);
+                return Ok(Some(McpStoredCredentialStatus {
+                    phase: McpStoredCredentialPhase::ReauthRequired,
+                    expires_at: stored.as_ref().and_then(|tokens| tokens.expires_at),
+                    account_id: stored.and_then(|tokens| tokens.account_id),
+                }));
+            }
+            // A legacy refresh marker is transient: the caller's reading
+            // stands until the refresh owner settles it.
+            Err(McpOAuthError::StalePreparation) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let Some(admitted) = admitted else {
+            return Ok(Some(McpStoredCredentialStatus {
+                phase: McpStoredCredentialPhase::AuthorizationRequired,
+                expires_at: None,
+                account_id: None,
+            }));
+        };
+        let phase = match admitted.disposition {
+            CredentialUseDisposition::RefreshRequired
+                if admitted.tokens.refresh_token.is_none() =>
+            {
+                McpStoredCredentialPhase::ReauthRequired
+            }
+            _ => McpStoredCredentialPhase::Authorized,
+        };
+        Ok(Some(McpStoredCredentialStatus {
+            phase,
+            expires_at: admitted.tokens.expires_at,
+            account_id: admitted.tokens.account_id,
+        }))
     }
 
     pub async fn require_stored_bearer_token(
@@ -1991,6 +2409,9 @@ impl McpOAuthAuthority {
         let binding = target.auth_binding_ref()?;
         let credential_identity: meerkat_core::AuthCredentialIdentity = binding.clone().into();
         let _admission = acquire_admission_lock(target.binding_slug()).await;
+        // Every network stage below (a join's issuer metadata, or discovery,
+        // preflight and registration) ends by this deadline.
+        let start_deadline = deadline_after(self.bounds.start);
         if let Some((state, record)) = authority
             .pending_connector_browser_attempt(&credential_identity)
             .map_err(McpOAuthError::Flow)?
@@ -2010,7 +2431,10 @@ impl McpOAuthAuthority {
             // `None`: the pending attempt no longer matches the server, or
             // its preflight is not retained; it was retired, so admit a
             // fresh one.
-            if let Some(joined) = self.join_pending_attempt(target, &state, record).await? {
+            if let Some(joined) = self
+                .join_pending_attempt(target, &state, record, start_deadline)
+                .await?
+            {
                 return Ok(joined);
             }
         }
@@ -2020,13 +2444,24 @@ impl McpOAuthAuthority {
         let occupant = self.slot_occupant(target).await?;
         let selection = attempt_selection(target, occupant.as_ref())?;
         let (mut discovery, requested) = self
-            .discover(target, www_authenticate, redirect_uri)
+            .discover(target, www_authenticate, start_deadline)
             .await?;
         // Before client registration and before the human is asked to
         // consent: an issuer the strategy cannot verify is refused here.
         // An unverified resource grant runs no account strategy.
         if !selection.is_unverified() {
-            strategy.preflight(&discovery.authorization_server).await?;
+            self.bounded_stage(
+                target,
+                McpOAuthNetworkStage::AccountPreflight,
+                start_deadline,
+                async {
+                    strategy
+                        .preflight(&discovery.authorization_server)
+                        .await
+                        .map_err(McpOAuthError::from)
+                },
+            )
+            .await?;
         }
         let client = match &occupant {
             // Reconnect with the admitted client: a fresh registration would
@@ -2055,8 +2490,13 @@ impl McpOAuthAuthority {
                 }
             }
             None => {
-                self.register_client(target, &discovery, redirect_uri, mode)
-                    .await?
+                self.bounded_stage(
+                    target,
+                    McpOAuthNetworkStage::ClientRegistration,
+                    start_deadline,
+                    self.register_client(target, &discovery, redirect_uri, mode),
+                )
+                .await?
             }
         };
         let context = McpOAuthCeremonyContext {
@@ -2170,6 +2610,7 @@ impl McpOAuthAuthority {
         target: &McpServerIdentity,
         state: &str,
         record: crate::oauth_flow::OAuthFlowRecord,
+        start_deadline: tokio::time::Instant,
     ) -> Result<Option<McpOAuthLoginStart>, McpOAuthError> {
         if !pending_attempt_matches(target, &record) || !preflight_receipt_retained(state) {
             // A failed retirement is propagated: no fresh attempt is admitted
@@ -2191,7 +2632,12 @@ impl McpOAuthAuthority {
         };
         let facts = connector.parameters();
         let endpoints = self
-            .discover_authorization_server(target, &facts.issuer)
+            .bounded_stage(
+                target,
+                McpOAuthNetworkStage::AuthorizationServerMetadata,
+                start_deadline,
+                self.discover_authorization_server(target, &facts.issuer),
+            )
             .await?;
         let offline_access = endpoints.offline_access;
         let discovery = completion_discovery(target, facts, endpoints)?;
@@ -2411,6 +2857,13 @@ impl McpOAuthAuthority {
                 Some(iss)
             }
         };
+        // Every network stage below ends by this deadline, never past the
+        // attempt's own validity: a later result would be refused anyway.
+        let completion_deadline = deadline_after(self.bounds.completion).min(
+            tokio::time::Instant::from_std(admitted.created_at + MCP_INTERACTIVE_LOGIN_TIMEOUT),
+        );
+        // The wake-up is registered before the attempt is verified, so a
+        // retirement is observed by the verify or by the stages below.
         let mut retire = AttemptRetireGuard {
             authority: Arc::clone(authority),
             state: state.clone(),
@@ -2419,6 +2872,7 @@ impl McpOAuthAuthority {
             redirect_uri: admitted.redirect_uri.clone(),
             armed: true,
             observed,
+            wake: AttemptWakeRegistration::register(&state),
         };
         // A registered completion names the admitted redirect byte for byte:
         // a mismatch is refused as what it is, and retires the attempt.
@@ -2461,8 +2915,16 @@ impl McpOAuthAuthority {
         // The admitted descriptor is the authority: the strategy's facts plus
         // the resource scopes selected when the attempt started.
         let descriptor: &ConnectorOAuthDescriptor = connector;
-        let endpoints = self
-            .discover_authorization_server(target, &facts.issuer)
+        let endpoints = retire
+            .unless_retired(
+                target,
+                self.bounded_stage(
+                    target,
+                    McpOAuthNetworkStage::AuthorizationServerMetadata,
+                    completion_deadline,
+                    self.discover_authorization_server(target, &facts.issuer),
+                ),
+            )
             .await?;
         // RFC 9207: a registered completion's response names the attempt's
         // own issuer, and a server that says it sends `iss` must have sent
@@ -2486,24 +2948,41 @@ impl McpOAuthAuthority {
             redirect_uri: record.redirect_uri.clone(),
         };
         let endpoints = mcp_oauth_endpoints(&discovery, &client);
-        let token = exchange_authorization_code_with_state(
-            self.http_for(target, &endpoints.token_url)?,
-            &endpoints,
-            &code,
-            &record.pkce_verifier,
-            None,
-            Some(&state),
-        )
-        .await
-        .map_err(|error| match error {
-            crate::auth_oauth::OAuthError::EgressRefused(refusal) => {
-                McpOAuthError::from_egress(target, HttpEgressError::Refused(refusal))
-            }
-            _ => McpOAuthError::TokenExchangeFailed {
-                server_name: target.server_name().to_owned(),
-                reason: "authorization-code exchange failed".into(),
-            },
-        })?;
+        let exchange = async {
+            exchange_authorization_code_with_state(
+                self.http_for(target, &endpoints.token_url)?,
+                &endpoints,
+                &code,
+                &record.pkce_verifier,
+                None,
+                Some(&state),
+            )
+            .await
+            .map_err(|error| match error {
+                crate::auth_oauth::OAuthError::EgressRefused(refusal) => {
+                    McpOAuthError::from_egress(target, HttpEgressError::Refused(refusal))
+                }
+                crate::auth_oauth::OAuthError::Timeout => McpOAuthError::NetworkTimedOut {
+                    server_name: target.server_name().to_owned(),
+                    stage: McpOAuthNetworkStage::TokenExchange,
+                },
+                _ => McpOAuthError::TokenExchangeFailed {
+                    server_name: target.server_name().to_owned(),
+                    reason: "authorization-code exchange failed".into(),
+                },
+            })
+        };
+        let token = retire
+            .unless_retired(
+                target,
+                self.bounded_stage(
+                    target,
+                    McpOAuthNetworkStage::TokenExchange,
+                    completion_deadline,
+                    exchange,
+                ),
+            )
+            .await?;
         let binding = McpCredentialBinding::for_descriptor(descriptor);
         let mut persisted = persisted_tokens_from_result(
             &token,
@@ -2520,13 +2999,28 @@ impl McpOAuthAuthority {
             persisted.scopes = grant.granted_scopes().iter().cloned().collect();
             grant.into()
         } else {
-            let evidence = descriptor
-                .verify_account(strategy.observe_account(descriptor, &token).await?, &token)?;
+            let observation = retire
+                .unless_retired(
+                    target,
+                    self.bounded_stage(
+                        target,
+                        McpOAuthNetworkStage::AccountEvidence,
+                        completion_deadline,
+                        async {
+                            strategy
+                                .observe_account(descriptor, &token)
+                                .await
+                                .map_err(McpOAuthError::from)
+                        },
+                    ),
+                )
+                .await?;
+            let evidence = descriptor.verify_account(observation, &token)?;
             persisted.account_id = Some(evidence.account().to_owned());
             persisted.scopes = evidence.granted_scopes().iter().cloned().collect();
             evidence.into()
         };
-        let committed = save_oauth_tokens_and_consume_browser_flow(
+        let commit = save_oauth_tokens_and_consume_browser_flow(
             self.provider_auth_persistence.clone(),
             self.auth_lease.clone(),
             credential_identity,
@@ -2537,9 +3031,25 @@ impl McpOAuthAuthority {
                 completion,
                 redirect_uri: record.redirect_uri.clone(),
             },
-        )
-        .await
-        .map_err(|error| map_coordinated_login_error(target, error))?;
+        );
+        // The commit's work is owned by the credential coordinator and runs to
+        // its own end; this completion observes it for a bounded time.
+        let observed_until = deadline_after(self.bounds.commit_observation);
+        let observed = retire
+            .unless_retired(target, async {
+                Ok(tokio::time::timeout_at(observed_until, commit).await)
+            })
+            .await?;
+        let committed = match observed {
+            Ok(Ok(committed)) => committed,
+            // Not observed to its end, or its owner was lost before it
+            // reported: the flow owner decides which side of the consume the
+            // commit is on.
+            Ok(Err(CredentialMutationError::Cancelled)) | Err(_) => {
+                return Err(retire.settle_unobserved_commit(target));
+            }
+            Ok(Err(error)) => return Err(map_coordinated_login_error(target, error)),
+        };
         // The commit consumed the attempt.
         retire.armed = false;
         if committed.primary_secret.is_none() {
@@ -2731,6 +3241,7 @@ impl McpOAuthAuthority {
         target: &McpServerIdentity,
         key: &TokenKey,
         guard: &meerkat_core::AuthLoginLifecycleGuard,
+        access: TokenStoreAccess,
     ) -> Result<Option<AdmittedMcpCredential>, McpOAuthError> {
         if guard.lease_key() != &target.lease_key()? {
             return Err(McpOAuthError::AuthLifecycle {
@@ -2740,7 +3251,7 @@ impl McpOAuthAuthority {
         }
         let Some(mut tokens) = self
             .token_store()
-            .load_for(key, TokenStoreAccess::Unattended)
+            .load_for(key, access)
             .await
             .map_err(mcp_store_error)?
         else {
@@ -2889,7 +3400,7 @@ impl McpOAuthAuthority {
             .await
             .ok_or_else(lifecycle_owner_busy)?;
         let mut admitted = self
-            .load_admitted_stored_credential(target, key, &_guard)
+            .load_admitted_stored_credential(target, key, &_guard, TokenStoreAccess::Unattended)
             .await
             .map_err(refresh_error_from_mcp)?
             .ok_or_else(|| {
@@ -2908,7 +3419,7 @@ impl McpOAuthAuthority {
         .is_some()
         {
             admitted = self
-                .load_admitted_stored_credential(target, key, &_guard)
+                .load_admitted_stored_credential(target, key, &_guard, TokenStoreAccess::Unattended)
                 .await
                 .map_err(refresh_error_from_mcp)?
                 .ok_or(RefreshError::StalePreparation)?;
@@ -2991,13 +3502,20 @@ impl McpOAuthAuthority {
             extra_headers: Vec::new(),
         };
         drop(_guard);
-        let exchange = exchange_refresh_token(
-            http,
-            &endpoints,
-            &refresh_token,
-            metadata.client.client_secret.as_deref(),
+        // Bounded like a login stage: a token endpoint that never answers
+        // ends as a request timeout (a transient failure), so this refresh
+        // never holds the credential's exclusive mutation without bound.
+        let exchange = tokio::time::timeout(
+            self.bounds.stage,
+            exchange_refresh_token(
+                http,
+                &endpoints,
+                &refresh_token,
+                metadata.client.client_secret.as_deref(),
+            ),
         )
-        .await;
+        .await
+        .unwrap_or(Err(crate::auth_oauth::OAuthError::Timeout));
         let _guard = meerkat_core::acquire_auth_login_lifecycle_guard(&lease_key).await;
         let current_tokens = match self
             .token_store()
@@ -3262,9 +3780,18 @@ impl McpOAuthAuthority {
                 "installed MCP OAuth account strategy differs from the bound one",
             ));
         }
-        strategy
-            .observe_account(&descriptor, refreshed)
-            .await
+        // Bounded like a login stage: unavailable evidence, never a mismatch.
+        let Ok(observed) = tokio::time::timeout(
+            self.bounds.stage,
+            strategy.observe_account(&descriptor, refreshed),
+        )
+        .await
+        else {
+            return Err(unobserved(
+                "refreshed MCP OAuth subject was not observed within its bound",
+            ));
+        };
+        observed
             .map(|observation| observation.account)
             .map_err(|refusal| SubjectUnobserved {
                 reason: "refreshed MCP OAuth subject could not be observed",
@@ -3384,47 +3911,24 @@ impl McpOAuthAuthority {
         }
     }
 
+    /// Discover the protected resource's authorization server and its
+    /// endpoints: the resource metadata stage, then the authorization-server
+    /// metadata stage, each bounded, and both by `start_deadline`.
     async fn discover(
         &self,
         target: &McpServerIdentity,
         www_authenticate: Option<&str>,
-        _redirect_uri: &str,
+        start_deadline: tokio::time::Instant,
     ) -> Result<(StoredMcpOAuthDiscovery, RequestedScopes), McpOAuthError> {
         require_https_or_loopback(target, target.server_url(), "MCP protected resource")?;
-        let resource_metadata_url = match www_authenticate.and_then(resource_metadata_from_header) {
-            Some(value) => absolutize_url(target.server_url(), &value).map_err(|error| {
-                McpOAuthError::DiscoveryFailed {
-                    server_name: target.server_name().to_string(),
-                    reason: error,
-                }
-            })?,
-            None => {
-                self.discover_resource_metadata_url_by_well_known(target)
-                    .await?
-            }
-        };
-        let resource: ProtectedResourceMetadata = self
-            .http_for(target, &resource_metadata_url)?
-            .get(resource_metadata_url.clone())
-            .send()
-            .await
-            .map_err(|error| {
-                oauth_send_error(target, error, |error| McpOAuthError::DiscoveryFailed {
-                    server_name: target.server_name().to_string(),
-                    reason: error.to_string(),
-                })
-            })?
-            .error_for_status_refusing_redirects()
-            .map_err(|error| McpOAuthError::DiscoveryFailed {
-                server_name: target.server_name().to_string(),
-                reason: error,
-            })?
-            .json()
-            .await
-            .map_err(|error| McpOAuthError::DiscoveryFailed {
-                server_name: target.server_name().to_string(),
-                reason: format!("decode protected resource metadata: {error}"),
-            })?;
+        let (resource_metadata_url, resource) = self
+            .bounded_stage(
+                target,
+                McpOAuthNetworkStage::ResourceMetadata,
+                start_deadline,
+                self.fetch_protected_resource_metadata(target, www_authenticate),
+            )
+            .await?;
         if resource.resource != target.server_url() {
             return Err(McpOAuthError::DiscoveryFailed {
                 server_name: target.server_name().to_string(),
@@ -3444,7 +3948,12 @@ impl McpOAuthAuthority {
                 reason: "protected resource metadata has no authorization_servers".to_string(),
             })?;
         let endpoints = self
-            .discover_authorization_server(target, &auth_server)
+            .bounded_stage(
+                target,
+                McpOAuthNetworkStage::AuthorizationServerMetadata,
+                start_deadline,
+                self.discover_authorization_server(target, &auth_server),
+            )
             .await?;
         let requested = RequestedScopes {
             resource_scopes: select_resource_scopes(www_authenticate, &resource.scopes_supported),
@@ -3465,6 +3974,57 @@ impl McpOAuthAuthority {
         ))
     }
 
+    /// The protected resource's metadata URL (from the challenge, or the
+    /// first well-known candidate that answers) and its document.
+    async fn fetch_protected_resource_metadata(
+        &self,
+        target: &McpServerIdentity,
+        www_authenticate: Option<&str>,
+    ) -> Result<(String, ProtectedResourceMetadata), McpOAuthError> {
+        let stage = McpOAuthNetworkStage::ResourceMetadata;
+        let resource_metadata_url = match www_authenticate.and_then(resource_metadata_from_header) {
+            Some(value) => absolutize_url(target.server_url(), &value).map_err(|error| {
+                McpOAuthError::DiscoveryFailed {
+                    server_name: target.server_name().to_string(),
+                    reason: error,
+                }
+            })?,
+            None => {
+                self.discover_resource_metadata_url_by_well_known(target)
+                    .await?
+            }
+        };
+        let resource: ProtectedResourceMetadata = self
+            .http_for(target, &resource_metadata_url)?
+            .get(resource_metadata_url.clone())
+            .send()
+            .await
+            .map_err(|error| {
+                oauth_send_error(target, stage, error, |error| {
+                    McpOAuthError::DiscoveryFailed {
+                        server_name: target.server_name().to_string(),
+                        reason: error.to_string(),
+                    }
+                })
+            })?
+            .error_for_status_refusing_redirects()
+            .map_err(|error| McpOAuthError::DiscoveryFailed {
+                server_name: target.server_name().to_string(),
+                reason: error,
+            })?
+            .json()
+            .await
+            .map_err(|error| {
+                oauth_send_error(target, stage, error, |error| {
+                    McpOAuthError::DiscoveryFailed {
+                        server_name: target.server_name().to_string(),
+                        reason: format!("decode protected resource metadata: {error}"),
+                    }
+                })
+            })?;
+        Ok((resource_metadata_url, resource))
+    }
+
     /// Fetch and validate the authorization-server metadata of `auth_server`:
     /// RFC 8414, then OpenID Connect discovery when the RFC 8414 document is
     /// absent (see [`authorization_server_metadata_urls`]). The first document
@@ -3478,6 +4038,7 @@ impl McpOAuthAuthority {
         let auth_server = auth_server.to_owned();
         require_https_or_loopback(target, &auth_server, "authorization server issuer")?;
         let mut found = None;
+        let stage = McpOAuthNetworkStage::AuthorizationServerMetadata;
         for candidate in authorization_server_metadata_urls(&auth_server)? {
             let response = self
                 .http_for(target, &candidate)?
@@ -3485,9 +4046,11 @@ impl McpOAuthAuthority {
                 .send()
                 .await
                 .map_err(|error| {
-                    oauth_send_error(target, error, |error| McpOAuthError::DiscoveryFailed {
-                        server_name: target.server_name().to_string(),
-                        reason: error.to_string(),
+                    oauth_send_error(target, stage, error, |error| {
+                        McpOAuthError::DiscoveryFailed {
+                            server_name: target.server_name().to_string(),
+                            reason: error.to_string(),
+                        }
                     })
                 })?;
             // Only an absent document moves on to the next well-known URI;
@@ -3516,9 +4079,13 @@ impl McpOAuthAuthority {
             })?
             .json()
             .await
-            .map_err(|error| McpOAuthError::DiscoveryFailed {
-                server_name: target.server_name().to_string(),
-                reason: format!("decode authorization server metadata: {error}"),
+            .map_err(|error| {
+                oauth_send_error(target, stage, error, |error| {
+                    McpOAuthError::DiscoveryFailed {
+                        server_name: target.server_name().to_string(),
+                        reason: format!("decode authorization server metadata: {error}"),
+                    }
+                })
             })?;
         if auth.issuer != auth_server {
             return Err(McpOAuthError::DiscoveryFailed {
@@ -3595,15 +4162,22 @@ impl McpOAuthAuthority {
                 .await;
             match response {
                 Ok(response) if response.status().is_success() => return Ok(candidate),
-                // The egress profile's own resolver refusal is typed; it is
-                // never taken as an absent document.
-                Err(error) if crate::http_egress::egress_refusal_in(&error).is_some() => {
-                    return Err(oauth_send_error(target, error, |_| {
-                        McpOAuthError::DiscoveryFailed {
+                // The egress profile's own resolver refusal is typed, and so is
+                // a probe that passed its client's bound; neither is ever taken
+                // as an absent document.
+                Err(error)
+                    if crate::http_egress::egress_refusal_in(&error).is_some()
+                        || error.is_timeout() =>
+                {
+                    return Err(oauth_send_error(
+                        target,
+                        McpOAuthNetworkStage::ResourceMetadata,
+                        error,
+                        |_| McpOAuthError::DiscoveryFailed {
                             server_name: target.server_name().to_string(),
                             reason: "egress refusal".to_string(),
-                        }
-                    }));
+                        },
+                    ));
                 }
                 _ => {}
             }
@@ -3644,10 +4218,15 @@ impl McpOAuthAuthority {
             .send()
             .await
             .map_err(|error| {
-                oauth_send_error(target, error, |error| McpOAuthError::RegistrationFailed {
-                    server_name: target.server_name().to_string(),
-                    reason: error.to_string(),
-                })
+                oauth_send_error(
+                    target,
+                    McpOAuthNetworkStage::ClientRegistration,
+                    error,
+                    |error| McpOAuthError::RegistrationFailed {
+                        server_name: target.server_name().to_string(),
+                        reason: error.to_string(),
+                    },
+                )
             })?
             .error_for_status_refusing_redirects()
             .map_err(|error| McpOAuthError::RegistrationFailed {
@@ -3656,9 +4235,16 @@ impl McpOAuthAuthority {
             })?
             .json()
             .await
-            .map_err(|error| McpOAuthError::RegistrationFailed {
-                server_name: target.server_name().to_string(),
-                reason: format!("decode: {error}"),
+            .map_err(|error| {
+                oauth_send_error(
+                    target,
+                    McpOAuthNetworkStage::ClientRegistration,
+                    error,
+                    |error| McpOAuthError::RegistrationFailed {
+                        server_name: target.server_name().to_string(),
+                        reason: format!("decode: {error}"),
+                    },
+                )
             })?;
         let token_endpoint_auth_method =
             wire.token_endpoint_auth_method
@@ -3726,7 +4312,7 @@ fn verify_stored_account(
     }
 }
 
-/// See [`verify_stored_account`]. Hosts use it to project status from a
+/// See `verify_stored_account`. Hosts use it to project status from a
 /// stored credential without admitting it.
 pub fn stored_credential_matches_selection(
     target: &McpServerIdentity,
@@ -3849,12 +4435,15 @@ fn preflight_receipt_retained(state: &str) -> bool {
         .contains_key(OAuthBrowserActionRef::project(state).as_str())
 }
 
-/// Process-local wake-ups for loopback waits, keyed by the non-secret
-/// reference of the attempt's state. A wake-up is only a signal: the flow
-/// owner stays the single retirement authority, and [`retire_attempt`] sends
-/// one only after the owner confirmed the retirement. Shared by every
-/// `McpOAuthAuthority` in the process, including request-scoped ones.
-type AttemptWakers = std::collections::HashMap<String, (u64, tokio::sync::watch::Sender<bool>)>;
+/// Process-local wake-ups for an attempt's waiters (a loopback login's
+/// callback wait, and the completion it or a host entered), keyed by the
+/// non-secret reference of the attempt's state. A wake-up is only a signal:
+/// the flow owner stays the single retirement authority, and
+/// [`retire_attempt`] sends one only after the owner confirmed the
+/// retirement. One sender per attempt, shared by all of its waiters, with the
+/// number of waiters registered; it is removed with the last one. Shared by
+/// every `McpOAuthAuthority` in the process, including request-scoped ones.
+type AttemptWakers = std::collections::HashMap<String, (usize, tokio::sync::watch::Sender<bool>)>;
 
 fn attempt_wakers() -> &'static parking_lot::Mutex<AttemptWakers> {
     static WAKERS: std::sync::OnceLock<parking_lot::Mutex<AttemptWakers>> =
@@ -3862,28 +4451,30 @@ fn attempt_wakers() -> &'static parking_lot::Mutex<AttemptWakers> {
     WAKERS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// One pending login's wake-up registration. Dropping it removes only this
-/// registration, never a later one for the same reference.
+/// One waiter's wake-up registration for an attempt. Every waiter of the
+/// attempt subscribes to the same sender, so a second registration never
+/// displaces the first; dropping one removes only its own share.
 struct AttemptWakeRegistration {
     key: String,
-    id: u64,
     retired: tokio::sync::watch::Receiver<bool>,
 }
 
 impl AttemptWakeRegistration {
     fn register(state: &str) -> Self {
-        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let key = OAuthBrowserActionRef::project(state).as_str().to_owned();
-        let (sender, retired) = tokio::sync::watch::channel(false);
-        attempt_wakers().lock().insert(key.clone(), (id, sender));
-        Self { key, id, retired }
+        let mut wakers = attempt_wakers().lock();
+        let (waiters, sender) = wakers
+            .entry(key.clone())
+            .or_insert_with(|| (0, tokio::sync::watch::channel(false).0));
+        *waiters += 1;
+        let retired = sender.subscribe();
+        Self { key, retired }
     }
 
     /// Resolves once a confirmed retirement of this attempt was signalled.
     async fn retired(&mut self) {
         if self.retired.wait_for(|retired| *retired).await.is_err() {
-            // The sender is owned by this registration's own entry; a closed
+            // The sender lives while this registration does; a closed
             // channel never means retirement.
             std::future::pending::<()>().await;
         }
@@ -3893,8 +4484,11 @@ impl AttemptWakeRegistration {
 impl Drop for AttemptWakeRegistration {
     fn drop(&mut self) {
         let mut wakers = attempt_wakers().lock();
-        if wakers.get(&self.key).is_some_and(|(id, _)| *id == self.id) {
-            wakers.remove(&self.key);
+        if let Some((waiters, _)) = wakers.get_mut(&self.key) {
+            *waiters = waiters.saturating_sub(1);
+            if *waiters == 0 {
+                wakers.remove(&self.key);
+            }
         }
     }
 }
@@ -3911,13 +4505,19 @@ fn retire_attempt(
     redirect_uri: &str,
 ) -> Result<(), OAuthFlowError> {
     authority.expire(state, target, identity, redirect_uri)?;
+    wake_attempt_waiters(state);
+    Ok(())
+}
+
+/// Wake every waiter of the attempt admitted under `state`. Only a confirmed
+/// retirement calls it.
+fn wake_attempt_waiters(state: &str) {
     if let Some((_, sender)) = attempt_wakers()
         .lock()
         .get(OAuthBrowserActionRef::project(state).as_str())
     {
         sender.send_replace(true);
     }
-    Ok(())
 }
 
 /// Serializes start-or-join per MCP target within this process, so a target
@@ -4264,6 +4864,19 @@ fn map_coordinated_login_error(
         },
         CredentialMutationError::CredentialAccess { refusal, detail } => {
             McpOAuthError::CredentialAccess { refusal, detail }
+        }
+        // The commit failed after it consumed the attempt and could not
+        // restore the previous credential and lifecycle: what is stored is
+        // known only from a read of the stored credential.
+        CredentialMutationError::RollbackFailed(reason) => {
+            tracing::warn!(
+                mcp_server = %target.server_name(),
+                %reason,
+                "MCP OAuth credential commit failed and its rollback failed; the stored credential is unsettled"
+            );
+            McpOAuthError::CommitUnsettled {
+                server_name: target.server_name().to_string(),
+            }
         }
     }
 }
@@ -6063,6 +6676,38 @@ mod tests {
         }
     }
 
+    /// A loopback wait and the completion it entered both register for the
+    /// same attempt: one confirmed retirement wakes both, and one waiter's
+    /// departure never takes the other's registration with it.
+    #[tokio::test]
+    async fn a_confirmed_retirement_wakes_every_waiter_of_the_attempt() {
+        let bound = Duration::from_secs(5);
+        let mut wait = AttemptWakeRegistration::register("fan-out-state");
+        let mut completion = AttemptWakeRegistration::register("fan-out-state");
+        wake_attempt_waiters("fan-out-state");
+        tokio::time::timeout(bound, wait.retired())
+            .await
+            .expect("the wait is woken");
+        tokio::time::timeout(bound, completion.retired())
+            .await
+            .expect("the completion is woken");
+
+        let mut remaining = AttemptWakeRegistration::register("fan-out-later");
+        drop(AttemptWakeRegistration::register("fan-out-later"));
+        wake_attempt_waiters("fan-out-later");
+        tokio::time::timeout(bound, remaining.retired())
+            .await
+            .expect("the remaining waiter is still registered");
+        drop(remaining);
+        let key = OAuthBrowserActionRef::project("fan-out-later")
+            .as_str()
+            .to_owned();
+        assert!(
+            !attempt_wakers().lock().contains_key(&key),
+            "the last waiter removes the entry"
+        );
+    }
+
     #[test]
     fn a_close_reports_its_own_retirement_result_without_inference() {
         assert!(matches!(
@@ -6176,7 +6821,11 @@ mod tests {
             format!("http://127.0.0.1:{port}/mcp"),
         );
         let result = authority
-            .discover(&target, None, "http://127.0.0.1:1/callback")
+            .discover(
+                &target,
+                None,
+                tokio::time::Instant::now() + MCP_OAUTH_START_BOUND,
+            )
             .await;
         assert!(
             matches!(

@@ -210,7 +210,9 @@ impl PersistentRuntimeDriver {
             }
             PreparedProvisionalPromotion::HeadCanonical(promotion) => {
                 PreparedRuntimeSessionCommit::promote_head_canonical_success(
-                    promotion,
+                    promotion.with_deferred_transcript_retirement(
+                        session.deferred_transcript_retirement(),
+                    ),
                     receipt,
                     input_updates,
                     owner_session_id,
@@ -252,7 +254,9 @@ impl PersistentRuntimeDriver {
             }
             PreparedProvisionalPromotion::HeadCanonical(promotion) => {
                 PreparedRuntimeSessionCommit::promote_head_canonical_machine_terminal(
-                    promotion,
+                    promotion.with_deferred_transcript_retirement(
+                        session.deferred_transcript_retirement(),
+                    ),
                     receipt,
                     machine_lifecycle,
                     input_updates,
@@ -1568,7 +1572,9 @@ impl PersistentRuntimeDriver {
                     }
                     Ok(PreparedProvisionalPromotion::HeadCanonical(promotion)) => {
                         PreparedRuntimeSessionCommit::promote_head_canonical_service_turn_terminal(
-                            promotion,
+                            promotion.with_deferred_transcript_retirement(
+                                session.deferred_transcript_retirement(),
+                            ),
                             receipt,
                             commit,
                             owner_session_id,

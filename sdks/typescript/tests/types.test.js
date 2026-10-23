@@ -4713,6 +4713,49 @@ describe("Mob surface fail-closed status parsing (DOGMA Rule 6)", () => {
       assert.equal(mobs.length, 1);
       assert.equal(mobs[0].mobId, "mob-1");
       assert.equal(mobs[0].status, "running");
+      assert.equal(
+        Object.hasOwn(mobs[0], "failure"),
+        false,
+        "a mob whose actor runs is listed without a failure",
+      );
+    });
+
+    it("keeps a stopped mob's typed failure next to its last phase", async () => {
+      const client = mobListClient({
+        mobs: [
+          {
+            mob_id: "mob-1",
+            status: "Running",
+            failure: {
+              cause: "internal",
+              message: "the mob's actor stopped",
+              code: "INTERNAL_ERROR",
+              structured_data: { kind: "durability_fail_stop" },
+            },
+          },
+        ],
+      });
+      const mobs = await client.listMobs();
+      assert.equal(mobs[0].status, "Running");
+      assert.deepEqual(mobs[0].failure, {
+        cause: "internal",
+        message: "the mob's actor stopped",
+        code: "INTERNAL_ERROR",
+        structuredData: { kind: "durability_fail_stop" },
+      });
+    });
+
+    it("rejects a failure without its cause", async () => {
+      const client = mobListClient({
+        mobs: [{ mob_id: "mob-1", status: "Running", failure: { message: "stopped" } }],
+      });
+      await assert.rejects(
+        () => client.listMobs(),
+        (error) =>
+          error instanceof MeerkatError &&
+          error.code === "INVALID_RESPONSE" &&
+          /failure: missing cause/.test(String(error.message)),
+      );
     });
 
     it("rejects an absent status instead of coalescing to empty string", async () => {
