@@ -1747,7 +1747,11 @@ impl SpiMobStoreHost {
     }
 
     /// Every storage the realm held when this host claimed the mob
-    /// families, with its pinned summary, plus every storage opened since.
+    /// families, with its pinned summary, plus every storage opened since,
+    /// less every storage removed since. The summaries are the ones read at
+    /// the claim (a storage first opened since has none): a mob created or
+    /// destroyed in this process does not update them, and a reopened realm
+    /// reads them again.
     #[must_use]
     pub fn stored_mobs(&self) -> Vec<SpiStoredMob> {
         lock_std(&self.inner.stored).values().cloned().collect()
