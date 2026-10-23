@@ -168,6 +168,13 @@ max-threads = 1
 filter = 'binary(agent_builder_policy_canary) and test(/^downstream_/)'
 test-group = 'downstream-cargo-canary'
 
+[[profile.default.overrides]]
+# meerkat-mob's long run conformance: each chapter test runs every row over a
+# fresh store, with a killed child process and a restart per row, so a test
+# takes minutes. The default profile's overrides apply to every profile.
+filter = 'binary(long_run_conformance)'
+slow-timeout = { period = "120s", terminate-after = 10 }
+
 [[profile.fast.overrides]]
 # Mirrors the default override above, as the cohort overrides below do.
 filter = 'binary(agent_builder_policy_canary) and test(/^downstream_/)'
