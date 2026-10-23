@@ -139,7 +139,8 @@ since 0.9.5 `.with_queued_inputs(QueuedInputsOnShutdown::Requeue(max_age))`
 keeps durable queued prompts that are neither directed nor bound to an
 objective (never a member's kickoff) for the next start, whose waiters get
 `BoundedTurnFailure::RequeuedAcrossStop`, or `RequeueExpired` when older than
-`max_age` at that start)
+`max_age` at that start; a persistent member's running turn is kept too and
+continues from its last committed round at that start)
 returns a `MobShutdownReport` with per-member `members`
 (`MemberShutdownOutcome`), `runs` and `run_starts`; `is_clean()` is true when
 every member is `Unregistered`. Since 0.9.4 `UnregisterPending { stage,

@@ -1369,14 +1369,20 @@ with `HandlingMode::Queue` is. It
 stays in the member's input store, its waiter ends with
 `BoundedTurnFailure::RequeuedAcrossStop`, and the mob's next start runs it
 once, in admission order, before new work; a same-key replay after the
-restart re-attaches to its result. Do not resubmit it. The cancelled
-turn's user message is not in what the kept input's turn sees. If it is older than
+restart re-attaches to its result. Do not resubmit it. If it is older than
 `max_age`, measured from its admission, when a start finds it still queued
 (every such start checks again), it
 ends as abandoned (`requeue_expired`) without running, and a same-key replay
 answers `BoundedTurnFailure::RequeueExpired`: resubmit it if it is still
-wanted. The running turn's own input still ends cancelled, and steer,
-ephemeral, event, directed and objective-bound inputs still end as stopped. A
+wanted. On a member whose session is persistent, the running turn is kept
+too: it stops at once, its inputs stay bound to its run with the same waiter
+answer and the same max age, and the run continues from its last committed
+round at the next start, before the kept inputs run (see
+[Durable runs: graceful stops and deploys](/guides/durable-runs#graceful-stops-and-deploys)).
+On any other member the running turn's own input still ends cancelled, and
+the cancelled turn's user message is not in what the kept input's turn sees.
+Steer, ephemeral, event, directed and objective-bound inputs that are not
+bound to the running turn's run still end as stopped. A
 member's kickoff is bound to its objective, so a kickoff still queued at a
 requeue Shutdown ends as stopped and is recorded failed, as with `Stop`.
 `QueuedInputsOnShutdown::Stop`, the default, ends every queued input as

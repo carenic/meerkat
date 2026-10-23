@@ -387,6 +387,16 @@ Contract and limits: `docs/guides/durable-runs.mdx`.
   whose process custody shows the process may have run, a Core comms tool
   that sends to another agent (every comms tool but `peers`), and a call that
   would run detached under a runner that declares itself non-resumable.
+- Graceful stop for a deploy: an unregister with
+  `UnregisterQueuedInputs::Requeue { max_age }` (or a mob Shutdown with
+  `QueuedInputsOnShutdown::Requeue(max_age)`) keeps a durable session's run
+  in flight like a crash: the turn stops at once (work since the last round
+  commit is redone), its inputs stay bound with waiters answered
+  `requeued_across_stop`, and the run continues at the next open, before
+  the kept queued prompts; inputs older than `max_age` (from admission) at
+  that start end `requeue_expired` instead. No Requeue, an explicit
+  stop/cancel, retire, destroy, reset, or a session without per-round
+  commits still ends the run.
 - Durable workers and the mob resume gate: `references/mobs.md`. Realms in a
   host's own database: `references/sessions_runtime_surfaces_storage_config.md`.
 
