@@ -55,3 +55,37 @@ fn run_in_child_process(test: &str) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// A process this test spawns that holds a copy of one of the test's
+/// descriptors, as its standard input, until it is dropped: what any process
+/// spawned meanwhile holds until it executes its program, kept for as long as
+/// the test needs.
+#[cfg(unix)]
+pub(crate) struct DescriptorCopy(std::process::Child);
+
+#[cfg(unix)]
+impl DescriptorCopy {
+    /// Spawn a process holding a copy of `file`'s descriptor.
+    pub(crate) fn spawn(file: &std::fs::File) -> Self {
+        let copy = file
+            .try_clone()
+            .unwrap_or_else(|error| panic!("a copy of the descriptor: {error}"));
+        #[allow(clippy::disallowed_methods)] // the test's own process, which holds the copy
+        let child = std::process::Command::new("sleep")
+            .arg("600")
+            .stdin(copy)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap_or_else(|error| panic!("a process holding the copy: {error}"));
+        Self(child)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DescriptorCopy {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}

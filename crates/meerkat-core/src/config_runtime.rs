@@ -705,31 +705,36 @@ tier = \"r2\"\n";
         .await;
     }
 
-    /// Why those tests run alone: custody belongs to the open file
-    /// description, so a copy of the holder's descriptor (what a process
-    /// spawned meanwhile holds until it executes its program) keeps the
-    /// custody after the holder released it, until the copy is gone.
+    /// Custody belongs to the open file description, which every copy of the
+    /// holder's descriptor shares: one this process holds, and the one a
+    /// process spawned meanwhile holds until it executes its program.
+    /// Releasing custody unlocks it, so a released custody is free while such
+    /// copies are still open, for writers and readers alike.
+    #[cfg(unix)]
     #[tokio::test]
-    async fn a_copy_of_the_holders_descriptor_keeps_the_custody() {
-        crate::process_isolation_tests::alone_in_child_process_async(
-            "config_runtime::tests::a_copy_of_the_holders_descriptor_keeps_the_custody",
-            async {
-                let temp = tempfile::tempdir().unwrap();
-                let path = temp.path().join("config_state.lock");
-                let held = ConfigWriterLock::acquire(&path).await.unwrap();
-                let copy = held._file.try_clone().unwrap();
-                drop(held);
-                assert!(
-                    ConfigWriterLock::try_hold(&path).unwrap().is_none(),
-                    "the copy still holds the released custody"
-                );
-                drop(copy);
-                ConfigWriterLock::try_hold(&path)
-                    .unwrap()
-                    .expect("free once the copy is gone");
-            },
-        )
-        .await;
+    async fn a_released_custody_is_free_while_a_copy_of_its_descriptor_is_open() {
+        use crate::process_isolation_tests::DescriptorCopy;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config_state.lock");
+
+        let writer = ConfigWriterLock::acquire(&path).await.unwrap();
+        let copy = writer._file.try_clone().unwrap();
+        let spawned = DescriptorCopy::spawn(&writer._file);
+        drop(writer);
+        let writer = ConfigWriterLock::try_hold(&path)
+            .unwrap()
+            .expect("a released writer custody is free while copies of its descriptor are open");
+        drop(writer);
+        drop((copy, spawned));
+
+        let reader = ConfigReadLock::acquire(&path).await.unwrap();
+        let copy = reader._file.try_clone().unwrap();
+        let spawned = DescriptorCopy::spawn(&reader._file);
+        drop(reader);
+        ConfigWriterLock::try_hold(&path)
+            .unwrap()
+            .expect("a released reader custody is free while copies of its descriptor are open");
+        drop((copy, spawned));
     }
 
     #[tokio::test]

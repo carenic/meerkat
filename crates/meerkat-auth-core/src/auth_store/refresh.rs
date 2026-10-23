@@ -663,6 +663,66 @@ mod file_lock {
             self.inner.with_forced_refresh(key, refresh_fn).await
         }
     }
+
+    #[cfg(test)]
+    #[allow(clippy::expect_used, clippy::panic)]
+    mod tests {
+        use super::*;
+
+        /// A process this test spawns that holds a copy of one of the test's
+        /// descriptors, as its standard input, until it is dropped: what any process
+        /// spawned meanwhile holds until it executes its program, kept for as long as
+        /// the test needs.
+        #[cfg(unix)]
+        struct DescriptorCopy(std::process::Child);
+
+        #[cfg(unix)]
+        impl DescriptorCopy {
+            /// Spawn a process holding a copy of `file`'s descriptor.
+            fn spawn(file: &std::fs::File) -> Self {
+                let copy = file.try_clone().expect("a copy of the descriptor");
+                #[allow(clippy::disallowed_methods)] // the test's own process, which holds the copy
+                let child = std::process::Command::new("sleep")
+                    .arg("600")
+                    .stdin(copy)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("a process holding the copy");
+                Self(child)
+            }
+        }
+
+        #[cfg(unix)]
+        impl Drop for DescriptorCopy {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        /// A refresh lock dropped without its explicit release (a refresh
+        /// cancelled while it held the lock) is free at once while a process
+        /// spawned meanwhile still holds a copy of its descriptor.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_dropped_lock_is_free_while_a_spawned_process_holds_its_descriptor() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let lock_path = dir.path().join("dev--binding.lock");
+            let Ok(lock) = acquire_lock_file(dir.path(), &lock_path, Duration::ZERO).await else {
+                panic!("the lock");
+            };
+            let copy = DescriptorCopy::spawn(&lock);
+            drop(lock);
+            assert!(
+                acquire_lock_file(dir.path(), &lock_path, Duration::ZERO)
+                    .await
+                    .is_ok(),
+                "a dropped lock is free while a spawned process holds a copy of its descriptor"
+            );
+            drop(copy);
+        }
+    }
 }
 
 #[cfg(test)]

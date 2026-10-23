@@ -564,6 +564,13 @@ impl FileGrantOwnerStore {
         self.durability == GrantStoreDurability::OsCrash
     }
 
+    /// Test-only: a copy of the lease writer's descriptor while this store
+    /// holds the lease. It shares the writer's open file description.
+    #[cfg(test)]
+    pub(super) fn writer_descriptor_copy(&self) -> Option<std::fs::File> {
+        self.writer.lock().ok()?.as_ref()?.file.try_clone().ok()
+    }
+
     fn open_locked(&self) -> std::io::Result<std::fs::File> {
         let file = std::fs::OpenOptions::new()
             .read(true)

@@ -8420,4 +8420,60 @@ mod tests {
         );
         Ok(())
     }
+
+    /// A process this test spawns that holds a copy of one of the test's
+    /// descriptors, as its standard input, until it is dropped: what any process
+    /// spawned meanwhile holds until it executes its program, kept for as long as
+    /// the test needs.
+    #[cfg(unix)]
+    struct DescriptorCopy(std::process::Child);
+
+    #[cfg(unix)]
+    impl DescriptorCopy {
+        /// Spawn a process holding a copy of `file`'s descriptor.
+        fn spawn(file: &std::fs::File) -> Self {
+            let copy = file.try_clone().expect("a copy of the descriptor");
+            #[allow(clippy::disallowed_methods)] // the test's own process, which holds the copy
+            let child = std::process::Command::new("sleep")
+                .arg("600")
+                .stdin(copy)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("a process holding the copy");
+            Self(child)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for DescriptorCopy {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A released sequence lock is free at once while a process spawned
+    /// meanwhile still holds a copy of its descriptor.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_released_sequence_lock_is_free_while_a_spawned_process_holds_its_descriptor() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.seq.lock");
+        let lock = FileEventStore::lock_sequence_file(path.clone())
+            .await
+            .unwrap();
+        let copy = DescriptorCopy::spawn(&lock._lock);
+        drop(lock);
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(
+            probe.try_lock().is_ok(),
+            "a released sequence lock is free while a spawned process holds a copy of its descriptor"
+        );
+        drop(copy);
+    }
 }

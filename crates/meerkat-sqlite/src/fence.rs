@@ -664,4 +664,98 @@ mod tests {
             "nothing planted"
         );
     }
+
+    /// A process this test spawns that holds a copy of one of the test's
+    /// descriptors, as its standard input, until it is dropped: what any process
+    /// spawned meanwhile holds until it executes its program, kept for as long as
+    /// the test needs.
+    #[cfg(unix)]
+    struct DescriptorCopy(std::process::Child);
+
+    #[cfg(unix)]
+    impl DescriptorCopy {
+        /// Spawn a process holding a copy of `file`'s descriptor.
+        fn spawn(file: &std::fs::File) -> Self {
+            let copy = file.try_clone().expect("a copy of the descriptor");
+            #[allow(clippy::disallowed_methods)] // the test's own process, which holds the copy
+            let child = std::process::Command::new("sleep")
+                .arg("600")
+                .stdin(copy)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("a process holding the copy");
+            Self(child)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for DescriptorCopy {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A released fence is free at once while a process spawned meanwhile
+    /// still holds copies of its descriptors: operations pass, a connection
+    /// can be kept, and the fence can be taken again.
+    #[cfg(unix)]
+    #[test]
+    fn a_released_fence_is_free_while_a_spawned_process_holds_its_descriptors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = existing_database(dir.path());
+        let fence = ExclusiveFence::try_acquire(&db)
+            .expect("fence")
+            .expect("the fence is free");
+        let copies = [
+            DescriptorCopy::spawn(&fence._lock),
+            DescriptorCopy::spawn(&fence._presence),
+        ];
+        drop(fence);
+        OperationGuard::for_database(&db).expect("an operation passes a released fence");
+        assert!(
+            KeptConnectionPresence::acquire(&db).is_some(),
+            "a connection can be kept once the fence is released"
+        );
+        assert!(
+            ExclusiveFence::try_acquire(&db).expect("fence").is_some(),
+            "a released fence can be taken again"
+        );
+        drop(copies);
+    }
+
+    /// A released operation guard leaves the fence free at once while a
+    /// process spawned meanwhile still holds a copy of its descriptor.
+    #[cfg(unix)]
+    #[test]
+    fn a_released_operation_guard_is_free_while_a_spawned_process_holds_its_descriptor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = existing_database(dir.path());
+        let guard = OperationGuard::for_database(&db).expect("guard");
+        let copy = DescriptorCopy::spawn(guard._lock.as_ref().expect("a held guard"));
+        drop(guard);
+        assert!(
+            ExclusiveFence::try_acquire(&db).expect("fence").is_some(),
+            "the fence is free once the guard is released"
+        );
+        drop(copy);
+    }
+
+    /// A released presence leaves the fence free at once while a process
+    /// spawned meanwhile still holds a copy of its descriptor.
+    #[cfg(unix)]
+    #[test]
+    fn a_released_presence_is_free_while_a_spawned_process_holds_its_descriptor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = existing_database(dir.path());
+        let presence = KeptConnectionPresence::acquire(&db).expect("presence");
+        let copy = DescriptorCopy::spawn(&presence._lock);
+        drop(presence);
+        assert!(
+            ExclusiveFence::try_acquire(&db).expect("fence").is_some(),
+            "the fence is free once the presence is released"
+        );
+        drop(copy);
+    }
 }
