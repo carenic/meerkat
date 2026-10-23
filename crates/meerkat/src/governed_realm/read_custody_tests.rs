@@ -282,6 +282,14 @@ impl ForkedCopies {
 #[cfg(unix)]
 impl Drop for ForkedCopies {
     fn drop(&mut self) {
+        // On request (MEERKAT_TEST_DESCRIPTOR_COPY_LINGER_MS), the copy stays open
+        // that long first, so an fd sampler watching the run sees it.
+        if let Some(linger) = std::env::var("MEERKAT_TEST_DESCRIPTOR_COPY_LINGER_MS")
+            .ok()
+            .and_then(|millis| millis.parse::<u64>().ok())
+        {
+            std::thread::sleep(std::time::Duration::from_millis(linger));
+        }
         let _ = nix::sys::signal::kill(self.0, nix::sys::signal::Signal::SIGKILL);
         let _ = nix::sys::wait::waitpid(self.0, None);
     }

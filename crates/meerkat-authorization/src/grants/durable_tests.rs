@@ -1229,6 +1229,14 @@ impl DescriptorCopy {
 #[cfg(unix)]
 impl Drop for DescriptorCopy {
     fn drop(&mut self) {
+        // On request (MEERKAT_TEST_DESCRIPTOR_COPY_LINGER_MS), the copy stays open
+        // that long first, so an fd sampler watching the run sees it.
+        if let Some(linger) = std::env::var("MEERKAT_TEST_DESCRIPTOR_COPY_LINGER_MS")
+            .ok()
+            .and_then(|millis| millis.parse::<u64>().ok())
+        {
+            std::thread::sleep(std::time::Duration::from_millis(linger));
+        }
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
