@@ -1484,8 +1484,55 @@ mod tests {
         }
     }
 
+    /// Whether a Changed tick comes within `window`, skipping sweeps.
+    fn changed_within(tick_rx: &mpsc::Receiver<SqliteWatchTick>, window: Duration) -> bool {
+        let deadline = Instant::now() + window;
+        loop {
+            match tick_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(SqliteWatchTick::Changed) => return true,
+                Ok(SqliteWatchTick::Sweep) => {}
+                Err(_) => return false,
+            }
+        }
+    }
+
+    /// Append `bytes` to the existing file at `path` and close it, as a
+    /// commit appends frames to a WAL that a connection holds open.
+    fn append(path: &Path, bytes: &[u8]) {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(bytes).unwrap();
+        drop(file);
+        log_row(
+            path,
+            format_args!("appended {} bytes and closed", bytes.len()),
+        );
+    }
+
+    /// Log a row's step for the database file or sidecar `path`, naming its
+    /// canonical directory as the notifications for it are logged (see
+    /// [`test_support::RAW_EVENT_LOG`]).
+    fn log_row(path: &Path, step: std::fmt::Arguments<'_>) {
+        let dir = path
+            .parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .unwrap_or_default();
+        test_support::log_raw(format_args!(
+            "row dir={} file={:?}: {step}",
+            dir.display(),
+            path.file_name().unwrap_or_default()
+        ));
+    }
+
+    /// A WAL database's WAL exists before the watch starts, as it does while
+    /// any connection holds the database open, so a write to it is a data
+    /// change only. (Its creation is a connection's own open, which ticks
+    /// nothing: see [`sqlite_watch_event_relevant`].)
     fn assert_database_write_ticks_changed(db: &Path) {
+        log_row(db, format_args!("a write row starts on {}", db.display()));
         std::fs::write(db, b"").unwrap();
+        let wal = sidecar_path(db, "-wal");
+        std::fs::write(&wal, b"").unwrap();
         let (tick_tx, tick_rx) = mpsc::channel();
         let watch = start_sqlite_change_watch(db, "test-watch", SQLITE_WATCH_SWEEP, move |tick| {
             let _ = tick_tx.send(tick);
@@ -1498,7 +1545,7 @@ mod tests {
             settled_registration(&watch),
             SqliteWatchRegistration::Registered
         );
-        std::fs::write(sidecar_path(db, "-wal"), b"frame").unwrap();
+        append(&wal, b"frame");
         next_changed(&tick_rx).expect("the write is observed within the hang guard");
     }
 
@@ -1764,6 +1811,110 @@ mod tests {
                 .expect("the commit ticks within the hang guard"),
             SqliteWatchTick::Changed
         );
+    }
+
+    /// How long a commit row waits for a commit's tick before its connection
+    /// closes. What it saw is logged (see [`test_support::RAW_EVENT_LOG`]),
+    /// never required: a platform can report a write only when the file
+    /// written closes.
+    const BEFORE_CLOSE_WINDOW: Duration = Duration::from_secs(2);
+
+    /// A commit while another connection (a kept reader) holds a WAL database
+    /// open appends to the existing WAL and ticks the watch. The committing
+    /// connection closes after its commit, as the stores' connections do.
+    #[test]
+    fn a_commit_to_an_existing_wal_ticks_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = wal_database(dir.path());
+        log_row(
+            &db,
+            format_args!("a_commit_to_an_existing_wal_ticks_changed starts"),
+        );
+        let wal = sidecar_path(&db, "-wal");
+        let kept = crate::open(&db, crate::ConnectionProfile::PRIMARY).unwrap();
+        let rows: i64 = kept
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert!(wal.exists(), "the kept connection holds the WAL open");
+        let (tick_tx, tick_rx) = mpsc::channel();
+        let watch = start_sqlite_change_watch(
+            &db,
+            "test-commit-existing-wal",
+            Duration::from_secs(3600),
+            move |tick| {
+                let _ = tick_tx.send(tick);
+                SqliteWatchControl::Handled
+            },
+        )
+        .expect("watch starts");
+        assert_eq!(
+            settled_registration(&watch),
+            SqliteWatchRegistration::Registered
+        );
+        let writer = crate::open(&db, crate::ConnectionProfile::PRIMARY).unwrap();
+        writer.execute("INSERT INTO t (v) VALUES (2)", []).unwrap();
+        let wal_len = std::fs::metadata(&wal).map(|metadata| metadata.len());
+        log_row(&wal, format_args!("committed, WAL length {wal_len:?}"));
+        let before_close = changed_within(&tick_rx, BEFORE_CLOSE_WINDOW);
+        log_row(
+            &wal,
+            format_args!("Changed before the writer closed: {before_close}"),
+        );
+        drop(writer);
+        if !before_close {
+            next_changed(&tick_rx).expect("the commit ticks once its connection closed");
+            log_row(&wal, format_args!("Changed after the writer closed"));
+        }
+        drop(kept);
+    }
+
+    /// A connection that opens a WAL database no other connection holds open
+    /// creates the WAL, and its commit at once appends to that new WAL: the
+    /// watch ticks. Whether it ticks before the connection closes (its close,
+    /// the last, then checkpoints into the database file and removes the
+    /// WAL) is logged, with every notification (see
+    /// [`test_support::RAW_EVENT_LOG`]).
+    #[test]
+    fn a_commit_that_creates_the_wal_ticks_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = wal_database(dir.path());
+        log_row(
+            &db,
+            format_args!("a_commit_that_creates_the_wal_ticks_changed starts"),
+        );
+        let wal = sidecar_path(&db, "-wal");
+        assert!(!wal.exists(), "no connection holds the database open");
+        let (tick_tx, tick_rx) = mpsc::channel();
+        let watch = start_sqlite_change_watch(
+            &db,
+            "test-commit-creates-wal",
+            Duration::from_secs(3600),
+            move |tick| {
+                let _ = tick_tx.send(tick);
+                SqliteWatchControl::Handled
+            },
+        )
+        .expect("watch starts");
+        assert_eq!(
+            settled_registration(&watch),
+            SqliteWatchRegistration::Registered
+        );
+        let writer = crate::open(&db, crate::ConnectionProfile::PRIMARY).unwrap();
+        writer.execute("INSERT INTO t (v) VALUES (2)", []).unwrap();
+        let wal_len = std::fs::metadata(&wal).map(|metadata| metadata.len());
+        log_row(&wal, format_args!("committed, WAL length {wal_len:?}"));
+        let before_close = changed_within(&tick_rx, BEFORE_CLOSE_WINDOW);
+        log_row(
+            &wal,
+            format_args!("Changed before the writer closed: {before_close}"),
+        );
+        drop(writer);
+        assert!(!wal.exists(), "the last connection removed the WAL");
+        if !before_close {
+            next_changed(&tick_rx).expect("the commit ticks once its connection closed");
+            log_row(&wal, format_args!("Changed after the writer closed"));
+        }
     }
 
     #[cfg(unix)]
@@ -2115,7 +2266,15 @@ mod tests {
                 let dir = tempfile::tempdir().unwrap();
                 let observed = test_support::observe_registrations_in(dir.path()).unwrap();
                 let db = dir.path().join("store.sqlite3");
+                log_row(
+                    &db,
+                    format_args!("dropping_a_watch_never_waits_for_its_sources_teardown starts"),
+                );
                 std::fs::write(&db, b"").unwrap();
+                // The WAL exists before the watches start: the write below is
+                // a data change only.
+                let wal = sidecar_path(&db, "-wal");
+                std::fs::write(&wal, b"").unwrap();
                 let first_ticks = Arc::new(AtomicUsize::new(0));
                 let first =
                     start_sqlite_change_watch(&db, "test-teardown-first", SQLITE_WATCH_SWEEP, {
@@ -2170,7 +2329,7 @@ mod tests {
                     0,
                     "the first source is held"
                 );
-                std::fs::write(sidecar_path(&db, "-wal"), b"frame").unwrap();
+                append(&wal, b"frame");
                 next_changed(&tick_rx).expect("the second watch sees the write");
                 // The held source still delivers that write, to the stopped watch
                 // only, which ticks no more.
