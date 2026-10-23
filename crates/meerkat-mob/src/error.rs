@@ -1570,8 +1570,11 @@ pub enum MobError {
     /// (`RuntimeDriverError::RecoveryRepairBlocked`), for example while a
     /// boundary commit past its deadline has not reported its durable
     /// outcome. Retryable: once the runtime's evidence settles, a redrive of
-    /// the retirement reloads the member and continues. The retire path
-    /// answers it, usually as the cause of a stuck retirement;
+    /// the retirement reloads the member and continues. A retirement's
+    /// ingress detach that the runtime refuses as repair-blocked, because the
+    /// member session degraded after the stage's reload check, answers it
+    /// too, with the refusal's own fields. The retire path answers it,
+    /// usually as the cause of a stuck retirement;
     /// `MobHandle::reload_member_registration` answers
     /// [`MobError::MemberReloadRefused`] for the same runtime refusal, and a
     /// caller treats both alike. The fields mirror the destroy report's

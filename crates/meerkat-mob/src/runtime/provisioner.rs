@@ -4348,6 +4348,34 @@ impl MemberSessionDisposalArc {
         deadline: Instant,
     ) -> Result<meerkat_runtime::ReloadRequiredRegistrationDisposition, DurabilityReloadFailure>
     {
+        Self::reload_durability_degraded_registration_settlement_until(
+            adapter,
+            ops_adapter,
+            registration,
+            session_id,
+            deadline,
+        )
+        .await
+        .map(|settlement| settlement.disposition())
+    }
+
+    /// [`Self::reload_durability_degraded_registration_until`], answering
+    /// with the reload's settlement: `Discarded` carries the exact successor
+    /// the reload published. A caller that acts on the successor follows
+    /// that witness, never the session's registration read after the reload
+    /// returned, which can already be a later owner's.
+    pub(super) async fn reload_durability_degraded_registration_settlement_until(
+        adapter: &Arc<MeerkatMachine>,
+        ops_adapter: Option<&Arc<super::ops_adapter::MobOpsAdapter>>,
+        registration: &RuntimeSessionRegistrationWitness,
+        session_id: &SessionId,
+        deadline: Instant,
+    ) -> Result<meerkat_runtime::ReloadRequiredRegistrationSettlement, DurabilityReloadFailure>
+    {
+        use meerkat_runtime::{
+            ReloadRequiredRegistrationSettlement as Settlement,
+            ReloadRequiredRegistrationUseSettlement as UseSettlement,
+        };
         // A reload-required discard atomically replaces the registration
         // with a cold successor. The exact bound operation identity must
         // ride that replacement as a durable retention request so the
@@ -4356,10 +4384,11 @@ impl MemberSessionDisposalArc {
         let prior_ops_binding = Self::recoverable_ops_binding_witness(ops_adapter, session_id)?;
         let remaining =
             Self::retirement_remaining(session_id, deadline, "durability_reload_discard")?;
-        tokio::time::timeout(
+        let settlement = tokio::time::timeout(
             remaining,
-            adapter.recover_or_discard_reload_required_registration_with_operation_if_current(
+            adapter.reload_required_registration_settlement_if_current(
                 registration,
+                None,
                 prior_ops_binding
                     .as_ref()
                     .map(|witness| witness.retention_request()),
@@ -4367,7 +4396,18 @@ impl MemberSessionDisposalArc {
         )
         .await
         .map_err(|_| Self::runtime_retirement_in_progress(session_id, "durability_reload_discard"))?
-        .map_err(DurabilityReloadFailure::Refused)
+        .map_err(DurabilityReloadFailure::Refused)?;
+        match settlement {
+            UseSettlement::NotCurrent => Ok(Settlement::NotCurrent),
+            UseSettlement::NotDegraded => Ok(Settlement::NotDegraded),
+            UseSettlement::Discarded { successor, .. } => Ok(Settlement::Discarded { successor }),
+            // A reload asked without an expected use is never `Changed`.
+            other => Err(DurabilityReloadFailure::Session(
+                Self::runtime_archive_error(format!(
+                    "durability reload of {session_id}, asked without an expected use, answered {other:?}"
+                )),
+            )),
+        }
     }
 
     /// Before an exact unregister: discard `registration` first when its

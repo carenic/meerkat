@@ -46890,6 +46890,179 @@ async fn test_reload_discard_cancelled_waiter_retry_rebinds_existing_cold_succes
     assert!(!provisioner.ops_binding_present_for_test(&session_id));
 }
 
+/// A reload at a retirement's ingress detach (a member that degraded after
+/// its quiesce) carries the member's bound operation into the cold successor
+/// as a retention request. The detach acts on that successor, and the
+/// disposal that follows (the session archive stage) rebinds and retires the
+/// retained operation: nothing of the operation binding is left once the
+/// member's session is disposed.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reload_at_the_ingress_detach_hands_its_retained_operation_to_the_disposal() {
+    struct FailingBoundaryExecutor;
+    #[async_trait::async_trait]
+    impl meerkat_core::lifecycle::core_executor::CoreExecutor for FailingBoundaryExecutor {
+        async fn apply(
+            &mut self,
+            run_id: meerkat_core::RunId,
+            primitive: meerkat_core::lifecycle::run_primitive::RunPrimitive,
+        ) -> Result<
+            meerkat_core::lifecycle::core_executor::CoreApplyOutput,
+            meerkat_core::lifecycle::core_executor::CoreExecutorError,
+        > {
+            Ok(
+                meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_untyped_snapshot(
+                    meerkat_core::lifecycle::run_receipt::RunBoundaryReceiptDraft {
+                        run_id,
+                        boundary:
+                            meerkat_core::lifecycle::run_primitive::RunApplyBoundary::RunStart,
+                        contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                        conversation_digest: None,
+                        message_count: 0,
+                    },
+                    None,
+                    None,
+                ),
+            )
+        }
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+            Ok(())
+        }
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+            Ok(())
+        }
+    }
+    let service = Arc::new(MockSessionService::new());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let adapter = Arc::new(
+        meerkat_runtime::MeerkatMachine::persistent_without_blobs(runtime_store)
+            .expect("construct runtime authority"),
+    );
+    service.set_runtime_adapter(Arc::clone(&adapter));
+    let provisioner = Arc::new(super::provisioner::SessionBackend::new(
+        service,
+        Some(Arc::clone(&adapter)),
+        None,
+    ));
+    let session = Session::new();
+    let session_id = session.id().clone();
+    provision_runtime_backed_disposal_fixture(
+        provisioner.as_ref(),
+        session,
+        "ingress-stage-reload",
+    )
+    .await;
+    adapter
+        .ensure_session_with_executor(session_id.clone(), Box::new(FailingBoundaryExecutor))
+        .await
+        .expect("replace fixture executor");
+    let exact_operation_id = provisioner
+        .ops_binding_operation_id_for_test(&session_id)
+        .expect("fixture publishes one exact mob-child operation");
+    adapter
+        .persist_current_ops_lifecycle_for_test(&session_id)
+        .await
+        .expect("persist exact pre-fault mob-child operation authority");
+    assert!(
+        adapter
+            .force_session_durability_reload_required_for_test(&session_id)
+            .await
+    );
+    meerkat_runtime::SessionServiceRuntimeExt::accept_input(
+        adapter.as_ref(),
+        &session_id,
+        meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::new(
+            "trigger degraded teardown",
+            None,
+        )),
+    )
+    .await
+    .expect_err("degraded admission must start teardown");
+
+    // The ingress stage's reload: the registration current for the retiring
+    // member's session, through the quiesce's reload helper.
+    let registration = adapter
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("the degraded registration is current");
+    let settlement = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::provisioner::MemberSessionDisposalArc::reload_durability_degraded_registration_settlement_until(
+            &adapter,
+            Some(&provisioner.session_ops_adapter()),
+            &registration,
+            &session_id,
+            Instant::now() + Duration::from_secs(5),
+        ),
+    )
+    .await
+    .expect("the reload settles")
+    .expect("the reload is not refused");
+    let meerkat_runtime::ReloadRequiredRegistrationSettlement::Discarded { successor } = settlement
+    else {
+        panic!("the degraded registration is discarded: {settlement:?}");
+    };
+    let successor_registry = adapter
+        .ops_lifecycle_registry_if_current_registration(&successor)
+        .await
+        .expect("the published successor is current");
+    assert!(
+        meerkat_core::ops_lifecycle::OpsLifecycleRegistry::snapshot(
+            successor_registry.as_ref(),
+            &exact_operation_id,
+        )
+        .expect("read the retained operation")
+        .is_some(),
+        "the reload retains the member's bound operation in the successor"
+    );
+    // The ingress detach on the successor, as the stage runs it.
+    match adapter
+        .update_peer_ingress_context(&session_id, false, None)
+        .await
+    {
+        Ok(_)
+        | Err(
+            meerkat_runtime::RuntimeDriverError::NotFound { .. }
+            | meerkat_runtime::RuntimeDriverError::Destroyed
+            | meerkat_runtime::RuntimeDriverError::NotReady { .. },
+        ) => {}
+        Err(error) => panic!("the successor's ingress detaches: {error}"),
+    }
+    assert!(matches!(
+        adapter.peer_ingress_owner(&session_id).await,
+        meerkat_runtime::PeerIngressOwner::Unattached
+    ));
+    assert_eq!(
+        adapter
+            .current_session_registration_witness(&session_id)
+            .await
+            .as_ref(),
+        Some(&successor),
+        "the detach leaves the published successor current"
+    );
+
+    // The session archive stage's disposal consumes the retention.
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        provisioner.dispose_inline_for_recovery_test(&session_id),
+    )
+    .await
+    .expect("the disposal stays bounded")
+    .expect("the disposal rebinds and retires the retained operation");
+    assert!(!adapter.contains_session(&session_id).await);
+    assert!(
+        !provisioner.ops_binding_present_for_test(&session_id),
+        "no operation binding of the member's session is left"
+    );
+}
+
 #[cfg(feature = "runtime-adapter")]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_reload_recovery_cancel_after_hook_reuses_terminal_receipt() {
