@@ -4391,6 +4391,11 @@ impl PendingRuntimeExecutorAttachment {
                 "executor attachment was replaced before request completion";
             let (predecessor_input_ids, candidate_owner_input_id) = {
                 let mut driver = driver.lock().await;
+                // Inputs a store-owned durable-tail recovery consumed are not
+                // pending: adopt them before this sweep names its batch.
+                driver
+                    .adopt_durable_consumed_inputs(Some(&completions))
+                    .await?;
                 let predecessor_input_ids = driver.as_driver().active_input_ids();
                 if predecessor_input_ids.is_empty() {
                     (predecessor_input_ids, None)
@@ -4689,6 +4694,11 @@ impl CommittedRuntimeExecutorAttachmentPublicationLease {
 
         let predecessor_input_ids = {
             let mut driver = driver.lock().await;
+            // Inputs a store-owned durable-tail recovery consumed are not
+            // pending: adopt them before this sweep names its inputs.
+            driver
+                .adopt_durable_consumed_inputs(Some(&completions))
+                .await?;
             let predecessor_input_ids = driver.as_driver().active_input_ids();
             if predecessor_input_ids.is_empty() {
                 return Ok(0);

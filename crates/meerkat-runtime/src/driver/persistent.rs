@@ -2460,9 +2460,12 @@ impl PersistentRuntimeDriver {
     /// Reload from the store the `Consumed` terminals a store-owned
     /// durable-tail recovery committed for inputs this driver still holds as
     /// non-terminal. The recovery consumes the rows bound to the run whose
-    /// tail it commits, outside this driver; each such input is adopted in
-    /// memory through the generated authority. Nothing is written, because
+    /// tail it commits, outside this driver (an archive's settle, or an
+    /// observation's settle of a hosted session); each such input is adopted
+    /// in memory through the generated authority. Nothing is written, because
     /// the store already holds the terminal rows. Returns the adopted inputs.
+    /// Every sweep of the pending inputs runs this first, so no sweep names a
+    /// consumed input in its batch or writes over its row.
     ///
     /// A reload that fails leaves this driver's view of those rows unknown, so
     /// it requires a registration-authorized cold reload: no later mutation

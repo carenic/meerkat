@@ -1385,17 +1385,25 @@ them.
   still refuses a `Stopped` runtime, because a later start may resume its
   run.
 
-- `meerkat-runtime`, `meerkat-session`: the retire that follows an archive's
-  settle of a durable tail no longer abandons the inputs that settle
-  consumed. The archive's recovery commits the tail at the store level and
-  consumes the input rows bound to its run, while the archive's runtime
-  lease driver still held those inputs as pending. The retire under that
-  lease then wrote `Abandoned { Retired }` over the consumed rows, and a
-  directed input's sender was told the work was terminated although it ran,
-  so a peer could send it again. After a committed settle the archive now
-  reloads those terminals into the lease's driver
-  (`MeerkatMachine::reload_recovered_input_terminals_with_archive_lease`), and
-  the retire leaves them consumed.
+- `meerkat-runtime`: a sweep of a runtime's pending inputs no longer abandons
+  inputs that a store-owned durable-tail recovery already consumed. That
+  recovery commits a tail at the store level and consumes the input rows
+  bound to its run, outside the registered runtime's driver: an archive
+  settles a tail it meets under its runtime lease, and an observation of a
+  hosted session settles the tail a turn left when its boundary was
+  cancelled (for example by a retirement). The driver still held those
+  inputs as pending, so the next retire, reset, destroy, stop or
+  queued-input cancel sweep wrote its abandonment (`Abandoned { Retired }`
+  for a retire) over the consumed rows, and a directed input's sender was
+  told that work which ran was terminated, so a peer could send it again.
+  Every such sweep, and a replaced executor attachment's cleanup of its
+  predecessor's inputs, now first adopts the `Consumed` terminals the store
+  holds for inputs the driver still holds as pending, and leaves them
+  consumed. A process-local waiter of such an input fails with
+  `CompletionWaitError::AuthorityUnavailable` instead of being told the
+  runtime terminated it; the input's result is in the session's committed
+  history. An adoption that fails requires a registration-authorized cold
+  reload of the runtime and fails the sweep.
 
 - `meerkat-gemini`: preserve provider-issued `functionCall.id` through
   streamed tool calls, saved transcripts, assistant replay and matching
