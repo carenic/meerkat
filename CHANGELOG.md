@@ -162,6 +162,14 @@ them.
 
 ### Fixed
 
+- `meerkat-mob`: a mob host that fail-stops on a durable write whose outcome
+  stayed uncertain names the first such write in every refusal after it.
+  Before, a later uncertain write in the same process could replace it, so
+  the refusals named a consequence instead of the cause. The detail is the
+  host's typed error (`MobHostActorError`); where the host built the detail
+  itself it now reads `durable host binding outcome is uncertain: ...`. The
+  refusals keep their cause (`Internal`) and their "restart required" prefix.
+
 - A turn that compacts its history more often than
   `[compaction] history_retained_rewrites` keeps (five or more compactions at
   the default of 4) no longer ends at its intra-turn checkpoint on a
