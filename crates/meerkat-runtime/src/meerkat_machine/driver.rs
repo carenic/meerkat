@@ -4446,6 +4446,32 @@ impl DriverEntry {
         }
     }
 
+    /// The inputs among `input_ids` that the generated stop classifier
+    /// retains now; see [`EphemeralRuntimeDriver::stop_retained_input_ids`].
+    pub(crate) fn stop_retained_input_ids(
+        &mut self,
+        input_ids: &[InputId],
+    ) -> Result<Vec<InputId>, RuntimeDriverError> {
+        match self {
+            DriverEntry::Ephemeral(d) => d.stop_retained_input_ids(input_ids),
+            DriverEntry::Persistent(d) => d.inner_mut().stop_retained_input_ids(input_ids),
+        }
+    }
+
+    /// The inputs a committed stop kept queued for the next start, with the
+    /// time the stop kept them: non-terminal, and carrying the stop's mark.
+    pub(crate) fn stop_requeued_inputs(&self) -> Vec<(InputId, chrono::DateTime<chrono::Utc>)> {
+        let driver = self.as_driver();
+        driver
+            .active_input_ids()
+            .into_iter()
+            .filter_map(|input_id| {
+                let stopped_at = driver.input_state(&input_id)?.stop_requeue?.stopped_at;
+                Some((input_id, stopped_at))
+            })
+            .collect()
+    }
+
     /// Input admissions of this driver; see
     /// [`EphemeralRuntimeDriver::subscribe_admissions`].
     pub(crate) fn subscribe_admissions(&self) -> crate::tokio::sync::watch::Receiver<u64> {
@@ -8463,15 +8489,16 @@ pub(crate) fn machine_build_replay_plan(
 
 pub(crate) async fn machine_stop_runtime(
     driver: &mut DriverEntry,
+    retained_before_exit: &[InputId],
 ) -> Result<(), RuntimeDriverError> {
     match driver {
         DriverEntry::Ephemeral(d) => {
             d.apply_runtime_executor_exited_authority()?;
             d.sync_control_projection_from_dsl_authority();
-            d.finalize_stop_runtime()?;
+            d.finalize_stop_runtime(retained_before_exit)?;
             Ok(())
         }
-        DriverEntry::Persistent(d) => d.finalize_runtime_executor_exit().await,
+        DriverEntry::Persistent(d) => d.finalize_runtime_executor_exit(retained_before_exit).await,
     }
 }
 

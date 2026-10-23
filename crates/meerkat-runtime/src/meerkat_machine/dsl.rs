@@ -2382,6 +2382,10 @@ pub enum RuntimeCompletionWaitFailureObservation {
     #[default]
     ChannelClosed,
     AuthorityUnavailable,
+    /// A graceful stop kept the waited input durably queued for the
+    /// session's next start (`ClassifyStopInputDisposition` answered
+    /// `Retain`). The input is not terminal.
+    RequeuedAcrossStop,
 }
 
 /// Generated public error class for mechanical runtime completion waiter
@@ -2390,6 +2394,8 @@ pub enum RuntimeCompletionWaitFailureObservation {
 pub enum RuntimeCompletionWaitFailurePublicErrorClass {
     #[default]
     InternalError,
+    /// The session is not running: its waited input runs on the next start.
+    SessionNotRunning,
 }
 
 /// Generated public reason classifier for mechanical runtime completion waiter
@@ -2399,6 +2405,7 @@ pub enum RuntimeCompletionWaitFailurePublicReason {
     #[default]
     CompletionChannelClosed,
     CompletionAuthorityUnavailable,
+    RequeuedAcrossStop,
 }
 
 /// Generated durability action for runtime-owned ops lifecycle snapshots.
@@ -2990,7 +2997,8 @@ pub enum LiveContextRowDisposition {
 pub use meerkat_machine_schema::catalog::dsl::meerkat_machine::{
     LiveContextDeliveryReadiness, LiveContextPayloadAvailability, LiveContextPreparationFailure,
     LiveContextPreparationPhase, LiveContextRowAuthor, LiveContextRowSource,
-    LiveConversationStartCause, RunStartHoldReason,
+    LiveConversationStartCause, RunStartHoldReason, StopInputDisposition,
+    UnregisterQueuedInputsDisposition,
 };
 
 /// Bridging copy of the catalog-owned delegation result disposition.
@@ -3673,6 +3681,9 @@ pub enum InputAbandonReason {
     /// The input's in-flight run had a tool process that host process custody
     /// proved had started; the input is settled instead of replayed.
     ToolProcessInterrupted,
+    /// A graceful stop kept the input queued for the next start, and the next
+    /// start found it older than that stop's max age.
+    RequeueExpired,
 }
 
 impl From<&crate::input_state::InputAbandonReason> for InputAbandonReason {
@@ -3690,6 +3701,7 @@ impl From<&crate::input_state::InputAbandonReason> for InputAbandonReason {
             crate::input_state::InputAbandonReason::ToolProcessInterrupted => {
                 Self::ToolProcessInterrupted
             }
+            crate::input_state::InputAbandonReason::RequeueExpired => Self::RequeueExpired,
         }
     }
 }
@@ -3708,6 +3720,7 @@ impl InputAbandonReason {
             Self::MaxAttemptsExhausted => "max_attempts_exhausted",
             Self::NeverExecuted => "never_executed",
             Self::ToolProcessInterrupted => "tool_process_interrupted",
+            Self::RequeueExpired => "requeue_expired",
         }
     }
 }

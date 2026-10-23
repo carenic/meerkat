@@ -74,6 +74,7 @@ impl RunlessTerminalConvergenceError {
             // A receipt-less terminal is a legitimate read verdict, but a
             // runless terminal convergence expects the receipt it staged.
             error @ (RuntimeDriverError::ValidationFailed { .. }
+            | RuntimeDriverError::QueuedInputsRefused(_)
             | RuntimeDriverError::ScopedContextGenerationNotAdvanced { .. }
             | RuntimeDriverError::InputRefused { .. }
             | RuntimeDriverError::RetainedResumeRefused { .. }
@@ -667,24 +668,45 @@ pub(crate) async fn terminalize_async_stop_once(
     publication_handle: Option<&dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
     runless_terminal: &mut crate::meerkat_machine::RunlessTerminalAnnouncement,
 ) -> Result<(), RuntimeDriverError> {
-    let (completion_input_ids, candidate_owner_input_id, termination_reason) = {
+    let (completion_input_ids, requeued_input_ids, candidate_owner_input_id, termination_reason) = {
         let mut driver = driver.lock().await;
-        let completion_input_ids = driver.as_driver().active_input_ids();
+        let active_input_ids = driver.as_driver().active_input_ids();
         let termination_reason = generated_runtime_termination_reason(&driver).to_string();
-        let prepared = driver.prepare_runless_runtime_terminated_interaction_outboxes(
-            &completion_input_ids,
-            termination_reason.clone(),
-        )?;
         // `Stopped` must still replay RuntimeExecutorExited so an interrupted
         // terminalization can idempotently repair cleanup facts. `Destroyed`
         // is different: Destroy already committed the absorbing DSL terminal
         // while the executor stop hook was in flight, and the machine
         // intentionally has no RuntimeExecutorExited transition from it.
-        if driver.runtime_state() != crate::RuntimeState::Destroyed {
-            if let Err(error) = machine_stop_runtime(&mut driver).await {
+        let stops = driver.runtime_state() != crate::RuntimeState::Destroyed;
+        // The inputs the stop keeps queued for the next start are not
+        // terminal, so they get no runless carrier and are not in its batch.
+        // The generated classifier names them before anything is staged; the
+        // stop checks it gives the same verdicts after the executor's exit.
+        let retained_input_ids = if stops {
+            driver.stop_retained_input_ids(&active_input_ids)?
+        } else {
+            Vec::new()
+        };
+        let completion_input_ids: Vec<meerkat_core::lifecycle::InputId> = active_input_ids
+            .into_iter()
+            .filter(|input_id| !retained_input_ids.contains(input_id))
+            .collect();
+        let prepared = driver.prepare_runless_runtime_terminated_interaction_outboxes(
+            &completion_input_ids,
+            termination_reason.clone(),
+        )?;
+        let mut requeued_input_ids = Vec::new();
+        if stops {
+            if let Err(error) = machine_stop_runtime(&mut driver, &retained_input_ids).await {
                 driver.rollback_prepared_runless_interaction_terminal_outboxes(prepared);
                 return Err(error);
             }
+            // Their waiters get the requeued answer instead of a terminal.
+            requeued_input_ids = driver
+                .stop_requeued_inputs()
+                .into_iter()
+                .filter(|(input_id, _)| retained_input_ids.contains(input_id))
+                .collect();
             if !completion_input_ids.is_empty() {
                 runless_terminal.owe();
             }
@@ -693,10 +715,21 @@ pub(crate) async fn terminalize_async_stop_once(
             crate::meerkat_machine::driver::DriverEntry::commit_prepared_runless_interaction_terminal_outboxes(prepared);
         (
             completion_input_ids,
+            requeued_input_ids,
             candidate_owner_input_id,
             termination_reason,
         )
     };
+
+    if let Some(completions) = completions {
+        let mut completions = completions.lock().await;
+        for (input_id, stopped_at) in requeued_input_ids {
+            completions.fail_inputs(
+                [input_id],
+                crate::completion::CompletionWaitError::RequeuedAcrossStop { stopped_at },
+            );
+        }
+    }
 
     publish_and_resolve_runless_runtime_termination(
         driver,

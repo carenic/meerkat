@@ -416,6 +416,43 @@ them.
   `MobError::ForkContextTooLarge` (code `INVALID_PARAMS`, data kind
   `fork_context_too_large`).
 
+- `meerkat-machine-kernels`: the generated runtime machine
+  (`generated::meerkat`) gains the stop classifier of a graceful stop that
+  keeps queued inputs (see Added, queued prompts kept across a graceful stop).
+  `Input` and `InputKind` gain `ClassifyStopInputDisposition` (`input_id`,
+  `durability`, `directed`, `objective_bound`), `Effect` and
+  `EffectKind` gain `StopInputDispositionClassified`, `TransitionId` gains
+  `ClassifyStopInputDispositionRetain*` and
+  `ClassifyStopInputDispositionAbandon*` (one per phase from `Initializing` to
+  `Stopped`), and `InputAbandonReason` gains `RequeueExpired`. The
+  wait-failure enums gain a kept input's answer:
+  `RuntimeCompletionWaitFailureObservation::RequeuedAcrossStop`,
+  `RuntimeCompletionWaitFailurePublicErrorClass::SessionNotRunning` and
+  `RuntimeCompletionWaitFailurePublicReason::RequeuedAcrossStop`, and
+  `TransitionId` gains `ResolveRuntimeCompletionWaitFailureRequeuedAcrossStop*`
+  (one per phase from `Initializing` to `Stopped`). Each is appended last, so
+  no existing implicit discriminant changes. The new enums
+  are `UnregisterQueuedInputsDisposition` (`Stop`, `Requeue`) and
+  `StopInputDisposition` (`Abandon`, `Retain`). `State` gains the public fields
+  `unregister_queued_inputs` and `unregister_requeue_max_age_ms`, and the
+  input struct `BeginUnregisterSession` gains `queued_inputs` and
+  `requeue_max_age_ms` (struct literals need them; `Stop` and `0` keep the
+  earlier behaviour).
+
+- `meerkat-machine-schema` (`catalog::dsl::meerkat_machine`): the runtime
+  machine's DSL types gain the same variants, appended last, and the same
+  input fields (`MeerkatMachineInput::BeginUnregisterSession` gains
+  `queued_inputs` and `requeue_max_age_ms`).
+
+- `meerkat-runtime`: `MeerkatMachineRuntimeInternalInput` gains
+  `ClassifyStopInputDisposition`, appended last. The enum is exhaustive, so a
+  `match` outside the crate needs the arm. The wait-failure enums of
+  `meerkat_machine::dsl` gain the variants above, also appended last.
+
+- `meerkat-rest`: `ApiError` gains `SessionNotRunningWithData { message,
+  details }` (`409` `SESSION_NOT_RUNNING`), appended last. The enum is
+  exhaustive, so a `match` outside the crate needs the arm.
+
 ### Added
 
 - `MemberBinding::labels()`: the application labels the incarnation was
@@ -860,6 +897,68 @@ them.
   `BridgeAdoptedFirstTurn` and `HOST_FEATURE_ADOPTED_FIRST_TURN` from
   `runtime::bridge_protocol`.
 
+- Queued prompts kept across a graceful stop. `meerkat-mob`:
+  `ShutdownOptions::with_queued_inputs(QueuedInputsOnShutdown::Requeue(max_age))`
+  with a `RequeueMaxAge` (default 15 minutes; a bound under one millisecond,
+  zero included, or over 24 hours is refused with `ShutdownOptionsError`).
+  `meerkat-runtime`: `UnregisterQueuedInputs::Requeue { max_age }` through
+  `MeerkatMachine::observe_unregister_session_registration_with_queued_inputs_if_current`
+  and `observe_unregister_session_registration_with_queued_inputs_if_use_unchanged`,
+  which refuse the same bounds before they start anything
+  (`RuntimeDriverError::QueuedInputsRefused` with an
+  `UnregisterQueuedInputsError`; `UnregisterQueuedInputs::check` is the one
+  rule, and `UnregisterQueuedInputs::MAX_AGE_CAP` the cap). The bound is
+  recorded in whole milliseconds and never clamped.
+  An input is kept when it is still queued behind the running turn, in the
+  queue lane, a prompt, not directed, not bound to an objective, and durable.
+  A member's kickoff is bound to its objective, so a requeue Shutdown ends a
+  queued kickoff as stopped, exactly as `Stop` does. A kept input stays in the
+  session's
+  input store with its payload and a stop mark, its completion waiter ends
+  with `CompletionWaitError::RequeuedAcrossStop { stopped_at }`
+  (`BoundedTurnFailure::RequeuedAcrossStop` for a mob member), and the next
+  start runs it once, in admission order, before new work. An input older
+  than `max_age`, measured from its admission, when a start finds it still
+  queued ends as abandoned with `InputAbandonReason::RequeueExpired` instead
+  and never runs (`BoundedTurnFailure::RequeueExpired` for a member; resubmit
+  it if it is still wanted). Every start that finds it queued checks again. An admission time ahead of the clock is not
+  expired. The generated runtime machine decides each input, and the
+  unregister records its disposition durably, so an unregister that a crash
+  interrupts converges with the same one. The default, `Stop`, and every stop
+  outside such an unregister end every non-terminal input as stopped, as in
+  0.9.4.
+
+- `meerkat-runtime`, `meerkat-rpc`, `meerkat-rest`, `meerkat-mcp-server`,
+  `meerkat`: a completion wait that a graceful mob Shutdown answered by
+  keeping its input queued (`CompletionWaitError::RequeuedAcrossStop`) has
+  its own generated wait-failure observation, and the generated resolver
+  classes it: session not running, reason `requeued_across_stop`, resumable,
+  and the surface's pre-admission released. That arm reads no session
+  state, so it answers the same after the session is gone, and every surface
+  answers from it, never as the internal `completion_authority_unavailable`
+  class. JSON-RPC answers `-32003` (session not running) with `data.kind`
+  and `data.reason` `requeued_across_stop`, `data.input_id`,
+  `data.stopped_at` and `data.resumable`. REST answers `409`
+  `SESSION_NOT_RUNNING` with the same `details` (and `session_ref` and
+  `session_created`), not a retryable `503`: an unkeyed retry after the
+  restart would run the input twice. The MCP server releases the
+  attachment's request-local admission, since the next start's attachment
+  runs the input, a scheduled delivery re-reads the input's own outcome, as
+  for a rolled-back boundary, and the mob host's tracked-turn watcher keeps
+  the turn pending. `CompletionWaitError::requeued_stopped_at` reads
+  the stop's time, and `meerkat_machine::RuntimeCompletionWaitFailureAuthority`
+  is exported. Do not resubmit such an input: after the restart the same
+  idempotency key re-attaches to it.
+
+- `meerkat-mob`: `MobError::MemberInputRequeuedAcrossStop` and
+  `MobError::MemberInputRequeueExpired` (appended; `MobError` is
+  `#[non_exhaustive]`), the answers of a non-bounded member turn whose input a
+  graceful Shutdown kept queued, or that the next start ended as older than
+  its requeue bound. Delegation, fork relinking and temporary councils read
+  both typed outcomes as an end imposed from outside, never as the turn's own
+  failure, and the mob host's tracked-turn watcher keeps the turn pending
+  for the next start.
+
 ### Changed
 
 - `meerkat-core`, `meerkat-session`, `meerkat-runtime`: a HeadCanonical run
@@ -919,6 +1018,24 @@ them.
   `web_search` fallback tool. The ChatGPT backend, Azure OpenAI and GitHub
   Copilot Responses wires keep their request shape: no sources asked for or
   replayed, and `annotations: []`. No API change.
+
+- `meerkat-runtime` persistence: an input row that carries a stop mark or
+  the `RequeueExpired` reason is written as stored input state version 8, and
+  the machine lifecycle record of an unregister in progress with the requeue
+  disposition as version 6. Every other row and record keeps version 7 and
+  version 5, which 0.9.4 reads. 0.9.4 refuses a version 8 row that carries a
+  stop mark, and a version 6 record, with its typed unsupported-version error.
+  A version 8 row that ended `RequeueExpired` fails earlier in 0.9.4, when it
+  decodes the row's abandon reason, which 0.9.4 does not know: a read failure,
+  not the typed error, and the fact is not misread either. After a downgrade,
+  a store that holds a kept input still queued does not open, because 0.9.4's
+  recovery reads every non-terminal row. Once every kept input has run or
+  expired, its row is terminal (a kept input's row keeps its mark after it
+  runs) and the store opens, but each read that decodes such a row still
+  fails: the input's status, a same-key lookup that finds it, and a batch
+  compare-and-swap over it. In `meerkat-core`'s generated version authority,
+  `STORED_INPUT_STATE_VERSION` is 8, and `STORED_INPUT_STATE_BASELINE_VERSION`
+  (7) and `stored_input_state_version_for_row` are new.
 
 ### Fixed
 

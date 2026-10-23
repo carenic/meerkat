@@ -85,6 +85,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `unregister_teardown_retains_snapshot`: `Bool`
 - `unregister_runtime_loop_forced_abort`: `Bool`
 - `unregister_comms_drain_forced_abort`: `Bool`
+- `unregister_queued_inputs`: `UnregisterQueuedInputsDisposition`
+- `unregister_requeue_max_age_ms`: `u64`
 - `staged_session_phase`: `StagedSessionPhase`
 - `staged_session_id`: `Option<SessionId>`
 - `staged_session_keep_alive`: `Option<Bool>`
@@ -536,7 +538,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 ## Runtime-Internal Inputs
 - `AuthorizeDurableTailRecovery`(session_id: SessionId, candidate_id: String, candidate_run_id: RunId, class: DurableTailRecoveryClass, observed_lifecycle: DurableRecoveryObservedLifecycle, observed_current_run: DurableRecoveryObservedRun, last_committed_sequence: u64, prior_commit: DurableRecoveryPriorCommit, input_evidence: DurableRecoveryInputEvidence)
 - `PrepareTerminalSupervisorCleanupBindings`(session_id: SessionId)
-- `BeginUnregisterSession`(session_id: SessionId, agent_runtime_id: Option<AgentRuntimeId>, fence_token: Option<FenceToken>, generation: Option<Generation>, runtime_epoch_id: Option<RuntimeEpochId>)
+- `BeginUnregisterSession`(session_id: SessionId, agent_runtime_id: Option<AgentRuntimeId>, fence_token: Option<FenceToken>, generation: Option<Generation>, runtime_epoch_id: Option<RuntimeEpochId>, queued_inputs: UnregisterQueuedInputsDisposition, requeue_max_age_ms: u64)
 - `BeginUnregisterUnservedAttachment`(session_id: SessionId, agent_runtime_id: Option<AgentRuntimeId>, fence_token: Option<FenceToken>, generation: Option<Generation>, runtime_epoch_id: Option<RuntimeEpochId>)
 - `RuntimeLoopStoppedForUnregister`(session_id: SessionId, forced_abort: Bool)
 - `CommsDrainExitedForUnregister`(session_id: SessionId, forced_abort: Bool)
@@ -893,6 +895,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `RecoverInputCompletionBoundary`(input_id: String, run_id: RunId, sequence: u64, boundary: Option<RecoveredRunApplyBoundary>, execution_kind: RecoveredRuntimeExecutionKind)
 - `ResolveCheckpointCompletionResult`(owner_input_id: String, run_id: RunId, candidate_digest: String, completion_input_ids_digest: String, requires_session_checkpoint: Bool, recipient_input_ids: Set<String>, finalization: RuntimeCompletionFinalizationObservation)
 - `ResolveAbandonedCompletionResult`(owner_input_id: String, run_id: RunId, candidate_digest: String, completion_input_ids_digest: String, recipient_input_ids: Set<String>, terminal_outcome: TurnTerminalOutcome, terminal_cause_kind: TurnTerminalCauseKind, requires_session_checkpoint: Bool, has_interaction_terminal_outbox: Bool, finalization: RuntimeCompletionFinalizationObservation)
+- `ClassifyStopInputDisposition`(input_id: String, durability: InputDurabilityKind, directed: Bool, objective_bound: Bool)
 
 ## Signals
 - `Initialize`
@@ -1159,6 +1162,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `TerminalCompletionCorrelationClassified`(owner_input_id: String, run_id: Option<RunId>, correlation: TerminalCompletionCorrelation)
 - `CheckpointCompletionResultResolved`(session_id: SessionId, agent_runtime_id: Option<AgentRuntimeId>, fence_token: Option<FenceToken>, runtime_generation: Option<Generation>, runtime_epoch_id: Option<RuntimeEpochId>, run_id: RunId, owner_input_id: String, candidate_digest: String, completion_input_ids_digest: String, recipient_input_ids: Set<String>, requires_session_checkpoint: Bool, result_class: RuntimeCompletionResultClass, cleanup_outcome: RuntimeCompletionObservedOutcome)
 - `AbandonedCompletionResultResolved`(session_id: SessionId, agent_runtime_id: Option<AgentRuntimeId>, fence_token: Option<FenceToken>, runtime_generation: Option<Generation>, runtime_epoch_id: Option<RuntimeEpochId>, run_id: RunId, owner_input_id: String, candidate_digest: String, completion_input_ids_digest: String, recipient_input_ids: Set<String>, requires_session_checkpoint: Bool, result_class: RuntimeCompletionResultClass, cleanup_outcome: RuntimeCompletionObservedOutcome)
+- `StopInputDispositionClassified`(input_id: String, disposition: StopInputDisposition, requeue_max_age_ms: u64)
 
 ## Helpers
 - `runtime_authority_reconcile_decision`(observation_kind: RuntimeAuthorityObservationKind, state: Option<RuntimeLifecycleObservedState>, agent_runtime_id: Option<AgentRuntimeId>, fence_token: Option<FenceToken>, runtime_generation: Option<Generation>, runtime_epoch_id: Option<RuntimeEpochId>, current_run_id: Option<RunId>, pre_run_phase: Option<PreRunPhase>, malformed_reclaim_safe: Bool) -> `RuntimeAuthorityReconcileDecision`
@@ -1457,6 +1461,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `running_has_current_run`
 - `deferred_stop_requires_active_runtime_phase`
 - `unregister_drain_obligations_require_draining`
+- `unregister_requeue_max_age_matches_disposition`
 - `current_run_only_while_running_or_retired`
 - `current_run_has_pre_run_phase`
 - `input_context_targets_are_governed`
@@ -2065,7 +2070,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `BeginUnregisterSessionIdle`
 - From: `Idle`
-- On: `BeginUnregisterSession`(session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id)
+- On: `BeginUnregisterSession`(session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id, queued_inputs, requeue_max_age_ms)
 - Guards:
   - `session_matches_current`
   - `runtime_binding_matches_observation`
@@ -2073,12 +2078,13 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `generation_binding_matches_observation`
   - `epoch_binding_matches_observation`
   - `not_already_draining`
+  - `queued_inputs_max_age_matches_disposition`
 - Emits: `RequestRuntimeLoopStopForUnregister`, `RequestCommsDrainExitForUnregister`, `RequestCompletionWaiterResolutionForUnregister`
 - To: `Idle`
 
 ### `BeginUnregisterSessionAttached`
 - From: `Attached`
-- On: `BeginUnregisterSession`(session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id)
+- On: `BeginUnregisterSession`(session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id, queued_inputs, requeue_max_age_ms)
 - Guards:
   - `session_matches_current`
   - `runtime_binding_matches_observation`
@@ -2086,12 +2092,13 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `generation_binding_matches_observation`
   - `epoch_binding_matches_observation`
   - `not_already_draining`
+  - `queued_inputs_max_age_matches_disposition`
 - Emits: `RequestRuntimeLoopStopForUnregister`, `RequestCommsDrainExitForUnregister`, `RequestCompletionWaiterResolutionForUnregister`
 - To: `Attached`
 
 ### `BeginUnregisterSessionRunning`
 - From: `Running`
-- On: `BeginUnregisterSession`(session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id)
+- On: `BeginUnregisterSession`(session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id, queued_inputs, requeue_max_age_ms)
 - Guards:
   - `session_matches_current`
   - `runtime_binding_matches_observation`
@@ -2099,12 +2106,13 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `generation_binding_matches_observation`
   - `epoch_binding_matches_observation`
   - `not_already_draining`
+  - `queued_inputs_max_age_matches_disposition`
 - Emits: `RequestRuntimeLoopStopForUnregister`, `RequestCommsDrainExitForUnregister`, `RequestCompletionWaiterResolutionForUnregister`
 - To: `Running`
 
 ### `BeginUnregisterSessionRetainsSnapshotRetired`
 - From: `Retired`
-- On: `BeginUnregisterSession`(session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id)
+- On: `BeginUnregisterSession`(session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id, queued_inputs, requeue_max_age_ms)
 - Guards:
   - `session_matches_current`
   - `runtime_binding_matches_observation`
@@ -2112,12 +2120,13 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `generation_binding_matches_observation`
   - `epoch_binding_matches_observation`
   - `not_already_draining`
+  - `queued_inputs_max_age_matches_disposition`
 - Emits: `RequestRuntimeLoopStopForUnregister`, `RequestCommsDrainExitForUnregister`, `RequestCompletionWaiterResolutionForUnregister`
 - To: `Retired`
 
 ### `BeginUnregisterSessionRetainsSnapshotStopped`
 - From: `Stopped`
-- On: `BeginUnregisterSession`(session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id)
+- On: `BeginUnregisterSession`(session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id, queued_inputs, requeue_max_age_ms)
 - Guards:
   - `session_matches_current`
   - `runtime_binding_matches_observation`
@@ -2125,6 +2134,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `generation_binding_matches_observation`
   - `epoch_binding_matches_observation`
   - `not_already_draining`
+  - `queued_inputs_max_age_matches_disposition`
 - Emits: `RequestRuntimeLoopStopForUnregister`, `RequestCommsDrainExitForUnregister`, `RequestCompletionWaiterResolutionForUnregister`
 - To: `Stopped`
 
@@ -27799,6 +27809,150 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `all_recipients_consumed_by_run`
   - `finalization_failed`
 - Emits: `CheckpointCompletionResultResolved`
+- To: `Stopped`
+
+### `ClassifyStopInputDispositionRetainInitializing`
+- From: `Initializing`
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
+- Guards:
+  - `requeue_eligible`
+- Emits: `StopInputDispositionClassified`
+- To: `Initializing`
+
+### `ClassifyStopInputDispositionRetainIdle`
+- From: `Idle`
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
+- Guards:
+  - `requeue_eligible`
+- Emits: `StopInputDispositionClassified`
+- To: `Idle`
+
+### `ClassifyStopInputDispositionRetainAttached`
+- From: `Attached`
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
+- Guards:
+  - `requeue_eligible`
+- Emits: `StopInputDispositionClassified`
+- To: `Attached`
+
+### `ClassifyStopInputDispositionRetainRunning`
+- From: `Running`
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
+- Guards:
+  - `requeue_eligible`
+- Emits: `StopInputDispositionClassified`
+- To: `Running`
+
+### `ClassifyStopInputDispositionRetainRetired`
+- From: `Retired`
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
+- Guards:
+  - `requeue_eligible`
+- Emits: `StopInputDispositionClassified`
+- To: `Retired`
+
+### `ClassifyStopInputDispositionRetainStopped`
+- From: `Stopped`
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
+- Guards:
+  - `requeue_eligible`
+- Emits: `StopInputDispositionClassified`
+- To: `Stopped`
+
+### `ClassifyStopInputDispositionAbandonInitializing`
+- From: `Initializing`
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
+- Guards:
+  - `not_requeue_eligible`
+- Emits: `StopInputDispositionClassified`
+- To: `Initializing`
+
+### `ClassifyStopInputDispositionAbandonIdle`
+- From: `Idle`
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
+- Guards:
+  - `not_requeue_eligible`
+- Emits: `StopInputDispositionClassified`
+- To: `Idle`
+
+### `ClassifyStopInputDispositionAbandonAttached`
+- From: `Attached`
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
+- Guards:
+  - `not_requeue_eligible`
+- Emits: `StopInputDispositionClassified`
+- To: `Attached`
+
+### `ClassifyStopInputDispositionAbandonRunning`
+- From: `Running`
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
+- Guards:
+  - `not_requeue_eligible`
+- Emits: `StopInputDispositionClassified`
+- To: `Running`
+
+### `ClassifyStopInputDispositionAbandonRetired`
+- From: `Retired`
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
+- Guards:
+  - `not_requeue_eligible`
+- Emits: `StopInputDispositionClassified`
+- To: `Retired`
+
+### `ClassifyStopInputDispositionAbandonStopped`
+- From: `Stopped`
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
+- Guards:
+  - `not_requeue_eligible`
+- Emits: `StopInputDispositionClassified`
+- To: `Stopped`
+
+### `ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopInitializing`
+- From: `Initializing`
+- On: `ResolveRuntimeCompletionWaitFailure`(session_id, failure)
+- Guards:
+  - `requeued_across_stop`
+- Emits: `RuntimeCompletionWaitFailureResolved`
+- To: `Initializing`
+
+### `ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopIdle`
+- From: `Idle`
+- On: `ResolveRuntimeCompletionWaitFailure`(session_id, failure)
+- Guards:
+  - `requeued_across_stop`
+- Emits: `RuntimeCompletionWaitFailureResolved`
+- To: `Idle`
+
+### `ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopAttached`
+- From: `Attached`
+- On: `ResolveRuntimeCompletionWaitFailure`(session_id, failure)
+- Guards:
+  - `requeued_across_stop`
+- Emits: `RuntimeCompletionWaitFailureResolved`
+- To: `Attached`
+
+### `ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopRunning`
+- From: `Running`
+- On: `ResolveRuntimeCompletionWaitFailure`(session_id, failure)
+- Guards:
+  - `requeued_across_stop`
+- Emits: `RuntimeCompletionWaitFailureResolved`
+- To: `Running`
+
+### `ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopRetired`
+- From: `Retired`
+- On: `ResolveRuntimeCompletionWaitFailure`(session_id, failure)
+- Guards:
+  - `requeued_across_stop`
+- Emits: `RuntimeCompletionWaitFailureResolved`
+- To: `Retired`
+
+### `ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopStopped`
+- From: `Stopped`
+- On: `ResolveRuntimeCompletionWaitFailure`(session_id, failure)
+- Guards:
+  - `requeued_across_stop`
+- Emits: `RuntimeCompletionWaitFailureResolved`
 - To: `Stopped`
 
 ## Coverage

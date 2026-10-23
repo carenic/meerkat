@@ -828,6 +828,35 @@ waited for it.
   and the last cause. Nothing in that wait reloads the session (see
   [Scheduling](/guides/scheduling)).
 
+A graceful mob Shutdown that keeps queued inputs
+(`QueuedInputsOnShutdown::Requeue` on `meerkat_mob::ShutdownOptions`) fails the
+completion waiters of the inputs it keeps with
+`CompletionWaitError::RequeuedAcrossStop`. Such an input is neither failed nor
+consumed: it stays durably queued, and the session's next start runs it, or
+ends it abandoned with reason `requeue_expired` when it is older than the
+Shutdown's max age by then. Every start that still finds it queued (after a
+crash before it ran, say) checks its age again. Retiring, archiving or
+destroying the session before a start runs it ends it as any other queued
+input: abandoned with reason `retired` (retire, archive) or `destroyed`. Do
+not resubmit it; after the restart, the same
+idempotency key re-attaches to it. Only a durable prompt in the queue lane
+that is neither directed nor bound to an objective is kept: a member's kickoff,
+and any other objective-bound input, ends as stopped, as without the option.
+
+- The generated wait-failure resolver classes such a wait: session not
+  running, reason `requeued_across_stop`, resumable, and the surface's
+  pre-admission released. It answers the same after the session is gone.
+- A JSON-RPC `turn/start` waiting on it answers `-32003` (session not running)
+  with `data.kind` and `data.reason` `requeued_across_stop`, `data.input_id`,
+  `data.stopped_at` and `data.resumable`.
+- REST answers `409` with code `SESSION_NOT_RUNNING` and the same `details`.
+  It is not a retryable `503`: an unkeyed retry after the restart would run
+  the input twice.
+- A mob member's bounded wait answers `BoundedTurnFailure::RequeuedAcrossStop`,
+  and a same-key replay of an input that expired answers
+  `BoundedTurnFailure::RequeueExpired`.
+- A scheduled delivery re-reads the input's own outcome, as for the cases above.
+
 An input admission whose store write never answers has the same deadline
 since 0.9.4. Past it the admission refuses with the retryable
 `RuntimeDriverError::RecoveryRepairBlocked`, naming the input, and the session

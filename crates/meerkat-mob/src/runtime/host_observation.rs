@@ -3394,14 +3394,36 @@ async fn run_directed_turn_watcher(
         Some(handle) => Some(handle.try_wait().await),
         None => None,
     };
+    // A wait failure the generated authority resolves as resumable (a
+    // graceful stop kept the input durably queued for the next start) is
+    // neither failed nor terminal here. Record nothing; the tracked turn
+    // stays Pending and the next start's recovery reattaches to it.
+    if let Some(Err(error)) = &completion_result
+        && adapter
+            .resolve_runtime_completion_wait_failure(&session, error)
+            .await
+            .is_ok_and(|authority| authority.resumable)
+    {
+        tracing::info!(
+            session_id = %session,
+            input_id = %input_id,
+            error = %error,
+            "input kept queued across a graceful stop; retaining tracked turn Pending for the next start"
+        );
+        return;
+    }
+    // A kept input whose resolution failed is no terminal either.
     if completion_result.as_ref().is_some_and(|result| {
-        result
-            .as_ref()
-            .err()
-            .and_then(CompletionWaitError::wait_failure_observation)
-            == Some(
-                meerkat_runtime::meerkat_machine::dsl::RuntimeCompletionWaitFailureObservation::AuthorityUnavailable,
+        matches!(
+            result
+                .as_ref()
+                .err()
+                .and_then(CompletionWaitError::wait_failure_observation),
+            Some(
+                meerkat_runtime::meerkat_machine::dsl::RuntimeCompletionWaitFailureObservation::AuthorityUnavailable
+                    | meerkat_runtime::meerkat_machine::dsl::RuntimeCompletionWaitFailureObservation::RequeuedAcrossStop,
             )
+        )
     }) {
         if let Some(Err(error)) = &completion_result {
             tracing::error!(

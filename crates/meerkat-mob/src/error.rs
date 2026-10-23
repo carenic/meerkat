@@ -1667,6 +1667,28 @@ pub enum MobError {
         identity: AgentIdentity,
         refusal: MemberSendIdempotencyRefusal,
     },
+
+    /// A graceful Shutdown kept the member input durably queued: it runs on
+    /// the mob's next start. It is not failed. Do not resubmit it; a
+    /// same-key replay after the restart re-attaches to it.
+    #[error(
+        "input {input_id} in session {session_id} stays queued across the stop and runs on the next start; re-attach with the same delivery key, do not resubmit"
+    )]
+    MemberInputRequeuedAcrossStop {
+        session_id: meerkat_core::SessionId,
+        input_id: meerkat_core::InputId,
+    },
+
+    /// An input a graceful Shutdown kept queued was older than its requeue
+    /// bound when the mob's next start recovered it, so it ended without
+    /// running. Resubmitting it is now correct.
+    #[error(
+        "input {input_id} in session {session_id} was requeued across a stop but expired before it ran; resubmit it"
+    )]
+    MemberInputRequeueExpired {
+        session_id: meerkat_core::SessionId,
+        input_id: meerkat_core::InputId,
+    },
 }
 
 /// Why a member's operator authority ceiling was refused
@@ -2688,7 +2710,10 @@ impl MobError {
             | Self::MemberReloadRefused { .. }
             | Self::MemberReloadRepairBlocked { .. }
             | Self::MemberReloadTimedOut { .. }
-            | Self::FlowTurnTimedOut => MobFailureClass::Transport,
+            | Self::FlowTurnTimedOut
+            // The input aged out before it ran: nothing was delivered, and
+            // resubmitting it is correct.
+            | Self::MemberInputRequeueExpired { .. } => MobFailureClass::Transport,
             Self::Internal(_)
             | Self::WorkInputCompletionUnavailable { .. }
             | Self::ExternalMemberCleanupUncertain { .. }
@@ -2719,6 +2744,9 @@ impl MobError {
             | Self::DirectMemberAdoptionPending { .. }
             | Self::WorkInputIdempotencyConflict { .. }
             | Self::MemberInputRefused { .. }
+            // The runtime holds the input queued for the next start: it
+            // completes then, never by a resubmission now.
+            | Self::MemberInputRequeuedAcrossStop { .. }
             | Self::RuntimeEffectRefused { .. }
             // The host refused the restored member: only an explicit repair
             // brings it back.

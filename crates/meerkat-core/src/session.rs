@@ -19257,6 +19257,43 @@ mod deferred_tool_failure_tests {
         include!("../tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt");
     }
 
+    // Byte-exact released v0.9.4 authority, commit
+    // e91835c5fea0170d0dfc1d297d70269234fd4a16, source blob
+    // 845ba539ac70e8bc670b343df78a8dbbdd59e455: the newest released reader.
+    #[allow(dead_code)]
+    mod released_v0_9_4_version_authority {
+        include!("../tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt");
+    }
+
+    /// The released 0.9.4 version authority admits stored input state v3 to
+    /// v7. A row this binary writes without a requeue-across-stop fact is
+    /// stamped at the v7 baseline, so 0.9.4 still reads it; a row carrying a
+    /// stop mark is v8, which this gate refuses with its typed version error
+    /// instead of misreading the mark. A v8 row that ended `RequeueExpired`
+    /// never reaches this gate in 0.9.4: its decode fails first, on the abandon
+    /// reason 0.9.4 does not know (meerkat-runtime's
+    /// `a_released_v0_9_4_reader_fails_closed_on_both_requeue_facts`).
+    #[test]
+    fn released_v0_9_4_version_gate_reads_baseline_rows_and_refuses_v8_typed() {
+        use crate::generated::session_persistence_version_authority as current;
+        assert_eq!(
+            released_v0_9_4_version_authority::restore_stored_input_state_version(
+                current::stored_input_state_version_for_row(false)
+            ),
+            Ok(7)
+        );
+        let refusal = released_v0_9_4_version_authority::restore_stored_input_state_version(
+            current::stored_input_state_version_for_row(true),
+        )
+        .expect_err("0.9.4 refuses a v8 row");
+        assert!(
+            refusal.to_string().contains(
+                "generated session persistence version authority rejected StoredInputState"
+            ),
+            "{refusal}"
+        );
+    }
+
     /// The released 0.9.3 authority admits stored input state v3 to v6 and
     /// rejects a current row: once a 0.9.4 binary has written an input row,
     /// a 0.9.3 binary cannot reopen it.
@@ -19279,23 +19316,24 @@ mod deferred_tool_failure_tests {
 
     /// The released 0.8.50 authority, which admits only stored input state v3
     /// to v5, rejects a current row; the current authority still admits every
-    /// supported older form, the v6 rows 0.9.0 to 0.9.3 wrote included. An
+    /// supported older form, the v6 rows 0.9.0 to 0.9.3 wrote and the v7 rows
+    /// 0.9.4 wrote included. An
     /// older binary may reject a newer row's content before reaching this
     /// version check, so no specific error is promised.
     #[test]
     fn released_reader_rejects_current_stored_input_state_and_current_admits_older_rows() {
         use crate::generated::session_persistence_version_authority as current;
-        assert_eq!(current::stored_input_state_version(), 7);
+        assert_eq!(current::stored_input_state_version(), 8);
         assert!(
             released_v0_8_50_version_authority::restore_stored_input_state_version(
                 current::stored_input_state_version()
             )
             .is_err()
         );
-        for supported in [3, 4, 5, 6, 7] {
+        for supported in [3, 4, 5, 6, 7, 8] {
             assert_eq!(
                 current::restore_stored_input_state_version(supported),
-                Ok(7)
+                Ok(8)
             );
         }
     }

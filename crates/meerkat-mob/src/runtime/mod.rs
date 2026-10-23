@@ -529,7 +529,8 @@ pub(crate) use retirement_settlement::{
 };
 pub use retirement_settlement::{
     MemberShutdownOutcome, MemberUnregisterSettlement, MemberUnregisterState, MobShutdownReport,
-    RetirementSettlement, RetirementSettlementWatch, RetirementStage, ShutdownOptions,
+    QueuedInputsOnShutdown, RequeueMaxAge, RetirementSettlement, RetirementSettlementWatch,
+    RetirementStage, ShutdownOptions, ShutdownOptionsError,
 };
 use roster_authority::{RosterAuthority, RosterMutator};
 #[cfg(not(target_arch = "wasm32"))]

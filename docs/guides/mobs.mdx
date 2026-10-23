@@ -1288,6 +1288,33 @@ Shutdown report such a member's run and run starts as `ReloadRequired` instead
 of failing on it, and a Shutdown holds every member's run starts, reporting the
 first failure in roster order.
 
+Since 0.9.5 a Shutdown can keep queued work for the next start:
+`ShutdownOptions::default().with_queued_inputs(QueuedInputsOnShutdown::Requeue(max_age))`,
+where `max_age` is a `RequeueMaxAge` (`RequeueMaxAge::new(duration)` refuses
+a bound under one millisecond, zero included, or over 24 hours with
+`ShutdownOptionsError`; the default is
+`RequeueMaxAge::DEFAULT`, 15 minutes). A member input still queued behind the
+running turn is kept when it is a durable prompt in the queue lane that is
+neither directed nor bound to an objective, as a host human input submitted
+with `HandlingMode::Queue` is. It
+stays in the member's input store, its waiter ends with
+`BoundedTurnFailure::RequeuedAcrossStop`, and the mob's next start runs it
+once, in admission order, before new work; a same-key replay after the
+restart re-attaches to its result. Do not resubmit it. The cancelled
+turn's user message is not in what the kept input's turn sees. If it is older than
+`max_age`, measured from its admission, when a start finds it still queued
+(every such start checks again), it
+ends as abandoned (`requeue_expired`) without running, and a same-key replay
+answers `BoundedTurnFailure::RequeueExpired`: resubmit it if it is still
+wanted. The running turn's own input still ends cancelled, and steer,
+ephemeral, event, directed and objective-bound inputs still end as stopped. A
+member's kickoff is bound to its objective, so a kickoff still queued at a
+requeue Shutdown ends as stopped and is recorded failed, as with `Stop`.
+`QueuedInputsOnShutdown::Stop`, the default, ends every queued input as
+stopped, as in 0.9.4. 0.9.4 cannot open a store that holds a kept input still
+queued, and cannot read a kept or expired input's row after it ran or expired
+(see [Upgrading](/guides/upgrading)).
+
 A mob restored with an unfinished destroy starts with admission closed before
 `MobBuilder::resume` returns its handle, so nothing is spawned into it while the
 destroy is retried. A recorded placed lifecycle intent, such as a Reset, is not

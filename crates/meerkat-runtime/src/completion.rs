@@ -78,6 +78,19 @@ pub enum CompletionWaitError {
         "the durable outcome of run {run_id} is unknown: its store did not answer within its commit deadline; read the input after its session reloads"
     )]
     DurableOutcomeUnknown { run_id: RunId },
+    /// The input was still queued when its runtime stopped, and the stop's
+    /// unregister kept it durably queued for the next start
+    /// ([`UnregisterQueuedInputs::Requeue`](crate::UnregisterQueuedInputs::Requeue)).
+    /// It is neither failed nor consumed: the next start runs it, or ends it
+    /// as abandoned with reason `requeue_expired` when it is older than the
+    /// stop's max age by then. Do not resubmit it; read it after the restart.
+    #[error(
+        "the input stays queued across the runtime stop at {stopped_at} and runs on the next start; do not resubmit it"
+    )]
+    RequeuedAcrossStop {
+        /// When the stop kept the input queued.
+        stopped_at: chrono::DateTime<chrono::Utc>,
+    },
 }
 
 impl CompletionWaitError {
@@ -95,6 +108,9 @@ impl CompletionWaitError {
             | Self::BoundaryRolledBack { .. }
             | Self::DurableOutcomeUnknown { .. } => Some(
                 crate::meerkat_machine::dsl::RuntimeCompletionWaitFailureObservation::AuthorityUnavailable,
+            ),
+            Self::RequeuedAcrossStop { .. } => Some(
+                crate::meerkat_machine::dsl::RuntimeCompletionWaitFailureObservation::RequeuedAcrossStop,
             ),
             Self::DisclosureRefused { .. } => None,
         }
@@ -125,6 +141,24 @@ impl CompletionWaitError {
     #[must_use]
     pub const fn is_durable_outcome_unknown(&self) -> bool {
         matches!(self, Self::DurableOutcomeUnknown { .. })
+    }
+
+    /// Stable typed predicate: a stop kept the input durably queued for the
+    /// next start. The input is not failed.
+    #[must_use]
+    pub const fn is_requeued_across_stop(&self) -> bool {
+        matches!(self, Self::RequeuedAcrossStop { .. })
+    }
+
+    /// When the stop kept the input queued, for a
+    /// [`RequeuedAcrossStop`](Self::RequeuedAcrossStop) answer; `None` for
+    /// every other failure.
+    #[must_use]
+    pub fn requeued_stopped_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        match self {
+            Self::RequeuedAcrossStop { stopped_at } => Some(*stopped_at),
+            _ => None,
+        }
     }
 }
 
@@ -1906,15 +1940,48 @@ impl CompletionRegistry {
         }
     }
 
-    pub(crate) fn fail_inputs<I>(&mut self, input_ids: I, error: CompletionWaitError)
+    /// Fail the waiters of `input_ids` with `error`. Returns how many of the
+    /// inputs had waiters.
+    pub(crate) fn fail_inputs<I>(&mut self, input_ids: I, error: CompletionWaitError) -> usize
     where
         I: IntoIterator<Item = InputId>,
     {
+        let mut failed = 0;
         for input_id in input_ids {
             if let Some(senders) = self.take_waiters(&input_id) {
                 Self::send_error(senders, error.clone());
+                failed += 1;
             }
         }
+        failed
+    }
+
+    /// Answer every waiter still registered when an unregister's drain
+    /// resumes after the stop terminalization. A waiter of an input the stop
+    /// kept queued for the next start gets
+    /// [`CompletionWaitError::RequeuedAcrossStop`] with the stop's time; every
+    /// other one gets `AuthorityUnavailable`, since the terminalization has
+    /// already published every terminal recipient. Returns how many kept
+    /// inputs still had waiters here.
+    pub(crate) fn drain_unregistered_waiters<I>(&mut self, kept: I) -> usize
+    where
+        I: IntoIterator<Item = (InputId, chrono::DateTime<chrono::Utc>)>,
+    {
+        let mut late = 0;
+        for (input_id, stopped_at) in kept {
+            late += self.fail_inputs(
+                [input_id],
+                CompletionWaitError::RequeuedAcrossStop { stopped_at },
+            );
+        }
+        self.fail_not_pending_waiters(
+            |_| false,
+            CompletionWaitError::AuthorityUnavailable(
+                "runtime session unregistered after canonical terminal recipients resolved"
+                    .to_string(),
+            ),
+        );
+        late
     }
 
     /// Fail waiter plumbing whose input IDs are no longer pending after a
@@ -2108,6 +2175,40 @@ mod tests {
             CompletionOutcome::Completed(r) => assert_eq!(r.text, "hello"),
             other => panic!("Expected Completed, got {other:?}"),
         }
+    }
+
+    /// The unregister drain answers each waiter of an input the stop kept
+    /// queued with the requeued answer and the stop's time, never with the
+    /// unregistered failure; every other leftover waiter gets that failure.
+    #[tokio::test]
+    async fn the_unregister_drain_answers_a_kept_inputs_waiters_as_requeued() {
+        let mut registry = CompletionRegistry::new();
+        let kept = InputId::new();
+        let other = InputId::new();
+        let kept_waiters = [
+            registry.register(kept.clone()),
+            registry.register(kept.clone()),
+        ];
+        let other_waiter = registry.register(other);
+        let stopped_at = chrono::Utc::now();
+
+        let late = registry.drain_unregistered_waiters([(kept, stopped_at)]);
+
+        assert_eq!(late, 1, "the kept input still had waiters at the drain");
+        for waiter in kept_waiters {
+            match waiter.try_wait().await {
+                Err(error) => assert_eq!(
+                    error,
+                    CompletionWaitError::RequeuedAcrossStop { stopped_at }
+                ),
+                Ok(outcome) => panic!("a kept input's waiter completed: {outcome:?}"),
+            }
+        }
+        match other_waiter.try_wait().await {
+            Err(CompletionWaitError::AuthorityUnavailable(_)) => {}
+            other => panic!("expected the unregistered failure, got {other:?}"),
+        }
+        assert!(!registry.debug_has_waiters());
     }
 
     #[tokio::test]
@@ -2474,6 +2575,68 @@ mod tests {
             crate::meerkat_machine::dsl::RuntimeCompletionWaitFailurePublicReason::CompletionAuthorityUnavailable
         );
         assert!(!authority.resumable);
+    }
+
+    /// A graceful stop answers a kept input's waiter while its session
+    /// unregisters. The generated arm for that failure reads no session
+    /// state, so it answers the same before and after the session is gone:
+    /// release the pre-admission, session not running, requeued across the
+    /// stop, resumable. The waiter's error carries the stop's time.
+    #[tokio::test]
+    async fn wait_failure_authority_resolves_a_kept_input_with_or_without_its_session() {
+        use crate::meerkat_machine::dsl::{
+            RuntimeCompletionWaitFailureObservation, RuntimeCompletionWaitFailurePublicErrorClass,
+            RuntimeCompletionWaitFailurePublicReason,
+        };
+
+        let adapter = crate::meerkat_machine::MeerkatMachine::ephemeral();
+        let session_id = SessionId::new();
+        let stopped_at = chrono::Utc::now();
+        let requeued = CompletionWaitError::RequeuedAcrossStop { stopped_at };
+        assert_eq!(
+            requeued.wait_failure_observation(),
+            Some(RuntimeCompletionWaitFailureObservation::RequeuedAcrossStop)
+        );
+        assert_eq!(requeued.requeued_stopped_at(), Some(stopped_at));
+        assert_eq!(
+            CompletionWaitError::ChannelClosed.requeued_stopped_at(),
+            None
+        );
+
+        for registered in [false, true] {
+            if registered {
+                adapter
+                    .prepare_bindings(session_id.clone())
+                    .await
+                    .expect("session should prepare runtime bindings");
+            }
+            let authority = adapter
+                .resolve_runtime_completion_wait_failure(&session_id, &requeued)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("registered={registered}: a kept input's wait must resolve: {error:?}")
+                });
+            assert!(
+                authority.releases_pre_admission(),
+                "registered={registered}"
+            );
+            assert_eq!(
+                authority.failure,
+                RuntimeCompletionWaitFailureObservation::RequeuedAcrossStop,
+                "registered={registered}"
+            );
+            assert_eq!(
+                authority.public_error_class,
+                RuntimeCompletionWaitFailurePublicErrorClass::SessionNotRunning,
+                "registered={registered}"
+            );
+            assert_eq!(
+                authority.public_reason,
+                RuntimeCompletionWaitFailurePublicReason::RequeuedAcrossStop,
+                "registered={registered}"
+            );
+            assert!(authority.resumable, "registered={registered}");
+        }
     }
 
     #[tokio::test]

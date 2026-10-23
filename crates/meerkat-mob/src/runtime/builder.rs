@@ -11026,6 +11026,8 @@ impl MobBuilder {
                 stuck_retirements: BTreeMap::new(),
                 shutdown_report: super::MobShutdownReport::default(),
                 shutdown_deadline: None,
+                #[cfg(feature = "runtime-adapter")]
+                shutdown_queued_inputs: super::QueuedInputsOnShutdown::Stop,
                 pending_shutdown_teardown: None,
                 pending_stuck_redrives: std::collections::VecDeque::new(),
                 next_retirement_ticket: 0,

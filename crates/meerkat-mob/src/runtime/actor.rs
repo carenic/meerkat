@@ -7837,6 +7837,10 @@ pub(super) struct MobActor {
     pub(super) shutdown_report: super::MobShutdownReport,
     /// Caller-owned bound of the Shutdown in progress (`ShutdownOptions`).
     pub(super) shutdown_deadline: Option<Instant>,
+    /// What the Shutdown in progress does with inputs still queued behind a
+    /// member's running turn (`ShutdownOptions`).
+    #[cfg(feature = "runtime-adapter")]
+    pub(super) shutdown_queued_inputs: super::QueuedInputsOnShutdown,
     /// A Shutdown parked while its runtime teardown runs off the actor loop.
     pub(super) pending_shutdown_teardown: Option<shutdown_teardown::PendingShutdownTeardown>,
     /// Stuck retirements a resume handed back for re-drive, started one at a
@@ -16787,6 +16791,10 @@ impl MobActor {
         }
         let report = std::mem::take(&mut self.shutdown_report);
         self.shutdown_deadline = None;
+        #[cfg(feature = "runtime-adapter")]
+        {
+            self.shutdown_queued_inputs = super::QueuedInputsOnShutdown::Stop;
+        }
         let outstanding = report
             .members
             .values()
@@ -29312,7 +29320,11 @@ impl MobActor {
                     return Box::pin(self.resolve_shutdown_teardown(ticket, outcomes, command_rx))
                         .await;
                 }
-                MobCommand::Shutdown { deadline, reply_tx } => {
+                MobCommand::Shutdown {
+                    deadline,
+                    queued_inputs,
+                    reply_tx,
+                } => {
                     // A Shutdown arriving while one is parked on its runtime
                     // teardown receives that Shutdown's result.
                     if let Some(pending) = self.pending_shutdown_teardown.as_mut() {
@@ -29320,6 +29332,12 @@ impl MobActor {
                         return ActorLoopControl::SkipBoundary;
                     }
                     self.shutdown_deadline = deadline;
+                    #[cfg(feature = "runtime-adapter")]
+                    {
+                        self.shutdown_queued_inputs = queued_inputs;
+                    }
+                    #[cfg(not(feature = "runtime-adapter"))]
+                    let _ = queued_inputs;
                     // Probe only: Shutdown commits at its end. The probed
                     // transition owns the run-start hold obligation.
                     let admission = self
@@ -63269,6 +63287,28 @@ mod kickoff_tests {
         assert_eq!(
             metadata.transcript_identity.objective_id,
             Some(objective_id)
+        );
+    }
+
+    /// The producer half of the requeue rule's objective binding: the turn
+    /// metadata that delegation, fork and helper work carry on a turn-driven
+    /// member holds their objective in its transcript identity, on the
+    /// input's own turn metadata, where the runtime's stop classifier reads
+    /// it. Work without an objective carries none.
+    #[test]
+    fn submit_work_turn_metadata_carries_the_objective_the_stop_classifier_reads() {
+        let objective_id = meerkat_core::interaction::ObjectiveId::new();
+        let metadata = submit_work_turn_metadata(None, None, Some(objective_id))
+            .expect("an objective alone never conflicts")
+            .expect("an objective produces turn metadata");
+        assert_eq!(
+            metadata.transcript_identity.objective_id,
+            Some(objective_id)
+        );
+        assert!(
+            submit_work_turn_metadata(None, None, None)
+                .expect("empty metadata never conflicts")
+                .is_none()
         );
     }
 

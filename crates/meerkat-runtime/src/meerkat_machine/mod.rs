@@ -926,6 +926,7 @@ fn input_terminality_parts(
                 InputAbandonReason::ToolProcessInterrupted => {
                     dsl::InputAbandonReason::ToolProcessInterrupted
                 }
+                InputAbandonReason::RequeueExpired => dsl::InputAbandonReason::RequeueExpired,
             }),
         ),
     }
@@ -1238,6 +1239,7 @@ pub(crate) use session_management::{
 };
 
 pub use composition::{MeerkatCompositionSignalDispatcher, MeerkatConsumerSurface};
+pub use runtime_control::RuntimeCompletionWaitFailureAuthority;
 
 pub use comms_drain::{
     CommsDrainMode, CommsDrainPhase, DrainExitReason, PeerEndpointStageError, PeerIngressOwner,
@@ -1306,6 +1308,10 @@ struct UnregisterTeardownCoordinator {
     epoch_id: meerkat_core::RuntimeEpochId,
     coordinator_id: uuid::Uuid,
     result_rx: crate::tokio::sync::watch::Receiver<Option<UnregisterTeardownResult>>,
+    /// The checked disposition the caller that installed this coordinator
+    /// asked for. `BeginUnregisterSession` records it once; from then on the
+    /// generated state and the durable progress own it.
+    queued_inputs: UnregisterDisposition,
 }
 
 /// Read-only terminal-result observer for one exact runtime unregister
@@ -1395,6 +1401,110 @@ pub enum RuntimeSessionUnregisterAdmission {
     /// The exact coordinator remains process-owned; poll this observer on a
     /// later caller retry.
     Pending(RuntimeSessionUnregisterObserver),
+}
+
+/// What a runtime unregister does with inputs still queued behind the
+/// session's running turn when it stops the runtime.
+///
+/// [`Self::Stop`] ends every non-terminal input as stopped, as an
+/// unregister always has. [`Self::Requeue`] keeps each eligible queued input
+/// (a durable prompt in the Queue lane that is neither directed nor bound to
+/// an objective) durably queued instead, marked for the runtime's next start,
+/// which runs it unless it is older than `max_age` by then. Its waiter is
+/// answered
+/// [`CompletionWaitError::RequeuedAcrossStop`](crate::completion::CompletionWaitError::RequeuedAcrossStop).
+/// An unregister already in progress keeps the disposition it began with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum UnregisterQueuedInputs {
+    /// End every non-terminal input as stopped.
+    #[default]
+    Stop,
+    /// Keep eligible queued inputs durably queued for the next start.
+    Requeue {
+        /// The age, measured from admission, past which the next start ends
+        /// a kept input as expired instead of running it.
+        max_age: std::time::Duration,
+    },
+}
+
+impl UnregisterQueuedInputs {
+    /// The longest max age a requeue may carry.
+    pub const MAX_AGE_CAP: std::time::Duration = std::time::Duration::from_hours(24);
+
+    /// Check the disposition every unregister entry point checks before it
+    /// starts anything. A requeue's max age is recorded in whole
+    /// milliseconds, so a max age under one millisecond (zero included) is
+    /// refused, as is one over [`Self::MAX_AGE_CAP`]; neither is clamped.
+    ///
+    /// # Errors
+    /// [`UnregisterQueuedInputsError`] names the refused max age.
+    pub fn check(self) -> Result<(), UnregisterQueuedInputsError> {
+        self.recorded().map(|_| ())
+    }
+
+    /// The generated disposition and the max age in whole milliseconds that
+    /// `BeginUnregisterSession` records, for a disposition that passes
+    /// [`Self::check`].
+    pub(crate) fn recorded(self) -> Result<UnregisterDisposition, UnregisterQueuedInputsError> {
+        match self {
+            Self::Stop => Ok(UnregisterDisposition::STOP),
+            Self::Requeue { max_age } => {
+                if max_age > Self::MAX_AGE_CAP {
+                    return Err(UnregisterQueuedInputsError::MaxAgeOverCap {
+                        max_age,
+                        cap: Self::MAX_AGE_CAP,
+                    });
+                }
+                match u64::try_from(max_age.as_millis()) {
+                    Ok(0) | Err(_) => {
+                        Err(UnregisterQueuedInputsError::MaxAgeUnderOneMillisecond { max_age })
+                    }
+                    Ok(requeue_max_age_ms) => Ok(UnregisterDisposition {
+                        queued_inputs: dsl::UnregisterQueuedInputsDisposition::Requeue,
+                        requeue_max_age_ms,
+                    }),
+                }
+            }
+        }
+    }
+}
+
+/// A refused [`UnregisterQueuedInputs`]: nothing was started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum UnregisterQueuedInputsError {
+    /// The requeue max age is under one millisecond, the resolution the stop
+    /// mark records; zero is refused here too.
+    #[error("requeue max age {max_age:?} is under one millisecond")]
+    MaxAgeUnderOneMillisecond { max_age: std::time::Duration },
+    /// The requeue max age is over [`UnregisterQueuedInputs::MAX_AGE_CAP`].
+    #[error("requeue max age {max_age:?} is over the {cap:?} cap")]
+    MaxAgeOverCap {
+        max_age: std::time::Duration,
+        cap: std::time::Duration,
+    },
+}
+
+/// A checked [`UnregisterQueuedInputs`], as an unregister coordinator holds
+/// it: the generated disposition and the whole milliseconds
+/// `BeginUnregisterSession` records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UnregisterDisposition {
+    queued_inputs: dsl::UnregisterQueuedInputsDisposition,
+    requeue_max_age_ms: u64,
+}
+
+impl UnregisterDisposition {
+    /// Stop every non-terminal input; nothing to record.
+    pub(crate) const STOP: Self = Self {
+        queued_inputs: dsl::UnregisterQueuedInputsDisposition::Stop,
+        requeue_max_age_ms: 0,
+    };
+
+    pub(crate) fn dsl_disposition(self) -> (dsl::UnregisterQueuedInputsDisposition, u64) {
+        (self.queued_inputs, self.requeue_max_age_ms)
+    }
 }
 
 /// Answer of
@@ -3747,6 +3857,61 @@ impl PendingRuntimeExecutorAttachment {
             );
         }
         Ok(abandoned)
+    }
+
+    /// End, before this attachment can serve, every input an earlier
+    /// graceful stop kept queued that is now older than that stop's max age
+    /// (`crate::input_state::stop_requeue_expired` at `now`). Each is
+    /// abandoned through the machine's `AbandonInput` with the typed
+    /// [`crate::input_state::InputAbandonReason::RequeueExpired`], durably
+    /// committed with its payload retired, so it never runs. The retained
+    /// mutation guard and the pending (non-serving) slot keep the input set
+    /// complete. Every attachment passes here before its serving gate, so no
+    /// path serves a kept input that has not been checked. Returns the
+    /// expired inputs.
+    pub(crate) async fn settle_expired_stop_requeued_inputs(
+        &mut self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<InputId>, RuntimeDriverError> {
+        let (driver, completions) = self
+            .exact_pending_driver("requeue expiry settlement")
+            .await?;
+        let expired = {
+            let mut driver = driver.lock().await;
+            let candidates =
+                crate::input_state::expired_stop_requeued_inputs(driver.as_driver(), now);
+            let mut expired = Vec::with_capacity(candidates.len());
+            for input_id in candidates {
+                if driver
+                    .abandon_queued_input(
+                        &input_id,
+                        crate::input_state::InputAbandonReason::RequeueExpired,
+                    )
+                    .await?
+                {
+                    // Committed: told once this attachment releases its
+                    // mutation guard, even if a later input fails here.
+                    self.runless_terminal.owe();
+                    expired.push(input_id);
+                } else {
+                    tracing::warn!(
+                        session_id = %self.witness.session_id(),
+                        %input_id,
+                        "an input a stop kept queued was not queued at its expiry settlement; left as is"
+                    );
+                }
+            }
+            expired
+        };
+        if !expired.is_empty() {
+            // As for an interrupted run's inputs: the old input is durably
+            // ended, and a retry is a new request.
+            completions.lock().await.fail_inputs(
+                expired.clone(),
+                crate::completion::CompletionWaitError::AttachmentReplaced,
+            );
+        }
+        Ok(expired)
     }
 
     /// Settle the session's interrupted-run evidence before serving, in a
@@ -8209,6 +8374,15 @@ impl MeerkatMachine {
         context: &str,
     ) -> Result<Vec<dsl::MeerkatMachineEffect>, String> {
         let authority = self.session_dsl_authority(session_id).await?;
+        Self::preview_dsl_input_on_shared_authority(&authority, input, context)
+    }
+
+    /// Preview `input` on a fork of one session's live authority.
+    fn preview_dsl_input_on_shared_authority(
+        authority: &std::sync::Mutex<dsl::MeerkatMachineAuthority>,
+        input: dsl::MeerkatMachineInput,
+        context: &str,
+    ) -> Result<Vec<dsl::MeerkatMachineEffect>, String> {
         let preview = match authority.lock() {
             Ok(authority) => Ok(authority.fork()),
             Err(poisoned) => {

@@ -743,14 +743,22 @@ CREATE TABLE IF NOT EXISTS runtime_direct_member_high_waters (
                     5 | 6 if target_current => {}
                     version
                         if target_current
-                            && version
+                            && (version
                                 == u64::from(
-                                    meerkat_core::generated::session_persistence_version_authority::stored_input_state_version(),
-                                ) =>
+                                    meerkat_core::generated::session_persistence_version_authority::stored_input_state_version_for_row(false),
+                                )
+                                || version
+                                    == u64::from(
+                                        meerkat_core::generated::session_persistence_version_authority::stored_input_state_version(),
+                                    )) =>
                     {
                         // A file already at the current encoding is verified,
                         // not rewritten: the row must already be exactly what
-                        // this binary would write.
+                        // this binary would write. This binary stamps a row
+                        // with the baseline version unless it carries a fact
+                        // only the current version can hold, and the
+                        // exact-bytes check below holds the stamp to the
+                        // row's own facts.
                         let stored: StoredInputState =
                             serde_json::from_value(encoded).map_err(|error| error.to_string())?;
                         validate_pre_0_8_10_row_identity(input_id, &stored)?;
@@ -3555,7 +3563,7 @@ END";
                 serde_json::from_slice(&carried_v3).expect("carried v3 json");
             assert_eq!(
                 carried_v3_json["stored_input_state_version"],
-                meerkat_core::generated::session_persistence_version_authority::stored_input_state_version()
+                meerkat_core::generated::session_persistence_version_authority::stored_input_state_version_for_row(false)
             );
             for field in [
                 "input_id",
@@ -3935,7 +3943,7 @@ END";
             let successor = load_row(&conn, "runtime", &input_id);
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&successor).expect("successor json")["stored_input_state_version"],
-                meerkat_core::generated::session_persistence_version_authority::stored_input_state_version()
+                meerkat_core::generated::session_persistence_version_authority::stored_input_state_version_for_row(false)
             );
 
             conn.execute_batch(
@@ -3948,14 +3956,57 @@ END";
             )
             .expect("target ledger");
             let tx = conn.transaction().expect("rerun tx");
-            assert_eq!(
-                prepare_pre_0_8_10_runtime_input_states(&tx)
-                    .expect("target-v2 rerun")
-                    .changed,
-                0
-            );
+            let rerun = prepare_pre_0_8_10_runtime_input_states(&tx).expect("target-v2 rerun");
+            assert_eq!(rerun.changed, 0);
+            assert!(rerun.refused.is_empty(), "{:?}", rerun.refused);
             tx.commit().expect("rerun commit");
             assert_eq!(load_row(&conn, "runtime", &input_id), successor);
+        }
+
+        /// A store a released 0.9.4 binary wrote holds every runtime input
+        /// row at stored input state version 7 under runtime-store ledger 3.
+        /// Version 7 is still the encoding this binary writes for a row
+        /// without a requeue fact, so a maintenance rerun over such a store
+        /// reads those rows as already canonical: nothing is rewritten and
+        /// nothing is refused as not admitted.
+        #[test]
+        fn maintenance_prepare_rerun_accepts_the_v7_rows_of_a_store_released_0_9_4_wrote() {
+            let mut conn = Connection::open_in_memory().expect("open");
+            conn.execute_batch(CREATE_RUNTIME_SCHEMA_SQL)
+                .expect("runtime v1 schema");
+            let (input_id, source) = legacy_prompt_row();
+            insert_row(&conn, "runtime", &input_id, &source);
+            let tx = conn.transaction().expect("bridge tx");
+            assert_eq!(
+                prepare_pre_0_8_10_runtime_input_states(&tx)
+                    .expect("bridge")
+                    .changed,
+                1
+            );
+            tx.commit().expect("bridge commit");
+            let released_row = load_row(&conn, "runtime", &input_id);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&released_row).expect("row json")["stored_input_state_version"],
+                7,
+                "a row without a requeue fact is in the version 7 encoding 0.9.4 writes"
+            );
+
+            conn.execute_batch(
+                "CREATE TABLE meerkat_schema (
+                     domain TEXT PRIMARY KEY,
+                     version INTEGER NOT NULL
+                 );
+                 INSERT INTO meerkat_schema (domain, version)
+                 VALUES ('runtime-store', 3);",
+            )
+            .expect("the runtime-store ledger 0.9.4 writes");
+            let tx = conn.transaction().expect("rerun tx");
+            let rerun = prepare_pre_0_8_10_runtime_input_states(&tx)
+                .expect("a rerun over a store 0.9.4 wrote");
+            assert_eq!(rerun.changed, 0);
+            assert!(rerun.refused.is_empty(), "{:?}", rerun.refused);
+            tx.commit().expect("rerun commit");
+            assert_eq!(load_row(&conn, "runtime", &input_id), released_row);
         }
 
         /// A row a 0.8.11 to 0.8.52 binary wrote (v5), or a 0.9.0 to 0.9.3
@@ -9391,7 +9442,11 @@ ORDER BY runtime_id";
     /// release left pending could never be finalized. Such a row is compared as
     /// the current typed decoder reads it, re-encoded. A row at the current
     /// version is compared exactly as stored, and a row that does not decode
-    /// stays as stored, so any other difference is still stale.
+    /// stays as stored, so any other difference is still stale. A row this
+    /// binary writes without a requeue fact keeps the baseline stamp, below
+    /// the current version, and is re-encoded too: the stamp cannot tell it
+    /// from an earlier release's row of that version, whose bytes may differ,
+    /// and its own re-encoding is the same bytes.
     fn input_row_in_current_encoding(stored: Vec<u8>) -> Vec<u8> {
         use meerkat_core::generated::session_persistence_version_authority as version_authority;
 
@@ -28270,9 +28325,11 @@ ORDER BY runtime_id";
                 completion.phase,
                 crate::input_state::InputTerminalCompletionPhase::Pending
             ));
+            // This binary stamps a row without a requeue fact with the
+            // baseline version.
             let current_stamp = format!(
                 "\"stored_input_state_version\":{}",
-                version_authority::stored_input_state_version()
+                version_authority::stored_input_state_version_for_row(false)
             );
             assert_eq!(
                 serde_json::to_string(&expected).unwrap(),

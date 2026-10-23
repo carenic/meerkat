@@ -2801,6 +2801,8 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         | MobError::MemberInputRefused { .. }
         | MobError::GovernedInputUnbound { .. }
         | MobError::WorkInputCompletionUnavailable { .. }
+        | MobError::MemberInputRequeuedAcrossStop { .. }
+        | MobError::MemberInputRequeueExpired { .. }
         | MobError::ActorCommandTimedOut { .. }
         | MobError::MemberReloadRefused { .. }
         | MobError::MemberReloadRepairBlocked { .. }
@@ -3257,6 +3259,17 @@ pub(crate) enum ExactTurnTerminal {
     Runtime(meerkat_runtime::completion::CompletionOutcome),
     DirectSessionError(meerkat_core::service::SessionError),
     PlacedBounded(meerkat_contracts::wire::supervisor_bridge::BridgeBoundedTurnResult),
+    /// A graceful stop kept the admitted input durably queued for the next
+    /// start ([`meerkat_runtime::completion::CompletionWaitError::RequeuedAcrossStop`]).
+    RequeuedAcrossStop {
+        input_id: meerkat_core::lifecycle::InputId,
+    },
+    /// The next start ended an input a graceful stop had kept queued, as
+    /// older than its requeue bound
+    /// ([`meerkat_runtime::InputAbandonReason::RequeueExpired`]).
+    RequeueExpired {
+        input_id: meerkat_core::lifecycle::InputId,
+    },
 }
 
 pub(crate) type ExactTurnCompletionSender =
@@ -4339,6 +4352,20 @@ pub enum BoundedTurnFailure {
         admitted_session_id: SessionId,
         error: MobError,
     },
+    /// A graceful Shutdown kept this queued input durably queued: it runs on
+    /// the mob's next start. Do not resubmit it; a same-key replay after the
+    /// restart re-attaches to it.
+    RequeuedAcrossStop {
+        session_id: SessionId,
+        input_id: meerkat_core::lifecycle::InputId,
+    },
+    /// An input a graceful Shutdown kept queued was older than its requeue
+    /// bound when the next start recovered it, so it ended without running.
+    /// Resubmitting it is now correct.
+    RequeueExpired {
+        session_id: SessionId,
+        input_id: meerkat_core::lifecycle::InputId,
+    },
 }
 
 impl std::fmt::Display for BoundedTurnFailure {
@@ -4438,6 +4465,20 @@ impl std::fmt::Display for BoundedTurnFailure {
                     "exact turn completion plumbing for admitted session '{admitted_session_id}' failed: {error}"
                 )
             }
+            Self::RequeuedAcrossStop {
+                session_id,
+                input_id,
+            } => write!(
+                f,
+                "input '{input_id}' for session '{session_id}' stays queued across the stop and runs on the next start; re-attach with the same delivery key, do not resubmit"
+            ),
+            Self::RequeueExpired {
+                session_id,
+                input_id,
+            } => write!(
+                f,
+                "input '{input_id}' for session '{session_id}' was requeued across a stop but expired before it ran; resubmit it"
+            ),
         }
     }
 }
@@ -4791,6 +4832,16 @@ fn bounded_exact_turn_result(
         ExactTurnTerminal::DirectSessionError(error) => {
             Err(bounded_direct_session_failure(error, session_id, spec))
         }
+        ExactTurnTerminal::RequeuedAcrossStop { input_id } => {
+            Err(BoundedTurnFailure::RequeuedAcrossStop {
+                session_id,
+                input_id,
+            })
+        }
+        ExactTurnTerminal::RequeueExpired { input_id } => Err(BoundedTurnFailure::RequeueExpired {
+            session_id,
+            input_id,
+        }),
         ExactTurnTerminal::PlacedBounded(result) => {
             let result_session_id = SessionId::parse(&result.session_id).map_err(|_| {
                 BoundedTurnFailure::ResultAttributionMismatch {
@@ -4999,6 +5050,18 @@ pub(crate) fn legacy_exact_turn_result(
             return Err(legacy_direct_session_error(&session_id, error));
         }
         ExactTurnTerminal::PlacedBounded(_) => return Ok(None),
+        ExactTurnTerminal::RequeuedAcrossStop { input_id } => {
+            return Err(MobError::MemberInputRequeuedAcrossStop {
+                session_id,
+                input_id,
+            });
+        }
+        ExactTurnTerminal::RequeueExpired { input_id } => {
+            return Err(MobError::MemberInputRequeueExpired {
+                session_id,
+                input_id,
+            });
+        }
     };
     match outcome {
         meerkat_runtime::completion::CompletionOutcome::Completed(result) => Ok(Some(result)),
@@ -8718,9 +8781,16 @@ impl MobHandle {
                     .await??;
                 Ok(MobMachineCommandResult::Unit)
             }
-            MobMachineCommand::Shutdown { deadline } => {
-                self.send_actor_command(|reply_tx| MobCommand::Shutdown { deadline, reply_tx })
-                    .await??;
+            MobMachineCommand::Shutdown {
+                deadline,
+                queued_inputs,
+            } => {
+                self.send_actor_command(|reply_tx| MobCommand::Shutdown {
+                    deadline,
+                    queued_inputs,
+                    reply_tx,
+                })
+                .await??;
                 Ok(MobMachineCommandResult::Unit)
             }
             MobMachineCommand::ForceCancel { agent_identity } => {
@@ -15555,11 +15625,17 @@ impl MobHandle {
     /// the member's exact registration afterwards) and Shutdown returns.
     /// Without a deadline the member lifecycle hang guard is the failure
     /// bound. Durable state stays re-drivable on the next start either way.
+    ///
+    /// `options.queued_inputs` chooses what happens to inputs still queued
+    /// behind a member's running turn: the default ends them as stopped;
+    /// [`QueuedInputsOnShutdown::Requeue`](super::QueuedInputsOnShutdown::Requeue)
+    /// keeps the eligible ones durably queued for the mob's next start.
     pub async fn shutdown_with_report(
         &self,
         options: super::ShutdownOptions,
     ) -> Result<super::MobShutdownReport, MobError> {
-        self.shutdown_until(options.deadline).await?;
+        self.shutdown_until(options.deadline, options.queued_inputs)
+            .await?;
         Ok(self
             .lifecycle_observations
             .last_shutdown_report()
@@ -15590,10 +15666,15 @@ impl MobHandle {
     /// mob's next start. Members the Shutdown could not settle are logged at
     /// warn; use [`Self::shutdown_with_report`] for the per-member account.
     pub async fn shutdown(&self) -> Result<(), MobError> {
-        self.shutdown_until(None).await
+        self.shutdown_until(None, super::QueuedInputsOnShutdown::Stop)
+            .await
     }
 
-    async fn shutdown_until(&self, caller_deadline: Option<Instant>) -> Result<(), MobError> {
+    async fn shutdown_until(
+        &self,
+        caller_deadline: Option<Instant>,
+        queued_inputs: super::QueuedInputsOnShutdown,
+    ) -> Result<(), MobError> {
         let now = tokio::time::Instant::now();
         let default_guard = now + DEFAULT_KICKOFF_WAIT_TIMEOUT;
         let hang_guard = caller_deadline.map_or(default_guard, |caller| {
@@ -15604,6 +15685,7 @@ impl MobHandle {
             match self
                 .execute_machine_command(MobMachineCommand::Shutdown {
                     deadline: caller_deadline,
+                    queued_inputs,
                 })
                 .await
             {
@@ -15625,6 +15707,7 @@ impl MobHandle {
     pub(super) async fn shutdown_once_for_test(&self) -> Result<(), MobError> {
         self.send_actor_command(|reply_tx| MobCommand::Shutdown {
             deadline: None,
+            queued_inputs: super::QueuedInputsOnShutdown::Stop,
             reply_tx,
         })
         .await?
@@ -21213,6 +21296,57 @@ mod tests {
             }
             other => panic!("expected bounded direct extraction failure, got {other:?}"),
         }
+    }
+
+    /// A graceful stop's requeue answers reach a bounded waiter typed, with
+    /// the admitted session and the input: kept queued for the next start,
+    /// or expired at that start. Never completion plumbing, never an
+    /// abandoned reason string.
+    #[test]
+    fn requeue_terminals_reach_a_bounded_waiter_typed() {
+        let session_id = SessionId::new();
+        let input_id = meerkat_core::lifecycle::InputId::new();
+        let spec = BoundedResultSpec::new("requeue", 64).expect("bounded spec");
+        let kept = bounded_exact_turn_result(
+            ExactTurnCompletion {
+                session_id: session_id.clone(),
+                terminal: ExactTurnTerminal::RequeuedAcrossStop {
+                    input_id: input_id.clone(),
+                },
+            },
+            &session_id,
+            &spec,
+        );
+        assert!(
+            matches!(
+                &kept,
+                Err(BoundedTurnFailure::RequeuedAcrossStop {
+                    session_id: kept_session,
+                    input_id: kept_input,
+                }) if kept_session == &session_id && kept_input == &input_id
+            ),
+            "{kept:?}"
+        );
+        let expired = bounded_exact_turn_result(
+            ExactTurnCompletion {
+                session_id: session_id.clone(),
+                terminal: ExactTurnTerminal::RequeueExpired {
+                    input_id: input_id.clone(),
+                },
+            },
+            &session_id,
+            &spec,
+        );
+        assert!(
+            matches!(
+                &expired,
+                Err(BoundedTurnFailure::RequeueExpired {
+                    session_id: expired_session,
+                    input_id: expired_input,
+                }) if expired_session == &session_id && expired_input == &input_id
+            ),
+            "{expired:?}"
+        );
     }
 
     #[test]

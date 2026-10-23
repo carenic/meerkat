@@ -44,6 +44,11 @@ const SUPERVISOR_MACHINE_LIFECYCLE_STORE_RECORD_VERSION: u16 = 2;
 const UNREGISTER_MACHINE_LIFECYCLE_STORE_RECORD_VERSION: u16 = 3;
 const RUN_MACHINE_LIFECYCLE_STORE_RECORD_VERSION: u16 = 4;
 pub(crate) const MACHINE_LIFECYCLE_STORE_RECORD_VERSION: u16 = 5;
+/// A record whose unregister progress keeps queued inputs for the next start.
+/// Only such records carry it, so a host that never requeues writes version
+/// 5 byte for byte, and an older reader refuses a requeue record as an
+/// unsupported version instead of stopping its kept inputs.
+pub(crate) const REQUEUE_MACHINE_LIFECYCLE_STORE_RECORD_VERSION: u16 = 6;
 
 /// Maximum number of exact input-state rows admitted by one compare-and-swap
 /// boundary. Directed-terminal outbox batches share the same 256-row bound as
@@ -6609,6 +6614,9 @@ pub struct MachineUnregisterProgressSnapshot {
     completion_waiter_drain_pending: bool,
     runtime_loop_forced_abort: bool,
     comms_drain_forced_abort: bool,
+    /// The max age, in milliseconds, of the queued inputs this unregister
+    /// keeps for the next start; `None` when it stops them.
+    requeue_max_age_ms: Option<u64>,
 }
 
 impl MachineUnregisterProgressSnapshot {
@@ -6625,7 +6633,21 @@ impl MachineUnregisterProgressSnapshot {
             completion_waiter_drain_pending,
             runtime_loop_forced_abort,
             comms_drain_forced_abort,
+            requeue_max_age_ms: None,
         }
+    }
+
+    /// This progress with the unregister's requeue max age: `Some` when it
+    /// began with the requeue disposition.
+    #[must_use]
+    pub(crate) fn with_requeue_max_age_ms(mut self, requeue_max_age_ms: Option<u64>) -> Self {
+        self.requeue_max_age_ms = requeue_max_age_ms;
+        self
+    }
+
+    /// The requeue max age the unregister began with, `None` for a stop.
+    pub(crate) fn requeue_max_age_ms(&self) -> Option<u64> {
+        self.requeue_max_age_ms
     }
 
     pub(crate) fn runtime_loop_drain_pending(&self) -> bool {
@@ -6946,6 +6968,23 @@ struct MachineUnregisterProgressSnapshotStoreWire {
     completion_waiter_drain_pending: bool,
     runtime_loop_forced_abort: bool,
     comms_drain_forced_abort: bool,
+    /// Present only when the unregister keeps queued inputs, so a stopping
+    /// unregister's progress is the version 5 shape byte for byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    queued_inputs: Option<UnregisterQueuedInputsStoreWire>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnregisterQueuedInputsStoreWire {
+    disposition: UnregisterQueuedInputsDispositionStoreWire,
+    max_age_ms: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum UnregisterQueuedInputsDispositionStoreWire {
+    Requeue,
 }
 
 impl From<&MachineUnregisterProgressSnapshot> for MachineUnregisterProgressSnapshotStoreWire {
@@ -6956,6 +6995,12 @@ impl From<&MachineUnregisterProgressSnapshot> for MachineUnregisterProgressSnaps
             completion_waiter_drain_pending: snapshot.completion_waiter_drain_pending(),
             runtime_loop_forced_abort: snapshot.runtime_loop_forced_abort(),
             comms_drain_forced_abort: snapshot.comms_drain_forced_abort(),
+            queued_inputs: snapshot.requeue_max_age_ms().map(|max_age_ms| {
+                UnregisterQueuedInputsStoreWire {
+                    disposition: UnregisterQueuedInputsDispositionStoreWire::Requeue,
+                    max_age_ms,
+                }
+            }),
         }
     }
 }
@@ -6969,6 +7014,11 @@ impl From<MachineUnregisterProgressSnapshotStoreWire> for MachineUnregisterProgr
             snapshot.runtime_loop_forced_abort,
             snapshot.comms_drain_forced_abort,
         )
+        .with_requeue_max_age_ms(snapshot.queued_inputs.map(|queued_inputs| {
+            match queued_inputs.disposition {
+                UnregisterQueuedInputsDispositionStoreWire::Requeue => queued_inputs.max_age_ms,
+            }
+        }))
     }
 }
 
@@ -7651,8 +7701,15 @@ impl TryFrom<SupervisorAuthoritySnapshotStoreWire> for SupervisorAuthoritySnapsh
 
 impl From<&MachineLifecycleSnapshot> for MachineLifecycleSnapshotStoreWire {
     fn from(snapshot: &MachineLifecycleSnapshot) -> Self {
+        let requeues = snapshot
+            .unregister_progress()
+            .is_some_and(|progress| progress.requeue_max_age_ms().is_some());
         Self {
-            record_version: MACHINE_LIFECYCLE_STORE_RECORD_VERSION,
+            record_version: if requeues {
+                REQUEUE_MACHINE_LIFECYCLE_STORE_RECORD_VERSION
+            } else {
+                MACHINE_LIFECYCLE_STORE_RECORD_VERSION
+            },
             runtime_state: snapshot.runtime_state(),
             binding: snapshot.binding().into(),
             current_run_id: snapshot.run().current_run_id().cloned(),
@@ -7680,8 +7737,34 @@ fn validate_unregister_progress_snapshot(
                     .into(),
             ));
         }
+        if progress.requeue_max_age_ms() == Some(0) {
+            return Err(RuntimeStoreError::ReadFailed(
+                "unregister requeue disposition requires a max age above zero".into(),
+            ));
+        }
     }
     Ok(())
+}
+
+/// The requeue disposition is a version 6 fact: an older record version
+/// cannot carry it, and a version 6 record must.
+fn validate_unregister_progress_requeue_version(
+    record_version: u16,
+    progress: Option<&MachineUnregisterProgressSnapshot>,
+) -> Result<(), RuntimeStoreError> {
+    let requeues = progress.is_some_and(|progress| progress.requeue_max_age_ms().is_some());
+    match (
+        record_version == REQUEUE_MACHINE_LIFECYCLE_STORE_RECORD_VERSION,
+        requeues,
+    ) {
+        (true, true) | (false, false) => Ok(()),
+        (false, true) => Err(RuntimeStoreError::ReadFailed(format!(
+            "machine lifecycle record version {record_version} cannot carry a requeue disposition"
+        ))),
+        (true, false) => Err(RuntimeStoreError::ReadFailed(format!(
+            "machine lifecycle record version {record_version} must carry a requeue disposition"
+        ))),
+    }
 }
 
 impl TryFrom<MachineLifecycleSnapshotStoreWireV3> for MachineLifecycleSnapshot {
@@ -7698,6 +7781,10 @@ impl TryFrom<MachineLifecycleSnapshotStoreWireV3> for MachineLifecycleSnapshot {
             require_present_nullable(record.unregister_progress, "unregister_progress")?
                 .map(Into::into);
         validate_unregister_progress_snapshot(unregister_progress.as_ref())?;
+        validate_unregister_progress_requeue_version(
+            record.record_version,
+            unregister_progress.as_ref(),
+        )?;
         Ok(Self::new_with_unregister_progress(
             record.runtime_state,
             record.binding.try_into()?,
@@ -7725,6 +7812,10 @@ fn decode_machine_lifecycle_observation_v4(
         require_present_nullable(record.unregister_progress, "unregister_progress")?
             .map(Into::into);
     validate_unregister_progress_snapshot(unregister_progress.as_ref())?;
+    validate_unregister_progress_requeue_version(
+        record.record_version,
+        unregister_progress.as_ref(),
+    )?;
     Ok(DecodedMachineLifecycleObservation {
         record_version: record.record_version,
         runtime_state,
@@ -7736,12 +7827,16 @@ fn decode_machine_lifecycle_observation_v4(
     })
 }
 
+/// Decode a version 5 record, or a version 6 one: the same shape, whose
+/// unregister progress keeps queued inputs for the next start.
 fn decode_machine_lifecycle_observation_v5(
     bytes: &[u8],
 ) -> Result<DecodedMachineLifecycleObservation, RuntimeStoreError> {
     let record = serde_json::from_slice::<MachineLifecycleObservationStoreWireV5>(bytes)
         .map_err(|err| RuntimeStoreError::ReadFailed(err.to_string()))?;
-    if record.record_version != MACHINE_LIFECYCLE_STORE_RECORD_VERSION {
+    if record.record_version != MACHINE_LIFECYCLE_STORE_RECORD_VERSION
+        && record.record_version != REQUEUE_MACHINE_LIFECYCLE_STORE_RECORD_VERSION
+    {
         return Err(RuntimeStoreError::ReadFailed(format!(
             "unsupported machine lifecycle store record version {}",
             record.record_version
@@ -7754,6 +7849,10 @@ fn decode_machine_lifecycle_observation_v5(
         require_present_nullable(record.unregister_progress, "unregister_progress")?
             .map(Into::into);
     validate_unregister_progress_snapshot(unregister_progress.as_ref())?;
+    validate_unregister_progress_requeue_version(
+        record.record_version,
+        unregister_progress.as_ref(),
+    )?;
     record
         .live_bridge_recovery
         .validate_bound()
@@ -7842,7 +7941,7 @@ fn decode_machine_lifecycle_store_record(
                 ),
             )
         }
-        MACHINE_LIFECYCLE_STORE_RECORD_VERSION => {
+        MACHINE_LIFECYCLE_STORE_RECORD_VERSION | REQUEUE_MACHINE_LIFECYCLE_STORE_RECORD_VERSION => {
             let record = decode_machine_lifecycle_observation_v5(bytes)?;
             let runtime_state = record.runtime_state.ok_or_else(|| {
                 RuntimeStoreError::ReadFailed(
@@ -7900,6 +7999,7 @@ fn classify_machine_lifecycle_record(bytes: &[u8]) -> MachineLifecycleObservatio
         u64::from(UNREGISTER_MACHINE_LIFECYCLE_STORE_RECORD_VERSION),
         u64::from(RUN_MACHINE_LIFECYCLE_STORE_RECORD_VERSION),
         u64::from(MACHINE_LIFECYCLE_STORE_RECORD_VERSION),
+        u64::from(REQUEUE_MACHINE_LIFECYCLE_STORE_RECORD_VERSION),
     ];
     if !supported.contains(&record_version) {
         return MachineLifecycleObservation::Unsupported {
@@ -7909,7 +8009,9 @@ fn classify_machine_lifecycle_record(bytes: &[u8]) -> MachineLifecycleObservatio
         };
     }
 
-    let decoded = if record_version == u64::from(MACHINE_LIFECYCLE_STORE_RECORD_VERSION) {
+    let decoded = if record_version == u64::from(MACHINE_LIFECYCLE_STORE_RECORD_VERSION)
+        || record_version == u64::from(REQUEUE_MACHINE_LIFECYCLE_STORE_RECORD_VERSION)
+    {
         decode_machine_lifecycle_observation_v5(bytes)
     } else if record_version == u64::from(RUN_MACHINE_LIFECYCLE_STORE_RECORD_VERSION) {
         decode_machine_lifecycle_observation_v4(bytes)
@@ -11182,6 +11284,84 @@ mod lifecycle_record_compatibility_tests {
             },
             "unregister_progress": null
         }));
+    }
+
+    /// A stopping unregister's progress keeps the version 5 record shape
+    /// exactly: the five progress fields 0.9.4 writes and nothing else. A
+    /// requeue's progress also carries its disposition and max age, is
+    /// written as version 6 and round-trips. Version 5 cannot carry a
+    /// requeue disposition and version 6 must; a higher version is refused
+    /// as unsupported, the typed refusal 0.9.4 gives a version 6 record.
+    #[test]
+    fn requeue_unregister_progress_is_a_version_6_record_and_a_stop_stays_version_5() {
+        let progress = MachineUnregisterProgressSnapshot::new(true, true, true, false, false);
+        let unbound = || MachineLifecycleBindingFacts::new(None, None, None, None);
+        let stopping = MachineLifecycleSnapshot::new_with_unregister_progress(
+            RuntimeState::Running,
+            unbound(),
+            SupervisorAuthoritySnapshot::UnboundNoReceipt,
+            Some(progress.clone()),
+        );
+        let stop_value = encoded_value(&stopping);
+        assert_eq!(
+            stop_value["record_version"],
+            serde_json::json!(MACHINE_LIFECYCLE_STORE_RECORD_VERSION)
+        );
+        assert_eq!(
+            stop_value["unregister_progress"],
+            serde_json::json!({
+                "runtime_loop_drain_pending": true,
+                "comms_drain_exit_pending": true,
+                "completion_waiter_drain_pending": true,
+                "runtime_loop_forced_abort": false,
+                "comms_drain_forced_abort": false
+            })
+        );
+
+        let requeue = MachineLifecycleSnapshot::new_with_unregister_progress(
+            RuntimeState::Running,
+            unbound(),
+            SupervisorAuthoritySnapshot::UnboundNoReceipt,
+            Some(progress.with_requeue_max_age_ms(Some(900_000))),
+        );
+        let requeue_bytes = encode_snapshot(&requeue);
+        let requeue_value: serde_json::Value =
+            serde_json::from_slice(&requeue_bytes).expect("requeue record is JSON");
+        assert_eq!(
+            requeue_value["record_version"],
+            serde_json::json!(REQUEUE_MACHINE_LIFECYCLE_STORE_RECORD_VERSION)
+        );
+        assert_eq!(
+            requeue_value["unregister_progress"]["queued_inputs"],
+            serde_json::json!({ "disposition": "requeue", "max_age_ms": 900_000 })
+        );
+        assert_eq!(
+            decode_machine_lifecycle_store_record(&requeue_bytes)
+                .expect("a version 6 requeue record decodes"),
+            requeue
+        );
+        assert!(matches!(
+            classify_machine_lifecycle_record(&requeue_bytes),
+            MachineLifecycleObservation::Decoded { .. }
+        ));
+
+        let mut version_5_with_requeue = requeue_value.clone();
+        version_5_with_requeue["record_version"] =
+            serde_json::json!(MACHINE_LIFECYCLE_STORE_RECORD_VERSION);
+        assert_decode_fails(version_5_with_requeue);
+        let mut version_6_without_requeue = stop_value;
+        version_6_without_requeue["record_version"] =
+            serde_json::json!(REQUEUE_MACHINE_LIFECYCLE_STORE_RECORD_VERSION);
+        assert_decode_fails(version_6_without_requeue);
+        let mut future = requeue_value;
+        future["record_version"] =
+            serde_json::json!(REQUEUE_MACHINE_LIFECYCLE_STORE_RECORD_VERSION + 1);
+        let future_bytes = serde_json::to_vec(&future).expect("serialize future record");
+        assert!(matches!(
+            classify_machine_lifecycle_record(&future_bytes),
+            MachineLifecycleObservation::Unsupported { record_version, .. }
+                if record_version == u64::from(REQUEUE_MACHINE_LIFECYCLE_STORE_RECORD_VERSION + 1)
+        ));
     }
 
     #[test]

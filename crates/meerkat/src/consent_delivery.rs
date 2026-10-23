@@ -529,6 +529,7 @@ mod tests {
             InputAbandonReason::MaxAttemptsExhausted { attempts: 3 },
             InputAbandonReason::NeverExecuted,
             InputAbandonReason::ToolProcessInterrupted,
+            InputAbandonReason::RequeueExpired,
         ] {
             assert!(
                 ends_notice_input(&InputTerminalOutcome::Abandoned {

@@ -1862,6 +1862,7 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
                     "MaxAttemptsExhausted",
                     "NeverExecuted",
                     "ToolProcessInterrupted",
+                    "RequeueExpired",
                 ],
             ),
             NamedTypeBinding::string_enum("InputLane", &["Queue", "Steer"]),
@@ -2643,15 +2644,23 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
             ),
             NamedTypeBinding::string_enum(
                 "RuntimeCompletionWaitFailureObservation",
-                &["ChannelClosed", "AuthorityUnavailable"],
+                &[
+                    "ChannelClosed",
+                    "AuthorityUnavailable",
+                    "RequeuedAcrossStop",
+                ],
             ),
             NamedTypeBinding::string_enum(
                 "RuntimeCompletionWaitFailurePublicErrorClass",
-                &["InternalError"],
+                &["InternalError", "SessionNotRunning"],
             ),
             NamedTypeBinding::string_enum(
                 "RuntimeCompletionWaitFailurePublicReason",
-                &["CompletionChannelClosed", "CompletionAuthorityUnavailable"],
+                &[
+                    "CompletionChannelClosed",
+                    "CompletionAuthorityUnavailable",
+                    "RequeuedAcrossStop",
+                ],
             ),
             NamedTypeBinding::string_enum(
                 "RuntimeOpsLifecycleDurabilityAction",
@@ -2731,6 +2740,11 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
                 "RecoveredInputRecoveryDisposition",
                 &["Retain", "Discard"],
             ),
+            NamedTypeBinding::string_enum(
+                "UnregisterQueuedInputsDisposition",
+                &["Stop", "Requeue"],
+            ),
+            NamedTypeBinding::string_enum("StopInputDisposition", &["Abandon", "Retain"]),
             NamedTypeBinding::string_enum(
                 "RecoveredTerminalCompletionDisposition",
                 &["Recover", "DiscardUnrecoverable", "Blocked"],
@@ -3159,6 +3173,7 @@ runtime_internal_inputs!(
         ClassifyOperationCompletionWake,
         ClassifyOperationDurability,
         ClassifyRecoveredInputDurability,
+        ClassifyStopInputDisposition,
         ClassifyRecoveredOperationRecord,
         ClassifyRuntimeLifecycleDurability,
         ClassifyRuntimeLifecycleState,

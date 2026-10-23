@@ -2316,11 +2316,14 @@ fn wait_failure_completion(error: &CompletionWaitError) -> ScheduleDomainError {
 
 /// The completion of a live wait that failed.
 ///
-/// A rolled-back boundary ([`CompletionWaitError::BoundaryRolledBack`]) or an
+/// A rolled-back boundary ([`CompletionWaitError::BoundaryRolledBack`]), an
 /// unknown durable outcome ([`CompletionWaitError::DurableOutcomeUnknown`])
-/// leaves the input durably admitted with its terminal still to come: it runs
-/// again after its session reloads, or its stalled commit lands. Neither
-/// failure is the input's outcome, so when the host knows the input
+/// or a failure the generated wait-failure authority resolves as resumable (a
+/// graceful stop that kept the input queued,
+/// [`CompletionWaitError::RequeuedAcrossStop`]) leaves the input durably
+/// admitted with its terminal still to come: it runs again after its session
+/// reloads, its stalled commit lands, or the next start runs it. None of these
+/// failures is the input's outcome, so when the host knows the input
 /// (`outcome_read`), the completion reads the input's own terminal through
 /// the bounded re-read loop ([`reread_admitted_input_outcome`]), under the
 /// driver's lease renewal, and resolves the occurrence from it; at the bound
@@ -2331,13 +2334,18 @@ async fn completion_after_wait_failure(
     error: CompletionWaitError,
     outcome_read: Option<AdmittedInputOutcomeRead>,
 ) -> Result<CompletionOutcome, ScheduleDomainError> {
-    match outcome_read {
-        Some(outcome_read)
-            if error.is_boundary_rolled_back() || error.is_durable_outcome_unknown() =>
-        {
-            reread_admitted_input_outcome(outcome_read.into_reread(error.to_string())).await
-        }
-        _ => Err(wait_failure_completion(&error)),
+    let Some(outcome_read) = outcome_read else {
+        return Err(wait_failure_completion(&error));
+    };
+    let input_continues =
+        error.is_boundary_rolled_back() || error.is_durable_outcome_unknown() || {
+            let resumable = (outcome_read.resumable)(error.clone());
+            resumable.await
+        };
+    if input_continues {
+        reread_admitted_input_outcome(outcome_read.into_reread(error.to_string())).await
+    } else {
+        Err(wait_failure_completion(&error))
     }
 }
 
@@ -2358,6 +2366,11 @@ fn completion_wait_failure_reason(error: &CompletionWaitError) -> DeliveryComple
             DeliveryCompletionFailureReason::RuntimeCompletionChannelClosed
         }
         Some(RuntimeCompletionWaitFailureObservation::AuthorityUnavailable) => {
+            DeliveryCompletionFailureReason::RuntimeCompletionAuthorityUnavailable
+        }
+        // A kept input the host cannot read past: this delivery holds no
+        // authority over the outcome the next start gives it.
+        Some(RuntimeCompletionWaitFailureObservation::RequeuedAcrossStop) => {
             DeliveryCompletionFailureReason::RuntimeCompletionAuthorityUnavailable
         }
         // A disclosure refusal is no wait failure. It is only reached for an
@@ -2591,6 +2604,19 @@ type AdmittedOutcomeReadFn = Box<dyn FnMut() -> AdmittedOutcomeReadFuture + Send
 type AdmittedCompletionWait =
     Pin<Box<dyn Future<Output = Result<CompletionOutcome, CompletionWaitError>> + Send>>;
 
+/// Whether the generated wait-failure authority resolves a failed live wait
+/// as resumable: the input stays admitted and its terminal is still to come.
+#[cfg(not(target_arch = "wasm32"))]
+type AdmittedWaitResumableFuture = Pin<Box<dyn Future<Output = bool> + Send>>;
+#[cfg(target_arch = "wasm32")]
+type AdmittedWaitResumableFuture = Pin<Box<dyn Future<Output = bool>>>;
+
+/// The resolution [`completion_after_wait_failure`] asks: the runtime's
+/// generated wait-failure authority for the input's session
+/// ([`runtime_wait_failure_resumable`]).
+type AdmittedWaitResumableFn =
+    Box<dyn Fn(CompletionWaitError) -> AdmittedWaitResumableFuture + Send>;
+
 /// How to read one admitted input's own terminal past a live wait that
 /// failed without saying it: the input, the bounds of the wait and the read.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -2598,6 +2624,7 @@ struct AdmittedInputOutcomeRead {
     input_id: InputId,
     bounds: AdmittedOutcomeRereadBounds,
     read: AdmittedOutcomeReadFn,
+    resumable: AdmittedWaitResumableFn,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2841,6 +2868,28 @@ fn runtime_admitted_outcome_read(
     })
 }
 
+/// The generated wait-failure resolution of `session_id`'s failed waits, as
+/// [`completion_after_wait_failure`] asks it. A resolution that fails says
+/// not resumable.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+fn runtime_wait_failure_resumable(
+    runtime_adapter: &MeerkatMachine,
+    session_id: &SessionId,
+) -> AdmittedWaitResumableFn {
+    let runtime_adapter = runtime_adapter.clone();
+    let session_id = session_id.clone();
+    Box::new(move |error| {
+        let runtime_adapter = runtime_adapter.clone();
+        let session_id = session_id.clone();
+        Box::pin(async move {
+            runtime_adapter
+                .resolve_runtime_completion_wait_failure(&session_id, &error)
+                .await
+                .is_ok_and(|authority| authority.resumable)
+        })
+    })
+}
+
 /// Project one runtime admission into the schedule driver's typed delivery
 /// contract.
 ///
@@ -2911,8 +2960,9 @@ pub async fn runtime_delivery_dispatch_from_admission(
 
     let accepted = match handle {
         Some(handle) => {
-            // A wait that fails with a rolled-back boundary or an unknown
-            // durable outcome reads this input's own terminal.
+            // A wait that fails with a rolled-back boundary, an unknown
+            // durable outcome or a failure the generated authority resolves
+            // as resumable reads this input's own terminal.
             let read = runtime_admitted_outcome_read(runtime_adapter, session_id, &input_id);
             AcceptedScheduledInput {
                 correlation_id: correlation_id.clone(),
@@ -2923,6 +2973,7 @@ pub async fn runtime_delivery_dispatch_from_admission(
                         input_id,
                         bounds: AdmittedOutcomeRereadBounds::for_host(),
                         read,
+                        resumable: runtime_wait_failure_resumable(runtime_adapter, session_id),
                     }),
                 },
             }
@@ -7202,6 +7253,7 @@ mod tests {
                         input_id: InputId::new(),
                         bounds: AdmittedOutcomeRereadBounds::for_host(),
                         read: (self.read)(),
+                        resumable: unregistered_runtime_wait_failure_resumable(),
                     }),
                 },
                 None => {
@@ -7566,8 +7618,10 @@ mod tests {
     // A run whose boundary commit rolled back (`BoundaryRolledBack`) or whose
     // durable outcome is unknown (`DurableOutcomeUnknown`) fails its live
     // completion waiters. The input stays admitted and reaches its own
-    // terminal after its session reloads. These tests script the failed wait
-    // and the reads of the input's terminal that follow it.
+    // terminal after its session reloads. A graceful stop that kept a queued
+    // input (`RequeuedAcrossStop`) leaves it admitted the same way, until the
+    // next start runs it. These tests script the failed wait and the reads of
+    // the input's terminal that follow it.
 
     fn rolled_back_boundary() -> CompletionWaitError {
         CompletionWaitError::BoundaryRolledBack {
@@ -7582,13 +7636,28 @@ mod tests {
         }
     }
 
+    fn requeued_across_stop() -> CompletionWaitError {
+        CompletionWaitError::RequeuedAcrossStop {
+            stopped_at: chrono::Utc::now(),
+        }
+    }
+
+    /// The production resolution ([`runtime_wait_failure_resumable`]) on a
+    /// runtime that holds no session: only a failure the generated authority
+    /// resolves without the session, a graceful stop's requeue, is
+    /// resumable.
+    fn unregistered_runtime_wait_failure_resumable() -> AdmittedWaitResumableFn {
+        runtime_wait_failure_resumable(&MeerkatMachine::ephemeral(), &SessionId::new())
+    }
+
     /// Which wait failures read the input's own terminal: a rolled-back
-    /// boundary and an unknown durable outcome, when the host knows the
-    /// input. Every other wait failure, and a handle built without its input
-    /// (`AcceptedScheduledInput::with_runtime_handle`), ends the delivery with
-    /// the wait failure at once, with no read.
+    /// boundary, an unknown durable outcome and a failure the generated
+    /// wait-failure authority resolves as resumable (a graceful stop's
+    /// requeue), when the host knows the input. Every other wait failure, and a handle
+    /// built without its input (`AcceptedScheduledInput::with_runtime_handle`),
+    /// ends the delivery with the wait failure at once, with no read.
     #[tokio::test]
-    async fn only_a_rolled_back_or_unknown_wait_reads_the_inputs_terminal() {
+    async fn only_a_wait_that_leaves_the_input_admitted_reads_its_terminal() {
         use DeliveryCompletionFailureReason::{
             RuntimeCompletionAuthorityUnavailable, RuntimeCompletionChannelClosed,
         };
@@ -7615,6 +7684,18 @@ mod tests {
             (
                 "an unknown durable outcome without its input",
                 unknown_durable_outcome(),
+                false,
+                Some(RuntimeCompletionAuthorityUnavailable),
+            ),
+            (
+                "a requeue across a graceful stop",
+                requeued_across_stop(),
+                true,
+                None,
+            ),
+            (
+                "a requeue across a graceful stop without its input",
+                requeued_across_stop(),
                 false,
                 Some(RuntimeCompletionAuthorityUnavailable),
             ),
@@ -7647,6 +7728,7 @@ mod tests {
                 read: scripted_outcome_read(Arc::clone(&calls), |_| {
                     Some(Ok(Some(CompletionOutcome::CompletedWithoutResult)))
                 }),
+                resumable: unregistered_runtime_wait_failure_resumable(),
             });
             let wait_error = error.clone();
             let accepted = AcceptedScheduledInput {
