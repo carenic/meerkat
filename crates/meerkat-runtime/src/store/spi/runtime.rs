@@ -388,6 +388,9 @@ impl SpiRuntimeStore {
             scopes.disarm();
             return result;
         }
+        // A read is not expected to change memory; one that did is
+        // committed like a mutation, and a drop from here on poisons.
+        scopes.arm();
         let (deltas, runtimes) = match self.prepare_commit(scopes.guards(), &touches).await {
             Ok(prepared) => prepared,
             Err(error) => {

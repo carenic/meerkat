@@ -1077,7 +1077,11 @@ impl SpiMobIdentityStore {
 /// authority the host acknowledged (no commit of that scope is in flight).
 /// While a commit of that scope is in flight it answers Backoff, and the
 /// runtime retries it for the host's declared longest commit
-/// ([`meerkat_core::host_store::FenceTiming::max_commit_latency`]).
+/// ([`meerkat_core::host_store::FenceTiming::max_commit_latency`]). That
+/// bound covers one host commit: an identity write holds the scope through
+/// its commit retries (the realm's retry budget) and a re-acquire, so while
+/// the host is in trouble fenced runtime writes report Backoff past the
+/// bound. They never wait longer than it.
 #[cfg(feature = "runtime-adapter")]
 pub(super) struct SpiIdentityRuntimeWriteFence {
     cell: Arc<meerkat_runtime::store::spi::ScopeCell>,
@@ -1769,7 +1773,7 @@ impl MobRunStore for SpiMobRunStore {
         };
         let bundle = &self.bundle;
         self.bundle
-            .write(touch, async move {
+            .write_whole(touch, async move {
                 let transitioned = bundle
                     .runs
                     .cas_run_snapshot_with_authority(
@@ -1780,11 +1784,21 @@ impl MobRunStore for SpiMobRunStore {
                         next_flow_state,
                         authority_inputs,
                     )
-                    .await?;
+                    .await
+                    .map_err(WriteFailure::Failed)?;
                 if !transitioned {
                     return Ok(None);
                 }
-                bundle.events.append(terminal_event).await.map(Some)
+                // The run is terminal in memory now: an event refused here
+                // must not let the run commit alone.
+                match bundle.events.append(terminal_event).await {
+                    Ok(stored) => Ok(Some(stored)),
+                    Err(error) => Err(WriteFailure::Torn(MobStoreError::Internal(format!(
+                        "the terminal event of run '{run_id}' was refused after its terminal \
+                         snapshot won: {error}; neither is committed, and this storage's run \
+                         and mob scopes refuse every call until the realm is reopened"
+                    )))),
+                }
             })
             .await
     }
