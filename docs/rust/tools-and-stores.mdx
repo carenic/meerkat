@@ -264,8 +264,10 @@ Provider implementations should run the published `meerkat-store-conformance`
 chapters for each supplied session, blob, and artifact trait capability. The
 suite covers session round trips, guarded revisions, incremental/rewrite
 semantics, concurrency, blob/artifact survival, and dangling references.
-Runtime, scheduler, WorkGraph, and job stores retain their own crate-level
-conformance suites, while facade composition enforces the provider's complete
+It is the only published suite. Runtime, scheduler, WorkGraph, and job store
+contracts are checked by tests inside the Meerkat repository, against the
+built-in memory and SQLite stores only; no published suite runs them against
+a provider's own stores. Facade composition enforces the provider's complete
 durability declaration set.
 
 A provider that versions its own SQLite domains can call
