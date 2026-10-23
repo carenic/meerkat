@@ -184,6 +184,125 @@ set `custody_deferred` (`None`) where you build `MobMemberStatusResult` with a
 struct literal, and handle the `Unknown` case where you read a custody
 restore or cause.
 
+#### Per-round commits and resumed runs
+
+A run in a durable session now commits every tool round and continues after
+a crash (see [Durable Runs](/guides/durable-runs)). Integrations see:
+
+- `meerkat-core`: a `SessionCheckpointer` whose `checkpoint_run` returns
+  `Ok(None)` (nothing made durable) for a round's first commit now fails that
+  tool round before any of its tools runs; 0.9.4 accepted `Ok(None)` at every
+  checkpoint. The trait also gains `rebases_runs` (default `false`) and
+  `rebase_run`. A checkpointer that answers `false` takes no round commit
+  after a run's first compaction on a store that accepts only strict
+  continuations of the committed document; the run's last round commit
+  before the compaction stays its resume point.
+- `meerkat-core`: `AgentEvent` gains `RunResumed { session_id, run_id, round,
+  resume_point }`, wire type `run_resumed`, with the new non-exhaustive
+  `RunResumePointKind` (`tools_pending`, `awaiting_model`). A resumed run
+  publishes it in place of `RunStarted`. `AgentEvent` is non-exhaustive, so a
+  Rust match already has a wildcard arm. An SDK of this version reports the
+  event in its unknown-event form; an older SDK refuses it, as for any newer
+  event.
+- `meerkat-runtime`, `meerkat-core`, `meerkat-machine-schema`,
+  `meerkat-machine-kernels`: the durable-tail recovery and runtime machine
+  vocabularies grow:
+  - `meerkat_runtime::recovery::DurableTailRecoveryOutcome` gains
+    `Continue { candidate, run_id, receipt }`;
+  - the machine enums gain `DurableTailRecoveryClass::ContinuableCandidate`,
+    `DurableTailRecoveryDisposition::ContinueRun`,
+    `RecoveredInputNormalizationReasonKind::ResumableRun` and
+    `InputAbandonReason::ResumeRefused` (with the `meerkat_machine::dsl`
+    bridge copies and the catalog and kernel types);
+  - the session document vocabulary gains `RunIdCardinality::NoRunRows` and
+    the `DurableTailRunCursor` type, and
+    `SessionDocumentInput::ClassifyDurableTail` and
+    `SessionDocumentMachineAuthority::classify_durable_tail` take
+    `run_cursor` and `cursor_inputs_open`;
+  - `MeerkatMachineState` gains `resumable_run_id`; `MeerkatMachineInput`
+    gains `MarkRunResumable`, `ResumeRun`, `ReleaseResumableRun`,
+    `SettleResumableRun`, `ReplayAppliedRunContributor` and
+    `SuspendRunForStop`, and `NormalizeRecoveredInputLifecycle` gains
+    `bound_run_resumable`; `MeerkatMachineEffect` gains `ResumableRunMarked`,
+    `ResumedRunAuthorized`, `ResumableRunReleased`, `ResumableRunSettled`
+    and `RunSuspendedForStop`.
+
+**Do:** return a receipt from `checkpoint_run` once the checkpoint is
+durable, and an error when it cannot be made durable. A custom checkpointer
+over a store that accepts only strict continuations implements
+`rebases_runs` and `rebase_run` to keep round commits after a compaction.
+Handle `run_resumed` where you consume events. Where you build these machine
+inputs or state literals, pass `DurableTailRunCursor::Absent` and `false` to
+`ClassifyDurableTail`, `None` for `resumable_run_id` and `false` for
+`bound_run_resumable` (a tail without a run cursor, the 0.9.4 behaviour),
+and add the arms (or a wildcard) where you match the enums exhaustively.
+
+#### Durable workers
+
+`meerkat-mob`'s `Profile` gains `durable: bool`, and so do its wire forms
+`meerkat_contracts::WireMobProfile`, `MobProfileInput` and `PortableProfile`.
+Serde reads an omitted `durable` as `false` and writes it only when `true`,
+so stored and sent ordinary profiles keep their bytes, and the adaptive
+`LayerDecision` schema leaves it out. The wire forms refuse unknown fields,
+so a host older than 0.9.5 refuses a profile that sets `durable`. A spawn of
+a durable profile on a mob whose session service keeps no persistent sessions
+is refused with the new `MobError::NonDurableService { member_id, profile }`
+(wire code `CAPABILITY_UNAVAILABLE`, data kind `mob_non_durable_service`).
+
+**Do:** pass `durable: false` where you build these with struct literals, and
+set `durable = true` only on mobs over persistent sessions, once every host
+that reads the profile runs 0.9.5. See
+[Mobs: durable workers](/guides/mobs#durable-workers).
+
+#### Dedupe key on pending callback calls
+
+A pending callback call carries the call's dedupe key (see Other behaviour
+changes below):
+
+- `meerkat-core`: `PendingCallbackToolCall` gains
+  `dedupe_key: Option<ToolCallDedupeKey>`, the struct variant
+  `AgentError::CallbackPending` gains
+  `dedupe_key: Option<Box<ToolCallDedupeKey>>`, and
+  `CoreApplyTerminal::CallbackPending` gains
+  `dedupe_key: Option<ToolCallDedupeKey>`;
+- `meerkat-runtime`: `CompletionOutcome::CallbackPending` gains
+  `dedupe_key: Option<ToolCallDedupeKey>`;
+- `meerkat-contracts`: `WirePendingToolCall` gains
+  `dedupe_key: Option<ToolCallDedupeKey>`, and `WireCallbackPending::single`
+  takes the key as its eighth argument.
+
+On the wire the field is optional and omitted when absent, so readers that
+ignore unknown fields are unaffected.
+
+**Do:** name the field (`dedupe_key: None` for a call outside an agent-loop
+round) where you build these with struct literals, add it or `..` to
+patterns that list every field, and pass the key to
+`WireCallbackPending::single`.
+
+#### Orphaned drains in a quiescent close
+
+`meerkat-runtime`: `RuntimeSessionQuiescentClose` is now `#[non_exhaustive]`
+and gains `ClosedOrphanedDrain`.
+`MeerkatMachine::unregister_session_registration_until_terminal_if_quiescent`
+returns it after it completes an orphaned drain or a pending finalization,
+which may abandon held inputs with reason `Stopped`. `Closed` now means only
+a genuinely quiescent close.
+
+**Do:** handle `ClosedOrphanedDrain` and add a wildcard arm where you match
+`RuntimeSessionQuiescentClose`. Where you need a close that interrupted
+nothing, do not treat `ClosedOrphanedDrain` as `Closed`.
+
+#### WebRTC to mob members
+
+`meerkat-rpc`: WebRTC to a mob member is not available in 0.9.5. The
+session-scoped `live/open` and `live/webrtc/answer` flow refuses a mob
+member's session with `INVALID_PARAMS` (-32602) and data kind
+`mob_member_session_addressed_by_id`, and `mob/member_live_open`, the route
+for a member, is WebSocket only.
+
+**Do:** open a member's live channel with `mob/member_live_open` over
+WebSocket, and keep WebRTC for sessions that are not mob members.
+
 ### Other behaviour changes
 
 - **A Broken member no longer stops a mob start:** when a member whose
@@ -231,6 +350,38 @@ restore or cause.
   has run or expired, the store opens in 0.9.4, but each read that decodes
   such a row still fails: the input's status, a same-key lookup that finds
   it, and a batch compare-and-swap over it. See [Mobs](/guides/mobs).
+- **Runs continue after a crash:** a run in a durable session (`sqlite`,
+  `jsonl` or host-store realm) commits every tool round twice and, after a
+  crash, kill or restart, continues under the same run id from its last
+  committed round when its session is opened again, announced by
+  `run_resumed`. 0.9.4 ran the input again or closed the run as interrupted.
+  There is no switch. A call dispatched again carries the same dedupe key,
+  and a call whose effect may already have happened gets an
+  `outcome_uncertain` tool error instead. See
+  [Durable Runs](/guides/durable-runs).
+- **Write volume on WholeBlob realms:** a `jsonl` or host-store realm writes
+  the whole session document at each round commit, twice per tool round; a
+  `sqlite` realm writes only the round's rows. Long, tool-heavy runs on
+  `jsonl` write much more than in 0.9.4. See
+  [Storage Operations](/guides/storage-operations#write-volume-of-per-round-commits).
+- **Dedupe key for tools outside the process:** MCP `tools/call` requests
+  carry the call's dedupe key in `_meta` under
+  `io.meerkat/tool_call_dedupe_key`, and callback requests and pending
+  callback calls carry it as `dedupe_key`; the SDKs pass it to callback
+  handlers. A host `McpCallContextProvider` whose metadata uses that name is
+  refused with `McpCallContextError::Denied`. See
+  [Durable Runs: the dedupe key](/guides/durable-runs#the-dedupe-key).
+- **A requeue stop keeps a durable run in flight:** an unregister with
+  `UnregisterQueuedInputs::Requeue`, or a mob Shutdown with
+  `QueuedInputsOnShutdown::Requeue`, now suspends a durable session's run in
+  flight instead of cancelling it: the run continues from its last committed
+  round at the next start, or its inputs end as `RequeueExpired` past the
+  max age. See
+  [Durable Runs: graceful stops and deploys](/guides/durable-runs#graceful-stops-and-deploys).
+- **Host stores:** a host can keep a realm's durable state in its own
+  database through the host store SPI (`meerkat_core::host_store`), checked
+  by the host store chapter of `meerkat-store-conformance`. See the
+  [Host Store SPI reference](/reference/host-store-spi).
 
 ### Upgrade checklist
 
@@ -254,6 +405,24 @@ restore or cause.
    still wanted".
 7. Add a wildcard arm where you match `RuntimeBindingsError`, and set
    `custody_deferred` in `MobMemberStatusResult` struct literals.
+8. Custom `SessionCheckpointer` implementations: return a receipt from
+   `checkpoint_run` once a checkpoint is durable, and implement
+   `rebases_runs` and `rebase_run` if your store accepts only strict
+   continuations.
+9. Handle the `run_resumed` event, and pass the new fields of the recovery
+   and runtime machine inputs.
+10. Pass `durable` where you build `Profile` or its wire forms, and handle
+    `MobError::NonDurableService`.
+11. Name `dedupe_key` where you build pending callback calls, and pass the
+    key to `WireCallbackPending::single`.
+12. Handle `ClosedOrphanedDrain` where you match
+    `RuntimeSessionQuiescentClose`.
+13. Open mob members' live channels with `mob/member_live_open` over
+    WebSocket.
+14. Tools whose effects must not repeat: record and check the dedupe key, as
+    described in [Durable Runs](/guides/durable-runs#the-dedupe-key).
+15. On `jsonl` or host-store realms, check the write volume of long,
+    tool-heavy runs.
 
 ## Upgrading to 0.9.4
 

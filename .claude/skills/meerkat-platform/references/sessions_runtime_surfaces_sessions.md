@@ -371,7 +371,7 @@ Contract and limits: `docs/guides/durable-runs.mdx`.
   never committed: a cursor that disagrees with the transcript, and a tail
   left behind with requeued inputs.
 - Reruns are at least once and pass authorization, approval review and
-  pre-tool hooks again. Rust tools read
+  pre- and post-tool hooks again. Rust tools read
   `ToolDispatchContext::tool_call_dedupe_key(call) -> Option<ToolCallDedupeKey>`
   (`run_id`, `round`, `call_id`, `call_digest` = lowercase hex SHA-256 of the
   tool name and canonical arguments; `ToolCallDedupeKey::new` derives it) and

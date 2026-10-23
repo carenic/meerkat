@@ -243,7 +243,10 @@ RPC (the client answers inline):
   for durable job-backed callbacks (see the durable jobs guide).
 - Python `@client.tool(name, description=..., input_schema=...)`; TypeScript
   `client.registerTool(name, description, inputSchema, handler)`. RPC
-  `session/create` also takes `external_tools`.
+  `session/create` also takes `external_tools`. Since 0.9.5 a Python handler
+  that declares a `dedupe_key` parameter gets the call's
+  `ToolCallDedupeKey` (`None` without one); a TypeScript or Web handler gets
+  it as an optional second argument.
 - Mob members use the callbacks of the connection that holds the mob's
   callback route: its `mob/create` connection, or the one that claimed it
   with `mob/claim_callback_route` and the claim token `mob/create` returned

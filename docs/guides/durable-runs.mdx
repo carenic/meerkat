@@ -188,8 +188,8 @@ The rules for every kind of durable tail are in
 
 Delivery is at least once. After a crash between the two commits of a round,
 the round's tool calls are dispatched again under the same call ids. Each one
-goes through authorization, approval review and pre-tool hooks again; no
-approval given before the crash is reused. MCP tools and host callback tools
+goes through authorization, approval review and pre- and post-tool hooks
+again; no approval given before the crash is reused. MCP tools and host callback tools
 are dispatched again the same way, and a callback request to a client is
 sent again.
 
@@ -220,9 +220,14 @@ Core delivers the key to every kind of tool, unchanged:
   Core adds it beside any metadata the host adds, and refuses a call whose
   host metadata uses that name, so the server always gets Core's key.
 - A callback tool answered by a client receives it as `dedupe_key`, an
-  object with the four fields: in the JSON-RPC `tool/execute` request, in
-  each entry of `pending_tool_calls` when a run suspends on callback tools,
-  and in the Web SDK as the optional second argument of a JS tool callback.
+  object with the four fields: in the JSON-RPC `tool/execute` request, and
+  in each pending call when a run suspends on callback tools
+  (`pending_tool_calls`, the `interaction_callback_pending` event and the
+  REST `CALLBACK_PENDING` details). The SDKs pass it to your handler as a
+  `ToolCallDedupeKey`: in Python to a handler that declares a `dedupe_key`
+  parameter, and in TypeScript and the Web SDK as the handler's optional
+  second argument. A missing or malformed key is no key; the call still
+  runs.
 
 A call made outside a run's tool round carries no key. Neither does a
 callback tool that runs as a detached job: the job deduplicates by its own
@@ -425,6 +430,14 @@ Before you run a host store in production, run the host store chapter of the
   compacted has already committed its inputs with the compacted document, so
   a later failure ends the run without running its inputs again.
 - A WholeBlob realm writes the whole session document at every commit.
+- A run that resumes after a crash during structured-output extraction asks
+  the model again from its last round commit, so it publishes `RunCompleted`
+  with `extraction_required` a second time under the same run id.
+- The tools of a resumed run see no content of the current turn, as with a
+  pending continuation.
+- Budget counters that span the agent's lifetime, rather than the run's,
+  start again with the agent after a restart, as for any session a host
+  rebuilds; the run's own time budget continues.
 
 ## See Also
 
