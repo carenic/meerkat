@@ -3393,19 +3393,21 @@ impl From<session_document::SessionDocumentLifecycle> for SessionLifecycleTermin
 /// Where a resumed run re-enters its loop.
 ///
 /// A durable session commits every inner-loop round twice: once after the
-/// model call (the assistant message with its tool calls) and once after the
-/// tools (their results). The resume point names which of the two the last
-/// committed round reached.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// model call and once after the tools. The first commit stages the round's
+/// assistant message here instead of in the transcript, so a run that ends
+/// between the two commits never leaves a tool call without its result; the
+/// second commit puts the message and its results into the transcript
+/// together. The resume point names which of the two the last committed
+/// round reached.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RunResumePoint {
-    /// The round's assistant message and these tool calls are committed and
-    /// their results are not. A resumed run dispatches exactly these calls
+    /// The round's assistant message, with its tool calls, is committed here
+    /// and its results are not. A resumed run dispatches exactly these calls
     /// again, under the same call ids, without calling the model.
     ToolsPending {
-        /// Provider tool call ids of the committed assistant message, in
-        /// emission order.
-        call_ids: Vec<String>,
+        /// The round's assistant message as the model returned it.
+        assistant_message: BlockAssistantMessage,
     },
     /// The round's tool results are committed, or the run has not called the
     /// model yet. A resumed run makes the next model call.
@@ -3416,7 +3418,7 @@ pub enum RunResumePoint {
 ///
 /// The agent loop owns these fields and may add more; other components treat
 /// the value as opaque and carry it unchanged.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct RunLoopCarryOver {
     /// Model calls the run has completed.
@@ -3434,7 +3436,7 @@ pub struct RunLoopCarryOver {
 /// run, the inputs bound to it, the last committed round and where the run
 /// resumes, so recovery can continue the same run instead of running its
 /// input again.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct SessionRunCursor {
     /// The open run.
@@ -3474,7 +3476,10 @@ impl SessionRunCursor {
 ///
 /// A resumed run dispatches the calls of a round whose results were not
 /// committed again, under the same key, so a tool with external effects can
-/// recognize a repeat.
+/// recognize a repeat. A round that had no committed model response is asked
+/// of the model again, and a provider may reuse a call id for a different
+/// call; the digest of the call's tool name and arguments keeps such calls
+/// apart, so a repeat is only a call with the same name and arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ToolCallDedupeKey {
     /// The run the call belongs to.
@@ -3483,6 +3488,8 @@ pub struct ToolCallDedupeKey {
     pub round: u64,
     /// Provider tool call id.
     pub call_id: String,
+    /// Digest of the call's tool name and canonical arguments.
+    pub call_digest: String,
 }
 
 /// Durable control state for deferred first-turn prompt and staged callback tool results.

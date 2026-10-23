@@ -865,6 +865,19 @@ pub enum ProviderMeta {
         #[serde(rename = "thoughtSignature")]
         thought_signature: String,
     },
+    /// Gemini-issued function-call identity for replay and response pairing.
+    /// The enclosing tool-use ID remains Meerkat's internal correlation key.
+    GeminiFunctionCall {
+        /// Opaque `functionCall.id` supplied by the provider, never a fallback.
+        id: String,
+        /// A signature belongs to the call part, not its function response.
+        #[serde(
+            default,
+            rename = "thoughtSignature",
+            skip_serializing_if = "Option::is_none"
+        )]
+        thought_signature: Option<String>,
+    },
     /// OpenAI reasoning item metadata for stateless replay.
     /// The `id`, `encrypted_content`, and `phase` fields must be preserved
     /// verbatim when present so Responses API output items can be replayed.
@@ -3068,7 +3081,7 @@ impl SystemNoticeBlock {
                     sender_taint,
                     Some(crate::comms::SenderContentTaint::Tainted)
                 ) {
-                    lines.push("[sender declared this content tainted]".to_string());
+                    lines.push(crate::interaction::SENDER_TAINT_MARKER.to_string());
                 }
                 lines.join("\n")
             }

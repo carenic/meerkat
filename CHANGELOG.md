@@ -37,6 +37,12 @@ them.
 
 ### Breaking
 
+- `meerkat-contracts`: `WireProviderMeta` gains the
+  `GeminiFunctionCall { id, thought_signature }` variant, serialized with
+  `provider: "gemini_function_call"`. Downstream exhaustive Rust matches
+  and wire decoders must handle this metadata for provider-issued Gemini
+  call IDs. The existing signature-only `Gemini` variant is unchanged.
+
 - `meerkat-schedule`: the occurrence lifecycle carries the admission evidence
   of an occurrence's receipt history (see Fixed, scheduled delivery after a
   lost executor). `OccurrenceLifecycleInput::ClassifyDue` and `Claim` gain the
@@ -510,6 +516,11 @@ them.
   variant and an enum marked non-exhaustive. A downstream match needs a
   wildcard arm; `rejected_before_effect` stays false for the new variant.
 
+- `meerkat`: `LiveOrchestrator` gains the field `session_addressing`
+  (`LiveSessionAddressing`: `SessionScoped` or `MobMember`), so code that
+  builds it with a struct literal sets it. A surface that opens live channels
+  by session id passes `SessionScoped`; the member live host passes
+  `MobMember` (see Fixed).
 - `meerkat-contracts`: `MobMemberStatusResult` gains the field
   `custody_deferred: Option<WireMemberCustodyDeferral>`, absent from the wire
   unless the mob's start deferred the member's custody restore. Code that
@@ -662,7 +673,10 @@ them.
   `SurfaceScheduleSessionHost` gains the defaulted
   `decides_existing_admission` (default `false`): a host that returns `true`
   admits its prompt and event deliveries through
-  `accept_schedule_runtime_input_with_reconciliation` on the calling task, so
+  `accept_schedule_runtime_input_with_reconciliation` on the calling task (a
+  host whose admission is fenced through
+  `accept_fenced_schedule_runtime_input_with_reconciliation` with its
+  `ScheduleAdmissionFence`, so the redelivery keeps that fence), so
   a redelivery through it only replays the earlier input, and a host that
   declares it but admits another way is logged as an incident. With the
   default the adapter answers an unproven late redelivery not admitted
@@ -974,6 +988,8 @@ them.
   version table, as a host of an earlier release does. `meerkat-runtime`:
   `MemberObservationHost` gains `visible_tool_names`, whose default
   answers `Unavailable`.
+- `meerkat-core`: `interaction::SENDER_TAINT_MARKER`, the line a model reads
+  after peer content whose sender declared it tainted.
 
 - Supervisor bridge protocol 7 (`meerkat-contracts`): a `Resume`
   `MaterializeMember` may set `report_adopted_first_turn`. The member host
@@ -1180,6 +1196,12 @@ them.
 
 ### Fixed
 
+- `meerkat-gemini`: preserve provider-issued `functionCall.id` through
+  streamed tool calls, saved transcripts, assistant replay and matching
+  `functionResponse.id`, including parallel calls to the same function.
+  Meerkat's internal tool correlation IDs remain separate and are never
+  emitted as provider IDs when Gemini omitted the optional field.
+
 - Continuations on a retired address. A continuation whose drain reserved it
   before a crash, on an address that retired since, no longer reads
   `pending` forever: the delivery owner settles the reservation from the
@@ -1308,7 +1330,10 @@ them.
     receipt): the occurrence is reclaimed, also past its misfire deadline, for
     up to five attempts. The redelivery uses the runtime's deduplicate-only
     admission, so it finds the admitted input and never admits it again, and
-    the occurrence records that input's outcome. A target still busy with
+    the occurrence records that input's outcome. For a mob member's session
+    that admission is fenced like the first delivery's, to the member's
+    executor attachment and residency; a refused fence admits nothing and
+    leaves the occurrence to its next reclaim. A target still busy with
     that input does not end the redelivery under `skip_if_running`, since a
     redelivery starts no new run. After five lost executors it ends
     `delivery_failed` with `lease_lost`; an input the runtime no longer knows
@@ -1324,7 +1349,8 @@ them.
     asks the target, a busy one too, whether it admitted the delivery. It
     records that input's outcome when the target did, and ends `misfired`
     with nothing delivered when it did not. A mob target answers from its
-    durable external-delivery record and begins none;
+    durable external-delivery record and begins none, and so does a mob
+    member's identity target, on every surface (JSON-RPC and CLI included);
   - no dispatch was recorded (a crash before the dispatch start was
     recorded): the misfire policy decides, as before.
   The evidence is read from the occurrence's receipt history in both stores,
@@ -1700,6 +1726,14 @@ them.
   included, and every tool result, under every policy. The rows are now
   decided by their typed activation identity and by the tool call that
   produced them, never by their text (see Breaking).
+- A prompt-context fork child now reads the peer traffic in its source's
+  history: whom the source heard from (or wrote to), the text of a peer
+  message, a status and a payload preview (a request's params, a
+  response's result) when the notice has them, and the sender's taint
+  marker. The child was given only each notice's title ("Peer message",
+  "Peer request: review"). The means to answer a peer (request and
+  delivery ids, reply instructions) are not carried: the child is not
+  the addressee.
 
 - A turn-driven `MobHandle::fork_helper` (the default helper mode) now sees
   its fork context. The helper is created without an initial message, so
@@ -1776,6 +1810,17 @@ them.
   restore already failed, is deferred instead (see the entries next to this
   one).
 
+- `meerkat`, `meerkat-rpc`: the session-scoped `live/open`, and the
+  projection, refresh-config, identity and precheck reads behind it, restored
+  a mob member's session from storage by its session id alone when it was
+  not live. That registered the member's session outside its mob, which
+  restores a member only after checking it (a member whose custody restore
+  was deferred stays down). It now refuses with `INVALID_PARAMS` (-32602) and
+  data kind `mob_member_session_addressed_by_id` (with the session, mob and
+  member) and restores nothing; `mob/member_live_open` opens the member
+  through its mob. A member session that is live opens as before.
+  `SessionError::mob_member_session_addressed_by_id` and
+  `SessionError::is_mob_member_session_addressed_by_id` name the refusal.
 - `meerkat-mob`: a mob restarted while another runtime owner on the realm
   hosts a retiring member's session now starts and runs. The start restores
   the retiring member's local cleanup delivery, which settles the session's
@@ -1792,6 +1837,14 @@ them.
   on its own, on the identity reconcile's backoff (250 ms doubling to 60 s),
   and once it succeeds the member's started retirement is re-driven and
   completes. Any other restore failure still fails the start.
+- `meerkat`: an agent built from an `AgentBuildConfig` whose mob tools are
+  disabled (`override_mob` `Disable`) while it carries a generated mob
+  operator authority context no longer mounts the factory's mob tool surface.
+  Only an embedder that builds the config directly can set both (session
+  build options resolve `Disable` to no authority context). The build's
+  external mob operator tools were already bound to no authority, hidden and
+  denying every call; the factory's own mob tools (`delegate`,
+  `mob_spawn_member` and the rest) still mounted beside them.
 
 ## [0.9.4] - 2026-10-20
 

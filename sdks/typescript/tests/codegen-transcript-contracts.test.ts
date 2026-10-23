@@ -94,6 +94,9 @@ const providerMetas: WireProviderMeta[] = [
   { provider: "anthropic_redacted", data: "redacted" },
   { provider: "anthropic_compaction", content: "compact" },
   { provider: "gemini", thoughtSignature: "thought" },
+  { provider: "gemini_function_call", id: "native-call" },
+  { provider: "gemini_function_call", id: "native-call", thoughtSignature: "thought" },
+  { provider: "gemini_function_call", id: "native-call", thoughtSignature: null },
   {
     provider: "open_ai",
     id: "item-1",

@@ -482,7 +482,7 @@ impl GeminiClient {
         let mut system_instruction_parts = Vec::new();
         let mut leading_system_prefix = true;
 
-        let mut tool_name_by_id: HashMap<String, String> = HashMap::new();
+        let mut tool_call_by_id: HashMap<String, (String, Option<String>)> = HashMap::new();
 
         for (index, msg) in request.messages.iter().enumerate() {
             match msg {
@@ -557,17 +557,28 @@ impl GeminiClient {
                                 args,
                                 meta,
                             } => {
-                                tool_name_by_id.insert(id.clone(), name.clone());
+                                let (provider_id, signature) = match meta.as_deref() {
+                                    Some(meerkat_core::ProviderMeta::GeminiFunctionCall {
+                                        id,
+                                        thought_signature,
+                                    }) => (Some(id), thought_signature.as_ref()),
+                                    Some(meerkat_core::ProviderMeta::Gemini {
+                                        thought_signature,
+                                    }) => (None, Some(thought_signature)),
+                                    _ => (None, None),
+                                };
+                                tool_call_by_id
+                                    .insert(id.clone(), (name.clone(), provider_id.cloned()));
                                 // Parse RawValue to Value
                                 let args_value: Value = serde_json::from_str(args.get())
                                     .unwrap_or_else(|_| serde_json::json!({}));
                                 let mut part = serde_json::json!({"functionCall": {"name": name, "args": args_value}});
+                                if let Some(provider_id) = provider_id {
+                                    part["functionCall"]["id"] = serde_json::json!(provider_id);
+                                }
                                 // Only add signature if present (first parallel call has it)
-                                if let Some(meerkat_core::ProviderMeta::Gemini {
-                                    thought_signature,
-                                }) = meta.as_deref()
-                                {
-                                    part["thoughtSignature"] = serde_json::json!(thought_signature);
+                                if let Some(signature) = signature {
+                                    part["thoughtSignature"] = serde_json::json!(signature);
                                 }
                                 parts.push(part);
                             }
@@ -593,16 +604,16 @@ impl GeminiClient {
                                     .to_string(),
                             });
                         }
-                        let function_name = tool_name_by_id
+                        let (function_name, provider_id) = tool_call_by_id
                             .get(&r.tool_use_id)
                             .cloned()
-                            .unwrap_or_else(|| r.tool_use_id.clone());
+                            .unwrap_or_else(|| (r.tool_use_id.clone(), None));
 
                         // functionResponse only supports text content. For tool
                         // results with images we emit text in the functionResponse
                         // and append the images as separate inlineData parts so
                         // the model still sees the actual image data.
-                        parts.push(serde_json::json!({
+                        let mut part = serde_json::json!({
                             "functionResponse": {
                                 "name": function_name,
                                 "response": {
@@ -610,7 +621,11 @@ impl GeminiClient {
                                     "error": r.is_error
                                 }
                             }
-                        }));
+                        });
+                        if let Some(provider_id) = provider_id {
+                            part["functionResponse"]["id"] = serde_json::json!(provider_id);
+                        }
+                        parts.push(part);
                         // NOTE: thoughtSignature is intentionally NOT included here
                         // Verified by scripts/test_gemini_thought_signature.py:
                         // - sig on functionCall only: PASS
@@ -2332,8 +2347,17 @@ impl GeminiClient {
                                                 );
                                             }
                                             if let Some(fc) = part.function_call {
+                                                // Keep internal IDs in one namespace even when a
+                                                // provider ID happens to look like a fallback ID.
                                                 let id = format!("fc_{tool_call_index}");
                                                 tool_call_index += 1;
+                                                let meta = match fc.id {
+                                                    Some(id) => Some(Box::new(meerkat_core::ProviderMeta::GeminiFunctionCall {
+                                                        id,
+                                                        thought_signature: part.thought_signature,
+                                                    })),
+                                                    None => meta,
+                                                };
                                                 chunk_yielded.set(true);
                                                 yield LlmEvent::ToolCallComplete {
                                                     id,
@@ -2644,6 +2668,7 @@ struct GeminiFileResource {
 
 #[derive(Debug, Deserialize)]
 struct FunctionCall {
+    id: Option<String>,
     name: String,
     args: Option<Value>,
 }
@@ -4928,6 +4953,152 @@ mod tests {
             Some((StopReason::EndTurn, None)),
             "{:?}",
             events.last()
+        );
+    }
+
+    /// Exercise provider parsing, block assembly, durable serialization, replay
+    /// projection and the actual next HTTP request together.
+    async fn function_call_id_roundtrip(chunks: Vec<Vec<Value>>) -> (Vec<AssistantBlock>, Value) {
+        let mut payload = chunks
+            .into_iter()
+            .map(|parts| {
+                format!(
+                    "data: {}\n",
+                    json!({"candidates": [{"content": {"parts": parts}}]})
+                )
+            })
+            .collect::<String>();
+        payload.push_str("data: {\"candidates\":[{\"finishReason\":\"STOP\"}]}\n");
+        let events = gemini_stream_events(payload).await;
+        let mut assembler = meerkat_llm_core::BlockAssembler::new();
+        let mut results = Vec::new();
+        for event in events {
+            if let LlmEvent::ToolCallComplete {
+                id,
+                name,
+                args,
+                meta,
+            } = event
+            {
+                results.push(ToolResult::new(id.clone(), args["city"].to_string(), false));
+                assembler
+                    .on_tool_call_complete(
+                        id,
+                        name,
+                        serde_json::value::to_raw_value(&args).unwrap(),
+                        meta,
+                    )
+                    .unwrap();
+            }
+        }
+        let blocks = assembler.finalize();
+        assert!(
+            !blocks.is_empty(),
+            "fixture must produce tool calls through the real stream"
+        );
+        // Results may finish in another order, including calls to the same tool.
+        results.reverse();
+        let messages = vec![
+            Message::User(UserMessage::text("Look up the cities")),
+            Message::BlockAssistant(BlockAssistantMessage::new(
+                blocks.clone(),
+                StopReason::ToolUse,
+            )),
+            Message::tool_results(results),
+        ];
+        let messages = serde_json::from_value(serde_json::to_value(messages).unwrap()).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let response = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"done\"}]},\"finishReason\":\"STOP\"}]}\n";
+        let (base_url, server) =
+            spawn_gemini_stream_stub("gemini-3.5-flash", response.into(), Arc::clone(&seen)).await;
+        let client = GeminiClient::new_with_base_url("test-key".into(), base_url);
+        let request = LlmRequest::new("gemini-3.5-flash", messages);
+        let events = client.stream(&request).collect::<Vec<_>>().await;
+        server.abort();
+        assert!(events.iter().all(Result::is_ok));
+        let bodies = seen.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        (blocks, bodies[0].clone())
+    }
+
+    #[tokio::test]
+    async fn native_function_call_ids_survive_parallel_replay_and_match_results() {
+        let (blocks, body) = function_call_id_roundtrip(vec![vec![
+            json!({"functionCall": {"id": "native-A", "name": "weather", "args": {"city": "Oslo"}},
+                   "thoughtSignature": "opaque-signature"}),
+            json!({"functionCall": {"id": "native-B", "name": "weather", "args": {"city": "Paris"}}}),
+        ]]).await;
+        let first = &body["contents"][1]["parts"][0];
+        let second = &body["contents"][1]["parts"][1];
+        assert_eq!(first["functionCall"]["id"], "native-A");
+        assert_eq!(second["functionCall"]["id"], "native-B");
+        assert_eq!(first["thoughtSignature"], "opaque-signature");
+        assert!(second.get("thoughtSignature").is_none());
+        let responses = body["contents"][2]["parts"].as_array().unwrap();
+        assert_eq!(responses[0]["functionResponse"]["id"], "native-B");
+        assert_eq!(responses[1]["functionResponse"]["id"], "native-A");
+        assert_eq!(
+            responses[0]["functionResponse"]["response"]["content"],
+            "\"Paris\""
+        );
+        assert!(
+            responses
+                .iter()
+                .all(|part| part.get("thoughtSignature").is_none())
+        );
+        assert!(
+            matches!(&blocks[0], AssistantBlock::ToolUse { meta: Some(meta), .. }
+            if matches!(meta.as_ref(), ProviderMeta::GeminiFunctionCall { id, thought_signature }
+                if id == "native-A" && thought_signature.as_deref() == Some("opaque-signature")))
+        );
+    }
+
+    #[tokio::test]
+    async fn generated_correlation_ids_are_never_replayed_as_provider_ids() {
+        let (blocks, body) = function_call_id_roundtrip(vec![vec![
+            json!({"functionCall": {"name": "weather", "args": {"city": "Oslo"}},
+                   "thoughtSignature": "legacy-signature"}),
+            json!({"functionCall": {"name": "weather", "args": {"city": "Paris"}}}),
+        ]])
+        .await;
+        let calls = body["contents"][1]["parts"].as_array().unwrap();
+        let responses = body["contents"][2]["parts"].as_array().unwrap();
+        assert!(
+            calls
+                .iter()
+                .all(|part| part["functionCall"].get("id").is_none())
+        );
+        assert!(
+            responses
+                .iter()
+                .all(|part| part["functionResponse"].get("id").is_none())
+        );
+        assert_eq!(calls[0]["thoughtSignature"], "legacy-signature");
+        assert!(matches!(&blocks[0], AssistantBlock::ToolUse { id, .. } if id == "fc_0"));
+        assert!(matches!(&blocks[1], AssistantBlock::ToolUse { id, .. } if id == "fc_1"));
+    }
+
+    #[tokio::test]
+    async fn mixed_native_and_generated_ids_stay_distinct_across_stream_chunks() {
+        let (blocks, body) = function_call_id_roundtrip(vec![
+            vec![json!({"functionCall": {"name": "weather", "args": {"city": "Oslo"}}})],
+            vec![json!({"functionCall": {"id": "fc_0", "name": "weather", "args": {"city": "Paris"}}})],
+        ]).await;
+        assert!(
+            matches!(&blocks[0], AssistantBlock::ToolUse { id, meta: None, .. } if id == "fc_0")
+        );
+        assert!(
+            matches!(&blocks[1], AssistantBlock::ToolUse { id, meta: Some(_), .. } if id == "fc_1")
+        );
+        let calls = body["contents"][1]["parts"].as_array().unwrap();
+        assert!(calls[0]["functionCall"].get("id").is_none());
+        assert_eq!(calls[1]["functionCall"]["id"], "fc_0");
+        let responses = body["contents"][2]["parts"].as_array().unwrap();
+        assert_eq!(responses[0]["functionResponse"]["id"], "fc_0");
+        assert!(responses[1]["functionResponse"].get("id").is_none());
+        assert_eq!(
+            responses[0]["functionResponse"]["response"]["content"],
+            "\"Paris\""
         );
     }
 
