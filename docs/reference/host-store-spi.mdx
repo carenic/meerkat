@@ -302,6 +302,14 @@ on the database's clock, in a row of their own.
 - **Commit.** Append the batch with one pending-stream batch commit, or
   append its rows tagged with the commit id and close them with a marker
   row.
+- **Retries.** A streaming insert can fail in transport under a burst of
+  commits. Retry it a bounded number of times with jittered backoff.
+  Per-row insert ids and the load-time collapse of a repeated commit id make
+  such a retry safe. In one store, transport errors hit about a third of the
+  commits in a burst until it retried up to six times.
+- **Request size.** A batch of up to 8 MiB grows to about 11 MB as JSON.
+  Split its rows into requests of at most 7 MiB each, and write the commit
+  marker last.
 - **Load.** Take the scope's committed batches, drop fenced-out batches by
   their marker's commit order, collapse duplicate commit ids, keep the lowest
   commit id per version, and return the highest version's head and its rows
