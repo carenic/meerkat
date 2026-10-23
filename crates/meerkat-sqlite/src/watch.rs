@@ -718,8 +718,14 @@ impl WatchBackend for NotifyBackend {
         let parent = targets.parent.clone();
         let watched_paths = targets.watched_paths.clone();
         let watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
+            let relevant = matches!(
+                &result,
+                Ok(event) if sqlite_watch_event_relevant(event, &parent, &watched_paths)
+            );
+            #[cfg(any(test, feature = "test-support"))]
+            test_support::log_raw_event(&parent, &result, relevant);
             match result {
-                Ok(event) if sqlite_watch_event_relevant(&event, &parent, &watched_paths) => {
+                Ok(_) if relevant => {
                     let _ = wake.send(());
                 }
                 Ok(_) => {}
@@ -965,6 +971,7 @@ fn settle_failed(slot: &Mutex<RegistrationSlot>, reason: String) {
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
     use std::collections::HashMap;
+    use std::io::Write as _;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, mpsc};
@@ -988,6 +995,65 @@ pub mod test_support {
                 .and_then(|millis| millis.parse().ok())
                 .map(Duration::from_millis)
         })
+    }
+
+    /// The variable that names a file this test process appends a line to
+    /// for every notification its platform watchers report, before anything
+    /// filters it: when it arrived, the watched directory, the event (its
+    /// kind, paths and attributes) and whether it was relevant. Rows add
+    /// their own lines ([`log_raw`]). Unset: nothing is logged.
+    pub const RAW_EVENT_LOG: &str = "MEERKAT_TEST_SQLITE_WATCH_EVENT_LOG";
+
+    fn raw_event_log() -> Option<&'static Mutex<std::fs::File>> {
+        static LOG: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+        LOG.get_or_init(|| {
+            let path = std::env::var_os(RAW_EVENT_LOG)?;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()
+                .map(Mutex::new)
+        })
+        .as_ref()
+    }
+
+    /// Append `line` to the [`RAW_EVENT_LOG`] file, after the time (seconds
+    /// and microseconds since the Unix epoch) and this process's id. Without
+    /// that variable it does nothing.
+    pub fn log_raw(line: std::fmt::Arguments<'_>) {
+        let Some(log) = raw_event_log() else {
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let _ = writeln!(
+            lock(log),
+            "{}.{:06} pid={} {line}",
+            now.as_secs(),
+            now.subsec_micros(),
+            std::process::id()
+        );
+    }
+
+    /// Log one notification a platform watcher of `parent` reported, and
+    /// whether the watch took it as relevant.
+    pub(super) fn log_raw_event(
+        parent: &Path,
+        result: &notify::Result<notify::Event>,
+        relevant: bool,
+    ) {
+        if raw_event_log().is_none() {
+            return;
+        }
+        match result {
+            Ok(event) => log_raw(format_args!(
+                "event dir={} relevant={relevant} {event:?}",
+                parent.display()
+            )),
+            Err(error) => log_raw(format_args!("error dir={} {error}", parent.display())),
+        }
     }
 
     /// Held directories, by canonical path.
@@ -1305,6 +1371,7 @@ pub mod test_support {
             .collect();
         let watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
             let Ok(event) = result else {
+                log_raw_event(&parent, &result, false);
                 return;
             };
             let mut reports = vec![event.clone()];
@@ -1316,10 +1383,11 @@ pub mod test_support {
                     );
                 }
             }
-            if reports
+            let relevant = reports
                 .iter()
-                .any(|report| super::sqlite_watch_event_relevant(report, &parent, &watched_paths))
-            {
+                .any(|report| super::sqlite_watch_event_relevant(report, &parent, &watched_paths));
+            log_raw_event(&parent, &Ok(event), relevant);
+            if relevant {
                 let _ = wake.send(());
             }
         })
