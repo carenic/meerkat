@@ -642,6 +642,7 @@ impl MaterializePreflightProbe for ScriptedPreflightProbe {
     async fn preflight_llm_identity(
         &self,
         _identity: &meerkat_core::SessionLlmIdentity,
+        _resume_prior: Option<&meerkat_core::SessionLlmIdentity>,
         _custom_models: &std::collections::BTreeMap<
             String,
             meerkat_core::config::CustomModelConfig,

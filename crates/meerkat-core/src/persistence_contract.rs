@@ -347,6 +347,14 @@ pub trait SessionCheckpointer: Send + Sync {
         run_id: &RunId,
         previous: Option<&RunCheckpointReceipt>,
     ) -> Result<Option<RunCheckpointReceipt>, AgentError>;
+
+    /// Record how far the live session retired its transcript history once
+    /// this run's latest checkpoint moved the durable head over its rewrites.
+    ///
+    /// Checkpoints prune no stored rewrite rows while the run is open; the
+    /// boundary commit that promotes the run applies this cut to them. The
+    /// default records nothing.
+    fn note_run_transcript_retirement(&self, _run_id: &RunId, _retired_occurrences: u64) {}
 }
 
 /// Fixed-size store authority returned by a runtime-owned control mutation.

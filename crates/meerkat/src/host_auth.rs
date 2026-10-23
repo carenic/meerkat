@@ -60,7 +60,9 @@ use meerkat_providers::connector_oauth::{AccountSelection, ScopeEvidence};
 use meerkat_providers::mcp_oauth::{
     McpAccountSelection, McpOAuthAccountStrategy, McpOAuthAuthority, McpOAuthCallback,
     McpOAuthError, McpOAuthLoginComplete, McpOAuthLoginStart, McpOAuthLoopbackBegin,
-    McpOAuthPendingAttempt, McpServerIdentity, OidcUserInfoAccountStrategy,
+    McpOAuthNetworkBounds, McpOAuthPendingAttempt, McpOAuthRegisteredCallback,
+    McpRegisteredRedirectBase, McpServerIdentity, McpStoredCredentialPhase,
+    OidcUserInfoAccountStrategy,
 };
 use meerkat_providers::oauth_flow::{
     OAuthFlowError, OAuthTargetValidationError, oauth_provider_resolution,
@@ -673,6 +675,12 @@ const CREDENTIAL_ACCESS_PENDING_PUBLIC_MESSAGE: &str =
     "access to the stored credential is still pending";
 const CREDENTIAL_STORE_UNAVAILABLE_PUBLIC_MESSAGE: &str = "the credential store is unavailable";
 
+/// Fixed public text for a credential commit whose outcome is unknown, from
+/// every source. A failed rollback's store and lifecycle detail stays in
+/// protected diagnostics.
+const COMMIT_UNSETTLED_PUBLIC_MESSAGE: &str =
+    "the credential commit's outcome is unknown; read the status later";
+
 impl HostAuthError {
     /// The typed public reason of this error: the one mapping every auth
     /// surface projects. Exhaustive on purpose, so a new native error must
@@ -716,6 +724,29 @@ impl HostAuthError {
         }
     }
 
+    /// The stable sub-kind every auth surface projects beside
+    /// [`Self::reason`], for the refusals a host must tell apart within one
+    /// reason.
+    pub fn detail(&self) -> Option<meerkat_contracts::WireAuthErrorDetail> {
+        use meerkat_contracts::WireAuthErrorDetail as D;
+        match self {
+            Self::McpOAuth(McpOAuthError::RemoteCustodyRequired { .. })
+            | Self::Connector(ConnectorLoginError::RemoteCustodyRequired) => {
+                Some(D::RemoteCustodyRequired)
+            }
+            // Whether the authorization code had been sent when the stage
+            // ran out of time.
+            Self::McpOAuth(McpOAuthError::NetworkTimedOut { stage, .. }) => {
+                Some(if stage.code_sent() {
+                    D::UpstreamTimeoutAfterCode
+                } else {
+                    D::UpstreamTimeout
+                })
+            }
+            _ => None,
+        }
+    }
+
     /// The error text a public surface may show. Infrastructure failures and
     /// refused credential accesses use fixed text per reason; their detail
     /// goes only to protected diagnostics.
@@ -743,6 +774,7 @@ fn fixed_public_message(reason: meerkat_contracts::WireAuthErrorReason) -> Optio
         R::CredentialInteractionRequired => Some(CREDENTIAL_INTERACTION_REQUIRED_PUBLIC_MESSAGE),
         R::CredentialAccessPending => Some(CREDENTIAL_ACCESS_PENDING_PUBLIC_MESSAGE),
         R::CredentialStoreUnavailable => Some(CREDENTIAL_STORE_UNAVAILABLE_PUBLIC_MESSAGE),
+        R::CommitUnsettled => Some(COMMIT_UNSETTLED_PUBLIC_MESSAGE),
         _ => None,
     }
 }
@@ -762,6 +794,7 @@ fn connection_target_reason(
         | E::InvalidBindingId { .. }
         | E::ProviderMismatch { .. }
         | E::AmbiguousCredentialAccountBindings { .. }
+        | E::NoCredentialAccountRoute { .. }
         | E::RealmChain(_) => R::InvalidTarget,
     }
 }
@@ -841,11 +874,15 @@ fn credential_mutation_reason(
         CredentialMutationError::CredentialAccess { refusal, .. } => {
             credential_access_reason(*refusal)
         }
+        // A failed rollback or a lost owner leaves the commit's outcome
+        // unknown: settle, then read the status.
+        CredentialMutationError::RollbackFailed(_) | CredentialMutationError::Cancelled => {
+            meerkat_contracts::WireAuthErrorReason::CommitUnsettled
+        }
         CredentialMutationError::StalePreparation
         | CredentialMutationError::Operation(_)
         | CredentialMutationError::TokenStore(_)
         | CredentialMutationError::AuthLifecycle(_)
-        | CredentialMutationError::Cancelled
         | CredentialMutationError::LockFailed(_) => {
             meerkat_contracts::WireAuthErrorReason::Infrastructure
         }
@@ -868,6 +905,9 @@ fn mcp_oauth_reason(error: &McpOAuthError) -> meerkat_contracts::WireAuthErrorRe
         McpOAuthError::MissingStoredToken { .. }
         | McpOAuthError::HumanAuthorizationRequired { .. } => R::AuthorizationRequired,
         McpOAuthError::Callback { .. } => R::CallbackUnavailable,
+        // A registered attempt's completion without the host's custody; the
+        // error data's `detail` tells it apart from a malformed target.
+        McpOAuthError::RemoteCustodyRequired { .. } => R::InvalidTarget,
         McpOAuthError::DiscoveryFailed { .. }
         | McpOAuthError::RegistrationFailed { .. }
         | McpOAuthError::TokenExchangeFailed { .. }
@@ -885,6 +925,11 @@ fn mcp_oauth_reason(error: &McpOAuthError) -> meerkat_contracts::WireAuthErrorRe
         | McpOAuthError::AuthLifecycle { .. }
         | McpOAuthError::EgressUnavailable { .. }
         | McpOAuthError::HttpClientUnavailable(_) => R::Infrastructure,
+        // A stage of the provider's servers got no answer within its bound;
+        // the error data's `detail` says whether the code had been sent.
+        McpOAuthError::NetworkTimedOut { .. } => R::UpstreamFailure,
+        // Neither a success nor a failure: the commit may still land.
+        McpOAuthError::CommitUnsettled { .. } => R::CommitUnsettled,
     }
 }
 
@@ -909,6 +954,7 @@ fn connector_reason(error: &ConnectorLoginError) -> meerkat_contracts::WireAuthE
         | ConnectorLoginError::HttpClientUnavailable(_) => R::Infrastructure,
         ConnectorLoginError::ClientConfig(_)
         | ConnectorLoginError::ClientSecretUnavailable { .. } => R::ConfigurationInvalid,
+        ConnectorLoginError::CommitUnsettled => R::CommitUnsettled,
     }
 }
 
@@ -924,6 +970,11 @@ pub struct HostAuthService {
     connector_strategies: ConnectorStrategies,
     /// The runtime realm whose MCP credentials this service owns.
     mcp_realm: Option<RealmId>,
+    /// The host's registered `https` redirect base for MCP logins (host
+    /// configuration), when the host serves a hosted callback.
+    mcp_registered_redirect_base: Option<McpRegisteredRedirectBase>,
+    /// How long the MCP OAuth owner waits on the network.
+    mcp_network_bounds: McpOAuthNetworkBounds,
     /// Host-installed connector client-auth profiles (secrets from host
     /// configuration).
     connector_client_auth: Vec<ConnectorClientAuthProfile>,
@@ -950,6 +1001,8 @@ impl HostAuthService {
             mcp_account_strategy: Arc::new(OidcUserInfoAccountStrategy::new()),
             connector_strategies: ConnectorStrategies::with_defaults(),
             mcp_realm: None,
+            mcp_registered_redirect_base: None,
+            mcp_network_bounds: McpOAuthNetworkBounds::default(),
             connector_client_auth: Vec::new(),
             connector_protocols:
                 meerkat_providers::connector_protocol::ConnectorProtocols::with_defaults(),
@@ -965,6 +1018,45 @@ impl HostAuthService {
     pub fn with_mcp_realm(mut self, realm: RealmId) -> Self {
         self.mcp_realm = Some(realm);
         self
+    }
+
+    /// Serve MCP logins through the host's own `https` callback under
+    /// `base` as well as through loopback redirects. Host configuration
+    /// only: each target's exact redirect is derived from it
+    /// ([`Self::mcp_registered_redirect_uri`]).
+    pub fn with_mcp_registered_redirect_base(mut self, base: McpRegisteredRedirectBase) -> Self {
+        self.mcp_registered_redirect_base = Some(base);
+        self
+    }
+
+    /// The host's registered redirect base, if it serves one.
+    pub fn mcp_registered_redirect_base(&self) -> Option<&McpRegisteredRedirectBase> {
+        self.mcp_registered_redirect_base.as_ref()
+    }
+
+    /// Bound the MCP OAuth owner's network waits by `bounds` (see
+    /// [`McpOAuthNetworkBounds`]; the default applies otherwise). They hold
+    /// for the MCP authority's own client and its account strategy.
+    pub fn with_mcp_network_bounds(mut self, bounds: McpOAuthNetworkBounds) -> Self {
+        self.mcp_network_bounds = bounds;
+        self
+    }
+
+    /// The exact registered `https` redirect of `target` in this service's
+    /// realm, when the host serves a registered base: the URI the
+    /// authorization server redirects to, which the host routes to its
+    /// callback endpoint. Local and secret-free.
+    pub fn mcp_registered_redirect_uri(
+        &self,
+        target: &McpServerIdentity,
+    ) -> Result<Option<String>, HostAuthError> {
+        let Some(base) = &self.mcp_registered_redirect_base else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.mcp_oauth_authority()?
+                .registered_redirect_uri(target, base)?,
+        ))
     }
 
     /// Replace the provider protocols client-auth profiles may name. The
@@ -1155,12 +1247,14 @@ impl HostAuthService {
     /// `McpAuthResolver` so agent connections share the host's credentials.
     ///
     /// It uses its own HTTP client, which follows no redirects, rather than
-    /// [`Self::with_http_client`]'s.
+    /// [`Self::with_http_client`]'s, and waits on the network within this
+    /// service's [`Self::with_mcp_network_bounds`].
     pub fn mcp_oauth_authority(&self) -> Result<McpOAuthAuthority, HostAuthError> {
         let authority = McpOAuthAuthority::new(
             self.persistence.clone(),
             self.authority.generated_auth_lease_handle(),
         )
+        .with_network_bounds(self.mcp_network_bounds)
         .with_interactive_strategy(
             self.authority.oauth_flow_authority(),
             Arc::clone(&self.mcp_account_strategy),
@@ -1186,6 +1280,47 @@ impl HostAuthService {
         Ok(self
             .mcp_oauth_authority()?
             .login_start(target, redirect_uri, www_authenticate)
+            .await?)
+    }
+
+    /// Admit one host-driven MCP OAuth attempt on the target's registered
+    /// `https` redirect under this service's base: the host's own callback
+    /// endpoint, for a host whose users' browsers cannot reach its loopback
+    /// address. A started attempt returns a host-only `host_attempt_handle`,
+    /// a secret the host keeps server-side with its ceremony and passes to
+    /// [`Self::mcp_login_complete_registered`]; a joined projection carries
+    /// none. Refused when the service has no registered base. See
+    /// [`McpOAuthAuthority::login_start_registered`].
+    pub async fn mcp_login_start_registered(
+        &self,
+        target: &McpServerIdentity,
+        www_authenticate: Option<&str>,
+    ) -> Result<McpOAuthLoginStart, HostAuthError> {
+        let Some(base) = &self.mcp_registered_redirect_base else {
+            return Err(McpOAuthError::Verification(
+                meerkat_providers::connector_oauth::ConnectorOAuthRefusal::InvalidDescriptor,
+            )
+            .into());
+        };
+        Ok(self
+            .mcp_oauth_authority()?
+            .login_start_registered(target, base, www_authenticate)
+            .await?)
+    }
+
+    /// Complete an attempt admitted on a registered redirect from the host's
+    /// `https` callback, with the host's retained `host_attempt_handle`. A
+    /// callback without that custody is refused and leaves the attempt to
+    /// its owner. Returns a secret-free projection. See
+    /// [`McpOAuthAuthority::login_complete_registered`].
+    pub async fn mcp_login_complete_registered(
+        &self,
+        target: &McpServerIdentity,
+        callback: McpOAuthRegisteredCallback,
+    ) -> Result<McpOAuthLoginComplete, HostAuthError> {
+        Ok(self
+            .mcp_oauth_authority()?
+            .login_complete_registered(target, callback)
             .await?)
     }
 
@@ -1267,8 +1402,15 @@ impl HostAuthService {
         Ok(target.scoped_to(self.mcp_realm.as_ref())?)
     }
 
-    /// Secret-free authorization status of one MCP target, projected from
-    /// its durable credential and its pending attempt. It performs no
+    /// Secret-free authorization status of one MCP target, from its stored
+    /// credential and its pending attempt. A stored credential's phase and
+    /// fields come from one read through the use path's own rule
+    /// ([`McpOAuthAuthority::stored_credential_status`]): like a use, that
+    /// read may restore the credential's lifecycle from its durable marker,
+    /// and in a process that has not used the credential yet that restoration
+    /// can make one bounded credential-store lookup, as connector status does.
+    /// It never waits for the credential's lifecycle owner: while the owner
+    /// is busy, the stored credential's own reading decides. It performs no
     /// refresh and no network I/O.
     pub async fn mcp_status(
         &self,
@@ -1285,13 +1427,12 @@ impl HostAuthService {
             .await?
             .filter(|tokens| {
                 tokens.auth_mode == meerkat_providers::auth_store::PersistedAuthMode::McpOauth
-                    && tokens.primary_secret.is_some()
                     && meerkat_providers::mcp_oauth::stored_credential_matches_selection(
                         target, tokens,
                     )
             });
-        let attempt = match self.mcp_oauth_authority() {
-            Ok(authority) => authority.pending_attempt(target)?,
+        let authority = match self.mcp_oauth_authority() {
+            Ok(authority) => Some(authority),
             // Without an AuthMachine-owned flow owner no attempt can have
             // been admitted, so none is pending.
             Err(HostAuthError::McpOAuth(McpOAuthError::Verification(
@@ -1299,22 +1440,54 @@ impl HostAuthService {
             ))) => None,
             Err(error) => return Err(error),
         };
+        let attempt = match &authority {
+            Some(authority) => authority.pending_attempt(target)?,
+            None => None,
+        };
+        let absent = |attempt| HostMcpAuthStatus {
+            target: target.clone(),
+            phase: HostMcpAuthPhase::AuthorizationRequired,
+            expires_at: None,
+            account_id: None,
+            account_verification: target.account_verification(),
+            attempt,
+        };
         let Some(tokens) = stored else {
+            return Ok(absent(attempt));
+        };
+        let expired = tokens.expires_at.is_some_and(|at| at <= Utc::now());
+        // A record without a secret is refused at use: reauth, never absent.
+        let durable_phase =
+            if tokens.primary_secret.is_none() || (expired && tokens.refresh_token.is_none()) {
+                HostMcpAuthPhase::ReauthRequired
+            } else {
+                HostMcpAuthPhase::Authorized
+            };
+        let used = match &authority {
+            Some(authority) => authority.stored_credential_status(target).await?,
+            None => None,
+        };
+        if let Some(used) = used {
+            let phase = match used.phase {
+                McpStoredCredentialPhase::AuthorizationRequired => return Ok(absent(attempt)),
+                McpStoredCredentialPhase::ReauthRequired => HostMcpAuthPhase::ReauthRequired,
+                McpStoredCredentialPhase::Authorized => HostMcpAuthPhase::Authorized,
+                // A phase this host does not know keeps the stored
+                // credential's own reading.
+                _ => durable_phase,
+            };
             return Ok(HostMcpAuthStatus {
                 target: target.clone(),
-                phase: HostMcpAuthPhase::AuthorizationRequired,
-                expires_at: None,
-                account_id: None,
+                phase,
+                expires_at: used.expires_at,
+                account_id: used.account_id,
                 account_verification: target.account_verification(),
                 attempt,
             });
-        };
-        let expired = tokens.expires_at.is_some_and(|at| at <= Utc::now());
-        let phase = if expired && tokens.refresh_token.is_none() {
-            HostMcpAuthPhase::ReauthRequired
-        } else {
-            HostMcpAuthPhase::Authorized
-        };
+        }
+        // The credential's lifecycle owner is busy: the stored credential's
+        // own reading.
+        let phase = durable_phase;
         Ok(HostMcpAuthStatus {
             target: target.clone(),
             phase,
@@ -1725,6 +1898,45 @@ mod tests {
         RealmConfigSection,
     };
     use std::sync::Arc;
+
+    /// A commit whose outcome is unknown, from any source, is
+    /// commit_unsettled with one fixed public text: the store or lifecycle
+    /// detail of a failed rollback never reaches a public surface.
+    #[test]
+    fn an_unsettled_commit_from_any_source_is_commit_unsettled_with_a_fixed_text() {
+        use meerkat_contracts::WireAuthErrorReason as Reason;
+
+        const DETAIL: &str = "private-rollback-detail-canary-1045";
+        let cases = [
+            HostAuthError::CredentialMutation(CredentialMutationError::RollbackFailed(
+                DETAIL.into(),
+            )),
+            HostAuthError::CredentialMutation(CredentialMutationError::Cancelled),
+            HostAuthError::Connector(ConnectorLoginError::CommitUnsettled),
+            HostAuthError::McpOAuth(McpOAuthError::CommitUnsettled {
+                server_name: "s".into(),
+            }),
+        ];
+        let mut texts = std::collections::BTreeSet::new();
+        for error in cases {
+            assert_eq!(error.reason(), Reason::CommitUnsettled, "{error:?}");
+            assert!(error.withholds_detail(), "{error:?}");
+            let public = error.public_message();
+            assert!(!public.contains(DETAIL), "{public}");
+            texts.insert(public);
+        }
+        assert_eq!(texts.len(), 1, "one reason, one public text: {texts:?}");
+    }
+
+    /// The facade re-exports the credential settle a host runs before it
+    /// reads a status after an unsettled commit.
+    #[tokio::test]
+    async fn the_facade_settles_the_credential_work_this_process_started() {
+        assert_eq!(
+            crate::settle_in_flight_credential_mutations(std::time::Duration::ZERO).await,
+            crate::CredentialSettlement::Settled
+        );
+    }
 
     #[test]
     fn credential_access_public_messages_preserve_reasons_without_internal_details() {

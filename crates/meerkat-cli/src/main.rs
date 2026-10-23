@@ -13141,6 +13141,13 @@ impl meerkat_mob::MobSessionService for RunMobSessionService {
         <EphemeralSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::discard_live_session_under_runtime_turn_boundary(&self.inner, session_id).await
     }
 
+    /// The wrapped service owns the session actors, so the exit of a removed
+    /// one is awaited there.
+    async fn await_removed_actor_exit(&self, session_id: &SessionId) {
+        meerkat_mob::MobSessionService::await_removed_actor_exit(self.inner.as_ref(), session_id)
+            .await;
+    }
+
     async fn subscribe_session_events(
         &self,
         session_id: &SessionId,
@@ -17006,6 +17013,13 @@ impl meerkat_mob::MobSessionService for MobCliSessionService {
         session_id: &SessionId,
     ) -> Result<(), meerkat_core::service::SessionError> {
         <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::discard_live_session_under_runtime_turn_boundary(&self.inner, session_id).await
+    }
+
+    /// The wrapped persistent service owns the session actors, so the exit
+    /// of a removed one is awaited there.
+    async fn await_removed_actor_exit(&self, session_id: &SessionId) {
+        meerkat_mob::MobSessionService::await_removed_actor_exit(self.inner.as_ref(), session_id)
+            .await;
     }
 
     async fn subscribe_session_events(

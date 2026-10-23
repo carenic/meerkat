@@ -941,10 +941,11 @@ mod degradation_marker_tests {
     /// measurement, because "some turn was unaccounted" is not actionable.
     #[test]
     fn unmeasured_turn_usage_renders_the_request_identity() {
-        let unmeasured = UnmeasuredTurnUsageAccounting::new(Provider::Anthropic, "claude-opus-5");
+        let unmeasured =
+            UnmeasuredTurnUsageAccounting::new(Provider::Anthropic, "test-anthropic-model");
         assert_eq!(
             unmeasured.to_string(),
-            "unmeasured:turn_usage_accounting{provider=anthropic, model=claude-opus-5}"
+            "unmeasured:turn_usage_accounting{provider=anthropic, model=test-anthropic-model}"
         );
         assert_eq!(unmeasured.marker(), UnmeasuredTurnUsageAccounting::MARKER);
     }

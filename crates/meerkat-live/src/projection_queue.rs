@@ -597,7 +597,9 @@ pub(crate) mod test_support {
             }
         }
 
-        /// The writes the sink refused, in order.
+        /// The writes the sink refused, in order. Only the WebRTC tests read
+        /// them.
+        #[cfg(feature = "webrtc")]
         pub(crate) fn refused_rows(&self) -> Vec<&'static str> {
             self.refused
                 .lock()
@@ -965,6 +967,8 @@ pub(crate) mod test_support {
         }
     }
 
+    /// Only the WebRTC tests interrupt a turn.
+    #[cfg(feature = "webrtc")]
     pub(crate) fn turn_interrupted(
         response: &str,
     ) -> meerkat_core::live_adapter::LiveAdapterObservation {

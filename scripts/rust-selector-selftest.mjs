@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
-import { embeddedInputs, gitLines, moduleReferences, packageForFile } from "./rust-test-selector.mjs";
+import { embeddedInputs, gitLines, moduleReferences, packageForFile, packagesForFile } from "./rust-test-selector.mjs";
 
 const refs = moduleReferences(`
 //! A doc example with #[path = "support/not_a_module.rs"] must not affect
@@ -61,5 +61,38 @@ assert.ok(
 assert.equal(packageForFile("LICENSE-MIT", dirs), null);
 assert.equal(packageForFile("LICENSE-APACHE", dirs), null);
 assert.ok(embedded.every((input) => !/^LICENSE/.test(input.path)));
+
+// A crate can link a file or directory of another crate into its own
+// directory (a test fixture both crates read). A change there selects the
+// crate that holds it first, then each crate that links it, in name order;
+// packageForFile still names the crate that holds it.
+const names = (pkgs) => pkgs.map((pkg) => pkg.name);
+const core = dirs[0][1];
+const facade = dirs[1][1];
+const runtime = { name: "meerkat-runtime" };
+const linkDirs = [["crates/meerkat-runtime", runtime], ...dirs];
+const links = [
+  { path: "crates/meerkat-core/tests/fixtures/shared.json", pkg: runtime, owner: core, isDirectory: false },
+  { path: "crates/meerkat-core/tests/fixtures/shared.json", pkg: facade, owner: core, isDirectory: false },
+  { path: "crates/meerkat-core/tests/shared", pkg: runtime, owner: core, isDirectory: true },
+  { path: ".claude/skills/meerkat-platform", pkg: facade, owner: null, isDirectory: true },
+];
+assert.deepEqual(
+  names(packagesForFile("crates/meerkat-core/tests/fixtures/shared.json", linkDirs, links)),
+  ["meerkat-core", "meerkat", "meerkat-runtime"],
+);
+assert.deepEqual(names(packagesForFile("./crates/meerkat-core/tests/shared/a/b.json", linkDirs, links)), ["meerkat-core", "meerkat-runtime"]);
+assert.deepEqual(names(packagesForFile("crates/meerkat-core/tests/shared-other/b.json", linkDirs, links)), ["meerkat-core"]);
+assert.deepEqual(names(packagesForFile("crates/meerkat-core/tests/fixtures/other.json", linkDirs, links)), ["meerkat-core"]);
+assert.deepEqual(names(packagesForFile("crates/meerkat-runtime/tests/fixtures/shared.json", linkDirs, links)), ["meerkat-runtime"]);
+assert.deepEqual(names(packagesForFile(".claude/skills/meerkat-platform/SKILL.md", linkDirs, links)), ["meerkat"]);
+assert.deepEqual(names(packagesForFile("docs/reference/build-and-ci.mdx", linkDirs, links)), []);
+assert.equal(packageForFile("crates/meerkat-core/tests/fixtures/shared.json", linkDirs)?.name, "meerkat-core");
+
+// With this tree's own links: an embedded document selects its embedder,
+// a crate file selects its crate first.
+assert.deepEqual(names(packagesForFile(".claude/skills/meerkat-platform/SKILL.md", dirs)), ["meerkat"]);
+assert.equal(packagesForFile("crates/meerkat-core/src/lib.rs", dirs)[0].name, "meerkat-core");
+assert.deepEqual(names(packagesForFile("LICENSE-MIT", dirs)), []);
 
 console.log("rust selector selftest ok");

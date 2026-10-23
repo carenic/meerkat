@@ -692,10 +692,7 @@ pub async fn handle_public_tools_call(
                 .await
                 .map_err(|err| McpToolError::from_mob(&err))?
                 .into_iter()
-                .map(|(mob_id, status)| meerkat_contracts::MobStatusResult {
-                    mob_id: mob_id.to_string(),
-                    status: crate::wire_mob_lifecycle_status(status),
-                })
+                .map(|(mob_id, observation)| crate::wire_mob_status_row(&mob_id, &observation))
                 .collect::<Vec<_>>();
             Ok(json!(meerkat_contracts::MobListResult { mobs }))
         }
@@ -706,9 +703,12 @@ pub async fn handle_public_tools_call(
                 .mob_status(&mob_id)
                 .await
                 .map_err(|err| McpToolError::from_mob(&err))?;
+            // A mob whose actor has stopped answers its typed failure as the
+            // error above, so a status row carries none.
             Ok(json!(meerkat_contracts::MobStatusResult {
                 mob_id: mob_id.to_string(),
                 status: crate::wire_mob_lifecycle_status(status),
+                failure: None,
             }))
         }
         "meerkat_mob_lifecycle" => {

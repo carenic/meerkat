@@ -212,6 +212,13 @@ Project config wins on name collisions.
   args = ["-m", "db_mcp_server"]
   env = { DATABASE_URL = "${DATABASE_URL}" }
 
+  # Stdio server launched in its own working directory
+  [[servers]]
+  name = "github"
+  command = "/opt/github-mcp/bin/github-mcp-server"
+  args = ["stdio"]
+  cwd = "/opt/github-mcp"
+
   # HTTP server (streamable HTTP is default for URLs)
   [[servers]]
   name = "remote-api"
@@ -235,6 +242,25 @@ Project config wins on name collisions.
 <Note>
 Supported transports: **stdio**, **streamable HTTP** (default for URLs), and **SSE**.
 Environment variables in config use `${VAR_NAME}` syntax.
+</Note>
+
+<Note>
+`cwd` sets the working directory a stdio server is launched in; without it
+the server starts where it did before. The value is an absolute path used
+exactly as written: it is never expanded (no `${VAR_NAME}`, no `~`) or
+resolved. A relative, empty or NUL-containing `cwd` refuses the
+configuration when it is loaded, persisted, staged or connected. A `cwd`
+that is missing or not a directory when the server is launched refuses the
+launch before anything runs; there is no fallback to another directory.
+With `cwd` set, `command` must be an absolute path or a bare program name
+(checked after `${VAR_NAME}` expansion), because a relative program path
+would resolve differently by platform. Under the host's OS process
+confinement, `cwd` never widens what the server can reach: on Linux a
+directory outside the confinement's mounts refuses the launch. A changed
+`cwd` is a changed server definition: it is launched anew, a resumed
+session's recorded attachment to the old definition is refused as rebound,
+and realm service secrets (`secret_env`) stored for the old definition must
+be stored again. Mob portable profiles cannot carry `cwd`.
 </Note>
 
 <Note>
@@ -402,7 +428,8 @@ ask its user.
    "redirect_uri": "http://127.0.0.1:53682/mcp/oauth/callback"}
   ```
 
-  `redirect_uri` must be an http loopback URL. Completion sends only the
+  `redirect_uri` must be an http loopback URL, or the host's registered
+  `https` callback (next item). Completion sends only the
   callback's `code` and `state` (and the same `redirect_uri`): issuer, client
   and resource come from the admitted attempt, and nothing network-facing
   happens until `state` is proven. Cancel takes `{mcp, state}`. A joined start
@@ -421,6 +448,101 @@ ask its user.
   `oauth_account_selection`, if given, the configured value; they never
   select or change the mode. Anything else is refused before any network
   request.
+- **Hosted callback (registered `https` redirect).** A host whose users'
+  browsers cannot reach its loopback address (a server-hosted app) serves
+  its own `https` callback endpoint and configures its base as host
+  configuration: `rkat-rpc --mcp-oauth-redirect-base
+  https://host.example/mcp/oauth/callback`, or
+  `HostAuthService::with_mcp_registered_redirect_base` in an embedding host.
+  Agents, MCP server definitions and mob profiles cannot set it. Each
+  server's exact redirect is the base followed by one path segment, its
+  credential binding, so every server, realm and account selection has its
+  own redirect. `auth/login/start` with `redirect_uri` set to the base (or
+  to that server's derived redirect) starts on it and adds two fields:
+
+  ```json
+  {"authorize_url": "https://idp.example/authorize?...",
+   "state": "st-...",
+   "redirect_uri": "https://host.example/mcp/oauth/callback/remote-oauth-AbC123dEf456GhI7",
+   "host_attempt_handle": "...",
+   "mcp": {"server_name": "remote-oauth", "server_url": "https://mcp.example.com/api", "oauth_account": "subject-id"},
+   "disposition": "started",
+   "attempt_ref": "oauth-action:..."}
+  ```
+
+  `host_attempt_handle` is a secret: the host keeps it server-side with the
+  ceremony it started, keyed by `state`, and never puts it in the browser, a
+  URL, a model, a transcript or a log. `attempt_ref` is the public reference
+  `auth/status/get` reports; it authorizes nothing. Dynamic registration
+  registers a public PKCE `web` client for exactly the derived redirect; a
+  server that answers with a confidential client is refused with its remedy
+  before any attempt exists. The host routes the derived redirect to its
+  callback endpoint, which must authenticate the user's own session and match
+  it to the session and realm that started the attempt, then call
+  `auth/login/complete` once:
+
+  ```json
+  {"mcp": {"server_name": "remote-oauth", "server_url": "https://mcp.example.com/api", "oauth_account": "subject-id"},
+   "code": "<callback code>",
+   "state": "<callback state>",
+   "redirect_uri": "<the start result's redirect_uri, from the host's route config>",
+   "host_attempt_handle": "<the start's handle>",
+   "iss": "<the callback's iss, when the authorization server sent one>"}
+  ```
+
+  `redirect_uri` must equal the admitted redirect byte for byte. `iss`
+  (RFC 9207) must equal the attempt's issuer byte for byte, and is required
+  when the authorization server advertises
+  `authorization_response_iss_parameter_supported`. A completion without the
+  handle, with another one, or through a loopback-only path is refused
+  (`error.data.reason` `invalid_target`, `error.data.detail`
+  `remote_custody_required`) and leaves the attempt pending, so a forged
+  callback cannot cancel it. The handle's key lives in the runtime process:
+  after a runtime restart, cancel the attempt with `{mcp, attempt_ref}` and
+  start again. A joined start (an attempt already pending on the same
+  redirect) carries no handle; an attempt pending on another redirect is
+  refused (`attempt_mismatch`) until it is cancelled, and so is a loopback
+  start while a registered attempt is pending. The credential lands in
+  the same slot as a loopback login's, with the same refresh, status, cancel
+  and logout; a credential whose client was registered for the other
+  redirect kind needs a logout first. The window is the same 300 s. REST and
+  `rkat mcp login` serve loopback logins only.
+- **Bounded network stages.** No stalled authorization server holds a login,
+  its host or the credential. Each network stage of a login or refresh
+  (protected resource metadata, authorization-server metadata, account
+  preflight, client registration, the code exchange, account evidence, and a
+  refresh's token request and subject check) gets 20 s for all of its
+  requests; a start's stages get 60 s together, and a completion's get 60 s
+  together, never past the attempt's 300 s window. Every credential request
+  Core sends is also bounded at 30 s (10 s to connect). A stage that runs out
+  of time ends the call with `error.data.reason` `upstream_failure` and
+  `error.data.detail` `upstream_timeout` (the authorization code had not been
+  sent) or `upstream_timeout_after_code` (it had, and may be spent at the
+  provider; any tokens it issued are never stored). Nothing is published: a
+  start admits no attempt and a completion's attempt is retired, so start a
+  new login. A refresh that runs out of time fails transiently and keeps the
+  credential.
+
+  Cancelling an attempt (`auth/login/cancel` by `state` or `attempt_ref`, or a
+  logout) while its `auth/login/complete` is in flight ends that call at once
+  with `attempt_missing`, and `cancelled: true` means nothing from that
+  attempt is ever published. A cancel answered `attempt_missing` while a
+  completion of the attempt is still in flight means the attempt is already
+  gone: the credential commit consumed it, it expired, or an earlier cancel
+  retired it. The completion answers its true end, or, when the commit has not
+  reported within 60 s, `error.data.reason` `commit_unsettled`. Whether that
+  credential landed is unknown until the commit settles; read
+  `auth/status/get` later. It is neither a success nor a failure. A commit
+  that fails after it consumed the attempt and cannot restore the previous
+  credential also answers `commit_unsettled`; if a call to that server is then
+  refused for authorization, log in again. A completion answered
+  `credential_access_pending` was not admitted to its credential commit within
+  60 s: its attempt was retired and nothing from it is published, so start a
+  new login. An embedding host that must know the outcome calls
+  `meerkat::settle_in_flight_credential_mutations` and, once it answers
+  `Settled`, reads `HostAuthService::mcp_status`, which reports what a use of
+  the stored credential would do. An embedding host sets the bounds with
+  `HostAuthService::with_mcp_network_bounds`.
 
 <Warning>
 The authorize URL and `state`, and the callback's `code` and `state`, let

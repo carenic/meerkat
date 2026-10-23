@@ -9984,6 +9984,92 @@ fn merge_content_inputs(
     }
 }
 
+/// Lower the staged create-time prompt into the turn that consumed it.
+///
+/// A direct turn (no typed appends) commits its prompt as the user row, so the
+/// staged prompt is merged ahead of it. A runtime-authored turn commits only
+/// its typed appends: the staged prompt is folded into the first User append
+/// (staged content first), or inserted as one User append after the leading
+/// InjectedContext appends when the turn has none, and the provider prompt is
+/// recomputed from the final appends. Either way the run-start hooks and
+/// `RunStarted` see exactly the rows the turn commits. InjectedContext,
+/// System and notice appends are never modified. A turn whose input carries
+/// directed interaction custody is refused while a prompt is staged: its
+/// `RunStarted` content must equal the directed input's own projection.
+fn lower_staged_initial_prompt(
+    staged: Option<&meerkat_core::types::ContentInput>,
+    prompt: meerkat_core::types::ContentInput,
+    mut appends: Vec<meerkat_core::lifecycle::run_primitive::ConversationAppend>,
+    directed_turn: bool,
+) -> Result<
+    (
+        meerkat_core::types::ContentInput,
+        Vec<meerkat_core::lifecycle::run_primitive::ConversationAppend>,
+    ),
+    AgentError,
+> {
+    use meerkat_core::lifecycle::run_primitive::{
+        ConversationAppend, ConversationAppendRole, CoreRenderable,
+        model_projection_content_input_from_conversation_appends,
+    };
+    use meerkat_core::types::ContentInput;
+
+    let Some(staged) = staged else {
+        return Ok((prompt, appends));
+    };
+    // Fail closed whatever the turn carries: a directed turn's `RunStarted`
+    // must equal its input's own projection, with or without typed appends.
+    if directed_turn {
+        return Err(AgentError::StagedPromptDirectedTurnRefused);
+    }
+    if appends.is_empty() {
+        return Ok((merge_content_inputs(staged.clone(), prompt), appends));
+    }
+    if let Some(first_user) = appends
+        .iter_mut()
+        .find(|append| append.role == ConversationAppendRole::User)
+    {
+        let turn = match &first_user.content {
+            CoreRenderable::Text { text } => ContentInput::Text(text.clone()),
+            CoreRenderable::Blocks { blocks } => ContentInput::Blocks(blocks.clone()),
+            _ => {
+                return Err(AgentError::ConfigError(
+                    "role=user transcript append only accepts operator text or content blocks"
+                        .to_string(),
+                ));
+            }
+        };
+        first_user.content =
+            core_renderable_from_content_input(merge_content_inputs(staged.clone(), turn));
+    } else {
+        let position = appends
+            .iter()
+            .take_while(|append| append.role == ConversationAppendRole::InjectedContext)
+            .count();
+        appends.insert(
+            position,
+            ConversationAppend {
+                runtime_source: None,
+                role: ConversationAppendRole::User,
+                content: core_renderable_from_content_input(staged.clone()),
+                identity: None,
+            },
+        );
+    }
+    let prompt = model_projection_content_input_from_conversation_appends(&appends);
+    Ok((prompt, appends))
+}
+
+fn core_renderable_from_content_input(
+    content: meerkat_core::types::ContentInput,
+) -> meerkat_core::lifecycle::run_primitive::CoreRenderable {
+    use meerkat_core::lifecycle::run_primitive::CoreRenderable;
+    match content {
+        meerkat_core::types::ContentInput::Text(text) => CoreRenderable::Text { text },
+        meerkat_core::types::ContentInput::Blocks(blocks) => CoreRenderable::Blocks { blocks },
+    }
+}
+
 fn restore_deferred_turn_inputs(
     deferred_turn_state: &Arc<std::sync::Mutex<SessionDeferredTurnState>>,
     consumed: ConsumedDeferredTurnInputs,
@@ -10571,15 +10657,38 @@ async fn session_task<A: SessionAgent>(
                     }
                 }
 
-                let consumed_deferred_inputs = {
+                let mut consumed_deferred_inputs = {
                     let mut guard = lock_deferred_turn_state(&deferred_turn_state);
                     guard.consume_for_started_turn()
                 };
-                let prompt = match consumed_deferred_inputs.pending_initial_prompt() {
-                    Some(staged_prompt) => {
-                        merge_content_inputs(staged_prompt.prompt.clone(), prompt)
+                // The staged create-time prompt lands in the rows this turn
+                // commits, and the run-start hooks and `RunStarted` see exactly
+                // those rows. A turn carrying directed interaction custody is
+                // refused while a prompt is staged; every refusal restores it.
+                let directed_turn = metadata
+                    .as_ref()
+                    .is_some_and(|metadata| !metadata.directed_interaction_ids.is_empty());
+                let lowered = lower_staged_initial_prompt(
+                    consumed_deferred_inputs
+                        .pending_initial_prompt()
+                        .map(|staged| &staged.prompt),
+                    prompt,
+                    typed_turn_appends,
+                    directed_turn,
+                );
+                let (prompt, typed_turn_appends) = match lowered {
+                    Ok(lowered) => lowered,
+                    Err(error) => {
+                        restore_deferred_turn_inputs(
+                            &deferred_turn_state,
+                            consumed_deferred_inputs,
+                        );
+                        abort_admitted_turn(&control);
+                        let _ = result_tx.send(
+                            SessionTurnExecutionOutcome::without_machine_terminal(Err(error)),
+                        );
+                        continue;
                     }
-                    None => prompt,
                 };
                 let flattened_tool_results = consumed_deferred_inputs
                     .pending_tool_results()
@@ -10677,6 +10786,15 @@ async fn session_task<A: SessionAgent>(
                         )),
                     ));
                     continue;
+                }
+                if matches!(disposition, StartTurnDisposition::RunPending) {
+                    // A pending continuation replays the existing boundary and
+                    // commits no user row, so it cannot deliver the staged
+                    // prompt: keep it pending for the next content turn.
+                    restore_deferred_turn_inputs(
+                        &deferred_turn_state,
+                        consumed_deferred_inputs.take_initial_prompt(),
+                    );
                 }
                 let persist_runtime_keep_alive = {
                     let mut slot = lock_turn_admission(&control.turn_admission);
@@ -10897,6 +11015,15 @@ async fn session_task<A: SessionAgent>(
                         continue;
                     }
                 }
+                // A content run that publishes no `RunStarted` and leaves the
+                // transcript as it found it delivered nothing: a run-start
+                // veto, a refusal before the run, an interrupt before it
+                // started. The staged prompt it consumed then stays pending.
+                let staged_prompt_message_count = consumed_deferred_inputs
+                    .pending_initial_prompt()
+                    .is_some()
+                    .then(|| agent.snapshot().message_count);
+                let mut run_started_observed = false;
                 let mut event_stream_open = true;
 
                 // Scope the pinned future so its mutable borrow of `agent` is
@@ -10987,6 +11114,8 @@ async fn session_task<A: SessionAgent>(
                                 }
                             }
                             Some(event) = agent_event_rx.recv() => {
+                                run_started_observed |=
+                                    matches!(event, AgentEvent::RunStarted { .. });
                                 let envelope = stamp_event_envelope(
                                     &next_seq,
                                     &source,
@@ -11020,6 +11149,7 @@ async fn session_task<A: SessionAgent>(
                         .ok()
                         .or_else(|| dropped_run_terminal.take())
                     {
+                        run_started_observed |= matches!(event, AgentEvent::RunStarted { .. });
                         let envelope = stamp_event_envelope(&next_seq, &source, event);
                         control.publish_session_event(envelope.clone()).await;
                         if event_stream_open
@@ -11083,6 +11213,7 @@ async fn session_task<A: SessionAgent>(
 
                 // Update cached summary
                 let snap = agent.snapshot();
+                let message_count_after_run = snap.message_count;
                 control.publish_summary(SessionSummaryCache {
                     updated_at: snap.updated_at,
                     message_count: snap.message_count,
@@ -11090,6 +11221,16 @@ async fn session_task<A: SessionAgent>(
                     usage: snap.usage,
                     last_assistant_text: snap.last_assistant_text,
                 });
+                if let Some(message_count_before_run) = staged_prompt_message_count
+                    && result.is_err()
+                    && !run_started_observed
+                    && message_count_after_run == message_count_before_run
+                {
+                    restore_deferred_turn_inputs(
+                        &deferred_turn_state,
+                        consumed_deferred_inputs.take_initial_prompt(),
+                    );
+                }
 
                 // Release the turn lock AFTER setting state to Idle and
                 // updating the summary, so the next caller sees consistent state.
@@ -15824,3 +15965,6 @@ mod inline_video_admission_tests {
 
 #[cfg(test)]
 mod tool_application_custody_tests;
+
+#[cfg(test)]
+mod staged_prompt_lowering_tests;

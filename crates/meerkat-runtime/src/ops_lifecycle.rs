@@ -2376,7 +2376,7 @@ impl RuntimeOpsLifecycleRegistry {
     /// Rebuilds DSL state, retaining terminal operations and running
     /// `DetachedJobWait` bindings while stripping every other non-terminal
     /// operation. ReloadRequired recovery may preserve one exact typed record
-    /// separately through [`Self::from_recovered_preserving_operation`]. Fresh
+    /// separately through `from_recovered_preserving_operation`. Fresh
     /// shell records come from specs; completion entries are seeded only after
     /// generated recovery authority accepts them.
     pub fn from_recovered(snapshot: PersistedOpsSnapshot) -> Result<Self, OpsLifecycleError> {

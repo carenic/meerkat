@@ -4140,6 +4140,54 @@ mod skill_activation_effect_tests {
         );
     }
 
+    /// A notice-only runtime turn of a deferred session gets the staged
+    /// create-time prompt as one User append after the leading InjectedContext
+    /// rows (the session task's lowering). Skill context then enriches that
+    /// staged row, the first User append, instead of a new trailing User row.
+    #[test]
+    fn skill_context_enriches_the_inserted_staged_row_not_a_trailing_user_row() {
+        use crate::types::ContentBlock;
+
+        let staged = "Remember the codeword ORBIT-7 for later.";
+        let mut appends = vec![
+            skill_append(
+                ConversationAppendRole::InjectedContext,
+                CoreRenderable::text("ambient"),
+            ),
+            skill_append(ConversationAppendRole::User, CoreRenderable::text(staged)),
+            skill_append(
+                ConversationAppendRole::SystemNotice,
+                CoreRenderable::SystemNotice {
+                    kind: crate::types::SystemNoticeKind::Generic,
+                    body: Some("a peer said hello".into()),
+                    blocks: Vec::new(),
+                },
+            ),
+        ];
+        let before = appends.clone();
+        let skill = ContentBlock::SkillContext {
+            skill_key: fixture_skill_key("staged-row-skill"),
+            text: "full staged-row-skill body".into(),
+        };
+        lower_skill_context_into_turn_appends(&mut appends, vec![skill.clone()]).unwrap();
+        assert_eq!(appends.len(), before.len(), "no trailing User row is added");
+        assert_eq!(appends[0], before[0]);
+        assert_eq!(appends[2], before[2]);
+        assert_eq!(appends[1].role, ConversationAppendRole::User);
+        assert_eq!(
+            appends[1].content,
+            CoreRenderable::Blocks {
+                blocks: vec![
+                    skill,
+                    ContentBlock::Text {
+                        text: staged.into()
+                    }
+                ],
+            },
+            "skills must land in the staged row, ahead of its text"
+        );
+    }
+
     #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn runtime_skill_activation_commits_once_with_identity_and_hook_input() {

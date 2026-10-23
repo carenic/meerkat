@@ -994,7 +994,7 @@ RecoverSessionFromStoreUnrecoverable(session_id, has_metadata, has_build_state, 
 
 ClassifyDurableTailCompleted(session_id, candidate_id, relation, run_id_cardinality, terminal_stop_reason, dangling_tool_use_count, orphan_tool_result_count, messages_after_terminal) ==
     /\ phase = "Ready"
-    /\ ((relation = "VerifiedStrictDescendant") /\ (run_id_cardinality = "SingleRunId") /\ (terminal_stop_reason = "EndTurn") /\ (dangling_tool_use_count = 0) /\ (orphan_tool_result_count = 0) /\ (messages_after_terminal = FALSE))
+    /\ ((IF (relation = "VerifiedStrictDescendant") THEN TRUE ELSE (relation = "VerifiedRewriteDescendant")) /\ (run_id_cardinality = "SingleRunId") /\ (terminal_stop_reason = "EndTurn") /\ (dangling_tool_use_count = 0) /\ (orphan_tool_result_count = 0) /\ (messages_after_terminal = FALSE))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_afcdf325669eb17c
@@ -1002,7 +1002,7 @@ ClassifyDurableTailCompleted(session_id, candidate_id, relation, run_id_cardinal
 
 ClassifyDurableTailRepairable(session_id, candidate_id, relation, run_id_cardinality, terminal_stop_reason, dangling_tool_use_count, orphan_tool_result_count, messages_after_terminal) ==
     /\ phase = "Ready"
-    /\ ((relation = "VerifiedStrictDescendant") /\ (run_id_cardinality = "SingleRunId") /\ (dangling_tool_use_count = 0) /\ (orphan_tool_result_count = 0) /\ (messages_after_terminal = FALSE) /\ (IF (terminal_stop_reason = "ToolUse") THEN TRUE ELSE (terminal_stop_reason = "Absent")))
+    /\ ((IF (relation = "VerifiedStrictDescendant") THEN TRUE ELSE (relation = "VerifiedRewriteDescendant")) /\ (run_id_cardinality = "SingleRunId") /\ (dangling_tool_use_count = 0) /\ (orphan_tool_result_count = 0) /\ (messages_after_terminal = FALSE) /\ (IF (terminal_stop_reason = "ToolUse") THEN TRUE ELSE (terminal_stop_reason = "Absent")))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_afcdf325669eb17c
@@ -1010,7 +1010,7 @@ ClassifyDurableTailRepairable(session_id, candidate_id, relation, run_id_cardina
 
 ClassifyDurableTailAmbiguous(session_id, candidate_id, relation, run_id_cardinality, terminal_stop_reason, dangling_tool_use_count, orphan_tool_result_count, messages_after_terminal) ==
     /\ phase = "Ready"
-    /\ (IF (relation # "VerifiedStrictDescendant") THEN TRUE ELSE (IF (run_id_cardinality # "SingleRunId") THEN TRUE ELSE (IF (orphan_tool_result_count # 0) THEN TRUE ELSE (IF (messages_after_terminal = TRUE) THEN TRUE ELSE (IF (terminal_stop_reason = "Other") THEN TRUE ELSE (dangling_tool_use_count # 0))))))
+    /\ (IF ((relation # "VerifiedStrictDescendant") /\ (relation # "VerifiedRewriteDescendant")) THEN TRUE ELSE (IF (run_id_cardinality # "SingleRunId") THEN TRUE ELSE (IF (orphan_tool_result_count # 0) THEN TRUE ELSE (IF (messages_after_terminal = TRUE) THEN TRUE ELSE (IF (terminal_stop_reason = "Other") THEN TRUE ELSE (dangling_tool_use_count # 0))))))
     /\ phase' = "Ready"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_afcdf325669eb17c

@@ -118,6 +118,7 @@ use crate::runtime::host_observation::{
     HostTurnOutcomeRecordRequest, PendingTurnObservation, SessionObservationFacts,
 };
 use crate::runtime::host_reply::HostBridgeReply;
+use crate::runtime::uncertain_durability::UncertainDurabilityFailStop;
 
 use meerkat_runtime::SessionServiceRuntimeExt as _;
 use meerkat_runtime::meerkat_machine::PeerEndpointStageError;
@@ -6129,8 +6130,10 @@ pub struct MobHostActor {
     /// Sticky fail-stop after a bind persistence outcome that durable reread
     /// could not classify. Serving any later command in that live process
     /// could act on a machine snapshot that lags the durable binding row;
-    /// restart recovery is the only authority-restoring boundary.
-    durable_uncertainty_fail_stop: Option<String>,
+    /// restart recovery is the only authority-restoring boundary. It holds
+    /// the first uncertain write's own error, which every later refusal
+    /// names.
+    durable_uncertainty_fail_stop: UncertainDurabilityFailStop<MobHostActorError>,
 }
 
 /// Prepare one validated durable snapshot, publish the initial descriptor,
@@ -6306,7 +6309,7 @@ pub async fn spawn_mob_host_actor(
         turn_outcome_rows,
         generation_start_seqs,
         registered_member_incarnations: HashMap::new(),
-        durable_uncertainty_fail_stop: None,
+        durable_uncertainty_fail_stop: Default::default(),
     };
 
     // COMMIT: reserve the exact owner + identity without making it resolvable,
@@ -6614,9 +6617,9 @@ async fn certify_stale_pending_absent(
 
 impl MobHostActor {
     fn durable_fail_stop_reason(&self) -> Option<String> {
-        self.durable_uncertainty_fail_stop.as_ref().map(|detail| {
+        self.durable_uncertainty_fail_stop.cause().map(|cause| {
             format!(
-                "mob host is fail-stopped after uncertain binding persistence; restart required: {detail}"
+                "mob host is fail-stopped after uncertain binding persistence; restart required: {cause}"
             )
         })
     }
@@ -6959,10 +6962,11 @@ impl MobHostActor {
                         }
                     }),
                     Err(error) => {
+                        let reply = error.to_string();
                         if error.is_durable_uncertainty() {
-                            self.durable_uncertainty_fail_stop = Some(error.to_string());
+                            self.durable_uncertainty_fail_stop.record_unreplied(error);
                         }
-                        Err(error.to_string())
+                        Err(reply)
                     }
                 };
                 if result.is_ok() {
@@ -7032,10 +7036,11 @@ impl MobHostActor {
                         "definite-no-effect Pending cancellation produced {other:?}"
                     )),
                     Err(error) => {
+                        let reply = error.to_string();
                         if error.is_durable_uncertainty() {
-                            self.durable_uncertainty_fail_stop = Some(error.to_string());
+                            self.durable_uncertainty_fail_stop.record_unreplied(error);
                         }
-                        Err(error.to_string())
+                        Err(reply)
                     }
                 };
                 if result.is_ok() {
@@ -7097,10 +7102,11 @@ impl MobHostActor {
                         Ok(HostTrackedInputCancelReply::Unreserved)
                     }
                     Err(error) => {
+                        let reply = error.to_string();
                         if error.is_durable_uncertainty() {
-                            self.durable_uncertainty_fail_stop = Some(error.to_string());
+                            self.durable_uncertainty_fail_stop.record_unreplied(error);
                         }
-                        Err(error.to_string())
+                        Err(reply)
                     }
                 };
                 if result.is_ok() {
@@ -7160,10 +7166,11 @@ impl MobHostActor {
                         Ok(HostTrackedInputCancelReply::Unreserved)
                     }
                     Err(error) => {
+                        let reply = error.to_string();
                         if error.is_durable_uncertainty() {
-                            self.durable_uncertainty_fail_stop = Some(error.to_string());
+                            self.durable_uncertainty_fail_stop.record_unreplied(error);
                         }
-                        Err(error.to_string())
+                        Err(reply)
                     }
                 };
                 if result.is_ok() {
@@ -7254,16 +7261,17 @@ impl MobHostActor {
                 Ok(())
             }
             Err(error) => {
-                if error.is_durable_uncertainty() {
-                    self.durable_uncertainty_fail_stop = Some(error.to_string());
-                }
                 tracing::error!(
                     mob_id = %mob_id,
                     agent_identity = %agent_identity,
                     error = %error,
                     "turn-outcome journal record failed"
                 );
-                Err(error.to_string())
+                let reply = error.to_string();
+                if error.is_durable_uncertainty() {
+                    self.durable_uncertainty_fail_stop.record_unreplied(error);
+                }
+                Err(reply)
             }
         };
         let _ = request.reply.send(reply);
@@ -7321,9 +7329,6 @@ impl MobHostActor {
                 }
                 Ok(TurnOutcomeAckDisposition::Absent) => {}
                 Err(error) => {
-                    if error.is_durable_uncertainty() {
-                        self.durable_uncertainty_fail_stop = Some(error.to_string());
-                    }
                     tracing::error!(
                         mob_id = %mob_id,
                         agent_identity = %agent_identity,
@@ -7334,6 +7339,9 @@ impl MobHostActor {
                         "turn-outcome acknowledgement failed"
                     );
                     result = Err(error.to_string());
+                    if error.is_durable_uncertainty() {
+                        self.durable_uncertainty_fail_stop.record_unreplied(error);
+                    }
                     break;
                 }
             }
@@ -8824,7 +8832,11 @@ impl MobHostActor {
                                 ),
                             };
                             if requires_fail_stop || retained.is_err() {
-                                self.durable_uncertainty_fail_stop = Some(detail.clone());
+                                self.durable_uncertainty_fail_stop.record_unreplied(
+                                    MobHostActorError::DurableUncertainty {
+                                        detail: detail.clone(),
+                                    },
+                                );
                             }
                             self.send_failure(
                                 candidate,
@@ -8837,7 +8849,11 @@ impl MobHostActor {
                         }
                     }
                     if requires_fail_stop {
-                        self.durable_uncertainty_fail_stop = Some(reason.clone());
+                        self.durable_uncertainty_fail_stop.record_unreplied(
+                            MobHostActorError::DurableUncertainty {
+                                detail: reason.clone(),
+                            },
+                        );
                     }
                     self.send_failure(candidate, cause, reason, Some(reply_address.as_str()))
                         .await;
@@ -8884,6 +8900,9 @@ impl MobHostActor {
                 "materialize member aborted: the superseded residency's capability attachment \
                  could not be released ({failure})"
             );
+            // Each step below can leave the outcome uncertain; the record
+            // takes the final detail, which names every uncertain step.
+            let mut uncertain = false;
             if let Some(association) = admitted_forked_attachment.as_ref()
                 && let Err(rollback) = release_forked_participant_association(
                     self.forked_participant_service.as_ref(),
@@ -8906,25 +8925,30 @@ impl MobHostActor {
                          ({rollback}) and is durably retained for reconciliation"
                     ),
                     Err(retain_error) => {
-                        let detail = format!(
+                        uncertain = true;
+                        format!(
                             "{detail}; the replacement attachment could not be rolled back \
                              ({rollback}) nor durably retained ({retain_error})"
-                        );
-                        self.durable_uncertainty_fail_stop = Some(detail.clone());
-                        detail
+                        )
                     }
                 };
             }
             if let Some(publication) = outcome.runtime_publication.take() {
                 if let Err(error) = publication.abort().await {
-                    let aborted =
+                    uncertain = true;
+                    detail =
                         format!("{detail}; exact unpublished attachment abort failed: {error}");
-                    self.durable_uncertainty_fail_stop = Some(aborted.clone());
-                    detail = aborted;
                 }
                 if let Some(materializer) = self.materializer.as_mut() {
                     materializer.forget_runtime_after_exact_publication_abort(&outcome.session_id);
                 }
+            }
+            if uncertain {
+                self.durable_uncertainty_fail_stop.record_unreplied(
+                    MobHostActorError::DurableUncertainty {
+                        detail: detail.clone(),
+                    },
+                );
             }
             self.send_failure(
                 candidate,
@@ -8942,7 +8966,11 @@ impl MobHostActor {
             let failure =
                 "materialized build lost its exact unpublished attachment lease before durable record"
                     .to_string();
-            self.durable_uncertainty_fail_stop = Some(failure.clone());
+            self.durable_uncertainty_fail_stop.record_unreplied(
+                MobHostActorError::DurableUncertainty {
+                    detail: failure.clone(),
+                },
+            );
             self.send_failure(
                 candidate,
                 BridgeRejectionCause::Internal,
@@ -8983,6 +9011,7 @@ impl MobHostActor {
                 }
                 let cleanup_failure = publication_abort_failure;
                 let cleanup_uncertain = cleanup_failure.is_some();
+                let mut retain_failed = false;
                 let mut failure = match (durable_uncertainty, cleanup_failure) {
                     (true, Some(cleanup)) => format!(
                         "materialize record became durably uncertain ({error}); attempted runtime quiescence also failed: {cleanup}"
@@ -9039,7 +9068,7 @@ impl MobHostActor {
                                  retained ({release_failure})"
                             ),
                             Err(retain_error) => {
-                                self.durable_uncertainty_fail_stop = Some(failure.clone());
+                                retain_failed = true;
                                 format!(
                                     "{failure}; capability attachment reconciliation could not be \
                                      retained ({release_failure}; {retain_error})"
@@ -9048,8 +9077,14 @@ impl MobHostActor {
                         };
                     }
                 }
-                if durable_uncertainty || cleanup_uncertain {
-                    self.durable_uncertainty_fail_stop = Some(failure.clone());
+                // One record with the final detail, which names every
+                // uncertain step.
+                if durable_uncertainty || cleanup_uncertain || retain_failed {
+                    self.durable_uncertainty_fail_stop.record_unreplied(
+                        MobHostActorError::DurableUncertainty {
+                            detail: failure.clone(),
+                        },
+                    );
                 }
                 self.send_failure(
                     candidate,
@@ -9109,7 +9144,11 @@ impl MobHostActor {
                 let failure = format!(
                     "materialized row committed but exact runtime residency publication failed ({error}); exact publication cleanup ran under the retained boundary and cold recovery is required"
                 );
-                self.durable_uncertainty_fail_stop = Some(failure.clone());
+                self.durable_uncertainty_fail_stop.record_unreplied(
+                    MobHostActorError::DurableUncertainty {
+                        detail: failure.clone(),
+                    },
+                );
                 self.send_failure(
                     candidate,
                     BridgeRejectionCause::Internal,
@@ -9132,7 +9171,11 @@ impl MobHostActor {
                     let failure = format!(
                         "replacement row and residency committed, but superseded residency vacancy publication failed ({error}); cold recovery is required"
                     );
-                    self.durable_uncertainty_fail_stop = Some(failure.clone());
+                    self.durable_uncertainty_fail_stop.record_unreplied(
+                        MobHostActorError::DurableUncertainty {
+                            detail: failure.clone(),
+                        },
+                    );
                     self.send_failure(
                         candidate,
                         BridgeRejectionCause::Internal,
@@ -9187,7 +9230,11 @@ impl MobHostActor {
                     "replacement row and residency committed, but superseded session \
                      '{superseded_session_id}' cleanup failed ({cleanup}); cold recovery is required"
                 );
-                self.durable_uncertainty_fail_stop = Some(failure.clone());
+                self.durable_uncertainty_fail_stop.record_unreplied(
+                    MobHostActorError::DurableUncertainty {
+                        detail: failure.clone(),
+                    },
+                );
                 self.send_failure(
                     candidate,
                     BridgeRejectionCause::Internal,
@@ -9868,7 +9915,11 @@ impl MobHostActor {
             Ok(recorded) => recorded,
             Err(retention) => {
                 if retention.durable_uncertainty {
-                    self.durable_uncertainty_fail_stop = Some(retention.detail.clone());
+                    self.durable_uncertainty_fail_stop.record_unreplied(
+                        MobHostActorError::DurableUncertainty {
+                            detail: retention.detail.clone(),
+                        },
+                    );
                 }
                 return MemberTeardownOutcome::Retained {
                     cause: retention.cause,
@@ -10838,11 +10889,12 @@ impl MobHostActor {
         {
             Ok(outcome) => outcome,
             Err(error) => {
-                self.durable_uncertainty_fail_stop = Some(error.to_string());
+                let reason = format!("bind host failed: {error}");
+                self.durable_uncertainty_fail_stop.record_unreplied(error);
                 self.send_failure(
                     candidate,
                     BridgeRejectionCause::Internal,
-                    format!("bind host failed: {error}"),
+                    reason,
                     Some(payload.supervisor.address.as_str()),
                 )
                 .await;
@@ -11023,11 +11075,12 @@ impl MobHostActor {
         {
             Ok(outcome) => outcome,
             Err(error) => {
-                self.durable_uncertainty_fail_stop = Some(error.to_string());
+                let reason = format!("rebind host failed: {error}");
+                self.durable_uncertainty_fail_stop.record_unreplied(error);
                 self.send_failure(
                     candidate,
                     BridgeRejectionCause::Internal,
-                    format!("rebind host failed: {error}"),
+                    reason,
                     Some(payload.supervisor.address.as_str()),
                 )
                 .await;
@@ -11317,20 +11370,24 @@ impl MobHostActor {
                     }
                 };
                 if let Err(error) = convergence {
-                    self.durable_uncertainty_fail_stop = Some(error.to_string());
+                    let reason = format!("revoke host durable terminal failed: {error}");
+                    self.durable_uncertainty_fail_stop.record_unreplied(error);
                     self.send_failure(
                         candidate,
                         BridgeRejectionCause::Internal,
-                        format!("revoke host durable terminal failed: {error}"),
+                        reason,
                         Some(reply_address.as_str()),
                     )
                     .await;
                     return;
                 }
                 if let Err(error) = self.binding_authority.commit_prepared_authority(prepared) {
-                    self.durable_uncertainty_fail_stop = Some(format!(
-                        "revoke host durable receipt committed but prepared authority commit failed: {error:?}"
-                    ));
+                    self.durable_uncertainty_fail_stop
+                        .record_unreplied(MobHostActorError::DurableUncertainty {
+                            detail: format!(
+                                "revoke host durable receipt committed but prepared authority commit failed: {error:?}"
+                            ),
+                        });
                     self.send_failure(
                         candidate,
                         BridgeRejectionCause::Internal,
@@ -11345,9 +11402,12 @@ impl MobHostActor {
                     let publication = match update.vacate() {
                         Ok(publication) => publication,
                         Err(error) => {
-                            self.durable_uncertainty_fail_stop = Some(format!(
-                                "revoke durable commit succeeded but residency vacancy publication failed: {error}"
-                            ));
+                            self.durable_uncertainty_fail_stop
+                                .record_unreplied(MobHostActorError::DurableUncertainty {
+                                    detail: format!(
+                                        "revoke durable commit succeeded but residency vacancy publication failed: {error}"
+                                    ),
+                                });
                             self.send_failure(
                                 candidate,
                                 BridgeRejectionCause::Internal,

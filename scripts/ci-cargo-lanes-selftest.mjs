@@ -5,10 +5,10 @@
 // BuildBuddy mode violated: a build-relevant change always yields lanes.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import {
   CI_ROW_STEPS,
   rowStepBindings,
@@ -1254,6 +1254,64 @@ for (const path of [
   assert.equal(plan.mode, "packages");
   assert.deepEqual(plan.packages, ["meerkat"]);
   assertLanes(plan, "embedded skill doc");
+}
+
+// A crate can link a file of another crate into its own directory, such as a
+// test fixture both crates' tests read. Git records the link, not the file
+// it names, so the planner resolves the link: a change to that file selects
+// the linking crate as well as the file's own crate, and a pull request runs
+// the linking crate's unit lane. The row adds such a link (staged, not
+// committed) in a scratch worktree of HEAD and plans there with this
+// checkout's classifier. Its caches stay in the scratch directory
+// (XDG_CACHE_HOME), and repo-cargo takes this checkout's Cargo home and lane
+// name, so cargo metadata there downloads nothing and leaves no lane behind.
+{
+  const scratch = mkdtempSync(join(tmpdir(), "ci-lanes-cross-crate-link-"));
+  // A unique name: concurrent runs share the repository's worktree list.
+  const tree = join(scratch, basename(scratch));
+  const git = (args, cwd) => {
+    const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+    assert.equal(result.status, 0, `git ${args.join(" ")}: ${result.stderr}`);
+  };
+  const printed = spawnSync(join(root, "scripts/repo-cargo"), ["--print-env"], { cwd: root, encoding: "utf8" });
+  assert.equal(printed.status, 0, `repo-cargo --print-env: ${printed.stderr}`);
+  const cargo = Object.fromEntries(
+    printed.stdout.split("\n").filter((line) => line.includes("=")).map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]),
+  );
+  assert.ok(cargo.CARGO_HOME && cargo.lane_key, "repo-cargo names its Cargo home and lane");
+  const env = { ...process.env, XDG_CACHE_HOME: join(scratch, "cache"), CARGO_HOME: cargo.CARGO_HOME, RUST_LANE_ID: cargo.lane_key };
+  const target = "crates/meerkat-core/tests/fixtures/v0_8_8_manifest.json";
+  const sibling = "crates/meerkat-core/tests/fixtures/v0_8_8_slim_session.json";
+  const link = "crates/meerkat-runtime/tests/fixtures/cross_crate_link_selftest.json";
+  let added = false;
+  try {
+    git(["worktree", "add", "--quiet", "--detach", tree, "HEAD"], root);
+    added = true;
+    for (const path of [target, sibling]) assert.ok(existsSync(join(tree, path)), `${path} exists at HEAD`);
+    assert.ok(!existsSync(join(tree, link)), `${link} is free at HEAD`);
+    mkdirSync(dirname(join(tree, link)), { recursive: true });
+    symlinkSync(relative(dirname(join(tree, link)), join(tree, target)), join(tree, link));
+    git(["add", "--", link], tree);
+    const planIn = (path) => {
+      const result = spawnSync("node", [classifier, "--format", "json", "--event", "pull_request", "--", path], {
+        cwd: tree,
+        encoding: "utf8",
+        env,
+        maxBuffer: 64 * 1024 * 1024,
+      });
+      assert.equal(result.status, 0, `classifier failed in the scratch worktree: ${result.stderr}`);
+      return JSON.parse(result.stdout);
+    };
+    const linked = planIn(target);
+    assert.deepEqual(linked.packages, ["meerkat-core", "meerkat-runtime"], "a linked fixture selects its own crate and the linking crate");
+    assert.ok(linked.unit_packages.includes("meerkat-runtime"), "the linking crate's unit lane runs in the pull request");
+    assertLanes(linked, "a fixture another crate links");
+    assert.deepEqual(planIn(sibling).packages, ["meerkat-core"], "a fixture no link names selects its own crate alone");
+    assert.deepEqual(planIn(link).packages, ["meerkat-runtime"], "the link itself selects the crate that holds it");
+  } finally {
+    if (added) spawnSync("git", ["worktree", "remove", "--force", tree], { cwd: root });
+    rmSync(scratch, { recursive: true, force: true });
+  }
 }
 
 // Generated-contract and SDK-host flags.

@@ -641,7 +641,15 @@ also warms the remote cache for the tag run. The self-hosted graph is
 default off behind the repository variable `MEERKAT_GCP_BUILDBUDDY_ENABLED`:
 unless it is `true`, scheduled runs skip `gcp-buildbuddy` (nothing in GCP
 starts; the other nightly jobs still run) and a `graph_only` dispatch fails
-in `buildbuddy.yml`'s gate instead of finishing green. The full nightly set is:
+in `buildbuddy.yml`'s gate instead of finishing green. After the variable is
+set again, the first `full-fresh` run (a nightly, or a release final gate's
+`graph_only` dispatch) starts with a cold action cache for the
+`linux_x86_64_gcp_ci` platform, whose action keys changed when it stopped
+naming an image. Accept the re-enabled lane once that run is green with its
+actions in the digest-pinned `MEERKAT_BUILDBUDDY_CI_IMAGE` and the next run is
+warm. Every change of `MEERKAT_BUILDBUDDY_CI_IMAGE` starts that cache cold
+again: the image digest is part of the platform's action keys. The full
+nightly set is:
 `workspace-unit` (`make test-unit`), `workspace-int` (`make test-int`),
 `e2e-fast`, `dense-topology` (`mob-dense-topology.yml`),
 `machine-verify` (bounded TLC, including every non-skipped composition
