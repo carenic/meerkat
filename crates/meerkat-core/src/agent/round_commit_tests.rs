@@ -1068,8 +1068,8 @@ async fn a_call_after_the_fence_closes_never_starts() {
 /// dispatches next carries no dedupe key, even under the failed round's call
 /// id and arguments: tool call ids repeat across turns, and a host that
 /// deduplicates on the key must never answer a new call with an old result.
-/// A host call made while a dropped run's future left its round bound, before
-/// the host ended that run, carries none either.
+/// Dropping a run's future closes its dispatch context, round included, and
+/// a host call carries no key even while a round is bound.
 #[tokio::test]
 async fn a_host_call_after_a_failed_round_carries_no_key() {
     let client = ScriptedClient::new(vec![Step::Tools(vec![("call-1", "probe", "{}")])]);
@@ -1126,9 +1126,15 @@ async fn a_host_call_after_a_failed_round_carries_no_key() {
     assert_eq!(round_key.round, 0);
     assert_eq!(
         agent.tool_dispatch_context.round(),
-        Some(0),
-        "the dropped future left its round bound"
+        None,
+        "dropping the run future closed its dispatch context"
     );
+    // The host call path drops the round itself: bind the dropped run's
+    // identity and round as its loop had them, so the call could carry a key.
+    agent
+        .tool_dispatch_context
+        .bind_run_id(round_key.run_id.clone());
+    agent.tool_dispatch_context.bind_round(0);
     agent
         .dispatch_external_tool_call(meerkat_core::ToolCall::new(
             "call-1".into(),
@@ -1140,7 +1146,7 @@ async fn a_host_call_after_a_failed_round_carries_no_key() {
     assert_eq!(
         tools.dispatched()[1],
         ("call-1".to_string(), None),
-        "a host call carries no key while a dropped run's round is bound"
+        "a host call carries no key while a round is bound"
     );
     let _ = agent.cancel_dropped_run();
     assert_eq!(agent.tool_dispatch_context.round(), None);
@@ -1446,8 +1452,17 @@ async fn a_run_without_round_commits_is_not_resumable() {
         );
         assert_eq!(
             agent.tool_dispatch_context.round(),
-            Some(0),
-            "the run's state is left for the caller's cancellation"
+            None,
+            "dropping the run future closed its dispatch context"
+        );
+        let again = agent.suspend_dropped_run();
+        assert!(
+            matches!(
+                &again,
+                Some(meerkat_core::DroppedRunSuspension::NotResumable { run_id: kept })
+                    if *kept == run_id
+            ),
+            "the run's state is left for the caller's cancellation: {again:?}"
         );
 
         let _ = agent.cancel_dropped_run();
