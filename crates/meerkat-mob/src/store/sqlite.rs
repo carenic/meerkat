@@ -15445,7 +15445,8 @@ mod tests {
         );
 
         // Revoke: delete requires the exact expected record + revoke
-        // witness; the other mob's row survives (A14 isolation).
+        // witness; the other mob's row survives, as each mob's rows are
+        // isolated.
         let deletion =
             crate::store::mob_host_authority_deletion_authority_for_record(&host_b_rebound)
                 .unwrap();
@@ -16567,7 +16568,7 @@ mod identity_fence_contention_tests {
         assert!(machine.contains_session(&session_id).await);
     }
 
-    /// C1: with nothing holding mob.db, the bounded-wait entry admits at once.
+    /// With nothing holding mob.db, the bounded-wait entry admits at once.
     #[tokio::test]
     async fn an_uncontended_bounded_fence_admits_without_waiting() {
         let adopted = adopted_identity().await;
@@ -16581,7 +16582,7 @@ mod identity_fence_contention_tests {
         );
     }
 
-    /// C2: with mob.db held until the fence has answered, the bounded-wait
+    /// With mob.db held until the fence has answered, the bounded-wait
     /// entry answers the contended Backoff once its wait is spent, without
     /// running the operation. Its wait is bounded on both sides without a
     /// wall-clock window: its one attempt ran with exactly the bound as its

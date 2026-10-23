@@ -176,7 +176,7 @@ struct AdmissionWire {
 }
 
 /// Facts a boot reads from a runtime's head to decide whether recovery must
-/// act on it (D2), refreshed by every commit of the runtime.
+/// act on it, refreshed by every commit of the runtime.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BootFactsV1 {
@@ -1025,7 +1025,7 @@ impl InMemoryRuntimeStore {
     }
 
     /// Whether a runtime is archived and recovery has nothing to act on:
-    /// its body may leave memory (D2).
+    /// its body may leave memory.
     pub(crate) async fn journal_archived_idle(&self, rt: &str) -> bool {
         let inner = self.inner.lock().await;
         let archived = inner
