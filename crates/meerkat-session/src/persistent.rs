@@ -2833,6 +2833,40 @@ impl meerkat_core::SessionCheckpointer for StoreCheckpointer {
         drop(guard);
         result
     }
+
+    /// The host store's self-fence: over a runtime store whose writer holds a
+    /// fence lease ([`RuntimeStore::self_fence`]), the run makes no model
+    /// call and dispatches nothing once the writer's window has closed, since
+    /// another process may already own the session. The window is read
+    /// afresh on every call. A store without a lease always allows. A clock
+    /// read and an atomic load: no I/O, and it never waits.
+    fn dispatch_fence_check(&self) -> Result<(), AgentError> {
+        let Some(fence) = self.runtime_store.self_fence() else {
+            return Ok(());
+        };
+        let window = fence.window();
+        if window.is_open() {
+            return Ok(());
+        }
+        // Names the session when its base is at hand without waiting.
+        let session = self
+            .whole_blob_base_authority
+            .try_lock()
+            .ok()
+            .and_then(|base| {
+                base.as_ref()
+                    .map(|authority| format!("session {}", authority.session_id()))
+            })
+            .unwrap_or_else(|| "this session".to_string());
+        Err(AgentError::session_durable_projection_authority_unknown(
+            format!(
+                "{session}: this writer's self-fence window closed ({:?} since its last acquire \
+                 or renew started, window {:?}, renew failed: {}); another process may own the \
+                 session, so nothing more is dispatched; live actor reload required",
+                window.elapsed, window.window, window.renew_failed
+            ),
+        ))
+    }
 }
 
 /// Session service backed by persistent storage.
@@ -25888,6 +25922,284 @@ mod tests {
         assert!(!meerkat_core::SessionCheckpointer::rebases_runs(
             &checkpointer(decorated)
         ));
+    }
+
+    /// The store checkpointer's run re-base through the real seam: a
+    /// single-turn WholeBlob run whose one boundary compacts saves its end
+    /// with no cursor and no earlier tail (`rebase_run` with no previous
+    /// receipt). The receipt names the new tail at candidate sequence 1 on
+    /// the new base. The process crashes before the boundary commit, and a
+    /// restarted session service recovers the session's committed boundary
+    /// as an interrupted run's closing save. Unrun until the candidate's
+    /// validation.
+    #[tokio::test]
+    async fn a_checkpointer_closing_rebase_recovers_after_a_restart() {
+        use meerkat_core::lifecycle::core_executor::BoundSessionCommit;
+        use meerkat_core::types::{AssistantBlock, BlockAssistantMessage};
+        use meerkat_runtime::store::PreparedRuntimeSessionCommit;
+
+        let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
+        let runtime_store: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());
+        let mut committed = Session::new();
+        committed.push(Message::User(UserMessage::text(
+            "earlier context".to_string(),
+        )));
+        committed.push(Message::User(UserMessage::text(
+            "more earlier context".to_string(),
+        )));
+        let session_id = committed.id().clone();
+        let runtime_id =
+            PersistentSessionService::<DummyBuilder>::runtime_id_for_session(&session_id);
+        let base_authority = runtime_store
+            .commit_prepared_session_boundary(
+                &runtime_id,
+                PreparedRuntimeSessionCommit::snapshot_only(
+                    BoundSessionCommit::sealed(Arc::new(committed.clone())).unwrap(),
+                ),
+            )
+            .await
+            .unwrap()
+            .authority()
+            .and_then(RuntimeSessionAuthority::whole_blob)
+            .cloned()
+            .expect("a WholeBlob base");
+        // The live actor's checkpointer over that base.
+        let checkpointer = StoreCheckpointer {
+            runtime_store: Arc::clone(&runtime_store),
+            incremental: None,
+            blob_store: memory_blob_store(),
+            gate: Arc::new(CheckpointerGate {
+                cancelled: Mutex::new(false),
+            }),
+            whole_blob_base_authority: std::sync::Mutex::new(Some(base_authority.clone())),
+            latest_run_checkpoint_receipt: Mutex::new(None),
+            latest_run_transcript_retirement: std::sync::Mutex::new(None),
+            live_deferred_turn_state: std::sync::OnceLock::new(),
+            unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
+            rebased_run: std::sync::Mutex::new(None),
+            rewrite_audit: None,
+        };
+        assert!(meerkat_core::SessionCheckpointer::rebases_runs(
+            &checkpointer
+        ));
+
+        // The run answered, then compacted at its final boundary: its
+        // end-of-run save carries no cursor.
+        let run_id = RunId::new();
+        let mut session = committed;
+        session.push(Message::User(UserMessage::text("the question".to_string())));
+        session.push(Message::BlockAssistant(BlockAssistantMessage {
+            blocks: vec![AssistantBlock::Text {
+                text: "the answer".to_string(),
+                meta: None,
+            }],
+            stop_reason: Some(StopReason::EndTurn),
+            identity: meerkat_core::types::TranscriptMessageIdentity::default()
+                .with_run_id(run_id.clone()),
+            created_at: meerkat_core::types::message_timestamp_now(),
+            assistant_message_id: None,
+        }));
+        let parent = session.transcript_revision().unwrap();
+        session
+            .commit_transcript_rewrite(
+                meerkat_core::TranscriptRewriteSelection::MessageRange { start: 0, end: 2 },
+                vec![Message::User(UserMessage::compaction_summary(
+                    "earlier context, compacted",
+                ))],
+                meerkat_core::TranscriptRewriteReason::new("compaction"),
+                Some("checkpointer-closing-rebase".to_string()),
+                Some(parent),
+            )
+            .unwrap();
+        assert!(session.try_run_cursor().unwrap().is_none());
+        let compacted_messages = session.messages().to_vec();
+        let receipt = meerkat_core::SessionCheckpointer::rebase_run(
+            &checkpointer,
+            &mut session,
+            &run_id,
+            None,
+        )
+        .await
+        .expect("the closing save re-bases");
+        let tail = receipt
+            .whole_blob()
+            .cloned()
+            .expect("a WholeBlob provisional receipt");
+        assert_eq!(tail.run_id(), &run_id);
+        assert_eq!(tail.candidate_sequence(), 1);
+        assert_eq!(
+            tail.base_store_revision(),
+            base_authority.store_revision() + 1
+        );
+        assert_eq!(tail.candidate_blob_sha256(), tail.base_blob_sha256());
+
+        // The process crashes before the boundary commit; a new session
+        // service over the same stores recovers.
+        drop(checkpointer);
+        let restarted = PersistentSessionService::new(
+            DummyBuilder,
+            4,
+            Arc::clone(&store),
+            Arc::clone(&runtime_store),
+            memory_blob_store(),
+        );
+        let recovery = restarted
+            .recover_committed_boundary(&session_id)
+            .await
+            .expect("the closing save recovers");
+        assert_eq!(
+            recovery,
+            CommittedBoundaryRecovery::Recovered {
+                message_count: compacted_messages.len() + 1,
+            }
+        );
+        let recovered = runtime_store
+            .load_committed_whole_blob_snapshot(&runtime_id)
+            .await
+            .unwrap()
+            .expect("the recovered boundary");
+        let messages = recovered.session().messages();
+        assert_eq!(
+            &messages[..compacted_messages.len()],
+            compacted_messages.as_slice(),
+            "nothing the run wrote is lost or duplicated"
+        );
+        assert!(matches!(messages.last(), Some(Message::SystemNotice(_))));
+        assert!(
+            runtime_store
+                .load_whole_blob_provisional_tail(&runtime_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the recovery consumes the tail"
+        );
+    }
+
+    /// A host store whose renews always fail: the realm's first renew
+    /// stops its writer, and its self-fence window closes.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[derive(Debug)]
+    struct RenewFailingHost;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[async_trait::async_trait]
+    impl meerkat_core::host_store::HostStore for RenewFailingHost {
+        async fn acquire_fence(
+            &self,
+            _mode: meerkat_core::host_store::AcquireMode,
+        ) -> Result<meerkat_core::host_store::FenceGrant, meerkat_core::host_store::HostStoreError>
+        {
+            Ok(meerkat_core::host_store::FenceGrant {
+                token: meerkat_core::host_store::FenceToken::new(1),
+                superseded_lease: std::time::Duration::ZERO,
+            })
+        }
+
+        async fn renew_fence(
+            &self,
+            _token: meerkat_core::host_store::FenceToken,
+        ) -> Result<(), meerkat_core::host_store::HostStoreError> {
+            Err(meerkat_core::host_store::HostStoreError::Unavailable(
+                "every renew fails in this row".to_string(),
+            ))
+        }
+
+        fn fence_timing(&self) -> meerkat_core::host_store::FenceTiming {
+            meerkat_core::host_store::FenceTiming::try_new(
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(3),
+            )
+            .expect("a 1 s renew interval on a 3 s lease")
+        }
+
+        async fn load_head(
+            &self,
+            _scope: &meerkat_core::host_store::ScopeRef,
+        ) -> Result<
+            Option<meerkat_core::host_store::VersionedHead>,
+            meerkat_core::host_store::HostStoreError,
+        > {
+            Ok(None)
+        }
+
+        async fn list_heads(
+            &self,
+            _kind: meerkat_core::host_store::ScopeKind,
+            _after: Option<&meerkat_core::host_store::ScopeName>,
+            _limit: usize,
+        ) -> Result<meerkat_core::host_store::HeadPage, meerkat_core::host_store::HostStoreError>
+        {
+            Ok(meerkat_core::host_store::HeadPage {
+                heads: Vec::new(),
+                next: None,
+            })
+        }
+
+        async fn read_rows(
+            &self,
+            _scope: &meerkat_core::host_store::ScopeRef,
+            _from: meerkat_core::host_store::RowIndex,
+            _limit: usize,
+        ) -> Result<Vec<meerkat_core::host_store::Row>, meerkat_core::host_store::HostStoreError>
+        {
+            Ok(Vec::new())
+        }
+
+        async fn commit(
+            &self,
+            _batch: &meerkat_core::host_store::CommitBatch,
+        ) -> Result<(), meerkat_core::host_store::HostStoreError> {
+            Ok(())
+        }
+    }
+
+    /// The store checkpointer reads the host store's self-fence: over a host
+    /// store realm whose writer's window has closed (its renew failed),
+    /// `dispatch_fence_check` refuses with the teardown class, so the run
+    /// makes no model call and dispatches no tool. An open window, and a
+    /// store without a lease, allow. Unrun until the candidate's validation.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_host_store_fence_window_refuses_dispatch() {
+        use meerkat_runtime::store::spi::{SpiRealm, SpiRealmConfig, SpiRuntimeStore};
+        let checkpointer = |runtime_store: Arc<dyn RuntimeStore>| StoreCheckpointer {
+            runtime_store,
+            incremental: None,
+            blob_store: memory_blob_store(),
+            gate: Arc::new(CheckpointerGate {
+                cancelled: Mutex::new(false),
+            }),
+            whole_blob_base_authority: std::sync::Mutex::new(None),
+            latest_run_checkpoint_receipt: Mutex::new(None),
+            latest_run_transcript_retirement: std::sync::Mutex::new(None),
+            live_deferred_turn_state: std::sync::OnceLock::new(),
+            unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
+            rebased_run: std::sync::Mutex::new(None),
+            rewrite_audit: None,
+        };
+        let realm = SpiRealm::open(Arc::new(RenewFailingHost), SpiRealmConfig::default())
+            .await
+            .expect("the realm opens");
+        let runtime_store: Arc<dyn RuntimeStore> = Arc::new(
+            SpiRuntimeStore::open(realm)
+                .await
+                .expect("the runtime store opens"),
+        );
+        let fenced = checkpointer(runtime_store);
+        // Right after the acquire, the window is open.
+        meerkat_core::SessionCheckpointer::dispatch_fence_check(&fenced)
+            .expect("an open window allows");
+        // The first renew, at 1 s, fails: the writer stops and its window
+        // closes until a fresh acquire and renew succeed, which this host
+        // never allows.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let refused = meerkat_core::SessionCheckpointer::dispatch_fence_check(&fenced)
+            .expect_err("a closed window refuses");
+        assert_teardown_required_projection_authority(refused, "self-fence window closed");
+        // A store without a lease always allows.
+        let unfenced = checkpointer(Arc::new(InMemoryRuntimeStore::new()));
+        meerkat_core::SessionCheckpointer::dispatch_fence_check(&unfenced)
+            .expect("a store without a lease allows");
     }
 
     struct WholeBlobAuthorityReadProbe {
