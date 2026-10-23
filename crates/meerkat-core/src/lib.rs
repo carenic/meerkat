@@ -80,6 +80,7 @@ pub mod generated;
 pub mod governance_config;
 pub mod handles;
 pub mod hooks;
+pub mod host_store;
 pub mod image_content;
 pub mod image_generation;
 pub mod interaction;
