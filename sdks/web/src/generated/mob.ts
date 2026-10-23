@@ -284,9 +284,44 @@ export interface MobAppendSystemContextResult {
   status: "applied" | "duplicate";
 }
 
+export interface WireMemberReloadRefusalRepairBlocked {
+  evidence_digest?: string | null;
+  kind: "repair_blocked";
+  reason: string;
+}
+
+export interface WireMemberReloadRefusalUnknown {
+  kind: "unknown";
+}
+
+export type WireMemberReloadRefusal = WireMemberReloadRefusalRepairBlocked | WireMemberReloadRefusalUnknown;
+
+export interface WireMobDestroyMemberRefusal {
+  member: string;
+  refusal: WireMemberReloadRefusal;
+}
+
+export interface WireMobDestroyReport {
+  errors?: string[];
+  events_cleared?: boolean;
+  force_destroyed_members?: string[];
+  member_reload_refusals?: WireMobDestroyMemberRefusal[];
+  metadata_scrubbed?: boolean;
+  namespace_cleaned?: boolean;
+  orphaned_remote_members?: string[];
+  reloaded_members?: string[];
+  remote_cleanup_deadline_exceeded?: boolean;
+}
+
+export interface WireMobDestroyIncompleteData {
+  code: string;
+  destroy_report: WireMobDestroyReport;
+  retryable: boolean;
+}
+
 export interface MobLifecycleResult {
   action: "stop" | "resume" | "complete" | "reset" | "destroy";
-  destroy_report?: unknown;
+  destroy_report?: WireMobDestroyReport | null;
   mob_id: string;
   ok: boolean;
   stop_report?: unknown;

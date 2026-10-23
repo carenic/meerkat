@@ -816,11 +816,16 @@ fn err_bounded_member_run(error: meerkat_mob::BoundedMemberRunError) -> JsValue 
 
 fn mob_destroy_error_value(e: MobMcpDestroyError) -> serde_json::Value {
     match e {
+        // The typed incomplete data rides under `data`, exactly as RPC sends
+        // it in `error.data`: the Web SDK's `MeerkatError.fromWasm` keeps an
+        // envelope's `data`. The top-level report and flag stay for callers
+        // that read the raw envelope.
         MobMcpDestroyError::Incomplete { report } => serde_json::json!({
             "code": "mob_destroy_incomplete",
             "message": MobMcpDestroyError::incomplete_message(&report),
-            "destroy_report": report,
+            "destroy_report": meerkat_contracts::WireMobDestroyReport::from(&report),
             "retryable": true,
+            "data": MobMcpDestroyError::incomplete_error_data(&report),
         }),
         MobMcpDestroyError::Mob(error) => mob_error_value(&error),
     }
@@ -2282,8 +2287,8 @@ pub async fn mob_lifecycle(mob_id: &str, action: &str) -> Result<JsValue, JsValu
         .map_err(err_mob_destroy)?;
     let destroy_report = reports
         .destroy_report
-        .map(|report| serde_json::to_value(&report).map_err(|e| err_str("serialize_error", e)))
-        .transpose()?;
+        .as_ref()
+        .map(meerkat_contracts::WireMobDestroyReport::from);
     let stop_report = reports
         .stop_report
         .map(|report| serde_json::to_value(&report).map_err(|e| err_str("serialize_error", e)))
@@ -4004,6 +4009,27 @@ capabilities = [{capability_values}]
                 .is_some_and(|errors| !errors.is_empty()),
             "web destroy error projection must carry the destroy report: {value}"
         );
+    }
+
+    /// The Web SDK's `MeerkatError.fromWasm` keeps an envelope's `data` and
+    /// nothing else beside its code and message, so an incomplete destroy's
+    /// envelope carries its typed data there: exactly the `error.data` RPC
+    /// sends, report included.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn mob_destroy_incomplete_envelope_carries_the_rpc_error_data() {
+        let mut report = meerkat_mob::MobDestroyReport::default();
+        report.errors.push("worker-1: reload refused".to_string());
+        report
+            .reloaded_members
+            .push(meerkat_mob::AgentIdentity::from("worker-2"));
+        let rpc_data = meerkat_mob_mcp::MobMcpDestroyError::incomplete_error_data(&report);
+
+        let value =
+            mob_destroy_error_value(meerkat_mob_mcp::MobMcpDestroyError::Incomplete { report });
+
+        assert_eq!(value["data"], rpc_data, "{value}");
+        assert_eq!(value["data"]["code"], "mob_destroy_incomplete", "{value}");
     }
 
     #[cfg(not(target_arch = "wasm32"))]

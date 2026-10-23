@@ -34,6 +34,11 @@ from .generated.types import (
     CommsSendErrorData as CommsSendErrorData,
     WireAuthErrorDetail as WireAuthErrorDetail,
     WireAuthErrorReason as WireAuthErrorReason,
+    WireMemberReloadRefusal as WireMemberReloadRefusal,
+    WireMemberReloadRefusalRepairBlocked as WireMemberReloadRefusalRepairBlocked,
+    WireMemberReloadRefusalUnknown as WireMemberReloadRefusalUnknown,
+    WireMobDestroyMemberRefusal as WireMobDestroyMemberRefusal,
+    WireMobDestroyReport as WireMobDestroyReport,
 )
 
 
@@ -123,6 +128,91 @@ def comms_send_error(error: BaseException) -> CommsSendErrorData | None:
     if isinstance(code, str) and code in COMMS_SEND_ERROR_CODES:
         return details  # type: ignore[return-value]
     return None
+
+
+def mob_destroy_incomplete_report(error: BaseException) -> WireMobDestroyReport | None:
+    """The destroy report of a mob destroy that did not finish.
+
+    ``mob/destroy``, and ``mob/lifecycle`` with ``"destroy"``, fail with
+    ``error.data`` ``{"code": "mob_destroy_incomplete", "destroy_report": ...,
+    "retryable": true}``, which the SDK keeps as ``MeerkatError.details``. The
+    report says what is left; for example, ``member_reload_refusals`` names
+    each member whose reload the runtime refused, with its typed ``refusal``:
+    retry the destroy later. A refusal ``kind`` this SDK does not know reads
+    as ``{"kind": "unknown"}``. ``None`` for any other error, or when the
+    report does not parse.
+    """
+    details = getattr(error, "details", None)
+    if not isinstance(details, dict) or details.get("code") != "mob_destroy_incomplete":
+        return None
+    return _parse_mob_destroy_report(details.get("destroy_report"))
+
+
+_DESTROY_REPORT_STRING_LISTS = (
+    "force_destroyed_members",
+    "orphaned_remote_members",
+    "errors",
+    "reloaded_members",
+)
+_DESTROY_REPORT_FLAGS = (
+    "remote_cleanup_deadline_exceeded",
+    "metadata_scrubbed",
+    "events_cleared",
+    "namespace_cleaned",
+)
+
+
+def _parse_mob_destroy_report(value: _Any) -> WireMobDestroyReport | None:
+    """The report's known fields, each checked; absent fields stay ``None``."""
+    if not isinstance(value, dict):
+        return None
+    fields: dict[str, _Any] = {}
+    for name in _DESTROY_REPORT_STRING_LISTS:
+        if name in value:
+            items = value[name]
+            if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
+                return None
+            fields[name] = list(items)
+    for name in _DESTROY_REPORT_FLAGS:
+        if name in value:
+            if not isinstance(value[name], bool):
+                return None
+            fields[name] = value[name]
+    if "member_reload_refusals" in value:
+        entries = value["member_reload_refusals"]
+        if not isinstance(entries, list):
+            return None
+        refusals = [_parse_mob_destroy_member_refusal(entry) for entry in entries]
+        if any(refusal is None for refusal in refusals):
+            return None
+        fields["member_reload_refusals"] = refusals
+    return WireMobDestroyReport(**fields)
+
+
+def _parse_mob_destroy_member_refusal(value: _Any) -> WireMobDestroyMemberRefusal | None:
+    if not isinstance(value, dict) or not isinstance(value.get("member"), str):
+        return None
+    refusal = _parse_member_reload_refusal(value.get("refusal"))
+    if refusal is None:
+        return None
+    return WireMobDestroyMemberRefusal(member=value["member"], refusal=refusal)
+
+
+def _parse_member_reload_refusal(value: _Any) -> WireMemberReloadRefusal | None:
+    if not isinstance(value, dict) or not isinstance(value.get("kind"), str):
+        return None
+    if value["kind"] != "repair_blocked":
+        # A kind this SDK does not know: the server's own `Unknown` form.
+        unknown: WireMemberReloadRefusalUnknown = {"kind": "unknown"}
+        return unknown
+    reason = value.get("reason")
+    digest = value.get("evidence_digest")
+    if not isinstance(reason, str) or not (digest is None or isinstance(digest, str)):
+        return None
+    refusal: WireMemberReloadRefusalRepairBlocked = {"kind": "repair_blocked", "reason": reason}
+    if digest is not None:
+        refusal["evidence_digest"] = digest
+    return refusal
 
 
 class BinaryIntegrityError(MeerkatError):

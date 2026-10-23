@@ -418,6 +418,45 @@ test('Mob.spawn preserves canonical capability code and remediation data', async
   });
 });
 
+test('Mob.lifecycle rejects an incomplete destroy as a MeerkatError that keeps its typed data', async () => {
+  // The runtime's envelope for an incomplete destroy (mob_destroy_error_value
+  // in crates/meerkat-web-runtime/src/lib.rs): its typed data under `data`,
+  // as RPC sends it in `error.data`.
+  const data = {
+    code: 'mob_destroy_incomplete',
+    destroy_report: {
+      remote_cleanup_deadline_exceeded: false,
+      metadata_scrubbed: false,
+      events_cleared: false,
+      namespace_cleaned: false,
+      errors: ['worker-1: the runtime refused the reload'],
+      member_reload_refusals: [
+        { member: 'worker-1', refusal: { kind: 'repair_blocked', reason: 'commit outcome not reported' } },
+      ],
+    },
+    retryable: true,
+  };
+  const mob = new Mob('mob-web-unit', {
+    async mob_lifecycle() {
+      throw JSON.stringify({
+        code: 'mob_destroy_incomplete',
+        message: 'mob destroy incomplete: worker-1: the runtime refused the reload',
+        destroy_report: data.destroy_report,
+        retryable: true,
+        data,
+      });
+    },
+  });
+
+  await assert.rejects(() => mob.lifecycle('destroy'), (error) => {
+    assert.ok(error instanceof MeerkatError, `rejected with ${String(error)}`);
+    assert.equal(error.code, 'mob_destroy_incomplete');
+    assert.equal(error.message, 'mob destroy incomplete: worker-1: the runtime refused the reload');
+    assert.deepEqual(error.data, data);
+    return true;
+  });
+});
+
 test('Mob.subscribeMemberEvents projects canonical WASM EventEnvelope payloads', async () => {
   const envelope = canonicalEnvelope();
   const mob = makeSubscriptionMob((handle) => {

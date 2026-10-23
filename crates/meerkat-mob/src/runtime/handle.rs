@@ -2207,11 +2207,199 @@ pub struct MobDestroyReport {
     /// retirement recorded what became of that input.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reloaded_members: Vec<AgentIdentity>,
+    /// Members whose durability reload the runtime refused, typed. A
+    /// `repair_blocked` refusal is retryable: the same destroy can complete
+    /// once the runtime's evidence settles, for example once a boundary
+    /// commit past its outcome deadline has reported its outcome. Each
+    /// member here also has its entry in `errors`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub member_reload_refusals: Vec<MobDestroyMemberRefusal>,
+}
+
+/// A member whose durability reload the runtime refused during a destroy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct MobDestroyMemberRefusal {
+    /// The member the destroy could not reload.
+    pub member: AgentIdentity,
+    /// The runtime's typed refusal.
+    pub refusal: MemberReloadRefusal,
+}
+
+/// The runtime's typed refusal of a member's durability reload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MemberReloadRefusal {
+    /// The runtime's recovery is repair-blocked for now
+    /// (`RuntimeDriverError::RecoveryRepairBlocked`): retry later.
+    RepairBlocked {
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence_digest: Option<String>,
+    },
+}
+
+impl From<&MobDestroyReport> for meerkat_contracts::WireMobDestroyReport {
+    fn from(report: &MobDestroyReport) -> Self {
+        // Every field, with no `..`: a new report field does not compile
+        // until the wire report carries it.
+        let MobDestroyReport {
+            force_destroyed_members,
+            orphaned_remote_members,
+            remote_cleanup_deadline_exceeded,
+            metadata_scrubbed,
+            events_cleared,
+            namespace_cleaned,
+            errors,
+            reloaded_members,
+            member_reload_refusals,
+        } = report;
+        let members = |members: &[AgentIdentity]| -> Vec<String> {
+            members.iter().map(ToString::to_string).collect()
+        };
+        Self {
+            force_destroyed_members: members(force_destroyed_members),
+            orphaned_remote_members: members(orphaned_remote_members),
+            remote_cleanup_deadline_exceeded: *remote_cleanup_deadline_exceeded,
+            metadata_scrubbed: *metadata_scrubbed,
+            events_cleared: *events_cleared,
+            namespace_cleaned: *namespace_cleaned,
+            errors: errors.clone(),
+            reloaded_members: members(reloaded_members),
+            member_reload_refusals: member_reload_refusals.iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<&MobDestroyMemberRefusal> for meerkat_contracts::WireMobDestroyMemberRefusal {
+    fn from(refusal: &MobDestroyMemberRefusal) -> Self {
+        let MobDestroyMemberRefusal { member, refusal } = refusal;
+        Self {
+            member: member.to_string(),
+            refusal: refusal.into(),
+        }
+    }
+}
+
+impl From<&MemberReloadRefusal> for meerkat_contracts::WireMemberReloadRefusal {
+    fn from(refusal: &MemberReloadRefusal) -> Self {
+        // Exhaustive within this crate: a new refusal kind does not compile
+        // until it is mapped, and nothing maps to the wire's `Unknown`.
+        match refusal {
+            MemberReloadRefusal::RepairBlocked {
+                reason,
+                evidence_digest,
+            } => Self::RepairBlocked {
+                reason: reason.clone(),
+                evidence_digest: evidence_digest.clone(),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod destroy_report_wire_tests {
+    use super::{AgentIdentity, MemberReloadRefusal, MobDestroyMemberRefusal, MobDestroyReport};
+    use meerkat_contracts::WireMobDestroyReport;
+
+    fn assert_wire_matches_domain(report: &MobDestroyReport) {
+        let wire = WireMobDestroyReport::from(report);
+        let domain_json = serde_json::to_string(report).expect("domain report serializes");
+        assert_eq!(
+            serde_json::to_string(&wire).expect("wire report serializes"),
+            domain_json
+        );
+        assert_eq!(
+            serde_json::from_str::<WireMobDestroyReport>(&domain_json)
+                .expect("the domain JSON parses as the wire report"),
+            wire
+        );
+    }
+
+    #[test]
+    fn the_wire_destroy_report_serializes_byte_identical_to_the_domain_report() {
+        assert_wire_matches_domain(&MobDestroyReport::default());
+        assert_wire_matches_domain(&MobDestroyReport {
+            force_destroyed_members: vec![AgentIdentity::from("forced")],
+            orphaned_remote_members: vec![AgentIdentity::from("orphaned")],
+            remote_cleanup_deadline_exceeded: true,
+            metadata_scrubbed: true,
+            events_cleared: true,
+            namespace_cleaned: true,
+            errors: vec!["cleanup failed".to_string()],
+            reloaded_members: vec![AgentIdentity::from("reloaded")],
+            member_reload_refusals: vec![
+                MobDestroyMemberRefusal {
+                    member: AgentIdentity::from("refused"),
+                    refusal: MemberReloadRefusal::RepairBlocked {
+                        reason: "commit outcome not reported".to_string(),
+                        evidence_digest: Some("digest".to_string()),
+                    },
+                },
+                MobDestroyMemberRefusal {
+                    member: AgentIdentity::from("refused-without-digest"),
+                    refusal: MemberReloadRefusal::RepairBlocked {
+                        reason: "commit outcome not reported".to_string(),
+                        evidence_digest: None,
+                    },
+                },
+            ],
+        });
+    }
+}
+
+#[cfg(feature = "runtime-adapter")]
+impl MemberReloadRefusal {
+    /// The refusal a destroy report keeps typed for the runtime's `error`:
+    /// only a repair-blocked recovery. Every other error stays text only.
+    pub(crate) fn from_runtime_refusal(
+        error: &meerkat_runtime::RuntimeDriverError,
+    ) -> Option<Self> {
+        match error {
+            meerkat_runtime::RuntimeDriverError::RecoveryRepairBlocked {
+                evidence_digest,
+                reason,
+            } => Some(Self::RepairBlocked {
+                reason: reason.clone(),
+                evidence_digest: evidence_digest.clone(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// A member's durability reload that failed during a destroy: its entry in
+/// the report's `errors` and, when the runtime refused the reload typed, that
+/// refusal.
+#[cfg(feature = "runtime-adapter")]
+#[derive(Debug)]
+pub(crate) struct MemberReloadFailure {
+    pub(crate) message: String,
+    pub(crate) refusal: Option<MemberReloadRefusal>,
 }
 
 impl MobDestroyReport {
     pub(crate) fn push_error(&mut self, error: impl Into<String>) {
         self.errors.push(error.into());
+    }
+
+    /// Record `member`'s failed reload: its text in `errors` and, when the
+    /// runtime refused it typed, the refusal in `member_reload_refusals`.
+    #[cfg(feature = "runtime-adapter")]
+    pub(crate) fn push_member_reload_failure(
+        &mut self,
+        member: &AgentIdentity,
+        failure: MemberReloadFailure,
+    ) {
+        let MemberReloadFailure { message, refusal } = failure;
+        self.errors.push(message);
+        if let Some(refusal) = refusal {
+            self.member_reload_refusals.push(MobDestroyMemberRefusal {
+                member: member.clone(),
+                refusal,
+            });
+        }
     }
 
     fn error_summary(&self) -> String {
@@ -2545,6 +2733,7 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         | MobError::WorkInputCompletionUnavailable { .. }
         | MobError::ActorCommandTimedOut { .. }
         | MobError::MemberReloadRefused { .. }
+        | MobError::MemberReloadRepairBlocked { .. }
         | MobError::MemberReloadTimedOut { .. }
         | MobError::HeldSpawnUnsupported { .. }
         | MobError::HeldSpawnAborted { .. }

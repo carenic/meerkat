@@ -274,6 +274,25 @@ them.
   connection, and answers a store notification from its last read while
   the database and its WAL stat as they did before that read
   (`DeliveryGenerationReader::read_on_notification`).
+- `meerkat-contracts`: the mob destroy report is typed on the wire.
+  `MobDestroyResult.destroy_report` changes from `serde_json::Value` to
+  `WireMobDestroyReport`, and `MobLifecycleResult.destroy_report` from
+  `Option<serde_json::Value>` to `Option<WireMobDestroyReport>` (see
+  Added). The JSON value each surface sends is unchanged. Inside
+  `destroy_report`, the members of the JSON-RPC `mob/destroy` and
+  `mob/lifecycle` results and of the `@rkat/web` `Mob.lifecycle()` result now
+  follow the report's field order, as the domain report serializes, instead
+  of alphabetical order; the `mob_destroy_incomplete` data keeps its bytes.
+  Code that read the field as a `Value` reads the struct's fields instead;
+  code that builds a result converts a `meerkat_mob::MobDestroyReport` with
+  `WireMobDestroyReport::from(&report)`.
+- TypeScript and Web SDKs (not measured by the gate): `@rkat/sdk`'s
+  `MeerkatClient.mobDestroy()` returns `destroyReport` as
+  `WireMobDestroyReport` instead of `Record<string, unknown>`, and rejects a
+  malformed report with `INVALID_RESPONSE`. `@rkat/web`'s `Mob.lifecycle()`
+  rejects a refused action with a `MeerkatError` (`code`, `message`,
+  `data`), as the other `Mob` methods do, instead of the runtime's JSON
+  error string, and rejects a malformed destroy report.
 
 - `meerkat-mob-mcp`: `HostJobSource::new` refuses a namespace in the
   Core-owned `meerkat.` prefix (for example the consent notices'
@@ -323,6 +342,63 @@ them.
   `remote_custody_required` (cancel the attempt by its reference and start
   again); the login window stays the shared 300 s browser window of the flow
   owner; REST and `rkat mcp login` stay loopback-only.
+- `meerkat_mob::MobDestroyReport` gains `member_reload_refusals`: the
+  members whose durability reload the runtime refused as repair-blocked
+  (`RuntimeDriverError::RecoveryRepairBlocked`), each a
+  `MobDestroyMemberRefusal` with its `MemberReloadRefusal::RepairBlocked`
+  (`reason`, `evidence_digest`). A destroy that could not reload such a
+  member answered `Incomplete` with that refusal flattened into one
+  `errors` string; the string stays, and the typed entry beside it tells a
+  caller to retry the destroy later, for example once a boundary commit past
+  its deadline has reported its durable outcome. The `mob_destroy_incomplete`
+  data of every surface carries it as
+  `destroy_report.member_reload_refusals[].refusal.kind ==
+  "repair_blocked"`. Both new types are `#[non_exhaustive]`, and the field is
+  left out of the serialized report when it is empty, so any other destroy
+  report is unchanged.
+- `meerkat-contracts`: `WireMobDestroyReport`, the wire form of
+  `meerkat_mob::MobDestroyReport` field for field, with
+  `WireMobDestroyMemberRefusal` and `WireMemberReloadRefusal` (tagged on
+  `kind`; a kind this version does not know parses as `Unknown`, which the
+  server never sends), and `WireMobDestroyIncompleteData`, the typed `data`
+  of a `mob_destroy_incomplete` error. `meerkat-mob` converts a report with
+  `From`. The generated Python, TypeScript and Web SDK types carry them, so
+  `destroy_report` is typed in every SDK.
+- Python, TypeScript and Web SDKs: `mob_destroy_incomplete_report(error)`
+  (Python) and `mobDestroyIncompleteReport(error)` (TypeScript and Web)
+  return the typed `WireMobDestroyReport` of a destroy that did not finish
+  (code `mob_destroy_incomplete`), or `None`/`undefined` for any other error
+  or a report that does not parse. A refusal in its `member_reload_refusals`
+  tells the caller to retry the destroy later; a refusal kind the SDK does
+  not know reads as `{"kind": "unknown"}`. The SDKs export the report
+  types; the error's `details` (`data` on the Web) are unchanged.
+- `meerkat_mob::MobError::MemberReloadRepairBlocked` (`session_id`,
+  `reason`, `evidence_digest`): a member retirement whose durability reload
+  of the member session the runtime refused as repair-blocked
+  (`RuntimeDriverError::RecoveryRepairBlocked`) reports this typed cause
+  instead of a session error with the refusal as text. A retire that sticks
+  at its quiesce stage, for example while a boundary commit past its
+  deadline has not reported its durable outcome, answers
+  `MemberRetirementStuck` with this cause, and a redrive of the retirement
+  completes it once the outcome is reported. Its structured data is
+  `{kind: "mob_member_reload_repair_blocked", session_id, reason,
+  evidence_digest (when the runtime has one), retryable: true,
+  authority_retained: true, live_shell_discarded: false}` and its wire code
+  `SessionBusy`, as for `MemberReloadRefused`, which
+  `MobHandle::reload_member_registration` still answers for the same
+  refusal. A destroy that meets the same refusal while it archives a
+  member's session (the member degraded after the destroy's own reload
+  passes) now reports this variant's text in the member's `errors` entry,
+  where it reported a session error, and lists the member in
+  `MobDestroyReport::member_reload_refusals` as its reload passes do.
+- `meerkat-mob`: the structured data of `MobError::MemberRetirementStuck`
+  (kind `mob_retirement_stuck`) gains `cause_data`, the cause's own
+  structured data, when the cause has some: for example kind
+  `mob_member_reload_repair_blocked` for a retirement whose member reload
+  the runtime refused, which a redrive completes once the runtime's
+  evidence settles. A client routes on that kind instead of parsing the
+  `cause` text, which is unchanged; a cause without structured data adds
+  no key.
 - `meerkat-schedule`: `ScheduleTargetDelivery::deliver_existing_occurrence`,
   a defaulted method the driver calls to redeliver a reclaimed occurrence
   whose earlier attempt recorded its dispatch, with `ExistingDelivery`
@@ -658,6 +734,20 @@ them.
   `AgentError::StagedPromptDirectedTurnRefused` while a prompt is staged. The
   realtime seed still carries no staged prompt: in a voice-first session it
   lands with the first later text turn.
+- `meerkat-mob`: a member retirement whose member session degraded after
+  its quiesce stage, for example a retire that waited there on a boundary
+  commit that then passed its deadline, no longer sticks at its ingress
+  detach. The runtime refused the detach of the degraded session
+  (`RuntimeDriverError::RecoveryRepairBlocked`), the retirement stuck with
+  an internal error, and a manual reload of the retiring member was refused
+  too. The ingress detach now reloads the member session first, through the
+  same durability reload as the quiesce stage and a destroy, and detaches
+  the cold successor that reload published, so the retirement completes (on
+  a plain retry when the caller's wait ended first). When the runtime
+  refuses that reload as repair-blocked, or the session degrades after the
+  stage's reload check, the retirement sticks with the typed
+  `MobError::MemberReloadRepairBlocked`, and a redrive completes it once the
+  runtime's evidence settles.
 - A turn that compacts its history more often than
   `[compaction] history_retained_rewrites` keeps (five or more compactions at
   the default of 4) no longer ends at its intra-turn checkpoint on a
@@ -929,6 +1019,14 @@ them.
   read (a platform that reports a read's own open or close as a change of
   the WAL) is answered from that read without opening the database; a
   sweep always reads.
+- `@rkat/web`: a destroy that did not finish (`Mob.lifecycle("destroy")`,
+  `Session.destroy()` of a session that owns mobs, or
+  `MeerkatRuntime.destroy()`) no longer loses its report. The runtime's
+  error envelope carried the report only at its top level, and
+  `MeerkatError.fromWasm` keeps an envelope's `data`; `Mob.lifecycle()`
+  rejected with the raw envelope string. The envelope now also carries the
+  typed incomplete data under `data`, as JSON-RPC sends it in `error.data`,
+  and `mobDestroyIncompleteReport(error)` reads the report.
 
 - An MCP connect under the interactive auth mode no longer waits out the
   300 s interactive login window when it cannot open a login. Only a remote

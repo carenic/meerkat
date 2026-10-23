@@ -1,6 +1,7 @@
 export { MeerkatRuntime } from './runtime.js';
 export type { WasmModule } from './runtime.js';
 export { Mob } from './mob.js';
+export { mobDestroyIncompleteReport } from './mob-destroy-report.js';
 export { MeerkatError, Session } from './session.js';
 export type { BrowserTurnOptions } from './session.js';
 export { EventSubscription } from './events.js';

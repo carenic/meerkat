@@ -751,11 +751,9 @@ impl MobMcpDestroyError {
     }
 
     pub fn incomplete_error_data(report: &meerkat_mob::MobDestroyReport) -> serde_json::Value {
-        json!({
-            "code": "mob_destroy_incomplete",
-            "destroy_report": report,
-            "retryable": true,
-        })
+        json!(meerkat_contracts::WireMobDestroyIncompleteData::new(
+            report.into()
+        ))
     }
 
     pub fn error_data(&self) -> Option<serde_json::Value> {

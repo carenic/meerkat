@@ -24,6 +24,18 @@ export type {
   WireMobLifecycleFailure,
 } from './generated/mob.js';
 
+// The destroy report of `Mob.lifecycle('destroy')` and of
+// `mobDestroyIncompleteReport`, nameable through the package root.
+export type {
+  MobLifecycleResult,
+  WireMemberReloadRefusal,
+  WireMemberReloadRefusalRepairBlocked,
+  WireMemberReloadRefusalUnknown,
+  WireMobDestroyIncompleteData,
+  WireMobDestroyMemberRefusal,
+  WireMobDestroyReport,
+} from './generated/mob.js';
+
 // ─── Bootstrap / session config (generated wire parity) ─────────
 //
 // K19: RuntimeConfig / InitResult / SessionConfig / AuthBindingRef are

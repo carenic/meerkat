@@ -1264,6 +1264,46 @@ waits on that member's ingress detach reloads the member from its durable
 store, retries its retirement once, and names it in
 `MobDestroyReport::reloaded_members`; 0.9.3 answered `Incomplete`.
 
+A destroy also reloads, before it starts, every member whose runtime requires
+a durability reload. When the runtime refuses such a reload as repair-blocked,
+for example while a boundary commit past its deadline has not reported its
+durable outcome, the destroy answers `Incomplete`. Since 0.9.5 its report also
+lists the member in `MobDestroyReport::member_reload_refusals`
+(`{"member": ..., "refusal": {"kind": "repair_blocked", "reason": ...}}`
+in the `destroy_report` of the `mob_destroy_incomplete` data): retry the
+destroy later. The SDKs read that report typed, as a `WireMobDestroyReport`:
+`mob_destroy_incomplete_report(error)` in Python and
+`mobDestroyIncompleteReport(error)` in TypeScript and `@rkat/web`. A refusal
+in the reload pass before the destroy starts leaves the mob unchanged. A
+refusal later in the destroy comes after its cleanup has begun: the mob's
+admission is closed, and some members may already be retired. A member that
+degrades only after those reloads, and whose reload the runtime refuses while
+the destroy archives its session, is listed the same way; its `errors` entry
+then carries the text of `MobError::MemberReloadRepairBlocked`. Any other
+reload failure stays text in `errors` only.
+
+A retire reloads such a member as well, at its quiesce stage. When the runtime
+refuses that reload as repair-blocked, the retirement sticks: `retire` answers
+`MobError::MemberRetirementStuck`, and since 0.9.5 its cause is
+`MobError::MemberReloadRepairBlocked` (`session_id`, `reason`,
+`evidence_digest`; structured data kind `mob_member_reload_repair_blocked`
+with `retryable: true`, wire code `SessionBusy`) instead of a session error
+with the refusal as text. Redrive the retirement with
+`MobHandle::redrive_retirement` once the boundary commit has reported its
+outcome; the redrive reloads the member and completes the retirement.
+
+A retire that started before the member degraded waits at its quiesce stage
+on the boundary commit instead, and reaches its ingress detach once the
+commit reports, with the member still degraded. Since 0.9.5 the ingress
+detach reloads the member as the quiesce does and retires the cold successor,
+so the retirement completes: retry a retire that answered
+`MemberRetirementInProgress`. When the runtime refuses that reload as
+repair-blocked, or the member degrades just after the stage's reload check,
+the retirement sticks with the same `MemberReloadRepairBlocked` cause; redrive
+it. Since 0.9.5 the stuck error's own data (kind `mob_retirement_stuck`)
+carries the cause's data as `cause_data`, so a client routes on the cause's
+kind rather than on its text.
+
 ### Admission in custom Rust session services
 
 A custom `MobSessionService` that executes standalone turns must implement

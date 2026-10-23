@@ -973,6 +973,33 @@ try {
 }
 ```
 
+### Incomplete mob destroys
+
+A mob destroy that did not finish (`mobDestroy()`, or `mobLifecycle()` with
+`"destroy"`) rejects with code `mob_destroy_incomplete`; its `details` carry
+the `destroy_report` and `retryable: true`. `mobDestroyIncompleteReport(err)`
+returns that report as a `WireMobDestroyReport`, or `undefined` for any
+other error. Retry the destroy later: `member_reload_refusals` names each
+member whose reload the runtime refused, with its typed `refusal` (a kind
+this SDK does not know reads as `{ kind: "unknown" }`). `mobDestroy()`
+returns the report of a finished destroy as a `WireMobDestroyReport` too.
+`@rkat/web` exports the same function for the rejections of
+`mob.lifecycle("destroy")`, `session.destroy()` and `runtime.destroy()`.
+
+```typescript
+import { mobDestroyIncompleteReport } from "@rkat/sdk";
+
+try {
+  await client.mobDestroy(mobId);
+} catch (err) {
+  const report = mobDestroyIncompleteReport(err);
+  if (report === undefined) throw err;
+  for (const { member, refusal } of report.member_reload_refusals ?? []) {
+    console.warn(`${member}: ${refusal.kind}`);
+  }
+}
+```
+
 ---
 
 ## Skills

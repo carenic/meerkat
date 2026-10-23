@@ -1237,15 +1237,9 @@ pub async fn handle_lifecycle(
             Err(MobMcpDestroyError::Mob(err)) => return mob_call_error(id, &err),
         },
     };
-    let destroy_report = match destroy_report {
-        Some(report) => match serde_json::to_value(&report) {
-            Ok(value) => Some(value),
-            Err(err) => {
-                return invalid_params(id, format!("destroy report serialize: {err}"));
-            }
-        },
-        None => None,
-    };
+    let destroy_report = destroy_report
+        .as_ref()
+        .map(meerkat_contracts::WireMobDestroyReport::from);
     RpcResponse::success(
         id,
         MobLifecycleResult {
@@ -1993,25 +1987,14 @@ pub async fn handle_destroy(
         Err(resp) => return resp,
     };
     match state.mob_destroy(&mob_id).await {
-        Ok(report) => {
-            let report_value = match serde_json::to_value(&report) {
-                Ok(v) => v,
-                Err(err) => {
-                    return invalid_params(
-                        id,
-                        format!("failed to serialize MobDestroyReport: {err}"),
-                    );
-                }
-            };
-            RpcResponse::success(
-                id,
-                MobDestroyResult {
-                    mob_id: mob_id.to_string(),
-                    ok: true,
-                    destroy_report: report_value,
-                },
-            )
-        }
+        Ok(report) => RpcResponse::success(
+            id,
+            MobDestroyResult {
+                mob_id: mob_id.to_string(),
+                ok: true,
+                destroy_report: meerkat_contracts::WireMobDestroyReport::from(&report),
+            },
+        ),
         Err(MobMcpDestroyError::Incomplete { report }) => destroy_incomplete_response(id, &report),
         Err(MobMcpDestroyError::Mob(err)) => mob_call_error(id, &err),
     }
