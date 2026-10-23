@@ -3282,6 +3282,13 @@ async fn a_crash_mid_drain_leaves_the_queued_input_for_the_restarted_mob() {
             .expect("same-key replay admission");
         replays.push(drained_answer(replay).await.0);
     }
+    // A replay answers once its input settles, which can be before the run's
+    // RunCompleted reaches the event log. The log is complete once the
+    // shutdown returns, so it is read after it, as in the other Stop rows.
+    tokio::time::timeout(WAIT, restarted.handle.shutdown())
+        .await
+        .expect("mob shutdown finishes")
+        .expect("mob shutdown");
     let events = stop_events(&root_path, &session_id).await;
     let mut across = Vec::new();
     for (index, (key, input_id, _)) in inputs.iter().enumerate() {
@@ -3368,10 +3375,6 @@ async fn a_crash_mid_drain_leaves_the_queued_input_for_the_restarted_mob() {
         "a crash while the drain waits leaves the Stop's state: the queued input stays Queued \
          and runs once after the restart, after the interrupted input runs again"
     );
-    tokio::time::timeout(WAIT, restarted.handle.shutdown())
-        .await
-        .expect("mob shutdown finishes")
-        .expect("mob shutdown");
 }
 
 /// A plain Stop, without `StopOptions::leave_runs_running`, still cancels an

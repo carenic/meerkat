@@ -2085,6 +2085,44 @@ async fn stop_member_run_stops_live_local_run_by_its_run_started_id() {
 }
 
 // ==========================================================================
+// The fail-stop restart fixture refuses a cut with a turn in flight
+// ==========================================================================
+
+/// `restart_after_actor_fail_stop` stands in for a process exit, which
+/// writes nothing. Its session service shutdown would end a turn in flight
+/// with RunFailed, so a restart over that cut would read a shutdown's
+/// outcome, not a crash's. The fixture refuses the cut by name instead.
+#[tokio::test(flavor = "multi_thread")]
+#[should_panic(expected = "have a turn in flight")]
+async fn a_fail_stop_restart_refuses_a_cut_with_a_turn_in_flight() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let gate = StallGate::new();
+    let controlling = support::create_controlling_mob_with_local_llm_client(
+        "xhf-fail-stop-cut",
+        scripted_member_client_stalling(gate.clone()),
+    )
+    .await;
+    controlling
+        .handle
+        .spawn_spec(
+            meerkat_mob::SpawnMemberSpec::new("worker", "a12c")
+                .with_backend(meerkat_mob::MobBackendKind::Session),
+        )
+        .await
+        .expect("spawn local worker a12c");
+    controlling
+        .handle
+        .member(&identity("a12c"))
+        .await
+        .expect("member handle for a12c")
+        .send("stall forever", meerkat_core::HandlingMode::Queue)
+        .await
+        .expect("stalled local turn is admitted");
+    gate.wait_until_entered().await;
+    let _restarted = controlling.restart_after_actor_fail_stop().await;
+}
+
+// ==========================================================================
 // T-F11b - run-fenced Stop of a live placed-member run by its run_started id
 // ==========================================================================
 
