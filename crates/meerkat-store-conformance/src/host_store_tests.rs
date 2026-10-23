@@ -17,11 +17,15 @@ use meerkat_core::host_store::{
     HostStoreError, Row, RowIndex, ScopeKind, ScopeName, ScopeRef, ScopeUpdate, ScopeVersion,
     VersionedHead,
 };
-use meerkat_core::{RunId, RunResumePoint, ToolCallDedupeKey};
+use meerkat_core::{
+    AssistantBlock, BlockAssistantMessage, RunId, RunResumePoint, StopReason, ToolCallDedupeKey,
+};
+use serde_json::value::RawValue;
 
 use crate::long_run::{
-    BeforeResume, DurableWorkerHarness, KillMode, KillPoint, KilledRun, KilledWorker,
-    LongRunHarness, LongRunPlan, RestartReport, RestartedWorker, ResumeGate, ResumedRun, call_id,
+    BeforeResume, DurableWorkerHarness, KillPoint, KilledRun, KilledWorker, LongRunHarness,
+    LongRunPlan, RestartReport, RestartedWorker, ResumeGate, ResumedRun, call_id, resumes,
+    takes_first_commit,
 };
 use crate::{ConformanceFailure, HostStoreFactory, InMemoryHostStore, chapters};
 
@@ -488,8 +492,6 @@ fn fence_timing_bounds() {
 /// one that calls the model again for a round whose calls were committed.
 struct ScriptedCore {
     recalls_model: bool,
-    kill_mode: KillMode,
-    fence_leases: bool,
     run_id: Mutex<Option<RunId>>,
 }
 
@@ -497,8 +499,6 @@ impl ScriptedCore {
     fn new(recalls_model: bool) -> Self {
         Self {
             recalls_model,
-            kill_mode: KillMode::DropAndReopen,
-            fence_leases: true,
             run_id: Mutex::new(None),
         }
     }
@@ -512,12 +512,28 @@ impl ScriptedCore {
             .collect()
     }
 
+    /// The scripted model asks for the same tool with the same arguments
+    /// each time, so a call's digest follows from its id.
     fn key(run_id: &RunId, round: u64, call: String) -> ToolCallDedupeKey {
         ToolCallDedupeKey {
             run_id: run_id.clone(),
             round,
+            call_digest: format!("digest-{call}"),
             call_id: call,
         }
+    }
+
+    fn staged_message(plan: &LongRunPlan, round: u64) -> BlockAssistantMessage {
+        let blocks = Self::calls(plan, round)
+            .into_iter()
+            .map(|id| AssistantBlock::ToolUse {
+                id,
+                name: "scripted_tool".to_string(),
+                args: RawValue::from_string("{}".to_string()).expect("valid json"),
+                meta: None,
+            })
+            .collect();
+        BlockAssistantMessage::new(blocks, StopReason::ToolUse)
     }
 
     fn kill(&self, plan: &LongRunPlan) -> KilledRun {
@@ -533,7 +549,9 @@ impl ScriptedCore {
             .collect();
         if matches!(
             plan.kill_point,
-            KillPoint::DuringTools | KillPoint::DuringProcessTool
+            KillPoint::DuringTools
+                | KillPoint::DuringUnrepeatableTool(_)
+                | KillPoint::DuringCallbackTools
         ) {
             dispatched.push(Self::key(
                 &run_id,
@@ -544,52 +562,65 @@ impl ScriptedCore {
         KilledRun { run_id, dispatched }
     }
 
+    fn settled_report() -> RestartReport {
+        RestartReport {
+            resumed: None,
+            waited_out_lease: true,
+            runs: Vec::new(),
+            model_call_rounds: Vec::new(),
+            dispatched: Vec::new(),
+            interrupted: Vec::new(),
+            transcript_rounds: Vec::new(),
+            transcript_results: Vec::new(),
+            receipts: 0,
+            inputs_settled: true,
+        }
+    }
+
     fn restart_report(&self, plan: &LongRunPlan) -> RestartReport {
-        let run_id = self
+        if matches!(
+            plan.before_resume,
+            BeforeResume::Stop | BeforeResume::Retire
+        ) {
+            return Self::settled_report();
+        }
+        let killed_run = self
             .run_id
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
             .unwrap_or_else(RunId::new);
-        let waited_out_lease = self.kill_mode == KillMode::DropAndReopen && self.fence_leases;
-        if matches!(
-            plan.before_resume,
-            BeforeResume::Stop | BeforeResume::Retire
-        ) {
-            return RestartReport {
-                resumed: None,
-                waited_out_lease,
-                runs: Vec::new(),
-                model_call_rounds: Vec::new(),
-                dispatched: Vec::new(),
-                interrupted: Vec::new(),
-                transcript_rounds: Vec::new(),
-                transcript_results: Vec::new(),
-                receipts: 0,
-                inputs_settled: true,
-            };
-        }
         let kill_round = plan.kill_round;
-        let model_call = plan.kill_point == KillPoint::ModelCall;
-        let process =
-            (plan.kill_point == KillPoint::DuringProcessTool).then(|| call_id(kill_round, 0));
-        let first_model_round = if model_call || self.recalls_model {
-            kill_round
+        let resumed_run = resumes(plan);
+        let tools_pending = resumed_run
+            && plan.kill_point != KillPoint::ModelCall
+            && takes_first_commit(plan, kill_round);
+        let input_run = if resumed_run {
+            killed_run
         } else {
-            kill_round + 1
+            RunId::new()
         };
-        let mut runs = vec![run_id.clone()];
+        let mut runs = vec![input_run.clone()];
         if plan.before_resume == BeforeResume::QueueInput {
             runs.push(RunId::new());
         }
-        let dispatched = (kill_round..plan.rounds)
+        let first_round = if resumed_run { kill_round } else { 0 };
+        let first_model_round = if tools_pending && !self.recalls_model {
+            kill_round + 1
+        } else {
+            first_round
+        };
+        let interrupted = (tools_pending
+            && matches!(plan.kill_point, KillPoint::DuringUnrepeatableTool(_)))
+        .then(|| call_id(kill_round, 0));
+        let dispatched = (first_round..plan.rounds)
             .flat_map(|round| {
                 Self::calls(plan, round)
                     .into_iter()
                     .map(move |call| (round, call))
             })
-            .filter(|(_, call)| process.as_ref() != Some(call))
-            .map(|(round, call)| Self::key(&run_id, round, call))
+            .filter(|(_, call)| interrupted.as_ref() != Some(call))
+            .map(|(round, call)| Self::key(&input_run, round, call))
             .collect();
         let first_transcript_round = if plan.compact_in_kill_round {
             kill_round
@@ -601,22 +632,23 @@ impl ScriptedCore {
             .iter()
             .flat_map(|round| Self::calls(plan, *round))
             .collect();
+        let resumed = resumed_run.then(|| ResumedRun {
+            run_id: input_run.clone(),
+            resume_point: if tools_pending {
+                RunResumePoint::ToolsPending {
+                    assistant_message: Self::staged_message(plan, kill_round),
+                }
+            } else {
+                RunResumePoint::AwaitingModel
+            },
+        });
         RestartReport {
-            resumed: Some(ResumedRun {
-                run_id,
-                resume_point: if model_call {
-                    RunResumePoint::AwaitingModel
-                } else {
-                    RunResumePoint::ToolsPending {
-                        call_ids: Self::calls(plan, kill_round),
-                    }
-                },
-            }),
-            waited_out_lease,
+            resumed,
+            waited_out_lease: true,
             runs,
             model_call_rounds: (first_model_round..plan.rounds).collect(),
             dispatched,
-            interrupted: process.into_iter().collect(),
+            interrupted: interrupted.into_iter().collect(),
             transcript_rounds,
             transcript_results,
             receipts: 1,
@@ -627,12 +659,8 @@ impl ScriptedCore {
 
 #[async_trait]
 impl LongRunHarness for ScriptedCore {
-    fn kill_mode(&self) -> KillMode {
-        self.kill_mode
-    }
-
     fn fence_leases(&self) -> bool {
-        self.fence_leases
+        true
     }
 
     async fn run_and_kill(&self, plan: &LongRunPlan) -> Result<KilledRun, ConformanceFailure> {
@@ -646,12 +674,8 @@ impl LongRunHarness for ScriptedCore {
 
 #[async_trait]
 impl DurableWorkerHarness for ScriptedCore {
-    fn kill_mode(&self) -> KillMode {
-        self.kill_mode
-    }
-
     fn fence_leases(&self) -> bool {
-        self.fence_leases
+        true
     }
 
     async fn spawn_and_kill(&self, plan: &LongRunPlan) -> Result<KilledWorker, ConformanceFailure> {
@@ -667,19 +691,16 @@ impl DurableWorkerHarness for ScriptedCore {
         plan: &LongRunPlan,
         gate: ResumeGate,
     ) -> Result<RestartedWorker, ConformanceFailure> {
-        let superseded = gate == ResumeGate::Superseded;
-        let report = if superseded {
-            self.restart_report(&LongRunPlan {
-                before_resume: BeforeResume::Stop,
-                ..*plan
-            })
+        let refused = matches!(gate, ResumeGate::Superseded | ResumeGate::Unavailable);
+        let report = if refused {
+            Self::settled_report()
         } else {
             self.restart_report(plan)
         };
         Ok(RestartedWorker {
             identity: "worker".to_string(),
             session: "worker-session".to_string(),
-            superseded,
+            refused,
             report,
         })
     }
@@ -701,5 +722,36 @@ async fn long_run_chapter_refuses_a_core_that_calls_the_model_again() {
         .await
         .expect_err("calling the model again for a committed round must fail");
     assert_eq!(failure.chapter(), "long_run");
-    assert_eq!(failure.step(), "first_round_during_tools");
+    assert_eq!(failure.step(), "before_dispatch");
+}
+
+#[test]
+fn first_commit_rule() {
+    let plain = LongRunPlan {
+        rounds: 5,
+        calls_per_round: 2,
+        kill_round: 3,
+        kill_point: KillPoint::DuringTools,
+        compact_in_kill_round: false,
+        before_resume: BeforeResume::Nothing,
+    };
+    assert!(!takes_first_commit(&plain, 0));
+    assert!(takes_first_commit(&plain, 1));
+    assert!(takes_first_commit(&plain, 3));
+    let compacted = LongRunPlan {
+        compact_in_kill_round: true,
+        ..plain
+    };
+    assert!(!takes_first_commit(&compacted, 3));
+    assert!(takes_first_commit(&compacted, 2));
+    let callbacks = LongRunPlan {
+        kill_point: KillPoint::DuringCallbackTools,
+        ..plain
+    };
+    assert!(!takes_first_commit(&callbacks, 3));
+    assert!(resumes(&plain));
+    assert!(!resumes(&LongRunPlan {
+        kill_round: 0,
+        ..plain
+    }));
 }

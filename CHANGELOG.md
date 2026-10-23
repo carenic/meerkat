@@ -542,18 +542,20 @@ them.
   exclusive acquire refuses typed (`HostStoreError::Held`) while another
   holder's lease lasts, and a takeover's `FenceGrant` says how long the new
   writer waits before it dispatches anything.
-- `meerkat-store-conformance`: `chapters::host_store` checks a host store
-  against those obligations through a `HostStoreFactory`, whose every open
-  stands for a new process: reopen; a kill before, during and after a
-  commit; stale fences, leases and takeovers, with a commit of unknown
-  outcome; two batches for one version; retries; rows, removal and listing
-  over 210 scopes; the batch and row limits; and 210 scopes committing
-  concurrently. `InMemoryHostStore` is the reference store that passes it.
-  `chapters::long_run` and `chapters::durable_worker` drive Core through a
-  `LongRunHarness` or `DurableWorkerHarness`, and check that a run or a
-  durable worker killed at any point of a round resumes at its last
-  committed round under the same run id, with every round once and one
-  receipt.
+- `meerkat-store-conformance`: `InMemoryHostStore`, the reference host
+  store, meets those obligations at commit; its fence leases run on a
+  manual clock or an outside one. A `HostStoreFactory` opens a new handle
+  over one realm for each simulated process. `chapters::long_run` and
+  `chapters::durable_worker` drive Core through a `LongRunHarness` or
+  `DurableWorkerHarness` and kill a run or a durable worker at each point
+  of a round. A run resumes from its last durable commit under the same
+  run id: after a round's first commit it dispatches that round's calls
+  again under the same dedupe keys without asking the model, and a started
+  call of an unrepeatable tool gets the typed interrupted result instead;
+  otherwise the model is asked again for the round. A kill in round 0
+  before any commit requeues the input as a new run. Either way the input
+  finishes with every round once and one receipt, and over a store with
+  fence leases every restart waits out the killed process's lease.
 - `MemberBinding::labels()`: the application labels the incarnation was
   spawned with, as its spawn recorded them (a member reset keeps them). Every
   read of the member binding history carries them, the store-level
