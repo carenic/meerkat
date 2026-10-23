@@ -388,9 +388,10 @@ WebSocket, and keep WebRTC for sessions that are not mob members.
   `UnregisterQueuedInputs::Requeue`, or a mob Shutdown with
   `QueuedInputsOnShutdown::Requeue`, now suspends the run in flight of a session with per-round
   commits instead of cancelling it: the run continues from its last committed
-  round at the next start, or its inputs end as `RequeueExpired` past the
-  max age. Because a graceful shutdown that does not choose uses Requeue for
-  such sessions, a deploy no longer cancels their runs in flight. See
+  round at the next start, or, past the max age, its inputs end as
+  `RequeueExpired` and the run is closed as interrupted with its committed
+  rounds kept. Because a graceful shutdown that does not choose uses Requeue
+  for such sessions, a deploy no longer cancels their runs in flight. See
   [Durable Runs: graceful stops and deploys](/guides/durable-runs#graceful-stops-and-deploys).
 - **Host stores:** a host can keep a realm's durable state in its own
   database through the host store SPI (`meerkat_core::host_store`), checked

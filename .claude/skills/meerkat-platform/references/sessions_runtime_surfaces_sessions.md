@@ -361,13 +361,19 @@ Contract and limits: `docs/guides/durable-runs.mdx`.
   still queue and run after it. Bound inputs are the start input plus every
   steer or peer input applied at a committed round; an input applied only in
   the lost round is redelivered. A stop before the resume abandons them as
-  cancelled and fails the run; retire, destroy, reset and unregister abandon
+  cancelled and fails the run, which is closed as interrupted with its
+  committed rounds kept; retire, destroy, reset and unregister abandon
   them; a graceful unregister that keeps queued work leaves the run to resume
   at the next start, unless a bound input is older than the stop's max age
   by then.
 - Not resumed, closed as interrupted with content kept: a bound input already
   settled, a retired runtime, or a run with no bound inputs (direct and
-  machine-service turns). Held (`SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY`),
+  machine-service turns). A run settled without resuming (a stop first, a
+  refused resume, a requeue stop past its max age) is closed the same way,
+  never discarded: committed rounds stay, a round's staged response is
+  written with an outcome-unknown error result per tool call (the calls may
+  have run), the interrupted notice is appended, and its inputs never run
+  again. Held (`SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY`),
   never committed: a cursor that disagrees with the transcript, and a tail
   left behind with requeued inputs.
 - Reruns are at least once and pass authorization, approval review and
@@ -396,7 +402,8 @@ Contract and limits: `docs/guides/durable-runs.mdx`.
   `requeued_across_stop`, and the run continues at the next open, before
   the kept queued prompts; if a bound input is older than `max_age` (from
   admission; unregister: no default, 1 ms to 24 h; mob: 15 min default) at
-  that start, the inputs end `requeue_expired` instead. No Requeue, an
+  that start, the inputs end `requeue_expired` instead and the run is closed
+  as interrupted, its committed rounds kept. No Requeue, an
   explicit stop/cancel, retire, destroy, reset, a requeue stop that meets a
   steer being written into the turn, or a session without per-round
   commits still ends the run. Requeue (15 min) is the default of every

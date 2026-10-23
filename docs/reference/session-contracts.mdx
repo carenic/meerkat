@@ -753,17 +753,24 @@ the committed authority is preserved.
   cursor inside a committed body never makes a run continuable. A cursor tail
   whose bound inputs were settled, whose run has no bound inputs (a direct or
   machine-service turn), or whose runtime was retired is closed as
-  interrupted. A run that fails and whose inputs are queued for another
-  attempt discards its tail before they requeue, so it starts over from its
-  inputs; a cursor tail left behind with requeued inputs is held for
-  reconciliation, never committed.
+  interrupted. So is the tail of a run settled without continuing: stopped
+  before it continued, refused by a durable worker's resume gate, or kept by
+  a requeue stop past its max age. The abandonment of its inputs commits
+  first, then the tail is closed as interrupted, never discarded. A run that
+  fails and whose inputs are queued for another attempt discards its tail
+  before they requeue, so it starts over from its inputs; a cursor tail left
+  behind with requeued inputs is held for reconciliation, never committed.
 - A completed tail (single run, `EndTurn` terminal, structurally coherent) is
   committed as a recovered run boundary in one atomic store transaction:
   recovered snapshot, boundary receipt, and input terminalization land
   together, so exactly-once holds and the delivery layer never re-runs a
   recovered turn.
 - An interrupted tail is closed as interrupted: content preserved, a typed
-  recovery notice appended, the original run terminalized — never requeued.
+  recovery notice appended, the original run terminalized, never requeued.
+  Since 0.9.5, when the tail's run cursor holds a round's staged model
+  response, the response is written into the transcript before the notice,
+  with an error result for each of its tool calls that says only that the
+  call's outcome is unknown: the calls may have run.
 - Anything else — including any tail carrying a dangling `tool_use` — is held
   intact for reconciliation. A dangling call proves intent, not execution;
   its external side effect may already have fired, so recovery never closes
