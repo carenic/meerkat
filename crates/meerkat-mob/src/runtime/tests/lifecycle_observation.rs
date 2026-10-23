@@ -92,7 +92,8 @@ async fn a_handle_observes_an_in_loop_fail_stop_with_its_recorded_cause() {
         matches!(
             reported.as_ref(),
             MobError::DurabilityFailStop { cause, .. }
-                if cause.to_string().contains("FlowFailed append failed")
+                if cause.to_string().contains("terminal event append failed")
+                    && cause.to_string().contains("FlowFailed")
         ),
         "the in-loop fail-stop's record carries its own cause: {reported:?}"
     );

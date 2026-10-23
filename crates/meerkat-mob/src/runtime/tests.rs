@@ -23217,11 +23217,15 @@ async fn test_rotate_supervisor_pending_commit_conflict_fails_closed_without_loc
     assert!(
         matches!(
             &error,
-            MobError::Internal(reason)
-                if reason.contains("exact reread found divergent supervisor authority")
-                    && reason.contains("fail-stopping for cold recovery")
+            MobError::SharedLifecycleFailure(cause) if matches!(
+                cause.as_ref(),
+                MobError::Internal(reason)
+                    if reason.contains("exact reread found divergent supervisor authority")
+                        && reason.contains("fail-stopping for cold recovery")
+            )
         ),
-        "operation-anchor CAS divergence must be a durable fail-stop, got: {error:?}",
+        "operation-anchor CAS divergence must be a durable fail-stop, its reply the recorded cause \
+         shared, got: {error:?}",
     );
     let after_conflict = runtime_metadata
         .load_supervisor_authority(&mob_id)
@@ -23295,11 +23299,15 @@ async fn test_rotate_supervisor_receipt_checkpoint_conflict_does_not_reauthorize
     assert!(
         matches!(
             &error,
-            MobError::Internal(reason)
-                if reason.contains("exact reread found divergent supervisor authority")
-                    && reason.contains("fail-stopping for cold recovery")
+            MobError::SharedLifecycleFailure(cause) if matches!(
+                cause.as_ref(),
+                MobError::Internal(reason)
+                    if reason.contains("exact reread found divergent supervisor authority")
+                        && reason.contains("fail-stopping for cold recovery")
+            )
         ),
-        "receipt-checkpoint CAS divergence must be a durable fail-stop, got: {error:?}",
+        "receipt-checkpoint CAS divergence must be a durable fail-stop, its reply the recorded cause \
+         shared, got: {error:?}",
     );
     let attempted_public_peer_id = external
         .authorized_supervisor_peer_id()
@@ -57310,10 +57318,11 @@ async fn an_in_loop_durability_fail_stop_reports_why_to_status_and_resume() {
         let MobError::DurabilityFailStop { cause, .. } = failure.as_ref() else {
             panic!("{call} must name the durability fail-stop: {failure:?}");
         };
+        let rendered = cause.to_string();
         assert!(
-            cause.to_string().contains("FlowFailed append failed"),
+            rendered.contains("terminal event append failed") && rendered.contains("FlowFailed"),
             "{call} must name the uncertain mutation, the failed run's terminal event \
-             append: {cause}"
+             append: {rendered}"
         );
     }
 }

@@ -124,7 +124,7 @@ async fn a_returned_cause_is_recorded_and_replied() {
 
 /// A site that forwards an error it did not build (a flow's terminal
 /// commit whose event append failed after the run's terminal status
-/// persisted) records that error as it is.
+/// persisted) records that error as it is: the store's own typed error.
 #[tokio::test]
 async fn a_forwarded_cause_is_recorded_as_it_is() {
     let events = Arc::new(FaultInjectedMobEventStore::new());
@@ -155,9 +155,13 @@ async fn a_forwarded_cause_is_recorded_as_it_is() {
     let record = recorded_fail_stop(&handle).await;
     let cause = cause_of(&handle, &record);
     assert!(
-        matches!(cause.as_ref(), MobError::Internal(message)
-            if message.contains("FlowCompleted append failed")),
-        "the record carries the terminal commit's own error: {cause:?}"
+        matches!(cause.as_ref(), MobError::StorageError(_)),
+        "the record carries the store's own typed error: {cause:?}"
+    );
+    let rendered = cause.to_string();
+    assert!(
+        rendered.contains("terminal event append failed") && rendered.contains("FlowCompleted"),
+        "the record names the terminal commit's failed append: {rendered}"
     );
 }
 
