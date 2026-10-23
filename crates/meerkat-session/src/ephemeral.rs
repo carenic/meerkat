@@ -7831,6 +7831,12 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
             .map_err(|error| (SessionError::Agent(error), None))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "its session-map closure answers with the typed session error and the \
+                  reserved admission guard, the pair this function returns so its caller \
+                  gets the admission back"
+    )]
     async fn start_turn_execution_with_admission_recovering_not_found(
         &self,
         id: &SessionId,
