@@ -1723,6 +1723,19 @@ pub enum MobError {
         restore: MemberCustodyRestore,
         cause: Arc<MobError>,
     },
+
+    /// A spawn of member `member_id` from profile `profile`, which declares
+    /// `durable = true`, on a mob whose session service keeps no persistent
+    /// sessions. A durable member must survive a restart on its session, so
+    /// the spawn is refused before anything is created. Run the mob on a
+    /// persistent realm, or drop `durable` from the profile.
+    #[error(
+        "member {member_id} uses durable profile '{profile}', but the mob's session service keeps no persistent sessions"
+    )]
+    NonDurableService {
+        member_id: AgentIdentity,
+        profile: ProfileName,
+    },
 }
 
 /// Why a member's operator authority ceiling was refused
@@ -2397,6 +2410,12 @@ impl MobError {
                 }
                 Some(data)
             }
+            Self::NonDurableService { member_id, profile } => Some(serde_json::json!({
+                "kind": "mob_non_durable_service",
+                "member_id": member_id.as_str(),
+                "profile": profile.as_str(),
+                "retryable": false,
+            })),
             Self::MemberRegistrationRefused {
                 member_id,
                 session_id,
@@ -2682,6 +2701,11 @@ impl MobError {
                 // A member that cannot be scope-bound (no native session
                 // binding) does not support scope-bound delivery at all.
                 Self::DeliveryScopeUnavailable { .. } => {
+                    Some(meerkat_contracts::ErrorCode::CapabilityUnavailable)
+                }
+                // A durable profile needs persistent sessions, a capability
+                // the mob's session service does not have.
+                Self::NonDurableService { .. } => {
                     Some(meerkat_contracts::ErrorCode::CapabilityUnavailable)
                 }
                 error if error.is_held_before_activation() => {
@@ -3897,6 +3921,33 @@ mod tests {
         }
     }
 
+    /// A durable profile's spawn on a mob without persistent sessions is
+    /// refused typed: a closed refusal under the existing
+    /// `CAPABILITY_UNAVAILABLE` code, naming the member and the profile,
+    /// never retryable as is.
+    #[test]
+    fn a_durable_profile_on_a_non_persistent_mob_is_a_typed_refusal() {
+        let error = MobError::NonDurableService {
+            member_id: AgentIdentity::from("w-1"),
+            profile: ProfileName::from("worker"),
+        };
+        assert_eq!(
+            error.wire_error_code(),
+            Some(meerkat_contracts::ErrorCode::CapabilityUnavailable)
+        );
+        assert_eq!(error.failure_class(), MobFailureClass::MobRejected);
+        let data = error.structured_data().expect("structured data");
+        assert_eq!(data["kind"], "mob_non_durable_service");
+        assert_eq!(data["member_id"], "w-1");
+        assert_eq!(data["profile"], "worker");
+        assert_eq!(data["retryable"], false);
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("w-1") && rendered.contains("worker"),
+            "{rendered}"
+        );
+    }
+
     #[test]
     fn test_all_variants_exist() {
         // Ensures all variants are constructible.
@@ -3982,6 +4033,10 @@ mod tests {
                 session_id: meerkat_core::types::SessionId::new(),
                 restore: MemberCustodyRestore::CleanupDelivery,
                 cause: Arc::new(MobError::Internal("deferred".to_string())),
+            },
+            MobError::NonDurableService {
+                member_id: AgentIdentity::from("m"),
+                profile: ProfileName::from("worker"),
             },
             MobError::MemberReloadTimedOut {
                 session_id: meerkat_core::types::SessionId::new(),

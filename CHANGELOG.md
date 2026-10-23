@@ -515,6 +515,19 @@ them.
   unless the mob's start deferred the member's custody restore. Code that
   builds the result with a struct literal sets it.
 
+- `meerkat-mob`: `Profile` gains `durable: bool` (see Added, durable
+  workers), and so do its wire forms `meerkat_contracts::WireMobProfile`,
+  `MobProfileInput` and `PortableProfile`. A struct literal needs the field;
+  `durable: false` keeps today's behaviour. Serde reads an omitted `durable`
+  as false and writes it only when true, so a stored or sent ordinary profile
+  keeps its bytes, and the adaptive `LayerDecision` schema leaves it out, so
+  packs stay compatible across versions. The wire forms refuse unknown fields,
+  so an older host refuses a profile that sets `durable`. A spawn of a durable
+  profile on a mob whose session service keeps no persistent sessions is
+  refused with the new `MobError::NonDurableService { member_id, profile }`,
+  under the existing `CAPABILITY_UNAVAILABLE` wire code (structured data kind
+  `mob_non_durable_service`).
+
 ### Added
 
 - `MemberBinding::labels()`: the application labels the incarnation was
@@ -1073,6 +1086,18 @@ them.
   and Web SDKs surface it as `{"unknown": value}` and ignore a field they do
   not know, instead of failing the read. A `custody_deferred` that is not an
   object, or whose restore or cause is not a string, is still refused.
+
+- Durable workers: a mob profile with `durable = true` spawns its members as
+  durable workers. The spawn records a durable identity
+  (`SpawnContinuityIntent::DurableIdentity`, keyed by the member's identity),
+  so a host can list and re-attach the worker after a restart
+  (`MobHandle::durable_identity_members`). A mob whose session service keeps
+  no persistent sessions refuses the spawn (`MobError::NonDurableService`)
+  instead of spawning a worker that would not survive one. Like every member
+  of a persisted mob, a durable worker is rebuilt on its session after a
+  crash, kill or restart, and a run it was in continues from its last
+  committed round. An explicit continuity intent on the spawn wins over the
+  profile.
 
 ### Changed
 

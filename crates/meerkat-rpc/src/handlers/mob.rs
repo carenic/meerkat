@@ -293,6 +293,7 @@ fn profile_from_wire(profile: WireMobProfile) -> Result<Profile, meerkat_core::S
         max_inline_peer_notifications: profile.max_inline_peer_notifications,
         output_schema,
         provider_params: profile.provider_params.map(Into::into),
+        durable: profile.durable,
     })
 }
 
@@ -3593,6 +3594,35 @@ mod tests {
     };
     use std::sync::Arc;
 
+    /// A spawn's override profile keeps its durable worker flag across the
+    /// wire form, both ways.
+    #[test]
+    fn override_profile_keeps_the_durable_worker_flag_across_the_wire() {
+        let durable: Profile = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "durable": true
+        }))
+        .expect("durable profile");
+        let wire = meerkat_mob::profile_to_wire(&durable);
+        assert!(wire.durable);
+        assert!(profile_from_wire(wire).expect("decode").durable);
+
+        let ordinary: Profile = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4-5"
+        }))
+        .expect("ordinary profile");
+        let wire = meerkat_mob::profile_to_wire(&ordinary);
+        assert!(!wire.durable);
+        assert!(
+            serde_json::to_value(&wire)
+                .expect("encode")
+                .get("durable")
+                .is_none(),
+            "an ordinary wire profile does not write the field"
+        );
+        assert!(!profile_from_wire(wire).expect("decode").durable);
+    }
+
     fn rpc_destroy_test_definition(mob_id: &MobId) -> MobDefinition {
         let mut profiles = BTreeMap::new();
         profiles.insert(
@@ -3614,6 +3644,7 @@ mod tests {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
+                durable: false,
             })),
         );
         let mut definition = MobDefinition::explicit(mob_id.clone());

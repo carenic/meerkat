@@ -12392,6 +12392,7 @@ mod tests {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
+                durable: false,
             },
             definition_extract: PortableDefinitionExtract {
                 profile_names: vec!["worker".to_string()],

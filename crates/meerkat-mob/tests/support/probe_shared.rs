@@ -545,6 +545,7 @@ pub fn portable_member_spec_for_raw_probe(
             max_inline_peer_notifications: None,
             output_schema: None,
             provider_params: None,
+            durable: false,
         },
         definition_extract: PortableDefinitionExtract {
             models: std::collections::BTreeMap::new(),

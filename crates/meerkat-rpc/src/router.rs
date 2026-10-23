@@ -7422,6 +7422,7 @@ mod tests {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
+                durable: false,
             })),
         );
         let mut definition = meerkat_mob::MobDefinition::explicit(mob_id.clone());
@@ -7482,6 +7483,7 @@ mod tests {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
+                durable: false,
             })),
         );
         let mut definition = meerkat_mob::MobDefinition::explicit(mob_id.clone());
@@ -11256,6 +11258,7 @@ mod tests {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
+                durable: false,
             })),
         );
         let mut definition = meerkat_mob::MobDefinition::explicit(mob_id.clone());

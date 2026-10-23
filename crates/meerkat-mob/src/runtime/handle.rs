@@ -1690,6 +1690,7 @@ pub fn profile_to_wire(profile: &crate::Profile) -> meerkat_contracts::WireMobPr
             .as_ref()
             .map(|schema| schema.as_value().clone()),
         provider_params: profile.provider_params.clone().map(Into::into),
+        durable: profile.durable,
     }
 }
 
@@ -2903,7 +2904,10 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
             mob_dsl::MobSpawnManyFailureObservationKind::SupervisorEscalation
         }
         MobError::UnsupportedForMode { .. }
-        | MobError::ResumeProviderParamsRequireResume { .. } => {
+        | MobError::ResumeProviderParamsRequireResume { .. }
+        // A durable profile is a spawn this mob's session service cannot
+        // honour, the same family as an unsupported runtime mode.
+        | MobError::NonDurableService { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::UnsupportedForMode
         }
         MobError::MissingMemberCapability { .. } => {
@@ -6641,6 +6645,22 @@ pub enum SpawnContinuityIntent {
     DurableIdentity {
         continuity_key: String,
     },
+}
+
+impl SpawnContinuityIntent {
+    /// The intent a spawn of `profile` takes. An explicit durable intent on
+    /// the spawn wins. Otherwise a profile that declares `durable = true`
+    /// turns the default ephemeral intent into a durable identity keyed by
+    /// the member's identity, as identity convergence keys it.
+    #[must_use]
+    pub(crate) fn for_profile(self, profile: &crate::Profile, identity: &AgentIdentity) -> Self {
+        match self {
+            Self::Ephemeral if profile.durable => Self::DurableIdentity {
+                continuity_key: identity.as_str().to_string(),
+            },
+            other => other,
+        }
+    }
 }
 
 /// Build-boundary context supplied to [`SpawnMemberCustomizer`].
@@ -19866,6 +19886,35 @@ impl MemberHandle {
 mod tests {
     use super::*;
     use crate::ids::Generation;
+
+    /// A durable profile turns a spawn's default ephemeral intent into a
+    /// durable identity keyed by the member's identity. An explicit durable
+    /// intent keeps its own key, and an ordinary profile changes nothing.
+    #[test]
+    fn a_durable_profile_turns_the_default_intent_into_a_durable_identity() {
+        let identity = AgentIdentity::from("worker-1");
+        let ordinary: crate::Profile =
+            toml::from_str("model = \"claude-sonnet-4-5\"\n").expect("ordinary profile");
+        let durable: crate::Profile =
+            toml::from_str("model = \"claude-sonnet-4-5\"\ndurable = true\n")
+                .expect("durable profile");
+        let explicit = SpawnContinuityIntent::DurableIdentity {
+            continuity_key: "work-item-7".to_string(),
+        };
+
+        assert_eq!(
+            SpawnContinuityIntent::Ephemeral.for_profile(&durable, &identity),
+            SpawnContinuityIntent::DurableIdentity {
+                continuity_key: "worker-1".to_string(),
+            }
+        );
+        assert_eq!(
+            SpawnContinuityIntent::Ephemeral.for_profile(&ordinary, &identity),
+            SpawnContinuityIntent::Ephemeral
+        );
+        assert_eq!(explicit.clone().for_profile(&durable, &identity), explicit);
+        assert_eq!(explicit.clone().for_profile(&ordinary, &identity), explicit);
+    }
 
     /// A failed fork-context probe is classified by what failed it: a
     /// probe whose bridge request timed out is a transport failure, as

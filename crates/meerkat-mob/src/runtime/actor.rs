@@ -32762,6 +32762,20 @@ impl MobActor {
                 reject_spawn_before_custody!("prepare", error);
             }
         };
+        // A durable profile spawns its member with a durable identity, which
+        // a host reads back to re-attach the worker after a restart. That
+        // needs a session service that keeps sessions, so a mob without one
+        // refuses the spawn before anything exists.
+        if profile.durable && !self.session_service.supports_persistent_sessions() {
+            reject_spawn_before_custody!(
+                "durable_profile",
+                MobError::NonDurableService {
+                    member_id: agent_identity.clone(),
+                    profile: profile_name.clone(),
+                }
+            );
+        }
+        let continuity_intent = continuity_intent.for_profile(&profile, &agent_identity);
 
         // ---------- Off-loop preparation (#1249) ----------
         // Everything below reads durable/session state or builds agent config
@@ -34880,6 +34894,11 @@ impl MobActor {
             build::open_profile_tool_categories_for_inherited_filter(&mut profile);
         }
         let selected_runtime_mode = runtime_mode.unwrap_or(profile.runtime_mode);
+        // A durable profile's placed member carries a durable identity too.
+        // Its member host keeps the sessions, so that host's materialize
+        // preflight, not this mob, refuses one without persistent sessions
+        // (a durable identity requires durable sessions there).
+        let continuity_intent = continuity_intent.for_profile(&profile, &agent_identity);
 
         // §4.1(a) resume/fork normalization: the LOCAL resume fast-path is
         // skipped — member-side validation is authoritative (§19.L1). Fork
@@ -36404,6 +36423,16 @@ impl MobActor {
         if let Some(model) = model_override.as_ref() {
             profile.model.clone_from(model);
         }
+        // A policy auto-spawn of a durable profile is a durable worker like
+        // any other spawn of it (see `enqueue_spawn_with_origin`): refused
+        // before anything exists on a mob without persistent sessions.
+        if profile.durable && !self.session_service.supports_persistent_sessions() {
+            return Err(MobError::NonDurableService {
+                member_id: agent_identity.clone(),
+                profile: profile_name.clone(),
+            });
+        }
+        let continuity_intent = continuity_intent.for_profile(&profile, agent_identity);
         super::spec_compiler::apply_tool_category_overrides(&mut profile, tool_category_overrides);
         // ADJ-6: explicit fact captured before the inherited-open mutation.
         let explicit_workgraph = profile.tools.workgraph;
