@@ -1440,6 +1440,18 @@ them.
   fork child placed on a host of 0.9.4 or earlier without an initial
   message still receives no fork context.
 
+- `meerkat-core`, `meerkat-sqlite`, `meerkat-runtime`, `meerkat-session`,
+  `meerkat-authorization`, `meerkat-auth-core`: a file lock released by its
+  holder is now unlocked before its file closes: config document custody,
+  session hosting claims and the cold-delivery owner lock, the SQLite
+  maintenance fence with its operation and presence guards, runtime
+  execution custody, the durable grant owner's lease, the credential
+  refresh lock and the session event sequence lock. A process spawned
+  meanwhile holds a copy of the holder's descriptor until it executes its
+  program, and that copy kept a lock released by the close alone, so a
+  single-try claim right after the release could be refused as held (for
+  example, a governed MCP decision refused as not current).
+
 ## [0.9.4] - 2026-10-20
 
 ### Breaking
