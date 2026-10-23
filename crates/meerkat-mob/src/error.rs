@@ -641,7 +641,9 @@ pub enum MobError {
     /// The member's retirement durably started and then stopped at `stage`
     /// with the typed `cause`. The member stays `Retiring`, owned by the mob
     /// actor's stuck-retirement registry. Retrying a plain retirement does not
-    /// drive it; `MobHandle::redrive_retirement` or a mob resume does.
+    /// drive it; `MobHandle::redrive_retirement` or a mob resume does. Its
+    /// structured data carries the cause's text as `cause` and, when the
+    /// cause has structured data, that data as `cause_data`.
     #[error("member retirement for '{member_id}' is stuck at {stage}: {cause}")]
     MemberRetirementStuck {
         member_id: AgentIdentity,
@@ -1568,8 +1570,11 @@ pub enum MobError {
     /// (`RuntimeDriverError::RecoveryRepairBlocked`), for example while a
     /// boundary commit past its deadline has not reported its durable
     /// outcome. Retryable: once the runtime's evidence settles, a redrive of
-    /// the retirement reloads the member and continues. The retire path
-    /// answers it, usually as the cause of a stuck retirement;
+    /// the retirement reloads the member and continues. A retirement's
+    /// ingress detach that the runtime refuses as repair-blocked, because the
+    /// member session degraded after the stage's reload check, answers it
+    /// too, with the refusal's own fields. The retire path answers it,
+    /// usually as the cause of a stuck retirement;
     /// `MobHandle::reload_member_registration` answers
     /// [`MobError::MemberReloadRefused`] for the same runtime refusal, and a
     /// caller treats both alike. The fields mirror the destroy report's
@@ -1992,15 +1997,25 @@ impl MobError {
                 member_id,
                 stage,
                 cause,
-            } => Some(serde_json::json!({
-                "kind": "mob_retirement_stuck",
-                "member_id": member_id.as_str(),
-                "stage": stage,
-                "cause": cause.to_string(),
-                "retryable": false,
-                "redrive": true,
-                "authority_retained": true,
-            })),
+            } => {
+                let mut data = serde_json::json!({
+                    "kind": "mob_retirement_stuck",
+                    "member_id": member_id.as_str(),
+                    "stage": stage,
+                    "cause": cause.to_string(),
+                    "retryable": false,
+                    "redrive": true,
+                    "authority_retained": true,
+                });
+                // The cause's own data, so a client routes on its kind
+                // rather than on the cause's text.
+                if let (Some(cause_data), Some(fields)) =
+                    (cause.structured_data(), data.as_object_mut())
+                {
+                    fields.insert("cause_data".to_string(), cause_data);
+                }
+                Some(data)
+            }
             Self::MemberRetirementAdmissionPending { member_id, stage } => {
                 Some(serde_json::json!({
                     "kind": "mob_retirement_admission_pending",
@@ -2774,6 +2789,70 @@ mod tests {
                 .structured_data()
                 .and_then(|data| data.get("evidence_digest").cloned()),
             Some(serde_json::json!("digest"))
+        );
+    }
+
+    /// A stuck retirement's wire data carries its cause's structured data
+    /// beside the cause's text, so a client tells "redrive later" from
+    /// "reload the member, then redrive" without parsing text. A cause
+    /// without structured data adds no key, and the rest is unchanged.
+    #[test]
+    fn a_stuck_retirement_carries_its_typed_cause_data_beside_its_text() {
+        let member_id = AgentIdentity::from("member");
+        let typed_causes = [
+            MobError::MemberReloadRepairBlocked {
+                session_id: meerkat_core::types::SessionId::new(),
+                reason: "commit outcome not reported".to_string(),
+                evidence_digest: None,
+            },
+            MobError::MemberReloadRequired {
+                member_id: member_id.clone(),
+                reason: "durability reload required".to_string(),
+            },
+        ];
+        for cause in typed_causes {
+            let cause_text = cause.to_string();
+            let cause_data = cause
+                .structured_data()
+                .expect("a typed cause has structured data");
+            let stuck = MobError::MemberRetirementStuck {
+                member_id: member_id.clone(),
+                stage: "retire-ingress-detach".to_string(),
+                cause: Arc::new(cause),
+            };
+            assert_eq!(
+                stuck.structured_data(),
+                Some(serde_json::json!({
+                    "kind": "mob_retirement_stuck",
+                    "member_id": "member",
+                    "stage": "retire-ingress-detach",
+                    "cause": cause_text,
+                    "cause_data": cause_data,
+                    "retryable": false,
+                    "redrive": true,
+                    "authority_retained": true,
+                }))
+            );
+        }
+        let untyped = MobError::Internal("failed to detach peer ingress".to_string());
+        let cause_text = untyped.to_string();
+        let stuck = MobError::MemberRetirementStuck {
+            member_id,
+            stage: "retire-ingress-detach".to_string(),
+            cause: Arc::new(untyped),
+        };
+        assert_eq!(
+            stuck.structured_data(),
+            Some(serde_json::json!({
+                "kind": "mob_retirement_stuck",
+                "member_id": "member",
+                "stage": "retire-ingress-detach",
+                "cause": cause_text,
+                "retryable": false,
+                "redrive": true,
+                "authority_retained": true,
+            })),
+            "a cause without structured data adds no cause_data key"
         );
     }
 

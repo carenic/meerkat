@@ -146,6 +146,14 @@ them.
   `SessionBusy`, as for `MemberReloadRefused`, which
   `MobHandle::reload_member_registration` still answers for the same
   refusal.
+- `meerkat-mob`: the structured data of `MobError::MemberRetirementStuck`
+  (kind `mob_retirement_stuck`) gains `cause_data`, the cause's own
+  structured data, when the cause has some: for example kind
+  `mob_member_reload_repair_blocked` for a retirement whose member reload
+  the runtime refused, which a redrive completes once the runtime's
+  evidence settles. A client routes on that kind instead of parsing the
+  `cause` text, which is unchanged; a cause without structured data adds
+  no key.
 - `meerkat-schedule`: `ScheduleTargetDelivery::deliver_existing_occurrence`,
   a defaulted method the driver calls to redeliver a reclaimed occurrence
   whose earlier attempt recorded its dispatch, with `ExistingDelivery`
@@ -189,6 +197,20 @@ them.
 
 ### Fixed
 
+- `meerkat-mob`: a member retirement whose member session degraded after
+  its quiesce stage, for example a retire that waited there on a boundary
+  commit that then passed its deadline, no longer sticks at its ingress
+  detach. The runtime refused the detach of the degraded session
+  (`RuntimeDriverError::RecoveryRepairBlocked`), the retirement stuck with
+  an internal error, and a manual reload of the retiring member was refused
+  too. The ingress detach now reloads the member session first, through the
+  same durability reload as the quiesce stage and a destroy, and detaches
+  the cold successor that reload published, so the retirement completes (on
+  a plain retry when the caller's wait ended first). When the runtime
+  refuses that reload as repair-blocked, or the session degrades after the
+  stage's reload check, the retirement sticks with the typed
+  `MobError::MemberReloadRepairBlocked`, and a redrive completes it once the
+  runtime's evidence settles.
 - A turn that compacts its history more often than
   `[compaction] history_retained_rewrites` keeps (five or more compactions at
   the default of 4) no longer ends at its intra-turn checkpoint on a

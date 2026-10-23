@@ -1251,6 +1251,18 @@ with the refusal as text. Redrive the retirement with
 `MobHandle::redrive_retirement` once the boundary commit has reported its
 outcome; the redrive reloads the member and completes the retirement.
 
+A retire that started before the member degraded waits at its quiesce stage
+on the boundary commit instead, and reaches its ingress detach once the
+commit reports, with the member still degraded. Since 0.9.5 the ingress
+detach reloads the member as the quiesce does and retires the cold successor,
+so the retirement completes: retry a retire that answered
+`MemberRetirementInProgress`. When the runtime refuses that reload as
+repair-blocked, or the member degrades just after the stage's reload check,
+the retirement sticks with the same `MemberReloadRepairBlocked` cause; redrive
+it. Since 0.9.5 the stuck error's own data (kind `mob_retirement_stuck`)
+carries the cause's data as `cause_data`, so a client routes on the cause's
+kind rather than on its text.
+
 ### Admission in custom Rust session services
 
 A custom `MobSessionService` that executes standalone turns must implement

@@ -2560,8 +2560,17 @@ const HUNG_COMMIT_BUSY_WINDOW: Duration = Duration::from_secs(1);
 /// A forked child whose terminal boundary commit waits at the store, which
 /// never answers until the test releases it.
 async fn fork_child_whose_boundary_commit_hangs(child: &str) -> GatedChild {
-    let gated =
-        fork_child_at_its_gated_turn_measured_in(child, Some(HUNG_COMMIT_BUSY_WINDOW)).await;
+    fork_child_whose_boundary_commit_hangs_measured_in(child, HUNG_COMMIT_BUSY_WINDOW).await
+}
+
+/// [`fork_child_whose_boundary_commit_hangs`] with the store's declaration
+/// measured in `busy_window`: the member's session degrades two of them after
+/// the commit entered the store.
+async fn fork_child_whose_boundary_commit_hangs_measured_in(
+    child: &str,
+    busy_window: Duration,
+) -> GatedChild {
+    let gated = fork_child_at_its_gated_turn_measured_in(child, Some(busy_window)).await;
     gated
         .store
         .arm(meerkat_runtime::LogicalRuntimeId::for_session(
@@ -2876,6 +2885,181 @@ async fn a_retire_whose_member_reload_the_runtime_refuses_sticks_with_the_refusa
     .await
     .expect("the redriven retirement finishes")
     .expect("the redriven retirement reloads the member and retires it");
+    assert!(
+        handle
+            .get_member(&held.child)
+            .await
+            .expect("the roster answers")
+            .is_none(),
+        "the retired member left the roster"
+    );
+}
+
+/// The busy window of the rows whose retire must start before the member's
+/// session degrades: its deadline, two of them, leaves the retire's admission
+/// and first stages ample time to reach the quiesce first.
+const DEGRADING_RETIRE_BUSY_WINDOW: Duration = Duration::from_secs(3);
+
+/// Start a retire of `held`'s member before its session degrades: the
+/// retirement waits at its quiesce stage for the hung commit, and the
+/// session degrades at the store's deadline meanwhile.
+async fn retire_before_the_member_degrades(held: &GatedChild, handle: &meerkat_mob::MobHandle) {
+    let started = tokio::time::timeout(DEGRADED_DESTROY_BOUND, handle.retire(held.child.clone()))
+        .await
+        .expect("the retire answers while the store has not");
+    assert!(
+        matches!(
+            &started,
+            Err(meerkat_mob::MobError::MemberRetirementInProgress { stage, .. })
+                if stage == "retire-runtime-quiesce"
+        ),
+        "a retire started before the commit's deadline waits at its quiesce: {started:?}"
+    );
+    assert!(
+        held.runtime
+            .durability_reload_required(&held.child_session)
+            .await
+            .is_some(),
+        "the member's session degraded while the retire waited"
+    );
+}
+
+/// Retire `held`'s member until its retirement answers other than in
+/// progress, within the caller's bound.
+async fn retire_until_settled(
+    held: &GatedChild,
+    handle: &meerkat_mob::MobHandle,
+) -> Result<(), meerkat_mob::MobError> {
+    tokio::time::timeout(DEGRADED_DESTROY_BOUND, async {
+        loop {
+            match handle.retire(held.child.clone()).await {
+                Err(meerkat_mob::MobError::MemberRetirementInProgress { .. }) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                other => return other,
+            }
+        }
+    })
+    .await
+    .expect("the retirement settles within the bound")
+}
+
+/// A retire that started before its member's session degraded behind a
+/// boundary commit the store has not answered waits at its quiesce stage for
+/// the commit. Once the commit reports, the retirement reaches its ingress
+/// detach with the session still degraded. The stage reloads the member's
+/// registration first, as the quiesce does, and detaches the cold successor,
+/// so a plain retry completes the retirement with no manual reload. Before,
+/// the runtime refused the detach and the retirement stuck there.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retire_whose_member_degraded_while_it_waited_completes_once_the_commit_reports() {
+    let held = fork_child_whose_boundary_commit_hangs_measured_in(
+        "retire-detach-child",
+        DEGRADING_RETIRE_BUSY_WINDOW,
+    )
+    .await;
+    let handle = held
+        .fixture
+        .state
+        .handle_for(&held.fixture.source_mob_id())
+        .await
+        .unwrap();
+    retire_before_the_member_degrades(&held, &handle).await;
+    held.store.release();
+
+    retire_until_settled(&held, &handle)
+        .await
+        .expect("the retirement reloads the degraded member at its ingress detach and completes");
+    assert!(
+        handle
+            .get_member(&held.child)
+            .await
+            .expect("the roster answers")
+            .is_none(),
+        "the retired member left the roster"
+    );
+    assert!(
+        held.runtime
+            .current_session_registration_witness(&held.child_session)
+            .await
+            .is_none(),
+        "no registration of the member's session remains"
+    );
+    assert!(
+        matches!(
+            held.runtime.peer_ingress_owner(&held.child_session).await,
+            meerkat_runtime::PeerIngressOwner::Unattached
+        ),
+        "the member's session has no peer ingress owner"
+    );
+}
+
+/// A retire whose reload at its ingress detach has not settled when the
+/// caller's budget ends answers that the retirement is in progress at its
+/// ingress detach, retryable by a plain retry; it does not stick. Once the
+/// reload settles, a plain retry completes the retirement.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retire_whose_ingress_reload_is_held_answers_in_progress_until_it_settles() {
+    let held = fork_child_whose_boundary_commit_hangs_measured_in(
+        "retire-held-reload-child",
+        DEGRADING_RETIRE_BUSY_WINDOW,
+    )
+    .await;
+    let handle = held
+        .fixture
+        .state
+        .handle_for(&held.fixture.source_mob_id())
+        .await
+        .unwrap();
+    retire_before_the_member_degrades(&held, &handle).await;
+    let (reload_entered, release_reload) = held
+        .runtime
+        .arm_reload_required_discard_before_mutation_gate_test_hook(held.child_session.clone());
+    held.store.release();
+
+    tokio::time::timeout(DEGRADED_DESTROY_BOUND, async {
+        loop {
+            match handle.retire(held.child.clone()).await {
+                Err(meerkat_mob::MobError::MemberRetirementInProgress { stage, .. })
+                    if stage == "retire-ingress-detach" =>
+                {
+                    return;
+                }
+                Err(meerkat_mob::MobError::MemberRetirementInProgress { .. }) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                other => panic!("the retire waits on its held ingress reload: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the retirement reaches its ingress detach");
+    tokio::time::timeout(DEGRADED_DESTROY_BOUND, reload_entered)
+        .await
+        .expect("the ingress detach reloads the degraded member")
+        .expect("the held reload's hook stays armed until it is entered");
+    let waiting = handle.retire(held.child.clone()).await;
+    assert!(
+        matches!(
+            &waiting,
+            Err(meerkat_mob::MobError::MemberRetirementInProgress { stage, .. })
+                if stage == "retire-ingress-detach"
+        ),
+        "a retire while the reload is held is in progress, not stuck: {waiting:?}"
+    );
+    assert!(
+        waiting
+            .as_ref()
+            .is_err_and(meerkat_mob::MobError::is_retirement_in_progress),
+        "{waiting:?}"
+    );
+
+    release_reload
+        .send(())
+        .expect("the held reload waits for its release");
+    retire_until_settled(&held, &handle)
+        .await
+        .expect("a plain retry completes the retirement once the reload settles");
     assert!(
         handle
             .get_member(&held.child)
