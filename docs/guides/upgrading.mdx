@@ -258,10 +258,16 @@ a crash (see [Durable Runs](/guides/durable-runs)). Integrations see:
     gains `MarkRunResumable`, `ResumeRun`, `ReleaseResumableRun`,
     `SettleResumableRun`, `ReplayAppliedRunContributor`,
     `SuspendRunForStop` and `AuthorizeOperatorDurableTailRepair`, and
-    `NormalizeRecoveredInputLifecycle` gains
-    `bound_run_resumable`; `MeerkatMachineEffect` gains `ResumableRunMarked`,
+    `NormalizeRecoveredInputLifecycle` gains `bound_run_resumable`;
+    `MeerkatMachineEffect` gains `ResumableRunMarked`,
     `ResumedRunAuthorized`, `ResumableRunReleased`, `ResumableRunSettled`
     and `RunSuspendedForStop`;
+  - `meerkat-runtime`'s `MeerkatMachineRuntimeInternalInput` gains
+    `MarkRunResumable`, `ResumeRun`, `ReleaseResumableRun`,
+    `SettleResumableRun`, `SuspendRunForStop`,
+    `ReplayAppliedRunContributor` and `AuthorizeOperatorDurableTailRepair`,
+    appended last; the enum is exhaustive, so a match outside the crate
+    needs the arms;
   - the generated transition enums gain the per-phase transitions of these
     inputs, among them the `SuspendRunForStop` arms,
     `ClassifyDurableTailContinuable` and
@@ -276,8 +282,8 @@ over a store that accepts only strict continuations implements
 and a `RuntimeStore` decorator forwards
 `commit_prepared_whole_blob_run_rebase` and
 `supports_whole_blob_run_rebase`. Handle `run_resumed` where you consume
-events. Where you build these machine
-inputs or state literals, pass `DurableTailRunCursor::Absent` and `false` to
+events. Where you build these machine inputs or state literals, pass
+`DurableTailRunCursor::Absent` and `false` to
 `ClassifyDurableTail`, `None` for `resumable_run_id` and `false` for
 `bound_run_resumable` (a tail without a run cursor, the 0.9.4 behaviour),
 and add the arms (or a wildcard) where you match the enums exhaustively.
@@ -450,8 +456,9 @@ WebSocket, and keep WebRTC for sessions that are not mob members.
   `rkat session resolve-held-tail <id> [--apply] [--runtime-store <FILE>] [--json]`
   or `meerkat_runtime::recovery::resolve_held_durable_tail`. The dry run is
   the default; applied, it commits the tail as interrupted with every row
-  kept and each call without a result answered `outcome_uncertain`, while
-  the runtime is stopped. 0.9.4 had no path out of such a hold. See
+  kept and each call without a result answered `outcome_uncertain`, once
+  every host of the session is stopped. 0.9.4 had no path out of such a
+  hold. See
   [Storage Operations](/guides/storage-operations#resolve-a-durable-tail-held-for-recovery).
 - **Host stores:** a host can keep a realm's durable state in its own
   database through the host store SPI (`meerkat_core::host_store`), checked
