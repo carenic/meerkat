@@ -498,7 +498,7 @@ pub(crate) fn pin_inline(value: &[u8]) -> PinnedV1 {
 mod tests {
     use super::*;
 
-    // UNRUN (Policy v1.1): written for the frozen candidate.
+    // Unrun until the candidate's validation.
     #[test]
     fn rows_round_trip_every_operation_and_split_at_the_row_limit() {
         let chunk = ChunkRef {
@@ -529,7 +529,7 @@ mod tests {
         assert_eq!(unpacked.len(), rows.len());
     }
 
-    // UNRUN (Policy v1.1).
+    // Unrun until the candidate's validation.
     #[test]
     fn scope_names_are_injective_bounded_and_verified() {
         let long = "k".repeat(1000);
@@ -545,7 +545,7 @@ mod tests {
         assert_ne!(key_part(&lookalike), key_part(&long));
     }
 
-    // UNRUN (Policy v1.1).
+    // Unrun until the candidate's validation.
     #[test]
     fn heads_refuse_an_unknown_format() {
         let head = ScopeHeadV1 {

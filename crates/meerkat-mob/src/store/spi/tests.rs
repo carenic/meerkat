@@ -1,5 +1,5 @@
-//! Rows for the mob host store adapter. UNRUN (Policy v1.1): written for the
-//! frozen candidate, which the validation owner runs.
+//! Rows for the mob host store adapter, unrun until the candidate's
+//! validation.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -284,7 +284,7 @@ fn event(kind: MobEventKind, timestamp: Option<DateTime<Utc>>) -> NewMobEvent {
     }
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[tokio::test]
 async fn reopen_restores_the_exact_export_after_each_mutating_call() {
     let host = Arc::new(MemoryHost::default());
@@ -367,7 +367,7 @@ async fn reopen_restores_the_exact_export_after_each_mutating_call() {
     );
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[tokio::test]
 async fn a_write_over_two_scopes_commits_one_batch() {
     let host = Arc::new(MemoryHost::default());
@@ -411,7 +411,7 @@ async fn a_write_over_two_scopes_commits_one_batch() {
     );
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[tokio::test]
 async fn an_event_append_writes_only_the_new_event() {
     let host = Arc::new(MemoryHost::default());
@@ -442,7 +442,7 @@ async fn an_event_append_writes_only_the_new_event() {
     );
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[tokio::test]
 async fn a_failed_batch_poisons_its_scopes_and_only_them() {
     let host = Arc::new(MemoryHost::default());
@@ -490,7 +490,7 @@ async fn a_failed_batch_poisons_its_scopes_and_only_them() {
         .expect("another storage appends");
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[tokio::test]
 async fn subscribers_receive_committed_events_in_cursor_order() {
     let host = Arc::new(MemoryHost::default());
@@ -511,7 +511,7 @@ async fn subscribers_receive_committed_events_in_cursor_order() {
     assert_eq!(cursors, vec![1, 2, 3]);
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[tokio::test]
 async fn the_mob_families_are_claimed_once_per_realm() {
     let host = Arc::new(MemoryHost::default());
@@ -539,7 +539,7 @@ async fn the_mob_families_are_claimed_once_per_realm() {
     );
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[test]
 fn entries_of_an_unknown_format_are_refused() {
     let newer = br#"{"v":2,"d":{"mob_id":null,"finalized":false}}"#;
@@ -561,7 +561,7 @@ fn entries_of_an_unknown_format_are_refused() {
     );
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[test]
 fn keyed_entry_names_are_injective_and_verified() {
     let left = hashed_name(G_SUPERVISOR, &MobId::from("a/b")).expect("name");

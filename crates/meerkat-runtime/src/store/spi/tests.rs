@@ -1,5 +1,5 @@
-//! Rows for the host store adapters. UNRUN (Policy v1.1): written for the
-//! frozen candidate; none has been compiled or run.
+//! Rows for the host store adapters, unrun until the candidate's
+//! validation.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -61,7 +61,7 @@ fn delivery_record(sequence: u64) -> RuntimeDeliveryStoreRecord {
     )
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[tokio::test]
 async fn writes_reach_the_host_and_a_reopen_sees_the_same_full_export() {
     let host = Arc::new(TestHost::new());
@@ -137,7 +137,7 @@ async fn writes_reach_the_host_and_a_reopen_sees_the_same_full_export() {
     assert_eq!(authorities.len(), 1);
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[tokio::test]
 async fn a_body_recovery_does_not_need_stays_on_the_host_until_first_use() {
     let host = Arc::new(TestHost::new());
@@ -192,7 +192,7 @@ async fn a_body_recovery_does_not_need_stays_on_the_host_until_first_use() {
     assert!(reopened.1.runtime_loaded_for_test("quiet").await);
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[tokio::test]
 async fn a_failed_batch_poisons_its_scopes_and_nothing_else() {
     let host = Arc::new(TestHost::new());
@@ -228,7 +228,7 @@ async fn a_failed_batch_poisons_its_scopes_and_nothing_else() {
     );
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[tokio::test]
 async fn an_unknown_outcome_that_landed_settles_from_the_head() {
     let host = Arc::new(TestHost::new());
@@ -253,7 +253,7 @@ async fn an_unknown_outcome_that_landed_settles_from_the_head() {
         .expect("next version");
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[tokio::test]
 async fn an_unavailable_store_is_retried_with_the_same_commit_id() {
     let host = Arc::new(TestHost::new());
@@ -269,14 +269,18 @@ async fn an_unavailable_store_is_retried_with_the_same_commit_id() {
     assert_eq!(host.commit_count(), 1);
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[tokio::test(start_paused = true)]
 async fn a_failed_renew_stops_writes_before_memory_changes() {
     let timing = FenceTiming::try_new(Duration::from_secs(1), Duration::from_secs(3)).unwrap();
     let host = Arc::new(TestHost::with_timing(timing));
     let (realm, store) = open(&host).await;
-    // The background renew fails, then the synchronous one fails too.
-    host.faults.lock().unwrap().renew_unavailable = 2;
+    // The background renew fails, then the re-acquire fails too.
+    {
+        let mut faults = host.faults.lock().unwrap();
+        faults.renew_unavailable = 1;
+        faults.acquire_unavailable = 1;
+    }
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert!(
         !realm.lease_is_live(),
@@ -301,7 +305,7 @@ async fn a_failed_renew_stops_writes_before_memory_changes() {
     );
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[tokio::test(start_paused = true)]
 async fn an_exclusive_open_refuses_a_live_holder_and_a_takeover_waits_out_its_lease() {
     let host = Arc::new(TestHost::new());
@@ -323,7 +327,7 @@ async fn an_exclusive_open_refuses_a_live_holder_and_a_takeover_waits_out_its_le
     assert!(second.fence() > first.fence());
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[tokio::test]
 async fn both_adapters_share_one_fence() {
     let host = Arc::new(TestHost::new());
@@ -386,7 +390,7 @@ async fn reload(
     (realm, image)
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[tokio::test]
 async fn an_oversized_value_lives_in_a_chunk_that_dies_with_it() {
     let host = Arc::new(TestHost::new());
@@ -425,7 +429,7 @@ async fn an_oversized_value_lives_in_a_chunk_that_dies_with_it() {
     );
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[tokio::test]
 async fn a_change_set_over_the_batch_limit_spills_and_reloads() {
     let host = Arc::new(TestHost::new());
@@ -452,7 +456,7 @@ async fn a_change_set_over_the_batch_limit_spills_and_reloads() {
     assert_eq!(image, expected);
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[tokio::test]
 async fn a_checkpoint_drops_every_earlier_row_in_one_batch() {
     let host = Arc::new(TestHost::new());
@@ -489,7 +493,7 @@ async fn a_checkpoint_drops_every_earlier_row_in_one_batch() {
     assert_eq!(image.get("hot"), Some(&value(round)));
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[tokio::test]
 async fn a_deleted_scope_comes_back_under_a_new_name() {
     let host = Arc::new(TestHost::new());
@@ -513,7 +517,7 @@ async fn a_deleted_scope_comes_back_under_a_new_name() {
     assert_ne!(first, second);
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[tokio::test]
 async fn mob_host_bindings_follow_the_sqlite_store() {
     let host = Arc::new(TestHost::new());
@@ -600,7 +604,7 @@ async fn mob_host_bindings_follow_the_sqlite_store() {
     assert_eq!(store.load_mob_host_binding("another").await.unwrap(), None);
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[tokio::test]
 async fn controller_custody_refuses_while_a_commit_is_in_flight() {
     let host = Arc::new(TestHost::new());
@@ -634,16 +638,16 @@ async fn controller_custody_refuses_while_a_commit_is_in_flight() {
     assert!(RuntimeStore::try_controller_mutation_custody(&*store, &claim).is_ok());
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[tokio::test]
 async fn a_host_declared_self_fence_margin_bounds_the_write_window() {
     use meerkat_core::host_store::SelfFence;
     let timing = FenceTiming::try_with_margin(
-        Duration::from_secs(10),
+        Duration::from_secs(5),
         Duration::from_secs(30),
         Duration::from_secs(12),
     )
-    .expect("a 12 s margin on a 30 s lease");
+    .expect("a 12 s margin on a 30 s lease at 5 s renews");
     let host = Arc::new(TestHost::with_timing(timing));
     let (realm, store) = open(&host).await;
     let window = realm.window();
@@ -651,4 +655,100 @@ async fn a_host_declared_self_fence_margin_bounds_the_write_window() {
     assert!(window.is_open());
     let fence = RuntimeStore::self_fence(&store).expect("a host store realm fences itself");
     assert_eq!(fence.window().window, Duration::from_secs(18));
+}
+
+// Unrun until the candidate's validation. The K3 re-acquire rule, with the
+// visibility-lag counterexample: renews fail from some point, the lease
+// lapses, another process acquires, and the old writer's connection comes
+// back. A renew that now succeeded would prove nothing (the new acquire may
+// have missed the last renew), so the old writer never resumes on a renew:
+// it tries a fresh acquire, finds the new holder, and stays down.
+#[tokio::test(start_paused = true)]
+async fn a_writer_that_stopped_never_resumes_on_a_later_renew() {
+    let timing = FenceTiming::try_new(Duration::from_secs(1), Duration::from_secs(3)).unwrap();
+    let host = Arc::new(TestHost::with_timing(timing));
+    let (old_realm, old_store) = open(&host).await;
+    host.faults.lock().unwrap().renew_unavailable = 1;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !old_realm.lease_is_live(),
+        "the failed renew stopped the old writer"
+    );
+    // Its lease lapses and a new process acquires.
+    host.expire_lease();
+    let (new_realm, _new_store) = open(&host).await;
+    assert!(new_realm.fence() > old_realm.fence());
+    // The old writer's next tick re-acquires, meets the new holder, and
+    // poisons itself; it never wrote again.
+    let before = host.commit_count();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert!(!old_realm.lease_is_live());
+    let refused = old_store
+        .persist_input_state(
+            &LogicalRuntimeId::new("late"),
+            &persistable(StoredInputState::new_accepted(InputId::new())),
+        )
+        .await;
+    assert!(refused.is_err());
+    assert!(old_realm.realm_poisoned().is_some());
+    assert_eq!(host.commit_count(), before);
+}
+
+// Unrun until the candidate's validation.
+#[tokio::test(start_paused = true)]
+async fn a_stopped_writer_reacquires_and_resumes_when_nothing_changed() {
+    let timing = FenceTiming::try_new(Duration::from_secs(1), Duration::from_secs(3)).unwrap();
+    let host = Arc::new(TestHost::with_timing(timing));
+    let (realm, store) = open(&host).await;
+    let first = realm.fence();
+    host.faults.lock().unwrap().renew_unavailable = 1;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(!realm.lease_is_live());
+    // The next tick re-acquires over its own still-recorded lease.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert!(realm.lease_is_live());
+    assert!(realm.fence() > first, "a fresh token");
+    store
+        .persist_input_state(
+            &LogicalRuntimeId::new("resumed"),
+            &persistable(StoredInputState::new_accepted(InputId::new())),
+        )
+        .await
+        .expect("writes resume under the new token");
+}
+
+// Unrun until the candidate's validation.
+#[tokio::test(start_paused = true)]
+async fn a_stopped_writer_finds_a_foreign_write_and_stays_down() {
+    let timing = FenceTiming::try_new(Duration::from_secs(1), Duration::from_secs(3)).unwrap();
+    let host = Arc::new(TestHost::with_timing(timing));
+    let (old_realm, old_store) = open(&host).await;
+    host.faults.lock().unwrap().renew_unavailable = 1;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // Another process writes while the old writer is stopped, then dies.
+    host.expire_lease();
+    {
+        let (other_realm, other_store) = open(&host).await;
+        other_store
+            .persist_input_state(
+                &LogicalRuntimeId::new("foreign"),
+                &persistable(StoredInputState::new_accepted(InputId::new())),
+            )
+            .await
+            .unwrap();
+        drop(other_store);
+        drop(other_realm);
+    }
+    host.expire_lease();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert!(
+        old_realm.realm_poisoned().is_some(),
+        "a foreign batch since the stop keeps the old writer down"
+    );
+    assert!(
+        old_store
+            .load_input_states(&LogicalRuntimeId::new("foreign"))
+            .await
+            .is_err()
+    );
 }

@@ -46,6 +46,8 @@ pub(crate) struct Faults {
     pub(crate) conflict: u32,
     /// Renews that answer `Unavailable`.
     pub(crate) renew_unavailable: u32,
+    /// Acquires that answer `Unavailable`.
+    pub(crate) acquire_unavailable: u32,
 }
 
 /// The test host store.
@@ -109,6 +111,13 @@ impl TestHost {
 #[async_trait]
 impl HostStore for TestHost {
     async fn acquire_fence(&self, mode: AcquireMode) -> Result<FenceGrant, HostStoreError> {
+        {
+            let mut faults = self.faults();
+            if faults.acquire_unavailable > 0 {
+                faults.acquire_unavailable -= 1;
+                return Err(HostStoreError::Unavailable("injected".into()));
+            }
+        }
         let now = Instant::now();
         let mut state = self.state();
         let remaining = state

@@ -26,14 +26,18 @@
 //!   before the realm serves anything.
 //! - A background task renews once per the host's renew interval
 //!   ([`HostStore::fence_timing`]). A fenced out answer poisons the realm;
-//!   any other failed renew stops writes until a renew succeeds.
+//!   any other failed renew, or a window seen closed, STOPS the writer, and
+//!   a stopped writer never resumes on a later renew: it re-acquires the
+//!   fence (exclusive; its own still-recorded lease is superseded) and
+//!   resumes only when a fresh listing shows no batch it did not write.
+//!   Another live holder, or a foreign batch, poisons the realm.
 //! - **Self-fence on the local clock:** a mutation runs only while the last
 //!   renew did not fail and the last successful acquire or renew *started*
 //!   less than the lease minus the host-declared margin ago
 //!   ([`FenceTiming::self_fence_window`]). The realm is the process's
 //!   [`SelfFence`]: the run loop reads the same window right before each
-//!   model call and each tool dispatch. Otherwise the call
-//!   renews synchronously first, and refuses when that fails. In the steady
+//!   model call and each tool dispatch. Otherwise the call re-acquires
+//!   first, and refuses when that fails. In the steady
 //!   state this is a local clock read: no store I/O is added to a round.
 //!   Every per-round commit of a run (commits A and B) is such a mutation,
 //!   so a writer past its window dispatches no tool and makes no model call
@@ -489,14 +493,25 @@ pub struct SpiRealm {
     /// How long after the start of the last successful acquire or renew
     /// this writer may write (the lease minus the self-fence margin).
     self_fence_window: Duration,
-    fence: FenceToken,
+    /// The token this writer commits with; a re-acquire replaces it.
+    fence: AtomicU64,
     /// What the open waited out of a superseded holder's lease.
     superseded_lease: Duration,
     writer: String,
     counter: AtomicU64,
     lease_start: StdMutex<Instant>,
-    renew_failed: AtomicBool,
+    /// Set when a renew failed or the window was seen closed; cleared only
+    /// by a fresh fenced acquire (the K3 re-acquire rule), never by a renew.
+    stopped: AtomicBool,
+    /// Commits hold it shared; a re-acquire holds it exclusive, so no batch
+    /// carrying the old token is in flight when the token changes.
+    fence_gate: tokio::sync::RwLock<()>,
+    /// Serializes re-acquires.
     renew_gate: Mutex<()>,
+    /// The version of every visible scope as this writer last saw or wrote
+    /// it: a re-acquire compares a fresh listing with it to prove no other
+    /// writer committed while this one was stopped.
+    known_heads: StdMutex<HashMap<(ScopeKind, String), ScopeVersion>>,
     realm_poison: StdMutex<Option<String>>,
     poisoned_scopes: AtomicUsize,
     cells: StdMutex<HashMap<ScopeId, Arc<ScopeCell>>>,
@@ -511,7 +526,7 @@ pub struct SpiRealm {
 impl std::fmt::Debug for SpiRealm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SpiRealm")
-            .field("fence", &self.fence)
+            .field("fence", &self.fence())
             .field("writer", &self.writer)
             .field("poisoned", &self.realm_poisoned())
             .finish_non_exhaustive()
@@ -523,7 +538,7 @@ impl SelfFence for SpiRealm {
         SelfFenceWindow {
             elapsed: self.lease_started().elapsed(),
             window: self.self_fence_window,
-            renew_failed: self.renew_failed.load(Ordering::Acquire),
+            renew_failed: self.stopped.load(Ordering::Acquire),
         }
     }
 }
@@ -573,13 +588,15 @@ impl SpiRealm {
             host,
             timing,
             self_fence_window,
-            fence: grant.token,
+            fence: AtomicU64::new(grant.token.get()),
             superseded_lease: grant.superseded_lease,
             writer: uuid::Uuid::now_v7().simple().to_string(),
             counter: AtomicU64::new(0),
             lease_start: StdMutex::new(started),
-            renew_failed: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+            fence_gate: tokio::sync::RwLock::new(()),
             renew_gate: Mutex::new(()),
+            known_heads: StdMutex::new(HashMap::new()),
             realm_poison: StdMutex::new(None),
             poisoned_scopes: AtomicUsize::new(0),
             cells: StdMutex::new(HashMap::new()),
@@ -600,10 +617,10 @@ impl SpiRealm {
         Ok(realm)
     }
 
-    /// The fence token this realm commits with.
+    /// The fence token this realm commits with now.
     #[must_use]
     pub fn fence(&self) -> FenceToken {
-        self.fence
+        FenceToken::new(self.fence.load(Ordering::Acquire))
     }
 
     /// The options this realm was opened with.
@@ -674,17 +691,36 @@ impl SpiRealm {
         *lock(&self.lease_start)
     }
 
+    /// A renew that started at `started` succeeded. It extends the window
+    /// only while the writer has not stopped: a stopped writer resumes on a
+    /// fresh acquire alone.
     fn renewed(&self, started: Instant) {
+        if self.stopped.load(Ordering::Acquire) {
+            return;
+        }
         let mut slot = lock(&self.lease_start);
+        if started.duration_since(*slot) >= self.self_fence_window {
+            // The window closed before this renew started: an acquire made
+            // meanwhile may have missed the last renew. Stop instead.
+            drop(slot);
+            self.stop("the self-fence window closed before a renew");
+            return;
+        }
         if started > *slot {
             *slot = started;
         }
-        self.renew_failed.store(false, Ordering::Release);
     }
 
-    /// Whether this writer may write: its last renew did not fail, and its
-    /// last successful acquire or renew started less than the self-fence
-    /// window ago (the lease minus the host-declared margin,
+    fn stop(&self, cause: &str) {
+        if !self.stopped.swap(true, Ordering::AcqRel) {
+            tracing::warn!(%cause, "host store writer stopped; it resumes only on a fresh acquire");
+        }
+    }
+
+    /// Whether this writer may write: it has not stopped (no failed renew
+    /// and no closed window since its last acquire), and its last successful
+    /// acquire or renew started less than the self-fence window ago (the
+    /// lease minus the host-declared margin,
     /// [`FenceTiming::self_fence_window`]). A local clock read only, no
     /// store I/O.
     #[must_use]
@@ -692,40 +728,130 @@ impl SpiRealm {
         SelfFence::window(self).is_open()
     }
 
-    /// Make sure the local lease is live before a mutation: a no-op while it
-    /// is, otherwise one synchronous renew.
+    /// Make sure this writer may write before a mutation: a no-op while its
+    /// window is open, otherwise a fresh fenced acquire (K3: a stopped
+    /// holder re-acquires; it never resumes on a later renew).
     ///
     /// # Errors
-    /// [`SpiError::LeaseLapsed`] when the renew fails or times out (nothing
-    /// is poisoned: the caller has not mutated anything yet), and
-    /// [`SpiError::RealmPoisoned`] when the realm was fenced out.
+    /// [`SpiError::LeaseLapsed`] when the acquire fails or times out
+    /// (nothing is poisoned: the caller has not mutated anything yet), and
+    /// [`SpiError::RealmPoisoned`] when another writer holds the realm or
+    /// committed while this one was stopped.
     pub async fn ensure_lease(&self) -> Result<(), SpiError> {
         self.check_realm()?;
         if self.lease_is_live() {
             return Ok(());
         }
-        let _gate = self.renew_gate.lock().await;
+        self.stop("the self-fence window closed");
+        self.reacquire().await
+    }
+
+    /// Acquire the fence again after a stop, and resume only when no other
+    /// writer committed in between: a fresh listing (which, after the
+    /// acquire, shows every batch committed before it) must match every
+    /// version this writer last saw or wrote.
+    async fn reacquire(&self) -> Result<(), SpiError> {
+        let _serial = self.renew_gate.lock().await;
+        self.check_realm()?;
         if self.lease_is_live() {
             return Ok(());
         }
+        // No batch with the old token may be in flight.
+        let _no_commits = self.fence_gate.write().await;
+        let previous = self.fence();
         let started = Instant::now();
-        match tokio::time::timeout(self.config.renew_timeout, self.host.renew_fence(self.fence))
-            .await
-        {
-            Ok(Ok(())) => {
-                self.renewed(started);
-                Ok(())
+        let acquired = tokio::time::timeout(
+            self.config.renew_timeout,
+            self.host.acquire_fence(AcquireMode::Exclusive),
+        )
+        .await;
+        let grant = match acquired {
+            Ok(Ok(grant)) => grant,
+            Ok(Err(HostStoreError::Held { holder, .. })) if holder == previous => {
+                // This writer's own lease is still recorded and nobody
+                // acquired since: supersede it, with nothing to wait out.
+                match tokio::time::timeout(
+                    self.config.renew_timeout,
+                    self.host.acquire_fence(AcquireMode::Takeover),
+                )
+                .await
+                {
+                    Ok(Ok(grant)) => grant,
+                    Ok(Err(error)) => {
+                        return Err(SpiError::LeaseLapsed(format!(
+                            "the writer stopped and a re-acquire failed: {error}"
+                        )));
+                    }
+                    Err(_) => {
+                        return Err(SpiError::LeaseLapsed(
+                            "the writer stopped and a re-acquire timed out".into(),
+                        ));
+                    }
+                }
             }
-            Ok(Err(HostStoreError::FencedOut { current })) => Err(self.poison_realm(format!(
-                "fenced out: token {current} superseded token {}",
-                self.fence
-            ))),
-            Ok(Err(error)) => Err(SpiError::LeaseLapsed(format!(
-                "the lease lapsed and a renew failed: {error}"
-            ))),
-            Err(_) => Err(SpiError::LeaseLapsed(
-                "the lease lapsed and a renew timed out".into(),
-            )),
+            Ok(Err(HostStoreError::Held { holder, .. })) => {
+                return Err(self.poison_realm(format!(
+                    "fenced out while stopped: token {holder} holds the realm"
+                )));
+            }
+            Ok(Err(error)) => {
+                return Err(SpiError::LeaseLapsed(format!(
+                    "the writer stopped and a re-acquire failed: {error}"
+                )));
+            }
+            Err(_) => {
+                return Err(SpiError::LeaseLapsed(
+                    "the writer stopped and a re-acquire timed out".into(),
+                ));
+            }
+        };
+        let listed = self.list_versions().await?;
+        let unchanged = *lock(&self.known_heads) == listed;
+        if !unchanged {
+            return Err(self.poison_realm(
+                "another writer committed while this one was stopped; reopen the realm".into(),
+            ));
+        }
+        self.fence.store(grant.token.get(), Ordering::Release);
+        *lock(&self.lease_start) = started;
+        self.stopped.store(false, Ordering::Release);
+        tracing::info!(token = %grant.token, "host store writer re-acquired the fence and resumes");
+        Ok(())
+    }
+
+    /// The version of every visible scope, from one listing.
+    async fn list_versions(&self) -> Result<HashMap<(ScopeKind, String), ScopeVersion>, SpiError> {
+        let mut versions = HashMap::new();
+        for kind in LISTED_KINDS {
+            let mut after: Option<ScopeName> = None;
+            loop {
+                let page = self
+                    .host
+                    .list_heads(kind, after.as_ref(), LIST_PAGE_HEADS)
+                    .await?;
+                for scope in page.heads {
+                    versions.insert((kind, scope.name.as_str().to_string()), scope.head.version);
+                }
+                match page.next {
+                    Some(next) => after = Some(next),
+                    None => break,
+                }
+            }
+        }
+        Ok(versions)
+    }
+
+    /// Record what a landed batch did to the scope versions this writer
+    /// knows.
+    fn record_landed(&self, batch: &CommitBatch) {
+        let mut known = lock(&self.known_heads);
+        for update in batch.updates() {
+            let key = (update.scope.kind, update.scope.name.as_str().to_string());
+            if update.delete {
+                known.remove(&key);
+            } else {
+                known.insert(key, update.next);
+            }
         }
     }
 
@@ -756,44 +882,51 @@ impl SpiRealm {
         }
     }
 
+    /// Renew once per renew interval while the writer runs. A failed renew
+    /// stops the writer at once; a stopped writer is renewed no more and
+    /// tries a fresh acquire at each tick instead.
     fn spawn_renewal(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
         let interval = self.timing.renew_interval();
         tokio::spawn(async move {
+            let mut ticks =
+                tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                tokio::time::sleep(interval).await;
+                ticks.tick().await;
                 let Some(realm) = weak.upgrade() else {
                     return;
                 };
                 if realm.realm_poisoned().is_some() {
                     return;
                 }
+                if realm.stopped.load(Ordering::Acquire) || !realm.lease_is_live() {
+                    realm.stop("the self-fence window closed");
+                    if let Err(error) = realm.reacquire().await {
+                        tracing::warn!(%error, "host store re-acquire failed; writes stay stopped");
+                    }
+                    continue;
+                }
                 let started = Instant::now();
+                let token = realm.fence();
                 match tokio::time::timeout(
                     realm.config.renew_timeout,
-                    realm.host.renew_fence(realm.fence),
+                    realm.host.renew_fence(token),
                 )
                 .await
                 {
                     Ok(Ok(())) => realm.renewed(started),
                     Ok(Err(HostStoreError::FencedOut { current })) => {
                         realm.poison_realm(format!(
-                            "fenced out: token {current} superseded token {}",
-                            realm.fence
+                            "fenced out: token {current} superseded token {token}"
                         ));
                         return;
                     }
                     Ok(Err(error)) => {
-                        // Stop writing as soon as a renew fails: the next
-                        // mutation renews synchronously or refuses.
-                        realm.renew_failed.store(true, Ordering::Release);
-                        tracing::warn!(%error, "host store fence renew failed; writes stop until a renew succeeds");
+                        realm.stop(&format!("a renew failed: {error}"));
                     }
                     Err(_) => {
-                        realm.renew_failed.store(true, Ordering::Release);
-                        tracing::warn!(
-                            "host store fence renew timed out; writes stop until a renew succeeds"
-                        );
+                        realm.stop("a renew timed out");
                     }
                 }
             }
@@ -815,6 +948,7 @@ impl SpiRealm {
     async fn list_all(&self) -> Result<(), SpiError> {
         let mut listed: HashMap<String, Vec<ListedHead>> = HashMap::new();
         let mut chunks: HashMap<String, ChunkMeta> = HashMap::new();
+        let mut known: HashMap<(ScopeKind, String), ScopeVersion> = HashMap::new();
         for kind in LISTED_KINDS {
             let mut after: Option<ScopeName> = None;
             loop {
@@ -823,6 +957,7 @@ impl SpiRealm {
                     .list_heads(kind, after.as_ref(), LIST_PAGE_HEADS)
                     .await?;
                 for scope in page.heads {
+                    known.insert((kind, scope.name.as_str().to_string()), scope.head.version);
                     let Some(tag) = codec::name_tag(&scope.name).map(str::to_string) else {
                         // Not a name this journal writes: leave it alone.
                         continue;
@@ -865,6 +1000,7 @@ impl SpiRealm {
         }
         *lock(&self.listed) = listed;
         *lock(&self.chunks) = chunks;
+        *lock(&self.known_heads) = known;
         Ok(())
     }
 
@@ -910,8 +1046,10 @@ impl SpiRealm {
                 delete: true,
             });
         }
-        let batch = CommitBatch::try_new(self.commit_id()?, self.fence, updates)?;
+        let _commits = self.fence_gate.read().await;
+        let batch = CommitBatch::try_new(self.commit_id()?, self.fence(), updates)?;
         self.commit_settled(&batch).await?;
+        self.record_landed(&batch);
         let mut table = lock(&self.chunks);
         for (name, _) in chunks {
             table.remove(name);
@@ -1289,8 +1427,10 @@ impl SpiRealm {
     }
 
     async fn write_plans(&self, plans: &mut [ScopePlan]) -> Result<(), SpiError> {
-        // Self-fence again: the call may have outlived the lease.
+        // Self-fence again: the call may have outlived the window.
         self.ensure_lease().await?;
+        // Every batch of this call carries one token.
+        let _commits = self.fence_gate.read().await;
         self.fit_batch(plans)?;
         for plan in &*plans {
             for chunk in &plan.new_chunks {
@@ -1351,8 +1491,9 @@ impl SpiRealm {
                 delete: true,
             });
         }
-        let batch = CommitBatch::try_new(self.commit_id()?, self.fence, updates)?;
+        let batch = CommitBatch::try_new(self.commit_id()?, self.fence(), updates)?;
         self.commit_settled(&batch).await?;
+        self.record_landed(&batch);
         let mut table = lock(&self.chunks);
         for name in dead.keys() {
             table.remove(name);
@@ -1440,8 +1581,9 @@ impl SpiRealm {
                 drop_before: None,
                 delete: false,
             };
-            let batch = CommitBatch::try_new(self.commit_id()?, self.fence, vec![update])?;
+            let batch = CommitBatch::try_new(self.commit_id()?, self.fence(), vec![update])?;
             self.commit_settled(&batch).await?;
+            self.record_landed(&batch);
             previous = Some(next);
             lock(&self.chunks).insert(
                 pending.chunk.name.as_str().to_string(),
