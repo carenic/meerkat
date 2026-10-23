@@ -496,6 +496,19 @@ const MACHINE_TRANSITION_ENUM_LATE_TAILS: &[(&str, &[&str])] = &[
         "SessionTurnAdmissionMachine",
         &["ResolveDispositionResumeRun"],
     ),
+    (
+        "OccurrenceLifecycleMachine",
+        &[
+            "ClassifyDuePendingReclaimExhausted",
+            "ClaimPendingAfterAdmission",
+            "ClaimPendingAfterUnprovenDispatch",
+            "TargetProbeBusyExistingRedelivery",
+            "ReclaimExhaustedAfterAdmission",
+            "ReclaimExhaustedAfterUnprovenDispatch",
+            "UnprovenLateNotAdmittedFromClaimed",
+            "UnprovenLateNotAdmittedFromDispatching",
+        ],
+    ),
 ];
 
 #[cfg(not(test))]
