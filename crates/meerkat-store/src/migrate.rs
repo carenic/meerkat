@@ -2191,6 +2191,7 @@ mod tests {
                 if path.ends_with(REALM_WRITE_ADMISSION_STEM)),
             "{error:?}"
         );
+        foreign.unlock().unwrap();
         drop(foreign);
         RealmMaintenanceFence::acquire(&realm, Duration::from_secs(1)).unwrap();
     }
