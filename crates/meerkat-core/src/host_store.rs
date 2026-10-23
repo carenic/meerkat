@@ -171,8 +171,9 @@ pub const FENCE_RENEW_INTERVAL_SECS: u64 = 10;
 /// [`HostStore::fence_timing`].
 pub const FENCE_LEASE_SECS: u64 = 30;
 
-/// The fewest renew intervals a lease lasts, so that one late or failed
-/// renew does not make a live holder fence itself.
+/// The fewest renew intervals a lease lasts, so that one late renew does not
+/// make a live holder fence itself. A failed renew stops the holder at once
+/// (it acquires again before it resumes).
 pub const FENCE_MIN_LEASE_RENEWALS: u32 = 3;
 
 /// The longest one commit takes by default, in seconds. A host declares its
@@ -244,7 +245,7 @@ impl FenceTiming {
         if self_fence_margin < renew_interval || self_fence_margin > longest_margin {
             return Err(HostStoreError::Invalid(format!(
                 "a self-fence margin of {self_fence_margin:?} lies outside {renew_interval:?} to \
-                 {longest_margin:?} (one renew interval to the lease minus two)"
+                 {longest_margin:?} (one renew interval to the lease minus two renew intervals)"
             )));
         }
         Ok(Self {
