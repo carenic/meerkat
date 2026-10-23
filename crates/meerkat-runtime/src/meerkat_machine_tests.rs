@@ -8455,11 +8455,14 @@ async fn local_materialization_concludes_a_cold_recovered_drain() {
         )
         .expect("persistent machine"),
     );
-    let prepared = recovered
+    let mut prepared = recovered
         .prepare_local_session_materialization(session_id.clone())
         .await
         .expect("the materialization concludes the cold-recovered drain and prepares the fresh registration");
-    drop(prepared);
+    // Read the concluded teardown while the fresh registration is still
+    // prepared. Dropping it would roll the registration back on a
+    // process-owned task, whose own unregister writes Draining progress
+    // while it runs, so a read after the drop races that rollback.
     assert!(
         crate::store::load_machine_lifecycle(inner.as_ref(), &runtime_id)
             .await
@@ -8468,6 +8471,27 @@ async fn local_materialization_concludes_a_cold_recovered_drain() {
             .unregister_progress()
             .is_none(),
         "the concluded teardown left no Draining progress"
+    );
+    assert!(
+        prepared.inserted_registration(),
+        "the materialization registers the session again for its own claim"
+    );
+    assert!(
+        prepared
+            .rollback_now()
+            .await
+            .expect("roll the fresh registration back"),
+        "the prepared materialization owns its rollback"
+    );
+    assert!(!recovered.contains_session(&session_id).await);
+    assert!(
+        crate::store::load_machine_lifecycle(inner.as_ref(), &runtime_id)
+            .await
+            .expect("load final record")
+            .expect("lifecycle record should remain queryable")
+            .unregister_progress()
+            .is_none(),
+        "the rollback's unregister settled"
     );
 }
 
