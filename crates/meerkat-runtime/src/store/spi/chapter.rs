@@ -145,10 +145,13 @@ fn encoded(step: &'static str, session: &Session) -> Result<Vec<u8>, ChapterFail
 pub async fn large_documents(opener: &dyn HostStoreOpener) -> Result<(), ChapterFailure> {
     let (realm, store) = start(opener, "open", AcquireMode::Exclusive).await?;
 
-    // The base: a small message and the large one.
+    // The base: a small message and the large one. The check keeps the large
+    // message it commits: a message carries its creation time, so one built
+    // again later never equals it.
+    let large = large_message();
     let mut base = Session::new();
     base.push(Message::User(UserMessage::text("context to compact")));
-    base.push(large_message());
+    base.push(large.clone());
     let session_id = base.id().clone();
     let runtime_id = LogicalRuntimeId::for_session(&session_id);
     let base_bytes = encoded("base", &base)?;
@@ -340,7 +343,6 @@ pub async fn large_documents(opener: &dyn HostStoreOpener) -> Result<(), Chapter
             ));
         }
     };
-    let large = large_message();
     ensure(
         "recovery",
         recovered.messages().iter().any(|message| message == &large),

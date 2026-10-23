@@ -433,6 +433,37 @@ async fn an_oversized_value_lives_in_a_chunk_that_dies_with_it() {
     );
 }
 
+// A chunked value replaced by another reloads from the host: the replacing
+// batch deleted the first chunk, and the load reads only the chunk of the
+// entry that survives the fold, not the one its superseded row names.
+#[tokio::test]
+async fn a_replaced_chunked_value_reloads_without_its_deleted_chunk() {
+    let host = Arc::new(TestHost::new());
+    let realm = SpiRealm::open(Arc::clone(&host) as _, SpiRealmConfig::default())
+        .await
+        .unwrap();
+    let id = ScopeId::new(TEST_FAMILY, "big");
+    let first = Arc::new(vec![7_u8; INLINE_VALUE_LIMIT + 1]);
+    let second = Arc::new(vec![8_u8; INLINE_VALUE_LIMIT + 1]);
+    for value in [&first, &second] {
+        commit_one(
+            &realm,
+            &id,
+            ScopeDelta::Changes(vec![("body".into(), Some(Arc::clone(value)))]),
+        )
+        .await
+        .unwrap();
+    }
+    let chunks = host
+        .scopes_of(ScopeKind::Record)
+        .keys()
+        .filter(|name| name.starts_with("ch:"))
+        .count();
+    assert_eq!(chunks, 1, "the first chunk died with the replacing batch");
+    let (_realm, image) = reload(&host, realm).await;
+    assert_eq!(image.get("body"), Some(&second));
+}
+
 // Unrun until the candidate's validation.
 #[tokio::test]
 async fn a_change_set_over_the_batch_limit_spills_and_reloads() {
