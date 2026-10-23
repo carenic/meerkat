@@ -613,13 +613,20 @@ impl GeminiClient {
                         // results with images we emit text in the functionResponse
                         // and append the images as separate inlineData parts so
                         // the model still sees the actual image data.
+                        //
+                        // The response object uses Gemini's documented keys: the
+                        // tool's output under "output", or, for a failed call, its
+                        // error details under "error". An "error" key on every
+                        // result told the model that no call produced output.
+                        let response = if r.is_error {
+                            serde_json::json!({ "error": r.text_content() })
+                        } else {
+                            serde_json::json!({ "output": r.text_content() })
+                        };
                         let mut part = serde_json::json!({
                             "functionResponse": {
                                 "name": function_name,
-                                "response": {
-                                    "content": r.text_content(),
-                                    "error": r.is_error
-                                }
+                                "response": response
                             }
                         });
                         if let Some(provider_id) = provider_id {
@@ -2209,7 +2216,12 @@ impl GeminiClient {
                             .flat_map(|tool| tool.keys())
                             .filter(|name| name.as_str() != "functionDeclarations")
                             .map(|name| match name.as_str() {
-                                "googleSearch" | "googleSearchRetrieval" => ServerToolKind::GoogleSearch,
+                                // The request builder names native search
+                                // "google_search"; Gemini also reads the
+                                // camelCase keys.
+                                "googleSearch" | "google_search" | "googleSearchRetrieval" => {
+                                    ServerToolKind::GoogleSearch
+                                }
                                 _ => ServerToolKind::ProviderNative { name: name.clone() },
                             }).collect();
                         prepared.prepare_model_authorization(&url, wire_model, capabilities)?
@@ -5045,8 +5057,8 @@ mod tests {
                 .all(|part| part["functionResponse"].get("provider_id").is_none())
         );
         assert_eq!(
-            responses[0]["functionResponse"]["response"]["content"],
-            "\"Paris\""
+            responses[0]["functionResponse"]["response"],
+            json!({"output": "\"Paris\""})
         );
         assert!(
             responses
@@ -5149,12 +5161,12 @@ mod tests {
             assert_eq!(responses[0]["functionResponse"]["name"], "time_zone");
             assert_eq!(responses[1]["functionResponse"]["name"], "weather");
             assert_eq!(
-                responses[0]["functionResponse"]["response"]["content"],
-                "UTC+09:00"
+                responses[0]["functionResponse"]["response"],
+                json!({"output": "UTC+09:00"})
             );
             assert_eq!(
-                responses[1]["functionResponse"]["response"]["content"],
-                "Clear, 12 C"
+                responses[1]["functionResponse"]["response"],
+                json!({"output": "Clear, 12 C"})
             );
             assert!(
                 calls
@@ -5193,8 +5205,8 @@ mod tests {
         assert_eq!(responses[0]["functionResponse"]["id"], "fc_0");
         assert!(responses[1]["functionResponse"].get("id").is_none());
         assert_eq!(
-            responses[0]["functionResponse"]["response"]["content"],
-            "\"Paris\""
+            responses[0]["functionResponse"]["response"],
+            json!({"output": "\"Paris\""})
         );
     }
 
@@ -7570,6 +7582,64 @@ mod tests {
         Ok(())
     }
 
+    /// A tool result's functionResponse.response uses Gemini's documented
+    /// keys: a successful call's text under "output", with no "error" key,
+    /// and a failed call's text under "error", with no "output" key. Name and
+    /// id are unchanged, and the response part carries no thoughtSignature.
+    #[test]
+    fn gemini_function_response_names_output_or_error() -> Result<(), Box<dyn std::error::Error>> {
+        let client = GeminiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gemini-3.1-pro-preview",
+            vec![
+                Message::User(UserMessage::text("look both up")),
+                Message::BlockAssistant(BlockAssistantMessage::new(
+                    vec![
+                        AssistantBlock::ToolUse {
+                            id: "call-ok".into(),
+                            name: "lookup".into(),
+                            args: serde_json::value::to_raw_value(&json!({"q": "a"}))?,
+                            meta: None,
+                        },
+                        AssistantBlock::ToolUse {
+                            id: "call-failed".into(),
+                            name: "lookup".into(),
+                            args: serde_json::value::to_raw_value(&json!({"q": "b"}))?,
+                            meta: None,
+                        },
+                    ],
+                    StopReason::ToolUse,
+                )),
+                Message::tool_results(vec![
+                    ToolResult::new("call-ok".into(), "found a".into(), false),
+                    ToolResult::new("call-failed".into(), "lookup b failed".into(), true),
+                ]),
+            ],
+        );
+
+        let body = client.build_request_body(&request)?;
+        let parts = body["contents"][2]["parts"]
+            .as_array()
+            .ok_or("missing tool result parts")?;
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["functionResponse"]["name"], "lookup");
+        assert_eq!(
+            parts[0]["functionResponse"]["response"],
+            json!({"output": "found a"})
+        );
+        assert_eq!(parts[1]["functionResponse"]["name"], "lookup");
+        assert_eq!(
+            parts[1]["functionResponse"]["response"],
+            json!({"error": "lookup b failed"})
+        );
+        assert!(
+            parts
+                .iter()
+                .all(|part| part.get("thoughtSignature").is_none())
+        );
+        Ok(())
+    }
+
     #[test]
     fn gemini_tool_result_with_image_preserves_inline_data()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -7621,12 +7691,16 @@ mod tests {
             .as_array()
             .ok_or("missing parts")?;
 
-        // First part: functionResponse with text content
+        // First part: functionResponse with text content, as the output
         let response = &parts[0]["functionResponse"]["response"];
-        let content_str = response["content"].as_str().ok_or("content not string")?;
+        let content_str = response["output"].as_str().ok_or("output not string")?;
         assert!(
             content_str.contains("captured"),
             "text content should be preserved in functionResponse"
+        );
+        assert!(
+            response.get("error").is_none(),
+            "a successful result names no error"
         );
 
         // Second part: inlineData with the actual image
@@ -7945,9 +8019,9 @@ mod tests {
         assert_eq!(parts.len(), 1);
         let result = &parts[0]["functionResponse"];
         assert_eq!(result["name"], "lookup");
-        assert_eq!(result["response"]["error"], false);
+        assert!(result["response"].get("error").is_none());
         assert_eq!(
-            serde_json::from_str::<Value>(result["response"]["content"].as_str().unwrap()).unwrap(),
+            serde_json::from_str::<Value>(result["response"]["output"].as_str().unwrap()).unwrap(),
             mcp_structured_payload()
         );
     }
@@ -7962,8 +8036,8 @@ mod tests {
         assert_eq!(parts.len(), 2);
         let result = &parts[0]["functionResponse"];
         assert_eq!(result["name"], "lookup");
-        assert_eq!(result["response"]["error"], false);
-        let text = result["response"]["content"].as_str().unwrap();
+        assert!(result["response"].get("error").is_none());
+        let text = result["response"]["output"].as_str().unwrap();
         let structured = text
             .strip_prefix("before\n[image: image/png]\nafter\n")
             .expect("ordered text and image projection");
