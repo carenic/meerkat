@@ -2140,6 +2140,12 @@ them.
   signature are unchanged. The request bytes of every Gemini tool
   continuation change, so a resumed session takes one prompt-cache miss.
 
+- `meerkat-gemini`: under authorization, a request that asks for Gemini's
+  native search reaches the policy as the `GoogleSearch` hosted capability.
+  The request names the tool `google_search`, which the capability check did
+  not map, so the policy saw an unknown provider-native tool and a governed
+  Gemini web search was refused as malformed.
+
 ### Known limitations
 
 - `meerkat-mob`: role-target admission and each step's choice of targets are

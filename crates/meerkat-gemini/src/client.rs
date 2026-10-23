@@ -2216,7 +2216,12 @@ impl GeminiClient {
                             .flat_map(|tool| tool.keys())
                             .filter(|name| name.as_str() != "functionDeclarations")
                             .map(|name| match name.as_str() {
-                                "googleSearch" | "googleSearchRetrieval" => ServerToolKind::GoogleSearch,
+                                // The request builder names native search
+                                // "google_search"; Gemini also reads the
+                                // camelCase keys.
+                                "googleSearch" | "google_search" | "googleSearchRetrieval" => {
+                                    ServerToolKind::GoogleSearch
+                                }
                                 _ => ServerToolKind::ProviderNative { name: name.clone() },
                             }).collect();
                         prepared.prepare_model_authorization(&url, wire_model, capabilities)?
