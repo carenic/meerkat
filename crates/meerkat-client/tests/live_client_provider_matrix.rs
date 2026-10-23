@@ -30,7 +30,9 @@ use meerkat_core::lifecycle::run_primitive::{
     ReasoningEffort,
 };
 use meerkat_core::model_profile::catalog::ImageGenerationModelRoute;
-use meerkat_core::{AgentLlmClient, BlockAssistantMessage, Message, StopReason, UserMessage};
+use meerkat_core::{
+    AgentLlmClient, AssistantBlock, BlockAssistantMessage, Message, StopReason, UserMessage,
+};
 use meerkat_gemini::{GeminiImageOutputOptions, GeminiImageTurnPlan};
 use meerkat_llm_core::{ImageGenerationExecutor, LlmClientAdapter, ProviderImageGenerationRequest};
 use meerkat_openai::{
@@ -332,9 +334,13 @@ async fn e2e_smoke_provider_web_search_all_three() -> Result<(), Box<dyn std::er
 }
 
 /// The stateless two-step hosted-search loop on the OpenAI API (`store:
-/// false`, the default). The second step's request carries the first step's
-/// `web_search_call` with the sources it consulted and the answer's
-/// `url_citation` annotations, and the API accepts that request.
+/// false`, the default). Step 1 answers a question that needs a search and
+/// names no page, so the model searches. Step 2's request replays every
+/// `web_search_call` of step 1 exactly as captured, each search action with
+/// the sources it consulted, and the answer with its `url_citation`
+/// annotations, and the API accepts that request. A step 1 that made no
+/// search action fails on its own message, apart from a replay defect: then
+/// the sources path was not exercised.
 #[tokio::test]
 #[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_openai_web_search_evidence_replays_into_the_next_step()
@@ -355,7 +361,7 @@ async fn e2e_openai_web_search_evidence_replays_into_the_next_step()
     let adapter = LlmClientAdapter::new(client.clone(), OPENAI_MODEL.to_string())
         .with_provider_params(Some(web_search.clone()));
     let question = Message::User(UserMessage::text(
-        "Use the web search tool for this answer. Search for the current title of https://example.com and answer in one short sentence that cites the page.".to_string(),
+        "Use the web search tool for this answer. What is the latest stable release of the Rust programming language, and on what date was it released? Answer in one short sentence and cite your source.".to_string(),
     ));
     let step = AgentLlmClient::stream_response(
         &adapter,
@@ -366,6 +372,31 @@ async fn e2e_openai_web_search_evidence_replays_into_the_next_step()
         None,
     )
     .await?;
+    // Step 1's search calls, as captured.
+    let captured: Vec<&Value> = step
+        .blocks()
+        .iter()
+        .filter_map(|block| match block {
+            AssistantBlock::ServerToolContent { content, .. }
+                if content["type"] == "web_search_call" =>
+            {
+                Some(content)
+            }
+            _ => None,
+        })
+        .collect();
+    let searches = captured
+        .iter()
+        .filter(|call| call["action"]["type"] == "search")
+        .count();
+    assert!(
+        searches > 0,
+        "no search action: the sources path was not exercised (step 1's web_search_call actions: {:?})",
+        captured
+            .iter()
+            .map(|call| call["action"]["type"].clone())
+            .collect::<Vec<_>>()
+    );
     let history = vec![
         question,
         Message::BlockAssistant(BlockAssistantMessage::new(
@@ -381,23 +412,44 @@ async fn e2e_openai_web_search_evidence_replays_into_the_next_step()
     let request = LlmRequest::new(OPENAI_MODEL, client.project_replay_messages(&history)?)
         .with_provider_params(web_search);
     let body = client.build_request_body(&request)?;
+    assert_eq!(body["store"], false, "the loop is stateless: {body}");
     let input = body["input"]
         .as_array()
         .ok_or("the request input is not an array")?;
-    assert!(
-        input.iter().any(|item| item["type"] == "web_search_call"
-            && item["action"]["sources"]
-                .as_array()
-                .is_some_and(|sources| !sources.is_empty())),
-        "step 2 must replay the search call with its sources: {body}"
+    let replayed: Vec<&Value> = input
+        .iter()
+        .filter(|item| item["type"] == "web_search_call")
+        .collect();
+    assert_eq!(
+        replayed, captured,
+        "step 2 must replay every web_search_call of step 1 exactly as captured: {body}"
     );
+    for call in &replayed {
+        if call["action"]["type"] == "search" {
+            assert!(
+                call["action"]["sources"]
+                    .as_array()
+                    .is_some_and(|sources| !sources.is_empty()),
+                "every replayed search action must carry the sources it consulted: {call}"
+            );
+        }
+    }
+    let sources: usize = replayed
+        .iter()
+        .filter_map(|call| call["action"]["sources"].as_array())
+        .map(Vec::len)
+        .sum();
+    let citations = input
+        .iter()
+        .filter(|item| item["type"] == "message")
+        .filter_map(|item| item["content"].as_array())
+        .flatten()
+        .filter_map(|part| part["annotations"].as_array())
+        .flatten()
+        .filter(|annotation| annotation["type"] == "url_citation")
+        .count();
     assert!(
-        input.iter().any(|item| item["type"] == "message"
-            && item["content"][0]["annotations"]
-                .as_array()
-                .is_some_and(|annotations| annotations
-                    .iter()
-                    .any(|annotation| annotation["type"] == "url_citation"))),
+        citations > 0,
         "step 2 must replay the answer's url_citation annotations: {body}"
     );
 
@@ -413,6 +465,10 @@ async fn e2e_openai_web_search_evidence_replays_into_the_next_step()
     assert!(
         matches!(outcome, Some(LlmDoneOutcome::Success { .. })),
         "the API must accept step 2: {outcome:?}"
+    );
+    println!(
+        "OpenAI web search evidence replayed: {} web_search_call item(s) byte-equal, {searches} search action(s) with {sources} source(s), {citations} url_citation annotation(s); the API accepted step 2",
+        replayed.len()
     );
     Ok(())
 }
