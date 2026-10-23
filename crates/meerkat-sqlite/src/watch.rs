@@ -487,7 +487,14 @@ fn unregister(source: Box<dyn WatchSource>) {
             .name("sqlite-watch-unregister".to_string())
             .spawn(move || {
                 for source in sources {
-                    drop(source);
+                    // A drop can panic (notify's macOS watcher expects its
+                    // run-loop thread to join). Contain it, as a registration's
+                    // panic is, so this thread keeps dropping its queue.
+                    if std::panic::catch_unwind(AssertUnwindSafe(move || drop(source))).is_err() {
+                        tracing::warn!(
+                            "dropping a stopped sqlite change watch's notification source panicked"
+                        );
+                    }
                 }
             })
             .map(|thread| Unregister {
@@ -2251,6 +2258,122 @@ mod tests {
         fn drop(&mut self) {
             panic!("the notification event loop is gone");
         }
+    }
+
+    /// A registered source whose teardown waits and whose drop panics.
+    struct PanicsOnDropBackend;
+
+    struct PanicsOnDropSource;
+
+    impl WatchBackend for PanicsOnDropBackend {
+        fn create(
+            &self,
+            _targets: &WatchTargets,
+            _wake: mpsc::Sender<()>,
+        ) -> Result<Box<dyn WatchSource>, String> {
+            Ok(Box::new(PanicsOnDropSource))
+        }
+    }
+
+    impl WatchSource for PanicsOnDropSource {
+        fn watch(&mut self, _directory: &Path) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn teardown_waits(&self) -> bool {
+            true
+        }
+    }
+
+    #[allow(clippy::panic)]
+    impl Drop for PanicsOnDropSource {
+        fn drop(&mut self) {
+            panic!("the run-loop thread did not shut down");
+        }
+    }
+
+    /// The unregister thread contains a panicking source drop: a source whose
+    /// drop panics, queued between two others, leaves both dropped, and the
+    /// thread still drops a source queued after them.
+    #[test]
+    fn a_panicking_source_drop_leaves_the_unregister_thread_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let observed = test_support::observe_registrations_in(dir.path()).unwrap();
+        let db = dir.path().join("store.sqlite3");
+        std::fs::write(&db, b"").unwrap();
+        let observed_watch = |name: &str| {
+            start_sqlite_change_watch(&db, name, SQLITE_WATCH_SWEEP, |_| {
+                SqliteWatchControl::Handled
+            })
+            .expect("watch starts")
+        };
+        let first = observed_watch("test-unregister-first");
+        assert!(
+            observed.wait_registered(1, HANG_GUARD),
+            "the first registered"
+        );
+        let panicking = start_with_backend(
+            &dir.path().join("panics.sqlite3"),
+            "test-unregister-panics",
+            SQLITE_WATCH_SWEEP,
+            |_| SqliteWatchControl::Handled,
+            |_| Box::new(PanicsOnDropBackend),
+        )
+        .expect("watch starts");
+        assert_eq!(
+            settled_registration(&panicking),
+            SqliteWatchRegistration::Registered
+        );
+        let second = observed_watch("test-unregister-second");
+        assert!(
+            observed.wait_registered(2, HANG_GUARD),
+            "the second registered"
+        );
+
+        // Queued in this order behind the first source's held drop.
+        observed.hold_source_drops();
+        drop(first);
+        drop(panicking);
+        drop(second);
+        observed.release_source_drops();
+        assert!(
+            observed.wait_source_drops_finished(2, HANG_GUARD),
+            "both observed sources are dropped around the panicking one"
+        );
+
+        // The thread keeps going: a source queued after the panic goes to it,
+        // so its held drop does not hold the dropping thread, and it is
+        // dropped once released.
+        let third = observed_watch("test-unregister-third");
+        assert!(
+            observed.wait_registered(3, HANG_GUARD),
+            "the third registered"
+        );
+        observed.hold_source_drops();
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let dropper = thread::spawn(move || {
+            drop(third);
+            let _ = dropped_tx.send(());
+        });
+        let returned = dropped_rx.recv_timeout(HANG_GUARD).is_ok();
+        observed.release_source_drops();
+        dropper.join().unwrap();
+        assert!(
+            returned,
+            "a source queued after the panic went to the unregister thread"
+        );
+        assert!(
+            observed.wait_source_drops_finished(3, HANG_GUARD),
+            "the unregister thread drops a source queued after the panic"
+        );
+        let unregister = UNREGISTER
+            .get()
+            .and_then(Option::as_ref)
+            .expect("the unregister thread started");
+        assert!(
+            !unregister._thread.is_finished(),
+            "the unregister thread runs"
+        );
     }
 
     /// The registration panics in a child process: a panic during a panic
