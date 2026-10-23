@@ -326,7 +326,10 @@ them.
   its store-owned recovery kept (it could not prove the tail) is reported as
   `MobError::MemberDurableTailUnprovable`, naming the member and its session
   and carrying the `tail_held_for_recovery` resume hold, instead of a bare
-  transcript revision conflict. The start still refuses in both cases.
+  transcript revision conflict. Where the start still fails on such a
+  member, that typed cause is what it reports; a member whose restore
+  already failed at that start is deferred instead (see the entry next to
+  this one).
 
 - A graceful mob Shutdown releases a member's identity reconcile lease once
   it has unregistered the member's runtime and the member's session actor has

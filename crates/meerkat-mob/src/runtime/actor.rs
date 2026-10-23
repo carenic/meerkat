@@ -26429,6 +26429,10 @@ impl MobActor {
                     Ok(false)
                 }
                 IdentityReconcileDecision::CancelActiveMember => {
+                    // Cancelling acts on the member's runtime inputs: a
+                    // deferred custody restore is re-attempted first, and
+                    // backs the reconcile off while it stays deferred.
+                    self.reattempt_deferred_member_custody(identity).await?;
                     let entry = self
                         .roster
                         .read()
