@@ -413,6 +413,77 @@ impl super::driver::DriverEntry {
         true
     }
 
+    /// Close the provisional tail of `run_id`, a run whose cancellation the
+    /// loop has just committed, as an interrupted run.
+    ///
+    /// A cancel (a user interrupt, a run stop, a refused suspension) drops
+    /// the run future, so the run's last round commit stays in the store as
+    /// its provisional tail, cursor included. Left standing, that tail
+    /// refuses the session's next ordinary save and the next run's first
+    /// commit until a registration's recovery settles it. Once the
+    /// cancellation committed (no current run, the run's inputs abandoned),
+    /// the durable-tail recovery a registration runs, guarded to that run
+    /// ([`crate::recovery::recover_durable_tail_for_run`]), commits the tail
+    /// as an interrupted run here instead: every row kept, open calls
+    /// answered as outcome-unknown, the interrupted notice appended.
+    ///
+    /// Unlike [`Self::repair_settled_run_tail`] this asks for no reload. The
+    /// session layer kept the live actor, and its next step under the turn
+    /// boundary resynchronizes that actor from the committed boundary, the
+    /// checkpointer's receipt and base included. A tail the recovery holds,
+    /// refuses or would continue, another run's tail, and a failed recovery
+    /// are left as they stand, for the next registration's recovery, and
+    /// logged. A suspended run never comes here: the loop realizes a
+    /// suspension before its cancelled arm. An ephemeral runtime keeps no
+    /// tail.
+    pub(crate) async fn settle_cancelled_run_tail(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+        run_id: &meerkat_core::lifecycle::RunId,
+    ) {
+        let super::driver::DriverEntry::Persistent(driver) = self else {
+            return;
+        };
+        let outcome =
+            crate::recovery::recover_durable_tail_for_run(driver.store_ref(), session_id, run_id)
+                .await;
+        let left = match &outcome {
+            // No tail stood: the run left nothing to settle.
+            Ok(Some(crate::recovery::DurableTailRecoveryOutcome::AlreadyAligned { .. })) => {
+                return;
+            }
+            Ok(Some(crate::recovery::DurableTailRecoveryOutcome::Committed {
+                boundary_sequence,
+                ..
+            })) => {
+                tracing::info!(
+                    %session_id,
+                    %run_id,
+                    boundary_sequence,
+                    "closed the cancelled run's provisional tail as an interrupted run"
+                );
+                return;
+            }
+            Ok(None) => "another run's provisional tail stands".to_string(),
+            Ok(Some(crate::recovery::DurableTailRecoveryOutcome::Held)) => {
+                "the recovery held the tail".to_string()
+            }
+            Ok(Some(crate::recovery::DurableTailRecoveryOutcome::Refused)) => {
+                "the recovery refused the tail".to_string()
+            }
+            Ok(Some(crate::recovery::DurableTailRecoveryOutcome::Continue { .. })) => {
+                "the recovery would continue the run".to_string()
+            }
+            Err(error) => format!("the recovery failed: {error}"),
+        };
+        tracing::warn!(
+            %session_id,
+            %run_id,
+            reason = %left,
+            "the cancelled run's provisional tail was not settled; it stays for the next registration's recovery"
+        );
+    }
+
     /// Clear the requeue marks a graceful stop left on a resumed run's
     /// inputs as it starts, durably for a persistent runtime, before the run
     /// is dispatched.
