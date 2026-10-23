@@ -2777,6 +2777,70 @@ mod tests {
         );
     }
 
+    /// A stuck retirement's wire data carries its cause's structured data
+    /// beside the cause's text, so a client tells "redrive later" from
+    /// "reload the member, then redrive" without parsing text. A cause
+    /// without structured data adds no key, and the rest is unchanged.
+    #[test]
+    fn a_stuck_retirement_carries_its_typed_cause_data_beside_its_text() {
+        let member_id = AgentIdentity::from("member");
+        let typed_causes = [
+            MobError::MemberReloadRepairBlocked {
+                session_id: meerkat_core::types::SessionId::new(),
+                reason: "commit outcome not reported".to_string(),
+                evidence_digest: None,
+            },
+            MobError::MemberReloadRequired {
+                member_id: member_id.clone(),
+                reason: "durability reload required".to_string(),
+            },
+        ];
+        for cause in typed_causes {
+            let cause_text = cause.to_string();
+            let cause_data = cause
+                .structured_data()
+                .expect("a typed cause has structured data");
+            let stuck = MobError::MemberRetirementStuck {
+                member_id: member_id.clone(),
+                stage: "retire-ingress-detach".to_string(),
+                cause: Arc::new(cause),
+            };
+            assert_eq!(
+                stuck.structured_data(),
+                Some(serde_json::json!({
+                    "kind": "mob_retirement_stuck",
+                    "member_id": "member",
+                    "stage": "retire-ingress-detach",
+                    "cause": cause_text,
+                    "cause_data": cause_data,
+                    "retryable": false,
+                    "redrive": true,
+                    "authority_retained": true,
+                }))
+            );
+        }
+        let untyped = MobError::Internal("failed to detach peer ingress".to_string());
+        let cause_text = untyped.to_string();
+        let stuck = MobError::MemberRetirementStuck {
+            member_id,
+            stage: "retire-ingress-detach".to_string(),
+            cause: Arc::new(untyped),
+        };
+        assert_eq!(
+            stuck.structured_data(),
+            Some(serde_json::json!({
+                "kind": "mob_retirement_stuck",
+                "member_id": "member",
+                "stage": "retire-ingress-detach",
+                "cause": cause_text,
+                "retryable": false,
+                "redrive": true,
+                "authority_retained": true,
+            })),
+            "a cause without structured data adds no cause_data key"
+        );
+    }
+
     #[test]
     fn actor_command_timeout_projects_observation_without_execution_or_retry_verdict() {
         for stage in ["actor_command_admission", "actor_command_reply"] {
