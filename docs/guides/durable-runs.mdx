@@ -368,10 +368,14 @@ worker's owner key with `lower_agent_identity_owner_key`.
 Without a gate, the run continues. Other members' runs continue without
 asking.
 
-The mob binds the gate when it registers the worker's session. If another
-surface opens a worker's session before the mob has rebuilt the worker, the
-run continues without asking. A host that relies on the gate builds its mobs
-before it serves other surfaces.
+The mob binds the gate on the durable workers it provisions itself, when it
+registers their sessions: at spawn, cold restore, explicit resume and warm
+revival. The gate is an in-process callback of the mob's own host, so a
+durable worker placed on and materialized by another host resumes its runs
+there without asking the gate. If another surface opens a worker's session
+before the mob has rebuilt the worker, the run continues without asking. A
+host that relies on the gate builds its mobs before it serves other
+surfaces.
 
 ## Keeping A Realm In Your Own Database
 
