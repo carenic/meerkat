@@ -1173,7 +1173,7 @@ attempted; the first failure is reported, and a retry converges. Members
 spawned by other means are not affected.
 
 `rkat mob force-cancel <MOB_ID> <AGENT_IDENTITY>` (RPC `mob/force_cancel`)
-cooperatively cancels a member's in-flight turn without retiring it — the
+cooperatively cancels a member's in-flight turn without retiring it - the
 member stays in the roster and can take new turns. As the operator remedy for
 a wedged member it is legal whenever the mob is running and idempotent:
 cancelling a member whose runtime is no longer live, or one already retiring,

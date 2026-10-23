@@ -84,12 +84,12 @@ Primary crates:
 ### `MobBuilder` API
 
 - `MobBuilder::new(definition, storage)`
-- `MobBuilder::from_mobpack(definition, packed_skills, storage)` — create from mobpack with inline skills
+- `MobBuilder::from_mobpack(definition, packed_skills, storage)` - create from mobpack with inline skills
 - `MobBuilder::for_resume(storage)`
 - `.with_session_service(Arc<dyn MobSessionService>)`
 - `.allow_ephemeral_sessions(bool)`
 - `.notify_orchestrator_on_resume(bool)` (a notification that fails after the resume returned is recorded as an `OrchestratorResumeNotificationFailed` mob event once its input has failed terminally, after the runtime's bounded retries; one a retry delivers records nothing; the mob keeps running. The event is recorded in process: a crash before the input's terminal loses it)
-- `.with_default_llm_client(client)` — override LLM client (primarily for testing)
+- `.with_default_llm_client(client)` - override LLM client (primarily for testing)
 - `.register_tool_bundle(name, dispatcher)` / `.register_tool_bundle_with_account(name, account, dispatcher)` (states the `OperationAccount` the bundle's operations act with)
 - `.with_member_runtime_registration_hook(hook)` (`runtime-adapter`) - the host selects each member's destination and agent mandate. Since 0.9.4 `MemberRuntimeBuildIdentity::registration()` names the exact registration a call is for (a new member's prepared one, or a recovered member's current one): bind decisions to it, not to the session id or labels. The identity is no longer `UnwindSafe`; wrap it in `AssertUnwindSafe` to move it into `catch_unwind`
 - `.with_fork_instruction_policy(policy)` (0.9.4+) - the host's `ForkInstructionPolicy` for every fork of a member with activated host instructions: `RequireExplicitActivation` (default), `ReactivateInherited` or `Refuse`. Never a tool argument or part of a definition; `MobMcpState::with_fork_instruction_policy` sets it for MCP-managed mobs
@@ -99,7 +99,7 @@ Primary crates:
 ### `MobHandle` API
 
 - inspection: `status()`, `definition()`, `mob_id()`, `roster()`, `list_members()`, `list_all_members()`, `get_member()`, `events()`
-- membership: `spawn_spec(spec)`, `spawn_many(specs)`, `retire(identity)`, `respawn(identity)`, `retire_all()`, `set_spawn_policy()` — all identity-keyed via `AgentIdentity`
+- membership: `spawn_spec(spec)`, `spawn_many(specs)`, `retire(identity)`, `respawn(identity)`, `retire_all()`, `set_spawn_policy()` - all identity-keyed via `AgentIdentity`
 - graph: `wire()`, `unwire()`
 - turns: `member(id)` returns a `MemberHandle` with `send(content, handling_mode)` and `internal_turn(content)`
 - lifecycle: `stop()` (returns a `MobStopReport`), `resume()`, `complete()`, `reset()`, `destroy()`, `shutdown()`, `shutdown_with_report(options)`
@@ -799,7 +799,7 @@ The web build is a surface over the shared `MeerkatMachine`. Direct sessions and
 
 **How it works:**
 - `meerkat-core` + `meerkat-client` compile to wasm32 via `tokio_with_wasm` (drop-in tokio replacement)
-- `reqwest` uses browser `fetch` on wasm32 — no custom JS bridge
+- `reqwest` uses browser `fetch` on wasm32 - no custom JS bridge
 - `web-time` replaces `std::time` types (SystemTime, Instant) for browser compatibility
 - Anthropic CORS header added automatically on wasm32 targets
 
@@ -927,11 +927,11 @@ generated structure. These are two authoring forms, not separate engines.
 
 Key types:
 
-- `FrameSpec` — a set of `FlowNodeSpec` nodes forming a dependency graph within a frame
-- `FlowNodeSpec` — either `Step(FrameStepSpec)` or `RepeatUntil(RepeatUntilSpec)`
-- `FrameStepSpec` — references a named `step_id`, with `depends_on` and
+- `FrameSpec` - a set of `FlowNodeSpec` nodes forming a dependency graph within a frame
+- `FlowNodeSpec` - either `Step(FrameStepSpec)` or `RepeatUntil(RepeatUntilSpec)`
+- `FrameStepSpec` - references a named `step_id`, with `depends_on` and
   `depends_on_mode`; role/message stay in the flow's `steps` map
-- `RepeatUntilSpec` — loop with `loop_id`, `depends_on`, `depends_on_mode`,
+- `RepeatUntilSpec` - loop with `loop_id`, `depends_on`, `depends_on_mode`,
   `body: FrameSpec`, `until: ConditionExpr`, `max_iterations: u32`
 
 Execution model:
@@ -993,7 +993,7 @@ With generated authority, `AgentMobToolSurface`
 
 | Tool | Purpose |
 |------|---------|
-| `delegate` | Quick helper spawn — creates implicit mob on first use, spawns member, auto-wires comms |
+| `delegate` | Quick helper spawn - creates implicit mob on first use, spawns member, auto-wires comms |
 | `conclude_objective` | Supply only `outcome` to conclude the kickoff objective pre-addressed by the current turn |
 | `mob_create` | Create a mob from a definition |
 | `mob_destroy` | Destroy a mob and archive all members |
