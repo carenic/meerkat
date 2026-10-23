@@ -252,9 +252,11 @@ The store relies on Core keeping these rules:
 - **Self-fencing.** The holder fences itself on its own clock: it makes no
   model call, dispatches nothing and commits nothing unless its last
   successful acquire or renew started less than the self-fence window ago.
-  It checks the clock before each commit, each tool dispatch and each model
-  call, which takes no store request; the per-round path sends no fence
-  request to the store.
+  It checks the clock before each commit, before each model call, and right
+  before each tool call starts, after the round's pre-tool hooks; a call
+  refused there never starts, and the round commits none of its results. A
+  check takes no store request; the per-round path sends no fence request to
+  the store.
 - **Takeover wait.** After an acquire that supersedes a live holder, the new
   holder waits out `FenceGrant::superseded_lease` before it makes a model
   call or dispatches anything. By then the old holder has fenced itself: the

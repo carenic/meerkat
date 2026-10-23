@@ -335,9 +335,10 @@ Contract and limits: `docs/guides/durable-runs.mdx`.
 - Cost: `sqlite` (HeadCanonical) writes the round's rows; `jsonl` and
   host-store realms (WholeBlob) write the whole session document at each
   commit, so the bytes grow with the square of the tool rounds. A compaction
-  keeps the commits going: on WholeBlob it re-bases the run (one store call
-  commits the compacted document as the committed base and restarts the run's
-  tail on it).
+  keeps the commits going: on WholeBlob the run's next round commit re-bases
+  it (one store call commits the document, compaction included, as the
+  committed base and restarts the run's tail on it; a crash before that
+  commit continues from the previous one and compacts again).
 - Resume: when the session is opened again (any surface, or a mob rebuilding
   its `durable = true` workers) its open run continues under the same run id;
   no new input is needed. There is no boot sweep: a session nobody opens

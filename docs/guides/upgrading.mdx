@@ -197,6 +197,11 @@ a crash (see [Durable Runs](/guides/durable-runs)). Integrations see:
   after a run's first compaction on a store that accepts only strict
   continuations of the committed document; the run's last round commit
   before the compaction stays its resume point.
+- `meerkat-runtime`: `RuntimeStore` gains
+  `commit_prepared_whole_blob_run_rebase` (default `Unsupported`) and
+  `supports_whole_blob_run_rebase` (default `false`). The session service
+  re-bases a WholeBlob run only over a store that answers `true`; over any
+  other store the run takes no round commit after its first compaction.
 - `meerkat-core`: `AgentEvent` gains `RunResumed { session_id, run_id, round,
   resume_point }`, wire type `run_resumed`, with the new non-exhaustive
   `RunResumePointKind` (`tools_pending`, `awaiting_model`). A resumed run
@@ -235,8 +240,11 @@ a crash (see [Durable Runs](/guides/durable-runs)). Integrations see:
 **Do:** return a receipt from `checkpoint_run` once the checkpoint is
 durable, and an error when it cannot be made durable. A custom checkpointer
 over a store that accepts only strict continuations implements
-`rebases_runs` and `rebase_run` to keep round commits after a compaction.
-Handle `run_resumed` where you consume events. Where you build these machine
+`rebases_runs` and `rebase_run` to keep round commits after a compaction,
+and a `RuntimeStore` decorator forwards
+`commit_prepared_whole_blob_run_rebase` and
+`supports_whole_blob_run_rebase`. Handle `run_resumed` where you consume
+events. Where you build these machine
 inputs or state literals, pass `DurableTailRunCursor::Absent` and `false` to
 `ClassifyDurableTail`, `None` for `resumable_run_id` and `false` for
 `bound_run_resumable` (a tail without a run cursor, the 0.9.4 behaviour),
@@ -426,7 +434,8 @@ WebSocket, and keep WebRTC for sessions that are not mob members.
 8. Custom `SessionCheckpointer` implementations: return a receipt from
    `checkpoint_run` once a checkpoint is durable, and implement
    `rebases_runs` and `rebase_run` if your store accepts only strict
-   continuations.
+   continuations. `RuntimeStore` decorators: forward the two WholeBlob run
+   re-base methods.
 9. Handle the `run_resumed` event, and pass the new fields of the recovery
    and runtime machine inputs.
 10. Pass `durable` where you build `Profile` or its wire forms, and handle

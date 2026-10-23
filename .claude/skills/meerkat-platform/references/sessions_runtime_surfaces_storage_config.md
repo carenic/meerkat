@@ -114,8 +114,9 @@ Contract, obligations and conformance: `docs/reference/host-store-spi.mdx`.
   settled before the
   scope's next version. A refused batch, or one still unknown after the retry
   budget, poisons the scopes it touched until the realm is reopened.
-- The runtime store is WholeBlob, with the cost above; a compaction re-bases
-  a run's commits rather than stopping them. An interactive OAuth login in
+- The runtime store is WholeBlob, with the cost above; the run's next round
+  commit after a compaction re-bases the run rather than stopping its
+  commits. An interactive OAuth login in
   progress is process-local: after a restart or a takeover, start it again;
   completed credentials are kept.
 - Test a store with the host store chapter of `meerkat-store-conformance`.
