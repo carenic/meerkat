@@ -3,11 +3,9 @@
 #[cfg(not(feature = "memory-store"))]
 use async_trait::async_trait;
 use std::any::Any;
-use std::collections::BTreeMap;
-#[cfg(feature = "skills")]
-use std::collections::BTreeSet;
 #[cfg(not(feature = "memory-store"))]
 use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
