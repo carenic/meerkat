@@ -356,6 +356,23 @@ pub trait SessionCheckpointer: Send + Sync {
         previous: Option<&RunCheckpointReceipt>,
     ) -> Result<Option<RunCheckpointReceipt>, AgentError>;
 
+    /// Whether this writer may still act on the session now.
+    ///
+    /// A checkpointer over a host store answers from its fence handle's
+    /// self-fence window: past it, another process may already own the
+    /// session, and nothing this process dispatches may run. The agent asks
+    /// right before each model request and right after a tool round's first
+    /// commit, before any tool of the round is admitted, because a pause
+    /// between a commit and a dispatch writes nothing that would meet the
+    /// write path's own fence check. An error stops the run there, as a
+    /// refused commit does; return the teardown-required class
+    /// ([`AgentError::session_durable_projection_authority_unknown`]) so the
+    /// live actor reloads instead of continuing on stale authority. Called
+    /// synchronously, with no I/O. The default allows.
+    fn dispatch_fence_check(&self) -> Result<(), AgentError> {
+        Ok(())
+    }
+
     /// Record how far the live session retired its transcript history once
     /// this run's latest checkpoint moved the durable head over its rewrites.
     ///

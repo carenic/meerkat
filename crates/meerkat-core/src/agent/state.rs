@@ -1689,6 +1689,18 @@ where
                 .commits_allowed(self.session.has_durable_head_canonical_head())
     }
 
+    /// Whether this writer may still dispatch: the session checkpointer's
+    /// fence check (see [`crate::SessionCheckpointer::dispatch_fence_check`]),
+    /// asked only of an agent whose runs commit their rounds.
+    fn check_dispatch_fence(&self) -> Result<(), AgentError> {
+        match self.checkpointer.as_ref() {
+            Some(checkpointer) if self.round_commits_enabled() => {
+                checkpointer.dispatch_fence_check()
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Start the round state of a fresh run.
     ///
     /// A cursor another run left in the live session (its future was dropped
@@ -1994,7 +2006,8 @@ where
     /// suspended state, so the staging record must be in it: there, and for a
     /// result, a failed write fails the run. After a failure the run's own
     /// error stands and the write's is logged, unless the write's error
-    /// requires the session's teardown.
+    /// requires the session's teardown. A run whose own failure requires the
+    /// session's teardown writes nothing more.
     pub(super) async fn close_run_cursor_at_exit(
         &mut self,
         result: Result<RunResult, AgentError>,
@@ -2005,6 +2018,12 @@ where
         let Some(run_id) = self.round_commits.run_id.clone() else {
             return result;
         };
+        // A failure that requires the session's teardown (store authority
+        // unknown, a writer past its fence) writes nothing more: the live
+        // actor reloads, and recovery reads the last round commit.
+        if matches!(&result, Err(error) if error.requires_session_teardown()) {
+            return result;
+        }
         let promotes = self.run_exit_promotes_latest_checkpoint(&result);
         if !promotes
             && !self
@@ -3185,6 +3204,8 @@ where
             if let Some(exceeded) = self.budget.observe().exceeded() {
                 return Err(exceeded.to_agent_error());
             }
+            // 1b. A writer past its self-fence window calls no model.
+            self.check_dispatch_fence()?;
 
             // 2. Compute effective timeout for this call
             let controller = if *controller_feedback {
@@ -8668,6 +8689,16 @@ where
         {
             self.terminalize_fatal_error(ctx.run_id, ctx.turn_count, ctx.event_tx, &error)
                 .await?;
+            return Err(error);
+        }
+        // A writer past its self-fence window admits no tool: a pause since
+        // the commit (or since a resumed round's adopted tail) wrote nothing
+        // the store's own fence check would refuse.
+        if let Err(error) = self.check_dispatch_fence() {
+            if !error.requires_session_teardown() {
+                self.terminalize_fatal_error(ctx.run_id, ctx.turn_count, ctx.event_tx, &error)
+                    .await?;
+            }
             return Err(error);
         }
 

@@ -199,23 +199,29 @@ struct RecordingCheckpointer {
     receipts: bool,
     commits: Mutex<Vec<(Session, RunCheckpointReceipt)>>,
     calls: AtomicUsize,
+    /// The writer's self-fence window has closed: dispatch is refused.
+    fenced: std::sync::atomic::AtomicBool,
+    /// Close the window as soon as a round's first commit lands.
+    fence_after_first_commit: bool,
 }
 
 impl RecordingCheckpointer {
-    fn new() -> Arc<Self> {
+    fn with(receipts: bool, fenced: bool, fence_after_first_commit: bool) -> Arc<Self> {
         Arc::new(Self {
-            receipts: true,
+            receipts,
             commits: Mutex::new(Vec::new()),
             calls: AtomicUsize::new(0),
+            fenced: std::sync::atomic::AtomicBool::new(fenced),
+            fence_after_first_commit,
         })
     }
 
+    fn new() -> Arc<Self> {
+        Self::with(true, false, false)
+    }
+
     fn without_receipts() -> Arc<Self> {
-        Arc::new(Self {
-            receipts: false,
-            commits: Mutex::new(Vec::new()),
-            calls: AtomicUsize::new(0),
-        })
+        Self::with(false, false, false)
     }
 
     fn commits(&self) -> Vec<(Session, RunCheckpointReceipt)> {
@@ -261,11 +267,27 @@ impl SessionCheckpointer for RecordingCheckpointer {
         }
         let sequence = previous.map_or(1, |previous| previous.candidate_sequence() + 1);
         let next = receipt(session, run_id, sequence);
+        if self.fence_after_first_commit
+            && cursor_of(session).is_some_and(|cursor| {
+                matches!(cursor.resume_point, RunResumePoint::ToolsPending { .. })
+            })
+        {
+            self.fenced.store(true, Ordering::SeqCst);
+        }
         self.commits
             .lock()
             .unwrap()
             .push((session.clone(), next.clone()));
         Ok(Some(next))
+    }
+
+    fn dispatch_fence_check(&self) -> Result<(), AgentError> {
+        if self.fenced.load(Ordering::SeqCst) {
+            return Err(AgentError::session_durable_projection_authority_unknown(
+                "the writer's self-fence window closed",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -842,6 +864,56 @@ async fn a_first_commit_without_a_receipt_runs_no_tool() {
     );
     assert!(tools.dispatched().is_empty(), "no tool of the round runs");
     assert_eq!(checkpointer.calls.load(Ordering::SeqCst), 1);
+}
+
+/// A writer past its self-fence window dispatches nothing: no model call
+/// when the window closed before the run, and no tool when it closed right
+/// after a round's first commit. The run stops with the teardown-required
+/// failure and writes nothing more.
+#[tokio::test]
+async fn a_writer_past_its_fence_window_dispatches_nothing() {
+    let client = ScriptedClient::new(vec![Step::Answer("done")]);
+    let tools = RecordingTools::new(RecordingTools::probes(), None);
+    let checkpointer = RecordingCheckpointer::with(true, true, false);
+    let mut agent = build_agent(
+        fresh_session(),
+        &client,
+        &tools,
+        Some(Arc::clone(&checkpointer)),
+        true,
+        None,
+    )
+    .await;
+    let error = agent
+        .run("start".into())
+        .await
+        .expect_err("a fenced writer calls no model");
+    assert!(error.requires_session_teardown(), "{error}");
+    assert_eq!(client.calls(), 0);
+
+    let client = ScriptedClient::new(vec![Step::Tools(vec![("call-1", "probe", "{}")])]);
+    let tools = RecordingTools::new(RecordingTools::probes(), None);
+    let checkpointer = RecordingCheckpointer::with(true, false, true);
+    let mut agent = build_agent(
+        fresh_session(),
+        &client,
+        &tools,
+        Some(Arc::clone(&checkpointer)),
+        true,
+        None,
+    )
+    .await;
+    let error = agent
+        .run("start".into())
+        .await
+        .expect_err("a writer fenced after the first commit runs no tool");
+    assert!(error.requires_session_teardown(), "{error}");
+    assert!(tools.dispatched().is_empty(), "no tool of the round runs");
+    assert_eq!(
+        checkpointer.commits().len(),
+        1,
+        "only the round's first commit was written; the fenced run writes nothing more"
+    );
 }
 
 /// A run that ends without an end-of-run save (here at its turn cap, right
