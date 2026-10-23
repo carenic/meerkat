@@ -286,7 +286,11 @@ async fn reference_host_store_leases() {
             remaining: lease,
         })
     );
-    store.advance_clock(lease - Duration::from_secs(1));
+    store.advance_clock(
+        lease
+            .checked_sub(Duration::from_secs(1))
+            .expect("the default lease is longer than one second"),
+    );
     assert_eq!(
         store.acquire_fence(AcquireMode::Exclusive).await,
         Err(HostStoreError::Held {
@@ -603,7 +607,7 @@ impl ScriptedCore {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
-            .unwrap_or_else(RunId::new);
+            .unwrap_or_default();
         let kill_round = plan.kill_round;
         let resumed_run = resumes(plan);
         let race = plan.kill_point == KillPoint::RebaseRace;
