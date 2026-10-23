@@ -3126,29 +3126,25 @@ mod hosting {
             .expect("move the delivery generation");
         }
 
-        /// Commit delivery authority `revision` through a store of the test's
-        /// own on the same file, as another process's delivery would: it
-        /// moves the store's delivery generation, and its first commit
-        /// provisions the delivery domain. The owner hears of it only through
-        /// its store watch.
-        async fn commit_a_delivery_elsewhere(path: &std::path::Path, revision: u64) {
+        /// Provision the store's delivery domain, as a store's first delivery
+        /// write does, through a store of the test's own on the same file: a
+        /// compare-and-swap that expects a revision no row has conflicts and
+        /// commits nothing, so no runtime is left for the owner to route.
+        async fn provision_the_delivery_domain(path: &std::path::Path) {
             let store = SqliteRuntimeStore::new(path.to_path_buf()).expect("another store");
             let outcome = store
                 .compare_and_swap_runtime_delivery_authority(
-                    &LogicalRuntimeId::new("elsewhere"),
-                    revision.checked_sub(1).filter(|observed| *observed > 0),
-                    meerkat_runtime::RuntimeDeliveryAuthorityRecord::from_parts(
-                        revision,
-                        br#"{"opaque":true}"#.to_vec(),
-                    ),
+                    &LogicalRuntimeId::new("provisioning"),
+                    Some(1),
+                    meerkat_runtime::RuntimeDeliveryAuthorityRecord::from_parts(2, b"{}".to_vec()),
                     None,
                 )
                 .await
-                .expect("a delivery commit");
+                .expect("the delivery write connection");
             assert!(
                 matches!(
                     outcome,
-                    meerkat_runtime::RuntimeDeliveryAuthorityCasOutcome::Applied(_)
+                    meerkat_runtime::RuntimeDeliveryAuthorityCasOutcome::Conflict(_)
                 ),
                 "{outcome:?}"
             );
@@ -3255,6 +3251,7 @@ mod hosting {
         async fn a_fresh_read_owner_reads_a_commit_where_its_own_open_notifies_a_wal_change() {
             let (fixture, path, capability) = watched_store();
             hooks::force_fresh_reads(&path);
+            provision_the_delivery_domain(&path).await;
             let handle = arm_registered(&fixture, &path, &capability, NO_SWEEP, true);
             let mut passes = handle.subscribe_passes();
             first_pass(&mut passes).await;
@@ -3262,7 +3259,10 @@ mod hosting {
             let opens = hooks::verified_opens(&path);
             let reconciled = passes.borrow().generation;
 
-            commit_a_delivery_elsewhere(&path, 1).await;
+            let conn = meerkat_sqlite::open(&path, meerkat_sqlite::ConnectionProfile::PRIMARY)
+                .expect("another connection");
+            move_the_delivery_generation(&conn);
+            drop(conn);
             wait_real("the commit's reconcile", EVENT_GUARD, || {
                 passes.borrow().generation > reconciled
             })
@@ -3285,7 +3285,7 @@ mod hosting {
             let (fixture, path, capability) = watched_store();
             hooks::force_fresh_reads(&path);
             let wal = wal_of(&path);
-            commit_a_delivery_elsewhere(&path, 1).await;
+            provision_the_delivery_domain(&path).await;
             // Held through the test: no read is the store's first or last
             // connection, so the WAL stays and no read changes it.
             let held = meerkat_sqlite::open(&path, meerkat_sqlite::ConnectionProfile::PRIMARY)
