@@ -1383,7 +1383,14 @@ An autonomous member keeps its running turn the same way, and its kickoff
 stays open: the next start resumes the run under the same objective, and
 when that run is the kickoff's, the kickoff resolves when it ends. A
 retiring or host-placed autonomous member is still interrupted, with its
-kickoff closed. The runtime stop still cancels a run that commits no rounds,
+kickoff closed. A draining deploy that first stops the mob with
+`MobHandle::stop_with_options(StopOptions::default().leave_runs_running())`
+and drains with `MobHandle::drain_stopped_runs` leaves such a member's
+kickoff open as well, so the Shutdown that follows decides: its default
+keeps the kickoff and the run for the next start, and
+`with_queued_inputs(QueuedInputsOnShutdown::Stop)` closes the kickoff and
+cancels the run. A plain Stop, which interrupts runs, still closes the
+kickoff. The runtime stop still cancels a run that commits no rounds,
 such as a live bridge run: that turn's own input ends cancelled, and its
 user message is not in what a kept input's turn sees.
 

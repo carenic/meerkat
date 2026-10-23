@@ -145,11 +145,14 @@ applies to every member. Under Requeue the Shutdown holds run starts and
 cancels no running turn: a run that commits every round is suspended at its
 last committed round and continues at the next start (an autonomous member's
 too, its kickoff kept open and resumed under the same objective, unless the
-member is retiring or host-placed; a run with no round commits is
-cancelled), and durable queued prompts that are neither directed nor bound
-to an objective (never a member's kickoff) are kept to run after it; their
-waiters get `BoundedTurnFailure::RequeuedAcrossStop`, or `RequeueExpired`
-when older than `max_age` at that start)
+member is retiring or host-placed; a Stop with
+`StopOptions::default().leave_runs_running()` before the Shutdown leaves that
+kickoff open for the Shutdown to decide, while a plain Stop closes it; a run
+with no round commits is cancelled), and durable queued prompts that are
+neither directed nor bound to an objective (never a member's kickoff) are
+kept to run after it; their waiters get
+`BoundedTurnFailure::RequeuedAcrossStop`, or `RequeueExpired` when older than
+`max_age` at that start)
 returns a `MobShutdownReport` with per-member `members`
 (`MemberShutdownOutcome`), `runs` and `run_starts`; `is_clean()` is true when
 every member is `Unregistered`. Since 0.9.4 `UnregisterPending { stage,

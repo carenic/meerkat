@@ -180,8 +180,9 @@ add the arms (or a wildcard) where you match these enums exhaustively.
   and its DSL (`meerkat-machine-schema`) decide an autonomous member's case:
   the input `ResolveAutonomousShutdownMemberAction` gains
   `keeps_durable_run`, the string enum `AutonomousShutdownMemberActionKind`
-  gains `KeepForResume`, appended last, and the transition ids gain the
-  per-phase transitions `ResolveAutonomousShutdownMemberActionKeepForResume*`.
+  gains `KeepForResume`, and the transition ids gain the per-phase
+  transitions `ResolveAutonomousShutdownMemberActionKeepForResume*`, each
+  appended last.
 
 **Do:** where a mob Shutdown must end members' work as before, pass
 `ShutdownOptions::default().with_queued_inputs(QueuedInputsOnShutdown::Stop)`,
