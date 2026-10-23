@@ -50,8 +50,10 @@ def _session(client: MeerkatClient) -> Session:
     ("contract_version", "opts_out"),
     [
         pytest.param("0.9.5", True, id="0.9.5"),
+        pytest.param("0.9.10", True, id="0.9.10"),
         pytest.param("0.10.0", True, id="0.10.0"),
         pytest.param("0.9.4", False, id="older"),
+        pytest.param("0.9.x", False, id="not-numeric"),
         pytest.param("", False, id="unknown"),
     ],
 )

@@ -54,8 +54,10 @@ function session(client) {
 describe("turn session/event opt-out", () => {
   for (const [contractVersion, optsOut] of [
     ["0.9.5", true],
+    ["0.9.10", true],
     ["0.10.0", true],
     ["0.9.4", false],
+    ["0.9.x", false],
     ["", false],
   ]) {
     it(`a non-streaming turn against contract "${contractVersion}" ${optsOut ? "opts out" : "sends no field"}`, async () => {

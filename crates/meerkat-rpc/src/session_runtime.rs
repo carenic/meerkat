@@ -15846,16 +15846,6 @@ mod tests {
         assert_eq!(metadata.provider, Some(meerkat_core::Provider::Anthropic));
     }
 
-    /// #61/#67 gate: direct session-create provider resolution mirrors REST's
-    /// fail-closed `resolve_validation_identity`.
-    ///
-    /// - A model string with **no** explicit provider and **no** registered
-    ///   catalog owner returns `INVALID_PARAMS` — pre-fix this path inferred
-    ///   a provider from the model string (`ModelCatalog::infer_provider`),
-    ///   minting an unblessed provider hint instead of failing closed.
-    /// - A registered catalog model with no provider resolves to the catalog
-    ///   owner.
-    /// - An explicit provider that contradicts the catalog owner is rejected.
     /// A turn writes its `session/event` copies unless every one of its
     /// inputs was admitted by a request that opted out, and a request's
     /// opt-out ends with the request.
@@ -15887,6 +15877,16 @@ mod tests {
         );
     }
 
+    /// #61/#67 gate: direct session-create provider resolution mirrors REST's
+    /// fail-closed `resolve_validation_identity`.
+    ///
+    /// - A model string with **no** explicit provider and **no** registered
+    ///   catalog owner returns `INVALID_PARAMS` — pre-fix this path inferred
+    ///   a provider from the model string (`ModelCatalog::infer_provider`),
+    ///   minting an unblessed provider hint instead of failing closed.
+    /// - A registered catalog model with no provider resolves to the catalog
+    ///   owner.
+    /// - An explicit provider that contradicts the catalog owner is rejected.
     #[tokio::test]
     async fn create_provider_resolves_through_registered_owner_fail_closed() {
         let temp = tempfile::tempdir().expect("tempdir");
