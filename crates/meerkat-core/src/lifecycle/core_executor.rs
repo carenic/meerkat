@@ -2064,9 +2064,10 @@ pub trait CoreExecutor: Send + Sync {
     /// otherwise its next boundary preparation names a predecessor the store
     /// no longer holds and is refused. The runtime asks only for a
     /// HeadCanonical store, after every intent finalized. Every store-backed
-    /// executor that reconciles committed compaction projections must
-    /// implement this hook; the default refuses, typed, so an executor that
-    /// cannot adopt the commit never leaves a stale actor serving silently.
+    /// executor that reconciles committed compaction projections should
+    /// implement this hook. The default refuses, typed; the runtime logs a
+    /// refusal and carries on, leaving the unadopted actor to the store's
+    /// refusal of its next preparation and the resync that follows.
     async fn acknowledge_compaction_finalization(
         &mut self,
         _authority: &CommittedSessionBoundaryAuthority,

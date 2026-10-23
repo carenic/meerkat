@@ -662,19 +662,32 @@ pub(crate) async fn reconcile_loaded_compaction_projection_outbox(
         // dropped them in the executor reconciliation above. Adopt the
         // committed head once every intent is finalized, or the actor's next
         // boundary preparation names a predecessor the store no longer holds.
+        //
+        // The adoption is best-effort. The finalization is durable either
+        // way, and an actor that did not adopt it cannot commit over it: the
+        // store refuses its next preparation and the turn resyncs from
+        // durable state. So a refused adoption (an executor or session
+        // service that does not implement it, an actor that just exited)
+        // fails neither the committed run nor the runtime.
         if !intents.is_empty() {
             let authority = {
                 let driver = driver.lock().await;
-                driver.committed_head_canonical_authority().await?
+                driver.committed_head_canonical_authority().await
             };
-            executor
-                .acknowledge_compaction_finalization(&authority)
-                .await
-                .map_err(|error| {
-                    crate::RuntimeDriverError::Internal(format!(
-                        "the live actor could not adopt the HeadCanonical compaction finalization: {error}"
-                    ))
-                })?;
+            let adopted = match authority {
+                Ok(authority) => executor
+                    .acknowledge_compaction_finalization(&authority)
+                    .await
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            if let Err(error) = adopted {
+                tracing::warn!(
+                    session_id = ?intents.first().map(|intent| intent.projection.session_id()),
+                    %error,
+                    "the live actor did not adopt the HeadCanonical compaction finalization; its next boundary preparation is refused and resyncs"
+                );
+            }
         }
         return Ok(None);
     }

@@ -13728,8 +13728,9 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// nothing to adopt: a later materialization reads the finalized head.
     ///
     /// The committed head is re-read and must still be the one `authority`
-    /// names. Any divergence is an error: the runtime fails closed and the
-    /// actor is rebuilt from durable state.
+    /// names. Any divergence is an error, which the runtime logs: the store
+    /// refuses the unadopted actor's next boundary preparation, and the turn
+    /// resyncs from durable state.
     pub async fn acknowledge_runtime_compaction_finalization(
         &self,
         id: &SessionId,

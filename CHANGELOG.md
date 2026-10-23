@@ -1029,6 +1029,10 @@ them.
   implement them. `meerkat-session`:
   `SessionAgent::acknowledge_head_canonical_compaction_finalization` (refusing
   by default) and `PersistentSessionService::acknowledge_runtime_compaction_finalization`.
+  A `SessionService` wrapper or `CoreExecutor` that forwards the compaction
+  reconcile should forward the new method too: otherwise the runtime logs the
+  refusal, the live actor is not adopted, and its next checkpoint after such
+  a compaction is refused once and resyncs, as before.
 
 - `meerkat-mob`: `MobSessionService` gains `fork_source_tools`, the visible
   tool names a fork notice compares, read from the set the session task
