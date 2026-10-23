@@ -2834,9 +2834,10 @@ them.
 
 ### Security
 
-- tokio updated to 1.53.3 for RUSTSEC-2026-0386. The workspace still
-  accepts tokio 1.43 and later, so update tokio to >= 1.53.3 in your
-  lockfile (RUSTSEC-2026-0386).
+- tokio is updated to 1.53.3 in Meerkat's lockfile for RUSTSEC-2026-0386.
+  Meerkat's crates still accept tokio 1.43 and later, so a project that
+  depends on them should update tokio to 1.53.3 or later in its own lockfile,
+  for example with `cargo update -p tokio`.
 
 ### Upgrade notes
 
