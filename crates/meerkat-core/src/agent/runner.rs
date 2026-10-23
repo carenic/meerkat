@@ -4507,6 +4507,38 @@ mod skill_activation_effect_tests {
         }
     }
 
+    /// [`ObservationTools`] whose dispatch first spends `delay` of wall
+    /// time on a blocking thread, as a starved host makes it slow.
+    struct StarvedObservationTools {
+        delay: std::time::Duration,
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl AgentToolDispatcher for StarvedObservationTools {
+        fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+            ObservationTools.tools()
+        }
+        async fn dispatch(&self, call: ToolCallView<'_>) -> Result<ToolDispatchOutcome, ToolError> {
+            let delay = self.delay;
+            tokio::task::spawn_blocking(move || std::thread::sleep(delay))
+                .await
+                .unwrap();
+            ObservationTools.dispatch(call).await
+        }
+        async fn resolve_tool_application(
+            &self,
+            tool_name: &str,
+            request: &crate::ToolApplicationRequest,
+            host_metadata: &serde_json::Value,
+            context: &crate::ToolDispatchContext,
+        ) -> Result<crate::tool_application::ToolApplicationResolution, ToolError> {
+            ObservationTools
+                .resolve_tool_application(tool_name, request, host_metadata, context)
+                .await
+        }
+    }
+
     struct ObservationTools;
     #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -4608,7 +4640,10 @@ mod skill_activation_effect_tests {
         let mut agent = with_test_turn_state_handle(AgentBuilder::new())
             .build_standalone(
                 client.clone(),
-                Arc::new(ObservationTools),
+                // The bridge's tool dispatch is slow, as on a starved host.
+                Arc::new(StarvedObservationTools {
+                    delay: std::time::Duration::from_millis(5500),
+                }),
                 Arc::new(NoopStore),
             )
             .await;
