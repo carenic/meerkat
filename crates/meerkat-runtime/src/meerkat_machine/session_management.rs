@@ -2198,7 +2198,7 @@ impl MeerkatMachine {
         // reservation stay here until an attempt publishes them, and a
         // registration dropped at an await has published nothing.
         let mut pending = Some((session_entry, owner_loss));
-        let mut retry = crate::store::FenceBackoffRetry::default();
+        let mut retry = crate::store::FenceBackoffRetry::for_fence(Some(write_fence.as_ref()));
         let publication = loop {
             let mut sessions = self.sessions.write().await;
             if sessions.contains_key(&session_id) {

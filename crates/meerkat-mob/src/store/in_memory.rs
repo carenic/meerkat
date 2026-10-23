@@ -141,7 +141,7 @@ where
 /// In-memory event store for tests and ephemeral mobs.
 #[derive(Debug)]
 pub struct InMemoryMobEventStore {
-    aggregate: Arc<RwLock<InMemoryMobAggregateState>>,
+    pub(super) aggregate: Arc<RwLock<InMemoryMobAggregateState>>,
     event_tx: broadcast::Sender<MobEvent>,
     definition_resume_gate: Arc<RwLock<()>>,
     #[cfg(any(test, feature = "test-support"))]
@@ -436,12 +436,12 @@ impl private::MobEventStoreSealed for InMemoryMobEventStore {
     }
 }
 
-type ExternalBindingOverlayMap = BTreeMap<
+pub(super) type ExternalBindingOverlayMap = BTreeMap<
     (MobId, crate::ids::AgentIdentity, crate::ids::Generation),
     ExternalBindingOverlayRecord,
 >;
 
-type MemberOperatorRequestMap =
+pub(super) type MemberOperatorRequestMap =
     BTreeMap<(MobId, MobMemberOperatorRequestKey), MobMemberOperatorRequestRecord>;
 
 #[derive(Debug, Clone, Default)]
@@ -464,30 +464,33 @@ pub(super) struct IdentityAuthorityState {
 /// wiring event append. Ordinary event and identity operations use the same
 /// aggregate so the final CAS cannot race either side.
 #[derive(Debug, Default)]
-struct InMemoryMobAggregateState {
-    events: Vec<MobEvent>,
+pub(super) struct InMemoryMobAggregateState {
+    pub(super) events: Vec<MobEvent>,
     /// The store's creation record, written with its `MobCreated` under this
     /// one lock.
-    creation: Option<MobCreationRecord>,
-    external_deliveries: BTreeMap<(MobId, String), MobExternalDeliveryRecord>,
-    identity: IdentityAuthorityState,
+    pub(super) creation: Option<MobCreationRecord>,
+    pub(super) external_deliveries: BTreeMap<(MobId, String), MobExternalDeliveryRecord>,
+    pub(super) identity: IdentityAuthorityState,
 }
 
 /// In-memory runtime metadata store for tests and ephemeral mobs.
 #[derive(Debug, Default)]
 pub struct InMemoryMobRuntimeMetadataStore {
-    supervisor_records: Arc<RwLock<BTreeMap<MobId, SupervisorAuthorityRecord>>>,
-    host_authority_records: Arc<RwLock<BTreeMap<(MobId, String), MobHostAuthorityRecord>>>,
-    host_binding_generation_highwaters: Arc<RwLock<BTreeMap<(MobId, String), u64>>>,
-    member_operator_requests: Arc<RwLock<MemberOperatorRequestMap>>,
-    placed_spawns: Arc<RwLock<BTreeMap<(MobId, String), MobPlacedSpawnCarrierRecord>>>,
-    operator_grants: Arc<RwLock<BTreeMap<(MobId, String), MobOperatorGrantRecord>>>,
-    member_event_cursors: Arc<RwLock<BTreeMap<(MobId, String), MobMemberEventCursorRecord>>>,
-    member_live_cleanup_records: Arc<RwLock<BTreeMap<(MobId, String), MobMemberLiveCleanupRecord>>>,
-    forked_participant_member_associations:
+    pub(super) supervisor_records: Arc<RwLock<BTreeMap<MobId, SupervisorAuthorityRecord>>>,
+    pub(super) host_authority_records:
+        Arc<RwLock<BTreeMap<(MobId, String), MobHostAuthorityRecord>>>,
+    pub(super) host_binding_generation_highwaters: Arc<RwLock<BTreeMap<(MobId, String), u64>>>,
+    pub(super) member_operator_requests: Arc<RwLock<MemberOperatorRequestMap>>,
+    pub(super) placed_spawns: Arc<RwLock<BTreeMap<(MobId, String), MobPlacedSpawnCarrierRecord>>>,
+    pub(super) operator_grants: Arc<RwLock<BTreeMap<(MobId, String), MobOperatorGrantRecord>>>,
+    pub(super) member_event_cursors:
+        Arc<RwLock<BTreeMap<(MobId, String), MobMemberEventCursorRecord>>>,
+    pub(super) member_live_cleanup_records:
+        Arc<RwLock<BTreeMap<(MobId, String), MobMemberLiveCleanupRecord>>>,
+    pub(super) forked_participant_member_associations:
         Arc<RwLock<BTreeMap<(MobId, String), MobForkedParticipantMemberAssociation>>>,
-    external_binding_overlays: Arc<RwLock<ExternalBindingOverlayMap>>,
-    callback_claim_verifiers: Arc<RwLock<BTreeMap<MobId, crate::MobClaimVerifier>>>,
+    pub(super) external_binding_overlays: Arc<RwLock<ExternalBindingOverlayMap>>,
+    pub(super) callback_claim_verifiers: Arc<RwLock<BTreeMap<MobId, crate::MobClaimVerifier>>>,
 }
 
 /// In-memory first-class identity authority store. One lock preserves
@@ -549,7 +552,7 @@ impl meerkat_runtime::RuntimeStoreWriteFence for InMemoryIdentityRuntimeWriteFen
 /// the desired-state authority lock.
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryMobIdentityStatusStore {
-    statuses: Arc<RwLock<BTreeMap<(MobId, AgentIdentity), IdentityConvergenceStatus>>>,
+    pub(super) statuses: Arc<RwLock<BTreeMap<(MobId, AgentIdentity), IdentityConvergenceStatus>>>,
 }
 
 impl InMemoryMobIdentityStatusStore {
@@ -652,7 +655,7 @@ fn validate_identity_store_text(field: &'static str, value: &str) -> Result<(), 
     Ok(())
 }
 
-fn identity_receipt_key(
+pub(super) fn identity_receipt_key(
     mob_id: &MobId,
     subject: &IdentityOperationSubject,
     slot: &IdentityOperationSlot,
@@ -3338,9 +3341,9 @@ impl MobEventStore for InMemoryMobEventStore {
 /// In-memory run store.
 #[derive(Debug, Default)]
 pub struct InMemoryMobRunStore {
-    runs: Arc<RwLock<IndexMap<RunId, MobRun>>>,
-    remote_turn_intents: Arc<RwLock<BTreeMap<(RunId, u64), MobRunRemoteTurnIntent>>>,
-    remote_turn_receipts: Arc<RwLock<BTreeMap<(RunId, u64), MobRunRemoteTurnReceipt>>>,
+    pub(super) runs: Arc<RwLock<IndexMap<RunId, MobRun>>>,
+    pub(super) remote_turn_intents: Arc<RwLock<BTreeMap<(RunId, u64), MobRunRemoteTurnIntent>>>,
+    pub(super) remote_turn_receipts: Arc<RwLock<BTreeMap<(RunId, u64), MobRunRemoteTurnReceipt>>>,
 }
 
 impl InMemoryMobRunStore {
@@ -4000,7 +4003,7 @@ impl MobRunStore for InMemoryMobRunStore {
 /// In-memory spec store with revision CAS semantics.
 #[derive(Debug, Default)]
 pub struct InMemoryMobSpecStore {
-    specs: Arc<RwLock<BTreeMap<MobId, (MobDefinition, u64)>>>,
+    pub(super) specs: Arc<RwLock<BTreeMap<MobId, (MobDefinition, u64)>>>,
 }
 
 impl InMemoryMobSpecStore {
@@ -4074,7 +4077,7 @@ impl MobSpecStore for InMemoryMobSpecStore {
 /// reference, and `commit` is a strict compare-and-swap.
 #[derive(Debug, Default, Clone)]
 pub struct InMemoryForkedParticipantStore {
-    records: Arc<RwLock<BTreeMap<String, ForkedParticipantRecord>>>,
+    pub(super) records: Arc<RwLock<BTreeMap<String, ForkedParticipantRecord>>>,
 }
 
 impl InMemoryForkedParticipantStore {
@@ -4307,7 +4310,7 @@ impl TemporaryCouncilStore for InMemoryTemporaryCouncilStore {
 /// In-memory realm profile store with CAS semantics.
 #[derive(Debug, Default)]
 pub struct InMemoryRealmProfileStore {
-    profiles: Arc<RwLock<BTreeMap<String, StoredRealmProfile>>>,
+    pub(super) profiles: Arc<RwLock<BTreeMap<String, StoredRealmProfile>>>,
 }
 
 impl InMemoryRealmProfileStore {

@@ -4,6 +4,8 @@ mod forked_participant;
 mod in_memory;
 mod realm_profile;
 #[cfg(not(target_arch = "wasm32"))]
+mod spi;
+#[cfg(not(target_arch = "wasm32"))]
 mod sqlite;
 mod temporary_council;
 
@@ -29,6 +31,15 @@ pub use sqlite::{
 };
 pub use temporary_council::{
     TemporaryCouncilRecord, TemporaryCouncilRecoveryVerdict, TemporaryCouncilStore,
+};
+
+// Mob storage over the host store SPI (native only).
+#[cfg(not(target_arch = "wasm32"))]
+pub use spi::{
+    MOB_FAMILY, MOB_IDENTITY_FAMILY, MOB_RUN_FAMILY, MOB_STATUS_FAMILY, SpiForkedParticipantStore,
+    SpiMobEventStore, SpiMobIdentityStatusStore, SpiMobIdentityStore, SpiMobRunStore,
+    SpiMobRuntimeMetadataStore, SpiMobSpecStore, SpiMobStoreHost, SpiMobStores,
+    SpiRealmProfileStore, SpiStoredMob,
 };
 
 use crate::definition::MobDefinition;
