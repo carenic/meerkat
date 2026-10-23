@@ -3736,6 +3736,11 @@
             "const": "member_host_unsupported",
             "description": "The source's member host is too old to report its visible tools.",
             "type": "string"
+          },
+          {
+            "const": "seed_unreadable",
+            "description": "The fork seed recorded for the child could not be read (a corrupt\nrecord, or one a later release wrote), so the notice carries nothing\nof it.",
+            "type": "string"
           }
         ]
       },
@@ -29445,6 +29450,11 @@
             "const": "member_host_unsupported",
             "description": "The source's member host is too old to report its visible tools.",
             "type": "string"
+          },
+          {
+            "const": "seed_unreadable",
+            "description": "The fork seed recorded for the child could not be read (a corrupt\nrecord, or one a later release wrote), so the notice carries nothing\nof it.",
+            "type": "string"
           }
         ]
       },
@@ -34448,6 +34458,11 @@
           {
             "const": "member_host_unsupported",
             "description": "The source's member host is too old to report its visible tools.",
+            "type": "string"
+          },
+          {
+            "const": "seed_unreadable",
+            "description": "The fork seed recorded for the child could not be read (a corrupt\nrecord, or one a later release wrote), so the notice carries nothing\nof it.",
             "type": "string"
           }
         ]
@@ -45681,6 +45696,11 @@
           {
             "const": "member_host_unsupported",
             "description": "The source's member host is too old to report its visible tools.",
+            "type": "string"
+          },
+          {
+            "const": "seed_unreadable",
+            "description": "The fork seed recorded for the child could not be read (a corrupt\nrecord, or one a later release wrote), so the notice carries nothing\nof it.",
             "type": "string"
           }
         ]
@@ -64644,6 +64664,11 @@
           {
             "const": "member_host_unsupported",
             "description": "The source's member host is too old to report its visible tools.",
+            "type": "string"
+          },
+          {
+            "const": "seed_unreadable",
+            "description": "The fork seed recorded for the child could not be read (a corrupt\nrecord, or one a later release wrote), so the notice carries nothing\nof it.",
             "type": "string"
           }
         ]
@@ -86131,6 +86156,11 @@
             "const": "member_host_unsupported",
             "description": "The source's member host is too old to report its visible tools.",
             "type": "string"
+          },
+          {
+            "const": "seed_unreadable",
+            "description": "The fork seed recorded for the child could not be read (a corrupt\nrecord, or one a later release wrote), so the notice carries nothing\nof it.",
+            "type": "string"
           }
         ]
       },
@@ -99649,6 +99679,11 @@
           {
             "const": "member_host_unsupported",
             "description": "The source's member host is too old to report its visible tools.",
+            "type": "string"
+          },
+          {
+            "const": "seed_unreadable",
+            "description": "The fork seed recorded for the child could not be read (a corrupt\nrecord, or one a later release wrote), so the notice carries nothing\nof it.",
             "type": "string"
           }
         ]
@@ -125801,6 +125836,11 @@
           {
             "const": "member_host_unsupported",
             "description": "The source's member host is too old to report its visible tools.",
+            "type": "string"
+          },
+          {
+            "const": "seed_unreadable",
+            "description": "The fork seed recorded for the child could not be read (a corrupt\nrecord, or one a later release wrote), so the notice carries nothing\nof it.",
             "type": "string"
           }
         ]
@@ -152431,6 +152471,11 @@
             "const": "member_host_unsupported",
             "description": "The source's member host is too old to report its visible tools.",
             "type": "string"
+          },
+          {
+            "const": "seed_unreadable",
+            "description": "The fork seed recorded for the child could not be read (a corrupt\nrecord, or one a later release wrote), so the notice carries nothing\nof it.",
+            "type": "string"
           }
         ]
       },
@@ -163084,6 +163129,11 @@
             "const": "member_host_unsupported",
             "description": "The source's member host is too old to report its visible tools.",
             "type": "string"
+          },
+          {
+            "const": "seed_unreadable",
+            "description": "The fork seed recorded for the child could not be read (a corrupt\nrecord, or one a later release wrote), so the notice carries nothing\nof it.",
+            "type": "string"
           }
         ]
       },
@@ -168665,6 +168715,11 @@
           {
             "const": "member_host_unsupported",
             "description": "The source's member host is too old to report its visible tools.",
+            "type": "string"
+          },
+          {
+            "const": "seed_unreadable",
+            "description": "The fork seed recorded for the child could not be read (a corrupt\nrecord, or one a later release wrote), so the notice carries nothing\nof it.",
             "type": "string"
           }
         ]
@@ -178221,6 +178276,11 @@
             "const": "member_host_unsupported",
             "description": "The source's member host is too old to report its visible tools.",
             "type": "string"
+          },
+          {
+            "const": "seed_unreadable",
+            "description": "The fork seed recorded for the child could not be read (a corrupt\nrecord, or one a later release wrote), so the notice carries nothing\nof it.",
+            "type": "string"
           }
         ]
       },
@@ -186524,6 +186584,11 @@
             "const": "member_host_unsupported",
             "description": "The source's member host is too old to report its visible tools.",
             "type": "string"
+          },
+          {
+            "const": "seed_unreadable",
+            "description": "The fork seed recorded for the child could not be read (a corrupt\nrecord, or one a later release wrote), so the notice carries nothing\nof it.",
+            "type": "string"
           }
         ]
       },
@@ -189706,6 +189771,11 @@
           {
             "const": "member_host_unsupported",
             "description": "The source's member host is too old to report its visible tools.",
+            "type": "string"
+          },
+          {
+            "const": "seed_unreadable",
+            "description": "The fork seed recorded for the child could not be read (a corrupt\nrecord, or one a later release wrote), so the notice carries nothing\nof it.",
             "type": "string"
           }
         ]
@@ -193349,6 +193419,11 @@
           {
             "const": "member_host_unsupported",
             "description": "The source's member host is too old to report its visible tools.",
+            "type": "string"
+          },
+          {
+            "const": "seed_unreadable",
+            "description": "The fork seed recorded for the child could not be read (a corrupt\nrecord, or one a later release wrote), so the notice carries nothing\nof it.",
             "type": "string"
           }
         ]

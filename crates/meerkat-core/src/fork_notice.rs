@@ -102,6 +102,10 @@ pub enum ForkToolsNotComparedReason {
     PlacedSource,
     /// The source's member host is too old to report its visible tools.
     MemberHostUnsupported,
+    /// The fork seed recorded for the child could not be read (a corrupt
+    /// record, or one a later release wrote), so the notice carries nothing
+    /// of it.
+    SeedUnreadable,
 }
 
 /// The tools a fork notice names: the source's visible tool names at the fork
@@ -293,6 +297,37 @@ impl ForkSeed {
 }
 
 impl ForkBoundaryNotice {
+    /// The notice for the child `child_session_id` whose fork seed this
+    /// release cannot read. It names no source and carries nothing, and it is
+    /// a `transcript` notice: every row the child holds when it is delivered
+    /// stays copied history, so the skills those rows loaded reach its model
+    /// by name only.
+    pub(crate) fn for_unreadable_seed(child_session_id: SessionId) -> Self {
+        Self {
+            fork: ForkNoticeKind::Transcript,
+            child_session_id,
+            source: ForkNoticeSource {
+                member: None,
+                session_id: None,
+            },
+            source_system_prompt: ForkNoticeSystemPrompt::NotApplicable,
+            instructions_removed: Vec::new(),
+            instructions_added: Vec::new(),
+            instructions_carried: Vec::new(),
+            skills_removed: Vec::new(),
+            skills_carried: Vec::new(),
+            injected_rows_removed: 0,
+            injected_rows_carried: 0,
+            earlier_rows_omitted: 0,
+            tools: ForkNoticeTools::NotCompared {
+                reason: ForkToolsNotComparedReason::SeedUnreadable,
+            },
+            summary: "Fork notice. You are a fork of another agent, but the fork context \
+                      recorded for you could not be read, so it was not given to you."
+                .to_string(),
+        }
+    }
+
     /// The source as a notice names it.
     fn source_name(&self) -> String {
         match (&self.source.member, &self.source.session_id) {

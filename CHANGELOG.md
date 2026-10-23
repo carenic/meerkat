@@ -149,7 +149,12 @@ them.
     them under the default instead of refusing;
   - a fork notice it copied from an earlier fork reaches its model as
     history: one line naming the session that notice was given to.
-  The child's own fork notice names the skills it removed or carried.
+  The child's own fork notice names the skills it removed or carried. A
+  fork seed this release cannot read (a corrupt record, or one a later
+  release wrote) is dropped, and the child gets a fork notice that
+  carries nothing and names no source (its tools are `not_compared`
+  with the new reason `seed_unreadable`), so the rows it holds stay
+  copied history and a skill they loaded reaches its model by name only.
 
 ### Added
 

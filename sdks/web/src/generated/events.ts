@@ -349,7 +349,7 @@ export type ForkNoticeTools = {
   reason: ForkToolsNotComparedReason;
 };
 
-export type ForkToolsNotComparedReason = "source_not_live" | "placed_source" | "member_host_unsupported";
+export type ForkToolsNotComparedReason = "source_not_live" | "placed_source" | "member_host_unsupported" | "seed_unreadable";
 
 export type GeminiImageMetadata = {
   continuity_ref?: string | null;

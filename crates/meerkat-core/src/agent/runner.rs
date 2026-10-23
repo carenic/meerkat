@@ -2472,22 +2472,25 @@ where
         let seed: crate::fork_notice::ForkSeed = match serde_json::from_value(value) {
             Ok(seed) => seed,
             Err(error) => {
-                // A seed this release cannot read (for example one a later
-                // release wrote) must not stop the session: it is dropped,
-                // and the child is told once that its fork context is gone.
+                // A seed this release cannot read (a corrupt record, or one a
+                // later release wrote) must not stop the session: it is
+                // dropped, and the child is told once, by a fork notice of
+                // its own that carries nothing, that its fork context is
+                // gone. The notice keeps every row the child holds copied
+                // history, as the undelivered seed did, so no skill body
+                // those rows loaded reaches the model.
                 tracing::warn!(
                     session_id = %child,
                     %error,
                     "dropping a fork seed this release cannot read"
                 );
-                self.session.push(Message::SystemNotice(
-                    crate::types::SystemNoticeMessage::new(
-                        crate::types::SystemNoticeKind::Generic,
-                        "Fork notice. You are a fork of another agent, but the fork \
-                         context recorded for you could not be read, so it was not \
-                         given to you.",
-                    ),
-                ));
+                if !crate::fork_notice::holds_fork_notice_for(self.session.messages(), &child) {
+                    self.session.push(Message::SystemNotice(
+                        crate::types::SystemNoticeMessage::fork_boundary(
+                            crate::fork_notice::ForkBoundaryNotice::for_unreadable_seed(child),
+                        ),
+                    ));
+                }
                 self.session
                     .remove_metadata(crate::fork_notice::SESSION_FORK_SEED_KEY);
                 return Ok(());
