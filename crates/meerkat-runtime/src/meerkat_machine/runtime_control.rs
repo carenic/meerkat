@@ -18207,7 +18207,7 @@ impl MeerkatMachine {
     /// The deduplicate-only admission of
     /// [`SessionServiceRuntimeExt::accept_existing_input_with_completion`]:
     /// the ordinary ingress command with
-    /// [`crate::accept::AdmissionRequirement::ExistingOnly`], decided by the
+    /// `AdmissionRequirement::ExistingOnly`, decided by the
     /// session's driver where it decides deduplication.
     pub fn accept_existing_input_with_completion_boxed<'a>(
         &'a self,

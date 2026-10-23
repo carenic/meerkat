@@ -39,6 +39,39 @@ impl MobStopReport {
     }
 }
 
+/// Caller options for
+/// [`MobHandle::stop_with_options`](super::MobHandle::stop_with_options).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StopOptions {
+    /// Leave every member's current run running. See
+    /// [`Self::leave_runs_running`].
+    pub leave_runs_running: bool,
+}
+
+impl StopOptions {
+    /// Leave every member's current run running: an autonomous member's run
+    /// is not cancelled at its next boundary, as a plain Stop does. Its run
+    /// starts are held and its kickoff stop intent is recorded as usual, and
+    /// the Stop reports the run `LeftRunning` and returns without waiting
+    /// for any turn. A Stop that arrives while a plain Stop still waits for
+    /// the turns it cancelled joins that Stop and returns its report. A Stop
+    /// with this option does not recall cancels that an earlier, failed
+    /// plain Stop already dispatched: those runs still end at their next
+    /// boundary.
+    ///
+    /// Meant for Stop, then
+    /// [`MobHandle::drain_stopped_runs`](super::MobHandle::drain_stopped_runs),
+    /// then Shutdown, which cancels what is still running. A host that stops
+    /// with this option and never shuts down leaves autonomous turns running
+    /// under a Stopped mob.
+    #[must_use]
+    pub fn leave_runs_running(mut self) -> Self {
+        self.leave_runs_running = true;
+        self
+    }
+}
+
 /// One member's stop outcome.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MemberStopOutcome {
@@ -68,8 +101,9 @@ pub enum MemberStopRun {
     CancelDispatched { run_id: RunId },
     /// The run ended on its own between the hold and the cancel.
     RunEndedBeforeCancel { run_id: RunId },
-    /// A turn-driven member's run: Stop does not cancel it, and it finishes
-    /// normally. No new run starts after it until Resume.
+    /// A run the Stop left running: a turn-driven member's, or any member's
+    /// under [`StopOptions::leave_runs_running`]. It finishes normally, and
+    /// no new run starts after it until Resume.
     LeftRunning { run_id: RunId },
     /// A remote member that cannot report its run (it lacks the run-start
     /// hold capability); the stop sent it the ambient interrupt.
@@ -144,4 +178,56 @@ impl HostRunStartHoldReason {
             Self::ToolsNotPublished => meerkat_runtime::RunStartHoldReason::ToolsNotPublished,
         }
     }
+}
+
+/// What [`MobHandle::drain_stopped_runs`](super::MobHandle::drain_stopped_runs)
+/// found for each member of a Stopped mob: whether the run each member had
+/// when the drain started ended within its bound.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct MobRunDrainReport {
+    /// One outcome per roster member, by identity.
+    pub members: BTreeMap<AgentIdentity, MemberRunDrainOutcome>,
+}
+
+/// One member's drain outcome: what happened to its run, and whether its run
+/// starts are held, as the Stop the drain follows reported them.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct MemberRunDrainOutcome {
+    /// The member's run, as the drain saw it.
+    pub run: MemberRunDrain,
+    /// The member's run starts as this process's last Stop recorded them;
+    /// `None` when no Stop outcome is recorded in this process (the mob was
+    /// stopped before a restart, or by another process). A member whose
+    /// starts are not `Held` may have started runs the drain neither waited
+    /// for nor reports.
+    pub starts: Option<MemberRunStarts>,
+}
+
+/// A member's run as a drain saw it. Only the run current when the drain
+/// started is drained.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "run", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MemberRunDrain {
+    /// The member had no run when the drain started.
+    NoRun,
+    /// The run ended within the bound. `terminal` is the run's recorded
+    /// terminal, or `None` when its runtime registration ended with it.
+    Ended {
+        run_id: RunId,
+        terminal: Option<meerkat_core::turn_execution_authority::TurnTerminalOutcome>,
+    },
+    /// The run was still current at the bound. The drain does not cancel it:
+    /// a mob Shutdown that follows does, as without a drain.
+    StillRunning { run_id: RunId },
+    /// The member's session had an open live channel when the drain started.
+    /// Its run, if any, was not waited for.
+    LiveChannelOpen { run_id: Option<RunId> },
+    /// A placed or remote member: its host owns its run.
+    NotLocal,
+    /// The member's runtime registration needs a durability reload: no run
+    /// outcome is recorded on it.
+    ReloadRequired,
 }

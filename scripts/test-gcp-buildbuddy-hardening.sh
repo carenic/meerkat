@@ -349,8 +349,14 @@ run_wrapper gcp-tls "${GCP[@]}" BUILDBUDDY_GRPC_URL=grpcs://127.0.0.1:1986 BUILD
 expect_ran "gcp-buildbuddy over its IAP tunnel" "--remote_cache=grpcs://127.0.0.1:1986" \
   "--remote_executor=grpcs://127.0.0.1:1986" "--bes_backend=grpcs://127.0.0.1:1986" \
   "--tls_certificate=${TEST_ROOT}/control-ca.pem" \
-  "--remote_exec_header=x-buildbuddy-platform.container-image=docker://${FAKE_CI_IMAGE}" \
+  "--remote_default_exec_properties=container-image=docker://${FAKE_CI_IMAGE}" \
   "--remote_exec_header=x-buildbuddy-platform.use-self-hosted-executors=true"
+
+if grep -qF -- "x-buildbuddy-platform.container-image" "${wrapper_work}/tmp/fake-bb.argv"; then
+  fail "gcp-buildbuddy still sends the container image as a header; the platform property is its one source"
+else
+  pass "gcp-buildbuddy sends the container image only as a platform property"
+fi
 
 # --- control plane and executor pool scenarios --------------------------------
 
@@ -861,6 +867,14 @@ for label, env, message in (
     else:
         ok(f"executor pool ensure refuses {label}")
 
+unpinned = "registry.example.invalid/meerkat-ci:1"
+proc, calls = run(POOL, ["ensure"], {"secrets": SECRETS_OK}, **dict(POOL_ENV, MEERKAT_BUILDBUDDY_CI_IMAGE=unpinned))
+hint = proc.stderr.replace(unpinned, "")
+if proc.returncode == 0 or "scripts/gcp-buildbuddy-ci-image image" not in hint or "docker.pkg.dev/" in hint:
+    fail(f"the unpinned action image error must point at the image script and name no registry path: {proc.stderr[-300:]}")
+else:
+    ok("the unpinned action image error points at the image script and names no registry path")
+
 policy = {"bindings": [{"role": "roles/secretmanager.secretAccessor", "members": [f"serviceAccount:{EXECUTOR_SA}"]}]}
 proc, calls = run(POOL, ["ensure"], {"secrets": SECRETS_OK, "project_iam_policy": policy}, MEERKAT_GCP_BUILDBUDDY_MANAGE_IAM="1", **POOL_ENV)
 problems = []
@@ -880,6 +894,7 @@ if not re.fullmatch(r"meerkat-bb-exec-template-[0-9a-f]{12}", template_name):
     problems.append(f"template name {template_name!r} is not derived from its rendering")
 for needle in ('API_KEY_SECRET="meerkat-bb-executor-api-key"', 'ENDPOINT_SECRET="meerkat-bb-control-endpoint"',
                'CA_SECRET="meerkat-bb-control-ca"', f'EXECUTOR_IMAGE="{EXECUTOR_IMAGE}"', f'CI_IMAGE="{CI_IMAGE}"',
+               'default_isolation_type: "oci"', 'default_image: "${CI_IMAGE}"',
                'case "${app_target}" in\n  grpcs://*) ;;\n  *)\n    echo "Refusing a non-TLS BuildBuddy app target',
                "SSL_CERT_FILE=/etc/buildbuddy/ca-bundle.pem", "umask 077",
                "Refusing a BuildBuddy app target outside the private network"):
@@ -1040,6 +1055,68 @@ if proc.returncode != 0 or calls or f"-docker.pkg.dev/{PROJECT}/meerkat-ci/meerk
     fail(f"ci-image image does not derive its reference from MEERKAT_GCP_PROJECT_ID: {proc.stdout.strip()!r}")
 else:
     ok("ci-image image derives its reference from MEERKAT_GCP_PROJECT_ID")
+
+# --- the self-hosted RBE platform names no image ---------------------------------------------
+
+platforms_build = open(os.path.join(REPO, "tools", "bazel", "platforms", "BUILD.bazel"), encoding="utf-8").read()
+gcp_block = re.search(r'platform\(\n    name = "linux_x86_64_gcp_ci",\n(.*?)\n\)\n', platforms_build, re.S)
+gcp_body = gcp_block.group(1) if gcp_block else ""
+gcp_constraints = sorted(re.findall(r'"(@[^"]+)"', gcp_body.split("constraint_values = [", 1)[-1].split("]", 1)[0]))
+if (not gcp_block or "exec_properties" in gcp_body or "parents" in gcp_body
+        or gcp_constraints != ["@bazel_tools//tools/cpp:gcc", "@platforms//cpu:x86_64", "@platforms//os:linux"]):
+    fail(f"linux_x86_64_gcp_ci must set no exec_properties and no parent, with the parent's constraints: {gcp_body!r}")
+else:
+    ok("linux_x86_64_gcp_ci sets no exec_properties and no parent, with the former parent's constraints")
+# Its properties are the .bazelrc defaults that reach its config: the unscoped build and
+# common lines, and every config that buildbuddy-linux-gcp-ci-rbe pulls in through
+# --config= (buildbuddy-linux-rbe, buildbuddy). The wrapper adds only the container image.
+with open(os.path.join(REPO, ".bazelrc"), encoding="utf-8") as handle:
+    rc_lines = [line.split() for line in handle if line.strip() and not line.lstrip().startswith("#")]
+gcp_chain, pending = set(), ["buildbuddy-linux-gcp-ci-rbe"]
+while pending:
+    config = pending.pop()
+    if config in gcp_chain:
+        continue
+    gcp_chain.add(config)
+    for tokens in rc_lines:
+        if tokens[0] in (f"build:{config}", f"common:{config}"):
+            pending += [token.split("=", 1)[1] for token in tokens[1:] if token.startswith("--config=")]
+applies = {"build", "common"} | {f"{command}:{config}" for config in gcp_chain for command in ("build", "common")}
+gcp_defaults = {}
+for tokens in rc_lines:
+    if tokens[0] in applies:
+        for token in tokens[1:]:
+            if token.startswith("--remote_default_exec_properties="):
+                key, _, value = token.split("=", 1)[1].partition("=")
+                gcp_defaults[key] = value
+want_defaults = {"Arch": "amd64", "OSFamily": "linux", "Pool": "meerkat-ci", "dockerNetwork": "off", "network": "external"}
+if gcp_defaults != want_defaults:
+    fail(f"the gcp platform's .bazelrc defaults changed: {gcp_defaults} (want {want_defaults})")
+else:
+    ok("the gcp platform's .bazelrc defaults are its former properties, with no container image")
+registry_path = re.compile(r"[a-z0-9-]+-docker\.pkg\.dev/[a-z][a-z0-9-]{4,28}[a-z0-9]/")
+scanned = [os.path.join(REPO, ".bazelrc")]
+for directory, _, names in os.walk(os.path.join(REPO, "tools", "bazel")):
+    scanned += [os.path.join(directory, name) for name in names
+                if name in ("BUILD", "BUILD.bazel") or name.endswith(".bzl")]
+scripts_dir = os.path.join(REPO, "scripts")
+scanned += [os.path.join(scripts_dir, name) for name in sorted(os.listdir(scripts_dir))
+            if name.startswith(("ci-action-pins", "gcp-buildbuddy-", "buildbuddy-"))]
+# The BuildBuddy workflow and the actions it runs pass the CI image at run time too.
+scanned.append(os.path.join(REPO, ".github", "workflows", "buildbuddy.yml"))
+actions_dir = os.path.join(REPO, ".github", "actions")
+scanned += [os.path.join(actions_dir, name, "action.yml") for name in sorted(os.listdir(actions_dir))
+            if "buildbuddy" in name and os.path.isfile(os.path.join(actions_dir, name, "action.yml"))]
+written = []
+for path in scanned:
+    with open(path, encoding="utf-8") as handle:
+        written += [f"{os.path.relpath(path, REPO)}:{number}" for number, line in enumerate(handle, 1)
+                    if registry_path.search(line)]
+if written:
+    fail(f"a project-scoped registry path is written out: {written}")
+else:
+    ok("no project-scoped registry path is written out in the Bazel platforms, the pin check, the GCP and "
+       "BuildBuddy scripts, or the BuildBuddy workflow and its actions")
 
 sys.exit(1 if FAILURES else 0)
 PY

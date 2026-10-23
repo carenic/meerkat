@@ -173,6 +173,8 @@ impl MobCommand {
             | Self::GetIdentityConvergenceStatus { .. }
             | Self::MemberMachineProjection { .. }
             | Self::QueryPhase { .. } => Some(ControlScope::List),
+            #[cfg(feature = "runtime-adapter")]
+            Self::DrainRunsSnapshot { .. } => Some(ControlScope::List),
 
             // Composite/projection surfaces choose their outer scope as data
             // and enter the same serialized actor admission before any raw
@@ -455,7 +457,7 @@ impl MobCommand {
             Self::AdmitControlScope { reply_tx, .. } => {
                 let _ = reply_tx.send(Err(error));
             }
-            Self::Stop { reply_tx } => {
+            Self::Stop { reply_tx, .. } => {
                 let _ = reply_tx.send(Err(error));
             }
             Self::CloseIfIdle { reply_tx } => {
@@ -543,6 +545,10 @@ impl MobCommand {
                 let _ = reply_tx.send(Err(error));
             }
             Self::QueryPhase { reply_tx } => {
+                let _ = reply_tx.send(Err(error));
+            }
+            #[cfg(feature = "runtime-adapter")]
+            Self::DrainRunsSnapshot { reply_tx } => {
                 let _ = reply_tx.send(Err(error));
             }
             Self::Wire { reply_tx, .. } | Self::Unwire { reply_tx, .. } => {
@@ -748,7 +754,11 @@ mod tests {
         );
         let (tx, _rx) = oneshot::channel();
         assert_eq!(
-            MobCommand::Stop { reply_tx: tx }.required_control_scope(),
+            MobCommand::Stop {
+                leave_runs_running: false,
+                reply_tx: tx,
+            }
+            .required_control_scope(),
             Some(ControlScope::Retire),
         );
         let (tx, _rx) = oneshot::channel();

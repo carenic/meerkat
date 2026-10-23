@@ -1674,7 +1674,9 @@ pub async fn handle_auth_login_start(
                         authorize_url: started.authorize_url,
                         state: started.state,
                         redirect_uri: started.redirect_uri,
-                        host_attempt_handle: None,
+                        // A registered https start's host-only handle; none
+                        // for a loopback one.
+                        host_attempt_handle: started.host_attempt_handle,
                         target: WireLoginStartTarget::Connector(WireConnectorSlotTarget {
                             connector: connector.slot,
                         }),
@@ -1813,10 +1815,10 @@ pub async fn handle_auth_login_complete(
             );
         }
         WireLoginTarget::Connector(WireConnectorLoginTarget { connector }) => {
-            if parsed.host_attempt_handle.is_some() || parsed.iss.is_some() {
+            if parsed.iss.is_some() {
                 return registered_callback_field_refused(
                     id,
-                    "host_attempt_handle and iss are accepted only for an MCP target",
+                    "iss is accepted only for an MCP target",
                 );
             }
             let completed = match meerkat::connector_target_from_wire(&connector) {
@@ -1828,7 +1830,10 @@ pub async fn handle_auth_login_complete(
                                 redirect_uri: parsed.redirect_uri,
                                 state: parsed.state,
                                 code: parsed.code,
-                                host_attempt_handle: None,
+                                // Required for a registered https attempt,
+                                // which completes only from the host's
+                                // custody; ignored for a loopback one.
+                                host_attempt_handle: parsed.host_attempt_handle,
                             },
                         )
                         .await
@@ -1854,7 +1859,7 @@ pub async fn handle_auth_login_complete(
     if parsed.host_attempt_handle.is_some() || parsed.iss.is_some() {
         return registered_callback_field_refused(
             id,
-            "host_attempt_handle and iss are accepted only for an MCP target",
+            "host_attempt_handle is accepted only for an MCP or connector target, and iss only for an MCP target",
         );
     }
     let target = match host_auth_target(
@@ -6708,9 +6713,96 @@ mod tests {
         assert_eq!(authorized["phase"], "authorized");
     }
 
-    /// The registered-callback completion fields belong to an MCP target: on
-    /// a provider or connector completion they are refused before any
-    /// lookup, never ignored.
+    /// A connector login on a registered https redirect (a client-auth
+    /// profile's `registered_redirect_uris`) completes over RPC from the
+    /// host's custody: the start returns the host-only handle, a completion
+    /// without it is refused with the typed detail and leaves the attempt
+    /// pending, and the completion with it lands the credential.
+    #[tokio::test]
+    async fn connector_registered_https_login_over_rpc_completes_with_host_custody() {
+        use meerkat::test_fixtures::mcp_oauth::{CODE_CANARY, McpOAuthFixture, SUBJECT};
+        const REMOTE: &str = "https://connect.example/connector/oauth/callback";
+
+        let fixture = McpOAuthFixture::spawn().await.unwrap();
+        let runtime = test_runtime();
+        runtime.set_connector_client_auth_profiles(vec![meerkat::ConnectorClientAuthProfile {
+            id: "web".into(),
+            issuer: fixture.base().into(),
+            client: "connector-client".into(),
+            client_secret: None,
+            authorize_params: Vec::new(),
+            resource_indicator: false,
+            protocol: None,
+            registered_redirect_uris: vec![REMOTE.into()],
+        }]);
+        let slot = serde_json::json!({ "realm_id": "tenant-a", "slot_id": "drive-web" });
+        let connector = serde_json::json!({
+            "slot": slot,
+            "issuer": fixture.base(),
+            "client": "connector-client",
+            "resource": "https://api.service.example",
+            "scopes": ["openid"],
+            "strategy_id": "oidc-userinfo-v1",
+            "account_selection": { "mode": "discover" },
+            "client_auth_profile": "web",
+        });
+        let started = rpc_result(
+            handle_auth_login_start(
+                Some(RpcId::Num(1)),
+                Some(
+                    raw_params(serde_json::json!({
+                        "connector": connector,
+                        "redirect_uri": REMOTE,
+                    }))
+                    .as_ref(),
+                ),
+                &runtime,
+            )
+            .await,
+        );
+        assert_eq!(started["redirect_uri"], REMOTE);
+        let state = started["state"].as_str().unwrap().to_owned();
+        let handle = started["host_attempt_handle"]
+            .as_str()
+            .expect("a registered https start returns the host handle")
+            .to_owned();
+        let complete = |id: i64, handle: Option<&str>| {
+            let mut params = serde_json::json!({
+                "connector": connector,
+                "code": CODE_CANARY,
+                "state": state,
+                "redirect_uri": REMOTE,
+            });
+            if let Some(handle) = handle {
+                params["host_attempt_handle"] = serde_json::json!(handle);
+            }
+            let runtime = &runtime;
+            async move {
+                handle_auth_login_complete(
+                    Some(RpcId::Num(id)),
+                    Some(raw_params(params).as_ref()),
+                    runtime,
+                )
+                .await
+            }
+        };
+        for (id, attempt) in [(2, None), (3, Some("forged-handle"))] {
+            let refused = complete(id, attempt).await;
+            let data = auth_error_data(&refused);
+            assert_eq!(data["reason"], "invalid_target", "{data}");
+            assert_eq!(data["detail"], "remote_custody_required", "{data}");
+        }
+        let ready = rpc_result(complete(4, Some(&handle)).await);
+        assert_eq!(ready["connector"], slot);
+        assert_eq!(ready["verified_account"]["subject"], SUBJECT);
+        let replay = complete(5, Some(&handle)).await;
+        assert_eq!(auth_error_data(&replay)["reason"], "attempt_missing");
+    }
+
+    /// The registered-callback completion fields are refused before any
+    /// lookup, never ignored, where they do not apply: both on a provider
+    /// completion, and `iss` on a connector completion (a connector takes
+    /// the host handle, see the registered connector row).
     #[tokio::test]
     async fn registered_callback_fields_are_refused_off_mcp_targets() {
         let runtime = test_runtime();
@@ -6745,7 +6837,14 @@ mod tests {
                 provider[key] = value.clone();
                 connector_params[key] = value.clone();
             }
-            for params in [provider, connector_params] {
+            // A connector completion takes the handle (its registered
+            // https attempts need it) but never `iss`.
+            let connector_refuses = extra.get("iss").is_some();
+            for (params, refused_here) in [(provider, true), (connector_params, connector_refuses)]
+            {
+                if !refused_here {
+                    continue;
+                }
                 let refused = handle_auth_login_complete(
                     Some(RpcId::Num(1)),
                     Some(raw_params(params.clone()).as_ref()),
@@ -6805,6 +6904,54 @@ mod tests {
                 "a refused redirect sends nothing"
             );
         }
+    }
+
+    /// A loopback completion on another redirect than the one its start
+    /// admitted is the caller's attempt mismatch (`INVALID_PARAMS`, reason
+    /// `attempt_mismatch`), not an infrastructure fault a host would retry.
+    #[tokio::test]
+    async fn mcp_loopback_completion_on_another_redirect_is_an_attempt_mismatch() {
+        use meerkat::test_fixtures::mcp_oauth::{CODE_CANARY, McpOAuthFixture};
+
+        let fixture = McpOAuthFixture::spawn().await.unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let (runtime, mcp) = registered_callback_runtime(&fixture, &project, None);
+        let started = rpc_result(
+            handle_auth_login_start(
+                Some(RpcId::Num(1)),
+                Some(
+                    raw_params(serde_json::json!({
+                        "mcp": mcp,
+                        "redirect_uri": "http://127.0.0.1:1/mcp/oauth/callback",
+                    }))
+                    .as_ref(),
+                ),
+                &runtime,
+            )
+            .await,
+        );
+        let refused = handle_auth_login_complete(
+            Some(RpcId::Num(2)),
+            Some(
+                raw_params(serde_json::json!({
+                    "mcp": mcp,
+                    "code": CODE_CANARY,
+                    "state": started["state"],
+                    "redirect_uri": "http://127.0.0.1:2/mcp/oauth/callback",
+                }))
+                .as_ref(),
+            ),
+            &runtime,
+        )
+        .await;
+        assert_eq!(
+            refused.error.as_ref().map(|error| error.code),
+            Some(error::INVALID_PARAMS),
+            "{refused:?}"
+        );
+        let data = auth_error_data(&refused);
+        assert_eq!(data["reason"], "attempt_mismatch", "{data}");
+        assert!(data.get("detail").is_none(), "{data}");
     }
 }
 #[cfg(test)]

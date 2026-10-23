@@ -1666,6 +1666,15 @@ pub enum LlmIdentityPreflightError {
     ModelUnresolvable { detail: String },
     #[error("provider binding or client is not resolvable on this host: {detail}")]
     BindingUnresolvable { detail: String },
+    /// The identity switches provider and the binding it must keep cannot be
+    /// selected, for example
+    /// [`meerkat_core::ConnectionTargetError::NoCredentialAccountRoute`] when
+    /// no route for the new provider shares the session's credential account.
+    /// The build refuses with the same typed connection error.
+    #[error("provider binding is not resolvable on this host: {source}")]
+    BindingSelection {
+        source: meerkat_core::ConnectionTargetError,
+    },
 }
 
 #[cfg(feature = "comms")]
@@ -2005,6 +2014,7 @@ impl CreateSessionModelResolutionError {
             }
             | meerkat_core::ConnectionTargetError::ProviderMismatch { .. }
             | meerkat_core::ConnectionTargetError::AmbiguousCredentialAccountBindings { .. }
+            | meerkat_core::ConnectionTargetError::NoCredentialAccountRoute { .. }
             | meerkat_core::ConnectionTargetError::RealmChain(_) => true,
         }
     }
@@ -5197,33 +5207,34 @@ impl AgentFactory {
 
         let mask = build_config.resume_override_mask;
 
-        if !mask.model {
-            build_config.model = metadata.model.clone();
-        }
         if !mask.max_tokens {
             build_config.max_tokens = Some(metadata.max_tokens);
         }
         if !mask.structured_output_retries {
             build_config.structured_output_retries = Some(metadata.structured_output_retries);
         }
-        if !mask.provider {
-            build_config.provider = Some(metadata.provider);
-        }
-        if !mask.model && !mask.provider && !mask.self_hosted_server_id {
-            build_config.self_hosted_server_id = metadata.self_hosted_server_id.clone();
-        }
-        if !mask.provider_params {
-            build_config.provider_params = metadata.provider_params.clone();
-        }
-        // Phase 3: propagate persisted auth_binding so resume re-resolves
-        // through the same realm binding. The caller keeps precedence —
-        // if build_config already carries an auth binding reference, leave it.
-        if !mask.auth_binding && build_config.auth_binding.is_none() {
-            build_config.auth_binding = metadata
-                .auth_binding
-                .clone()
-                .filter(|auth_binding| !auth_binding.is_env_default());
-        }
+        // The resumed LLM identity follows the one Core rule every resume
+        // merge uses. A build that claims the provider without naming one
+        // recomputes it from the model; `assemble_agent` then settles the
+        // binding against the provider the registry resolves.
+        let recompute_provider = mask.provider && build_config.provider.is_none();
+        let durable = metadata.llm_identity();
+        let resumed = meerkat_core::resolve_resumed_session_llm_identity(
+            SessionLlmIdentity {
+                model: build_config.model.clone(),
+                provider: build_config.provider.unwrap_or(durable.provider),
+                self_hosted_server_id: build_config.self_hosted_server_id.clone(),
+                provider_params: build_config.provider_params.clone(),
+                auth_binding: build_config.auth_binding.clone(),
+            },
+            &durable,
+            &mask,
+        );
+        build_config.model = resumed.model;
+        build_config.provider = (!recompute_provider).then_some(resumed.provider);
+        build_config.self_hosted_server_id = resumed.self_hosted_server_id;
+        build_config.provider_params = resumed.provider_params;
+        build_config.auth_binding = resumed.auth_binding;
         if !mask.override_builtins {
             build_config.override_builtins = metadata.tooling.builtins;
         }
@@ -5544,6 +5555,56 @@ impl AgentFactory {
         preferred_realm: Option<&RealmId>,
         auth_lease_handle: Option<meerkat_core::handles::GeneratedAuthLeaseHandle>,
     ) -> Result<(), LlmIdentityPreflightError> {
+        self.preflight_resumed_llm_identity(
+            config,
+            identity,
+            None,
+            custom_models,
+            preferred_realm,
+            auth_lease_handle,
+        )
+        .await
+    }
+
+    /// [`Self::preflight_llm_identity`] for a resumed session whose durable
+    /// identity is `resume_prior`.
+    ///
+    /// `identity` is the resume merge's identity. When it switches provider
+    /// without naming a binding, the preflight applies the account-affinity
+    /// rule the build applies, so the preflight and the build reach the same
+    /// route or the same typed refusal.
+    pub async fn preflight_resumed_llm_identity(
+        &self,
+        config: &Config,
+        identity: &SessionLlmIdentity,
+        resume_prior: Option<&SessionLlmIdentity>,
+        custom_models: &BTreeMap<String, meerkat_core::config::CustomModelConfig>,
+        preferred_realm: Option<&RealmId>,
+        auth_lease_handle: Option<meerkat_core::handles::GeneratedAuthLeaseHandle>,
+    ) -> Result<(), LlmIdentityPreflightError> {
+        let mut switched;
+        let identity = match resume_prior {
+            Some(prior)
+                if identity.auth_binding.is_none() && identity.provider != prior.provider =>
+            {
+                switched = identity.clone();
+                switched.auth_binding = Self::credential_account_route_for_provider_switch(
+                    config,
+                    prior,
+                    identity.provider,
+                )
+                .map_err(|error| match error {
+                    FactoryError::ConnectionTarget(source) => {
+                        LlmIdentityPreflightError::BindingSelection { source }
+                    }
+                    other => LlmIdentityPreflightError::BindingUnresolvable {
+                        detail: other.to_string(),
+                    },
+                })?;
+                &switched
+            }
+            _ => identity,
+        };
         let registry = if custom_models.is_empty() {
             self.model_registry(config).map_err(|error| {
                 LlmIdentityPreflightError::ModelUnresolvable {
@@ -5790,6 +5851,43 @@ impl AgentFactory {
                 |binding| binding.credential_identity(auth_binding),
             ),
         ))
+    }
+
+    /// The route a session that switches to `target_provider` keeps its
+    /// credential account on. One account-affinity rule for the hot swap, a
+    /// resumed build and the member-host preflight.
+    ///
+    /// `Ok(None)` when the session's binding is not account-backed: the new
+    /// provider then resolves its own route. An account-backed binding moves
+    /// only to the `target_provider` route that shares its account, and
+    /// refuses with [`meerkat_core::ConnectionTargetError::NoCredentialAccountRoute`]
+    /// when none does. A provider switch never moves a session onto another
+    /// account's credential.
+    pub(crate) fn credential_account_route_for_provider_switch(
+        config: &Config,
+        current: &SessionLlmIdentity,
+        target_provider: Provider,
+    ) -> Result<Option<AuthBindingRef>, FactoryError> {
+        let Some(meerkat_core::AuthCredentialIdentity::Account(account)) =
+            Self::credential_identity_for_llm_identity(config, current)?
+        else {
+            return Ok(None);
+        };
+        let route = meerkat_core::resolve_credential_account_binding_for_provider(
+            config,
+            target_provider,
+            &account,
+        )
+        .map_err(FactoryError::ConnectionTarget)?;
+        match route {
+            Some(route) => Ok(Some(route.auth_binding)),
+            None => Err(FactoryError::ConnectionTarget(
+                meerkat_core::ConnectionTargetError::NoCredentialAccountRoute {
+                    provider: target_provider,
+                    account,
+                },
+            )),
+        }
     }
 
     fn credential_identity_for_client_override(
@@ -6916,6 +7014,9 @@ impl AgentFactory {
 
         let explicit_mob_override =
             !matches!(build_config.override_mob, ToolCategoryOverride::Inherit);
+        // The binding the caller named, before the resume merge fills one in:
+        // the resumed binding is settled against the registry's provider below.
+        let caller_auth_binding = build_config.auth_binding.clone();
         let resumed_session_metadata = Self::apply_resumed_session_metadata(&mut build_config)?;
         self.validate_runtime_profile(&build_config, config)?;
         let mut session =
@@ -7041,9 +7142,6 @@ impl AgentFactory {
         };
 
         // 2. Resolve provider and any self-hosted server binding.
-        let resumed_self_hosted_server_id = resumed_session_metadata
-            .as_ref()
-            .and_then(|metadata| metadata.self_hosted_server_id.clone());
         let (provider, resolved_self_hosted_server_id) =
             self.resolve_provider_from_registry(&registry, &build_config)?;
         // Durable agent construction is the single fail-closed chokepoint for
@@ -7065,6 +7163,38 @@ impl AgentFactory {
                 },
             ));
         }
+        // A resumed build seats its binding against the provider the registry
+        // settled, by the same Core rule as the merge (a provider the merge
+        // recomputes from the model is first known here). A provider switch
+        // with no binding named keeps the session's credential account, or
+        // refuses typed; otherwise the new provider resolves its own route
+        // from the session's realm as a fresh session would.
+        let resumed_provider_switch = if let Some(metadata) = resumed_session_metadata.as_ref() {
+            let durable = metadata.llm_identity();
+            build_config.auth_binding = meerkat_core::resolve_resumed_session_auth_binding(
+                &durable,
+                provider,
+                caller_auth_binding.as_ref(),
+                build_config.resume_override_mask.auth_binding,
+            );
+            // A client override bypasses credential resolution, so it needs no
+            // route either.
+            let resolves_credentials = build_config.llm_client_override.is_none()
+                && build_config.agent_llm_client_override.is_none();
+            if resolves_credentials
+                && build_config.auth_binding.is_none()
+                && caller_auth_binding.is_none()
+                && !build_config.resume_override_mask.auth_binding
+                && provider != durable.provider
+            {
+                build_config.auth_binding =
+                    Self::credential_account_route_for_provider_switch(config, &durable, provider)
+                        .map_err(BuildAgentError::LlmClient)?;
+            }
+            (provider != durable.provider).then_some(durable)
+        } else {
+            None
+        };
         if let Some(client) = build_config.llm_client_override.as_ref() {
             let claimed_provider = client.provider();
             if !matches!(claimed_provider, Provider::Other) && claimed_provider != provider {
@@ -7193,11 +7323,14 @@ impl AgentFactory {
         {
             profile.require(meerkat_capabilities::RuntimeProfileCapability::FallbackWebSearch)?;
         }
+        // A resumed session's server is already settled by the resume rule
+        // (`apply_resumed_session_metadata`): the durable server when the build
+        // claims neither model, provider nor server, and the build's own
+        // otherwise. A build naming none follows the registry for its model.
         let self_hosted_server_id = if matches!(provider, Provider::SelfHosted) {
             build_config
                 .self_hosted_server_id
                 .clone()
-                .or(resumed_self_hosted_server_id)
                 .or(resolved_self_hosted_server_id)
         } else {
             None
@@ -7335,6 +7468,17 @@ impl AgentFactory {
         };
         #[cfg(any(not(feature = "session-store"), target_arch = "wasm32"))]
         let resolved_llm_client_phase = primary_llm_client_phase?;
+        if let Some(durable) = resumed_provider_switch.as_ref() {
+            // Binding refs only, never credential material.
+            tracing::info!(
+                session_id = %session.id(),
+                from_provider = durable.provider.as_str(),
+                from_binding = ?durable.auth_binding,
+                to_provider = provider.as_str(),
+                to_binding = ?build_config.auth_binding,
+                "resumed session switched provider"
+            );
+        }
         let llm_client = resolved_llm_client_phase.llm_client;
         // The selected account's own output limit, when its provider states
         // one: an unspecified per-turn budget never asks for more.
@@ -10435,6 +10579,9 @@ mod brain_swap_runtime_loop_ab_tests;
 #[cfg(all(test, feature = "session-compaction", not(target_arch = "wasm32")))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod compaction_summary_budget_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod resume_provider_override_binding_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

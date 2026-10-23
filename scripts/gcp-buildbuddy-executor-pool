@@ -81,7 +81,6 @@ executor_image="${MEERKAT_BUILDBUDDY_EXECUTOR_IMAGE:-}"
 intended_executor_image="buildbuddy.bbcr.io/public/buildbuddy-executor-enterprise:enterprise-v2.265.0"
 ci_image="${MEERKAT_BUILDBUDDY_CI_IMAGE:-}"
 ci_image="${ci_image#docker://}"
-intended_ci_image="europe-west1-docker.pkg.dev/king-dnn-training-dev/meerkat-ci/meerkat-ci-rust:1.94.0"
 api_key_secret="${MEERKAT_BUILDBUDDY_API_KEY_SECRET:-meerkat-bb-executor-api-key}"
 endpoint_secret="${MEERKAT_BUILDBUDDY_ENDPOINT_SECRET:-meerkat-bb-control-endpoint}"
 ca_secret="${MEERKAT_BUILDBUDDY_CA_SECRET:-meerkat-bb-control-ca}"
@@ -164,7 +163,7 @@ require_pinned_images() {
     die "MEERKAT_BUILDBUDDY_EXECUTOR_IMAGE must pin the executor image by digest (<repository>[:tag]@sha256:<64 hex>); got '${executor_image}'. Resolve the digest of ${intended_executor_image} and set it."
   fi
   if ! [[ "${ci_image}" =~ ^[A-Za-z0-9._/:-]+@sha256:[0-9a-f]{64}$ ]]; then
-    die "MEERKAT_BUILDBUDDY_CI_IMAGE must pin the action image by digest (<repository>[:tag]@sha256:<64 hex>); got '${ci_image}'. Resolve the digest of ${intended_ci_image} and set it."
+    die "MEERKAT_BUILDBUDDY_CI_IMAGE must pin the action image by digest (<repository>[:tag]@sha256:<64 hex>); got '${ci_image}'. Resolve the digest of the image that scripts/gcp-buildbuddy-ci-image image prints and set it."
   fi
 }
 

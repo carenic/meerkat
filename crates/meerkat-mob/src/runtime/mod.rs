@@ -333,6 +333,8 @@ mod remote_flow_ticket;
 mod remote_turn_reconciler;
 mod retirement_settlement;
 mod roster_authority;
+#[cfg(feature = "runtime-adapter")]
+mod run_drain;
 pub(crate) mod scope_gate;
 mod session_service;
 mod spawn_policy;

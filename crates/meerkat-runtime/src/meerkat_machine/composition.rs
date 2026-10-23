@@ -2,11 +2,11 @@
 //!
 //! Wave-c C-6p landed the producer side: the mob actor converts each
 //! emitted `MobMachineEffect::Request*` variant into a typed
-//! [`MobSeamEffect`][mse] and routes it through a
+//! `meerkat_mob::runtime::composition::MobSeamEffect` and routes it through a
 //! [`CompositionDispatcher`][cd]. Until this module lands, that
 //! dispatcher resolves the typed route but fails with
 //! [`DispatchRefusal::UnwiredConsumer`][dr] because no
-//! [`ConsumerSurface`][cs] is registered for the `meerkat` target
+//! [`ConsumerSurface`] is registered for the `meerkat` target
 //! instance.
 //!
 //! C-6c closes that seam: [`MeerkatConsumerSurface`] is the typed
@@ -27,9 +27,7 @@
 //! surface is reached, so [`apply_routed_input`][cs_apply] can assume
 //! the declared bindings are present.
 //!
-//! [mse]: meerkat_mob::runtime::composition::MobSeamEffect
 //! [cd]: crate::composition::CompositionDispatcher
-//! [cs]: crate::composition::ConsumerSurface
 //! [cs_apply]: crate::composition::ConsumerSurface::apply_routed_input
 //! [dr]: crate::composition::DispatchRefusal
 

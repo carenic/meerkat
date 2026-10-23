@@ -105,6 +105,21 @@ them.
   absent, so loopback starts and completions and every existing error keep
   their exact JSON.
 
+- Resumed provider switches (see Fixed, provider override on resume):
+  `meerkat-core`'s `ConnectionTargetError` gains the variant
+  `NoCredentialAccountRoute { provider, account }`; `meerkat`'s
+  `LlmIdentityPreflightError` gains the variant
+  `BindingSelection { source }`; and `meerkat-mob`'s
+  `MaterializePreflightProbe::preflight_llm_identity` gains the parameter
+  `resume_prior: Option<&SessionLlmIdentity>` (the resumed session's durable
+  identity, `None` for a fresh member). Behaviour-only: a resume whose
+  provider override changes the provider no longer restores the durable
+  binding, also when the configuration now points that binding's name at the
+  new provider; the new provider resolves its own route. A resumed
+  self-hosted session whose build claims the model or the provider without
+  naming a server follows the registry's server for its model, in the
+  factory and in a mob member's merge alike, instead of the durable server.
+
 ### Added
 
 - Hosted MCP OAuth through the host's own `https` callback (#1808), for a
@@ -178,6 +193,70 @@ them.
   is seen as gone, never admitted again. The trait default refuses.
   `MeerkatMachine::accept_existing_input_with_completion_for_attachment_and_member_residency`
   is the same for a mob member's attachment.
+- `MobHandle::drain_stopped_runs(until)` waits, up to `until`, for the run
+  each member of a Stopped mob had when it was called, and reports for each
+  member whether that run ended (with the terminal it recorded), was still
+  running at the bound, or was not waited for: no run, an open live channel,
+  a placed or remote member, or a runtime registration that needs a
+  durability reload. It cancels and writes nothing, so a graceful shutdown
+  that lets in-flight turns finish runs Stop, the drain, then Shutdown, which
+  cancels what is still running as before. On a mob that is not Stopped it
+  is refused with `MobError::DrainRequiresStoppedMob`.
+- `MobHandle::stop_with_options(StopOptions::default().leave_runs_running())`
+  leaves every member's current run running, an autonomous member's
+  included, and returns without waiting for any turn: run starts are held
+  and autonomous kickoffs are closed as by a plain Stop, and each such run is
+  reported `LeftRunning`. `MobHandle::stop` is unchanged and still cancels
+  an autonomous member's run at its next boundary.
+- `MeerkatMachine::session_live_channel_active` reports whether a session
+  has an active live channel at that instant.
+
+- `meerkat-core`: `resolve_resumed_session_llm_identity` and
+  `resolve_resumed_session_auth_binding`, the one rule every resume merge
+  uses for the resumed LLM identity, and `resolve_session_auth_binding`, the
+  binding rule they share with turn and hot-swap overrides.
+  `SessionCredentialAccountRouteFailure` with
+  `SessionError::credential_account_route_failure` and
+  `SessionError::credential_account_route_failure_data` carry a refused
+  account-backed provider switch typed across session, Meta and RPC
+  boundaries. `meerkat`: `AgentFactory::preflight_resumed_llm_identity`.
+
+- `meerkat-runtime`, `meerkat-authorization`: governed service calls, the
+  native seam for provider calls that no runtime input carries, such as a
+  scheduled host runnable that reads a provider through a connector-bound
+  MCP server. Such a call needs governed work authorization, and until now
+  no admitted run or control supplied it to host code, so the call was
+  refused. The trusted host enrolls a service original at
+  operator-reviewed setup: a standing association whose basis selects the
+  operator's grant for exactly the installation's MCP server, the grant
+  recording that server's connector approval. Its original source answers
+  the record through the new defaulted
+  `AuthenticatedOriginalSource::enrolled_service_original` (`EnrolledServiceOriginal`),
+  and an enrolled original always answers `NotRetained` to
+  `retained_custody`, so it never stands for admitted work. Each schedule
+  occurrence then presents a `ServiceCallRequest` to
+  `MeerkatMachine::prepare_service_call`.
+  `ServiceCallRequest::from_trusted_host` refuses as `MalformedFacts` an
+  association that cannot be a service original: one with a controller, a
+  represented subject or contributing work, a basis that selects no MCP
+  server or checked route target, or a namespace with the reserved
+  `meerkat.` prefix. The installed native host
+  (`NativeWorkAuthorizationHost::service_call_authorization`, defaulted to
+  unavailable) admits the request once, and only when its whole
+  association is the enrolled record. It returns a `ServiceCall` (not
+  `Clone`, one per occurrence) whose `dispatch` runs the ordinary fenced
+  dispatch, Domain-scoped and runless, for MCP server operations only.
+  Every operation is prepared from the current enrollment, the operator's
+  grant, the connector approval it records and the operation owner, and is
+  audited to the request's own sink. No review composition is attached,
+  so an operation that needs review is refused, and the connector owner
+  still checks the slot's credential at the call. A scoped composition's
+  admitted-work owner reaches the record through the new defaulted
+  `AdmittedWorkPolicyOwner::enrolled_service_original`; every other owner
+  keeps the default, so the seam is unavailable outside scoped
+  compositions and on ungoverned machines. The `ServiceOccurrence` a
+  request carries is host-asserted audit data, not authority. Additive:
+  no wire, contract or persistence change.
 
 ### Changed
 
@@ -388,6 +467,45 @@ them.
   stayed uncertain reports that the same way, as `MobError::AdmissionClosed`
   with `MobAdmissionCloseReason::DurabilityFailStop`; the mutation itself is
   still named only in the error log where it failed.
+
+- A durable session resumed with `provider` in a mob profile's
+  `resume_overrides` (or a surface resume that changes provider) after the
+  profile moved to another provider no longer fails with
+  `ProviderMismatch` ("binding 'global:openai' resolves backend=OpenAI
+  auth=OpenAI, expected provider Anthropic"), leaving a Meta identity Broken.
+  Both resume merges restored the old provider's binding under the new
+  provider. One Core rule now decides the resumed identity for the mob merge,
+  the factory merge, the surface recovery merge and the member-host preflight:
+  the durable binding is kept while the provider is unchanged, and a changed
+  provider resolves its binding from the session's realm as a fresh member
+  would (the realm's binding, then the parent realms and `global`, then the
+  environment key). A binding backed by a credential account keeps its
+  account, by the hot swap's affinity rule, or the resume refuses with the
+  typed `NoCredentialAccountRoute` and leaves the durable session untouched.
+  The history replays to the new provider without the old provider's native
+  reasoning items. A name re-pointed in configuration at the new provider is
+  not reused: the new provider's route is resolved afresh. Hosts that run
+  members for other hosts need this release to resume such members.
+
+- A connector OAuth login on one of its client profile's
+  `registered_redirect_uris` can complete over RPC: `auth/login/start`
+  returns its `host_attempt_handle`, and `auth/login/complete` passes the
+  one the host sends (before, RPC dropped it both ways, so such a login was
+  always refused as needing the host's custody). Without the handle the
+  refusal carries `error.data.detail` `remote_custody_required` and leaves
+  the attempt pending. `iss` stays MCP-only.
+
+- `meerkat-runtime`: a browser OAuth completion on another redirect than the
+  one its attempt was started on is refused as the caller's mismatched
+  attempt (`OAuthFlowError::RedirectUriMismatch`: wire reason
+  `attempt_mismatch`, RPC `INVALID_PARAMS`, REST 400), not as a flow-owner
+  lifecycle failure (wire reason `infrastructure`, RPC `INTERNAL_ERROR`, REST
+  500) that a host would retry. The runtime's flow owner checks a completion
+  against the attempt its AuthMachine admitted, which refused another
+  redirect only as a rejected transition; the machine's own record of the
+  attempt now tells that case apart. This covers a loopback MCP login and a
+  provider browser login; a completion for another provider keeps its
+  lifecycle rejection.
 
 ## [0.9.4] - 2026-10-20
 

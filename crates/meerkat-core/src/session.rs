@@ -9262,14 +9262,12 @@ pub fn resolve_session_llm_identity_override(
         None
     };
 
-    let auth_binding = match overrides.auth_binding {
-        Some(TurnMetadataOverride::Clear) => None,
-        Some(TurnMetadataOverride::Set(value)) => Some(value.clone()),
-        // Inherit: a provider change without an explicit binding drops the
-        // stale binding; otherwise the durable binding is retained.
-        None if provider != current.provider => None,
-        None => current.auth_binding.clone(),
-    };
+    let auth_binding = resolve_session_auth_binding(
+        current.provider,
+        current.auth_binding.as_ref(),
+        provider,
+        overrides.auth_binding,
+    );
 
     Ok(SessionLlmIdentity {
         model,
@@ -9278,6 +9276,110 @@ pub fn resolve_session_llm_identity_override(
         provider_params,
         auth_binding,
     })
+}
+
+/// The credential binding a session carries across an LLM identity change.
+///
+/// One rule for every seam that moves a session's identity: a turn or hot-swap
+/// override ([`resolve_session_llm_identity_override`]) and a resumed build
+/// ([`resolve_resumed_session_llm_identity`]). `Set` names the binding and
+/// `Clear` removes it. With neither, a provider change drops the current
+/// binding, because a binding serves one provider and the new provider
+/// resolves its own route as a fresh session would, while the same provider
+/// keeps the current binding.
+#[must_use]
+pub fn resolve_session_auth_binding(
+    current_provider: Provider,
+    current_binding: Option<&crate::AuthBindingRef>,
+    target_provider: Provider,
+    binding_override: Option<TurnMetadataOverride<&crate::AuthBindingRef>>,
+) -> Option<crate::AuthBindingRef> {
+    match binding_override {
+        Some(TurnMetadataOverride::Clear) => None,
+        Some(TurnMetadataOverride::Set(value)) => Some(value.clone()),
+        None if target_provider != current_provider => None,
+        None => current_binding.cloned(),
+    }
+}
+
+/// The LLM identity a resumed session builds with.
+///
+/// One rule for every resume merge (a mob member's, the agent factory's, the
+/// member-host preflight's). `candidate` holds the build's values, and its
+/// `auth_binding` is a binding the build names explicitly. A field `mask`
+/// lists keeps the build's value; every other field restores `durable`.
+///
+/// - The self-hosted server follows the route: a build that claims the model,
+///   the provider or the server keeps its own server, and otherwise the
+///   durable server stays.
+/// - The binding follows [`resolve_resumed_session_auth_binding`].
+#[must_use]
+pub fn resolve_resumed_session_llm_identity(
+    candidate: SessionLlmIdentity,
+    durable: &SessionLlmIdentity,
+    mask: &crate::service::ResumeOverrideMask,
+) -> SessionLlmIdentity {
+    let provider = if mask.provider {
+        candidate.provider
+    } else {
+        durable.provider
+    };
+    let auth_binding = resolve_resumed_session_auth_binding(
+        durable,
+        provider,
+        candidate.auth_binding.as_ref(),
+        mask.auth_binding,
+    );
+    SessionLlmIdentity {
+        model: if mask.model {
+            candidate.model
+        } else {
+            durable.model.clone()
+        },
+        provider,
+        self_hosted_server_id: if mask.model || mask.provider || mask.self_hosted_server_id {
+            candidate.self_hosted_server_id
+        } else {
+            durable.self_hosted_server_id.clone()
+        },
+        provider_params: if mask.provider_params {
+            candidate.provider_params
+        } else {
+            durable.provider_params.clone()
+        },
+        auth_binding,
+    }
+}
+
+/// The binding part of [`resolve_resumed_session_llm_identity`], for a build
+/// that settles its provider after the merge.
+///
+/// A binding the build names explicitly wins. A build that claims the binding
+/// without naming one clears it. Otherwise [`resolve_session_auth_binding`]
+/// decides against the durable binding: kept for the same provider, dropped
+/// for a provider change. The synthetic env-default binding is never restored:
+/// it is not a durable, config-resolvable identity.
+#[must_use]
+pub fn resolve_resumed_session_auth_binding(
+    durable: &SessionLlmIdentity,
+    target_provider: Provider,
+    explicit_binding: Option<&crate::AuthBindingRef>,
+    binding_masked: bool,
+) -> Option<crate::AuthBindingRef> {
+    let binding_override = match (explicit_binding, binding_masked) {
+        (Some(binding), _) => Some(TurnMetadataOverride::Set(binding)),
+        (None, true) => Some(TurnMetadataOverride::Clear),
+        (None, false) => None,
+    };
+    resolve_session_auth_binding(
+        durable.provider,
+        durable
+            .auth_binding
+            .as_ref()
+            .filter(|binding| !binding.is_env_default()),
+        target_provider,
+        binding_override,
+    )
 }
 
 /// Live request policy paired with a session LLM identity hot-swap.

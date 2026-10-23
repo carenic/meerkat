@@ -48585,8 +48585,12 @@ async fn test_retire_member_waits_for_active_runtime_turn_before_unregister() {
             meerkat_core::lifecycle::core_executor::CoreApplyOutput,
             meerkat_core::lifecycle::core_executor::CoreExecutorError,
         > {
+            // apply runs on the runtime's serving thread, and the test may
+            // release it as soon as it sees the start. notify_waiters keeps
+            // no permit, so register for the release before announcing.
+            let allow_finish = self.allow_finish.notified();
             self.apply_started.notify_waiters();
-            self.allow_finish.notified().await;
+            allow_finish.await;
 
             Ok(
                 meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_untyped_snapshot(
@@ -48787,8 +48791,12 @@ async fn test_retire_member_cancels_visible_retired_drain_run_before_archive() {
             meerkat_core::lifecycle::core_executor::CoreApplyOutput,
             meerkat_core::lifecycle::core_executor::CoreExecutorError,
         > {
+            // apply runs on the runtime's serving thread, and the test may
+            // release it as soon as it sees the start. notify_waiters keeps
+            // no permit, so register for the release before announcing.
+            let allow_finish = self.allow_finish.notified();
             self.apply_started.notify_waiters();
-            self.allow_finish.notified().await;
+            allow_finish.await;
             Ok(
                 meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_untyped_snapshot(
                     meerkat_core::lifecycle::run_receipt::RunBoundaryReceiptDraft {
@@ -49280,8 +49288,12 @@ async fn test_retire_member_bounds_wedged_exact_control_and_retry_converges() {
             meerkat_core::lifecycle::core_executor::CoreApplyOutput,
             meerkat_core::lifecycle::core_executor::CoreExecutorError,
         > {
+            // apply runs on the runtime's serving thread, and the test may
+            // release it as soon as it sees the start. notify_waiters keeps
+            // no permit, so register for the release before announcing.
+            let allow_finish = self.allow_finish.notified();
             self.apply_started.notify_waiters();
-            self.allow_finish.notified().await;
+            allow_finish.await;
             Ok(
                 meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_untyped_snapshot(
                     meerkat_core::lifecycle::run_receipt::RunBoundaryReceiptDraft {
@@ -56295,8 +56307,11 @@ fn test_flow_canceled_cleanup_requires_terminalization_proof() {
 #[test]
 fn test_lifecycle_commands_admit_on_live_authority_not_clone_probe() {
     let source = include_str!("actor.rs");
-    let start = source
-        .find("MobCommand::Stop { reply_tx }")
+    let stop_body = source
+        .find("StopInlineStage::PlacedCompletionCleanup")
+        .expect("Stop command arm exists");
+    let start = source[..stop_body]
+        .rfind("MobCommand::Stop")
         .expect("Stop command arm exists");
     let end = source[start..]
         .find("MobCommand::RotateSupervisor")
@@ -84796,6 +84811,9 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         MobError::InvalidTransition { from, to } => {
             format!("invalid_transition:{}->{}", from.as_str(), to.as_str())
         }
+        MobError::DrainRequiresStoppedMob { state } => {
+            format!("drain_requires_stopped_mob:{}", state.as_str())
+        }
         MobError::MobMachineRejected { context, .. } => {
             format!("mob_machine_rejected:{context}")
         }
@@ -92532,6 +92550,9 @@ async fn test_running_steer_without_override_resolves_applied_identity_as_none()
 /// #1102 actor-loop isolation, per-member admission lanes, bounded
 /// deliveries, and the member registration reload primitive.
 mod actor_isolation;
+/// A bounded drain of a Stopped mob's runs.
+#[cfg(feature = "runtime-adapter")]
+mod run_drain;
 /// A graceful Shutdown releases the identity leases of the members it
 /// unregistered.
 mod shutdown_lease_release;
