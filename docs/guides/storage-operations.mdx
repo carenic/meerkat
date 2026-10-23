@@ -127,7 +127,9 @@ after a second without a read (`KEPT_DELIVERY_READER_IDLE`), so the fence gets
 the database well inside the default wait. A fence wait shorter than that
 second can meet an idle reader and refuse. A closed reader stays closed until
 another connection commits or the store watch's sweep (every 5 seconds)
-reads: the reader's own open and close are no change to the watch.
+reads: the reader's own open and close are no change to the watch. A
+notification is only a hint: a commit read while its WAL sync is still
+running can wait for that sweep, within 5 seconds.
 Windows keeps the fresh-open read path, one verified open per read, because
 no CI lane runs the kept reader on Windows. There, a store notification after
 which the database and its WAL stat as they did before the last read is
