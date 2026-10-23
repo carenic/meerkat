@@ -37552,6 +37552,7 @@ supports_reasoning = true
             schema_version: 4,
             root_step_outputs: Default::default(),
             loop_iteration_outputs: Default::default(),
+            role_targets: None,
         };
 
         let run_json = render_flow_status_json(Some(run)).expect("encode run json");

@@ -85441,6 +85441,12 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         }
         MobError::SchemaValidation { .. } => "schema_validation".to_string(),
         MobError::InsufficientTargets { .. } => "insufficient_targets".to_string(),
+        MobError::FlowRoleTargetsRefused { refusal, .. } => {
+            format!("flow_role_targets_refused:{refusal:?}")
+        }
+        MobError::BoundFlowTargetsUnavailable { .. } => {
+            "bound_flow_targets_unavailable".to_string()
+        }
         MobError::TopologyViolation { .. } => "topology_violation".to_string(),
         MobError::BridgeDeliveryRejected { cause, .. } => {
             format!("bridge_delivery_rejected:{cause}")
@@ -93186,6 +93192,10 @@ mod delivery_scope_gates;
 /// Each in-loop durability fail-stop records its own cause.
 #[cfg(not(target_arch = "wasm32"))]
 mod fail_stop_cause;
+/// Role-targeted flow runs dispatch only to their admitted members; every
+/// refusal and shortfall is typed.
+#[cfg(not(target_arch = "wasm32"))]
+mod flow_role_targets;
 /// #1497 fork job terminals are committed once and validated on every read.
 mod fork_job_terminal;
 /// Producer bridge Part B: held spawns.

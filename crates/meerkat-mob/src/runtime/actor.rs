@@ -15103,6 +15103,25 @@ impl MobActor {
         })
     }
 
+    /// Whether MobMachine records `identity` as an Active member holding
+    /// `profile_name`: the one "Active and holds the role" predicate over
+    /// machine-owned member facts. Same-profile auto-wiring and role-targets
+    /// admission both decide through it.
+    fn machine_member_is_active_with_profile(
+        dsl: &mob_dsl::MobMachineState,
+        identity: &mob_dsl::AgentIdentity,
+        profile_name: &ProfileName,
+    ) -> bool {
+        dsl.member_profile_names
+            .get(identity)
+            .is_some_and(|machine_profile_name| {
+                machine_profile_name.as_str() == profile_name.as_str()
+            })
+            && MobMemberLifecycleProjection::is_active_machine_lifecycle(
+                &dsl.member_lifecycle_for_identity(identity),
+            )
+    }
+
     fn active_machine_member_ids_for_profile(
         &self,
         profile_name: &ProfileName,
@@ -15110,19 +15129,82 @@ impl MobActor {
     ) -> Vec<AgentIdentity> {
         let dsl = self.dsl_authority.state();
         dsl.member_profile_names
-            .iter()
-            .filter_map(|(identity, machine_profile_name)| {
-                if machine_profile_name.as_str() != profile_name.as_str()
-                    || identity.0.as_str() == excluded_identity.as_str()
-                    || !MobMemberLifecycleProjection::is_active_machine_lifecycle(
-                        &dsl.member_lifecycle_for_identity(identity),
-                    )
-                {
-                    return None;
-                }
-                Some(AgentIdentity::from(identity.0.as_str()))
+            .keys()
+            .filter(|identity| {
+                identity.0.as_str() != excluded_identity.as_str()
+                    && Self::machine_member_is_active_with_profile(dsl, identity, profile_name)
             })
+            .map(|identity| AgentIdentity::from(identity.0.as_str()))
             .collect()
+    }
+
+    /// Admit a flow run's role targets: the binding must fit the flow
+    /// (every bound role is a step role, every step role is bound, no quorum
+    /// exceeds its role's bound set), and every bound identity must be an
+    /// Active member of this mob holding that role.
+    ///
+    /// Called once per run, inside the run-flow actor command and before any
+    /// durable write, provisioning, `FlowStarted` or dispatch, so no lifecycle
+    /// transition can land between the verdict and the run record. It reads
+    /// MobMachine's own member facts through the shared predicate; the
+    /// refusal kind is only named after that predicate refused.
+    fn admit_flow_role_targets(
+        &self,
+        config: &FlowRunConfig,
+        role_targets: &crate::run::FlowRoleTargets,
+    ) -> Result<(), MobError> {
+        let refuse = |refusal| MobError::FlowRoleTargetsRefused {
+            flow_id: config.flow_id.clone(),
+            refusal,
+        };
+        role_targets
+            .check_against_flow(&config.flow_spec)
+            .map_err(refuse)?;
+        let dsl = self.dsl_authority.state();
+        for (role, members) in role_targets.bound_roles() {
+            for member in members {
+                let identity = mob_dsl::AgentIdentity::from_domain(member);
+                if Self::machine_member_is_active_with_profile(dsl, &identity, role) {
+                    continue;
+                }
+                let refusal = match dsl.member_profile_names.get(&identity) {
+                    None => crate::error::FlowRoleTargetRefusal::NotAMember {
+                        role: role.clone(),
+                        member: member.clone(),
+                    },
+                    Some(member_role) if member_role.as_str() != role.as_str() => {
+                        crate::error::FlowRoleTargetRefusal::RoleMismatch {
+                            role: role.clone(),
+                            member: member.clone(),
+                            member_role: ProfileName::from(member_role.as_str()),
+                        }
+                    }
+                    Some(_) => crate::error::FlowRoleTargetRefusal::NotActive {
+                        role: role.clone(),
+                        member: member.clone(),
+                        status: match dsl.member_lifecycle_for_identity(&identity).status {
+                            mob_dsl::MobMemberLifecycleStatus::Active => {
+                                super::handle::MobMemberStatus::Active
+                            }
+                            mob_dsl::MobMemberLifecycleStatus::Retiring => {
+                                super::handle::MobMemberStatus::Retiring
+                            }
+                            mob_dsl::MobMemberLifecycleStatus::Broken => {
+                                super::handle::MobMemberStatus::Broken
+                            }
+                            mob_dsl::MobMemberLifecycleStatus::Completed => {
+                                super::handle::MobMemberStatus::Completed
+                            }
+                            mob_dsl::MobMemberLifecycleStatus::Unknown => {
+                                super::handle::MobMemberStatus::Unknown
+                            }
+                        },
+                    },
+                };
+                return Err(refuse(refusal));
+            }
+        }
+        Ok(())
     }
 
     async fn project_member_list_from_machine(
@@ -28441,6 +28523,7 @@ impl MobActor {
                     external_delivery_intent,
                     scoped_event_tx,
                     exact_operation,
+                    role_targets,
                     reply_tx,
                 } => {
                     let result = self
@@ -28451,6 +28534,7 @@ impl MobActor {
                             external_delivery_intent,
                             scoped_event_tx,
                             exact_operation,
+                            role_targets,
                         )
                         .await;
                     let _ = reply_tx.send(result);
@@ -58720,6 +58804,7 @@ impl MobActor {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_run_flow(
         &mut self,
         requested_run_id: Option<RunId>,
@@ -58728,6 +58813,7 @@ impl MobActor {
         external_delivery_intent: Option<crate::store::MobExternalDeliveryIntent>,
         scoped_event_tx: Option<mpsc::Sender<meerkat_core::ScopedAgentEvent>>,
         exact_operation: Option<super::handle::FlowOperationCustody>,
+        role_targets: Option<Arc<crate::run::FlowRoleTargets>>,
     ) -> Result<RunId, MobError> {
         self.ensure_pending_spawn_alignment("handle_run_flow preflight")?;
         self.ensure_flow_tracker_alignment("handle_run_flow preflight")
@@ -58748,9 +58834,10 @@ impl MobActor {
             if existing.mob_id != self.definition.id
                 || existing.flow_id != flow_id
                 || existing.activation_params != activation_params
+                || existing.role_targets.as_ref() != role_targets.as_deref()
             {
                 return Err(MobError::Internal(format!(
-                    "stable external flow run '{run_id}' was reused for different mob, flow, or activation parameters"
+                    "stable external flow run '{run_id}' was reused for different mob, flow, activation parameters, or role targets"
                 )));
             }
             let terminal =
@@ -58876,6 +58963,11 @@ impl MobActor {
         }
         self.preview_run_flow_command_admission(&run_id)?;
         let config = FlowRunConfig::from_definition(flow_id.clone(), &self.definition)?;
+        // The one admission point for role targets: inside this actor command,
+        // before any durable write, provisioning, FlowStarted or dispatch.
+        if let Some(role_targets) = role_targets.as_deref() {
+            self.admit_flow_role_targets(&config, role_targets)?;
+        }
         let run_flow = MobRun::run_flow_input(&run_id, &config)?;
         debug_assert!(matches!(run_flow, mob_dsl::MobMachineInput::RunFlow { .. }));
         let prepared_run_flow = self
@@ -58886,6 +58978,7 @@ impl MobActor {
             &config,
             prepared_run_flow.authority.state(),
             activation_params.clone(),
+            role_targets.as_deref().cloned(),
             vec![run_flow],
         )
         .await
@@ -59070,6 +59163,7 @@ impl MobActor {
                 .execute_flow(
                     run_id_for_execute,
                     config,
+                    role_targets,
                     activation_params,
                     execution_cancel,
                 )
@@ -59280,6 +59374,7 @@ impl MobActor {
         config: &FlowRunConfig,
         machine_state: &mob_dsl::MobMachineState,
         activation_params: serde_json::Value,
+        role_targets: Option<crate::run::FlowRoleTargets>,
         authority_inputs: Vec<mob_dsl::MobMachineInput>,
     ) -> Result<RunId, MobError> {
         let flow_state =
@@ -59292,6 +59387,9 @@ impl MobActor {
             activation_params,
         );
         run.flow_definition_digest = Some(config.definition_digest()?);
+        // Written once, here, in the same create_run as the run and its
+        // activation params; no store operation rewrites it.
+        run.role_targets = role_targets;
         run.append_flow_authority_inputs(authority_inputs)?;
         self.run_store.create_run(run).await?;
         Ok(run_id)

@@ -3012,6 +3012,12 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         MobError::MemberCommsName(_) | MobError::ConditionEval { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
         }
+        // Role-targets admission and bound-target dispatch refusals belong to
+        // flow runs; spawn-many provisioning never admits or runs a flow.
+        // Classify as Internal to keep the match total.
+        MobError::FlowRoleTargetsRefused { .. } | MobError::BoundFlowTargetsUnavailable { .. } => {
+            mob_dsl::MobSpawnManyFailureObservationKind::Internal
+        }
         // Flow-step dispatch classification never runs during spawn-many
         // provisioning (it is the flow lane's admission gate). Classify as
         // Internal to keep the match total.
@@ -8402,6 +8408,7 @@ impl MobHandle {
                 external_delivery_intent,
                 scoped_event_tx,
                 exact_operation,
+                role_targets,
             } => {
                 let run_id = self
                     .send_actor_command(|reply_tx| MobCommand::RunFlow {
@@ -8411,6 +8418,7 @@ impl MobHandle {
                         external_delivery_intent,
                         scoped_event_tx,
                         exact_operation,
+                        role_targets,
                         reply_tx,
                     })
                     .await??;
@@ -11744,6 +11752,39 @@ impl MobHandle {
         self.run_flow_with_stream(flow_id, params, None).await
     }
 
+    /// Start a flow run whose roles dispatch only to the members bound to
+    /// them, and return its run ID.
+    ///
+    /// `role_targets` must bind every role a step of the flow dispatches to.
+    /// The mob actor admits the binding once, before anything is written,
+    /// provisioned or dispatched: every bound identity must be a member of
+    /// this mob, hold that role and be Active, or the run is refused with a
+    /// typed `MobError::FlowRoleTargetsRefused`. The admitted binding is
+    /// fixed for the run and recorded on `MobRun::role_targets`. Each
+    /// execution of a step dispatches only to its role's bound members that
+    /// are still Active and still hold the role; when they can no longer meet
+    /// the step's collection policy, the run fails with the
+    /// `InsufficientTargets` failure class before that step dispatches any
+    /// turn. No flow member is provisioned for a bound run; an installed
+    /// embedder flow-target barrier still runs first, as for every run.
+    pub async fn run_flow_with_role_targets(
+        &self,
+        flow_id: FlowId,
+        params: serde_json::Value,
+        role_targets: crate::run::FlowRoleTargets,
+        scoped_event_tx: Option<mpsc::Sender<meerkat_core::ScopedAgentEvent>>,
+    ) -> Result<RunId, MobError> {
+        self.run_flow_with_stream_and_external_identity(
+            flow_id,
+            params,
+            scoped_event_tx,
+            None,
+            None,
+            Some(Arc::new(role_targets)),
+        )
+        .await
+    }
+
     /// Admit one exact Flow run after registering its terminal waiter.
     ///
     /// The caller must construct `spec` before invoking this method, so an
@@ -11800,6 +11841,7 @@ impl MobHandle {
                 external_delivery_intent: None,
                 scoped_event_tx: None,
                 exact_operation: Some(exact_operation.clone()),
+                role_targets: None,
             })
             .await;
         match admission {
@@ -12044,6 +12086,7 @@ impl MobHandle {
             scoped_event_tx,
             None,
             None,
+            None,
         )
         .await
     }
@@ -12065,6 +12108,7 @@ impl MobHandle {
             None,
             None,
             provision_bound,
+            None,
         )
         .await
     }
@@ -12077,8 +12121,15 @@ impl MobHandle {
         params: serde_json::Value,
         identity: &crate::store::MobExternalDeliveryIdentity,
     ) -> Result<RunId, MobError> {
-        self.run_flow_with_stream_and_external_identity(flow_id, params, None, Some(identity), None)
-            .await
+        self.run_flow_with_stream_and_external_identity(
+            flow_id,
+            params,
+            None,
+            Some(identity),
+            None,
+            None,
+        )
+        .await
     }
 
     /// Prepare the Flow target, then let the Mob actor persist the exact
@@ -12126,6 +12177,7 @@ impl MobHandle {
                 external_delivery_intent: Some(intent.clone()),
                 scoped_event_tx: None,
                 exact_operation: None,
+                role_targets: None,
             })
             .await
         {
@@ -12158,6 +12210,7 @@ impl MobHandle {
         scoped_event_tx: Option<mpsc::Sender<meerkat_core::ScopedAgentEvent>>,
         identity: Option<&crate::store::MobExternalDeliveryIdentity>,
         provision_bound: Option<&super::MemberOperatorAuthorityCeiling>,
+        role_targets: Option<Arc<crate::run::FlowRoleTargets>>,
     ) -> Result<RunId, MobError> {
         self.execute_machine_command(MobMachineCommand::PreviewRunFlowAdmission)
             .await?;
@@ -12175,8 +12228,16 @@ impl MobHandle {
         if let Some(provisioner) = provisioner {
             provisioner().await?;
         }
-        self.ensure_flow_targets_provisioned(&flow_id, provision_bound)
-            .await?;
+        // A role-targeted run dispatches only to the existing members it was
+        // admitted with, so no flow member is provisioned for it: a refused
+        // binding leaves no member behind. The embedder barrier above still
+        // runs first, as for every run; it is the embedder's flow-boundary
+        // policy, not a membership decision. Membership is judged once, by
+        // the actor's admission, never here.
+        if role_targets.is_none() {
+            self.ensure_flow_targets_provisioned(&flow_id, provision_bound)
+                .await?;
+        }
         let run_id = match identity {
             Some(identity) => {
                 identity.validate()?;
@@ -12196,6 +12257,7 @@ impl MobHandle {
                 external_delivery_intent: None,
                 scoped_event_tx,
                 exact_operation: None,
+                role_targets,
             })
             .await?
         {

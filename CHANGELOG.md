@@ -689,6 +689,15 @@ them.
   candidate digest no longer verifies there. A row without a key keeps its
   bytes.
 
+- `meerkat-mob`: `MobRun` gains the public field
+  `role_targets: Option<FlowRoleTargets>`, the member set a role-targeted
+  flow run was admitted with (see Added). Code that builds a `MobRun` with a
+  struct literal must set it (`None` for a role-wide run). The run gains the
+  serialized key only when it is role-targeted, so a role-wide run's stored
+  and wire form is unchanged. A bound run read by an older runtime shows no
+  role_targets, and an in-flight bound run canceled by an older runtime loses
+  it; a gate must treat a missing binding as not authorized.
+
 ### Added
 
 - `meerkat-runtime`: a durable session whose process stopped inside a run
@@ -1645,6 +1654,46 @@ them.
   only over a store that answers `true`, and over any other store the run
   takes no round commit after its first rewrite. A decorator forwards both.
 
+- `MeerkatMachine::session_input_states` exposes the existing strict input
+  witness observation through the selected machine. It includes pending and
+  terminal rows, fails on corrupt durable rows, and reads unregistered sessions
+  without restoring them. It does not fence ingress or establish settlement;
+  hosts must separately establish the close boundary and inspect each input's
+  canonical terminal receipt.
+
+- `meerkat-mob`: role-targeted flow runs, so several runs can share one mob
+  and one role while each dispatches only to its own members.
+  `MobHandle::run_flow_with_role_targets` starts a run with
+  `FlowRoleTargets`, which maps each role the flow's steps dispatch to onto
+  the existing members that role's steps may use, for example
+  `{"reviewer": ["rev-a1", "rev-a2"]}`. Building or decoding the value refuses
+  an empty map, a role without members, a role named twice and a member
+  listed twice (`FlowRoleTargetsError`). The mob actor admits the binding once,
+  before anything is written, provisioned or dispatched: it must bind every
+  role the flow's steps use and no other, no quorum may need more members
+  than its role binds, and every bound identity must be an Active member of
+  the mob that holds the role. A refusal is
+  `MobError::FlowRoleTargetsRefused`, whose structured data carries the typed
+  `FlowRoleTargetRefusal` as
+  `{"kind": "flow_role_targets_refused", "flow_id": ..., "refusal": {"kind": ...}}`
+  (`role_not_in_flow`, `role_unbound`, `quorum_exceeds_bound_set`,
+  `not_a_member`, `role_mismatch`, `not_active`). The admitted binding is
+  fixed for the run and recorded on `MobRun::role_targets`, which flow status
+  and run lists return. Every execution of a step, each `repeat_until`
+  iteration included, dispatches only to the bound members of its role that
+  are still Active and still hold the role. When they can no longer meet the
+  step's collection policy, the run fails with the `InsufficientTargets`
+  failure class (`MobError::BoundFlowTargetsUnavailable`) before that step
+  dispatches any turn, whatever the step's `failure_policy`. A bound run never
+  substitutes another member and never waits for one, and no flow member is
+  provisioned for it (an installed embedder flow-target barrier still runs
+  first, as for every run). Outputs keep their per-member attribution (the
+  `StepTargetCompleted` targets and the keys of a multi-target step's
+  aggregate output), and a collection policy counts each bound member at most
+  once. A bound run cut off by a restart is canceled with
+  `ExecutionCustodyLost` like any other run; its binding stays on the record
+  and nothing reuses it, so the next run is admitted afresh.
+
 ### Changed
 
 - `meerkat-session`: materializing a durable session whose durable-tail
@@ -2482,6 +2531,23 @@ them.
   Reserved capacity follows the stream through close races, pending delivery and
   transport disconnect, without blocking the agent event producer.
 
+- `meerkat-runtime`, `meerkat-session`: the archive of an ending session
+  settles a durable tail when the session's runtime has stopped. When an
+  input waited behind the boundary-cancelled turn, the runtime loop read the
+  session's committed history before admitting it, met the tail, failed
+  closed and left the runtime persisted `Stopped`. Durable-tail recovery
+  counts a `Stopped` runtime as not quiescent, so the archive's recovery
+  refused the tail and the retirement stayed stuck with
+  `SessionError::DurableTailRecoveryRefused`. The new
+  `recovery::recover_durable_tail_for_session_archive` is the store-owned
+  recovery for an archive that holds the session's gates while the session
+  ends, and the archive now uses it. Unlike ordinary recovery, it counts a
+  persisted `Stopped` runtime as quiescent, as it counts a retired one, and
+  it re-asserts `Stopped`. A persisted current run still refuses, and the
+  commit stays fenced on the observed lifecycle row. Every other recovery
+  still refuses a `Stopped` runtime, because a later start may resume its
+  run.
+
 ### Known limitations
 
 - A durable run that resumes asks the model again for a round that took no
@@ -2513,6 +2579,12 @@ them.
   no current-turn content, as for a pending continuation, and the agent's
   lifetime budget counters restart with the agent, as for any session a host
   materializes after a restart.
+
+- `meerkat-mob`: role-target admission and each step's choice of targets are
+  checks that the mob actor and the flow engine make over the mob machine's
+  member facts; the mob machine does not decide them itself. The role-wide
+  target choice every flow step already used works the same way. The 0.9.6
+  line moves both into the mob machine.
 
 ## [0.9.4] - 2026-10-20
 

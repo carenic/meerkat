@@ -4146,6 +4146,7 @@ mod tests {
             )]),
             loop_iteration_outputs: BTreeMap::new(),
             flow_authority_inputs: Vec::new(),
+            role_targets: None,
         }
     }
 

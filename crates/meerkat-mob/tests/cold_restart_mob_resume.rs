@@ -7463,6 +7463,230 @@ async fn a_destroy_with_a_member_whose_turn_stopped_before_its_boundary_commit_c
     stopped.assert_tail_settled("stopped-turn-destroy").await;
 }
 
+/// [`persistent_head_canonical_service`] with the session-LLM reconfigure host
+/// a product surface installs. With it, the runtime loop reads the session's
+/// committed model-routing history before it admits a queued input.
+#[cfg(feature = "test-support")]
+fn persistent_head_canonical_service_with_reconfigure_host(
+    paths: &Paths,
+    runtime_store: Arc<dyn meerkat_runtime::RuntimeStore>,
+) -> (
+    Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    Arc<SqliteSessionStore>,
+) {
+    use meerkat::session_runtime::llm_reconfigure::{
+        SessionRuntimeLlmReconfigureHostBlueprint, SessionRuntimeLlmReconfigureService,
+    };
+
+    paths.materialize_project_context();
+    let factory = factory(paths);
+    let mut builder = FactoryAgentBuilder::new(factory, Config::default());
+    builder.default_llm_client = Some(openai_test_client());
+    let store = Arc::new(
+        SqliteSessionStore::open(&paths.realm_db_path)
+            .expect("open co-tenant SQLite session store"),
+    );
+    builder.default_session_store = Some(Arc::new(StoreAdapter::new(store.clone())));
+    let blueprint = SessionRuntimeLlmReconfigureHostBlueprint::new(
+        &builder,
+        paths.runtime_root.join("reconfigure-state.json"),
+        Arc::new(std::sync::RwLock::new(builder.default_llm_client.clone())),
+    );
+
+    let store_dyn: Arc<dyn meerkat::SessionStore> = store.clone();
+    let blob_store: Arc<dyn meerkat_core::BlobStore> =
+        Arc::new(meerkat_store::MemoryBlobStore::default());
+    let service = Arc::new(PersistentSessionService::new(
+        builder,
+        32,
+        store_dyn,
+        runtime_store,
+        blob_store,
+    ));
+    let runtime = service
+        .canonical_runtime_adapter()
+        .expect("the session service's runtime owner");
+    let reconfigure_service: Arc<dyn SessionRuntimeLlmReconfigureService> = service.clone();
+    blueprint.install(&runtime, reconfigure_service);
+    (service, store)
+}
+
+/// A member retired after its runtime stopped over the durable tail of a
+/// boundary-cancelled turn retires.
+///
+/// The member's turn waits inside its provider call while a second input
+/// queues behind it. The boundary cancel reaches the turn's boundary handle
+/// before the provider call is released (a positive event, never a sleep), so
+/// the turn ends after its end-of-run checkpoint without its boundary commit:
+/// its durable tail is ahead of the runtime boundary. Before the runtime loop
+/// admits the queued input it reads the session's committed model-routing
+/// history; that read meets the tail and fails closed, the loop exits, and the
+/// runtime is persisted `Stopped`. The retirement then reaches the archive,
+/// whose store-owned recovery treats that stopped runtime as quiescent (the
+/// session ends with the archive), settles the tail and retires the member.
+/// Recovery outside an archive would still refuse a `Stopped` runtime.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_retired_after_its_runtime_stopped_over_a_cancelled_turns_tail_retires() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "warn,meerkat_mob::runtime::actor::retirement_io=info,meerkat_runtime::recovery=info,\
+             meerkat_session::persistent=info,meerkat_runtime::runtime_loop=info",
+        ))
+        .with_writer(std::io::stderr)
+        .try_init();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let power_store = Arc::new(PowerCutRuntimeStore::new(&paths.realm_db_path));
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = power_store.clone();
+    let (service, store) =
+        persistent_head_canonical_service_with_reconfigure_host(&paths, runtime_store.clone());
+    let client = Arc::new(HeldTurnClient::default());
+    let handle = MobBuilder::new(
+        mob_definition(MobRuntimeMode::TurnDriven),
+        MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage"),
+    )
+    .with_session_service(service.clone())
+    .with_default_llm_client(client.clone())
+    .create()
+    .await
+    .expect("create persistent mob");
+    handle
+        .spawn_spec(SpawnMemberSpec::new("lead", AgentIdentity::from("lead-1")))
+        .await
+        .expect("spawn lead");
+    handle
+        .spawn_spec(SpawnMemberSpec::new("worker", AgentIdentity::from("w-1")))
+        .await
+        .expect("spawn worker");
+    let identity = AgentIdentity::from("w-1");
+    let w1_sid = handle
+        .resolve_bridge_session_id(&identity)
+        .await
+        .expect("w1 session id");
+    send_and_wait(
+        &handle,
+        service.as_ref(),
+        "w-1",
+        "PRE_HELD_TURN token-alpha",
+        "stopped-runtime-first",
+    )
+    .await;
+    wait_for_head_canonical_authority_convergence(
+        store.as_ref(),
+        runtime_store.as_ref(),
+        &w1_sid,
+        "PRE_HELD_TURN",
+        "stopped-runtime-first-boundary",
+    )
+    .await;
+
+    // Nothing in process settles the tail before the archive does.
+    power_store.hold_durable_tail_recovery(true);
+    let member = handle.member(&identity).await.expect("member handle");
+    member
+        .send(HELD_TURN_PROMPT.to_string(), HandlingMode::Queue)
+        .await
+        .expect("queue the held turn");
+    tokio::time::timeout(Duration::from_secs(30), client.entered.notified())
+        .await
+        .expect("the held turn's provider call is in flight");
+    // A second input waits behind the running turn, so the loop admits work
+    // once that turn ends.
+    member
+        .send("QUEUED_BEHIND token-psi".to_string(), HandlingMode::Queue)
+        .await
+        .expect("queue an input behind the held turn");
+    let runtime = service
+        .canonical_runtime_adapter()
+        .expect("the session service's runtime owner");
+    let mut boundary_cancels = runtime.boundary_cancel_dispatches();
+    let dispatched_before = *boundary_cancels.borrow_and_update();
+    runtime
+        .cancel_after_boundary(&w1_sid)
+        .await
+        .expect("ask the running turn to stop at its next boundary");
+    let dispatched = tokio::time::timeout(
+        Duration::from_secs(10),
+        boundary_cancels.wait_for(|dispatched| *dispatched > dispatched_before),
+    )
+    .await
+    .expect("the boundary cancel reaches the running turn within its bound")
+    .map(|dispatched| *dispatched)
+    .expect("the boundary cancel dispatches stay observable");
+    assert!(
+        dispatched > dispatched_before,
+        "the boundary cancel reached the turn"
+    );
+    client.release.notify_one();
+
+    // The turn stops at its boundary after its end-of-run checkpoint; the
+    // loop's pre-admission read of the queued input then meets the tail and
+    // fails closed, which stops the runtime.
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&w1_sid);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let stopped = runtime
+            .meerkat_machine_archive_snapshot(&w1_sid)
+            .await
+            .is_some_and(|snapshot| {
+                snapshot.control.phase == meerkat_runtime::RuntimeState::Stopped
+                    && snapshot.control.current_run_id.is_none()
+            });
+        let provisional_tail = runtime_store
+            .load_head_canonical_provisional_tail(&runtime_id)
+            .await
+            .expect("load the provisional tail")
+            .is_some();
+        let ahead = physical_head_token(&store, &w1_sid).await
+            != committed_head_token(runtime_store.as_ref(), &w1_sid).await;
+        if stopped && provisional_tail && ahead {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the runtime must stop over the cancelled turn's tail: stopped={stopped}, \
+             provisional_tail={provisional_tail}, ahead={ahead}"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    // The archive's recovery may settle the tail from here on.
+    power_store.hold_durable_tail_recovery(false);
+    let retired = tokio::time::timeout(Duration::from_secs(60), handle.retire(identity.clone()))
+        .await
+        .expect("the retirement ends within its bound");
+    assert!(
+        retired.is_ok(),
+        "a member whose runtime stopped over a cancelled turn's tail must retire: {retired:?}"
+    );
+    assert!(
+        handle
+            .get_member(&identity)
+            .await
+            .expect("read the roster")
+            .is_none(),
+        "the retired member leaves the roster"
+    );
+    assert_eq!(
+        committed_head_token(runtime_store.as_ref(), &w1_sid).await,
+        physical_head_token(&store, &w1_sid).await,
+        "the archive settles the durable tail: the runtime authority names the physical head"
+    );
+    let retired_session = service
+        .load_revivable_retired_session(&w1_sid)
+        .await
+        .expect("read the member's retired session")
+        .expect("the retirement archived the member's session");
+    let history = to_string(retired_session.messages()).expect("serialize the retired transcript");
+    assert_eq!(
+        history.matches(HELD_TURN_PROMPT).count(),
+        1,
+        "the retired session keeps the cancelled turn exactly once: {history}"
+    );
+    let _ = handle.shutdown().await;
+}
+
 /// One destructive reset as Meta's identity reset sends it: an atomic
 /// successor respawn onto a fresh session, with no parent auto-wiring.
 async fn destructive_reset(handle: &MobHandle, identity: &AgentIdentity) -> Result<(), String> {
