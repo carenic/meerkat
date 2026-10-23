@@ -675,6 +675,12 @@ const CREDENTIAL_ACCESS_PENDING_PUBLIC_MESSAGE: &str =
     "access to the stored credential is still pending";
 const CREDENTIAL_STORE_UNAVAILABLE_PUBLIC_MESSAGE: &str = "the credential store is unavailable";
 
+/// Fixed public text for a credential commit whose outcome is unknown, from
+/// every source. A failed rollback's store and lifecycle detail stays in
+/// protected diagnostics.
+const COMMIT_UNSETTLED_PUBLIC_MESSAGE: &str =
+    "the credential commit's outcome is unknown; read the status later";
+
 impl HostAuthError {
     /// The typed public reason of this error: the one mapping every auth
     /// surface projects. Exhaustive on purpose, so a new native error must
@@ -768,6 +774,7 @@ fn fixed_public_message(reason: meerkat_contracts::WireAuthErrorReason) -> Optio
         R::CredentialInteractionRequired => Some(CREDENTIAL_INTERACTION_REQUIRED_PUBLIC_MESSAGE),
         R::CredentialAccessPending => Some(CREDENTIAL_ACCESS_PENDING_PUBLIC_MESSAGE),
         R::CredentialStoreUnavailable => Some(CREDENTIAL_STORE_UNAVAILABLE_PUBLIC_MESSAGE),
+        R::CommitUnsettled => Some(COMMIT_UNSETTLED_PUBLIC_MESSAGE),
         _ => None,
     }
 }
@@ -866,13 +873,16 @@ fn credential_mutation_reason(
         CredentialMutationError::CredentialAccess { refusal, .. } => {
             credential_access_reason(*refusal)
         }
+        // A failed rollback or a lost owner leaves the commit's outcome
+        // unknown: settle, then read the status.
+        CredentialMutationError::RollbackFailed(_) | CredentialMutationError::Cancelled => {
+            meerkat_contracts::WireAuthErrorReason::CommitUnsettled
+        }
         CredentialMutationError::StalePreparation
         | CredentialMutationError::Operation(_)
         | CredentialMutationError::TokenStore(_)
         | CredentialMutationError::AuthLifecycle(_)
-        | CredentialMutationError::Cancelled
-        | CredentialMutationError::LockFailed(_)
-        | CredentialMutationError::RollbackFailed(_) => {
+        | CredentialMutationError::LockFailed(_) => {
             meerkat_contracts::WireAuthErrorReason::Infrastructure
         }
     }

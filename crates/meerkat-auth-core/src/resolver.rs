@@ -823,7 +823,17 @@ fn refresh_error_from_mutation(error: CredentialMutationError) -> RefreshError {
         CredentialMutationError::CredentialAccess { refusal, detail } => {
             RefreshError::CredentialAccess { refusal, detail }
         }
-        other => RefreshError::Refresh(other.to_string()),
+        // Every other mutation failure is a refresh failure with its text. A
+        // failed publication rollback cannot reach this path: the
+        // shared-refresh adoption mutation never compensates through one, and
+        // a lost owner is classified by the refresh rules like any failure.
+        error @ (CredentialMutationError::Operation(_)
+        | CredentialMutationError::TokenStore(_)
+        | CredentialMutationError::AuthLifecycle(_)
+        | CredentialMutationError::LockFailed(_)
+        | CredentialMutationError::SlotRefused(_)
+        | CredentialMutationError::Cancelled
+        | CredentialMutationError::RollbackFailed(_)) => RefreshError::Refresh(error.to_string()),
     }
 }
 

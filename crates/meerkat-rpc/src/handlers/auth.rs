@@ -92,7 +92,7 @@ fn credential_commit_error_response(
     id: Option<RpcId>,
     error_value: CredentialMutationError,
 ) -> RpcResponse {
-    RpcResponse::error(id, error::INTERNAL_ERROR, error_value.to_string())
+    host_auth_error_response(id, meerkat::HostAuthError::CredentialMutation(error_value))
 }
 
 fn host_auth_error_response(id: Option<RpcId>, error_value: meerkat::HostAuthError) -> RpcResponse {

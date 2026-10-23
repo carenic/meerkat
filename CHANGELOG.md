@@ -145,9 +145,38 @@ them.
   crate needs the arm. An MCP login completion now ends such a commit as
   `McpOAuthError::CommitUnsettled` (reason `commit_unsettled`), where it
   ended as `AuthLifecycle` (reason `infrastructure`). A connector login
-  still reports it as `ConnectorLoginError::AuthLifecycle`. A provider
+  reports it as `ConnectorLoginError::CommitUnsettled` (below). A provider
   login's `HostAuthError::CredentialMutation` now carries `RollbackFailed`
-  where it carried `AuthLifecycle`; its reason stays `infrastructure`.
+  where it carried `AuthLifecycle`, with the reason `commit_unsettled`.
+- `meerkat-auth-core` (unsettled credential commits): `ConnectorLoginError`
+  gains the unit variant `CommitUnsettled`, appended last: a connector
+  login's commit failed and could not restore the previous credential, or
+  its owner ended after the attempt was consumed, so whether the credential
+  landed is unknown. It carries no store text. The semver gate reports it as
+  an enum variant added to an exhaustive enum; a match outside the crate
+  needs the arm. Surfaces map it to the reason `commit_unsettled`.
+- Behaviour-only (not measured by the gate): unsettled credential commits on
+  every surface. A connector login whose commit owner ended before the
+  consume is refused with `CredentialAccess` (`Pending`) and its attempt is
+  retired, so nothing is published; after the consume it is
+  `CommitUnsettled`, and a connector logout whose owner was lost is
+  `CommitUnsettled` too, where all three were `AuthLifecycle`. A provider
+  commit or logout whose rollback failed or whose owner was lost
+  (`HostAuthError::CredentialMutation` with `RollbackFailed` or `Cancelled`)
+  reports `commit_unsettled` where it reported `infrastructure`.
+  `commit_unsettled` has one fixed public text, "the credential commit's
+  outcome is unknown; read the status later", for every source; the detail
+  stays in protected diagnostics. `auth/profile/create`,
+  `auth/login/provision_api_key` and `POST /auth/profiles` answer a failed
+  credential commit with a typed reason and a fixed text, where they put the
+  store's own error text in the message and carried no reason; their codes
+  are unchanged. `HostAuthService::mcp_status` now reports what a use of the
+  stored credential would do, through the same rule
+  (`McpOAuthAuthority::stored_credential_status`): a stored credential the
+  use path refuses is `reauth_required` where it was `authorized`, and the
+  read may restore the credential's lifecycle from its durable marker, as a
+  use does. It never waits for the credential's lifecycle owner: while the
+  owner is busy, the stored credential's own expiry decides.
 - Behaviour-only (not measured by the gate): `meerkat-auth-core`:
   `auth_oauth::credential_http_client` and a required egress profile's
   credential client now bound every request: 30 s in total
@@ -179,6 +208,14 @@ them.
   delivery is now bounded too.
 
 ### Added
+
+- `meerkat` re-exports `settle_in_flight_credential_mutations` and
+  `CredentialSettlement`: after an unsettled credential commit, an embedding
+  host settles its in-flight credential work, then reads the status.
+  `meerkat-auth-core` adds `McpOAuthAuthority::stored_credential_status`
+  with `McpStoredCredentialPhase` and `McpStoredCredentialStatus`
+  (non-exhaustive): one status read of an MCP target's stored credential
+  through the use path's own rule.
 
 - Bounded MCP OAuth network stages. Every network stage of an MCP login or
   refresh has a bound: each stage (protected resource metadata,

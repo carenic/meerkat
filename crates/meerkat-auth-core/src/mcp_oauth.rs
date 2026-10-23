@@ -1845,10 +1845,10 @@ pub enum McpOAuthError {
     /// its owner was lost, or it failed after the consume and could not
     /// restore the previous credential and lifecycle. A commit still running
     /// keeps running to its end; once the in-flight credential mutations
-    /// settle ([`crate::auth_store::settle_in_flight_credential_mutations`]),
-    /// a read of the stored credential reports the outcome. After a failed
-    /// restore, a stored credential that read reports may still be refused at
-    /// use until a new login. Never a success and never a clean failure.
+    /// settle ([`crate::auth_store::settle_in_flight_credential_mutations`],
+    /// re-exported by the `meerkat` facade), a status read
+    /// ([`McpOAuthAuthority::stored_credential_status`]) reports what a use of
+    /// the stored credential does. Never a success and never a clean failure.
     #[error(
         "MCP OAuth login for '{server_name}': whether the credential landed is unknown until the credential commit settles"
     )]
@@ -2237,8 +2237,59 @@ impl McpOAuthAuthority {
         &self,
         target: &McpServerIdentity,
     ) -> Result<Option<McpStoredCredentialStatus>, McpOAuthError> {
-        let _ = self.scoped(target)?;
-        Ok(None)
+        let target = &self.scoped(target)?;
+        if self.interactive.is_some() && !target.is_selected() {
+            return Ok(None);
+        }
+        let key = target.token_key()?;
+        let lease_key = target.lease_key()?;
+        // A status read never waits for the lifecycle owner.
+        let Some(guard) = meerkat_core::try_acquire_auth_login_lifecycle_guard(&lease_key) else {
+            return Ok(None);
+        };
+        let admitted = match self
+            .load_admitted_stored_credential(target, &key, &guard, TokenStoreAccess::Status)
+            .await
+        {
+            Ok(admitted) => admitted,
+            Err(McpOAuthError::ReauthRequired { .. }) => {
+                let stored = self
+                    .token_store()
+                    .load_for(&key, TokenStoreAccess::Status)
+                    .await
+                    .map_err(mcp_store_error)?
+                    .filter(|tokens| tokens.auth_mode == PersistedAuthMode::McpOauth);
+                return Ok(Some(McpStoredCredentialStatus {
+                    phase: McpStoredCredentialPhase::ReauthRequired,
+                    expires_at: stored.as_ref().and_then(|tokens| tokens.expires_at),
+                    account_id: stored.and_then(|tokens| tokens.account_id),
+                }));
+            }
+            // A legacy refresh marker is transient: the caller's reading
+            // stands until the refresh owner settles it.
+            Err(McpOAuthError::StalePreparation) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let Some(admitted) = admitted else {
+            return Ok(Some(McpStoredCredentialStatus {
+                phase: McpStoredCredentialPhase::AuthorizationRequired,
+                expires_at: None,
+                account_id: None,
+            }));
+        };
+        let phase = match admitted.disposition {
+            CredentialUseDisposition::RefreshRequired
+                if admitted.tokens.refresh_token.is_none() =>
+            {
+                McpStoredCredentialPhase::ReauthRequired
+            }
+            _ => McpStoredCredentialPhase::Authorized,
+        };
+        Ok(Some(McpStoredCredentialStatus {
+            phase,
+            expires_at: admitted.tokens.expires_at,
+            account_id: admitted.tokens.account_id,
+        }))
     }
 
     pub async fn require_stored_bearer_token(

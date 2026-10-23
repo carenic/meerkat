@@ -512,7 +512,10 @@ ask its user.
   refused for authorization, log in again. A completion answered
   `credential_access_pending` was not admitted to its credential commit within
   60 s: its attempt was retired and nothing from it is published, so start a
-  new login. An embedding host sets the bounds with
+  new login. An embedding host that must know the outcome calls
+  `meerkat::settle_in_flight_credential_mutations` and, once it answers
+  `Settled`, reads `HostAuthService::mcp_status`, which reports what a use of
+  the stored credential would do. An embedding host sets the bounds with
   `HostAuthService::with_mcp_network_bounds`.
 
 <Warning>

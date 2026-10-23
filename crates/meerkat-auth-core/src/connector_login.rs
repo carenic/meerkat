@@ -1479,6 +1479,27 @@ impl ConnectorOAuthAuthority {
                 retire.armed = false;
                 return Err(ConnectorLoginError::Slot(refusal));
             }
+            // The commit's owner ended before it reported. The flow owner
+            // linearizes the commit's consume against this retirement: an
+            // attempt it still retires was never consumed and now cannot be,
+            // so nothing is published; one it cannot retire was consumed, or
+            // may have been, so whether the credential landed is unknown.
+            Err(CredentialMutationError::Cancelled) => {
+                retire.armed = false;
+                let retired = retire.flows.expire(
+                    &retire.state,
+                    &retire.target,
+                    retire.identity.clone(),
+                    &retire.redirect_uri,
+                );
+                return Err(match retired {
+                    Ok(()) => ConnectorLoginError::CredentialAccess {
+                        refusal: meerkat_core::auth::TokenStoreRefusal::Pending,
+                        detail: COMMIT_OWNER_LOST_BEFORE_CONSUME.into(),
+                    },
+                    Err(_) => ConnectorLoginError::CommitUnsettled,
+                });
+            }
             Err(error) => return Err(map_mutation_error(error)),
         };
         Ok(ConnectorLoginComplete {
@@ -2892,13 +2913,18 @@ fn map_mutation_error(error: CredentialMutationError) -> ConnectorLoginError {
         CredentialMutationError::TokenStore(reason) => ConnectorLoginError::TokenStore(reason),
         CredentialMutationError::AuthLifecycle(reason)
         | CredentialMutationError::Operation(reason)
-        | CredentialMutationError::LockFailed(reason)
-        | CredentialMutationError::RollbackFailed(reason) => {
-            ConnectorLoginError::AuthLifecycle(reason)
+        | CredentialMutationError::LockFailed(reason) => ConnectorLoginError::AuthLifecycle(reason),
+        // The mutation failed and could not restore the previous credential,
+        // or its owner ended before it reported: what is stored is known only
+        // from a later read.
+        CredentialMutationError::RollbackFailed(reason) => {
+            tracing::warn!(
+                %reason,
+                "connector credential mutation failed and its rollback failed; the stored credential is unsettled"
+            );
+            ConnectorLoginError::CommitUnsettled
         }
-        CredentialMutationError::Cancelled => ConnectorLoginError::AuthLifecycle(
-            "credential mutation coordinator cancelled the login commit".to_owned(),
-        ),
+        CredentialMutationError::Cancelled => ConnectorLoginError::CommitUnsettled,
         CredentialMutationError::CredentialAccess { refusal, detail } => {
             ConnectorLoginError::CredentialAccess { refusal, detail }
         }
@@ -2920,6 +2946,11 @@ fn refusal_after_closure(closure: Result<(), String>, refusal: RefreshError) -> 
 /// credential call still physically holds the slot's lifecycle owner.
 const LIFECYCLE_OWNER_BUSY: &str =
     "an operating-system credential call for this slot is still running";
+
+/// Why a completion whose commit owner ended before the consume is refused:
+/// its attempt was retired, so nothing was or can be published.
+const COMMIT_OWNER_LOST_BEFORE_CONSUME: &str =
+    "the credential commit ended before it consumed the attempt; nothing was published";
 
 /// Unattended use of a slot whose lifecycle owner an operating-system
 /// credential call still physically holds: refused at once, never waited for.

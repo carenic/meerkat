@@ -364,11 +364,14 @@ pub enum WireAuthErrorReason {
     CredentialStoreUnavailable,
     /// An internal failure; its detail is only in protected diagnostics.
     Infrastructure,
-    /// An MCP login's attempt was consumed by its credential commit, or may
-    /// have been, and the commit's outcome is unknown: it did not report in
-    /// time, or it failed and could not restore the previous credential.
-    /// Whether the credential landed is unknown until it settles, so read the
-    /// status later. Neither a success nor a failure.
+    /// A credential commit's outcome is unknown: an MCP login's commit did
+    /// not report in time, the commit's owner ended before it reported, or
+    /// the commit failed and could not restore the previous credential.
+    /// Whether the credential landed is unknown until it settles: an
+    /// embedding host settles its in-flight credential work and then reads
+    /// the status; a wire client reads the status later. If a use is then
+    /// refused for authorization, log in again. Neither a success nor a
+    /// failure.
     CommitUnsettled,
 }
 

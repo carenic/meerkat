@@ -153125,7 +153125,7 @@
           },
           {
             "const": "commit_unsettled",
-            "description": "An MCP login's attempt was consumed by its credential commit, or may\nhave been, and the commit's outcome is unknown: it did not report in\ntime, or it failed and could not restore the previous credential.\nWhether the credential landed is unknown until it settles, so read the\nstatus later. Neither a success nor a failure.",
+            "description": "A credential commit's outcome is unknown: an MCP login's commit did\nnot report in time, the commit's owner ended before it reported, or\nthe commit failed and could not restore the previous credential.\nWhether the credential landed is unknown until it settles: an\nembedding host settles its in-flight credential work and then reads\nthe status; a wire client reads the status later. If a use is then\nrefused for authorization, log in again. Neither a success nor a\nfailure.",
             "type": "string"
           }
         ]
@@ -153272,7 +153272,7 @@
           },
           {
             "const": "commit_unsettled",
-            "description": "An MCP login's attempt was consumed by its credential commit, or may\nhave been, and the commit's outcome is unknown: it did not report in\ntime, or it failed and could not restore the previous credential.\nWhether the credential landed is unknown until it settles, so read the\nstatus later. Neither a success nor a failure.",
+            "description": "A credential commit's outcome is unknown: an MCP login's commit did\nnot report in time, the commit's owner ended before it reported, or\nthe commit failed and could not restore the previous credential.\nWhether the credential landed is unknown until it settles: an\nembedding host settles its in-flight credential work and then reads\nthe status; a wire client reads the status later. If a use is then\nrefused for authorization, log in again. Neither a success nor a\nfailure.",
             "type": "string"
           }
         ]
@@ -153415,7 +153415,7 @@
       },
       {
         "const": "commit_unsettled",
-        "description": "An MCP login's attempt was consumed by its credential commit, or may\nhave been, and the commit's outcome is unknown: it did not report in\ntime, or it failed and could not restore the previous credential.\nWhether the credential landed is unknown until it settles, so read the\nstatus later. Neither a success nor a failure.",
+        "description": "A credential commit's outcome is unknown: an MCP login's commit did\nnot report in time, the commit's owner ended before it reported, or\nthe commit failed and could not restore the previous credential.\nWhether the credential landed is unknown until it settles: an\nembedding host settles its in-flight credential work and then reads\nthe status; a wire client reads the status later. If a use is then\nrefused for authorization, log in again. Neither a success nor a\nfailure.",
         "type": "string"
       }
     ],

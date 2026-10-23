@@ -224,11 +224,7 @@ async fn configured_mcp_target(
 
 /// The response for a failed credential commit (a profile's secret).
 fn credential_commit_error_response(error: CredentialMutationError) -> axum::response::Response {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({ "error": error.to_string() })),
-    )
-        .into_response()
+    host_auth_error_response(meerkat::HostAuthError::CredentialMutation(error))
 }
 
 fn host_auth_error_response(error: meerkat::HostAuthError) -> axum::response::Response {
