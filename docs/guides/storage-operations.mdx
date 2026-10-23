@@ -432,8 +432,9 @@ So is a run cursor that cannot be read, or whose saved response has calls
 but no message id: those calls may have run, and the repair cannot place
 their results. The results after the tail's last assistant message are
 paired with its calls by position, since providers repeat call ids across
-responses. An answer this version of `rkat` does not know also exits with
-an error. With `--json`, an answer that fails the command
+responses; when that pairing does not leave exactly the calls the
+transcript shows without a result, the command answers with an error too.
+An answer this version of `rkat` does not know also exits with an error. With `--json`, an answer that fails the command
 (`held_otherwise`, `refused`, or an unknown answer) still prints its report
 to standard output, and the error's message goes to standard error. An
 error before any answer (the store cannot be opened, or the evidence cannot
