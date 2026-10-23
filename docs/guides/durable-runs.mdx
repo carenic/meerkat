@@ -46,6 +46,12 @@ final round, in which the model answers without calling tools, ends the run
 with the usual end-of-run save, which also removes the cursor.
 Structured-output extraction takes no round commits.
 
+The one exception is a round whose model response contains an image: the run
+cursor cannot hold images, so that round takes only the second commit. If the
+process stops during its tools, the run asks the model again for that round,
+as it does when the process stops during a model call, and the new
+response's tool calls are dispatched as new calls.
+
 If a round commit fails, the run ends with the error. When the first commit
 fails, none of the round's tools has run.
 
@@ -91,7 +97,11 @@ its open run until its next open.
     model call, and the same tool calls are dispatched again under the same
     call ids. The saved response is not announced again: no new assistant,
     tool-call request or turn-completed events are emitted for it.
-  - After the second commit, the run makes its next model call.
+  - After the second commit, the run makes its next model call. If the
+    round's tools had started asynchronous work that the run waits for
+    before that call, the work ended with the process: a system notice
+    tells the model which tool calls started it and that their results
+    will not arrive.
 - **What is lost** is the round that was in progress. If its model call had
   already run, that call's usage is not recorded, although the provider bills
   it.
@@ -143,8 +153,8 @@ sent again.
 
 ### The Dedupe Key
 
-Every tool call of a run's tool round carries a dedupe key, on its first
-dispatch and on every dispatch after a restart:
+Every tool call made in a run's tool round carries a dedupe key, whether or
+not the session commits per round:
 
 | Field | Meaning |
 |-------|---------|
@@ -157,20 +167,40 @@ A call dispatched again carries the same key as its first dispatch. A tool
 whose effect must not happen twice records the key with the effect, and
 skips a call whose key it has already seen, comparing all four fields.
 
-How a tool gets the key depends on where it runs. Core sends the key on no
-wire itself:
+Core delivers the key to every kind of tool, unchanged:
 
 - A Rust tool reads it with `ToolDispatchContext::tool_call_dedupe_key`,
   which answers `None` outside a run's tool round. `ToolCallDedupeKey::new`
   derives the same key, digest included, from a call's run, round, id, tool
   name and arguments.
-- For an MCP tool, a host can add the key to the call's metadata in its
-  `McpCallContextProvider::prepare`, which receives the call and its dispatch
-  context.
-- A host that answers callback tools can compute the digest with
-  `meerkat_core::tool_call_digest(name, arguments)` and pair it with the
-  call's `tool_use_id`. The run id and round are not part of a callback
-  request.
+- An MCP tool receives it in the `tools/call` request's `_meta`, under
+  `io.meerkat/tool_call_dedupe_key`, as an object with the four fields.
+  Core adds it beside any metadata the host adds, and refuses a call whose
+  host metadata uses that name, so the server always gets Core's key.
+- A callback tool answered by a client receives it as `dedupe_key`, an
+  object with the four fields: in the JSON-RPC `tool/execute` request, in
+  each entry of `pending_tool_calls` when a run suspends on callback tools,
+  and in the Web SDK as the optional second argument of a JS tool callback.
+
+A call made outside a run's tool round carries no key. Neither does a
+callback tool that runs as a detached job: the job deduplicates by its own
+submission key. For example, the parameters of an MCP `tools/call` request
+made in round 2, the run's third round:
+
+```json
+{
+  "name": "charge_card",
+  "arguments": {"amount_cents": 1200, "order_id": "ord_5521"},
+  "_meta": {
+    "io.meerkat/tool_call_dedupe_key": {
+      "run_id": "0199f3a2-5c1d-7e4b-9a10-3f6d2b8c4e71",
+      "round": 2,
+      "call_id": "toolu_01JX4PQ8V2",
+      "call_digest": "e979128b57a17e7b86ca9fb7cc3fef6e145fefecccb9cfdd01ff1de0736f8403"
+    }
+  }
+}
+```
 
 The digest keeps calls apart when a provider reuses call ids, as some
 providers number them per response: a call matches an earlier key only when
@@ -273,21 +303,25 @@ fence:
   succeeds.
 - **Self-fencing.** The holder makes no model call, dispatches no tool and
   commits nothing unless its last successful acquire or renew started less
-  than the self-fence window ago. The window is the lease minus one renew
-  interval, so a paused process stops itself before its lease ends. Past the
-  window, Core renews first and goes on only if the renew succeeds. In the
-  steady state this is a clock read, with no store request added to a round.
+  than the self-fence window ago. The window is the lease minus the store's
+  self-fence margin, so a paused process stops itself before its lease ends.
+  Past the window, Core renews first and goes on only if the renew succeeds.
+  In the steady state this is a clock read, with no store request added to a
+  round.
 
-The store sets the renew interval and the lease with
+The store sets the renew interval, the lease and the self-fence margin with
 `HostStore::fence_timing`:
 
 | Setting | Default | Bounds |
 |---------|---------|--------|
 | Renew interval | 10 s | At least 1 s |
 | Lease | 30 s | At least 3 renew intervals, at most 1 hour |
+| Self-fence margin | One renew interval | More than 0 and less than the lease |
 
 A shorter lease shortens the wait for the next process after a holder died,
-and at a takeover. A longer renew interval renews less often.
+and at a takeover. A longer renew interval renews less often. The margin must
+exceed the time your store may take to make a write visible to other
+readers, so declare a larger one for a store whose writes can lag.
 
 ### Loading
 
@@ -313,8 +347,11 @@ and at a takeover. A longer renew interval renews less often.
 ### Limits And Exceptions
 
 - **Size.** A batch carries at most 8 MiB of heads and rows, and a row at
-  most 1 MiB. Core stores larger values as chunks of their own, committed
-  before the batch that refers to them.
+  most 1 MiB. Core writes large values first, as chunks in scopes of their
+  own and in as many batches as they need, then makes the change visible
+  with one commit batch that refers to them. A change that cannot be written
+  that way fails as a whole with a typed size error; nothing is truncated or
+  partly committed.
 - **Pending OAuth logins.** An interactive login that has started but not
   finished stays in the process; it is not written to your store. After a
   restart or a takeover, start the login again. Completed credentials are not
@@ -334,6 +371,8 @@ Before you run a host store in production, run the host store chapter of the
   dedupe key.
 - A run that crashes before its first commit runs its input again as a new
   run.
+- A round whose model response contains an image takes no first commit; a
+  crash during its tools asks the model again for that round.
 - Round commits serve crash recovery only. A run that fails and whose inputs
   are queued for another attempt discards its round commits and starts again
   from its inputs, as before 0.9.5. On a WholeBlob realm, a run that has

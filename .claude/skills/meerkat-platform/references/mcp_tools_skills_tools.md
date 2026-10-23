@@ -231,8 +231,12 @@ RPC (the client answers inline):
 
 - RPC `tools/register {tools: [{name, description, input_schema,
   execution?}]}` returns `{registered: N}`. During a turn the server sends
-  `tool/execute {tool_use_id, name, arguments}`; reply `{content, is_error}`
-  within 120 s or the call fails `timeout`.
+  `tool/execute {tool_use_id, name, arguments, dedupe_key?}`; reply
+  `{content, is_error}` within 120 s or the call fails `timeout`.
+  `dedupe_key {run_id, round, call_id, call_digest}` (0.9.5) rides every call
+  of a run's tool round; a durable run continued after a restart sends the
+  call again with the same key (`references/sessions_runtime_surfaces_sessions.md`,
+  Durable runs).
 - Registration is per connection; a session's callbacks go to the connection
   that created it and fail `tool_unavailable` once it is gone.
 - `execution` is `{"mode": "fast"}` (default) or `{"mode": "detached", ...}`
@@ -259,7 +263,8 @@ RPC (the client answers inline):
   `{"status": "pending_tool_call", "session_id": ..., "resumable": true,
   "pending_tool_calls": [{"tool_use_id", "tool_name", "args"}], "content":
   [...]}` (text "Agent is waiting for tool results"). Parallel callback calls
-  arrive together in one list, each keyed by its `tool_use_id`.
+  arrive together in one list, each keyed by its `tool_use_id`; since 0.9.5
+  an entry also carries the call's `dedupe_key` when it has one.
 - Resume with `meerkat_resume {session_id, prompt: "", tools: <same tools>,
   tool_results: [{tool_use_id, content, is_error?}]}`. The ids must be exactly
   the pending set: a mismatch, a duplicate or a conflicting redelivery is

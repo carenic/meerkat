@@ -1128,6 +1128,13 @@ Echo each provider-issued `tool_use_id` exactly in `tool_results`, as
 `tc_abc123` is echoed above. Never correlate by tool name or array position,
 even when several pending calls invoke the same tool.
 
+Since 0.9.5 a pending call made in a run's tool round also carries
+`dedupe_key`, an object with `run_id`, `round`, `call_id` and `call_digest`.
+After a restart, a durable run can suspend on the same call again, with the
+same key. A tool whose effect must not happen twice records the key with the
+effect and answers a repeat from that record; see
+[Durable Runs: Tools That Run Again](/guides/durable-runs#tools-that-run-again).
+
 #### Parameter reference
 
 <ParamField body="session_id" type="string" required>

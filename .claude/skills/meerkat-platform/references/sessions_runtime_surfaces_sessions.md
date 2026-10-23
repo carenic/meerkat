@@ -329,7 +329,9 @@ Contract and limits: `docs/guides/durable-runs.mdx`.
   tool call without its result. The final round (no tool calls) ends with the
   normal end-of-run save, which clears the cursor. Structured-output
   extraction takes no round commits. A failed round commit ends the run; a
-  failed first commit dispatches nothing.
+  failed first commit dispatches nothing. Exception: a round whose model
+  response contains an image takes only the second commit (the cursor cannot
+  hold images); a crash during its tools re-asks the model for that round.
 - Cost: `sqlite` (HeadCanonical) writes the round's rows; `jsonl` and
   host-store realms (WholeBlob) write the whole session document at each
   commit, so the bytes grow with the square of the tool rounds. A compaction
@@ -347,7 +349,9 @@ Contract and limits: `docs/guides/durable-runs.mdx`.
 - Event `run_resumed {run_id, round, resume_point}`: `tools_pending` (the
   saved response stands in for the model call and its calls are dispatched
   again under the same call ids, with no new assistant, tool-call request or
-  turn-completed events for it) or `awaiting_model` (the next model call).
+  turn-completed events for it) or `awaiting_model` (the next model call;
+  asynchronous work the run was waiting for ended with the process, and a
+  system notice tells the model those results will not arrive).
 - Carried over: turn and tool-call counts, the run's usage and its elapsed
   time (the budget continues; downtime is not charged). Lost: the round in
   progress; its model call is billed but its usage is not recorded.
@@ -371,11 +375,14 @@ Contract and limits: `docs/guides/durable-runs.mdx`.
   (`run_id`, `round`, `call_id`, `call_digest` = lowercase hex SHA-256 of the
   tool name and canonical arguments; `ToolCallDedupeKey::new` derives it) and
   deduplicate on all four fields. MCP tools and host callback tools are
-  dispatched again too, and a callback request is sent again. Core sends the
-  key on no wire: a host adds it to an MCP call's metadata in
-  `McpCallContextProvider::prepare(target, call, context)`, and a callback
-  host computes `meerkat_core::tool_call_digest(name, args)` and pairs it with
-  the `tool_use_id` (run id and round are not in a callback request).
+  dispatched again too, and a callback request is sent again. Core delivers
+  the key to every call of a run's tool round, per-round commits or not: MCP
+  `tools/call` requests carry it in `_meta` under
+  `io.meerkat/tool_call_dedupe_key` (`{run_id, round, call_id,
+  call_digest}`; host metadata using that name is refused), and RPC
+  `tool/execute`, `pending_tool_calls` entries and Web JS tool callbacks (2nd
+  argument) carry an optional `dedupe_key` with the same fields. Calls
+  outside a run's tool round and detached callback jobs carry none.
 - Not rerun, answered with an `outcome_uncertain` tool error instead: a call
   whose process custody shows the process may have run, a Core comms tool
   that sends to another agent (every comms tool but `peers`), and a call that

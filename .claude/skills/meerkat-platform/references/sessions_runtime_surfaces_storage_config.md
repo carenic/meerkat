@@ -91,14 +91,19 @@ Contract, obligations and conformance: `docs/reference/host-store-spi.mdx`.
   (default 30 s, from 3 intervals to 1 hour) that the store sizes with
   `fence_timing()`. It makes no model call, dispatches nothing and writes
   nothing unless its last successful acquire or renew started less than the
-  lease minus one interval ago. `FencedOut` stops every write until the realm
-  is reopened; another failed renew stops writes until a renew succeeds.
+  lease minus the self-fence margin ago (one interval by default; a store
+  with lagging visibility declares more with `FenceTiming::try_with_margin`).
+  `FencedOut` stops every write until the realm is reopened; another failed
+  renew stops writes until a renew succeeds.
 - Opening lists every head once. A session body loads at open only when
   recovery must act on it (unsettled inputs, an open run cursor, a current
   run), otherwise on first use, and stays loaded until the session is
   archived.
-- Limits: 8 MiB of heads and rows per batch, 1 MiB per row; Core chunks
-  larger values itself. An unknown commit outcome is settled before the
+- Limits: 8 MiB of heads and rows per batch, 1 MiB per row. Core writes
+  large values first as digest-keyed chunk scopes, then one commit batch that
+  refers to them; a change that cannot fit fails whole with a typed size
+  error, never truncated or partly committed. An unknown commit outcome is
+  settled before the
   scope's next version. A refused batch, or one still unknown after the retry
   budget, poisons the scopes it touched until the realm is reopened.
 - The runtime store is WholeBlob, with the cost above; a compaction re-bases
