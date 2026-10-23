@@ -377,6 +377,15 @@ them.
   checkpoint now persists the session's live deferred-turn state, the value an
   export already wrote. A session that carries no deferred-turn state is
   persisted as before.
+- `meerkat-mob`: a turn-driven placed spawn (`placement` set) with an
+  `initial_message` no longer always fails. The member was materialized and
+  committed on its host, then the spawn refused to admit its first turn
+  with an internal "resolved to a placed admission" error and unwound. The
+  initial message is now delivered to the member through the placed
+  delivery lane an ordinary member send uses. A delivery the member refuses
+  fails the spawn with that typed refusal, and the member is released. No
+  durable intent covers this first turn, so a controller crash before its
+  delivery loses it.
 - A prompt-context fork no longer hands its source's activated instruction
   bodies or the skill bodies its source loaded with `load_skill` to the
   child as plain context under the default fork instruction policy, and

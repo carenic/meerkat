@@ -56602,6 +56602,52 @@ impl MobActor {
         }
     }
 
+    /// Admit one machine-admitted turn of a placed member through the placed
+    /// ingress-accepted delivery lane (`DeliverMemberInput` to its host).
+    /// The host's transport receipt must be this delivery's own input id.
+    /// Tracked completion is not supported for remotely hosted members.
+    async fn admit_placed_ingress_turn(
+        provisioner: &Arc<dyn MobProvisioner>,
+        member_ref: MemberRef,
+        req: Box<meerkat_core::service::StartTurnRequest>,
+        tracked: bool,
+        expected_member: super::bridge_protocol::BridgeMemberIncarnation,
+        input_id: String,
+    ) -> Result<(), MobError> {
+        if tracked {
+            return Err(MobError::UnsupportedForMode {
+                mode: crate::MobRuntimeMode::TurnDriven,
+                reason: "tracked completion is not supported for remotely hosted members"
+                    .to_string(),
+            });
+        }
+        let transcript_interaction_id = placed_turn_supplied_interaction_id(&req)?;
+        let expected_receipt = input_id.clone();
+        match provisioner
+            .start_turn_with_correlation(
+                &member_ref,
+                *req,
+                Some(super::provisioner::PlacedTurnDeliveryContext {
+                    input_id,
+                    transcript_interaction_id: transcript_interaction_id
+                        .map(|interaction_id| interaction_id.0.to_string()),
+                    expected_member,
+                    // IngressAccepted carries no retained terminal-publication
+                    // custody.
+                    outcome_tracking: None,
+                    bounded_result_spec: None,
+                }),
+            )
+            .await
+        {
+            Ok(receipt) if receipt.as_deref() == Some(expected_receipt.as_str()) => Ok(()),
+            Ok(receipt) => Err(MobError::Internal(format!(
+                "placed admission returned transport receipt {receipt:?}, expected '{expected_receipt}'"
+            ))),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Detached admission-task version of the former inline
     /// `spawn_turn_admission_reply` body: the runtime (or placed transport)
     /// admission for one already machine-admitted turn.
@@ -56619,47 +56665,15 @@ impl MobActor {
         debug_assert_eq!(revival.is_some(), placed_incarnation.is_some());
         let result = match (placed_incarnation, placed_input_id) {
             (Some(expected_member), Some(input_id)) => {
-                if completion_tx.is_some() || llm_identity_applied_tx.is_some() {
-                    Err(MobError::UnsupportedForMode {
-                        mode: crate::MobRuntimeMode::TurnDriven,
-                        reason: "tracked completion is not supported for remotely hosted members"
-                            .to_string(),
-                    })
-                } else {
-                    match placed_turn_supplied_interaction_id(&req) {
-                        Ok(transcript_interaction_id) => {
-                            let expected_receipt = input_id.clone();
-                            match provisioner
-                                .start_turn_with_correlation(
-                                    &member_ref,
-                                    *req,
-                                    Some(super::provisioner::PlacedTurnDeliveryContext {
-                                        input_id,
-                                        transcript_interaction_id: transcript_interaction_id
-                                            .map(|interaction_id| interaction_id.0.to_string()),
-                                        expected_member,
-                                        // IngressAccepted carries no retained
-                                        // terminal-publication custody.
-                                        outcome_tracking: None,
-                                        bounded_result_spec: None,
-                                    }),
-                                )
-                                .await
-                            {
-                                Ok(receipt)
-                                    if receipt.as_deref() == Some(expected_receipt.as_str()) =>
-                                {
-                                    Ok(())
-                                }
-                                Ok(receipt) => Err(MobError::Internal(format!(
-                                    "placed admission returned transport receipt {receipt:?}, expected '{expected_receipt}'"
-                                ))),
-                                Err(error) => Err(error),
-                            }
-                        }
-                        Err(error) => Err(error),
-                    }
-                }
+                Self::admit_placed_ingress_turn(
+                    provisioner,
+                    member_ref,
+                    req,
+                    completion_tx.is_some() || llm_identity_applied_tx.is_some(),
+                    expected_member,
+                    input_id,
+                )
+                .await
             }
             (None, None) => {
                 if let Some(completion_tx) = completion_tx {

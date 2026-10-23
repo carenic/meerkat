@@ -258,6 +258,14 @@ impl SpawnActivationWorkerContext {
     /// operation-scoped admission the spawn kickoff depends on — but runs it
     /// through the detached readiness helper, whose #37 revival re-enters the
     /// actor that is now free to answer it.
+    ///
+    /// A placed member's first turn is delivered to its host through the
+    /// placed ingress lane an ordinary member send uses
+    /// ([`MobActor::admit_placed_ingress_turn`]). No carrier intent covers a
+    /// turn-driven placed initial message, so the kickoff custody that keeps
+    /// an autonomous placed kickoff across a controller crash does not cover
+    /// it: a crash before the delivery loses it. A failed delivery unwinds
+    /// the spawn and fires no placed revival.
     async fn realize_initial_turn(
         &self,
         agent_identity: &AgentIdentity,
@@ -298,7 +306,7 @@ impl SpawnActivationWorkerContext {
                 req,
                 completion_tx,
                 llm_identity_applied_tx,
-                placed_identity,
+                placed_identity: _,
                 placed_incarnation,
                 placed_input_id,
             } => {
@@ -313,15 +321,24 @@ impl SpawnActivationWorkerContext {
                     )
                     .await?;
                 }
-                debug_assert_eq!(placed_identity.is_some(), placed_incarnation.is_some());
+                // A placed first turn rides the ordinary placed ingress lane
+                // (see the rustdoc above): no carrier intent covers it, and a
+                // failure unwinds the spawn without a revival trigger.
                 let result = match (placed_incarnation, placed_input_id) {
-                    (Some(_), _) | (None, Some(_)) => {
-                        // A placed member's kickoff rides the durable placed
-                        // delivery lane, never this local admission.
-                        Err(MobError::Internal(format!(
-                            "turn-driven spawn kickoff for '{agent_identity}' resolved to a placed admission"
-                        )))
+                    (Some(expected_member), Some(input_id)) => {
+                        MobActor::admit_placed_ingress_turn(
+                            &self.provisioner,
+                            member_ref,
+                            req,
+                            completion_tx.is_some() || llm_identity_applied_tx.is_some(),
+                            expected_member,
+                            input_id,
+                        )
+                        .await
                     }
+                    (Some(_), None) | (None, Some(_)) => Err(MobError::Internal(
+                        "turn admission placement/transport fields drifted".to_string(),
+                    )),
                     (None, None) => {
                         if let Some(completion_tx) = completion_tx {
                             self.provisioner
@@ -341,13 +358,6 @@ impl SpawnActivationWorkerContext {
                         }
                     }
                 };
-                if let Err(error) = &result {
-                    MobActor::fire_placed_revival_trigger(
-                        placed_identity.map(|identity| (self.command_tx.clone(), identity)),
-                        error,
-                    )
-                    .await;
-                }
                 result
             }
             SubmitWorkDispatchCompletion::AwaitTurnCompletion { .. } => {
