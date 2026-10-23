@@ -135,6 +135,115 @@ them.
   struct literal sets `failure: None`. The wire stays additive: the field is
   left out when absent.
 
+- `meerkat-auth-core` (bounded MCP OAuth network stages): `McpOAuthError`
+  gains the variants `NetworkTimedOut { server_name, stage }` and
+  `CommitUnsettled { server_name }`, appended last. `NetworkTimedOut`: a
+  network stage of an MCP login got no answer within its bound
+  (`McpOAuthNetworkStage`); nothing was published, a start admitted no
+  attempt and a completion's attempt was retired, and
+  `McpOAuthNetworkStage::code_sent` says whether the authorization code had
+  been sent. `CommitUnsettled`: the credential commit consumed the attempt,
+  or may have, and did not report within its observation bound, or its owner
+  was lost, or it failed after the consume and could not restore the
+  previous credential and lifecycle; whether the credential landed is
+  unknown until the commit settles, and a later read of the stored
+  credential reports it. It is never a success and never a clean failure.
+  The semver gate reports each as an enum variant added to an exhaustive
+  enum (`McpOAuthError` stays exhaustive, as above); a match outside the
+  crate needs the arms. Surfaces map `NetworkTimedOut` to the reason
+  `upstream_failure` with the detail `upstream_timeout` (the code had not
+  been sent) or `upstream_timeout_after_code`, and `CommitUnsettled` to the
+  new reason `commit_unsettled`.
+
+- `meerkat-contracts` (bounded MCP OAuth network stages):
+  `WireAuthErrorReason` gains `CommitUnsettled`, appended last; the semver
+  gate reports it as an enum variant added to an exhaustive enum.
+  `WireAuthErrorDetail`, new in this release (hosted MCP OAuth above), gains
+  `UpstreamTimeout` and `UpstreamTimeoutAfterCode`, appended last: not a
+  finding against 0.9.4, but a match written against an earlier build of
+  this release needs the arms. On the wire they are new values
+  (`upstream_timeout`, `upstream_timeout_after_code`, `commit_unsettled`);
+  SDK helpers built before them read them as absent.
+
+- `meerkat-core` (bounded MCP OAuth network stages):
+  `CredentialMutationError` gains the variant `RollbackFailed(String)`,
+  appended last: a publication failed after it acquired the credential
+  lifecycle, and restoring the previous credential and lifecycle failed too,
+  so what is stored is unsettled. The commit paths of `meerkat-auth-core`
+  (`save_tokens_and_publish_lifecycle`,
+  `save_oauth_tokens_and_consume_browser_flow` and
+  `save_oauth_tokens_and_consume_device_flow`) return it where they returned
+  `AuthLifecycle` ("acquired lease rollback failed"). The semver gate reports
+  it as an enum variant added to an exhaustive enum; a match outside the
+  crate needs the arm. An MCP login completion now ends such a commit as
+  `McpOAuthError::CommitUnsettled` (reason `commit_unsettled`), where it
+  ended as `AuthLifecycle` (reason `infrastructure`). A connector login
+  reports it as `ConnectorLoginError::CommitUnsettled` (below). A provider
+  login's `HostAuthError::CredentialMutation` now carries `RollbackFailed`
+  where it carried `AuthLifecycle`, with the reason `commit_unsettled`.
+
+- `meerkat-auth-core` (unsettled credential commits): `ConnectorLoginError`
+  gains the unit variant `CommitUnsettled`, appended last: a connector
+  login's commit failed and could not restore the previous credential, or
+  its owner ended after the attempt was consumed, so whether the credential
+  landed is unknown. It carries no store text. The semver gate reports it as
+  an enum variant added to an exhaustive enum; a match outside the crate
+  needs the arm. Surfaces map it to the reason `commit_unsettled`.
+
+- Behaviour-only (not measured by the gate): unsettled credential commits on
+  every surface. A connector login whose commit owner ended before the
+  consume is refused with `CredentialAccess` (`Pending`) and its attempt is
+  retired, so nothing is published; after the consume it is
+  `CommitUnsettled`, and a connector logout whose owner was lost is
+  `CommitUnsettled` too, where all three were `AuthLifecycle`. A provider
+  commit or logout whose rollback failed or whose owner was lost
+  (`HostAuthError::CredentialMutation` with `RollbackFailed` or `Cancelled`)
+  reports `commit_unsettled` where it reported `infrastructure`.
+  `commit_unsettled` has one fixed public text, "the credential commit's
+  outcome is unknown; read the status later", for every source; the detail
+  stays in protected diagnostics. `auth/profile/create`,
+  `auth/login/provision_api_key` and `POST /auth/profiles` answer a failed
+  credential commit with a typed reason and a fixed text, where they put the
+  store's own error text in the message and carried no reason; their codes
+  are unchanged. `HostAuthService::mcp_status` now reports what a use of the
+  stored credential would do, through the same rule
+  (`McpOAuthAuthority::stored_credential_status`): a stored credential the
+  use path refuses is `reauth_required` where it was `authorized`, and the
+  read may restore the credential's lifecycle from its durable marker, as a
+  use does. It never waits for the credential's lifecycle owner: while the
+  owner is busy, the stored credential's own expiry decides.
+
+- Behaviour-only (not measured by the gate): `meerkat-auth-core`:
+  `auth_oauth::credential_http_client` and a required egress profile's
+  credential client now bound every request: 30 s in total
+  (`CREDENTIAL_REQUEST_TIMEOUT`) and 10 s to connect
+  (`CREDENTIAL_CONNECT_TIMEOUT`). This covers every credential request Core
+  sends with them, provider OAuth included (token, refresh, device code, and
+  the code-assist setup requests). A token or device-code request that runs
+  out of time reports `OAuthError::Timeout` where it reported
+  `OAuthError::Network`; both stay transient for a refresh. The MCP
+  transports' client (`same_origin_credential_http_client`) and the egress
+  profile's ordinary and protected clients are unchanged: they carry tool
+  calls and event streams.
+
+- Behaviour-only (not measured by the gate): `meerkat-auth-core`:
+  `McpOAuthAuthority` bounds each network stage of a start, a completion and
+  a refresh (`McpOAuthNetworkBounds`), its account strategy's calls
+  included: a host `McpOAuthAccountStrategy`'s `preflight` and
+  `observe_account` futures are dropped at their stage bound. A confirmed
+  retirement of an attempt (cancel by state or reference, a cancel handle, a
+  logout) now also ends a completion of it already in flight, at once:
+  `login_complete`, `login_complete_registered` and a pending loopback
+  login's completion return `AttemptRetired` (the consuming `complete` with
+  its close receipt). A completion observes its credential commit for a
+  bounded time; one not admitted by then is retired and refused with
+  `CredentialAccess` (`Pending`), and one past its consume is
+  `CommitUnsettled`, where a lost commit owner was reported as
+  `AuthLifecycle`. A well-known probe that timed out is a typed timeout, no
+  longer an absent document. `McpOAuthPendingLogin::complete_until` keeps
+  bounding only the callback wait with its deadline; the completion after
+  delivery is now bounded too.
+
 ### Added
 
 - Hosted MCP OAuth through the host's own `https` callback (#1808), for a
@@ -300,6 +409,28 @@ them.
   current address names that incarnation. A key bound at another
   incarnation is `OwnerRetired` for a stale caller, and replays as before
   for a caller of the current incarnation. A session owner is unchanged.
+
+- `meerkat` re-exports `settle_in_flight_credential_mutations` and
+  `CredentialSettlement`: after an unsettled credential commit, an embedding
+  host settles its in-flight credential work, then reads the status.
+  `meerkat-auth-core` adds `McpOAuthAuthority::stored_credential_status`
+  with `McpStoredCredentialPhase` and `McpStoredCredentialStatus`
+  (non-exhaustive): one status read of an MCP target's stored credential
+  through the use path's own rule.
+
+- Bounded MCP OAuth network stages. Every network stage of an MCP login or
+  refresh has a bound: each stage (protected resource metadata,
+  authorization-server metadata, account preflight, client registration,
+  the code exchange, account evidence, and a refresh's token request and
+  subject check) gets 20 s for all of its requests, a start's stages get
+  60 s together, and a completion's get 60 s together, never past the
+  attempt's own 300 s window. A completion observes its credential commit
+  for 60 s. `McpOAuthNetworkBounds` holds these (`MCP_OAUTH_STAGE_BOUND`,
+  `MCP_OAUTH_START_BOUND`, `MCP_OAUTH_COMPLETION_BOUND`,
+  `MCP_OAUTH_COMMIT_OBSERVATION_BOUND`); an embedding host sets them with
+  `HostAuthService::with_mcp_network_bounds` or
+  `McpOAuthAuthority::with_network_bounds`, and they hold for the
+  authority's own client, a host-supplied one and the account strategy.
 
 ### Changed
 
@@ -629,6 +760,23 @@ them.
   host's typed error (`MobHostActorError`); where the host built the detail
   itself it now reads `durable host binding outcome is uncertain: ...`. The
   refusals keep their cause (`Internal`) and their "restart required" prefix.
+
+- An authorization server that accepts a request and never answers no longer
+  holds an MCP login, its host or the credential forever. A start that
+  stalls ends typed (`upstream_failure`, detail `upstream_timeout`) and
+  admits nothing, so the server's next start is not queued behind it. A
+  completion that stalls ends typed (detail `upstream_timeout` before the
+  authorization code was sent, `upstream_timeout_after_code` after), its
+  attempt retired and nothing published. Cancelling the attempt by its
+  reference while its `auth/login/complete` is in flight ends that call at
+  once (`attempt_missing`); a cancel answered `cancelled: true` means nothing
+  from that attempt is ever published. A refresh whose token endpoint never
+  answers fails transiently at its bound and keeps the credential, where it
+  held the credential's exclusive mutation without bound, so a login of the
+  same server (or its logout) waited forever. A credential commit that does
+  not report in time ends as `commit_unsettled`, never as a success or a
+  clean failure; `rkat-rpc` notes it for shutdown, so its attempt is never
+  reported as cleanly resolved.
 
 ## [0.9.4] - 2026-10-20
 

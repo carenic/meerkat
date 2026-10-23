@@ -394,3 +394,155 @@ async fn unselected_server_demanding_oauth_is_refused_with_typed_account_selecti
         "got {error:?}"
     );
 }
+
+/// The facade-built MCP authority uses its own client, not
+/// `with_http_client`'s; the service's network bounds reach it. A token
+/// endpoint that accepts the exchange and never answers ends the login at
+/// its stage bound, with the public reason and detail a host branches on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_service_mcp_authority_bounds_a_stalled_token_endpoint() {
+    let fixture = McpOAuthFixture::spawn().await.unwrap();
+    let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+    let service = host_service(&runtime).with_mcp_network_bounds(
+        meerkat::McpOAuthNetworkBounds::default()
+            .with_stage(std::time::Duration::from_millis(300))
+            .with_completion(std::time::Duration::from_secs(3)),
+    );
+    let target = McpServerIdentity::from_config(&selected_server(fixture.mcp_url())).unwrap();
+    let pending = begin(&service, &target).await;
+    fixture.stall_token_exchange(true);
+    assert_eq!(
+        pending.launch_browser(fixture_browser).await,
+        McpOAuthBrowserLaunch::Launched
+    );
+    let completed = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        pending.complete(MCP_INTERACTIVE_LOGIN_TIMEOUT),
+    )
+    .await
+    .expect("the stalled exchange ends at its stage bound");
+    let error = meerkat::HostAuthError::from(completed.expect_err("nothing was published"));
+    assert_eq!(
+        error.reason(),
+        meerkat_contracts::WireAuthErrorReason::UpstreamFailure
+    );
+    assert_eq!(
+        error.detail(),
+        Some(meerkat_contracts::WireAuthErrorDetail::UpstreamTimeoutAfterCode)
+    );
+    assert_eq!(
+        service.mcp_status(&target).await.unwrap().phase,
+        HostMcpAuthPhase::AuthorizationRequired
+    );
+}
+
+/// Log in to the fixture through the host service and return the target.
+async fn logged_in(fixture: &McpOAuthFixture, service: &HostAuthService) -> McpServerIdentity {
+    let target = McpServerIdentity::from_config(&selected_server(fixture.mcp_url())).unwrap();
+    let pending = begin(service, &target).await;
+    assert_eq!(
+        pending.launch_browser(fixture_browser).await,
+        McpOAuthBrowserLaunch::Launched
+    );
+    pending
+        .complete(MCP_INTERACTIVE_LOGIN_TIMEOUT)
+        .await
+        .expect("the login completes");
+    target
+}
+
+/// A lease released over the durable credential (as a failed rollback can
+/// leave it): the use path refuses the credential, and the status says so
+/// instead of projecting the durable bytes as authorized.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_status_reports_reauth_when_use_refuses_a_released_lease() {
+    let fixture = McpOAuthFixture::spawn().await.unwrap();
+    let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+    let service = host_service(&runtime);
+    let target = logged_in(&fixture, &service).await;
+    assert_eq!(
+        service.mcp_status(&target).await.unwrap().phase,
+        HostMcpAuthPhase::Authorized
+    );
+    let scoped = service.mcp_target_in_service_realm(&target).unwrap();
+    runtime
+        .generated_auth_lease_handle()
+        .release_credential_lifecycle(&scoped.lease_key().unwrap())
+        .unwrap();
+    let used = service
+        .mcp_oauth_authority()
+        .unwrap()
+        .stored_bearer_token(&target)
+        .await;
+    assert!(
+        matches!(used, Err(meerkat::McpOAuthError::ReauthRequired { .. })),
+        "positive control: the use path refuses the credential: {used:?}"
+    );
+    assert_eq!(
+        service.mcp_status(&target).await.unwrap().phase,
+        HostMcpAuthPhase::ReauthRequired
+    );
+}
+
+/// A status read never waits for the credential's lifecycle owner: while the
+/// owner holds the lifecycle, the stored credential's own reading answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_status_answers_a_phase_while_the_lifecycle_owner_is_busy() {
+    let fixture = McpOAuthFixture::spawn().await.unwrap();
+    let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+    let service = host_service(&runtime);
+    let target = logged_in(&fixture, &service).await;
+    let scoped = service.mcp_target_in_service_realm(&target).unwrap();
+    let held = meerkat_core::try_acquire_auth_login_lifecycle_guard(&scoped.lease_key().unwrap())
+        .expect("the lifecycle owner is free after the login");
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        service.mcp_status(&target),
+    )
+    .await
+    .expect("a status read never waits for the lifecycle owner")
+    .unwrap();
+    assert_eq!(status.phase, HostMcpAuthPhase::Authorized);
+    drop(held);
+}
+
+/// A stored credential without a secret (a corrupt record): the use path
+/// refuses it with reauth, and the status says the same instead of
+/// filtering the record out as absent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_status_reports_reauth_for_a_stored_credential_without_a_secret() {
+    let fixture = McpOAuthFixture::spawn().await.unwrap();
+    let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+    let store = Arc::new(EphemeralTokenStore::new());
+    let service = HostAuthService::new(
+        ProviderAuthPersistence::new(store.clone(), Arc::new(InMemoryCoordinator::new())),
+        runtime.provider_auth_runtime_authority(),
+    );
+    let target = logged_in(&fixture, &service).await;
+    let key = service
+        .mcp_target_in_service_realm(&target)
+        .unwrap()
+        .token_key()
+        .unwrap();
+    let mut tokens = meerkat_providers::auth_store::TokenStore::load(store.as_ref(), &key)
+        .await
+        .unwrap()
+        .expect("the login stored a credential");
+    tokens.primary_secret = None;
+    meerkat_providers::auth_store::TokenStore::save(store.as_ref(), &key, &tokens)
+        .await
+        .unwrap();
+    let used = service
+        .mcp_oauth_authority()
+        .unwrap()
+        .stored_bearer_token(&target)
+        .await;
+    assert!(
+        matches!(used, Err(meerkat::McpOAuthError::ReauthRequired { .. })),
+        "positive control: the use path refuses a secret-less credential: {used:?}"
+    );
+    assert_eq!(
+        service.mcp_status(&target).await.unwrap().phase,
+        HostMcpAuthPhase::ReauthRequired
+    );
+}
