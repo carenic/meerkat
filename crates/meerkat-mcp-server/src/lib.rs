@@ -4647,6 +4647,7 @@ async fn handle_meerkat_run_with_help_tools(
                 max_inline_peer_notifications: None,
                 app_context: input.app_context.clone(),
                 fork_source: None,
+                prompt_context_fork_source: None,
                 additional_instructions: input.additional_instructions.clone(),
                 // The help marker makes every rebuild of a help session from
                 // storage refuse it.
@@ -5126,6 +5127,7 @@ async fn handle_meerkat_resume(
             max_inline_peer_notifications: None,
             app_context: None,
             fork_source: None,
+            prompt_context_fork_source: None,
             additional_instructions: input.additional_instructions.clone(),
             initial_metadata_entries: std::collections::BTreeMap::new(),
             initial_tool_filter: None,

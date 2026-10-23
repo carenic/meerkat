@@ -52559,6 +52559,38 @@ fn host_addressed_trust_commands_are_served_off_drain_by_host_daemon() {
     }
 }
 
+/// Protocol V7 (prompt-context fork children): the host-addressed
+/// `HostFeatures` probe is admitted and served off the member drain by the
+/// host daemon, as `HostStatus` is; the member-addressed
+/// `ReadMemberVisibleTools` read is admitted through the bound-supervisor
+/// ladder and served on the member drain, as `ReadMemberHistory` is.
+#[test]
+fn v7_fork_child_commands_are_classified() {
+    use crate::meerkat_machine_types::{
+        OffDrainResponder, SupervisorBridgeCommandAdmissionRoute, SupervisorBridgeCommandKind,
+        SupervisorBridgeCommandRealization,
+    };
+
+    assert_eq!(
+        SupervisorBridgeCommandKind::HostFeatures.admission_route(),
+        SupervisorBridgeCommandAdmissionRoute::NotMemberAddressed,
+    );
+    assert_eq!(
+        SupervisorBridgeCommandKind::HostFeatures.realization(),
+        SupervisorBridgeCommandRealization::RealizedOffDrain {
+            by: OffDrainResponder::HostDaemon,
+        },
+    );
+    assert_eq!(
+        SupervisorBridgeCommandKind::ReadMemberVisibleTools.admission_route(),
+        SupervisorBridgeCommandAdmissionRoute::SupervisorBridgeCommand,
+    );
+    assert_eq!(
+        SupervisorBridgeCommandKind::ReadMemberVisibleTools.realization(),
+        SupervisorBridgeCommandRealization::Realized,
+    );
+}
+
 /// Multi-host mobs phase 6 (§7.4, DEC-P6E-1): the observation pair and
 /// member-input cancellation commands are served by member-drain arms and the
 /// manifest says so; the live-channel family stays fail-closed until phase 6b.
@@ -52656,6 +52688,7 @@ async fn member_addressed_bridge_admission_covers_manifest_kinds() {
         SupervisorBridgeCommandKind::CloseMemberLiveChannel,
         SupervisorBridgeCommandKind::MemberLiveChannelStatus,
         SupervisorBridgeCommandKind::ControlMemberLiveChannel,
+        SupervisorBridgeCommandKind::ReadMemberVisibleTools,
     ] {
         assert!(
             member_addressed.contains(&kind),

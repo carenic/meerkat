@@ -1705,6 +1705,10 @@ struct CreateSessionRecord {
     mob_member_binding: Option<meerkat_core::MobMemberBinding>,
     app_context: Option<serde_json::Value>,
     fork_source: Option<meerkat_core::ForkBuildSource>,
+    /// The typed source of a prompt-context fork child the build names.
+    prompt_context_fork_source: Option<meerkat_core::PromptContextForkSource>,
+    /// The session the create seats.
+    session_id: SessionId,
     /// Names of the tools the build's composed `external_tools` surface, in
     /// catalog order (the per-spawn overlay composed with mob-owned tools).
     external_tool_names: Vec<String>,
@@ -4034,6 +4038,11 @@ impl MockSessionService {
                     .build
                     .as_ref()
                     .and_then(|build| build.fork_source.clone()),
+                prompt_context_fork_source: req
+                    .build
+                    .as_ref()
+                    .and_then(|build| build.prompt_context_fork_source.clone()),
+                session_id: session_id.clone(),
                 external_tool_names: req
                     .build
                     .as_ref()
@@ -32083,6 +32092,107 @@ async fn test_fork_helper_tool_access_policy_reaches_session_metadata() {
     );
 }
 
+/// A prompt-context fork child's create request carries its typed source
+/// (`SessionBuildOptions::prompt_context_fork_source`): the source
+/// member's binding and its session. The child's creation stays a spawn
+/// with no durable fork source, and no other create carries one.
+#[tokio::test]
+async fn test_fork_helper_create_carries_the_typed_prompt_context_source() {
+    let mut definition = sample_definition();
+    definition
+        .profiles
+        .get_mut(&ProfileName::from("worker"))
+        .and_then(|binding| binding.as_inline_mut())
+        .expect("worker profile")
+        .external_addressable = true;
+    let (handle, service) = create_test_mob(definition).await;
+    service.set_return_exact_run_result(true);
+    let source_id = AgentIdentity::from("typed-source");
+    handle
+        .spawn_with_options(
+            ProfileName::from("worker"),
+            source_id.clone(),
+            Some("source context".into()),
+            Some(crate::MobRuntimeMode::TurnDriven),
+            None,
+        )
+        .await
+        .expect("spawn source member");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        handle.fork_helper(
+            &source_id,
+            AgentIdentity::from("typed-helper"),
+            "continue",
+            crate::launch::ForkContext::FullHistory,
+            HelperOptions {
+                role_name: Some(ProfileName::from("worker")),
+                runtime_mode: Some(crate::MobRuntimeMode::TurnDriven),
+                ..HelperOptions::default()
+            },
+            "typed-source-result",
+            256,
+        ),
+    )
+    .await
+    .expect("fork_helper must not hang")
+    .expect("fork_helper succeeds");
+
+    let creates = service.recorded_create_requests().await;
+    let create_of = |member: &str| {
+        creates
+            .iter()
+            .find(|record| {
+                record
+                    .mob_member_binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.member == member)
+            })
+            .unwrap_or_else(|| panic!("the create request of {member}"))
+    };
+    let source = create_of("typed-source");
+    let helper = create_of("typed-helper");
+    let typed = helper
+        .prompt_context_fork_source
+        .as_ref()
+        .expect("the helper's create carries its typed source");
+    assert_eq!(
+        Some(&typed.source_member),
+        source.mob_member_binding.as_ref(),
+        "the typed source names the source member's binding"
+    );
+    assert_eq!(
+        typed.source_session_id.as_ref(),
+        Some(&source.session_id),
+        "the typed source names the source member's session"
+    );
+    assert!(helper.fork_source.is_none(), "no durable fork source");
+    assert!(
+        creates
+            .iter()
+            .filter(|record| record.prompt_context_fork_source.is_some())
+            .count()
+            == 1,
+        "only the fork child's create carries a typed source"
+    );
+    // The host forked the helper, so no member's spawn proves its
+    // ancestry; it is never a durable fork.
+    let snapshot = handle
+        .member_creation_for_session(&helper.session_id)
+        .await
+        .expect("the helper's creation reads")
+        .expect("the helper has a creation record");
+    assert_eq!(
+        snapshot.creation.provenance,
+        crate::member_creation::MemberCreationProvenance::Unproven,
+        "a host-forked prompt-context child is not a durable fork"
+    );
+    assert!(
+        snapshot.fork_source.is_none(),
+        "its creation names no fork source"
+    );
+}
+
 #[tokio::test]
 async fn test_spawn_helper_defaults_to_turn_driven_even_when_profile_is_autonomous() {
     let mut definition = sample_definition();
@@ -38304,6 +38414,131 @@ async fn test_attach_existing_session_restores_persisted_inactive_session() {
             |message| !matches!(message, Message::System(system) if system.content == resume_prompt)
         ),
         "resume build configuration must not append a new System row",
+    );
+}
+
+/// A session with no messages and no deferred-turn state is a deferred
+/// template: the session service marks its first turn pending when a
+/// deferred resume creates it. A resume of such a session therefore owes the
+/// member's first turn and delivers it.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test]
+async fn test_resume_of_a_deferred_template_session_delivers_the_first_turn() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    let _adapter = service.enable_runtime_adapter();
+    let identity = AgentIdentity::from("w-template");
+    let seeded = service
+        .create_session(CreateSessionRequest {
+            injected_context: Vec::new(),
+            model: "claude-sonnet-4-5".to_string(),
+            prompt: "seed".to_string().into(),
+            system_prompt: meerkat_core::SystemPromptOverride::Inherit,
+            max_tokens: Some(4096),
+            event_tx: None,
+            build: Some(meerkat_core::service::SessionBuildOptions {
+                comms_name: Some(
+                    super::actor::render_member_comms_name(
+                        sample_definition().id.as_str(),
+                        "worker",
+                        identity.as_str(),
+                    )
+                    .expect("comms name"),
+                ),
+                ..Default::default()
+            }),
+            initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+            deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+            labels: None,
+        })
+        .await
+        .expect("seed the worker session");
+    let session_id = seeded.session_id.clone();
+    let seeded_session = service
+        .live_session_clone(&session_id)
+        .await
+        .expect("seeded live session");
+    let mut template = Session::with_id(session_id.clone());
+    template
+        .set_session_metadata(
+            seeded_session
+                .session_metadata()
+                .expect("seeded session metadata"),
+        )
+        .expect("template metadata");
+    assert!(
+        template.messages().is_empty()
+            && template
+                .try_deferred_turn_state()
+                .expect("template deferred-turn state")
+                .is_none(),
+        "the fixture is a deferred template"
+    );
+    service.replace_live_session(template).await;
+    MobSessionService::discard_live_session(service.as_ref(), &session_id)
+        .await
+        .expect("keep only the durable template");
+
+    handle
+        .spawn_spec(
+            SpawnMemberSpec::new("worker", identity.as_str())
+                .with_resume_bridge_session_id(session_id.clone()),
+        )
+        .await
+        .expect("resume the template session");
+    wait_for_keep_alive_start_turn_count(service.as_ref(), 1).await;
+    assert_eq!(
+        service.keep_alive_start_turn_call_count(),
+        1,
+        "the template's owed first turn runs once"
+    );
+}
+
+/// The resume witness owes the first turn exactly when the session service
+/// leaves it pending: a stored pending first turn, or a deferred template.
+#[test]
+fn adopted_first_turn_is_owed_only_while_the_first_turn_never_started() {
+    use super::handle::AdoptedFirstTurn;
+
+    assert_eq!(
+        AdoptedFirstTurn::of(&Session::new()),
+        AdoptedFirstTurn::Owed,
+        "a deferred template owes its first turn"
+    );
+
+    let mut pending = Session::new();
+    pending.push(Message::System(meerkat_core::types::SystemMessage::new(
+        "member prompt",
+    )));
+    let mut state = meerkat_core::SessionDeferredTurnState::default();
+    state.mark_initial_turn_pending();
+    pending
+        .set_deferred_turn_state(state.clone())
+        .expect("pending deferred-turn state");
+    assert_eq!(
+        AdoptedFirstTurn::of(&pending),
+        AdoptedFirstTurn::Owed,
+        "a stored pending first turn is owed"
+    );
+
+    let mut started = pending.clone();
+    assert!(state.mark_initial_turn_started(), "pending to consumed");
+    started
+        .set_deferred_turn_state(state)
+        .expect("consumed deferred-turn state");
+    assert_eq!(
+        AdoptedFirstTurn::of(&started),
+        AdoptedFirstTurn::Started,
+        "a consumed first turn is not owed"
+    );
+
+    let mut immediate = Session::new();
+    immediate.push(Message::User(meerkat_core::types::UserMessage::text(
+        "first turn of a session created without a deferred first turn",
+    )));
+    assert_eq!(
+        AdoptedFirstTurn::of(&immediate),
+        AdoptedFirstTurn::Started,
+        "a session that was not created deferred owes nothing"
     );
 }
 
@@ -84971,6 +85206,8 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         }
         MobError::DeliveryInteractionConflict { .. } => "delivery_interaction_conflict".to_string(),
         MobError::ForkInstructionRefused { .. } => "fork_instruction_refused".to_string(),
+        MobError::ForkContextTooLarge { .. } => "fork_context_too_large".to_string(),
+        MobError::HostFeaturesProbeFailed { .. } => "host_features_probe_failed".to_string(),
         MobError::IncarnationInconsistent { .. } => "incarnation_inconsistent".to_string(),
         MobError::IncarnationDestroyed { .. } => "incarnation_destroyed".to_string(),
         MobError::ProvenanceUnavailable { .. } => "provenance_unavailable".to_string(),
@@ -92765,6 +93002,58 @@ fn placement_fixture_uses_local_mob_authority_types() {
         ],
         "shared unit fixtures must not import the separately compiled self-dev-dependency",
     );
+}
+/// A turn-driven placed spawn with an initial message settles its activation
+/// without retaining a cleanup that would block graph-scoped controls.
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+#[tokio::test(flavor = "multi_thread")]
+async fn turn_driven_placed_spawn_with_initial_message_retains_no_activation_cleanup() {
+    let _guard = placement_support::REAL_COMMS_TEST_LOCK.lock().await;
+    let scripted = placement_support::spawn_scripted_host_peer("td-cleanup-host").await;
+    let member_endpoint = Arc::new(
+        placement_support::spawn_peer_comms_endpoint("td-cleanup-member", true, None).await,
+    );
+    let member =
+        placement_support::spawn_scripted_member_turn_responder(Arc::clone(&member_endpoint));
+    scripted.script_member_identity(
+        "td-cleanup",
+        placement_support::member_identity_of(&member_endpoint),
+    );
+    scripted.bind_member_endpoint("td-cleanup", member_endpoint);
+    let controlling = placement_support::create_controlling_mob("td-cleanup").await;
+    let report = controlling.bind_scripted(&scripted).await;
+    let spec = placement_support::placed_spawn_spec("worker", "td-cleanup", &report.host_id)
+        .with_runtime_mode(crate::MobRuntimeMode::TurnDriven)
+        .with_initial_message("PLACED_INITIAL_MESSAGE token-tau".to_string());
+    let spawned =
+        tokio::time::timeout(Duration::from_secs(10), controlling.handle.spawn_spec(spec))
+            .await
+            .expect("the placed spawn settles");
+
+    let reply_rx = controlling
+        .handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::SpawnActivationCustodyProbe {
+            reply_tx,
+        })
+        .await
+        .expect("custody probe enqueue");
+    let census = tokio::time::timeout(Duration::from_secs(2), reply_rx)
+        .await
+        .expect("custody probe answers")
+        .expect("custody probe reply");
+    assert!(
+        spawned.is_ok(),
+        "the spawn commits: {spawned:?}; retained cleanups {}",
+        census.retained_cleanups
+    );
+    assert_eq!(census.total, 0, "no activation holds custody");
+    assert_eq!(
+        census.retained_cleanups, 0,
+        "no activation cleanup is retained to block graph-scoped controls"
+    );
+    assert_eq!(member.admitted_delivery_count(), 1);
+    member.shutdown();
+    scripted.shutdown();
 }
 /// D67: public ownership and the Closing admission state.
 mod admission_close;

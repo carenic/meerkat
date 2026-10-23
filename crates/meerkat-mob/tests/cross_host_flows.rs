@@ -36,10 +36,10 @@ use support::{
     raw_deliver_member_input_command, raw_poll_member_events_command_with_outcome_protocol,
     sample_materialize_payload, sample_portable_member_spec,
     scripted_member_client_calling_tool_then_completing, scripted_member_client_completing,
-    scripted_member_client_stalling, single_step_flow, single_step_flow_with_blocked_tools,
-    single_step_flow_with_timeout, spawn_host_daemon_fixture, spawn_peer_comms_endpoint,
-    spawn_scripted_host_peer, spawn_scripted_member_turn_responder, wait_for_flow_run_terminal,
-    wait_until,
+    scripted_member_client_completing_recorded, scripted_member_client_stalling, single_step_flow,
+    single_step_flow_with_blocked_tools, single_step_flow_with_timeout, spawn_host_daemon_fixture,
+    spawn_peer_comms_endpoint, spawn_scripted_host_peer, spawn_scripted_member_turn_responder,
+    wait_for_flow_run_terminal, wait_until,
 };
 
 const RUN_WAIT: Duration = Duration::from_secs(60);
@@ -2234,5 +2234,203 @@ async fn stop_member_run_stops_live_placed_run_by_its_run_started_id() {
     );
 
     gate.release();
+    fixture.shutdown().await;
+}
+
+// ==========================================================================
+// A placed member resumed on its member host delivers its first turn only
+// while the adopted session owes it (the host reads the session and reports
+// it on the materialize ack).
+// ==========================================================================
+
+/// A placed spawn of `member` that resumes `session_id` on `host_id`.
+fn placed_resume_of(
+    member: &AgentIdentity,
+    host_id: &str,
+    session_id: &str,
+    runtime_mode: meerkat_mob::MobRuntimeMode,
+    initial_message: Option<&str>,
+) -> meerkat_mob::SpawnMemberSpec {
+    let mut spec = support::placed_spawn_spec("worker", member.as_str(), host_id);
+    spec.runtime_mode = Some(runtime_mode);
+    spec.launch_mode = meerkat_mob::launch::MemberLaunchMode::Resume {
+        bridge_session_id: meerkat_core::SessionId::parse(session_id).expect("member session id"),
+        resume_from_role: None,
+    };
+    match initial_message {
+        Some(message) => spec.with_initial_message(message.to_string()),
+        None => spec,
+    }
+}
+
+async fn member_row(
+    fixture: &support::HostDaemonFixture,
+    mob_id: &str,
+    member: &AgentIdentity,
+) -> meerkat_mob::runtime::host_actor::MaterializedMemberRow {
+    fixture
+        .host_binding_record(mob_id)
+        .await
+        .materialized
+        .get(member.as_str())
+        .cloned()
+        .expect("materialized member row")
+}
+
+fn request_count(requests: &std::sync::Mutex<Vec<Vec<meerkat_core::Message>>>) -> usize {
+    requests.lock().expect("member request log").len()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_placed_autonomous_member_resumed_on_its_host_runs_no_second_kickoff() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut opts = HostFixtureOptions::named("xhf-resume-started-host").with_member_build();
+    opts.member_llm_client = Some(scripted_member_client_completing_recorded(
+        "resume-done",
+        std::sync::Arc::clone(&requests),
+    ));
+    let fixture = spawn_host_daemon_fixture(opts)
+        .await
+        .expect("spawn member-build host fixture");
+    let controlling = create_controlling_mob("xhf-resume-started").await;
+    let report = controlling.bind_fixture(&fixture).await;
+    let mob_id = controlling.mob_id.to_string();
+    let member = identity("resumed-worker");
+
+    let mut spec = support::placed_spawn_spec("worker", member.as_str(), &report.host_id)
+        .with_initial_message("PLACED_KICKOFF token-kappa".to_string());
+    spec.runtime_mode = Some(meerkat_mob::MobRuntimeMode::AutonomousHost);
+    controlling
+        .handle
+        .spawn_spec(spec)
+        .await
+        .expect("placed autonomous member materializes");
+    controlling
+        .handle
+        .wait_for_members_kickoff_complete(std::slice::from_ref(&member), Some(RUN_WAIT))
+        .await
+        .expect("the fresh kickoff completes");
+    assert_eq!(
+        request_count(&requests),
+        1,
+        "the fresh spawn ran its kickoff"
+    );
+    let session_id = member_row(&fixture, &mob_id, &member).await.session_id;
+
+    controlling
+        .handle
+        .retire(member.clone())
+        .await
+        .expect("retire the placed member");
+    controlling
+        .handle
+        .spawn_spec(placed_resume_of(
+            &member,
+            &report.host_id,
+            &session_id,
+            meerkat_mob::MobRuntimeMode::AutonomousHost,
+            Some("PLACED_KICKOFF token-kappa"),
+        ))
+        .await
+        .expect("the placed member resumes on its host");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        request_count(&requests),
+        1,
+        "the resume of a started session runs no second kickoff"
+    );
+    let row = member_row(&fixture, &mob_id, &member).await;
+    assert_eq!(row.session_id, session_id);
+    assert_eq!(
+        row.adopted_first_turn,
+        Some(meerkat_mob::runtime::bridge_protocol::BridgeAdoptedFirstTurn::Started)
+    );
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_placed_turn_driven_member_resumed_on_its_host_delivers_its_first_turn_once() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut opts = HostFixtureOptions::named("xhf-resume-owed-host").with_member_build();
+    opts.member_llm_client = Some(scripted_member_client_completing_recorded(
+        "resume-owed-done",
+        std::sync::Arc::clone(&requests),
+    ));
+    let fixture = spawn_host_daemon_fixture(opts)
+        .await
+        .expect("spawn member-build host fixture");
+    let controlling = create_controlling_mob("xhf-resume-owed").await;
+    let report = controlling.bind_fixture(&fixture).await;
+    let mob_id = controlling.mob_id.to_string();
+    let member = identity("owed-worker");
+
+    // A turn-driven member spawned without a message never starts a turn.
+    controlling
+        .handle
+        .spawn_spec(support::placed_spawn_spec(
+            "worker",
+            member.as_str(),
+            &report.host_id,
+        ))
+        .await
+        .expect("placed turn-driven member materializes");
+    let session_id = member_row(&fixture, &mob_id, &member).await.session_id;
+    controlling
+        .handle
+        .retire(member.clone())
+        .await
+        .expect("retire the placed member");
+
+    // Its session still owes the first turn: the resume delivers it once.
+    controlling
+        .handle
+        .spawn_spec(placed_resume_of(
+            &member,
+            &report.host_id,
+            &session_id,
+            meerkat_mob::MobRuntimeMode::TurnDriven,
+            Some("PLACED_FIRST_TURN token-lambda"),
+        ))
+        .await
+        .expect("the owed resume commits");
+    wait_until("the owed first turn runs", || {
+        let requests = std::sync::Arc::clone(&requests);
+        async move { request_count(&requests) == 1 }
+    })
+    .await;
+    controlling
+        .handle
+        .retire(member.clone())
+        .await
+        .expect("retire the placed member again");
+
+    // Now it has started: a later resume delivers nothing.
+    controlling
+        .handle
+        .spawn_spec(placed_resume_of(
+            &member,
+            &report.host_id,
+            &session_id,
+            meerkat_mob::MobRuntimeMode::TurnDriven,
+            Some("PLACED_FIRST_TURN token-lambda"),
+        ))
+        .await
+        .expect("the second resume commits");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        request_count(&requests),
+        1,
+        "the first turn ran exactly once over both resumes"
+    );
+    assert_eq!(
+        member_row(&fixture, &mob_id, &member)
+            .await
+            .adopted_first_turn,
+        Some(meerkat_mob::runtime::bridge_protocol::BridgeAdoptedFirstTurn::Started)
+    );
+
     fixture.shutdown().await;
 }

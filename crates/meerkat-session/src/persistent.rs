@@ -1055,6 +1055,13 @@ struct StoreCheckpointer {
     /// its successor. An intra-run checkpoint prunes no store rows (the
     /// committed boundary must stay rebuildable); the promotion applies it.
     latest_run_transcript_retirement: std::sync::Mutex<Option<(RunId, u64)>>,
+    /// The live deferred-turn state of this actor's session, attached once the
+    /// actor exists and before it can run a turn. A checkpoint of a session
+    /// that carries deferred-turn state persists this live value.
+    live_deferred_turn_state: std::sync::OnceLock<Arc<std::sync::Mutex<SessionDeferredTurnState>>>,
+    /// Set once a checkpoint of a session carrying deferred-turn state ran
+    /// before the live state was attached, so that warning is logged once.
+    unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool,
 }
 
 struct HeadCanonicalProvisionalIntent<'a> {
@@ -1574,6 +1581,35 @@ impl StoreCheckpointer {
             .map(|(_, retired)| retired)
     }
 
+    /// The deferred-turn state a checkpoint of `session` persists.
+    ///
+    /// The session's live handle owns the deferred first turn. The agent's
+    /// Session carries the deferred-turn state it was resumed from, which goes
+    /// stale when the first turn starts, so a checkpoint persists the live
+    /// state instead (the value an export stamps). A session that carries no
+    /// deferred-turn state persists none, as before.
+    fn deferred_turn_state_for_checkpoint(
+        &self,
+        session: &Session,
+    ) -> Option<SessionDeferredTurnState> {
+        let carried = session.deferred_turn_state()?;
+        match self.live_deferred_turn_state.get() {
+            Some(live) => Some(crate::ephemeral::live_deferred_turn_state_for_durable_write(live)),
+            None => {
+                if !self
+                    .unattached_deferred_checkpoint_warned
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    tracing::warn!(
+                        session_id = %session.id(),
+                        "checkpoint of a session with deferred-turn state ran before its live state was attached; persisting the carried state"
+                    );
+                }
+                Some(carried)
+            }
+        }
+    }
+
     async fn run_checkpoint_receipt(
         &self,
         session_id: &SessionId,
@@ -1754,7 +1790,7 @@ impl StoreCheckpointer {
                     session.id()
                 ))
             })?;
-        if let Some(mut state) = session.deferred_turn_state() {
+        if let Some(mut state) = self.deferred_turn_state_for_checkpoint(session) {
             externalize_deferred_turn_state(self.blob_store.as_ref(), &mut state)
                 .await
                 .map_err(|error| {
@@ -2091,7 +2127,7 @@ impl StoreCheckpointer {
                 None
             }
         };
-        if let Some(mut state) = session.deferred_turn_state() {
+        if let Some(mut state) = self.deferred_turn_state_for_checkpoint(session) {
             externalize_deferred_turn_state(self.blob_store.as_ref(), &mut state)
                 .await
                 .map_err(|error| {
@@ -3822,6 +3858,16 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// inside the actor.
     pub async fn live_session_actor_registered(&self, id: &SessionId) -> bool {
         self.inner.live_session_actor_registered(id).await
+    }
+
+    /// The visible tool names of the live session `id` at a fork boundary,
+    /// read without waiting on a running turn. See
+    /// [`EphemeralSessionService::fork_source_tools`].
+    pub async fn fork_source_tools(
+        &self,
+        id: &SessionId,
+    ) -> meerkat_core::fork_notice::ForkSeedSourceTools {
+        self.inner.fork_source_tools(id).await
     }
 
     /// Subscribe to the live inner session actor's turn activity, or `None`
@@ -6826,6 +6872,19 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         let reactivated_instruction_count = forked
             .apply_fork_instruction_policy(&source_session_id, inherited_instructions)
             .map_err(SessionError::ForkInstructionRefused)?;
+        // What the child holds of its source: its effective instruction keys
+        // and, read without waiting on a running turn, its visible tools. The
+        // child's first run turns them into its fork notice.
+        // Only the rows the source activated itself are effective there;
+        // rows it copied from its own source are history.
+        let source_instructions =
+            meerkat_core::fork_notice::effective_instruction_keys(forked.messages(), |origin| {
+                origin == &source_session_id
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+        let source_tools = self.fork_source_tools(&source_session_id).await;
+        let mut source_member = None;
         // Core transcript forks deliberately strip session authority metadata.
         // Rebuild sanitized execution configuration whenever canonical source
         // metadata exists: the metadata, and the build state derived for a
@@ -6851,6 +6910,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 // the same materialization target before either is committed.
                 metadata.apply_llm_identity(cache_identity);
             }
+            source_member = metadata.mob_member_binding.clone();
             let target_binding = target.as_ref().map(|target| target.member_binding.clone());
             metadata.comms_name = target_binding
                 .as_ref()
@@ -6937,6 +6997,34 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 ))));
             }
         }
+        let seed = meerkat_core::fork_notice::ForkSeed {
+            fork: meerkat_core::fork_notice::ForkNoticeKind::Transcript,
+            source: meerkat_core::fork_notice::ForkNoticeSource {
+                member: source_member,
+                session_id: Some(source_session_id.clone()),
+            },
+            planned_context: None,
+            source_instructions,
+            instructions_carried: Vec::new(),
+            skills_removed: Vec::new(),
+            skills_carried: Vec::new(),
+            injected_rows_removed: 0,
+            injected_rows_carried: 0,
+            earlier_rows_omitted: 0,
+            source_tools,
+        };
+        let seed = serde_json::to_value(&seed).map_err(|error| {
+            SessionError::Agent(AgentError::InternalError(format!(
+                "failed to record the fork seed of session {source_session_id}: {error}"
+            )))
+        })?;
+        forked
+            .try_set_metadata(meerkat_core::fork_notice::SESSION_FORK_SEED_KEY, seed)
+            .map_err(|error| {
+                SessionError::Agent(AgentError::InternalError(format!(
+                    "failed to record the fork seed of session {source_session_id}: {error}"
+                )))
+            })?;
         let saved = match self.runtime_store.session_persistence_profile() {
             RuntimeSessionPersistenceProfile::WholeBlobV1 => {
                 self.save_normalized_session(forked).await?
@@ -13642,6 +13730,8 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             whole_blob_base_authority: std::sync::Mutex::new(None),
             latest_run_checkpoint_receipt: Mutex::new(None),
             latest_run_transcript_retirement: std::sync::Mutex::new(None),
+            live_deferred_turn_state: std::sync::OnceLock::new(),
+            unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
         });
         let requested_resume_session_id = req
             .build
@@ -14085,6 +14175,13 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 return Err(error);
             }
         };
+        // The actor's run checkpoints persist its live deferred-turn state. A
+        // runtime-backed create runs no turn inside the inner create (an eager
+        // create is refused above), so this attaches before the actor can run
+        // a turn.
+        if let Some(live) = self.inner.deferred_turn_state(&result.session_id).await {
+            let _ = checkpointer.live_deferred_turn_state.set(live);
+        }
         if let Some(permit) = actor_materialization_permit.take()
             && let Err(error) = permit.commit()
         {
@@ -18047,6 +18144,8 @@ mod tests {
             whole_blob_base_authority: std::sync::Mutex::new(Some(authority)),
             latest_run_checkpoint_receipt: Mutex::new(None),
             latest_run_transcript_retirement: std::sync::Mutex::new(None),
+            live_deferred_turn_state: std::sync::OnceLock::new(),
+            unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
         };
         (runtime_store, session, checkpointer)
     }
@@ -18073,6 +18172,187 @@ mod tests {
             ),
             other => panic!("expected a typed durable-projection teardown, got {other:?}"),
         }
+    }
+
+    /// A stored deferred-turn state with a pending first turn, a staged prompt
+    /// and a staged callback result (what a resumed agent's copy carries), and
+    /// the live state after that first turn started and consumed them.
+    fn stale_and_live_deferred_turn_states() -> (SessionDeferredTurnState, SessionDeferredTurnState)
+    {
+        let mut stale = SessionDeferredTurnState::default();
+        stale.mark_initial_turn_pending();
+        stale.stage_initial_prompt(
+            "staged first prompt".to_string().into(),
+            meerkat_core::time_compat::SystemTime::now(),
+        );
+        assert_eq!(
+            stale.stage_tool_results(
+                vec![ToolResult::new(
+                    "callback-1".to_string(),
+                    "staged callback result".to_string(),
+                    false,
+                )],
+                meerkat_core::time_compat::SystemTime::now(),
+            ),
+            1,
+            "fixture stages one callback result"
+        );
+        let mut live = stale.clone();
+        let consumed = live.consume_for_started_turn();
+        assert!(
+            consumed.pending_initial_prompt().is_some()
+                && !consumed.pending_tool_results().is_empty(),
+            "the first turn consumed the staged inputs"
+        );
+        (stale, live)
+    }
+
+    fn assert_persisted_live_deferred_turn_state(
+        session: &Session,
+        live: &SessionDeferredTurnState,
+    ) {
+        let persisted = session
+            .try_deferred_turn_state()
+            .expect("persisted deferred-turn state")
+            .expect("a session that carried the state still carries it");
+        assert_eq!(&persisted, live, "the checkpoint persisted the live state");
+        assert_eq!(
+            persisted.first_turn_phase(),
+            meerkat_core::DeferredFirstTurnPhase::Consumed
+        );
+        assert!(persisted.pending_initial_prompt().is_none());
+        assert_eq!(persisted.pending_tool_results_len(), 0);
+    }
+
+    /// A run checkpoint persists the session's live deferred-turn state, not
+    /// the copy the resumed agent carried: once the first turn starts, its
+    /// staged prompt and callback results are consumed and the phase is
+    /// consumed, and none of the stale copy is stored again.
+    #[tokio::test]
+    async fn run_checkpoint_persists_the_live_deferred_turn_state_over_a_stale_copy() {
+        let (_runtime_store, mut session, checkpointer) = whole_blob_checkpointer_fixture().await;
+        let (stale, live) = stale_and_live_deferred_turn_states();
+        session
+            .set_deferred_turn_state(stale)
+            .expect("the agent copy carries the stored state");
+        assert!(
+            checkpointer
+                .live_deferred_turn_state
+                .set(Arc::new(std::sync::Mutex::new(live.clone())))
+                .is_ok(),
+            "attach the live state once"
+        );
+
+        meerkat_core::SessionCheckpointer::checkpoint_run(
+            &checkpointer,
+            &mut session,
+            &RunId::new(),
+            None,
+        )
+        .await
+        .expect("the run checkpoint succeeds");
+
+        assert_persisted_live_deferred_turn_state(&session, &live);
+    }
+
+    /// The HeadCanonical twin: its intra-run checkpoint persists the live
+    /// deferred-turn state too.
+    #[tokio::test]
+    async fn head_canonical_run_checkpoint_persists_the_live_deferred_turn_state_over_a_stale_copy()
+    {
+        let directory = tempfile::Builder::new()
+            .prefix(".deferred-turn-checkpoint-")
+            .tempdir_in(".")
+            .unwrap();
+        let database_path = directory.path().join("runtime.sqlite3");
+        let runtime_store = Arc::new(
+            meerkat_runtime::SqliteRuntimeStore::new_head_canonical(&database_path).unwrap(),
+        );
+        let store = Arc::new(meerkat_store::SqliteSessionStore::open(&database_path).unwrap());
+        let service = PersistentSessionService::new(
+            DummyBuilder,
+            4,
+            store,
+            runtime_store.clone(),
+            memory_blob_store(),
+        );
+        let (stale, live) = stale_and_live_deferred_turn_states();
+        let mut source = live_context_summary_source();
+        source
+            .set_deferred_turn_state(stale)
+            .expect("the stored session carries the pending state");
+        let committed = service
+            .persist_detached_head_canonical_session(source, "deferred-turn checkpoint fixture")
+            .await
+            .unwrap();
+        let checkpointer = StoreCheckpointer {
+            runtime_store,
+            incremental: service.incremental.clone(),
+            blob_store: memory_blob_store(),
+            gate: Arc::new(CheckpointerGate {
+                cancelled: Mutex::new(false),
+            }),
+            whole_blob_base_authority: std::sync::Mutex::new(None),
+            latest_run_checkpoint_receipt: Mutex::new(None),
+            latest_run_transcript_retirement: std::sync::Mutex::new(None),
+            live_deferred_turn_state: std::sync::OnceLock::new(),
+            unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
+        };
+        assert!(
+            checkpointer
+                .live_deferred_turn_state
+                .set(Arc::new(std::sync::Mutex::new(live.clone())))
+                .is_ok(),
+            "attach the live state once"
+        );
+        let mut provisional = committed;
+        provisional.push(user_message("the first turn's input"));
+
+        meerkat_core::SessionCheckpointer::checkpoint_run(
+            &checkpointer,
+            &mut provisional,
+            &RunId::new(),
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("physical provisional head receipt");
+
+        assert_persisted_live_deferred_turn_state(&provisional, &live);
+    }
+
+    /// A session that carries no deferred-turn state is checkpointed exactly
+    /// as before: the live state attached to its checkpointer adds nothing.
+    #[tokio::test]
+    async fn run_checkpoint_of_a_session_without_deferred_turn_state_adds_none() {
+        let (_runtime_store, mut session, checkpointer) = whole_blob_checkpointer_fixture().await;
+        let mut live = SessionDeferredTurnState::default();
+        live.mark_initial_turn_pending();
+        let _ = live.consume_for_started_turn();
+        assert!(
+            checkpointer
+                .live_deferred_turn_state
+                .set(Arc::new(std::sync::Mutex::new(live)))
+                .is_ok(),
+            "attach the live state once"
+        );
+
+        meerkat_core::SessionCheckpointer::checkpoint_run(
+            &checkpointer,
+            &mut session,
+            &RunId::new(),
+            None,
+        )
+        .await
+        .expect("the run checkpoint succeeds");
+
+        assert!(
+            session
+                .try_deferred_turn_state()
+                .expect("deferred-turn state reads")
+                .is_none(),
+            "a session without deferred-turn state gains none"
+        );
     }
 
     #[tokio::test]
@@ -18190,6 +18470,8 @@ mod tests {
             whole_blob_base_authority: std::sync::Mutex::new(Some(initial_authority.clone())),
             latest_run_checkpoint_receipt: Mutex::new(None),
             latest_run_transcript_retirement: std::sync::Mutex::new(None),
+            live_deferred_turn_state: std::sync::OnceLock::new(),
+            unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
         };
 
         let mut successor = session;
@@ -29525,6 +29807,8 @@ mod tests {
             ),
             latest_run_checkpoint_receipt: Mutex::new(None),
             latest_run_transcript_retirement: std::sync::Mutex::new(None),
+            live_deferred_turn_state: std::sync::OnceLock::new(),
+            unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
         };
         let mut provisional = committed.clone();
         provisional.push(user_message("provisional context is not committed"));
@@ -29790,6 +30074,8 @@ mod tests {
             whole_blob_base_authority: std::sync::Mutex::new(None),
             latest_run_checkpoint_receipt: Mutex::new(None),
             latest_run_transcript_retirement: std::sync::Mutex::new(None),
+            live_deferred_turn_state: std::sync::OnceLock::new(),
+            unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
         };
         let mut provisional = committed;
         provisional.push(user_message("physical provisional successor"));
@@ -29868,6 +30154,8 @@ mod tests {
             whole_blob_base_authority: std::sync::Mutex::new(None),
             latest_run_checkpoint_receipt: Mutex::new(None),
             latest_run_transcript_retirement: std::sync::Mutex::new(None),
+            live_deferred_turn_state: std::sync::OnceLock::new(),
+            unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
         };
         (directory, service, checkpointer, committed)
     }
@@ -30501,6 +30789,8 @@ mod tests {
             whole_blob_base_authority: std::sync::Mutex::new(None),
             latest_run_checkpoint_receipt: Mutex::new(None),
             latest_run_transcript_retirement: std::sync::Mutex::new(None),
+            live_deferred_turn_state: std::sync::OnceLock::new(),
+            unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
         };
         let mut session = recovered;
         let run_id = RunId::new();
@@ -40104,6 +40394,8 @@ mod tests {
             whole_blob_base_authority: std::sync::Mutex::new(None),
             latest_run_checkpoint_receipt: Mutex::new(None),
             latest_run_transcript_retirement: std::sync::Mutex::new(None),
+            live_deferred_turn_state: std::sync::OnceLock::new(),
+            unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
         });
         service
             .live_checkpointers

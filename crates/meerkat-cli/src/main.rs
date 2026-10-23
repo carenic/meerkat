@@ -13349,6 +13349,17 @@ impl meerkat_mob::MobSessionService for RunMobSessionService {
         .await
     }
 
+    async fn fork_source_tools(
+        &self,
+        session_id: &SessionId,
+    ) -> meerkat_core::fork_notice::ForkSeedSourceTools {
+        <EphemeralSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::fork_source_tools(
+            &self.inner,
+            session_id,
+        )
+        .await
+    }
+
     async fn tool_catalog_view(
         &self,
         session_id: &SessionId,
@@ -14605,6 +14616,7 @@ async fn run_agent(
             app_context: parsed_app_context,
             // A CLI-created session is never a mob fork seating.
             fork_source: None,
+            prompt_context_fork_source: None,
             additional_instructions: if instructions.is_empty() {
                 None
             } else {
@@ -17252,6 +17264,17 @@ impl meerkat_mob::MobSessionService for MobCliSessionService {
         session_id: &SessionId,
     ) -> Result<Option<meerkat_core::ToolScopeSnapshot>, meerkat_core::service::SessionError> {
         <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::tool_scope_snapshot(
+            &self.inner,
+            session_id,
+        )
+        .await
+    }
+
+    async fn fork_source_tools(
+        &self,
+        session_id: &SessionId,
+    ) -> meerkat_core::fork_notice::ForkSeedSourceTools {
+        <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::fork_source_tools(
             &self.inner,
             session_id,
         )

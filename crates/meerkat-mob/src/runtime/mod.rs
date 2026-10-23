@@ -224,6 +224,7 @@ mod events;
 mod flow;
 pub mod flow_frame_engine;
 mod fork_build;
+mod fork_context;
 pub mod forked_participant_routing;
 mod handle;
 mod held_spawn;

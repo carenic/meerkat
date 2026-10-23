@@ -6536,6 +6536,19 @@ async fn recover_placed_kickoff_outcome_custody(
                 expected.agent_identity
             )));
         }
+        // A plain resume whose member host reported the adopted session's
+        // first turn as started waived its kickoff: there is nothing to
+        // repair. A waived kickoff never records custody, so a chain for it
+        // fails closed.
+        if entry.record.waives_first_turn() {
+            if chains.contains_key(&key) {
+                return Err(MobError::Internal(format!(
+                    "waived placed kickoff '{}' has custody history",
+                    expected.input_id
+                )));
+            }
+            continue;
+        }
         if let Some(chain) = chains.get(&key) {
             if chain
                 .recorded_cursor
@@ -12433,6 +12446,7 @@ mod tests {
                         signing_key: mob_dsl::PeerSigningKey(signing_key),
                     },
                     ack_engine_version: "placed-recovery-test-engine".to_string(),
+                    adopted_first_turn_started: false,
                 },
             );
         }
@@ -12471,6 +12485,59 @@ mod tests {
             .validate_for_mob(mob_id)
             .expect("valid autonomous placed carrier");
         record
+    }
+
+    /// The kickoff waiver is written only when it waives, so every other
+    /// commit record keeps its bytes; a waiver round-trips; and only an
+    /// autonomous carrier may carry one.
+    #[test]
+    fn a_placed_commit_record_waives_only_an_autonomous_kickoff() {
+        let mob_id = MobId::from("placed-waiver-shape");
+        let identity = AgentIdentity::from("placed-worker");
+        let record = test_autonomous_placed_carrier(&mob_id, &identity);
+        let crate::store::PlacedSpawnCarrierPhase::Committed(commit) = &record.phase else {
+            panic!("the autonomous test carrier is committed");
+        };
+        let unwaived = serde_json::to_value(commit).expect("encode commit record");
+        assert!(
+            unwaived.get("adopted_first_turn_started").is_none(),
+            "a record without a waiver keeps its bytes"
+        );
+
+        let mut waived = record.clone();
+        let crate::store::PlacedSpawnCarrierPhase::Committed(commit) = &mut waived.phase else {
+            panic!("the autonomous test carrier is committed");
+        };
+        commit.adopted_first_turn_started = true;
+        waived
+            .validate_for_mob(&mob_id)
+            .expect("an autonomous carrier may waive its kickoff");
+        let encoded = serde_json::to_value(&waived).expect("encode waived carrier");
+        assert_eq!(
+            encoded["phase"]["commit"]["adopted_first_turn_started"],
+            serde_json::json!(true)
+        );
+        let decoded: crate::store::MobPlacedSpawnCarrierRecord =
+            serde_json::from_value(encoded).expect("decode waived carrier");
+        assert_eq!(decoded, waived);
+
+        let mut turn_driven = test_placed_carrier(
+            &mob_id,
+            &identity,
+            Generation::INITIAL,
+            FenceToken::new(73),
+            crate::ids::PlacedSpawnId::new(),
+            true,
+        );
+        let crate::store::PlacedSpawnCarrierPhase::Committed(commit) = &mut turn_driven.phase
+        else {
+            panic!("the test carrier is committed");
+        };
+        commit.adopted_first_turn_started = true;
+        let error = turn_driven
+            .validate_for_mob(&mob_id)
+            .expect_err("a carrier that is not autonomous may not waive a kickoff");
+        assert!(error.to_string().contains("not autonomous"), "got {error}");
     }
 
     fn test_current_carrier_plan(
@@ -13035,6 +13102,140 @@ mod tests {
             error
                 .to_string()
                 .contains("no-effect rejection does not match its lifecycle projection")
+        );
+    }
+
+    /// An autonomous placed carrier whose committed record waives its
+    /// kickoff: its member host reported the adopted session's first turn as
+    /// started.
+    fn test_waived_autonomous_placed_carrier(
+        mob_id: &MobId,
+        identity: &AgentIdentity,
+    ) -> crate::store::MobPlacedSpawnCarrierRecord {
+        let mut record = test_autonomous_placed_carrier(mob_id, identity);
+        let crate::store::PlacedSpawnCarrierPhase::Committed(commit) = &mut record.phase else {
+            panic!("the autonomous test carrier is committed");
+        };
+        commit.adopted_first_turn_started = true;
+        record
+            .validate_for_mob(mob_id)
+            .expect("valid waived autonomous placed carrier");
+        record
+    }
+
+    /// A waived carrier committed before a crash, with no kickoff custody
+    /// yet: cold recovery repairs no kickoff for it.
+    #[tokio::test]
+    async fn a_waived_placed_carrier_recovers_no_kickoff_custody() {
+        let mob_id = MobId::from("kickoff-recovery-waived");
+        let identity = AgentIdentity::from("placed-worker");
+        let record = test_waived_autonomous_placed_carrier(&mob_id, &identity);
+        let plan = test_current_carrier_plan(&record);
+        let store: Arc<dyn MobEventStore> = Arc::new(InMemoryMobEventStore::new());
+        store
+            .append(repaired_placed_spawn_event(&mob_id, &record).expect("spawn projection"))
+            .await
+            .expect("append exact MemberSpawned projection");
+        let mut events = store.replay_all().await.expect("replay");
+        let mut authority = test_authority_for_current_carrier(&record, &plan);
+
+        recover_placed_kickoff_outcome_custody(&mut authority, &store, &mob_id, &mut events, &plan)
+            .await
+            .expect("a waived carrier recovers");
+
+        assert!(
+            !events.iter().any(|event| matches!(
+                event.kind,
+                MobEventKind::PlacedKickoffObligationRecorded { .. }
+                    | MobEventKind::MemberKickoffUpdated { .. }
+            )),
+            "no kickoff custody or lifecycle is repaired for a waived carrier"
+        );
+        let state = authority.state();
+        assert!(state.pending_placed_kickoff_outcomes.is_empty());
+        assert!(state.member_kickoff_starting.is_empty());
+    }
+
+    /// A waived kickoff never records custody, so custody history for one
+    /// fails closed.
+    #[tokio::test]
+    async fn a_waived_placed_carrier_with_custody_history_fails_closed() {
+        let mob_id = MobId::from("kickoff-recovery-waived-history");
+        let identity = AgentIdentity::from("placed-worker");
+        let record = test_waived_autonomous_placed_carrier(&mob_id, &identity);
+        let plan = test_current_carrier_plan(&record);
+        let store: Arc<dyn MobEventStore> = Arc::new(InMemoryMobEventStore::new());
+        store
+            .append(repaired_placed_spawn_event(&mob_id, &record).expect("spawn projection"))
+            .await
+            .expect("append exact MemberSpawned projection");
+        let obligation = super::placed_kickoff_reconciler::obligation_event_from_carrier(&record)
+            .expect("derive exact kickoff obligation");
+        append_kickoff_pair(
+            &store,
+            &mob_id,
+            MobEventKind::PlacedKickoffObligationRecorded {
+                obligation: obligation.clone(),
+            },
+            &identity,
+            &MobMemberKickoffSnapshot {
+                objective_id: Some(obligation.objective_id),
+                phase: MobMemberKickoffPhase::Starting,
+                error: None,
+                updated_at: UNIX_EPOCH,
+            },
+        )
+        .await;
+        let mut events = store.replay_all().await.expect("replay");
+        let mut authority = test_authority_for_current_carrier(&record, &plan);
+
+        let error = recover_placed_kickoff_outcome_custody(
+            &mut authority,
+            &store,
+            &mob_id,
+            &mut events,
+            &plan,
+        )
+        .await
+        .expect_err("custody history for a waived kickoff fails closed");
+        assert!(
+            error.to_string().contains("has custody history"),
+            "got {error}"
+        );
+    }
+
+    /// The duplicate-current check runs before the waiver is read: two
+    /// current carriers for one kickoff fail even when both waive it.
+    #[tokio::test]
+    async fn duplicate_waived_placed_carriers_still_fail_as_duplicates() {
+        let mob_id = MobId::from("kickoff-recovery-waived-duplicate");
+        let identity = AgentIdentity::from("placed-worker");
+        let record = test_waived_autonomous_placed_carrier(&mob_id, &identity);
+        let single = test_current_carrier_plan(&record);
+        let mut plan = test_current_carrier_plan(&record);
+        plan.entries.push(plan.entries[0].clone());
+        let store: Arc<dyn MobEventStore> = Arc::new(InMemoryMobEventStore::new());
+        store
+            .append(repaired_placed_spawn_event(&mob_id, &record).expect("spawn projection"))
+            .await
+            .expect("append exact MemberSpawned projection");
+        let mut events = store.replay_all().await.expect("replay");
+        let mut authority = test_authority_for_current_carrier(&record, &single);
+
+        let error = recover_placed_kickoff_outcome_custody(
+            &mut authority,
+            &store,
+            &mob_id,
+            &mut events,
+            &plan,
+        )
+        .await
+        .expect_err("duplicate current carriers fail");
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate current placed kickoff carrier"),
+            "got {error}"
         );
     }
 

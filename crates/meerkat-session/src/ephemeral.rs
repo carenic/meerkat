@@ -5279,7 +5279,7 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
             })?
             .map_err(SessionError::Agent)?;
 
-        let state = lock_deferred_turn_state(&deferred_turn_state).clone();
+        let state = live_deferred_turn_state_for_durable_write(&deferred_turn_state);
         session.set_deferred_turn_state(state).map_err(|err| {
             SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
                 "failed to serialize deferred-turn state: {err}"
@@ -5433,7 +5433,7 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
         if !still_current {
             return Ok(None);
         }
-        let state = lock_deferred_turn_state(&deferred_turn_state).clone();
+        let state = live_deferred_turn_state_for_durable_write(&deferred_turn_state);
         session.set_deferred_turn_state(state).map_err(|error| {
             SessionError::Agent(AgentError::InternalError(format!(
                 "failed to serialize generation-bound deferred-turn state: {error}"
@@ -5682,6 +5682,40 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
                 "Session task dropped the reply channel".to_string(),
             ))
         })
+    }
+
+    /// The visible tool names of the live session `id` at a fork boundary,
+    /// for the child's fork notice ([`meerkat_core::fork_notice`]): the
+    /// tools its session task last published (see
+    /// [`Self::published_live_visible_tool_defs`]). No command is sent, so a
+    /// source in the middle of a turn, such as one forking itself from one
+    /// of its own tool calls, is read as of its last turn boundary instead
+    /// of waiting on that turn.
+    pub async fn fork_source_tools(
+        &self,
+        id: &SessionId,
+    ) -> meerkat_core::fork_notice::ForkSeedSourceTools {
+        use meerkat_core::fork_notice::{ForkSeedSourceTools, ForkToolsNotComparedReason};
+        let published = self
+            .sessions
+            .with_handle(id, |handle| {
+                (!handle.command_tx.is_closed()).then(|| {
+                    handle
+                        .visible_tool_defs_rx
+                        .borrow()
+                        .iter()
+                        .map(|tool| tool.name.clone())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .await
+            .flatten();
+        match published {
+            Some(names) => ForkSeedSourceTools::Read { names },
+            None => ForkSeedSourceTools::NotRead {
+                reason: ForkToolsNotComparedReason::SourceNotLive,
+            },
+        }
     }
 
     /// How a live session's next model request projects its tool catalog:
@@ -8313,9 +8347,8 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
             })?
             .flatten();
         let mut deferred_turn_state = resumed_deferred_turn_state.clone().unwrap_or_default();
-        let resumed_session_is_deferred_template = resumed_session.is_some_and(|session| {
-            session.messages().is_empty() && resumed_deferred_turn_state.is_none()
-        });
+        let resumed_session_is_deferred_template =
+            resumed_session.is_some_and(meerkat_core::Session::is_deferred_template);
         if let Some(blob_store) = req
             .build
             .as_ref()
@@ -9876,6 +9909,18 @@ fn lock_deferred_turn_state(
             poisoned.into_inner()
         }
     }
+}
+
+/// The live deferred-turn state a durable write of the session carries.
+///
+/// The live handle owns the deferred first turn: its phase, staged prompt and
+/// staged tool results. Every durable write of a live session (an export, a
+/// run checkpoint) stamps this value, never a copy the session's agent was
+/// built from, so the store records the first turn's start.
+pub(crate) fn live_deferred_turn_state_for_durable_write(
+    state: &Arc<std::sync::Mutex<SessionDeferredTurnState>>,
+) -> SessionDeferredTurnState {
+    lock_deferred_turn_state(state).clone()
 }
 
 fn lock_active_capacity_lease(

@@ -1928,6 +1928,22 @@ impl MemberObservationHost for HostMemberObservation {
         Ok(self.session_facts(session)?.generation)
     }
 
+    async fn visible_tool_names(
+        &self,
+        session: &SessionId,
+    ) -> Result<Option<Vec<String>>, MemberObservationError> {
+        // Only a resident member's session answers.
+        self.session_facts(session)?;
+        Ok(
+            match self.session_service.fork_source_tools(session).await {
+                meerkat_core::fork_notice::ForkSeedSourceTools::Read { names } => {
+                    Some(names.iter().map(ToString::to_string).collect())
+                }
+                meerkat_core::fork_notice::ForkSeedSourceTools::NotRead { .. } => None,
+            },
+        )
+    }
+
     async fn read_history(
         &self,
         session: &SessionId,

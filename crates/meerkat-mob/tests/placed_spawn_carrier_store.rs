@@ -410,6 +410,7 @@ fn attempt_witnesses(
             member_session_id: member_session_id.clone(),
             member_peer_endpoint,
             ack_engine_version: HOST_ENGINE_VERSION.to_string(),
+            adopted_first_turn_started: false,
         }),
         ..pending.clone()
     };

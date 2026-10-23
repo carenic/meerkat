@@ -59,19 +59,19 @@ use meerkat_comms::{
 // the integration-tests consumer of this file has no meerkat-contracts
 // dependency (A1 lane owns the re-export block additions).
 use self::meerkat_mob::runtime::bridge_protocol::{
-    BridgeAck, BridgeCapabilities, BridgeCommand, BridgeCreateForkedParticipantPayload,
-    BridgeForkedParticipantCreatedResponse, BridgeForkedParticipantOwnerRoute,
-    BridgeForkedParticipantRef, BridgeForkedParticipantRevocationOutcome,
-    BridgeForkedParticipantRevokedResponse, BridgeHostBindResponse, BridgeHostMemberRecord,
-    BridgeHostRevokedResponse, BridgeHostRuntimeIncarnation, BridgeHostStatusResponse,
-    BridgeMaterializePayload, BridgeMaterializedResponse, BridgeMemberIncarnation,
-    BridgeMemberReleasedResponse, BridgePeerTrustPayload, BridgeProtocolVersion,
-    BridgeRejectionCause, BridgeReleasePayload, BridgeReply, BridgeRevokeForkedParticipantPayload,
-    MaterializeLaunchMode, MaterializeLaunchOutcome,
-    MemberSessionDisposal as WireMemberSessionDisposal, PortableDefinitionExtract,
-    PortableMemberSpec, PortableProfile, PortableSpawnOverlay, PortableSystemPrompt,
-    PortableToolConfig, WireHostBindingDescriptor, WireMobRuntimeMode, WireSpawnContinuityIntent,
-    portable_member_spec_digest,
+    BridgeAck, BridgeAdoptedFirstTurn, BridgeCapabilities, BridgeCommand,
+    BridgeCreateForkedParticipantPayload, BridgeForkedParticipantCreatedResponse,
+    BridgeForkedParticipantOwnerRoute, BridgeForkedParticipantRef,
+    BridgeForkedParticipantRevocationOutcome, BridgeForkedParticipantRevokedResponse,
+    BridgeHostBindResponse, BridgeHostMemberRecord, BridgeHostRevokedResponse,
+    BridgeHostRuntimeIncarnation, BridgeHostStatusResponse, BridgeMaterializePayload,
+    BridgeMaterializedResponse, BridgeMemberIncarnation, BridgeMemberReleasedResponse,
+    BridgePeerTrustPayload, BridgeProtocolVersion, BridgeRejectionCause, BridgeReleasePayload,
+    BridgeReply, BridgeRevokeForkedParticipantPayload, MaterializeLaunchMode,
+    MaterializeLaunchOutcome, MemberSessionDisposal as WireMemberSessionDisposal,
+    PortableDefinitionExtract, PortableMemberSpec, PortableProfile, PortableSpawnOverlay,
+    PortableSystemPrompt, PortableToolConfig, WireHostBindingDescriptor, WireMobRuntimeMode,
+    WireSpawnContinuityIntent, portable_member_spec_digest,
 };
 use self::meerkat_mob::runtime::host_actor::{
     HostBindingDeletionAuthority, HostBindingPersistenceAuthority, HostCapabilityFacts,
@@ -407,6 +407,9 @@ pub struct HostFixtureOptions {
     /// Phase 3: wrap the member session service so the FIRST `create_session`
     /// fails typed (H T12 build-failure rollback row).
     pub failing_first_create_session: bool,
+    /// Wrap the member session service so every member create's build
+    /// facts are recorded ([`FailingOnceSessionService::recorded_creates`]).
+    pub record_member_creates: bool,
     /// Fail one selected one-based `create_session` invocation. This extends
     /// the first-call shorthand with a deterministic superseding-build fault.
     pub failing_create_session_call: Option<u64>,
@@ -473,6 +476,7 @@ impl HostFixtureOptions {
             forked_participant_realm: None,
             forked_participant_sweep_interval: None,
             failing_first_create_session: false,
+            record_member_creates: false,
             failing_create_session_call: None,
             corrupt_first_create_session_result_identity: false,
             corrupt_create_session_result_identity_call: None,
@@ -673,6 +677,17 @@ pub struct FailingOnceSessionService {
     archive_failures_fired: AtomicU64,
     fail_projection_drain: bool,
     projection_drain_failed_once: AtomicBool,
+    recorded_creates: std::sync::Mutex<Vec<RecordedMemberCreate>>,
+}
+
+/// The build facts of one member create a fixture host's session service
+/// received.
+#[derive(Debug, Clone)]
+pub struct RecordedMemberCreate {
+    pub mob_member_binding: Option<meerkat_core::MobMemberBinding>,
+    pub prompt_context_fork_source: Option<meerkat_core::PromptContextForkSource>,
+    /// The fork seed the create records on the child's session, as JSON.
+    pub fork_seed: Option<serde_json::Value>,
 }
 
 impl FailingOnceSessionService {
@@ -696,7 +711,34 @@ impl FailingOnceSessionService {
             archive_failures_fired: AtomicU64::new(0),
             fail_projection_drain,
             projection_drain_failed_once: AtomicBool::new(false),
+            recorded_creates: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    /// Every member create received, in order.
+    pub fn recorded_creates(&self) -> Vec<RecordedMemberCreate> {
+        self.recorded_creates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn record_create(&self, req: &meerkat_core::service::CreateSessionRequest) {
+        let build = req.build.as_ref();
+        self.recorded_creates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(RecordedMemberCreate {
+                mob_member_binding: build.and_then(|build| build.mob_member_binding.clone()),
+                prompt_context_fork_source: build
+                    .and_then(|build| build.prompt_context_fork_source.clone()),
+                fork_seed: build.and_then(|build| {
+                    build
+                        .initial_metadata_entries
+                        .get(meerkat_core::fork_notice::SESSION_FORK_SEED_KEY)
+                        .cloned()
+                }),
+            });
     }
 
     /// True once the injected failure has fired.
@@ -767,6 +809,7 @@ impl meerkat_core::service::SessionService for FailingOnceSessionService {
         &self,
         req: meerkat_core::service::CreateSessionRequest,
     ) -> Result<meerkat_core::RunResult, meerkat_core::service::SessionError> {
+        self.record_create(&req);
         let call = self.begin_create_call()?;
         let result = self.inner.create_session(req).await?;
         Ok(self.finish_create_call(call, result))
@@ -867,6 +910,13 @@ impl meerkat_core::service::SessionServiceHistoryExt for FailingOnceSessionServi
 
 #[async_trait::async_trait]
 impl meerkat_mob::MobSessionService for FailingOnceSessionService {
+    async fn fork_source_tools(
+        &self,
+        session_id: &meerkat_core::SessionId,
+    ) -> meerkat_core::fork_notice::ForkSeedSourceTools {
+        self.inner.fork_source_tools(session_id).await
+    }
+
     async fn predecessor_tool_restrictions(
         &self,
         session_id: &meerkat_core::SessionId,
@@ -990,6 +1040,7 @@ impl meerkat_mob::MobSessionService for FailingOnceSessionService {
         &self,
         req: meerkat_core::service::CreateSessionRequest,
     ) -> Result<meerkat_core::RunResult, meerkat_core::service::SessionError> {
+        self.record_create(&req);
         let call = self.begin_create_call()?;
         let result = self
             .inner
@@ -1004,6 +1055,7 @@ impl meerkat_mob::MobSessionService for FailingOnceSessionService {
         resume_preparation: Option<meerkat_mob::SessionResumePreparationReceipt>,
         actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
     ) -> Result<meerkat_core::RunResult, meerkat_core::service::SessionError> {
+        self.record_create(&req);
         let call = self.begin_create_call()?;
         let result = self
             .inner
@@ -1021,6 +1073,7 @@ impl meerkat_mob::MobSessionService for FailingOnceSessionService {
         req: meerkat_core::service::CreateSessionRequest,
         authorization: meerkat_runtime::ArchivedSessionActorMaterializationAuthorization,
     ) -> Result<meerkat_core::RunResult, meerkat_core::service::SessionError> {
+        self.record_create(&req);
         let call = self.begin_create_call()?;
         let result = self
             .inner
@@ -1034,6 +1087,7 @@ impl meerkat_mob::MobSessionService for FailingOnceSessionService {
         req: meerkat_core::service::CreateSessionRequest,
         authorization: meerkat_runtime::ArchivedSessionActorMaterializationAuthorization,
     ) -> Result<meerkat_core::RunResult, meerkat_core::service::SessionError> {
+        self.record_create(&req);
         let call = self.begin_create_call()?;
         let result = self
             .inner
@@ -1052,6 +1106,7 @@ impl meerkat_mob::MobSessionService for FailingOnceSessionService {
         resume_preparation: meerkat_mob::SessionResumePreparationReceipt,
         actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
     ) -> Result<meerkat_core::RunResult, meerkat_core::service::SessionError> {
+        self.record_create(&req);
         let call = self.begin_create_call()?;
         let result = self
             .inner
@@ -2166,6 +2221,7 @@ pub async fn spawn_host_daemon_fixture(
                 || corrupt_create_result_call.is_some()
                 || opts.failing_archive_with_mob_lifecycle_authority_calls > 0
                 || opts.failing_first_projection_drain
+                || opts.record_member_creates
             {
                 let failing = FailingOnceSessionService::new(
                     mob_service,
@@ -2367,6 +2423,8 @@ pub struct ScriptedHostPeer {
     trust: Arc<std::sync::Mutex<ScriptedPeerTrustState>>,
     /// V6 source-owned forked-participant capability scripting (issue #159).
     forked_participants: Arc<std::sync::Mutex<ScriptedForkedParticipantState>>,
+    /// What this scripted host answers to commands stamped protocol V7.
+    v7: Arc<std::sync::Mutex<ScriptedV7State>>,
     /// Protocol versions this scripted host advertises at bind AND status.
     /// Both replies read the same value so a status refresh can never
     /// contradict the negotiated bind-time capability contract.
@@ -2427,6 +2485,93 @@ pub enum ScriptedForkedParticipantTamper {
     ForeignSourceIdentity,
 }
 
+/// What a scripted host does with a command stamped above protocol V6:
+/// the `HostFeatures` probe and a `MaterializeMember` that carries a
+/// prompt-context fork.
+#[derive(Default)]
+pub struct ScriptedV7State {
+    mode: ScriptedV7Mode,
+    /// Refuse the next V7 `MaterializeMember` with
+    /// `UnsupportedProtocolVersion`: a host downgraded after it answered
+    /// the probe.
+    refuse_next_v7_materialize: bool,
+    /// The `command` name of every request received, in order.
+    command_kinds: Vec<String>,
+}
+
+/// How a scripted host answers commands stamped above protocol V6.
+#[derive(Debug, Clone, Default)]
+pub enum ScriptedV7Mode {
+    /// A 0.9.4 host: such a command is refused with
+    /// `UnsupportedProtocolVersion` before its payload is read.
+    #[default]
+    BeforeV7,
+    /// Answers the `HostFeatures` probe with these features and serves
+    /// the other V7 commands.
+    Features(Vec<String>),
+    /// Never answers the `HostFeatures` probe.
+    HoldFeatures,
+}
+
+/// How the scripted host answers one request stamped above V6.
+enum ScriptedV7Answer {
+    /// It never answers.
+    Hold,
+    /// It answers this reply.
+    Reply(serde_json::Value),
+}
+
+/// The scripted answer to one request (`params`, stamped `stamped`), or
+/// `None` to serve it as usual.
+fn scripted_v7_answer(
+    state: &mut ScriptedV7State,
+    params: &serde_json::Value,
+    stamped: u64,
+    kind: &str,
+) -> Option<ScriptedV7Answer> {
+    if stamped <= 6 {
+        return None;
+    }
+    // A host before V7 is the contracts decoder with a V6 table, answered
+    // the way a host answers a decode failure, so this host cannot drift
+    // from a real one.
+    let refused = || {
+        let error = meerkat_mob::runtime::bridge_protocol::decode_bridge_command_accepting(
+            params.clone(),
+            BridgeProtocolVersion::V6,
+        )
+        .expect_err("a host before V7 refuses a command stamped above V6");
+        let cause = match &error {
+            meerkat_mob::runtime::bridge_protocol::BridgeCommandDecodeError::UnsupportedProtocolVersion(_) => {
+                BridgeRejectionCause::UnsupportedProtocolVersion
+            }
+            meerkat_mob::runtime::bridge_protocol::BridgeCommandDecodeError::Invalid(_) => {
+                BridgeRejectionCause::Unsupported
+            }
+        };
+        serde_json::to_value(BridgeReply::Rejected {
+            cause,
+            reason: format!("invalid bridge command: {error}"),
+        })
+        .expect("scripted version refusal")
+    };
+    match &state.mode {
+        ScriptedV7Mode::BeforeV7 => Some(ScriptedV7Answer::Reply(refused())),
+        ScriptedV7Mode::HoldFeatures if kind == "host_features" => Some(ScriptedV7Answer::Hold),
+        ScriptedV7Mode::Features(features) if kind == "host_features" => {
+            Some(ScriptedV7Answer::Reply(
+                serde_json::json!({ "result": "host_features", "features": features }),
+            ))
+        }
+        _ if kind == "materialize_member"
+            && std::mem::take(&mut state.refuse_next_v7_materialize) =>
+        {
+            Some(ScriptedV7Answer::Reply(refused()))
+        }
+        _ => None,
+    }
+}
+
 /// Scripted materialize-responder state (fault injectors in the
 /// `fail_next_bind` template).
 #[derive(Default)]
@@ -2443,6 +2588,26 @@ pub struct ScriptedMaterializeState {
     /// Scripted per-identity member identity material, so a test-held
     /// endpoint can BE the member (upcall-lane rows).
     member_identities: std::collections::BTreeMap<String, ScriptedMemberIdentity>,
+    /// The first turn the session a `Resume` of an identity adopts, as its
+    /// member host reads it (owed unless scripted).
+    adopted_first_turns: std::collections::BTreeMap<String, BridgeAdoptedFirstTurn>,
+    /// The first turn each recorded `Resume` build read, reported again on a
+    /// replay that asks (the host row's shape).
+    recorded_first_turns: std::collections::BTreeMap<(String, u64, u64), BridgeAdoptedFirstTurn>,
+    /// Replace the adopted first turn of the next ack, whatever its request
+    /// asked: a host that contradicts its request.
+    tamper_next_first_turn: Option<ScriptedFirstTurnReport>,
+    /// Ack the next materialize as a `Fresh` launch, whatever launch it sent.
+    fresh_outcome_next: bool,
+}
+
+/// What a tampered materialize ack says about the adopted first turn.
+#[derive(Debug, Clone, Copy)]
+pub enum ScriptedFirstTurnReport {
+    /// The ack carries no report.
+    Omit,
+    /// The ack carries this report.
+    Report(BridgeAdoptedFirstTurn),
 }
 
 /// Ack identity material for one scripted member.
@@ -2551,8 +2716,55 @@ impl ScriptedHostPeer {
             .count()
     }
 
+    /// The first turn the session a `Resume` of `identity` adopts, as its
+    /// member host reads it (owed unless scripted). An ack reports it only
+    /// when its request asks.
+    pub fn script_adopted_first_turn(&self, identity: &str, first_turn: BridgeAdoptedFirstTurn) {
+        self.materialize_state()
+            .adopted_first_turns
+            .insert(identity.to_string(), first_turn);
+    }
+
+    /// The next materialize ack carries `field` as its adopted first turn,
+    /// whatever its request asked: a host that contradicts its request.
+    pub fn tamper_next_adopted_first_turn(&self, field: Option<BridgeAdoptedFirstTurn>) {
+        self.materialize_state().tamper_next_first_turn = Some(match field {
+            Some(first_turn) => ScriptedFirstTurnReport::Report(first_turn),
+            None => ScriptedFirstTurnReport::Omit,
+        });
+    }
+
+    /// The next materialize ack reports a `Fresh` launch outcome, whatever
+    /// launch its request sent.
+    pub fn ack_next_launch_as_fresh(&self) {
+        self.materialize_state().fresh_outcome_next = true;
+    }
+
     pub fn materialize_count(&self) -> u64 {
         self.materialize_state().count
+    }
+
+    /// How this host answers commands stamped above protocol V6.
+    pub fn serve_v7(&self, mode: ScriptedV7Mode) {
+        self.v7_state().mode = mode;
+    }
+
+    /// Refuse the next V7 `MaterializeMember` with
+    /// `UnsupportedProtocolVersion`, as a host downgraded after it
+    /// answered the `HostFeatures` probe would.
+    pub fn refuse_next_v7_materialize(&self) {
+        self.v7_state().refuse_next_v7_materialize = true;
+    }
+
+    /// The `command` name of every request this host received, in order.
+    pub fn received_command_kinds(&self) -> Vec<String> {
+        self.v7_state().command_kinds.clone()
+    }
+
+    fn v7_state(&self) -> std::sync::MutexGuard<'_, ScriptedV7State> {
+        self.v7
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Every `BridgeMaterializePayload` received, in order — the captured-
@@ -2608,6 +2820,7 @@ impl ScriptedHostPeer {
             engine_version: "scripted-host-test".to_string(),
             launch_outcome: MaterializeLaunchOutcome::Fresh,
             resolved_auth_binding: None,
+            adopted_first_turn: None,
         };
         let replaced = self
             .materialize_state()
@@ -2813,8 +3026,9 @@ fn scripted_materialize_reply(
             engine_version: engine_version_default.to_string(),
             launch_outcome,
             resolved_auth_binding: None,
+            adopted_first_turn: None,
         };
-        state.recorded.insert(tuple, fresh.clone());
+        state.recorded.insert(tuple.clone(), fresh.clone());
         fresh
     };
     if state.wrong_digest_next {
@@ -2823,6 +3037,30 @@ fn scripted_materialize_reply(
     }
     if let Some(version) = state.engine_version_next.take() {
         response.engine_version = version;
+    }
+    // A member host reads the adopted first turn on every Resume build and
+    // reports it only to a request that asks, on a replay too.
+    response.adopted_first_turn = match &payload.launch {
+        MaterializeLaunchMode::Resume { .. } => {
+            let scripted = state
+                .adopted_first_turns
+                .get(agent_identity)
+                .copied()
+                .unwrap_or(BridgeAdoptedFirstTurn::Owed);
+            let read = *state.recorded_first_turns.entry(tuple).or_insert(scripted);
+            payload.report_adopted_first_turn.then_some(read)
+        }
+        MaterializeLaunchMode::Fresh {} => None,
+    };
+    match state.tamper_next_first_turn.take() {
+        Some(ScriptedFirstTurnReport::Omit) => response.adopted_first_turn = None,
+        Some(ScriptedFirstTurnReport::Report(first_turn)) => {
+            response.adopted_first_turn = Some(first_turn);
+        }
+        None => {}
+    }
+    if std::mem::take(&mut state.fresh_outcome_next) {
+        response.launch_outcome = MaterializeLaunchOutcome::Fresh;
     }
     if state.drop_next_reply > 0 {
         state.drop_next_reply -= 1;
@@ -3011,6 +3249,7 @@ pub async fn spawn_scripted_host_peer(name: &str) -> ScriptedHostPeer {
     let protocol_versions = Arc::new(std::sync::Mutex::new(
         BridgeProtocolVersion::supported().to_vec(),
     ));
+    let v7 = Arc::new(std::sync::Mutex::new(ScriptedV7State::default()));
     let member_endpoints = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::<
         String,
         Arc<PeerCommsEndpoint>,
@@ -3028,6 +3267,7 @@ pub async fn spawn_scripted_host_peer(name: &str) -> ScriptedHostPeer {
     let responder_trust = Arc::clone(&trust);
     let responder_forked_participants = Arc::clone(&forked_participants);
     let responder_protocol_versions = Arc::clone(&protocol_versions);
+    let responder_v7 = Arc::clone(&v7);
     let responder_member_endpoints = Arc::clone(&member_endpoints);
     let responder_address = endpoint.runtime.advertised_address();
     let responder_token = token;
@@ -3059,8 +3299,30 @@ pub async fn spawn_scripted_host_peer(name: &str) -> ScriptedHostPeer {
                     .request_received_from_ingress(&candidate)
                     .expect("record inbound peer request before response");
 
+                // A command stamped above V6 gets the scripted V7
+                // answer before its payload is read.
+                let mut v7_answer = {
+                    let stamped = params
+                        .get("protocol_version")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or_default();
+                    let kind = params
+                        .get("command")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let mut v7 = responder_v7
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    v7.command_kinds.push(kind.clone());
+                    scripted_v7_answer(&mut v7, params, stamped, &kind)
+                };
                 let command: Result<BridgeCommand, _> = serde_json::from_value(params.clone());
                 let reply_value: Option<serde_json::Value> = match command {
+                    _ if v7_answer.is_some() => match v7_answer.take() {
+                        Some(ScriptedV7Answer::Reply(reply)) => Some(reply),
+                        Some(ScriptedV7Answer::Hold) | None => None,
+                    },
                     // --- phase-3 scripted V4 serving arms ---
                     Ok(BridgeCommand::MaterializeMember(payload)) => {
                         let supervisor_spec =
@@ -3490,6 +3752,7 @@ pub async fn spawn_scripted_host_peer(name: &str) -> ScriptedHostPeer {
         release,
         trust,
         forked_participants,
+        v7,
         protocol_versions,
         member_endpoints,
         task,
@@ -4616,6 +4879,8 @@ pub fn sample_materialize_payload(
         spec_digest,
         launch,
         forked_participant_attachment: None,
+        prompt_context_fork: None,
+        report_adopted_first_turn: false,
     })
 }
 
@@ -5216,6 +5481,55 @@ impl meerkat_client::LlmClient for ScriptedCompletingClient {
     }
 }
 
+/// A member client whose every turn completes with `text` and records each
+/// request's messages in `requests`, in order.
+pub fn scripted_member_client_completing_recorded(
+    text: &str,
+    requests: Arc<std::sync::Mutex<Vec<Vec<meerkat_core::Message>>>>,
+) -> Arc<dyn meerkat_client::LlmClient> {
+    Arc::new(RecordingCompletingClient {
+        inner: ScriptedCompletingClient {
+            text: text.to_string(),
+            provider: meerkat_core::Provider::Anthropic,
+        },
+        requests,
+    })
+}
+
+struct RecordingCompletingClient {
+    inner: ScriptedCompletingClient,
+    requests: Arc<std::sync::Mutex<Vec<Vec<meerkat_core::Message>>>>,
+}
+
+#[async_trait::async_trait]
+impl meerkat_client::LlmClient for RecordingCompletingClient {
+    fn project_replay_messages(
+        &self,
+        messages: &[meerkat_core::Message],
+    ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+        self.inner.project_replay_messages(messages)
+    }
+
+    fn stream<'a>(
+        &'a self,
+        request: &'a meerkat_client::LlmRequest,
+    ) -> meerkat_client::types::LlmStream<'a> {
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(request.messages.clone());
+        self.inner.stream(request)
+    }
+
+    fn provider(&self) -> meerkat_core::Provider {
+        self.inner.provider()
+    }
+
+    async fn health_check(&self) -> Result<(), meerkat_client::LlmError> {
+        Ok(())
+    }
+}
+
 /// A member client whose every turn completes with `text`.
 pub fn scripted_member_client_completing(text: &str) -> Arc<dyn meerkat_client::LlmClient> {
     scripted_member_client_completing_for_provider(text, meerkat_core::Provider::Anthropic)
@@ -5580,6 +5894,8 @@ struct ScriptedMemberTurnState {
     silence_next_deliveries_before_admission: u32,
     reject_next_deliver_unavailable: u32,
     reject_next_deliver_decode: bool,
+    /// Refuse the next delivery with a typed internal delivery cause.
+    refuse_next_delivery: Option<String>,
     received: Vec<meerkat_mob::runtime::bridge_protocol::BridgeDeliveryPayload>,
     admitted: u64,
     /// Dedup memory keyed on `input_id`: a replayed delivery returns
@@ -5639,6 +5955,12 @@ impl ScriptedMemberTurnResponder {
     /// `deny_unknown_fields` receiver refusing a directive-bearing payload).
     pub fn reject_next_deliver_decode(&self) {
         self.state().reject_next_deliver_decode = true;
+    }
+
+    /// The next delivery is refused with a typed internal delivery cause
+    /// (`BridgeDeliveryOutcome::Rejected`): the member admitted nothing.
+    pub fn refuse_next_delivery(&self, detail: &str) {
+        self.state().refuse_next_delivery = Some(detail.to_string());
     }
 
     /// Every `BridgeDeliveryPayload` received, in order (attempt counting +
@@ -5765,6 +6087,22 @@ pub fn spawn_scripted_member_turn_responder(
                                         .to_string(),
                                 })
                                 .expect("decode rejection"),
+                            )
+                        } else if let Some(detail) = guard.refuse_next_delivery.take() {
+                            Some(
+                                serde_json::to_value(BridgeReply::Delivery(
+                                    BridgeDeliveryResponse {
+                                        input_id: payload.input_id.clone(),
+                                        canonical_input_id: None,
+                                        outcome: BridgeDeliveryOutcome::Rejected {
+                                            cause: meerkat_mob::runtime::bridge_protocol::BridgeDeliveryRejectionCause::Internal {
+                                                detail: detail.clone(),
+                                            },
+                                            reason: detail,
+                                        },
+                                    },
+                                ))
+                                .expect("refused delivery reply"),
                             )
                         } else {
                             guard.admitted += 1;

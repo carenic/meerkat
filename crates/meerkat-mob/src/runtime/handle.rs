@@ -2504,6 +2504,59 @@ pub struct PreviousMemberCleanupReport {
     pub destroy_error: Option<String>,
 }
 
+/// Whether the existing session a plain resume adopted still owes the
+/// member's first turn.
+///
+/// The session service owns the answer: a deferred create that resumes a
+/// session keeps its stored first-turn phase, and marks a deferred template
+/// ([`meerkat_core::Session::is_deferred_template`]) pending. The first turn
+/// is owed exactly when one of those leaves it pending, and the turn that
+/// delivers it moves the phase to consumed, so it is delivered once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdoptedFirstTurn {
+    /// The session's first turn never started.
+    Owed,
+    /// The session's first turn started, or the session was not created
+    /// with a deferred first turn.
+    Started,
+}
+
+impl From<AdoptedFirstTurn> for super::bridge_protocol::BridgeAdoptedFirstTurn {
+    fn from(first_turn: AdoptedFirstTurn) -> Self {
+        match first_turn {
+            AdoptedFirstTurn::Owed => Self::Owed,
+            AdoptedFirstTurn::Started => Self::Started,
+        }
+    }
+}
+
+impl From<super::bridge_protocol::BridgeAdoptedFirstTurn> for AdoptedFirstTurn {
+    fn from(first_turn: super::bridge_protocol::BridgeAdoptedFirstTurn) -> Self {
+        match first_turn {
+            super::bridge_protocol::BridgeAdoptedFirstTurn::Owed => Self::Owed,
+            super::bridge_protocol::BridgeAdoptedFirstTurn::Started => Self::Started,
+        }
+    }
+}
+
+impl AdoptedFirstTurn {
+    /// Read the stored session a resume loaded. A deferred-turn state the
+    /// session service would refuse reads as `Started`: it never
+    /// manufactures a first turn.
+    pub(crate) fn of(session: &meerkat_core::Session) -> Self {
+        let stored_pending = matches!(
+            session.try_deferred_turn_state(),
+            Ok(Some(state))
+                if state.first_turn_phase() == meerkat_core::DeferredFirstTurnPhase::Pending
+        );
+        if stored_pending || session.is_deferred_template() {
+            Self::Owed
+        } else {
+            Self::Started
+        }
+    }
+}
+
 /// Receipt returned by a successful member spawn.
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
@@ -2533,6 +2586,11 @@ pub(crate) struct MemberSpawnReceipt {
     /// deferred placed-spawn reply. Empty for ordinary spawns.
     #[serde(skip)]
     pub(crate) failed_restore_peer_ids: Vec<crate::ids::RespawnTopologyPeerId>,
+    /// For a plain resume ([`SpawnSource::Resume`]), whether the existing
+    /// session it adopted still owes the member's first turn, read from the
+    /// session the resume loaded. `None` for every other spawn.
+    #[serde(skip)]
+    pub(crate) adopted_first_turn: Option<AdoptedFirstTurn>,
 }
 
 /// Public result from a successful member spawn.
@@ -2668,12 +2726,19 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         MobError::MemberProvisionFailed { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
         }
-        // Durable-fork provisioning and refusal and bounded helper projection
-        // are separate composite operations. None can originate from a
+        // Durable-fork provisioning and bounded helper projection are
+        // separate composite operations that cannot originate from a
         // spawn-many row, so exposing a session/transport classification here
         // would invent a modeled spawn cause that MobMachine never observed.
+        // A spawn-many fork row can be refused before anything is spawned by
+        // the host's fork instruction policy or by the fork context budget;
+        // MobMachine models no spawn cause for either, so they stay Internal
+        // here and the row's typed code and structured data name the refusal.
+        // A failed fork-context probe is classified by what failed it.
+        MobError::HostFeaturesProbeFailed { cause, .. } => spawn_many_failure_observation(cause),
         MobError::ForkMemberProvisionFailed { .. }
         | MobError::ForkInstructionRefused { .. }
+        | MobError::ForkContextTooLarge { .. }
         | MobError::InvalidBoundedHelperResult { .. }
         | MobError::ForkJobOwnerNotSource { .. }
         | MobError::BoundedHelperResultUnavailable { .. }
@@ -6610,6 +6675,25 @@ pub struct SpawnMemberSpec {
     /// `role_name` remains a roster/topology label.
     pub role_name: ProfileName,
     pub identity: AgentIdentity,
+    /// The member's first turn.
+    ///
+    /// A fresh `AutonomousHost` member runs exactly one kickoff turn (one
+    /// model request) when it is spawned: on this message, or without one on
+    /// a fallback role prompt (`You have been spawned as '<identity>' (role:
+    /// <role>) in mob '<mob>'.`). A member that must start idle should be
+    /// `TurnDriven`. A fresh `TurnDriven` member runs this message as its
+    /// first turn, and nothing without one.
+    ///
+    /// A resume of an existing session
+    /// ([`crate::launch::MemberLaunchMode::Resume`]) delivers that first
+    /// turn only while the session's first turn has never started, and then
+    /// once. Otherwise the resume runs no kickoff and does not deliver this
+    /// message: the session's transcript already holds the member's start,
+    /// and a first turn that started and was interrupted is not re-run.
+    /// A placed member (`placement` set) follows the same rule: its member
+    /// host reports whether the adopted session's first turn started. A
+    /// member host of 0.9.4 or earlier reports nothing, and a resume there
+    /// still runs the first turn.
     pub initial_message: Option<ContentInput>,
     pub runtime_mode: Option<crate::MobRuntimeMode>,
     pub backend: Option<MobBackendKind>,
@@ -19630,6 +19714,30 @@ impl MemberHandle {
 mod tests {
     use super::*;
     use crate::ids::Generation;
+
+    /// A failed fork-context probe is classified by what failed it: a
+    /// probe whose bridge request timed out is a transport failure, as
+    /// the timeout itself is, and `spawn_many` observes it as one.
+    #[test]
+    fn a_probe_failed_by_a_bridge_timeout_is_a_transport_failure() {
+        let timeout = || MobError::BridgeRequestTimedOut {
+            request_envelope_id: "probe-envelope".to_string(),
+            timeout_ms: 10_000,
+        };
+        let failed = MobError::HostFeaturesProbeFailed {
+            host_id: "host-a".to_string(),
+            cause: Arc::new(timeout()),
+        };
+        assert_eq!(
+            failed.failure_class(),
+            crate::error::MobFailureClass::Transport
+        );
+        assert_eq!(failed.failure_class(), timeout().failure_class());
+        assert_eq!(
+            spawn_many_failure_observation(&failed),
+            mob_dsl::MobSpawnManyFailureObservationKind::CommsError
+        );
+    }
 
     /// A scoped retire's refusal travels as a step outcome, so a joiner keeps
     /// seeing a stale fence or a moved session that the actor answered as a

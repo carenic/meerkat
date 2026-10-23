@@ -1458,6 +1458,12 @@ pub enum SupervisorBridgeCommandKind {
     HostStatus,
     IssueHostBindingDescriptor,
     MemberOperatorRequest,
+    // Protocol V7 (prompt-context fork children): the host-addressed
+    // feature probe is served and admitted by the host daemon; the
+    // member-addressed visible-tools read rides the member drain through the
+    // bound-supervisor ladder, as `ReadMemberHistory` does.
+    HostFeatures,
+    ReadMemberVisibleTools,
 }
 
 impl SupervisorBridgeCommandKind {
@@ -1497,6 +1503,8 @@ impl SupervisorBridgeCommandKind {
         Self::HostStatus,
         Self::IssueHostBindingDescriptor,
         Self::MemberOperatorRequest,
+        Self::HostFeatures,
+        Self::ReadMemberVisibleTools,
     ];
 
     /// Wire enum variant identifier this kind mirrors.
@@ -1538,6 +1546,8 @@ impl SupervisorBridgeCommandKind {
             Self::HostStatus => "HostStatus",
             Self::IssueHostBindingDescriptor => "IssueHostBindingDescriptor",
             Self::MemberOperatorRequest => "MemberOperatorRequest",
+            Self::HostFeatures => "HostFeatures",
+            Self::ReadMemberVisibleTools => "ReadMemberVisibleTools",
         }
     }
 
@@ -1569,7 +1579,8 @@ impl SupervisorBridgeCommandKind {
             | Self::OpenMemberLiveChannel
             | Self::CloseMemberLiveChannel
             | Self::MemberLiveChannelStatus
-            | Self::ControlMemberLiveChannel => {
+            | Self::ControlMemberLiveChannel
+            | Self::ReadMemberVisibleTools => {
                 SupervisorBridgeCommandAdmissionRoute::SupervisorBridgeCommand
             }
             Self::BindHost
@@ -1583,9 +1594,8 @@ impl SupervisorBridgeCommandKind {
             | Self::RemovePeerTrust
             | Self::HostStatus
             | Self::IssueHostBindingDescriptor
-            | Self::MemberOperatorRequest => {
-                SupervisorBridgeCommandAdmissionRoute::NotMemberAddressed
-            }
+            | Self::MemberOperatorRequest
+            | Self::HostFeatures => SupervisorBridgeCommandAdmissionRoute::NotMemberAddressed,
         }
     }
 
@@ -1622,7 +1632,10 @@ impl SupervisorBridgeCommandKind {
             | Self::OpenMemberLiveChannel
             | Self::CloseMemberLiveChannel
             | Self::MemberLiveChannelStatus
-            | Self::ControlMemberLiveChannel => SupervisorBridgeCommandRealization::Realized,
+            | Self::ControlMemberLiveChannel
+            // V7: a prompt-context fork's source tools, read on the member
+            // drain the way `ReadMemberHistory` reads rows.
+            | Self::ReadMemberVisibleTools => SupervisorBridgeCommandRealization::Realized,
             // Host-addressed bind/rebind (phase 2), materialize/release/
             // status (phase 3), and the peer-trust pair (phase 4) are served
             // by the mob host daemon's serving loop, never a member drain
@@ -1639,7 +1652,10 @@ impl SupervisorBridgeCommandKind {
             | Self::InstallPeerTrust
             | Self::RemovePeerTrust
             | Self::HostStatus
-            | Self::IssueHostBindingDescriptor => {
+            | Self::IssueHostBindingDescriptor
+            // V7: the effect-free feature probe, answered by the host
+            // daemon's serving loop like `HostStatus`.
+            | Self::HostFeatures => {
                 SupervisorBridgeCommandRealization::RealizedOffDrain {
                 by: OffDrainResponder::HostDaemon,
                 }

@@ -1680,6 +1680,20 @@ pub trait MobSessionService:
         Ok(None)
     }
 
+    /// The visible tool names of the live session `session_id` at a fork
+    /// boundary, for the fork child's notice, read without waiting on a
+    /// running turn ([`meerkat_core::fork_notice::ForkSeedSourceTools`]). A
+    /// service that cannot report them answers that the source was not live;
+    /// a decorator forwards it to the service it wraps.
+    async fn fork_source_tools(
+        &self,
+        _session_id: &SessionId,
+    ) -> meerkat_core::fork_notice::ForkSeedSourceTools {
+        meerkat_core::fork_notice::ForkSeedSourceTools::NotRead {
+            reason: meerkat_core::fork_notice::ForkToolsNotComparedReason::SourceNotLive,
+        }
+    }
+
     /// How the live session's next model request projects its tool catalog
     /// ([`meerkat_core::ToolCatalogView`]). `None` when this service cannot
     /// report it.
@@ -2821,6 +2835,13 @@ where
         meerkat_session::EphemeralSessionService::<B>::tool_scope_snapshot(self, session_id).await
     }
 
+    async fn fork_source_tools(
+        &self,
+        session_id: &SessionId,
+    ) -> meerkat_core::fork_notice::ForkSeedSourceTools {
+        meerkat_session::EphemeralSessionService::<B>::fork_source_tools(self, session_id).await
+    }
+
     async fn tool_catalog_view(
         &self,
         session_id: &SessionId,
@@ -3923,6 +3944,13 @@ where
         session_id: &SessionId,
     ) -> Result<Option<ToolScopeSnapshot>, SessionError> {
         meerkat_session::PersistentSessionService::<B>::tool_scope_snapshot(self, session_id).await
+    }
+
+    async fn fork_source_tools(
+        &self,
+        session_id: &SessionId,
+    ) -> meerkat_core::fork_notice::ForkSeedSourceTools {
+        meerkat_session::PersistentSessionService::<B>::fork_source_tools(self, session_id).await
     }
 
     async fn tool_catalog_view(

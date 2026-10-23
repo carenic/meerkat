@@ -28,6 +28,10 @@ from .types import (  # noqa: F401
     ContentBlock,
     ContentInput,
     ExternalToolDeltaPhase,
+    ForkNoticeKind,
+    ForkNoticeSystemPrompt,
+    ForkNoticeTools,
+    ForkToolsNotComparedReason,
     InteractionId,
     InterruptedInputKind,
     InterruptedToolRunDisposition,
@@ -1599,6 +1603,63 @@ class RuntimeAppendOrigin(TypedDict, total=False):
     input_id: Required[InputId]
     run_id: Required[RunId]
     session_id: Required[SessionId]
+
+
+class MobMemberBinding(TypedDict, total=False):
+    """Durable, typed identity of a mob member, carried on
+    [`SessionMetadata`](crate::session::SessionMetadata).
+
+    This is the canonical owner of the `(mob_id, role, member)` identity fact
+    that ownership routing (`owns_persisted_bridge_session`) and outbound
+    peer-added payloads previously recovered by splitting the untyped
+    `comms_name` string and re-deriving the realm by format convention.
+
+    `comms_name`/`realm_id`/`peer_meta` remain on the metadata as the transport
+    routing name and discovery metadata — identity and transport are separate
+    facts. Old persisted rows written before this field existed deserialize as
+    `None` (the field is `#[serde(default, skip_serializing_if)]` on the
+    metadata), so back-read is safe.
+    """
+    member: Required[str]
+    mob_id: Required[str]
+    role: Required[str]
+
+
+class ForkNoticeSource(TypedDict, total=False):
+    """The source a fork notice names: the source member when a mob forked one
+    of its members, and the source session when the forking side knows it.
+    """
+    member: NotRequired[Optional[MobMemberBinding]]
+    session_id: NotRequired[Optional[str]]
+
+
+class InstructionKeyRef(TypedDict, total=False):
+    """One instruction key a fork notice names.
+    """
+    key: Required[str]
+    namespace: Required[str]
+
+
+class ForkBoundaryNotice(TypedDict, total=False):
+    """What a fork child was given of its source, by name only: the typed
+    content of a [`SystemNoticeBlock::ForkBoundary`](crate::types::SystemNoticeBlock)
+    notice. `summary` is the notice as the model reads it; a reader that does
+    not know the block type decodes it as an unknown notice with that summary.
+    """
+    child_session_id: Required[str]
+    earlier_rows_omitted: NotRequired[int]
+    fork: Required[ForkNoticeKind]
+    injected_rows_carried: NotRequired[int]
+    injected_rows_removed: NotRequired[int]
+    instructions_added: NotRequired[list[InstructionKeyRef]]
+    instructions_carried: NotRequired[list[InstructionKeyRef]]
+    instructions_removed: NotRequired[list[InstructionKeyRef]]
+    skills_carried: NotRequired[list[SkillKey]]
+    skills_removed: NotRequired[list[SkillKey]]
+    source: Required[ForkNoticeSource]
+    source_system_prompt: Required[ForkNoticeSystemPrompt]
+    summary: Required[str]
+    tools: Required[ForkNoticeTools]
 
 
 class SystemNoticePeer(TypedDict, total=False):

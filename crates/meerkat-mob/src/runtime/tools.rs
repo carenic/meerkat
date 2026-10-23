@@ -1483,7 +1483,7 @@ pub(crate) fn local_operator_tool_defs() -> Vec<Arc<ToolDef>> {
     let mut defs: Vec<Arc<ToolDef>> = Vec::new();
     defs.push(tool_def(
             TOOL_SPAWN_MEMBER,
-            "Spawn a mob member from a profile. Supports fresh, resume, or fork launch modes.",
+            "Spawn a mob member from a profile. Supports fresh, resume, or fork launch modes. A resume runs the member's first turn (its kickoff or initial_message) only if the resumed session's first turn never started; a started or interrupted first turn is not re-run.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1511,7 +1511,7 @@ pub(crate) fn local_operator_tool_defs() -> Vec<Arc<ToolDef>> {
         ));
     defs.push(tool_def(
             TOOL_SPAWN_MANY_MEMBERS,
-            "Spawn multiple mob members in one call. Returns per-item results in input order.",
+            "Spawn multiple mob members in one call. Returns per-item results in input order. A resume runs a member's first turn (its kickoff or initial_message) only if the resumed session's first turn never started.",
             json!({
                 "type": "object",
                 "properties": {

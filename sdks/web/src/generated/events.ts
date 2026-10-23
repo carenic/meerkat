@@ -313,6 +313,44 @@ export type EffortLevel = "none" | "minimal" | "low" | "medium" | "high" | "xhig
 
 export type ExternalToolDeltaPhase = "pending" | "applied" | "draining" | "forced" | "failed";
 
+export interface ForkBoundaryNotice {
+  child_session_id: string;
+  earlier_rows_omitted?: number;
+  fork: ForkNoticeKind;
+  injected_rows_carried?: number;
+  injected_rows_removed?: number;
+  instructions_added?: InstructionKeyRef[];
+  instructions_carried?: InstructionKeyRef[];
+  instructions_removed?: InstructionKeyRef[];
+  skills_carried?: SkillKey[];
+  skills_removed?: SkillKey[];
+  source: ForkNoticeSource;
+  source_system_prompt: ForkNoticeSystemPrompt;
+  summary: string;
+  tools: ForkNoticeTools;
+}
+
+export type ForkNoticeKind = "transcript" | "prompt_context";
+
+export type ForkNoticeSource = {
+  member?: MobMemberBinding | null;
+  session_id?: string | null;
+};
+
+export type ForkNoticeSystemPrompt = "not_carried" | "not_applicable";
+
+export type ForkNoticeTools = {
+  added?: ToolName[];
+  comparison: "compared";
+  omitted?: number;
+  removed?: ToolName[];
+} | {
+  comparison: "not_compared";
+  reason: ForkToolsNotComparedReason;
+};
+
+export type ForkToolsNotComparedReason = "source_not_live" | "placed_source" | "member_host_unsupported";
+
 export type GeminiImageMetadata = {
   continuity_ref?: string | null;
   response_id?: string | null;
@@ -352,6 +390,11 @@ export type HookPoint = "run_started" | "run_completed" | "run_failed" | "pre_ll
 export type HookReasonCode = "policy_violation" | "safety_violation" | "schema_violation" | "timeout" | "runtime_error";
 
 export type InputId = string;
+
+export interface InstructionKeyRef {
+  key: string;
+  namespace: string;
+}
 
 export type InteractionFailureReason = {
   kind: "cancelled";
@@ -441,6 +484,12 @@ export interface LoweredRequestProvenance {
 export type McpAttachmentRestoreWireOutcome = "suppressed" | "retired" | "rebound" | "account_changed" | "denied" | "unavailable" | "not_current" | "review_required" | "mismatch" | "stage_failed" | "renewal_required";
 
 export type MeerkatSchema = unknown;
+
+export interface MobMemberBinding {
+  member: string;
+  mob_id: string;
+  role: string;
+}
 
 export type ModelFallbackSkipReason = "provider_boundary" | "auth_unavailable" | "context_fit" | "context_unknown" | "output_budget" | "tool_parity" | "modality_parity" | "request_unsupported" | "admission_unavailable" | "tool_choice_unsupported";
 
@@ -875,6 +924,22 @@ export type SystemNoticeBlock = {
   spawner: ToolProcessSpawner;
   tool_call_id?: string | null;
   type: "tool_process_interrupted";
+} | {
+  child_session_id: string;
+  earlier_rows_omitted?: number;
+  fork: ForkNoticeKind;
+  injected_rows_carried?: number;
+  injected_rows_removed?: number;
+  instructions_added?: InstructionKeyRef[];
+  instructions_carried?: InstructionKeyRef[];
+  instructions_removed?: InstructionKeyRef[];
+  skills_carried?: SkillKey[];
+  skills_removed?: SkillKey[];
+  source: ForkNoticeSource;
+  source_system_prompt: ForkNoticeSystemPrompt;
+  summary: string;
+  tools: ForkNoticeTools;
+  type: "fork_boundary";
 } | {
   payload?: unknown;
   summary?: string | null;

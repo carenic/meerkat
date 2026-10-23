@@ -431,6 +431,7 @@ mod tests {
                 rollback_authority: None,
                 materialized_ack: None,
                 failed_restore_peer_ids: Vec::new(),
+                adopted_first_turn: None,
             })
         }
 

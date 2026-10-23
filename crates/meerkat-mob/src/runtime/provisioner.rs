@@ -769,6 +769,9 @@ pub(crate) struct MaterializedMemberAck {
     pub(crate) launch_outcome: super::bridge_protocol::MaterializeLaunchOutcome,
     #[allow(dead_code)]
     pub(crate) resolved_auth_binding: Option<meerkat_core::AuthBindingRef>,
+    /// The first turn of the session a plain resume adopted, as its member
+    /// host reported it. Present only when the request asked.
+    pub(crate) adopted_first_turn: Option<super::bridge_protocol::BridgeAdoptedFirstTurn>,
 }
 
 /// Input to [`MobProvisioner::release_host_member`].
@@ -14218,6 +14221,7 @@ impl ProvisionFinish {
             rollback_authority,
             materialized_ack: None,
             failed_restore_peer_ids: Vec::new(),
+            adopted_first_turn: None,
         })
         }
         .await;
@@ -17574,6 +17578,7 @@ impl MultiBackendProvisioner {
             rollback_authority: None,
             materialized_ack: None,
             failed_restore_peer_ids: Vec::new(),
+            adopted_first_turn: None,
         })
     }
 }
@@ -17783,6 +17788,11 @@ impl MobProvisioner for MultiBackendProvisioner {
         }
         let host_peer_id = host_peer.peer_id.to_string();
         let supervisor_peer_id = payload.supervisor.peer_id.clone();
+        let resume_launch = matches!(
+            payload.launch,
+            super::bridge_protocol::MaterializeLaunchMode::Resume { .. }
+        );
+        let report_adopted_first_turn = payload.report_adopted_first_turn;
         let command = super::bridge_protocol::BridgeCommand::MaterializeMember(payload);
         // ADJ-4: exactly ONE resend of the byte-identical command at the
         // same idempotency tuple, only on send-timeout / wire `Unavailable`
@@ -17814,6 +17824,17 @@ impl MobProvisioner for MultiBackendProvisioner {
             &host_peer_id,
             &supervisor_peer_id,
         )?;
+        // A spawn's ack must answer the launch it sent. A revival re-sends a
+        // committed member's tuple as a Resume and takes the recorded ack,
+        // whatever launch built it, so it is not checked here.
+        if matches!(operation_anchor, PlacedProvisionOperationAnchor::NewPending) {
+            validate_materialized_launch_ack(
+                &peer_name,
+                resume_launch,
+                report_adopted_first_turn,
+                &ack,
+            )?;
+        }
         let canonical_address =
             super::bridge_protocol::canonicalize_bridge_address(&ack.advertised_address);
         let member_pubkey = decode_ack_member_pubkey(&ack.member_pubkey)?;
@@ -17903,8 +17924,10 @@ impl MobProvisioner for MultiBackendProvisioner {
                             origin: Default::default(),
                         }
                     }),
+                    adopted_first_turn: ack.adopted_first_turn,
                 })),
                 failed_restore_peer_ids: Vec::new(),
+                adopted_first_turn: None,
             },
         })
     }
@@ -20869,6 +20892,41 @@ fn validate_turn_directive_delivery_response(
         }
     }
     Ok(())
+}
+
+/// A spawn's materialize ack answers the launch it was sent: a `Fresh`
+/// launch acks `Fresh`, a `Resume` launch acks a resumed outcome, and the
+/// adopted first turn is reported exactly when the request asked for it.
+#[cfg(feature = "runtime-adapter")]
+fn validate_materialized_launch_ack(
+    peer_name: &str,
+    resume_launch: bool,
+    report_adopted_first_turn: bool,
+    ack: &super::bridge_protocol::BridgeMaterializedResponse,
+) -> Result<(), MobError> {
+    let resumed = match ack.launch_outcome {
+        super::bridge_protocol::MaterializeLaunchOutcome::Fresh => false,
+        super::bridge_protocol::MaterializeLaunchOutcome::ResumedLive
+        | super::bridge_protocol::MaterializeLaunchOutcome::ResumedFromSnapshot => true,
+    };
+    if resumed != resume_launch {
+        return Err(MobError::WiringError(format!(
+            "materialize ack for '{peer_name}' reports launch outcome {:?} for a {} launch",
+            ack.launch_outcome,
+            if resume_launch { "Resume" } else { "Fresh" }
+        )));
+    }
+    match (report_adopted_first_turn, ack.adopted_first_turn) {
+        (true, None) => Err(MobError::WiringError(format!(
+            "materialize ack for '{peer_name}' omits the adopted first turn its request asked \
+             for"
+        ))),
+        (false, Some(_)) => Err(MobError::WiringError(format!(
+            "materialize ack for '{peer_name}' reports an adopted first turn its request did \
+             not ask for"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(any(feature = "runtime-adapter", test))]
