@@ -381,7 +381,9 @@ rkat session resolve-held-tail <session-uuid> --runtime-store <state_dir>/runtim
 Without `--runtime-store`, the command opens the runtime store of the realm
 it is scoped to (`--state-root`, `--realm`): a `sqlite` realm's
 `sessions.sqlite3` or a `jsonl` realm's `runtime.sqlite3`. It refuses a
-memory realm and a realm kept in a host's own database, and it refuses a
+memory realm, and a realm whose runtime store an external storage provider
+owns: name that runtime database with `--runtime-store`, or, for a realm
+kept in a host's own database, use the library call below. It refuses a
 missing database, or one with another schema version than the `rkat`
 binary's, without creating or migrating anything. `--json` prints the report
 as one JSON object.
