@@ -2677,6 +2677,8 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         }
         // A closed mob refuses the whole batch before any row is provisioned.
         MobError::AdmissionClosed { .. } => mob_dsl::MobSpawnManyFailureObservationKind::Internal,
+        // The close's answer, not the cause's.
+        MobError::DurabilityFailStop { .. } => mob_dsl::MobSpawnManyFailureObservationKind::Internal,
         // So does a shutting-down one.
         MobError::ShutdownInProgress { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
@@ -8497,8 +8499,8 @@ impl MobHandle {
     /// [`MobError::SharedLifecycleFailure`]: for a failed startup recovery of
     /// a member's session, a [`MobError::MemberStartupRecoveryFailed`] naming
     /// the member, its session and the cause; for an uncertain durable
-    /// mutation, [`MobError::AdmissionClosed`] with
-    /// `MobAdmissionCloseReason::DurabilityFailStop`.
+    /// mutation, a [`MobError::DurabilityFailStop`] whose cause is that
+    /// mutation's own error.
     pub async fn status(&self) -> Result<MobState, MobError> {
         match self
             .send_actor_command(|reply_tx| MobCommand::QueryPhase { reply_tx })
@@ -8545,8 +8547,42 @@ impl MobHandle {
     /// Observation-only surfaces use this when they must remain live while the
     /// mob actor is awaiting an in-flight member turn. Control paths that need
     /// the authoritative current phase must keep using [`Self::status`].
+    ///
+    /// This is the phase alone: an actor that has stopped (it fail-stopped,
+    /// or its task ended) keeps its last live phase here. An observation
+    /// surface that reports the mob reads [`Self::lifecycle_observation`],
+    /// which also says whether the actor has stopped, and why.
     pub fn status_observation_snapshot(&self) -> MobState {
         *self.phase_watch_rx.borrow()
+    }
+
+    /// The mob's lifecycle as observed without asking its actor: the last
+    /// phase the actor published and, once the actor has stopped, why. See
+    /// [`MobLifecycleObservation`](super::MobLifecycleObservation).
+    ///
+    /// The failure is the cause the actor recorded when it fail-stopped,
+    /// which [`Self::status`] reports in
+    /// [`MobError::SharedLifecycleFailure`]; or, for an actor task that ended
+    /// while its last phase was live and recorded no cause, the closed-actor
+    /// error `status` reports.
+    pub fn lifecycle_observation(&self) -> super::MobLifecycleObservation {
+        // The task's end is read before the phase: once the task has ended,
+        // the phase it last published is final, so a live phase read after
+        // the end is the stopped actor's, not a stale read of a lifecycle
+        // exit (Shutdown, Complete, Destroy) that published its phase first.
+        let task_ended =
+            self.lifecycle_observations.actor_task_end() != super::ActorTaskEnd::Running;
+        let phase = self.status_observation_snapshot();
+        let failure = match self.lifecycle_observations.fail_stop_cause() {
+            Some(cause) => Some(cause),
+            None if task_ended => {
+                Self::status_from_closed_actor(MobError::ActorCommandChannelClosed, phase)
+                    .err()
+                    .map(Arc::new)
+            }
+            None => None,
+        };
+        super::MobLifecycleObservation::new(phase, failure)
     }
 
     /// Access the mob definition.

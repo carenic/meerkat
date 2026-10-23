@@ -37252,6 +37252,120 @@ async fn terminal_receipt_follows_live_boundary_checkpoint_without_sequence_coll
     );
 }
 
+/// Every receipt a run commits before its terminal boundary carries no
+/// transcript count and no digest: the live-boundary context receipt and the
+/// owner-contribution receipt are receipt-only commits. Only the terminal
+/// receipt counts the transcript. Durable-tail recovery relies on this: its
+/// flat-prefix check of a crashed run's committed receipts is vacuous for
+/// count-0 receipts (`recovery::prepare_receipt_digest_enrichments`,
+/// `recovery::observe_prior_commits`). A writer that mints a counted receipt
+/// before its run's terminal boundary must first move that check to
+/// commit-chain ancestry: an in-run compaction rewrites the prefix it counts.
+#[tokio::test]
+async fn mid_run_receipts_carry_no_transcript_count_or_digest() {
+    let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let store: Arc<dyn RuntimeStore> = inner.clone();
+    let (driver, runtime_id, run_id, input_id) = persistent_staged_run_driver(store).await;
+    let owner_session_id = SessionId::parse(&runtime_id.to_string()).unwrap();
+
+    let live_input = Input::Prompt(crate::input::PromptInput::new(
+        "context admitted at the active boundary",
+        Some(
+            meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
+                handling_mode: Some(meerkat_core::types::HandlingMode::Steer),
+                ..Default::default()
+            },
+        ),
+    ));
+    let live_input_id = live_input.id().clone();
+    {
+        let mut entry = driver.lock().await;
+        let resolved = entry
+            .resolve_admission_with_active_turn_boundary(&live_input, true)
+            .expect("active boundary should authorize the live input");
+        entry
+            .accept_resolved_input(live_input, resolved)
+            .await
+            .expect("live input should be durably accepted");
+        entry
+            .machine_realize_live_boundary_context_injected(
+                &run_id,
+                std::slice::from_ref(&live_input_id),
+                None,
+                &owner_session_id,
+            )
+            .await
+            .expect("live-boundary context receipt should commit");
+        entry
+            .machine_realize_live_boundary_owner_context(
+                &run_id,
+                "owner-delegation-steer",
+                &owner_session_id,
+            )
+            .await
+            .expect("owner-contribution receipt should commit");
+    }
+
+    let mid_run = inner
+        .load_committed_boundary_receipts(&runtime_id, &run_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        mid_run
+            .iter()
+            .map(|receipt| receipt.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2],
+        "both mid-run boundaries commit a receipt: {mid_run:?}"
+    );
+    for receipt in &mid_run {
+        assert_eq!(
+            receipt.boundary,
+            meerkat_core::lifecycle::run_primitive::RunApplyBoundary::RunCheckpoint
+        );
+        assert_eq!(
+            receipt.message_count, 0,
+            "a mid-run receipt counts no transcript rows: {receipt:?}"
+        );
+        assert_eq!(
+            receipt.conversation_digest, None,
+            "a mid-run receipt carries no transcript digest: {receipt:?}"
+        );
+    }
+    assert_eq!(mid_run[0].contributing_input_ids, vec![live_input_id]);
+    assert_eq!(
+        mid_run[1].owner_contributions,
+        vec!["owner-delegation-steer".to_string()]
+    );
+
+    let mut session = meerkat_core::Session::with_id(owner_session_id);
+    session.push(meerkat_core::types::Message::User(
+        meerkat_core::types::UserMessage::text("persistent terminalization"),
+    ));
+    commit_runtime_loop_run(
+        &driver,
+        run_id.clone(),
+        vec![input_id.clone()],
+        machine_terminal_receipt(run_id.clone(), vec![input_id.clone()], &session),
+        Some(BoundSessionCommit::sealed(Arc::new(session.clone())).expect("seal terminal session")),
+        Vec::new(),
+        None,
+    )
+    .await
+    .expect("the terminal receipt follows the mid-run receipts");
+    let terminal = inner
+        .load_boundary_receipt(&runtime_id, &run_id, 3)
+        .await
+        .unwrap()
+        .expect("the terminal receipt takes sequence 3");
+    assert_eq!(
+        terminal.message_count,
+        session.messages().len(),
+        "only the terminal receipt counts the transcript"
+    );
+    assert!(terminal.conversation_digest.is_some());
+}
+
 #[tokio::test]
 async fn persistent_commit_success_uses_one_durable_receipt_terminal_write() {
     let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());

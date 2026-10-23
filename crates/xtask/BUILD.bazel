@@ -586,8 +586,12 @@ rust_test(
     size = "medium",
     data = [
         ":package_runfiles",
+        "//:test_fixtures",
         "//crates/meerkat-core:cargo_manifest",
         "//crates/meerkat-core:package_runfiles",
+        "//tests/fixtures/machine-dsl-tests:package_runfiles",
+        "//tests/fixtures/mcp-test-server:package_runfiles",
+        "//tests/fixtures/surface-build-fixtures:package_runfiles",
         "tests/rustfmt_host.sh",
         "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustfmt_bin",
         "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustc_lib",

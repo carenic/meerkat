@@ -5058,6 +5058,118 @@ END";
         }
     }
 
+    /// A delivery owner's reader of the durable delivery generation on the
+    /// fresh-open read path: every read opens the database, reads and closes
+    /// it, keeping nothing.
+    ///
+    /// A read for a store notification first stats the database and its WAL
+    /// and answers the last read's generation, without opening, when both
+    /// stat as they did before that read began. A read's own open and close
+    /// (the store's first and last connection, which create and remove the
+    /// WAL) leave them so, while a commit appends to the WAL or writes the
+    /// database file. Without this, a platform that reports a read's own
+    /// open or close as a change of the WAL would make every read wake the
+    /// next. A sweep reads
+    /// ([`crate::store::DeliveryGenerationReader::read`]): a change the stat
+    /// cannot see (the WAL rewritten from its start at the same length within
+    /// the file system's time resolution) waits for it.
+    struct FreshDeliveryGenerationReader {
+        path: PathBuf,
+        /// The last successful read's pre-image and generation.
+        last: Option<(StoreFileStamps, u64)>,
+    }
+
+    impl FreshDeliveryGenerationReader {
+        fn new(path: PathBuf) -> Self {
+            Self { path, last: None }
+        }
+
+        fn read_fresh(&mut self) -> Result<u64, RuntimeStoreError> {
+            // The pre-image comes before the open: a commit that lands during
+            // the read or after it changes the files after the pre-image, so
+            // its notification is never answered from this read.
+            let pre_image = StoreFileStamps::of(&self.path);
+            let read = read_delivery_generation_fresh(&self.path);
+            // A failed read, or a stat that failed, leaves no pre-image: the
+            // next notification reads.
+            self.last = match (&read, pre_image) {
+                (Ok(generation), Some(pre_image)) => Some((pre_image, *generation)),
+                _ => None,
+            };
+            read
+        }
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    impl crate::store::DeliveryGenerationReader for FreshDeliveryGenerationReader {
+        async fn read(&mut self) -> Result<u64, RuntimeStoreError> {
+            self.read_fresh()
+        }
+
+        async fn read_on_notification(&mut self) -> Result<u64, RuntimeStoreError> {
+            if let Some((pre_image, generation)) = &self.last
+                && StoreFileStamps::of(&self.path).as_ref() == Some(pre_image)
+            {
+                return Ok(*generation);
+            }
+            self.read_fresh()
+        }
+
+        fn keeps_connection(&self) -> bool {
+            false
+        }
+
+        fn release(&mut self) {}
+    }
+
+    /// The stat of a database file and its WAL: what a commit changes (it
+    /// appends to the WAL, or writes the database file) and a connection's
+    /// own open and close do not. The WAL index (`-shm`) is left out: every
+    /// first open writes it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct StoreFileStamps {
+        database: FileStamp,
+        wal: FileStamp,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum FileStamp {
+        Absent,
+        Present { len: u64, modified: SystemTime },
+    }
+
+    impl StoreFileStamps {
+        /// `None` when either stat fails for any reason but a missing file,
+        /// or reports no modification time: a stat error never answers a
+        /// notification from the last read.
+        fn of(path: &Path) -> Option<Self> {
+            #[cfg(any(test, feature = "test-support"))]
+            if delivery_generation_test_hooks::file_stamps_fail(path) {
+                return None;
+            }
+            let mut wal = path.as_os_str().to_owned();
+            wal.push("-wal");
+            Some(Self {
+                database: FileStamp::of(path)?,
+                wal: FileStamp::of(Path::new(&wal))?,
+            })
+        }
+    }
+
+    impl FileStamp {
+        fn of(path: &Path) -> Option<Self> {
+            match std::fs::metadata(path) {
+                Ok(metadata) => Some(Self::Present {
+                    len: metadata.len(),
+                    modified: metadata.modified().ok()?,
+                }),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(Self::Absent),
+                Err(_) => None,
+            }
+        }
+    }
+
     /// Test hooks of the delivery-generation reads, keyed by database
     /// path, so tests on their own databases do not meet.
     #[cfg(any(test, feature = "test-support"))]
@@ -5072,6 +5184,7 @@ END";
         #[derive(Default)]
         struct Hooks {
             fresh: HashSet<PathBuf>,
+            failing_stamps: HashSet<PathBuf>,
             verified_opens: HashMap<PathBuf, u64>,
             before_kept_read: HashMap<PathBuf, Hook>,
         }
@@ -5088,6 +5201,16 @@ END";
         /// fresh-open path (the platform switch, forced in tests).
         pub fn force_fresh_reads(path: &Path) {
             hooks().fresh.insert(path.to_path_buf());
+        }
+
+        /// From now on the fresh-open path's stat of the database at `path`
+        /// and its WAL fails, as it would for a file it may not stat.
+        pub fn fail_file_stamps(path: &Path) {
+            hooks().failing_stamps.insert(path.to_path_buf());
+        }
+
+        pub(super) fn file_stamps_fail(path: &Path) -> bool {
+            hooks().failing_stamps.contains(path)
         }
 
         /// Verified opens of an existing database at `path` by
@@ -10385,6 +10508,7 @@ ORDER BY runtime_id";
         expected: &HeadCanonicalProvisionalTailAuthority,
         receipt: &RunBoundaryReceipt,
         runtime_state: Option<RuntimeState>,
+        deferred_transcript_retirement: Option<u64>,
     ) -> Result<HeadCanonicalStoreAuthority, RuntimeStoreError> {
         let stored = load_head_canonical_provisional_tail(tx, runtime_id)?.ok_or_else(|| {
             session_authority_conflict(
@@ -10483,6 +10607,18 @@ ORDER BY runtime_id";
             runtime_id,
             &RuntimeSessionAuthority::HeadCanonical(committed.clone()),
         )?;
+        // The run's intra-run checkpoints pruned no rewrite rows, so the
+        // previous boundary stayed rebuildable until now. With the new
+        // authority written, apply the run's deferred retention cut to the
+        // promoted head; the store clamps it to that head's anchor floor.
+        if let Some(target) = deferred_transcript_retirement {
+            meerkat_store::sqlite_store::retire_head_canonical_rows_for_runtime_in_txn(
+                tx,
+                committed.boundary_head(),
+                target,
+            )
+            .map_err(|error| map_head_canonical_session_store_error(runtime_id, error))?;
+        }
         insert_compaction_projection_outbox_intents(
             tx,
             runtime_id,
@@ -12911,6 +13047,7 @@ ORDER BY runtime_id";
                 runtime_id,
                 "commit_head_canonical_provisional_promotion",
             )?;
+            let deferred_transcript_retirement = promotion.deferred_transcript_retirement();
             let (checkpoint, authority) = promotion.into_parts();
             if authority.session_id() != &session_store_key {
                 return Err(RuntimeStoreError::SessionKeyMismatch {
@@ -13065,6 +13202,7 @@ ORDER BY runtime_id";
                     &authority,
                     &receipt,
                     runtime_state,
+                    deferred_transcript_retirement,
                 )?;
                 if let Some(snapshot) = lifecycle_snapshot.as_ref() {
                     upsert_machine_lifecycle_snapshot(&tx, &runtime_id, snapshot)?;
@@ -14820,25 +14958,48 @@ ORDER BY runtime_id";
                     })?;
                     return Ok(Some(source));
                 }
-                let physical =
-                    meerkat_store::sqlite_store::verify_physical_head_retains_boundary_prefix_for_runtime_in_txn(
-                        &tx,
-                        boundary_head,
-                        &physical_head,
-                    )
-                    .map_err(|error| {
-                        map_head_canonical_session_store_error(
-                            &runtime_id,
-                            error,
+                // A run that compacted rewrote rows the boundary holds, so
+                // its physical head keeps no boundary row prefix: the store
+                // proves the descent through the rewrite occurrences instead.
+                let source = if physical_head.rewrite_count > boundary_head.rewrite_count {
+                    let descent =
+                        meerkat_store::sqlite_store::verify_physical_head_rewrite_descent_for_runtime_in_txn(
+                            &tx,
+                            boundary_head,
+                            &physical_head,
                         )
-                    })?;
-                let source =
+                        .map_err(|error| {
+                            map_head_canonical_session_store_error(
+                                &runtime_id,
+                                error,
+                            )
+                        })?;
+                    PreparedDurableTailRecoverySource::rewritten(
+                        authority,
+                        provisional,
+                        committed,
+                        descent,
+                    )?
+                } else {
+                    let physical =
+                        meerkat_store::sqlite_store::verify_physical_head_retains_boundary_prefix_for_runtime_in_txn(
+                            &tx,
+                            boundary_head,
+                            &physical_head,
+                        )
+                        .map_err(|error| {
+                            map_head_canonical_session_store_error(
+                                &runtime_id,
+                                error,
+                            )
+                        })?;
                     PreparedDurableTailRecoverySource::new(
                         authority,
                         provisional,
                         committed,
                         physical,
-                    )?;
+                    )?
+                };
                 tx.commit().map_err(|error| {
                     RuntimeStoreError::ReadFailed(error.to_string())
                 })?;
@@ -15905,13 +16066,17 @@ ORDER BY runtime_id";
         ) -> Option<Box<dyn crate::store::DeliveryGenerationReader>> {
             #[cfg(any(test, feature = "test-support"))]
             if delivery_generation_test_hooks::forces_fresh(&self.path) {
-                return None;
+                return Some(Box::new(FreshDeliveryGenerationReader::new(
+                    self.path.clone(),
+                )));
             }
             match delivery_generation_read_path(ReaderPlatform::current()) {
                 DeliveryGenerationReadPath::Kept => Some(Box::new(
                     KeptDeliveryGenerationReader::new(self.path.clone()),
                 )),
-                DeliveryGenerationReadPath::Fresh => None,
+                DeliveryGenerationReadPath::Fresh => Some(Box::new(
+                    FreshDeliveryGenerationReader::new(self.path.clone()),
+                )),
             }
         }
 

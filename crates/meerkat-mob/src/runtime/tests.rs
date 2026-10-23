@@ -23500,11 +23500,15 @@ async fn test_rotate_supervisor_pending_commit_conflict_fails_closed_without_loc
     assert!(
         matches!(
             &error,
-            MobError::Internal(reason)
-                if reason.contains("exact reread found divergent supervisor authority")
-                    && reason.contains("fail-stopping for cold recovery")
+            MobError::SharedLifecycleFailure(cause) if matches!(
+                cause.as_ref(),
+                MobError::Internal(reason)
+                    if reason.contains("exact reread found divergent supervisor authority")
+                        && reason.contains("fail-stopping for cold recovery")
+            )
         ),
-        "operation-anchor CAS divergence must be a durable fail-stop, got: {error:?}",
+        "operation-anchor CAS divergence must be a durable fail-stop, its reply the recorded cause \
+         shared, got: {error:?}",
     );
     let after_conflict = runtime_metadata
         .load_supervisor_authority(&mob_id)
@@ -23578,11 +23582,15 @@ async fn test_rotate_supervisor_receipt_checkpoint_conflict_does_not_reauthorize
     assert!(
         matches!(
             &error,
-            MobError::Internal(reason)
-                if reason.contains("exact reread found divergent supervisor authority")
-                    && reason.contains("fail-stopping for cold recovery")
+            MobError::SharedLifecycleFailure(cause) if matches!(
+                cause.as_ref(),
+                MobError::Internal(reason)
+                    if reason.contains("exact reread found divergent supervisor authority")
+                        && reason.contains("fail-stopping for cold recovery")
+            )
         ),
-        "receipt-checkpoint CAS divergence must be a durable fail-stop, got: {error:?}",
+        "receipt-checkpoint CAS divergence must be a durable fail-stop, its reply the recorded cause \
+         shared, got: {error:?}",
     );
     let attempted_public_peer_id = external
         .authorized_supervisor_peer_id()
@@ -57928,7 +57936,8 @@ async fn test_spawn_rejects_reserved_flow_member_prefix() {
 /// A mob actor that fail-stops on an uncertain durable mutation (here a
 /// failed run's terminal event append) reports why, typed, to a status read
 /// and to an explicit resume, as a startup recovery failure does, instead of
-/// a closed reply channel.
+/// a closed reply channel: the durability fail-stop, with that mutation's
+/// own error as its cause.
 #[tokio::test]
 async fn an_in_loop_durability_fail_stop_reports_why_to_status_and_resume() {
     let events = Arc::new(FaultInjectedMobEventStore::new());
@@ -57962,15 +57971,14 @@ async fn an_in_loop_durability_fail_stop_reports_why_to_status_and_resume() {
         let MobError::SharedLifecycleFailure(failure) = &error else {
             panic!("{call} must report the fail-stop, typed: {error:?}");
         };
+        let MobError::DurabilityFailStop { cause, .. } = failure.as_ref() else {
+            panic!("{call} must name the durability fail-stop: {failure:?}");
+        };
+        let rendered = cause.to_string();
         assert!(
-            matches!(
-                failure.as_ref(),
-                MobError::AdmissionClosed {
-                    reason: crate::runtime::MobAdmissionCloseReason::DurabilityFailStop,
-                    ..
-                }
-            ),
-            "{call} must name the durability fail-stop: {failure:?}"
+            rendered.contains("terminal event append failed") && rendered.contains("FlowFailed"),
+            "{call} must name the uncertain mutation, the failed run's terminal event \
+             append: {rendered}"
         );
     }
 }
@@ -84863,6 +84871,7 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         MobError::MemberStartupRecoveryFailed { .. } => {
             "member_startup_recovery_failed".to_string()
         }
+        MobError::DurabilityFailStop { .. } => "durability_fail_stop".to_string(),
         MobError::SpawnMemberAdmissionDenied { .. } => "spawn_member_admission_denied".to_string(),
         MobError::BridgeRequestTimedOut { .. } => "bridge_request_timed_out".to_string(),
         MobError::ForkSourceUnavailable { .. } => "fork_source_unavailable".to_string(),
@@ -92589,6 +92598,9 @@ mod continuation_resolver;
 /// recovery over real persistent stores.
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod delivery_scope_gates;
+/// Each in-loop durability fail-stop records its own cause.
+#[cfg(not(target_arch = "wasm32"))]
+mod fail_stop_cause;
 /// #1497 fork job terminals are committed once and validated on every read.
 mod fork_job_terminal;
 /// Producer bridge Part B: held spawns.
@@ -92600,6 +92612,9 @@ mod host_outage_recovery;
 /// commits hold the mob database's write lock across a slow fsync.
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod identity_fence_contention;
+/// A mob's lifecycle as its handles observe it without asking its actor.
+#[cfg(not(target_arch = "wasm32"))]
+mod lifecycle_observation;
 /// Member binding history reads over real persistent stores, on the running
 /// mob and on its stopped store.
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]

@@ -223,6 +223,11 @@ async fn configured_mcp_target(
     .map_err(host_auth_error_response)
 }
 
+/// The response for a failed credential commit (a profile's secret).
+fn credential_commit_error_response(error: CredentialMutationError) -> axum::response::Response {
+    host_auth_error_response(meerkat::HostAuthError::CredentialMutation(error))
+}
+
 fn host_auth_error_response(error: meerkat::HostAuthError) -> axum::response::Response {
     let status = match &error {
         meerkat::HostAuthError::Target(error) => target_error_status(error),
@@ -1123,11 +1128,7 @@ pub async fn create_auth_profile(
     )
     .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": error.to_string() })),
-        )
-            .into_response();
+        return credential_commit_error_response(error);
     }
     tracing::info!(
         target: "meerkat::auth::audit",
@@ -2127,6 +2128,34 @@ mod tests {
                 assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
                 assert_eq!(body["error"], "auth infrastructure failure");
             }
+        }
+    }
+
+    /// A failed profile-secret commit answers 500 with a typed reason and a
+    /// fixed text, never the store's own text: commit_unsettled when the
+    /// outcome is unknown, infrastructure otherwise.
+    #[tokio::test]
+    async fn credential_commit_errors_carry_a_typed_reason_body() {
+        const DETAIL: &str = "private-store-detail-canary-1045";
+        for (failure, reason) in [
+            (
+                CredentialMutationError::RollbackFailed(DETAIL.into()),
+                "commit_unsettled",
+            ),
+            (CredentialMutationError::Cancelled, "commit_unsettled"),
+            (
+                CredentialMutationError::Operation(DETAIL.into()),
+                "infrastructure",
+            ),
+        ] {
+            let response = credential_commit_error_response(failure);
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["reason"], reason, "{body}");
+            assert!(!body["error"].as_str().unwrap().contains(DETAIL), "{body}");
         }
     }
 

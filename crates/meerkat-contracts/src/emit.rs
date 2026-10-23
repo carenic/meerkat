@@ -180,6 +180,7 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
         "WirePeerConnectivitySnapshot": schema_for!(crate::wire::WirePeerConnectivitySnapshot),
         "WireUnreachablePeer": schema_for!(crate::wire::WireUnreachablePeer),
         "WireMobError": schema_for!(crate::wire::WireMobError),
+        "WireMobLifecycleFailure": schema_for!(crate::wire::WireMobLifecycleFailure),
         "MobFlowCancelResult": schema_for!(crate::wire::MobFlowCancelResult),
         "MobBoundedHelperResult": schema_for!(crate::wire::MobBoundedHelperResult),
         "MobBoundedHelperResultStatus": schema_for!(crate::wire::MobBoundedHelperResultStatus),

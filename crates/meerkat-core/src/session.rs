@@ -6708,6 +6708,59 @@ impl Session {
             Some(usize::try_from(rewrite_count).unwrap_or(usize::MAX));
     }
 
+    /// Whether this session keeps more rewrite bodies than `retention`
+    /// because its durable HeadCanonical head does not cover them yet
+    /// ([`Self::retire_transcript_history`] never retires past that head).
+    /// Only a checkpoint that moves the durable head over them lets
+    /// retirement reach the bound.
+    ///
+    /// It reads only the graph this process already holds validated (one
+    /// installed by a materialization or a compaction): an unchanged graph is
+    /// never parsed or validated again for this check, and a graph that is
+    /// not held answers false.
+    pub(crate) fn durable_head_holds_retirement(
+        &self,
+        retention: TranscriptHistoryRetention,
+    ) -> bool {
+        self.durable_head_held_graph().is_some_and(|history| {
+            history.commit_count() - history.retired_count() > retention.retained_rewrites()
+        })
+    }
+
+    /// The graph this session holds validated in this process, when its
+    /// durable HeadCanonical head bounds retirement; `None` without a durable
+    /// head (a WholeBlob session retires after each compaction instead) or
+    /// when the graph is not held, so nothing parses or validates it here.
+    fn durable_head_held_graph(&self) -> Option<std::sync::Arc<TranscriptHistoryState>> {
+        if self.history_caches.durable_rewrite_count.is_none()
+            || self.transcript_history_metadata_validation
+                != TranscriptHistoryMetadataValidation::Validated
+        {
+            return None;
+        }
+        self.history_caches.shared_state.get()
+    }
+
+    /// Retire the live graph to `retention` after a checkpoint moved this
+    /// session's durable HeadCanonical head over its rewrites, and report the
+    /// graph's retired count for the run's boundary commit to apply to the
+    /// stored rows. Only a session with a durable head whose graph this
+    /// process holds validated does any work: an unchanged graph is never
+    /// parsed or validated again, and a session without a durable head
+    /// answers `None`.
+    pub(crate) fn retire_transcript_history_after_checkpoint(
+        &mut self,
+        retention: TranscriptHistoryRetention,
+    ) -> Result<Option<usize>, TranscriptEditError> {
+        if self.durable_head_held_graph().is_none() {
+            return Ok(None);
+        }
+        self.retire_transcript_history(retention)?;
+        Ok(self
+            .durable_head_held_graph()
+            .map(|history| history.retired_count()))
+    }
+
     #[cfg(test)]
     pub(crate) fn durable_transcript_rewrite_count_for_test(&self) -> Option<usize> {
         self.history_caches.durable_rewrite_count
@@ -16937,6 +16990,7 @@ mod tests {
                 secret_env_names: Vec::new(),
                 withheld: false,
                 binding: None,
+                cwd: None,
             },
             oauth_account: None,
             oauth_account_selection: None,
@@ -17025,6 +17079,7 @@ mod tests {
                         secret_env_names: Vec::new(),
                         withheld: false,
                         binding: None,
+                        cwd: None,
                     },
                     oauth_account: None,
                     oauth_account_selection: None,
@@ -18924,13 +18979,13 @@ mod tests {
         let claim =
             crate::provider_cache_breakpoint_claim(crate::ProviderCacheBreakpointClaimRequest {
                 provider: crate::Provider::Anthropic,
-                model: "claude-opus-5",
+                model: "test-anthropic-model",
                 messages,
                 boundary: crate::CacheBreakpointBoundary::TranscriptAfter { message_count },
                 ttl: crate::ProviderCacheTtl::ProviderDefault,
                 rendered_prefix: br#"{"renderer_mode":"session-test"}"#,
                 lowered_request_encoding: crate::LoweredRequestEncoding::AnthropicMessagesJson,
-                lowered_request_body: br#"{"model":"claude-opus-5"}"#,
+                lowered_request_body: br#"{"model":"test-anthropic-model"}"#,
             })
             .expect("test claim shape");
         crate::AuthoredCacheBreakpoint::from_provider_claim(claim)
@@ -19035,7 +19090,7 @@ mod tests {
             crate::CacheBreakpointDiscardReason::CanonicalPrefixMoved
         ));
         let identity = discard.identity().expect("a decoded proof has an identity");
-        assert_eq!(identity.model, "claude-opus-5");
+        assert_eq!(identity.model, "test-anthropic-model");
         assert_eq!(identity.provider, crate::Provider::Anthropic);
     }
 

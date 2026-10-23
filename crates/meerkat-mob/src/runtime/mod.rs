@@ -230,12 +230,16 @@ mod held_spawn;
 mod identity_local_services;
 #[cfg(any(test, feature = "test-support"))]
 mod identity_recovery_test_support;
+mod lifecycle_observation;
 #[cfg(feature = "openai-live")]
 mod live_bridge_operation;
 mod member_creation;
 #[cfg(any(test, feature = "test-support"))]
 mod member_status_test_support;
 mod read_handle;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use actor::fail_stop_next_actor_start_for_test;
 pub(crate) use handle::MemberTurnLlmIdentityAppliedSender;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
@@ -351,6 +355,7 @@ pub use tools::{AGENT_MOB_TOOL_NAMES, agent_mob_tool_names};
 pub mod topology;
 mod transaction;
 pub mod turn_executor;
+mod uncertain_durability;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 pub(crate) mod upcall_responder;
 
@@ -494,6 +499,7 @@ pub use identity_local_services::{
     IdentityLocalExternalToolsError, IdentityLocalExternalToolsProvider,
     IdentityLocalMaterializationKey,
 };
+pub use lifecycle_observation::MobLifecycleObservation;
 #[cfg(feature = "openai-live")]
 pub use live_bridge_operation::{
     DEFAULT_LIVE_BRIDGE_OUTPUT_BYTES, DurableMemberLiveBridgeOperationExecutor,

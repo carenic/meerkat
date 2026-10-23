@@ -742,3 +742,363 @@ fn team_incarnation() -> meerkat_core::service::MobIncarnationId {
         .parse()
         .expect("canonical mob incarnation id")
 }
+
+/// Two incarnations of the mob `team`: the one a stopped mob ran at, and the
+/// one of a mob the host created again under the id.
+fn earlier_incarnation() -> meerkat_core::service::MobIncarnationId {
+    "1f0c6a9e-4b2d-4c3e-8a71-5d9b2e4f6a10"
+        .parse()
+        .expect("canonical mob incarnation id")
+}
+
+fn current_incarnation() -> meerkat_core::service::MobIncarnationId {
+    "8c2e4a61-7d3f-4e59-b1a2-6f0d9c3b5e27"
+        .parse()
+        .expect("canonical mob incarnation id")
+}
+
+fn later_incarnation() -> meerkat_core::service::MobIncarnationId {
+    "3d7b9f15-2a6c-4f80-9e14-c5a8b0d2e963"
+        .parse()
+        .expect("canonical mob incarnation id")
+}
+
+fn incarnation_of(address: &str) -> Option<meerkat_core::service::MobIncarnationId> {
+    LogicalRuntimeId::new(address.to_string())
+        .member_address()
+        .expect("member address")
+        .expect("a member address")
+        .incarnation
+}
+
+/// A concurrent submit through a second service, run just before the
+/// resolver answers: it binds the key between the commit's ledger read and
+/// its claim. `then` is what the resolver answers afterwards.
+struct RacingSubmit {
+    racer: ContinuationOwnerService,
+    delivery: ContinuationDelivery,
+    then: Option<meerkat_core::service::MobIncarnationId>,
+}
+
+/// A mob resolver test double for incarnations: the member's current address
+/// names the incarnation of the mob the host holds under the id, which the
+/// test moves as a host does when it holds a mob created again. Armed with a
+/// [`RacingSubmit`], its next answer first lets the racer bind the key.
+struct IncarnationResolver {
+    current: Mutex<Option<meerkat_core::service::MobIncarnationId>>,
+    race: tokio::sync::Mutex<Option<RacingSubmit>>,
+}
+
+impl IncarnationResolver {
+    fn at(incarnation: meerkat_core::service::MobIncarnationId) -> Arc<Self> {
+        Arc::new(Self {
+            current: Mutex::new(Some(incarnation)),
+            race: tokio::sync::Mutex::new(None),
+        })
+    }
+
+    fn hold(&self, incarnation: meerkat_core::service::MobIncarnationId) {
+        *self.current.lock().expect("lock") = Some(incarnation);
+    }
+}
+
+#[async_trait::async_trait]
+impl ContinuationAddressResolver for IncarnationResolver {
+    async fn current_address(
+        &self,
+        owner: &ContinuationOwner,
+    ) -> Result<Option<LogicalRuntimeId>, String> {
+        let ContinuationOwner::Member { mob_id, identity } = owner else {
+            return Err("member resolver".into());
+        };
+        let answer = *self.current.lock().expect("lock");
+        let race = self.race.lock().await.take();
+        if let Some(race) = race {
+            race.racer
+                .submit(owner, race.delivery, 1)
+                .await
+                .expect("the racer binds the key");
+            *self.current.lock().expect("lock") = race.then;
+        }
+        let Some(incarnation) = answer else {
+            return Ok(None);
+        };
+        member_delivery_address(mob_id, incarnation, identity, 1)
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
+    async fn resolve_address(
+        &self,
+        _address: &LogicalRuntimeId,
+    ) -> Result<AddressResolution, String> {
+        Ok(AddressResolution::NotServed)
+    }
+
+    async fn observe_address(
+        &self,
+        _address: &LogicalRuntimeId,
+    ) -> Result<AddressObservation, String> {
+        Ok(AddressObservation::MayServe)
+    }
+}
+
+fn team_lead() -> ContinuationOwner {
+    ContinuationOwner::Member {
+        mob_id: "team".into(),
+        identity: "lead".into(),
+    }
+}
+
+/// A member commit bound to a mob incarnation binds a new key only while the
+/// owner's current address names that incarnation: a caller of an earlier
+/// incarnation commits nothing for the mob created again under the id.
+#[tokio::test]
+async fn a_member_commit_binds_a_new_key_only_at_its_own_incarnation() {
+    let store: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());
+    let resolver = IncarnationResolver::at(current_incarnation());
+    let (continuations, _) = service(store, resolver);
+    let owner = team_lead();
+
+    assert_eq!(
+        continuations
+            .submit_for_member_incarnation(
+                &owner,
+                earlier_incarnation(),
+                delivery("task-1", "result"),
+                1,
+            )
+            .await,
+        Err(ContinuationSubmitError::OwnerRetired),
+        "a caller of the earlier incarnation binds nothing"
+    );
+    assert_eq!(
+        continuations
+            .continuation_status(&owner, &ContinuationKey::new("task-1").expect("key"))
+            .await
+            .expect("status"),
+        ContinuationStatus::NotCommitted
+    );
+    let receipt = continuations
+        .submit_for_member_incarnation(
+            &owner,
+            current_incarnation(),
+            delivery("task-1", "result"),
+            2,
+        )
+        .await
+        .expect("the current incarnation binds the key");
+    assert_eq!(
+        incarnation_of(&receipt.address),
+        Some(current_incarnation())
+    );
+}
+
+/// A key already bound, read from the ledger before the owner is resolved:
+/// bound at the caller's incarnation it replays; bound at another one it
+/// replays only for a caller of the current incarnation (a key an earlier
+/// incarnation bound, reused), and is `OwnerRetired` for a stale caller.
+#[tokio::test]
+async fn a_bound_key_replays_for_its_own_or_the_current_incarnation_only() {
+    let store: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());
+    let resolver = IncarnationResolver::at(earlier_incarnation());
+    let (continuations, _) = service(store, resolver.clone());
+    let owner = team_lead();
+    let earlier = continuations
+        .submit_for_member_incarnation(
+            &owner,
+            earlier_incarnation(),
+            delivery("task-1", "result"),
+            1,
+        )
+        .await
+        .expect("bind at the earlier incarnation");
+    resolver.hold(current_incarnation());
+
+    assert_eq!(
+        continuations
+            .submit_for_member_incarnation(
+                &owner,
+                earlier_incarnation(),
+                delivery("task-1", "result"),
+                2,
+            )
+            .await
+            .expect("a key bound at the caller's incarnation replays"),
+        earlier
+    );
+    assert_eq!(
+        continuations
+            .submit_for_member_incarnation(
+                &owner,
+                current_incarnation(),
+                delivery("task-1", "result"),
+                3,
+            )
+            .await
+            .expect("the current incarnation reusing the key replays it, as submit does"),
+        earlier
+    );
+    let current = continuations
+        .submit_for_member_incarnation(
+            &owner,
+            current_incarnation(),
+            delivery("task-2", "result"),
+            4,
+        )
+        .await
+        .expect("bind at the current incarnation");
+    assert_eq!(
+        continuations
+            .submit_for_member_incarnation(
+                &owner,
+                earlier_incarnation(),
+                delivery("task-2", "result"),
+                5,
+            )
+            .await,
+        Err(ContinuationSubmitError::OwnerRetired),
+        "a stale caller does not replay the current incarnation's receipt"
+    );
+    assert_eq!(
+        incarnation_of(&current.address),
+        Some(current_incarnation())
+    );
+}
+
+/// A key a concurrent submit binds between the commit's ledger read and its
+/// claim follows the same rule: replayed while the owner's current address
+/// names the caller's incarnation, `OwnerRetired` once it names another.
+#[tokio::test]
+async fn a_key_bound_by_a_racing_submit_follows_the_same_rule() {
+    let store: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());
+    let (racer, _) = service(
+        store.clone(),
+        IncarnationResolver::at(earlier_incarnation()),
+    );
+    let resolver = IncarnationResolver::at(current_incarnation());
+    let (continuations, _) = service(store.clone(), resolver.clone());
+    let owner = team_lead();
+
+    *resolver.race.lock().await = Some(RacingSubmit {
+        racer,
+        delivery: delivery("task-1", "result"),
+        then: Some(current_incarnation()),
+    });
+    let replayed = continuations
+        .submit_for_member_incarnation(
+            &owner,
+            current_incarnation(),
+            delivery("task-1", "result"),
+            2,
+        )
+        .await
+        .expect("the current incarnation replays the racer's binding");
+    assert_eq!(
+        incarnation_of(&replayed.address),
+        Some(earlier_incarnation()),
+        "the replay is the racer's first receipt"
+    );
+
+    let (racer, _) = service(store, IncarnationResolver::at(earlier_incarnation()));
+    *resolver.race.lock().await = Some(RacingSubmit {
+        racer,
+        delivery: delivery("task-2", "result"),
+        then: Some(later_incarnation()),
+    });
+    assert_eq!(
+        continuations
+            .submit_for_member_incarnation(
+                &owner,
+                current_incarnation(),
+                delivery("task-2", "result"),
+                3,
+            )
+            .await,
+        Err(ContinuationSubmitError::OwnerRetired),
+        "once the host holds yet another incarnation, the caller is stale"
+    );
+}
+
+/// A session owner has no mob incarnation: binding a commit to one leaves it
+/// unchanged, exactly a plain submit.
+#[tokio::test]
+async fn a_session_owner_is_unchanged_by_a_member_incarnation() {
+    let store: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());
+    let (continuations, _) = service(store, Arc::new(SessionAddressResolver));
+    let owner = ContinuationOwner::Session {
+        session_id: SessionId::new(),
+    };
+    let receipt = continuations
+        .submit_for_member_incarnation(
+            &owner,
+            earlier_incarnation(),
+            delivery("task-1", "result"),
+            1,
+        )
+        .await
+        .expect("a session owner commits");
+    assert_eq!(
+        continuations
+            .submit(&owner, delivery("task-1", "result"), 2)
+            .await
+            .expect("replay"),
+        receipt
+    );
+}
+
+/// A retained completion bound to a mob incarnation follows the same rule
+/// as a submission: a caller of an earlier incarnation commits nothing.
+#[tokio::test]
+async fn a_retained_completion_binds_only_at_its_own_incarnation() {
+    let store: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());
+    let (continuations, _) = service(store, IncarnationResolver::at(current_incarnation()));
+    let owner = team_lead();
+    let jobs = OneJob(meerkat::RetainedJobFacts {
+        owner_session_id: SessionId::new(),
+        retained_work: Some(retained_identity()),
+        result_digest: "sha256:result".into(),
+    });
+    let record =
+        meerkat::RetainedJobRecord::from_owner(&jobs, ContinuationProducer::ForkOff, "job-1")
+            .await
+            .expect("read")
+            .expect("committed job");
+
+    assert_eq!(
+        continuations
+            .submit_retained_completion_for_member_incarnation(
+                &owner,
+                earlier_incarnation(),
+                fork_completion("sha256:result"),
+                &record,
+                1,
+            )
+            .await,
+        Err(ContinuationSubmitError::OwnerRetired)
+    );
+    assert_eq!(
+        continuations
+            .continuation_status(
+                &owner,
+                &ContinuationKey::new("fork_off:job-1").expect("key")
+            )
+            .await
+            .expect("status"),
+        ContinuationStatus::NotCommitted
+    );
+    let receipt = continuations
+        .submit_retained_completion_for_member_incarnation(
+            &owner,
+            current_incarnation(),
+            fork_completion("sha256:result"),
+            &record,
+            2,
+        )
+        .await
+        .expect("the current incarnation commits the job's outcome");
+    assert_eq!(
+        incarnation_of(&receipt.address),
+        Some(current_incarnation())
+    );
+}

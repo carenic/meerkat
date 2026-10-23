@@ -86,6 +86,15 @@ fn host_auth_target(
     })
 }
 
+/// The response for a failed credential commit (a profile's secret or a
+/// provisioned key).
+fn credential_commit_error_response(
+    id: Option<RpcId>,
+    error_value: CredentialMutationError,
+) -> RpcResponse {
+    host_auth_error_response(id, meerkat::HostAuthError::CredentialMutation(error_value))
+}
+
 fn host_auth_error_response(id: Option<RpcId>, error_value: meerkat::HostAuthError) -> RpcResponse {
     let code = match &error_value {
         meerkat::HostAuthError::Target(_)
@@ -1480,7 +1489,7 @@ pub async fn handle_auth_profile_create(
     )
     .await
     {
-        return RpcResponse::error(id, error::INTERNAL_ERROR, error_value.to_string());
+        return credential_commit_error_response(id, error_value);
     }
     tracing::info!(
         target: "meerkat::auth::audit",
@@ -1782,7 +1791,18 @@ pub async fn handle_auth_login_complete(
                 Ok(completed) => completed,
                 // A failed completion does not prove the attempt's removal:
                 // it stays recorded for shutdown.
-                Err(error_value) => return host_auth_error_response(id, error_value),
+                Err(error_value) => {
+                    if matches!(
+                        error_value,
+                        meerkat::HostAuthError::McpOAuth(
+                            meerkat::McpOAuthError::CommitUnsettled { .. }
+                        )
+                    ) {
+                        // Its credential commit may still publish.
+                        runtime.note_unsettled_credential_commit();
+                    }
+                    return host_auth_error_response(id, error_value);
+                }
             };
             runtime.forget_mcp_wire_attempt(&state);
             // Wake the exact operation awaiting this target in this runtime's
@@ -2218,7 +2238,7 @@ pub async fn handle_auth_login_provision_api_key(
                 )
                 .await
             {
-                return RpcResponse::error(id, error::INTERNAL_ERROR, error_value.to_string());
+                return credential_commit_error_response(id, error_value);
             }
             RpcResponse::success(
                 id,
@@ -3379,6 +3399,105 @@ mod tests {
 
         fn backend_name(&self) -> &'static str {
             "save_counting"
+        }
+    }
+
+    /// Store whose save and clear both fail: a commit fails to save, and its
+    /// rollback then fails to clear.
+    struct SaveAndRollbackFailingTokenStore;
+
+    #[async_trait::async_trait]
+    impl TokenStore for SaveAndRollbackFailingTokenStore {
+        async fn load(
+            &self,
+            _key: &TokenKey,
+        ) -> Result<Option<PersistedTokens>, meerkat_providers::auth_store::TokenStoreError>
+        {
+            Ok(None)
+        }
+
+        async fn save(
+            &self,
+            _key: &TokenKey,
+            _tokens: &PersistedTokens,
+        ) -> Result<(), meerkat_providers::auth_store::TokenStoreError> {
+            Err(meerkat_providers::auth_store::TokenStoreError::Io(
+                "private-store-detail-canary-1045 save".into(),
+            ))
+        }
+
+        async fn clear(
+            &self,
+            _key: &TokenKey,
+        ) -> Result<(), meerkat_providers::auth_store::TokenStoreError> {
+            Err(meerkat_providers::auth_store::TokenStoreError::Io(
+                "private-store-detail-canary-1045 clear".into(),
+            ))
+        }
+
+        async fn list(
+            &self,
+        ) -> Result<Vec<TokenKey>, meerkat_providers::auth_store::TokenStoreError> {
+            Ok(Vec::new())
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "save_and_rollback_failing"
+        }
+    }
+
+    /// A profile whose secret commit fails and cannot be rolled back answers
+    /// with the typed reason commit_unsettled and the fixed public text,
+    /// never the store's own text.
+    #[tokio::test]
+    async fn rpc_profile_create_commit_failure_carries_a_typed_reason() {
+        let realm = "rpc-profile-create-unsettled";
+        let runtime = test_runtime_with_config_and_token_store(
+            in_own_realm(config_with_openai_managed_store_binding(), realm),
+            Arc::new(SaveAndRollbackFailingTokenStore),
+        );
+        let params = raw_params(serde_json::json!({
+            "realm_id": realm,
+            "binding_id": "default_openai",
+            "auth_method": "api_key",
+            "secret": "sk-test"
+        }));
+        let create =
+            handle_auth_profile_create(Some(RpcId::Num(1)), Some(params.as_ref()), &runtime).await;
+        let error = create
+            .error
+            .as_ref()
+            .expect("a commit whose save and rollback fail is an error");
+        assert_eq!(error.code, crate::error::INTERNAL_ERROR);
+        assert!(
+            !error.message.contains("private-store-detail-canary-1045"),
+            "{}",
+            error.message
+        );
+        assert_eq!(auth_error_data(&create)["reason"], "commit_unsettled");
+    }
+
+    /// Every credential commit failure (a profile's secret, a provisioned
+    /// key) carries a typed reason and withholds its store detail.
+    #[test]
+    fn credential_commit_errors_carry_a_typed_reason_and_withhold_their_detail() {
+        const DETAIL: &str = "private-store-detail-canary-1045";
+        for (failure, reason) in [
+            (
+                CredentialMutationError::RollbackFailed(DETAIL.into()),
+                "commit_unsettled",
+            ),
+            (CredentialMutationError::Cancelled, "commit_unsettled"),
+            (
+                CredentialMutationError::Operation(DETAIL.into()),
+                "infrastructure",
+            ),
+        ] {
+            let response = credential_commit_error_response(Some(RpcId::Num(1)), failure);
+            let error = response.error.as_ref().expect("an error response");
+            assert_eq!(error.code, crate::error::INTERNAL_ERROR);
+            assert!(!error.message.contains(DETAIL), "{}", error.message);
+            assert_eq!(auth_error_data(&response)["reason"], reason);
         }
     }
 
@@ -6570,6 +6689,74 @@ mod tests {
             "oauth_account": SUBJECT,
         });
         (runtime, mcp)
+    }
+
+    /// Over RPC, the token endpoint accepts the exchange and never answers;
+    /// `auth/login/cancel` by the public reference ends the in-flight
+    /// `auth/login/complete` at once (`attempt_missing`), and nothing lands.
+    #[tokio::test]
+    async fn mcp_rpc_cancel_by_reference_ends_an_in_flight_registered_completion() {
+        use meerkat::test_fixtures::mcp_oauth::{CODE_CANARY, McpOAuthFixture};
+
+        let fixture = McpOAuthFixture::spawn().await.unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let (runtime, mcp) = registered_callback_runtime(&fixture, &project, Some(REGISTERED_BASE));
+        let started = rpc_result(
+            handle_auth_login_start(
+                Some(RpcId::Num(1)),
+                Some(
+                    raw_params(serde_json::json!({ "mcp": mcp, "redirect_uri": REGISTERED_BASE }))
+                        .as_ref(),
+                ),
+                &runtime,
+            )
+            .await,
+        );
+        fixture.stall_token_exchange(true);
+        let complete = raw_params(serde_json::json!({
+            "mcp": mcp,
+            "code": CODE_CANARY,
+            "state": started["state"],
+            "redirect_uri": started["redirect_uri"],
+            "host_attempt_handle": started["host_attempt_handle"],
+        }));
+        let cancel = raw_params(serde_json::json!({
+            "mcp": mcp,
+            "attempt_ref": started["attempt_ref"],
+        }));
+        let (completed, cancelled) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(
+                    handle_auth_login_complete(
+                        Some(RpcId::Num(2)),
+                        Some(complete.as_ref()),
+                        &runtime
+                    ),
+                    async {
+                        fixture.token_exchange_stalled().await;
+                        handle_auth_login_cancel(
+                            Some(RpcId::Num(3)),
+                            Some(cancel.as_ref()),
+                            &runtime,
+                        )
+                        .await
+                    }
+                )
+            })
+            .await
+            .expect("the cancelled completion answers at once");
+        assert_eq!(rpc_result(cancelled)["cancelled"], true);
+        assert_eq!(auth_error_data(&completed)["reason"], "attempt_missing");
+        let status = rpc_result(
+            handle_auth_status_get(
+                Some(RpcId::Num(4)),
+                Some(raw_params(serde_json::json!({ "mcp": mcp })).as_ref()),
+                &runtime,
+            )
+            .await,
+        );
+        assert_eq!(status["phase"], "authorization_required", "{status}");
+        assert!(status.get("attempt").is_none(), "{status}");
     }
 
     /// #1808 over RPC: a host serving a registered callback base starts on

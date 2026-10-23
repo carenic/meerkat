@@ -13598,6 +13598,59 @@ mod tests {
         drop(catch_up);
     }
 
+    /// Count every tick of `catch_up`'s watches from now on.
+    fn count_watch_ticks(catch_up: &Arc<SqliteMobEventCatchUp>) -> Arc<AtomicU64> {
+        fn arm(catch_up: &Arc<SqliteMobEventCatchUp>, ticks: &Arc<AtomicU64>) {
+            let again = Arc::downgrade(catch_up);
+            let count = Arc::clone(ticks);
+            lock_unpoisoned(&catch_up.test_hooks).tick = Some(Box::new(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                if let Some(again) = again.upgrade() {
+                    arm(&again, &count);
+                }
+            }));
+        }
+        let ticks = Arc::new(AtomicU64::new(0));
+        arm(catch_up, &ticks);
+        ticks
+    }
+
+    /// A quiet observer's own catch-up wakes nothing. A catch-up opens the
+    /// database read-only; as its first connection it creates the WAL and
+    /// the WAL index and writes the index, and none of that is a change, so
+    /// one catch-up on a quiet store is followed by no tick (the sweep is
+    /// 5 s off). Before, each catch-up's open woke the next.
+    #[test]
+    fn a_quiet_observers_own_catch_up_wakes_nothing() {
+        let (_dir, path) = temp_db_path();
+        // A store that exists before its observer below starts.
+        drop(SqliteMobStores::open(&path).unwrap());
+        let _drained = SqliteMobStores::drain_observers(&path).expect("no owner remains");
+        // Held across the reopen: the reopen is neither the first nor the
+        // last connection, so it creates and removes nothing.
+        let held = open_existing_read_connection(&path).unwrap();
+        let stores = SqliteMobStores::open(&path).unwrap();
+        wait_for_watch_registrations(&path);
+        let wal = path.with_file_name("mob.db-wal");
+        assert_eq!(
+            std::fs::metadata(&wal).map(|wal| wal.len()).unwrap_or(0),
+            0,
+            "the reopen committed nothing"
+        );
+        drop(held);
+        let catch_up = Arc::clone(&stores.event_bus.catch_up);
+        let ticks = count_watch_ticks(&catch_up);
+
+        catch_up.publish_available_from_storage().unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            ticks.load(Ordering::SeqCst),
+            0,
+            "the observer's own catch-up woke its watch"
+        );
+        drop(stores);
+    }
+
     #[test]
     fn observer_drain_on_its_own_watch_worker_stays_unjoined_and_keeps_custody() {
         let (_dir, path) = temp_db_path();

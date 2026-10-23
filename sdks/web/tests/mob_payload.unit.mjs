@@ -789,6 +789,45 @@ test('MeerkatRuntime.listMobs projects only generated mob list status truth', as
   ]);
 });
 
+test("MeerkatRuntime.listMobs keeps a stopped mob's typed failure next to its last phase", async () => {
+  const runtime = await runtimeWithMobList({
+    mobs: [
+      {
+        mob_id: 'mob-web-unit',
+        status: 'Running',
+        failure: {
+          cause: 'internal',
+          message: "the mob's actor stopped",
+          code: 'INTERNAL_ERROR',
+          structured_data: { kind: 'durability_fail_stop' },
+        },
+      },
+    ],
+  });
+
+  const statuses = await runtime.listMobs();
+
+  assert.deepEqual(statuses, [
+    {
+      mob_id: 'mob-web-unit',
+      status: 'Running',
+      failure: {
+        cause: 'internal',
+        message: "the mob's actor stopped",
+        code: 'INTERNAL_ERROR',
+        structured_data: { kind: 'durability_fail_stop' },
+      },
+    },
+  ]);
+});
+
+test('MeerkatRuntime.listMobs rejects a failure without its cause', async () => {
+  const runtime = await runtimeWithMobList({
+    mobs: [{ mob_id: 'mob-web-unit', status: 'Running', failure: { message: 'stopped' } }],
+  });
+  await assert.rejects(() => runtime.listMobs(), /failure missing cause/);
+});
+
 test('MeerkatRuntime.listMobs rejects malformed typed status rows instead of projecting state', async () => {
   const malformedPayloads = [
     [{ mob_id: 'mob-web-unit', state: 'Running' }],

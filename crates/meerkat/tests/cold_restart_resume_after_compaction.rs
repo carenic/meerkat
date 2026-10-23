@@ -2251,6 +2251,22 @@ mod tests {
         Arc<MeerkatMachine>,
         Arc<meerkat::SqliteSessionStore>,
     ) {
+        build_plain_sqlite_service_with(
+            root,
+            Config::default(),
+            Arc::new(HistorySummarizingTestClient),
+        )
+    }
+
+    fn build_plain_sqlite_service_with(
+        root: &std::path::Path,
+        config: Config,
+        client: Arc<dyn LlmClient>,
+    ) -> (
+        Arc<PersistentSessionService<FactoryAgentBuilder>>,
+        Arc<MeerkatMachine>,
+        Arc<meerkat::SqliteSessionStore>,
+    ) {
         let sqlite_path = root.join("sessions.sqlite3");
         let raw_row_store =
             Arc::new(meerkat::SqliteSessionStore::open(sqlite_path.clone()).expect("open sqlite"));
@@ -2265,11 +2281,184 @@ mod tests {
             .expect("construct runtime authority");
 
         let factory = AgentFactory::new(root.join("sessions"));
-        let mut builder = FactoryAgentBuilder::new(factory, Config::default());
-        builder.default_llm_client = Some(Arc::new(HistorySummarizingTestClient));
+        let mut builder = FactoryAgentBuilder::new(factory, config);
+        builder.default_llm_client = Some(client);
         let (service, adapter) = build_runtime_backed_service(builder, 4, bundle)
             .expect("compose the runtime-backed service");
         (Arc::new(service), adapter, raw_row_store)
+    }
+
+    /// Asks for one `retention_probe` call on each of its first `tool_turns`
+    /// ordinary requests, then answers. Every compaction request gets a short
+    /// summary.
+    #[cfg(feature = "session-compaction")]
+    struct ToolLoopTestClient {
+        tool_turns: usize,
+        ordinary_calls: AtomicUsize,
+    }
+
+    #[cfg(feature = "session-compaction")]
+    #[async_trait::async_trait]
+    impl LlmClient for ToolLoopTestClient {
+        fn project_replay_messages(
+            &self,
+            messages: &[meerkat_core::Message],
+        ) -> Result<Vec<meerkat_core::Message>, LlmError> {
+            Ok(messages.to_vec())
+        }
+
+        fn stream<'a>(&'a self, request: &'a LlmRequest) -> LlmStream<'a> {
+            let is_compaction = request
+                .messages
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    meerkat_core::Message::User(user) => Some(user.text_content()),
+                    _ => None,
+                })
+                .is_some_and(|text| text.contains("CONTEXT COMPACTION"));
+            let (first, stop) = if is_compaction {
+                (
+                    LlmEvent::TextDelta {
+                        delta: "summary".to_string(),
+                        meta: None,
+                    },
+                    meerkat_core::StopReason::EndTurn,
+                )
+            } else {
+                let call = self.ordinary_calls.fetch_add(1, Ordering::SeqCst);
+                if call < self.tool_turns {
+                    (
+                        LlmEvent::ToolCallComplete {
+                            id: format!("probe-{call}"),
+                            name: "retention_probe".to_string(),
+                            args: serde_json::json!({}),
+                            meta: None,
+                        },
+                        meerkat_core::StopReason::ToolUse,
+                    )
+                } else {
+                    (
+                        LlmEvent::TextDelta {
+                            delta: "done".to_string(),
+                            meta: None,
+                        },
+                        meerkat_core::StopReason::EndTurn,
+                    )
+                }
+            };
+            Box::pin(futures::stream::iter(
+                [
+                    first,
+                    normalized_openai_usage(request),
+                    LlmEvent::Done {
+                        outcome: LlmDoneOutcome::success(stop),
+                    },
+                ]
+                .into_iter()
+                .map(Ok),
+            ))
+        }
+
+        fn provider(&self) -> meerkat_core::Provider {
+            meerkat_core::Provider::Other
+        }
+
+        async fn health_check(&self) -> Result<(), LlmError> {
+            Ok(())
+        }
+    }
+
+    /// The one tool [`ToolLoopTestClient`] calls.
+    #[cfg(feature = "session-compaction")]
+    struct RetentionProbeTool;
+
+    #[cfg(feature = "session-compaction")]
+    #[async_trait::async_trait]
+    impl meerkat_core::AgentToolDispatcher for RetentionProbeTool {
+        fn tools(&self) -> Arc<[Arc<meerkat_core::ToolDef>]> {
+            Arc::from([Arc::new(meerkat_core::ToolDef::new(
+                "retention_probe",
+                "returns ok",
+                serde_json::json!({ "type": "object" }),
+            ))])
+        }
+
+        async fn dispatch(
+            &self,
+            call: meerkat_core::ToolCallView<'_>,
+        ) -> Result<meerkat_core::ToolDispatchOutcome, meerkat_core::ToolError> {
+            Ok(meerkat_core::ToolResult::new(call.id.to_string(), "ok".to_string(), false).into())
+        }
+    }
+
+    /// One run of `TOOL_TURNS` tool calls compacts before every model call
+    /// after the first, and checkpoints only when it ends. A HeadCanonical
+    /// session keeps the rewrite bodies its durable head does not cover yet;
+    /// the run must still keep, and commit, no more than the retention.
+    #[cfg(feature = "session-compaction")]
+    #[tokio::test]
+    async fn a_long_run_commits_its_history_within_the_retention() {
+        const TOOL_TURNS: usize = 6;
+        const RETAINED: usize = 2;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = Config::default();
+        config.compaction.min_turns_between_compactions = 1;
+        config.compaction.history_retained_rewrites = RETAINED;
+        let (service, adapter, _raw_store) = build_plain_sqlite_service_with(
+            temp.path(),
+            config,
+            Arc::new(ToolLoopTestClient {
+                tool_turns: TOOL_TURNS,
+                ordinary_calls: AtomicUsize::new(0),
+            }),
+        );
+        let session = Session::new();
+        let session_id = session.id().clone();
+        let mut request = create_request();
+        let build = request
+            .build
+            .as_mut()
+            .expect("compaction request must carry build options");
+        build.external_tools = Some(Arc::new(RetentionProbeTool));
+        build.override_builtins = meerkat_core::ToolCategoryOverride::Disable;
+        let service_for_executor = Arc::clone(&service);
+        let adapter_for_executor = Arc::clone(&adapter);
+        Box::pin(materialize_session(
+            &service,
+            &adapter,
+            session,
+            request,
+            move |session_id| {
+                default_persistent_executor(service_for_executor, adapter_for_executor, session_id)
+            },
+        ))
+        .await
+        .expect("materialize session");
+
+        run_prompt(&adapter, &session_id, "start the tool loop").await;
+
+        let committed = service
+            .load_authoritative_session(&session_id)
+            .await
+            .expect("authoritative load after the run")
+            .expect("session should exist");
+        let graph = committed
+            .transcript_history_state()
+            .expect("graph decodes")
+            .expect("the run compacted");
+        assert_eq!(
+            graph.commit_count(),
+            TOOL_TURNS,
+            "one compaction rewrite before each model call after the first"
+        );
+        let retained = graph.commit_count() - graph.retired_count();
+        assert!(
+            retained <= RETAINED,
+            "after {} compactions in one run the committed session keeps {retained} rewrite \
+             bodies; the retention is {RETAINED}",
+            graph.commit_count()
+        );
     }
 
     /// Incremental-store cold-resume equality through the real sqlite store:

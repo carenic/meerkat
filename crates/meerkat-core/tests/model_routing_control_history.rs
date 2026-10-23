@@ -79,23 +79,23 @@ fn every_record_variant_round_trips_through_json() {
     let request_id = new_request_id();
     let run = RunId::new();
     let variants = vec![
-        requested(&request_id, &run, "claude-opus-5"),
+        requested(&request_id, &run, "test-anthropic-model"),
         SessionModelRoutingControlRecord::ModelRoutingIntentRealized {
             request_id,
             originating_run_id: run.clone(),
-            intent: intent("claude-opus-5"),
-            applied_identity: identity("claude-opus-5"),
+            intent: intent("test-anthropic-model"),
+            applied_identity: identity("test-anthropic-model"),
         },
         SessionModelRoutingControlRecord::ModelRoutingIntentDenied {
             request_id,
             originating_run_id: run.clone(),
-            intent: intent("claude-opus-5"),
+            intent: intent("test-anthropic-model"),
             reason: SwitchTurnDenialReason::UnsupportedModel,
         },
         SessionModelRoutingControlRecord::ModelRoutingIntentAbandoned {
             request_id,
             originating_run_id: run.clone(),
-            intent: intent("claude-opus-5"),
+            intent: intent("test-anthropic-model"),
         },
     ];
 
@@ -223,18 +223,18 @@ fn record_tag_names_the_model_routing_domain() {
     let run = RunId::new();
     let records = [
         (
-            requested(&request_id, &run, "gpt-5.5"),
+            requested(&request_id, &run, "test-openai-model"),
             "model_routing_intent_requested",
         ),
         (
-            realized(&request_id, &run, "gpt-5.5"),
+            realized(&request_id, &run, "test-openai-model"),
             "model_routing_intent_realized",
         ),
         (
             SessionModelRoutingControlRecord::ModelRoutingIntentDenied {
                 request_id,
                 originating_run_id: run.clone(),
-                intent: intent("gpt-5.5"),
+                intent: intent("test-openai-model"),
                 reason: SwitchTurnDenialReason::UnsupportedModel,
             },
             "model_routing_intent_denied",
@@ -243,7 +243,7 @@ fn record_tag_names_the_model_routing_domain() {
             SessionModelRoutingControlRecord::ModelRoutingIntentAbandoned {
                 request_id,
                 originating_run_id: run,
-                intent: intent("gpt-5.5"),
+                intent: intent("test-openai-model"),
             },
             "model_routing_intent_abandoned",
         ),
@@ -287,13 +287,13 @@ fn exact_duplicate_request_is_idempotent() {
 
     assert_eq!(
         history
-            .append(requested(&request_id, &run, "claude-opus-5"))
+            .append(requested(&request_id, &run, "test-anthropic-model"))
             .expect("first request appends"),
         ModelRoutingControlAppendOutcome::Appended
     );
     assert_eq!(
         history
-            .append(requested(&request_id, &run, "claude-opus-5"))
+            .append(requested(&request_id, &run, "test-anthropic-model"))
             .expect("identical request is idempotent"),
         ModelRoutingControlAppendOutcome::AlreadyRecorded
     );
@@ -310,11 +310,11 @@ fn same_request_id_different_target_is_typed_conflict() {
     let run = RunId::new();
     let mut history = SessionModelRoutingControlHistory::new();
     history
-        .append(requested(&request_id, &run, "claude-opus-5"))
+        .append(requested(&request_id, &run, "test-anthropic-model"))
         .expect("first request appends");
 
     let error = history
-        .append(requested(&request_id, &run, "gpt-5.5"))
+        .append(requested(&request_id, &run, "test-openai-model"))
         .expect_err("a conflicting target must be refused");
     assert!(
         matches!(
@@ -331,11 +331,19 @@ fn same_request_id_different_originating_run_is_typed_conflict() {
     let request_id = new_request_id();
     let mut history = SessionModelRoutingControlHistory::new();
     history
-        .append(requested(&request_id, &RunId::new(), "claude-opus-5"))
+        .append(requested(
+            &request_id,
+            &RunId::new(),
+            "test-anthropic-model",
+        ))
         .expect("first request appends");
 
     let error = history
-        .append(requested(&request_id, &RunId::new(), "claude-opus-5"))
+        .append(requested(
+            &request_id,
+            &RunId::new(),
+            "test-anthropic-model",
+        ))
         .expect_err("a different originating run must be refused");
     assert!(
         matches!(
@@ -355,8 +363,8 @@ fn terminal_record_requires_a_committed_request() {
             SessionModelRoutingControlRecord::ModelRoutingIntentRealized {
                 request_id,
                 originating_run_id: RunId::new(),
-                intent: intent("claude-opus-5"),
-                applied_identity: identity("claude-opus-5"),
+                intent: intent("test-anthropic-model"),
+                applied_identity: identity("test-anthropic-model"),
             },
         )
         .expect_err("a terminal for an unknown request must be refused");
@@ -372,14 +380,14 @@ fn exact_terminal_replay_is_idempotent_but_a_different_terminal_is_refused() {
     let run = RunId::new();
     let mut history = SessionModelRoutingControlHistory::new();
     history
-        .append(requested(&request_id, &run, "claude-opus-5"))
+        .append(requested(&request_id, &run, "test-anthropic-model"))
         .expect("request appends");
 
     let realized = SessionModelRoutingControlRecord::ModelRoutingIntentRealized {
         request_id,
         originating_run_id: run.clone(),
-        intent: intent("claude-opus-5"),
-        applied_identity: identity("claude-opus-5"),
+        intent: intent("test-anthropic-model"),
+        applied_identity: identity("test-anthropic-model"),
     };
     assert_eq!(
         history.append(realized.clone()).expect("realized appends"),
@@ -398,7 +406,7 @@ fn exact_terminal_replay_is_idempotent_but_a_different_terminal_is_refused() {
         .append(SessionModelRoutingControlRecord::ModelRoutingIntentDenied {
             request_id,
             originating_run_id: run,
-            intent: intent("claude-opus-5"),
+            intent: intent("test-anthropic-model"),
             reason: SwitchTurnDenialReason::UnsupportedModel,
         })
         .expect_err("a second, different terminal must be refused");
@@ -420,12 +428,12 @@ fn abandoned_is_an_idempotent_terminal_and_cannot_overwrite_a_settled_request() 
     let run = RunId::new();
     let mut history = SessionModelRoutingControlHistory::new();
     history
-        .append(requested(&request_id, &run, "claude-opus-5"))
+        .append(requested(&request_id, &run, "test-anthropic-model"))
         .expect("request appends");
     let abandoned = SessionModelRoutingControlRecord::ModelRoutingIntentAbandoned {
         request_id,
         originating_run_id: run.clone(),
-        intent: intent("claude-opus-5"),
+        intent: intent("test-anthropic-model"),
     };
     assert_eq!(
         history
@@ -443,7 +451,7 @@ fn abandoned_is_an_idempotent_terminal_and_cannot_overwrite_a_settled_request() 
         .append(SessionModelRoutingControlRecord::ModelRoutingIntentDenied {
             request_id,
             originating_run_id: run,
-            intent: intent("claude-opus-5"),
+            intent: intent("test-anthropic-model"),
             reason: SwitchTurnDenialReason::UnsupportedModel,
         })
         .expect_err("a denial cannot overwrite the archive terminal");
@@ -460,7 +468,7 @@ fn abandoned_is_an_idempotent_terminal_and_cannot_overwrite_a_settled_request() 
 fn a_request_that_is_not_an_until_changed_model_switch_is_unrepresentable() {
     let request_id = new_request_id();
     let finite = SwitchTurnIntent {
-        target_model: ModelId::new("claude-opus-5"),
+        target_model: ModelId::new("test-anthropic-model"),
         duration: SwitchTurnDuration::Finite {
             duration: meerkat_core::image_generation::FiniteScopedTurnDuration::OneTurn,
         },
@@ -479,7 +487,7 @@ fn a_request_that_is_not_an_until_changed_model_switch_is_unrepresentable() {
     );
 
     let user_origin = SwitchTurnIntent {
-        target_model: ModelId::new("claude-opus-5"),
+        target_model: ModelId::new("test-anthropic-model"),
         duration: SwitchTurnDuration::UntilChanged,
         origin: SwitchTurnOrigin::User {
             reason: SwitchTurnReasonTextDisposition::NotProvided,
@@ -503,20 +511,20 @@ fn awaiting_decision_reports_only_undecided_requests() {
     let run = RunId::new();
     let mut history = SessionModelRoutingControlHistory::new();
     history
-        .append(requested(&settled, &run, "claude-opus-5"))
+        .append(requested(&settled, &run, "test-anthropic-model"))
         .expect("settled request appends");
     history
         .append(
             SessionModelRoutingControlRecord::ModelRoutingIntentRealized {
                 request_id: settled,
                 originating_run_id: run.clone(),
-                intent: intent("claude-opus-5"),
-                applied_identity: identity("claude-opus-5"),
+                intent: intent("test-anthropic-model"),
+                applied_identity: identity("test-anthropic-model"),
             },
         )
         .expect("settled request terminalizes");
     history
-        .append(requested(&waiting, &run, "gpt-5.5"))
+        .append(requested(&waiting, &run, "test-openai-model"))
         .expect("waiting request appends");
 
     let awaiting: Vec<_> = history
@@ -539,8 +547,8 @@ fn from_records_revalidates_a_persisted_log() {
     let request_id = new_request_id();
     let run = RunId::new();
     let corrupt = vec![
-        requested(&request_id, &run, "claude-opus-5"),
-        requested(&request_id, &run, "gpt-5.5"),
+        requested(&request_id, &run, "test-anthropic-model"),
+        requested(&request_id, &run, "test-openai-model"),
     ];
     let error = SessionModelRoutingControlHistory::from_records(corrupt)
         .expect_err("an incoherent persisted log must not enter memory");
@@ -556,7 +564,7 @@ fn from_records_revalidates_a_persisted_log() {
 fn invalid_persisted_histories() -> Vec<(&'static str, Vec<SessionModelRoutingControlRecord>)> {
     let duplicate_id = new_request_id();
     let duplicate_run = RunId::new();
-    let duplicate = requested(&duplicate_id, &duplicate_run, "claude-opus-5");
+    let duplicate = requested(&duplicate_id, &duplicate_run, "test-anthropic-model");
 
     let orphan_id = new_request_id();
     let orphan_run = RunId::new();
@@ -569,14 +577,14 @@ fn invalid_persisted_histories() -> Vec<(&'static str, Vec<SessionModelRoutingCo
         ("duplicate", vec![duplicate.clone(), duplicate]),
         (
             "orphan terminal",
-            vec![realized(&orphan_id, &orphan_run, "claude-opus-5")],
+            vec![realized(&orphan_id, &orphan_run, "test-anthropic-model")],
         ),
         (
             "settled request resurrection",
             vec![
-                requested(&resurrected_id, &resurrected_run, "claude-opus-5"),
-                realized(&resurrected_id, &resurrected_run, "claude-opus-5"),
-                requested(&resurrected_id, &resurrected_run, "claude-opus-5"),
+                requested(&resurrected_id, &resurrected_run, "test-anthropic-model"),
+                realized(&resurrected_id, &resurrected_run, "test-anthropic-model"),
+                requested(&resurrected_id, &resurrected_run, "test-anthropic-model"),
             ],
         ),
         (
@@ -586,7 +594,7 @@ fn invalid_persisted_histories() -> Vec<(&'static str, Vec<SessionModelRoutingCo
                     request_id: scoped_id,
                     originating_run_id: RunId::new(),
                     intent: SwitchTurnIntent {
-                        target_model: ModelId::new("claude-opus-5"),
+                        target_model: ModelId::new("test-anthropic-model"),
                         duration: SwitchTurnDuration::Finite {
                             duration:
                                 meerkat_core::image_generation::FiniteScopedTurnDuration::OneTurn,
@@ -641,7 +649,11 @@ fn session_with_owed_handoff() -> (Session, SwitchTurnRequestId) {
     session.push(user_message());
     let request_id = new_request_id();
     session
-        .append_model_routing_control_record(requested(&request_id, &RunId::new(), "claude-opus-5"))
+        .append_model_routing_control_record(requested(
+            &request_id,
+            &RunId::new(),
+            "test-anthropic-model",
+        ))
         .expect("request appends to the session");
     (session, request_id)
 }
@@ -804,7 +816,7 @@ fn a_persisted_log_carrying_a_duplicate_record_is_refused() {
     // would make the decoded value disagree with the bytes it came from.
     let request_id = new_request_id();
     let run = RunId::new();
-    let record = requested(&request_id, &run, "claude-opus-5");
+    let record = requested(&request_id, &run, "test-anthropic-model");
     let error =
         SessionModelRoutingControlHistory::from_records(vec![record.clone(), record.clone()])
             .expect_err("a duplicated persisted record must fail closed");
@@ -844,12 +856,12 @@ fn a_committed_log_must_extend_its_predecessor() {
 
     let mut committed = SessionModelRoutingControlHistory::new();
     committed
-        .append(requested(&first, &run, "claude-opus-5"))
+        .append(requested(&first, &run, "test-anthropic-model"))
         .expect("request appends");
 
     let mut extended = committed.clone();
     extended
-        .append(requested(&second, &run, "gpt-5.5"))
+        .append(requested(&second, &run, "test-openai-model"))
         .expect("second request appends");
     assert!(
         extended.extends(&committed),
@@ -868,7 +880,7 @@ fn a_committed_log_must_extend_its_predecessor() {
 
     let mut divergent = SessionModelRoutingControlHistory::new();
     divergent
-        .append(requested(&second, &run, "gpt-5.5"))
+        .append(requested(&second, &run, "test-openai-model"))
         .expect("request appends");
     assert!(
         !divergent.extends(&committed),
@@ -887,7 +899,7 @@ fn recovery_adoption_takes_the_committed_handoff_log_from_the_durable_head() {
 
     let mut head = Session::new();
     head.push(user_message());
-    head.append_model_routing_control_record(requested(&request_id, &run, "claude-opus-5"))
+    head.append_model_routing_control_record(requested(&request_id, &run, "test-anthropic-model"))
         .expect("head owes a handoff");
 
     let mut recovered = Session::new();
@@ -909,7 +921,11 @@ fn recovery_adoption_takes_the_committed_handoff_log_from_the_durable_head() {
     let mut local_tail = Session::new();
     local_tail.push(user_message());
     local_tail
-        .append_model_routing_control_record(requested(&new_request_id(), &RunId::new(), "gpt-5.5"))
+        .append_model_routing_control_record(requested(
+            &new_request_id(),
+            &RunId::new(),
+            "test-openai-model",
+        ))
         .expect("local tail owes a handoff");
 
     let mut bare_head = Session::new();
@@ -963,7 +979,7 @@ fn the_whole_blob_byte_identity_changes_when_a_handoff_is_owed() {
     owed.append_model_routing_control_record(requested(
         &new_request_id(),
         &RunId::new(),
-        "claude-opus-5",
+        "test-anthropic-model",
     ))
     .expect("request appends");
     let owed_bytes = owed

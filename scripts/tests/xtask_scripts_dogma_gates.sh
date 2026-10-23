@@ -352,6 +352,8 @@ trap 'rm -rf "$tlc_env_tmp"' EXIT
 # plain-ordering mutant's evaluation error, its two replay mutants' generated
 # invariants violated, its two RetireAtScope mutants' invariants violated,
 # and its mint mutant's action property violated.
+# durable_tail_classification_audit.sh requires its Ready witness violated,
+# and with --mutants each seeded defect's target invariant violated.
 printf '%s\n' \
   '#!/bin/sh' \
   'printf "%s\n" "$JAVA_TOOL_OPTIONS" > "$TLC_JAVA_OPTIONS_CAPTURE"' \
@@ -447,6 +449,12 @@ printf '%s\n' \
   'echo "Error: Invariant pending_respawn_topology_has_no_current_runtime is violated."' \
   'echo "Error: Action property AuditObservationMonotonic is violated."' \
   'echo "Error: Action property AuditMintClearsExecutionHealth is violated."' \
+  'echo "Error: Invariant NotAuditWitnessReady is violated by the initial state:"' \
+  'echo "Error: Invariant AuditClassificationIsTotalAndDisjoint is violated by the initial state:"' \
+  'echo "Error: Invariant AuditRewriteClassifiesLikeStrict is violated by the initial state:"' \
+  'echo "Error: Invariant AuditRewriteWithoutOneRunIdHolds is violated by the initial state:"' \
+  'echo "Error: Invariant AuditRewriteEndTurnCompletes is violated by the initial state:"' \
+  'echo "Error: Invariant AuditRewriteToolUseRepairs is violated by the initial state:"' \
   'echo "Error: The first argument of <= should be an integer, but instead it is:"' \
   'echo "100000 states generated, 100000 distinct states found, 0 states left on queue."' \
   'echo "The coverage statistics at 2026-01-01 00:00:00"' \

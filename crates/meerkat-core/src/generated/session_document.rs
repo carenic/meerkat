@@ -263,6 +263,7 @@ pub enum DurableHeadRelation {
     VerifiedStrictDescendant,
     Diverged,
     Unverifiable,
+    VerifiedRewriteDescendant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -5330,7 +5331,8 @@ impl SessionDocumentMachineAuthority {
             } => {
                 let mut matches = Vec::new();
                 if (self.state.lifecycle_phase == SessionDocumentPhase::Ready)
-                    && ((relation == DurableHeadRelation::VerifiedStrictDescendant)
+                    && (((relation == DurableHeadRelation::VerifiedStrictDescendant)
+                        || (relation == DurableHeadRelation::VerifiedRewriteDescendant))
                         && (run_id_cardinality == RunIdCardinality::SingleRunId)
                         && (terminal_stop_reason == DurableTailStopReason::EndTurn)
                         && (dangling_tool_use_count == 0)
@@ -5340,7 +5342,8 @@ impl SessionDocumentMachineAuthority {
                     matches.push(SessionDocumentTransition::ClassifyDurableTailCompleted);
                 }
                 if (self.state.lifecycle_phase == SessionDocumentPhase::Ready)
-                    && ((relation == DurableHeadRelation::VerifiedStrictDescendant)
+                    && (((relation == DurableHeadRelation::VerifiedStrictDescendant)
+                        || (relation == DurableHeadRelation::VerifiedRewriteDescendant))
                         && (run_id_cardinality == RunIdCardinality::SingleRunId)
                         && (dangling_tool_use_count == 0)
                         && (orphan_tool_result_count == 0)
@@ -5351,7 +5354,8 @@ impl SessionDocumentMachineAuthority {
                     matches.push(SessionDocumentTransition::ClassifyDurableTailRepairable);
                 }
                 if (self.state.lifecycle_phase == SessionDocumentPhase::Ready)
-                    && ((relation != DurableHeadRelation::VerifiedStrictDescendant)
+                    && (((relation != DurableHeadRelation::VerifiedStrictDescendant)
+                        && (relation != DurableHeadRelation::VerifiedRewriteDescendant))
                         || (run_id_cardinality != RunIdCardinality::SingleRunId)
                         || (orphan_tool_result_count != 0)
                         || (messages_after_terminal == true)

@@ -2982,6 +2982,11 @@ class MeerkatClient:
         return Mob(self, mob_id)
 
     async def list_mobs(self) -> list[dict[str, Any]]:
+        """List the managed mobs, one ``mob/list`` row each.
+
+        A row's ``failure`` present means the mob's actor has stopped;
+        ``status`` is the last machine phase.
+        """
         self.require_capability("mob")
         result = await self._request("mob/list", {})
         mobs = self._require_present_list_field(
