@@ -2516,11 +2516,35 @@ function plan(args) {
     : changed === null
       ? Object.keys(GUARD_LANE_DEFINITIONS)
       : changedGuardDefinitions(args, changedPaths);
-  const guardRuns = (lane) =>
-    !deferToPush || touchesGuardLane(lane, changedPaths) || result.guard_definitions_changed.includes(lane);
+  // Why each exact-profile lane runs, typed: the one predicate that plans
+  // the lane, so a lane runs exactly when it has a reason. The CI gate reads
+  // the reasons for its pull-request budget, which leaves out a lane that
+  // runs only because the change touches its inputs (inputs_changed) or
+  // changes its definition (definition_changed): its own cold build takes
+  // 27-33 minutes (ci.yml's mcp-confinement-positive job), and the gate names
+  // it in a warning instead. Every other reason keeps the lane in the
+  // budget: a plan that runs it on every Rust change (every_rust_change: a
+  // push, a dispatch or a release projection), and a pull request whose diff
+  // is unknown (diff_unknown), where any definition only may have changed;
+  // that plan carries no other reason.
+  const guardReasons = (lane) => {
+    if (!result.rust_changed) return [];
+    if (!deferToPush) return ["every_rust_change"];
+    if (changed === null) return ["diff_unknown"];
+    return [
+      ...(result.guard_definitions_changed.includes(lane) ? ["definition_changed"] : []),
+      ...(touchesGuardLane(lane, changedPaths) ? ["inputs_changed"] : []),
+    ];
+  };
+  result.guard_lane_reasons = Object.fromEntries(
+    Object.keys(GUARD_LANE_DEFINITIONS)
+      .map((lane) => [lane, guardReasons(lane)])
+      .filter(([, reasons]) => reasons.length > 0),
+  );
+  const guardRuns = (lane) => Object.hasOwn(result.guard_lane_reasons, lane);
   result.closure_check = result.rust_changed && !deferToPush;
-  result.governed_jsonl = result.rust_changed && guardRuns("governed_jsonl");
-  result.mcp_confinement_positive = result.rust_changed && guardRuns("mcp_confinement_positive");
+  result.governed_jsonl = guardRuns("governed_jsonl");
+  result.mcp_confinement_positive = guardRuns("mcp_confinement_positive");
   deferred.closure_check = result.rust_changed && deferToPush;
   deferred.governed_jsonl = result.rust_changed && !result.governed_jsonl;
   deferred.mcp_confinement_positive = result.rust_changed && !result.mcp_confinement_positive;
@@ -2820,6 +2844,7 @@ function githubOutput(result) {
   scalar("closure_check", String(result.closure_check));
   scalar("governed_jsonl", String(result.governed_jsonl));
   scalar("mcp_confinement_positive", String(result.mcp_confinement_positive));
+  scalar("guard_lane_reasons", JSON.stringify(result.guard_lane_reasons));
   scalar("deferred_to_push", deferredSummary(result.deferred_to_push));
   // Each two-wave lane's first wave keeps the lane's matrix name; its rest
   // is the _rest matrix of the twin job that waits for the stagger job. The

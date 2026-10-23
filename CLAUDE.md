@@ -602,7 +602,11 @@ and its CI must be green before a release tag (`require_ci_green`):
   runner queue excluded) and a 1200-second
   push-to-terminal runaway ceiling (the owner's cap is 20 minutes from the
   start of the pre-push hook, which takes about a minute) (each lane timed from the start of the
-  run attempt it ran in, runner queue on its path excluded); runner queue
+  run attempt it ran in, runner queue on its path excluded); an
+  exact-profile lane the plan ran only because the change touched its
+  inputs or changed its definition (`guard_lane_reasons`) is outside both
+  budgets, still required, bounded by its own timeout-minutes and named in
+  a `Guard lane outside the budget` warning; runner queue
   wait of 300 s or more on the critical path is a `CI runner queue wait`
   warning with a typed verdict, never a
   failure (the account's 40 concurrent hosted jobs are shared by every PR,
