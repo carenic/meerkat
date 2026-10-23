@@ -137,8 +137,10 @@ skills it loaded with `load_skill` (each named in their place) and
 host-injected context such as memory recall are left out; under `refuse`
 a fork whose context holds an activation or a loaded skill is refused;
 under `reactivate_inherited` they are carried. A peer message in that
-conversation keeps its sender, its text and its sender's taint marker, but
-not the ids or instructions to answer it: the child is not its addressee.
+conversation keeps its sender, its text and its sender's taint marker; a
+peer request or response keeps its sender and a preview of its params or
+result (a response also its status). Neither keeps the ids or instructions
+to answer it: the child is not its addressee.
 The context fits a byte budget, newest rows first, and a fork whose newest
 row alone does not fit is refused with `fork_context_too_large`.
 

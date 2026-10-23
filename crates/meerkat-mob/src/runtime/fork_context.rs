@@ -31,7 +31,9 @@ use meerkat_core::fork_notice::{
     ForkNoticeKind, ForkNoticeSource, ForkSeed, ForkSeedSourceTools, InstructionKeyRef,
 };
 use meerkat_core::skills::{LOAD_SKILL_TOOL_NAME, SkillKey, SkillName, SourceUuid};
-use meerkat_core::types::{SystemNoticeBlock, SystemNoticeDirection, TranscriptUserRole};
+use meerkat_core::types::{
+    CommsNoticeKind, SystemNoticeBlock, SystemNoticeDirection, TranscriptUserRole,
+};
 use meerkat_core::{
     ForkInstructionPolicy, ForkInstructionRefusal, ForkInstructionRefusalCause,
     InstructionContentDigest, InstructionKey, InstructionNamespace,
@@ -598,13 +600,21 @@ fn preview(text: String) -> String {
 }
 
 /// What a copied comms block gives the child: whom the source heard from
-/// (or wrote to) and what was said, a status and a payload preview when the
-/// block has them, and the sender's taint declaration. The child is not the
-/// addressee: the request and delivery ids and the reply instructions the
-/// source's model was given are not carried, so the child has no means to
-/// answer a peer on its source's behalf.
+/// (or wrote to), the text of a peer message, a status and a payload preview
+/// when the block has them, and the sender's taint declaration.
+///
+/// Only a message's content is the sender's own words. The content of a
+/// request, a response or a lifecycle notice is the runtime's rendering of
+/// the notice for the source's model: the request id, a ready
+/// `send_response` call, the uncapped result or a note on whether to answer.
+/// Rows written by earlier releases have the same shape, so that content is
+/// left out here; the title names the intent or kind, and the payload
+/// preview carries the params or the result. The child is not the
+/// addressee: no request or delivery id or reply instruction reaches it, so
+/// it has no means to answer a peer on its source's behalf.
 fn copied_comms_text(block: &SystemNoticeBlock) -> Option<String> {
     let SystemNoticeBlock::Comms {
+        kind,
         direction,
         peer,
         sender_taint,
@@ -629,12 +639,14 @@ fn copied_comms_text(block: &SystemNoticeBlock) -> Option<String> {
             format!("from {peer}:")
         }
     }];
-    lines.extend(
-        content
-            .iter()
-            .map(|block| block.text_projection().into_owned())
-            .filter(|text| !text.trim().is_empty()),
-    );
+    if matches!(kind, CommsNoticeKind::Message) {
+        lines.extend(
+            content
+                .iter()
+                .map(|block| block.text_projection().into_owned())
+                .filter(|text| !text.trim().is_empty()),
+        );
+    }
     if let Some(status) = status {
         lines.push(format!("status: {status}"));
     }
