@@ -18,6 +18,13 @@
 //! closes. An incarnation this process minted may still have work running
 //! here, so it is never taken as ended.
 //!
+//! The lock file is named after the store's path, which must be canonical:
+//! two spellings of one store (a symlink, a relative path) would name two
+//! lock files, and two processes could each hold one. The SQLite identity
+//! store's path is canonical because `SqliteMobStores::open` canonicalizes
+//! it and `identity_store` inherits that path; a new constructor of a store
+//! that names a custody file must canonicalize as well.
+//!
 //! The lock file is created without truncation and never removed or
 //! replaced: a removed and recreated lock file is the one way to admit a
 //! second holder. A store reached through more than one link, a lock file
