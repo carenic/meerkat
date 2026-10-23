@@ -77,6 +77,16 @@ pub enum SessionStoreError {
     #[error("Session not found: {0}")]
     NotFound(SessionId),
 
+    /// The store cannot serve this read from the session's persisted state:
+    /// the state is inconsistent, or the request asks for what it does not
+    /// hold (such as a range past the committed rows).
+    ///
+    /// The verdict is deterministic for the same persisted state and the same
+    /// request: a re-read returns it again. A store never returns it for a
+    /// race with a concurrent writer; it returns `Io` or a revision conflict
+    /// instead. This binds every [`SessionStore`] and
+    /// [`IncrementalSessionStore`] implementor, and callers rely on it to
+    /// classify the error as permanent.
     #[error("Session corrupted: {0}")]
     Corrupted(SessionId),
 
@@ -2308,6 +2318,162 @@ impl VerifiedHeadCanonicalTranscriptHistory {
     pub fn history(&self) -> &ValidatedTranscriptHistory {
         &self.history
     }
+}
+
+/// Prove that a physical head descends from a runtime boundary head through
+/// the transcript rewrite occurrences written after it, and return the
+/// physical transcript's final audited rewrite endpoint (the row count the
+/// live tail after the last rewrite starts at).
+///
+/// A rewrite replaces rows, so a physical head written by a run that
+/// compacted does not keep the boundary's rows as a prefix. Its descent is
+/// proven the way the checkpoint that wrote it proved it against the head it
+/// observed:
+/// - `history` is the physical head's store-replayed graph and still holds
+///   every occurrence from the boundary's generation on, so the boundary is
+///   not below the retention cut;
+/// - the graph's rewrite prefix and rolling graph prefix at the boundary's
+///   generation are exactly the boundary's;
+/// - the first occurrence after the boundary advances from the boundary's
+///   exact rows: its base endpoint plus the leading rows of its parent
+///   advance give the boundary's exact row prefix (or, for a boundary before
+///   the anchor's rows were checkpointed, the boundary's rows extended by
+///   the missing anchor rows give the base).
+///
+/// The caller must also prove that its persisted rewrite rows bridge the two
+/// heads' rewrite prefixes; this function checks the graph, not the rows.
+#[doc(hidden)]
+pub fn prove_rewrite_descent_from_boundary(
+    boundary: &SessionHead,
+    physical: &SessionHead,
+    history: &ValidatedTranscriptHistory,
+) -> Result<u64, SessionStoreError> {
+    let id = &physical.id;
+    let unproven = |reason: String| SessionStoreError::InvalidTranscriptRewrite {
+        id: id.clone(),
+        reason,
+    };
+    if &boundary.id != id {
+        return Err(unproven(
+            "rewrite descent heads belong to different sessions".to_string(),
+        ));
+    }
+    if boundary.rewrite_count >= physical.rewrite_count {
+        return Err(unproven(format!(
+            "physical head carries {} rewrite occurrence(s), not more than the boundary's {}",
+            physical.rewrite_count, boundary.rewrite_count
+        )));
+    }
+    let state = history.state();
+    let physical_count = usize::try_from(physical.rewrite_count)
+        .map_err(|_| SessionStoreError::Corrupted(id.clone()))?;
+    if state.commit_count() != physical_count
+        || history.rewrite_prefix() != &physical.rewrite_prefix
+    {
+        return Err(unproven(
+            "replayed rewrite graph is not the physical head's graph".to_string(),
+        ));
+    }
+    let boundary_count = usize::try_from(boundary.rewrite_count)
+        .map_err(|_| SessionStoreError::Corrupted(id.clone()))?;
+    if boundary_count < state.retired_count() {
+        return Err(unproven(format!(
+            "boundary generation {boundary_count} predates the physical graph's retention cut at {}",
+            state.retired_count()
+        )));
+    }
+    if state
+        .rewrite_prefix_at(boundary_count)
+        .is_none_or(|prefix| prefix.as_ref() != &boundary.rewrite_prefix)
+    {
+        return Err(unproven(
+            "physical rewrite prefix does not extend the boundary's".to_string(),
+        ));
+    }
+    if state.graph_prefix_at(boundary_count) != boundary.graph_prefix.as_ref() {
+        return Err(unproven(
+            "physical graph prefix at the boundary's generation differs from the boundary's"
+                .to_string(),
+        ));
+    }
+
+    let edge = state.edge(boundary_count).ok_or_else(|| {
+        unproven("the first rewrite occurrence after the boundary is not retained".to_string())
+    })?;
+    let (base_count, base_prefix) = state
+        .occurrence_base_endpoint(boundary_count)
+        .ok_or_else(|| SessionStoreError::Corrupted(id.clone()))?;
+    let boundary_len = usize::try_from(boundary.message_count)
+        .map_err(|_| SessionStoreError::Corrupted(id.clone()))?;
+    let boundary_prefix = boundary.message_row_prefix.as_ref().ok_or_else(|| {
+        unproven("runtime boundary has no exact message-row prefix authority".to_string())
+    })?;
+    if base_count != edge.messages_before_base() || boundary_len > edge.messages_before() {
+        return Err(unproven(format!(
+            "rewrite occurrence {} cannot extend the boundary's rows",
+            edge.rewrite_generation()
+        )));
+    }
+    if boundary_len < base_count {
+        // The first rewrite of a graph may adopt anchor rows the boundary
+        // had not checkpointed yet: the boundary's rows prefix the anchor.
+        if boundary_count != 0 {
+            return Err(unproven(
+                "only the first compact occurrence may bridge an uncheckpointed anchor suffix"
+                    .to_string(),
+            ));
+        }
+        let anchor_messages = state.anchor().messages();
+        if anchor_messages.len() != base_count {
+            return Err(SessionStoreError::Corrupted(id.clone()));
+        }
+        let bridge = anchor_messages[boundary_len..base_count]
+            .iter()
+            .map(|message| serde_json::to_vec(message).map_err(SessionStoreError::from))
+            .collect::<Result<Vec<_>, _>>()?;
+        if &boundary_prefix.extend_serialized_rows(&bridge)? != base_prefix {
+            return Err(SessionStoreError::TranscriptContinuityViolation {
+                id: id.clone(),
+                previous_revision: boundary_prefix.digest().to_string(),
+                incoming_revision: base_prefix.digest().to_string(),
+                reason: "boundary rows do not prefix the compact rewrite anchor".to_string(),
+            });
+        }
+    } else {
+        let appended = edge.parent_advance().appended();
+        let already = boundary_len - base_count;
+        if already > appended.len() {
+            return Err(unproven(
+                "boundary rows exceed the first occurrence's parent advance".to_string(),
+            ));
+        }
+        let leading = appended[..already]
+            .iter()
+            .map(|message| serde_json::to_vec(message).map_err(SessionStoreError::from))
+            .collect::<Result<Vec<_>, _>>()?;
+        let expected = base_prefix.extend_serialized_rows(&leading)?;
+        if &expected != boundary_prefix {
+            return Err(SessionStoreError::TranscriptContinuityViolation {
+                id: id.clone(),
+                previous_revision: boundary_prefix.digest().to_string(),
+                incoming_revision: expected.digest().to_string(),
+                reason: "boundary rows do not match the first rewrite occurrence's parent advance"
+                    .to_string(),
+            });
+        }
+    }
+
+    let live_tail_base = history
+        .final_audited_live_tail_base()
+        .ok_or_else(|| SessionStoreError::Corrupted(id.clone()))?;
+    let live_tail_base =
+        u64::try_from(live_tail_base).map_err(|_| SessionStoreError::Corrupted(id.clone()))?;
+    if live_tail_base > physical.message_count {
+        return Err(unproven(
+            "final audited rewrite endpoint exceeds the physical transcript".to_string(),
+        ));
+    }
+    Ok(live_tail_base)
 }
 
 impl VerifiedSessionHeadMaterialization {
@@ -4954,6 +5120,21 @@ impl PreparedHeadCanonicalRewriteMutation {
     #[must_use]
     pub const fn transcript_retired_count(&self) -> u64 {
         self.transcript_retired_count
+    }
+
+    /// The same mutation, with no store-side retirement.
+    ///
+    /// An intra-run checkpoint writes a provisional successor while the
+    /// committed runtime boundary must stay rebuildable: recovery, a
+    /// provisional discard and promotion's descent check all replay it from
+    /// its own row-lineage anchor, and a retirement cut above that anchor
+    /// would delete the rows they need. So such a write keeps every rewrite
+    /// row; the boundary commit that promotes the run applies the deferred
+    /// cut ([`Self::transcript_retired_count`] of the live graph then).
+    #[must_use]
+    pub fn without_store_retirement(mut self) -> Self {
+        self.transcript_retired_count = 0;
+        self
     }
 
     #[must_use]
@@ -8430,6 +8611,119 @@ mod tests {
         (session, head)
     }
 
+    /// One compaction-shaped rewrite of everything so far down to a summary.
+    fn compact_all(session: &mut Session, label: &str) {
+        let end = session.messages().len();
+        session
+            .commit_transcript_rewrite(
+                TranscriptRewriteSelection::MessageRange { start: 0, end },
+                vec![Message::User(UserMessage::text(format!("summary {label}")))],
+                crate::TranscriptRewriteReason::new("test compaction"),
+                Some("unit-test".to_string()),
+                None,
+            )
+            .expect("compaction-shaped rewrite");
+    }
+
+    /// A committed boundary and a later physical head of the same session
+    /// whose run appended rows and compacted (rewriting rows the boundary
+    /// holds), then appended one more row. `earlier_compactions` rewrites
+    /// happen before the boundary.
+    #[allow(clippy::expect_used)]
+    fn rewritten_successor(
+        earlier_compactions: usize,
+    ) -> (SessionHead, SessionHead, ValidatedTranscriptHistory) {
+        let mut boundary = Session::new();
+        for compaction in 0..earlier_compactions {
+            boundary.push(Message::User(UserMessage::text(format!(
+                "early {compaction}"
+            ))));
+            compact_all(&mut boundary, &format!("early {compaction}"));
+        }
+        boundary.push(Message::User(UserMessage::text(
+            "committed row".to_string(),
+        )));
+        let boundary_head = SessionHead::from_session(
+            &boundary,
+            TranscriptStrandId::root(),
+            u64::try_from(earlier_compactions).expect("small count"),
+        )
+        .expect("boundary head");
+
+        let mut physical = boundary.clone();
+        physical.push(Message::User(UserMessage::text("run row".to_string())));
+        compact_all(&mut physical, "run");
+        physical.push(Message::User(UserMessage::text(
+            "after the rewrite".to_string(),
+        )));
+        let history = physical
+            .validated_transcript_history_state()
+            .expect("graph decodes")
+            .expect("graph present");
+        let physical_head = SessionHead::from_session(
+            &physical,
+            TranscriptStrandId::root(),
+            u64::try_from(earlier_compactions + 1).expect("small count"),
+        )
+        .expect("physical head");
+        (boundary_head, physical_head, history)
+    }
+
+    /// The physical graph's rolling prefix at the boundary's generation must
+    /// be the boundary's own.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn a_boundary_whose_graph_prefix_the_physical_graph_does_not_hold_is_refused() {
+        let (mut boundary, physical, history) = rewritten_successor(2);
+        boundary.graph_prefix = physical.graph_prefix.clone();
+        let error = prove_rewrite_descent_from_boundary(&boundary, &physical, &history)
+            .expect_err("a foreign graph prefix is no ancestor");
+        assert!(
+            matches!(error, SessionStoreError::InvalidTranscriptRewrite { .. }),
+            "{error:?}"
+        );
+    }
+
+    /// A physical graph that retired the boundary's generation no longer
+    /// holds the occurrence that advanced from the boundary.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn a_boundary_below_the_physical_retention_cut_is_refused() {
+        let (boundary, mut physical, _history) = rewritten_successor(2);
+        let mut session = Session::new();
+        for compaction in 0..2 {
+            session.push(Message::User(UserMessage::text(format!(
+                "early {compaction}"
+            ))));
+            compact_all(&mut session, &format!("early {compaction}"));
+        }
+        session.push(Message::User(UserMessage::text(
+            "committed row".to_string(),
+        )));
+        session.push(Message::User(UserMessage::text("run row".to_string())));
+        compact_all(&mut session, "run");
+        session.push(Message::User(UserMessage::text(
+            "after the rewrite".to_string(),
+        )));
+        session
+            .retire_transcript_history(
+                crate::TranscriptHistoryRetention::from_count(1).expect("non-zero retention"),
+            )
+            .expect("retire");
+        let retired = session
+            .validated_transcript_history_state()
+            .expect("graph decodes")
+            .expect("graph present");
+        assert_eq!(retired.state().retired_count(), 2);
+        physical.rewrite_prefix = retired.rewrite_prefix().clone();
+        let error = prove_rewrite_descent_from_boundary(&boundary, &physical, &retired)
+            .expect_err("a retired boundary generation is unprovable");
+        assert!(
+            matches!(error, SessionStoreError::InvalidTranscriptRewrite { .. }),
+            "{error:?}"
+        );
+    }
+
     /// A session materialized from a durable head records the rewrite
     /// occurrences that head covers as its retirement cap; a clone keeps it
     /// and a fork, which has no durable head of its own, does not.
@@ -8593,7 +8887,7 @@ mod tests {
                 lifecycle_bit: crate::event::ToolConfigLifecycleBit::Settled(false),
                 detail: Some(body.to_string()),
                 confinement_refusal: None,
-                pending_sources: vec!["king-search".to_string()],
+                pending_sources: vec!["slow-search".to_string()],
             },
         ))
     }
@@ -8619,7 +8913,7 @@ mod tests {
         let mut session = Session::new();
         session.push(Message::User(UserMessage::text("Hello".to_string())));
         session.push(mcp_pending_synthetic_notice(
-            "Servers connecting: king-search. Tools will appear when ready.",
+            "Servers connecting: slow-search. Tools will appear when ready.",
         ));
         session.push(assistant_reply("reply"));
         let mutation = PreparedHeadCanonicalMutation::prepare_root(&session).expect("prepare root");
@@ -8642,7 +8936,7 @@ mod tests {
         let refresh_shapes: [Vec<Message>; 2] = [
             Vec::new(),
             vec![mcp_pending_synthetic_notice(
-                "Servers connecting: king-search (retrying).",
+                "Servers connecting: slow-search (retrying).",
             )],
         ];
         for replacements in refresh_shapes {
@@ -8778,7 +9072,7 @@ mod tests {
             .replace_synthetic_notices(
                 SystemNoticeKind::McpPending,
                 vec![mcp_pending_synthetic_notice(
-                    "Servers connecting: king-search (retrying).",
+                    "Servers connecting: slow-search (retrying).",
                 )],
             )
             .expect("audited-prefix synthetic refresh must complete");

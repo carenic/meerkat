@@ -816,11 +816,16 @@ fn err_bounded_member_run(error: meerkat_mob::BoundedMemberRunError) -> JsValue 
 
 fn mob_destroy_error_value(e: MobMcpDestroyError) -> serde_json::Value {
     match e {
+        // The typed incomplete data rides under `data`, exactly as RPC sends
+        // it in `error.data`: the Web SDK's `MeerkatError.fromWasm` keeps an
+        // envelope's `data`. The top-level report and flag stay for callers
+        // that read the raw envelope.
         MobMcpDestroyError::Incomplete { report } => serde_json::json!({
             "code": "mob_destroy_incomplete",
             "message": MobMcpDestroyError::incomplete_message(&report),
-            "destroy_report": report,
+            "destroy_report": meerkat_contracts::WireMobDestroyReport::from(&report),
             "retryable": true,
+            "data": MobMcpDestroyError::incomplete_error_data(&report),
         }),
         MobMcpDestroyError::Mob(error) => mob_error_value(&error),
     }
@@ -1500,7 +1505,8 @@ fn build_wasm_tool_dispatcher() -> Result<Arc<dyn meerkat_core::AgentToolDispatc
 ///
 /// `mobpack_bytes`: tar.gz mobpack archive. Verified via the canonical
 /// [`meerkat_mob_pack::trust`] authority under the host-supplied
-/// `mobpack_trust` configuration ([`TrustPolicy::Strict`] + empty trust store
+/// `mobpack_trust` configuration
+/// ([`TrustPolicy::Strict`](meerkat_mob_pack::trust::TrustPolicy::Strict) + empty trust store
 /// when omitted) — an unsigned or unknown-signer pack fails closed with a
 /// typed error unless the host registered the signer (or explicitly opted in
 /// to `permissive`).
@@ -2228,9 +2234,12 @@ pub async fn mob_status(mob_id: &str) -> Result<JsValue, JsValue> {
     let mob_state = with_mob_state(Ok)?;
     let id = MobId::from(mob_id);
     let state = mob_state.mob_status(&id).await.map_err(err_mob)?;
+    // A mob whose actor has stopped answers its typed failure as the error
+    // above, so a status row carries none.
     let result = meerkat_contracts::MobStatusResult {
         mob_id: mob_id.to_string(),
         status: meerkat_mob_mcp::wire_mob_lifecycle_status(state),
+        failure: None,
     };
     let json = serde_json::to_string(&result).map_err(|e| err_str("serialize_error", e))?;
     Ok(JsValue::from_str(&json))
@@ -2245,10 +2254,7 @@ pub async fn mob_list() -> Result<JsValue, JsValue> {
     let mobs = mob_state.mob_list().await.map_err(err_mob)?;
     let rows: Vec<meerkat_contracts::MobStatusResult> = mobs
         .into_iter()
-        .map(|(id, state)| meerkat_contracts::MobStatusResult {
-            mob_id: id.to_string(),
-            status: meerkat_mob_mcp::wire_mob_lifecycle_status(state),
-        })
+        .map(|(id, observation)| meerkat_mob_mcp::wire_mob_status_row(&id, &observation))
         .collect();
     let result = meerkat_contracts::MobListResult { mobs: rows };
     let json = serde_json::to_string(&result).map_err(|e| err_str("serialize_error", e))?;
@@ -2281,8 +2287,8 @@ pub async fn mob_lifecycle(mob_id: &str, action: &str) -> Result<JsValue, JsValu
         .map_err(err_mob_destroy)?;
     let destroy_report = reports
         .destroy_report
-        .map(|report| serde_json::to_value(&report).map_err(|e| err_str("serialize_error", e)))
-        .transpose()?;
+        .as_ref()
+        .map(meerkat_contracts::WireMobDestroyReport::from);
     let stop_report = reports
         .stop_report
         .map(|report| serde_json::to_value(&report).map_err(|e| err_str("serialize_error", e)))
@@ -3109,7 +3115,7 @@ fn register_subscription(inner: SubscriptionInner) -> String {
 
 /// Subscribe to a mob member's session event stream.
 ///
-/// Returns a canonical `stream_id` string ([`StreamRef`] wire form). Use
+/// Returns a canonical `stream_id` string (`StreamRef` wire form). Use
 /// `poll_subscription(stream_id)` to drain buffered events. Each call returns
 /// all events since the last poll.
 ///
@@ -3149,12 +3155,13 @@ pub async fn mob_member_subscribe(mob_id: &str, agent_identity: &str) -> Result<
 
 /// Subscribe to mob-wide events (all members, continuously updated).
 ///
-/// Returns a canonical `stream_id` string ([`StreamRef`] wire form). Use
+/// Returns a canonical `stream_id` string (`StreamRef` wire form). Use
 /// `poll_subscription(stream_id)` to drain buffered events. Each call returns
 /// all events since the last poll.
 ///
 /// Unlike `mob_member_subscribe` which streams a single member's agent events,
-/// this streams [`AttributedEvent`]s tagged with source runtime identity and role
+/// this streams [`AttributedEvent`](meerkat_mob::AttributedEvent)s tagged with source
+/// runtime identity and role
 /// for every member in the mob, automatically tracking roster changes.
 #[wasm_bindgen]
 pub async fn mob_subscribe_events(mob_id: &str) -> Result<String, JsValue> {
@@ -4002,6 +4009,27 @@ capabilities = [{capability_values}]
                 .is_some_and(|errors| !errors.is_empty()),
             "web destroy error projection must carry the destroy report: {value}"
         );
+    }
+
+    /// The Web SDK's `MeerkatError.fromWasm` keeps an envelope's `data` and
+    /// nothing else beside its code and message, so an incomplete destroy's
+    /// envelope carries its typed data there: exactly the `error.data` RPC
+    /// sends, report included.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn mob_destroy_incomplete_envelope_carries_the_rpc_error_data() {
+        let mut report = meerkat_mob::MobDestroyReport::default();
+        report.errors.push("worker-1: reload refused".to_string());
+        report
+            .reloaded_members
+            .push(meerkat_mob::AgentIdentity::from("worker-2"));
+        let rpc_data = meerkat_mob_mcp::MobMcpDestroyError::incomplete_error_data(&report);
+
+        let value =
+            mob_destroy_error_value(meerkat_mob_mcp::MobMcpDestroyError::Incomplete { report });
+
+        assert_eq!(value["data"], rpc_data, "{value}");
+        assert_eq!(value["data"]["code"], "mob_destroy_incomplete", "{value}");
     }
 
     #[cfg(not(target_arch = "wasm32"))]

@@ -43,10 +43,13 @@ impl MemberEffectCommit for SpawnAdmissionCommit {
         settlement: MemberEffectSettlement,
     ) -> MemberEffectCommitFuture<'_> {
         Box::pin(async move {
-            if !settlement.is_current() || actor.durable_uncertainty_fail_stop {
-                actor.durable_uncertainty_fail_stop = true;
+            if !settlement.is_current() || actor.durable_uncertainty_fail_stop.is_set() {
                 return MemberEffectAck::Retained(MemberEffectRetention::resumable(
-                    MobError::Internal("spawn admission observation lost its exact owner".into()),
+                    actor
+                        .durable_uncertainty_fail_stop
+                        .record(MobError::Internal(
+                            "spawn admission observation lost its exact owner".into(),
+                        )),
                     self,
                 ));
             }
@@ -159,10 +162,13 @@ impl MemberEffectCommit for SpawnAdmissionOwnerLost {
         _settlement: MemberEffectSettlement,
     ) -> MemberEffectCommitFuture<'_> {
         Box::pin(async move {
-            actor.durable_uncertainty_fail_stop = true;
-            MemberEffectAck::Retained(MemberEffectRetention::unresumable(MobError::Internal(
-                "spawn admission observation owner disappeared".into(),
-            )))
+            MemberEffectAck::Retained(MemberEffectRetention::unresumable(
+                actor
+                    .durable_uncertainty_fail_stop
+                    .record(MobError::Internal(
+                        "spawn admission observation owner disappeared".into(),
+                    )),
+            ))
         })
     }
 }

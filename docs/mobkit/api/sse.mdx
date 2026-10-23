@@ -4,7 +4,7 @@ description: "Server-Sent Events for real-time Meta interaction and event subscr
 icon: "bolt"
 ---
 
-*Mirrored from MobKit main at [091f73c4a64c](https://github.com/lukacf/meerkat-meta/commit/091f73c4a64cd13e08fc7c8a0484c0bf3a93b4c2) on 2026-10-22; MobKit workspace version 0.9.4 at that commit.*
+*Mirrored from MobKit main at [39d8833a14a3](https://github.com/lukacf/meerkat-meta/commit/39d8833a14a30c9d7cb196543d793a05af02a156) on 2026-10-23; MobKit workspace version 0.9.4 at that commit.*
 
 Meta uses Server-Sent Events (SSE) for several live HTTP streams:
 
@@ -149,6 +149,7 @@ data: {"type":"snapshot_complete","cursor":"console:240"}
 | `frame_updated` | `{type: "frame_updated", frame}` **or** `{type: "console_frame", frame}` with `frame.kind = "frame_updated"`; handle as an update, not a new completed interaction | `frame.cursor` |
 | `snapshot_complete` | `{type: "snapshot_complete", cursor?}` ends replay; live continuation follows | `cursor` when present |
 | `replay_unavailable` | `{type: "replay_unavailable", requested_cursor, latest_cursor}`; `latest_cursor` may be `null`; refetch a recent page | none |
+| `access_changed` | `{type: "access_changed", revision}`: the committed revision of the Console access configuration, sent once when the live part of the stream starts and again after each committed change, only when Console access control is configured; read access-dependent views (Access, the roster) again when it is newer than the revision you hold | none |
 
 `after` and `cursor` are omitted on markers when absent. The SSE event name
 and `data.type` need not coincide for updates. Persist cursor-bearing IDs for

@@ -43,6 +43,7 @@ pub use ephemeral::{
     LiveChannelClosedNotPublished, LiveSessionActorRegistry, LiveSessionActorWitness,
     LiveSessionActorWitnessSlot, McpAttemptGuardSource, RuntimeContextAdmissionGuard,
     SessionActivityWatch, SessionAgent, SessionAgentBuilder, SessionSnapshot,
+    TryPinControllerError, TurnBoundaryHeld,
 };
 pub use live_durable_source::LiveDurableSourceObservation;
 pub use live_transcript_authority::LiveAssistantPlaybackObservationResult;

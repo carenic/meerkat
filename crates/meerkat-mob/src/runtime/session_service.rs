@@ -1531,7 +1531,7 @@ pub trait MobSessionService:
     }
 
     /// Whether this service implements the runtime-owned turn application
-    /// boundary used by [`MeerkatMachine`]. Merely exposing a runtime adapter
+    /// boundary used by [`MeerkatMachine`](meerkat_runtime::MeerkatMachine). Merely exposing a runtime adapter
     /// is not sufficient: some hosts use that adapter only for lifecycle or
     /// comms authority and still execute turns through the direct
     /// [`SessionService::start_turn`] path.
@@ -1895,10 +1895,51 @@ pub trait MobSessionService:
     /// retain the exact observations available from each authority owner.
     /// Downstream heal/resume consumers must use this owner-issued verdict
     /// rather than probing session and runtime stores independently.
+    ///
+    /// The persistent service's verdict is claim-scoped (#1813): its
+    /// preparation (`PersistentSessionService::prepare_committed_boundary_resume`)
+    /// takes this runtime owner's hosting claim for the session before it
+    /// converges the durable tail, and refuses with
+    /// [`SessionError::ServedElsewhere`] or [`SessionError::HostingUnavailable`]
+    /// before any recovery. A wrapper that forwards this method inherits that.
     async fn materialize_session_resume_verdict(
         &self,
         session_id: &SessionId,
     ) -> Result<SessionResumeVerdict, SessionError>;
+
+    /// Settle a durable tail ahead of the committed runtime boundary before a
+    /// start path reads a session that no live actor of this service hosts:
+    /// the cleanup delivery of a retiring member, which a mob start restores
+    /// before it admits any command.
+    ///
+    /// The persistent service takes this runtime owner's hosting claim for
+    /// the session and hands it to its cold-attach preparation
+    /// (`PersistentSessionService::prepare_cold_attach`). A session another
+    /// runtime owner hosts is refused with [`SessionError::ServedElsewhere`],
+    /// and one whose claim cannot be taken with
+    /// [`SessionError::HostingUnavailable`], before any recovery, so this
+    /// owner never settles another owner's in-flight tail (#1813). The claim
+    /// ends with the preparation: the caller's next read takes none.
+    ///
+    /// The default runs the durable-tail convergence of
+    /// [`Self::materialize_session_resume_verdict`] and drops the verdict. A
+    /// persistent service's convergence takes the hosting claim as well
+    /// (`PersistentSessionService::prepare_committed_boundary_resume`), but
+    /// materializes the whole resume and answers [`SessionError::Busy`] for
+    /// a session a live actor of the service hosts, so a wrapper around a
+    /// persistent service should forward this method.
+    async fn settle_durable_tail_before_cold_start(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), SessionError> {
+        tracing::debug!(
+            %session_id,
+            "settling a durable tail through the resume verdict (service default)"
+        );
+        self.materialize_session_resume_verdict(session_id)
+            .await
+            .map(|_| ())
+    }
 
     /// Load the persisted session METADATA view when available.
     ///
@@ -2277,7 +2318,7 @@ pub trait MobSessionService:
     /// member's archive closes its own session's gate.
     async fn cancel_all_checkpointers(&self) {}
 
-    /// Re-enable checkpointer gates cancelled by [`cancel_all_checkpointers`].
+    /// Re-enable checkpointer gates cancelled by [`Self::cancel_all_checkpointers`].
     ///
     /// The mob's Resume and Reset call this to restore persistence.
     async fn rearm_all_checkpointers(&self) {}
@@ -3187,6 +3228,17 @@ where
         let admission = self.reserve_create_session_admission().await?;
         self.create_session_with_reserved_admission_under_runtime_turn_boundary(req, admission)
             .await
+    }
+
+    async fn settle_durable_tail_before_cold_start(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), SessionError> {
+        // #1813: the hosting claim is taken first and handed over by move; a
+        // session another runtime owner hosts is refused here, typed, before
+        // any recovery.
+        let claim = self.grant_session_hosting(session_id)?;
+        self.prepare_cold_attach(session_id, claim).await
     }
 
     async fn materialize_session_resume_verdict(

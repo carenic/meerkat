@@ -184,6 +184,7 @@ export type {
   MobRunResult,
   MobRevokeScopesParams,
   MobRevokeScopesResult,
+  MobLifecycleFailure,
   MobStatus,
   MobSummary,
   MobTurnStartOptions,
@@ -361,12 +362,18 @@ export type {
   CommsSendRequiredAction,
 } from "./generated/types.js";
 export { COMMS_SEND_ERROR_CODES, commsSendError } from "./comms-errors.js";
+export { mobDestroyIncompleteReport } from "./mob-destroy-report.js";
 export { BinaryIntegrityError } from "./binary-errors.js";
 export type { BinaryIntegrityFailure } from "./binary-errors.js";
 
 export { CONTRACT_VERSION } from "./generated/types.js";
-export { WIRE_AUTH_ERROR_REASONS, authErrorReason } from "./auth-errors.js";
-export type { WireAuthErrorReason } from "./generated/types.js";
+export {
+  WIRE_AUTH_ERROR_DETAILS,
+  WIRE_AUTH_ERROR_REASONS,
+  authErrorDetail,
+  authErrorReason,
+} from "./auth-errors.js";
+export type { WireAuthErrorDetail, WireAuthErrorReason } from "./generated/types.js";
 export type {
   AttentionBindingRequest,
   AttentionBindingResult,
@@ -595,7 +602,13 @@ export type {
   WireMemberPreviewUnavailable,
   WireMemberRef,
   WireMemberRegistrationHookCall,
+  WireMemberReloadRefusal,
+  WireMemberReloadRefusalRepairBlocked,
+  WireMemberReloadRefusalUnknown,
   WireMobBackendKind,
+  WireMobDestroyIncompleteData,
+  WireMobDestroyMemberRefusal,
+  WireMobDestroyReport,
   WireMobMemberStatus,
   WireMobProfile,
   WireMobRuntimeMode,

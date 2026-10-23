@@ -1500,6 +1500,113 @@ mod tests {
         Ok(())
     }
 
+    fn autonomous_mob_helper_targets() -> [TargetBinding; 2] {
+        let options = HelperOptionsSpec {
+            runtime_mode: Some(crate::ScheduledMobRuntimeMode::AutonomousHost),
+            ..HelperOptionsSpec::default()
+        };
+        [
+            mob_helper_target(options.clone()),
+            TargetBinding::Mob(Box::new(MobTargetBinding::ForkHelper {
+                mob_id: "ops".to_string(),
+                source_member_id: "lead".to_string(),
+                member_id: "helper".to_string(),
+                prompt: "check state".to_string(),
+                fork_context: crate::ForkContextSpec::default(),
+                options,
+            })),
+        ]
+    }
+
+    /// A scheduled mob helper runs one tracked turn, which autonomous host
+    /// inbox delivery cannot complete, so a schedule refuses to store a
+    /// helper target with that runtime mode.
+    #[tokio::test]
+    async fn create_rejects_an_autonomous_mob_helper() {
+        let store = Arc::new(MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>;
+        let service = ScheduleService::new(store);
+
+        for target in autonomous_mob_helper_targets() {
+            let error = service
+                .create(CreateScheduleRequest {
+                    name: Some("autonomous-helper".into()),
+                    description: None,
+                    trigger: TriggerSpec::Interval(IntervalTriggerSpec {
+                        start_at_utc: Utc::now() + Duration::minutes(1),
+                        every_seconds: 60,
+                        end_at_utc: None,
+                    }),
+                    target,
+                    misfire_policy: MisfirePolicy::Skip,
+                    overlap_policy: OverlapPolicy::SkipIfRunning,
+                    missing_target_policy: crate::MissingTargetPolicy::MarkMisfired,
+                    labels: BTreeMap::new(),
+                    planning_horizon_days: Some(1),
+                    planning_horizon_occurrences: Some(1),
+                })
+                .await
+                .expect_err("an autonomous helper target should be rejected");
+
+            assert!(
+                matches!(
+                    &error,
+                    ScheduleDomainError::InvalidSchedule(message)
+                        if message.contains("autonomous_host")
+                ),
+                "unexpected refusal: {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_rejects_an_autonomous_mob_helper() -> Result<(), ScheduleDomainError> {
+        let store = Arc::new(MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>;
+        let service = ScheduleService::new(store);
+
+        let created = service
+            .create(CreateScheduleRequest {
+                name: Some("autonomous-helper-update".into()),
+                description: None,
+                trigger: TriggerSpec::Interval(IntervalTriggerSpec {
+                    start_at_utc: Utc::now() + Duration::minutes(1),
+                    every_seconds: 60,
+                    end_at_utc: None,
+                }),
+                target: materialize_on_demand_target("initial prompt"),
+                misfire_policy: MisfirePolicy::Skip,
+                overlap_policy: OverlapPolicy::SkipIfRunning,
+                missing_target_policy: crate::MissingTargetPolicy::MarkMisfired,
+                labels: BTreeMap::new(),
+                planning_horizon_days: Some(1),
+                planning_horizon_occurrences: Some(1),
+            })
+            .await?;
+
+        for target in autonomous_mob_helper_targets() {
+            let error = service
+                .update(
+                    &created.schedule_id,
+                    UpdateScheduleRequest {
+                        expected_revision: Some(created.revision),
+                        target: Some(target),
+                        ..UpdateScheduleRequest::default()
+                    },
+                )
+                .await
+                .expect_err("an autonomous helper target update should be rejected");
+
+            assert!(
+                matches!(
+                    &error,
+                    ScheduleDomainError::InvalidSchedule(message)
+                        if message.contains("autonomous_host")
+                ),
+                "unexpected refusal: {error:?}"
+            );
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn update_bumps_revision_and_supersedes_pending_future_occurrences()
     -> Result<(), ScheduleDomainError> {

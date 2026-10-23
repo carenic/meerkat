@@ -4394,6 +4394,21 @@ impl ConsumedDeferredTurnInputs {
     pub fn pending_tool_results(&self) -> &[PendingToolResultsMessage] {
         &self.pending_tool_results
     }
+
+    /// Move the staged initial prompt out into a restore set of its own.
+    ///
+    /// A turn that consumed the prompt but commits no row carrying it (a
+    /// pending continuation, or a run that committed nothing) restores the
+    /// returned set, so the prompt stays pending for the next content turn.
+    /// The first-turn phase and staged tool results stay with `self`.
+    #[must_use]
+    pub fn take_initial_prompt(&mut self) -> Self {
+        Self {
+            restore_first_turn_pending: false,
+            pending_initial_prompt: self.pending_initial_prompt.take(),
+            pending_tool_results: Vec::new(),
+        }
+    }
 }
 
 /// Per-session registry key for the first-turn region of the
@@ -6749,6 +6764,59 @@ impl Session {
             Some(usize::try_from(rewrite_count).unwrap_or(usize::MAX));
     }
 
+    /// Whether this session keeps more rewrite bodies than `retention`
+    /// because its durable HeadCanonical head does not cover them yet
+    /// ([`Self::retire_transcript_history`] never retires past that head).
+    /// Only a checkpoint that moves the durable head over them lets
+    /// retirement reach the bound.
+    ///
+    /// It reads only the graph this process already holds validated (one
+    /// installed by a materialization or a compaction): an unchanged graph is
+    /// never parsed or validated again for this check, and a graph that is
+    /// not held answers false.
+    pub(crate) fn durable_head_holds_retirement(
+        &self,
+        retention: TranscriptHistoryRetention,
+    ) -> bool {
+        self.durable_head_held_graph().is_some_and(|history| {
+            history.commit_count() - history.retired_count() > retention.retained_rewrites()
+        })
+    }
+
+    /// The graph this session holds validated in this process, when its
+    /// durable HeadCanonical head bounds retirement; `None` without a durable
+    /// head (a WholeBlob session retires after each compaction instead) or
+    /// when the graph is not held, so nothing parses or validates it here.
+    fn durable_head_held_graph(&self) -> Option<std::sync::Arc<TranscriptHistoryState>> {
+        if self.history_caches.durable_rewrite_count.is_none()
+            || self.transcript_history_metadata_validation
+                != TranscriptHistoryMetadataValidation::Validated
+        {
+            return None;
+        }
+        self.history_caches.shared_state.get()
+    }
+
+    /// Retire the live graph to `retention` after a checkpoint moved this
+    /// session's durable HeadCanonical head over its rewrites, and report the
+    /// graph's retired count for the run's boundary commit to apply to the
+    /// stored rows. Only a session with a durable head whose graph this
+    /// process holds validated does any work: an unchanged graph is never
+    /// parsed or validated again, and a session without a durable head
+    /// answers `None`.
+    pub(crate) fn retire_transcript_history_after_checkpoint(
+        &mut self,
+        retention: TranscriptHistoryRetention,
+    ) -> Result<Option<usize>, TranscriptEditError> {
+        if self.durable_head_held_graph().is_none() {
+            return Ok(None);
+        }
+        self.retire_transcript_history(retention)?;
+        Ok(self
+            .durable_head_held_graph()
+            .map(|history| history.retired_count()))
+    }
+
     #[cfg(test)]
     pub(crate) fn durable_transcript_rewrite_count_for_test(&self) -> Option<usize> {
         self.history_caches.durable_rewrite_count
@@ -6814,7 +6882,7 @@ impl Session {
     /// Retire transcript-history occurrences beyond `retention`.
     ///
     /// Applies the graph owner's one re-anchoring transition
-    /// ([`TranscriptHistoryState::retire_occurrences_beyond`]) and installs
+    /// (`TranscriptHistoryState::retire_occurrences_beyond`) and installs
     /// the result. Commits and rolling prefix digests are unchanged, so every
     /// rewrite authority that binds the graph still verifies; only the bodies
     /// of retired occurrences go. Returns how many occurrences this call
@@ -9303,14 +9371,12 @@ pub fn resolve_session_llm_identity_override(
         None
     };
 
-    let auth_binding = match overrides.auth_binding {
-        Some(TurnMetadataOverride::Clear) => None,
-        Some(TurnMetadataOverride::Set(value)) => Some(value.clone()),
-        // Inherit: a provider change without an explicit binding drops the
-        // stale binding; otherwise the durable binding is retained.
-        None if provider != current.provider => None,
-        None => current.auth_binding.clone(),
-    };
+    let auth_binding = resolve_session_auth_binding(
+        current.provider,
+        current.auth_binding.as_ref(),
+        provider,
+        overrides.auth_binding,
+    );
 
     Ok(SessionLlmIdentity {
         model,
@@ -9319,6 +9385,110 @@ pub fn resolve_session_llm_identity_override(
         provider_params,
         auth_binding,
     })
+}
+
+/// The credential binding a session carries across an LLM identity change.
+///
+/// One rule for every seam that moves a session's identity: a turn or hot-swap
+/// override ([`resolve_session_llm_identity_override`]) and a resumed build
+/// ([`resolve_resumed_session_llm_identity`]). `Set` names the binding and
+/// `Clear` removes it. With neither, a provider change drops the current
+/// binding, because a binding serves one provider and the new provider
+/// resolves its own route as a fresh session would, while the same provider
+/// keeps the current binding.
+#[must_use]
+pub fn resolve_session_auth_binding(
+    current_provider: Provider,
+    current_binding: Option<&crate::AuthBindingRef>,
+    target_provider: Provider,
+    binding_override: Option<TurnMetadataOverride<&crate::AuthBindingRef>>,
+) -> Option<crate::AuthBindingRef> {
+    match binding_override {
+        Some(TurnMetadataOverride::Clear) => None,
+        Some(TurnMetadataOverride::Set(value)) => Some(value.clone()),
+        None if target_provider != current_provider => None,
+        None => current_binding.cloned(),
+    }
+}
+
+/// The LLM identity a resumed session builds with.
+///
+/// One rule for every resume merge (a mob member's, the agent factory's, the
+/// member-host preflight's). `candidate` holds the build's values, and its
+/// `auth_binding` is a binding the build names explicitly. A field `mask`
+/// lists keeps the build's value; every other field restores `durable`.
+///
+/// - The self-hosted server follows the route: a build that claims the model,
+///   the provider or the server keeps its own server, and otherwise the
+///   durable server stays.
+/// - The binding follows [`resolve_resumed_session_auth_binding`].
+#[must_use]
+pub fn resolve_resumed_session_llm_identity(
+    candidate: SessionLlmIdentity,
+    durable: &SessionLlmIdentity,
+    mask: &crate::service::ResumeOverrideMask,
+) -> SessionLlmIdentity {
+    let provider = if mask.provider {
+        candidate.provider
+    } else {
+        durable.provider
+    };
+    let auth_binding = resolve_resumed_session_auth_binding(
+        durable,
+        provider,
+        candidate.auth_binding.as_ref(),
+        mask.auth_binding,
+    );
+    SessionLlmIdentity {
+        model: if mask.model {
+            candidate.model
+        } else {
+            durable.model.clone()
+        },
+        provider,
+        self_hosted_server_id: if mask.model || mask.provider || mask.self_hosted_server_id {
+            candidate.self_hosted_server_id
+        } else {
+            durable.self_hosted_server_id.clone()
+        },
+        provider_params: if mask.provider_params {
+            candidate.provider_params
+        } else {
+            durable.provider_params.clone()
+        },
+        auth_binding,
+    }
+}
+
+/// The binding part of [`resolve_resumed_session_llm_identity`], for a build
+/// that settles its provider after the merge.
+///
+/// A binding the build names explicitly wins. A build that claims the binding
+/// without naming one clears it. Otherwise [`resolve_session_auth_binding`]
+/// decides against the durable binding: kept for the same provider, dropped
+/// for a provider change. The synthetic env-default binding is never restored:
+/// it is not a durable, config-resolvable identity.
+#[must_use]
+pub fn resolve_resumed_session_auth_binding(
+    durable: &SessionLlmIdentity,
+    target_provider: Provider,
+    explicit_binding: Option<&crate::AuthBindingRef>,
+    binding_masked: bool,
+) -> Option<crate::AuthBindingRef> {
+    let binding_override = match (explicit_binding, binding_masked) {
+        (Some(binding), _) => Some(TurnMetadataOverride::Set(binding)),
+        (None, true) => Some(TurnMetadataOverride::Clear),
+        (None, false) => None,
+    };
+    resolve_session_auth_binding(
+        durable.provider,
+        durable
+            .auth_binding
+            .as_ref()
+            .filter(|binding| !binding.is_env_default()),
+        target_provider,
+        binding_override,
+    )
 }
 
 /// Live request policy paired with a session LLM identity hot-swap.
@@ -16876,6 +17046,7 @@ mod tests {
                 secret_env_names: Vec::new(),
                 withheld: false,
                 binding: None,
+                cwd: None,
             },
             oauth_account: None,
             oauth_account_selection: None,
@@ -16964,6 +17135,7 @@ mod tests {
                         secret_env_names: Vec::new(),
                         withheld: false,
                         binding: None,
+                        cwd: None,
                     },
                     oauth_account: None,
                     oauth_account_selection: None,
@@ -18863,13 +19035,13 @@ mod tests {
         let claim =
             crate::provider_cache_breakpoint_claim(crate::ProviderCacheBreakpointClaimRequest {
                 provider: crate::Provider::Anthropic,
-                model: "claude-opus-5",
+                model: "test-anthropic-model",
                 messages,
                 boundary: crate::CacheBreakpointBoundary::TranscriptAfter { message_count },
                 ttl: crate::ProviderCacheTtl::ProviderDefault,
                 rendered_prefix: br#"{"renderer_mode":"session-test"}"#,
                 lowered_request_encoding: crate::LoweredRequestEncoding::AnthropicMessagesJson,
-                lowered_request_body: br#"{"model":"claude-opus-5"}"#,
+                lowered_request_body: br#"{"model":"test-anthropic-model"}"#,
             })
             .expect("test claim shape");
         crate::AuthoredCacheBreakpoint::from_provider_claim(claim)
@@ -18974,7 +19146,7 @@ mod tests {
             crate::CacheBreakpointDiscardReason::CanonicalPrefixMoved
         ));
         let identity = discard.identity().expect("a decoded proof has an identity");
-        assert_eq!(identity.model, "claude-opus-5");
+        assert_eq!(identity.model, "test-anthropic-model");
         assert_eq!(identity.provider, crate::Provider::Anthropic);
     }
 

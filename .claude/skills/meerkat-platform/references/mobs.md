@@ -650,7 +650,24 @@ mob under that id is refused until the cleanup is done. An admitted destroy
 closes the mob's admission first (`MobAdmissionCloseReason::Destroyed`).
 Since 0.9.4 a member whose boundary commit fails while the destroy waits on its
 ingress detach is reloaded and its retirement retried once;
-`MobDestroyReport::reloaded_members` names it (0.9.3 answered `Incomplete`). A
+`MobDestroyReport::reloaded_members` names it (0.9.3 answered `Incomplete`).
+Since 0.9.5, when the runtime refuses a member reload as repair-blocked (for
+example while a boundary commit past its deadline has not reported its
+outcome), the destroy answers `Incomplete` with the member in
+`MobDestroyReport::member_reload_refusals` (`kind: "repair_blocked"` and the
+runtime's `reason`): retry the destroy later. The SDKs read that report typed
+(`WireMobDestroyReport`): `mob_destroy_incomplete_report(error)` in Python,
+`mobDestroyIncompleteReport(error)` in TypeScript and `@rkat/web`. A refusal
+in the reload pass before the destroy starts leaves the mob unchanged; a later
+one comes after the destroy's cleanup has begun. A retire meets the same
+refusal at its quiesce stage and answers `MemberRetirementStuck` whose cause
+is `MobError::MemberReloadRepairBlocked` (data kind
+`mob_member_reload_repair_blocked`, `retryable: true`); redrive it with
+`MobHandle::redrive_retirement` once the outcome is reported. Since 0.9.5 a
+retire that started before the member degraded reloads it at its ingress
+detach and completes (retry an in-progress answer); a refusal there sticks
+with the same cause. The stuck error's data carries the cause's data as
+`cause_data` (since 0.9.5). A
 host that drains observers itself reads a `SqliteMobObserverDrainReport`;
 since 0.9.4 its `retained_registrations` counts change-watch notification
 registrations still running when the drain stopped them (a struct literal

@@ -5800,32 +5800,33 @@ async fn mixed_directed_max_attempt_failure_terminalizes_only_exhausted_contribu
         .await
         .expect("accept first max-attempt input");
 
-    tokio::time::timeout(STEP_BOUND, async {
-        loop {
-            let first = machine
-                .input_state(&session_id, &first_input_id)
-                .await
-                .expect("read first input after initial failure")
-                .expect("first input remains inspectable");
-            if first.seed.phase == crate::input_state::InputLifecycleState::Queued
-                && first.seed.attempt_count == 1
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("first directed input must park after its initial failed attempt");
-    assert!(
-        machine
-            .wake_runtime_if_active_inputs(&session_id)
-            .await
-            .expect("wake first input for its second attempt")
-    );
+    // The initial attempt fails while it is the only queued work, so the loop
+    // keeps draining: it rolls the input back to its queue and retries it at
+    // once. An observer on a loaded host may read only once that retry began.
     tokio::time::timeout(STEP_BOUND, second_apply_started.notified())
         .await
-        .expect("first input must reach its gated second attempt");
+        .expect("the runtime retries the rolled-back first input by itself");
+    // The input's Queued state at attempt 1 lasted only until that retry; its
+    // recorded rollback stays.
+    let first = machine
+        .input_state(&session_id, &first_input_id)
+        .await
+        .expect("read first input in its gated second attempt")
+        .expect("first input remains inspectable");
+    assert_eq!(
+        first
+            .state
+            .history
+            .iter()
+            .filter(|entry| {
+                entry.from == crate::input_state::InputLifecycleState::Staged
+                    && entry.to == crate::input_state::InputLifecycleState::Queued
+                    && entry.reason.as_deref() == Some("ResolveStagedRollback")
+            })
+            .count(),
+        1,
+        "the first input's initial attempt failed and rolled it back to its queue once"
+    );
 
     let second_uuid = meerkat_core::time_compat::new_uuid_v7();
     let second_input = crate::mob_adapter::create_tracked_flow_step_input(
@@ -8402,6 +8403,73 @@ async fn cold_recovery_resumes_typed_v3_unregister_progress() {
         .expect("final lifecycle record should remain queryable");
     assert_eq!(durable_final.unregister_progress(), None);
     assert_eq!(durable_final.binding().agent_runtime_id(), None);
+}
+
+/// A member restore concludes a cold-recovered drain as a plain registration
+/// does. Its local materialization is the first registration of the session
+/// in the new process: it finds the Draining record a cut unregister left,
+/// concludes the teardown, and prepares the fresh registration for its own
+/// materialization claim instead of refusing the claim that teardown fenced.
+#[tokio::test]
+async fn local_materialization_concludes_a_cold_recovered_drain() {
+    let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let store = Arc::new(RuntimeCommitAtomicityStore::pass_through(Arc::clone(
+        &inner,
+    )));
+    let first_machine = Arc::new(
+        MeerkatMachine::persistent(
+            store.clone() as Arc<dyn crate::store::RuntimeStore>,
+            memory_blob_store(),
+        )
+        .expect("persistent machine"),
+    );
+    let session_id = SessionId::new();
+    let runtime_id = runtime_id_for_session(&session_id);
+    first_machine
+        .register_session(session_id.clone())
+        .await
+        .expect("register session on first process");
+    // Persist Begin + runtime-loop disposition, then fail a later lifecycle
+    // write: the durable record keeps Draining unregister progress, as an
+    // exit during the unregister leaves it.
+    let calls_before = store.commit_machine_lifecycle_calls();
+    store.fail_commit_machine_lifecycle_on_call(calls_before + 3);
+    first_machine
+        .unregister_session(&session_id)
+        .await
+        .expect_err("partial unregister progress should fail once before process loss");
+    assert!(
+        crate::store::load_machine_lifecycle(inner.as_ref(), &runtime_id)
+            .await
+            .expect("load partial record")
+            .expect("partial lifecycle record should exist")
+            .unregister_progress()
+            .is_some(),
+        "the cut unregister left its Draining progress durable"
+    );
+    drop(first_machine);
+
+    let recovered = Arc::new(
+        MeerkatMachine::persistent(
+            store.clone() as Arc<dyn crate::store::RuntimeStore>,
+            memory_blob_store(),
+        )
+        .expect("persistent machine"),
+    );
+    let prepared = recovered
+        .prepare_local_session_materialization(session_id.clone())
+        .await
+        .expect("the materialization concludes the cold-recovered drain and prepares the fresh registration");
+    drop(prepared);
+    assert!(
+        crate::store::load_machine_lifecycle(inner.as_ref(), &runtime_id)
+            .await
+            .expect("load recovered record")
+            .expect("lifecycle record should exist")
+            .unregister_progress()
+            .is_none(),
+        "the concluded teardown left no Draining progress"
+    );
 }
 
 /// OWNER REPRO (0.8.23): a first turn that fails terminally leaves the CLI
@@ -13579,6 +13647,77 @@ async fn persistent_without_blobs_keeps_persistent_driver() {
     );
 }
 
+/// The deduplicate-only admission through the runtime's public method, on
+/// a persistent runtime. With no input admitted earlier under the key it
+/// refuses NoExistingAdmission and the durable index holds nothing under
+/// the key; after an ordinary admission under the key it deduplicates
+/// against that input.
+#[tokio::test]
+async fn existing_only_admission_on_a_persistent_runtime_never_admits_fresh() {
+    let store = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let adapter = Arc::new(
+        MeerkatMachine::persistent_without_blobs(store as Arc<dyn crate::store::RuntimeStore>)
+            .expect("persistent machine"),
+    );
+    let session_id = SessionId::new();
+    adapter
+        .register_session(session_id.clone())
+        .await
+        .expect("register session");
+    let key = IdempotencyKey::new("scheduled-delivery");
+    let keyed = |text: &str| {
+        let mut input = make_prompt(text);
+        if let Input::Prompt(ref mut prompt) = input {
+            prompt.header.idempotency_key = Some(key.clone());
+        }
+        input
+    };
+
+    let early = keyed("redelivery before any admission");
+    let early_id = early.id().clone();
+    match adapter
+        .accept_existing_input_with_completion(&session_id, early)
+        .await
+    {
+        Err(RuntimeDriverError::NoExistingAdmission { key: refused }) => {
+            assert_eq!(refused, "scheduled-delivery");
+        }
+        other => panic!("expected NoExistingAdmission, got {other:?}"),
+    }
+    assert!(
+        adapter
+            .durable_input_state_by_idempotency_key(&session_id, "scheduled-delivery")
+            .await
+            .expect("durable index read")
+            .is_none(),
+        "a refused existing-only admission writes nothing under the key"
+    );
+    assert!(
+        adapter
+            .input_state(&session_id, &early_id)
+            .await
+            .expect("input read")
+            .is_none(),
+        "a refused existing-only admission admits nothing"
+    );
+
+    let first = keyed("first delivery");
+    let first_id = first.id().clone();
+    let (outcome, _handle) = adapter
+        .accept_input_with_completion(&session_id, first)
+        .await
+        .expect("ordinary admission");
+    assert!(outcome.is_accepted());
+    let (outcome, _handle) = adapter
+        .accept_existing_input_with_completion(&session_id, keyed("redelivery"))
+        .await
+        .expect("existing-only admission deduplicates");
+    match outcome {
+        AcceptOutcome::Deduplicated { existing_id, .. } => assert_eq!(existing_id, first_id),
+        other => panic!("expected Deduplicated, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn meerkat_machine_spine_snapshot_tracks_queued_prompt_input() {
     let adapter = Arc::new(MeerkatMachine::ephemeral());
@@ -14375,6 +14514,7 @@ async fn deduplicated_accept_with_completion_emits_no_new_signal() {
                 input: first,
                 register_completion: true,
                 replay_policy: crate::accept::InputReplayPolicy::KeyOnly,
+                admission_requirement: crate::accept::AdmissionRequirement::Any,
                 member_residency: MemberResidencyExpectation::Unfenced,
                 expected_attachment: None,
             },
@@ -14407,6 +14547,7 @@ async fn deduplicated_accept_with_completion_emits_no_new_signal() {
                 input: duplicate,
                 register_completion: true,
                 replay_policy: crate::accept::InputReplayPolicy::KeyOnly,
+                admission_requirement: crate::accept::AdmissionRequirement::Any,
                 member_residency: MemberResidencyExpectation::Unfenced,
                 expected_attachment: None,
             },
@@ -37112,6 +37253,120 @@ async fn terminal_receipt_follows_live_boundary_checkpoint_without_sequence_coll
     );
 }
 
+/// Every receipt a run commits before its terminal boundary carries no
+/// transcript count and no digest: the live-boundary context receipt and the
+/// owner-contribution receipt are receipt-only commits. Only the terminal
+/// receipt counts the transcript. Durable-tail recovery relies on this: its
+/// flat-prefix check of a crashed run's committed receipts is vacuous for
+/// count-0 receipts (`recovery::prepare_receipt_digest_enrichments`,
+/// `recovery::observe_prior_commits`). A writer that mints a counted receipt
+/// before its run's terminal boundary must first move that check to
+/// commit-chain ancestry: an in-run compaction rewrites the prefix it counts.
+#[tokio::test]
+async fn mid_run_receipts_carry_no_transcript_count_or_digest() {
+    let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let store: Arc<dyn RuntimeStore> = inner.clone();
+    let (driver, runtime_id, run_id, input_id) = persistent_staged_run_driver(store).await;
+    let owner_session_id = SessionId::parse(&runtime_id.to_string()).unwrap();
+
+    let live_input = Input::Prompt(crate::input::PromptInput::new(
+        "context admitted at the active boundary",
+        Some(
+            meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
+                handling_mode: Some(meerkat_core::types::HandlingMode::Steer),
+                ..Default::default()
+            },
+        ),
+    ));
+    let live_input_id = live_input.id().clone();
+    {
+        let mut entry = driver.lock().await;
+        let resolved = entry
+            .resolve_admission_with_active_turn_boundary(&live_input, true)
+            .expect("active boundary should authorize the live input");
+        entry
+            .accept_resolved_input(live_input, resolved)
+            .await
+            .expect("live input should be durably accepted");
+        entry
+            .machine_realize_live_boundary_context_injected(
+                &run_id,
+                std::slice::from_ref(&live_input_id),
+                None,
+                &owner_session_id,
+            )
+            .await
+            .expect("live-boundary context receipt should commit");
+        entry
+            .machine_realize_live_boundary_owner_context(
+                &run_id,
+                "owner-delegation-steer",
+                &owner_session_id,
+            )
+            .await
+            .expect("owner-contribution receipt should commit");
+    }
+
+    let mid_run = inner
+        .load_committed_boundary_receipts(&runtime_id, &run_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        mid_run
+            .iter()
+            .map(|receipt| receipt.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2],
+        "both mid-run boundaries commit a receipt: {mid_run:?}"
+    );
+    for receipt in &mid_run {
+        assert_eq!(
+            receipt.boundary,
+            meerkat_core::lifecycle::run_primitive::RunApplyBoundary::RunCheckpoint
+        );
+        assert_eq!(
+            receipt.message_count, 0,
+            "a mid-run receipt counts no transcript rows: {receipt:?}"
+        );
+        assert_eq!(
+            receipt.conversation_digest, None,
+            "a mid-run receipt carries no transcript digest: {receipt:?}"
+        );
+    }
+    assert_eq!(mid_run[0].contributing_input_ids, vec![live_input_id]);
+    assert_eq!(
+        mid_run[1].owner_contributions,
+        vec!["owner-delegation-steer".to_string()]
+    );
+
+    let mut session = meerkat_core::Session::with_id(owner_session_id);
+    session.push(meerkat_core::types::Message::User(
+        meerkat_core::types::UserMessage::text("persistent terminalization"),
+    ));
+    commit_runtime_loop_run(
+        &driver,
+        run_id.clone(),
+        vec![input_id.clone()],
+        machine_terminal_receipt(run_id.clone(), vec![input_id.clone()], &session),
+        Some(BoundSessionCommit::sealed(Arc::new(session.clone())).expect("seal terminal session")),
+        Vec::new(),
+        None,
+    )
+    .await
+    .expect("the terminal receipt follows the mid-run receipts");
+    let terminal = inner
+        .load_boundary_receipt(&runtime_id, &run_id, 3)
+        .await
+        .unwrap()
+        .expect("the terminal receipt takes sequence 3");
+    assert_eq!(
+        terminal.message_count,
+        session.messages().len(),
+        "only the terminal receipt counts the transcript"
+    );
+    assert!(terminal.conversation_digest.is_some());
+}
+
 #[tokio::test]
 async fn persistent_commit_success_uses_one_durable_receipt_terminal_write() {
     let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
@@ -48378,6 +48633,7 @@ async fn modeled_meerkat_accept_with_completion_attached_steer_matches_runtime()
                 input: runtime_parity_steered_prompt("modeled attached steer"),
                 register_completion: true,
                 replay_policy: crate::accept::InputReplayPolicy::KeyOnly,
+                admission_requirement: crate::accept::AdmissionRequirement::Any,
                 member_residency: MemberResidencyExpectation::Unfenced,
                 expected_attachment: None,
             },
@@ -48475,6 +48731,7 @@ async fn modeled_meerkat_accept_with_completion_idle_queue_signal_matches_runtim
                 input: runtime_parity_prompt("modeled idle queued admission"),
                 register_completion: true,
                 replay_policy: crate::accept::InputReplayPolicy::KeyOnly,
+                admission_requirement: crate::accept::AdmissionRequirement::Any,
                 member_residency: MemberResidencyExpectation::Unfenced,
                 expected_attachment: None,
             },
@@ -48772,6 +49029,7 @@ async fn modeled_meerkat_accept_with_completion_running_steer_signal_matches_run
                 input: runtime_parity_steered_prompt("modeled running steer admission"),
                 register_completion: true,
                 replay_policy: crate::accept::InputReplayPolicy::KeyOnly,
+                admission_requirement: crate::accept::AdmissionRequirement::Any,
                 member_residency: MemberResidencyExpectation::Unfenced,
                 expected_attachment: None,
             },
@@ -49630,6 +49888,7 @@ async fn modeled_meerkat_accept_with_completion_running_peer_interrupt_signal_ma
                 input: runtime_parity_peer_message("modeled running peer wake admission"),
                 register_completion: true,
                 replay_policy: crate::accept::InputReplayPolicy::KeyOnly,
+                admission_requirement: crate::accept::AdmissionRequirement::Any,
                 member_residency: MemberResidencyExpectation::Unfenced,
                 expected_attachment: None,
             },
@@ -50086,6 +50345,7 @@ fn runtime_parity_probe_command(
                 input: runtime_parity_prompt("runtime parity accept with completion"),
                 register_completion: true,
                 replay_policy: crate::accept::InputReplayPolicy::KeyOnly,
+                admission_requirement: crate::accept::AdmissionRequirement::Any,
                 member_residency: MemberResidencyExpectation::Unfenced,
                 expected_attachment: None,
             }
@@ -50224,6 +50484,9 @@ fn summarize_runtime_parity_driver_error(error: &RuntimeDriverError) -> String {
         }
         RuntimeDriverError::InputIdempotencyConflict { existing_id } => {
             format!("input_idempotency_conflict:{existing_id}")
+        }
+        RuntimeDriverError::NoExistingAdmission { key } => {
+            format!("no_existing_admission:{key}")
         }
         RuntimeDriverError::RetainedResumeRefused { reason } => {
             format!("retained_resume_refused:{reason:?}")

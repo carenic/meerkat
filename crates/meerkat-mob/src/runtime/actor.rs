@@ -36,6 +36,8 @@ mod spawn_admission_io;
 pub(super) mod spawn_preparation;
 pub(super) mod wiring_io;
 
+use super::uncertain_durability::UncertainDurabilityFailStop;
+
 use member_effect_lane::MemberIncarnationFence;
 use member_status_lane::{
     MEMBER_STATUS_OBSERVATION_DEADLINE, MemberStatusObservationWaiters,
@@ -458,6 +460,9 @@ fn is_transcript_revision_conflict(error: &meerkat_core::service::SessionError) 
 /// Classify a session read failure by its typed cause. Durable corruption and
 /// unsupported persistence are permanent observations; transport, I/O, and
 /// unknown failures remain retryable. Display text is diagnostic only.
+/// `Corrupted` is permanent because the `SessionStoreError::Corrupted`
+/// contract makes it deterministic for the same persisted state and request,
+/// never a race with a concurrent writer.
 fn identity_session_load_error_class(
     error: &meerkat_core::service::SessionError,
 ) -> IdentitySessionLoadErrorClass {
@@ -4258,11 +4263,11 @@ static FAIL_SESSION_INGRESS_DETACH_FOR_SESSION: std::sync::Mutex<Option<SessionI
 /// The mobs a one-shot per-mob test seam is armed for. A set, so arming the
 /// seam for one mob never disarms another's arm: tests in one process
 /// (in-process `cargo test`) can arm the same seam concurrently.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 type MobSeamForTest = std::sync::Mutex<std::collections::BTreeSet<MobId>>;
 
 /// Arm a one-shot per-mob test seam: it fires once, for this mob only.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn arm_mob_seam_for_test(seam: &MobSeamForTest, mob_id: &MobId) {
     if let Ok(mut armed) = seam.lock() {
         armed.insert(mob_id.clone());
@@ -4270,7 +4275,7 @@ fn arm_mob_seam_for_test(seam: &MobSeamForTest, mob_id: &MobId) {
 }
 
 /// Whether the seam is armed for this mob, disarming it if so.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn take_mob_seam_for_test(seam: &MobSeamForTest, mob_id: &MobId) -> bool {
     seam.lock().is_ok_and(|mut armed| armed.remove(mob_id))
 }
@@ -4412,12 +4417,16 @@ pub(super) fn fail_next_shutdown_drain_for_test(mob_id: &MobId) {
 
 /// Test seam: this mob's next actor start fail-stops in its durable recovery,
 /// before command admission.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static FAIL_STOP_ACTOR_START_FOR_MOB: MobSeamForTest =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
-#[cfg(test)]
-pub(super) fn fail_stop_next_actor_start_for_test(mob_id: &MobId) {
+/// Test-support seam: the next actor start of the mob `mob_id` fail-stops in
+/// its durable recovery, before it admits a command, as a real startup
+/// recovery failure does. The seam fires once, for that mob only.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn fail_stop_next_actor_start_for_test(mob_id: &MobId) {
     arm_mob_seam_for_test(&FAIL_STOP_ACTOR_START_FOR_MOB, mob_id);
 }
 #[cfg(test)]
@@ -8083,8 +8092,9 @@ pub(super) struct MobActor {
     /// durable replay may resolve the uncertainty.
     /// A durable mutation may have committed but could not be classified
     /// exactly.  The loop quiesces and terminates before accepting another
-    /// command; cold recovery is the only authority that may continue.
-    pub(super) durable_uncertainty_fail_stop: bool,
+    /// command; cold recovery is the only authority that may continue. It
+    /// holds that mutation's own error, the cause the loop exit records.
+    pub(super) durable_uncertainty_fail_stop: UncertainDurabilityFailStop,
     /// Test-only process-death acknowledgement retained until the actor object
     /// itself has been dropped. Sending this from the command arm races a cold
     /// same-process replacement with the actor-owned runtime adapter and its
@@ -9568,17 +9578,16 @@ impl MobActor {
         context: &'static str,
         error: MobError,
     ) -> MobError {
-        self.durable_uncertainty_fail_stop = true;
         tracing::error!(
             peer_id = %peer.peer_id,
             context,
             error = %error,
             "recipient trust install failed after a possibly committed DSL mutation; retaining trust obligation and fail-stopping actor"
         );
-        MobError::Internal(format!(
+        self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
             "recipient trust install for '{}' ({context}) failed after its declarative mutation may have committed: {error}; trust state and the pending recipient-trust obligation are retained for cold repair",
             peer.peer_id
-        ))
+        )))
     }
 
     /// Fail-closed rollback for supervisor recipient trust installed ahead of an
@@ -9601,19 +9610,17 @@ impl MobActor {
         if Self::recipient_trust_was_newly_installed(install)
             && let Err(untrust_error) = self.supervisor_bridge.untrust_recipient(peer).await
         {
-            self.durable_uncertainty_fail_stop = true;
-            return MobError::WiringError(format!(
+            return self.durable_uncertainty_fail_stop.record(MobError::WiringError(format!(
                 "supervisor authorization failed ({original_error}); additionally failed to roll back installed recipient trust, so the pending obligation is retained and the actor is fail-stopping: {untrust_error}"
-            ));
+            )));
         }
         if let Err(obligation_error) = self.rollback_pending_recipient_trust_obligation(
             peer,
             "rollback_supervisor_recipient_trust",
         ) {
-            self.durable_uncertainty_fail_stop = true;
-            return MobError::WiringError(format!(
+            return self.durable_uncertainty_fail_stop.record(MobError::WiringError(format!(
                 "supervisor authorization failed ({original_error}); additionally failed to roll back the pending recipient-trust obligation, so the actor is fail-stopping: {obligation_error}"
-            ));
+            )));
         }
         original_error
     }
@@ -9628,16 +9635,15 @@ impl MobActor {
         peer: &TrustedPeerDescriptor,
         error: MobError,
     ) -> MobError {
-        self.durable_uncertainty_fail_stop = true;
         tracing::error!(
             peer_id = %peer.peer_id,
             error = %error,
             "BindHost outcome is uncertain after request send; retaining trust and pending obligation for exact replay"
         );
-        MobError::Internal(format!(
+        self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
             "BindHost outcome for host '{}' is uncertain after request send: {error}; recipient trust and pending obligation retained for exact replay",
             peer.peer_id
-        ))
+        )))
     }
 
     fn quarantine_uncertain_host_revoke(
@@ -9645,16 +9651,15 @@ impl MobActor {
         host_id: &mob_dsl::HostId,
         error: MobError,
     ) -> MobError {
-        self.durable_uncertainty_fail_stop = true;
         tracing::error!(
             host = %host_id.as_str(),
             error = %error,
             "RevokeHost outcome crossed the remote terminal boundary; retaining the Started anchor for cold exact replay"
         );
-        MobError::Internal(format!(
+        self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
             "RevokeHost outcome for host '{}' is uncertain after remote delivery or terminal acceptance: {error}; Started anchor retained for cold exact replay",
             host_id.as_str()
-        ))
+        )))
     }
 
     fn quarantine_uncertain_host_rebind(
@@ -9663,17 +9668,16 @@ impl MobActor {
         epoch: u64,
         error: MobError,
     ) -> MobError {
-        self.durable_uncertainty_fail_stop = true;
         tracing::error!(
             host = %host_id.as_str(),
             epoch,
             error = %error,
             "RebindHost may have advanced the host authority; fail-stopping until cold exact convergence"
         );
-        MobError::Internal(format!(
+        self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
             "RebindHost outcome for host '{}' epoch {epoch} is uncertain after request delivery: {error}; actor is fail-stopping for cold exact convergence",
             host_id.as_str()
-        ))
+        )))
     }
 
     // -----------------------------------------------------------------------
@@ -10825,10 +10829,7 @@ impl MobActor {
             )
             .await;
         if retirement_cleanup {
-            result.map_err(|error| match error {
-                MobError::RetirementTopologyIncomplete(_) => error,
-                other => MobError::RetirementTopologyIncomplete(other.to_string()),
-            })
+            result.map_err(MobError::into_retirement_topology_incomplete)
         } else {
             result
         }
@@ -12597,9 +12598,11 @@ impl MobActor {
         )
     }
 
-    /// Whether a routed effect still names the runtime the machine runs for
-    /// its member: the bound runtime for a binding or a retire, a live
-    /// runtime for an ingress.
+    /// Whether a refused routed effect still names a runtime the machine runs
+    /// for its member: the bound and live runtime for a binding, the bound and
+    /// retiring runtime for a retire, a live runtime for an ingress. Any other
+    /// kind is never presumed stale (only these three carry refusal feedback
+    /// today): it waits while Stopped and keeps the error in any other phase.
     fn routed_effect_targets_current_runtime(
         state: &mob_dsl::MobMachineState,
         effect: &super::composition::MobSeamEffect,
@@ -12609,16 +12612,23 @@ impl MobActor {
                 agent_identity,
                 agent_runtime_id,
                 ..
+            } => {
+                state.identity_to_runtime.get(agent_identity) == Some(agent_runtime_id)
+                    && state.live_runtime_ids.contains(agent_runtime_id)
             }
-            | mob_dsl::MobMachineEffect::RequestRuntimeRetire {
+            mob_dsl::MobMachineEffect::RequestRuntimeRetire {
                 agent_identity,
                 agent_runtime_id,
                 ..
-            } => state.identity_to_runtime.get(agent_identity) == Some(agent_runtime_id),
+            } => {
+                state.identity_to_runtime.get(agent_identity) == Some(agent_runtime_id)
+                    && state.member_state_markers.get(agent_runtime_id)
+                        == Some(&mob_dsl::MobMemberState::Retiring)
+            }
             mob_dsl::MobMachineEffect::RequestRuntimeIngress {
                 agent_runtime_id, ..
             } => state.live_runtime_ids.contains(agent_runtime_id),
-            _ => false,
+            _ => true,
         }
     }
 
@@ -12790,9 +12800,10 @@ impl MobActor {
                             &effect,
                         ) {
                             // The route outlived the runtime it names (its
-                            // member retired, or now runs another runtime), so
-                            // no phase of the machine takes its refusal. Drop
-                            // it rather than dispatch it again at every flush.
+                            // member retired, runs another runtime, or for a
+                            // retire is no longer retiring), so no phase of
+                            // the machine takes its refusal. Drop it rather
+                            // than dispatch it again at every flush.
                             tracing::warn!(
                                 mob_id = %self.definition.id,
                                 effect = ?effect.body(),
@@ -12805,10 +12816,11 @@ impl MobActor {
                         }
                         if phase == mob_dsl::MobPhase::Stopped {
                             // The machine still runs this member but cannot
-                            // take the feedback while Stopped. Keep the head
-                            // queued, as the pending-detach deferral above
-                            // does: the first flush after activation
-                            // dispatches it again.
+                            // take the feedback while Stopped (binding and
+                            // ingress refusals have Running transitions only).
+                            // Keep the head queued, as the pending-detach
+                            // deferral above does: the first flush after
+                            // activation dispatches it again.
                             tracing::warn!(
                                 mob_id = %self.definition.id,
                                 effect = ?effect.body(),
@@ -12873,6 +12885,27 @@ impl MobActor {
             }
             Err(error) => ActorBoundaryFlushDisposition::Fatal(error),
         }
+    }
+
+    /// Whether a destroy supersedes a queued routed effect: it retires every
+    /// member and the mob never runs again once its admission closes, so a
+    /// queued binding or ingress for a member can only be refused or be moot.
+    /// Retire and destroy routes stay: the destroy dispatches them.
+    fn routed_effect_superseded_by_destroy(effect: &super::composition::MobSeamEffect) -> bool {
+        matches!(
+            effect.body(),
+            mob_dsl::MobMachineEffect::RequestRuntimeBinding { .. }
+                | mob_dsl::MobMachineEffect::RequestRuntimeIngress { .. }
+        )
+    }
+
+    /// Drop the queued routes a destroy supersedes (see
+    /// [`Self::routed_effect_superseded_by_destroy`]). A refused one, held
+    /// while the mob was Stopped, would otherwise stop every destroy attempt
+    /// at its first routed flush.
+    fn discard_routed_effects_superseded_by_destroy(&mut self) {
+        self.pending_routed_effects
+            .retain(|effect| !Self::routed_effect_superseded_by_destroy(effect));
     }
 
     fn discard_pending_routed_effects_for_session(&mut self, session_id: &SessionId) {
@@ -13874,28 +13907,25 @@ impl MobActor {
             if machine_generation == Some(host_binding_generation) {
                 return Ok(());
             }
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "placed carrier '{}' is durable at binding generation {} but machine authority is {:?}; actor is fail-stopping for cold recovery ({context})",
                 expected.agent_identity, host_binding_generation, machine_generation
-            )));
+            ))));
         }
         if expected.host_binding_generation == 0
             || host_binding_generation <= expected.host_binding_generation
         {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "placed carrier '{}' cannot promote binding generation {} -> {}; actor is fail-stopping for cold recovery ({context})",
                 expected.agent_identity, expected.host_binding_generation, host_binding_generation
-            )));
+            ))));
         }
 
         let crate::store::PlacedSpawnCarrierPhase::Committed(committed) = &expected.phase else {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "placed carrier '{}' binding promotion has no committed session facts; actor is fail-stopping for cold recovery ({context})",
                 expected.agent_identity
-            )));
+            ))));
         };
         let domain_identity = AgentIdentity::from(expected.agent_identity.as_str());
         let member_session_id = mob_dsl::SessionId(committed.member_session_id.to_string());
@@ -13926,11 +13956,10 @@ impl MobActor {
             )
             .await
         {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "placed carrier '{}' could not dispose exact generation-{} remote-turn custody before binding promotion; actor is fail-stopping ({context}): {error}",
                 expected.agent_identity, expected.host_binding_generation
-            )));
+            ))));
         }
         if let Err(error) = self
             .dispose_placed_completion_custody_for_exact_residency(ExactRemoteTurnResidency {
@@ -13943,11 +13972,10 @@ impl MobActor {
             })
             .await
         {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "placed carrier '{}' could not dispose exact generation-{} completion custody before binding promotion; actor is fail-stopping ({context}): {error}",
                 expected.agent_identity, expected.host_binding_generation
-            )));
+            ))));
         }
         if let Err(error) = self
             .dispose_placed_kickoff_custody_for_exact_residency(ExactRemoteTurnResidency {
@@ -13960,11 +13988,10 @@ impl MobActor {
             })
             .await
         {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "placed carrier '{}' could not dispose exact generation-{} kickoff custody before binding promotion; actor is fail-stopping ({context}): {error}",
                 expected.agent_identity, expected.host_binding_generation
-            )));
+            ))));
         }
 
         let input = mob_dsl::MobMachineInput::PromoteCommittedPlacedSpawnCarrierBinding {
@@ -13979,11 +14006,10 @@ impl MobActor {
         let prepared = match self.prepare_dsl_input_transition(input, context) {
             Ok(prepared) => prepared,
             Err(error) => {
-                self.durable_uncertainty_fail_stop = true;
-                return Err(MobError::Internal(format!(
+                return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                     "placed carrier '{}' promotion could not prepare exact machine authority; actor is fail-stopping for cold recovery ({context}): {error}",
                     expected.agent_identity
-                )));
+                ))));
             }
         };
         let mut promoted = expected.clone();
@@ -13996,11 +14022,10 @@ impl MobActor {
             ) {
                 Ok(persistence) => persistence,
                 Err(error) => {
-                    self.durable_uncertainty_fail_stop = true;
-                    return Err(MobError::Internal(format!(
+                    return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                         "placed carrier '{}' authenticated promotion proof could not mint its exact persistence witness; actor is fail-stopping for cold recovery ({context}): {error}",
                         expected.agent_identity
-                    )));
+                    ))));
                 }
             };
         let durable = match self
@@ -14045,11 +14070,10 @@ impl MobActor {
             },
         };
         if !durable {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "placed carrier '{}' binding generation promotion {} -> {} conflicted or remained uncertain; actor is fail-stopping for cold recovery ({context})",
                 expected.agent_identity, expected.host_binding_generation, host_binding_generation
-            )));
+            ))));
         }
         let old_expected_member = super::bridge_protocol::BridgeMemberIncarnation {
             mob_id: self.definition.id.to_string(),
@@ -14073,18 +14097,16 @@ impl MobActor {
             )
             .await
         {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "placed carrier '{}' durable binding generation {} was promoted before the old pump could be quiesced; actor is fail-stopping before machine publication ({context}): {error}",
                 expected.agent_identity, host_binding_generation
-            )));
+            ))));
         }
         if let Err(error) = self.commit_prepared_dsl_transition(prepared) {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "placed carrier '{}' durable binding generation {} was promoted before machine publication; actor is fail-stopping for cold recovery ({context}): {error}",
                 expected.agent_identity, host_binding_generation
-            )));
+            ))));
         }
         self.deliver_run_start_posture_to_placed_member(
             &domain_identity,
@@ -14305,10 +14327,9 @@ impl MobActor {
                 &peer_name,
             )
         {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "placed revival for '{agent_identity}' could not validate its exact committed operation anchor; actor is fail-stopping for cold recovery: {error}"
-            )));
+            ))));
         }
 
         let binding_owner = owner_bridge_session_id.clone();
@@ -15006,7 +15027,6 @@ impl MobActor {
         let delivery: Option<(PeerDeliveryId, AgentIdentity, AgentIdentity)> = None;
         let outcome = if error.is_cancelled() {
             if panic_disposition.requires_fail_stop() {
-                self.durable_uncertainty_fail_stop = true;
                 let cancellation_error = MobError::Internal(format!(
                     "{context} task {task_id} was cancelled; \
                      disposition=cancelled_ambiguous_effect_fail_stop"
@@ -15021,7 +15041,10 @@ impl MobActor {
                     error = %cancellation_error,
                     "peer delivery task was unexpectedly cancelled; effect outcome is unknown"
                 );
-                Some(cancellation_error)
+                Some(
+                    self.durable_uncertainty_fail_stop
+                        .record(cancellation_error),
+                )
             } else {
                 tracing::debug!(
                     context,
@@ -15036,9 +15059,6 @@ impl MobActor {
             }
         } else {
             let panic_error = actor_task_join_panic_error(context, panic_disposition, error);
-            if panic_disposition.requires_fail_stop() {
-                self.durable_uncertainty_fail_stop = true;
-            }
             tracing::error!(
                 context,
                 task_id = %task_id,
@@ -15048,7 +15068,11 @@ impl MobActor {
                 error = %panic_error,
                 "peer delivery effect may have escaped without a typed completion"
             );
-            Some(panic_error)
+            Some(if panic_disposition.requires_fail_stop() {
+                self.durable_uncertainty_fail_stop.record(panic_error)
+            } else {
+                panic_error
+            })
         };
         if let Some((delivery_id, _, _)) = delivery {
             self.peer_delivery_inflight.remove(&delivery_id);
@@ -15069,11 +15093,19 @@ impl MobActor {
                     disposition = "cancelled_ambiguous_effect_fail_stop",
                     "actor-owned I/O task was unexpectedly cancelled; effect outcome is unknown"
                 );
-                self.durable_uncertainty_fail_stop = true;
+                self.durable_uncertainty_fail_stop
+                    .record_unreplied(MobError::Internal(format!(
+                        "actor-owned I/O task {} was unexpectedly cancelled; effect outcome is unknown",
+                        actor_task_join_error_task_id(&error)
+                    )));
             } else {
                 let disposition = ActorTaskJoinPanicDisposition::AmbiguousEffectFailStop;
-                let _ = actor_task_join_panic_error("actor I/O completion", disposition, error);
-                self.durable_uncertainty_fail_stop = true;
+                self.durable_uncertainty_fail_stop
+                    .record_unreplied(actor_task_join_panic_error(
+                        "actor I/O completion",
+                        disposition,
+                        error,
+                    ));
             }
         }
     }
@@ -15464,16 +15496,17 @@ impl MobActor {
             }
             Err(join_error) if join_error.is_cancelled() => {
                 let task_id = actor_task_join_error_task_id(&join_error);
-                self.durable_uncertainty_fail_stop = true;
                 tracing::error!(
                     task_id = %task_id,
                     disposition = "cancelled_ambiguous_effect_fail_stop",
                     "orchestrator lifecycle delivery was cancelled; delivery outcome is unknown"
                 );
-                Err(MobError::Internal(format!(
-                    "orchestrator lifecycle delivery task {task_id} was cancelled; \
+                Err(self
+                    .durable_uncertainty_fail_stop
+                    .record(MobError::Internal(format!(
+                        "orchestrator lifecycle delivery task {task_id} was cancelled; \
                      disposition=cancelled_ambiguous_effect_fail_stop"
-                )))
+                    ))))
             }
             Err(join_error) => {
                 let disposition = ActorTaskJoinPanicDisposition::AmbiguousEffectFailStop;
@@ -15482,8 +15515,7 @@ impl MobActor {
                     disposition,
                     join_error,
                 );
-                self.durable_uncertainty_fail_stop = true;
-                Err(error)
+                Err(self.durable_uncertainty_fail_stop.record(error))
             }
         }
     }
@@ -15603,7 +15635,7 @@ impl MobActor {
                         "insert_pending_spawn_collision",
                     )
                     .await;
-                if self.durable_uncertainty_fail_stop {
+                if self.durable_uncertainty_fail_stop.is_set() {
                     cleanup_errors.push(cleanup_result.to_string());
                 }
             }
@@ -15615,13 +15647,12 @@ impl MobActor {
                     )
                     .await
             {
-                self.durable_uncertainty_fail_stop = true;
                 self.respawn_topology_reply_withheld = true;
-                return Err(MobError::Internal(format!(
+                return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                     "{reason}; durable respawn-topology abandonment failed and the actor is fail-stopping for cold recovery: {error}"
-                )));
+                ))));
             }
-            if self.durable_uncertainty_fail_stop {
+            if self.durable_uncertainty_fail_stop.is_set() {
                 replaced.fail(&reason);
                 return Err(MobError::Internal(format!(
                     "{reason}; collision cleanup remained durably uncertain and the actor is fail-stopping for cold recovery"
@@ -18008,7 +18039,7 @@ impl MobActor {
                 )
                 .await
             {
-                if self.durable_uncertainty_fail_stop {
+                if self.durable_uncertainty_fail_stop.is_set() {
                     // An unreadable write-then-error cancellation may already
                     // be durable. Join every volatile producer before the
                     // actor-loop fail-stop boundary so cold replay remains the
@@ -18674,6 +18705,60 @@ impl MobActor {
         }
     }
 
+    /// The members of this Stopped mob as a drain of its runs starts: each
+    /// roster member's local session, its current run and live channel at
+    /// this instant, and its run starts as this process's last Stop recorded
+    /// them. Refused unless the mob is Stopped.
+    #[cfg(feature = "runtime-adapter")]
+    async fn drain_runs_snapshot(&self) -> Result<super::run_drain::DrainSnapshot, MobError> {
+        let state = self.state();
+        if state != MobState::Stopped {
+            return Err(MobError::DrainRequiresStoppedMob { state });
+        }
+        let entries = {
+            let roster = self.roster.read().await;
+            roster.list().cloned().collect::<Vec<_>>()
+        };
+        let mut members = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let local = !super::member_runtime_is_host_owned(
+                self.dsl_authority.state(),
+                &entry.agent_identity,
+            ) && !self.placed_member_carrier_dormant(&entry.agent_identity);
+            let local_session = local
+                .then(|| entry.member_ref.bridge_session_id().cloned())
+                .flatten();
+            let facts = match (&self.runtime_adapter, &local_session) {
+                (Some(adapter), Some(session_id)) => super::run_drain::DrainMemberFacts {
+                    reload_required: adapter
+                        .durability_reload_required(session_id)
+                        .await
+                        .is_some(),
+                    live_channel_active: adapter.session_live_channel_active(session_id).await,
+                    current_run: adapter.current_run(session_id).await,
+                    local_session,
+                },
+                _ => super::run_drain::DrainMemberFacts {
+                    local_session,
+                    ..super::run_drain::DrainMemberFacts::default()
+                },
+            };
+            let starts = self
+                .stop_member_outcomes
+                .get(&entry.agent_identity)
+                .map(|outcome| outcome.starts.clone());
+            members.push(super::run_drain::DrainSnapshotMember {
+                target: super::run_drain::drain_target(facts, starts.as_ref()),
+                identity: entry.agent_identity,
+                starts,
+            });
+        }
+        Ok(super::run_drain::DrainSnapshot {
+            members,
+            machine: self.runtime_adapter.clone(),
+        })
+    }
+
     /// Hold roster members' run starts (#1500) for a Shutdown, returning each
     /// member's outcome: it holds only the members whose runtime this mob
     /// hosts (`local_only`), one after another. A remote member's host is not
@@ -18865,6 +18950,37 @@ impl MobActor {
         &mut self,
         kind: PendingAutonomousStopKind,
     ) -> Result<Vec<(AgentIdentity, AutonomousStopInterrupted)>, MobError> {
+        let entries = self.close_all_autonomous_kickoff_origins().await?;
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Phase 2 launches all exact interrupts together and returns without
+        // waiting for their bridge I/O. A later retry observes completion.
+        self.drive_autonomous_stop_interrupts(&entries, kind)?;
+
+        entries
+            .into_iter()
+            .map(|entry| {
+                self.autonomous_stop_interrupted
+                    .get(&entry.agent_identity)
+                    .cloned()
+                    .map(|target| (entry.agent_identity.clone(), target))
+                    .ok_or_else(|| {
+                        MobError::Internal(format!(
+                            "autonomous stop lost interrupt success for '{}'",
+                            entry.agent_identity
+                        ))
+                    })
+            })
+            .collect()
+    }
+
+    /// Phase 1 of every autonomous stop, for each autonomous member MobMachine
+    /// says to interrupt: durably close its kickoff origin, then refuse while
+    /// placed kickoff cleanup is pending. Returns those members; a Stop that
+    /// leaves runs running interrupts none of them.
+    async fn close_all_autonomous_kickoff_origins(&mut self) -> Result<Vec<RosterEntry>, MobError> {
         let entries = {
             let roster = self.roster.read().await;
             roster
@@ -18915,7 +19031,7 @@ impl MobActor {
                 if first_error.is_none() {
                     first_error = Some(error);
                 }
-                if self.durable_uncertainty_fail_stop {
+                if self.durable_uncertainty_fail_stop.is_set() {
                     break;
                 }
             }
@@ -18938,26 +19054,7 @@ impl MobActor {
                 resolved: placed_kickoff_resolved,
             });
         }
-
-        // Phase 2 launches all exact interrupts together and returns without
-        // waiting for their bridge I/O. A later retry observes completion.
-        self.drive_autonomous_stop_interrupts(&entries, kind)?;
-
-        entries
-            .into_iter()
-            .map(|entry| {
-                self.autonomous_stop_interrupted
-                    .get(&entry.agent_identity)
-                    .cloned()
-                    .map(|target| (entry.agent_identity.clone(), target))
-                    .ok_or_else(|| {
-                        MobError::Internal(format!(
-                            "autonomous stop lost interrupt success for '{}'",
-                            entry.agent_identity
-                        ))
-                    })
-            })
-            .collect()
+        Ok(entries)
     }
 
     /// Whether a Shutdown has started and is parked (on its members' stops
@@ -19248,7 +19345,9 @@ impl MobActor {
             return;
         };
         match cmd {
-            MobCommand::Stop { reply_tx } if pending.kind == PendingAutonomousStopKind::Stop => {
+            MobCommand::Stop { reply_tx, .. }
+                if pending.kind == PendingAutonomousStopKind::Stop =>
+            {
                 pending.joined.push(LifecycleReplyTx::Stop(reply_tx));
             }
             // A joining Shutdown adopts the pending Shutdown's deadline.
@@ -19542,7 +19641,7 @@ impl MobActor {
             // The Stop's error stays the reported one. An actor
             // fail-stopping for cold recovery releases none: cold replay
             // alone decides whether work can start.
-            if !self.durable_uncertainty_fail_stop
+            if !self.durable_uncertainty_fail_stop.is_set()
                 && let Err(error) = self.release_all_member_run_starts().await
             {
                 tracing::warn!(
@@ -19658,7 +19757,7 @@ impl MobActor {
             self.finish_shutdown_report();
         }
         if succeeded
-            && !self.durable_uncertainty_fail_stop
+            && !self.durable_uncertainty_fail_stop.is_set()
             && !self.retained_actor_completions.is_empty()
         {
             // Completions of work this actor owned arrived while it joined that
@@ -19669,7 +19768,7 @@ impl MobActor {
         if !self.respawn_topology_reply_withheld {
             send_lifecycle_result(reply_tx, joined, result, &self.current_stop_report());
         }
-        if !self.durable_uncertainty_fail_stop {
+        if !self.durable_uncertainty_fail_stop.is_set() {
             if succeeded {
                 return ActorLoopControl::BreakActor;
             }
@@ -21240,7 +21339,10 @@ impl MobActor {
         let ResumeLifecyclePhase::AwaitingTopologyOwners { post_commit_error } = pending.phase
         else {
             tracing::error!("resume topology lost its prior-owner continuation");
-            self.durable_uncertainty_fail_stop = true;
+            self.durable_uncertainty_fail_stop
+                .record_unreplied(MobError::Internal(
+                    "resume topology lost its prior-owner continuation".to_string(),
+                ));
             return;
         };
         self.start_resume_lifecycle_topology(
@@ -21321,7 +21423,10 @@ impl MobActor {
             )
         }) else {
             tracing::error!("topology completion lost its resume continuation");
-            self.durable_uncertainty_fail_stop = true;
+            self.durable_uncertainty_fail_stop
+                .record_unreplied(MobError::Internal(
+                    "topology completion lost its resume continuation".to_string(),
+                ));
             return;
         };
         self.begin_resume_post_topology_members(pending, result)
@@ -21647,10 +21752,12 @@ impl MobActor {
         let effects = prepared.transition.effects().to_vec();
         if structural_replay {
             if !effects.is_empty() {
-                self.durable_uncertainty_fail_stop = true;
-                return Err(MobError::Internal(
-                    "placed-kickoff outcome replay unexpectedly emitted fresh effects".to_string(),
-                ));
+                return Err(self
+                    .durable_uncertainty_fail_stop
+                    .record(MobError::Internal(
+                        "placed-kickoff outcome replay unexpectedly emitted fresh effects"
+                            .to_string(),
+                    )));
             }
             self.require_existing_placed_kickoff_structural_carrier(
                 PlacedKickoffStructuralReplay::Resolved {
@@ -21688,10 +21795,9 @@ impl MobActor {
             }
         };
         if let Err(error) = self.commit_prepared_dsl_transition(prepared) {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "placed-kickoff Resolve is durable but machine commit failed; actor is fail-stopping for cold recovery: {error}"
-            )));
+            ))));
         }
         self.roster
             .write()
@@ -21875,10 +21981,12 @@ impl MobActor {
         let effects = prepared.transition.effects().to_vec();
         if structural_replay {
             if !effects.is_empty() {
-                self.durable_uncertainty_fail_stop = true;
-                return Err(MobError::Internal(
-                    "placed-kickoff Start replay unexpectedly emitted fresh effects".to_string(),
-                ));
+                return Err(self
+                    .durable_uncertainty_fail_stop
+                    .record(MobError::Internal(
+                        "placed-kickoff Start replay unexpectedly emitted fresh effects"
+                            .to_string(),
+                    )));
             }
             self.require_existing_placed_kickoff_structural_carrier(
                 PlacedKickoffStructuralReplay::Record {
@@ -21914,10 +22022,9 @@ impl MobActor {
             }
         };
         if let Err(error) = self.commit_prepared_dsl_transition(prepared) {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "placed-kickoff Record is durable but machine commit failed; actor is fail-stopping for cold recovery: {error}"
-            )));
+            ))));
         }
         self.roster
             .write()
@@ -21978,11 +22085,12 @@ impl MobActor {
         let effects = prepared.transition.effects().to_vec();
         if structural_replay {
             if !effects.is_empty() {
-                self.durable_uncertainty_fail_stop = true;
-                return Err(MobError::Internal(
-                    "placed-kickoff rejection replay unexpectedly emitted fresh effects"
-                        .to_string(),
-                ));
+                return Err(self
+                    .durable_uncertainty_fail_stop
+                    .record(MobError::Internal(
+                        "placed-kickoff rejection replay unexpectedly emitted fresh effects"
+                            .to_string(),
+                    )));
             }
             self.require_existing_placed_kickoff_structural_carrier(
                 PlacedKickoffStructuralReplay::RejectedNoEffect {
@@ -22200,8 +22308,7 @@ impl MobActor {
             Ok(true) => return Ok(()),
             Ok(false) => {}
             Err(error) => {
-                self.durable_uncertainty_fail_stop = true;
-                return Err(error);
+                return Err(self.durable_uncertainty_fail_stop.record(error));
             }
         }
         let append = self
@@ -22220,8 +22327,7 @@ impl MobActor {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .observe(&desired)
                 {
-                    self.durable_uncertainty_fail_stop = true;
-                    return Err(error);
+                    return Err(self.durable_uncertainty_fail_stop.record(error));
                 }
                 Ok(())
             }
@@ -22229,10 +22335,9 @@ impl MobActor {
                 let replay = match self.events.replay_all().await {
                     Ok(replay) => replay,
                     Err(reconcile_error) => {
-                        self.durable_uncertainty_fail_stop = true;
-                        return Err(MobError::Internal(format!(
+                        return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                             "placed-completion append failed ({error}) and replay was unreadable; actor is fail-stopping for cold recovery: {reconcile_error}"
-                        )));
+                        ))));
                     }
                 };
                 let present = {
@@ -22248,10 +22353,7 @@ impl MobActor {
                 match present {
                     Ok(true) => Ok(()),
                     Ok(false) => Err(MobError::from(error)),
-                    Err(conflict) => {
-                        self.durable_uncertainty_fail_stop = true;
-                        Err(conflict)
-                    }
+                    Err(conflict) => Err(self.durable_uncertainty_fail_stop.record(conflict)),
                 }
             }
         }
@@ -22307,10 +22409,9 @@ impl MobActor {
             )
             .await?;
             if let Err(error) = self.commit_prepared_dsl_transition(prepared) {
-                self.durable_uncertainty_fail_stop = true;
-                return Err(MobError::Internal(format!(
+                return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                     "placed completion cancellation carrier is durable but machine commit failed; actor is fail-stopping for cold recovery: {error}"
-                )));
+                ))));
             }
             return Ok(());
         }
@@ -22389,10 +22490,11 @@ impl MobActor {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .require_exact(&desired);
             if let Err(error) = exact {
-                if was_resolved {
-                    self.durable_uncertainty_fail_stop = true;
-                }
-                return Err(error);
+                return Err(if was_resolved {
+                    self.durable_uncertainty_fail_stop.record(error)
+                } else {
+                    error
+                });
             }
         }
         if !was_pending && !was_resolved {
@@ -22408,10 +22510,9 @@ impl MobActor {
             .dsl_authority
             .commit_prepared_authority(prepared.authority)
         {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "placed completion Resolve carrier is durable but prepared commit failed; actor is fail-stopping for cold recovery: {error}"
-            )));
+            ))));
         }
         self.queue_routed_effects_from(&effects);
         let expected_member = super::bridge_protocol::BridgeMemberIncarnation {
@@ -22427,10 +22528,9 @@ impl MobActor {
             .member_event_pumps
             .resolve_placed_completion_waiter(&expected_member, &waiter_record)
         {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "placed completion Resolve committed but waiter handoff failed before ACK publication; actor is fail-stopping for cold recovery: {error}"
-            )));
+            ))));
         }
         if phase_changed {
             let _ = self.phase_watch_tx.send(self.state());
@@ -22474,10 +22574,9 @@ impl MobActor {
             .dsl_authority
             .commit_prepared_authority(prepared.authority)
         {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "placed completion Close carrier is durable but prepared commit failed; actor is fail-stopping for cold recovery: {error}"
-            )));
+            ))));
         }
         self.queue_routed_effects_from(&effects);
         let expected_member = super::bridge_protocol::BridgeMemberIncarnation {
@@ -22497,10 +22596,9 @@ impl MobActor {
                 closure,
             )
         {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "placed completion Close committed but waiter handoff failed; actor is fail-stopping for cold recovery: {error}"
-            )));
+            ))));
         }
         if phase_changed {
             let _ = self.phase_watch_tx.send(self.state());
@@ -22542,10 +22640,9 @@ impl MobActor {
         if was_resolved {
             self.ensure_placed_completion_carrier(desired).await?;
             if let Err(error) = self.commit_prepared_dsl_transition(prepared) {
-                self.durable_uncertainty_fail_stop = true;
-                return Err(MobError::Internal(format!(
+                return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                     "placed completion ACK carrier is durable but machine commit failed; actor is fail-stopping for cold recovery: {error}"
-                )));
+                ))));
             }
             return Ok(());
         }
@@ -22599,10 +22696,9 @@ impl MobActor {
                 let replay = match self.events.replay_all().await {
                     Ok(replay) => replay,
                     Err(reconcile_error) => {
-                        self.durable_uncertainty_fail_stop = true;
-                        return Err(MobError::Internal(format!(
+                        return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                             "completion quiesce marker append failed ({error}) and replay was unreadable; actor is fail-stopping for cold recovery: {reconcile_error}"
-                        )));
+                        ))));
                     }
                 };
                 if latest_matches(&replay) {
@@ -22666,10 +22762,9 @@ impl MobActor {
         self.ensure_placed_completion_quiesce_marker(true, intent)
             .await?;
         if let Err(error) = self.commit_prepared_dsl_transition(prepared) {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "completion quiesce Start is durable but machine commit failed; actor is fail-stopping for cold recovery: {error}"
-            )));
+            ))));
         }
         Ok(())
     }
@@ -22712,10 +22807,9 @@ impl MobActor {
         self.ensure_placed_completion_quiesce_marker(remains_active, persisted_intent)
             .await?;
         if let Err(error) = self.commit_prepared_dsl_transition(prepared) {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "completion quiesce End is durable but machine commit failed; actor is fail-stopping for cold recovery: {error}"
-            )));
+            ))));
         }
         Ok(())
     }
@@ -22752,10 +22846,9 @@ impl MobActor {
         self.ensure_placed_completion_quiesce_marker(false, intent)
             .await?;
         if let Err(error) = self.commit_prepared_dsl_transition(prepared) {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "completion quiesce End is durable but Resume commit failed; actor is fail-stopping for cold recovery: {error}"
-            )));
+            ))));
         }
         // The mob runs again: release the run starts its Stop held (#1500),
         // so input admitted before the stop runs now. The release at resume
@@ -22835,16 +22928,14 @@ impl MobActor {
             // The event store may have written before returning an error. A
             // cold replay can decide from the exact MobStopped carrier; the
             // live actor must not continue under an ambiguous public phase.
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "Stop completion marker append was ambiguous; actor is fail-stopping for cold recovery: {error}"
-            )));
+            ))));
         }
         if let Err(error) = self.commit_prepared_dsl_transition(prepared) {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "MobStopped is durable but Stop machine commit failed; actor is fail-stopping for cold recovery: {error}"
-            )));
+            ))));
         }
         Ok(())
     }
@@ -22923,20 +23014,16 @@ impl MobActor {
         let replay = match self.events.replay_all().await {
             Ok(events) => events,
             Err(error) => {
-                self.durable_uncertainty_fail_stop = true;
-                return Err(MobError::Internal(format!(
+                return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                     "{} replay for input '{}' could not read its durable carrier; actor is fail-stopping for cold recovery: {error}",
                     expected.carrier_name(),
                     expected.input_id()
-                )));
+                ))));
             }
         };
         match existing_placed_kickoff_structural_carrier(&replay, &self.definition.id, expected) {
             Ok(existing) => Ok(existing),
-            Err(error) => {
-                self.durable_uncertainty_fail_stop = true;
-                Err(error)
-            }
+            Err(error) => Err(self.durable_uncertainty_fail_stop.record(error)),
         }
     }
 
@@ -22953,10 +23040,11 @@ impl MobActor {
         {
             return Ok(());
         }
-        self.durable_uncertainty_fail_stop = true;
-        Err(MobError::Internal(format!(
-            "{carrier_name} replay for input '{input_id}' has no exact durable carrier"
-        )))
+        Err(self
+            .durable_uncertainty_fail_stop
+            .record(MobError::Internal(format!(
+                "{carrier_name} replay for input '{input_id}' has no exact durable carrier"
+            ))))
     }
 
     async fn ensure_exact_structural_event(
@@ -23009,10 +23097,9 @@ impl MobActor {
                 let replay = match self.events.replay_all().await {
                     Ok(events) => events,
                     Err(reconcile_error) => {
-                        self.durable_uncertainty_fail_stop = true;
-                        return Err(MobError::Internal(format!(
+                        return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                             "structural event append failed ({error}) and durable reconciliation remained unreadable; actor is fail-stopping for cold recovery: {reconcile_error}"
-                        )));
+                        ))));
                     }
                 };
                 if present(&replay) {
@@ -23058,8 +23145,7 @@ impl MobActor {
             }
             Ok(false) => {}
             Err(error) => {
-                self.durable_uncertainty_fail_stop = true;
-                return Err(error);
+                return Err(self.durable_uncertainty_fail_stop.record(error));
             }
         }
         let events = desired
@@ -23086,10 +23172,9 @@ impl MobActor {
                 let replay = match self.events.replay_all().await {
                     Ok(events) => events,
                     Err(reconcile_error) => {
-                        self.durable_uncertainty_fail_stop = true;
-                        return Err(MobError::Internal(format!(
+                        return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                             "structural batch append failed ({error}) and durable reconciliation remained unreadable; actor is fail-stopping for cold recovery: {reconcile_error}"
-                        )));
+                        ))));
                     }
                 };
                 match exact_structural_batch_present(&replay, &mob_id, &desired) {
@@ -23101,10 +23186,7 @@ impl MobActor {
                         Ok(())
                     }
                     Ok(false) => Err(MobError::from(error)),
-                    Err(conflict) => {
-                        self.durable_uncertainty_fail_stop = true;
-                        Err(conflict)
-                    }
+                    Err(conflict) => Err(self.durable_uncertainty_fail_stop.record(conflict)),
                 }
             }
         }
@@ -23429,7 +23511,10 @@ impl MobActor {
                 %error,
                 "member effect custody survived actor teardown"
             );
-            self.durable_uncertainty_fail_stop = true;
+            self.durable_uncertainty_fail_stop
+                .record_unreplied(MobError::Internal(format!(
+                    "member effect custody survived actor teardown: {error}"
+                )));
         }
         self.log_shutdown_step("member_effects_joined", step);
         self.member_live_mutation_tasks.abort_all();
@@ -25453,6 +25538,18 @@ impl MobActor {
                     super::IdentityRecoveryFailStopPoint::LeaseAcquired,
                 );
             }
+            if let IdentityLeaseClaimOutcome::HeldByOther(active) = &outcome {
+                // The claim met a live holder although the lease read showed
+                // it expired: another incarnation claimed it in between, or
+                // the store's clock is behind this actor's. Wait for that
+                // holder's expiry, at least one re-check interval.
+                self.schedule_identity_reconcile_wait(
+                    identity,
+                    IdentityReconcileAuthorityKey::from_observation(&intent_observation),
+                    identity_lease_wait_delay(Some(active.expires_at_ms), now_ms)
+                        .max(IDENTITY_RECONCILE_LEASE_RECHECK),
+                );
+            }
             return Ok(IdentityReconcilePassDisposition::Outcome(matches!(
                 outcome,
                 IdentityLeaseClaimOutcome::Acquired(_) | IdentityLeaseClaimOutcome::Renewed(_)
@@ -25489,9 +25586,12 @@ impl MobActor {
                 .await;
                 if preliminary == IdentityReconcileDecision::AwaitLease {
                     // Another incarnation holds the lease. A holder that
-                    // crashed or stopped never releases it, and nothing else
-                    // wakes this identity when it expires (only the slow
-                    // safety scan would), so wait for that expiry.
+                    // crashed never releases it, nor does a Shutdown that
+                    // kept it (a member still unregistering, or whose
+                    // session actor had not exited, at its deadline; a
+                    // retiring member). Neither that expiry nor a release
+                    // wakes this identity (only the slow safety scan
+                    // would), so wait for the observed expiry.
                     let expires_at_ms = match &lease_observation {
                         IdentityStoredObservation::Valid(record) => {
                             record.active.as_ref().map(|active| active.expires_at_ms)
@@ -26666,9 +26766,6 @@ impl MobActor {
                             }
                         }
                         Err(error) => {
-                            if Self::host_status_rejection_requires_fail_stop(&error) {
-                                self.durable_uncertainty_fail_stop = true;
-                            }
                             self.mark_current_host_observation_failure(&host_id, &error);
                             tracing::warn!(
                                 mob_id = %self.definition.id,
@@ -26676,6 +26773,9 @@ impl MobActor {
                                 error = %error,
                                 "periodic host status/reconciliation poll failed"
                             );
+                            if Self::host_status_rejection_requires_fail_stop(&error) {
+                                self.durable_uncertainty_fail_stop.record_unreplied(error);
+                            }
                         }
                     }
                 }
@@ -26885,7 +26985,6 @@ impl MobActor {
                                     );
                                 }
                                 Err(abandon_error) => {
-                                    self.durable_uncertainty_fail_stop = true;
                                     self.respawn_topology_reply_withheld = true;
                                     tracing::error!(
                                         agent_identity = %respawn_identity,
@@ -26893,6 +26992,8 @@ impl MobActor {
                                         abandonment_error = %abandon_error,
                                         "durable topology abandonment failed; withholding respawn failure reply and fail-stopping for cold recovery"
                                     );
+                                    self.durable_uncertainty_fail_stop
+                                        .record_unreplied(abandon_error);
                                 }
                             }
                         }
@@ -27699,10 +27800,9 @@ impl MobActor {
                             .ensure_remote_turn_carrier(public_record)
                             .await;
                         if let Err(error) = self.commit_prepared_dsl_transition(prepared) {
-                            self.durable_uncertainty_fail_stop = true;
-                            return Err(MobError::Internal(format!(
+                            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                                 "remote-turn private/public Record is durable but machine commit failed; actor is fail-stopping for cold recovery: {error}"
-                            )));
+                            ))));
                         }
                         if let Err(error) = carrier_append {
                             tracing::warn!(
@@ -28092,7 +28192,7 @@ impl MobActor {
                         // Fail-stop into cold recovery instead of leaving a
                         // nonterminal run that the reconciler must mistake
                         // for actor-owned work.
-                        self.durable_uncertainty_fail_stop = true;
+                        self.durable_uncertainty_fail_stop.record_unreplied(error);
                     }
                 }
                 MobCommand::FlowCanceledCleanup {
@@ -28104,13 +28204,16 @@ impl MobActor {
                             %run_id,
                             "flow canceled cleanup refused: spawned cancellation path did not prove persisted terminalization"
                         );
-                        self.durable_uncertainty_fail_stop = true;
+                        self.durable_uncertainty_fail_stop
+                            .record_unreplied(MobError::Internal(format!(
+                                "flow canceled cleanup refused for run {run_id}: spawned cancellation path did not prove persisted terminalization"
+                            )));
                     } else if let Err(error) = self
                         .handle_flow_cleanup(run_id, "flow canceled cleanup")
                         .await
                     {
                         tracing::error!(error = %error, "flow canceled cleanup failed");
-                        self.durable_uncertainty_fail_stop = true;
+                        self.durable_uncertainty_fail_stop.record_unreplied(error);
                     }
                 }
                 #[cfg(test)]
@@ -28547,7 +28650,10 @@ impl MobActor {
                     let _ =
                         reply_tx.send(Ok(self.machine_projection_for_identity(&agent_identity)));
                 }
-                MobCommand::Stop { reply_tx } => {
+                MobCommand::Stop {
+                    leave_runs_running,
+                    reply_tx,
+                } => {
                     self.inline_step_watchdog
                         .set_stop_stage(StopInlineStage::PlacedCompletionCleanup);
                     let result = if self.state() == MobState::Destroyed {
@@ -28585,11 +28691,13 @@ impl MobActor {
                                     // held, so it could only read the notice
                                     // after Resume, when it is stale. Resume
                                     // tells it the pause happened instead.
-                                    // The checkpointer gates stay armed: a
-                                    // turn-driven member's run that the Stop
-                                    // leaves running must still commit. A host
-                                    // that deletes storage Destroys the mob,
-                                    // and archive closes each session's gate.
+                                    // The checkpointer gates stay armed: a run
+                                    // the Stop leaves running (a turn-driven
+                                    // member's, or any member's when the
+                                    // caller leaves runs running) must still
+                                    // commit. A host that deletes storage
+                                    // Destroys the mob, and archive closes
+                                    // each session's gate.
                                 }
                                 // Hold every member's run starts before any
                                 // interrupt (#1500): input admitted before the
@@ -28603,7 +28711,24 @@ impl MobActor {
                                         stop_result = Err(error);
                                     }
                                 }
-                                if stop_result.is_ok() {
+                                if stop_result.is_ok() && leave_runs_running {
+                                    // Every member's run stays running, as its
+                                    // hold above reported it: only kickoff
+                                    // origin closes, and the Stop does not wait
+                                    // for any turn.
+                                    self.inline_step_watchdog
+                                        .set_stop_stage(StopInlineStage::AutonomousStops);
+                                    if let Err(error) =
+                                        Box::pin(self.close_all_autonomous_kickoff_origins()).await
+                                    {
+                                        tracing::warn!(
+                                            mob_id = %self.definition.id,
+                                            error = %error,
+                                            "stop encountered autonomous kickoff cleanup error"
+                                        );
+                                        stop_result = Err(error);
+                                    }
+                                } else if stop_result.is_ok() {
                                     self.inline_step_watchdog
                                         .set_stop_stage(StopInlineStage::AutonomousStops);
                                     match Box::pin(self.prepare_all_autonomous_member_stops(
@@ -28711,7 +28836,7 @@ impl MobActor {
                     if !self.respawn_topology_reply_withheld {
                         let _ = reply_tx.send(result);
                     }
-                    if destroy_succeeded && !self.durable_uncertainty_fail_stop {
+                    if destroy_succeeded && !self.durable_uncertainty_fail_stop.is_set() {
                         // Destroy is terminal for the current ownership model:
                         // once a mob is destroyed, the actor task exits and no
                         // further commands are accepted.
@@ -29087,6 +29212,10 @@ impl MobActor {
                 MobCommand::QueryPhase { reply_tx } => {
                     let _ = reply_tx.send(Ok(self.state()));
                 }
+                #[cfg(feature = "runtime-adapter")]
+                MobCommand::DrainRunsSnapshot { reply_tx } => {
+                    let _ = reply_tx.send(self.drain_runs_snapshot().await);
+                }
                 MobCommand::CloseIfIdle { reply_tx } => {
                     let outcome = self.close_admission_if_idle(deferred_commands).await;
                     let _ = reply_tx.send(Ok(outcome));
@@ -29239,7 +29368,7 @@ impl MobActor {
                         if !self.respawn_topology_reply_withheld {
                             send_lifecycle_result(reply_tx, joined, result, &self.current_stop_report());
                         }
-                        if !self.durable_uncertainty_fail_stop {
+                        if !self.durable_uncertainty_fail_stop.is_set() {
                             return ActorLoopControl::SkipBoundary;
                         }
                     } else {
@@ -29390,7 +29519,7 @@ impl MobActor {
             self.retain_lifecycle_delivery_error(error);
         }
         boxed_arm_future(|| self.drain_completed_member_live_mutations()).await;
-        if self.durable_uncertainty_fail_stop {
+        if self.durable_uncertainty_fail_stop.is_set() {
             return ActorLoopWakeSelection::Continue;
         }
 
@@ -29413,6 +29542,10 @@ impl MobActor {
         #[cfg(feature = "runtime-adapter")]
         let identity_reconcile_pending =
             identity_reconcile_pending && !self.resume_topology_mutation_pending();
+        // A Shutdown parked on its runtime teardown releases members' identity
+        // leases from there: no reconcile pass claims one again meanwhile.
+        let identity_reconcile_pending =
+            identity_reconcile_pending && self.pending_shutdown_teardown.is_none();
         let identity_reconcile_backoff_wait = self.identity_reconcile_next_backoff_wait();
         let ready_deferred = deferred_commands
             .iter()
@@ -29567,15 +29700,20 @@ impl MobActor {
     /// and command dispatch can never execute concurrently. Erasing this
     /// phase drops the recovery frame before a deeply nested command handler
     /// is polled, without moving actor authority out of the serialized task.
-    async fn prepare_actor_run(&mut self) -> bool {
-        #[cfg(test)]
+    ///
+    /// An error is the durable recovery failure that stops the actor before
+    /// it admits any command; `run` records it for the mob's handles.
+    async fn prepare_actor_run(&mut self) -> Result<(), MobError> {
+        #[cfg(any(test, feature = "test-support"))]
         if take_mob_seam_for_test(&FAIL_STOP_ACTOR_START_FOR_MOB, &self.definition.id) {
             tracing::error!(
                 mob_id = %self.definition.id,
                 "test seam: durable recovery fail-stops before command admission"
             );
             self.quiesce_volatile_producers_after_fail_stop().await;
-            return false;
+            return Err(MobError::Internal(
+                "test seam: durable recovery fail-stops before command admission".into(),
+            ));
         }
         if let Err(error) = self.restore_local_cleanup_composition_delivery().await {
             tracing::error!(
@@ -29584,7 +29722,7 @@ impl MobActor {
                 "local cleanup delivery recovery failed before command admission"
             );
             self.quiesce_volatile_producers_after_fail_stop().await;
-            return false;
+            return Err(error);
         }
         if matches!(self.dsl_state(), MobState::Running) {
             if let Err(error) = self.restore_generated_member_operation_bindings().await {
@@ -29604,7 +29742,7 @@ impl MobActor {
                 "durable member-live Open cleanup recovery failed; fail-stopping before command admission"
             );
             self.quiesce_volatile_producers_after_fail_stop().await;
-            return false;
+            return Err(error);
         }
         // Durable capability associations are rehydrated before command
         // admission so an orphaned lease cannot survive a restart unnoticed,
@@ -29620,7 +29758,7 @@ impl MobActor {
                 "durable forked-participant association recovery failed; fail-stopping before command admission"
             );
             self.quiesce_volatile_producers_after_fail_stop().await;
-            return false;
+            return Err(error);
         }
         // Prune only after generated member bindings have recovered: before
         // that point the machine snapshot may not yet contain every current
@@ -29657,7 +29795,20 @@ impl MobActor {
                     .await;
             }
         }
-        true
+        Ok(())
+    }
+
+    /// Write-before-close for the fail-stop on an uncertain durable
+    /// mutation: a status read or a resume after this exit reports it,
+    /// typed, with `cause`, the first uncertain mutation's own error. The
+    /// mutation is also logged where it failed.
+    fn record_durability_fail_stop(&self, cause: Arc<MobError>) {
+        self.lifecycle_observations.record_fail_stop_cause(Arc::new(
+            MobError::DurabilityFailStop {
+                mob_id: self.definition.id.clone(),
+                cause,
+            },
+        ));
     }
 
     /// Close the command channel, then receive until it is empty.
@@ -29687,8 +29838,13 @@ impl MobActor {
         // next lifecycle transition gets the run-start posture it implies.
         self.supervisor_bridge
             .set_member_run_start_posture(self.member_run_start_posture());
-        if !boxed_arm_future(|| self.prepare_actor_run()).await {
+        if let Err(error) = boxed_arm_future(|| self.prepare_actor_run()).await {
             // Durable recovery fail-stopped before command admission.
+            // Write-before-close: the cause is recorded before admission
+            // closes and before any reply channel drops, so every command
+            // this exit drops, and every status read after it, reports it.
+            self.lifecycle_observations
+                .record_fail_stop_cause(Arc::new(error));
             self.close_admission_for_exit(MobAdmissionCloseReason::DurabilityFailStop);
             self.inline_step_watchdog.stop();
             drop(self);
@@ -29732,7 +29888,8 @@ impl MobActor {
             // `SkipBoundary`, bypassing the ordinary post-command boundary.
             // Honor fail-stop before polling any new work so a confirmed
             // durable panic quarantine transfers ownership to cold recovery.
-            if self.durable_uncertainty_fail_stop {
+            if let Some(cause) = self.durable_uncertainty_fail_stop.cause().cloned() {
+                self.record_durability_fail_stop(cause);
                 self.close_admission_for_exit(MobAdmissionCloseReason::DurabilityFailStop);
                 tracing::error!(
                     mob_id = %self.definition.id,
@@ -29998,7 +30155,8 @@ impl MobActor {
                 ActorLoopControl::SkipBoundary => continue,
                 ActorLoopControl::BreakActor => break,
             }
-            if self.durable_uncertainty_fail_stop {
+            if let Some(cause) = self.durable_uncertainty_fail_stop.cause().cloned() {
+                self.record_durability_fail_stop(cause);
                 self.close_admission_for_exit(MobAdmissionCloseReason::DurabilityFailStop);
                 tracing::error!(
                     mob_id = %self.definition.id,
@@ -30635,16 +30793,21 @@ impl MobActor {
         // Operation restoration must not resurrect an absent local session.
         // Broken cleanup and completed archive publication retain their exact
         // MobMachine journal authority without a fabricated runtime residue.
+        // A session that is not live (a member whose restore failed at this
+        // start, say) may hold a durable tail: it is settled under this
+        // runtime owner's claim before the read, not read as a failed start.
         if local_member_owner
             && !io
                 .session_service
                 .has_live_session(&generated_owner_session_id)
                 .await?
-            && io
-                .session_service
-                .load_persisted_session(&generated_owner_session_id)
-                .await?
-                .is_none()
+            && Self::load_member_session_settling_durable_tail(
+                &io,
+                &entry.agent_identity,
+                &generated_owner_session_id,
+            )
+            .await?
+            .is_none()
             && !io
                 .adapter
                 .archive_runtime_residue_present(&generated_owner_session_id)
@@ -30875,55 +31038,76 @@ impl MobActor {
                     "local cleanup delivery tuple diverges from generated authority".into(),
                 ));
             }
-            if !io.session_service.has_live_session(session).await?
-                && Self::load_cleanup_session_settling_durable_tail(&io, session)
-                    .await?
-                    .is_none()
-                && !io
-                    .adapter
-                    .archive_runtime_residue_present(session)
-                    .await
-                    .map_err(|error| MobError::Internal(error.to_string()))?
-            {
-                continue;
-            }
-            let bindings = io
-                .adapter
-                .prepare_local_session_bindings(session.clone())
+            // The start fails before admission on the first member that
+            // fails, in roster (identity) order; name that member and its
+            // session for the caller.
+            self.restore_member_local_cleanup_delivery(&io, &entry, session)
                 .await
-                .map_err(|error| {
-                    MobError::Internal(format!("prepare local cleanup delivery: {error}"))
+                .map_err(|cause| MobError::MemberStartupRecoveryFailed {
+                    member_id: entry.agent_identity.clone(),
+                    session_id: session.clone(),
+                    cause: Arc::new(cause),
                 })?;
-            // A cold start can re-register a session whose runtime already
-            // stopped, which clears its member binding; the unbound endpoint
-            // is then refused, typed and pre-effect, while the previous
-            // attachment's retained cleanup tail still owns the registration.
-            // That owner keeps delivery custody until the lifecycle operation
-            // that retires or reloads this member takes it over; failing the
-            // actor here would refuse every command for a condition that
-            // needs no startup action.
-            if Self::restore_composition_delivery(&io, &entry, &bindings).await?
-                == CompositionDeliveryRestore::HeldByRegistrationOwner
-            {
-                tracing::debug!(
-                    mob_id = %self.definition.id,
-                    member = %entry.agent_identity,
-                    session_id = %session,
-                    "local cleanup delivery custody stays with the registration's current owner"
-                );
-            }
-            // The generated member or pending retirement tuple identifies the
-            // same operation registry for a later archive's final transition.
-            // This creates no serving/runtime binding.
-            io.provisioner
-                .bind_member_owner_context(
-                    &entry.member_ref,
-                    session.clone(),
-                    Arc::clone(bindings.ops_lifecycle()),
-                )
-                .await?;
         }
         Ok(())
+    }
+
+    /// Restore one member's local cleanup delivery for `session`, the member
+    /// session its generated cleanup tuple names.
+    #[cfg(feature = "runtime-adapter")]
+    async fn restore_member_local_cleanup_delivery(
+        &self,
+        io: &ResumeOperationBindingIo,
+        entry: &RosterEntry,
+        session: &SessionId,
+    ) -> Result<(), MobError> {
+        if !io.session_service.has_live_session(session).await?
+            && Self::load_member_session_settling_durable_tail(io, &entry.agent_identity, session)
+                .await?
+                .is_none()
+            && !io
+                .adapter
+                .archive_runtime_residue_present(session)
+                .await
+                .map_err(|error| MobError::Internal(error.to_string()))?
+        {
+            return Ok(());
+        }
+        let bindings = io
+            .adapter
+            .prepare_local_session_bindings(session.clone())
+            .await
+            .map_err(|error| {
+                MobError::Internal(format!("prepare local cleanup delivery: {error}"))
+            })?;
+        // A cold start can re-register a session whose runtime already
+        // stopped, which clears its member binding; the unbound endpoint
+        // is then refused, typed and pre-effect, while the previous
+        // attachment's retained cleanup tail still owns the registration.
+        // That owner keeps delivery custody until the lifecycle operation
+        // that retires or reloads this member takes it over; failing the
+        // actor here would refuse every command for a condition that
+        // needs no startup action.
+        if Self::restore_composition_delivery(io, entry, &bindings).await?
+            == CompositionDeliveryRestore::HeldByRegistrationOwner
+        {
+            tracing::debug!(
+                mob_id = %self.definition.id,
+                member = %entry.agent_identity,
+                session_id = %session,
+                "local cleanup delivery custody stays with the registration's current owner"
+            );
+        }
+        // The generated member or pending retirement tuple identifies the
+        // same operation registry for a later archive's final transition.
+        // This creates no serving/runtime binding.
+        io.provisioner
+            .bind_member_owner_context(
+                &entry.member_ref,
+                session.clone(),
+                Arc::clone(bindings.ops_lifecycle()),
+            )
+            .await
     }
 
     #[cfg(not(feature = "runtime-adapter"))]
@@ -30931,8 +31115,11 @@ impl MobActor {
         Ok(())
     }
 
-    /// The persisted session a local cleanup delivery restores, read once its
-    /// durable tail is settled.
+    /// The persisted session of a member the start restores without a live
+    /// actor, read once its durable tail is settled: the session a retiring
+    /// member's local cleanup delivery restores, or the session whose
+    /// operation binding the start restores for a member that is not live
+    /// (one whose restore failed at this start, say).
     ///
     /// A member whose last turn's durable rows landed after the runtime
     /// boundary it committed (a mid-turn retirement's boundary cancel, or a
@@ -30943,21 +31130,50 @@ impl MobActor {
     /// recovery the resume path runs (a proven continuation is adopted, an
     /// unprovable one is kept intact), and the session is read once more; a
     /// tail the recovery keeps still refuses, typed, as before.
+    ///
+    /// The settle runs under this runtime owner's hosting claim for the
+    /// session (#1813), taken for the settle alone; the second read takes
+    /// none. A session another runtime owner on the realm hosts is refused,
+    /// typed, without settling its tail: that owner may still commit the
+    /// tail itself. The start then fails before admission, since nothing
+    /// restores the member later in this incarnation; the refusal names the
+    /// member, its session and the remedy.
     #[cfg(feature = "runtime-adapter")]
-    async fn load_cleanup_session_settling_durable_tail(
+    async fn load_member_session_settling_durable_tail(
         io: &ResumeOperationBindingIo,
+        member: &AgentIdentity,
         session: &SessionId,
     ) -> Result<Option<meerkat_core::Session>, MobError> {
         match io.session_service.load_persisted_session(session).await {
             Err(error) if is_transcript_revision_conflict(&error) => {
                 tracing::info!(
+                    %member,
                     session_id = %session,
-                    "settling a durable tail ahead of its runtime boundary before restoring \
-                     local cleanup delivery"
+                    "settling a durable tail ahead of its runtime boundary before the mob start \
+                     restores the member"
                 );
-                io.session_service
-                    .materialize_session_resume_verdict(session)
-                    .await?;
+                if let Err(error) = io
+                    .session_service
+                    .settle_durable_tail_before_cold_start(session)
+                    .await
+                {
+                    if matches!(
+                        error,
+                        meerkat_core::service::SessionError::ServedElsewhere { .. }
+                            | meerkat_core::service::SessionError::HostingUnavailable { .. }
+                    ) {
+                        tracing::error!(
+                            %member,
+                            session_id = %session,
+                            %error,
+                            "a member's session has a durable tail and this runtime owner cannot \
+                             host it; the mob start refuses rather than settle another owner's \
+                             tail. Stop the runtime owner that hosts the session, or wait until it \
+                             releases it, then start the mob again"
+                        );
+                    }
+                    return Err(error.into());
+                }
                 Ok(io.session_service.load_persisted_session(session).await?)
             }
             loaded => Ok(loaded?),
@@ -31075,7 +31291,7 @@ impl MobActor {
                         "fail_all_pending_spawns_remote",
                     )
                     .await;
-                if self.durable_uncertainty_fail_stop {
+                if self.durable_uncertainty_fail_stop.is_set() {
                     cleanup_errors.push(format!(
                         "{agent_identity} ticket {spawn_ticket}: {cleanup_result}"
                     ));
@@ -31090,12 +31306,12 @@ impl MobActor {
                     )
                     .await
             {
-                self.durable_uncertainty_fail_stop = true;
                 self.respawn_topology_reply_withheld = true;
                 may_reply = false;
                 cleanup_errors.push(format!(
                     "{agent_identity} ticket {spawn_ticket}: durable respawn-topology abandonment failed; actor is fail-stopping for cold recovery: {error}"
                 ));
+                self.durable_uncertainty_fail_stop.record_unreplied(error);
             }
             if may_reply {
                 slot.fail_with(MobError::SpawnCanceled {
@@ -31366,13 +31582,13 @@ impl MobActor {
                         .durably_abandon_respawn_topology_if_terminal_exact(&requested_identity, origin))
                         .await
                 {
-                    self.durable_uncertainty_fail_stop = true;
                     self.respawn_topology_reply_withheld = true;
                     tracing::error!(
                         agent_identity = %requested_identity,
                         error = %abandon_error,
                         "respawn pre-custody rejection could not settle exact topology ownership"
                     );
+                    self.durable_uncertainty_fail_stop.record_unreplied(abandon_error);
                     return;
                 }
                 let _ = reply_tx.send(Err(error));
@@ -31871,16 +32087,28 @@ impl MobActor {
                     });
                 }
 
-                // Validate the session exists and is active.
-                let is_active = preparation_context
+                // Validate the session exists and is active. A session whose
+                // durable tail runs past its committed runtime boundary
+                // refuses this read as a transcript revision conflict, and the
+                // refusal stays typed. The spawn does not settle the tail: a
+                // session no start of this mob restores (another mob's member
+                // session, say) is not this spawn's to complete.
+                let is_active = match preparation_context
                     .provisioner
                     .is_member_active(&member_ref)
                     .await
-                    .map_err(|e| {
+                {
+                    Err(MobError::SessionError(error))
+                        if is_transcript_revision_conflict(&error) =>
+                    {
+                        return Err(MobError::SessionError(error));
+                    }
+                    checked => checked.map_err(|e| {
                         MobError::Internal(format!(
                             "resume bridge session check failed for '{agent_identity}': {e}"
                         ))
-                    })?;
+                    })?,
+                };
                 if is_active.unwrap_or(false) {
                     if let Some(declared_predecessor_role) = resume_from_role.as_ref() {
                         return Err(MobError::MemberRoleMigrationRejected {
@@ -32343,13 +32571,13 @@ impl MobActor {
                         .durably_abandon_respawn_topology_if_terminal_exact(&requested_identity, origin))
                         .await
                 {
-                    self.durable_uncertainty_fail_stop = true;
                     self.respawn_topology_reply_withheld = true;
                     tracing::error!(
                         agent_identity = %requested_identity,
                         error = %abandon_error,
                         "respawn pre-custody rejection could not settle exact topology ownership"
                     );
+                    self.durable_uncertainty_fail_stop.record_unreplied(abandon_error);
                     return;
                 }
                 let reply = Err(error);
@@ -33142,11 +33370,10 @@ impl MobActor {
         transition: &mob_dsl::MobMachineTransition,
     ) -> Result<(), MobError> {
         if operation_id != &pending.provision_operation_id {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "placed carrier commit for '{}' attempted to replace pre-minted provision operation '{}' with '{}'; actor is fail-stopping for cold recovery",
                 pending.agent_identity, pending.provision_operation_id, operation_id,
-            )));
+            ))));
         }
         let mut committed = pending.clone();
         committed.phase = crate::store::PlacedSpawnCarrierPhase::Committed(
@@ -33185,11 +33412,10 @@ impl MobActor {
                     )));
                 }
                 Ok(crate::store::CommitPlacedSpawnResult::Conflict) => {
-                    self.durable_uncertainty_fail_stop = true;
-                    return Err(MobError::Internal(format!(
+                    return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                         "placed carrier commit conflict for '{}' spawn_id={}; actor is fail-stopping for cold recovery",
                         pending.agent_identity, pending.spawn_id
-                    )));
+                    ))));
                 }
                 Err(error) => {
                     last_error = Some(error);
@@ -33212,29 +33438,26 @@ impl MobActor {
                             )));
                         }
                         Ok(Some(current)) => {
-                            self.durable_uncertainty_fail_stop = true;
-                            return Err(MobError::Internal(format!(
+                            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                                 "placed carrier commit for '{}' found conflicting durable phase {:?}; actor is fail-stopping for cold recovery",
                                 pending.agent_identity, current.phase
-                            )));
+                            ))));
                         }
                         Ok(None) => {
-                            self.durable_uncertainty_fail_stop = true;
-                            return Err(MobError::Internal(format!(
+                            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                                 "placed carrier commit for '{}' lost its Pending carrier; actor is fail-stopping for cold recovery",
                                 pending.agent_identity
-                            )));
+                            ))));
                         }
                         Err(read_error) if attempt < 2 => {
                             last_error = Some(read_error);
                             tokio::task::yield_now().await;
                         }
                         Err(read_error) => {
-                            self.durable_uncertainty_fail_stop = true;
-                            return Err(MobError::Internal(format!(
+                            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                                 "placed carrier commit for '{}' and exact reread remained uncertain; actor is fail-stopping for cold recovery: {read_error}",
                                 pending.agent_identity
-                            )));
+                            ))));
                         }
                     }
                 }
@@ -33263,10 +33486,9 @@ impl MobActor {
             let floor = match self.events.latest_cursor().await {
                 Ok(cursor) => cursor,
                 Err(error) => {
-                    self.durable_uncertainty_fail_stop = true;
-                    return Err(MobError::Internal(format!(
+                    return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                         "committed placed event could not establish an append cursor floor; actor is fail-stopping for cold recovery: {error}"
-                    )));
+                    ))));
                 }
             };
             match self
@@ -33298,31 +33520,28 @@ impl MobActor {
                         }
                         Ok(None) if attempt < 2 => tokio::task::yield_now().await,
                         Ok(None) => {
-                            self.durable_uncertainty_fail_stop = true;
-                            return Err(MobError::Internal(format!(
+                            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                                 "committed placed event append was proven absent after bounded retries; actor is fail-stopping for cold recovery: {}",
                                 last_append_error
                                     .map(|error| error.to_string())
                                     .unwrap_or_else(|| "unknown append error".to_string())
-                            )));
+                            ))));
                         }
                         Err(reconcile_error) => {
-                            self.durable_uncertainty_fail_stop = true;
-                            return Err(MobError::Internal(format!(
+                            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                                 "committed placed event append acknowledgement and exact cursor reconciliation remained uncertain; actor is fail-stopping for cold recovery: {reconcile_error}"
-                            )));
+                            ))));
                         }
                     }
                 }
             }
         }
-        self.durable_uncertainty_fail_stop = true;
-        Err(MobError::Internal(format!(
+        Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
             "committed placed event append exhausted retries; actor is fail-stopping for cold recovery: {}",
             last_append_error
                 .map(|error| error.to_string())
                 .unwrap_or_else(|| "unknown append error".to_string())
-        )))
+        ))))
     }
 
     /// §4.4: witness the typed materialization failure, open the exact Pending
@@ -33361,11 +33580,10 @@ impl MobActor {
         ) {
             Ok(transition) => transition,
             Err(abort_error) => {
-                self.durable_uncertainty_fail_stop = true;
                 return RemoteSpawnFailureOutcome {
-                    error: MobError::Internal(format!(
+                    error: self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                         "spawn pre-commit unwind for '{agent_identity}' ({context}): {original}; AbortSpawnExec failed, the durable Pending carrier is retained, and the actor is fail-stopping for cold recovery: {abort_error}"
-                    )),
+                    ))),
                     cleanup_completed: false,
                 };
             }
@@ -33377,11 +33595,10 @@ impl MobActor {
             _ => None,
         });
         let Some(obligation) = obligation else {
-            self.durable_uncertainty_fail_stop = true;
             return RemoteSpawnFailureOutcome {
-                error: MobError::Internal(format!(
+                error: self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                     "spawn pre-commit unwind for '{agent_identity}' ({context}): {original}; AbortSpawnExec emitted no placed-carrier cleanup obligation, the durable Pending carrier is retained, and the actor is fail-stopping for cold recovery"
-                )),
+                ))),
                 cleanup_completed: false,
             };
         };
@@ -33392,11 +33609,10 @@ impl MobActor {
         ) {
             Ok(authority) => authority,
             Err(authority_error) => {
-                self.durable_uncertainty_fail_stop = true;
                 return RemoteSpawnFailureOutcome {
-                    error: MobError::Internal(format!(
+                    error: self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                         "spawn pre-commit unwind for '{agent_identity}' ({context}): {original}; cleanup obligation does not authorize the exact Pending carrier, no lifecycle operation was mutated, and the actor is fail-stopping for cold recovery: {authority_error}"
-                    )),
+                    ))),
                     cleanup_completed: false,
                 };
             }
@@ -33406,11 +33622,10 @@ impl MobActor {
                 .release_placed_attempt_or_certify_absent(pending_carrier)
                 .await
         {
-            self.durable_uncertainty_fail_stop = true;
             return RemoteSpawnFailureOutcome {
-                error: MobError::Internal(format!(
+                error: self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                     "spawn pre-commit unwind for '{agent_identity}' ({context}): {original}; exact remote absence could not be certified, the Pending cleanup obligation is retained, and the actor is fail-stopping for cold recovery: {release_error}"
-                )),
+                ))),
                 cleanup_completed: false,
             };
         }
@@ -33421,11 +33636,10 @@ impl MobActor {
         ) {
             Ok(display_name) => display_name,
             Err(display_error) => {
-                self.durable_uncertainty_fail_stop = true;
                 return RemoteSpawnFailureOutcome {
-                    error: MobError::Internal(format!(
+                    error: self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                         "spawn pre-commit unwind for '{agent_identity}' ({context}): {original}; exact operation display tuple could not be reconstructed, the Pending cleanup obligation is retained, and the actor is fail-stopping for cold recovery: {display_error}"
-                    )),
+                    ))),
                     cleanup_completed: false,
                 };
             }
@@ -33445,13 +33659,12 @@ impl MobActor {
             )
             .await
         {
-            self.durable_uncertainty_fail_stop = true;
             return RemoteSpawnFailureOutcome {
-                error: MobError::Internal(format!(
+                error: self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                     "spawn pre-commit unwind for '{agent_identity}' ({context}): {original}; exact provision operation '{}' owned by '{}' could not be terminalized, the Pending cleanup obligation is retained, and the actor is fail-stopping for cold recovery: {operation_error}",
                     pending_carrier.provision_operation_id,
                     pending_carrier.operation_owner_session_id,
-                )),
+                ))),
                 cleanup_completed: false,
             };
         }
@@ -33469,11 +33682,10 @@ impl MobActor {
                 cleanup_completed: true,
             },
             Err(cleanup_error) => {
-                self.durable_uncertainty_fail_stop = true;
                 RemoteSpawnFailureOutcome {
-                    error: MobError::Internal(format!(
+                    error: self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                         "spawn pre-commit unwind for '{agent_identity}' ({context}): {original}; exact placed-carrier cleanup failed and the actor is fail-stopping for cold recovery: {cleanup_error}"
-                    )),
+                    ))),
                     cleanup_completed: false,
                 }
             }
@@ -33544,21 +33756,19 @@ impl MobActor {
         if Self::recipient_trust_was_newly_installed(install)
             && let Err(untrust_error) = self.supervisor_bridge.untrust_recipient(peer).await
         {
-            self.durable_uncertainty_fail_stop = true;
-            return MobError::Internal(format!(
+            return self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "{}; exact remote cleanup completed but newly installed recipient trust could not be removed, so the actor is fail-stopping for cold recovery: {untrust_error}",
                 outcome.error
-            ));
+            )));
         }
         if let Err(obligation_error) = self.rollback_pending_recipient_trust_obligation(
             peer,
             "remote_spawn_precommit_cleanup_confirmed",
         ) {
-            self.durable_uncertainty_fail_stop = true;
-            return MobError::Internal(format!(
+            return self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "{}; exact remote cleanup completed but the pending recipient-trust obligation could not be closed, so the actor is fail-stopping for cold recovery: {obligation_error}",
                 outcome.error
-            ));
+            )));
         }
         outcome.error
     }
@@ -33636,12 +33846,11 @@ impl MobActor {
                 {
                     Ok(()) => error,
                     Err(abandon_error) => {
-                        self.durable_uncertainty_fail_stop = true;
                         self.respawn_topology_reply_withheld = true;
                         may_reply = false;
-                        MobError::Internal(format!(
+                        self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                             "{error}; durable respawn-topology abandonment failed and the actor is fail-stopping for cold recovery: {abandon_error}"
-                        ))
+                        )))
                     }
                 }
             } else {
@@ -34210,16 +34419,14 @@ impl MobActor {
                     break;
                 }
                 Ok(crate::store::BeginPlacedSpawnResult::ExistingExactCommitted) => {
-                    self.durable_uncertainty_fail_stop = true;
-                    fail!(MobError::Internal(format!(
+                    fail!(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                         "placed spawn begin for '{agent_identity}' encountered an already committed carrier for the same attempt; actor is fail-stopping for cold recovery"
-                    )));
+                    ))));
                 }
                 Ok(crate::store::BeginPlacedSpawnResult::Conflict) => {
-                    self.durable_uncertainty_fail_stop = true;
-                    fail!(MobError::Internal(format!(
+                    fail!(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                         "placed spawn begin conflict for '{agent_identity}' generation={generation} fence={fence} spawn_id={placed_spawn_id}; actor is fail-stopping for cold recovery"
-                    )));
+                    ))));
                 }
                 Err(error) => {
                     begin_error = Some(error);
@@ -34237,11 +34444,10 @@ impl MobActor {
                         }
                         Ok(None) if attempt < 2 => tokio::task::yield_now().await,
                         Ok(Some(current)) => {
-                            self.durable_uncertainty_fail_stop = true;
-                            fail!(MobError::Internal(format!(
+                            fail!(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                                 "placed spawn begin acknowledgement was lost and exact reread found conflicting carrier for '{agent_identity}' spawn_id={}; actor is fail-stopping for cold recovery",
                                 current.spawn_id
-                            )));
+                            ))));
                         }
                         Ok(None) => final_read_proved_absent = true,
                         Err(read_error) if attempt < 2 => {
@@ -34254,10 +34460,7 @@ impl MobActor {
             }
         }
         if !pending_certain {
-            if !final_read_proved_absent {
-                self.durable_uncertainty_fail_stop = true;
-            }
-            fail!(MobError::Internal(format!(
+            let failure = MobError::Internal(format!(
                 "placed spawn pending carrier for '{agent_identity}' was not established after bounded begin/reread retries{}: {}",
                 if final_read_proved_absent {
                     " (final exact read proved no write)"
@@ -34267,16 +34470,20 @@ impl MobActor {
                 begin_error
                     .map(|error| error.to_string())
                     .unwrap_or_else(|| "carrier remained absent".to_string())
-            )));
+            ));
+            fail!(if final_read_proved_absent {
+                failure
+            } else {
+                self.durable_uncertainty_fail_stop.record(failure)
+            });
         }
         if let Err(error) = self.commit_prepared_dsl_transition(prepared_begin) {
             // Durable Pending exists but the in-memory authority could not be
             // published.  Cold recovery owns this exact attempt; do not issue
             // bridge traffic from the stale actor.
-            self.durable_uncertainty_fail_stop = true;
-            fail!(MobError::Internal(format!(
+            fail!(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "placed spawn pending carrier for '{agent_identity}' committed but machine publication failed; actor is fail-stopping for cold recovery: {error}"
-            )));
+            ))));
         }
 
         // §4.1(h) payload build (owner realization: the actor constructs
@@ -34625,7 +34832,6 @@ impl MobActor {
                         )
                         .await
                 {
-                    self.durable_uncertainty_fail_stop = true;
                     self.respawn_topology_reply_withheld = true;
                     may_reply = false;
                     tracing::error!(
@@ -34634,6 +34840,8 @@ impl MobActor {
                         abandonment_error = %abandon_error,
                         "remote respawn start refusal could not durably abandon topology; withholding reply and fail-stopping for cold recovery"
                     );
+                    self.durable_uncertainty_fail_stop
+                        .record_unreplied(abandon_error);
                 }
                 if may_reply {
                     let _ = pending.reply_tx.send(Err(error));
@@ -34905,15 +35113,19 @@ impl MobActor {
                     reply_tx,
                 },
             ));
-            if let Err(error) = &result
-                && error.external_member_cleanup_is_uncertain()
-            {
+            if let Err(error @ MobError::ExternalMemberCleanupUncertain { reason }) = &result {
                 // A caught provisioning panic cannot prove whether an
                 // external member or host row was created. Keep every durable
                 // recovery anchor intact and stop this incarnation; it must
                 // never flow through the ordinary "failure means cleanup"
                 // path below, even when no recipient-trust peer was involved.
-                self.durable_uncertainty_fail_stop = true;
+                // The spawn's reply below carries the error itself; the
+                // record carries the same typed error.
+                self.durable_uncertainty_fail_stop.record_unreplied(
+                    MobError::ExternalMemberCleanupUncertain {
+                        reason: reason.clone(),
+                    },
+                );
                 tracing::error!(
                     member = %agent_identity,
                     error = %error,
@@ -34949,7 +35161,7 @@ impl MobActor {
                     ),
                 };
                 if let Some(Err(error)) = close_result {
-                    self.durable_uncertainty_fail_stop = true;
+                    self.durable_uncertainty_fail_stop.record_unreplied(MobError::Internal(format!("failed to close pending recipient-trust obligation after provision result; fail-stopping actor: {error}")));
                     tracing::error!(
                         peer_id,
                         error = %error,
@@ -36248,7 +36460,7 @@ impl MobActor {
             })
             .await;
             if let Err(error) = persist_result {
-                if self.durable_uncertainty_fail_stop {
+                if self.durable_uncertainty_fail_stop.is_set() {
                     // CAS may have committed.  Preserve durable ownership for
                     // cold exact reread; never release/disarm an uncertain
                     // possibly-Committed carrier.
@@ -36277,13 +36489,13 @@ impl MobActor {
                 return Err(failure);
             }
             if let Err(error) = self.commit_prepared_dsl_transition(prepared_spawn) {
-                self.durable_uncertainty_fail_stop = true;
+                let failure = self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
+                    "placed carrier for '{agent_identity}' committed durably but membership machine publication failed; actor is fail-stopping for cold recovery: {error}"
+                )));
                 // The carrier is already Committed: ownership is durable and
                 // must never be disarmed/aborted as a precommit orphan.
                 let _member_ref = provision.commit()?;
-                return Err(MobError::Internal(format!(
-                    "placed carrier for '{agent_identity}' committed durably but membership machine publication failed; actor is fail-stopping for cold recovery: {error}"
-                )));
+                return Err(failure);
             }
             // Carrier and machine are now irreversible.  Transfer provision
             // ownership before the private-linked event append; every later
@@ -36292,10 +36504,9 @@ impl MobActor {
             let member_ref = match provision.commit() {
                 Ok(member_ref) => member_ref,
                 Err(error) => {
-                    self.durable_uncertainty_fail_stop = true;
-                    return Err(MobError::Internal(format!(
+                    return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                         "remote spawn of '{agent_identity}' committed its carrier and membership, but the provision guard could not transfer ownership; trust and its pending obligation are retained and the actor is fail-stopping: {error}"
-                    )));
+                    ))));
                 }
             };
             let member_peer_endpoint = remote.ack.member_peer.clone();
@@ -36303,15 +36514,14 @@ impl MobActor {
                 &member_peer_endpoint,
                 "remote_spawn_member_trust_confirmed",
             ) {
-                self.durable_uncertainty_fail_stop = true;
                 tracing::error!(
                     agent_identity = %agent_identity,
                     error = %error,
                     "failed to resolve member recipient-trust obligation after remote commit; fail-stopping actor with trust and obligation retained"
                 );
-                return Err(MobError::Internal(format!(
+                return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                     "remote spawn of '{agent_identity}' committed its carrier and membership, but the recipient-trust obligation could not be resolved; actor is fail-stopping for cold recovery: {error}"
-                )));
+                ))));
             }
             let mut spawned = crate::event::MemberSpawnedEvent::new(
                 identity.clone(),
@@ -39766,8 +39976,7 @@ impl MobActor {
                         // Only an exact durable row authorizes process exit.
                         // Cold recovery reconstructs this obligation; the
                         // current incarnation must not re-run faulting cleanup.
-                        self.durable_uncertainty_fail_stop = true;
-                        return Err(error);
+                        return Err(self.durable_uncertainty_fail_stop.record(error));
                     }
 
                     // No durable owner exists yet. Keep the volatile mutation
@@ -39940,16 +40149,17 @@ impl MobActor {
             }
             Err(error) if error.is_cancelled() => {
                 let task_id = actor_task_join_error_task_id(&error);
-                self.durable_uncertainty_fail_stop = true;
                 tracing::error!(
                     task_id = %task_id,
                     disposition = "cancelled_ambiguous_effect_fail_stop",
                     "actor-owned mutating member-live task was cancelled without a completion; effect outcome is unknown"
                 );
-                Err(MobError::Internal(format!(
-                    "actor-owned mutating member-live task {task_id} was cancelled without a \
+                Err(self
+                    .durable_uncertainty_fail_stop
+                    .record(MobError::Internal(format!(
+                        "actor-owned mutating member-live task {task_id} was cancelled without a \
                      completion; disposition=cancelled_ambiguous_effect_fail_stop"
-                )))
+                    ))))
             }
             Err(error) => {
                 let disposition = ActorTaskJoinPanicDisposition::AmbiguousEffectFailStop;
@@ -39958,8 +40168,7 @@ impl MobActor {
                     disposition,
                     error,
                 );
-                self.durable_uncertainty_fail_stop = true;
-                Err(error)
+                Err(self.durable_uncertainty_fail_stop.record(error))
             }
         }
     }
@@ -39997,7 +40206,7 @@ impl MobActor {
                 self.member_live_open_cleanup_obligations.len()
             )));
         }
-        if first_error.is_some() && !self.durable_uncertainty_fail_stop {
+        if first_error.is_some() && !self.durable_uncertainty_fail_stop.is_set() {
             let retries = self
                 .member_live_open_cleanup_obligations
                 .iter()
@@ -42598,10 +42807,9 @@ impl MobActor {
                 {
                     Ok(reconciled) => reconciled,
                     Err(reconcile_error) => {
-                        self.durable_uncertainty_fail_stop = true;
-                        return Err(MobError::Internal(format!(
+                        return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                             "MembersUnwired append failed ({error}) and exact cursor reconciliation remained uncertain after bounded read retries ({reconcile_error}); the actor is fail-stopping and cold replay is required"
-                        )));
+                        ))));
                     }
                 };
                 if let Some(stored) = reconciled {
@@ -45400,11 +45608,10 @@ impl MobActor {
         let (obligation, record) = match (obligation, record) {
             (None, None) => return Ok(()),
             (None, Some(record)) => {
-                self.durable_uncertainty_fail_stop = true;
-                return Err(MobError::Internal(format!(
+                return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                     "retirement cleanup for '{}' found canonical carrier {} without a machine cleanup obligation; actor is fail-stopping for cold recovery",
                     identity, record.spawn_id
-                )));
+                ))));
             }
             (Some(obligation), Some(record)) => (obligation, record),
             (Some(_), None) => {
@@ -45412,10 +45619,9 @@ impl MobActor {
                 // The full expected carrier is no longer reconstructible from the
                 // obligation alone, so live code must not mint an absent-row
                 // authority.  Cold recovery sees neither carrier nor obligation.
-                self.durable_uncertainty_fail_stop = true;
-                return Err(MobError::Internal(format!(
+                return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                     "retirement cleanup for '{identity}' retained an obligation but the exact carrier is absent; actor is fail-stopping for cold recovery"
-                )));
+                ))));
             }
         };
         if !matches!(
@@ -45433,10 +45639,9 @@ impl MobActor {
         ) {
             Ok(authority) => authority,
             Err(authority_error) => {
-                self.durable_uncertainty_fail_stop = true;
-                return Err(MobError::Internal(format!(
+                return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                     "retirement cleanup for '{identity}' found an obligation/carrier tuple mismatch; no lifecycle operation was mutated, the obligation and carrier are retained, and the actor is fail-stopping for cold recovery: {authority_error}"
-                )));
+                ))));
             }
         };
         let display_name = match render_member_comms_name(
@@ -45446,10 +45651,9 @@ impl MobActor {
         ) {
             Ok(display_name) => display_name,
             Err(error) => {
-                self.durable_uncertainty_fail_stop = true;
-                return Err(MobError::Internal(format!(
+                return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                     "retirement cleanup for '{identity}' could not reconstruct the exact operation display tuple; cleanup obligation and carrier are retained, and the actor is fail-stopping for cold recovery: {error}"
-                )));
+                ))));
             }
         };
         let operation_result = self
@@ -45461,11 +45665,10 @@ impl MobActor {
             )
             .await;
         if let Err(operation_error) = operation_result {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "retirement cleanup for '{}' could not terminalize exact provision operation '{}' owned by '{}'; cleanup obligation and carrier are retained, and the actor is fail-stopping for cold recovery: {operation_error}",
                 identity, record.provision_operation_id, record.operation_owner_session_id,
-            )));
+            ))));
         }
         let result = self
             .realize_authorized_placed_carrier_cleanup(
@@ -45475,10 +45678,7 @@ impl MobActor {
                 "retired_placed_carrier_cleanup",
             )
             .await;
-        if result.is_err() {
-            self.durable_uncertainty_fail_stop = true;
-        }
-        result
+        result.map_err(|error| self.durable_uncertainty_fail_stop.record(error))
     }
 
     async fn require_placed_spawn_carriers_empty(&self, context: &str) -> Result<(), MobError> {
@@ -46161,18 +46361,16 @@ impl MobActor {
                 Ok(Some(_)) => {}
                 Ok(None) => return Err(MobError::from(error)),
                 Err(reconcile_error) => {
-                    self.durable_uncertainty_fail_stop = true;
-                    return Err(MobError::Internal(format!(
+                    return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                         "respawn topology abandonment append failed ({error}) and exact reconciliation remained uncertain; actor is fail-stopping for cold recovery: {reconcile_error}"
-                    )));
+                    ))));
                 }
             }
         }
         if let Err(error) = self.commit_prepared_dsl_transition(prepared) {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "respawn topology abandonment event committed but live machine convergence failed; actor is fail-stopping for cold recovery: {error}"
-            )));
+            ))));
         }
         self.preserved_respawn_topology_event_index
             .write()
@@ -46681,6 +46879,29 @@ impl MobActor {
                     .map(|()| None)
             }
             _ => boxed_arm_future(|| self.execute_step(step, ctx)).await,
+        }
+    }
+
+    /// The typed refusal of the member reload that aborted the destroy's
+    /// disposal of a member: the runtime refused as repair-blocked the reload
+    /// the disposal asked for while archiving the member's session (the
+    /// member degraded after the destroy's own reload passes). The report
+    /// lists it as those passes list theirs. Any other disposal failure is
+    /// text only.
+    fn destroy_disposal_reload_refusal(
+        report: &DisposalReport,
+    ) -> Option<super::handle::MemberReloadRefusal> {
+        let (_, error) = report.aborted_at.as_ref()?;
+        match error.retirement_root_cause() {
+            MobError::MemberReloadRepairBlocked {
+                reason,
+                evidence_digest,
+                ..
+            } => Some(super::handle::MemberReloadRefusal::RepairBlocked {
+                reason: reason.clone(),
+                evidence_digest: evidence_digest.clone(),
+            }),
+            _ => None,
         }
     }
 
@@ -47518,10 +47739,9 @@ impl MobActor {
                 .dsl_authority
                 .commit_prepared_authority(prepared.authority)
             {
-                self.durable_uncertainty_fail_stop = true;
-                return Err(MobError::Internal(format!(
+                return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                     "placed completion Dispose carrier is durable but machine commit failed; actor is fail-stopping for cold recovery: {error}"
-                )));
+                ))));
             }
             self.queue_routed_effects_from(&effects);
             let expected_member = super::bridge_protocol::BridgeMemberIncarnation {
@@ -47540,10 +47760,9 @@ impl MobActor {
                     &obligation_event.input_id,
                 )
             {
-                self.durable_uncertainty_fail_stop = true;
-                return Err(MobError::Internal(format!(
+                return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                     "placed completion Dispose committed but waiter handoff failed; actor is fail-stopping for cold recovery: {error}"
-                )));
+                ))));
             }
             if phase_changed {
                 let _ = self.phase_watch_tx.send(self.state());
@@ -47968,11 +48187,10 @@ impl MobActor {
             // upcall responder and every volatile producer before another
             // command can observe that split; cold replay re-drives the final
             // signal from the journal+carrier anchors.
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "MemberRetired journal committed for '{}' but final machine publication failed; actor is fail-stopping for cold recovery: {error}",
                 ctx.agent_identity
-            )));
+            ))));
         }
         Ok(())
     }
@@ -48101,16 +48319,14 @@ impl MobActor {
             })
             .await
         {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "Complete marker append was ambiguous; actor is fail-stopping for cold recovery: {error}"
-            )));
+            ))));
         }
         if let Err(error) = self.commit_prepared_dsl_transition(prepared) {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "MobCompleted is durable but Complete machine commit failed; actor is fail-stopping for cold recovery: {error}"
-            )));
+            ))));
         }
         self.ensure_pending_spawn_alignment("handle_complete completion")?;
         self.ensure_flow_tracker_alignment("handle_complete completion")
@@ -48629,11 +48845,10 @@ impl MobActor {
             self.append_retire_event_for_entry(&ctx.entry).await?;
         }
         if let Err(error) = self.commit_prepared_dsl_transition(prepared) {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "destroy MemberRetired journal committed for '{}' but final machine publication failed; actor is fail-stopping for cold recovery: {error}",
                 ctx.agent_identity
-            )));
+            ))));
         }
         Ok(())
     }
@@ -49335,6 +49550,14 @@ impl MobActor {
             let disposal_report = boxed_arm_future(|| self.dispose_member_for_destroy(&ctx)).await;
             if let Some(error) = Self::destroy_disposal_failure(&disposal_report) {
                 report.push_error(format!("{}: {error}", entry.agent_identity));
+                if let Some(refusal) = Self::destroy_disposal_reload_refusal(&disposal_report) {
+                    report
+                        .member_reload_refusals
+                        .push(super::handle::MobDestroyMemberRefusal {
+                            member: entry.agent_identity.clone(),
+                            refusal,
+                        });
+                }
                 return Err(super::handle::MobDestroyError::Incomplete {
                     report: report.clone(),
                 });
@@ -49425,6 +49648,7 @@ impl MobActor {
     /// Report the members the destroy reloaded before it started (`reloaded`,
     /// first) together with any it reloaded later, before their ingress
     /// detach, on the report `result` carries.
+    #[allow(clippy::result_large_err)] // the destroy's typed report, incomplete or not, is its answer
     fn with_destroy_reloaded_members(
         result: Result<super::handle::MobDestroyReport, super::handle::MobDestroyError>,
         reloaded: Vec<AgentIdentity>,
@@ -49467,12 +49691,12 @@ impl MobActor {
             match boxed_arm_future(|| self.reload_member_if_durability_degraded(entry)).await {
                 Ok(true) => reloaded.push(entry.agent_identity.clone()),
                 Ok(false) => {}
-                Err(error) => {
+                Err(failure) => {
                     let mut report = super::handle::MobDestroyReport {
                         reloaded_members: reloaded,
                         ..Default::default()
                     };
-                    report.push_error(error);
+                    report.push_member_reload_failure(&entry.agent_identity, failure);
                     return Err(super::handle::MobDestroyError::Incomplete { report });
                 }
             }
@@ -49499,12 +49723,13 @@ impl MobActor {
     /// member's retirement then records what became of it. Bounded by the
     /// member retire budget. Returns whether the member was reloaded; `Err`
     /// is the destroy report's entry for a reload that failed, or for a
-    /// member still degraded after it.
+    /// member still degraded after it, typed when the runtime refused the
+    /// reload as repair-blocked.
     #[cfg(feature = "runtime-adapter")]
     async fn reload_member_if_durability_degraded(
         &self,
         entry: &RosterEntry,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, super::handle::MemberReloadFailure> {
         let Some(adapter) = self.runtime_adapter.as_ref() else {
             return Ok(false);
         };
@@ -49526,10 +49751,13 @@ impl MobActor {
             .current_session_registration_witness(session_id)
             .await
         else {
-            return Err(format!(
-                "{}: {required}; the runtime has no current registration the destroy can reload",
-                entry.agent_identity
-            ));
+            return Err(super::handle::MemberReloadFailure {
+                message: format!(
+                    "{}: {required}; the runtime has no current registration the destroy can reload",
+                    entry.agent_identity
+                ),
+                refusal: None,
+            });
         };
         tracing::warn!(
             mob_id = %self.definition.id,
@@ -49547,11 +49775,18 @@ impl MobActor {
                 Instant::now() + super::provisioner::MEMBER_RETIRE_TOTAL_TIMEOUT,
             )
             .await
-            .map_err(|error| {
-                format!(
-                    "{}: {required}; reloading it before the destroy failed: {error}",
-                    entry.agent_identity
-                )
+            .map_err(|failure| {
+                let refusal = failure
+                    .runtime_refusal()
+                    .and_then(super::handle::MemberReloadRefusal::from_runtime_refusal);
+                super::handle::MemberReloadFailure {
+                    message: format!(
+                        "{}: {required}; reloading it before the destroy failed: {}",
+                        entry.agent_identity,
+                        failure.into_session_error(session_id)
+                    ),
+                    refusal,
+                }
             })?;
         if matches!(
             disposition,
@@ -49561,10 +49796,13 @@ impl MobActor {
         }
         match adapter.durability_reload_required(session_id).await {
             None => Ok(false),
-            Some(still) => Err(format!(
-                "{}: {still}; the runtime still requires a durability reload after the destroy's reload attempt",
-                entry.agent_identity
-            )),
+            Some(still) => Err(super::handle::MemberReloadFailure {
+                message: format!(
+                    "{}: {still}; the runtime still requires a durability reload after the destroy's reload attempt",
+                    entry.agent_identity
+                ),
+                refusal: None,
+            }),
         }
     }
 
@@ -49771,6 +50009,9 @@ impl MobActor {
             entries,
             mut trust_cleanup_plan_by_member,
         } = boxed_arm_future(|| self.admit_destroy_cleanup()).await?;
+        // Before anything below flushes the routed queue (each member's
+        // retire admission does, in cleanup mode), on every attempt.
+        self.discard_routed_effects_superseded_by_destroy();
         boxed_arm_future(|| self.fail_all_pending_spawns("mob is destroying"))
             .await
             .map_err(|error| {
@@ -49831,8 +50072,8 @@ impl MobActor {
                 match boxed_arm_future(|| self.reload_member_if_durability_degraded(entry)).await {
                     Ok(true) => report.reloaded_members.push(entry.agent_identity.clone()),
                     Ok(false) => {}
-                    Err(error) => {
-                        report.push_error(error);
+                    Err(failure) => {
+                        report.push_member_reload_failure(&entry.agent_identity, failure);
                         return Err(MobDestroyError::Incomplete { report });
                     }
                 }
@@ -49866,12 +50107,13 @@ impl MobActor {
                             continue;
                         }
                         Ok(false) => {}
-                        Err(reload_error) => {
+                        Err(reload_failure) => {
                             report.push_error(format!(
                                 "{}: destroy retire admission failed: {error}",
                                 entry.agent_identity
                             ));
-                            report.push_error(reload_error);
+                            report
+                                .push_member_reload_failure(&entry.agent_identity, reload_failure);
                             return Err(MobDestroyError::Incomplete { report });
                         }
                     }
@@ -50572,11 +50814,10 @@ impl MobActor {
         {
             Ok(changed) => Ok(changed),
             Err(error) => {
-                self.durable_uncertainty_fail_stop = true;
-                Err(MobError::Internal(format!(
+                Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                     "{context}: authenticated host facts for '{}' could not converge durably: {error}; actor is fail-stopping for cold recovery",
                     host_id.as_str()
-                )))
+                ))))
             }
         }
     }
@@ -50794,16 +51035,14 @@ impl MobActor {
                     .replacement_host_bind_endpoints
                     .contains_key(&host_id)
             {
-                self.durable_uncertainty_fail_stop = true;
-                return Err(MobError::Internal(format!(
+                return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                     "host '{}' confirmed revoke operation '{}' lost its durable row while machine authority remains active",
                     host_id.as_str(),
                     anchor.operation_id
-                )));
+                ))));
             }
             if let Err(error) = self.complete_host_revoke_anchor(&anchor).await {
-                self.durable_uncertainty_fail_stop = true;
-                return Err(error);
+                return Err(self.durable_uncertainty_fail_stop.record(error));
             }
         }
 
@@ -50917,7 +51156,7 @@ impl MobActor {
                     "post-rebind host member reconciliation sweep failed"
                 );
             }
-            if self.durable_uncertainty_fail_stop {
+            if self.durable_uncertainty_fail_stop.is_set() {
                 return Err(MobError::Internal(format!(
                     "host '{}' replay reconciliation entered durable fail-stop; suppressing replay success",
                     host_id.as_str()
@@ -51071,8 +51310,7 @@ impl MobActor {
             if bind_anchor_is_new {
                 if let Err(anchor_error) = self.abort_host_bind_anchor_no_effect(&bind_anchor).await
                 {
-                    self.durable_uncertainty_fail_stop = true;
-                    return Err(anchor_error);
+                    return Err(self.durable_uncertainty_fail_stop.record(anchor_error));
                 }
                 return Err(error);
             }
@@ -51085,8 +51323,7 @@ impl MobActor {
                     if let Err(anchor_error) =
                         self.abort_host_bind_anchor_no_effect(&bind_anchor).await
                     {
-                        self.durable_uncertainty_fail_stop = true;
-                        return Err(anchor_error);
+                        return Err(self.durable_uncertainty_fail_stop.record(anchor_error));
                     }
                 }
                 return Err(self.quarantine_uncertain_recipient_trust_install(
@@ -51107,8 +51344,7 @@ impl MobActor {
                     if let Err(anchor_error) =
                         self.abort_host_bind_anchor_no_effect(&bind_anchor).await
                     {
-                        self.durable_uncertainty_fail_stop = true;
-                        return Err(anchor_error);
+                        return Err(self.durable_uncertainty_fail_stop.record(anchor_error));
                     }
                     return Err(self
                         .rollback_supervisor_recipient_trust(&peer, install, send_error)
@@ -51127,8 +51363,7 @@ impl MobActor {
                     if let Err(anchor_error) =
                         self.abort_host_bind_anchor_no_effect(&bind_anchor).await
                     {
-                        self.durable_uncertainty_fail_stop = true;
-                        return Err(anchor_error);
+                        return Err(self.durable_uncertainty_fail_stop.record(anchor_error));
                     }
                     return Err(self
                         .rollback_supervisor_recipient_trust(&peer, install, rejection_error)
@@ -51304,7 +51539,7 @@ impl MobActor {
                 "post-bind host member reconciliation sweep failed"
             );
         }
-        if self.durable_uncertainty_fail_stop {
+        if self.durable_uncertainty_fail_stop.is_set() {
             return Err(MobError::Internal(format!(
                 "host '{}' bind reconciliation entered durable fail-stop; suppressing later route effects and success",
                 host_id.as_str()
@@ -51320,17 +51555,18 @@ impl MobActor {
 
     async fn observe_host_status(&mut self, host_id: &mob_dsl::HostId) -> Result<(), MobError> {
         let mut result = self.reconcile_host_members(host_id).await.map(|_| ());
-        if result
-            .as_ref()
-            .is_err_and(Self::host_status_rejection_requires_fail_stop)
-        {
-            self.durable_uncertainty_fail_stop = true;
-        }
+        result = result.map_err(|error| {
+            if Self::host_status_rejection_requires_fail_stop(&error) {
+                self.durable_uncertainty_fail_stop.record(error)
+            } else {
+                error
+            }
+        });
         // Bind/rebind is an explicit route-recovery boundary even if the
         // follow-up inventory probe itself is temporarily unavailable. Keep
         // the old pre-return convergence guarantee, but never emit route
         // side effects after a durable fail-stop classification.
-        if !self.durable_uncertainty_fail_stop {
+        if !self.durable_uncertainty_fail_stop.is_set() {
             if let Err(route_error) = self.drain_route_installs_for_host(host_id).await {
                 if result.is_ok() {
                     result = Err(route_error);
@@ -51377,13 +51613,14 @@ impl MobActor {
                 .map(|_| ()),
             Err(error) => Err(error),
         };
-        if result
-            .as_ref()
-            .is_err_and(Self::host_status_rejection_requires_fail_stop)
-        {
-            self.durable_uncertainty_fail_stop = true;
-        }
-        if !self.durable_uncertainty_fail_stop {
+        result = result.map_err(|error| {
+            if Self::host_status_rejection_requires_fail_stop(&error) {
+                self.durable_uncertainty_fail_stop.record(error)
+            } else {
+                error
+            }
+        });
+        if !self.durable_uncertainty_fail_stop.is_set() {
             if let Err(route_error) = self.drain_route_installs_for_host(host_id).await {
                 if result.is_ok() {
                     result = Err(route_error);
@@ -52091,8 +52328,7 @@ impl MobActor {
             // retained residency/custody. Do not rewrite machine capability
             // facts or keep operating on a degraded substrate; cold recovery
             // is the only boundary allowed to re-establish the contract.
-            self.durable_uncertainty_fail_stop = true;
-            return Err(error);
+            return Err(self.durable_uncertainty_fail_stop.record(error));
         }
         self.refresh_current_host_facts(host_id, &capabilities, "periodic host capability refresh")
             .await?;
@@ -52174,27 +52410,24 @@ impl MobActor {
                 {
                     Ok(Some(carrier)) => carrier,
                     Ok(None) => {
-                        self.durable_uncertainty_fail_stop = true;
-                        return Err(MobError::Internal(format!(
+                        return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                             "authenticated HostStatus reports placed member '{}' but its committed carrier is absent; actor is fail-stopping for cold recovery",
                             record.agent_identity
-                        )));
+                        ))));
                     }
                     Err(error) => {
-                        self.durable_uncertainty_fail_stop = true;
-                        return Err(MobError::Internal(format!(
+                        return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                             "authenticated HostStatus reports placed member '{}' but its carrier read failed; actor is fail-stopping for cold recovery: {error}",
                             record.agent_identity
-                        )));
+                        ))));
                     }
                 };
                 let crate::store::PlacedSpawnCarrierPhase::Committed(committed) = &carrier.phase
                 else {
-                    self.durable_uncertainty_fail_stop = true;
-                    return Err(MobError::Internal(format!(
+                    return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                         "authenticated HostStatus reports placed member '{}' while its carrier is Pending; actor is fail-stopping for cold recovery",
                         record.agent_identity
-                    )));
+                    ))));
                 };
                 if carrier.host_id.to_string() != host_id.as_str()
                     || carrier.generation != record.generation
@@ -52202,11 +52435,10 @@ impl MobActor {
                     || carrier.spec_digest != record.spec_digest
                     || committed.member_session_id.to_string() != record.session_id
                 {
-                    self.durable_uncertainty_fail_stop = true;
-                    return Err(MobError::Internal(format!(
+                    return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                         "authenticated HostStatus member '{}' conflicts with its exact committed carrier tuple; actor is fail-stopping for cold recovery",
                         record.agent_identity
-                    )));
+                    ))));
                 }
                 self.promote_committed_placed_carrier_binding_generation(
                     &carrier,
@@ -53161,18 +53393,17 @@ impl MobActor {
             .absorb_host_rebind_acceptance_inner(host_id, peer, next, rebound)
             .await
         {
-            self.durable_uncertainty_fail_stop = true;
             tracing::error!(
                 host = %host_id.as_str(),
                 epoch = next.epoch,
                 error = %error,
                 "authenticated HostRebound could not be absorbed exactly; fail-stopping for cold recovery"
             );
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "authenticated HostRebound for host '{}' epoch {} could not be absorbed exactly: {error}; actor is fail-stopping for cold recovery",
                 host_id.as_str(),
                 next.epoch,
-            )));
+            ))));
         }
         Ok(())
     }
@@ -53241,7 +53472,7 @@ impl MobActor {
                     "post-replay HostRebound capability/inventory sweep failed"
                 );
             }
-            if self.durable_uncertainty_fail_stop {
+            if self.durable_uncertainty_fail_stop.is_set() {
                 return Err(MobError::Internal(format!(
                     "host '{}' replayed HostRebound revealed an incompatible retained capability contract; suppressing rotation success",
                     host_id.as_str()
@@ -53350,7 +53581,7 @@ impl MobActor {
                 "post-rebind host member reconciliation sweep failed"
             );
         }
-        if self.durable_uncertainty_fail_stop {
+        if self.durable_uncertainty_fail_stop.is_set() {
             return Err(MobError::Internal(format!(
                 "host '{}' rebind reconciliation entered durable fail-stop; suppressing later route and rotation effects",
                 host_id.as_str()
@@ -54405,11 +54636,10 @@ impl MobActor {
             // with an older in-memory MobMachine would let a retry mint a new
             // epoch or sign with a stale bridge authority. Only cold recovery
             // may rebuild the machine from the exact durable record.
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "{context}: durable supervisor authority peer={} epoch={} could not publish its prepared MobMachine transition; actor is fail-stopping for cold recovery: {error}",
                 durable.public_peer_id, durable.epoch,
-            )));
+            ))));
         }
         Ok(())
     }
@@ -54497,23 +54727,20 @@ impl MobActor {
                 Err(original_error)
             }
             Ok(Some(durable)) => {
-                self.durable_uncertainty_fail_stop = true;
-                Err(MobError::Internal(format!(
+                Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                     "persist_pending_supervisor_rotation CAS failed ({original_detail}) and exact reread found divergent supervisor authority peer={} epoch={}; actor is fail-stopping for cold recovery",
                     durable.public_peer_id, durable.epoch,
-                )))
+                ))))
             }
             Ok(None) => {
-                self.durable_uncertainty_fail_stop = true;
-                Err(MobError::Internal(format!(
+                Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                     "persist_pending_supervisor_rotation CAS failed ({original_detail}) and exact reread found the supervisor authority missing; actor is fail-stopping for cold recovery"
-                )))
+                ))))
             }
             Err(read_error) => {
-                self.durable_uncertainty_fail_stop = true;
-                Err(MobError::Internal(format!(
+                Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                     "persist_pending_supervisor_rotation CAS failed ({original_detail}) and exact reread remained unreadable; actor is fail-stopping for cold recovery: {read_error}"
-                )))
+                ))))
             }
         }
     }
@@ -54671,32 +54898,29 @@ impl MobActor {
                 ))
             }
             Ok(Some(durable)) => {
-                self.durable_uncertainty_fail_stop = true;
                 Err(Self::supervisor_activation_error(
-                    MobError::Internal(format!(
+                    self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                         "final supervisor authority CAS failed ({original_detail}) and exact reread found divergent authority peer={} epoch={}; actor is fail-stopping for cold recovery",
                         durable.public_peer_id, durable.epoch,
-                    )),
+                    ))),
                     false,
                     durable.pending_rotation.is_some(),
                 ))
             }
             Ok(None) => {
-                self.durable_uncertainty_fail_stop = true;
                 Err(Self::supervisor_activation_error(
-                    MobError::Internal(format!(
+                    self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                         "final supervisor authority CAS failed ({original_detail}) and exact reread found the authority missing; actor is fail-stopping for cold recovery"
-                    )),
+                    ))),
                     false,
                     false,
                 ))
             }
             Err(read_error) => {
-                self.durable_uncertainty_fail_stop = true;
                 Err(Self::supervisor_activation_error(
-                    MobError::Internal(format!(
+                    self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                         "final supervisor authority CAS failed ({original_detail}) and exact reread remained unreadable; actor is fail-stopping for cold recovery: {read_error}"
-                    )),
+                    ))),
                     false,
                     true,
                 ))
@@ -54900,10 +55124,9 @@ impl MobActor {
         })
         .await?;
         if let Err(error) = self.commit_prepared_dsl_transition(prepared) {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "placed completion Record was durable but machine commit failed; actor is fail-stopping for cold recovery: {error}"
-            )));
+            ))));
         }
         Ok(obligation_event)
     }
@@ -55481,10 +55704,9 @@ impl MobActor {
                         .request_placed_completion_cancellation_in_actor(obligation)
                         .await
                 {
-                    self.durable_uncertainty_fail_stop = true;
-                    return Err(MobError::Internal(format!(
+                    return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                         "SubmitWork rejected after durable completion Record ({rejection}); pre-send closure also failed ({close_error})"
-                    )));
+                    ))));
                 }
                 return Err(rejection);
             }
@@ -55722,10 +55944,9 @@ impl MobActor {
             .request_placed_completion_cancellation_in_actor(obligation)
             .await
         {
-            self.durable_uncertainty_fail_stop = true;
-            return MobError::Internal(format!(
+            return self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "placed completion preparation failed ({error}) and its durable cancellation request failed ({cancel_error}); actor is fail-stopping for cold recovery"
-            ));
+            )));
         }
         match self.member_pump_tap_material(&identity).await {
             Ok(material) => self.install_member_event_pump_detached(material, false, None),
@@ -56700,10 +56921,9 @@ impl MobActor {
             )
             .await?;
         if let Err(error) = self.commit_prepared_dsl_transition(prepared) {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(MobError::Internal(format!(
+            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                 "remote-turn finalized privacy cleanup is durable but machine finalizer commit failed; actor is fail-stopping for cold recovery: {error}"
-            )));
+            ))));
         }
         Ok(())
     }
@@ -57098,10 +57318,9 @@ impl MobActor {
                 && !self.run_tasks.contains_key(&run_id)
                 && !self.run_cancel_tokens.contains_key(&run_id)
             {
-                self.durable_uncertainty_fail_stop = true;
-                return Err(MobError::Internal(format!(
+                return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                     "stable external flow run '{run_id}' is durable but has no live execution tracker; the actor is fail-stopping for cold recovery"
-                )));
+                ))));
             }
             return Ok(run_id);
         }
@@ -57198,8 +57417,7 @@ impl MobActor {
                         )
                         .await
                     {
-                        self.durable_uncertainty_fail_stop = true;
-                        return Err(start_error);
+                        return Err(self.durable_uncertainty_fail_stop.record(start_error));
                     }
                     let detail = format!(
                         "external delivery became terminal before Flow realization: {terminal:?}"
@@ -57214,8 +57432,9 @@ impl MobActor {
                         )
                         .await
                     {
-                        self.durable_uncertainty_fail_stop = true;
-                        return Err(compensation_error);
+                        return Err(self
+                            .durable_uncertainty_fail_stop
+                            .record(compensation_error));
                     }
                     return Err(MobError::Internal(detail));
                 }
@@ -57227,10 +57446,9 @@ impl MobActor {
                     {
                         Ok(record) => record,
                         Err(read_error) => {
-                            self.durable_uncertainty_fail_stop = true;
-                            return Err(MobError::Internal(format!(
+                            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                                 "delivery realization claim failed ({claim_error}) and exact reread failed ({read_error}); run {run_id} remains quarantined"
-                            )));
+                            ))));
                         }
                     };
                     match record {
@@ -57256,10 +57474,9 @@ impl MobActor {
                                 .await;
                         }
                         _ => {
-                            self.durable_uncertainty_fail_stop = true;
-                            return Err(MobError::Internal(format!(
+                            return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                                 "delivery realization claim failed ({claim_error}) without proving Realizing for exact run {run_id}; the pending run remains quarantined"
-                            )));
+                            ))));
                         }
                     }
                 }
@@ -57295,15 +57512,20 @@ impl MobActor {
                     "terminalizing pending run failed: {terminalize_error}"
                 ));
             }
-            let detail_suffix = if details.is_empty() {
-                String::new()
-            } else {
-                self.durable_uncertainty_fail_stop = true;
+            let uncertain = !details.is_empty();
+            let detail_suffix = if uncertain {
                 format!("; {}", details.join("; "))
+            } else {
+                String::new()
             };
-            return Err(MobError::Internal(format!(
+            let failure = MobError::Internal(format!(
                 "lifecycle StartRun transition failed during flow admission: {error}{detail_suffix}"
-            )));
+            ));
+            return Err(if uncertain {
+                self.durable_uncertainty_fail_stop.record(failure)
+            } else {
+                failure
+            });
         }
 
         let cancel_token = tokio_util::sync::CancellationToken::new();
@@ -57438,8 +57660,7 @@ impl MobActor {
             )
             .await
         {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(start_error);
+            return Err(self.durable_uncertainty_fail_stop.record(start_error));
         }
         if let Err(compensation_error) = self
             .terminalize_external_flow_admission_failure_after_start(
@@ -57451,8 +57672,9 @@ impl MobActor {
             )
             .await
         {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(compensation_error);
+            return Err(self
+                .durable_uncertainty_fail_stop
+                .record(compensation_error));
         }
         let ledger_result: Result<(), MobError> = async {
             let record = self
@@ -57491,8 +57713,7 @@ impl MobActor {
         }
         .await;
         if let Err(ledger_error) = ledger_result {
-            self.durable_uncertainty_fail_stop = true;
-            return Err(ledger_error);
+            return Err(self.durable_uncertainty_fail_stop.record(ledger_error));
         }
         Err(failure)
     }
@@ -58172,15 +58393,12 @@ impl MobActor {
                 .flow_engine
                 .repair_persisted_terminalization(run_id, flow_id, target)
                 .await;
-            if repaired.is_err() {
-                // A terminal run snapshot is already durable, but its public
-                // terminal carrier could not be repaired. Continuing to serve
-                // commands would let the live MobMachine project from a state
-                // whose durable event truth is incomplete. Cold recovery owns
-                // the only safe retry boundary for this ambiguous commit.
-                self.durable_uncertainty_fail_stop = true;
-            }
-            return repaired;
+            // A terminal run snapshot is already durable, but when its public
+            // terminal carrier cannot be repaired, continuing to serve
+            // commands would let the live MobMachine project from a state
+            // whose durable event truth is incomplete. Cold recovery owns
+            // the only safe retry boundary for this ambiguous commit.
+            return repaired.map_err(|error| self.durable_uncertainty_fail_stop.record(error));
         }
 
         let authority_input = command.authority_input(&run_id);
@@ -58217,10 +58435,9 @@ impl MobActor {
                         // Once the combined terminalization seam errors, an
                         // unreadable run snapshot leaves the commit outcome
                         // unknowable. Do not keep serving from volatile state.
-                        self.durable_uncertainty_fail_stop = true;
-                        return Err(MobError::Internal(format!(
+                        return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                             "terminalization failed for run '{run_id}' ({error}) and durable status reconciliation failed; actor is fail-stopping for cold recovery: {reconcile_error}"
-                        )));
+                        ))));
                     }
                 };
                 if persisted_target {
@@ -58231,8 +58448,9 @@ impl MobActor {
                     // actor from durable truth. Set the fence before the
                     // volatile authority commit too: if that alignment step
                     // rejects, the actor must still leave the serving set.
-                    self.durable_uncertainty_fail_stop = true;
+                    let error = self.durable_uncertainty_fail_stop.record(error);
                     self.commit_prepared_dsl_input(prepared)?;
+                    return Err(error);
                 }
                 Err(error)
             }
@@ -58662,11 +58880,10 @@ impl MobActor {
             let all_events = match self.events.replay_all().await {
                 Ok(events) => events,
                 Err(reconcile_error) => {
-                    self.durable_uncertainty_fail_stop = true;
-                    return Err(MobError::Internal(format!(
+                    return Err(self.durable_uncertainty_fail_stop.record(MobError::Internal(format!(
                         "MemberRetired append for '{}' failed ({error}) and durable reconciliation remained unreadable; actor is fail-stopping for cold recovery: {reconcile_error}",
                         entry.agent_identity
-                    )));
+                    ))));
                 }
             };
             let events = all_events
@@ -61803,34 +62020,139 @@ mod routed_effect_containment_tests {
     }
 
     #[test]
+    fn a_destroy_supersedes_queued_binding_and_ingress_routes_only() {
+        let identity = mob_dsl::AgentIdentity::from("worker");
+        let runtime_id = mob_dsl::AgentRuntimeId::from("worker:1");
+        let session = mob_dsl::SessionId::from("session-worker");
+        let routed = |body| {
+            super::super::composition::MobSeamEffect::routed(body)
+                .expect("a generated routed effect")
+        };
+        let binding = routed(mob_dsl::MobMachineEffect::RequestRuntimeBinding {
+            session_id: session.clone(),
+            agent_identity: identity.clone(),
+            agent_runtime_id: runtime_id.clone(),
+            fence_token: mob_dsl::FenceToken(1),
+            generation: None,
+        });
+        let ingress = routed(mob_dsl::MobMachineEffect::RequestRuntimeIngress {
+            session_id: session.clone(),
+            agent_runtime_id: runtime_id.clone(),
+            fence_token: mob_dsl::FenceToken(1),
+            generation: None,
+            work_id: mob_dsl::WorkId::from("work-1"),
+            origin: mob_dsl::WorkOrigin::External,
+            content_attribution: mob_dsl::WorkContentAttribution::Conversational,
+        });
+        let retire = routed(mob_dsl::MobMachineEffect::RequestRuntimeRetire {
+            agent_identity: identity,
+            agent_runtime_id: runtime_id,
+            session_id: session.clone(),
+        });
+        let destroy = routed(mob_dsl::MobMachineEffect::RequestRuntimeDestroy {
+            session_id: session,
+        });
+        assert!(MobActor::routed_effect_superseded_by_destroy(&binding));
+        assert!(MobActor::routed_effect_superseded_by_destroy(&ingress));
+        assert!(
+            !MobActor::routed_effect_superseded_by_destroy(&retire),
+            "the destroy dispatches its members' retire routes"
+        );
+        assert!(
+            !MobActor::routed_effect_superseded_by_destroy(&destroy),
+            "a destroy route is the destroy's own"
+        );
+    }
+
+    #[test]
     fn a_refused_route_names_a_current_runtime_only_while_its_member_runs_it() {
         let identity = mob_dsl::AgentIdentity::from("worker");
         let runtime_id = mob_dsl::AgentRuntimeId::from("worker:1");
+        let session = mob_dsl::SessionId::from("session-worker");
+        let routed = |body| {
+            super::super::composition::MobSeamEffect::routed(body)
+                .expect("a generated routed effect")
+        };
+        let retire = routed(mob_dsl::MobMachineEffect::RequestRuntimeRetire {
+            agent_identity: identity.clone(),
+            agent_runtime_id: runtime_id.clone(),
+            session_id: session.clone(),
+        });
+        let binding = routed(mob_dsl::MobMachineEffect::RequestRuntimeBinding {
+            session_id: session.clone(),
+            agent_identity: identity.clone(),
+            agent_runtime_id: runtime_id.clone(),
+            fence_token: mob_dsl::FenceToken(1),
+            generation: None,
+        });
+        let ingress = routed(mob_dsl::MobMachineEffect::RequestRuntimeIngress {
+            session_id: session.clone(),
+            agent_runtime_id: runtime_id.clone(),
+            fence_token: mob_dsl::FenceToken(1),
+            generation: None,
+            work_id: mob_dsl::WorkId::from("work-1"),
+            origin: mob_dsl::WorkOrigin::External,
+            content_attribution: mob_dsl::WorkContentAttribution::Conversational,
+        });
+        let destroy = routed(mob_dsl::MobMachineEffect::RequestRuntimeDestroy {
+            session_id: session,
+        });
+        let current = |state: &mob_dsl::MobMachineState, effect| {
+            MobActor::routed_effect_targets_current_runtime(state, effect)
+        };
         let mut state = mob_dsl::MobMachineAuthority::new().state().clone();
-        let retire = super::super::composition::MobSeamEffect::routed(
-            mob_dsl::MobMachineEffect::RequestRuntimeRetire {
-                agent_identity: identity.clone(),
-                agent_runtime_id: runtime_id.clone(),
-                session_id: mob_dsl::SessionId::from("session-worker"),
-            },
-        )
-        .expect("runtime retire is a generated routed effect");
 
         assert!(
-            !MobActor::routed_effect_targets_current_runtime(&state, &retire),
+            !current(&state, &retire),
             "a retired member runs no runtime"
         );
+        assert!(
+            !current(&state, &binding),
+            "an unbound member owns no binding"
+        );
+        assert!(
+            !current(&state, &ingress),
+            "a runtime that is not live takes no input"
+        );
+        assert!(
+            current(&state, &destroy),
+            "a kind without a rule is never presumed stale"
+        );
+
         state
             .identity_to_runtime
             .insert(identity.clone(), mob_dsl::AgentRuntimeId::from("worker:2"));
         assert!(
-            !MobActor::routed_effect_targets_current_runtime(&state, &retire),
+            !current(&state, &retire),
             "a member that runs a later runtime does not own the route"
         );
-        state.identity_to_runtime.insert(identity, runtime_id);
-        assert!(MobActor::routed_effect_targets_current_runtime(
-            &state, &retire
-        ));
+        assert!(!current(&state, &binding));
+
+        state
+            .identity_to_runtime
+            .insert(identity, runtime_id.clone());
+        assert!(
+            !current(&state, &binding),
+            "a bound runtime that is no longer live owns no binding"
+        );
+        assert!(
+            !current(&state, &retire),
+            "a bound member that is not retiring takes no retire refusal"
+        );
+        state
+            .member_state_markers
+            .insert(runtime_id.clone(), mob_dsl::MobMemberState::Retiring);
+        assert!(
+            current(&state, &retire),
+            "the retiring runtime owns its retire"
+        );
+
+        state.live_runtime_ids.insert(runtime_id);
+        assert!(
+            current(&state, &binding),
+            "the bound live runtime owns its binding"
+        );
+        assert!(current(&state, &ingress), "a live runtime takes its input");
     }
 
     #[test]

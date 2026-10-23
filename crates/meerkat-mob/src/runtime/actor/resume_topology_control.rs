@@ -61,7 +61,10 @@ impl MobActor {
                 reason = %effect.uncertainty_reason(),
                 "resume topology retry lost its exact effect custody"
             );
-            self.durable_uncertainty_fail_stop = true;
+            self.durable_uncertainty_fail_stop
+                .record_unreplied(MobError::Internal(
+                    "resume topology retry lost its exact effect custody".to_string(),
+                ));
             return;
         }
         tracing::warn!(
@@ -72,7 +75,10 @@ impl MobActor {
         if attempts == 1 && automatic_retry {
             if retry_tx.send(()).is_err() {
                 tracing::error!("resume topology effect owner disappeared before retry");
-                self.durable_uncertainty_fail_stop = true;
+                self.durable_uncertainty_fail_stop
+                    .record_unreplied(MobError::Internal(
+                        "resume topology effect owner disappeared before retry".to_string(),
+                    ));
             }
         } else {
             self.retained_resume_topology_effects
@@ -84,7 +90,10 @@ impl MobActor {
         for retained in std::mem::take(&mut self.retained_resume_topology_effects) {
             if !self.owns_resume_topology_effect(&retained.effect) {
                 tracing::error!("lifecycle control cannot retry a foreign topology effect");
-                self.durable_uncertainty_fail_stop = true;
+                self.durable_uncertainty_fail_stop
+                    .record_unreplied(MobError::Internal(
+                        "lifecycle control cannot retry a foreign topology effect".to_string(),
+                    ));
                 continue;
             }
             tracing::warn!(
@@ -93,7 +102,10 @@ impl MobActor {
             );
             if retained.retry_tx.send(()).is_err() {
                 tracing::error!("retained resume topology effect owner is unavailable");
-                self.durable_uncertainty_fail_stop = true;
+                self.durable_uncertainty_fail_stop
+                    .record_unreplied(MobError::Internal(
+                        "retained resume topology effect owner is unavailable".to_string(),
+                    ));
             }
         }
     }
@@ -115,7 +127,10 @@ impl MobActor {
                     || !self.retained_resume_topology_effects.is_empty()
                 {
                     tracing::error!("topology owner reported settlement with retained effects");
-                    self.durable_uncertainty_fail_stop = true;
+                    self.durable_uncertainty_fail_stop
+                        .record_unreplied(MobError::Internal(
+                            "topology owner reported settlement with retained effects".to_string(),
+                        ));
                     return;
                 }
                 self.resume_topology_settled(attempt, result).await;
@@ -126,7 +141,11 @@ impl MobActor {
                     "resume topology ended without proving remote effect settlement"
                 );
                 if !self.owns_resume_topology_effect(&effect) {
-                    self.durable_uncertainty_fail_stop = true;
+                    self.durable_uncertainty_fail_stop.record_unreplied(
+                        MobError::ExternalMemberCleanupUncertain {
+                            reason: effect.uncertainty_reason(),
+                        },
+                    );
                     return;
                 }
                 if let Some(pending) = self.pending_resume_lifecycle.take() {
@@ -141,7 +160,10 @@ impl MobActor {
             }
             ResumeTopologyOutcome::OwnerLost(reason) => {
                 tracing::error!(%reason, "resume topology owner disappeared without settlement");
-                self.durable_uncertainty_fail_stop = true;
+                self.durable_uncertainty_fail_stop
+                    .record_unreplied(MobError::Internal(
+                        "resume topology owner disappeared without settlement".to_string(),
+                    ));
             }
         }
     }

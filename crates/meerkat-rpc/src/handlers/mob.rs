@@ -451,10 +451,7 @@ pub async fn handle_list(id: Option<RpcId>, state: &Arc<MobMcpState>) -> RpcResp
     };
     let mobs = mobs
         .into_iter()
-        .map(|(mob_id, status)| MobStatusResult {
-            mob_id: mob_id.to_string(),
-            status: meerkat_mob_mcp::wire_mob_lifecycle_status(status),
-        })
+        .map(|(mob_id, observation)| meerkat_mob_mcp::wire_mob_status_row(&mob_id, &observation))
         .collect::<Vec<_>>();
     RpcResponse::success(id, MobListResult { mobs })
 }
@@ -480,9 +477,12 @@ pub async fn handle_status(
     match state.mob_status(&mob_id).await {
         Ok(status) => RpcResponse::success(
             id,
+            // A mob whose actor has stopped answers its typed failure as the
+            // error below, so a status row carries none.
             MobStatusResult {
                 mob_id: mob_id.to_string(),
                 status: meerkat_mob_mcp::wire_mob_lifecycle_status(status),
+                failure: None,
             },
         ),
         Err(err) => mob_call_error(id, &err),
@@ -1237,15 +1237,9 @@ pub async fn handle_lifecycle(
             Err(MobMcpDestroyError::Mob(err)) => return mob_call_error(id, &err),
         },
     };
-    let destroy_report = match destroy_report {
-        Some(report) => match serde_json::to_value(&report) {
-            Ok(value) => Some(value),
-            Err(err) => {
-                return invalid_params(id, format!("destroy report serialize: {err}"));
-            }
-        },
-        None => None,
-    };
+    let destroy_report = destroy_report
+        .as_ref()
+        .map(meerkat_contracts::WireMobDestroyReport::from);
     RpcResponse::success(
         id,
         MobLifecycleResult {
@@ -1993,25 +1987,14 @@ pub async fn handle_destroy(
         Err(resp) => return resp,
     };
     match state.mob_destroy(&mob_id).await {
-        Ok(report) => {
-            let report_value = match serde_json::to_value(&report) {
-                Ok(v) => v,
-                Err(err) => {
-                    return invalid_params(
-                        id,
-                        format!("failed to serialize MobDestroyReport: {err}"),
-                    );
-                }
-            };
-            RpcResponse::success(
-                id,
-                MobDestroyResult {
-                    mob_id: mob_id.to_string(),
-                    ok: true,
-                    destroy_report: report_value,
-                },
-            )
-        }
+        Ok(report) => RpcResponse::success(
+            id,
+            MobDestroyResult {
+                mob_id: mob_id.to_string(),
+                ok: true,
+                destroy_report: meerkat_contracts::WireMobDestroyReport::from(&report),
+            },
+        ),
         Err(MobMcpDestroyError::Incomplete { report }) => destroy_incomplete_response(id, &report),
         Err(MobMcpDestroyError::Mob(err)) => mob_call_error(id, &err),
     }
@@ -3716,6 +3699,105 @@ mod tests {
         );
     }
 
+    /// `mob/spawn_helper` and `mob/fork_helper` with `runtime_mode:
+    /// autonomous_host` are refused, typed, before a helper is spawned: a
+    /// bounded helper's one tracked turn cannot complete through autonomous
+    /// inbox delivery.
+    #[tokio::test]
+    async fn helpers_with_an_autonomous_runtime_mode_are_refused_before_spawning() {
+        let mob_id = MobId::from("rpc-autonomous-helper");
+        let state = MobMcpState::new_in_memory();
+        // Mob members need comms; the shared fixture profile leaves it off.
+        let mut definition = rpc_destroy_test_definition(&mob_id);
+        if let Some(meerkat_mob::ProfileBinding::Inline(profile)) = definition
+            .profiles
+            .get_mut(&meerkat_mob::ProfileName::from("worker"))
+        {
+            profile.tools.comms = true;
+        }
+        let handle = MobBuilder::new(definition, MobStorage::in_memory())
+            .with_session_service(state.session_service())
+            .allow_ephemeral_sessions(true)
+            .create()
+            .await
+            .expect("create the mob");
+        state
+            .mob_insert_handle(mob_id.clone(), handle.clone())
+            .await;
+        let mut source = meerkat_mob::SpawnMemberSpec::new("worker", AgentIdentity::from("source"));
+        source.runtime_mode = Some(MobRuntimeMode::TurnDriven);
+        handle
+            .spawn_spec(source)
+            .await
+            .expect("spawn the fork source");
+
+        let spawn = serde_json::json!({
+            "mob_id": mob_id.as_str(),
+            "agent_identity": "autonomous-helper",
+            "prompt": "do the thing",
+            "result_label": "helper_result",
+            "max_text_bytes": 4096,
+            "runtime_mode": "autonomous_host",
+        });
+        let raw = serde_json::value::RawValue::from_string(spawn.to_string())
+            .expect("serialize spawn_helper params");
+        let spawned = handle_spawn_helper(Some(RpcId::Num(13)), Some(&raw), &state).await;
+
+        let fork = serde_json::json!({
+            "mob_id": mob_id.as_str(),
+            "source_member_id": "source",
+            "agent_identity": "autonomous-fork",
+            "prompt": "do the thing",
+            "result_label": "helper_result",
+            "max_text_bytes": 4096,
+            "runtime_mode": "autonomous_host",
+        });
+        let raw = serde_json::value::RawValue::from_string(fork.to_string())
+            .expect("serialize fork_helper params");
+        let forked = handle_fork_helper(Some(RpcId::Num(14)), Some(&raw), &state).await;
+
+        for response in [spawned, forked] {
+            assert!(response.result.is_none());
+            let error = response
+                .error
+                .expect("an autonomous helper must be refused");
+            // UnsupportedForMode carries no typed wire detail: it maps to
+            // INVALID_PARAMS with the error's message and no data.
+            assert_eq!(error.code, crate::error::INVALID_PARAMS);
+            assert!(
+                error.data.is_none(),
+                "unexpected error data: {:?}",
+                error.data
+            );
+            assert!(
+                error
+                    .message
+                    .contains("unsupported for runtime mode autonomous_host"),
+                "the refusal must name the runtime mode: {}",
+                error.message
+            );
+        }
+        let spawned_helpers = handle
+            .events()
+            .replay_all()
+            .await
+            .expect("replay the mob events")
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    &event.kind,
+                    meerkat_mob::event::MobEventKind::MemberSpawned(spawned)
+                        if spawned.agent_identity.as_str() == "autonomous-helper"
+                            || spawned.agent_identity.as_str() == "autonomous-fork"
+                )
+            })
+            .count();
+        assert_eq!(
+            spawned_helpers, 0,
+            "a refused autonomous helper must never be spawned"
+        );
+    }
+
     fn assert_destroy_incomplete_rpc_error_with_message(
         response: RpcResponse,
         expected_error: &str,
@@ -4685,6 +4767,71 @@ mod tests {
             meerkat_contracts::WireControlScope::List,
             &[],
             "owner-only mob/list",
+        );
+    }
+
+    /// `mob/list` lists a mob whose actor fail-stopped with a typed failure
+    /// next to its status: the status stays the last machine phase, and the
+    /// failure says the mob's actor has stopped and why.
+    #[tokio::test]
+    async fn mob_list_rows_carry_a_fail_stopped_mobs_failure() {
+        let state = MobMcpState::new_in_memory_as(meerkat_mob::MobControlPrincipal::Owner);
+        let mob_id = MobId::from("rpc-list-fail-stopped");
+        meerkat_mob::fail_stop_next_actor_start_for_test(&mob_id);
+        let handle = MobBuilder::new(
+            rpc_destroy_test_definition(&mob_id),
+            MobStorage::in_memory(),
+        )
+        .with_session_service(state.session_service())
+        .allow_ephemeral_sessions(true)
+        .create()
+        .await
+        .expect("create the mob");
+        assert_eq!(
+            handle.actor_task_watch().wait().await,
+            meerkat_mob::MobActorTaskWait::Returned,
+            "the actor fail-stops in its startup recovery"
+        );
+        let cause = match handle.status().await {
+            Err(MobError::SharedLifecycleFailure(cause)) => cause,
+            other => panic!("a fail-stopped actor reports why, typed: {other:?}"),
+        };
+        state.mob_insert_handle(mob_id.clone(), handle).await;
+
+        let response = handle_list(Some(RpcId::Num(7)), &state).await;
+        assert!(
+            response.error.is_none(),
+            "owner mob/list must succeed: {:?}",
+            response.error
+        );
+        let result: serde_json::Value =
+            serde_json::from_str(response.result.expect("list result").get())
+                .expect("list result decodes");
+        let row = result["mobs"]
+            .as_array()
+            .expect("mob rows")
+            .iter()
+            .find(|row| row["mob_id"] == mob_id.as_str())
+            .expect("the fail-stopped mob is listed");
+        assert!(
+            row["status"] == "Creating" || row["status"] == "Running",
+            "the status stays the last machine phase: {row}"
+        );
+        let failure = row.get("failure").unwrap_or_else(|| {
+            panic!("a fail-stopped mob's row says why its actor stopped: {row}")
+        });
+        assert_eq!(failure["message"], cause.to_string(), "{row}");
+        assert_eq!(
+            failure["cause"],
+            serde_json::to_value(meerkat_mob::mob_error_wire_code(&cause)).expect("cause"),
+            "{row}"
+        );
+        assert_eq!(
+            failure.get("code").cloned(),
+            cause
+                .wire_error_code()
+                .map(|code| serde_json::to_value(code).expect("code")),
+            "{row}"
         );
     }
 

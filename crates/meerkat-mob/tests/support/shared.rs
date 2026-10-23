@@ -642,6 +642,7 @@ impl MaterializePreflightProbe for ScriptedPreflightProbe {
     async fn preflight_llm_identity(
         &self,
         _identity: &meerkat_core::SessionLlmIdentity,
+        _resume_prior: Option<&meerkat_core::SessionLlmIdentity>,
         _custom_models: &std::collections::BTreeMap<
             String,
             meerkat_core::config::CustomModelConfig,
@@ -983,6 +984,15 @@ impl meerkat_mob::MobSessionService for FailingOnceSessionService {
     ) -> Result<meerkat_mob::SessionResumeVerdict, meerkat_core::service::SessionError> {
         self.inner
             .materialize_session_resume_verdict(session_id)
+            .await
+    }
+
+    async fn settle_durable_tail_before_cold_start(
+        &self,
+        session_id: &meerkat_core::SessionId,
+    ) -> Result<(), meerkat_core::service::SessionError> {
+        self.inner
+            .settle_durable_tail_before_cold_start(session_id)
             .await
     }
 

@@ -4,7 +4,7 @@ description: "TypeScript SDK for Meta with type-safe contracts, parity tests, an
 icon: "js"
 ---
 
-*Mirrored from MobKit main at [091f73c4a64c](https://github.com/lukacf/meerkat-meta/commit/091f73c4a64cd13e08fc7c8a0484c0bf3a93b4c2) on 2026-10-22; MobKit workspace version 0.9.4 at that commit.*
+*Mirrored from MobKit main at [39d8833a14a3](https://github.com/lukacf/meerkat-meta/commit/39d8833a14a30c9d7cb196543d793a05af02a156) on 2026-10-23; MobKit workspace version 0.9.4 at that commit.*
 
 The TypeScript SDK (`@rkat/meta-sdk`) provides type-safe access to the Meta JSON-RPC gateway from Node.js.
 
@@ -50,6 +50,33 @@ const results = await handle.memoryQuery({
 });
 
 ```
+
+## Fork instruction policy
+
+A member forked with `fork_off`, a delegation fork or a council does not run
+the instructions its source activated (`meta/member_activate_instruction`,
+skill bodies activated that way included) unless the gateway's fork instruction
+policy says so. Under the default, `"require_explicit_activation"`, such a fork
+is refused with `fork_instruction_refused` before anything is committed. Set
+the policy on the builder; it is sent as
+`runtime_options.fork_instruction_policy`:
+
+```typescript
+import { Meta } from "@rkat/meta-sdk";
+
+const rt = await Meta.builder()
+  .mob("config/mob.toml")
+  .forkInstructionPolicy("reactivate_inherited")
+  .build();
+```
+
+`forkInstructionPolicy` takes a `ForkInstructionPolicy`:
+`"require_explicit_activation"`, `"reactivate_inherited"` or `"refuse"`;
+another value throws `RangeError`. Unset, nothing is sent and the gateway
+default applies. The setting applies to every fork of the gateway's mob and
+cannot be chosen per fork. See
+[Fork instruction policy](/mobkit/reference/configuration#fork-instruction-policy)
+for what each value does and what `reactivate_inherited` trusts.
 
 ## Waiting for a turn
 
@@ -446,7 +473,7 @@ from a hang.
 `compaction_persistence_rejected`, `actor_loop_stalled`,
 `actor_loop_recovered`, `actor_loop_terminated`, `host_loop_crash`, `rediscover_failure`,
 `event_log_flush_failure`, `identity_materialization_failure`,
-`mob_stop_proceeded_without_interrupt`). The SDK source constants are kept
+`mob_stop_proceeded_without_interrupt`, `retired_member_release_failed`). The SDK source constants are kept
 in lockstep with the Rust enum by `tests/sdk_error_category_parity.rs`;
 `context` carries the variant's fields (`member_id`, `error`, and so on).
 `actor_loop_terminated` is a terminal actor failure requiring a process restart,

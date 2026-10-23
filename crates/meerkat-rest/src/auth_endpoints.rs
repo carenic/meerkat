@@ -171,6 +171,7 @@ fn target_error_status(error: &ConnectionTargetError) -> StatusCode {
         | ConnectionTargetError::InvalidBindingId { .. }
         | ConnectionTargetError::ProviderMismatch { .. }
         | ConnectionTargetError::AmbiguousCredentialAccountBindings { .. }
+        | ConnectionTargetError::NoCredentialAccountRoute { .. }
         | ConnectionTargetError::RealmChain(_) => StatusCode::BAD_REQUEST,
     }
 }
@@ -220,6 +221,11 @@ async fn configured_mcp_target(
     )
     .await
     .map_err(host_auth_error_response)
+}
+
+/// The response for a failed credential commit (a profile's secret).
+fn credential_commit_error_response(error: CredentialMutationError) -> axum::response::Response {
+    host_auth_error_response(meerkat::HostAuthError::CredentialMutation(error))
 }
 
 fn host_auth_error_response(error: meerkat::HostAuthError) -> axum::response::Response {
@@ -280,6 +286,7 @@ fn host_auth_error_response(error: meerkat::HostAuthError) -> axum::response::Re
         Json(meerkat_contracts::WireAuthErrorBody {
             error: error.public_message(),
             reason,
+            detail: error.detail(),
         }),
     )
         .into_response()
@@ -1121,11 +1128,7 @@ pub async fn create_auth_profile(
     )
     .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": error.to_string() })),
-        )
-            .into_response();
+        return credential_commit_error_response(error);
     }
     tracing::info!(
         target: "meerkat::auth::audit",
@@ -1358,11 +1361,14 @@ pub async fn start_login(
                         authorize_url: started.authorize_url,
                         state: started.state,
                         redirect_uri: started.redirect_uri,
+                        // REST serves loopback logins only.
+                        host_attempt_handle: None,
                         target: WireLoginStartTarget::Mcp(WireMcpLoginStart {
                             mcp,
                             disposition: meerkat::mcp_login_disposition_to_wire(
                                 started.disposition,
                             ),
+                            attempt_ref: None,
                         }),
                     }),
                 )
@@ -1386,6 +1392,7 @@ pub async fn start_login(
                         authorize_url: started.authorize_url,
                         state: started.state,
                         redirect_uri: started.redirect_uri,
+                        host_attempt_handle: None,
                         target: WireLoginStartTarget::Connector(
                             meerkat_contracts::WireConnectorSlotTarget {
                                 connector: connector.slot,
@@ -1428,6 +1435,7 @@ pub async fn start_login(
                 authorize_url: started.authorize_url,
                 state: started.state,
                 redirect_uri: started.redirect_uri,
+                host_attempt_handle: None,
                 target: WireLoginStartTarget::Provider(WireProviderLoginStart {
                     provider: provider_target.provider,
                 }),
@@ -1445,6 +1453,17 @@ pub async fn complete_login(
     State(state): State<AppState>,
     Json(body): Json<LoginCompleteBody>,
 ) -> impl IntoResponse {
+    // REST serves loopback logins only: a registered-callback completion
+    // field is refused, never ignored.
+    if body.host_attempt_handle.is_some() || body.iss.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "host_attempt_handle and iss are accepted only over RPC auth/login/complete"
+            })),
+        )
+            .into_response();
+    }
     let provider_target = match body.target {
         WireLoginTarget::Provider(target) => target,
         WireLoginTarget::Mcp(WireMcpLoginTarget { mcp }) => {
@@ -2109,6 +2128,34 @@ mod tests {
                 assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
                 assert_eq!(body["error"], "auth infrastructure failure");
             }
+        }
+    }
+
+    /// A failed profile-secret commit answers 500 with a typed reason and a
+    /// fixed text, never the store's own text: commit_unsettled when the
+    /// outcome is unknown, infrastructure otherwise.
+    #[tokio::test]
+    async fn credential_commit_errors_carry_a_typed_reason_body() {
+        const DETAIL: &str = "private-store-detail-canary-1045";
+        for (failure, reason) in [
+            (
+                CredentialMutationError::RollbackFailed(DETAIL.into()),
+                "commit_unsettled",
+            ),
+            (CredentialMutationError::Cancelled, "commit_unsettled"),
+            (
+                CredentialMutationError::Operation(DETAIL.into()),
+                "infrastructure",
+            ),
+        ] {
+            let response = credential_commit_error_response(failure);
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["reason"], reason, "{body}");
+            assert!(!body["error"].as_str().unwrap().contains(DETAIL), "{body}");
         }
     }
 
@@ -2920,6 +2967,61 @@ mod tests {
         assert!(!flow.pkce_verifier.is_empty());
     }
 
+    /// REST serves loopback logins only: a registered-callback field on a
+    /// completion is refused before any lookup, for every target kind, and
+    /// never ignored.
+    #[tokio::test]
+    async fn rest_login_complete_refuses_registered_callback_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::load_from(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        let targets = [
+            WireLoginTarget::Provider(meerkat_contracts::WireProviderLoginTarget {
+                provider: WireOAuthProvider::OpenAi,
+                realm_id: "rest-registered-fields".to_string(),
+                binding_id: "default_openai".to_string(),
+                profile_id: None,
+            }),
+            WireLoginTarget::Mcp(WireMcpLoginTarget {
+                mcp: meerkat_contracts::WireMcpAuthTarget {
+                    server_name: "hosted".to_string(),
+                    server_url: "https://mcp.example.invalid/mcp".to_string(),
+                    oauth_account: None,
+                    oauth_account_selection: None,
+                },
+            }),
+        ];
+        for target in targets {
+            for (handle, iss) in [
+                (Some("handle".to_string()), None),
+                (None, Some("https://idp.example.invalid".to_string())),
+            ] {
+                let response = complete_login(
+                    State(state.clone()),
+                    Json(LoginCompleteBody {
+                        target: target.clone(),
+                        code: "code".to_string(),
+                        state: "st-never-admitted".to_string(),
+                        redirect_uri: "https://host.example.invalid/mcp/oauth/callback".to_string(),
+                        host_attempt_handle: handle,
+                        iss,
+                    }),
+                )
+                .await
+                .into_response();
+                let (status, body) = rest_json(response).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert!(
+                    body["error"]
+                        .as_str()
+                        .is_some_and(|error| error.contains("only over RPC")),
+                    "{body}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn rest_login_complete_with_an_unknown_state_is_attempt_missing() {
         let realm = "rest-login-unknown-state";
@@ -2967,6 +3069,8 @@ mod tests {
                 code: "provider-code".to_string(),
                 state: "st-never-admitted".to_string(),
                 redirect_uri: redirect_uri.to_string(),
+                host_attempt_handle: None,
+                iss: None,
             }),
         )
         .await
@@ -3264,6 +3368,8 @@ mod tests {
                 code: "provider-code".to_string(),
                 state: "missing-state".to_string(),
                 redirect_uri: "http://127.0.0.1:0/callback".to_string(),
+                host_attempt_handle: None,
+                iss: None,
             }),
         )
         .await
@@ -3490,6 +3596,8 @@ mod tests {
                         code: outcome.code,
                         state: outcome.state,
                         redirect_uri: start["redirect_uri"].as_str().unwrap().to_string(),
+                        host_attempt_handle: None,
+                        iss: None,
                     }),
                 )
                 .await
@@ -3579,6 +3687,8 @@ mod tests {
                     code: "code".to_string(),
                     state: "state".to_string(),
                     redirect_uri: "http://127.0.0.1:1/mcp/oauth/callback".to_string(),
+                    host_attempt_handle: None,
+                    iss: None,
                 }),
             )
             .await
@@ -3625,6 +3735,8 @@ mod tests {
                 code: "provider-code".to_string(),
                 state: "missing-state".to_string(),
                 redirect_uri: "http://127.0.0.1:0/callback".to_string(),
+                host_attempt_handle: None,
+                iss: None,
             }),
         )
         .await

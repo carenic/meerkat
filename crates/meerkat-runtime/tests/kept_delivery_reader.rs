@@ -2,9 +2,10 @@
 //! guarded snapshot read per store tick, closed for maintenance, for a file
 //! replaced at its path, and for a schema or ledger change. Unix only: the
 //! store keeps the reader on unix, and the replacement tests rename open
-//! files.
+//! files. The reader is the SQLite store's, and the tests count its opens
+//! through the store's test hooks: `sqlite-store` and `test-support`.
 
-#![cfg(unix)]
+#![cfg(all(unix, feature = "sqlite-store", feature = "test-support"))]
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use std::path::{Path, PathBuf};
@@ -89,21 +90,94 @@ async fn a_hundred_quiet_reads_cost_one_verified_open_when_kept() {
     drop(reader);
 
     hooks::force_fresh_reads(&path);
-    assert!(
-        store.delivery_generation_reader().is_none(),
-        "forced onto the fresh-open path"
-    );
+    let mut fresh = store
+        .delivery_generation_reader()
+        .expect("forced onto the fresh-open path, whose reader keeps nothing");
     let before = hooks::verified_opens(&path);
     for _ in 0..100 {
-        assert_eq!(
-            store.load_delivery_generation().await.expect("fresh read"),
-            3
-        );
+        assert_eq!(fresh.read().await.expect("fresh read"), 3);
+        assert!(!fresh.keeps_connection());
     }
     assert_eq!(
         hooks::verified_opens(&path) - before,
         100,
         "the fresh-open path opens per read"
+    );
+}
+
+/// The fresh-open path's reader answers a store notification from its last
+/// read, without opening, while the database and its WAL stat as they did
+/// before that read began: its own open and close leave them so. A commit
+/// since changes them, so its notification is read; a read (the owner's
+/// sweep) always opens.
+#[tokio::test]
+async fn a_fresh_reader_answers_an_unchanged_notification_from_its_last_read() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = store_with_generation(dir.path(), 3).await;
+    let path = store.path().to_path_buf();
+    hooks::force_fresh_reads(&path);
+    let mut reader = store
+        .delivery_generation_reader()
+        .expect("the fresh-open path's reader");
+    assert!(!reader.keeps_connection());
+
+    let before = hooks::verified_opens(&path);
+    assert_eq!(reader.read().await.expect("read"), 3);
+    for _ in 0..10 {
+        assert_eq!(
+            reader.read_on_notification().await.expect("notification"),
+            3
+        );
+    }
+    assert_eq!(
+        hooks::verified_opens(&path) - before,
+        1,
+        "only the read opened: its own open and close changed nothing the stat sees"
+    );
+
+    commit_deliveries(&store, "kept-reader-runtime", 1).await;
+    assert_eq!(
+        reader
+            .read_on_notification()
+            .await
+            .expect("notification after a commit"),
+        4,
+        "the commit changed the stat, so its notification is read"
+    );
+    assert_eq!(hooks::verified_opens(&path) - before, 2);
+    assert_eq!(reader.read().await.expect("a sweep's read"), 4);
+    assert_eq!(
+        hooks::verified_opens(&path) - before,
+        3,
+        "a read always opens"
+    );
+}
+
+/// A stat that fails never answers a notification from the last read: each
+/// notification opens the database.
+#[tokio::test]
+async fn a_fresh_reader_whose_stat_fails_reads_every_notification() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = store_with_generation(dir.path(), 3).await;
+    let path = store.path().to_path_buf();
+    hooks::force_fresh_reads(&path);
+    let mut reader = store
+        .delivery_generation_reader()
+        .expect("the fresh-open path's reader");
+    let before = hooks::verified_opens(&path);
+    assert_eq!(reader.read().await.expect("read"), 3);
+
+    hooks::fail_file_stamps(&path);
+    for _ in 0..3 {
+        assert_eq!(
+            reader.read_on_notification().await.expect("notification"),
+            3
+        );
+    }
+    assert_eq!(
+        hooks::verified_opens(&path) - before,
+        4,
+        "every notification opened the database"
     );
 }
 

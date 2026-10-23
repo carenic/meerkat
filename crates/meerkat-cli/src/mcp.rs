@@ -1165,7 +1165,7 @@ future_server_key = "preserve-too"
             "glean".to_string(),
             Some(McpTransportKind::StreamableHttp),
             None,
-            Some("https://king-be.glean.com/mcp/default".to_string()),
+            Some("https://tenant.glean.example/mcp/default".to_string()),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1173,7 +1173,7 @@ future_server_key = "preserve-too"
         .unwrap();
         match server.transport {
             McpTransportConfig::Http(http) => {
-                assert_eq!(http.url, "https://king-be.glean.com/mcp/default");
+                assert_eq!(http.url, "https://tenant.glean.example/mcp/default");
                 assert!(http.headers.is_empty());
             }
             _ => panic!("expected http transport"),

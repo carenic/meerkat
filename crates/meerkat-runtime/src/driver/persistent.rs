@@ -210,7 +210,9 @@ impl PersistentRuntimeDriver {
             }
             PreparedProvisionalPromotion::HeadCanonical(promotion) => {
                 PreparedRuntimeSessionCommit::promote_head_canonical_success(
-                    promotion,
+                    promotion.with_deferred_transcript_retirement(
+                        session.deferred_transcript_retirement(),
+                    ),
                     receipt,
                     input_updates,
                     owner_session_id,
@@ -252,7 +254,9 @@ impl PersistentRuntimeDriver {
             }
             PreparedProvisionalPromotion::HeadCanonical(promotion) => {
                 PreparedRuntimeSessionCommit::promote_head_canonical_machine_terminal(
-                    promotion,
+                    promotion.with_deferred_transcript_retirement(
+                        session.deferred_transcript_retirement(),
+                    ),
                     receipt,
                     machine_lifecycle,
                     input_updates,
@@ -1563,7 +1567,9 @@ impl PersistentRuntimeDriver {
                     }
                     Ok(PreparedProvisionalPromotion::HeadCanonical(promotion)) => {
                         PreparedRuntimeSessionCommit::promote_head_canonical_service_turn_terminal(
-                            promotion,
+                            promotion.with_deferred_transcript_retirement(
+                                session.deferred_transcript_retirement(),
+                            ),
                             receipt,
                             commit,
                             owner_session_id,
@@ -1912,6 +1918,14 @@ impl PersistentRuntimeDriver {
                 .inner
                 .accept_resolved_input_with_credential(input, resolved, custody);
         };
+        // An existing-only admission only deduplicates. The durable index
+        // holds no earlier admission under the key and the live preview would
+        // admit fresh, so it refuses here, under the driver lock and before
+        // any write. Registration ran cold recovery first, so a binding that
+        // recovery released is already gone.
+        if resolved.admission_requirement() == crate::accept::AdmissionRequirement::ExistingOnly {
+            return Err(crate::accept::no_existing_admission(&input));
+        }
 
         let flags = resolved.coarse_flags();
         let changed_input_ids = resolved.persistence_changed_input_ids(&expected_input_id);

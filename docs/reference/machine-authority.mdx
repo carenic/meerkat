@@ -188,6 +188,19 @@ Ownership splits three ways:
   transitions are total and disjoint over the observation. A tail carrying
   any dangling tool call classifies `Ambiguous`: the call proves intent, not
   execution, so the tail is held for reconciliation rather than repaired.
+  Only a store-proven descendant of the committed authority can classify as
+  recoverable, and the relation comes from the store-loaded recovery source,
+  never from a caller. `VerifiedStrictDescendant`: the physical head extends
+  the authority's exact message prefix. `VerifiedRewriteDescendant`: a
+  compaction rewrote the transcript after the authority, and the store proves
+  the descent from its persisted rewrite rows (they bridge both rewrite
+  prefixes, and the authority's exact row prefix chains into the first rewrite
+  after it). Both relations pass the same shape checks, and neither stands in
+  for the other: a descent the store cannot prove reaches the classifier as
+  `Unverifiable` and classifies `Ambiguous`. Rewrite rows carry no run
+  identity, so a rewrite descendant is observed from its last rewrite onward;
+  when that live tail holds no message of the run it has no run id and
+  classifies `Ambiguous`.
   The candidate id binds the exact store-issued base and candidate identities,
   run id, and candidate sequence, so classifying one physical tail can never
   authorize mutating a later one.

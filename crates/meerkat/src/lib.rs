@@ -214,6 +214,13 @@ pub use continuation::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use continuation::{
+    BoundHostOriginal, GovernedAdmissionOutcome, HostOriginalAdmission, HostOriginalBinder,
+    HostOriginalBinderReadiness, HostOriginalFacts, HostOriginalLookup, HostOriginalReadiness,
+    HostOriginalRecord, HostOriginalRef, HostOriginalRefusal, HostOriginalSettlement,
+    RESERVED_HOST_NAMESPACE_PREFIX, governed_admission_outcome, is_reserved_host_namespace,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use continuation::{
     ContinuationAdmitError, ContinuationBindError, ContinuationBinding,
     ContinuationBindingGeneration, ContinuationHostBindings, RetainedJobFacts, RetainedJobLookup,
     RetainedJobRecord, RetainedJobSource, retained_admission_outcome,
@@ -292,23 +299,23 @@ pub use meerkat_client::{
 pub use meerkat_schedule::{
     CalendarFieldSpec, CalendarTriggerSpec, ClaimDueRequest, ClaimDueResult, CreateScheduleRequest,
     DeliveryCompletion, DeliveryDispatch, DeliveryFailureReason, DeliveryReceipt,
-    DeliveryReceiptStage, DeliveryTerminal, DisabledScheduleStore, ForkContextSpec,
-    HelperOptionsSpec, HostRunnable, HostRunnableError, HostRunnableInvocation, HostRunnableName,
-    HostRunnableNameError, HostRunnableOutcome, HostRunnableParams, HostRunnableParamsError,
-    HostRunnableRegistry, HostRunnableRegistryError, HostRunnableTargetBinding,
-    IdentityTargetBinding, IdentityTargetDeliverability, IntervalTriggerSpec,
-    MOB_MEMBER_IDENTITY_TARGET_PREFIX, MemoryScheduleStore, MisfirePolicy, MissingTargetPolicy,
-    MobTargetBinding, Occurrence, OccurrenceFailureClass, OccurrenceFilter, OccurrenceId,
-    OccurrenceOrdinal, OccurrencePhase, OverlapPolicy, ResolvedSpawnSnapshot, RunnableProbe,
-    SCHEDULE_TOOL_CAPABILITY_UNAVAILABLE, SCHEDULE_TOOL_INVALID_ARGUMENTS, SCHEDULE_TOOL_NOT_FOUND,
-    Schedule, ScheduleDeliveryIdentity, ScheduleDomainError, ScheduleDriver, ScheduleDriverConfig,
-    ScheduleFilter, ScheduleId, ScheduleIdentityTargetProbe, SchedulePhase, ScheduleRevision,
-    ScheduleRunnableHost, ScheduleService, ScheduleSpawnTooling, ScheduleStore, ScheduleStoreError,
-    ScheduleStoreKind, ScheduleStoreWakeMode, ScheduleTargetDelivery, ScheduleTargetProbe,
-    ScheduleToolDispatcher, ScheduleToolError, ScheduledMobAction, ScheduledMobBackendKind,
-    ScheduledMobRuntimeMode, ScheduledSessionAction, SessionMaterializationSpec,
-    SessionTargetBinding, TargetBinding, TargetProbeOutcome, TriggerSpec, UpdateScheduleRequest,
-    handle_schedule_tools_call, schedule_tools_list,
+    DeliveryReceiptStage, DeliveryTerminal, DisabledScheduleStore, ExistingDelivery,
+    ExistingDeliveryAnswer, ForkContextSpec, HelperOptionsSpec, HostRunnable, HostRunnableError,
+    HostRunnableInvocation, HostRunnableName, HostRunnableNameError, HostRunnableOutcome,
+    HostRunnableParams, HostRunnableParamsError, HostRunnableRegistry, HostRunnableRegistryError,
+    HostRunnableTargetBinding, IdentityTargetBinding, IdentityTargetDeliverability,
+    IntervalTriggerSpec, MOB_MEMBER_IDENTITY_TARGET_PREFIX, MemoryScheduleStore, MisfirePolicy,
+    MissingTargetPolicy, MobTargetBinding, Occurrence, OccurrenceFailureClass, OccurrenceFilter,
+    OccurrenceId, OccurrenceOrdinal, OccurrencePhase, OverlapPolicy, ResolvedSpawnSnapshot,
+    RunnableProbe, SCHEDULE_TOOL_CAPABILITY_UNAVAILABLE, SCHEDULE_TOOL_INVALID_ARGUMENTS,
+    SCHEDULE_TOOL_NOT_FOUND, Schedule, ScheduleDeliveryIdentity, ScheduleDomainError,
+    ScheduleDriver, ScheduleDriverConfig, ScheduleFilter, ScheduleId, ScheduleIdentityTargetProbe,
+    SchedulePhase, ScheduleRevision, ScheduleRunnableHost, ScheduleService, ScheduleSpawnTooling,
+    ScheduleStore, ScheduleStoreError, ScheduleStoreKind, ScheduleStoreWakeMode,
+    ScheduleTargetDelivery, ScheduleTargetProbe, ScheduleToolDispatcher, ScheduleToolError,
+    ScheduledMobAction, ScheduledMobBackendKind, ScheduledMobRuntimeMode, ScheduledSessionAction,
+    SessionMaterializationSpec, SessionTargetBinding, TargetBinding, TargetProbeOutcome,
+    TriggerSpec, UpdateScheduleRequest, handle_schedule_tools_call, schedule_tools_list,
 };
 pub use meerkat_tools::ToolError;
 #[cfg(not(target_arch = "wasm32"))]
@@ -427,6 +434,13 @@ pub use host_auth::{
 pub use host_auth::{default_mcp_auth_resolver, default_mcp_auth_resolver_in_realm};
 #[cfg(not(target_arch = "wasm32"))]
 pub use meerkat_providers::auth_store::{ProviderAuthPersistence, TokenStoreBackend};
+// Settle the credential work this process started before reading a
+// credential's status: after an unsettled commit, `Settled` means nothing from
+// it is still running.
+#[cfg(not(target_arch = "wasm32"))]
+pub use meerkat_providers::auth_store::{
+    CredentialSettlement, settle_in_flight_credential_mutations,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use meerkat_providers::connector_login::{
     CONNECTOR_OAUTH_CALLBACK_PATH, ConnectorAccountStrategy, ConnectorAuthPhase,
@@ -445,8 +459,10 @@ pub use meerkat_providers::mcp_oauth::{
     McpOAuthAttemptCleanup, McpOAuthAuthority, McpOAuthBrowserLaunch, McpOAuthCallback,
     McpOAuthCancelHandle, McpOAuthCeremonyContext, McpOAuthError, McpOAuthListenerCleanup,
     McpOAuthLoginComplete, McpOAuthLoginDisposition, McpOAuthLoginStart, McpOAuthLoopbackBegin,
-    McpOAuthPendingAttempt, McpOAuthPendingClose, McpOAuthPendingLogin, McpServerIdentity,
-    OidcUserInfoAccountStrategy, open_system_browser_guarded, open_system_browser_trusting,
+    McpOAuthNetworkBounds, McpOAuthNetworkStage, McpOAuthPendingAttempt, McpOAuthPendingClose,
+    McpOAuthPendingLogin, McpOAuthRegisteredCallback, McpRegisteredRedirectBase, McpServerIdentity,
+    McpStoredCredentialPhase, McpStoredCredentialStatus, OidcUserInfoAccountStrategy,
+    open_system_browser_guarded, open_system_browser_trusting,
 };
 
 pub mod help;

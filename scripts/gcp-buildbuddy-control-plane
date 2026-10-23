@@ -50,7 +50,8 @@ Commands:
   render-config | config-sha256 | render-startup-script
 
 Environment:
-  MEERKAT_GCP_PROJECT_ID                         GCP project
+  MEERKAT_GCP_PROJECT_ID                         GCP project (required; GCP_PROJECT_ID
+                                                 is read when it is unset)
   MEERKAT_GCP_ZONE                               GCP zone
   MEERKAT_GCP_BUILDBUDDY_CONTROL_INSTANCE        VM name (default: meerkat-bb-control)
   MEERKAT_GCP_BUILDBUDDY_CONTROL_DISK            Data/cache disk name
@@ -68,7 +69,16 @@ Environment:
 EOF
 }
 
-project="${MEERKAT_GCP_PROJECT_ID:-${GCP_PROJECT_ID:-king-dnn-training-dev}}"
+project="${MEERKAT_GCP_PROJECT_ID:-${GCP_PROJECT_ID:-}}"
+if [[ -z "${project}" ]]; then
+  case "${1:-}" in
+    -h | --help | help) ;;
+    *)
+      echo "error: MEERKAT_GCP_PROJECT_ID must name the GCP project of the BuildBuddy control plane" >&2
+      exit 2
+      ;;
+  esac
+fi
 zone="${MEERKAT_GCP_ZONE:-europe-west1-b}"
 instance="${MEERKAT_GCP_BUILDBUDDY_CONTROL_INSTANCE:-meerkat-bb-control}"
 disk_name="${MEERKAT_GCP_BUILDBUDDY_CONTROL_DISK:-${instance}-data}"

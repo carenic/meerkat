@@ -17265,6 +17265,59 @@ impl MeerkatMachine {
             .await
     }
 
+    /// [`Self::accept_input_with_completion`] for a keyed prompt whose
+    /// process-local resource owner (for example a trusted host's custody of
+    /// the original the prompt binds) is settled by native admission, as
+    /// [`Self::accept_input_with_completion_for_attachment_and_replay_policy_with_custody`]
+    /// settles it, without an attachment fence. The replay contract is
+    /// `ExactPrompt`: a duplicate is the same prompt and context, verified
+    /// from the existing admission's retained witness. Before the credential
+    /// boundary, dropping the returned future settles `NotAdmitted`; after
+    /// it, dropping the acknowledgement cannot cancel the native-owned
+    /// settlement. This does not change the native admission result.
+    pub fn accept_input_with_completion_and_custody<'a>(
+        &'a self,
+        session_id: &'a SessionId,
+        input: Input,
+        custody: Box<dyn crate::input_admission_custody::NativeInputAdmissionCustody>,
+    ) -> AcceptInputWithCompletionFuture<'a> {
+        // Construct before boxing: even a never-polled future owns its cleanup.
+        let custody = crate::input_admission_custody::NativeInputAdmissionGuard::new(custody);
+        let session_id = session_id.clone();
+        Box::pin(async move {
+            if !matches!(input, Input::Prompt(_)) || input.header().idempotency_key.is_none() {
+                return Err(RuntimeDriverError::ValidationFailed {
+                    reason: "exact prompt replay requires a prompt with a stable idempotency key"
+                        .to_string(),
+                });
+            }
+            match self
+                .execute_meerkat_machine_ingress_command_with_custody(
+                    MeerkatMachineCommand::AcceptWithCompletion {
+                        session_id,
+                        input,
+                        register_completion: true,
+                        replay_policy: crate::accept::InputReplayPolicy::ExactPrompt,
+                        admission_requirement: crate::accept::AdmissionRequirement::Any,
+                        member_residency: MemberResidencyExpectation::Unfenced,
+                        expected_attachment: None,
+                    },
+                    Some(custody),
+                )
+                .await?
+            {
+                MeerkatMachineCommandResult::AcceptWithCompletion {
+                    outcome,
+                    handle,
+                    admission_signal: _,
+                } => Ok((outcome, handle)),
+                other => Err(RuntimeDriverError::Internal(format!(
+                    "unexpected custody accept result: {other:?}"
+                ))),
+            }
+        })
+    }
+
     pub(crate) async fn accept_peer_ingress_with_completion(
         &self,
         facts: meerkat_core::interaction::PeerIngressClaimCommitFacts,
@@ -17453,6 +17506,7 @@ impl MeerkatMachine {
                     input,
                     register_completion: true,
                     replay_policy,
+                    admission_requirement: crate::accept::AdmissionRequirement::Any,
                     member_residency: MemberResidencyExpectation::Unfenced,
                     expected_attachment: Some(witness.clone()),
                 },
@@ -17485,6 +17539,50 @@ impl MeerkatMachine {
         >,
     ) -> Result<(AcceptOutcome, Option<crate::completion::CompletionHandle>), RuntimeDriverError>
     {
+        self.accept_input_with_completion_for_attachment_and_member_residency_requiring(
+            witness,
+            input,
+            expected_member,
+            crate::accept::AdmissionRequirement::Any,
+        )
+        .await
+    }
+
+    /// The deduplicate-only admission of
+    /// [`SessionServiceRuntimeExt::accept_existing_input_with_completion`]
+    /// under the same attachment and member-residency fences as
+    /// [`Self::accept_input_with_completion_for_attachment_and_member_residency`]:
+    /// an input admitted earlier under the input's idempotency key answers
+    /// `Deduplicated`; otherwise it refuses with
+    /// [`RuntimeDriverError::NoExistingAdmission`] and admits nothing.
+    pub async fn accept_existing_input_with_completion_for_attachment_and_member_residency(
+        &self,
+        witness: &RuntimeExecutorAttachmentWitness,
+        input: Input,
+        expected_member: Option<
+            &meerkat_contracts::wire::supervisor_bridge::BridgeMemberIncarnation,
+        >,
+    ) -> Result<(AcceptOutcome, Option<crate::completion::CompletionHandle>), RuntimeDriverError>
+    {
+        self.accept_input_with_completion_for_attachment_and_member_residency_requiring(
+            witness,
+            input,
+            expected_member,
+            crate::accept::AdmissionRequirement::ExistingOnly,
+        )
+        .await
+    }
+
+    async fn accept_input_with_completion_for_attachment_and_member_residency_requiring(
+        &self,
+        witness: &RuntimeExecutorAttachmentWitness,
+        input: Input,
+        expected_member: Option<
+            &meerkat_contracts::wire::supervisor_bridge::BridgeMemberIncarnation,
+        >,
+        admission_requirement: crate::accept::AdmissionRequirement,
+    ) -> Result<(AcceptOutcome, Option<crate::completion::CompletionHandle>), RuntimeDriverError>
+    {
         if !witness.belongs_to(self) {
             return Err(RuntimeDriverError::StaleAuthority {
                 reason: "input admission attachment witness belongs to another machine".to_string(),
@@ -17500,6 +17598,7 @@ impl MeerkatMachine {
                 input,
                 register_completion: true,
                 replay_policy: crate::accept::InputReplayPolicy::KeyOnly,
+                admission_requirement,
                 member_residency,
                 expected_attachment: Some(witness.clone()),
             })
@@ -17540,6 +17639,7 @@ impl MeerkatMachine {
                 input,
                 register_completion: true,
                 replay_policy: crate::accept::InputReplayPolicy::KeyOnly,
+                admission_requirement: crate::accept::AdmissionRequirement::Any,
                 member_residency,
                 expected_attachment: None,
             })
@@ -18150,6 +18250,36 @@ impl MeerkatMachine {
         input: Box<Input>,
         _input_id: InputId,
     ) -> AcceptInputWithCompletionFuture<'a> {
+        self.accept_boxed_input_with_completion_requiring(
+            session_id,
+            input,
+            crate::accept::AdmissionRequirement::Any,
+        )
+    }
+
+    /// The deduplicate-only admission of
+    /// [`SessionServiceRuntimeExt::accept_existing_input_with_completion`]:
+    /// the ordinary ingress command with
+    /// `AdmissionRequirement::ExistingOnly`, decided by the
+    /// session's driver where it decides deduplication.
+    pub fn accept_existing_input_with_completion_boxed<'a>(
+        &'a self,
+        session_id: &'a SessionId,
+        input: Input,
+    ) -> AcceptInputWithCompletionFuture<'a> {
+        self.accept_boxed_input_with_completion_requiring(
+            session_id,
+            Box::new(input),
+            crate::accept::AdmissionRequirement::ExistingOnly,
+        )
+    }
+
+    fn accept_boxed_input_with_completion_requiring<'a>(
+        &'a self,
+        session_id: &'a SessionId,
+        input: Box<Input>,
+        admission_requirement: crate::accept::AdmissionRequirement,
+    ) -> AcceptInputWithCompletionFuture<'a> {
         let session_id = session_id.clone();
         Box::pin(async move {
             let input = *input;
@@ -18160,6 +18290,7 @@ impl MeerkatMachine {
                         input,
                         register_completion: true,
                         replay_policy: crate::accept::InputReplayPolicy::KeyOnly,
+                        admission_requirement,
                         member_residency: MemberResidencyExpectation::Unfenced,
                         expected_attachment: None,
                     },

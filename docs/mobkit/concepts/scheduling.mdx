@@ -4,7 +4,7 @@ description: "Durable schedule ownership, occurrence claims, firing, and target 
 icon: "clock"
 ---
 
-*Mirrored from MobKit main at [091f73c4a64c](https://github.com/lukacf/meerkat-meta/commit/091f73c4a64cd13e08fc7c8a0484c0bf3a93b4c2) on 2026-10-22; MobKit workspace version 0.9.4 at that commit.*
+*Mirrored from MobKit main at [39d8833a14a3](https://github.com/lukacf/meerkat-meta/commit/39d8833a14a30c9d7cb196543d793a05af02a156) on 2026-10-23; MobKit workspace version 0.9.4 at that commit.*
 
 Meta uses Meerkat's durable `ScheduleService` as its only scheduling
 authority. Schedule definitions live in the schedule store, every firing is
@@ -30,6 +30,14 @@ schedule = true
 The gateway binds the member's
 `meerkat_schedule_{create,get,list,update,pause,resume,delete,occurrences}`
 tools and the firing host to the same `ScheduleService` and store.
+
+To read those tools' definitions (names, descriptions and JSON input schemas)
+from a running gateway, call
+[`meta/schedule/tools`](/mobkit/api/rpc#meta%2Fschedule%2Ftools), or
+`MobHandle.schedule_tools()` in Python and `MobHandle.scheduleTools()` in
+TypeScript. It returns Meerkat's base definitions without touching the
+schedule store. Inside a member's session, `meerkat_schedule_create` and
+`meerkat_schedule_update` also accept a `current_session` session target.
 
 ## Durable ownership
 

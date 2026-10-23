@@ -1264,7 +1264,7 @@ fn verify_released_pre_floor_session_schema(conn: &Connection) -> Result<(), Str
 /// Maintenance-prepare callback for the explicit pre-0.8.10 session bridge.
 ///
 /// When the transaction's catalog is exactly the released pre-ledger
-/// plain-CREATE shape ([`verify_released_pre_floor_session_schema`]), the two
+/// plain-CREATE shape (`verify_released_pre_floor_session_schema`), the two
 /// legacy objects are rebuilt from the current migration-1 constants (the
 /// post-migration convergence fingerprint compares the stored CREATE text)
 /// and the remaining migration-1 objects are planted, so migrations
@@ -6822,6 +6822,116 @@ pub fn verify_physical_head_retains_boundary_prefix_for_runtime_in_txn(
     physical.with_verified_ancestor_row_prefix(expected_boundary_prefix.clone())
 }
 
+/// What the store proved about a physical head that carries transcript
+/// rewrite occurrences its runtime boundary does not.
+///
+/// Only [`verify_physical_head_rewrite_descent_for_runtime_in_txn`] mints
+/// one, so a recovery source can take its relation from this proof and from
+/// nowhere else.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct HeadCanonicalRewriteDescent {
+    physical: meerkat_core::VerifiedSessionHeadMaterialization,
+    verdict: RewriteDescentVerdict,
+}
+
+/// The store's verdict on a rewritten physical head's descent.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RewriteDescentVerdict {
+    /// The physical head descends from the boundary through store-proven
+    /// rewrite occurrences. The rows the run wrote after its final rewrite
+    /// start at `live_tail_base`.
+    Proven { live_tail_base: u64 },
+    /// The physical head verifies on its own, but nothing proves it descends
+    /// from the boundary.
+    Unproven { reason: String },
+}
+
+impl HeadCanonicalRewriteDescent {
+    #[must_use]
+    pub fn verdict(&self) -> &RewriteDescentVerdict {
+        &self.verdict
+    }
+
+    /// The physical head's materialization, verified on its own lineage,
+    /// and the verdict on its descent.
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        meerkat_core::VerifiedSessionHeadMaterialization,
+        RewriteDescentVerdict,
+    ) {
+        (self.physical, self.verdict)
+    }
+}
+
+/// Prove that a physical head carrying more rewrite occurrences than its
+/// runtime boundary descends from that boundary.
+///
+/// A rewrite replaces rows, so the boundary is no row prefix of the physical
+/// transcript; [`verify_physical_head_retains_boundary_prefix_for_runtime_in_txn`]
+/// refuses such a head. Here the physical head is verified on its own
+/// lineage, its persisted rewrite rows must bridge the boundary's rewrite
+/// prefix to its own (so the boundary must not predate the retention cut),
+/// and its replayed graph must hold the boundary's rewrite and graph prefix
+/// and advance its first post-boundary occurrence from the boundary's exact
+/// rows ([`meerkat_core::session_store::prove_rewrite_descent_from_boundary`]).
+/// Store failures are errors; evidence that does not prove the descent is
+/// [`RewriteDescentVerdict::Unproven`].
+#[doc(hidden)]
+pub fn verify_physical_head_rewrite_descent_for_runtime_in_txn(
+    tx: &Transaction<'_>,
+    boundary_head: &SessionHead,
+    physical_head: &SessionHead,
+) -> Result<HeadCanonicalRewriteDescent, SessionStoreError> {
+    if boundary_head.id != physical_head.id
+        || boundary_head.restored_session_version()? != physical_head.restored_session_version()?
+        || boundary_head.created_at != physical_head.created_at
+    {
+        return Err(SessionStoreError::Corrupted(physical_head.id.clone()));
+    }
+    let physical = verify_head_canonical_with_metadata_owner_in_txn(
+        tx,
+        physical_head,
+        HeadMetadataProjectionOwner::PhysicalHead,
+    )?;
+    let unproven = |physical, error: SessionStoreError| match error {
+        SessionStoreError::Io(_) | SessionStoreError::Internal(_) => Err(error),
+        error => Ok(HeadCanonicalRewriteDescent {
+            physical,
+            verdict: RewriteDescentVerdict::Unproven {
+                reason: error.to_string(),
+            },
+        }),
+    };
+    if let Err(error) = verify_head_rewrite_prefix_descent_in_txn(tx, boundary_head, physical_head)
+    {
+        return unproven(physical, error);
+    }
+    let Some(replayed) = replay_head_canonical_history_in_txn(tx, physical_head)? else {
+        return unproven(
+            physical,
+            SessionStoreError::InvalidTranscriptRewrite {
+                id: physical_head.id.clone(),
+                reason: "physical head carries no rewrite graph".to_string(),
+            },
+        );
+    };
+    match meerkat_core::session_store::prove_rewrite_descent_from_boundary(
+        boundary_head,
+        physical_head,
+        replayed.history(),
+    ) {
+        Ok(live_tail_base) => Ok(HeadCanonicalRewriteDescent {
+            physical,
+            verdict: RewriteDescentVerdict::Proven { live_tail_base },
+        }),
+        Err(error) => unproven(physical, error),
+    }
+}
+
 fn activation_boundary_strand_and_prove_rewrite_descent_in_txn(
     tx: &Transaction<'_>,
     id: &SessionId,
@@ -8262,9 +8372,14 @@ pub fn apply_prepared_head_canonical_mutation_in_txn(
                 .map_err(into_session_store_error)?
                 .is_some();
             if legacy_blob_exists {
+                // A plain save wrote this session whole: a pre-0.9 build, or
+                // a non-runtime service sharing this store (one without a
+                // session checkpointer saves through `SessionStore::save`).
                 return Err(prepared_head_conflict(
                     mutation,
-                    "legacy whole-blob session exists without a canonical head",
+                    "<legacy whole-blob session without a canonical head: saved outside the \
+                     runtime, by a pre-0.9 build or by a non-runtime service sharing this SQLite \
+                     session store; a runtime-backed host cannot adopt it>",
                 ));
             }
         }
@@ -9212,6 +9327,26 @@ fn retire_head_canonical_rows_in_txn(
     collect_unreachable_strands_in_txn(tx, head)
 }
 
+/// Apply a deferred transcript retention cut to the rows of `head`, the
+/// physical head a runtime boundary commit has just promoted, inside that
+/// co-tenant runtime transaction.
+///
+/// An intra-run checkpoint writes its provisional successor without pruning
+/// rewrite rows, so the committed boundary stays rebuildable until the run's
+/// boundary commit promotes the successor; the promotion then applies the
+/// live graph's cut here. The cut is clamped to `head`'s own row-lineage
+/// anchor floor and below its rewrite count, and a cut at or below the stored
+/// one is a no-op, so an over-large target cannot strand the promoted head
+/// and a retried promotion cuts nothing twice.
+#[doc(hidden)]
+pub fn retire_head_canonical_rows_for_runtime_in_txn(
+    tx: &Transaction<'_>,
+    head: &SessionHead,
+    target: u64,
+) -> Result<(), SessionStoreError> {
+    retire_head_canonical_rows_in_txn(tx, head, target)
+}
+
 /// Delete strands no retained authority can reach.
 ///
 /// Roots are the head strand, the head's row-lineage anchor strand, and both
@@ -9596,8 +9731,16 @@ impl SessionStore for SqliteSessionStore {
 
     async fn load(&self, id: &SessionId) -> Result<Option<Session>, SessionStoreError> {
         let id = id.clone();
+        #[cfg(test)]
+        let interleaving_path = self.path.clone();
+        // One read transaction: the head row and the rows and metadata it
+        // names come from one snapshot, so a commit that lands between them is
+        // never read half before and half after (`SessionStoreError::Corrupted`
+        // is never a writer race).
         self.in_read_txn(move |tx| {
             if let Some((head, stored_token)) = head_row_in_txn(tx, &id)? {
+                #[cfg(test)]
+                head_read_interleaving::fire(&interleaving_path);
                 // Slim, no history metadata — the O(live) cold-resume contract.
                 return Ok(Some(materialize_slim_in_txn(
                     tx,
@@ -10099,8 +10242,12 @@ impl IncrementalSessionStore for SqliteSessionStore {
 
     async fn load_head(&self, id: &SessionId) -> Result<Option<SessionHead>, SessionStoreError> {
         let id = id.clone();
+        #[cfg(test)]
+        let interleaving_path = self.path.clone();
         self.in_read_txn(move |tx| {
             if let Some((head, token)) = head_row_in_txn(tx, &id)? {
+                #[cfg(test)]
+                head_read_interleaving::fire(&interleaving_path);
                 if session_head_cas_token(&head)? != token {
                     return Err(SessionStoreError::Corrupted(id));
                 }
@@ -11865,6 +12012,48 @@ mod tests {
         );
     }
 
+    /// The same for `load` and `load_head`: a commit that lands between the
+    /// head read and the rows, metadata and token it names is not corruption.
+    /// The `SessionStoreError::Corrupted` contract relies on this: a session
+    /// read never returns it for a race with a writer.
+    #[tokio::test]
+    async fn load_and_load_head_read_one_snapshot_across_a_concurrent_commit() {
+        for read in ["load", "load_head"] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("sessions.sqlite3");
+            let store = SqliteSessionStore::open(&path).unwrap();
+            let (id, successor) = committed_head_with_a_metadata_change(&store).await;
+            let successor_token = successor.successor_head_token().to_string();
+            head_read_interleaving::arm(&path, commit_on_a_second_connection(&path, successor));
+
+            if read == "load" {
+                let loaded = store.load(&id).await;
+                assert!(
+                    loaded.is_ok(),
+                    "{read}: a concurrent commit is not corruption: {:?}",
+                    loaded.as_ref().err()
+                );
+                let loaded = loaded.expect("checked above").expect("the session exists");
+                assert_eq!(loaded.id(), &id);
+            } else {
+                let head = store.load_head(&id).await;
+                assert!(
+                    head.is_ok(),
+                    "{read}: a concurrent commit is not corruption: {:?}",
+                    head.as_ref().err()
+                );
+                let head = head.expect("checked above").expect("the head exists");
+                assert_eq!(head.id, id);
+            }
+            let head = store.load_head(&id).await.unwrap().unwrap();
+            assert_eq!(
+                session_head_cas_token(&head).unwrap(),
+                successor_token,
+                "{read}: the concurrent commit landed"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Incremental session persistence (a downstream ask)
     // -----------------------------------------------------------------------
@@ -11928,6 +12117,47 @@ mod tests {
         assert_eq!(
             component_rows, 0,
             "ordinary System rows must not mint out-of-band component events"
+        );
+    }
+
+    /// A session saved whole through the plain store API, as a pre-0.9 build
+    /// or a non-runtime service sharing this store saves it, has no canonical
+    /// head. The first runtime commit cannot adopt it and is refused, and the
+    /// refusal names that cause.
+    #[tokio::test]
+    async fn a_runtime_root_over_a_session_saved_outside_the_runtime_names_the_cause() {
+        let (_dir, store) = temp_store();
+        let mut session = Session::new();
+        session.push(user("saved by a non-runtime service"));
+        store
+            .save(&session)
+            .await
+            .expect("the plain save writes the whole session");
+        let root = PreparedHeadCanonicalMutation::prepare_root(&session).expect("prepare root");
+        let error = incremental(&store)
+            .apply_prepared_head_canonical_mutation(&root)
+            .await
+            .expect_err("a whole session without a canonical head is not adopted");
+        assert!(
+            matches!(error, SessionStoreError::TranscriptRevisionConflict { .. }),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("saved outside the runtime"),
+            "the refusal names the cause: {message}"
+        );
+        assert!(
+            message.contains("a non-runtime service sharing this SQLite session store"),
+            "the refusal names the sharing service: {message}"
+        );
+        assert!(
+            store
+                .load(session.id())
+                .await
+                .expect("load after the refusal")
+                .is_some_and(|loaded| loaded.messages() == session.messages()),
+            "the refused session's data stays intact"
         );
     }
 
@@ -12890,6 +13120,76 @@ mod tests {
     /// each compaction. HeadCanonical persistence must keep committing the
     /// pending occurrence from the re-anchored graph, and a cold load replays
     /// the store's whole graph with the same rolling identity.
+    /// The store's proof that a rewritten physical head descends from a
+    /// runtime boundary: the head written over a boundary by a compacting
+    /// mutation descends from it, and the run's rows after the rewrite start
+    /// at the rewrite's endpoint. A boundary whose rewrite prefix the
+    /// persisted rewrite rows do not bridge is unproven, which the caller
+    /// holds, not a store error.
+    #[tokio::test]
+    async fn a_rewritten_head_descends_from_the_head_it_was_written_over() {
+        let (dir, store) = temp_store();
+        let incremental = incremental(&store);
+        let mut session = Session::new();
+        for turn in 0..3 {
+            session.push(user(&format!("seed {turn}")));
+        }
+        let root = PreparedHeadCanonicalMutation::prepare_root(&session).expect("prepare root");
+        incremental
+            .apply_prepared_head_canonical_mutation(&root)
+            .await
+            .expect("persist root");
+        root.acknowledge_session(&mut session, root.successor_head_token())
+            .expect("acknowledge root");
+        let boundary = root.successor_head().clone();
+        session.push(user("run row"));
+        let end = session.messages().len();
+        session
+            .commit_transcript_rewrite(
+                TranscriptRewriteSelection::MessageRange { start: 0, end },
+                vec![user("summary")],
+                TranscriptRewriteReason::new("compaction"),
+                Some("unit-test".to_string()),
+                None,
+            )
+            .expect("commit rewrite");
+        session.push(user("after the rewrite"));
+        let rewrite = PreparedHeadCanonicalRewriteMutation::prepare_intra_turn(
+            &session,
+            &boundary,
+            boundary.clone(),
+        )
+        .expect("prepare the compacting checkpoint");
+        incremental
+            .apply_prepared_head_canonical_rewrite_mutation(&rewrite)
+            .await
+            .expect("persist the compacting checkpoint");
+        let physical = rewrite.successor_head().clone();
+
+        let mut conn = Connection::open(dir.path().join("sessions.sqlite3")).expect("open");
+        let tx = conn.transaction().expect("read transaction");
+        let descent =
+            verify_physical_head_rewrite_descent_for_runtime_in_txn(&tx, &boundary, &physical)
+                .expect("the store reads both heads");
+        assert_eq!(
+            descent.verdict(),
+            &RewriteDescentVerdict::Proven {
+                live_tail_base: physical.message_count - 1
+            }
+        );
+
+        let mut unbridged = boundary.clone();
+        unbridged.rewrite_prefix = physical.rewrite_prefix.clone();
+        let descent =
+            verify_physical_head_rewrite_descent_for_runtime_in_txn(&tx, &unbridged, &physical)
+                .expect("an unproven descent is a verdict, not a store error");
+        assert!(
+            matches!(descent.verdict(), RewriteDescentVerdict::Unproven { .. }),
+            "{:?}",
+            descent.verdict()
+        );
+    }
+
     #[tokio::test]
     async fn head_canonical_persistence_survives_in_memory_history_retirement() {
         let (_dir, store) = temp_store();

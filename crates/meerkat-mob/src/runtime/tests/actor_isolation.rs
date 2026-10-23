@@ -28,12 +28,16 @@ use crate::ids::WorkOrigin;
 use crate::runtime::handle::{MEMBER_ADMISSION_LANE_CAPACITY, MemberReloadDisposition};
 use crate::runtime::state::MobCommand;
 
+#[path = "degraded_retirement.rs"]
+mod degraded_retirement;
 #[path = "degraded_shutdown.rs"]
 mod degraded_shutdown;
 #[path = "reload_lane.rs"]
 mod reload_lane;
 #[path = "run_start_staging.rs"]
 mod run_start_staging;
+#[path = "unregister_self_heal.rs"]
+mod unregister_self_heal;
 
 /// `RuntimeStore` decorator (an `InMemoryRuntimeStore` by default) with
 /// per-session fault switches.
@@ -386,6 +390,11 @@ impl RuntimeStore for FaultInjectingRuntimeStore {
         self.inner.supports_compaction_projection_outbox()
     }
 
+    /// A wrapped store with hosting paths keeps its cross-process claims.
+    fn hosting_capability(&self) -> meerkat_runtime::HostingCapability {
+        self.inner.hosting_capability()
+    }
+
     async fn observe_machine_lifecycle(
         &self,
         runtime_id: &LogicalRuntimeId,
@@ -407,6 +416,28 @@ impl RuntimeStore for FaultInjectingRuntimeStore {
     > {
         self.inner
             .compare_and_swap_machine_lifecycle(runtime_id, expected, replacement)
+            .await
+    }
+
+    /// A wrapped store keeps its conditional lifecycle registration, which
+    /// identity reconciliation needs.
+    async fn compare_and_swap_machine_lifecycle_with_fence(
+        &self,
+        runtime_id: &LogicalRuntimeId,
+        expected: meerkat_runtime::store::MachineLifecycleExpectedVersion,
+        replacement: meerkat_runtime::store::MachineLifecycleCommit,
+        write_fence: Arc<dyn meerkat_runtime::store::RuntimeStoreWriteFence>,
+    ) -> Result<
+        meerkat_runtime::store::FencedMachineLifecycleCasOutcome,
+        meerkat_runtime::store::RuntimeStoreError,
+    > {
+        self.inner
+            .compare_and_swap_machine_lifecycle_with_fence(
+                runtime_id,
+                expected,
+                replacement,
+                write_fence,
+            )
             .await
     }
 

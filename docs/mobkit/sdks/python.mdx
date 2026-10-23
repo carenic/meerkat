@@ -4,7 +4,7 @@ description: "Meta Python SDK — typed builder API, async runtime, and streamin
 icon: "python"
 ---
 
-*Mirrored from MobKit main at [091f73c4a64c](https://github.com/lukacf/meerkat-meta/commit/091f73c4a64cd13e08fc7c8a0484c0bf3a93b4c2) on 2026-10-22; MobKit workspace version 0.9.4 at that commit.*
+*Mirrored from MobKit main at [39d8833a14a3](https://github.com/lukacf/meerkat-meta/commit/39d8833a14a30c9d7cb196543d793a05af02a156) on 2026-10-23; MobKit workspace version 0.9.4 at that commit.*
 
 The Meta Python SDK provides a typed host API for launching and operating
 Meerkat mobs through the SDK-facing gateway. Apps own policy. Meerkat and
@@ -619,9 +619,30 @@ rt = await (
 | `.console_read_only(read_only=True)` | View-only console: mutating console RPCs are denied and omitted from capabilities |
 | `.console_fetch_timeout_ms(ms)` | Bundled-console JSON fetch timeout override (positive integer) |
 | `.console_config(path)` | Console UI TOML (`ConsoleUiConfig`) forwarded as `runtime_options.console_config_path` |
+| `.fork_instruction_policy(policy)` | What a fork of a member with activated instructions does with them, forwarded as `runtime_options.fork_instruction_policy`: `"require_explicit_activation"` (the default when unset), `"reactivate_inherited"` or `"refuse"`. Another value raises `ValueError`. See [Fork instruction policy](/mobkit/reference/configuration#fork-instruction-policy) |
 | `.gateway(bin_path)` | Path to rpc_gateway binary |
 | `.modules(specs)` | Module specifications |
 | `.build()` | Build and connect the runtime |
+
+A member forked with `fork_off`, a delegation fork or a council does not run
+the instructions its source activated (`meta/member_activate_instruction`,
+skill bodies activated that way included) unless the gateway's fork instruction
+policy says so. Under the default, such a fork is refused with
+`fork_instruction_refused` before anything is committed. To let forks carry
+their source's activations, opt in at boot:
+
+```python
+runtime = await (
+    Meta.builder()
+    .mob("config/mob.toml")
+    .fork_instruction_policy("reactivate_inherited")
+    .build()
+)
+```
+
+The setting applies to every fork of the gateway's mob and cannot be chosen
+per fork. Read [what `reactivate_inherited` trusts](/mobkit/reference/configuration#what-reactivate_inherited-trusts)
+before you enable it.
 
 Boot-time membership is declared, never derived: a member exists only once a
 `.roster(provider)` names it (identity plane) or `ensure_member` creates it
@@ -1025,6 +1046,7 @@ Most apps should use `send`, `subscribe_agent`/`subscribe_mob`, and `status`/`re
 | `spawn(spec: DiscoverySpec)` | `SpawnResult` | Spawn a member from a discovery spec |
 | `spawn_member(module_id)` | `SpawnResult` | Spawn a member by module ID |
 | `capabilities()` | `CapabilitiesResult` | List available RPC methods |
+| `schedule_tools()` | `ScheduleToolsResult` | Meerkat's durable schedule tool definitions ([`meta/schedule/tools`](/mobkit/api/rpc#meta%2Fschedule%2Ftools)) |
 | `subscribe_events(scope, ...)` | `SubscribeResult` | Low-level event subscription |
 | `resolve_routing(recipient)` | `RoutingResolution` | Resolve delivery routing |
 | `send_delivery(...)` | `DeliveryResult` | Send via delivery module |

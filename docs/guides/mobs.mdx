@@ -339,6 +339,16 @@ auto_compact_threshold = 60000
 resume_overrides = ["model", "provider"]
 ```
 
+A resumed member keeps its durable credential binding while its provider is
+unchanged. When `provider` in `resume_overrides` moves a member to another
+provider, the member keeps its history and resolves the new provider's binding
+from its realm, as a fresh member of the profile would: the realm's binding for
+that provider, then the parent realms and `global`, then the provider's
+environment key. A durable binding backed by a credential account keeps that
+account; if no binding for the new provider shares it, the resume is refused
+with a typed error and the durable session is left as it was. A host that runs
+a member for another host needs the release with this behaviour to resume it.
+
 Anthropic prompt caching is a per-profile `provider_params` decision. From
 0.8.33 the default is `automatic` on every backend that supports it (Anthropic
 API, Vertex, and Foundry); Bedrock and other backends that report automatic
@@ -1214,6 +1224,34 @@ above) keeps its reason. After any of them `acquire_owner()` is refused and
 `admission_closed()` reports the reason; 0.9.3 and earlier could still hand out
 an owner lease on a shut-down, destroyed or lost actor.
 
+When a mob start's durable recovery fails before the actor admits a command
+(`DurabilityFailStop`), `MobHandle::status` and `MobHandle::resume` return the
+failure, typed, as `MobError::SharedLifecycleFailure`. For a member's session
+it is `MobError::MemberStartupRecoveryFailed`, which names the member, its
+session and the cause, for example `SessionError::ServedElsewhere` while
+another runtime owner on the realm hosts the session. Other commands fail with
+`ActorCommandChannelClosed`. An actor that fail-stops later, on a durable
+mutation whose outcome stayed uncertain, reports `MobError::DurabilityFailStop`
+the same way: its `cause` is that mutation's own error, the first one when
+several stayed uncertain, and the command that hit it got the same error,
+shared in `SharedLifecycleFailure`. The record classifies as the admission
+close it stands for (no wire code, failure class `MobRejected`, `mob/list`
+cause `internal`) and carries no durable resume hold, even when its cause
+does: the mob needs a restart, not a parked member. Before 0.9.5, `status`
+reported only "mob actor reply channel closed", and the cause reached only the
+host's error log.
+
+`MobHandle::lifecycle_observation()` (and the same method on `MobReadHandle`)
+reads that answer without asking the actor: the last phase the actor
+published and, once the actor has stopped, `failure`. That is the cause
+`status` reports or, for an actor task that ended while the mob was live and
+recorded no cause, the closed-actor error. `status_observation_snapshot()` is
+the phase alone and keeps a stopped actor's last live phase. `mob/list`, the
+MCP `meerkat_mob_list` tool and the SDKs' mob listings give such a mob's row a
+typed `failure` (`cause`, `message`, `code`, `structured_data`): present
+means the mob's actor has stopped; `status` is the last machine phase. Before
+0.9.5 the row read `Running`.
+
 While a Shutdown drains, a command the close refuses (spawn, respawn, work, a
 flow run, wiring, a host bind, a live commit, resume, reset or reload) fails
 with `AdmissionClosed`, and every other request the actor answers (stop,
@@ -1256,6 +1294,46 @@ Since 0.9.4 a destroy whose member's boundary commit fails while the destroy
 waits on that member's ingress detach reloads the member from its durable
 store, retries its retirement once, and names it in
 `MobDestroyReport::reloaded_members`; 0.9.3 answered `Incomplete`.
+
+A destroy also reloads, before it starts, every member whose runtime requires
+a durability reload. When the runtime refuses such a reload as repair-blocked,
+for example while a boundary commit past its deadline has not reported its
+durable outcome, the destroy answers `Incomplete`. Since 0.9.5 its report also
+lists the member in `MobDestroyReport::member_reload_refusals`
+(`{"member": ..., "refusal": {"kind": "repair_blocked", "reason": ...}}`
+in the `destroy_report` of the `mob_destroy_incomplete` data): retry the
+destroy later. The SDKs read that report typed, as a `WireMobDestroyReport`:
+`mob_destroy_incomplete_report(error)` in Python and
+`mobDestroyIncompleteReport(error)` in TypeScript and `@rkat/web`. A refusal
+in the reload pass before the destroy starts leaves the mob unchanged. A
+refusal later in the destroy comes after its cleanup has begun: the mob's
+admission is closed, and some members may already be retired. A member that
+degrades only after those reloads, and whose reload the runtime refuses while
+the destroy archives its session, is listed the same way; its `errors` entry
+then carries the text of `MobError::MemberReloadRepairBlocked`. Any other
+reload failure stays text in `errors` only.
+
+A retire reloads such a member as well, at its quiesce stage. When the runtime
+refuses that reload as repair-blocked, the retirement sticks: `retire` answers
+`MobError::MemberRetirementStuck`, and since 0.9.5 its cause is
+`MobError::MemberReloadRepairBlocked` (`session_id`, `reason`,
+`evidence_digest`; structured data kind `mob_member_reload_repair_blocked`
+with `retryable: true`, wire code `SessionBusy`) instead of a session error
+with the refusal as text. Redrive the retirement with
+`MobHandle::redrive_retirement` once the boundary commit has reported its
+outcome; the redrive reloads the member and completes the retirement.
+
+A retire that started before the member degraded waits at its quiesce stage
+on the boundary commit instead, and reaches its ingress detach once the
+commit reports, with the member still degraded. Since 0.9.5 the ingress
+detach reloads the member as the quiesce does and retires the cold successor,
+so the retirement completes: retry a retire that answered
+`MemberRetirementInProgress`. When the runtime refuses that reload as
+repair-blocked, or the member degrades just after the stage's reload check,
+the retirement sticks with the same `MemberReloadRepairBlocked` cause; redrive
+it. Since 0.9.5 the stuck error's own data (kind `mob_retirement_stuck`)
+carries the cause's data as `cause_data`, so a client routes on the cause's
+kind rather than on its text.
 
 ### Admission in custom Rust session services
 

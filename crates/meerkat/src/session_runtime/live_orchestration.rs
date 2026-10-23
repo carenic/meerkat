@@ -2235,7 +2235,7 @@ mod orchestrator {
         /// media hydration and no replay seed. With a turn in flight it is
         /// built from the committed boundary and the published tool
         /// definitions, and the durable resync is deferred to the turn
-        /// boundary ([`Self::release_live_resync_at_turn_boundary`]).
+        /// boundary (`Self::release_live_resync_at_turn_boundary`).
         ///
         /// `llm_identity` is the identity the channel is bound to
         /// ([`MeerkatMachine::live_channel_binding`]); the session's text

@@ -1305,6 +1305,51 @@ where
             .await
     }
 
+    /// Persist the rewrites a run's compactions kept past the retention, then
+    /// retire down to it.
+    ///
+    /// A session a durable HeadCanonical head describes keeps every rewrite
+    /// occurrence that head does not cover yet: the next checkpoint proves
+    /// the pending rewrite suffix from it. The agent checkpoints at the end
+    /// of a run, so inside one long run its compactions' bodies would pile up
+    /// until then. At a model boundary that follows tool results, before that
+    /// boundary decides whether to compact, take the intra-run checkpoint (it
+    /// moves the durable head over those rewrites) and retire to the bound.
+    /// Never right after a compaction: a durable tail must hold a row the
+    /// run wrote after its last rewrite, or recovery cannot attribute it.
+    /// Sessions without a checkpointer, without a durable head, or in a live
+    /// bridge run that commits nothing keep today's behaviour.
+    async fn checkpoint_history_held_by_durable_head(
+        &mut self,
+        retention: crate::TranscriptHistoryRetention,
+    ) -> Result<(), AgentError> {
+        if self.checkpointer.is_none() || self.noncommitting_live_bridge_run {
+            return Ok(());
+        }
+        if !matches!(
+            self.session.messages().last(),
+            Some(Message::ToolResults { .. })
+        ) {
+            return Ok(());
+        }
+        if !self.session.durable_head_holds_retirement(retention) {
+            return Ok(());
+        }
+        let Some(run_id) = self.runtime_turn_authority_snapshot()?.active_run_id else {
+            return Ok(());
+        };
+        self.save_session_with_durability(&run_id, SessionSaveDurability::BestEffort)
+            .await?;
+        self.session
+            .retire_transcript_history(retention)
+            .map_err(|error| {
+                AgentError::InternalError(format!(
+                    "failed to retire transcript history after its checkpoint: {error}"
+                ))
+            })?;
+        Ok(())
+    }
+
     async fn save_session_with_durability(
         &mut self,
         run_id: &RunId,
@@ -1362,6 +1407,30 @@ where
                     ));
                 }
                 self.latest_run_checkpoint_receipt = Some(next);
+                // The checkpoint moved the durable head over every rewrite the
+                // run made, so the live history retires to the retention now
+                // instead of at the next compaction. The boundary commit that
+                // promotes the run applies the same cut to the stored rows.
+                // Only a session with a durable HeadCanonical head whose graph
+                // this process holds validated does any work here; an
+                // unchanged graph is not parsed or validated again.
+                if let Some(compactor) = self.compactor.clone()
+                    && let Some(retired) = self
+                        .session
+                        .retire_transcript_history_after_checkpoint(
+                            compactor.transcript_history_retention(),
+                        )
+                        .map_err(|error| {
+                            AgentError::InternalError(format!(
+                                "failed to retire transcript history after its checkpoint: {error}"
+                            ))
+                        })?
+                {
+                    checkpointer.note_run_transcript_retirement(
+                        run_id,
+                        u64::try_from(retired).unwrap_or(u64::MAX),
+                    );
+                }
             } else if previous.is_some() {
                 return Err(AgentError::InternalError(
                     "session checkpointer dropped an existing provisional receipt".to_string(),
@@ -2783,12 +2852,24 @@ where
             // a timer that fires always finds its deadline reached (a paused
             // test clock cannot leave the loop re-arming forever).
             let model_call_started = crate::time_compat::Instant::now();
-            let wait_outcome = {
+            let wait_outcome = 'wait: {
                 let call_fut = request_attempt.stream_response(assistant_message_id);
                 let mut call_fut = std::pin::pin!(call_fut);
                 let call_started = crate::time_compat::DeadlineInstant::now();
-                let mut last_activity = call_started;
+                // The call runs once before any deadline is checked, and its
+                // inactivity counts from then, after the activity read: a
+                // starved runtime can reach the first check a whole stall
+                // window after the call started or after a slow read, and a
+                // call that never ran, or one the watchdog has not watched
+                // across a wait, has not stalled.
+                if let std::task::Poll::Ready(result) =
+                    std::future::poll_fn(|cx| std::task::Poll::Ready(call_fut.as_mut().poll(cx)))
+                        .await
+                {
+                    break 'wait LlmCallWait::Completed(result);
+                }
                 let mut last_count = stream_activity_count();
+                let mut last_activity = crate::time_compat::DeadlineInstant::now();
                 loop {
                     let now = crate::time_compat::DeadlineInstant::now();
                     let hard_remaining = match hard_timeout {
@@ -3638,6 +3719,10 @@ where
                 let provider_request_pressure = self.pending_compaction_request_pressure.take();
                 let request_context_budget = self.pending_compaction_request_budget.take();
                 if let Some(compactor) = self.compactor.clone() {
+                    self.checkpoint_history_held_by_durable_head(
+                        compactor.transcript_history_retention(),
+                    )
+                    .await?;
                     let model_messages = self.session.messages_for_model_boundary()?;
                     let last_guarded_boundary = [
                         self.compaction_cadence.last_compaction_boundary_index,
@@ -9456,6 +9541,20 @@ fn dispatch_tool_calls_boxed<T: AgentToolDispatcher + ?Sized + 'static>(
                     let admitted_dispatch = async {
                         match dispatch_semaphore.acquire().await {
                             Ok(_permit) => {
+                                // The timeout below polls this future before its
+                                // own timer, and a starved runtime notices a freed
+                                // slot and a passed deadline in the same turn: a
+                                // call admitted after its deadline times out here,
+                                // without entering its body.
+                                if matches!(
+                                    effective_timeout,
+                                    Some(timeout) if start.elapsed() >= timeout
+                                ) {
+                                    return Err(ToolError::timeout(
+                                        tc.name.clone(),
+                                        advertised_timeout_ms,
+                                    ));
+                                }
                                 crate::dispatch_tool_execution_plan_fenced(
                                     &tools_ref,
                                     tc.as_view(),
@@ -9615,7 +9714,7 @@ mod tests {
         messages: &[Message],
         message_count: u64,
     ) -> crate::ProviderCacheBreakpointClaim {
-        anthropic_agent_claim_for_model("claude-opus-5", messages, message_count)
+        anthropic_agent_claim_for_model("test-anthropic-model", messages, message_count)
     }
 
     fn anthropic_agent_claim_for_model(
@@ -9631,7 +9730,7 @@ mod tests {
             ttl: crate::ProviderCacheTtl::ProviderDefault,
             rendered_prefix: br#"{"renderer_mode":"agent-test"}"#,
             lowered_request_encoding: crate::LoweredRequestEncoding::AnthropicMessagesJson,
-            lowered_request_body: br#"{"model":"claude-opus-5"}"#,
+            lowered_request_body: br#"{"model":"test-anthropic-model"}"#,
         })
         .expect("agent test claim shape")
     }
@@ -9735,7 +9834,7 @@ mod tests {
         }
 
         fn model(&self) -> &'static str {
-            "claude-opus-5"
+            "test-anthropic-model"
         }
     }
 
@@ -18611,7 +18710,7 @@ mod tests {
             })
             .collect();
 
-        let results = dispatch_tool_calls_boxed(
+        let dispatch = dispatch_tool_calls_boxed(
             dispatcher,
             crate::ToolDispatchContext::default(),
             std::time::Duration::from_secs(1),
@@ -18621,8 +18720,15 @@ mod tests {
             )]),
             1,
             calls,
-        )
-        .await;
+        );
+        // Once both calls are underway, this runtime's only thread is busy
+        // elsewhere for longer than the slot is held, as on a starved host:
+        // the queued call's deadline and the slot's release come due together.
+        let starve = async {
+            tokio::task::yield_now().await;
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        let (results, ()) = tokio::join!(dispatch, starve);
 
         assert!(matches!(
             &results[1].2,
@@ -26202,13 +26308,24 @@ mod tests {
     struct StallThenSucceedClient {
         calls: std::sync::atomic::AtomicUsize,
         activity: std::sync::atomic::AtomicU64,
+        /// How long each read of the stream activity count keeps the
+        /// caller's thread busy.
+        probe_delay: Duration,
     }
 
     impl StallThenSucceedClient {
         fn new() -> Self {
+            Self::with_probe_delay(Duration::ZERO)
+        }
+
+        /// As [`Self::new`], each read of the stream activity count keeping
+        /// the caller's thread busy for `probe_delay`, as on a starved
+        /// runtime.
+        fn with_probe_delay(probe_delay: Duration) -> Self {
             Self {
                 calls: std::sync::atomic::AtomicUsize::new(0),
                 activity: std::sync::atomic::AtomicU64::new(0),
+                probe_delay,
             }
         }
 
@@ -26255,6 +26372,9 @@ mod tests {
         }
 
         fn stream_activity_count(&self) -> Option<u64> {
+            if !self.probe_delay.is_zero() {
+                std::thread::sleep(self.probe_delay);
+            }
             Some(self.activity.load(std::sync::atomic::Ordering::SeqCst))
         }
     }
@@ -26301,6 +26421,9 @@ mod tests {
         activity: std::sync::atomic::AtomicU64,
         interval: Duration,
         ticks: u32,
+        /// How long each read of the stream activity count keeps the
+        /// caller's thread busy.
+        probe_delay: Duration,
     }
 
     impl SlowButAliveClient {
@@ -26310,6 +26433,17 @@ mod tests {
                 activity: std::sync::atomic::AtomicU64::new(0),
                 interval,
                 ticks,
+                probe_delay: Duration::ZERO,
+            }
+        }
+
+        /// As [`Self::new`], each read of the stream activity count keeping
+        /// the caller's thread busy for `probe_delay`, as on a starved
+        /// runtime.
+        fn with_probe_delay(interval: Duration, ticks: u32, probe_delay: Duration) -> Self {
+            Self {
+                probe_delay,
+                ..Self::new(interval, ticks)
             }
         }
 
@@ -26354,6 +26488,9 @@ mod tests {
         }
 
         fn stream_activity_count(&self) -> Option<u64> {
+            if !self.probe_delay.is_zero() {
+                std::thread::sleep(self.probe_delay);
+            }
             Some(self.activity.load(std::sync::atomic::Ordering::SeqCst))
         }
     }
@@ -27905,6 +28042,115 @@ mod tests {
         assert_eq!(client.calls(), 1, "no retry for a live stream");
     }
 
+    /// A live stream is never stalled by a starved read of its activity:
+    /// each read keeps the thread busy for 150 ms, past the 100 ms window,
+    /// and the watchdog counts inactivity only across a wait it measured
+    /// with the call polled.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn a_starved_activity_read_does_not_trip_the_watchdog() {
+        use crate::retry::RetryPolicy;
+
+        let client = Arc::new(SlowButAliveClient::with_probe_delay(
+            Duration::from_millis(10),
+            20,
+            Duration::from_millis(150),
+        ));
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .retry_policy(RetryPolicy {
+                max_retries: 0,
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(1),
+                multiplier: 1.0,
+                call_timeout: None,
+                stream_inactivity_timeout: Some(Duration::from_millis(100)),
+            })
+            .build_standalone(client.clone(), Arc::new(NoTools), Arc::new(NoopStore))
+            .await;
+
+        let result = agent
+            .run("stay alive".to_string().into())
+            .await
+            .expect("a starved activity read must not classify a live stream as stalled");
+        assert_eq!(result.text, "slow but alive");
+        assert_eq!(client.calls(), 1, "no retry for a live stream");
+    }
+
+    /// A client whose every call completes at once, and whose stream
+    /// activity reads each keep the caller's thread busy for `probe_delay`.
+    struct AnswersAtOnceClient {
+        calls: std::sync::atomic::AtomicUsize,
+        probe_delay: Duration,
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl AgentLlmClient for AnswersAtOnceClient {
+        async fn stream_response(
+            &self,
+            _messages: &[Message],
+            _tools: &[Arc<ToolDef>],
+            _max_tokens: u32,
+            _temperature: Option<f32>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
+        ) -> Result<super::LlmStreamResult, AgentError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(super::LlmStreamResult::new(
+                vec![AssistantBlock::Text {
+                    text: "answered at once".to_string(),
+                    meta: None,
+                }],
+                StopReason::EndTurn,
+                normalized_test_usage(self, Usage::default()),
+            ))
+        }
+
+        fn provider(&self) -> crate::provider::Provider {
+            crate::provider::Provider::Other
+        }
+
+        fn model(&self) -> &'static str {
+            "mock-model"
+        }
+
+        fn stream_activity_count(&self) -> Option<u64> {
+            std::thread::sleep(self.probe_delay);
+            Some(0)
+        }
+    }
+
+    /// A call is polled before any deadline is checked: one that completes
+    /// at once is never timed out by a starved runtime before it ran, though
+    /// the activity read keeps the thread busy past its 50 ms call timeout.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn a_call_that_completes_at_once_is_never_timed_out_before_it_ran() {
+        use crate::retry::RetryPolicy;
+
+        let client = Arc::new(AnswersAtOnceClient {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            probe_delay: Duration::from_millis(100),
+        });
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .retry_policy(RetryPolicy {
+                max_retries: 0,
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(1),
+                multiplier: 1.0,
+                call_timeout: Some(Duration::from_millis(50)),
+                stream_inactivity_timeout: Some(Duration::from_secs(3600)),
+            })
+            .build_standalone(client.clone(), Arc::new(NoTools), Arc::new(NoopStore))
+            .await;
+
+        let result = agent
+            .run("answer".to_string().into())
+            .await
+            .expect("a call that completes at once is not timed out before it ran");
+        assert_eq!(result.text, "answered at once");
+        assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     /// A model defaults resolver that declares one stream-inactivity window
     /// for every model.
     struct StallWindowResolver(Option<Duration>);
@@ -27940,7 +28186,11 @@ mod tests {
     #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn model_stream_inactivity_window_wins_over_the_policy_window() {
-        let client = Arc::new(StallThenSucceedClient::new());
+        // Each read of the stream's activity keeps the thread busy past the
+        // model's 30 ms window, as on a starved runtime.
+        let client = Arc::new(StallThenSucceedClient::with_probe_delay(
+            Duration::from_millis(60),
+        ));
         let mut agent = with_test_turn_state_handle(AgentBuilder::new())
             .retry_policy(stall_window_policy(Some(Duration::from_secs(3600))))
             .with_model_defaults_resolver(Arc::new(StallWindowResolver(Some(
