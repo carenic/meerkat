@@ -1016,7 +1016,9 @@ async fn a_call_after_the_fence_closes_never_starts() {
         .with_runtime_execution_kind_for_test(
             meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn,
         )
-        .with_checkpointer(Arc::clone(&checkpointer))
+        // The builder takes the trait object; the row keeps the concrete
+        // handle for its own assertions.
+        .with_checkpointer(Arc::clone(&checkpointer) as Arc<dyn SessionCheckpointer>)
         .with_tools_config(meerkat_core::ToolsConfig {
             max_concurrent: 1,
             ..meerkat_core::ToolsConfig::default()
