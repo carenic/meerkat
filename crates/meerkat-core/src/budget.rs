@@ -264,6 +264,24 @@ impl Budget {
         *self.turn_time_warned.get_mut() = false;
     }
 
+    /// Re-arm the per-turn horizon for a run that resumes after a restart.
+    ///
+    /// `elapsed` is the wall clock the run had already used when its last
+    /// round committed. The horizon counts it as spent, so the resumed run
+    /// continues the remaining budget instead of a fresh one; the time the
+    /// host was down is not charged. An `elapsed` this clock cannot represent
+    /// re-arms a fresh horizon.
+    pub fn resume_turn(&mut self, elapsed: Duration) {
+        let now = DeadlineInstant::now();
+        self.turn_start = now.checked_sub(elapsed).unwrap_or(now);
+        *self.turn_time_warned.get_mut() = false;
+    }
+
+    /// Wall clock the current turn horizon has used since it was armed.
+    pub fn turn_elapsed(&self) -> Duration {
+        self.turn_start.elapsed()
+    }
+
     /// Create an unlimited budget
     pub fn unlimited() -> Self {
         Self::new(BudgetLimits::unlimited())

@@ -3418,6 +3418,13 @@ pub enum RunResumePoint {
 ///
 /// The agent loop owns these fields and may add more; other components treat
 /// the value as opaque and carry it unchanged.
+///
+/// Nothing else of the loop needs carrying across a restart: no assistant
+/// message id is reserved at a round commit (the provider turn that reserved
+/// one has already committed its message, and a staged message keeps its own
+/// id), a sticky model fallback is published before the request that uses it,
+/// and a parked compaction check is consumed before the model response a
+/// round commit follows. Extraction never takes a round commit.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct RunLoopCarryOver {
@@ -3427,6 +3434,57 @@ pub struct RunLoopCarryOver {
     /// Tool calls the run has completed.
     #[serde(default)]
     pub tool_call_count: u32,
+    /// Whether the run has already produced visible or actionable output,
+    /// which the empty-output verdict of a later model call reads.
+    #[serde(default)]
+    pub has_visible_or_actionable_output: bool,
+    /// Wall clock the run's turn horizon had used when the round committed.
+    /// A resumed run continues the remaining horizon, not a fresh one.
+    #[serde(default)]
+    pub turn_elapsed_ms: u64,
+    /// The run's usage account when the round committed. It only restores
+    /// the run's own usage on its result; the session's usage total stays the
+    /// one source of truth for what was spent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<RunUsageCarryOver>,
+    /// Asynchronous operations the committed round registered and the run had
+    /// not seen settle, with the call that started each.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_ops: Vec<RoundPendingOperation>,
+    /// A permanent model routing request a tool of this run staged; it is
+    /// promoted only when the run reaches its clean end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_model_routing: Option<StagedModelRoutingCarryOver>,
+}
+
+/// The usage account of an open run: the session total it started from and
+/// one row per provider call it made.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RunUsageCarryOver {
+    /// The session's reported usage total when the run started.
+    #[serde(default)]
+    pub baseline: crate::types::Usage,
+    /// The run's provider calls, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rows: Vec<crate::types::TurnUsage>,
+}
+
+/// One asynchronous operation a committed round registered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoundPendingOperation {
+    /// Provider tool call id of the call that started the operation.
+    pub call_id: String,
+    /// The operation and how the run waits for it.
+    pub operation: crate::ops::AsyncOpRef,
+}
+
+/// A permanent routing request a tool staged in the open run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedModelRoutingCarryOver {
+    /// The request identity the staging tool returned to the model.
+    pub request_id: crate::image_generation::SwitchTurnRequestId,
+    /// The model the run asked to keep.
+    pub target_model: crate::lifecycle::run_primitive::ModelId,
 }
 
 /// Durable cursor of an open run in a durable session.
@@ -6873,23 +6931,13 @@ impl Session {
             Some(usize::try_from(rewrite_count).unwrap_or(usize::MAX));
     }
 
-    /// Whether this session keeps more rewrite bodies than `retention`
-    /// because its durable HeadCanonical head does not cover them yet
-    /// ([`Self::retire_transcript_history`] never retires past that head).
-    /// Only a checkpoint that moves the durable head over them lets
-    /// retirement reach the bound.
-    ///
-    /// It reads only the graph this process already holds validated (one
-    /// installed by a materialization or a compaction): an unchanged graph is
-    /// never parsed or validated again for this check, and a graph that is
-    /// not held answers false.
-    pub(crate) fn durable_head_holds_retirement(
-        &self,
-        retention: TranscriptHistoryRetention,
-    ) -> bool {
-        self.durable_head_held_graph().is_some_and(|history| {
-            history.commit_count() - history.retired_count() > retention.retained_rewrites()
-        })
+    /// Whether a durable HeadCanonical head describes this session. Its
+    /// recovery reads a provisional tail written after a transcript rewrite
+    /// as a rewrite descendant of that head; a session without one (a
+    /// WholeBlob session) is recovered only from a strict continuation of its
+    /// committed transcript.
+    pub(crate) fn has_durable_head_canonical_head(&self) -> bool {
+        self.history_caches.durable_rewrite_count.is_some()
     }
 
     /// The graph this session holds validated in this process, when its

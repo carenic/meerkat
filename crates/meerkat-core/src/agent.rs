@@ -813,6 +813,11 @@ impl CancelAfterBoundaryCommand {
 /// cancellation without holding a reference to the agent.
 pub type CancelAfterBoundarySender = tokio::sync::mpsc::UnboundedSender<CancelAfterBoundaryCommand>;
 
+/// Test observer of each durable round commit, given the cursor it wrote.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub type RoundCommitObserver = Arc<dyn Fn(&crate::SessionRunCursor) + Send + Sync>;
+
 /// Typed context supplied by the agent loop when dispatching a tool call.
 ///
 /// This is a dispatch-time projection of the already-admitted turn input. It
@@ -832,6 +837,10 @@ pub struct ToolDispatchContext {
     origin_session_id: Option<crate::types::SessionId>,
     interaction_lineage_id: Option<crate::interaction::InteractionId>,
     run_id: Option<crate::RunId>,
+    /// Zero-based index of the run's round this dispatch belongs to. Bound
+    /// with the run id by the agent loop for every tool round, so a call has
+    /// one dedupe key whether it runs fresh or again after a resume.
+    round: Option<u64>,
     streaming: Option<crate::ToolStreamingDispatchContext>,
     live_bridge_admission: Option<LiveBridgeToolDispatchAdmission>,
     work_authorization: Option<crate::WorkAuthorizationContext>,
@@ -1324,6 +1333,7 @@ impl std::fmt::Debug for ToolDispatchContext {
             .field("origin_session_id", &self.origin_session_id)
             .field("interaction_lineage_id", &self.interaction_lineage_id)
             .field("run_id", &self.run_id)
+            .field("round", &self.round)
             .field("streaming", &self.streaming)
             .field("live_bridge_admission", &self.live_bridge_admission)
             .field("work_authorization", &self.work_authorization)
@@ -1354,6 +1364,7 @@ impl PartialEq for ToolDispatchContext {
             && self.origin_session_id == other.origin_session_id
             && self.interaction_lineage_id == other.interaction_lineage_id
             && self.run_id == other.run_id
+            && self.round == other.round
             && self.streaming == other.streaming
             && self.live_bridge_admission == other.live_bridge_admission
             && match (&self.work_authorization, &other.work_authorization) {
@@ -1442,6 +1453,7 @@ impl ToolDispatchContext {
             origin_session_id: None,
             interaction_lineage_id: None,
             run_id: None,
+            round: None,
             streaming: None,
             live_bridge_admission: None,
             work_authorization: None,
@@ -2173,6 +2185,45 @@ impl ToolDispatchContext {
 
     pub(crate) fn bind_run_id(&mut self, run_id: crate::RunId) {
         self.run_id = Some(run_id);
+        self.round = None;
+    }
+
+    /// Zero-based index of the run's round this dispatch belongs to, when the
+    /// agent loop bound one.
+    pub const fn round(&self) -> Option<u64> {
+        self.round
+    }
+
+    pub(crate) fn bind_round(&mut self, round: u64) {
+        self.round = Some(round);
+    }
+
+    /// The deduplication key of one call of this dispatch's round.
+    ///
+    /// A durable run that resumes after a crash dispatches the calls of a
+    /// round whose results were never committed again, under the same call
+    /// ids, so the same call always carries the same key. Delivery is at
+    /// least once: a tool with external effects that must not repeat consults
+    /// this key and deduplicates on all of it. `None` outside an agent-loop
+    /// tool round (no run or no round bound) and for arguments that are not
+    /// JSON.
+    ///
+    /// An in-process tool reads it here. Core puts it on no wire: a host
+    /// that wants an MCP server to see it adds it to the call's metadata from
+    /// its `McpCallContextProvider`, which receives this context and the call.
+    #[must_use]
+    pub fn tool_call_dedupe_key(
+        &self,
+        call: crate::ToolCallView<'_>,
+    ) -> Option<crate::ToolCallDedupeKey> {
+        crate::ToolCallDedupeKey::new(
+            self.run_id.clone()?,
+            self.round?,
+            call.id,
+            call.name,
+            call.args,
+        )
+        .ok()
     }
 
     /// Streaming-only liveness surface minted by the canonical supervisor.
@@ -4459,6 +4510,11 @@ where
     /// never consulted for authorization or turn control.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) model_preparation_observer: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Per-instance callback after each durable round commit, with the
+    /// cursor it wrote; absent from ordinary builds and never consulted for
+    /// authorization or turn control.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) round_commit_observer: Option<RoundCommitObserver>,
     /// Request-only exact-boundary context coordinator for this live actor.
     pub(crate) transient_turn_context_state: crate::session::TransientTurnContextStateHandle,
     /// Optional default event channel configured at build time.
@@ -4482,6 +4538,16 @@ where
     /// actor removes it before each checkpoint await and installs only the
     /// exact returned successor.
     pub(crate) latest_run_checkpoint_receipt: Option<crate::RunCheckpointReceipt>,
+    /// The active run's per-round commit state: its round index, its bound
+    /// inputs, and whether a round commit wrote a run cursor. Run-local.
+    pub(crate) round_commits: state::RunRoundCommits,
+    /// Input ids the session layer staged for the next run: the runtime
+    /// batch's contributing inputs, which bind to the run that starts. Cleared
+    /// with the runtime execution kind.
+    pub(crate) run_start_input_ids: Vec<crate::lifecycle::InputId>,
+    /// The staged round a resumed run takes over at its first model
+    /// boundary, set by [`Agent::resume_run`] and consumed there.
+    pub(crate) pending_resumed_round: Option<state::ResumedToolRound>,
     pub(crate) tool_application_observations:
         crate::tool_application::ToolApplicationInvocationOwner,
     /// Rows `[0, floor)` are committed in the durable store exactly as they

@@ -30,7 +30,7 @@ use crate::types::{
     SystemNoticeMessage, ToolCallView, ToolDef, ToolNameSet, TurnUsage, UserMessage,
 };
 use serde_json::value::RawValue;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::Instrument as _;
@@ -863,6 +863,9 @@ struct CallingLlmPrepared {
 struct CallingLlmToolTurnAccounting {
     stop_reason: crate::types::StopReason,
     usage: Option<TurnUsage>,
+    /// The round's model response is a resumed run's staged message: its
+    /// turn was announced, and its usage accounted, before the restart.
+    replayed: bool,
 }
 
 /// The classified assistant response for one boundary.
@@ -880,9 +883,151 @@ struct CallingLlmAssistantTurn {
 struct CallingLlmToolBatch {
     tool_results: Vec<crate::types::ToolResult>,
     pending_op_refs: Vec<crate::ops::AsyncOpRef>,
+    /// The same operations as `pending_op_refs`, each with the call that
+    /// started it, for the round commit's cursor.
+    pending_ops_by_call: Vec<crate::session::RoundPendingOperation>,
     accumulated_session_effects: Vec<crate::ops::SessionEffect>,
     callback_pending: Vec<crate::error::PendingCallbackToolCall>,
     deferred_failure: Option<crate::session::DeferredToolBatchFailureKind>,
+}
+
+/// Whether a run in a session without a durable HeadCanonical head (a
+/// WholeBlob session) keeps taking round commits after it rewrote its
+/// transcript.
+///
+/// Recovery accepts such a session's provisional tail only as a strict
+/// continuation of its committed transcript, and a tail written after a
+/// rewrite is not one: recovery would refuse it, and every later resume of
+/// the session would fail. So, `false`: the run's last round commit before its
+/// first rewrite stays its resume point, and its end-of-run save is its next
+/// write, as before per-round commits.
+const WHOLE_BLOB_ROUND_COMMITS_AFTER_REWRITE: bool = false;
+
+/// Per-round commit state of the active run.
+///
+/// A durable run commits every tool round twice: after the model call (the
+/// assistant message with its tool calls, staged in the run cursor) and after
+/// the tools (the message and its results in the transcript). Run-local and
+/// never persisted itself: the cursor a commit writes is the durable record.
+#[derive(Debug, Default)]
+pub(crate) struct RunRoundCommits {
+    /// The run whose rounds commit; `None` outside a run.
+    run_id: Option<RunId>,
+    /// Zero-based index of the round the loop is in.
+    round: u64,
+    /// Every input bound to the run so far, in bind order: the inputs that
+    /// started it and each steer or peer input written into it at a boundary.
+    bound_input_ids: Vec<crate::lifecycle::InputId>,
+    /// The run's latest checkpoint is a round commit, which carries the
+    /// cursor: no save without the cursor followed it.
+    cursor_written: bool,
+    /// The live transcript holds an assistant message of the run, stamped
+    /// with its run id, after the run's last rewrite. A round commit is
+    /// attributable to the run without one (its cursor names the run, and
+    /// recovery accepts a first commit's cursor whose run id is the
+    /// store-issued provisional run id), but a checkpoint without the cursor
+    /// is attributable only by such a message.
+    run_row_since_rewrite: bool,
+    /// The run rewrote its transcript at least once.
+    rewritten: bool,
+}
+
+impl RunRoundCommits {
+    /// A compaction rewrote the live transcript: the run's earlier rows may
+    /// be gone from its live tail.
+    pub(crate) fn note_transcript_rewrite(&mut self) {
+        self.run_row_since_rewrite = false;
+        self.rewritten = true;
+    }
+
+    /// The run's own assistant message entered the live transcript.
+    fn note_run_row(&mut self) {
+        self.run_row_since_rewrite = true;
+    }
+
+    /// Record an input written into the running turn, once, in bind order.
+    pub(crate) fn bind_input(&mut self, input_id: crate::lifecycle::InputId) {
+        if !self.bound_input_ids.contains(&input_id) {
+            self.bound_input_ids.push(input_id);
+        }
+    }
+
+    /// Whether a round commit may be written. `rewrite_tolerant`: the
+    /// session has a durable HeadCanonical head, whose recovery reads a
+    /// rewritten tail (see [`WHOLE_BLOB_ROUND_COMMITS_AFTER_REWRITE`]).
+    fn commits_allowed(&self, rewrite_tolerant: bool) -> bool {
+        rewrite_tolerant || WHOLE_BLOB_ROUND_COMMITS_AFTER_REWRITE || !self.rewritten
+    }
+
+    /// Whether a checkpoint of the live session without the cursor leaves a
+    /// tail recovery attributes to the run and accepts.
+    fn closing_tail_attributable(&self, rewrite_tolerant: bool) -> bool {
+        self.run_row_since_rewrite && self.commits_allowed(rewrite_tolerant)
+    }
+}
+
+/// The round a resumed run takes over at its first model boundary.
+///
+/// Its assistant message was staged by the round's first commit and stands in
+/// for the model call: the run dispatches the message's calls again under
+/// their call ids and never asks the model for this round.
+#[derive(Debug, Clone)]
+pub(crate) struct ResumedToolRound {
+    /// The staged assistant message, with its own assistant message id.
+    pub(crate) assistant_message: BlockAssistantMessage,
+    /// Process custody evidence of the run's calls, by provider call id. A
+    /// call whose process may have run is answered as interrupted instead of
+    /// being dispatched again.
+    pub(crate) interrupted_calls: BTreeMap<String, crate::tool_process::InterruptedToolCall>,
+}
+
+/// What a resumed run restores when it starts.
+#[derive(Debug)]
+pub(crate) struct ResumedRunStart {
+    /// The run's cursor, from the provisional tail the session layer adopted.
+    pub(crate) cursor: crate::SessionRunCursor,
+    /// The receipt of that tail: the run's checkpoints chain from it.
+    pub(crate) receipt: crate::RunCheckpointReceipt,
+    /// Process custody evidence of the session's interrupted tool processes.
+    /// Only the run's own calls count.
+    pub(crate) interrupted_calls: Vec<crate::tool_process::InterruptedToolCall>,
+}
+
+impl ResumedRunStart {
+    /// A resumed run is exactly the cursor's run, and the adopted tail is
+    /// that run's: the run id the turn authority started and the receipt's
+    /// session and run must all agree with the cursor.
+    fn check(
+        &self,
+        run_id: &RunId,
+        session_id: &crate::types::SessionId,
+    ) -> Result<(), AgentError> {
+        if &self.cursor.run_id != run_id {
+            return Err(AgentError::InternalError(format!(
+                "a resumed run must keep its run id: its cursor names run {}, but the turn \
+                 authority started run {run_id}",
+                self.cursor.run_id
+            )));
+        }
+        if self.receipt.session_id() != session_id || self.receipt.run_id() != run_id {
+            return Err(AgentError::InternalError(format!(
+                "the checkpoint receipt a resumed run continues from names session {} and run \
+                 {}, not session {session_id} and run {run_id}",
+                self.receipt.session_id(),
+                self.receipt.run_id()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// How a resumed round answers one of its staged calls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResumedCallDisposition {
+    /// Dispatch the call again under its call id and dedupe key.
+    Rerun,
+    /// Do not dispatch it; its result says the outcome is unknown.
+    Interrupted { reason: String },
 }
 
 /// Whether a session save may fail quietly.
@@ -1322,52 +1467,22 @@ where
             .await
     }
 
-    /// Persist the rewrites a run's compactions kept past the retention, then
-    /// retire down to it.
-    ///
-    /// A session a durable HeadCanonical head describes keeps every rewrite
-    /// occurrence that head does not cover yet: the next checkpoint proves
-    /// the pending rewrite suffix from it. The agent checkpoints at the end
-    /// of a run, so inside one long run its compactions' bodies would pile up
-    /// until then. At a model boundary that follows tool results, before that
-    /// boundary decides whether to compact, take the intra-run checkpoint (it
-    /// moves the durable head over those rewrites) and retire to the bound.
-    /// Never right after a compaction: a durable tail must hold a row the
-    /// run wrote after its last rewrite, or recovery cannot attribute it.
-    /// Sessions without a checkpointer, without a durable head, or in a live
-    /// bridge run that commits nothing keep today's behaviour.
-    async fn checkpoint_history_held_by_durable_head(
+    async fn save_session_with_durability(
         &mut self,
-        retention: crate::TranscriptHistoryRetention,
+        run_id: &RunId,
+        durability: SessionSaveDurability,
     ) -> Result<(), AgentError> {
-        if self.checkpointer.is_none() || self.noncommitting_live_bridge_run {
-            return Ok(());
-        }
-        if !matches!(
-            self.session.messages().last(),
-            Some(Message::ToolResults { .. })
-        ) {
-            return Ok(());
-        }
-        if !self.session.durable_head_holds_retirement(retention) {
-            return Ok(());
-        }
-        let Some(run_id) = self.runtime_turn_authority_snapshot()?.active_run_id else {
-            return Ok(());
-        };
-        self.save_session_with_durability(&run_id, SessionSaveDurability::BestEffort)
-            .await?;
-        self.session
-            .retire_transcript_history(retention)
-            .map_err(|error| {
-                AgentError::InternalError(format!(
-                    "failed to retire transcript history after its checkpoint: {error}"
-                ))
-            })?;
+        // Every save that is not a round commit is a run's end-of-run or
+        // closing save. It removes the run cursor first: a committed boundary
+        // never carries a cursor, and recovery classifies a completed tail
+        // that still carries one as ambiguous.
+        self.session.clear_run_cursor();
+        self.write_session_checkpoint(run_id, durability).await?;
+        self.round_commits.cursor_written = false;
         Ok(())
     }
 
-    async fn save_session_with_durability(
+    async fn write_session_checkpoint(
         &mut self,
         run_id: &RunId,
         durability: SessionSaveDurability,
@@ -1553,6 +1668,411 @@ where
             SessionSaveDurability::BestEffort
         };
         self.save_session_with_durability(run_id, durability).await
+    }
+
+    /// Whether this agent commits each tool round of its runs: every agent
+    /// with a session checkpointer, except a live bridge run, which commits
+    /// nothing. An ephemeral session has no checkpointer: it writes nothing
+    /// per round and never carries a run cursor.
+    fn round_commits_enabled(&self) -> bool {
+        self.checkpointer.is_some() && !self.noncommitting_live_bridge_run
+    }
+
+    /// Whether the active run writes a round commit now: round commits are
+    /// enabled, and the run has not rewritten the transcript of a session
+    /// that recovery reads only as a strict continuation (see
+    /// [`WHOLE_BLOB_ROUND_COMMITS_AFTER_REWRITE`]).
+    fn round_commit_allowed(&self) -> bool {
+        self.round_commits_enabled()
+            && self
+                .round_commits
+                .commits_allowed(self.session.has_durable_head_canonical_head())
+    }
+
+    /// Start the round state of a fresh run.
+    ///
+    /// A cursor another run left in the live session (its future was dropped
+    /// between two of its rounds) names a run that is over, so it is removed
+    /// and never reaches this run's commits.
+    fn begin_round_commits(&mut self, run_id: &RunId) {
+        self.session.clear_run_cursor();
+        self.round_commits = RunRoundCommits {
+            run_id: Some(run_id.clone()),
+            ..RunRoundCommits::default()
+        };
+        for input_id in std::mem::take(&mut self.run_start_input_ids) {
+            self.round_commits.bind_input(input_id);
+        }
+    }
+
+    /// Restore the round state of a run that resumes from its cursor.
+    ///
+    /// The adopted tail is the cursor's round commit, the run's latest
+    /// checkpoint. A second commit's tail holds the round's own assistant
+    /// message. A first commit's tail may hold none after the run's last
+    /// rewrite (the run's first round, or the round right after a
+    /// compaction), so a resumed first commit counts as holding none until
+    /// the round's second commit writes one. The run's bound inputs are the
+    /// cursor's.
+    fn resume_round_commits(&mut self, cursor: &crate::SessionRunCursor) {
+        let (round, run_row_since_rewrite) = match cursor.resume_point {
+            crate::RunResumePoint::ToolsPending { .. } => (cursor.round, false),
+            crate::RunResumePoint::AwaitingModel => (cursor.round.saturating_add(1), true),
+        };
+        self.round_commits = RunRoundCommits {
+            run_id: Some(cursor.run_id.clone()),
+            round,
+            cursor_written: true,
+            run_row_since_rewrite,
+            ..RunRoundCommits::default()
+        };
+        for input_id in cursor.bound_input_ids.iter().cloned() {
+            self.round_commits.bind_input(input_id);
+        }
+        self.run_start_input_ids.clear();
+    }
+
+    /// Restore what a resumed run's cursor carries beyond its round state
+    /// and loop counters, before the run's first boundary.
+    ///
+    /// - A permanent routing request a tool of the run staged is staged
+    ///   again, so the run's clean end still promotes it.
+    /// - At `ToolsPending` the run's first model boundary takes over the
+    ///   staged round, with the process custody evidence of the run's own
+    ///   calls by call id.
+    /// - At `AwaitingModel`, asynchronous operations the run was to wait for
+    ///   before its next model call ended with the process that ran them:
+    ///   the run does not wait for them, and a notice tells the model their
+    ///   results will not arrive.
+    fn restore_resumed_run(
+        &mut self,
+        run_id: &RunId,
+        cursor: crate::SessionRunCursor,
+        custody: Vec<crate::tool_process::InterruptedToolCall>,
+    ) -> Result<(), AgentError> {
+        let crate::SessionRunCursor {
+            resume_point,
+            loop_state,
+            ..
+        } = cursor;
+        if let (Some(staged), Some(staging)) = (
+            loop_state.staged_model_routing,
+            self.model_routing_handoff_staging.as_ref(),
+        ) {
+            staging
+                .stage(staged.request_id, staged.target_model)
+                .map_err(|error| {
+                    AgentError::InternalError(format!(
+                        "failed to restore the staged model-routing request of a resumed run: \
+                         {error}"
+                    ))
+                })?;
+        }
+        match resume_point {
+            crate::RunResumePoint::ToolsPending { assistant_message } => {
+                let interrupted_calls = custody
+                    .into_iter()
+                    .filter(|call| &call.run_id == run_id)
+                    .filter_map(|call| Some((call.tool_call_id.clone()?, call)))
+                    .collect();
+                self.pending_resumed_round = Some(ResumedToolRound {
+                    assistant_message,
+                    interrupted_calls,
+                });
+            }
+            crate::RunResumePoint::AwaitingModel => {
+                let lost_calls = loop_state
+                    .pending_ops
+                    .iter()
+                    .filter(|pending| {
+                        pending.operation.wait_policy == crate::ops::WaitPolicy::Barrier
+                    })
+                    .map(|pending| pending.call_id.as_str())
+                    .collect::<BTreeSet<_>>();
+                if !lost_calls.is_empty() {
+                    let calls = lost_calls.into_iter().collect::<Vec<_>>().join(", ");
+                    self.session
+                        .push(Message::SystemNotice(SystemNoticeMessage::new(
+                            SystemNoticeKind::Generic,
+                            format!(
+                                "A host restart interrupted this run while it was waiting for \
+                             asynchronous work started by the tool calls {calls}. That work \
+                             ended with the restart and its results will not arrive; the run \
+                             continues without them."
+                            ),
+                        )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Loop state a resumed run restores, as of this commit.
+    fn round_loop_carry_over(
+        &self,
+        ctx: &CallingLlmTurnCtx<'_>,
+        turn_count: u32,
+        pending_ops: Vec<crate::session::RoundPendingOperation>,
+    ) -> Result<crate::RunLoopCarryOver, AgentError> {
+        let staged_model_routing = match self.model_routing_handoff_staging.as_ref() {
+            Some(staging) => staging
+                .peek()
+                .map_err(|error| {
+                    AgentError::InternalError(format!(
+                        "failed to read the staged model-routing handoff for a round commit: {error}"
+                    ))
+                })?
+                .map(|staged| crate::session::StagedModelRoutingCarryOver {
+                    request_id: *staged.request_id(),
+                    target_model: staged.target_model().clone(),
+                }),
+            None => None,
+        };
+        Ok(crate::RunLoopCarryOver {
+            turn_count,
+            tool_call_count: ctx.tool_call_count,
+            has_visible_or_actionable_output: *ctx.run_has_visible_or_actionable_output,
+            turn_elapsed_ms: u64::try_from(self.budget.turn_elapsed().as_millis())
+                .unwrap_or(u64::MAX),
+            usage: Some(crate::session::RunUsageCarryOver {
+                baseline: self.run_usage_baseline.clone(),
+                rows: self.run_request_usage.clone(),
+            }),
+            pending_ops,
+            staged_model_routing,
+        })
+    }
+
+    /// The round's first commit, taken after the model call and before any
+    /// tool of the round is admitted.
+    ///
+    /// The assistant message, with its tool calls, is staged in the run
+    /// cursor; it enters the transcript only at the round's second commit,
+    /// together with its results. No committed transcript therefore ever ends
+    /// in a tool call without its result: a run that ends between the two
+    /// commits leaves the transcript as the previous round left it. A crash
+    /// between them resumes the run at this round: [`Agent::resume_run`]
+    /// takes the staged message as the round's model response, without asking
+    /// the model, and dispatches its calls again under their call ids.
+    ///
+    /// Taken in every tool round: the run's first round, the round right
+    /// after a compaction and a round with a callback call included. Skipped
+    /// by design only while the run takes no round commits (see
+    /// [`Agent::round_commit_allowed`]) and when the message carries an
+    /// image, because the cursor travels in the session head, which media
+    /// externalization does not reach. A round that skips it dispatches its
+    /// calls without one; a crash inside it asks the model again, and only a
+    /// call with the same name and arguments under the same call id meets the
+    /// same dedupe key.
+    ///
+    /// A first commit that fails, or that the checkpointer does not make
+    /// durable (it returns no receipt), fails the round before any of its
+    /// tools runs: the run ends with the error and its inputs fall to
+    /// recovery.
+    async fn commit_round_tools_pending(
+        &mut self,
+        ctx: &CallingLlmTurnCtx<'_>,
+        assistant_msg: &BlockAssistantMessage,
+    ) -> Result<(), AgentError> {
+        if !self.round_commit_allowed()
+            || !assistant_image_events_from_blocks(&assistant_msg.blocks).is_empty()
+        {
+            return Ok(());
+        }
+        let mut cursor = crate::SessionRunCursor::new(
+            ctx.run_id.clone(),
+            self.round_commits.bound_input_ids.clone(),
+            self.round_commits.round,
+            crate::RunResumePoint::ToolsPending {
+                assistant_message: assistant_msg.clone(),
+            },
+        );
+        cursor.loop_state = self.round_loop_carry_over(ctx, ctx.turn_count, Vec::new())?;
+        if self.write_round_commit(ctx.run_id, &cursor).await? {
+            Ok(())
+        } else {
+            Err(AgentError::InternalError(format!(
+                "the first commit of round {} made nothing durable (the session checkpointer \
+                 returned no receipt); no tool of the round runs",
+                cursor.round
+            )))
+        }
+    }
+
+    /// The round's second commit, taken once the assistant message and its
+    /// results are in the transcript and before the round's asynchronous
+    /// operations are registered.
+    ///
+    /// The cursor resumes the run at its next model call, with the round's
+    /// pending operations listed by call. The checkpoint also moves the
+    /// durable head over the run's rewrites, and the live transcript history
+    /// retires to the compactor's retention.
+    ///
+    /// A second commit the checkpointer does not make durable leaves the
+    /// round uncommitted and the run going: nothing durable names the round,
+    /// and the next round's first commit fails before any of its tools runs.
+    async fn commit_round_results(
+        &mut self,
+        ctx: &CallingLlmTurnCtx<'_>,
+        pending_ops: Vec<crate::session::RoundPendingOperation>,
+    ) -> Result<(), AgentError> {
+        if !self.round_commit_allowed() {
+            return Ok(());
+        }
+        let mut cursor = crate::SessionRunCursor::new(
+            ctx.run_id.clone(),
+            self.round_commits.bound_input_ids.clone(),
+            self.round_commits.round,
+            crate::RunResumePoint::AwaitingModel,
+        );
+        // The round is complete: a resumed run continues from the next turn.
+        cursor.loop_state =
+            self.round_loop_carry_over(ctx, ctx.turn_count.saturating_add(1), pending_ops)?;
+        self.write_round_commit(ctx.run_id, &cursor).await?;
+        Ok(())
+    }
+
+    /// Write one round commit. The cursor rides the session document, so
+    /// neither store profile changes its schema.
+    ///
+    /// Returns whether the commit is durable. A checkpointer that returns no
+    /// receipt wrote nothing (only a session that never committed a boundary
+    /// has no base to chain a provisional tail from), so the cursor leaves the
+    /// live session again. A write that fails takes the cursor out of the
+    /// live session too; the run's latest checkpoint is then the one before.
+    async fn write_round_commit(
+        &mut self,
+        run_id: &RunId,
+        cursor: &crate::SessionRunCursor,
+    ) -> Result<bool, AgentError> {
+        self.session.set_run_cursor(cursor).map_err(|error| {
+            AgentError::InternalError(format!(
+                "failed to record the run cursor of round {}: {error}",
+                cursor.round
+            ))
+        })?;
+        if let Err(error) = self
+            .write_session_checkpoint(run_id, SessionSaveDurability::Required)
+            .await
+        {
+            self.session.clear_run_cursor();
+            return Err(error);
+        }
+        if self.latest_run_checkpoint_receipt.is_none() {
+            self.session.clear_run_cursor();
+            return Ok(false);
+        }
+        self.round_commits.cursor_written = true;
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(observer) = self.round_commit_observer.as_ref() {
+            observer(cursor);
+        }
+        Ok(true)
+    }
+
+    /// End the run's resumability at an exit that took no end-of-run save.
+    ///
+    /// A run whose latest checkpoint is a round commit writes one more
+    /// checkpoint of the live session, without the cursor, so the tail its
+    /// boundary commits, or leaves to recovery, no longer claims an open
+    /// round: a failed, cancelled, suspended or capped run is not resumed,
+    /// and its tools do not run again. A committed boundary never carries a
+    /// cursor. A dropped run future (a crash, a hard interrupt) never reaches
+    /// this, so its last round commit stays: that is the case the cursor
+    /// exists for.
+    ///
+    /// An exit the session layer commits from the run's latest checkpoint (a
+    /// result, a callback suspension, a hard-failure terminal) always takes
+    /// the write; the boundary commit follows it at once. Any other exit takes
+    /// it only when its tail is attributable to the run without the cursor
+    /// (an assistant message of the run after its last rewrite, and no
+    /// rewrite in a session recovered only from strict continuations);
+    /// otherwise the last round commit stays for recovery, which reads its
+    /// cursor together with the run's settled inputs.
+    ///
+    /// A callback suspension's boundary commits the latest checkpoint as the
+    /// suspended state, so the staging record must be in it: there, and for a
+    /// result, a failed write fails the run. After a failure the run's own
+    /// error stands and the write's is logged, unless the write's error
+    /// requires the session's teardown.
+    pub(super) async fn close_run_cursor_at_exit(
+        &mut self,
+        result: Result<RunResult, AgentError>,
+    ) -> Result<RunResult, AgentError> {
+        if !self.round_commits.cursor_written {
+            return result;
+        }
+        let Some(run_id) = self.round_commits.run_id.clone() else {
+            return result;
+        };
+        let promotes = self.run_exit_promotes_latest_checkpoint(&result);
+        if !promotes
+            && !self
+                .round_commits
+                .closing_tail_attributable(self.session.has_durable_head_canonical_head())
+        {
+            return result;
+        }
+        let Err(close_error) = self
+            .save_session_with_durability(&run_id, SessionSaveDurability::Required)
+            .await
+        else {
+            return result;
+        };
+        match result {
+            Ok(_) => Err(close_error),
+            Err(error) if close_error.requires_session_teardown() => {
+                Err(close_error.with_ancillary_failure("the run had already ended with", error))
+            }
+            Err(error) if Self::is_callback_suspension(&error) => {
+                tracing::warn!(
+                    %error,
+                    "a run's callback suspension could not be recorded: its closing checkpoint failed"
+                );
+                Err(close_error)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %close_error,
+                    "the closing checkpoint of a failed run failed; its last round commit stays its latest checkpoint"
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn is_callback_suspension(error: &AgentError) -> bool {
+        matches!(
+            error.primary_error(),
+            AgentError::CallbackPending { .. } | AgentError::CallbackBatchPending { .. }
+        )
+    }
+
+    /// Whether the session layer commits this exit's latest checkpoint as
+    /// the run's boundary: a result, a callback suspension, or a failure the
+    /// turn authority ended as a hard-failure terminal. A cancellation and
+    /// any other failure leave the latest checkpoint to recovery.
+    fn run_exit_promotes_latest_checkpoint(&self, result: &Result<RunResult, AgentError>) -> bool {
+        match result {
+            Ok(_) => true,
+            Err(error) if Self::is_callback_suspension(error) => true,
+            Err(error) => match error.primary_error() {
+                AgentError::NoPendingBoundary => true,
+                AgentError::Cancelled => false,
+                _ => self.runtime_turn_ended_in_hard_failure(),
+            },
+        }
+    }
+
+    /// The round state's run, round index and whether a round commit is its
+    /// latest checkpoint.
+    #[cfg(test)]
+    pub(crate) fn round_commit_state_for_test(&self) -> (Option<RunId>, u64, bool) {
+        (
+            self.round_commits.run_id.clone(),
+            self.round_commits.round,
+            self.round_commits.cursor_written,
+        )
     }
 
     async fn publish_pending_sticky_model_fallback(&mut self) -> Result<(), AgentError> {
@@ -3746,10 +4266,14 @@ where
                 let provider_request_pressure = self.pending_compaction_request_pressure.take();
                 let request_context_budget = self.pending_compaction_request_budget.take();
                 if let Some(compactor) = self.compactor.clone() {
-                    self.checkpoint_history_held_by_durable_head(
-                        compactor.transcript_history_retention(),
-                    )
-                    .await?;
+                    // No checkpoint here. The round's second commit, which
+                    // precedes this boundary, moved a HeadCanonical session's
+                    // durable head over the run's rewrites and retired its
+                    // live graph to the retention. A checkpoint between a
+                    // rewrite and the next model response would hold no row
+                    // the run wrote after that rewrite; the next round's
+                    // first commit, which follows the response, carries the
+                    // cursor that names the run.
                     let model_messages = self.session.messages_for_model_boundary()?;
                     let last_guarded_boundary = [
                         self.compaction_cadence.last_compaction_boundary_index,
@@ -4386,6 +4910,11 @@ where
                             self.tool_application_observations
                                 .refresh(self.session.messages());
                             if rewrite_committed {
+                                // The rewrite may have folded the run's own
+                                // rows into a summary: until the run writes an
+                                // assistant message again, a provisional tail
+                                // is not attributable to it.
+                                self.round_commits.note_transcript_rewrite();
                                 self.last_input_tokens = 0;
                                 self.post_compaction_pressure_check = provider_request_pressure
                                     .map(|pressure| {
@@ -5332,15 +5861,43 @@ where
             .cumulative_delta_since(&self.run_usage_baseline)
     }
 
-    /// The main agent loop
-    #[allow(unused_assignments)]
+    /// The main agent loop.
+    ///
+    /// `resumed` restarts a durable run from its run cursor after a restart
+    /// (see [`Agent::resume_run`]): the run keeps its run id, round index,
+    /// counters, usage account and turn horizon, and a run resumed at its
+    /// round's first commit takes the staged assistant message as the
+    /// round's model response. Every exit of the run's rounds passes
+    /// [`Agent::close_run_cursor_at_exit`].
     pub(super) async fn run_loop(
         &mut self,
         run_input: Option<crate::types::RunInput>,
         event_tx: Option<mpsc::Sender<AgentEvent>>,
         deferred_callback: Option<crate::session::DeferredCallbackContinuation>,
+        resumed: Option<ResumedRunStart>,
     ) -> Result<RunResult, AgentError> {
-        let mut turn_count = 0u32;
+        let result = self
+            .run_loop_rounds(run_input, event_tx, deferred_callback, resumed)
+            .await;
+        // A staged round no boundary took over belongs to this run only.
+        self.pending_resumed_round = None;
+        Box::pin(self.close_run_cursor_at_exit(result)).await
+    }
+
+    #[allow(unused_assignments)]
+    async fn run_loop_rounds(
+        &mut self,
+        run_input: Option<crate::types::RunInput>,
+        event_tx: Option<mpsc::Sender<AgentEvent>>,
+        deferred_callback: Option<crate::session::DeferredCallbackContinuation>,
+        resumed: Option<ResumedRunStart>,
+    ) -> Result<RunResult, AgentError> {
+        // A resumed run continues the loop state its last round commit
+        // carried; a fresh run starts from zero.
+        let carried = resumed
+            .as_ref()
+            .map(|start| start.cursor.loop_state.clone());
+        let mut turn_count = carried.as_ref().map_or(0, |carried| carried.turn_count);
         // The turn cap is resolved once at the build/composition seam
         // (`AgentBuilder::build_inner` applies `DEFAULT_MAX_TURNS` when the
         // surface left `config.max_turns` unset). The loop reads that resolved
@@ -5352,9 +5909,13 @@ where
                     .to_string(),
             )
         })?;
-        let mut tool_call_count = 0u32;
+        let mut tool_call_count = carried
+            .as_ref()
+            .map_or(0, |carried| carried.tool_call_count);
         let mut event_stream_open = true;
-        let mut run_has_visible_or_actionable_output = false;
+        let mut run_has_visible_or_actionable_output = carried
+            .as_ref()
+            .is_some_and(|carried| carried.has_visible_or_actionable_output);
         let mut reserved_assistant_message: Option<crate::types::AssistantMessageId> = None;
         let mut controller_feedback = false;
         let mut model_operation: Option<crate::hooks::HookModelOperation> = None;
@@ -5383,25 +5944,51 @@ where
         // horizon's remaining time. A barrier-ops wait
         // (`ops_lifecycle.wait_all`) is NOT interrupted by the horizon; that
         // park is a separate seam and remains unbounded here.
-        self.budget.begin_turn();
+        //
+        // A resumed run continues the horizon its run had used when its last
+        // round committed; the time the host was down is not charged.
+        match carried.as_ref() {
+            Some(carried) => self
+                .budget
+                .resume_turn(std::time::Duration::from_millis(carried.turn_elapsed_ms)),
+            None => self.budget.begin_turn(),
+        }
         self.extraction_state.reset();
-        // Once a suspended run's staged callback results are applied, the next
-        // run continues its account so calls made before the suspension stay
-        // in that run's usage, whichever entry point starts it. A suspension
-        // whose results were never applied is discarded, not absorbed.
-        match self
-            .run_usage_suspended_run
-            .take()
-            .filter(|suspended| suspended.callback_results_applied)
-        {
-            Some(resumed) => {
-                self.run_usage_baseline = resumed.baseline;
-                self.run_request_usage = resumed.rows;
+        match carried.as_ref() {
+            // A resumed run continues its own usage account. A suspension
+            // this agent recorded belongs to another run and is discarded.
+            Some(carried) => {
+                self.run_usage_suspended_run = None;
+                match carried.usage.clone() {
+                    Some(usage) => {
+                        self.run_usage_baseline = usage.baseline;
+                        self.run_request_usage = usage.rows;
+                    }
+                    None => {
+                        self.run_usage_baseline = self.reported_session_usage();
+                        self.run_request_usage.clear();
+                    }
+                }
             }
-            None => {
-                self.run_usage_baseline = self.reported_session_usage();
-                self.run_request_usage.clear();
-            }
+            // Once a suspended run's staged callback results are applied, the
+            // next run continues its account so calls made before the
+            // suspension stay in that run's usage, whichever entry point
+            // starts it. A suspension whose results were never applied is
+            // discarded, not absorbed.
+            None => match self
+                .run_usage_suspended_run
+                .take()
+                .filter(|suspended| suspended.callback_results_applied)
+            {
+                Some(resumed) => {
+                    self.run_usage_baseline = resumed.baseline;
+                    self.run_request_usage = resumed.rows;
+                }
+                None => {
+                    self.run_usage_baseline = self.reported_session_usage();
+                    self.run_request_usage.clear();
+                }
+            },
         }
         // RuntimeStore holds the pre-run Session snapshot until an explicit
         // sticky-fallback CAS advances its control projection. Seal that exact
@@ -5423,11 +6010,14 @@ where
         let run_id = if let Some(run_id) = self.started_primitive_run_from_authority()? {
             run_id
         } else {
-            let run_id = self
-                .turn_state_handle
-                .as_deref()
-                .and_then(|handle| handle.snapshot().active_run_id)
-                .unwrap_or_else(|| RunId(uuid::Uuid::new_v4()));
+            let run_id = match resumed.as_ref() {
+                Some(start) => start.cursor.run_id.clone(),
+                None => self
+                    .turn_state_handle
+                    .as_deref()
+                    .and_then(|handle| handle.snapshot().active_run_id)
+                    .unwrap_or_else(|| RunId(uuid::Uuid::new_v4())),
+            };
             self.apply_turn_input(TurnExecutionInput::StartConversationRun {
                 run_id: run_id.clone(),
                 primitive_kind: TurnPrimitiveKind::ConversationTurn,
@@ -5442,9 +6032,30 @@ where
         // zero-checkpoint predecessor synchronously once the fresh run
         // identity is known, before the first suspension point, so service
         // finalization can consume it only through the matching run-id filter.
-        self.latest_run_checkpoint_receipt = None;
+        // A resumed run is the cursor's run, and continues the receipt chain
+        // of the tail it resumed from.
+        let resumed = match resumed {
+            Some(start) => {
+                start.check(&run_id, self.session.id())?;
+                let ResumedRunStart {
+                    cursor,
+                    receipt,
+                    interrupted_calls,
+                } = start;
+                self.latest_run_checkpoint_receipt = Some(receipt);
+                Some((cursor, interrupted_calls))
+            }
+            None => {
+                self.latest_run_checkpoint_receipt = None;
+                None
+            }
+        };
         self.runtime_started_run_id = Some(run_id.clone());
         self.tool_dispatch_context.bind_run_id(run_id.clone());
+        match resumed.as_ref() {
+            Some((cursor, _)) => self.resume_round_commits(cursor),
+            None => self.begin_round_commits(&run_id),
+        }
         // A resumed run takes over the parked consent its staged notice
         // inputs carry, before its first model call.
         if let (Some(review), Some(work)) = (
@@ -5471,15 +6082,26 @@ where
             .map_err(|error| AgentError::InternalError(error.to_string()))?;
         // The existing authority has now selected the exact run id that will
         // be stamped onto assistant history. Publish it before this run's
-        // model output, without minting an observability id.
-        if let Some(input) = run_input {
-            self.emit_run_started_event(input, event_tx.as_ref()).await;
+        // model output, without minting an observability id. A resumed run
+        // announces its resumption instead, and restores what its cursor
+        // carries before its first boundary.
+        match resumed {
+            Some((cursor, custody)) => {
+                self.emit_run_resumed_event(&run_id, &cursor, event_tx.as_ref())
+                    .await;
+                self.restore_resumed_run(&run_id, cursor, custody)?;
+            }
+            None => {
+                if let Some(input) = run_input {
+                    self.emit_run_started_event(input, event_tx.as_ref()).await;
+                }
+            }
         }
         // PrimitiveApplied transitions ApplyingPrimitive -> CallingLlm
         let t = self.apply_turn_input(TurnExecutionInput::PrimitiveApplied {
             run_id: run_id.clone(),
         })?;
-        self.execute_turn_effects(&t, 0, &event_tx).await?;
+        self.execute_turn_effects(&t, turn_count, &event_tx).await?;
 
         // Helper to conditionally emit events (only when listener exists).
         // Also forwards to the event tap for interaction-scoped subscribers.
@@ -5766,6 +6388,9 @@ where
         if let Some(observer) = self.model_preparation_observer.as_ref() {
             observer();
         }
+        if let Some(resumed) = self.pending_resumed_round.take() {
+            return Box::pin(self.run_resumed_tool_round(ctx, resumed)).await;
+        }
         match self.refresh_calling_llm_boundary_notices(ctx).await? {
             CallingLlmBoundaryGate::Deferred => return Ok(CallingLlmStep::Repoll),
             CallingLlmBoundaryGate::Proceed => {}
@@ -5805,13 +6430,45 @@ where
         };
         // Check if we have tool calls
         if assistant.assistant_msg.has_tool_calls() {
-            self.run_calling_llm_tool_phase(ctx, prepared.in_extraction, &tool_defs, assistant)
-                .await
+            self.run_calling_llm_tool_phase(
+                ctx,
+                prepared.in_extraction,
+                &tool_defs,
+                assistant,
+                None,
+            )
+            .await
         } else if self.turn_in_extraction_flow()? {
             self.run_calling_llm_extraction_phase(ctx, assistant).await
         } else {
             self.run_calling_llm_terminal_phase(ctx, assistant).await
         }
+    }
+    /// The first model boundary of a run resumed at its round's first
+    /// commit.
+    ///
+    /// The staged assistant message stands in for the model call: no notice
+    /// refresh, request preparation or provider call happens for this round,
+    /// and nothing is published for the message itself. The boundary's tool
+    /// scope is applied as at any boundary, and the round continues as one
+    /// whose model call just returned these tool calls, so the turn authority
+    /// sees its ordinary sequence.
+    async fn run_resumed_tool_round(
+        &mut self,
+        ctx: &mut CallingLlmTurnCtx<'_>,
+        resumed: ResumedToolRound,
+    ) -> Result<CallingLlmStep, AgentError> {
+        let tool_defs = self.apply_calling_llm_tool_scope(ctx).await?;
+        let assistant_msg = resumed.assistant_message.clone();
+        let assistant = CallingLlmAssistantTurn {
+            assistant_text: assistant_msg.to_string(),
+            stop_reason: assistant_msg.stop_reason.unwrap_or(StopReason::ToolUse),
+            // Accounted when the model answered, before the restart.
+            usage: None,
+            assistant_msg,
+        };
+        self.run_calling_llm_tool_phase(ctx, false, &tool_defs, assistant, Some(resumed))
+            .await
     }
     /// Boundary steps 0–3b: auth/MCP/background-job synthetic notice
     /// refresh and completion-feed delivery admission.
@@ -7907,12 +8564,18 @@ where
     /// turn commit. The dispatch await lives here so only this thin
     /// driver frame (not the admission/commit locals) sits on the stack
     /// beneath the executing tools.
+    ///
+    /// `resumed` is the staged round a resumed run takes over: its assistant
+    /// message is the round's model response, its first commit is the tail
+    /// the run resumed from, and its calls are answered by
+    /// [`Agent::resumed_call_disposition`].
     async fn run_calling_llm_tool_phase(
         &mut self,
         ctx: &mut CallingLlmTurnCtx<'_>,
         in_extraction: bool,
         tool_defs: &Arc<[Arc<ToolDef>]>,
         assistant: CallingLlmAssistantTurn,
+        resumed: Option<ResumedToolRound>,
     ) -> Result<CallingLlmStep, AgentError> {
         let CallingLlmAssistantTurn {
             assistant_msg,
@@ -7962,17 +8625,20 @@ where
             }
         };
 
-        // Emit tool call requests
-        for (tc, args) in &tool_calls {
-            emit_phase_event!(
-                self,
-                ctx,
-                AgentEvent::ToolCallRequested {
-                    id: tc.id.clone(),
-                    name: tc.name.clone(),
-                    args: args.clone(),
-                }
-            );
+        // Emit tool call requests. A resumed round's calls were requested
+        // before the restart; its stored message announces nothing again.
+        if resumed.is_none() {
+            for (tc, args) in &tool_calls {
+                emit_phase_event!(
+                    self,
+                    ctx,
+                    AgentEvent::ToolCallRequested {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        args: args.clone(),
+                    }
+                );
+            }
         }
 
         // Transition to waiting for ops
@@ -7988,13 +8654,39 @@ where
         self.transient_turn_context_state
             .open_next_boundary(ctx.run_id)
             .map_err(|error| AgentError::InternalError(error.to_string()))?;
+        // Every call of the round carries the round's dedupe key, fresh or
+        // dispatched again after a resume.
+        self.tool_dispatch_context
+            .bind_round(self.round_commits.round);
 
+        // The round's first commit, before any of its tools is admitted. A
+        // resumed round's first commit is the tail it resumed from. Boxed so
+        // the checkpoint future stays out of this driver's frame, which sits
+        // beneath the executing tools.
+        if resumed.is_none()
+            && let Err(error) = Box::pin(self.commit_round_tools_pending(ctx, &assistant_msg)).await
+        {
+            self.terminalize_fatal_error(ctx.run_id, ctx.turn_count, ctx.event_tx, &error)
+                .await?;
+            return Err(error);
+        }
+
+        let indexed_calls = tool_calls
+            .into_iter()
+            .enumerate()
+            .map(|(tool_index, (tc, args))| (tool_index, tc, args))
+            .collect::<Vec<_>>();
+        let (indexed_calls, mut interrupted_calls) = match resumed.as_ref() {
+            Some(round) => self.partition_resumed_calls(round, tool_defs, indexed_calls),
+            None => (indexed_calls, Vec::new()),
+        };
         let CallingLlmToolAdmission {
             executable_tool_calls,
             mut refused_tool_calls,
         } = self
-            .admit_calling_llm_tool_calls(ctx, tool_defs, tool_calls)
+            .admit_calling_llm_tool_calls(ctx, tool_defs, indexed_calls)
             .await?;
+        refused_tool_calls.append(&mut interrupted_calls);
 
         // Execute all allowed tool calls in parallel, bounding
         // concurrency with a semaphore and applying the typed
@@ -8022,19 +8714,143 @@ where
         self.commit_calling_llm_tool_turn(
             ctx,
             assistant_msg,
-            CallingLlmToolTurnAccounting { stop_reason, usage },
+            CallingLlmToolTurnAccounting {
+                stop_reason,
+                usage,
+                replayed: resumed.is_some(),
+            },
             batch,
         )
         .await
     }
+    /// Answer the staged calls of a resumed round: the calls that are
+    /// dispatched again (each through admission, with its pre-tool hooks,
+    /// visibility check and review, as any call), and the results of the
+    /// calls that are not, at their own positions in the batch.
+    fn partition_resumed_calls(
+        &self,
+        round: &ResumedToolRound,
+        tool_defs: &Arc<[Arc<ToolDef>]>,
+        calls: Vec<(usize, ToolCallOwned, ToolCallArguments)>,
+    ) -> (
+        Vec<(usize, ToolCallOwned, ToolCallArguments)>,
+        Vec<ToolDispatchResult>,
+    ) {
+        let mut rerun = Vec::with_capacity(calls.len());
+        let mut interrupted = Vec::new();
+        for (tool_index, tc, args) in calls {
+            match self.resumed_call_disposition(round, tool_defs, &tc) {
+                ResumedCallDisposition::Rerun => rerun.push((tool_index, tc, args)),
+                ResumedCallDisposition::Interrupted { reason } => {
+                    let error = ToolError::OutcomeUncertain {
+                        name: tc.name.clone(),
+                        reason,
+                    };
+                    interrupted.push((tool_index, tc, Err(error), 0));
+                }
+            }
+        }
+        (rerun, interrupted)
+    }
+
+    /// How a resumed round answers one staged call. Delivery is at least
+    /// once: a call runs again under its call id and dedupe key (MCP and host
+    /// callback tools included), except
+    ///
+    /// - a call whose process custody shows that its process may have run
+    ///   before the restart,
+    /// - a call to one of Core's comms tools that sends to another agent
+    ///   (every comms tool but the roster read), which Core knows is not
+    ///   idempotent, and
+    /// - a call whose plan resolves to Detached execution under a runner that
+    ///   declares itself non-resumable,
+    ///
+    /// which get an outcome-uncertain result instead: they are not run again,
+    /// and the model decides.
+    fn resumed_call_disposition(
+        &self,
+        round: &ResumedToolRound,
+        tool_defs: &Arc<[Arc<ToolDef>]>,
+        tc: &ToolCallOwned,
+    ) -> ResumedCallDisposition {
+        if let Some(evidence) = round.interrupted_calls.get(&tc.id)
+            && evidence.cessation.may_have_run()
+        {
+            return ResumedCallDisposition::Interrupted {
+                reason: format!(
+                    "a host restart interrupted this call: its {} {}. It was not run again; \
+                     whether it took effect is unknown",
+                    evidence.spawner.description(),
+                    evidence.cessation.description()
+                ),
+            };
+        }
+        let comms_tool = tool_defs.iter().any(|tool| {
+            tool.name == tc.name.as_str()
+                && tool
+                    .provenance
+                    .as_ref()
+                    .is_some_and(|provenance| provenance.kind == crate::ToolSourceKind::Comms)
+        });
+        if comms_tool
+            && !self
+                .tools
+                .tool_mutation_class(tc.name.as_str())
+                .is_declared_read_only()
+        {
+            return ResumedCallDisposition::Interrupted {
+                reason: "a host restart interrupted this call, which sends to another agent. It \
+                         was not sent again; whether it was delivered is unknown"
+                    .to_string(),
+            };
+        }
+        if let Some(runner) = self.call_resolves_detached_non_resumable(tc) {
+            return ResumedCallDisposition::Interrupted {
+                reason: format!(
+                    "a host restart interrupted this call, and its runner {runner} cannot resume \
+                     or repeat it. It was not run again; whether it took effect is unknown"
+                ),
+            };
+        }
+        ResumedCallDisposition::Rerun
+    }
+
+    /// The runner of a call whose plan resolves to Detached execution under
+    /// a runner that declares itself non-resumable. The plan is resolved as
+    /// dispatch resolves it; a call that does not resolve is dispatched again
+    /// and meets the same refusal there.
+    fn call_resolves_detached_non_resumable(&self, tc: &ToolCallOwned) -> Option<String> {
+        let deadline = crate::ToolDeadlineContributor::finite(
+            crate::ToolDeadlineOwner::CoreToolDispatch,
+            self.tools_config.default_timeout,
+        );
+        let resolution = crate::ToolExecutionResolutionContext::new(
+            crate::ToolDeadlineChain::new(vec![deadline]).ok()?,
+        );
+        let plan = self
+            .tools
+            .resolve_execution_plan(tc.as_view(), &self.tool_dispatch_context, &resolution)
+            .ok()?;
+        match plan.kind() {
+            crate::ResolvedExecutionKind::Detached(policy)
+                if policy.restart_class() == crate::RestartClass::NonResumable =>
+            {
+                Some(policy.runner().name().to_string())
+            }
+            _ => None,
+        }
+    }
+
     /// Runs pre-tool hooks and visibility prechecks over the requested
     /// tool calls, admitting the executable subset and retaining ordinary
     /// access-denied results for the remaining calls.
+    ///
+    /// Each call keeps its index in the round's batch.
     async fn admit_calling_llm_tool_calls(
         &mut self,
         ctx: &mut CallingLlmTurnCtx<'_>,
         tool_defs: &Arc<[Arc<ToolDef>]>,
-        tool_calls: Vec<(ToolCallOwned, ToolCallArguments)>,
+        tool_calls: Vec<(usize, ToolCallOwned, ToolCallArguments)>,
     ) -> Result<CallingLlmToolAdmission, AgentError> {
         // Execute tool calls in parallel
         let tools_ref = Arc::clone(&self.tools);
@@ -8056,7 +8872,7 @@ where
                 .and_then(|tool| tool.provenance.clone())
         };
 
-        let mut collected = futures::future::join_all(tool_calls.iter().map(|(tc, args)| {
+        let mut collected = futures::future::join_all(tool_calls.iter().map(|(_, tc, args)| {
             self.collect_hook_execution(HookInvocation {
                 run_id: None,
                 point: HookPoint::PreToolExecution,
@@ -8089,15 +8905,11 @@ where
                 .await;
         }
 
-        for (tool_index, ((tc, _args), pre_tool_report)) in tool_calls
-            .into_iter()
-            .zip(
-                collected
-                    .into_iter()
-                    .map(|execution| execution.into_result()),
-            )
-            .enumerate()
-        {
+        for ((tool_index, tc, _args), pre_tool_report) in tool_calls.into_iter().zip(
+            collected
+                .into_iter()
+                .map(|execution| execution.into_result()),
+        ) {
             let pre_tool_report = match pre_tool_report {
                 Ok(report) => report,
                 Err(AgentError::HookLaunchRefused {
@@ -8233,6 +9045,7 @@ where
         };
         // Process results and emit events
         let mut all_async_ops = Vec::<crate::ops::AsyncOpRef>::new();
+        let mut pending_ops_by_call = Vec::<crate::session::RoundPendingOperation>::new();
         let mut accumulated_session_effects = Vec::<crate::ops::SessionEffect>::new();
         let mut callback_pending: Vec<crate::error::PendingCallbackToolCall> = Vec::new();
         let mut deferred_failure = None;
@@ -8256,6 +9069,12 @@ where
                         deferred_failure.get_or_insert(crate::session::DeferredToolBatchFailureKind::OperationObservationUnavailable);
                     }
                     outcome.clear_terminal_cause();
+                    pending_ops_by_call.extend(outcome.async_ops.iter().map(|operation| {
+                        crate::session::RoundPendingOperation {
+                            call_id: tc.id.clone(),
+                            operation: operation.clone(),
+                        }
+                    }));
                     all_async_ops.extend(outcome.async_ops);
                     tool_session_effects = outcome.session_effects;
                     outcome.result
@@ -8457,6 +9276,7 @@ where
         Ok(CallingLlmToolBatch {
             tool_results,
             pending_op_refs: all_async_ops,
+            pending_ops_by_call,
             accumulated_session_effects,
             callback_pending,
             deferred_failure,
@@ -8475,6 +9295,7 @@ where
         let CallingLlmToolBatch {
             tool_results,
             pending_op_refs,
+            pending_ops_by_call,
             accumulated_session_effects,
             mut callback_pending,
             deferred_failure,
@@ -8578,6 +9399,9 @@ where
             self.session
                 .push(Message::BlockAssistant(assistant_msg.clone()));
         }
+        // The run's own assistant message is in the transcript after any
+        // rewrite: a checkpoint without the cursor is attributable again.
+        self.round_commits.note_run_row();
         for image in assistant_image_events_from_blocks(&assistant_msg.blocks) {
             emit_phase_event!(
                 self,
@@ -8638,17 +9462,40 @@ where
         // with its callback batch), so its turn is complete. Publishing it
         // pairs this request's `TurnStarted` and puts its accounting on the
         // event stream, where a consumer sees every agent-loop provider call
-        // rather than only the one that closes the run.
-        let CallingLlmToolTurnAccounting { stop_reason, usage } = accounting;
-        emit_phase_event!(
-            self,
-            ctx,
-            AgentEvent::TurnCompleted {
-                stop_reason,
-                usage,
-                assistant_message_id,
+        // rather than only the one that closes the run. A resumed round's
+        // turn was announced, and its usage published, before the restart:
+        // nothing is announced again for its stored message.
+        let CallingLlmToolTurnAccounting {
+            stop_reason,
+            usage,
+            replayed,
+        } = accounting;
+        if !replayed {
+            emit_phase_event!(
+                self,
+                ctx,
+                AgentEvent::TurnCompleted {
+                    stop_reason,
+                    usage,
+                    assistant_message_id,
+                }
+            );
+        }
+
+        // The round's second commit: its assistant message and results are
+        // in the transcript. A callback batch takes none: its suspension
+        // closes the run's cursor, and its staging record owns the
+        // continuation. Boxed so the checkpoint future stays out of this
+        // frame.
+        if !callback_batch_pending {
+            if let Err(error) = Box::pin(self.commit_round_results(ctx, pending_ops_by_call)).await
+            {
+                self.terminalize_fatal_error(ctx.run_id, ctx.turn_count, ctx.event_tx, &error)
+                    .await?;
+                return Err(error);
             }
-        );
+            self.round_commits.round = self.round_commits.round.saturating_add(1);
+        }
 
         self.observe_cancel_after_boundary_request(ctx.run_id)?;
 
@@ -25870,7 +26717,7 @@ mod tests {
         });
 
         // Must be Ok (Success via BudgetExhausted), not Err(TokenBudgetExceeded).
-        let result = agent.run_loop(None, None, None).await.expect(
+        let result = agent.run_loop(None, None, None, None).await.expect(
             "token budget exhaustion must route through BudgetExhausted (Success), \
              not escape as raw AgentError",
         );
@@ -25898,7 +26745,7 @@ mod tests {
             max_tool_calls: Some(0),
         });
 
-        let result = agent.run_loop(None, None, None).await.expect(
+        let result = agent.run_loop(None, None, None, None).await.expect(
             "tool-call budget exhaustion must route through BudgetExhausted (Success), \
              not escape as raw AgentError",
         );
