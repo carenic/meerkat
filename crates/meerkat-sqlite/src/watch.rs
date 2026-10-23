@@ -626,6 +626,10 @@ fn watch_backend(parent: &Path) -> Box<dyn WatchBackend> {
     if let Some(held) = test_support::held_backend(parent) {
         return held;
     }
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(observed) = test_support::observed_backend(parent) {
+        return observed;
+    }
     Box::new(NotifyBackend)
 }
 
@@ -825,7 +829,7 @@ fn settle_failed(slot: &Mutex<RegistrationSlot>, reason: String) {
 pub mod test_support {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, mpsc};
     use std::time::{Duration, Instant};
 
@@ -973,6 +977,167 @@ pub mod test_support {
             self.hold.dropped_sources.fetch_add(1, Ordering::SeqCst);
         }
     }
+
+    /// Observed directories, by canonical path.
+    static OBSERVATIONS: OnceLock<Mutex<HashMap<PathBuf, Arc<Observation>>>> = OnceLock::new();
+
+    fn observations() -> &'static Mutex<HashMap<PathBuf, Arc<Observation>>> {
+        OBSERVATIONS.get_or_init(Mutex::default)
+    }
+
+    #[derive(Default)]
+    struct Observation {
+        registered: Mutex<usize>,
+        changed: Condvar,
+        /// Report a database's WAL created or removed also as modified.
+        wal_lifecycle_as_modified: AtomicBool,
+    }
+
+    /// Observes the notification registrations of the watches on databases
+    /// in one directory: they register with the platform as usual, and this
+    /// counts the ones that did. Dropping it ends the observation.
+    pub struct ObservedRegistrations {
+        directory: PathBuf,
+        observation: Arc<Observation>,
+    }
+
+    /// Observe the registration of every watch started from now on for a
+    /// database in `directory` (an existing directory, matched by its
+    /// canonical path), so a test can order its own file activity after a
+    /// watch's registration ([`ObservedRegistrations::wait_registered`]).
+    pub fn observe_registrations_in(directory: &Path) -> std::io::Result<ObservedRegistrations> {
+        let directory = directory.canonicalize()?;
+        let observation = Arc::new(Observation::default());
+        let mut observations = lock(observations());
+        if observations.contains_key(&directory) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("{} is already observed", directory.display()),
+            ));
+        }
+        observations.insert(directory.clone(), Arc::clone(&observation));
+        Ok(ObservedRegistrations {
+            directory,
+            observation,
+        })
+    }
+
+    impl ObservedRegistrations {
+        /// From now on, the observed watches also report a database's WAL
+        /// created or removed as modified (`Modify(Any)`), as
+        /// ReadDirectoryChangesW can report a new or removed file, so a
+        /// connection's own open and close notify a WAL change. Each report
+        /// still passes the watch's relevance filter.
+        pub fn report_wal_lifecycle_as_modified(&self) {
+            self.observation
+                .wal_lifecycle_as_modified
+                .store(true, Ordering::SeqCst);
+        }
+
+        /// Wait, at most `bound`, until `count` registrations have
+        /// registered. Whether they had.
+        pub fn wait_registered(&self, count: usize, bound: Duration) -> bool {
+            let deadline = Instant::now() + bound;
+            let mut registered = lock(&self.observation.registered);
+            while *registered < count {
+                let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                    return false;
+                };
+                registered = self
+                    .observation
+                    .changed
+                    .wait_timeout(registered, left)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+            true
+        }
+    }
+
+    impl Drop for ObservedRegistrations {
+        fn drop(&mut self) {
+            lock(observations()).remove(&self.directory);
+        }
+    }
+
+    /// The platform backend, observed, for a watch of `parent` while an
+    /// observation covers it.
+    pub(super) fn observed_backend(parent: &Path) -> Option<Box<dyn WatchBackend>> {
+        let observation = lock(observations()).get(parent).cloned()?;
+        Some(Box::new(ObservedBackend(observation)))
+    }
+
+    struct ObservedBackend(Arc<Observation>);
+
+    impl WatchBackend for ObservedBackend {
+        fn create(
+            &self,
+            targets: &WatchTargets,
+            wake: mpsc::Sender<()>,
+        ) -> Result<Box<dyn WatchSource>, String> {
+            let inner = if self.0.wal_lifecycle_as_modified.load(Ordering::SeqCst) {
+                wal_lifecycle_as_modified_source(targets, wake)?
+            } else {
+                super::NotifyBackend.create(targets, wake)?
+            };
+            Ok(Box::new(ObservedSource {
+                inner,
+                observation: Arc::clone(&self.0),
+            }))
+        }
+    }
+
+    /// The platform watcher, with a database's WAL created or removed also
+    /// reported as modified; every report passes the relevance filter.
+    fn wal_lifecycle_as_modified_source(
+        targets: &WatchTargets,
+        wake: mpsc::Sender<()>,
+    ) -> Result<Box<dyn WatchSource>, String> {
+        use notify::EventKind;
+        let parent = targets.parent.clone();
+        let watched_paths = targets.watched_paths.clone();
+        let wals: Vec<PathBuf> = watched_paths
+            .iter()
+            .map(|path| super::sidecar_path(path, "-wal"))
+            .filter(|wal| watched_paths.contains(wal))
+            .collect();
+        let watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
+            let Ok(event) = result else {
+                return;
+            };
+            let mut reports = vec![event.clone()];
+            if matches!(event.kind, EventKind::Create(_) | EventKind::Remove(_)) {
+                for wal in event.paths.iter().filter(|path| wals.contains(path)) {
+                    reports.push(
+                        notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+                            .add_path(wal.clone()),
+                    );
+                }
+            }
+            if reports
+                .iter()
+                .any(|report| super::sqlite_watch_event_relevant(report, &parent, &watched_paths))
+            {
+                let _ = wake.send(());
+            }
+        })
+        .map_err(|error| format!("cannot create the sqlite change watcher: {error}"))?;
+        Ok(Box::new(super::NotifySource(watcher)))
+    }
+
+    struct ObservedSource {
+        inner: Box<dyn WatchSource>,
+        observation: Arc<Observation>,
+    }
+
+    impl WatchSource for ObservedSource {
+        fn watch(&mut self, directory: &Path) -> Result<(), String> {
+            self.inner.watch(directory)?;
+            *lock(&self.observation.registered) += 1;
+            self.observation.changed.notify_all();
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1046,14 +1211,26 @@ mod tests {
         assert!(!db.exists());
         for path in &watched_paths {
             assert!(!path.exists());
-            for kind in [
-                notify::EventKind::Create(notify::event::CreateKind::File),
-                notify::EventKind::Remove(notify::event::RemoveKind::File),
-            ] {
-                let event = notify::Event::new(kind).add_path(path.clone());
-                assert!(sqlite_watch_event_relevant(&event, &parent, &watched_paths));
-            }
         }
+        let [database, wal, _index] = watched_paths.as_slice() else {
+            panic!("the database and its two sidecars: {watched_paths:?}");
+        };
+        for kind in [
+            notify::EventKind::Create(notify::event::CreateKind::File),
+            notify::EventKind::Remove(notify::event::RemoveKind::File),
+        ] {
+            let event = notify::Event::new(kind).add_path(database.clone());
+            assert!(sqlite_watch_event_relevant(&event, &parent, &watched_paths));
+        }
+        let append = notify::Event::new(notify::EventKind::Modify(
+            notify::event::ModifyKind::Data(notify::event::DataChange::Any),
+        ))
+        .add_path(wal.clone());
+        assert!(sqlite_watch_event_relevant(
+            &append,
+            &parent,
+            &watched_paths
+        ));
         for path in [
             canonical_parent.join("other.sqlite3-wal"),
             canonical_parent.join("other").join("store.sqlite3-wal"),
@@ -1072,6 +1249,206 @@ mod tests {
             &parent,
             &watched_paths
         ));
+    }
+
+    /// The `notify` kinds one platform backend reports for a WAL database's
+    /// files: a connection's own open and close, and a commit.
+    struct BackendShapes {
+        /// The first connection to open the database creates its WAL and the
+        /// WAL index.
+        created: &'static [notify::EventKind],
+        /// It writes the index (its truncation and size) and can touch the
+        /// sidecars' metadata.
+        written: &'static [notify::EventKind],
+        /// The last connection to close removes both.
+        removed: &'static [notify::EventKind],
+        /// A commit appends to the WAL; without a WAL it writes the database.
+        appended: &'static [notify::EventKind],
+    }
+
+    /// A connection's own open and close of a WAL database are no change,
+    /// whichever kinds the backend reports them as; a commit is, and so is
+    /// any event on the database file or the directory itself.
+    fn assert_only_a_commit_is_a_change(shapes: &BackendShapes) {
+        let parent = PathBuf::from("/data");
+        let database = parent.join("store.sqlite3");
+        let watched_paths = sqlite_watch_paths(&database);
+        let wal = sidecar_path(&database, "-wal");
+        let index = sidecar_path(&database, "-shm");
+        let relevant = |kind: notify::EventKind, path: &Path| {
+            sqlite_watch_event_relevant(
+                &notify::Event::new(kind).add_path(path.to_path_buf()),
+                &parent,
+                &watched_paths,
+            )
+        };
+        for &kind in shapes.created.iter().chain(shapes.removed) {
+            assert!(
+                !relevant(kind, &wal),
+                "the WAL created or removed is no change: {kind:?}"
+            );
+        }
+        for &kind in shapes
+            .created
+            .iter()
+            .chain(shapes.written)
+            .chain(shapes.removed)
+        {
+            assert!(
+                !relevant(kind, &index),
+                "nothing on the WAL index is a change: {kind:?}"
+            );
+        }
+        for &kind in shapes.appended {
+            assert!(relevant(kind, &wal), "a WAL append is a change: {kind:?}");
+            assert!(
+                relevant(kind, &database),
+                "a database write is a change: {kind:?}"
+            );
+        }
+        for &kind in shapes.created.iter().chain(shapes.removed) {
+            assert!(
+                relevant(kind, &database),
+                "the database created or removed is a change: {kind:?}"
+            );
+            assert!(
+                relevant(kind, &parent),
+                "the directory itself is a change: {kind:?}"
+            );
+        }
+        let rescan = notify::Event::new(notify::EventKind::Other);
+        assert!(
+            sqlite_watch_event_relevant(&rescan, &parent, &watched_paths),
+            "a rescan names no path and is a change"
+        );
+    }
+
+    /// inotify (Linux): IN_CREATE, IN_MODIFY, IN_ATTRIB and IN_DELETE.
+    #[test]
+    fn inotify_kinds_of_a_connections_own_open_and_close_are_no_change() {
+        use notify::EventKind::{Create, Modify, Remove};
+        use notify::event::{CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind};
+        assert_only_a_commit_is_a_change(&BackendShapes {
+            created: &[Create(CreateKind::File)],
+            written: &[
+                Modify(ModifyKind::Data(DataChange::Any)),
+                Modify(ModifyKind::Metadata(MetadataKind::Any)),
+            ],
+            removed: &[Remove(RemoveKind::File)],
+            appended: &[Modify(ModifyKind::Data(DataChange::Any))],
+        });
+    }
+
+    /// FSEvents (macOS): one event per flag of a record, so a record that
+    /// merges the WAL's creation with an append still carries the append's
+    /// data change.
+    #[test]
+    fn fsevents_kinds_of_a_connections_own_open_and_close_are_no_change() {
+        use notify::EventKind::{Create, Modify, Remove};
+        use notify::event::{CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind};
+        assert_only_a_commit_is_a_change(&BackendShapes {
+            created: &[Create(CreateKind::File), Create(CreateKind::Any)],
+            written: &[
+                Modify(ModifyKind::Data(DataChange::Content)),
+                Modify(ModifyKind::Metadata(MetadataKind::Any)),
+                Modify(ModifyKind::Metadata(MetadataKind::Ownership)),
+                Modify(ModifyKind::Metadata(MetadataKind::Extended)),
+            ],
+            removed: &[Remove(RemoveKind::File), Remove(RemoveKind::Any)],
+            appended: &[Modify(ModifyKind::Data(DataChange::Content))],
+        });
+        let parent = PathBuf::from("/data");
+        let watched_paths = sqlite_watch_paths(&parent.join("store.sqlite3"));
+        let merged = [
+            Create(CreateKind::File),
+            Modify(ModifyKind::Metadata(MetadataKind::Any)),
+            Modify(ModifyKind::Data(DataChange::Content)),
+        ];
+        assert!(
+            merged.into_iter().any(|kind| sqlite_watch_event_relevant(
+                &notify::Event::new(kind).add_path(watched_paths[1].clone()),
+                &parent,
+                &watched_paths,
+            )),
+            "a merged record of the WAL's creation and an append is a change"
+        );
+    }
+
+    /// ReadDirectoryChangesW (Windows): added, modified and removed, with no
+    /// finer kinds, so every modification of the WAL stays a change.
+    #[test]
+    fn read_directory_changes_kinds_of_a_connections_own_open_and_close_are_no_change() {
+        use notify::EventKind::{Any, Create, Modify, Remove};
+        use notify::event::{CreateKind, ModifyKind, RemoveKind};
+        assert_only_a_commit_is_a_change(&BackendShapes {
+            created: &[Create(CreateKind::Any)],
+            written: &[Modify(ModifyKind::Any)],
+            removed: &[Remove(RemoveKind::Any)],
+            appended: &[Modify(ModifyKind::Any), Any],
+        });
+    }
+
+    /// On a WAL database, a connection's own open (the first: it creates the
+    /// WAL and its index) and close (the last: it removes them) tick no
+    /// watch; its commit does. inotify reports all of it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_connections_own_open_and_close_tick_nothing_but_its_commit_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = wal_database(dir.path());
+        let wal = sidecar_path(&db, "-wal");
+        let index = sidecar_path(&db, "-shm");
+        assert!(
+            !wal.exists() && !index.exists(),
+            "the last close removed both"
+        );
+        let (tick_tx, tick_rx) = mpsc::channel();
+        let watch = start_sqlite_change_watch(
+            &db,
+            "test-own-open",
+            Duration::from_secs(3600),
+            move |tick| {
+                let _ = tick_tx.send(tick);
+                SqliteWatchControl::Handled
+            },
+        )
+        .expect("watch starts");
+        assert_eq!(
+            settled_registration(&watch),
+            SqliteWatchRegistration::Registered
+        );
+        {
+            let conn = crate::open(&db, crate::ConnectionProfile::PRIMARY).unwrap();
+            let rows: i64 = conn
+                .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(rows, 1);
+            assert!(
+                wal.exists() && index.exists(),
+                "the first connection created the WAL and its index"
+            );
+        }
+        assert!(
+            !wal.exists() && !index.exists(),
+            "the last connection removed them"
+        );
+        // The watch coalesces for 10 ms: a tick of the open or the close
+        // would have come long before this.
+        assert_eq!(
+            tick_rx.recv_timeout(Duration::from_millis(500)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "a connection's own open and close are no change"
+        );
+        {
+            let conn = crate::open(&db, crate::ConnectionProfile::PRIMARY).unwrap();
+            conn.execute("INSERT INTO t (v) VALUES (2)", []).unwrap();
+        }
+        assert_eq!(
+            tick_rx
+                .recv_timeout(HANG_GUARD)
+                .expect("the commit ticks within the hang guard"),
+            SqliteWatchTick::Changed
+        );
     }
 
     #[cfg(unix)]
