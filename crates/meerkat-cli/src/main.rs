@@ -16018,6 +16018,59 @@ impl SurfaceScheduleMobHost for CliScheduleMobHost {
             .deliver_identity_target(occurrence, identity, binding)
             .await
     }
+
+    /// A redelivery is the mob host's to decide: its existing-only answer
+    /// reads the mob's durable external-delivery record, where the trait
+    /// default answers an unproven late one not admitted unread. A mob state
+    /// that cannot be hydrated cannot show whether the earlier attempt was
+    /// admitted, so the occurrence stays reclaimable.
+    async fn deliver_existing_mob_target(
+        &self,
+        occurrence: &meerkat::Occurrence,
+        identity: &meerkat::ScheduleDeliveryIdentity,
+        binding: &meerkat::MobTargetBinding,
+        existing: meerkat::ExistingDelivery,
+    ) -> Result<meerkat::ExistingDeliveryAnswer, meerkat::ScheduleDomainError> {
+        let state = get_or_hydrate_cli_mob_state(
+            &self.scope,
+            Arc::clone(&self.service),
+            Arc::clone(&self.runtime_adapter),
+            Arc::clone(&self.mob_state_cache),
+        )
+        .await
+        .map_err(cli_redelivery_mob_state_unavailable)?;
+        meerkat_mob_mcp::MobMcpScheduleHost::new(state)
+            .deliver_existing_mob_target(occurrence, identity, binding, existing)
+            .await
+    }
+
+    async fn deliver_existing_identity_target(
+        &self,
+        occurrence: &meerkat::Occurrence,
+        identity: &meerkat::ScheduleDeliveryIdentity,
+        binding: &meerkat::IdentityTargetBinding,
+        existing: meerkat::ExistingDelivery,
+    ) -> Result<Option<meerkat::ExistingDeliveryAnswer>, meerkat::ScheduleDomainError> {
+        let state = get_or_hydrate_cli_mob_state(
+            &self.scope,
+            Arc::clone(&self.service),
+            Arc::clone(&self.runtime_adapter),
+            Arc::clone(&self.mob_state_cache),
+        )
+        .await
+        .map_err(cli_redelivery_mob_state_unavailable)?;
+        meerkat_mob_mcp::MobMcpScheduleHost::new(state)
+            .deliver_existing_identity_target(occurrence, identity, binding, existing)
+            .await
+    }
+}
+
+/// The schedule error of a redelivery whose mob state cannot be hydrated.
+#[cfg(all(feature = "mob", feature = "session-store"))]
+fn cli_redelivery_mob_state_unavailable(error: anyhow::Error) -> meerkat::ScheduleDomainError {
+    meerkat::ScheduleDomainError::DeliveryRepairDeferred {
+        detail: format!("mob state is unavailable for a redelivery: {error}"),
+    }
 }
 
 #[cfg(all(not(feature = "mob"), feature = "session-store"))]
@@ -34490,6 +34543,217 @@ default_model = "gpt-5.4"
             .expect("mob identity should be handled by mob adapter");
         let terminal = dispatch.completion.await.expect("delivery terminal");
         assert_eq!(terminal.phase, meerkat::OccurrencePhase::Completed);
+    }
+
+    /// One occurrence of a schedule firing `target`.
+    #[cfg(all(feature = "mob", feature = "session-store"))]
+    fn cli_scheduled_occurrence(target: meerkat::TargetBinding) -> meerkat::Occurrence {
+        let schedule = meerkat::Schedule::new(meerkat::CreateScheduleRequest {
+            name: Some("cli-mob-redelivery".to_string()),
+            description: None,
+            trigger: meerkat::TriggerSpec::Interval(meerkat::IntervalTriggerSpec {
+                start_at_utc: chrono::Utc::now(),
+                every_seconds: 60,
+                end_at_utc: None,
+            }),
+            target,
+            misfire_policy: meerkat::MisfirePolicy::Skip,
+            overlap_policy: meerkat::OverlapPolicy::SkipIfRunning,
+            missing_target_policy: meerkat::MissingTargetPolicy::Skip,
+            labels: Default::default(),
+            planning_horizon_days: None,
+            planning_horizon_occurrences: None,
+        })
+        .expect("a mob schedule");
+        meerkat::Occurrence::planned_from_schedule(
+            &schedule,
+            meerkat::OccurrenceOrdinal(0),
+            chrono::Utc::now(),
+        )
+        .expect("the occurrence plans")
+    }
+
+    /// The durable external-delivery record a first attempt leaves in mob
+    /// `ops`: its Begin under the occurrence's stable identity, then its
+    /// completed terminal.
+    #[cfg(all(feature = "mob", feature = "session-store"))]
+    async fn record_completed_cli_ops_delivery(
+        mob_state: &meerkat_mob_mcp::MobMcpState,
+        identity: &meerkat::ScheduleDeliveryIdentity,
+        canonical_action: &str,
+    ) {
+        let intent = meerkat_mob::MobExternalDeliveryIntent::new(
+            meerkat_mob::MobId::from("ops"),
+            meerkat_mob::MobExternalDeliveryIdentity::new(
+                identity.idempotency_key.clone(),
+                identity.correlation_id.clone(),
+            )
+            .expect("the occurrence's delivery identity"),
+            meerkat_mob::MobExternalDeliveryTargetKind::MemberSend,
+            canonical_action.as_bytes(),
+        )
+        .expect("the first attempt's intent");
+        assert_eq!(
+            mob_state
+                .mob_begin_external_delivery(&intent)
+                .await
+                .expect("the first attempt's Begin"),
+            meerkat_mob::MobExternalDeliveryBeginOutcome::Begun
+        );
+        mob_state
+            .mob_complete_external_delivery(
+                &intent,
+                &meerkat_mob::MobExternalDeliveryTerminal::Completed,
+            )
+            .await
+            .expect("the first attempt's terminal");
+    }
+
+    /// The CLI host's mob host (the wrapper the schedule host composes,
+    /// not the mob host it wraps) forwards a redelivery to the mob host, so
+    /// a late one reads the mob's durable external-delivery record: a mob
+    /// target and a mob member's identity whose first attempt mob `ops`
+    /// recorded answer from that record (the mob has no member, so only the
+    /// record can complete them). The trait defaults the wrapper fell back
+    /// to answered both not admitted without the read.
+    #[cfg(all(feature = "mob", feature = "session-store"))]
+    #[tokio::test]
+    async fn test_cli_schedule_mob_host_forwards_late_redeliveries_to_the_mob_record() {
+        let temp = tempfile::tempdir().expect("tempdir must be created");
+        let session_store = sqlite_session_store(&temp);
+        let persistence = PersistenceBundle::new(
+            Arc::clone(&session_store),
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
+            Arc::new(meerkat_store::MemoryBlobStore::default()),
+        )
+        .expect("construct runtime authority");
+        let factory = AgentFactory::new(temp.path().join("sessions"))
+            .session_store(session_store)
+            .builtins(false)
+            .shell(false);
+        let (service, runtime_adapter) = build_cli_runtime_backed_service_with_defaults(
+            factory,
+            Config::default(),
+            persistence,
+            temp.path().join("config_state.json"),
+            None,
+            None,
+            None,
+        )
+        .expect("compose the CLI runtime-backed service");
+        let mob_state = meerkat_mob_mcp::MobMcpState::new_in_memory();
+        let definition: meerkat_mob::MobDefinition = serde_json::from_value(serde_json::json!({
+            "id": "ops",
+            "profiles": {
+                "worker": {
+                    "model": "gpt-5.4",
+                    "external_addressable": true,
+                    "tools": {
+                        "comms": true
+                    }
+                }
+            }
+        }))
+        .expect("test mob definition should decode");
+        mob_state
+            .mob_create_definition(definition)
+            .await
+            .expect("the mob that recorded the first attempts");
+        // The cache holds the hydrated state, so the wrapper never hydrates.
+        let host = build_cli_schedule_mob_host(
+            test_scope(temp.path().to_path_buf(), "cli-mob-redelivery"),
+            service,
+            runtime_adapter,
+            Arc::new(CliMobStateCache {
+                state: tokio::sync::Mutex::new(Some(Arc::clone(&mob_state))),
+            }),
+        );
+
+        let mob_target = meerkat::MobTargetBinding::Member {
+            mob_id: "ops".to_string(),
+            member_id: "deploy-monitor".to_string(),
+            action: meerkat::ScheduledMobAction::Send {
+                content: "Check deploy state.".to_string().into(),
+                render_metadata: None,
+            },
+        };
+        let occurrence =
+            cli_scheduled_occurrence(meerkat::TargetBinding::Mob(Box::new(mob_target.clone())));
+        let identity = meerkat::ScheduleDeliveryIdentity::for_occurrence(&occurrence);
+        record_completed_cli_ops_delivery(
+            &mob_state,
+            &identity,
+            &mob_target.stable_key().expect("stable mob target key"),
+        )
+        .await;
+        let answer = host
+            .deliver_existing_mob_target(
+                &occurrence,
+                &identity,
+                &mob_target,
+                meerkat::ExistingDelivery::UnprovenLate,
+            )
+            .await
+            .expect("the mob host's record read answers");
+        let meerkat::ExistingDeliveryAnswer::Dispatch(dispatch) = answer else {
+            panic!("a recorded mob delivery replays from its record");
+        };
+        assert_eq!(
+            dispatch.receipt.stage,
+            meerkat::DeliveryReceiptStage::DispatchAccepted
+        );
+        assert_eq!(
+            dispatch.completion.await.expect("replay completion").phase,
+            meerkat::OccurrencePhase::Completed
+        );
+
+        let identity_target = meerkat::IdentityTargetBinding::resumable(
+            meerkat::surface::mob_member_schedule_identity(&meerkat_core::MobMemberBinding {
+                mob_id: "ops".to_string(),
+                role: "worker".to_string(),
+                member: "deploy-monitor".to_string(),
+            }),
+            meerkat::ScheduledSessionAction::Prompt {
+                prompt: "Check deploy state.".to_string().into(),
+                system_prompt: None,
+                render_metadata: None,
+                skill_refs: Vec::new(),
+                additional_instructions: Vec::new(),
+            },
+        );
+        let occurrence = cli_scheduled_occurrence(meerkat::TargetBinding::Identity(Box::new(
+            identity_target.clone(),
+        )));
+        let identity = meerkat::ScheduleDeliveryIdentity::for_occurrence(&occurrence);
+        record_completed_cli_ops_delivery(
+            &mob_state,
+            &identity,
+            &identity_target
+                .stable_key()
+                .expect("stable identity target key"),
+        )
+        .await;
+        let answer = host
+            .deliver_existing_identity_target(
+                &occurrence,
+                &identity,
+                &identity_target,
+                meerkat::ExistingDelivery::UnprovenLate,
+            )
+            .await
+            .expect("the mob host's record read answers")
+            .expect("the mob host owns a mob member's identity");
+        let meerkat::ExistingDeliveryAnswer::Dispatch(dispatch) = answer else {
+            panic!("a recorded identity delivery replays from its record");
+        };
+        assert_eq!(
+            dispatch.receipt.stage,
+            meerkat::DeliveryReceiptStage::DispatchAccepted
+        );
+        assert_eq!(
+            dispatch.completion.await.expect("replay completion").phase,
+            meerkat::OccurrencePhase::Completed
+        );
     }
 
     #[tokio::test]

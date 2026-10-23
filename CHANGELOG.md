@@ -1269,6 +1269,21 @@ them.
   `runtime_completion_authority_unavailable` end is recorded with:
   `internal_error`.
 
+- `meerkat-mob-mcp`, `meerkat-rpc`, `rkat`, `meerkat-mob`: a late
+  redelivery (only an earlier dispatch start recorded, past the misfire
+  deadline) to a mob member's stable identity, and on the JSON-RPC and CLI
+  hosts to every mob target, ended `misfired` without reading the mob's
+  durable external-delivery record, so an occurrence the mob had admitted
+  and was running ended misfired. The mob host now answers a member
+  identity from that record as it answers a mob target (a record replays
+  the earlier delivery with no second effect; no record ends the occurrence
+  `misfired` with nothing delivered), and the JSON-RPC and CLI hosts hand
+  both redeliveries to it. A remote member host hands a member identity's
+  late redelivery to its session host, as it hands the ordinary delivery,
+  so the deduplicate-only admission finds the earlier input. A JSON-RPC or
+  CLI host that cannot reach its mob state during a redelivery leaves the
+  occurrence reclaimable.
+
 - `SqliteSessionStore::list` and `load_meta` no longer fail now and then
   with `SessionStoreError::Corrupted` for an intact HeadCanonical session
   while a commit to that session lands. Each read took the session's head
