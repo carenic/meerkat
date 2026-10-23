@@ -622,6 +622,14 @@ them.
   a destroyed mob's handle was refused, because a stopped actor's handle
   keeps its last live phase.
 
+- `meerkat-mob`: a mob host that fail-stops on a durable write whose outcome
+  stayed uncertain names the first such write in every refusal after it.
+  Before, a later uncertain write in the same process could replace it, so
+  the refusals named a consequence instead of the cause. The detail is the
+  host's typed error (`MobHostActorError`); where the host built the detail
+  itself it now reads `durable host binding outcome is uncertain: ...`. The
+  refusals keep their cause (`Internal`) and their "restart required" prefix.
+
 ## [0.9.4] - 2026-10-20
 
 ### Breaking

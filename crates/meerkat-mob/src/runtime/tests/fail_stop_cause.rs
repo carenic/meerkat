@@ -236,17 +236,14 @@ async fn a_quarantine_helpers_cause_is_recorded_and_replied() {
 // only the loop exit builds the record variant.
 // ---------------------------------------------------------------------------
 
-/// The field that holds the first uncertain mutation's cause.
+/// The field that holds the first uncertain mutation's cause, in the mob
+/// actor and in the mob host actor alike.
 const FAIL_STOP_FIELD: &str = "durable_uncertainty_fail_stop";
 
 /// What may follow the field: its record methods, its reads, and the `:` of
 /// its declaration and initialization.
 const FAIL_STOP_FIELD_USES: &[&str] =
     &[".record(", ".record_unreplied(", ".is_set(", ".cause(", ":"];
-
-/// Files with a field of that name that is not this actor's: the host actor
-/// keeps its own detail and answers its host requests with it.
-const OTHER_FAIL_STOP_FIELDS: &[&str] = &["runtime/host_actor.rs"];
 
 /// The one function that builds the record, in `runtime/actor.rs`.
 const RECORD_BUILDER: &str = "fn record_durability_fail_stop";
@@ -386,9 +383,6 @@ fn function_body(code: &str, signature: &str) -> Option<std::ops::Range<usize>> 
 fn an_uncertain_durable_mutation_fail_stops_only_through_its_record() {
     let mut misuses = Vec::new();
     for (path, code) in shipped_sources() {
-        if OTHER_FAIL_STOP_FIELDS.contains(&path.as_str()) {
-            continue;
-        }
         misuses.extend(
             fail_stop_field_misuses(&code)
                 .into_iter()
