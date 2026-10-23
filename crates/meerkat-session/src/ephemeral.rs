@@ -2518,6 +2518,10 @@ enum SessionCommand {
         reply_tx:
             oneshot::Sender<Result<HeadCanonicalRuntimeBoundaryAcknowledgeOutcome, AgentError>>,
     },
+    AcknowledgeHeadCanonicalCompactionFinalization {
+        committed: meerkat_core::SessionHeadMetadataIdentity,
+        reply_tx: oneshot::Sender<Result<(), AgentError>>,
+    },
 }
 
 impl SessionCommand {
@@ -4096,6 +4100,19 @@ pub trait SessionAgent: Send {
     ) -> Result<HeadCanonicalRuntimeBoundaryAcknowledgeOutcome, AgentError> {
         Err(AgentError::ConfigError(
             "HeadCanonical boundary acknowledgement is not supported by this session agent"
+                .to_string(),
+        ))
+    }
+
+    /// Adopt the runtime's store-owned HeadCanonical compaction finalization
+    /// as this agent's metadata baseline
+    /// (`Session::acknowledge_head_canonical_compaction_finalization`).
+    fn acknowledge_head_canonical_compaction_finalization(
+        &mut self,
+        _committed: &meerkat_core::SessionHeadMetadataIdentity,
+    ) -> Result<(), AgentError> {
+        Err(AgentError::ConfigError(
+            "HeadCanonical compaction finalization acknowledgement is not supported by this session agent"
                 .to_string(),
         ))
     }
@@ -7481,6 +7498,39 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
             .map_err(SessionError::Agent)
     }
 
+    /// Adopt the runtime's store-owned HeadCanonical compaction finalization
+    /// (`committed` is the finalized head's metadata identity) as the live
+    /// agent's metadata baseline. `NotFound` when no live actor exists.
+    pub async fn acknowledge_head_canonical_compaction_finalization(
+        &self,
+        id: &SessionId,
+        committed: meerkat_core::SessionHeadMetadataIdentity,
+    ) -> Result<(), SessionError> {
+        let command_tx = self.session_command_tx(id).await?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        command_tx
+            .send(
+                SessionCommand::AcknowledgeHeadCanonicalCompactionFinalization {
+                    committed,
+                    reply_tx,
+                },
+            )
+            .await
+            .map_err(|_| {
+                SessionError::Agent(AgentError::InternalError(
+                    "Session task has exited".to_string(),
+                ))
+            })?;
+        reply_rx
+            .await
+            .map_err(|_| {
+                SessionError::Agent(AgentError::InternalError(
+                    "Session task dropped the reply channel".to_string(),
+                ))
+            })?
+            .map_err(SessionError::Agent)
+    }
+
     #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
     pub(crate) async fn sync_session_from_durable_snapshot(
         &self,
@@ -10565,6 +10615,9 @@ async fn drain_session_task_commands<A: SessionAgent>(
             SessionCommand::AcknowledgeHeadCanonicalRuntimeBoundary { reply_tx, .. } => {
                 let _ = reply_tx.send(Err(AgentError::Cancelled));
             }
+            SessionCommand::AcknowledgeHeadCanonicalCompactionFinalization { reply_tx, .. } => {
+                let _ = reply_tx.send(Err(AgentError::Cancelled));
+            }
             SessionCommand::ReplaceClient { reply_tx, .. } => {
                 let _ = reply_tx.send(Err(meerkat_core::error::AgentError::Cancelled));
             }
@@ -12455,6 +12508,13 @@ async fn session_task<A: SessionAgent>(
             } => {
                 let result =
                     agent.acknowledge_head_canonical_runtime_boundary(&successor_head_token);
+                let _ = reply_tx.send(result);
+            }
+            SessionCommand::AcknowledgeHeadCanonicalCompactionFinalization {
+                committed,
+                reply_tx,
+            } => {
+                let result = agent.acknowledge_head_canonical_compaction_finalization(&committed);
                 let _ = reply_tx.send(result);
             }
         }

@@ -698,6 +698,18 @@ them.
   role_targets, and an in-flight bound run canceled by an older runtime loses
   it; a gate must treat a missing binding as not authorized.
 
+- `meerkat-core`: `AgentEvent::ToolExecutionCompleted`
+  (`tool_execution_completed`) no longer carries the tool result body: its
+  `content` field is removed, and the event is `{ id, name, is_error,
+  duration_ms }`. `AgentEvent::ToolResultReceived` (`tool_result_received`)
+  for the same `id` is the only event that carries the body; read it there.
+  Each tool result body is now written once per event stream instead of
+  twice. A stored event that still has `content` decodes, and the field is
+  ignored. SDKs before 0.9.5 reading a 0.9.5 server: the Python SDK requires
+  `content` on `tool_execution_completed`, so it parses the event as a
+  malformed `UnknownEvent` (`malformed_event`); the TypeScript SDK parses it
+  with an empty `content` list.
+
 ### Added
 
 - `meerkat-runtime`: a durable session whose process stopped inside a run
@@ -1726,6 +1738,32 @@ them.
   durable worker placed on and materialized by another host resumes its runs
   there without asking it.
 
+- `meerkat-core`: `CoreExecutor::acknowledge_compaction_finalization` and
+  `SessionService::acknowledge_runtime_compaction_finalization` adopt the
+  runtime's HeadCanonical compaction-outbox finalization (a store-owned,
+  metadata-only head commit) on the live actor, and
+  `Session::acknowledge_head_canonical_compaction_finalization` rebases the
+  actor's metadata baseline over the compaction intents key. Both trait
+  methods refuse by default; the store-backed executors and session services
+  implement them. `meerkat-session`:
+  `SessionAgent::acknowledge_head_canonical_compaction_finalization` (refusing
+  by default) and `PersistentSessionService::acknowledge_runtime_compaction_finalization`.
+  A `SessionService` wrapper or `CoreExecutor` that forwards the compaction
+  reconcile should forward the new method too: otherwise the runtime logs the
+  refusal, the live actor is not adopted, and its next checkpoint after such
+  a compaction is refused once and resyncs, as before.
+
+- `rkat-rpc`: `turn/start`, `session/create` (for its first turn) and
+  `mob/turn_start` take `session_events`. With `false`, the turn's events are
+  not written as `session/event` notifications; absent or `true` keeps them.
+  A caller that reads the turn's events from a `session/stream_open`
+  subscription, or reads only the run result, sends it so each event reaches
+  it once. A turn that also carries the input of a request that wants the
+  events still writes them, and turns that no turn-starting request admitted
+  (external events, comms, schedules, resumed runs) are unchanged. A server
+  before 0.9.5 refuses the field on `turn/start` and `mob/turn_start` and
+  ignores it on `session/create`.
+
 ### Changed
 
 - `meerkat-session`: materializing a durable session whose durable-tail
@@ -1855,6 +1893,20 @@ them.
   compare-and-swap over it. In `meerkat-core`'s generated version authority,
   `STORED_INPUT_STATE_VERSION` is 8, and `STORED_INPUT_STATE_BASELINE_VERSION`
   (7) and `stored_input_state_version_for_row` are new.
+
+- **Behaviour:** Python and TypeScript event subscriptions now drain queued events and raise a
+  typed `EventSubscriptionError` when an existing stream terminal carries an
+  error, including unknown error codes. Previously those iterators ended
+  normally and required inspecting the separate terminal outcome. Error-free
+  remote ends and explicit closes continue to end normally.
+
+- Python and TypeScript SDKs: calls that do not stream their turn
+  (`create_session` / `createSession`, a session's `turn`, and
+  `mob_turn_start` / `mobTurnStart`) send `session_events: false` to a server
+  whose contract is 0.9.5 or later. The server then writes each of the turn's
+  events once, on a subscription if one is open, instead of also writing a
+  `session/event` copy that the SDK parsed and dropped. Streaming calls are
+  unchanged.
 
 ### Fixed
 
@@ -2580,6 +2632,23 @@ them.
   still refuses a `Stopped` runtime, because a later start may resume its
   run.
 
+- `meerkat-runtime`, `meerkat-session`: a live HeadCanonical session serves
+  its next turn after a compaction that staged memory. After a compacting
+  run's boundary, the runtime finalizes the compaction's projection intents
+  in a metadata-only head commit that the live actor never prepared, so the
+  actor's next checkpoint or boundary preparation (its next turn, or a live
+  context append) was refused with "prepared metadata transition does not
+  extend the observed head identity", until a resync on a later input. The
+  live actor now adopts that commit as its metadata baseline after every
+  finalization, after a run and in startup recovery.
+
+- RPC session event subscriptions survive temporary outbound admission or
+  notification-queue overflow. Before subsequent delivery they report lost
+  events through the existing sequence-zero `StreamTruncated(StreamLagged)`
+  marker. An unresolved gap at source end or close uses the reserved error
+  terminal with its dropped count. This remains bounded, best-effort delivery;
+  it does not replay lost events or change mob-stream overflow behavior.
+
 ### Known limitations
 
 - A durable run that resumes asks the model again for a round that took no
@@ -2617,6 +2686,11 @@ them.
   member facts; the mob machine does not decide them itself. The role-wide
   target choice every flow step already used works the same way. The 0.9.6
   line moves both into the mob machine.
+
+- `rkat-rpc`: a session subscription that overflowed reports its gap (the
+  `stream_lagged` marker, and a typed SDK error when the stream ends with the
+  gap open) but does not refill it. Take a run's token accounting from its
+  run result, not from the streamed events.
 
 ## [0.9.4] - 2026-10-20
 

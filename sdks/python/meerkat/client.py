@@ -488,6 +488,11 @@ class _RkatRpcRelease:
 # unkeyed, so the SDK refuses to send a key to it.
 _CALLER_IDEMPOTENCY_KEY_MIN_CONTRACT = (0, 9, 5)
 
+# The first server contract that takes `session_events` on the requests that
+# start a turn. An older server refuses the field on turn/start, so the SDK
+# sends it only to a server that reports this contract or later.
+_TURN_SESSION_EVENTS_OPT_OUT_MIN_CONTRACT = (0, 9, 5)
+
 
 def _contract_parts(version: str) -> tuple[int, ...] | None:
     core = version.split("-", 1)[0].split("+", 1)[0]
@@ -1614,6 +1619,7 @@ class MeerkatClient:
             shell_env=shell_env,
             external_tools=external_tools,
         )
+        self._opt_out_of_turn_session_events(params)
         raw = await self._request("session/create", params)
         result = self._parse_run_result(raw)
         return Session(self, result)
@@ -1866,6 +1872,17 @@ class MeerkatClient:
         """Read detailed session state."""
         result = await self._request("session/read", {"session_id": session_id})
         return self._parse_session_details(result)
+
+    def _opt_out_of_turn_session_events(self, params: dict[str, Any]) -> None:
+        """Ask the server not to write this turn's events as ``session/event``.
+
+        A call that does not stream its turn reads only the run result, so
+        those copies would be parsed and dropped. Sent only to a server whose
+        contract takes the field.
+        """
+        parts = _contract_parts(self._server_contract_version)
+        if parts is not None and parts >= _TURN_SESSION_EVENTS_OPT_OUT_MIN_CONTRACT:
+            params["session_events"] = False
 
     def _require_caller_idempotency_key_support(self) -> None:
         """Refuse a caller key before sending it to a server that would drop it."""
@@ -3985,7 +4002,9 @@ class MeerkatClient:
             provider_params=provider_params,
             auth_binding=auth_binding,
         )
-        return await self._request("mob/turn_start", _wire_value(params))
+        wire = _wire_value(params)
+        self._opt_out_of_turn_session_events(wire)
+        return await self._request("mob/turn_start", wire)
 
     async def mob_member_status(
         self, mob_id: str, agent_identity: str
@@ -4854,6 +4873,7 @@ class MeerkatClient:
             params["provider_params"] = provider_params
         if auth_binding is not None:
             params["auth_binding"] = _wire_value(auth_binding)
+        self._opt_out_of_turn_session_events(params)
         raw = await self._request("turn/start", params)
         return self._parse_run_result(raw)
 

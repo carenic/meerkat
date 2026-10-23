@@ -2691,10 +2691,10 @@ pub enum AgentEvent {
     /// Tool result received (injected into conversation).
     ///
     /// The conversation-level fact for a tool call: this result entered the
-    /// transcript. [`AgentEvent::ToolExecutionCompleted`] is the paired
-    /// execution-level fact for the same `id` and currently carries a full
-    /// copy of these same blocks - see that variant before persisting both, or
-    /// a durable consumer stores every result body twice.
+    /// transcript. It is the only event that carries the result body
+    /// (`content`). [`AgentEvent::ToolExecutionCompleted`] is the paired
+    /// execution-level fact for the same `id`: whether the call failed and
+    /// how long it took. Join the two on `id`.
     ToolResultReceived {
         id: String,
         name: String,
@@ -2753,41 +2753,18 @@ pub enum AgentEvent {
 
     /// Tool execution completed.
     ///
-    /// # This carries a SECOND COPY of the result body
+    /// The execution-level fact for a tool call: the call finished, whether
+    /// it failed, and how long it took. It carries no result body. The body
+    /// is on [`AgentEvent::ToolResultReceived`] for the same `id`, the
+    /// conversation-level fact, so a consumer that keeps both events stores
+    /// each body once and joins the two on `id`.
     ///
-    /// This event and [`AgentEvent::ToolResultReceived`] are both emitted for
-    /// every tool call, and they differ by exactly one field: `duration_ms`.
-    /// Both carry the full `content` blocks. The two facts are genuinely
-    /// distinct and both deserve to exist - `ToolResultReceived` is the
-    /// CONVERSATION fact (this result was injected into the transcript),
-    /// this is the EXECUTION fact (the call finished, and here is how long it
-    /// took) - but the cost of the execution fact currently scales with the
-    /// size of the result rather than with the fact itself.
-    ///
-    /// A consumer that durably persists BOTH events therefore stores every
-    /// tool result body twice. This is not hypothetical: it was measured
-    /// independently on two adopter fleets with different storage engines and
-    /// different payload shapes - a console frame store (~348 MB against
-    /// ~348 MB, pairwise-identical maxima, from 153 camera-tool calls) and a
-    /// warehouse events table (89,033 rows / 3.35 GB against 88,934 rows /
-    /// 1.69 GB). Neither had configured it; both inherited it from this
-    /// vocabulary. Note it is a PER-CALL cost, not a scale problem: one tool
-    /// returning a large blob is enough.
-    ///
-    /// `id` is present on both events and is already the join key. A consumer
-    /// persisting both should store the body once against `id` and join for
-    /// the execution fact, rather than capping bytes at its own writer - a cap
-    /// applied downstream still writes the body twice, only smaller, and every
-    /// consumer would have to reimplement it.
+    /// Before 0.9.5 this event also carried a copy of the body in `content`.
+    /// A stored event that still has the field decodes, and the field is
+    /// ignored.
     ToolExecutionCompleted {
         id: String,
         name: String,
-        /// Canonical typed tool-result content. Display text is derived from
-        /// these blocks at the consumer edge, never carried beside them.
-        ///
-        /// Duplicates the blocks [`AgentEvent::ToolResultReceived`] carries
-        /// for the same `id`; see this variant's docs before persisting both.
-        content: Vec<ContentBlock>,
         is_error: bool,
         duration_ms: u64,
     },
@@ -3410,17 +3387,21 @@ pub fn format_verbose_event_with_config(
         }
         AgentEvent::ToolExecutionCompleted {
             name,
-            content,
             is_error,
             duration_ms,
             ..
         } => {
             let status = if *is_error { "✗" } else { "✓" };
+            Some(format!("  {status} {name} ({duration_ms}ms)"))
+        }
+        AgentEvent::ToolResultReceived { content, .. } => {
             let result_text = crate::types::text_content(content);
-            let result_preview = truncate_preview(&result_text, config.max_tool_result_bytes);
-            Some(format!(
-                "  {status} {name} ({duration_ms}ms): {result_preview}"
-            ))
+            (!result_text.is_empty()).then(|| {
+                format!(
+                    "    {}",
+                    truncate_preview(&result_text, config.max_tool_result_bytes)
+                )
+            })
         }
         AgentEvent::TurnCompleted {
             stop_reason, usage, ..
@@ -4297,7 +4278,6 @@ mod tests {
         let completed = AgentEvent::ToolExecutionCompleted {
             id: "tc_text".to_string(),
             name: "text_tool".to_string(),
-            content: content.clone(),
             is_error: false,
             duration_ms: 12,
         };
@@ -4309,19 +4289,19 @@ mod tests {
         };
 
         let completed_json = serde_json::to_value(&completed).expect("serialize completed event");
-        assert_eq!(
-            completed_json["content"],
-            serde_json::json!([{"type": "text", "text": "plain output"}])
-        );
         assert!(
-            completed_json.get("has_images").is_none(),
-            "typed content blocks should replace image side flags on event surfaces"
+            completed_json.get("content").is_none(),
+            "the execution fact carries no result body: {completed_json}"
         );
 
         let received_json = serde_json::to_value(&received).expect("serialize received event");
         assert_eq!(
             received_json["content"],
             serde_json::json!([{"type": "text", "text": "plain output"}])
+        );
+        assert!(
+            received_json.get("has_images").is_none(),
+            "typed content blocks should replace image side flags on event surfaces"
         );
     }
 
@@ -4331,7 +4311,6 @@ mod tests {
         let completed = AgentEvent::ToolExecutionCompleted {
             id: "tc_image".to_string(),
             name: "view_image".to_string(),
-            content: content.clone(),
             is_error: false,
             duration_ms: 12,
         };
@@ -4342,9 +4321,16 @@ mod tests {
             is_error: false,
         };
 
+        // One copy of the image: on the conversation fact only.
         let completed_json = serde_json::to_value(&completed).expect("serialize completed event");
+        assert!(
+            !completed_json.to_string().contains("AAAA"),
+            "the execution fact carries no copy of the image: {completed_json}"
+        );
+
+        let received_json = serde_json::to_value(&received).expect("serialize received event");
         assert_eq!(
-            completed_json["content"],
+            received_json["content"],
             serde_json::json!([{
                 "type": "image",
                 "media_type": "image/png",
@@ -4353,12 +4339,9 @@ mod tests {
             }])
         );
         assert!(
-            completed_json.get("has_images").is_none(),
+            received_json.get("has_images").is_none(),
             "typed content blocks should replace image side flags on event surfaces"
         );
-
-        let received_json = serde_json::to_value(&received).expect("serialize received event");
-        assert_eq!(received_json["content"], completed_json["content"]);
     }
 
     #[test]
@@ -4368,13 +4351,6 @@ mod tests {
             image_block("image/png", "AAAA"),
             text_block("after"),
         ];
-        let completed = AgentEvent::ToolExecutionCompleted {
-            id: "tc_mixed".to_string(),
-            name: "mixed_tool".to_string(),
-            content: content.clone(),
-            is_error: false,
-            duration_ms: 12,
-        };
         let received = AgentEvent::ToolResultReceived {
             id: "tc_mixed".to_string(),
             name: "mixed_tool".to_string(),
@@ -4382,9 +4358,9 @@ mod tests {
             is_error: false,
         };
 
-        let completed_json = serde_json::to_value(&completed).expect("serialize completed event");
+        let received_json = serde_json::to_value(&received).expect("serialize received event");
         assert_eq!(
-            completed_json["content"],
+            received_json["content"],
             serde_json::json!([
                 {"type": "text", "text": "before"},
                 {
@@ -4396,43 +4372,66 @@ mod tests {
                 {"type": "text", "text": "after"}
             ])
         );
-        assert!(
-            completed_json.get("has_images").is_none(),
-            "typed content blocks should replace image side flags on event surfaces"
-        );
 
-        let roundtrip: AgentEvent = serde_json::from_value(completed_json).unwrap();
+        let roundtrip: AgentEvent = serde_json::from_value(received_json).unwrap();
         match roundtrip {
-            AgentEvent::ToolExecutionCompleted {
+            AgentEvent::ToolResultReceived {
                 content: roundtrip_content,
                 ..
             } => assert_eq!(roundtrip_content, content),
             other => unreachable!("unexpected event: {other:?}"),
         }
+    }
 
-        let received_json = serde_json::to_value(&received).expect("serialize received event");
-        assert_eq!(received_json["content"][0]["text"], "before");
-        assert_eq!(received_json["content"][1]["media_type"], "image/png");
-        assert_eq!(received_json["content"][2]["text"], "after");
+    /// A tool_execution_completed event stored before the body moved to
+    /// tool_result_received still carries `content`: it decodes, the field is
+    /// ignored, and it serializes again without it.
+    #[test]
+    fn a_stored_tool_execution_completed_with_content_still_decodes() {
+        let stored = serde_json::json!({
+            "type": "tool_execution_completed",
+            "id": "tc_stored",
+            "name": "view_image",
+            "content": [
+                {"type": "text", "text": "before"},
+                {
+                    "type": "image",
+                    "media_type": "image/png",
+                    "source": "inline",
+                    "data": "AAAA"
+                }
+            ],
+            "is_error": false,
+            "duration_ms": 7
+        });
+        let decoded: AgentEvent =
+            serde_json::from_value(stored).expect("a stored completion with content decodes");
+        match &decoded {
+            AgentEvent::ToolExecutionCompleted {
+                id,
+                name,
+                is_error,
+                duration_ms,
+            } => {
+                assert_eq!(
+                    (id.as_str(), name.as_str(), *is_error, *duration_ms),
+                    ("tc_stored", "view_image", false, 7)
+                );
+            }
+            other => unreachable!("unexpected event: {other:?}"),
+        }
+        let reencoded = serde_json::to_value(&decoded).expect("serialize the decoded event");
+        assert!(
+            reencoded.get("content").is_none(),
+            "the decoded event carries no body: {reencoded}"
+        );
     }
 
     #[test]
     fn content_less_tool_result_event_payloads_fail_closed() {
-        // Typed `content` blocks are the sole owner of tool-result content;
-        // payloads without them must be rejected, not folded to empty.
-        let completed = serde_json::from_value::<AgentEvent>(serde_json::json!({
-            "type": "tool_execution_completed",
-            "id": "tc_legacy",
-            "name": "legacy_tool",
-            "result": "legacy output",
-            "is_error": false,
-            "duration_ms": 3
-        }));
-        assert!(
-            completed.is_err(),
-            "tool_execution_completed without typed content must fail closed"
-        );
-
+        // Typed `content` blocks are the sole owner of tool-result content,
+        // and tool_result_received is the only event that carries them: a
+        // result payload without them must be rejected, not folded to empty.
         let received = serde_json::from_value::<AgentEvent>(serde_json::json!({
             "type": "tool_result_received",
             "id": "tc_legacy",
@@ -5693,7 +5692,6 @@ mod tests {
             AgentEvent::ToolExecutionCompleted {
                 id: "tool-1".to_string(),
                 name: "search".to_string(),
-                content: ContentBlock::text_vec("ok".to_string()),
                 is_error: false,
                 duration_ms: 1,
             },

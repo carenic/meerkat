@@ -416,7 +416,7 @@ import { parseMobDestroyReport } from "./mob-destroy-report.js";
 import { EventStream, AsyncQueue } from "./streaming.js";
 import { parseUsage } from "./events.js";
 import type { RealtimeMessageOrigin } from "./events.js";
-import { EventSubscription } from "./subscription.js";
+import { EventSubscription, type SubscriptionEvent, type SubscriptionItem } from "./subscription.js";
 import type {
   AgentEventEnvelope,
   AttributedMobEvent,
@@ -1026,7 +1026,7 @@ export class MeerkatClient {
   private eventQueues = new Map<string, AsyncQueue<Record<string, unknown> | null>>();
   private liveNotificationListeners = new Set<LiveNotificationListener>();
   private consentNoticeListeners = new Set<ConsentNoticeListener>();
-  private streamQueues = new Map<string, AsyncQueue<Record<string, unknown> | null>>();
+  private streamQueues = new Map<string, AsyncQueue<SubscriptionItem>>();
   // Per-request_id stream subscriptions for createSessionStreaming calls whose
   // session_id is not yet bound. Keyed by the JSON-RPC request id so concurrent
   // creates are admitted and correlated independently instead of colliding on a
@@ -1038,7 +1038,7 @@ export class MeerkatClient {
   // streams are pending: each event lands under the session it names, and the
   // response that binds that session_id drains exactly its own buffer.
   private unmatchedStreamBuffer = new Map<string, Record<string, unknown>[]>();
-  private unmatchedStandaloneStreamBuffer = new Map<string, Record<string, unknown>[]>();
+  private unmatchedStandaloneStreamBuffer = new Map<string, SubscriptionEvent[]>();
   private unmatchedStandaloneStreamEnd = new Map<string, Record<string, unknown>>();
   private streamTerminalOutcomes = new Map<string, Record<string, unknown>>();
   private rl: ReadlineInterface | null = null;
@@ -1443,6 +1443,7 @@ export class MeerkatClient {
     options?: SessionOptions,
   ): Promise<Session> {
     const params = MeerkatClient.buildCreateParams(prompt, options);
+    this.optOutOfTurnSessionEvents(params);
     const raw = await this.request("session/create", params);
     const result = MeerkatClient.parseRunResult(raw);
     return new Session(this, result);
@@ -1562,13 +1563,8 @@ export class MeerkatClient {
     return MeerkatClient.parseSessionInfo(raw);
   }
 
-  /**
-   * Refuse a caller idempotency key before sending it to a server that would
-   * drop it: before contract 0.9.5 `session/external_event` ignores the field
-   * and admits the call unkeyed.
-   */
-  private requireCallerIdempotencyKeySupport(): void {
-    const minimum = [0, 9, 5];
+  /** Whether the server reports a contract version of at least `minimum`. */
+  private serverContractAtLeast(minimum: readonly number[]): boolean {
     const core = this._serverContractVersion.split("-", 1)[0].split("+", 1)[0];
     const parts = core.split(".").map((part) => Number(part));
     const valid = core.length > 0 && parts.every((part) => Number.isInteger(part));
@@ -1582,7 +1578,29 @@ export class MeerkatClient {
         }
       }
     }
-    if (!atLeast) {
+    return atLeast;
+  }
+
+  /**
+   * Ask the server not to write this turn's events as `session/event`: a call
+   * that does not stream its turn reads only the run result, so those copies
+   * would be parsed and dropped. Sent only to a server whose contract (0.9.5
+   * or later) takes the field; an older server refuses it on `turn/start`.
+   */
+  private optOutOfTurnSessionEvents(params: Record<string, unknown>): void {
+    if (this.serverContractAtLeast([0, 9, 5])) {
+      params.session_events = false;
+    }
+  }
+
+  /**
+   * Refuse a caller idempotency key before sending it to a server that would
+   * drop it: before contract 0.9.5 `session/external_event` ignores the field
+   * and admits the call unkeyed.
+   */
+  private requireCallerIdempotencyKeySupport(): void {
+    const minimum = [0, 9, 5];
+    if (!this.serverContractAtLeast(minimum)) {
       throw new CapabilityUnavailableError(
         "CAPABILITY_UNAVAILABLE",
         `idempotencyKey needs a server contract >= ${minimum.join(".")}; `
@@ -3312,12 +3330,13 @@ export class MeerkatClient {
     prompt: ContentInput,
     options?: MobTurnStartOptions,
   ): Promise<Record<string, unknown>> {
-    return await this.request("mob/turn_start", mobTurnStartPayload(
-      mobId,
-      agentIdentity,
-      prompt,
-      options,
-    ));
+    const payload = mobTurnStartPayload(mobId, agentIdentity, prompt, options);
+    // A non-streaming member turn: opt out of its session/event copies, as
+    // `optOutOfTurnSessionEvents` does for `turn/start`.
+    if (this.serverContractAtLeast([0, 9, 5])) {
+      payload.session_events = false;
+    }
+    return await this.request("mob/turn_start", payload);
   }
 
   async mobMemberStatus(
@@ -4114,15 +4133,17 @@ export class MeerkatClient {
     if (!streamId) {
       throw new MeerkatError("INVALID_RESPONSE", `${openMethod} did not return stream_id`);
     }
-    const queue = new AsyncQueue<Record<string, unknown> | null>();
+    const queue = new AsyncQueue<SubscriptionItem>();
     this.streamQueues.set(streamId, queue);
     const buffered = this.unmatchedStandaloneStreamBuffer.get(streamId) ?? [];
     for (const event of buffered) {
       queue.put(event);
     }
     this.unmatchedStandaloneStreamBuffer.delete(streamId);
-    if (this.unmatchedStandaloneStreamEnd.delete(streamId)) {
-      queue.put(null);
+    const terminal = this.unmatchedStandaloneStreamEnd.get(streamId);
+    if (terminal != null) {
+      this.unmatchedStandaloneStreamEnd.delete(streamId);
+      queue.put({ terminalOutcome: terminal });
     }
     return new EventSubscription<T>({
       streamId,
@@ -4333,6 +4354,7 @@ export class MeerkatClient {
     }
     if (options?.providerParams) params.provider_params = options.providerParams;
     if (options?.authBinding != null) params.auth_binding = options.authBinding;
+    this.optOutOfTurnSessionEvents(params);
     const raw = await this.request("turn/start", params);
     return MeerkatClient.parseRunResult(raw);
   }
@@ -5190,11 +5212,17 @@ export class MeerkatClient {
           scopeId != null || scopePath != null
             ? { event: rawEvent, scope_id: scopeId, scope_path: scopePath }
             : rawEvent;
+        const sequence = params.sequence;
+        const delivery: SubscriptionEvent = {
+          event,
+          rpcSequence: typeof sequence === "number" && Number.isSafeInteger(sequence) && sequence >= 0
+            ? sequence : undefined,
+        };
         if (queue && event) {
-          queue.put(event);
+          queue.put(delivery);
         } else if (streamId && event) {
           const buffered = this.unmatchedStandaloneStreamBuffer.get(streamId) ?? [];
-          buffered.push(event);
+          buffered.push(delivery);
           this.unmatchedStandaloneStreamBuffer.set(streamId, buffered);
         }
         return;
@@ -5206,7 +5234,7 @@ export class MeerkatClient {
         }
         const queue = this.streamQueues.get(streamId);
         if (queue) {
-          queue.put(null);
+          queue.put({ terminalOutcome: params });
         } else if (streamId) {
           this.unmatchedStandaloneStreamEnd.set(streamId, params);
         }

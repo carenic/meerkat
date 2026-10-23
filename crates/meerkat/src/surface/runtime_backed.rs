@@ -2450,6 +2450,16 @@ impl<B: SessionAgentBuilder + 'static> CoreExecutor for PersistentRuntimeExecuto
             .map_err(|error| CoreExecutorError::Internal(error.to_string()))
     }
 
+    async fn acknowledge_compaction_finalization(
+        &mut self,
+        authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+    ) -> Result<(), CoreExecutorError> {
+        self.service
+            .acknowledge_runtime_compaction_finalization(&self.session_id, authority)
+            .await
+            .map_err(|error| CoreExecutorError::Internal(error.to_string()))
+    }
+
     async fn abort_uncommitted_compaction_projections(&mut self) -> Result<(), CoreExecutorError> {
         self.service
             .abort_uncommitted_compaction_projections(&self.session_id)
@@ -5597,6 +5607,14 @@ mod tests {
             ) -> Result<(), CoreExecutorError> {
                 self.inner
                     .reconcile_committed_compaction_projections(intents)
+                    .await
+            }
+            async fn acknowledge_compaction_finalization(
+                &mut self,
+                authority: &CommittedSessionBoundaryAuthority,
+            ) -> Result<(), CoreExecutorError> {
+                self.inner
+                    .acknowledge_compaction_finalization(authority)
                     .await
             }
             async fn abort_uncommitted_compaction_projections(

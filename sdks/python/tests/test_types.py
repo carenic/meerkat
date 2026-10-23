@@ -3732,6 +3732,24 @@ def test_parse_tool_execution_completed():
         "type": "tool_execution_completed",
         "id": "t1",
         "name": "search",
+        "is_error": False,
+        "duration_ms": 42,
+    }
+    event = parse_event(raw)
+    assert isinstance(event, ToolExecutionCompleted)
+    assert event.name == "search"
+    assert event.duration_ms == 42
+    assert event.is_error is False
+    # The execution fact carries no result body: it is on ToolResultReceived.
+    assert not hasattr(event, "content")
+
+
+def test_parse_tool_execution_completed_ignores_an_older_servers_content():
+    # A server before 0.9.5 still sends the body on the completion too.
+    raw = {
+        "type": "tool_execution_completed",
+        "id": "t1",
+        "name": "search",
         "content": [
             {"type": "text", "text": "found it"},
             {
@@ -3746,18 +3764,13 @@ def test_parse_tool_execution_completed():
     }
     event = parse_event(raw)
     assert isinstance(event, ToolExecutionCompleted)
-    assert event.name == "search"
-    assert event.duration_ms == 42
-    assert event.is_error is False
-    assert event.content == [
-        {"type": "text", "text": "found it"},
-        {
-            "type": "image",
-            "media_type": "image/png",
-            "source": "inline",
-            "data": "AAAA",
-        },
-    ]
+    assert (event.id, event.name, event.is_error, event.duration_ms) == (
+        "t1",
+        "search",
+        False,
+        42,
+    )
+    assert not hasattr(event, "content")
 
 
 def test_parse_tool_result_received_content_blocks():
@@ -3774,14 +3787,13 @@ def test_parse_tool_result_received_content_blocks():
     assert event.is_error is False
 
 
-def test_parse_tool_execution_completed_preserves_malformed_content_blocks():
+def test_parse_tool_result_received_preserves_malformed_content_blocks():
     raw = {
-        "type": "tool_execution_completed",
+        "type": "tool_result_received",
         "id": "t1",
         "name": "search",
         "content": "not blocks",
         "is_error": False,
-        "duration_ms": 42,
     }
     event = parse_event(raw)
     assert isinstance(event, UnknownEvent)
@@ -3795,7 +3807,6 @@ def test_parse_tool_execution_completed_does_not_coerce_missing_or_malformed_is_
             "type": "tool_execution_completed",
             "id": "t1",
             "name": "search",
-            "content": [{"type": "text", "text": "found it"}],
         }
     )
     malformed = parse_event(
@@ -3803,7 +3814,6 @@ def test_parse_tool_execution_completed_does_not_coerce_missing_or_malformed_is_
             "type": "tool_execution_completed",
             "id": "t1",
             "name": "search",
-            "content": [{"type": "text", "text": "found it"}],
             "is_error": "false",
         }
     )
@@ -3813,8 +3823,6 @@ def test_parse_tool_execution_completed_does_not_coerce_missing_or_malformed_is_
     assert malformed.is_error is None
     assert missing.duration_ms is None
     assert malformed.duration_ms is None
-    assert missing.content == [{"type": "text", "text": "found it"}]
-    assert malformed.content == [{"type": "text", "text": "found it"}]
 
 
 def test_parse_unknown_event_type():

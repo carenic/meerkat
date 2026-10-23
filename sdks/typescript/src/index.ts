@@ -76,7 +76,7 @@ export type {
 export { CONSENT_NOTICE_NOTIFICATION, parseConsentNotice } from "./consent.js";
 export type { ConsentNotice, ConsentNoticeListener } from "./consent.js";
 export { EventStream } from "./streaming.js";
-export { EventSubscription } from "./subscription.js";
+export { EventSubscription, EventSubscriptionError } from "./subscription.js";
 export type {
   AgentEventEnvelope,
   AttributedEvent,

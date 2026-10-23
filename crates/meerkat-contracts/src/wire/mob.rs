@@ -2791,6 +2791,11 @@ pub struct MobTurnStartParams {
     /// Host-regenerated request-only context for this member turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transient_turn_context: Option<meerkat_core::lifecycle::run_primitive::TurnRequestContext>,
+    /// `false`: this turn's events are not written as `session/event`
+    /// notifications, as on `turn/start`. Absent or `true` keeps them. Since
+    /// 0.9.5; an older server refuses the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_events: Option<bool>,
 }
 
 /// One currently wired peer that is known to be unreachable.

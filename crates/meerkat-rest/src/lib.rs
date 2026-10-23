@@ -2295,6 +2295,17 @@ impl CoreExecutor for RestSessionRuntimeExecutor {
             .map_err(|error| CoreExecutorError::Internal(error.to_string()))
     }
 
+    async fn acknowledge_compaction_finalization(
+        &mut self,
+        authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+    ) -> Result<(), CoreExecutorError> {
+        self.context
+            .session_service
+            .acknowledge_runtime_compaction_finalization(&self.session_id, authority)
+            .await
+            .map_err(|error| CoreExecutorError::Internal(error.to_string()))
+    }
+
     async fn checkpoint_committed_session_snapshot(
         &mut self,
         session_snapshot: Arc<Vec<u8>>,
