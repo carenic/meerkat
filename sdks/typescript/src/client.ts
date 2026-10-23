@@ -980,6 +980,20 @@ function normalizeMobWireMembersBatchEdge(
 // close before its exit is settled anyway.
 const CHILD_EXIT_PIPE_GRACE_MS = 1_000;
 
+// How much of a child's stderr an error message carries, in UTF-16 units.
+const CHILD_STDERR_TAIL_UNITS = 8_192;
+
+/**
+ * The last `CHILD_STDERR_TAIL_UNITS` units of a child's stderr, never starting
+ * with the second half of a surrogate pair that the cut split.
+ */
+function childStderrTail(text: string): string {
+  if (text.length <= CHILD_STDERR_TAIL_UNITS) return text;
+  const tail = text.slice(-CHILD_STDERR_TAIL_UNITS);
+  const first = tail.charCodeAt(0);
+  return first >= 0xdc00 && first <= 0xdfff ? tail.slice(1) : tail;
+}
+
 export class MeerkatClient {
   private process: ChildProcess | null = null;
   // Permanent transport-failed state: once the JSONL framing is untrustworthy
@@ -1175,8 +1189,11 @@ export class MeerkatClient {
     this.transportFault = null;
     const child = this.process;
     this.processStderr = "";
-    child.stderr?.on("data", (chunk: string | Buffer) => {
-      this.processStderr = (this.processStderr + String(chunk)).slice(-8192);
+    // Decoded as one stream: a character split across two pipe reads stays
+    // whole instead of becoming U+FFFD.
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk: string) => {
+      this.processStderr = childStderrTail(this.processStderr + chunk);
     });
     child.once("error", (error) => {
       if (this.process === child) {
@@ -8644,7 +8661,9 @@ export class MeerkatClient {
       const options: SpawnOptions = { stdio: ["ignore", "inherit", "pipe"] };
       const proc = spawn(command, args, options);
       let stderr = "";
-      proc.stderr?.on("data", (chunk: string | Buffer) => { stderr += String(chunk); });
+      // Decoded as one stream, so a character split across two reads stays whole.
+      proc.stderr?.setEncoding("utf8");
+      proc.stderr?.on("data", (chunk: string) => { stderr += chunk; });
       proc.on("error", (error: Error) => { reject(error); });
       proc.on("close", (code: number | null) => {
         if (code === 0) { resolve(); return; }

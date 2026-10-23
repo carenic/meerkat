@@ -881,6 +881,28 @@ them.
   names the deadline it had ("after 301s (1s connect timeout and the 300s
   interactive login window)"). No public API changes.
 
+- Streamed model text keeps a character that a network chunk boundary split
+  intact. The OpenAI Responses, OpenAI-compatible Chat Completions, OpenAI
+  streamed image, Anthropic and Gemini stream readers decoded every network
+  chunk on its own before splitting it into lines, so a multi-byte character
+  (a typographic apostrophe, an emoji) that straddled two chunks became
+  U+FFFD in the streamed text, the live events and the stored history. The
+  readers now keep the bytes until a line is complete and decode each
+  complete line strictly (`meerkat_llm_core::streaming::Utf8LineBuffer`). A
+  complete line that is not valid UTF-8 fails the stream as a stream parse
+  error instead of being replaced; after an OpenAI-compatible stream's finish
+  it ends the stream, like any other undecodable line there. Bytes after the
+  last line break are treated as before: the Anthropic reader still reads
+  them as a last line, now decoded as strictly, and an OpenAI-compatible
+  stream that ends inside a line before its finish is still an incomplete
+  response, also when it ends inside a character.
+
+- The TypeScript SDK decodes a child process's stderr as one stream, so a
+  character that a pipe read split stays intact in the stderr that a
+  `PROCESS_EXITED` or `ARCHIVE_EXTRACT_FAILED` error carries (it became
+  U+FFFD), and the stderr tail of a `PROCESS_EXITED` error never starts with
+  half of a surrogate pair.
+
 ## [0.9.4] - 2026-10-20
 
 ### Breaking

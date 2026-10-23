@@ -2353,21 +2353,21 @@ impl OpenAiClient {
         response: reqwest::Response,
     ) -> Result<ProviderImageGenerationOutput, LlmError> {
         let mut stream = Box::pin(response.bytes_stream());
-        let mut buffer = String::with_capacity(512);
+        let mut lines = meerkat_llm_core::streaming::Utf8LineBuffer::with_capacity(512);
         let mut streamed_output_items: Vec<Value> = Vec::new();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|_| LlmError::ConnectionReset)?;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            lines.push(&chunk);
 
-            while let Some(newline_pos) = buffer.find('\n') {
-                let line = buffer[..newline_pos].trim();
+            while let Some(line) = lines.next_line() {
+                let line = line?;
+                let line = line.trim();
                 let should_process = !line.is_empty() && !line.starts_with(':');
                 let parsed_event = if should_process {
                     Self::parse_responses_sse_line(line)?
                 } else {
                     None
                 };
-                buffer.drain(..=newline_pos);
 
                 let Some(event) = parsed_event else {
                     continue;
@@ -2579,7 +2579,7 @@ impl OpenAiClient {
             for diagnostic in diagnostics { yield diagnostic; }
             let response = response?;
             let mut stream = response.bytes_stream();
-            let mut buffer = String::with_capacity(512);
+            let mut lines = meerkat_llm_core::streaming::Utf8LineBuffer::with_capacity(512);
             let mut usage = Usage::default();
             let mut active_response_id: Option<String> = None;
             let mut saw_stream_text_delta = false;
@@ -2606,15 +2606,15 @@ impl OpenAiClient {
 
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|_| LlmError::ConnectionReset)?;
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                lines.push(&chunk);
 
                 let chunk_yielded = std::cell::Cell::new(false);
                 let mut chunk_consumed_line = false;
-                while let Some(newline_pos) = buffer.find('\n') {
+                while let Some(line) = lines.next_line() {
                     chunk_consumed_line = true;
-                    let line = buffer[..newline_pos].trim();
+                    let line = line?;
+                    let line = line.trim();
                     if line == "data: [DONE]" {
-                        buffer.drain(..=newline_pos);
                         if !done_emitted && saw_terminal_fallback_output {
                             if !completed_items.is_empty() {
                                 let blocks = crate::responses_output::lower_items(completed_items.values(), active_response_id.as_deref())?;
@@ -2654,8 +2654,6 @@ impl OpenAiClient {
                     } else {
                         None
                     };
-
-                    buffer.drain(..=newline_pos);
 
                     if let Some(event) = parsed_event {
                         if let Some(response_id) = event
@@ -4808,6 +4806,181 @@ mod tests {
             axum::serve(listener, app).await.expect("serve test server");
         });
         (format!("http://{addr}"), handle)
+    }
+
+    /// Serves each element of `chunks` as a separate paced HTTP body chunk of
+    /// raw bytes, so one character can straddle two network reads.
+    async fn paced_byte_sse(State(chunks): State<Vec<Vec<u8>>>) -> impl IntoResponse {
+        let body_stream = async_stream::stream! {
+            for chunk in chunks {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                yield Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(chunk));
+            }
+        };
+        (
+            [("content-type", "text/event-stream")],
+            axum::body::Body::from_stream(body_stream),
+        )
+    }
+
+    async fn spawn_openai_paced_byte_server(
+        route: &'static str,
+        chunks: Vec<Vec<u8>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route(route, post(paced_byte_sse))
+            .with_state(chunks);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// `payload` cut into two network chunks inside each multi-byte character
+    /// of `text` (a 3-byte one 1|2 and 2|1, a 4-byte one 1|3, 2|2 and 3|1),
+    /// and on each side of the line break that ends the line holding `text`.
+    fn utf8_split_cases(payload: &str, text: &str) -> Vec<(String, Vec<Vec<u8>>)> {
+        let bytes = payload.as_bytes();
+        let start = payload.find(text).expect("payload holds the text");
+        let mut cases = Vec::new();
+        for (offset, ch) in text.char_indices().filter(|(_, ch)| ch.len_utf8() > 1) {
+            for split in 1..ch.len_utf8() {
+                let at = start + offset + split;
+                cases.push((
+                    format!(
+                        "U+{:04X} split {split}|{}",
+                        ch as u32,
+                        ch.len_utf8() - split
+                    ),
+                    vec![bytes[..at].to_vec(), bytes[at..].to_vec()],
+                ));
+            }
+        }
+        let line_end = start + payload[start..].find('\n').expect("a line break");
+        for (side, at) in [("before", line_end), ("after", line_end + 1)] {
+            cases.push((
+                format!("chunk boundary {side} the line break"),
+                vec![bytes[..at].to_vec(), bytes[at..].to_vec()],
+            ));
+        }
+        cases
+    }
+
+    const SPLIT_TEXT: &str = "don\u{2019}t panic \u{1F642}";
+
+    fn split_responses_payload(text_json: &str) -> String {
+        let delta =
+            format!(r#"data: {{"type":"response.output_text.delta","delta":"{text_json}"}}"#);
+        [
+            delta.as_str(),
+            r#"data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":4,"output_tokens":3}}}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n")
+    }
+
+    /// The streamed Responses text and terminal outcome of one paced byte
+    /// stream.
+    async fn stream_responses_paced_bytes(
+        chunks: Vec<Vec<u8>>,
+    ) -> (String, Option<LlmDoneOutcome>) {
+        let (base_url, server) = spawn_openai_paced_byte_server("/v1/responses", chunks).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let request = LlmRequest::new(
+            "gpt-5.5",
+            vec![Message::User(UserMessage::text("hello".to_string()))],
+        );
+        let mut stream = client.stream(&request);
+        let mut text = String::new();
+        let mut done = None;
+        while let Some(event) = stream.next().await {
+            match event.expect("stream event") {
+                LlmEvent::TextDelta { delta, .. } => text.push_str(&delta),
+                LlmEvent::Done { outcome } => {
+                    done = Some(outcome);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        server.abort();
+        (text, done)
+    }
+
+    /// A character split across network chunks reaches the Responses text
+    /// exactly, never as U+FFFD, wherever the chunk boundary falls.
+    /// (Fails-old: each chunk was decoded on its own, so a split character
+    /// became U+FFFD.)
+    #[tokio::test]
+    async fn responses_text_split_inside_a_multibyte_character_arrives_exact() {
+        let payload = split_responses_payload(SPLIT_TEXT);
+        let mut failures = Vec::new();
+        for (case, chunks) in utf8_split_cases(&payload, SPLIT_TEXT) {
+            let (text, done) = stream_responses_paced_bytes(chunks).await;
+            if text != SPLIT_TEXT || !matches!(done, Some(LlmDoneOutcome::Success { .. })) {
+                failures.push(format!("{case}: {text:?} {done:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// A complete Responses line that is not valid UTF-8 fails the stream as
+    /// a parse error; its bytes are never replaced with U+FFFD. (Fails-old:
+    /// the invalid byte became U+FFFD in the text and the turn succeeded.)
+    #[tokio::test]
+    async fn responses_line_with_invalid_utf8_is_a_stream_parse_error() {
+        let mut payload = split_responses_payload("bad \u{0001} byte").into_bytes();
+        let marker = payload
+            .iter()
+            .position(|byte| *byte == 0x01)
+            .expect("marker byte");
+        payload[marker] = 0xFF;
+        let (text, done) = stream_responses_paced_bytes(vec![payload]).await;
+        assert!(!text.contains('\u{FFFD}'), "{text:?}");
+        assert!(
+            matches!(
+                &done,
+                Some(LlmDoneOutcome::Error {
+                    error: LlmError::StreamParseError { .. }
+                })
+            ),
+            "{done:?}"
+        );
+    }
+
+    /// The streamed image path (ChatGPT backend) reads a provider message
+    /// split inside a multi-byte character exactly. (Fails-old: the split
+    /// character became U+FFFD in the reported failure.)
+    #[tokio::test]
+    async fn streamed_image_failure_split_inside_a_multibyte_character_arrives_exact() {
+        let event = format!(
+            r#"data: {{"type":"error","error":{{"code":"rate_limit_exceeded","message":"{SPLIT_TEXT}"}}}}"#
+        );
+        let payload = [event.as_str(), "data: [DONE]", ""].join("\n");
+        let mut failures = Vec::new();
+        for (case, chunks) in utf8_split_cases(&payload, SPLIT_TEXT) {
+            let (base_url, handle) = spawn_openai_paced_byte_server("/responses", chunks).await;
+            let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url)
+                .with_chatgpt_backend_wire();
+            let output = client
+                .execute_image_generation(image_executor_request_json(hosted_openai_plan_json()))
+                .await
+                .unwrap_or_else(|err| panic!("{case}: a provider failure output: {err}"));
+            handle.abort();
+            if !matches!(
+                output.warnings.as_slice(),
+                [ImageGenerationWarning::ProviderExecutionFailed { message }]
+                    if message.contains(SPLIT_TEXT) && !message.contains('\u{FFFD}')
+            ) {
+                failures.push(format!("{case}: {:?}", output.warnings));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     async fn spawn_openai_stub_server_with_body(
