@@ -15,13 +15,13 @@
 # whole bounded space once (safety), then reruns it once per reachability
 # witness with that witness's negation as an extra invariant and requires
 # TLC to report exactly that violation, so the invariants are not vacuous.
-# With --mutants it then seeds eleven defects into a copy of the generated
+# With --mutants it then seeds twelve defects into a copy of the generated
 # model (or, for the serve-before-settle control, into the audit's settlement
 # order) and requires TLC to refuse each with the invariant it breaks: a
 # verdict that ignores the phase and lane, one that reads a fact the
 # unregister changes, one that differs across the exit, a stop cleanup that
 # skips staged inputs, an expiry abandon that keeps the input queued,
-# serving before the settlement, a verdict without the disposition, three
+# serving before the settlement, a verdict without the disposition, four
 # verdicts each without one eligibility conjunct, and an Abandon arm that
 # overlaps Retain. An anchor this script expects but cannot find fails the
 # run.
@@ -121,6 +121,7 @@ write_cfg() {
   AuditExpiredNeverRuns
   AuditRetainOnlyUnderRequeue
   AuditRetainOnlyEligible
+  AuditRetainNeverObjectiveBound
   AuditStopVerdictIsAFunction${extra}" "${cfg}"
   replace_exact_line "  CiStateConstraint" "  AuditStateConstraint" "${cfg}"
   printf 'CHECK_DEADLOCK FALSE\n' >> "${cfg}"
@@ -355,6 +356,17 @@ from requeue_mutation import edit_arms
 path = os.environ["MODEL"]
 text = open(path).read()
 text = edit_arms(text, ' /\\ (durability = "Durable")', '')
+open(path, "w").write(text)
+PY
+
+  # The objective conjunct: a member's kickoff (an objective-bound prompt)
+  # is never kept, so its failure record stays true.
+  mutate retains_objective_bound AuditRetainNeverObjectiveBound TRUE <<'PY'
+import os
+from requeue_mutation import edit_arms
+path = os.environ["MODEL"]
+text = open(path).read()
+text = edit_arms(text, ' /\\ (objective_bound = FALSE)', '')
 open(path, "w").write(text)
 PY
 

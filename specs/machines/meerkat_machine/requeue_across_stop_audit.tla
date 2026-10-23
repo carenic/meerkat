@@ -16,23 +16,24 @@
 \* This audit keeps the generated MeerkatMachine model unchanged and explores
 \* two processes. Process 1 registers one session, admits an input A and runs
 \* it, then admits an input B behind that run with every combination of kind
-\* (Prompt, ExternalEvent), durability and directedness. It begins an
-\* unregister with either disposition, or none at all, and either cancels A's
-\* run (the run cancel ends A Abandoned(Cancelled)) or leaves it running,
-\* then stops the runtime. The stop classifies each non-terminal input twice,
-\* as the shell does: once for the carriers before the exit and once for the
-\* cleanup after it (the shell refuses a stop whose two answers differ).
-\* After the stop it explores a replayed stop transaction
-\* (terminalize_async_stop_once runs again when no runless carrier was
-\* committed), an unregister begun only after a plain stop, and the
-\* unregister drain. The restart is a NEW process: every generated variable
-\* returns to its initial value (AuditFreshMachine, derived from the
-\* generated Init on every run by requeue_across_stop_audit.sh), and each
-\* durable non-terminal row is recovered through the generated recovery arms
-\* (the durability and normalization classifiers, RecoverAdmittedInput,
-\* RecoverInputLifecycle). Then each marked row is settled before the serving
-\* gate, with the shell's expired observation either value, the executor
-\* attaches and the runtime loop runs. Properties (all invariants):
+\* (Prompt, ExternalEvent), durability, directedness and objective binding (a
+\* member's kickoff carries its objective id). It begins an unregister with
+\* either disposition, or none at all, and either cancels A's run (the run
+\* cancel ends A Abandoned(Cancelled)) or leaves it running, then stops the
+\* runtime. The stop classifies each non-terminal input twice, as the shell
+\* does: once for the carriers before the exit and once for the cleanup after
+\* it (the shell refuses a stop whose two answers differ). After the stop it
+\* explores a replayed stop transaction (terminalize_async_stop_once runs
+\* again when no runless carrier was committed), an unregister begun only
+\* after a plain stop, and the unregister drain. The restart is a NEW
+\* process: every generated variable returns to its initial value
+\* (AuditFreshMachine, derived from the generated Init on every run by
+\* requeue_across_stop_audit.sh), and each durable non-terminal row is
+\* recovered through the generated recovery arms (the durability and
+\* normalization classifiers, RecoverAdmittedInput, RecoverInputLifecycle).
+\* Then each marked row is settled before the serving gate, with the shell's
+\* expired observation either value, the executor attaches and the runtime
+\* loop runs. Properties (all invariants):
 \*
 \*   AuditRetainedNeverRunBeforeRestart (P1): no input answered Retain was
 \*     ever staged into a run of process 1, and it stays Queued until the
@@ -55,6 +56,8 @@
 \*     blanket abandon.
 \*   AuditRetainOnlyEligible: a kept input is a Queue-lane Prompt, durable
 \*     and not directed, by the facts its admission recorded.
+\*   AuditRetainNeverObjectiveBound: a kept input is never objective-bound,
+\*     so a kickoff the stopping process records failed is never run later.
 \*   AuditStopVerdictIsAFunction: during a stop transaction exactly one of
 \*     the two verdict arms is enabled for each input still to classify.
 \*
@@ -86,7 +89,7 @@ CONSTANTS AuditMaxSteps, AuditSettleBeforeServe
 
 VARIABLES
     audit_stage,           \* which part of the two-process run this is
-    audit_facts,           \* each admitted input's kind, durability, directedness
+    audit_facts,           \* each admitted input's kind, durability, directedness, objective
     audit_disposition,     \* the disposition the host began its unregister with
     audit_attempts,        \* stop transactions committed in process 1
     audit_pending,         \* inputs the open stop pass still classifies
@@ -133,21 +136,21 @@ Answered(verdicts, v) == {i \in DOMAIN verdicts : verdicts[i] = v}
 
 \* ---- generated arms, one disjunct per phase ----
 
-RetainArm(i, d, dir) ==
-    \/ ClassifyStopInputDispositionRetainInitializing(i, d, dir)
-    \/ ClassifyStopInputDispositionRetainIdle(i, d, dir)
-    \/ ClassifyStopInputDispositionRetainAttached(i, d, dir)
-    \/ ClassifyStopInputDispositionRetainRunning(i, d, dir)
-    \/ ClassifyStopInputDispositionRetainRetired(i, d, dir)
-    \/ ClassifyStopInputDispositionRetainStopped(i, d, dir)
+RetainArm(i, d, dir, obj) ==
+    \/ ClassifyStopInputDispositionRetainInitializing(i, d, dir, obj)
+    \/ ClassifyStopInputDispositionRetainIdle(i, d, dir, obj)
+    \/ ClassifyStopInputDispositionRetainAttached(i, d, dir, obj)
+    \/ ClassifyStopInputDispositionRetainRunning(i, d, dir, obj)
+    \/ ClassifyStopInputDispositionRetainRetired(i, d, dir, obj)
+    \/ ClassifyStopInputDispositionRetainStopped(i, d, dir, obj)
 
-AbandonArm(i, d, dir) ==
-    \/ ClassifyStopInputDispositionAbandonInitializing(i, d, dir)
-    \/ ClassifyStopInputDispositionAbandonIdle(i, d, dir)
-    \/ ClassifyStopInputDispositionAbandonAttached(i, d, dir)
-    \/ ClassifyStopInputDispositionAbandonRunning(i, d, dir)
-    \/ ClassifyStopInputDispositionAbandonRetired(i, d, dir)
-    \/ ClassifyStopInputDispositionAbandonStopped(i, d, dir)
+AbandonArm(i, d, dir, obj) ==
+    \/ ClassifyStopInputDispositionAbandonInitializing(i, d, dir, obj)
+    \/ ClassifyStopInputDispositionAbandonIdle(i, d, dir, obj)
+    \/ ClassifyStopInputDispositionAbandonAttached(i, d, dir, obj)
+    \/ ClassifyStopInputDispositionAbandonRunning(i, d, dir, obj)
+    \/ ClassifyStopInputDispositionAbandonRetired(i, d, dir, obj)
+    \/ ClassifyStopInputDispositionAbandonStopped(i, d, dir, obj)
 
 AbandonAny(i, reason, n) ==
     \/ AbandonInputIdle(i, reason, n)
@@ -176,8 +179,8 @@ AdmitPlan(i, kind) ==
 \* The stop classification of input i under its admission facts.
 Classify(i, verdicts) ==
     LET f == audit_facts[i] IN
-    \/ RetainArm(i, f.durability, f.directed) /\ verdicts' = verdicts @@ (i :> "Retain")
-    \/ AbandonArm(i, f.durability, f.directed) /\ verdicts' = verdicts @@ (i :> "Abandon")
+    \/ RetainArm(i, f.durability, f.directed, f.objective_bound) /\ verdicts' = verdicts @@ (i :> "Retain")
+    \/ AbandonArm(i, f.durability, f.directed, f.objective_bound) /\ verdicts' = verdicts @@ (i :> "Abandon")
 
 KeepAudit == UNCHANGED auditVars
 
@@ -199,9 +202,12 @@ AuditSetup ==
           /\ UNCHANGED <<audit_stage, setupVars, regionVars, historyVars, audit_staged_p2,
                          restartVars>>
        \/ model_step_count = 7
-          /\ \E kind \in AuditKinds, d \in InputDurabilityKindValues, dir \in BOOLEAN :
+          /\ \E kind \in AuditKinds, d \in InputDurabilityKindValues, dir \in BOOLEAN,
+                obj \in BOOLEAN :
                 /\ AdmitPlan(AuditB, kind)
-                /\ audit_facts' = audit_facts @@ (AuditB :> [kind |-> kind, durability |-> d, directed |-> dir])
+                /\ audit_facts' = audit_facts @@ (AuditB :> [kind |-> kind, durability |-> d,
+                                                             directed |-> dir,
+                                                             objective_bound |-> obj])
           /\ UNCHANGED <<audit_stage, audit_disposition, audit_attempts, regionVars,
                          historyVars, runVars, restartVars>>
        \/ model_step_count = 8
@@ -442,7 +448,8 @@ AuditNext ==
 AuditInit ==
     /\ Init
     /\ audit_stage = "Setup"
-    /\ audit_facts = (AuditA :> [kind |-> "Prompt", durability |-> "Durable", directed |-> FALSE])
+    /\ audit_facts = (AuditA :> [kind |-> "Prompt", durability |-> "Durable", directed |-> FALSE,
+                                  objective_bound |-> FALSE])
     /\ audit_disposition = "None"
     /\ audit_attempts = 0
     /\ audit_pending = {}
@@ -497,12 +504,15 @@ AuditRetainOnlyEligible ==
         /\ audit_facts[i].durability = "Durable"
         /\ ~audit_facts[i].directed
 
+AuditRetainNeverObjectiveBound ==
+    \A i \in OpenRetains \cup audit_retained : ~audit_facts[i].objective_bound
+
 AuditStopVerdictIsAFunction ==
     audit_stage \in {"PreExit", "PostExit"} =>
         \A i \in audit_pending :
             LET f == audit_facts[i] IN
-            (ENABLED RetainArm(i, f.durability, f.directed))
-                # (ENABLED AbandonArm(i, f.durability, f.directed))
+            (ENABLED RetainArm(i, f.durability, f.directed, f.objective_bound))
+                # (ENABLED AbandonArm(i, f.durability, f.directed, f.objective_bound))
 
 \* ---- reachability goals, each checked as an expected violation ----
 
@@ -535,6 +545,7 @@ AuditWitnessStopAbandonsEligible ==
     /\ audit_facts[AuditB].kind = "Prompt"
     /\ audit_facts[AuditB].durability = "Durable"
     /\ ~audit_facts[AuditB].directed
+    /\ ~audit_facts[AuditB].objective_bound
 \* A stop outside an unregister ends B, and the restart recovers nothing.
 AuditWitnessPlainStopAbandons ==
     /\ audit_disposition = "None"
