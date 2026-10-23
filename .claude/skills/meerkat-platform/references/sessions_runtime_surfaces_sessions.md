@@ -372,9 +372,9 @@ Contract and limits: `docs/guides/durable-runs.mdx`.
   machine-service turns). A run settled without resuming (a stop first, a
   refused resume, a requeue stop past its max age) is closed the same way,
   never discarded: committed rounds stay, a round's staged response is
-  written with an outcome-unknown error result per tool call (the calls may
-  have run), the interrupted notice is appended, and its inputs never run
-  again. Held (`SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY`),
+  written with an `outcome_uncertain` error result per tool call (the calls
+  may have run), the interrupted notice is appended, and its inputs never
+  run again. Held (`SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY`),
   never committed: a cursor that disagrees with the transcript, and a tail
   left behind with requeued inputs.
 - Reruns are at least once and pass authorization, approval review and

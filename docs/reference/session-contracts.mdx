@@ -772,8 +772,9 @@ the committed authority is preserved.
   recovery notice appended, the original run terminalized, never requeued.
   Since 0.9.5, when the tail's run cursor holds a round's staged model
   response, the response is written into the transcript before the notice,
-  with an error result for each of its tool calls that says only that the
-  call's outcome is unknown: the calls may have run.
+  with an `outcome_uncertain` tool error result for each of its tool calls,
+  which says only that the call's outcome is unknown: the calls may have
+  run.
 - Anything else — including any tail carrying a dangling `tool_use` — is held
   intact for reconciliation. A dangling call proves intent, not execution;
   its external side effect may already have fired, so recovery never closes
