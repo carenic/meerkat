@@ -833,6 +833,7 @@ impl CompletionHandle {
                 tool_use_id,
                 tool_name,
                 args,
+                dedupe_key: None,
             },
             crate::meerkat_machine::dsl::RuntimeCompletionResultClass::CallbackPending,
             crate::meerkat_machine::dsl::RuntimeCompletionTerminalObservation::CallbackPending,
@@ -1728,6 +1729,7 @@ impl CompletionRegistry {
                     tool_use_id,
                     tool_name,
                     args,
+                    dedupe_key: None,
                 },
                 cleanup_observation,
                 None,
@@ -2131,12 +2133,14 @@ mod tests {
                 tool_name: "ask_a".to_string(),
                 args: serde_json::json!({"tool_use_id": "call-a", "question": "a"}),
                 settlement_failures: Vec::new(),
+                dedupe_key: None,
             },
             meerkat_core::error::PendingCallbackToolCall {
                 tool_use_id: "call-b".to_string(),
                 tool_name: "ask_b".to_string(),
                 args: serde_json::json!({"tool_use_id": "call-b", "question": "b"}),
                 settlement_failures: Vec::new(),
+                dedupe_key: None,
             },
         ];
 
@@ -2985,6 +2989,7 @@ mod tests {
                 tool_use_id,
                 tool_name,
                 args,
+                ..
             } => {
                 assert_eq!(tool_use_id, "call-1");
                 assert_eq!(tool_name, "browser");

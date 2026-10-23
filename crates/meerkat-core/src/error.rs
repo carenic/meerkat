@@ -1653,6 +1653,7 @@ mod tests {
             tool_name: "tool".into(),
             args: serde_json::json!({}),
             settlement_failures: Vec::new(),
+            dedupe_key: None,
         };
         assert!(matches!(
             AgentError::callback_pending_with_settlement(call),
@@ -1822,6 +1823,7 @@ mod tests {
             tool_name: "tool".into(),
             args: serde_json::json!({}),
             settlement_failures: vec![marker.clone()],
+            dedupe_key: None,
         })
         .with_settlement_failures(vec![marker.clone()]);
         assert!(matches!(

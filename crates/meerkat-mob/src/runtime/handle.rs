@@ -21289,6 +21289,7 @@ mod tests {
                     tool_use_id: "call-81".to_string(),
                     tool_name: "ask_user".to_string(),
                     args: serde_json::json!({"question": "continue?"}),
+                    dedupe_key: None,
                 },
             ),
             callback_session.clone(),
@@ -21312,6 +21313,7 @@ mod tests {
             tool_name: "ask_batch".to_string(),
             args: serde_json::json!({"question": "continue all?"}),
             settlement_failures: Vec::new(),
+            dedupe_key: None,
         }];
         let batch = bounded_direct_session_failure(
             meerkat_core::service::SessionError::Agent(

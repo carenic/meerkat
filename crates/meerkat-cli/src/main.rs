@@ -26120,6 +26120,7 @@ default_model = "gemma"
                 tool_use_id: "call-1".to_string(),
                 tool_name: "external_mock".into(),
                 args: serde_json::json!({ "value": "browser" }),
+                dedupe_key: None,
             },
             &session_id,
             &realm,

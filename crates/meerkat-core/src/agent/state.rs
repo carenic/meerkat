@@ -20735,6 +20735,7 @@ mod tests {
                 tool_use_id,
                 tool_name,
                 args,
+                ..
             } => {
                 assert_eq!(tool_use_id, "callback-call");
                 assert_eq!(tool_name, "ask_user");

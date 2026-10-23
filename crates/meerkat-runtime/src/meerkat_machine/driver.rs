@@ -11820,10 +11820,12 @@ mod recovery_tests {
                 tool_use_id,
                 tool_name,
                 args,
+                dedupe_key,
             } => CompletionOutcome::CallbackPending {
                 tool_use_id: tool_use_id.clone().unwrap_or_default(),
                 tool_name: tool_name.clone(),
                 args: args.clone(),
+                dedupe_key: dedupe_key.clone(),
             },
             InteractionTerminalCandidate::CallbackBatchPending { pending_tool_calls } => {
                 CompletionOutcome::CallbackBatchPending {

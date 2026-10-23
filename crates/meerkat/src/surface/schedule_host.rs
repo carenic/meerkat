@@ -4572,6 +4572,7 @@ mod tests {
                 tool_use_id: "call-1".to_string(),
                 tool_name: "external_approval".to_string(),
                 args: serde_json::json!({"ticket": "INC-1"}),
+                dedupe_key: None,
             },
             None,
         );

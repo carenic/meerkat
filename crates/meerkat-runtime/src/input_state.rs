@@ -3469,6 +3469,7 @@ mod tests {
             tool_use_id: None,
             tool_name: "external".to_string(),
             args: args.clone(),
+            dedupe_key: None,
         };
         let event = |pending_tool_calls| AgentEvent::InteractionCallbackPending {
             interaction_id,
@@ -3483,6 +3484,7 @@ mod tests {
             tool_name: "external".to_string(),
             args: args.clone(),
             settlement_failures: Vec::new(),
+            dedupe_key: None,
         }]);
         assert!(interaction_terminal_candidate_matches_event(
             &legacy_candidate,
@@ -3501,6 +3503,7 @@ mod tests {
             tool_use_id: Some("call-9".to_string()),
             tool_name: "external".to_string(),
             args: args.clone(),
+            dedupe_key: None,
         };
         assert!(!interaction_terminal_candidate_matches_event(
             &modern_candidate,
@@ -3513,6 +3516,7 @@ mod tests {
             tool_name: "external".to_string(),
             args: args.clone(),
             settlement_failures: Vec::new(),
+            dedupe_key: None,
         }]);
         assert!(interaction_terminal_candidate_matches_event(
             &modern_candidate,
@@ -3733,6 +3737,7 @@ mod tests {
                 tool_name: "external".to_string(),
                 args: serde_json::json!({"value": 1}),
                 settlement_failures: Vec::new(),
+                dedupe_key: None,
             }],
         };
         let event = AgentEvent::InteractionFailed {

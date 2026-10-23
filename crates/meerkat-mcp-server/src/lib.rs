@@ -9499,12 +9499,14 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
                     physical_outcome: meerkat_core::LiveBridgeEffectOutcome::Unknown,
                     failure_kind: meerkat_core::ToolDispatchTerminalErrorKind::Unavailable,
                 }],
+                dedupe_key: None,
             },
             meerkat_core::error::PendingCallbackToolCall {
                 tool_use_id: "callback-b".to_string(),
                 tool_name: "ask_b".to_string(),
                 args: json!({"question": "b"}),
                 settlement_failures: Vec::new(),
+                dedupe_key: None,
             },
         ];
         let payload = format_agent_result(

@@ -11846,6 +11846,7 @@ mod tests {
                     tool_use_id: "call-1".to_string(),
                     tool_name: "external_mock".to_string(),
                     args: json!({ "value": "browser" }),
+                    dedupe_key: None,
                 },
             ),
             None,
@@ -12033,6 +12034,7 @@ mod tests {
                 tool_use_id: "call-1".to_string(),
                 tool_name: "external_mock".to_string(),
                 args: json!({ "value": "browser" }),
+                dedupe_key: None,
             }),
         );
 
@@ -12061,12 +12063,14 @@ mod tests {
                 tool_name: "ask_a".to_string(),
                 args: json!({"tool_use_id": "callback-a"}),
                 settlement_failures: Vec::new(),
+                dedupe_key: None,
             },
             meerkat_core::error::PendingCallbackToolCall {
                 tool_use_id: "callback-b".to_string(),
                 tool_name: "ask_b".to_string(),
                 args: json!({"tool_use_id": "callback-b"}),
                 settlement_failures: Vec::new(),
+                dedupe_key: None,
             },
         ];
         let err = session_turn_error_to_mob_error(

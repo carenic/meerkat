@@ -17300,6 +17300,7 @@ matching the required schema. Output ONLY the JSON, no additional text or markdo
                 tool_use_id: "call-1".to_string(),
                 tool_name: "external_mock".to_string(),
                 args: json!({ "value": "browser" }),
+                dedupe_key: None,
             },
             &session_id,
             &realm,
@@ -17349,6 +17350,7 @@ matching the required schema. Output ONLY the JSON, no additional text or markdo
                 physical_outcome: meerkat_core::LiveBridgeEffectOutcome::Unknown,
                 failure_kind: meerkat_core::ToolDispatchTerminalErrorKind::Unavailable,
             }],
+            dedupe_key: None,
         }];
         let expected = serde_json::to_value(&pending).expect("typed pending calls");
         let error = completion_outcome_to_api_result(

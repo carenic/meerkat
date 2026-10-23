@@ -21970,6 +21970,7 @@ mod tests {
                     tool_use_id: "test-call".to_string(),
                     tool_name: "test_callback".to_string(),
                     args: serde_json::json!({}),
+                    dedupe_key: None,
                 });
             }
             Ok(result)

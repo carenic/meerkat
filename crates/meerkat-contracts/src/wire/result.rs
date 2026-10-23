@@ -265,6 +265,7 @@ mod tests {
             tool_name: "external".to_string(),
             args: serde_json::json!({"question": "approve?"}),
             settlement_failures: Vec::new(),
+            dedupe_key: None,
         };
         let json = serde_json::to_value(&call)?;
         assert_eq!(json["tool_use_id"], "call-1");

@@ -13694,6 +13694,7 @@ mod tests {
             tool_use_id: "call-1".to_string(),
             tool_name: "external_mock".to_string(),
             args: serde_json::json!({ "value": "browser" }),
+            dedupe_key: None,
         });
 
         registry.resolve_process_local_runtime_completion_authorized(
@@ -13711,6 +13712,7 @@ mod tests {
                 tool_use_id,
                 tool_name,
                 args,
+                ..
             } => {
                 assert_eq!(tool_use_id, "call-1");
                 assert_eq!(tool_name, "external_mock");
