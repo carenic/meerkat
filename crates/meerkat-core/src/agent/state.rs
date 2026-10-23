@@ -2788,17 +2788,19 @@ where
                 let mut call_fut = std::pin::pin!(call_fut);
                 let call_started = crate::time_compat::DeadlineInstant::now();
                 // The call runs once before any deadline is checked, and its
-                // inactivity counts from then: a starved runtime can reach the
-                // first check a whole stall window after the call started, and
-                // a call that never ran has not stalled.
+                // inactivity counts from then, after the activity read: a
+                // starved runtime can reach the first check a whole stall
+                // window after the call started or after a slow read, and a
+                // call that never ran, or one the watchdog has not watched
+                // across a wait, has not stalled.
                 if let std::task::Poll::Ready(result) =
                     std::future::poll_fn(|cx| std::task::Poll::Ready(call_fut.as_mut().poll(cx)))
                         .await
                 {
                     break 'wait LlmCallWait::Completed(result);
                 }
-                let mut last_activity = crate::time_compat::DeadlineInstant::now();
                 let mut last_count = stream_activity_count();
+                let mut last_activity = crate::time_compat::DeadlineInstant::now();
                 loop {
                     let now = crate::time_compat::DeadlineInstant::now();
                     let hard_remaining = match hard_timeout {
@@ -27990,6 +27992,81 @@ mod tests {
             .expect("a starved activity read must not classify a live stream as stalled");
         assert_eq!(result.text, "slow but alive");
         assert_eq!(client.calls(), 1, "no retry for a live stream");
+    }
+
+    /// A client whose every call completes at once, and whose stream
+    /// activity reads each keep the caller's thread busy for `probe_delay`.
+    struct AnswersAtOnceClient {
+        calls: std::sync::atomic::AtomicUsize,
+        probe_delay: Duration,
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl AgentLlmClient for AnswersAtOnceClient {
+        async fn stream_response(
+            &self,
+            _messages: &[Message],
+            _tools: &[Arc<ToolDef>],
+            _max_tokens: u32,
+            _temperature: Option<f32>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
+        ) -> Result<super::LlmStreamResult, AgentError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(super::LlmStreamResult::new(
+                vec![AssistantBlock::Text {
+                    text: "answered at once".to_string(),
+                    meta: None,
+                }],
+                StopReason::EndTurn,
+                normalized_test_usage(self, Usage::default()),
+            ))
+        }
+
+        fn provider(&self) -> crate::provider::Provider {
+            crate::provider::Provider::Other
+        }
+
+        fn model(&self) -> &'static str {
+            "mock-model"
+        }
+
+        fn stream_activity_count(&self) -> Option<u64> {
+            std::thread::sleep(self.probe_delay);
+            Some(0)
+        }
+    }
+
+    /// A call is polled before any deadline is checked: one that completes
+    /// at once is never timed out by a starved runtime before it ran, though
+    /// the activity read keeps the thread busy past its 50 ms call timeout.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn a_call_that_completes_at_once_is_never_timed_out_before_it_ran() {
+        use crate::retry::RetryPolicy;
+
+        let client = Arc::new(AnswersAtOnceClient {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            probe_delay: Duration::from_millis(100),
+        });
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .retry_policy(RetryPolicy {
+                max_retries: 0,
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(1),
+                multiplier: 1.0,
+                call_timeout: Some(Duration::from_millis(50)),
+                stream_inactivity_timeout: Some(Duration::from_secs(3600)),
+            })
+            .build_standalone(client.clone(), Arc::new(NoTools), Arc::new(NoopStore))
+            .await;
+
+        let result = agent
+            .run("answer".to_string().into())
+            .await
+            .expect("a call that completes at once is not timed out before it ran");
+        assert_eq!(result.text, "answered at once");
+        assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// A model defaults resolver that declares one stream-inactivity window
