@@ -924,6 +924,11 @@ pub(crate) struct RunRoundCommits {
     /// checkpointer that does not re-base, the run takes no more round
     /// commits.
     rewritten_since_base: bool,
+    /// A save without the cursor (the run's end-of-run save, or its closing
+    /// write) landed: the store issued its receipt, so the run's latest
+    /// checkpoint holds its committed work and no cursor, and nothing of the
+    /// run is left to resume. A later round commit clears it.
+    final_save_written: bool,
 }
 
 impl RunRoundCommits {
@@ -957,6 +962,12 @@ impl RunRoundCommits {
     /// Whether the next round commit must be written as a re-base.
     fn needs_rebase(&self, rewrite_tolerant: bool) -> bool {
         !rewrite_tolerant && self.rewritten_since_base
+    }
+
+    /// Whether a save without the cursor landed as the run's latest
+    /// checkpoint (see the field).
+    pub(crate) const fn final_save_written(&self) -> bool {
+        self.final_save_written
     }
 
     /// Whether a checkpoint of the live session without the cursor leaves a
@@ -1497,6 +1508,12 @@ where
             self.write_session_checkpoint(run_id, durability).await?;
         }
         self.round_commits.cursor_written = false;
+        // The save is the run's latest checkpoint once the store issued its
+        // receipt. A save that made nothing durable leaves the run's last
+        // round commit, cursor included, as its resume point.
+        if self.latest_run_checkpoint_receipt.is_some() {
+            self.round_commits.final_save_written = true;
+        }
         Ok(())
     }
 
@@ -2008,6 +2025,7 @@ where
             return Ok(false);
         }
         self.round_commits.cursor_written = true;
+        self.round_commits.final_save_written = false;
         #[cfg(any(test, feature = "test-support"))]
         if let Some(observer) = self.round_commit_observer.as_ref() {
             observer(cursor);
@@ -5816,6 +5834,25 @@ where
         Ok(())
     }
 
+    /// Terminalize the turn of a round that failed at one of its commits or
+    /// fence checks, unless the failure requires the session's teardown
+    /// (store authority unknown, a writer past its fence): the live actor
+    /// then reloads, and no terminal is committed from a checkpoint the store
+    /// may no longer accept.
+    async fn terminalize_round_failure(
+        &mut self,
+        run_id: &RunId,
+        turn_count: u32,
+        event_tx: &Option<mpsc::Sender<AgentEvent>>,
+        error: &AgentError,
+    ) -> Result<(), AgentError> {
+        if error.requires_session_teardown() {
+            return Ok(());
+        }
+        self.terminalize_fatal_error(run_id, turn_count, event_tx, error)
+            .await
+    }
+
     async fn terminalize_fatal_error(
         &mut self,
         run_id: &RunId,
@@ -5995,8 +6032,13 @@ where
         let result = self
             .run_loop_rounds(run_input, event_tx, deferred_callback, resumed)
             .await;
-        // A staged round no boundary took over belongs to this run only.
+        // A staged round no boundary took over belongs to this run only, and
+        // so does the round bound in the dispatch context: a round that ended
+        // in an error before its collect (a fence refusal, a failed commit)
+        // leaves it bound, and a call the host dispatches next carries no
+        // round's key.
         self.pending_resumed_round = None;
+        self.tool_dispatch_context.clear_round();
         Box::pin(self.close_run_cursor_at_exit(result)).await
     }
 
@@ -6056,9 +6098,9 @@ where
         // the loop cannot tear a tool down mid-write. The resulting ceiling is
         // `max_turn_duration + the longest segment already in flight`: for
         // tool batches that is the largest single per-call tool timeout
-        // (`dispatch_tool_calls_boxed` starts every call's clock together and
-        // wraps its concurrency wait, so a batch cannot sum), and for LLM
-        // calls it is zero because the call is itself wrapped with the
+        // (`dispatch_tool_calls_fenced_boxed` starts every call's clock
+        // together and wraps its concurrency wait, so a batch cannot sum), and
+        // for LLM calls it is zero because the call is itself wrapped with the
         // horizon's remaining time. A barrier-ops wait
         // (`ops_lifecycle.wait_all`) is NOT interrupted by the horizon; that
         // park is a separate seam and remains unbounded here.
@@ -6950,6 +6992,9 @@ where
     ) -> Result<Vec<crate::ops::AsyncOpRef>, AgentError> {
         let tool_use_id = decided.tool_call_id.to_string();
         let tool_name = decided.tool_name.clone().unwrap_or_default();
+        // A writer past its self-fence window starts no tool, a decided
+        // consent's retained attempt included: the refusal ends the run.
+        self.check_dispatch_fence()?;
         let dispatched = dispatch_retained_consent_boxed(
             Arc::clone(&self.tools),
             self.observed_tool_dispatch_context(Some(Arc::clone(review))),
@@ -8784,7 +8829,7 @@ where
         if resumed.is_none()
             && let Err(error) = Box::pin(self.commit_round_tools_pending(ctx, &assistant_msg)).await
         {
-            self.terminalize_fatal_error(ctx.run_id, ctx.turn_count, ctx.event_tx, &error)
+            self.terminalize_round_failure(ctx.run_id, ctx.turn_count, ctx.event_tx, &error)
                 .await?;
             return Err(error);
         }
@@ -8792,10 +8837,8 @@ where
         // the commit (or since a resumed round's adopted tail) wrote nothing
         // the store's own fence check would refuse.
         if let Err(error) = self.check_dispatch_fence() {
-            if !error.requires_session_teardown() {
-                self.terminalize_fatal_error(ctx.run_id, ctx.turn_count, ctx.event_tx, &error)
-                    .await?;
-            }
+            self.terminalize_round_failure(ctx.run_id, ctx.turn_count, ctx.event_tx, &error)
+                .await?;
             return Err(error);
         }
 
@@ -8825,15 +8868,28 @@ where
         // expiry becomes a `ToolError::Timeout` so it flows
         // through `terminal_tool_outcome_for_error` exactly like
         // any other tool execution failure.
-        let mut dispatch_results = dispatch_tool_calls_boxed(
+        //
+        // A writer past its self-fence window starts no further call: each
+        // call asks the fence right before it starts, after its concurrency
+        // permit, and once one is refused, no later call starts.
+        let fence = self.checkpointer.clone().map(DispatchFence::new);
+        let mut dispatch_results = dispatch_tool_calls_fenced_boxed(
             Arc::clone(&self.tools),
             self.observed_tool_dispatch_context(self.operation_review.clone()),
             self.tools_config.default_timeout,
             self.tools_config.tool_timeouts.clone(),
             self.tools_config.max_concurrent.max(1),
             executable_tool_calls,
+            fence.clone(),
         )
         .await;
+        // A fence refusal fails the round before its results are collected
+        // or committed, as the fence check before the round does.
+        if let Some(error) = fence.and_then(|fence| fence.take_refusal()) {
+            self.terminalize_round_failure(ctx.run_id, ctx.turn_count, ctx.event_tx, &error)
+                .await?;
+            return Err(error);
+        }
         if !refused_tool_calls.is_empty() {
             dispatch_results.append(&mut refused_tool_calls);
             dispatch_results.sort_by_key(|(tool_index, _, _, _)| *tool_index);
@@ -9625,7 +9681,7 @@ where
         if !callback_batch_pending {
             if let Err(error) = Box::pin(self.commit_round_results(ctx, pending_ops_by_call)).await
             {
-                self.terminalize_fatal_error(ctx.run_id, ctx.turn_count, ctx.event_tx, &error)
+                self.terminalize_round_failure(ctx.run_id, ctx.turn_count, ctx.event_tx, &error)
                     .await?;
                 return Err(error);
             }
@@ -10459,9 +10515,52 @@ type ToolDispatchFuture =
 type ToolDispatchFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = Vec<ToolDispatchResult>> + 'static>>;
 
-// Keep construction and polling of the concrete tool-dispatch batch out of
-// the already-large agent run-loop poll frame.
-#[inline(never)]
+/// The writer's fence a tool batch asks right before each call starts (see
+/// [`crate::SessionCheckpointer::dispatch_fence_check`]). The first refusal
+/// is kept for the round, and no later call of the batch starts.
+#[derive(Clone)]
+struct DispatchFence {
+    checkpointer: Arc<dyn crate::SessionCheckpointer>,
+    refusal: Arc<std::sync::Mutex<Option<AgentError>>>,
+}
+
+impl DispatchFence {
+    fn new(checkpointer: Arc<dyn crate::SessionCheckpointer>) -> Self {
+        Self {
+            checkpointer,
+            refusal: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Whether one call may start now: no earlier call of the batch was
+    /// refused, and the fence allows.
+    fn admits_call(&self) -> bool {
+        let mut refusal = self
+            .refusal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if refusal.is_some() {
+            return false;
+        }
+        match self.checkpointer.dispatch_fence_check() {
+            Ok(()) => true,
+            Err(error) => {
+                *refusal = Some(error);
+                false
+            }
+        }
+    }
+
+    /// The batch's fence refusal, if a call was refused.
+    fn take_refusal(&self) -> Option<AgentError> {
+        self.refusal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
+#[cfg(test)]
 fn dispatch_tool_calls_boxed<T: AgentToolDispatcher + ?Sized + 'static>(
     tools_ref: Arc<T>,
     tool_dispatch_context: super::ToolDispatchContext,
@@ -10469,6 +10568,29 @@ fn dispatch_tool_calls_boxed<T: AgentToolDispatcher + ?Sized + 'static>(
     tool_timeouts: std::collections::HashMap<String, std::time::Duration>,
     max_concurrent: usize,
     executable_tool_calls: Vec<(usize, ToolCallOwned)>,
+) -> ToolDispatchFuture {
+    dispatch_tool_calls_fenced_boxed(
+        tools_ref,
+        tool_dispatch_context,
+        default_timeout,
+        tool_timeouts,
+        max_concurrent,
+        executable_tool_calls,
+        None,
+    )
+}
+
+// Keep construction and polling of the concrete tool-dispatch batch out of
+// the already-large agent run-loop poll frame.
+#[inline(never)]
+fn dispatch_tool_calls_fenced_boxed<T: AgentToolDispatcher + ?Sized + 'static>(
+    tools_ref: Arc<T>,
+    tool_dispatch_context: super::ToolDispatchContext,
+    default_timeout: std::time::Duration,
+    tool_timeouts: std::collections::HashMap<String, std::time::Duration>,
+    max_concurrent: usize,
+    executable_tool_calls: Vec<(usize, ToolCallOwned)>,
+    fence: Option<DispatchFence>,
 ) -> ToolDispatchFuture {
     Box::pin(async move {
         let dispatch_semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
@@ -10478,6 +10600,7 @@ fn dispatch_tool_calls_boxed<T: AgentToolDispatcher + ?Sized + 'static>(
                 let tools_ref = Arc::clone(&tools_ref);
                 let tool_dispatch_context = tool_dispatch_context.clone();
                 let dispatch_semaphore = Arc::clone(&dispatch_semaphore);
+                let fence = fence.clone();
                 // An operator's per-tool override is recorded as such, so a
                 // tool that owns its lifetime bound drops only the default.
                 let core_deadline = match tool_timeouts.get(tc.name.as_str()).copied() {
@@ -10578,6 +10701,12 @@ fn dispatch_tool_calls_boxed<T: AgentToolDispatcher + ?Sized + 'static>(
                                     return Err(ToolError::timeout(
                                         tc.name.clone(),
                                         advertised_timeout_ms,
+                                    ));
+                                }
+                                if fence.as_ref().is_some_and(|fence| !fence.admits_call()) {
+                                    return Err(ToolError::execution_failed(
+                                        "this writer's self-fence window closed before the call \
+                                         started; it did not run",
                                     ));
                                 }
                                 crate::dispatch_tool_execution_plan_fenced(

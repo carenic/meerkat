@@ -141,6 +141,9 @@ struct RecordingTools {
     /// Ask the running run to cancel at its next boundary from the first
     /// dispatch.
     boundary_cancel: Mutex<Option<meerkat_core::CancelAfterBoundarySender>>,
+    /// Close this checkpointer's self-fence window once the first call
+    /// starts.
+    fence_on_first_dispatch: Mutex<Option<Arc<RecordingCheckpointer>>>,
 }
 
 impl RecordingTools {
@@ -151,11 +154,16 @@ impl RecordingTools {
             hang_on,
             entered: Notify::new(),
             boundary_cancel: Mutex::new(None),
+            fence_on_first_dispatch: Mutex::new(None),
         })
     }
 
     fn cancel_at_next_boundary(&self, sender: meerkat_core::CancelAfterBoundarySender) {
         *self.boundary_cancel.lock().unwrap() = Some(sender);
+    }
+
+    fn close_fence_when_a_call_starts(&self, checkpointer: Arc<RecordingCheckpointer>) {
+        *self.fence_on_first_dispatch.lock().unwrap() = Some(checkpointer);
     }
 
     fn probes() -> Vec<ToolDef> {
@@ -192,6 +200,10 @@ impl AgentToolDispatcher for RecordingTools {
             .lock()
             .unwrap()
             .push((call.id.to_string(), context.tool_call_dedupe_key(call)));
+        let fence = self.fence_on_first_dispatch.lock().unwrap().take();
+        if let Some(checkpointer) = fence {
+            checkpointer.fenced.store(true, Ordering::SeqCst);
+        }
         let boundary_cancel = self.boundary_cancel.lock().unwrap().take();
         if let (Some(sender), Some(run_id)) = (boundary_cancel, context.run_id()) {
             sender
@@ -981,6 +993,157 @@ async fn a_writer_past_its_fence_window_dispatches_nothing() {
     );
 }
 
+/// A writer whose self-fence window closes while a round's calls run starts
+/// no further call. With one call at a time, the round's second call asks
+/// the fence after the first started, is refused, and never runs. The round
+/// fails before its second commit with the teardown-required failure, the
+/// run writes nothing more, and its first commit, cursor included, stays the
+/// resume point.
+#[tokio::test]
+async fn a_call_after_the_fence_closes_never_starts() {
+    let client = ScriptedClient::new(vec![Step::Tools(vec![
+        ("call-1", "probe", "{}"),
+        ("call-2", "probe2", "{}"),
+    ])]);
+    let tools = RecordingTools::new(RecordingTools::probes(), None);
+    let checkpointer = RecordingCheckpointer::new();
+    tools.close_fence_when_a_call_starts(Arc::clone(&checkpointer));
+    let mut agent = AgentBuilder::new()
+        .resume_session(fresh_session())
+        .with_turn_state_handle(Arc::new(
+            crate::agent::test_turn_state_handle::TestTurnStateHandle::new(),
+        ))
+        .with_runtime_execution_kind_for_test(
+            meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn,
+        )
+        .with_checkpointer(Arc::clone(&checkpointer))
+        .with_tools_config(meerkat_core::ToolsConfig {
+            max_concurrent: 1,
+            ..meerkat_core::ToolsConfig::default()
+        })
+        .build_standalone(Arc::clone(&client), Arc::clone(&tools), Arc::new(NoopStore))
+        .await;
+
+    let error = agent
+        .run("start".into())
+        .await
+        .expect_err("the fence refusal fails the round");
+    assert!(error.requires_session_teardown(), "{error}");
+    let dispatched = tools.dispatched();
+    assert_eq!(
+        dispatched
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["call-1"],
+        "the first call started before the window closed; the second never ran"
+    );
+    let commits = checkpointer.commits();
+    assert_eq!(
+        commits.len(),
+        1,
+        "only the round's first commit: no second commit and no closing write"
+    );
+    let cursor = cursor_of(&commits[0].0).expect("the first commit keeps its cursor");
+    assert!(matches!(
+        cursor.resume_point,
+        RunResumePoint::ToolsPending { .. }
+    ));
+    assert!(
+        tool_results(agent.session()).is_empty(),
+        "no result of the round reached the transcript"
+    );
+    assert!(cursor_of(agent.session()).is_none(), "no cursor stays live");
+    assert_eq!(
+        agent.tool_dispatch_context.round(),
+        None,
+        "the failed round no longer names its round for the next dispatch"
+    );
+}
+
+/// No round outlives its run. A run whose round fails (here its first
+/// commit returns no receipt) leaves no round bound, and a call the host
+/// dispatches next carries no dedupe key, even under the failed round's call
+/// id and arguments: tool call ids repeat across turns, and a host that
+/// deduplicates on the key must never answer a new call with an old result.
+/// A host call made while a dropped run's future left its round bound, before
+/// the host ended that run, carries none either.
+#[tokio::test]
+async fn a_host_call_after_a_failed_round_carries_no_key() {
+    let client = ScriptedClient::new(vec![Step::Tools(vec![("call-1", "probe", "{}")])]);
+    let tools = RecordingTools::new(RecordingTools::probes(), None);
+    let mut agent = build_agent(
+        fresh_session(),
+        &client,
+        &tools,
+        Some(RecordingCheckpointer::without_receipts()),
+        true,
+        None,
+    )
+    .await;
+    agent
+        .run("start".into())
+        .await
+        .expect_err("the round fails at its first commit");
+    assert!(tools.dispatched().is_empty(), "no tool of the round ran");
+    assert_eq!(
+        agent.tool_dispatch_context.round(),
+        None,
+        "the failed round is not bound after the run"
+    );
+    agent
+        .dispatch_external_tool_call(meerkat_core::ToolCall::new(
+            "call-1".into(),
+            "probe".into(),
+            serde_json::json!({}),
+        ))
+        .await
+        .expect("the host call dispatches");
+    assert_eq!(
+        tools.dispatched(),
+        vec![("call-1".to_string(), None)],
+        "the host call carries no key"
+    );
+
+    let client = ScriptedClient::new(vec![Step::Tools(vec![("call-1", "probe", "{}")])]);
+    let tools = RecordingTools::new(RecordingTools::probes(), Some("probe"));
+    let mut agent = build_agent(
+        fresh_session(),
+        &client,
+        &tools,
+        Some(RecordingCheckpointer::new()),
+        true,
+        None,
+    )
+    .await;
+    run_until_stopped(agent.run("start".into()), &tools.entered).await;
+    let round_key = tools.dispatched()[0]
+        .1
+        .clone()
+        .expect("the round's own call carries its key");
+    assert_eq!(round_key.round, 0);
+    assert_eq!(
+        agent.tool_dispatch_context.round(),
+        Some(0),
+        "the dropped future left its round bound"
+    );
+    agent
+        .dispatch_external_tool_call(meerkat_core::ToolCall::new(
+            "call-1".into(),
+            "probe2".into(),
+            serde_json::json!({}),
+        ))
+        .await
+        .expect("the host call dispatches");
+    assert_eq!(
+        tools.dispatched()[1],
+        ("call-1".to_string(), None),
+        "a host call carries no key while a dropped run's round is bound"
+    );
+    let _ = agent.cancel_dropped_run();
+    assert_eq!(agent.tool_dispatch_context.round(), None);
+}
+
 /// A run that ends without an end-of-run save (here at its turn cap, right
 /// after a round's second commit) closes its cursor with one more
 /// checkpoint, so its boundary never commits a cursor.
@@ -1101,8 +1264,8 @@ async fn a_run_cancelled_at_a_boundary_closes_its_cursor() {
 /// A run the host suspends (it drains and requeues its work) is dropped at
 /// its next await point and realizes nothing: no terminal, no write. Its
 /// last round commit, cursor included, stays its resume point; the live
-/// session keeps no cursor; and the suspended run's id comes back for the
-/// session layer's typed outcome.
+/// session keeps no cursor; and the suspended run comes back as resumable,
+/// with its id, for the session layer's typed outcome.
 #[tokio::test]
 async fn a_suspended_run_keeps_its_last_round_commit_and_realizes_nothing() {
     let client = ScriptedClient::new(vec![Step::Tools(vec![("call-1", "probe", "{}")])]);
@@ -1119,9 +1282,12 @@ async fn a_suspended_run_keeps_its_last_round_commit_and_realizes_nothing() {
     .await;
     run_until_stopped(agent.run("start".into()), &tools.entered).await;
 
-    let suspended = agent
+    let suspension = agent
         .suspend_dropped_run()
         .expect("the suspended run had started");
+    let meerkat_core::DroppedRunSuspension::Resumable { run_id: suspended } = suspension else {
+        panic!("a run stopped inside a round resumes there: {suspension:?}");
+    };
 
     let commits = checkpointer.commits();
     assert_eq!(
@@ -1140,6 +1306,86 @@ async fn a_suspended_run_keeps_its_last_round_commit_and_realizes_nothing() {
         agent.suspend_dropped_run().is_none(),
         "the agent holds no run after the suspension"
     );
+}
+
+/// A run whose future the host drops after its end-of-run save landed has
+/// nothing left to resume: its latest checkpoint holds its answer and no
+/// cursor. The agent reports it past its final save, so the stop runs none
+/// of its inputs again.
+#[tokio::test]
+async fn a_run_suspended_after_its_final_save_reports_it() {
+    let client = ScriptedClient::new(vec![
+        Step::Tools(vec![("call-1", "probe", "{}")]),
+        Step::Answer("done"),
+    ]);
+    let tools = RecordingTools::new(RecordingTools::probes(), None);
+    let checkpointer = RecordingCheckpointer::new();
+    let mut agent = build_agent(
+        fresh_session(),
+        &client,
+        &tools,
+        Some(Arc::clone(&checkpointer)),
+        true,
+        None,
+    )
+    .await;
+    let final_save_landed = || {
+        checkpointer
+            .commits()
+            .last()
+            .is_some_and(|(session, _)| cursor_of(session).is_none())
+    };
+    // A one-event channel, drained one event at a time: each poll of the
+    // run publishes one event and then waits at its next, so the run is
+    // dropped at the first event it publishes after its final save (its
+    // `RunCompleted`).
+    let (tx, mut rx) = mpsc::channel(1);
+    {
+        let run = agent.run_with_events("start".into(), tx);
+        tokio::pin!(run);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut run => panic!("the run ended before it was dropped"),
+                event = rx.recv() => {
+                    assert!(event.is_some(), "the run holds the sender");
+                    if final_save_landed() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let suspension = agent
+        .suspend_dropped_run()
+        .expect("the suspended run had started");
+    let meerkat_core::DroppedRunSuspension::PastFinalSave { run_id } = suspension else {
+        panic!("the run's final save had landed: {suspension:?}");
+    };
+    let commits = checkpointer.commits();
+    assert_eq!(
+        commits.len(),
+        3,
+        "two round commits, then the end-of-run save"
+    );
+    let (tail, _) = commits.last().unwrap();
+    assert!(cursor_of(tail).is_none(), "the final save has no cursor");
+    assert!(
+        assistant_rows(tail).iter().any(|assistant| assistant
+            .blocks
+            .iter()
+            .any(|block| matches!(block, AssistantBlock::Text { text, .. } if text == "done"))),
+        "the final save holds the run's answer"
+    );
+    let (first, _) = &commits[0];
+    assert_eq!(
+        cursor_of(first)
+            .expect("a round commit carries the cursor")
+            .run_id,
+        run_id
+    );
+    assert!(cursor_of(agent.session()).is_none());
 }
 
 /// The cursor lists the inputs the session layer staged for the run; a run

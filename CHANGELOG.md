@@ -620,22 +620,28 @@ them.
     canonical arguments under a versioned domain tag:
     `meerkat_core::tool_call_digest(name, arguments)` computes it, and
     `ToolCallDedupeKey::new` builds the whole key. A call dispatched outside an
-    agent-loop round (an external call, a tool application) has no key.
+    agent-loop round (an external call, a tool application) has no key, and
+    no round outlives its run, a failed or dropped one included: tool call
+    ids repeat across turns, so a later call never carries an earlier round's
+    key.
   - Three kinds of call get an outcome-uncertain result instead of running
     again: a call whose process custody shows its process may have run before
     the restart, a call to one of Core's comms tools that sends to another
     agent, and a call whose plan is Detached under a runner that cannot resume
     or repeat it.
   - A first commit that fails or returns no receipt fails its round before any
-    tool runs. A run that ends without an end-of-run save writes one more
-    checkpoint without the cursor when the session layer commits the run's
-    boundary from it: a result (a turn or budget cap), a callback suspension
-    or a hard-failure terminal. So a committed boundary never carries a
-    cursor. At a callback suspension that write is required, because the
-    suspension's boundary commits it as the suspended state. After a
-    cancellation or another failure the run writes it only when the run's own
-    assistant message identifies the tail; otherwise the last round commit,
-    with its cursor, stays for recovery, which settles it by the run's
+    tool runs. A commit failure that requires the session's teardown (store
+    authority unknown, a writer past its fence) ends the run without a
+    terminal and without another write: the live actor reloads, and recovery
+    reads the last round commit. A run that ends without an end-of-run save
+    writes one more checkpoint without the cursor when the session layer
+    commits the run's boundary from it: a result (a turn or budget cap), a
+    callback suspension or a hard-failure terminal. So a committed boundary
+    never carries a cursor. At a callback suspension that write is required,
+    because the suspension's boundary commits it as the suspended state. After
+    a cancellation or another failure the run writes it only when the run's
+    own assistant message identifies the tail; otherwise the last round
+    commit, with its cursor, stays for recovery, which settles it by the run's
     inputs. Every exit leaves the live session without a cursor.
   - `Agent::set_run_start_input_ids` stages the inputs a runtime batch binds
     to the next run; each steer or peer input written into a running turn at a
@@ -657,17 +663,26 @@ them.
   - `SessionCheckpointer::dispatch_fence_check` lets a checkpointer over a
     host store refuse dispatch once its writer's self-fence window has
     closed. The agent asks right before each model request (a compaction's
-    summarization request included) and right after a tool round's first
-    commit, before any tool runs, for every run with a checkpointer, a live
-    bridge run's included; a refusal stops the run as a refused commit does,
-    and the run writes nothing more.
+    summarization request included), right after a tool round's first
+    commit, before any tool runs, and right before each tool call starts,
+    for every run with a checkpointer, a live bridge run's included. A
+    refusal stops the run as a refused commit does: no later call of the
+    round starts, the round's results are not committed, and the run writes
+    nothing more.
   - A stop that keeps a durable session's queued work (a host draining and
     requeueing, for a deploy) suspends the session's run instead of
     cancelling it. The session layer drops the run future at its next await
     point, and `Agent::suspend_dropped_run` ends the run without a terminal,
-    without a turn-authority change and without a write, returning the run's
-    id. The run's last round commit, cursor included, stays its resume point,
-    and the turn answers `AgentError::RunSuspended { run_id }`.
+    without a turn-authority change and without a write. It answers where the
+    run stood (`DroppedRunSuspension`): `Resumable { run_id }`, whose last
+    round commit, cursor included, stays its resume point (a save without the
+    cursor still in flight counts here, and the next start's recovery reads
+    which tail the store holds), or `PastFinalSave { run_id }`, whose save
+    without the cursor had landed, so its work is committed and its inputs
+    must not run again. A resumable run's turn answers
+    `AgentError::RunSuspended { run_id }`, which a core executor reports as
+    `CoreExecutorError::Suspended { run_id }`: neither a cancellation nor an
+    apply failure.
 
 - `meerkat_core::host_store`: the host store SPI, a small storage interface
   a host implements so that Core can keep a realm's durable state in the
@@ -2053,6 +2068,11 @@ them.
   asks the model again from its last round commit, so it publishes
   `RunCompleted` with `extraction_required` a second time under the same run
   id.
+- A WholeBlob run whose final save follows a compaction with no round commit
+  since, and whose process stops before the run's boundary commit, is
+  recovered as interrupted although its transcript is whole: that save
+  re-based the run, so its rows are already the committed base, and the run
+  shows the interrupted notice. Nothing is lost or run twice.
 - The usage of a model call that a restart interrupted is not recorded,
   although the provider bills it. Asynchronous operations a resumed run was
   waiting for ended with the restart: the run does not wait for them, and the

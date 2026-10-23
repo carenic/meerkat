@@ -175,7 +175,7 @@ pub use agent::{
     AgentLlmRequestAttempt, AgentOwnedRelease, AgentRunner, AgentSessionStore, AgentToolDispatcher,
     BindOutcome, CancelAfterBoundaryCommand, CancelAfterBoundarySender, CommsCapabilityError,
     CommsRuntime, CurrentTurnContent, CurrentTurnImageRef, DefaultSystemPromptPolicy,
-    DispatcherCapabilities, ExternalToolUpdate, FilteredToolDispatcher,
+    DispatcherCapabilities, DroppedRunSuspension, ExternalToolUpdate, FilteredToolDispatcher,
     LiveBridgeNoncommittingRunPermit, LiveBridgePreparedOperation, LiveBridgeToolDispatchAdmission,
     LlmStreamResult, ObservedCommsSender, RequestAttemptAuthority, SnapshotProjectionError,
     StickyModelFallbackActivationProof, ToolDispatchContext, dispatch_retained_consent_attempt,

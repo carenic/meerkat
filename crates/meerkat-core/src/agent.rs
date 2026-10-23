@@ -782,6 +782,40 @@ pub struct ExternalToolUpdate {
     pub pending: Vec<String>,
 }
 
+/// Where a run stood when the host dropped its future to suspend it
+/// ([`Agent::suspend_dropped_run`]), for a stop that keeps the session's
+/// queued work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DroppedRunSuspension {
+    /// The run's latest checkpoint is a round commit, cursor included, or the
+    /// run wrote none: it resumes there at the session's next start, as after
+    /// a crash. A save without the cursor that was in flight when the future
+    /// was dropped counts here: the store may hold either tail, and the next
+    /// start's recovery reads which.
+    Resumable {
+        /// The suspended run.
+        run_id: crate::lifecycle::RunId,
+    },
+    /// The run's save without the cursor (its end-of-run save, or the closing
+    /// write of its exit) had landed: its latest checkpoint holds the run's
+    /// committed work and no cursor. Nothing of the run is left to resume,
+    /// and its inputs must not run again.
+    PastFinalSave {
+        /// The suspended run.
+        run_id: crate::lifecycle::RunId,
+    },
+}
+
+impl DroppedRunSuspension {
+    /// The suspended run.
+    #[must_use]
+    pub fn run_id(&self) -> &crate::lifecycle::RunId {
+        match self {
+            Self::Resumable { run_id } | Self::PastFinalSave { run_id } => run_id,
+        }
+    }
+}
+
 /// Typed command requesting cancellation at the next turn boundary.
 ///
 /// Carried over the cancel-after-boundary command channel from the surface
@@ -2205,6 +2239,15 @@ impl ToolDispatchContext {
     /// the host dispatches outside a round carries no dedupe key.
     pub(crate) fn clear_round(&mut self) {
         self.round = None;
+    }
+
+    /// This context for a call the host dispatches itself (an external
+    /// call): it belongs to no round of the agent's loop, so it carries no
+    /// dedupe key, whatever round the agent bound last.
+    #[must_use]
+    pub(crate) fn outside_round(mut self) -> Self {
+        self.round = None;
+        self
     }
 
     /// The deduplication key of one call of this dispatch's round.

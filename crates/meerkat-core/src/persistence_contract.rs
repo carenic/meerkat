@@ -400,11 +400,13 @@ pub trait SessionCheckpointer: Send + Sync {
     /// A checkpointer over a host store answers from its fence handle's
     /// self-fence window: past it, another process may already own the
     /// session, and nothing this process dispatches may run. The agent asks
-    /// right before each model request and right after a tool round's first
-    /// commit, before any tool of the round is admitted, because a pause
-    /// between a commit and a dispatch writes nothing that would meet the
-    /// write path's own fence check. An error stops the run there, as a
-    /// refused commit does; return the teardown-required class
+    /// right before each model request, right after a tool round's first
+    /// commit, before any tool of the round is admitted, and right before
+    /// each tool call starts, because a pause between a commit and a
+    /// dispatch writes nothing that would meet the write path's own fence
+    /// check. An error stops the run there, as a refused commit does: no
+    /// later call of the round starts and the round's results are not
+    /// committed. Return the teardown-required class
     /// ([`AgentError::session_durable_projection_authority_unknown`]) so the
     /// live actor reloads instead of continuing on stale authority. Called
     /// synchronously, with no I/O. The default allows.
