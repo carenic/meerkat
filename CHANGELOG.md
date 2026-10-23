@@ -554,10 +554,14 @@ them.
   scopes (at most 8 MiB, each row at most 1 MiB). The module documentation
   states the nine obligations and the valid ways to meet each, at commit or
   at load. The host sizes the fence renew interval and lease through
-  `HostStore::fence_timing` (`FenceTiming`, by default 10 s and 30 s): an
-  exclusive acquire refuses typed (`HostStoreError::Held`) while another
-  holder's lease lasts, and a takeover's `FenceGrant` says how long the new
-  writer waits before it dispatches anything.
+  `HostStore::fence_timing` (`FenceTiming`, by default 10 s and 30 s), and
+  may declare the self-fence margin (`FenceTiming::try_with_margin`: at
+  least one renew interval plus twice the store's visibility lag);
+  `SelfFence` reports a writer's window. An exclusive acquire refuses typed
+  (`HostStoreError::Held`) while another holder's lease lasts, a takeover's
+  `FenceGrant` says how long the new writer waits before it dispatches
+  anything, and a holder whose renew failed or whose window closed acquires
+  again before it resumes.
 - `meerkat-store-conformance`: `chapters::host_store` checks a host store
   against those obligations through a `HostStoreFactory`, whose every open
   stands for a new process: reopen; a kill before, during and after a commit;
