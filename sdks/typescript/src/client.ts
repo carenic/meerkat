@@ -416,7 +416,7 @@ import { parseMobDestroyReport } from "./mob-destroy-report.js";
 import { EventStream, AsyncQueue } from "./streaming.js";
 import { parseUsage } from "./events.js";
 import type { RealtimeMessageOrigin } from "./events.js";
-import { EventSubscription } from "./subscription.js";
+import { EventSubscription, type SubscriptionEvent, type SubscriptionItem } from "./subscription.js";
 import type {
   AgentEventEnvelope,
   AttributedMobEvent,
@@ -1025,7 +1025,7 @@ export class MeerkatClient {
   private eventQueues = new Map<string, AsyncQueue<Record<string, unknown> | null>>();
   private liveNotificationListeners = new Set<LiveNotificationListener>();
   private consentNoticeListeners = new Set<ConsentNoticeListener>();
-  private streamQueues = new Map<string, AsyncQueue<Record<string, unknown> | null>>();
+  private streamQueues = new Map<string, AsyncQueue<SubscriptionItem>>();
   // Per-request_id stream subscriptions for createSessionStreaming calls whose
   // session_id is not yet bound. Keyed by the JSON-RPC request id so concurrent
   // creates are admitted and correlated independently instead of colliding on a
@@ -1037,7 +1037,7 @@ export class MeerkatClient {
   // streams are pending: each event lands under the session it names, and the
   // response that binds that session_id drains exactly its own buffer.
   private unmatchedStreamBuffer = new Map<string, Record<string, unknown>[]>();
-  private unmatchedStandaloneStreamBuffer = new Map<string, Record<string, unknown>[]>();
+  private unmatchedStandaloneStreamBuffer = new Map<string, SubscriptionEvent[]>();
   private unmatchedStandaloneStreamEnd = new Map<string, Record<string, unknown>>();
   private streamTerminalOutcomes = new Map<string, Record<string, unknown>>();
   private rl: ReadlineInterface | null = null;
@@ -4102,15 +4102,17 @@ export class MeerkatClient {
     if (!streamId) {
       throw new MeerkatError("INVALID_RESPONSE", `${openMethod} did not return stream_id`);
     }
-    const queue = new AsyncQueue<Record<string, unknown> | null>();
+    const queue = new AsyncQueue<SubscriptionItem>();
     this.streamQueues.set(streamId, queue);
     const buffered = this.unmatchedStandaloneStreamBuffer.get(streamId) ?? [];
     for (const event of buffered) {
       queue.put(event);
     }
     this.unmatchedStandaloneStreamBuffer.delete(streamId);
-    if (this.unmatchedStandaloneStreamEnd.delete(streamId)) {
-      queue.put(null);
+    const terminal = this.unmatchedStandaloneStreamEnd.get(streamId);
+    if (terminal != null) {
+      this.unmatchedStandaloneStreamEnd.delete(streamId);
+      queue.put({ terminalOutcome: terminal });
     }
     return new EventSubscription<T>({
       streamId,
@@ -5154,11 +5156,17 @@ export class MeerkatClient {
           scopeId != null || scopePath != null
             ? { event: rawEvent, scope_id: scopeId, scope_path: scopePath }
             : rawEvent;
+        const sequence = params.sequence;
+        const delivery: SubscriptionEvent = {
+          event,
+          rpcSequence: typeof sequence === "number" && Number.isSafeInteger(sequence) && sequence >= 0
+            ? sequence : undefined,
+        };
         if (queue && event) {
-          queue.put(event);
+          queue.put(delivery);
         } else if (streamId && event) {
           const buffered = this.unmatchedStandaloneStreamBuffer.get(streamId) ?? [];
-          buffered.push(event);
+          buffered.push(delivery);
           this.unmatchedStandaloneStreamBuffer.set(streamId, buffered);
         }
         return;
@@ -5170,7 +5178,7 @@ export class MeerkatClient {
         }
         const queue = this.streamQueues.get(streamId);
         if (queue) {
-          queue.put(null);
+          queue.put({ terminalOutcome: params });
         } else if (streamId) {
           this.unmatchedStandaloneStreamEnd.set(streamId, params);
         }

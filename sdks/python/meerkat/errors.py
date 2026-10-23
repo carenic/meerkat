@@ -42,6 +42,46 @@ from .generated.types import (
 )
 
 
+class EventSubscriptionError(MeerkatError):
+    """A standalone subscription ended with a server-reported error.
+
+    Earlier queued events are delivered before this error is raised. The raw
+    terminal notification is retained, including unknown codes and outcomes.
+    Sequence fields describe the last delivered event, not a replay cursor.
+    """
+
+    def __init__(
+        self,
+        stream_id: str,
+        terminal_outcome: dict[str, _Any],
+        last_rpc_sequence: int | None,
+        last_event_seq: int | None,
+    ):
+        error = terminal_outcome.get("error")
+        if (
+            isinstance(error, dict)
+            and isinstance(error.get("code"), str)
+            and isinstance(error.get("message"), str)
+        ):
+            code, message = error["code"], error["message"]
+        else:
+            code, message = "INVALID_RESPONSE", "Malformed stream_end error"
+        super().__init__(
+            code,
+            message,
+            details={
+                "stream_id": stream_id,
+                "terminal_outcome": terminal_outcome,
+                "last_rpc_sequence": last_rpc_sequence,
+                "last_event_seq": last_event_seq,
+            },
+        )
+        self.stream_id = stream_id
+        self.terminal_outcome = terminal_outcome
+        self.last_rpc_sequence = last_rpc_sequence
+        self.last_event_seq = last_event_seq
+
+
 def _literal_values(alias: _Any) -> frozenset[str]:
     values: set[str] = set()
     for arm in _get_args(alias) or (alias,):

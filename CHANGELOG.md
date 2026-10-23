@@ -1328,6 +1328,12 @@ them.
   `STORED_INPUT_STATE_VERSION` is 8, and `STORED_INPUT_STATE_BASELINE_VERSION`
   (7) and `stored_input_state_version_for_row` are new.
 
+- **Behaviour:** Python and TypeScript event subscriptions now drain queued events and raise a
+  typed `EventSubscriptionError` when an existing stream terminal carries an
+  error, including unknown error codes. Previously those iterators ended
+  normally and required inspecting the separate terminal outcome. Error-free
+  remote ends and explicit closes continue to end normally.
+
 ### Fixed
 
 - `meerkat-runtime`, `meerkat-session`: a live HeadCanonical session serves
@@ -2046,6 +2052,13 @@ them.
   notification when ordinary outbound byte or message admission is saturated.
   Reserved capacity follows the stream through close races, pending delivery and
   transport disconnect, without blocking the agent event producer.
+
+- RPC session event subscriptions survive temporary outbound admission or
+  notification-queue overflow. Before subsequent delivery they report lost
+  events through the existing sequence-zero `StreamTruncated(StreamLagged)`
+  marker. An unresolved gap at source end or close uses the reserved error
+  terminal with its dropped count. This remains bounded, best-effort delivery;
+  it does not replay lost events or change mob-stream overflow behavior.
 
 ### Known limitations
 

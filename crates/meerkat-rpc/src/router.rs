@@ -639,6 +639,165 @@ struct StreamForwarder {
     terminal: StreamTerminal,
     terminal_reservation: RpcStreamTerminalReservation,
     state: StreamForwarderState,
+    session_delivery: Option<Arc<Mutex<SessionStreamDelivery>>>,
+}
+
+/// Connection-local delivery accounting, not session lifecycle authority.
+/// The same guard covers nonblocking admission and close so a pending gap
+/// cannot be hidden by a racing explicit close.
+#[derive(Default)]
+struct SessionStreamDelivery {
+    sequence: u64,
+    dropped: u64,
+    closing: bool,
+}
+
+impl SessionStreamDelivery {
+    async fn emit(
+        &mut self,
+        sink: &NotificationSink,
+        stream_id: &StreamRef,
+        session_id: &SessionId,
+        envelope: &EventEnvelope<AgentEvent>,
+    ) -> Option<StreamEmitStatus> {
+        if self.closing {
+            return None;
+        }
+        if self.dropped != 0 {
+            // Sequence zero identifies an advisory marker, never a fabricated
+            // canonical session event. RPC notification order remains monotonic.
+            let marker = EventEnvelope::new_session(
+                session_id.clone(),
+                0,
+                None,
+                AgentEvent::StreamTruncated {
+                    reason: meerkat_core::event::StreamTruncationReason::StreamLagged {
+                        dropped: self.dropped,
+                    },
+                },
+            );
+            self.sequence += 1;
+            match sink
+                .emit_session_stream_event(stream_id, self.sequence, session_id, &marker)
+                .await
+            {
+                StreamEmitStatus::Delivered => self.dropped = 0,
+                StreamEmitStatus::Overflow => {
+                    // This source event must not overtake the unreported gap.
+                    // A refused synthetic marker is not itself a lost event.
+                    self.dropped = self.dropped.saturating_add(1);
+                    return Some(StreamEmitStatus::Overflow);
+                }
+                StreamEmitStatus::ReceiverGone => return Some(StreamEmitStatus::ReceiverGone),
+            }
+        }
+        self.sequence += 1;
+        let status = sink
+            .emit_session_stream_event(stream_id, self.sequence, session_id, envelope)
+            .await;
+        if status == StreamEmitStatus::Overflow {
+            self.dropped = self.dropped.saturating_add(1);
+        }
+        Some(status)
+    }
+
+    fn pending_gap_detail(&self) -> Option<String> {
+        (self.dropped != 0).then(|| {
+            format!("transport stream notification queue overflow: {} event(s) dropped without a delivered gap marker", self.dropped)
+        })
+    }
+}
+
+struct SessionStreamForwarding {
+    notification_sink: NotificationSink,
+    active_session_streams: Arc<Mutex<HashMap<StreamRef, StreamForwarder>>>,
+    stream_authority: RpcStreamAuthority,
+    stream_id: StreamRef,
+    session_id: SessionId,
+    delivery: Arc<Mutex<SessionStreamDelivery>>,
+}
+
+impl SessionStreamForwarding {
+    async fn run(self, stream: meerkat_core::comms::EventStream, stop_rx: oneshot::Receiver<()>) {
+        let Self {
+            notification_sink,
+            active_session_streams,
+            stream_authority,
+            stream_id: stream_id_for_task,
+            session_id: session_id_for_task,
+            delivery: session_delivery,
+        } = self;
+        let mut stream = stream;
+        let mut stop_rx = stop_rx;
+
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => {
+                    break;
+                }
+                _ = notification_sink.tx.closed() => {
+                    emit_authorized_session_stream_terminal(
+                        &notification_sink, &active_session_streams, &stream_authority,
+                        stream_id_for_task,
+                        meerkat_runtime::meerkat_machine::dsl::RpcEventStreamTerminalObservationKind::NotificationReceiverGone,
+                        Some("transport stream notification receiver closed".to_string()),
+                    ).await;
+                    break;
+                }
+                event = stream.next() => {
+                    match event {
+                        Some(envelope) => {
+                            let status = session_delivery.lock().await
+                                .emit(&notification_sink, &stream_id_for_task, &session_id_for_task, &envelope)
+                                .await;
+                            let Some(emit_status) = status else { break; };
+                            // A temporary backlog drops data with a typed gap;
+                            // it does not retire the subscription or await permits.
+                            if emit_status == StreamEmitStatus::Overflow {
+                                continue;
+                            }
+                            if let Some((observation, detail)) =
+                                terminal_observation_from_emit_status(emit_status)
+                            {
+                                emit_authorized_session_stream_terminal(
+                                    &notification_sink,
+                                    &active_session_streams,
+                                    &stream_authority,
+                                    stream_id_for_task,
+                                    observation,
+                                    Some(detail.to_string()),
+                                )
+                                .await;
+                                break;
+                            }
+                        }
+                        None => {
+                            let mut delivery = session_delivery.lock().await;
+                            if delivery.closing { break; }
+                            delivery.closing = true;
+                            let gap = delivery.pending_gap_detail();
+                            drop(delivery);
+                            let observation = if gap.is_some() {
+                                meerkat_runtime::meerkat_machine::dsl::RpcEventStreamTerminalObservationKind::NotificationQueueOverflow
+                            } else {
+                                meerkat_runtime::meerkat_machine::dsl::RpcEventStreamTerminalObservationKind::TransportEnded
+                            };
+                            emit_authorized_session_stream_terminal(
+                                &notification_sink,
+                                &active_session_streams,
+                                &stream_authority,
+                                stream_id_for_task,
+                                observation,
+                                gap,
+                            )
+                            .await;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -845,11 +1004,20 @@ async fn record_session_stream_terminal_authority(
     observation: meerkat_runtime::meerkat_machine::dsl::RpcEventStreamTerminalObservationKind,
     detail: Option<String>,
 ) -> Result<SessionStreamTerminalAuthority, String> {
+    let mut authority = authority.lock().await;
+    record_session_stream_terminal_authority_locked(&mut authority, stream_id, observation, detail)
+}
+
+fn record_session_stream_terminal_authority_locked(
+    authority: &mut meerkat_runtime::meerkat_machine::dsl::MeerkatMachineAuthority,
+    stream_id: &StreamRef,
+    observation: meerkat_runtime::meerkat_machine::dsl::RpcEventStreamTerminalObservationKind,
+    detail: Option<String>,
+) -> Result<SessionStreamTerminalAuthority, String> {
     let detail = bounded_stream_terminal_detail(detail);
     let stream_id = stream_id.as_string();
-    let mut authority = authority.lock().await;
     let transition = meerkat_runtime::meerkat_machine::dsl::MeerkatMachineMutator::apply(
-        &mut *authority,
+        authority,
         meerkat_runtime::meerkat_machine::dsl::MeerkatMachineInput::RecordSessionEventStreamTerminated {
             stream_id: stream_id.clone(),
             observation,
@@ -916,14 +1084,13 @@ async fn emit_authorized_session_stream_terminal(
     }
 }
 
-async fn resolve_session_stream_close_authority(
-    authority: &RpcStreamAuthority,
+fn resolve_session_stream_close_authority_locked(
+    authority: &mut meerkat_runtime::meerkat_machine::dsl::MeerkatMachineAuthority,
     stream_id: &StreamRef,
 ) -> Result<SessionStreamCloseAuthority, String> {
     let stream_id = stream_id.as_string();
-    let mut authority = authority.lock().await;
     let transition = meerkat_runtime::meerkat_machine::dsl::MeerkatMachineMutator::apply(
-        &mut *authority,
+        authority,
         meerkat_runtime::meerkat_machine::dsl::MeerkatMachineInput::ResolveSessionEventStreamClose {
             stream_id: stream_id.clone(),
         },
@@ -968,6 +1135,90 @@ async fn resolve_session_stream_close_authority(
                 "ResolveSessionEventStreamClose for stream '{stream_id}' emitted no SessionEventStreamCloseResolved effect"
             )
         })
+}
+
+async fn close_session_stream(
+    notification_sink: &NotificationSink,
+    active_streams: &Arc<Mutex<HashMap<StreamRef, StreamForwarder>>>,
+    stream_authority: &RpcStreamAuthority,
+    stream_id: &StreamRef,
+) -> Result<SessionStreamCloseAuthority, String> {
+    {
+        let mut authority = stream_authority.lock().await;
+        if authority
+            .state()
+            .closed_session_event_streams
+            .contains(&stream_id.as_string())
+        {
+            // Another terminal issuer may be waiting for the physical map.
+            // A repeated close must not take or wait for its reservation.
+            return resolve_session_stream_close_authority_locked(&mut authority, stream_id);
+        }
+    }
+    let delivery = active_streams
+        .lock()
+        .await
+        .get(stream_id)
+        .and_then(|stream| stream.session_delivery.clone());
+    let mut delivery = match delivery.as_ref() {
+        Some(delivery) => Some(delivery.lock().await),
+        None => None,
+    };
+    let mut authority = stream_authority.lock().await;
+    if authority
+        .state()
+        .closed_session_event_streams
+        .contains(&stream_id.as_string())
+    {
+        return resolve_session_stream_close_authority_locked(&mut authority, stream_id);
+    }
+    let mut streams = active_streams.lock().await;
+    // All awaited locks precede sealing or machine mutation. From the first
+    // effect through reservation transfer there is no cancellation point.
+    let gap = delivery
+        .as_ref()
+        .and_then(|delivery| delivery.pending_gap_detail());
+    let pending_terminal = if let Some(detail) = gap {
+        Some(record_session_stream_terminal_authority_locked(
+            &mut authority,
+            stream_id,
+            meerkat_runtime::meerkat_machine::dsl::RpcEventStreamTerminalObservationKind::NotificationQueueOverflow,
+            Some(detail),
+        )?)
+    } else {
+        None
+    };
+    let close = resolve_session_stream_close_authority_locked(&mut authority, stream_id);
+    if let Some(delivery) = delivery.as_mut() {
+        delivery.closing = true;
+    }
+    let terminal =
+        pending_terminal.or_else(|| close.as_ref().ok().and_then(|close| close.terminal.clone()));
+    let send = terminal.and_then(|terminal| {
+        streams.remove(stream_id).map(|mut stream| {
+            stop_stream_forwarder(&mut stream);
+            let sink = notification_sink.clone();
+            // Custody survives caller cancellation. The existing reservation bounds
+            // this task, and receiver closure releases it without a second queue.
+            tokio::spawn(async move {
+                sink.emit_session_stream_end(&terminal, stream.terminal_reservation)
+                    .await;
+            })
+        })
+    });
+    if close.is_err() {
+        if let Some(mut stream) = streams.remove(stream_id) {
+            stop_stream_forwarder(&mut stream);
+        }
+    }
+    drop(streams);
+    drop(authority);
+    drop(delivery);
+    if let Some(send) = send {
+        send.await
+            .map_err(|error| format!("session stream terminal sender failed: {error}"))?;
+    }
+    close
 }
 
 async fn resolve_mob_stream_open_authority(
@@ -4693,12 +4944,14 @@ impl MethodRouter {
         let stream_authority = self.stream_authority.clone();
         let stream_id_for_task = stream_id;
         let session_id_for_task = session_id.clone();
+        let session_delivery = Arc::new(Mutex::new(SessionStreamDelivery::default()));
 
         self.active_session_streams.lock().await.insert(
             stream_id,
             StreamForwarder {
                 terminal: StreamTerminal::Session(session_id.clone()),
                 terminal_reservation,
+                session_delivery: Some(session_delivery.clone()),
                 state: StreamForwarderState::Active {
                     stop_tx: Some(stop_tx),
                     task: None,
@@ -4706,64 +4959,17 @@ impl MethodRouter {
             },
         );
 
-        let task = tokio::spawn(async move {
-            let mut stream = stream;
-            let mut stop_rx = stop_rx;
-            let mut sequence = 0u64;
-
-            loop {
-                tokio::select! {
-                    _ = &mut stop_rx => {
-                        break;
-                    }
-                    _ = notification_sink.tx.closed() => {
-                        emit_authorized_session_stream_terminal(
-                            &notification_sink, &active_session_streams, &stream_authority,
-                            stream_id_for_task,
-                            meerkat_runtime::meerkat_machine::dsl::RpcEventStreamTerminalObservationKind::NotificationReceiverGone,
-                            Some("transport stream notification receiver closed".to_string()),
-                        ).await;
-                        break;
-                    }
-                    event = stream.next() => {
-                        match event {
-                            Some(envelope) => {
-                                sequence += 1;
-                                let emit_status = notification_sink
-                                    .emit_session_stream_event(&stream_id_for_task, sequence, &session_id_for_task, &envelope)
-                                    .await;
-                                if let Some((observation, detail)) =
-                                    terminal_observation_from_emit_status(emit_status)
-                                {
-                                    emit_authorized_session_stream_terminal(
-                                        &notification_sink,
-                                        &active_session_streams,
-                                        &stream_authority,
-                                        stream_id_for_task,
-                                        observation,
-                                        Some(detail.to_string()),
-                                    )
-                                    .await;
-                                    break;
-                                }
-                            }
-                            None => {
-                                emit_authorized_session_stream_terminal(
-                                    &notification_sink,
-                                    &active_session_streams,
-                                    &stream_authority,
-                                    stream_id_for_task,
-                                    meerkat_runtime::meerkat_machine::dsl::RpcEventStreamTerminalObservationKind::TransportEnded,
-                                    None,
-                                )
-                                .await;
-                                break;
-                            }
-                        }
-                    }
-                }
+        let task = tokio::spawn(
+            SessionStreamForwarding {
+                notification_sink,
+                active_session_streams,
+                stream_authority,
+                stream_id: stream_id_for_task,
+                session_id: session_id_for_task,
+                delivery: session_delivery,
             }
-        });
+            .run(stream, stop_rx),
+        );
 
         attach_stream_forwarder_task(&self.active_session_streams, stream_id, task).await;
 
@@ -4804,7 +5010,9 @@ impl MethodRouter {
             }
         };
 
-        let close_authority = match resolve_session_stream_close_authority(
+        let close_authority = match close_session_stream(
+            &self.notification_sink,
+            &self.active_session_streams,
             &self.stream_authority,
             &stream_id,
         )
@@ -4812,11 +5020,6 @@ impl MethodRouter {
         {
             Ok(authority) => authority,
             Err(error) => {
-                if let Some(mut stream) =
-                    self.active_session_streams.lock().await.remove(&stream_id)
-                {
-                    stop_stream_forwarder(&mut stream);
-                }
                 return RpcResponse::error(
                     id,
                     error::INVALID_PARAMS,
@@ -4824,18 +5027,6 @@ impl MethodRouter {
                 );
             }
         };
-        // Only the caller receiving the machine terminal effect owns teardown.
-        // An already-closed result emits no replacement effect: its original
-        // issuer may still be waiting to claim this forwarder's reservation.
-        if let Some(terminal) = close_authority.terminal.as_ref() {
-            let stream = self.active_session_streams.lock().await.remove(&stream_id);
-            if let Some(mut stream) = stream {
-                stop_stream_forwarder(&mut stream);
-                self.notification_sink
-                    .emit_session_stream_end(terminal, stream.terminal_reservation)
-                    .await;
-            }
-        }
 
         let result = meerkat_contracts::SessionStreamCloseResult {
             stream_id: stream_id.as_string(),
@@ -4916,6 +5107,7 @@ impl MethodRouter {
                 StreamForwarder {
                     terminal: StreamTerminal::Mob,
                     terminal_reservation,
+                    session_delivery: None,
                     state: StreamForwarderState::Active {
                         stop_tx: Some(stop_tx),
                         task: None,
@@ -5030,6 +5222,7 @@ impl MethodRouter {
                 StreamForwarder {
                     terminal: StreamTerminal::Mob,
                     terminal_reservation,
+                    session_delivery: None,
                     state: StreamForwarderState::Active {
                         stop_tx: Some(stop_tx),
                         task: None,
@@ -10771,8 +10964,16 @@ mod tests {
         sink: &NotificationSink,
         terminal: StreamTerminal,
     ) -> StreamForwarder {
+        let session_delivery = match &terminal {
+            StreamTerminal::Session(_) => {
+                Some(Arc::new(Mutex::new(SessionStreamDelivery::default())))
+            }
+            #[cfg(feature = "mob")]
+            StreamTerminal::Mob => None,
+        };
         StreamForwarder {
             terminal,
+            session_delivery,
             terminal_reservation: sink
                 .stream_terminal_admission
                 .try_reserve()
@@ -10787,6 +10988,11 @@ mod tests {
     async fn assert_idempotent_close_preserves_pending_terminal(terminal: StreamTerminal) {
         let (mut router, mut notif_rx) = test_router().await;
         router.notification_sink.stream_terminal_admission = RpcStreamTerminalAdmission::new(1);
+        if matches!(&terminal, StreamTerminal::Session(_)) {
+            let (tx, rx) = mpsc::channel(1);
+            router.notification_sink.tx = tx;
+            notif_rx = rx;
+        }
         let router = Arc::new(router);
         let stream_ref = StreamRef::mint();
         let (streams, close_method, terminal_method) = match &terminal {
@@ -10820,9 +11026,31 @@ mod tests {
             stream_ref,
             reserved_test_stream_forwarder(&router.notification_sink, terminal.clone()),
         );
-        // Stop the first real close handler after it obtains the canonical
-        // terminal effect but before it can take the physical reservation.
-        let streams_guard = streams.lock().await;
+        // Session close atomically transfers its terminal reservation to an
+        // owned sender. Hold it at the channel; mob's existing boundary is the
+        // map claim after machine authorization. Repeated closes must not take
+        // the reservation from either issuer.
+        let streams_guard: Option<
+            tokio::sync::MutexGuard<'_, HashMap<StreamRef, StreamForwarder>>,
+        > = match &terminal {
+            StreamTerminal::Session(session_id) => {
+                assert_eq!(
+                    router
+                        .notification_sink
+                        .emit_session_stream_event(
+                            &stream_ref,
+                            1,
+                            session_id,
+                            &recovery_envelope(session_id, 1),
+                        )
+                        .await,
+                    StreamEmitStatus::Delivered
+                );
+                None
+            }
+            #[cfg(feature = "mob")]
+            StreamTerminal::Mob => Some(streams.lock().await),
+        };
         let first_close = tokio::spawn({
             let router = router.clone();
             async move {
@@ -10871,7 +11099,14 @@ mod tests {
         .unwrap();
         assert_eq!(result_value(&repeated_close)["closed"], true);
         assert_eq!(result_value(&repeated_close)["already_closed"], true);
-        assert!(streams_guard.contains_key(&stream_ref));
+        if let Some(streams_guard) = &streams_guard {
+            assert!(streams_guard.contains_key(&stream_ref));
+        } else {
+            assert!(
+                streams.lock().await.is_empty(),
+                "owned sender has the reservation"
+            );
+        }
         assert!(!first_close.is_finished());
         assert!(
             router
@@ -10881,6 +11116,12 @@ mod tests {
                 .is_err()
         );
         drop(streams_guard);
+        if matches!(&terminal, StreamTerminal::Session(_)) {
+            assert_eq!(
+                notif_rx.recv().await.unwrap().method,
+                "session/stream_event"
+            );
+        }
         let first_close = tokio::time::timeout(Duration::from_secs(1), first_close)
             .await
             .unwrap()
@@ -11409,68 +11650,645 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_stream_router_overflow_emits_terminal_error_outcome() {
+    async fn pending_session_stream_recovers_after_overflow_and_follows_journal_bridge() {
         let requests = Arc::new(std::sync::Mutex::new(Vec::<Vec<Message>>::new()));
         let llm_client = Arc::new(RecordingMockLlmClient::new(requests));
-        let (router, mut notif_rx) =
-            test_router_with_llm_and_notification_capacity(llm_client, 1).await;
-
-        let create_resp = router
+        let (mut router, mut rx) = test_router_with_llm_and_notification_capacity(
+            llm_client,
+            crate::NOTIFICATION_CHANNEL_CAPACITY,
+        )
+        .await;
+        let admission = RpcOutboundAdmission::isolated_production();
+        router.notification_sink.outbound_admission = admission.clone();
+        let created = router
             .dispatch(make_request(
                 "session/create",
-                serde_json::json!({ "prompt": "create overflow session" }),
-            ))
-            .await
-            .unwrap();
-        let session_id = result_value(&create_resp)["session_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-
-        drain_notifications(&mut notif_rx).await;
-
-        let open_resp = router
-            .dispatch(make_request(
-                "session/stream_open",
-                serde_json::json!({ "session_id": session_id }),
-            ))
-            .await
-            .unwrap();
-        let stream_id = result_value(&open_resp)["stream_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-
-        let turn_resp = router
-            .dispatch(make_request(
-                "turn/start",
                 serde_json::json!({
-                    "session_id": session_id,
-                    "prompt": "overflow please"
+                    "prompt": "pending stream recovery", "initial_turn": "deferred"
                 }),
             ))
             .await
             .unwrap();
-        assert!(turn_resp.error.is_none(), "turn should succeed");
-
-        let notification = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let session_id = result_value(&created)["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let opened = router
+            .dispatch(make_request(
+                "session/stream_open",
+                serde_json::json!({
+                    "session_id": session_id
+                }),
+            ))
+            .await
+            .unwrap();
+        let stream_id =
+            StreamRef::parse(result_value(&opened)["stream_id"].as_str().unwrap()).unwrap();
+        let delivery = router.active_session_streams.lock().await[&stream_id]
+            .session_delivery
+            .clone()
+            .unwrap();
+        let held: Vec<_> = (0..256).map(|_| admission.try_admit(1).unwrap()).collect();
+        let first = router
+            .dispatch(make_request(
+                "turn/start",
+                serde_json::json!({
+                    "session_id": session_id, "prompt": "first pending turn"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(first.error.is_none());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while delivery.lock().await.dropped == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the real pending forwarder observes admission loss");
+        assert!(
+            router
+                .active_session_streams
+                .lock()
+                .await
+                .contains_key(&stream_id)
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no premature terminal while data budget is full"
+        );
+        drop(held);
+        let second = router
+            .dispatch(make_request(
+                "turn/start",
+                serde_json::json!({
+                    "session_id": session_id, "prompt": "journal bridge recovery"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(second.error.is_none());
+        let mut saw_gap = false;
+        tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let notif = notif_rx.recv().await.expect("notification");
-                if notif.method == "session/stream_end" {
-                    break notif;
+                let notification = rx.recv().await.unwrap();
+                assert_ne!(notification.method, "session/stream_end");
+                if notification.method != "session/stream_event" {
+                    continue;
+                }
+                let params = notification_params!(notification);
+                let event = &params["event"];
+                if event["payload"]["type"] == "stream_truncated" {
+                    assert_eq!(event["seq"], 0);
+                    assert!(event["payload"]["reason"]["dropped"].as_u64().unwrap() > 0);
+                    saw_gap = true;
+                }
+                if event["payload"]["type"] == "run_started"
+                    && event["payload"]["input"]["content"] == "journal bridge recovery"
+                {
+                    assert!(saw_gap, "the gap precedes the bridged turn's event");
+                    break;
                 }
             }
         })
         .await
-        .expect("session stream end notification");
-        assert_eq!(notification_params!(notification)["stream_id"], stream_id);
+        .expect("same pending subscription follows the later journal turn");
+        let close = router
+            .dispatch(make_request(
+                "session/stream_close",
+                serde_json::json!({
+                    "stream_id": stream_id.as_string()
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(close.error.is_none());
+    }
+
+    fn recovery_envelope(session_id: &SessionId, seq: u64) -> EventEnvelope<AgentEvent> {
+        EventEnvelope::new_session(
+            session_id.clone(),
+            seq,
+            None,
+            AgentEvent::TextDelta {
+                delta: format!("event-{seq}"),
+                assistant_message_id: None,
+            },
+        )
+    }
+
+    async fn recovery_forwarder(
+        sink: NotificationSink,
+    ) -> (
+        SessionStreamForwarding,
+        mpsc::Sender<EventEnvelope<AgentEvent>>,
+        oneshot::Receiver<()>,
+        meerkat_core::comms::EventStream,
+    ) {
+        let authority = Arc::new(Mutex::new(new_rpc_stream_authority()));
+        let streams = Arc::new(Mutex::new(HashMap::new()));
+        let session_id = SessionId::new();
+        let stream_id = StreamRef::mint();
+        let mut entry =
+            reserved_test_stream_forwarder(&sink, StreamTerminal::Session(session_id.clone()));
+        let delivery = entry.session_delivery.clone().unwrap();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        entry.state = StreamForwarderState::Active {
+            stop_tx: Some(stop_tx),
+            task: None,
+        };
+        streams.lock().await.insert(stream_id, entry);
+        resolve_session_stream_open_authority(&authority, &stream_id, &session_id)
+            .await
+            .unwrap();
+        let (events_tx, events_rx) = mpsc::channel(8);
+        let stream = Box::pin(futures::stream::unfold(events_rx, |mut rx| async {
+            rx.recv().await.map(|event| (event, rx))
+        }));
+        (
+            SessionStreamForwarding {
+                notification_sink: sink,
+                active_session_streams: streams,
+                stream_authority: authority,
+                stream_id,
+                session_id,
+                delivery,
+            },
+            events_tx,
+            stop_rx,
+            stream,
+        )
+    }
+
+    async fn await_recovery_drop(delivery: &Mutex<SessionStreamDelivery>, count: u64) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while delivery.lock().await.dropped != count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("forwarder consumes the refused source event without waiting for permits");
+    }
+
+    #[tokio::test]
+    async fn session_stream_recovery_survives_count_and_byte_admission_saturation() {
+        for (message_count, wire_bytes) in [(256, 1), (8, 8 * 1024 * 1024)] {
+            let admission = RpcOutboundAdmission::isolated_production();
+            let (tx, mut rx) = mpsc::channel(crate::NOTIFICATION_CHANNEL_CAPACITY);
+            let mut sink = NotificationSink::new(tx);
+            sink.outbound_admission = admission.clone();
+            sink.stream_terminal_admission = RpcStreamTerminalAdmission::new(1);
+            let (forwarder, events, stop_rx, stream) = recovery_forwarder(sink.clone()).await;
+            let session_id = forwarder.session_id.clone();
+            let delivery = forwarder.delivery.clone();
+            let streams = forwarder.active_session_streams.clone();
+            let task = tokio::spawn(forwarder.run(stream, stop_rx));
+            let mut held: Vec<_> = (0..message_count)
+                .map(|_| admission.try_admit(wire_bytes).unwrap())
+                .collect();
+            events
+                .send(recovery_envelope(&session_id, 1))
+                .await
+                .unwrap();
+            await_recovery_drop(&delivery, 1).await;
+            assert_eq!(streams.lock().await.len(), 1);
+            assert!(rx.try_recv().is_err());
+            // The idle forwarder does not reserve the first released permit or
+            // await admission ahead of ordinary responses/callback requests.
+            drop(held.pop());
+            let response = RpcResponse::success_with_admission(
+                Some(crate::protocol::RpcId::Num(9)),
+                serde_json::json!({"ok":true}),
+                admission.clone(),
+            );
+            assert!(response.error.is_none());
+            drop(response);
+            drop(held);
+            events
+                .send(recovery_envelope(&session_id, 2))
+                .await
+                .unwrap();
+            let marker = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(marker.method, "session/stream_event");
+            assert_eq!(event.method, "session/stream_event");
+            assert_eq!(notification_params!(marker)["sequence"], 2);
+            assert_eq!(notification_params!(marker)["event"]["seq"], 0);
+            assert_eq!(
+                notification_params!(marker)["event"]["payload"],
+                serde_json::json!({
+                    "type":"stream_truncated", "reason":{"kind":"stream_lagged","dropped":1}
+                })
+            );
+            assert_eq!(notification_params!(event)["sequence"], 3);
+            assert_eq!(notification_params!(event)["event"]["seq"], 2);
+            assert_eq!(delivery.lock().await.dropped, 0);
+            assert_eq!(streams.lock().await.len(), 1);
+            drop(events);
+            let terminal = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(notification_params!(terminal)["outcome"], "remote_end");
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn session_stream_unreported_gap_uses_reserved_error_terminal_when_source_ends() {
+        let admission = RpcOutboundAdmission::isolated_production();
+        let (tx, mut rx) = mpsc::channel(crate::NOTIFICATION_CHANNEL_CAPACITY);
+        let mut sink = NotificationSink::new(tx);
+        sink.outbound_admission = admission.clone();
+        sink.stream_terminal_admission = RpcStreamTerminalAdmission::new(1);
+        let (forwarder, events, stop_rx, stream) = recovery_forwarder(sink.clone()).await;
+        let session_id = forwarder.session_id.clone();
+        let delivery = forwarder.delivery.clone();
+        let streams = forwarder.active_session_streams.clone();
+        let task = tokio::spawn(forwarder.run(stream, stop_rx));
+        let held: Vec<_> = (0..256).map(|_| admission.try_admit(1).unwrap()).collect();
+        events
+            .send(recovery_envelope(&session_id, 1))
+            .await
+            .unwrap();
+        await_recovery_drop(&delivery, 1).await;
+        events
+            .send(recovery_envelope(&session_id, 2))
+            .await
+            .unwrap();
+        await_recovery_drop(&delivery, 2).await;
+        drop(events);
+        let terminal = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.method, "session/stream_end");
+        assert_eq!(notification_params!(terminal)["outcome"], "terminal_error");
         assert_eq!(
-            notification_params!(notification)["outcome"],
-            "terminal_error"
+            notification_params!(terminal)["error"]["code"],
+            "stream_queue_overflow"
+        );
+        assert!(
+            notification_params!(terminal)["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("2 event(s)")
+        );
+        assert!(admission.try_admit(1).is_err());
+        assert!(streams.lock().await.is_empty());
+        task.await.unwrap();
+        drop(terminal);
+        assert!(sink.stream_terminal_admission.try_reserve().is_ok());
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn session_stream_repeated_marker_refusal_counts_only_source_events() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let sink = NotificationSink::new(tx);
+        let session_id = SessionId::new();
+        let stream_id = StreamRef::mint();
+        let mut delivery = SessionStreamDelivery::default();
+        assert_eq!(
+            delivery
+                .emit(
+                    &sink,
+                    &stream_id,
+                    &session_id,
+                    &recovery_envelope(&session_id, 1)
+                )
+                .await,
+            Some(StreamEmitStatus::Delivered)
+        );
+        for seq in 2..=4 {
+            assert_eq!(
+                delivery
+                    .emit(
+                        &sink,
+                        &stream_id,
+                        &session_id,
+                        &recovery_envelope(&session_id, seq)
+                    )
+                    .await,
+                Some(StreamEmitStatus::Overflow)
+            );
+        }
+        assert_eq!(delivery.dropped, 3);
+        drop(rx.recv().await.unwrap());
+        // The marker occupies the only channel slot. Its following real event
+        // is refused and starts a new, separate one-event gap.
+        assert_eq!(
+            delivery
+                .emit(
+                    &sink,
+                    &stream_id,
+                    &session_id,
+                    &recovery_envelope(&session_id, 5)
+                )
+                .await,
+            Some(StreamEmitStatus::Overflow)
+        );
+        let marker = rx.recv().await.unwrap();
+        assert_eq!(
+            notification_params!(marker)["event"]["payload"]["reason"]["dropped"],
+            3
+        );
+        assert_eq!(delivery.dropped, 1);
+        delivery.closing = true;
+        assert_eq!(
+            delivery
+                .emit(
+                    &sink,
+                    &stream_id,
+                    &session_id,
+                    &recovery_envelope(&session_id, 6)
+                )
+                .await,
+            None
+        );
+        assert_eq!(delivery.dropped, 1);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn session_stream_close_waits_for_emission_and_reports_pending_gap_once() {
+        let (router, mut rx) = test_router().await;
+        let router = Arc::new(router);
+        let session_id = SessionId::new();
+        let stream_id = StreamRef::mint();
+        let entry = reserved_test_stream_forwarder(
+            &router.notification_sink,
+            StreamTerminal::Session(session_id.clone()),
+        );
+        let delivery = entry.session_delivery.clone().unwrap();
+        router
+            .active_session_streams
+            .lock()
+            .await
+            .insert(stream_id, entry);
+        resolve_session_stream_open_authority(&router.stream_authority, &stream_id, &session_id)
+            .await
+            .unwrap();
+        let mut emission = delivery.lock().await;
+        let (started_tx, started_rx) = oneshot::channel();
+        let close = tokio::spawn({
+            let router = router.clone();
+            async move {
+                started_tx.send(()).unwrap();
+                router
+                    .dispatch(make_request(
+                        "session/stream_close",
+                        serde_json::json!({
+                            "stream_id":stream_id.as_string()
+                        }),
+                    ))
+                    .await
+                    .unwrap()
+            }
+        });
+        started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !close.is_finished(),
+            "close cannot race past admission accounting"
+        );
+        emission.dropped = 2;
+        drop(emission);
+        let response = close.await.unwrap();
+        assert!(response.error.is_none());
+        let terminal = rx.recv().await.unwrap();
+        assert_eq!(terminal.method, "session/stream_end");
+        assert_eq!(notification_params!(terminal)["outcome"], "terminal_error");
+        assert_eq!(
+            notification_params!(terminal)["error"]["code"],
+            "stream_queue_overflow"
+        );
+        assert!(
+            notification_params!(terminal)["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("2 event(s)")
+        );
+        assert!(delivery.lock().await.closing);
+        let repeated = router
+            .dispatch(make_request(
+                "session/stream_close",
+                serde_json::json!({
+                    "stream_id":stream_id.as_string()
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(result_value(&repeated)["already_closed"], true);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn canceled_session_close_before_authority_does_not_seal_delivery() {
+        let (router, mut rx) = test_router().await;
+        let router = Arc::new(router);
+        let session_id = SessionId::new();
+        let stream_id = StreamRef::mint();
+        let entry = reserved_test_stream_forwarder(
+            &router.notification_sink,
+            StreamTerminal::Session(session_id.clone()),
+        );
+        let delivery = entry.session_delivery.clone().unwrap();
+        router
+            .active_session_streams
+            .lock()
+            .await
+            .insert(stream_id, entry);
+        resolve_session_stream_open_authority(&router.stream_authority, &stream_id, &session_id)
+            .await
+            .unwrap();
+        let mut emission = delivery.lock().await;
+        emission.dropped = 2;
+        let mut close = Box::pin(close_session_stream(
+            &router.notification_sink,
+            &router.active_session_streams,
+            &router.stream_authority,
+            &stream_id,
+        ));
+        // Poll the production future to the two exact cancellation boundaries.
+        // A mutex wakeup alone cannot prove its waiter has resumed execution.
+        assert!(futures::poll!(close.as_mut()).is_pending());
+        let authority = router.stream_authority.lock().await;
+        drop(emission);
+        assert!(futures::poll!(close.as_mut()).is_pending());
+        drop(close);
+        let emission = delivery.lock().await;
+        assert!(!emission.closing);
+        assert_eq!(emission.dropped, 2);
+        assert!(
+            authority
+                .state()
+                .active_session_event_streams
+                .contains(&stream_id.as_string())
+        );
+        assert!(
+            router
+                .active_session_streams
+                .lock()
+                .await
+                .contains_key(&stream_id)
+        );
+        assert!(rx.try_recv().is_err());
+        drop(emission);
+        drop(authority);
+        // The still-open stream can deliver its pending marker and source event.
+        assert_eq!(
+            delivery
+                .lock()
+                .await
+                .emit(
+                    &router.notification_sink,
+                    &stream_id,
+                    &session_id,
+                    &recovery_envelope(&session_id, 3),
+                )
+                .await,
+            Some(StreamEmitStatus::Delivered)
         );
         assert_eq!(
-            notification_params!(notification)["error"]["code"],
+            notification_params!(rx.recv().await.unwrap())["event"]["seq"],
+            0
+        );
+        assert_eq!(
+            notification_params!(rx.recv().await.unwrap())["event"]["seq"],
+            3
+        );
+        close_session_stream(
+            &router.notification_sink,
+            &router.active_session_streams,
+            &router.stream_authority,
+            &stream_id,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn canceled_session_close_keeps_owned_reserved_gap_terminal() {
+        let (mut router, _) = test_router().await;
+        let (tx, mut rx) = mpsc::channel(1);
+        router.notification_sink.tx = tx;
+        router.notification_sink.stream_terminal_admission = RpcStreamTerminalAdmission::new(1);
+        let router = Arc::new(router);
+        let session_id = SessionId::new();
+        let stream_id = StreamRef::mint();
+        let entry = reserved_test_stream_forwarder(
+            &router.notification_sink,
+            StreamTerminal::Session(session_id.clone()),
+        );
+        let delivery = entry.session_delivery.clone().unwrap();
+        delivery.lock().await.dropped = 3;
+        router
+            .active_session_streams
+            .lock()
+            .await
+            .insert(stream_id, entry);
+        resolve_session_stream_open_authority(&router.stream_authority, &stream_id, &session_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            router
+                .notification_sink
+                .emit_session_stream_event(
+                    &stream_id,
+                    1,
+                    &session_id,
+                    &recovery_envelope(&session_id, 1),
+                )
+                .await,
+            StreamEmitStatus::Delivered
+        );
+        let close = tokio::spawn({
+            let router = router.clone();
+            async move {
+                router
+                    .dispatch(make_request(
+                        "session/stream_close",
+                        serde_json::json!({
+                            "stream_id": stream_id.as_string(),
+                        }),
+                    ))
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while router
+                .active_session_streams
+                .lock()
+                .await
+                .contains_key(&stream_id)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal custody transferred to reserved sender");
+        assert!(
+            router
+                .stream_authority
+                .lock()
+                .await
+                .state()
+                .closed_session_event_streams
+                .contains(&stream_id.as_string())
+        );
+        assert!(
+            !close.is_finished(),
+            "reserved sender awaits the slow reader"
+        );
+        close.abort();
+        assert!(close.await.unwrap_err().is_cancelled());
+        let repeated = close_session_stream(
+            &router.notification_sink,
+            &router.active_session_streams,
+            &router.stream_authority,
+            &stream_id,
+        )
+        .await
+        .unwrap();
+        assert!(repeated.already_closed);
+        assert!(
+            router
+                .notification_sink
+                .stream_terminal_admission
+                .try_reserve()
+                .is_err()
+        );
+        assert_eq!(rx.recv().await.unwrap().method, "session/stream_event");
+        let terminal = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(notification_params!(terminal)["outcome"], "terminal_error");
+        assert_eq!(
+            notification_params!(terminal)["error"]["code"],
             "stream_queue_overflow"
+        );
+        assert!(
+            notification_params!(terminal)["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("3 event(s)")
+        );
+        assert!(rx.try_recv().is_err());
+        drop(terminal);
+        assert!(
+            router
+                .notification_sink
+                .stream_terminal_admission
+                .try_reserve()
+                .is_ok()
         );
     }
 

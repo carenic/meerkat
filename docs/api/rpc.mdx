@@ -3211,7 +3211,8 @@ without polling `live/status`. `reason` is one of:
 `reopen_recommended` is true only for a `media_fault` while the session's one
 reopen is still available; the reopened channel keeps its retained context.
 
-`stream_truncated` is subscriber-local. It reports UI-ring lag, not an
+`stream_truncated` is subscriber-local. It reports UI-ring lag or dropped
+source events at an explicit session stream's outbound queue, not an
 EventStore projection result. Use `events/list_since` or `events/snapshot`
 when that optional replay surface is healthy, and reconcile against current
 session state after receiving it.
@@ -3250,6 +3251,17 @@ from the source envelope's `event.seq`. Outer `stream_id` and `session_id`
 are routing fields; scoped streams can additionally carry `scope_id` and
 `scope_path`. None of these flattens or replaces `event.payload`.
 
+Temporary outbound admission or notification-channel saturation keeps the
+session subscription open. Before delivering its next source event, the
+server emits a `stream_truncated` marker with `event.seq: 0` and
+`reason: {"kind":"stream_lagged","dropped":N}`. The count includes source
+events that could not be admitted; refused synthetic markers do not increase
+it. Admission stays nonblocking, so a slow subscriber does not reserve capacity
+ahead of RPC responses or callback requests. This is a loss notice, not replay.
+Mob streams (member-scoped and aggregate) retain their existing overflow
+termination behavior. Aggregate recovery requires separate attribution because
+a mixed-member gap cannot be attributed to one member's event envelope.
+
 ### session/stream_end notifications
 
 Session and mob streams reserve terminal delivery capacity before opening.
@@ -3276,8 +3288,10 @@ An explicit session stream terminates with this notification:
 ```
 
 `outcome` is `"remote_end"`, `"terminal_error"`, or `"explicit_close"`.
-Calling `session/stream_close` terminates the handle with `explicit_close`;
-normal upstream exhaustion uses `remote_end`. When a terminal error is
+Calling `session/stream_close` normally terminates the handle with `explicit_close`;
+normal upstream exhaustion uses `remote_end`. If dropped events remain without
+a delivered gap marker, either path uses `terminal_error` with
+`stream_queue_overflow` and the unreported source-event count. When a terminal error is
 reported, the notification additionally contains
 `error: {"code":"stream_queue_overflow","message":"..."}` or
 `error: {"code":"stream_receiver_gone","message":"..."}`.
@@ -3286,6 +3300,13 @@ reported, the notification additionally contains
 protocol. Stop consuming a terminated handle and reopen/reconcile as needed.
 A disconnected transport or lost notification receiver cannot be relied on to
 deliver its final end notification.
+
+Python and TypeScript `EventSubscription` iterators drain earlier queued events,
+then raise `EventSubscriptionError` when the terminal contains an error. The
+error retains the raw terminal, including unknown server codes, and the last
+delivered RPC and envelope sequence values. Error-free `remote_end` and
+`explicit_close` still end iteration normally. Subscription failure does not
+itself establish that the agent's run failed or stopped.
 
 ### mob/stream_event notifications
 
