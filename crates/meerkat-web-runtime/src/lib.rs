@@ -4004,6 +4004,27 @@ capabilities = [{capability_values}]
         );
     }
 
+    /// The Web SDK's `MeerkatError.fromWasm` keeps an envelope's `data` and
+    /// nothing else beside its code and message, so an incomplete destroy's
+    /// envelope carries its typed data there: exactly the `error.data` RPC
+    /// sends, report included.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn mob_destroy_incomplete_envelope_carries_the_rpc_error_data() {
+        let mut report = meerkat_mob::MobDestroyReport::default();
+        report.errors.push("worker-1: reload refused".to_string());
+        report
+            .reloaded_members
+            .push(meerkat_mob::AgentIdentity::from("worker-2"));
+        let rpc_data = meerkat_mob_mcp::MobMcpDestroyError::incomplete_error_data(&report);
+
+        let value =
+            mob_destroy_error_value(meerkat_mob_mcp::MobMcpDestroyError::Incomplete { report });
+
+        assert_eq!(value["data"], rpc_data, "{value}");
+        assert_eq!(value["data"]["code"], "mob_destroy_incomplete", "{value}");
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     struct GatedTeardownExecutor {
         cleanup_started: Arc<tokio::sync::Notify>,
