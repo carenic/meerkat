@@ -245,6 +245,7 @@ a crash (see [Durable Runs](/guides/durable-runs)). Integrations see:
     `Continue { candidate, run_id, receipt }`;
   - the machine enums gain `DurableTailRecoveryClass::ContinuableCandidate`,
     `DurableTailRecoveryDisposition::ContinueRun`,
+    `DurableTailRecoveryDisposition::OperatorRepairAndCommitInterrupted`,
     `RecoveredInputNormalizationReasonKind::ResumableRun` and
     `InputAbandonReason::ResumeRefused` (with the `meerkat_machine::dsl`
     bridge copies and the catalog and kernel types);
@@ -255,8 +256,9 @@ a crash (see [Durable Runs](/guides/durable-runs)). Integrations see:
     `run_cursor` and `cursor_inputs_open`;
   - `MeerkatMachineState` gains `resumable_run_id`; `MeerkatMachineInput`
     gains `MarkRunResumable`, `ResumeRun`, `ReleaseResumableRun`,
-    `SettleResumableRun`, `ReplayAppliedRunContributor` and
-    `SuspendRunForStop`, and `NormalizeRecoveredInputLifecycle` gains
+    `SettleResumableRun`, `ReplayAppliedRunContributor`,
+    `SuspendRunForStop` and `AuthorizeOperatorDurableTailRepair`, and
+    `NormalizeRecoveredInputLifecycle` gains
     `bound_run_resumable`; `MeerkatMachineEffect` gains `ResumableRunMarked`,
     `ResumedRunAuthorized`, `ResumableRunReleased`, `ResumableRunSettled`
     and `RunSuspendedForStop`;
@@ -441,6 +443,15 @@ WebSocket, and keep WebRTC for sessions that are not mob members.
   answered `409` `SESSION_NOT_RUNNING` with `kind` `requeued_across_stop`.
   See
   [Durable Runs: graceful stops and deploys](/guides/durable-runs#graceful-stops-and-deploys).
+- **An operator path for a held durable tail:** a session held as
+  `SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY` with ambiguous evidence, such as a
+  transcript that ends in a tool call without its result, can be resolved
+  with `rkat session resolve-held-tail <id> [--apply] [--runtime-store <FILE>]`
+  or `meerkat_runtime::recovery::resolve_held_durable_tail`. The dry run is
+  the default; applied, it commits the tail as interrupted with every row
+  kept and each call without a result answered `outcome_uncertain`, while
+  the runtime is stopped. 0.9.4 had no path out of such a hold. See
+  [Storage Operations](/guides/storage-operations#resolve-a-durable-tail-held-for-recovery).
 - **Host stores:** a host can keep a realm's durable state in its own
   database through the host store SPI (`meerkat_core::host_store`), checked
   by the host store chapter of `meerkat-store-conformance`. See the

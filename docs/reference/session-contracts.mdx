@@ -780,7 +780,12 @@ the committed authority is preserved.
   its external side effect may already have fired, so recovery never closes
   it with synthetic results. A tail whose last turn stopped for a reason
   other than `EndTurn` or `ToolUse` (for example `MaxTokens` or `PauseTurn`)
-  is held the same way: that turn did not reach a natural end.
+  is held the same way: that turn did not reach a natural end. Since 0.9.5
+  an operator can resolve a tail held as ambiguous:
+  `rkat session resolve-held-tail` commits it as interrupted, keeps every
+  row, and answers each call without a result with an `outcome_uncertain`
+  tool error, which says only that its outcome is unknown (see
+  [Storage Operations](/guides/storage-operations#resolve-a-durable-tail-held-for-recovery)).
 
 A session whose transcript has rewrite occurrences (compaction) is recovered
 the same way: a completed tail becomes a recovered run boundary, an
@@ -817,7 +822,8 @@ resume fails typed rather than with internal-error prose:
 
 - `SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY` - the durable tail exists but
   machine-authorized recovery has not promoted it yet; it awaits
-  reconciliation.
+  reconciliation. An operator resolves a tail held as ambiguous with
+  `rkat session resolve-held-tail`.
 - `SESSION_DURABLE_TAIL_RECOVERY_REFUSED` - machine-authorized recovery was
   refused by conflicting persisted runtime facts (another live runtime, or
   boundary receipts that already cover or contradict the tail); retry after
