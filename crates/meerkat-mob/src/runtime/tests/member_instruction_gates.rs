@@ -612,10 +612,25 @@ async fn a_self_starting_fork_reactivates_inherited_instructions_when_the_host_o
     let child_request = requests
         .get(requests_before)
         .expect("the child's first turn reached the model");
+    // The inherited row reaches the model as a header that names the key;
+    // the body comes once, from the child's own re-activation.
     assert_eq!(
         system_rows_with_body(child_request),
-        2,
-        "the child's request carries the inherited history row and its own activation"
+        1,
+        "the child's request carries the body once, from its own activation"
+    );
+    assert_eq!(
+        child_request
+            .messages
+            .iter()
+            .filter(|message| matches!(
+                message,
+                Message::System(system)
+                    if system.content.starts_with("[meerkat-inherited-instruction-v2]")
+            ))
+            .count(),
+        1,
+        "the inherited history row is a header without its body"
     );
     let child = fixture
         .durable(&outcome.fork.session_id)

@@ -6675,6 +6675,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn fork_durable_session_with_optional_planned_identity(
         &self,
         source_session_id: &SessionId,
