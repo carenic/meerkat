@@ -12,6 +12,7 @@ pub use execution_custody::{
 };
 
 pub mod memory;
+pub mod spi;
 #[cfg(feature = "sqlite-store")]
 pub mod sqlite;
 #[cfg(any(test, feature = "test-support"))]
@@ -4347,7 +4348,7 @@ impl PreparedRecoveryEvidence {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-#[cfg(feature = "sqlite-store")]
+#[cfg(any(feature = "sqlite-store", not(target_arch = "wasm32")))]
 struct CommittedRecoveryReceiptDigestEnrichmentWire {
     original_receipt: RunBoundaryReceipt,
     original_exact_row_token: String,
@@ -4356,7 +4357,7 @@ struct CommittedRecoveryReceiptDigestEnrichmentWire {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-#[cfg(feature = "sqlite-store")]
+#[cfg(any(feature = "sqlite-store", not(target_arch = "wasm32")))]
 struct CommittedRecoveryInputUpdateWire {
     input_id: InputId,
     expected_row_digest: String,
@@ -4365,7 +4366,7 @@ struct CommittedRecoveryInputUpdateWire {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(tag = "profile", rename_all = "snake_case", deny_unknown_fields)]
-#[cfg(feature = "sqlite-store")]
+#[cfg(any(feature = "sqlite-store", not(target_arch = "wasm32")))]
 enum CommittedRecoverySessionAuthorityWire {
     WholeBlobV1 {
         base_store_revision: u64,
@@ -4385,7 +4386,7 @@ enum CommittedRecoverySessionAuthorityWire {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-#[cfg(feature = "sqlite-store")]
+#[cfg(any(feature = "sqlite-store", not(target_arch = "wasm32")))]
 struct CommittedRecoveryBoundaryWire {
     version: u16,
     session_id: meerkat_core::types::SessionId,
@@ -4412,7 +4413,7 @@ pub struct CommittedRecoveryBoundary {
 }
 
 impl CommittedRecoveryBoundary {
-    #[cfg(feature = "sqlite-store")]
+    #[cfg(any(feature = "sqlite-store", not(target_arch = "wasm32")))]
     const VERSION: u16 = 6;
 
     pub(crate) fn from_prepared(
@@ -4433,7 +4434,7 @@ impl CommittedRecoveryBoundary {
         &self.receipt
     }
 
-    #[cfg(feature = "sqlite-store")]
+    #[cfg(any(feature = "sqlite-store", not(target_arch = "wasm32")))]
     pub(crate) fn encode(&self) -> Result<Vec<u8>, RuntimeStoreError> {
         serde_json::to_vec(&CommittedRecoveryBoundaryWire {
             version: Self::VERSION,
@@ -4510,7 +4511,7 @@ impl CommittedRecoveryBoundary {
         })
     }
 
-    #[cfg(feature = "sqlite-store")]
+    #[cfg(any(feature = "sqlite-store", not(target_arch = "wasm32")))]
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, RuntimeStoreError> {
         let wire: CommittedRecoveryBoundaryWire =
             serde_json::from_slice(bytes).map_err(|error| {
@@ -6370,6 +6371,16 @@ pub trait RuntimeStoreWriteFence: Send + Sync {
     ) -> Result<RuntimeStoreWriteFenceOutcome, RuntimeStoreError> {
         self.execute_if_current(operation)
     }
+
+    /// How long a caller that holds an async lock retries this fence while
+    /// it answers [`RuntimeStoreWriteFenceOutcome::Backoff`], releasing the
+    /// lock between attempts, before it reports the Backoff. The default is
+    /// two seconds. A fence whose authority guard waits for a host store
+    /// commit answers the host's declared longest commit
+    /// ([`meerkat_core::host_store::FenceTiming::max_commit_latency`]).
+    fn backoff_retry_bound(&self) -> std::time::Duration {
+        FENCE_BACKOFF_RETRY_BOUND
+    }
 }
 
 /// Which entry of a [`RuntimeStoreWriteFence`] a fenced write goes through.
@@ -6513,7 +6524,8 @@ fn execute_optional_target_write_through<T>(
 }
 
 /// How long a fenced write whose caller holds an async lock retries a fence
-/// that answers [`RuntimeStoreWriteFenceOutcome::Backoff`].
+/// that answers [`RuntimeStoreWriteFenceOutcome::Backoff`], unless the fence
+/// declares another bound ([`RuntimeStoreWriteFence::backoff_retry_bound`]).
 ///
 /// Such a caller cannot wait inside the fence: the wait would block its
 /// thread while it holds a lock other tasks need. Between attempts it
@@ -6534,8 +6546,10 @@ const FENCE_BACKOFF_MAX_PAUSE: std::time::Duration = std::time::Duration::from_m
 /// Each attempt takes the caller's lock, re-observes what it writes and
 /// runs one fence attempt. After an attempt the fence answered with
 /// Backoff, the caller releases the lock and calls [`Self::pause`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct FenceBackoffRetry {
+    /// How long the retries last: the fence's declared bound.
+    bound: std::time::Duration,
     /// Set at the first pause, so a write the fence admits at once reads no
     /// clock.
     deadline: Option<crate::tokio::time::Instant>,
@@ -6543,13 +6557,24 @@ pub(crate) struct FenceBackoffRetry {
 }
 
 impl FenceBackoffRetry {
+    /// The retry policy for writes through `fence`, bounded by
+    /// [`RuntimeStoreWriteFence::backoff_retry_bound`] (the default bound
+    /// when there is no fence, which never answers Backoff).
+    pub(crate) fn for_fence(fence: Option<&dyn RuntimeStoreWriteFence>) -> Self {
+        Self {
+            bound: fence.map_or(FENCE_BACKOFF_RETRY_BOUND, |fence| {
+                fence.backoff_retry_bound()
+            }),
+            deadline: None,
+            pause: std::time::Duration::ZERO,
+        }
+    }
+
     /// Wait before the next attempt and return `true`, or return `false`
     /// once the bound has passed: the caller then reports the Backoff.
     pub(crate) async fn pause(&mut self) -> bool {
         let now = crate::tokio::time::Instant::now();
-        let deadline = *self
-            .deadline
-            .get_or_insert_with(|| now + FENCE_BACKOFF_RETRY_BOUND);
+        let deadline = *self.deadline.get_or_insert_with(|| now + self.bound);
         if now >= deadline {
             return false;
         }
@@ -9439,6 +9464,15 @@ pub trait RuntimeStore: Send + Sync {
     /// their inner store's capability.
     fn hosting_capability(&self) -> crate::session_hosting::HostingCapability {
         crate::session_hosting::HostingCapability::None
+    }
+
+    /// The self-fence of a store whose writes hold a host store fence
+    /// ([`meerkat_core::host_store::SelfFence`]), or `None`, the default. The
+    /// run loop's checkpointer reads its window right before each model call
+    /// and each tool dispatch. Decorators must forward their inner store's
+    /// fence.
+    fn self_fence(&self) -> Option<std::sync::Arc<dyn meerkat_core::host_store::SelfFence>> {
+        None
     }
 
     /// Load the exact generated runtime-delivery authority record.

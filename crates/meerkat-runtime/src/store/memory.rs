@@ -42,6 +42,12 @@ use crate::identifiers::{IdempotencyKey, LogicalRuntimeId};
 use crate::input_state::{InputStatePersistenceRecord, StoredInputState};
 use crate::ops_lifecycle::PersistedOpsSnapshot;
 
+pub(crate) mod journal;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod journal_image;
+
+use journal::{Group, Narrow, Tracked, TrackedSet, touch_runtime_entry};
+
 /// Receipt key: (runtime_id, run_id, sequence).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ReceiptKey {
@@ -73,56 +79,92 @@ type InputStateBatchCasTestBlock = (
 );
 
 /// Inner state protected by the mutex.
-#[derive(Debug, Default)]
+///
+/// Every map is [`Tracked`]: it reports the journal entries a mutation
+/// touches to the host store journal's change log (see [`journal`]); outside
+/// a capture it behaves as the plain map.
+#[derive(Debug)]
 struct Inner {
     /// runtime_id → (input_id → StoredInputState). IndexMap for deterministic iteration order.
-    input_states: HashMap<String, IndexMap<InputId, StoredInputState>>,
+    input_states: Tracked<String, IndexMap<InputId, StoredInputState>>,
     /// Runtime id → canonical owners of unfinished terminal work.
-    pending_terminal_owners: HashMap<String, BTreeSet<uuid::Uuid>>,
+    pending_terminal_owners: Tracked<String, BTreeSet<uuid::Uuid>>,
     /// Runtime id → canonical complete set of nonterminal input ids.
-    recovery_nonterminal_inputs: HashMap<String, BTreeSet<uuid::Uuid>>,
+    recovery_nonterminal_inputs: Tracked<String, BTreeSet<uuid::Uuid>>,
     /// Runtime id → store-owned revision bumped for every input-row mutation.
     ///
     /// Missing is canonical generation zero and remains a real absence fence.
-    recovery_input_set_revisions: HashMap<String, u64>,
+    recovery_input_set_revisions: Tracked<String, u64>,
     /// Runtime id → exact idempotency key → input id.
-    input_idempotency_index: HashMap<String, HashMap<String, InputId>>,
+    input_idempotency_index: Tracked<String, HashMap<String, InputId>>,
     /// Receipt storage.
-    receipts: HashMap<ReceiptKey, RunBoundaryReceipt>,
+    receipts: Tracked<ReceiptKey, RunBoundaryReceipt>,
     /// Exact machine-authorized recovery witness by runtime/candidate.
-    recovery_boundaries: HashMap<(String, String), super::CommittedRecoveryBoundary>,
+    recovery_boundaries: Tracked<(String, String), super::CommittedRecoveryBoundary>,
     /// Runtime session snapshots keyed by canonical runtime id.
-    sessions: HashMap<String, Arc<Vec<u8>>>,
+    sessions: Tracked<String, Arc<Vec<u8>>>,
     /// Fixed-size authority paired atomically with every WholeBlob snapshot.
-    session_authorities: HashMap<String, WholeBlobStoreAuthority>,
+    session_authorities: Tracked<String, WholeBlobStoreAuthority>,
     /// Body-free session listing/lifecycle projection.
-    session_catalog: HashMap<String, super::RuntimeSessionCatalogEntry>,
+    session_catalog: Tracked<String, super::RuntimeSessionCatalogEntry>,
     /// Store-owned provisional candidate body and exact base/run identity.
-    whole_blob_provisional_tails: HashMap<String, StoredWholeBlobProvisionalTail>,
+    whole_blob_provisional_tails: Tracked<String, StoredWholeBlobProvisionalTail>,
     /// Canonical runtime ids whose projection fallback is quarantined.
     ///
     /// Mirrors the durable SQLite `runtime_projection_quarantine` table: set
     /// when a rejected runtime snapshot is cleared via
     /// `clear_session_snapshot_if_current`, cleared whenever a live snapshot is
     /// written for the runtime.
-    projection_quarantine: HashSet<String>,
+    projection_quarantine: TrackedSet<String>,
     /// Exact persisted machine-lifecycle bytes. Raw storage is required so
     /// malformed and unsupported rows remain observable instead of being
     /// normalized by an eager typed decode.
-    runtime_lifecycle: HashMap<String, Vec<u8>>,
+    runtime_lifecycle: Tracked<String, Vec<u8>>,
     /// Durable semantic high-water for peer-only member sessions. Runtime
     /// bearer tokens are deliberately never persisted here.
     direct_member_incarnation_high_waters:
-        HashMap<String, meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation>,
+        Tracked<String, meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberIncarnation>,
     /// Runtime id -> transcript-rewrite-keyed compaction projection outbox.
     compaction_projection_outbox:
-        HashMap<String, HashMap<meerkat_core::CompactionProjectionId, CompactionOutboxEntry>>,
+        Tracked<String, HashMap<meerkat_core::CompactionProjectionId, CompactionOutboxEntry>>,
     /// Exact generated runtime-delivery authority by logical runtime.
-    runtime_delivery_authority: HashMap<String, RuntimeDeliveryAuthorityRecord>,
+    runtime_delivery_authority: Tracked<String, RuntimeDeliveryAuthorityRecord>,
     /// Durable runtime-delivery rows ordered by generated sequence.
-    runtime_delivery_records: HashMap<String, BTreeMap<u64, RuntimeDeliveryStoreRecord>>,
-    continuation_key_bindings: HashMap<(String, String), ContinuationKeyBinding>,
-    continuation_admissions: HashMap<(String, String), ContinuationAdmission>,
+    runtime_delivery_records: Tracked<String, BTreeMap<u64, RuntimeDeliveryStoreRecord>>,
+    continuation_key_bindings: Tracked<(String, String), ContinuationKeyBinding>,
+    continuation_admissions: Tracked<(String, String), ContinuationAdmission>,
+}
+
+impl Default for Inner {
+    fn default() -> Self {
+        use journal::{
+            key_binding, member_high_water, receipt_entry, runtime_pair_entry, whole_runtime,
+        };
+        Self {
+            input_states: Tracked::new(Group::InputStates, whole_runtime),
+            pending_terminal_owners: Tracked::new(Group::PendingOwners, whole_runtime),
+            recovery_nonterminal_inputs: Tracked::new(Group::Nonterminal, whole_runtime),
+            recovery_input_set_revisions: Tracked::new(Group::InputSetRevision, whole_runtime),
+            input_idempotency_index: Tracked::new(Group::IdempotencyIndex, whole_runtime),
+            receipts: Tracked::new(Group::Receipts, receipt_entry),
+            recovery_boundaries: Tracked::new(Group::RecoveryBoundaries, runtime_pair_entry),
+            sessions: Tracked::new(Group::Sessions, whole_runtime),
+            session_authorities: Tracked::new(Group::SessionAuthorities, whole_runtime),
+            session_catalog: Tracked::new(Group::Catalog, whole_runtime),
+            whole_blob_provisional_tails: Tracked::new(Group::ProvisionalTails, whole_runtime),
+            projection_quarantine: TrackedSet::new(Group::Quarantine, whole_runtime),
+            runtime_lifecycle: Tracked::new(Group::Lifecycle, whole_runtime),
+            direct_member_incarnation_high_waters: Tracked::new(
+                Group::MemberHighWaters,
+                member_high_water,
+            ),
+            compaction_projection_outbox: Tracked::new(Group::CompactionOutbox, whole_runtime),
+            runtime_delivery_authority: Tracked::new(Group::DeliveryAuthority, whole_runtime),
+            runtime_delivery_records: Tracked::new(Group::DeliveryRecords, whole_runtime),
+            continuation_key_bindings: Tracked::new(Group::KeyBindings, key_binding),
+            continuation_admissions: Tracked::new(Group::Admissions, runtime_pair_entry),
+        }
+    }
 }
 
 struct MemoryControllerCustody<'a> {
@@ -216,7 +258,10 @@ fn store_input_state_prechecked(
     bundle: StoredInputState,
     next_revision: u64,
 ) {
+    // The journal records the exact input row and index keys this changes.
+    let _narrow = Narrow::begin(&[Group::InputStates, Group::IdempotencyIndex]);
     let input_id = bundle.state.input_id.clone();
+    touch_runtime_entry(runtime_id, Group::InputStates, || input_id.0.to_string());
     let new_idempotency_key = bundle
         .state
         .idempotency_key
@@ -269,6 +314,7 @@ fn store_input_state_prechecked(
         {
             if index.get(&old_key) == Some(&input_id) {
                 index.remove(&old_key);
+                touch_runtime_entry(runtime_id, Group::IdempotencyIndex, || old_key.clone());
             }
             index.is_empty()
         } else {
@@ -278,6 +324,7 @@ fn store_input_state_prechecked(
             inner.input_idempotency_index.remove(runtime_id);
         }
         if let Some(new_key) = new_idempotency_key {
+            touch_runtime_entry(runtime_id, Group::IdempotencyIndex, || new_key.clone());
             inner
                 .input_idempotency_index
                 .entry(runtime_id.to_string())
@@ -328,6 +375,9 @@ fn delete_input_state_prechecked(
     input_id: &InputId,
     next_revision: u64,
 ) {
+    // The journal records the exact input row and index key this removes.
+    let _narrow = Narrow::begin(&[Group::InputStates, Group::IdempotencyIndex]);
+    touch_runtime_entry(runtime_id, Group::InputStates, || input_id.0.to_string());
     let removed = inner
         .input_states
         .get_mut(runtime_id)
@@ -362,6 +412,7 @@ fn delete_input_state_prechecked(
     {
         if index.get(&key.0) == Some(input_id) {
             index.remove(&key.0);
+            touch_runtime_entry(runtime_id, Group::IdempotencyIndex, || key.0.clone());
         }
         index.is_empty()
     } else {
@@ -506,6 +557,9 @@ fn apply_prepared_memory_input_state_mutations(
     runtime_id: &str,
     prepared: Vec<PreparedMemoryInputStateMutation>,
 ) {
+    // The journal records the exact index keys this removes; the row
+    // helpers below record their own rows and keys.
+    let _narrow = Narrow::begin(&[Group::IdempotencyIndex]);
     let remove_empty_index = if let Some(index) = inner.input_idempotency_index.get_mut(runtime_id)
     {
         for mutation in &prepared {
@@ -521,6 +575,7 @@ fn apply_prepared_memory_input_state_mutations(
                 && index.get(old_key) == Some(input_id)
             {
                 index.remove(old_key);
+                touch_runtime_entry(runtime_id, Group::IdempotencyIndex, || old_key.to_string());
             }
         }
         index.is_empty()
@@ -552,13 +607,22 @@ fn apply_prepared_memory_input_state_mutations(
 /// would never wake. So this lock is a std mutex, held only for short sections
 /// that never await, and it never waits on `inner`. Lock order where both are
 /// needed (`commit_unregister_finalization`): `inner`, then this.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct OpsLifecycleState {
     /// Persisted ops lifecycle snapshots.
-    snapshots: HashMap<String, PersistedOpsSnapshot>,
+    snapshots: Tracked<String, PersistedOpsSnapshot>,
     /// Exact ops epochs retired by atomic unregister finalization. Tombstones
     /// outlive row deletion so detached callbacks cannot resurrect them.
-    retired_epochs: HashSet<(String, meerkat_core::RuntimeEpochId)>,
+    retired_epochs: TrackedSet<(String, meerkat_core::RuntimeEpochId)>,
+}
+
+impl Default for OpsLifecycleState {
+    fn default() -> Self {
+        Self {
+            snapshots: Tracked::new(Group::OpsSnapshots, journal::whole_runtime),
+            retired_epochs: TrackedSet::new(Group::OpsRetiredEpochs, journal::retired_epoch),
+        }
+    }
 }
 
 /// In-memory runtime store. Thread-safe via `tokio::sync::Mutex`, except the
@@ -1996,7 +2060,7 @@ impl super::RuntimeSessionAuthorityOps for InMemoryRuntimeStore {
                 // store lock released between attempts; the prepared
                 // snapshot stays here until an attempt commits it.
                 let mut pending = Some(prepared);
-                let mut retry = super::FenceBackoffRetry::default();
+                let mut retry = super::FenceBackoffRetry::for_fence(write_fence.as_deref());
                 loop {
                     let mut inner = self.inner.lock().await;
                     let session = pending
@@ -2606,28 +2670,29 @@ fn compare_and_swap_runtime_delivery_authority_locked(
             replacement.revision()
         )));
     }
-    if let Some(record) = inserted_delivery.as_ref() {
-        let records = inner
-            .runtime_delivery_records
-            .entry(runtime_id.0.clone())
-            .or_default();
-        if records.contains_key(&record.sequence())
+    if let Some(record) = inserted_delivery.as_ref()
+        && let Some(records) = inner.runtime_delivery_records.get(&runtime_id.0)
+        && (records.contains_key(&record.sequence())
             || records
                 .values()
-                .any(|existing| existing.delivery_id() == record.delivery_id())
-        {
-            return Err(RuntimeStoreError::WriteFailed(format!(
-                "runtime delivery row {} / sequence {} already exists",
-                record.delivery_id(),
-                record.sequence()
-            )));
-        }
+                .any(|existing| existing.delivery_id() == record.delivery_id()))
+    {
+        return Err(RuntimeStoreError::WriteFailed(format!(
+            "runtime delivery row {} / sequence {} already exists",
+            record.delivery_id(),
+            record.sequence()
+        )));
     }
 
     inner
         .runtime_delivery_authority
         .insert(runtime_id.0.clone(), replacement.clone());
     if let Some(record) = inserted_delivery {
+        // The journal records the one delivery row this adds.
+        let _narrow = Narrow::begin(&[Group::DeliveryRecords]);
+        touch_runtime_entry(&runtime_id.0, Group::DeliveryRecords, || {
+            record.sequence().to_string()
+        });
         inner
             .runtime_delivery_records
             .entry(runtime_id.0.clone())
@@ -3369,7 +3434,7 @@ impl RuntimeStore for InMemoryRuntimeStore {
         }
 
         let mut inner = self.inner.lock().await;
-        let Some(states) = inner.input_states.get_mut(&runtime_id.0) else {
+        let Some(states) = inner.input_states.get(&runtime_id.0) else {
             return Ok(InputStateBatchCasOutcome::Stale);
         };
         let mut all_expected = true;
@@ -3431,7 +3496,7 @@ impl RuntimeStore for InMemoryRuntimeStore {
     ) -> Result<FencedInputStateBatchCasOutcome, RuntimeStoreError> {
         // A fence that answers Backoff is tried again with the store lock
         // released between attempts; each attempt re-reads the rows.
-        let mut retry = super::FenceBackoffRetry::default();
+        let mut retry = super::FenceBackoffRetry::for_fence(Some(write_fence.as_ref()));
         loop {
             let prepared = prepare_input_state_batch_cas(expected, replacements)?;
             if prepared.is_empty() {
@@ -3439,7 +3504,7 @@ impl RuntimeStore for InMemoryRuntimeStore {
             }
 
             let mut inner = self.inner.lock().await;
-            let Some(states) = inner.input_states.get_mut(&runtime_id.0) else {
+            let Some(states) = inner.input_states.get(&runtime_id.0) else {
                 return Ok(FencedInputStateBatchCasOutcome::Stale);
             };
             let mut all_expected = true;
@@ -3562,7 +3627,7 @@ impl RuntimeStore for InMemoryRuntimeStore {
     ) -> Result<FencedInputStateBatchCasOutcome, RuntimeStoreError> {
         // A fence that answers Backoff is tried again with the store lock
         // released between attempts; each attempt re-reads the rows.
-        let mut retry = super::FenceBackoffRetry::default();
+        let mut retry = super::FenceBackoffRetry::for_fence(Some(write_fence.as_ref()));
         loop {
             let prepared = prepare_recovery_input_state_mutations(mutations)?;
             let mut inner = self.inner.lock().await;
@@ -3842,7 +3907,7 @@ impl RuntimeStore for InMemoryRuntimeStore {
             .fetch_add(1, Ordering::AcqRel);
         // A fence that answers Backoff is tried again with the store lock
         // released between attempts; each attempt re-reads the row.
-        let mut retry = super::FenceBackoffRetry::default();
+        let mut retry = super::FenceBackoffRetry::for_fence(Some(write_fence.as_ref()));
         loop {
             let replacement = prepare_machine_lifecycle_replacement(replacement.clone())?;
             let mut inner = self.inner.lock().await;
@@ -4624,6 +4689,82 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    /// Answers Backoff until `busy_for` has passed since its first call, as a
+    /// host store identity fence does while a slow host commit holds the
+    /// identity scope, and declares `bound` as its Backoff retry bound.
+    struct SlowCommitFence {
+        busy_until: std::sync::Mutex<Option<tokio::time::Instant>>,
+        busy_for: std::time::Duration,
+        bound: std::time::Duration,
+    }
+
+    impl RuntimeStoreWriteFence for SlowCommitFence {
+        fn execute_if_current(
+            &self,
+            operation: Box<dyn FnOnce() -> Result<(), RuntimeStoreError> + '_>,
+        ) -> Result<RuntimeStoreWriteFenceOutcome, RuntimeStoreError> {
+            let now = tokio::time::Instant::now();
+            let busy_until = *self
+                .busy_until
+                .lock()
+                .unwrap()
+                .get_or_insert(now + self.busy_for);
+            if now < busy_until {
+                return Ok(RuntimeStoreWriteFenceOutcome::Backoff {
+                    reason: "a host store commit is in flight".to_string(),
+                });
+            }
+            operation().map(|()| RuntimeStoreWriteFenceOutcome::Applied)
+        }
+
+        fn backoff_retry_bound(&self) -> std::time::Duration {
+            self.bound
+        }
+    }
+
+    // Unrun until the candidate's validation. A fenced write waits out a
+    // host commit slower than the default bound when the fence declares a
+    // longer one (a host store's declared longest commit), and backs off
+    // under the default.
+    #[tokio::test(start_paused = true)]
+    async fn a_fenced_write_waits_out_a_slow_commit_under_its_declared_bound() {
+        for (bound, admitted) in [
+            (std::time::Duration::from_secs(10), true),
+            (crate::store::FENCE_BACKOFF_RETRY_BOUND, false),
+        ] {
+            let store = InMemoryRuntimeStore::new();
+            let runtime_id = LogicalRuntimeId::new("fenced-slow-commit");
+            let fence = Arc::new(SlowCommitFence {
+                busy_until: std::sync::Mutex::new(None),
+                busy_for: std::time::Duration::from_secs(3),
+                bound,
+            });
+            let outcome = store
+                .compare_and_swap_machine_lifecycle_with_fence(
+                    &runtime_id,
+                    MachineLifecycleExpectedVersion::Missing,
+                    lifecycle_commit(&runtime_id, RuntimeState::Idle, 1, 1),
+                    fence,
+                )
+                .await
+                .unwrap();
+            if admitted {
+                assert!(
+                    matches!(outcome, FencedMachineLifecycleCasOutcome::Applied { .. }),
+                    "{outcome:?}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        outcome,
+                        FencedMachineLifecycleCasOutcome::FenceBackoff { .. }
+                    ),
+                    "{outcome:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
