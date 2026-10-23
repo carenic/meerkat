@@ -62,6 +62,14 @@ them.
   protocol 7 entry under Added). Code that builds them with a struct
   literal sets the new field, normally to `None`; a materialized row
   written before it reads as `None`.
+- `meerkat-runtime`: `meerkat_machine_types::SupervisorBridgeCommandKind`
+  gains the variants `HostFeatures` and `ReadMemberVisibleTools`, appended
+  after `MemberOperatorRequest` (no other discriminant moves), for the
+  protocol 7 commands of the same names. `HostFeatures` is admitted and
+  served by the host daemon (`NotMemberAddressed`, served off the member
+  drain); `ReadMemberVisibleTools` is admitted through the bound-supervisor
+  ladder and served on the member drain. Exhaustive matches must handle
+  both.
 - Not measured by the gate (a wire change): `meerkat-core`:
   `ForkInstructionRefusal` gains `skills: Box<[SkillKey]>`, the skills a
   prompt-context fork's source loaded with the built-in `load_skill` tool
