@@ -324,7 +324,7 @@ impl SpawnActivationWorkerContext {
                 // A placed first turn rides the ordinary placed ingress lane
                 // (see the rustdoc above): no carrier intent covers it, and a
                 // failure unwinds the spawn without a revival trigger.
-                let result = match (placed_incarnation, placed_input_id) {
+                match (placed_incarnation, placed_input_id) {
                     (Some(expected_member), Some(input_id)) => {
                         MobActor::admit_placed_ingress_turn(
                             &self.provisioner,
@@ -357,8 +357,7 @@ impl SpawnActivationWorkerContext {
                             self.provisioner.admit_turn(&member_ref, *req).await
                         }
                     }
-                };
-                result
+                }
             }
             SubmitWorkDispatchCompletion::AwaitTurnCompletion { .. } => {
                 Err(MobError::Internal(format!(
