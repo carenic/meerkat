@@ -289,7 +289,10 @@ as ambiguous and what the repair keeps, answers and ends; with `--apply` it
 commits a repair the runtime machine authorizes as an interrupted run (every
 row kept, the open calls answered as outcome unknown). Stop every host of the
 session first: the repair is refused while the persisted lifecycle row is not
-quiescent, and an idle live host is not detected. It exits non-zero when the
+quiescent, and an idle live host is not detected. A row a host left `Stopped`
+when it ended before unregistering (no current run, no unregister in progress)
+counts as the `Idle` row a start would normalize it to: the report says so, and
+`--apply` writes it with the repair. It exits non-zero when the
 repair is refused or the tail is held for another reason, and never retries.
 Without `--runtime-store` it opens the realm's runtime database (a SQLite
 realm's session database, a JSONL realm's `runtime.sqlite3`); with it, the id
