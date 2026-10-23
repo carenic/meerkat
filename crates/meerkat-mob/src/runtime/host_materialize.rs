@@ -1030,6 +1030,9 @@ pub struct MaterializedBuildOutcome {
     pub resolved_auth_binding: Option<WireAuthBindingRef>,
     /// First durable event seq belonging to this materialization generation.
     pub generation_start_seq: u64,
+    /// The first turn of the session a `Resume` launch adopted, read from
+    /// the snapshot that launch loaded. `None` on a `Fresh` launch.
+    pub adopted_first_turn: Option<crate::runtime::bridge_protocol::BridgeAdoptedFirstTurn>,
 }
 
 /// Machine-admitted authority facts for one materialization attempt.
@@ -1910,6 +1913,14 @@ impl HostMemberMaterializer {
             }
         };
 
+        // The first turn of the adopted session, read from the snapshot this
+        // Resume launch loaded, before the build consumes it. Every Resume
+        // build records it; the ack reports it only when asked.
+        let adopted_first_turn = resumed_session.as_ref().map(|session| {
+            crate::runtime::bridge_protocol::BridgeAdoptedFirstTurn::from(
+                crate::runtime::handle::AdoptedFirstTurn::of(session),
+            )
+        });
         let mut config = self
             .compile_member_config(
                 &decompiled,
@@ -2288,6 +2299,7 @@ impl HostMemberMaterializer {
             launch_outcome,
             resolved_auth_binding,
             generation_start_seq,
+            adopted_first_turn,
         })
     }
 

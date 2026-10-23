@@ -73,10 +73,11 @@ use meerkat_contracts::wire::supervisor_bridge::{
     BridgeMaterializedResponse, BridgeMemberReleasedResponse, BridgePeerIdentity, BridgePeerSpec,
     BridgePeerTrustPayload, BridgePromptContextFork, BridgeProtocolVersion, BridgeRejectionCause,
     BridgeReleasePayload, BridgeReply, BridgeRevokeForkedParticipantPayload, BridgeTurnOutcomeAck,
-    BridgeTurnOutcomeRecord, HOST_FEATURE_PROMPT_CONTEXT_FORK, MaterializeLaunchMode,
-    MaterializeLaunchOutcome, MemberSessionDisposal as WireMemberSessionDisposal,
-    RuntimeReleaseCause, WireFlowTurnOutcome, WireHostBindingDescriptor,
-    WireHostBindingDescriptorKind, canonicalize_bridge_address, decode_bridge_command,
+    BridgeTurnOutcomeRecord, HOST_FEATURE_ADOPTED_FIRST_TURN, HOST_FEATURE_PROMPT_CONTEXT_FORK,
+    MaterializeLaunchMode, MaterializeLaunchOutcome,
+    MemberSessionDisposal as WireMemberSessionDisposal, RuntimeReleaseCause, WireFlowTurnOutcome,
+    WireHostBindingDescriptor, WireHostBindingDescriptorKind, canonicalize_bridge_address,
+    decode_bridge_command,
 };
 use meerkat_contracts::wire::{
     PortableMemberSpec, WireAuthBindingRef, portable_member_spec_digest,
@@ -8863,7 +8864,7 @@ impl MobHostActor {
             supervisor_address: payload.supervisor.address.clone(),
             forked_participant_attachment: None,
             prompt_context_fork_digest: recorded_fork_digest,
-            adopted_first_turn: None,
+            adopted_first_turn: outcome.adopted_first_turn,
         };
         // Supersession compensation, immediately before the replacement row
         // commits: the old residency has already been quiesced, so its
@@ -9222,7 +9223,9 @@ impl MobHostActor {
             engine_version: meerkat_contracts::ContractVersion::CURRENT.to_string(),
             launch_outcome: outcome.launch_outcome,
             resolved_auth_binding: outcome.resolved_auth_binding,
-            adopted_first_turn: None,
+            adopted_first_turn: outcome
+                .adopted_first_turn
+                .filter(|_| payload.report_adopted_first_turn),
         });
         self.send_reply(
             candidate,
@@ -9530,6 +9533,8 @@ impl MobHostActor {
         }
 
         // The RECORDED ack, verbatim (including engine_version_at_build).
+        // The adopted first turn the build read is reported only to a
+        // request that asks for it.
         let reply = BridgeReply::MemberMaterialized(BridgeMaterializedResponse {
             member_pubkey: row.member_pubkey,
             member_peer_id: row.member_peer_id,
@@ -9539,7 +9544,9 @@ impl MobHostActor {
             engine_version: row.engine_version_at_build,
             launch_outcome: row.launch_outcome,
             resolved_auth_binding: row.resolved_auth_binding,
-            adopted_first_turn: None,
+            adopted_first_turn: row
+                .adopted_first_turn
+                .filter(|_| payload.report_adopted_first_turn),
         });
         self.send_reply(
             candidate,
@@ -10409,10 +10416,13 @@ impl MobHostActor {
         {
             return;
         }
-        // A prompt-context fork child is a member build: only a host
-        // composed with a member substrate serves it.
+        // A prompt-context fork child and a resumed member are member
+        // builds: only a host composed with a member substrate serves them.
         let features = if self.materializer.is_some() {
-            vec![HOST_FEATURE_PROMPT_CONTEXT_FORK.to_string()]
+            vec![
+                HOST_FEATURE_PROMPT_CONTEXT_FORK.to_string(),
+                HOST_FEATURE_ADOPTED_FIRST_TURN.to_string(),
+            ]
         } else {
             Vec::new()
         };
