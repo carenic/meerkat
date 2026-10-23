@@ -417,7 +417,8 @@ struct CompiledHttpEgress {
     /// Protected tool calls: no redirect and no retry.
     protected: reqwest::Client,
     /// Credential endpoints (OAuth discovery, registration, exchange,
-    /// refresh, userinfo): no redirect.
+    /// refresh, userinfo): no redirect, each request bounded by
+    /// [`crate::auth_oauth::CREDENTIAL_REQUEST_TIMEOUT`].
     credential: reqwest::Client,
 }
 
@@ -449,10 +450,15 @@ impl CompiledHttpEgress {
             .dns_resolver(Arc::clone(&resolver))
             .build()
             .map_err(|_| HttpEgressUnavailable::ClientUnavailable)?;
+        // Credential requests are single exchanges: each is bounded like the
+        // trusted-host credential client's. The ordinary and protected
+        // clients carry MCP traffic and its streams, so they stay unbounded.
         let credential = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
             .dns_resolver(resolver)
+            .connect_timeout(crate::auth_oauth::CREDENTIAL_CONNECT_TIMEOUT)
+            .timeout(crate::auth_oauth::CREDENTIAL_REQUEST_TIMEOUT)
             .build()
             .map_err(|_| HttpEgressUnavailable::ClientUnavailable)?;
         Ok(Self {
@@ -591,8 +597,9 @@ impl HttpEgressProfile {
             .map(|compiled| compiled.map(|compiled| &compiled.protected))
     }
 
-    /// The required credential-endpoint client (no redirect); `None` for a
-    /// trusted-host profile.
+    /// The required credential-endpoint client (no redirect, each request
+    /// bounded like [`crate::auth_oauth::credential_http_client`]'s); `None`
+    /// for a trusted-host profile.
     pub fn credential_client(&self) -> Option<Result<&reqwest::Client, HttpEgressUnavailable>> {
         self.compiled()
             .map(|compiled| compiled.map(|compiled| &compiled.credential))
@@ -942,6 +949,49 @@ mod tests {
             .expect("an exactly authorized local service is reachable");
         assert!(response.status().is_success());
         assert_eq!(arrivals.load(Ordering::SeqCst), 1);
+    }
+
+    /// Only a required profile's credential client is bounded: its ordinary
+    /// and protected clients carry MCP traffic and streams, so a slow answer
+    /// still reaches them. Virtual time.
+    #[tokio::test(start_paused = true)]
+    async fn only_the_credential_client_of_a_required_profile_is_bounded() {
+        let never = crate::auth_oauth::redirect_fixture::spawn_slow_endpoint(None).await;
+        let slow = crate::auth_oauth::redirect_fixture::spawn_slow_endpoint(Some(
+            crate::auth_oauth::CREDENTIAL_REQUEST_TIMEOUT * 4,
+        ))
+        .await;
+        let local = |port: u16| {
+            HttpEgressPolicy::new().allow_local(
+                origin(&format!("http://localhost:{port}")),
+                [ip("127.0.0.1"), ip("::1")],
+            )
+        };
+        let bounded = HttpEgressProfile::required(local(never.port()));
+        let request = bounded
+            .credential_client()
+            .unwrap()
+            .unwrap()
+            .post(format!("http://localhost:{}/token", never.port()))
+            .send();
+        let error =
+            tokio::time::timeout(crate::auth_oauth::CREDENTIAL_REQUEST_TIMEOUT * 10, request)
+                .await
+                .expect("the credential client ends the request itself")
+                .expect_err("a credential request its endpoint never answers ends");
+        assert!(error.is_timeout(), "{error:?}");
+
+        let unbounded = HttpEgressProfile::required(local(slow.port()));
+        for client in [unbounded.ordinary_client(), unbounded.protected_client()] {
+            let response = client
+                .unwrap()
+                .unwrap()
+                .post(format!("http://localhost:{}/mcp", slow.port()))
+                .send()
+                .await
+                .expect("a slow MCP answer still arrives");
+            assert!(response.status().is_success());
+        }
     }
 
     #[tokio::test]

@@ -14,7 +14,7 @@
 //! tier = "r2"
 //!
 //! [governance.review.reviewer]
-//! identity = { model = "claude-sonnet-5-5", provider = "anthropic" }
+//! identity = { model = "<model-id>", provider = "anthropic" }
 //! max_output_tokens = 1024
 //! ```
 
@@ -311,7 +311,7 @@ target = { kind = "mcp_server", server = "calendar" }
 tier = "r2"
 
 [governance.review.reviewer]
-identity = { model = "claude-sonnet-5-5", provider = "anthropic" }
+identity = { model = "test-anthropic-second", provider = "anthropic" }
 max_output_tokens = 1024
 "#;
 
@@ -371,7 +371,7 @@ max_output_tokens = 1024
             ]
         );
         let reviewer = review.reviewer.as_ref().expect("reviewer");
-        assert_eq!(reviewer.identity.model, "claude-sonnet-5-5");
+        assert_eq!(reviewer.identity.model, "test-anthropic-second");
         assert_eq!(reviewer.max_output_tokens, 1024);
         governance
             .validate()

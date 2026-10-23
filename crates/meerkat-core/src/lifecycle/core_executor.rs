@@ -709,6 +709,10 @@ enum BoundSessionCommitKind {
     /// nor a lazy WholeBlob artifact nor a HeadCanonical delta.
     ProvisionalPromotion {
         receipt: crate::RunCheckpointReceipt,
+        /// The live graph's retention cut when the run's last checkpoint
+        /// wrote its provisional successor. Intra-run checkpoints prune no
+        /// store rows; the promotion applies this deferred cut.
+        deferred_transcript_retirement: Option<u64>,
     },
 }
 
@@ -781,7 +785,10 @@ impl BoundSessionCommit {
     #[must_use]
     pub fn provisional_promotion(receipt: crate::RunCheckpointReceipt) -> Self {
         Self {
-            kind: BoundSessionCommitKind::ProvisionalPromotion { receipt },
+            kind: BoundSessionCommitKind::ProvisionalPromotion {
+                receipt,
+                deferred_transcript_retirement: None,
+            },
             #[cfg(test)]
             whole_blob_encode_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
@@ -931,12 +938,43 @@ impl BoundSessionCommit {
         }
     }
 
+    /// The same final promotion boundary, carrying the store-side retention
+    /// cut the promotion applies: the live graph's retired count when the
+    /// run's last checkpoint wrote its provisional successor. A boundary of
+    /// another kind is returned unchanged.
+    #[must_use]
+    pub fn with_deferred_transcript_retirement(mut self, retired: Option<u64>) -> Self {
+        if let BoundSessionCommitKind::ProvisionalPromotion {
+            deferred_transcript_retirement,
+            ..
+        } = &mut self.kind
+        {
+            *deferred_transcript_retirement = retired;
+        }
+        self
+    }
+
+    /// The store-side retention cut a final promotion boundary applies, if
+    /// any.
+    #[must_use]
+    pub fn deferred_transcript_retirement(&self) -> Option<u64> {
+        match &self.kind {
+            BoundSessionCommitKind::ProvisionalPromotion {
+                deferred_transcript_retirement,
+                ..
+            } => *deferred_transcript_retirement,
+            BoundSessionCommitKind::WholeBlobTyped { .. }
+            | BoundSessionCommitKind::WholeBlobUntyped { .. }
+            | BoundSessionCommitKind::HeadCanonical { .. } => None,
+        }
+    }
+
     /// Store-issued provisional physical identity carried by a final promotion
     /// boundary.
     #[must_use]
     pub fn provisional_promotion_receipt(&self) -> Option<&crate::RunCheckpointReceipt> {
         match &self.kind {
-            BoundSessionCommitKind::ProvisionalPromotion { receipt } => Some(receipt),
+            BoundSessionCommitKind::ProvisionalPromotion { receipt, .. } => Some(receipt),
             BoundSessionCommitKind::WholeBlobTyped { .. }
             | BoundSessionCommitKind::WholeBlobUntyped { .. }
             | BoundSessionCommitKind::HeadCanonical { .. } => None,

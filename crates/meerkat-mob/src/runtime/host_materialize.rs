@@ -86,9 +86,15 @@ pub enum MaterializeLlmPreflightOutcome {
 pub trait MaterializePreflightProbe: ProviderPresenceProbe {
     /// Resolve the exact digest-covered model/provider/binding tuple through
     /// the same host factory seam the subsequent member build uses.
+    ///
+    /// `resume_prior` is the resumed session's durable identity (`None` for a
+    /// fresh member). A resume that switches provider keeps the durable
+    /// credential account exactly as the build does, so the preflight and
+    /// the build reach the same route or the same refusal.
     async fn preflight_llm_identity(
         &self,
         identity: &meerkat_core::SessionLlmIdentity,
+        resume_prior: Option<&meerkat_core::SessionLlmIdentity>,
         custom_models: &BTreeMap<String, meerkat_core::config::CustomModelConfig>,
         preferred_realm: Option<&meerkat_core::RealmId>,
         auth_lease_handle: &meerkat_core::handles::GeneratedAuthLeaseHandle,
@@ -859,6 +865,41 @@ fn stdio_command_discoverable(command: &str) -> bool {
     std::env::split_paths(&search).any(|dir| dir.join(command).is_file())
 }
 
+/// The identity the Tier-2 preflight checks for a resumed member, and the
+/// durable identity it resumes from.
+///
+/// The identity is the resume merge's (the one the member build seats). The
+/// durable identity goes to the probe with it, so a resume that switches
+/// provider keeps the durable credential account in the preflight exactly as
+/// it does in the build.
+fn resumed_preflight_identity(
+    candidate: meerkat_core::SessionLlmIdentity,
+    metadata: &meerkat_core::session::SessionMetadata,
+    resume_overrides: &[meerkat_contracts::wire::WireMobResumeOverrideField],
+) -> (
+    meerkat_core::SessionLlmIdentity,
+    meerkat_core::SessionLlmIdentity,
+) {
+    let mut mask = meerkat_core::service::ResumeOverrideMask::default();
+    for field in resume_overrides {
+        match field {
+            meerkat_contracts::wire::WireMobResumeOverrideField::Model => {
+                mask.model = true;
+            }
+            meerkat_contracts::wire::WireMobResumeOverrideField::Provider => {
+                mask.provider = true;
+            }
+            meerkat_contracts::wire::WireMobResumeOverrideField::ProviderParams => {
+                mask.provider_params = true;
+            }
+        }
+    }
+    (
+        crate::build::effective_resumed_session_llm_identity(candidate, metadata, mask),
+        metadata.llm_identity(),
+    )
+}
+
 /// Assemble the tier-2 preflight observations. Every field is an observed
 /// host fact, never a pre-decision (A11/RMAT read discipline); the generated
 /// `ResolveMaterializePreflight` arms compose the verdict.
@@ -881,7 +922,7 @@ pub async fn assemble_preflight_observations(
             .map(meerkat_core::AuthBindingRef::from),
     };
     let identity = match launch {
-        MaterializeLaunchMode::Fresh {} => Some(candidate_identity),
+        MaterializeLaunchMode::Fresh {} => Some((candidate_identity, None)),
         MaterializeLaunchMode::Resume { session_id, .. } => match SessionId::parse(session_id) {
             Err(_) => {
                 // The materializer owns the stable typed invalid-id reply.
@@ -905,25 +946,12 @@ pub async fn assemble_preflight_observations(
                             ),
                         }
                     })?;
-                    let mut mask = meerkat_core::service::ResumeOverrideMask::default();
-                    for field in &spec.profile.resume_overrides {
-                        match field {
-                            meerkat_contracts::wire::WireMobResumeOverrideField::Model => {
-                                mask.model = true;
-                            }
-                            meerkat_contracts::wire::WireMobResumeOverrideField::Provider => {
-                                mask.provider = true;
-                            }
-                            meerkat_contracts::wire::WireMobResumeOverrideField::ProviderParams => {
-                                mask.provider_params = true;
-                            }
-                        }
-                    }
-                    Some(crate::build::effective_resumed_session_llm_identity(
+                    let (identity, durable) = resumed_preflight_identity(
                         candidate_identity,
                         &metadata,
-                        mask,
-                    ))
+                        &spec.profile.resume_overrides,
+                    );
+                    Some((identity, Some(durable)))
                 }
                 // Let the materializer return ResumeSessionNotFound through
                 // its existing typed launch seam; do not probe credentials
@@ -939,10 +967,11 @@ pub async fn assemble_preflight_observations(
     })?;
     let auth_lease_handle = substrate.runtime_adapter.generated_auth_lease_handle();
     let (model_resolvable, binding_resolvable) = match identity {
-        Some(identity) => match substrate
+        Some((identity, resume_prior)) => match substrate
             .preflight_probe
             .preflight_llm_identity(
                 &identity,
+                resume_prior.as_ref(),
                 &spec.definition_extract.models,
                 Some(&preferred_realm),
                 &auth_lease_handle,
@@ -3659,5 +3688,64 @@ mod tests {
     fn stdio_command_path_walk_finds_absolute_and_path_entries() {
         assert!(!stdio_command_discoverable("/definitely/not/a/real/binary"));
         assert!(!stdio_command_discoverable("definitely-not-a-real-binary"));
+    }
+
+    /// R9 (member host). A resume whose profile moved to Anthropic preflights
+    /// the merged Anthropic identity without the durable OpenAI binding, and
+    /// hands the probe the durable identity, so the factory applies the same
+    /// account affinity in the preflight as in the build.
+    #[test]
+    fn resumed_preflight_identity_drops_the_old_binding_and_carries_the_durable_identity() {
+        let openai = meerkat_core::AuthBindingRef {
+            realm: meerkat_core::RealmId::global(),
+            binding: meerkat_core::BindingId::parse("openai").unwrap(),
+            profile: None,
+            origin: meerkat_core::BindingOrigin::Configured,
+        };
+        let metadata = meerkat_core::session::SessionMetadata {
+            model_fallback: None,
+            schema_version: meerkat_core::SESSION_METADATA_SCHEMA_VERSION,
+            model: "gpt-5.4".to_string(),
+            max_tokens: 4096,
+            structured_output_retries: 2,
+            provider: meerkat_core::Provider::OpenAI,
+            self_hosted_server_id: None,
+            provider_params: None,
+            tooling: Default::default(),
+            keep_alive: false,
+            comms_name: None,
+            peer_meta: None,
+            realm_id: None,
+            instance_id: None,
+            backend: None,
+            config_generation: None,
+            auth_binding: Some(openai),
+            mob_member_binding: None,
+        };
+        let candidate = meerkat_core::SessionLlmIdentity {
+            model: "claude-sonnet-4-6".to_string(),
+            provider: meerkat_core::Provider::Anthropic,
+            self_hosted_server_id: None,
+            provider_params: None,
+            auth_binding: None,
+        };
+        let (identity, durable) = resumed_preflight_identity(
+            candidate,
+            &metadata,
+            &[
+                meerkat_contracts::wire::WireMobResumeOverrideField::Model,
+                meerkat_contracts::wire::WireMobResumeOverrideField::Provider,
+            ],
+        );
+        assert_eq!(
+            (
+                identity.provider,
+                identity.model.as_str(),
+                identity.auth_binding
+            ),
+            (meerkat_core::Provider::Anthropic, "claude-sonnet-4-6", None),
+            "the preflight checks the switched identity, not the OpenAI binding"
+        );
+        assert_eq!(durable, metadata.llm_identity());
     }
 }

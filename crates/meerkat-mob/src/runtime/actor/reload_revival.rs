@@ -109,14 +109,14 @@ impl MemberEffectCommit for RevivalCommit {
         settlement: MemberEffectSettlement,
     ) -> MemberEffectCommitFuture<'_> {
         Box::pin(async move {
-            if actor.durable_uncertainty_fail_stop {
+            if actor.durable_uncertainty_fail_stop.is_set() {
                 return MemberEffectAck::Retained(MemberEffectRetention::resumable(
                     MobError::Internal("warm revival commit is held by fail-stop".to_string()),
                     self,
                 ));
             }
             boxed_arm_future(|| actor.commit_warm_revival(self.work, self.step, settlement)).await;
-            if actor.durable_uncertainty_fail_stop {
+            if actor.durable_uncertainty_fail_stop.is_set() {
                 MemberEffectAck::Retained(MemberEffectRetention::unresumable(MobError::Internal(
                     "warm revival still lacks owner settlement".to_string(),
                 )))
@@ -271,10 +271,12 @@ impl MobActor {
         settlement: MemberEffectSettlement,
     ) {
         if settlement.unsettled.is_some() || matches!(step, RevivalStep::Unsettled) {
-            self.durable_uncertainty_fail_stop = true;
-            work.reply(Err(MobError::Internal(
-                "warm revival effect ended without owned settlement evidence".to_string(),
-            )));
+            let fail_stop_reply = self
+                .durable_uncertainty_fail_stop
+                .record(MobError::Internal(
+                    "warm revival effect ended without owned settlement evidence".to_string(),
+                ));
+            work.reply(Err(fail_stop_reply));
             return;
         }
         if !settlement.fence.is_current()
@@ -426,10 +428,12 @@ impl MobActor {
                 #[cfg(feature = "runtime-adapter")]
                 if let Some(successor) = &work.scope.registration {
                     let Some(publication) = built.publication.as_ref() else {
-                        self.durable_uncertainty_fail_stop = true;
-                        work.reply(Err(MobError::Internal(
-                            "warm reload lost its publication receipt".to_string(),
-                        )));
+                        let fail_stop_reply =
+                            self.durable_uncertainty_fail_stop
+                                .record(MobError::Internal(
+                                    "warm reload lost its publication receipt".to_string(),
+                                ));
+                        work.reply(Err(fail_stop_reply));
                         return;
                     };
                     if let Err(error) = self
@@ -437,8 +441,8 @@ impl MobActor {
                         .record_reload_publication(&work.member_ref, successor, publication.clone())
                         .await
                     {
-                        self.durable_uncertainty_fail_stop = true;
-                        work.reply(Err(error));
+                        let fail_stop_reply = self.durable_uncertainty_fail_stop.record(error);
+                        work.reply(Err(fail_stop_reply));
                         return;
                     }
                 }
@@ -455,13 +459,13 @@ impl MobActor {
                         "resolve_warm_revival_publication",
                     )
                 {
-                    self.durable_uncertainty_fail_stop = true;
-                    work.reply(Err(error));
+                    let fail_stop_reply = self.durable_uncertainty_fail_stop.record(error);
+                    work.reply(Err(fail_stop_reply));
                     return;
                 }
                 if let Err(error) = built.provision.commit() {
-                    self.durable_uncertainty_fail_stop = true;
-                    work.reply(Err(error));
+                    let fail_stop_reply = self.durable_uncertainty_fail_stop.record(error);
+                    work.reply(Err(fail_stop_reply));
                     return;
                 }
                 self.clear_member_restore_failure(&work.entry.agent_identity)
@@ -777,8 +781,8 @@ impl MobActor {
                 "resolve_warm_revival_failure",
             )
         {
-            self.durable_uncertainty_fail_stop = true;
-            work.reply(Err(error));
+            let fail_stop_reply = self.durable_uncertainty_fail_stop.record(error);
+            work.reply(Err(fail_stop_reply));
             return;
         }
         if let Some(reason) = self

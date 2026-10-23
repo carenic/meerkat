@@ -271,6 +271,7 @@ import {
   packageDir,
   packageDirs,
   packageForFile,
+  packagesForFile,
   readMetadata,
   root,
   workspacePackages,
@@ -2068,19 +2069,19 @@ function plan(args) {
         // compiles in through include macros) that the selector maps to a
         // package from outside its directory. Only documentation that lives
         // inside the crate directory is not a build input, unless the crate
-        // compiles it in (the reader inventory lists it).
-        const owner = packageForFile(path, dirs);
-        if (owner) {
-          const insideOwner = path.startsWith(`${packageDir(owner)}/`);
+        // compiles it in (the reader inventory lists it). A file another crate
+        // links into its own directory selects that crate as well.
+        for (const pkg of packagesForFile(path, dirs)) {
+          const insidePackage = path.startsWith(`${packageDir(pkg)}/`);
           const isDoc = /\.(md|mdx)$/.test(path);
-          const compiledIn = compiledInDocs.has(`${path}\0${owner.name}`);
-          if (!insideOwner || !isDoc || compiledIn) seeds.add(owner.name);
+          const compiledIn = compiledInDocs.has(`${path}\0${pkg.name}`);
+          if (!insidePackage || !isDoc || compiledIn) seeds.add(pkg.name);
         }
         continue;
       }
-      const owner = packageForFile(path, dirs);
-      if (owner) {
-        seeds.add(owner.name);
+      const pathPackages = packagesForFile(path, dirs);
+      if (pathPackages.length > 0) {
+        for (const pkg of pathPackages) seeds.add(pkg.name);
       } else {
         result.unmapped_rust_paths.push(path);
       }

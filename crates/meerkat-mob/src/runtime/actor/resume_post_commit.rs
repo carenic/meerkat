@@ -7,7 +7,10 @@ impl MobActor {
         topology_result: Result<(), MobError>,
     ) {
         let ResumeLifecyclePhase::PostCommitTopology { post_commit_error } = pending.phase else {
-            self.durable_uncertainty_fail_stop = true;
+            self.durable_uncertainty_fail_stop
+                .record_unreplied(MobError::Internal(
+                    "post-topology work lost its matching continuation".to_string(),
+                ));
             tracing::error!("post-topology work lost its matching continuation");
             return;
         };
@@ -80,7 +83,10 @@ impl MobActor {
                 post_commit_error.get_or_insert(error);
             }
             _ => {
-                self.durable_uncertainty_fail_stop = true;
+                self.durable_uncertainty_fail_stop
+                    .record_unreplied(MobError::Internal(format!(
+                        "resume post-commit error lost its post-commit continuation: {error}"
+                    )));
             }
         }
     }
@@ -92,7 +98,10 @@ impl MobActor {
         action: ActorCommandFuture<'static, Result<(), MobError>>,
     ) {
         let Some(attempt) = self.dsl_authority.state().explicit_resume_attempt.clone() else {
-            self.durable_uncertainty_fail_stop = true;
+            self.durable_uncertainty_fail_stop
+                .record_unreplied(MobError::Internal(
+                    "post-commit member work has no resume authority".to_string(),
+                ));
             tracing::error!("post-commit member work has no resume authority");
             return;
         };
@@ -100,7 +109,10 @@ impl MobActor {
             .resume_post_commit_member_tasks
             .insert(identity.clone())
         {
-            self.durable_uncertainty_fail_stop = true;
+            self.durable_uncertainty_fail_stop
+                .record_unreplied(MobError::Internal(
+                    "duplicate post-commit member task".to_string(),
+                ));
             tracing::error!(%identity, "duplicate post-commit member task");
             return;
         }
@@ -153,7 +165,10 @@ impl MobActor {
             ResumePostCommitMemberOutcome::Settled(result) => result,
             ResumePostCommitMemberOutcome::OwnerLost(error) => {
                 tracing::error!(%identity, %error, "post-commit owner disappeared without settlement");
-                self.durable_uncertainty_fail_stop = true;
+                self.durable_uncertainty_fail_stop
+                    .record_unreplied(MobError::Internal(format!(
+                        "post-commit owner of member '{identity}' disappeared without settlement: {error}"
+                    )));
                 return;
             }
         };
@@ -188,11 +203,18 @@ impl MobActor {
 
     async fn begin_resume_orchestrator_notifications(&mut self) {
         let Some(pending) = self.pending_resume_lifecycle.as_mut() else {
-            self.durable_uncertainty_fail_stop = true;
+            self.durable_uncertainty_fail_stop
+                .record_unreplied(MobError::Internal(
+                    "resume orchestrator notifications have no resume continuation".to_string(),
+                ));
             return;
         };
         let ResumeLifecyclePhase::PostCommitMembers { step, .. } = &mut pending.phase else {
-            self.durable_uncertainty_fail_stop = true;
+            self.durable_uncertainty_fail_stop
+                .record_unreplied(MobError::Internal(
+                "resume orchestrator notifications found the resume outside its post-commit phase"
+                    .to_string(),
+            ));
             return;
         };
         *step = ResumePostCommitStep::OrchestratorNotification;
@@ -261,18 +283,28 @@ impl MobActor {
     fn finish_resume_post_commit_members(&mut self) {
         if !self.resume_post_commit_member_tasks.is_empty() {
             tracing::error!("resume post-commit completion still has owned member tasks");
-            self.durable_uncertainty_fail_stop = true;
+            self.durable_uncertainty_fail_stop
+                .record_unreplied(MobError::Internal(
+                    "resume post-commit completion still has owned member tasks".to_string(),
+                ));
             return;
         }
         let Some(pending) = self.pending_resume_lifecycle.take() else {
-            self.durable_uncertainty_fail_stop = true;
+            self.durable_uncertainty_fail_stop
+                .record_unreplied(MobError::Internal(
+                    "resume post-commit completion has no resume continuation".to_string(),
+                ));
             return;
         };
         let ResumeLifecyclePhase::PostCommitMembers {
             post_commit_error, ..
         } = pending.phase
         else {
-            self.durable_uncertainty_fail_stop = true;
+            self.durable_uncertainty_fail_stop
+                .record_unreplied(MobError::Internal(
+                    "resume post-commit completion found the resume outside its post-commit phase"
+                        .to_string(),
+                ));
             return;
         };
         let result = if self.dsl_authority.state().explicit_resume_cancel_requested {

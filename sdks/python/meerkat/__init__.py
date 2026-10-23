@@ -411,8 +411,11 @@ from .types import (
 
 # Error hierarchy
 from .errors import (
+    WIRE_AUTH_ERROR_DETAILS,
     WIRE_AUTH_ERROR_REASONS,
+    WireAuthErrorDetail,
     WireAuthErrorReason,
+    auth_error_detail,
     auth_error_reason,
     COMMS_SEND_ERROR_CODES,
     comms_send_error,
@@ -877,8 +880,11 @@ __all__ = [
     "TextBlock",
     # Errors
     "MeerkatError",
+    "WIRE_AUTH_ERROR_DETAILS",
     "WIRE_AUTH_ERROR_REASONS",
+    "WireAuthErrorDetail",
     "WireAuthErrorReason",
+    "auth_error_detail",
     "auth_error_reason",
     "COMMS_SEND_ERROR_CODES",
     "comms_send_error",

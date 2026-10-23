@@ -117,6 +117,9 @@ pub mod realtime_transcript;
 pub mod realtime_transcript_revision;
 pub mod realtime_transcript_sidecar;
 pub mod redact;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod resume_identity_cases;
 pub mod retained_work;
 pub mod retry;
 pub mod runtime_bootstrap;
@@ -393,7 +396,7 @@ pub use mcp_config::{
     EffectiveMcpServersError, McpAccountDeclaration, McpConfig, McpConfigError,
     McpConnectorApproval, McpScope, McpSecretEnvDeclarationError, McpServerAccess,
     McpServerAccessError, McpServerConfig, McpServerDefinitionConflict, McpServerRefusal,
-    McpServerSource, McpServerWithScope, McpServerWithSource,
+    McpServerSource, McpServerWithScope, McpServerWithSource, McpStdioCwdError, McpStdioCwdRefusal,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use mcp_config::{McpRealmPersistError, McpRealmPersistTarget};
@@ -557,8 +560,9 @@ pub use session::{
     WitnessedToolFilter, audited_endpoint_divergence,
     capability_base_filter_for_image_tool_results, extend_transcript_rewrite_prefix_accumulator,
     import_released_0810_session, released_0810_transcript_serialized_rows_digest,
-    resolve_session_llm_identity_override, session_metadata_document_from_slice,
-    session_metadata_schema_version, session_version,
+    resolve_resumed_session_auth_binding, resolve_resumed_session_llm_identity,
+    resolve_session_auth_binding, resolve_session_llm_identity_override,
+    session_metadata_document_from_slice, session_metadata_schema_version, session_version,
     transcript_history_full_body_materializations, transcript_messages_digest,
     transcript_rewrite_prefix_digest, try_lifecycle_terminal_from_map,
     try_session_metadata_from_map, try_tool_visibility_state_from_map,

@@ -769,12 +769,12 @@ mod tests {
             },
         );
         config.self_hosted.models.insert(
-            "gemma-4-31b".to_string(),
+            "test-self-hosted-large".to_string(),
             SelfHostedModelConfig {
                 server: "local".to_string(),
-                remote_model: "gemma4:31b".to_string(),
-                display_name: "Gemma 4 31B".to_string(),
-                family: "gemma-4".to_string(),
+                remote_model: "test-remote-large".to_string(),
+                display_name: "Test Large Model".to_string(),
+                family: "test-self-hosted-family".to_string(),
                 tier: ModelTier::Supported,
                 context_window: Some(256_000),
                 max_input_tokens: None,
@@ -800,12 +800,12 @@ mod tests {
             Ok(registry) => registry,
             Err(err) => panic!("registry construction failed: {err}"),
         };
-        let entry = match registry.entry("gemma-4-31b") {
+        let entry = match registry.entry("test-self-hosted-large") {
             Some(entry) => entry,
-            None => panic!("missing self-hosted entry for gemma-4-31b"),
+            None => panic!("missing self-hosted entry for test-self-hosted-large"),
         };
         assert_eq!(entry.provider, Provider::SelfHosted);
-        assert_eq!(entry.display_name, "Gemma 4 31B");
+        assert_eq!(entry.display_name, "Test Large Model");
         assert_eq!(
             entry
                 .self_hosted
@@ -818,7 +818,7 @@ mod tests {
                 .self_hosted
                 .as_ref()
                 .map(|server| server.remote_model.as_str()),
-            Some("gemma4:31b")
+            Some("test-remote-large")
         );
         assert_eq!(
             entry
@@ -829,12 +829,13 @@ mod tests {
         );
         assert_eq!(
             registry.default_model(Provider::SelfHosted),
-            Some("gemma-4-31b")
+            Some("test-self-hosted-large")
         );
-        let profile = match registry.profile_for_provider(Provider::SelfHosted, "gemma-4-31b") {
-            Some(profile) => profile,
-            None => panic!("missing self-hosted profile"),
-        };
+        let profile =
+            match registry.profile_for_provider(Provider::SelfHosted, "test-self-hosted-large") {
+                Some(profile) => profile,
+                None => panic!("missing self-hosted profile"),
+            };
         assert!(
             profile.image_tool_results,
             "Responses-mode self-hosted models should retain configured image tool-result support"
@@ -923,10 +924,11 @@ mod tests {
             Ok(registry) => registry,
             Err(err) => panic!("registry construction failed: {err}"),
         };
-        let profile = match registry.profile_for_provider(Provider::SelfHosted, "gemma-4-31b") {
-            Some(profile) => profile,
-            None => panic!("missing self-hosted profile"),
-        };
+        let profile =
+            match registry.profile_for_provider(Provider::SelfHosted, "test-self-hosted-large") {
+                Some(profile) => profile,
+                None => panic!("missing self-hosted profile"),
+            };
         assert!(
             !profile.image_tool_results,
             "Chat Completions self-hosted models text-project tool results even when raw config requests image support"
@@ -941,7 +943,7 @@ mod tests {
         let minimum = crate::retry::MIN_MODEL_STREAM_INACTIVITY_TIMEOUT.as_secs();
         let with_window = |window| {
             let mut config = config_with_self_hosted();
-            match config.self_hosted.models.get_mut("gemma-4-31b") {
+            match config.self_hosted.models.get_mut("test-self-hosted-large") {
                 Some(model) => model.stream_inactivity_timeout_secs = Some(window),
                 None => panic!("missing self-hosted model"),
             }
@@ -973,7 +975,9 @@ mod tests {
                 Ok(registry) => registry,
                 Err(err) => panic!("window {window}: {err}"),
             };
-            let profile = match registry.profile_for_provider(Provider::SelfHosted, "gemma-4-31b") {
+            let profile = match registry
+                .profile_for_provider(Provider::SelfHosted, "test-self-hosted-large")
+            {
                 Some(profile) => profile,
                 None => panic!("missing self-hosted profile"),
             };
@@ -983,12 +987,12 @@ mod tests {
 
     fn insert_second_self_hosted_model(config: &mut Config) {
         config.self_hosted.models.insert(
-            "gemma-4-9b".to_string(),
+            "test-self-hosted-small".to_string(),
             SelfHostedModelConfig {
                 server: "local".to_string(),
-                remote_model: "gemma4:9b".to_string(),
-                display_name: "Gemma 4 9B".to_string(),
-                family: "gemma-4".to_string(),
+                remote_model: "test-remote-small".to_string(),
+                display_name: "Test Small Model".to_string(),
+                family: "test-self-hosted-family".to_string(),
                 tier: ModelTier::Supported,
                 context_window: Some(128_000),
                 max_input_tokens: None,
@@ -1028,14 +1032,14 @@ mod tests {
         insert_second_self_hosted_model(&mut config);
         // Declare the lexicographically-larger id as the default to prove the
         // choice is declared, not a `.min()` key-order artifact.
-        config.self_hosted.default_model = Some("gemma-4-9b".to_string());
+        config.self_hosted.default_model = Some("test-self-hosted-small".to_string());
         let registry = match ModelRegistry::from_config(&config, test_catalog()) {
             Ok(registry) => registry,
             Err(err) => panic!("registry construction failed: {err}"),
         };
         assert_eq!(
             registry.default_model(Provider::SelfHosted),
-            Some("gemma-4-9b")
+            Some("test-self-hosted-small")
         );
     }
 
@@ -1059,12 +1063,12 @@ mod tests {
     fn rejects_unknown_server_reference() {
         let mut config = Config::default();
         config.self_hosted.models.insert(
-            "gemma-4-31b".to_string(),
+            "test-self-hosted-large".to_string(),
             SelfHostedModelConfig {
                 server: "missing".to_string(),
-                remote_model: "gemma4:31b".to_string(),
-                display_name: "Gemma 4 31B".to_string(),
-                family: "gemma-4".to_string(),
+                remote_model: "test-remote-large".to_string(),
+                display_name: "Test Large Model".to_string(),
+                family: "test-self-hosted-family".to_string(),
                 tier: ModelTier::Supported,
                 context_window: None,
                 max_input_tokens: None,

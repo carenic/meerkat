@@ -2966,11 +2966,17 @@ impl MeerkatMachine {
             ops_lifecycle_persistence_worker: None,
             epoch_id,
             handle_teardown_gate,
-            materialization_claim_state: materialization_claim_state.unwrap_or_else(|| {
-                Arc::new(std::sync::Mutex::new(
+            // A cold-recovered Draining entry exists only to conclude the
+            // unregister an exit cut, and that teardown fences the
+            // materialization claim the entry carries. The caller's claim
+            // belongs to the fresh registration that follows the teardown,
+            // so this entry carries a private one.
+            materialization_claim_state: match materialization_claim_state {
+                Some(claim_state) if !cold_recovered_generated_draining => claim_state,
+                _ => Arc::new(std::sync::Mutex::new(
                     crate::RuntimeActorMaterializationClaimState::new(false),
-                ))
-            }),
+                )),
+            },
             cursor_state,
             post_commit_hooks: Arc::new(meerkat_core::PostCommitHookDispatcher::new(
                 session_id.clone(),
@@ -5922,7 +5928,7 @@ impl MeerkatMachine {
     /// held.
     ///
     /// This is the typed claim-release event a caller refused with
-    /// [`RuntimeBindingsError::RegistrationOwned`](crate::RuntimeBindingsError::RegistrationOwned) awaits before re-attempting
+    /// [`RuntimeBindingsError::RegistrationOwned`] awaits before re-attempting
     /// materialization. It waits on the claim's own change notification; it
     /// never polls or times out. A replacement registration is observed
     /// afresh.

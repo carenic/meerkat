@@ -16860,9 +16860,10 @@ async fn an_adopted_identity_converges_once_the_previous_incarnations_lease_expi
         other => panic!("a converged identity holds a live lease, got {other:?}"),
     };
 
-    // The process ends without releasing the lease. Its last renewal is the
-    // short one below, so the lease is still live when the next incarnation
-    // starts and expires a few seconds later.
+    // The graceful shutdown releases the lease. The claim below takes it again
+    // for the previous incarnation, as a process that ended without a
+    // shutdown leaves it: still live when the next incarnation starts, and
+    // expiring a few seconds later.
     handle
         .shutdown()
         .await
@@ -16933,6 +16934,288 @@ async fn an_adopted_identity_converges_once_the_previous_incarnations_lease_expi
     assert!(
         awaited_lease,
         "the resumed incarnation must first wait on the previous incarnation's live lease"
+    );
+    assert!(
+        matches!(
+            &lease,
+            crate::identity::IdentityStoredObservation::Valid(crate::identity::IdentityLeaseRecord {
+                active: Some(claim),
+                ..
+            }) if claim.incarnation_id != previous.incarnation_id && claim.epoch > previous.epoch
+        ),
+        "the resumed incarnation must hold the lease: {lease:?}"
+    );
+    resumed.shutdown().await.expect("shutdown resumed mob");
+}
+
+/// An identity store clock that runs `lag_ms` behind this process's clock.
+struct LaggingIdentityStoreClock {
+    lag_ms: u64,
+}
+
+impl crate::store::MobIdentityStoreClock for LaggingIdentityStoreClock {
+    fn now_ms(&self) -> Result<u64, MobStoreError> {
+        crate::store::MobIdentityStoreClock::now_ms(&crate::store::SystemMobIdentityStoreClock)
+            .map(|now_ms| now_ms.saturating_sub(self.lag_ms))
+    }
+}
+
+#[tokio::test]
+async fn a_lost_identity_lease_claim_is_retried_once_the_holders_lease_expires() {
+    // The store's clock runs behind the actor's, so the resumed actor reads
+    // the previous incarnation's lease as expired while the store still holds
+    // it: the actor's claim meets a live holder.
+    const STORE_CLOCK_LAG_MS: u64 = 5_000;
+    const PREVIOUS_LEASE_TTL_MS: u64 = 4_000;
+
+    let definition = with_unique_mob_id(sample_definition(), "identity-lost-lease-claim");
+    let mob_id = definition.id.clone();
+    let event_store = InMemoryMobEventStore::new();
+    let runs = Arc::new(InMemoryMobRunStore::new());
+    let specs = Arc::new(InMemoryMobSpecStore::new());
+    let runtime_metadata = Arc::new(InMemoryMobRuntimeMetadataStore::new());
+    let identity_store = Arc::new(InMemoryMobIdentityStore::paired_with_event_store(
+        &event_store,
+        Arc::new(LaggingIdentityStoreClock {
+            lag_ms: STORE_CLOCK_LAG_MS,
+        }),
+    ));
+    let events: Arc<dyn MobEventStore> = Arc::new(event_store);
+    let identity_status = Arc::new(InMemoryMobIdentityStatusStore::new());
+    let session_store_dyn: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let blob_store: Arc<dyn meerkat_core::BlobStore> =
+        Arc::new(meerkat_store::MemoryBlobStore::new());
+    let service = Arc::new(meerkat_session::PersistentSessionService::new(
+        PersistentMockBuilder,
+        16,
+        session_store_dyn,
+        runtime_store,
+        blob_store,
+    ));
+    let storage = || MobStorage {
+        events: events.clone(),
+        runs: runs.clone(),
+        specs: specs.clone(),
+        definition_projection_composition:
+            crate::storage::DefinitionProjectionComposition::Independent,
+        runtime_metadata: runtime_metadata.clone(),
+        identity: identity_store.clone(),
+        identity_member: Some(identity_store.clone()),
+        identity_status: identity_status.clone(),
+        identity_status_projection_order: Default::default(),
+        realm_profiles: None,
+        forked_participants: None,
+    };
+    let base_prompt = || {
+        Arc::new(crate::StaticSpawnBasePromptSource(
+            "lost lease claim test base prompt".to_string(),
+        ))
+    };
+    let handle = MobBuilder::new(definition, storage())
+        .with_session_service(service.clone())
+        .with_spawn_base_prompt_source(base_prompt())
+        .create()
+        .await
+        .expect("create lost-lease-claim test mob");
+    let member = AgentIdentity::from("worker-1");
+    let mut spawn = SpawnMemberSpec::new(ProfileName::from("worker"), member.clone());
+    spawn.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    handle
+        .spawn_spec(spawn)
+        .await
+        .expect("spawn pre-existing member");
+    let session_id = handle
+        .resolve_bridge_session_id(&member)
+        .await
+        .expect("session-backed member");
+    let adoption = crate::identity::AdoptMemberIdentityDeclaration {
+        mob_id: mob_id.clone(),
+        agent_identity: member.clone(),
+        request_id: crate::identity::IdentityAdoptionId::new("adopt-worker-1")
+            .expect("valid adoption id"),
+        precondition: crate::identity::IdentityAdoptionPrecondition::ExpectedAbsent,
+        declaration_scope: crate::identity::IdentityDeclarationScopeId::new("example-policy")
+            .expect("valid declaration scope"),
+        declaration_revision: 1,
+        session: crate::identity::DesiredSessionTarget {
+            session_id: session_id.clone(),
+            lineage_id: meerkat_core::SessionLineageId::for_session(&session_id),
+            lineage_generation: meerkat_core::SessionGeneration::INITIAL,
+            authority_policy: crate::identity::DesiredSessionAuthorityPolicy::RequireExisting,
+        },
+        member: crate::identity::IdentityProfileMemberDeclaration {
+            profile_name: ProfileName::from("worker"),
+            profile_override: None,
+            model_override: None,
+            external_addressable_override: None,
+            context: None,
+            labels: None,
+            additional_instructions: None,
+            system_prompt_override: None,
+            tool_access_policy: None,
+            auth_binding: None,
+            budget_limits: None,
+            runtime_mode: Some(meerkat_contracts::wire::WireMobRuntimeMode::TurnDriven),
+            required_env_keys: Vec::new(),
+            required_local_callback_tools: Vec::new(),
+            execution: crate::identity::DesiredExecution::ControllingSession,
+        },
+        wiring_custody: crate::identity::IdentityWiringCustody::ExternalManaged,
+        owned_wiring: BTreeSet::new(),
+        convergence: crate::identity::IdentityConvergenceMode::Drain { max_wait_ms: 5_000 },
+    };
+    assert!(matches!(
+        handle
+            .adopt_member_identity_declaration(adoption)
+            .await
+            .expect("adopt existing member")
+            .adoption,
+        crate::identity::IdentityAdoptionOutcome::Adopted {
+            desired_revision: 1
+        }
+    ));
+    let converged = |status: &crate::identity::IdentityStoredObservation<
+        crate::identity::IdentityConvergenceStatus,
+    >,
+                     after_epoch: u64| {
+        matches!(
+            status,
+            crate::identity::IdentityStoredObservation::Valid(
+                crate::identity::IdentityConvergenceStatus {
+                    intent_revision: Some(1),
+                    decision: Some(crate::identity::IdentityReconcileDecision::Converged),
+                    lease_epoch: Some(epoch),
+                    ..
+                }
+            ) if *epoch > after_epoch
+        )
+    };
+    let adoption_convergence = tokio::time::timeout(Duration::from_secs(20), async {
+        while !converged(
+            &handle
+                .identity_convergence_status(&member)
+                .await
+                .expect("read adoption convergence"),
+            0,
+        ) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        adoption_convergence.is_ok(),
+        "adoption must converge before the restart; latest status: {:?}",
+        handle
+            .identity_convergence_status(&member)
+            .await
+            .expect("read final adoption convergence")
+    );
+    let previous = match identity_store
+        .observe_identity_lease(&mob_id, &member)
+        .await
+        .expect("read the converged identity lease")
+    {
+        crate::identity::IdentityStoredObservation::Valid(
+            crate::identity::IdentityLeaseRecord {
+                active: Some(claim),
+                ..
+            },
+        ) => claim,
+        other => panic!("a converged identity holds a live lease, got {other:?}"),
+    };
+
+    // The graceful shutdown releases the lease. The claim below takes it again
+    // for the previous incarnation, as a process that ended without a
+    // shutdown leaves it, stamped by the store's own, lagging clock: the
+    // resumed actor reads that lease as expired, but the store holds it for
+    // the claim's lifetime.
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown lost-lease-claim test mob");
+    let previous = match identity_store
+        .claim_or_renew_identity_lease(
+            &mob_id,
+            &member,
+            &previous.holder_id,
+            &previous.incarnation_id,
+            PREVIOUS_LEASE_TTL_MS,
+        )
+        .await
+        .expect("renew the previous incarnation's lease")
+    {
+        crate::identity::IdentityLeaseClaimOutcome::Renewed(claim)
+        | crate::identity::IdentityLeaseClaimOutcome::Acquired(claim) => claim,
+        crate::identity::IdentityLeaseClaimOutcome::HeldByOther(other) => {
+            panic!("no other incarnation may hold the lease yet: {other:?}")
+        }
+    };
+    let resumed = MobBuilder::for_resume(storage())
+        .with_session_service(service.clone())
+        .with_spawn_base_prompt_source(base_prompt())
+        .notify_orchestrator_on_resume(false)
+        .resume()
+        .await
+        .expect("resume while the store still holds the previous lease");
+
+    let mut lost_claim = false;
+    let resumed_convergence = tokio::time::timeout(
+        Duration::from_millis(PREVIOUS_LEASE_TTL_MS) + Duration::from_secs(5),
+        async {
+            loop {
+                let status = resumed
+                    .identity_convergence_status(&member)
+                    .await
+                    .expect("read resumed convergence");
+                if converged(&status, previous.epoch) {
+                    break;
+                }
+                if matches!(
+                    status,
+                    crate::identity::IdentityStoredObservation::Valid(
+                        crate::identity::IdentityConvergenceStatus {
+                            decision: Some(
+                                crate::identity::IdentityReconcileDecision::AcquireLease
+                            ),
+                            ..
+                        }
+                    )
+                ) {
+                    lost_claim |= matches!(
+                        identity_store
+                            .observe_identity_lease(&mob_id, &member)
+                            .await
+                            .expect("read the identity lease while claiming"),
+                        crate::identity::IdentityStoredObservation::Valid(
+                            crate::identity::IdentityLeaseRecord {
+                                active: Some(claim),
+                                ..
+                            }
+                        ) if claim.incarnation_id == previous.incarnation_id
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
+    .await;
+    let lease = identity_store
+        .observe_identity_lease(&mob_id, &member)
+        .await
+        .expect("read the identity lease after resume");
+    assert!(
+        resumed_convergence.is_ok(),
+        "a lost lease claim must be retried once the holder's lease expires, not at the slow safety scan; latest status: {:?}; lease: {lease:?}",
+        resumed
+            .identity_convergence_status(&member)
+            .await
+            .expect("read final resumed convergence")
+    );
+    assert!(
+        lost_claim,
+        "the resumed incarnation's claim must first meet the lease the store still holds"
     );
     assert!(
         matches!(
@@ -23217,11 +23500,15 @@ async fn test_rotate_supervisor_pending_commit_conflict_fails_closed_without_loc
     assert!(
         matches!(
             &error,
-            MobError::Internal(reason)
-                if reason.contains("exact reread found divergent supervisor authority")
-                    && reason.contains("fail-stopping for cold recovery")
+            MobError::SharedLifecycleFailure(cause) if matches!(
+                cause.as_ref(),
+                MobError::Internal(reason)
+                    if reason.contains("exact reread found divergent supervisor authority")
+                        && reason.contains("fail-stopping for cold recovery")
+            )
         ),
-        "operation-anchor CAS divergence must be a durable fail-stop, got: {error:?}",
+        "operation-anchor CAS divergence must be a durable fail-stop, its reply the recorded cause \
+         shared, got: {error:?}",
     );
     let after_conflict = runtime_metadata
         .load_supervisor_authority(&mob_id)
@@ -23295,11 +23582,15 @@ async fn test_rotate_supervisor_receipt_checkpoint_conflict_does_not_reauthorize
     assert!(
         matches!(
             &error,
-            MobError::Internal(reason)
-                if reason.contains("exact reread found divergent supervisor authority")
-                    && reason.contains("fail-stopping for cold recovery")
+            MobError::SharedLifecycleFailure(cause) if matches!(
+                cause.as_ref(),
+                MobError::Internal(reason)
+                    if reason.contains("exact reread found divergent supervisor authority")
+                        && reason.contains("fail-stopping for cold recovery")
+            )
         ),
-        "receipt-checkpoint CAS divergence must be a durable fail-stop, got: {error:?}",
+        "receipt-checkpoint CAS divergence must be a durable fail-stop, its reply the recorded cause \
+         shared, got: {error:?}",
     );
     let attempted_public_peer_id = external
         .authorized_supervisor_peer_id()
@@ -31826,6 +32117,364 @@ async fn test_spawn_helper_defaults_to_turn_driven_even_when_profile_is_autonomo
         0,
         "spawn_helper must default to TurnDriven semantics instead of inheriting AutonomousHost"
     );
+}
+
+/// A bounded helper runs one tracked turn and returns its result, and an
+/// autonomous host member's inbox delivery has no tracked turn completion.
+/// `spawn_helper` with an explicit `AutonomousHost` runtime mode is therefore
+/// refused, typed, before anything is spawned: no member, no kickoff turn,
+/// no model request.
+#[tokio::test]
+async fn spawn_helper_refuses_an_autonomous_runtime_mode_before_spawning() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    service.set_return_exact_run_result(true);
+    let helper = AgentIdentity::from("helper-autonomous");
+
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handle.spawn_helper(
+            helper.clone(),
+            "summarize this",
+            HelperOptions {
+                role_name: Some(ProfileName::from("worker")),
+                runtime_mode: Some(crate::MobRuntimeMode::AutonomousHost),
+                ..HelperOptions::default()
+            },
+            "autonomous-helper",
+            256,
+        ),
+    )
+    .await
+    .expect("the refusal returns within the watchdog");
+
+    assert!(
+        matches!(
+            &refused,
+            Err(BoundedMemberRunError::Admission(
+                MobError::UnsupportedForMode {
+                    mode: crate::MobRuntimeMode::AutonomousHost,
+                    ..
+                }
+            ))
+        ),
+        "an autonomous bounded helper must be refused as UnsupportedForMode: {:?}",
+        refused.as_ref().err()
+    );
+    assert_eq!(
+        service.keep_alive_start_turn_call_count(),
+        0,
+        "a refused autonomous helper must never run a kickoff turn"
+    );
+    let spawned = handle
+        .events()
+        .replay_all()
+        .await
+        .expect("replay the mob events")
+        .into_iter()
+        .any(|event| {
+            matches!(
+                &event.kind,
+                crate::event::MobEventKind::MemberSpawned(spawned)
+                    if spawned.agent_identity == helper
+            )
+        });
+    assert!(
+        !spawned,
+        "a refused autonomous helper must never be spawned"
+    );
+}
+
+/// The fork launch of a bounded helper is refused the same way: no fork
+/// child is seated and no kickoff turn carries the fork context.
+#[tokio::test]
+async fn fork_helper_refuses_an_autonomous_runtime_mode_before_spawning() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    service.set_return_exact_run_result(true);
+    let source = AgentIdentity::from("fork-source");
+    handle
+        .spawn_with_options(
+            ProfileName::from("worker"),
+            source.clone(),
+            None,
+            Some(crate::MobRuntimeMode::TurnDriven),
+            None,
+        )
+        .await
+        .expect("spawn the source member");
+    let helper = AgentIdentity::from("fork-helper-autonomous");
+
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handle.fork_helper(
+            &source,
+            helper.clone(),
+            "continue from source",
+            crate::launch::ForkContext::FullHistory,
+            HelperOptions {
+                role_name: Some(ProfileName::from("worker")),
+                runtime_mode: Some(crate::MobRuntimeMode::AutonomousHost),
+                ..HelperOptions::default()
+            },
+            "fork-helper-result",
+            256,
+        ),
+    )
+    .await
+    .expect("the refusal returns within the watchdog");
+
+    assert!(
+        matches!(
+            &refused,
+            Err(BoundedMemberRunError::Admission(
+                MobError::UnsupportedForMode {
+                    mode: crate::MobRuntimeMode::AutonomousHost,
+                    ..
+                }
+            ))
+        ),
+        "an autonomous bounded fork helper must be refused as UnsupportedForMode: {:?}",
+        refused.as_ref().err()
+    );
+    assert_eq!(
+        service.keep_alive_start_turn_call_count(),
+        0,
+        "a refused autonomous fork helper must never run a kickoff turn"
+    );
+    let spawned = handle
+        .events()
+        .replay_all()
+        .await
+        .expect("replay the mob events")
+        .into_iter()
+        .any(|event| {
+            matches!(
+                &event.kind,
+                crate::event::MobEventKind::MemberSpawned(spawned)
+                    if spawned.agent_identity == helper
+            )
+        });
+    assert!(
+        !spawned,
+        "a refused autonomous fork helper must never be spawned"
+    );
+}
+
+/// `fork_member_then_run_bounded` runs its child's one tracked turn, so a
+/// child spec asking for `AutonomousHost` is refused, typed, before anything
+/// is forked: no child is seated and no kickoff turn runs.
+#[tokio::test]
+async fn fork_member_then_run_bounded_refuses_an_autonomous_child_before_forking() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    service.set_return_exact_run_result(true);
+    let source = AgentIdentity::from("bounded-fork-source");
+    spawn_settled_fork_source(&handle, &source).await;
+    let child = AgentIdentity::from("autonomous-bounded-child");
+    let mut spec = bounded_fork_child_spec(&child);
+    spec.runtime_mode = Some(crate::MobRuntimeMode::AutonomousHost);
+
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handle.fork_member_then_run_bounded(
+            &source,
+            spec,
+            None,
+            "fork_child_result",
+            256,
+            meerkat_core::DurableForkSourceAdmission::Quiescent,
+        ),
+    )
+    .await
+    .expect("the refusal returns within the watchdog");
+
+    assert!(
+        matches!(
+            &refused,
+            Err(BoundedMemberRunError::Admission(
+                MobError::UnsupportedForMode {
+                    mode: crate::MobRuntimeMode::AutonomousHost,
+                    ..
+                }
+            ))
+        ),
+        "an autonomous bounded fork child must be refused as UnsupportedForMode: {:?}",
+        refused.as_ref().err()
+    );
+    assert_eq!(
+        service.keep_alive_start_turn_call_count(),
+        0,
+        "a refused autonomous fork child must never run a kickoff turn"
+    );
+    let spawned = handle
+        .events()
+        .replay_all()
+        .await
+        .expect("replay the mob events")
+        .into_iter()
+        .any(|event| {
+            matches!(
+                &event.kind,
+                crate::event::MobEventKind::MemberSpawned(spawned)
+                    if spawned.agent_identity == child
+            )
+        });
+    assert!(
+        !spawned,
+        "a refused autonomous fork child must never be seated"
+    );
+}
+
+/// `fork_member_then_run_detached` admits its child's one tracked turn
+/// before it returns, so it refuses an `AutonomousHost` child spec the same
+/// way, before anything is forked.
+#[tokio::test]
+async fn fork_member_then_run_detached_refuses_an_autonomous_child_before_forking() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    service.set_return_exact_run_result(true);
+    let source = AgentIdentity::from("detached-fork-source");
+    spawn_settled_fork_source(&handle, &source).await;
+    let child = AgentIdentity::from("autonomous-detached-child");
+    let mut spec = bounded_fork_child_spec(&child);
+    spec.runtime_mode = Some(crate::MobRuntimeMode::AutonomousHost);
+
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handle.fork_member_then_run_detached(
+            &source,
+            spec,
+            None,
+            "fork_child_result",
+            256,
+            meerkat_core::DurableForkSourceAdmission::Quiescent,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("the refusal returns within the watchdog");
+
+    assert!(
+        matches!(
+            &refused,
+            Err(BoundedMemberRunError::Admission(
+                MobError::UnsupportedForMode {
+                    mode: crate::MobRuntimeMode::AutonomousHost,
+                    ..
+                }
+            ))
+        ),
+        "an autonomous detached fork child must be refused as UnsupportedForMode: {:?}",
+        refused.as_ref().err()
+    );
+    assert_eq!(
+        service.keep_alive_start_turn_call_count(),
+        0,
+        "a refused autonomous detached fork child must never run a kickoff turn"
+    );
+    let spawned = handle
+        .events()
+        .replay_all()
+        .await
+        .expect("replay the mob events")
+        .into_iter()
+        .any(|event| {
+            matches!(
+                &event.kind,
+                crate::event::MobEventKind::MemberSpawned(spawned)
+                    if spawned.agent_identity == child
+            )
+        });
+    assert!(
+        !spawned,
+        "a refused autonomous detached fork child must never be seated"
+    );
+}
+
+/// A bounded fork child with no runtime mode runs turn-driven, whatever its
+/// profile's default (the sample worker profile is autonomous), the rule
+/// bounded helpers follow too: it never runs an autonomous kickoff turn, and
+/// its one tracked turn returns the bounded result.
+#[tokio::test]
+async fn fork_member_then_run_bounded_runs_a_child_without_a_runtime_mode_turn_driven() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    service.set_return_exact_run_result(true);
+    let source = AgentIdentity::from("bounded-fork-source");
+    spawn_settled_fork_source(&handle, &source).await;
+    let child = AgentIdentity::from("unmoded-bounded-child");
+    let mut spec = bounded_fork_child_spec(&child);
+    spec.runtime_mode = None;
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handle.fork_member_then_run_bounded(
+            &source,
+            spec,
+            None,
+            "fork_child_result",
+            256,
+            meerkat_core::DurableForkSourceAdmission::Quiescent,
+        ),
+    )
+    .await
+    .expect("the bounded run returns within the watchdog")
+    .expect("a child without a runtime mode runs its bounded turn");
+
+    assert_eq!(outcome.turn.result().result().text(), "exact child task");
+    assert_eq!(
+        service.keep_alive_start_turn_call_count(),
+        0,
+        "a bounded fork child without a runtime mode must never run an autonomous kickoff turn"
+    );
+    let entry = handle
+        .get_member(&child)
+        .await
+        .expect("read the roster")
+        .expect("a child whose bounded turn completed stays seated");
+    assert_eq!(entry.runtime_mode, crate::MobRuntimeMode::TurnDriven);
+}
+
+/// The same rule for `fork_member_then_run_detached`.
+#[tokio::test]
+async fn fork_member_then_run_detached_runs_a_child_without_a_runtime_mode_turn_driven() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    service.set_return_exact_run_result(true);
+    let source = AgentIdentity::from("detached-fork-source");
+    spawn_settled_fork_source(&handle, &source).await;
+    let child = AgentIdentity::from("unmoded-detached-child");
+    let mut spec = bounded_fork_child_spec(&child);
+    spec.runtime_mode = None;
+
+    let (_fork, run) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handle.fork_member_then_run_detached(
+            &source,
+            spec,
+            None,
+            "fork_child_result",
+            256,
+            meerkat_core::DurableForkSourceAdmission::Quiescent,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("the detached run is admitted within the watchdog")
+    .expect("a child without a runtime mode starts its bounded turn");
+    tokio::time::timeout(std::time::Duration::from_secs(5), run.outcome())
+        .await
+        .expect("the child's run reaches an outcome within the watchdog")
+        .expect("the child's bounded turn completes");
+
+    assert_eq!(
+        service.keep_alive_start_turn_call_count(),
+        0,
+        "a detached fork child without a runtime mode must never run an autonomous kickoff turn"
+    );
+    let entry = handle
+        .get_member(&child)
+        .await
+        .expect("read the roster")
+        .expect("a child whose bounded turn completed stays seated");
+    assert_eq!(entry.runtime_mode, crate::MobRuntimeMode::TurnDriven);
 }
 
 #[tokio::test]
@@ -48117,8 +48766,12 @@ async fn test_retire_member_waits_for_active_runtime_turn_before_unregister() {
             meerkat_core::lifecycle::core_executor::CoreApplyOutput,
             meerkat_core::lifecycle::core_executor::CoreExecutorError,
         > {
+            // apply runs on the runtime's serving thread, and the test may
+            // release it as soon as it sees the start. notify_waiters keeps
+            // no permit, so register for the release before announcing.
+            let allow_finish = self.allow_finish.notified();
             self.apply_started.notify_waiters();
-            self.allow_finish.notified().await;
+            allow_finish.await;
 
             Ok(
                 meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_untyped_snapshot(
@@ -48319,8 +48972,12 @@ async fn test_retire_member_cancels_visible_retired_drain_run_before_archive() {
             meerkat_core::lifecycle::core_executor::CoreApplyOutput,
             meerkat_core::lifecycle::core_executor::CoreExecutorError,
         > {
+            // apply runs on the runtime's serving thread, and the test may
+            // release it as soon as it sees the start. notify_waiters keeps
+            // no permit, so register for the release before announcing.
+            let allow_finish = self.allow_finish.notified();
             self.apply_started.notify_waiters();
-            self.allow_finish.notified().await;
+            allow_finish.await;
             Ok(
                 meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_untyped_snapshot(
                     meerkat_core::lifecycle::run_receipt::RunBoundaryReceiptDraft {
@@ -48812,8 +49469,12 @@ async fn test_retire_member_bounds_wedged_exact_control_and_retry_converges() {
             meerkat_core::lifecycle::core_executor::CoreApplyOutput,
             meerkat_core::lifecycle::core_executor::CoreExecutorError,
         > {
+            // apply runs on the runtime's serving thread, and the test may
+            // release it as soon as it sees the start. notify_waiters keeps
+            // no permit, so register for the release before announcing.
+            let allow_finish = self.allow_finish.notified();
             self.apply_started.notify_waiters();
-            self.allow_finish.notified().await;
+            allow_finish.await;
             Ok(
                 meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_untyped_snapshot(
                     meerkat_core::lifecycle::run_receipt::RunBoundaryReceiptDraft {
@@ -55827,8 +56488,11 @@ fn test_flow_canceled_cleanup_requires_terminalization_proof() {
 #[test]
 fn test_lifecycle_commands_admit_on_live_authority_not_clone_probe() {
     let source = include_str!("actor.rs");
-    let start = source
-        .find("MobCommand::Stop { reply_tx }")
+    let stop_body = source
+        .find("StopInlineStage::PlacedCompletionCleanup")
+        .expect("Stop command arm exists");
+    let start = source[..stop_body]
+        .rfind("MobCommand::Stop")
         .expect("Stop command arm exists");
     let end = source[start..]
         .find("MobCommand::RotateSupervisor")
@@ -57440,6 +58104,56 @@ async fn test_spawn_rejects_reserved_flow_member_prefix() {
             .contains("reserved system identifier namespace"),
         "error should clearly explain reserved id namespace: {err}"
     );
+}
+
+/// A mob actor that fail-stops on an uncertain durable mutation (here a
+/// failed run's terminal event append) reports why, typed, to a status read
+/// and to an explicit resume, as a startup recovery failure does, instead of
+/// a closed reply channel: the durability fail-stop, with that mutation's
+/// own error as its cause.
+#[tokio::test]
+async fn an_in_loop_durability_fail_stop_reports_why_to_status_and_resume() {
+    let events = Arc::new(FaultInjectedMobEventStore::new());
+    events.fail_appends_for("FlowFailed").await;
+    let (handle, service, runs, _specs, _runtime_metadata, _identity, _identity_status) =
+        create_test_mob_with_recoverable_fault_events(
+            sample_definition_with_single_step_flow(500, 8),
+            events.clone(),
+        )
+        .await;
+    handle
+        .spawn(
+            ProfileName::from("worker"),
+            AgentIdentity::from("w-1"),
+            None,
+        )
+        .await
+        .expect("spawn worker");
+    service.set_flow_turn_fail(true);
+    let run_id = handle
+        .run_flow(FlowId::from("demo"), serde_json::json!({}))
+        .await
+        .expect("run flow");
+    wait_for_run_terminal_in_store(runs.as_ref(), &run_id, Duration::from_secs(3)).await;
+    wait_for_actor_fail_stop(&handle).await;
+
+    let status = handle.status().await.map(|_| ());
+    let resumed = handle.resume().await;
+    for (call, result) in [("status", status), ("resume", resumed)] {
+        let error = result.expect_err("a fail-stopped mob must report why");
+        let MobError::SharedLifecycleFailure(failure) = &error else {
+            panic!("{call} must report the fail-stop, typed: {error:?}");
+        };
+        let MobError::DurabilityFailStop { cause, .. } = failure.as_ref() else {
+            panic!("{call} must name the durability fail-stop: {failure:?}");
+        };
+        let rendered = cause.to_string();
+        assert!(
+            rendered.contains("terminal event append failed") && rendered.contains("FlowFailed"),
+            "{call} must name the uncertain mutation, the failed run's terminal event \
+             append: {rendered}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -74978,6 +75692,101 @@ async fn a_refused_runtime_retire_for_a_retired_member_leaves_the_stopped_mob_ru
     handle.shutdown().await.expect("shutdown");
 }
 
+/// A Destroy of a Stopped mob whose routed-effect queue still holds an
+/// ingress for one of its members that the consumer refuses. While the mob is
+/// Stopped the machine cannot take that refusal, so the head waits for a
+/// resume. The destroy retires the member anyway, so it must not stall on
+/// that head: each destroy attempt used to report Incomplete until a resume
+/// or a restart emptied the queue.
+#[tokio::test]
+async fn a_destroy_of_a_stopped_mob_does_not_stall_on_a_refused_queued_ingress() {
+    let service = Arc::new(MockSessionService::new());
+    let _adapter = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(sample_definition(), MobStorage::in_memory())
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let mut spec = SpawnMemberSpec::new("worker", "w-1");
+    spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    handle.spawn_spec(spec).await.expect("spawn w-1");
+    let identity = AgentIdentity::from("w-1");
+    let session_id = handle
+        .resolve_bridge_session_id(&identity)
+        .await
+        .expect("session-backed");
+    let dsl_identity = crate::machines::mob_machine::AgentIdentity::from("w-1");
+    let machine = handle
+        .query_machine_state()
+        .await
+        .expect("query machine state");
+    let runtime_id = machine
+        .identity_to_runtime
+        .get(&dsl_identity)
+        .cloned()
+        .expect("w-1 has a runtime");
+    let generation = machine
+        .identity_runtime_generations
+        .get(&dsl_identity)
+        .copied()
+        .expect("w-1 has a generation");
+    handle.stop().await.expect("stop the mob");
+
+    // An ingress for w-1's live runtime under a fence it never held: the
+    // consumer refuses it, and while the mob is Stopped the machine cannot
+    // take that refusal, so the head stays queued.
+    let refused = super::composition::MobSeamEffect::routed(
+        crate::machines::mob_machine::MobMachineEffect::RequestRuntimeIngress {
+            session_id: crate::machines::mob_machine::SessionId::from_domain(&session_id),
+            agent_runtime_id: runtime_id,
+            fence_token: crate::machines::mob_machine::FenceToken(u64::MAX),
+            generation: Some(generation),
+            work_id: crate::machines::mob_machine::WorkId::from("work-refused-while-stopped"),
+            origin: crate::machines::mob_machine::WorkOrigin::External,
+            content_attribution:
+                crate::machines::mob_machine::WorkContentAttribution::Conversational,
+        },
+    )
+    .expect("a runtime ingress is a routed effect");
+    handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::QueueRoutedEffectForTest {
+            effect: refused,
+            reply_tx,
+        })
+        .await
+        .expect("queue the refused ingress")
+        .await
+        .expect("the actor answers the queue command")
+        .expect("the actor queues the refused ingress");
+
+    let first = handle
+        .destroy()
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string());
+    // A retry shows the stall is not transient: the same head refuses again.
+    let retried = if first.is_err() {
+        Some(
+            handle
+                .destroy()
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+        )
+    } else {
+        None
+    };
+    assert_eq!(
+        (first, retried),
+        (Ok(()), None),
+        "the destroy supersedes the member's refused queued ingress"
+    );
+    assert_eq!(
+        handle.status().await.expect("status after destroy"),
+        MobState::Destroyed
+    );
+}
+
 /// Lifecycle-notification failures during retirement remain best-effort.
 ///
 /// The notification may legitimately fail during concurrent teardown, but
@@ -84183,6 +84992,9 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         MobError::InvalidTransition { from, to } => {
             format!("invalid_transition:{}->{}", from.as_str(), to.as_str())
         }
+        MobError::DrainRequiresStoppedMob { state } => {
+            format!("drain_requires_stopped_mob:{}", state.as_str())
+        }
         MobError::MobMachineRejected { context, .. } => {
             format!("mob_machine_rejected:{context}")
         }
@@ -84229,6 +85041,10 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
             "bounded_helper_retirement_failed".to_string()
         }
         MobError::MemberRestoreFailed { .. } => "member_restore_failed".to_string(),
+        MobError::MemberStartupRecoveryFailed { .. } => {
+            "member_startup_recovery_failed".to_string()
+        }
+        MobError::DurabilityFailStop { .. } => "durability_fail_stop".to_string(),
         MobError::SpawnMemberAdmissionDenied { .. } => "spawn_member_admission_denied".to_string(),
         MobError::BridgeRequestTimedOut { .. } => "bridge_request_timed_out".to_string(),
         MobError::ForkSourceUnavailable { .. } => "fork_source_unavailable".to_string(),
@@ -91917,6 +92733,12 @@ async fn test_running_steer_without_override_resolves_applied_identity_as_none()
 /// #1102 actor-loop isolation, per-member admission lanes, bounded
 /// deliveries, and the member registration reload primitive.
 mod actor_isolation;
+/// A bounded drain of a Stopped mob's runs.
+#[cfg(feature = "runtime-adapter")]
+mod run_drain;
+/// A graceful Shutdown releases the identity leases of the members it
+/// unregistered.
+mod shutdown_lease_release;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 use crate as fixture_mob;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
@@ -91950,6 +92772,9 @@ mod continuation_resolver;
 /// recovery over real persistent stores.
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod delivery_scope_gates;
+/// Each in-loop durability fail-stop records its own cause.
+#[cfg(not(target_arch = "wasm32"))]
+mod fail_stop_cause;
 /// #1497 fork job terminals are committed once and validated on every read.
 mod fork_job_terminal;
 /// Producer bridge Part B: held spawns.
@@ -91961,6 +92786,9 @@ mod host_outage_recovery;
 /// commits hold the mob database's write lock across a slow fsync.
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod identity_fence_contention;
+/// A mob's lifecycle as its handles observe it without asking its actor.
+#[cfg(not(target_arch = "wasm32"))]
+mod lifecycle_observation;
 /// Member binding history reads over real persistent stores, on the running
 /// mob and on its stopped store.
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]

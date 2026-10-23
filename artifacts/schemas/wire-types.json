@@ -122857,19 +122857,192 @@
   },
   "MobListResult": {
     "$defs": {
+      "ErrorCode": {
+        "description": "Stable error codes for wire protocol.",
+        "oneOf": [
+          {
+            "enum": [
+              "SESSION_NOT_FOUND",
+              "SCHEDULE_NOT_FOUND",
+              "SESSION_BUSY",
+              "SESSION_NOT_RUNNING",
+              "REQUEST_CANCELLED",
+              "PROVIDER_ERROR",
+              "BUDGET_EXHAUSTED",
+              "HOOK_DENIED",
+              "AGENT_ERROR",
+              "CAPABILITY_UNAVAILABLE",
+              "SKILL_NOT_FOUND",
+              "SKILL_RESOLUTION_FAILED",
+              "INVALID_PARAMS",
+              "INTERNAL_ERROR",
+              "DUPLICATE_INPUT",
+              "SUPERVISOR_ROTATION_INCOMPLETE"
+            ],
+            "type": "string"
+          },
+          {
+            "const": "SCOPE_DENIED",
+            "description": "Plane-(b) control-scope denial; wire detail carries\n`{ required, presented }`.",
+            "type": "string"
+          },
+          {
+            "const": "HOST_UNAVAILABLE",
+            "description": "Member host unreachable/timeout; observation degrades typed, never\nquiet.",
+            "type": "string"
+          },
+          {
+            "const": "STALE_CURSOR",
+            "description": "Event cursor overran an ephemeral host's buffer; reply carries the\ncurrent watermark.",
+            "type": "string"
+          },
+          {
+            "const": "STALE_FENCE",
+            "description": "Command carried a superseded `(generation, fence)` tuple.",
+            "type": "string"
+          },
+          {
+            "const": "MEMBER_RELOAD_REQUIRED",
+            "description": "A mob member's runtime registration is durability-degraded and\nrefuses ordinary work until an explicit registration-authorized cold\nreload replaces it (`MobError::MemberReloadRequired`). Deliberately\nits own code rather than [`Self::SessionBusy`]: the condition never\nclears on its own, so ordinary busy/backoff retry is never correct —\nonly the named `reload_member_registration` repair resolves it.",
+            "type": "string"
+          },
+          {
+            "const": "INPUT_REFUSED",
+            "description": "The native owner declined an unaccepted input. Details retain the\ncanonical refusal kind without private policy or principal data.",
+            "type": "string"
+          },
+          {
+            "const": "INPUT_NOT_READY",
+            "description": "Current native input readiness is unavailable. This is an operational\ncondition, not a permission verdict or a terminal result for prior work.",
+            "type": "string"
+          },
+          {
+            "const": "SESSION_RUNTIME_UNAVAILABLE",
+            "description": "Runtime authority is unavailable before a session operation starts.",
+            "type": "string"
+          },
+          {
+            "const": "APPROVAL_STORE_UNAVAILABLE",
+            "description": "The approval store committed nothing (unavailable or contended). An\nexplicitly attempted retry through fresh checks is valid.",
+            "type": "string"
+          },
+          {
+            "const": "APPROVAL_CONFLICT",
+            "description": "Another owner of the approval store changed the approval first; it\nis reconciled before reuse.",
+            "type": "string"
+          },
+          {
+            "const": "APPROVAL_COMMIT_UNKNOWN",
+            "description": "The approval store cannot confirm whether the commit happened; the\napproval is reconciled from the store before reuse, never resent.",
+            "type": "string"
+          },
+          {
+            "const": "STALE_DELIVERY_SCOPE",
+            "description": "A scope-bound mob submit named a member session that is no longer the\nmember's current session binding: the session rotated under a still\ncurrent runtime incarnation and fence. Distinct from\n[`Self::StaleFence`] (a superseded incarnation): the recovery is to\nre-capture the delivery scope, not to re-resolve the member.",
+            "type": "string"
+          },
+          {
+            "const": "FORK_INSTRUCTION_REFUSED",
+            "description": "A durable fork was refused before commit because of the activation\nrows its child would inherit, under the host's fork instruction\npolicy. No child exists; the typed cause and keys ride in the error\ndata. A fork request may set `inherited_instructions` to\n`reactivate_inherited` to carry the source's effective activations.",
+            "type": "string"
+          }
+        ]
+      },
+      "MobSpawnManyFailureCause": {
+        "description": "Typed failure cause for one failed `mob/spawn_many` member row.",
+        "enum": [
+          "profile_not_found",
+          "member_not_found",
+          "member_already_exists",
+          "not_externally_addressable",
+          "invalid_transition",
+          "wiring_error",
+          "bridge_command_rejected",
+          "member_restore_failed",
+          "kickoff_wait_timed_out",
+          "ready_wait_timed_out",
+          "definition_error",
+          "flow_not_found",
+          "flow_failed",
+          "run_not_found",
+          "run_canceled",
+          "flow_turn_timed_out",
+          "frame_depth_limit_exceeded",
+          "frame_atomic_persistence_unavailable",
+          "spec_revision_conflict",
+          "schema_validation",
+          "insufficient_targets",
+          "topology_violation",
+          "bridge_delivery_rejected",
+          "supervisor_escalation",
+          "unsupported_for_mode",
+          "missing_member_capability",
+          "reset_barrier",
+          "storage_error",
+          "session_error",
+          "comms_error",
+          "callback_pending",
+          "stale_fence_token",
+          "stale_event_cursor",
+          "work_not_found",
+          "internal"
+        ],
+        "type": "string"
+      },
       "MobStatusResult": {
-        "description": "One active mob row returned by `mob/list`.",
+        "description": "One active mob row returned by `mob/list`.\n\n`failure` present means the mob's actor has stopped; `status` is the last\nmachine phase. The actor admits no command until a restart recovers the\nmob from its durable state.",
         "properties": {
+          "failure": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WireMobLifecycleFailure"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Present means the mob's actor has stopped; `status` is the last\nmachine phase. Why the actor stopped, typed."
+          },
           "mob_id": {
             "type": "string"
           },
           "status": {
-            "$ref": "#/$defs/WireMobLifecycleStatus"
+            "$ref": "#/$defs/WireMobLifecycleStatus",
+            "description": "The last machine phase the mob's actor published."
           }
         },
         "required": [
           "mob_id",
           "status"
+        ],
+        "type": "object"
+      },
+      "WireMobLifecycleFailure": {
+        "description": "Why a mob's actor has stopped, on a `mob/list` row: the fields a failed\n`mob/spawn_many` row carries.",
+        "properties": {
+          "cause": {
+            "$ref": "#/$defs/MobSpawnManyFailureCause",
+            "description": "The mob failure cause, as the mob's machine classifies it."
+          },
+          "code": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ErrorCode"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Stable classification supplied by the canonical failure owner."
+          },
+          "message": {
+            "type": "string"
+          },
+          "structured_data": true
+        },
+        "required": [
+          "cause",
+          "message"
         ],
         "type": "object"
       },
@@ -131076,6 +131249,167 @@
   },
   "MobStatusResult": {
     "$defs": {
+      "ErrorCode": {
+        "description": "Stable error codes for wire protocol.",
+        "oneOf": [
+          {
+            "enum": [
+              "SESSION_NOT_FOUND",
+              "SCHEDULE_NOT_FOUND",
+              "SESSION_BUSY",
+              "SESSION_NOT_RUNNING",
+              "REQUEST_CANCELLED",
+              "PROVIDER_ERROR",
+              "BUDGET_EXHAUSTED",
+              "HOOK_DENIED",
+              "AGENT_ERROR",
+              "CAPABILITY_UNAVAILABLE",
+              "SKILL_NOT_FOUND",
+              "SKILL_RESOLUTION_FAILED",
+              "INVALID_PARAMS",
+              "INTERNAL_ERROR",
+              "DUPLICATE_INPUT",
+              "SUPERVISOR_ROTATION_INCOMPLETE"
+            ],
+            "type": "string"
+          },
+          {
+            "const": "SCOPE_DENIED",
+            "description": "Plane-(b) control-scope denial; wire detail carries\n`{ required, presented }`.",
+            "type": "string"
+          },
+          {
+            "const": "HOST_UNAVAILABLE",
+            "description": "Member host unreachable/timeout; observation degrades typed, never\nquiet.",
+            "type": "string"
+          },
+          {
+            "const": "STALE_CURSOR",
+            "description": "Event cursor overran an ephemeral host's buffer; reply carries the\ncurrent watermark.",
+            "type": "string"
+          },
+          {
+            "const": "STALE_FENCE",
+            "description": "Command carried a superseded `(generation, fence)` tuple.",
+            "type": "string"
+          },
+          {
+            "const": "MEMBER_RELOAD_REQUIRED",
+            "description": "A mob member's runtime registration is durability-degraded and\nrefuses ordinary work until an explicit registration-authorized cold\nreload replaces it (`MobError::MemberReloadRequired`). Deliberately\nits own code rather than [`Self::SessionBusy`]: the condition never\nclears on its own, so ordinary busy/backoff retry is never correct —\nonly the named `reload_member_registration` repair resolves it.",
+            "type": "string"
+          },
+          {
+            "const": "INPUT_REFUSED",
+            "description": "The native owner declined an unaccepted input. Details retain the\ncanonical refusal kind without private policy or principal data.",
+            "type": "string"
+          },
+          {
+            "const": "INPUT_NOT_READY",
+            "description": "Current native input readiness is unavailable. This is an operational\ncondition, not a permission verdict or a terminal result for prior work.",
+            "type": "string"
+          },
+          {
+            "const": "SESSION_RUNTIME_UNAVAILABLE",
+            "description": "Runtime authority is unavailable before a session operation starts.",
+            "type": "string"
+          },
+          {
+            "const": "APPROVAL_STORE_UNAVAILABLE",
+            "description": "The approval store committed nothing (unavailable or contended). An\nexplicitly attempted retry through fresh checks is valid.",
+            "type": "string"
+          },
+          {
+            "const": "APPROVAL_CONFLICT",
+            "description": "Another owner of the approval store changed the approval first; it\nis reconciled before reuse.",
+            "type": "string"
+          },
+          {
+            "const": "APPROVAL_COMMIT_UNKNOWN",
+            "description": "The approval store cannot confirm whether the commit happened; the\napproval is reconciled from the store before reuse, never resent.",
+            "type": "string"
+          },
+          {
+            "const": "STALE_DELIVERY_SCOPE",
+            "description": "A scope-bound mob submit named a member session that is no longer the\nmember's current session binding: the session rotated under a still\ncurrent runtime incarnation and fence. Distinct from\n[`Self::StaleFence`] (a superseded incarnation): the recovery is to\nre-capture the delivery scope, not to re-resolve the member.",
+            "type": "string"
+          },
+          {
+            "const": "FORK_INSTRUCTION_REFUSED",
+            "description": "A durable fork was refused before commit because of the activation\nrows its child would inherit, under the host's fork instruction\npolicy. No child exists; the typed cause and keys ride in the error\ndata. A fork request may set `inherited_instructions` to\n`reactivate_inherited` to carry the source's effective activations.",
+            "type": "string"
+          }
+        ]
+      },
+      "MobSpawnManyFailureCause": {
+        "description": "Typed failure cause for one failed `mob/spawn_many` member row.",
+        "enum": [
+          "profile_not_found",
+          "member_not_found",
+          "member_already_exists",
+          "not_externally_addressable",
+          "invalid_transition",
+          "wiring_error",
+          "bridge_command_rejected",
+          "member_restore_failed",
+          "kickoff_wait_timed_out",
+          "ready_wait_timed_out",
+          "definition_error",
+          "flow_not_found",
+          "flow_failed",
+          "run_not_found",
+          "run_canceled",
+          "flow_turn_timed_out",
+          "frame_depth_limit_exceeded",
+          "frame_atomic_persistence_unavailable",
+          "spec_revision_conflict",
+          "schema_validation",
+          "insufficient_targets",
+          "topology_violation",
+          "bridge_delivery_rejected",
+          "supervisor_escalation",
+          "unsupported_for_mode",
+          "missing_member_capability",
+          "reset_barrier",
+          "storage_error",
+          "session_error",
+          "comms_error",
+          "callback_pending",
+          "stale_fence_token",
+          "stale_event_cursor",
+          "work_not_found",
+          "internal"
+        ],
+        "type": "string"
+      },
+      "WireMobLifecycleFailure": {
+        "description": "Why a mob's actor has stopped, on a `mob/list` row: the fields a failed\n`mob/spawn_many` row carries.",
+        "properties": {
+          "cause": {
+            "$ref": "#/$defs/MobSpawnManyFailureCause",
+            "description": "The mob failure cause, as the mob's machine classifies it."
+          },
+          "code": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ErrorCode"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Stable classification supplied by the canonical failure owner."
+          },
+          "message": {
+            "type": "string"
+          },
+          "structured_data": true
+        },
+        "required": [
+          "cause",
+          "message"
+        ],
+        "type": "object"
+      },
       "WireMobLifecycleStatus": {
         "description": "Lifecycle status of a mob on the wire. Mirrors\n`meerkat_mob::runtime::MobState` so surfaces report mob lifecycle through a\nclosed type rather than re-deriving meaning from free-form status text.\n\nVariants serialize to their PascalCase names (`\"Creating\"`, `\"Running\"`,\n...) to match the canonical `MobState::as_str()` projection that producers\nemit on the wire.",
         "enum": [
@@ -131089,13 +131423,25 @@
       }
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "description": "One active mob row returned by `mob/list`.",
+    "description": "One active mob row returned by `mob/list`.\n\n`failure` present means the mob's actor has stopped; `status` is the last\nmachine phase. The actor admits no command until a restart recovers the\nmob from its durable state.",
     "properties": {
+      "failure": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/WireMobLifecycleFailure"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "Present means the mob's actor has stopped; `status` is the last\nmachine phase. Why the actor stopped, typed."
+      },
       "mob_id": {
         "type": "string"
       },
       "status": {
-        "$ref": "#/$defs/WireMobLifecycleStatus"
+        "$ref": "#/$defs/WireMobLifecycleStatus",
+        "description": "The last machine phase the mob's actor published."
       }
     },
     "required": [
@@ -153265,6 +153611,15 @@
   },
   "WireAuthErrorBody": {
     "$defs": {
+      "WireAuthErrorDetail": {
+        "description": "A stable sub-kind of some auth errors, carried beside their `reason`\nfor hosts that must act on it. `remote_custody_required` (reason\n`invalid_target`): an attempt started on a registered `https` redirect\nwas completed without the handle its start returned, with another one,\nor through a path that cannot carry it, for example after the host or\nthe runtime restarted. The attempt stays pending: cancel it by its\nreference and start again. `upstream_timeout` (reason\n`upstream_failure`): a network stage of an MCP login got no answer within\nits bound before the authorization code was sent; nothing was published\nand the attempt is gone, so start again. `upstream_timeout_after_code`\n(reason `upstream_failure`): the same after the code was sent, so it may\nbe spent at the provider; any tokens it issued were never stored.",
+        "enum": [
+          "remote_custody_required",
+          "upstream_timeout",
+          "upstream_timeout_after_code"
+        ],
+        "type": "string"
+      },
       "WireAuthErrorReason": {
         "description": "Typed reason of an auth error on the RPC and REST surfaces: RPC\n`error.data.reason`, REST body `reason`. Hosts branch on it, never on the\nerror text. One native mapping (`HostAuthError::reason`) owns it; the\nexisting status codes and RPC error codes are unchanged.",
         "oneOf": [
@@ -153362,6 +153717,11 @@
             "const": "infrastructure",
             "description": "An internal failure; its detail is only in protected diagnostics.",
             "type": "string"
+          },
+          {
+            "const": "commit_unsettled",
+            "description": "A credential commit's outcome is unknown: an MCP login's commit did\nnot report in time, the commit's owner ended before it reported, or\nthe commit failed and could not restore the previous credential.\nWhether the credential landed is unknown until it settles: an\nembedding host settles its in-flight credential work and then reads\nthe status; a wire client reads the status later. If a use is then\nrefused for authorization, log in again. Neither a success nor a\nfailure.",
+            "type": "string"
           }
         ]
       }
@@ -153370,6 +153730,17 @@
     "additionalProperties": false,
     "description": "Body of a REST auth endpoint error.",
     "properties": {
+      "detail": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/WireAuthErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "The refusal's stable sub-kind, when it has one."
+      },
       "error": {
         "description": "Human-readable, secret-free text; never part of the contract.",
         "type": "string"
@@ -153387,6 +153758,15 @@
   },
   "WireAuthErrorData": {
     "$defs": {
+      "WireAuthErrorDetail": {
+        "description": "A stable sub-kind of some auth errors, carried beside their `reason`\nfor hosts that must act on it. `remote_custody_required` (reason\n`invalid_target`): an attempt started on a registered `https` redirect\nwas completed without the handle its start returned, with another one,\nor through a path that cannot carry it, for example after the host or\nthe runtime restarted. The attempt stays pending: cancel it by its\nreference and start again. `upstream_timeout` (reason\n`upstream_failure`): a network stage of an MCP login got no answer within\nits bound before the authorization code was sent; nothing was published\nand the attempt is gone, so start again. `upstream_timeout_after_code`\n(reason `upstream_failure`): the same after the code was sent, so it may\nbe spent at the provider; any tokens it issued were never stored.",
+        "enum": [
+          "remote_custody_required",
+          "upstream_timeout",
+          "upstream_timeout_after_code"
+        ],
+        "type": "string"
+      },
       "WireAuthErrorReason": {
         "description": "Typed reason of an auth error on the RPC and REST surfaces: RPC\n`error.data.reason`, REST body `reason`. Hosts branch on it, never on the\nerror text. One native mapping (`HostAuthError::reason`) owns it; the\nexisting status codes and RPC error codes are unchanged.",
         "oneOf": [
@@ -153484,6 +153864,11 @@
             "const": "infrastructure",
             "description": "An internal failure; its detail is only in protected diagnostics.",
             "type": "string"
+          },
+          {
+            "const": "commit_unsettled",
+            "description": "A credential commit's outcome is unknown: an MCP login's commit did\nnot report in time, the commit's owner ended before it reported, or\nthe commit failed and could not restore the previous credential.\nWhether the credential landed is unknown until it settles: an\nembedding host settles its in-flight credential work and then reads\nthe status; a wire client reads the status later. If a use is then\nrefused for authorization, log in again. Neither a success nor a\nfailure.",
+            "type": "string"
           }
         ]
       }
@@ -153492,6 +153877,17 @@
     "additionalProperties": false,
     "description": "`error.data` of an auth RPC error.",
     "properties": {
+      "detail": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/WireAuthErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "The refusal's stable sub-kind, when it has one."
+      },
       "reason": {
         "$ref": "#/$defs/WireAuthErrorReason"
       }
@@ -153501,6 +153897,17 @@
     ],
     "title": "WireAuthErrorData",
     "type": "object"
+  },
+  "WireAuthErrorDetail": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "A stable sub-kind of some auth errors, carried beside their `reason`\nfor hosts that must act on it. `remote_custody_required` (reason\n`invalid_target`): an attempt started on a registered `https` redirect\nwas completed without the handle its start returned, with another one,\nor through a path that cannot carry it, for example after the host or\nthe runtime restarted. The attempt stays pending: cancel it by its\nreference and start again. `upstream_timeout` (reason\n`upstream_failure`): a network stage of an MCP login got no answer within\nits bound before the authorization code was sent; nothing was published\nand the attempt is gone, so start again. `upstream_timeout_after_code`\n(reason `upstream_failure`): the same after the code was sent, so it may\nbe spent at the provider; any tokens it issued were never stored.",
+    "enum": [
+      "remote_custody_required",
+      "upstream_timeout",
+      "upstream_timeout_after_code"
+    ],
+    "title": "WireAuthErrorDetail",
+    "type": "string"
   },
   "WireAuthErrorReason": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -153599,6 +154006,11 @@
       {
         "const": "infrastructure",
         "description": "An internal failure; its detail is only in protected diagnostics.",
+        "type": "string"
+      },
+      {
+        "const": "commit_unsettled",
+        "description": "A credential commit's outcome is unknown: an MCP login's commit did\nnot report in time, the commit's owner ended before it reported, or\nthe commit failed and could not restore the previous credential.\nWhether the credential landed is unknown until it settles: an\nembedding host settles its in-flight credential work and then reads\nthe status; a wire client reads the status later. If a use is then\nrefused for authorization, log in again. Neither a success nor a\nfailure.",
         "type": "string"
       }
     ],
@@ -173888,6 +174300,13 @@
         "additionalProperties": false,
         "description": "MCP arm of [`WireLoginStartTarget`]. A joined start returns the pending\nattempt's authorize URL and state: wire callers are host-privileged by\ncontract.",
         "properties": {
+          "attempt_ref": {
+            "description": "For a start on a registered `https` redirect: the attempt's\nnon-secret reference, as `auth/status/get` reports it, for status\nreads and `auth/login/cancel` by reference. It authorizes nothing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "disposition": {
             "$ref": "#/$defs/WireMcpLoginDisposition"
           },
@@ -173926,7 +174345,7 @@
       }
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "description": "`POST /auth/login/start` success body. Host-channel data: the\nauthorize URL and state must never reach an agent, tool result,\ntranscript or log.",
+    "description": "`POST /auth/login/start` success body. Host-channel data: the\nauthorize URL, state and host attempt handle must never reach an agent,\ntool result, transcript or log.",
     "oneOf": [
       {
         "$ref": "#/$defs/WireProviderLoginStart"
@@ -173941,6 +174360,13 @@
     "properties": {
       "authorize_url": {
         "type": "string"
+      },
+      "host_attempt_handle": {
+        "description": "For an attempt started on a registered `https` redirect: a secret\nthat proves this host started it. The host keeps it server-side with\nits ceremony (never in the browser, a URL, a model or a log) and\npasses it to `auth/login/complete`. Absent for loopback attempts and\njoined projections.",
+        "type": [
+          "string",
+          "null"
+        ]
       },
       "redirect_uri": {
         "type": "string"
@@ -178066,6 +178492,171 @@
       "message"
     ],
     "title": "WireMobError",
+    "type": "object"
+  },
+  "WireMobLifecycleFailure": {
+    "$defs": {
+      "ErrorCode": {
+        "description": "Stable error codes for wire protocol.",
+        "oneOf": [
+          {
+            "enum": [
+              "SESSION_NOT_FOUND",
+              "SCHEDULE_NOT_FOUND",
+              "SESSION_BUSY",
+              "SESSION_NOT_RUNNING",
+              "REQUEST_CANCELLED",
+              "PROVIDER_ERROR",
+              "BUDGET_EXHAUSTED",
+              "HOOK_DENIED",
+              "AGENT_ERROR",
+              "CAPABILITY_UNAVAILABLE",
+              "SKILL_NOT_FOUND",
+              "SKILL_RESOLUTION_FAILED",
+              "INVALID_PARAMS",
+              "INTERNAL_ERROR",
+              "DUPLICATE_INPUT",
+              "SUPERVISOR_ROTATION_INCOMPLETE"
+            ],
+            "type": "string"
+          },
+          {
+            "const": "SCOPE_DENIED",
+            "description": "Plane-(b) control-scope denial; wire detail carries\n`{ required, presented }`.",
+            "type": "string"
+          },
+          {
+            "const": "HOST_UNAVAILABLE",
+            "description": "Member host unreachable/timeout; observation degrades typed, never\nquiet.",
+            "type": "string"
+          },
+          {
+            "const": "STALE_CURSOR",
+            "description": "Event cursor overran an ephemeral host's buffer; reply carries the\ncurrent watermark.",
+            "type": "string"
+          },
+          {
+            "const": "STALE_FENCE",
+            "description": "Command carried a superseded `(generation, fence)` tuple.",
+            "type": "string"
+          },
+          {
+            "const": "MEMBER_RELOAD_REQUIRED",
+            "description": "A mob member's runtime registration is durability-degraded and\nrefuses ordinary work until an explicit registration-authorized cold\nreload replaces it (`MobError::MemberReloadRequired`). Deliberately\nits own code rather than [`Self::SessionBusy`]: the condition never\nclears on its own, so ordinary busy/backoff retry is never correct —\nonly the named `reload_member_registration` repair resolves it.",
+            "type": "string"
+          },
+          {
+            "const": "INPUT_REFUSED",
+            "description": "The native owner declined an unaccepted input. Details retain the\ncanonical refusal kind without private policy or principal data.",
+            "type": "string"
+          },
+          {
+            "const": "INPUT_NOT_READY",
+            "description": "Current native input readiness is unavailable. This is an operational\ncondition, not a permission verdict or a terminal result for prior work.",
+            "type": "string"
+          },
+          {
+            "const": "SESSION_RUNTIME_UNAVAILABLE",
+            "description": "Runtime authority is unavailable before a session operation starts.",
+            "type": "string"
+          },
+          {
+            "const": "APPROVAL_STORE_UNAVAILABLE",
+            "description": "The approval store committed nothing (unavailable or contended). An\nexplicitly attempted retry through fresh checks is valid.",
+            "type": "string"
+          },
+          {
+            "const": "APPROVAL_CONFLICT",
+            "description": "Another owner of the approval store changed the approval first; it\nis reconciled before reuse.",
+            "type": "string"
+          },
+          {
+            "const": "APPROVAL_COMMIT_UNKNOWN",
+            "description": "The approval store cannot confirm whether the commit happened; the\napproval is reconciled from the store before reuse, never resent.",
+            "type": "string"
+          },
+          {
+            "const": "STALE_DELIVERY_SCOPE",
+            "description": "A scope-bound mob submit named a member session that is no longer the\nmember's current session binding: the session rotated under a still\ncurrent runtime incarnation and fence. Distinct from\n[`Self::StaleFence`] (a superseded incarnation): the recovery is to\nre-capture the delivery scope, not to re-resolve the member.",
+            "type": "string"
+          },
+          {
+            "const": "FORK_INSTRUCTION_REFUSED",
+            "description": "A durable fork was refused before commit because of the activation\nrows its child would inherit, under the host's fork instruction\npolicy. No child exists; the typed cause and keys ride in the error\ndata. A fork request may set `inherited_instructions` to\n`reactivate_inherited` to carry the source's effective activations.",
+            "type": "string"
+          }
+        ]
+      },
+      "MobSpawnManyFailureCause": {
+        "description": "Typed failure cause for one failed `mob/spawn_many` member row.",
+        "enum": [
+          "profile_not_found",
+          "member_not_found",
+          "member_already_exists",
+          "not_externally_addressable",
+          "invalid_transition",
+          "wiring_error",
+          "bridge_command_rejected",
+          "member_restore_failed",
+          "kickoff_wait_timed_out",
+          "ready_wait_timed_out",
+          "definition_error",
+          "flow_not_found",
+          "flow_failed",
+          "run_not_found",
+          "run_canceled",
+          "flow_turn_timed_out",
+          "frame_depth_limit_exceeded",
+          "frame_atomic_persistence_unavailable",
+          "spec_revision_conflict",
+          "schema_validation",
+          "insufficient_targets",
+          "topology_violation",
+          "bridge_delivery_rejected",
+          "supervisor_escalation",
+          "unsupported_for_mode",
+          "missing_member_capability",
+          "reset_barrier",
+          "storage_error",
+          "session_error",
+          "comms_error",
+          "callback_pending",
+          "stale_fence_token",
+          "stale_event_cursor",
+          "work_not_found",
+          "internal"
+        ],
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Why a mob's actor has stopped, on a `mob/list` row: the fields a failed\n`mob/spawn_many` row carries.",
+    "properties": {
+      "cause": {
+        "$ref": "#/$defs/MobSpawnManyFailureCause",
+        "description": "The mob failure cause, as the mob's machine classifies it."
+      },
+      "code": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorCode"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "Stable classification supplied by the canonical failure owner."
+      },
+      "message": {
+        "type": "string"
+      },
+      "structured_data": true
+    },
+    "required": [
+      "cause",
+      "message"
+    ],
+    "title": "WireMobLifecycleFailure",
     "type": "object"
   },
   "WireMobProfile": {

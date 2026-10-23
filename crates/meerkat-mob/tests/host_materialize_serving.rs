@@ -81,6 +81,7 @@ fn assert_rejected(reply: &BridgeReply, expected: &BridgeRejectionCause) {
 
 async fn assert_fail_stopped_reply<T: std::fmt::Debug>(
     reply: oneshot::Receiver<Result<T, String>>,
+    first_error: &str,
 ) {
     let error = tokio::time::timeout(REPLY_TIMEOUT, reply)
         .await
@@ -90,6 +91,10 @@ async fn assert_fail_stopped_reply<T: std::fmt::Debug>(
     assert!(
         error.contains("fail-stopped") && error.contains("restart required"),
         "sticky rejection must identify the restart boundary: {error}"
+    );
+    assert!(
+        error.contains(first_error),
+        "sticky rejection names the first uncertain write ({first_error}): {error}"
     );
 }
 
@@ -2490,6 +2495,13 @@ async fn materialize_postcommit_unreadable_row_quiesces_and_fail_stops_until_res
         reason.contains("fail-stopped") && reason.contains("restart required"),
         "sticky rejection must identify the restart boundary: {reason}"
     );
+    assert!(
+        reason.contains(
+            "restart required: durable host binding outcome is uncertain: materialize record \
+             became durably uncertain"
+        ),
+        "sticky rejection names the first uncertain write as its typed cause: {reason}"
+    );
 
     let fixture = fixture.restart().await;
     probe.trust(fixture.host_peer_descriptor()).await;
@@ -2560,7 +2572,7 @@ async fn durable_uncertainty_fail_stop_guards_every_internal_journal_mutation_la
         })
         .await
         .expect("send blocked Pending reservation");
-    assert_fail_stopped_reply(received).await;
+    assert_fail_stopped_reply(received, &first_error).await;
 
     let (reply, received) = oneshot::channel();
     fixture
@@ -2575,7 +2587,7 @@ async fn durable_uncertainty_fail_stop_guards_every_internal_journal_mutation_la
         })
         .await
         .expect("send blocked Pending cancellation");
-    assert_fail_stopped_reply(received).await;
+    assert_fail_stopped_reply(received, &first_error).await;
 
     let (reply, received) = oneshot::channel();
     fixture
@@ -2595,7 +2607,7 @@ async fn durable_uncertainty_fail_stop_guards_every_internal_journal_mutation_la
         })
         .await
         .expect("send blocked outcome record");
-    assert_fail_stopped_reply(received).await;
+    assert_fail_stopped_reply(received, &first_error).await;
 
     let (reply, received) = oneshot::channel();
     fixture
@@ -2612,7 +2624,7 @@ async fn durable_uncertainty_fail_stop_guards_every_internal_journal_mutation_la
         })
         .await
         .expect("send blocked outcome acknowledgement");
-    assert_fail_stopped_reply(received).await;
+    assert_fail_stopped_reply(received, &first_error).await;
 
     assert_eq!(
         fixture.host_binding_record(&mob_id).await,

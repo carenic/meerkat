@@ -52,6 +52,7 @@ import type {
   WireMemberPreviewUnavailable,
   WireMemberProgressSnapshot,
   WireMemberRegistrationHookCall,
+  WireMobLifecycleFailure,
   WireNonPortableResourceKind,
   WireReachability,
   WireResolvedModelCapabilities,
@@ -462,9 +463,42 @@ export function parseMobStatusResult(
     'status',
     `${context}: missing status`,
   );
+  const failure = parseMobLifecycleFailure(record.failure, context);
+  return failure === undefined
+    ? { mob_id: mobId, status }
+    : { mob_id: mobId, status, failure };
+}
+
+/**
+ * The typed failure of a listed mob. Present means the mob's actor has
+ * stopped; `status` is the last machine phase. Absent or `null` yields
+ * `undefined`.
+ */
+function parseMobLifecycleFailure(
+  raw: unknown,
+  context: string,
+): WireMobLifecycleFailure | undefined {
+  if (raw == null) {
+    return undefined;
+  }
+  const record = requireRecord(raw, `${context}: malformed failure`);
+  const cause = record.cause;
+  if (!isMobSpawnManyFailureCause(cause)) {
+    throw new Error(`${context}: failure missing cause`);
+  }
+  const message = record.message;
+  if (typeof message !== 'string') {
+    throw new Error(`${context}: failure missing message`);
+  }
+  const code = record.code;
+  if (code != null && (typeof code !== 'string' || code.length === 0)) {
+    throw new Error(`${context}: failure has invalid code`);
+  }
   return {
-    mob_id: mobId,
-    status,
+    cause,
+    message,
+    ...(code == null ? {} : { code: code as WireMobLifecycleFailure['code'] }),
+    ...(record.structured_data == null ? {} : { structured_data: record.structured_data }),
   };
 }
 

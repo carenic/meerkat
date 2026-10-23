@@ -11,6 +11,8 @@ mod budget_warning_tests;
 mod builder;
 pub mod comms_impl;
 pub mod compact;
+#[cfg(all(test, feature = "workspace-tests"))]
+mod compaction_retention_tests;
 #[cfg(test)]
 mod durable_boundary_tests;
 mod extraction;

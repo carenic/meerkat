@@ -654,9 +654,12 @@ impl MemberEffectCommit for RetirementCommit {
     ) -> MemberEffectCommitFuture<'_> {
         Box::pin(async move {
             let Some(mut continuation) = actor.retirements.remove(&self.identity) else {
-                actor.durable_uncertainty_fail_stop = true;
                 return MemberEffectAck::Retained(MemberEffectRetention::resumable(
-                    MobError::Internal("retirement effect lost its continuation".to_string()),
+                    actor
+                        .durable_uncertainty_fail_stop
+                        .record(MobError::Internal(
+                            "retirement effect lost its continuation".to_string(),
+                        )),
                     self,
                 ));
             };
@@ -670,9 +673,12 @@ impl MemberEffectCommit for RetirementCommit {
                         });
                 }
                 actor.retirements.insert(self.identity, continuation);
-                actor.durable_uncertainty_fail_stop = true;
                 return MemberEffectAck::Retained(MemberEffectRetention::unresumable(
-                    MobError::Internal("retirement effect ticket was superseded".to_string()),
+                    actor
+                        .durable_uncertainty_fail_stop
+                        .record(MobError::Internal(
+                            "retirement effect ticket was superseded".to_string(),
+                        )),
                 ));
             }
             continuation
@@ -706,12 +712,15 @@ impl MemberEffectCommit for RetirementCommit {
                     return MemberEffectAck::Settled;
                 }
                 actor.retirements.insert(self.identity, continuation);
-                actor.durable_uncertainty_fail_stop = true;
                 return MemberEffectAck::Retained(MemberEffectRetention::unresumable(
-                    MobError::Internal("retirement effect has no owner result".to_string()),
+                    actor
+                        .durable_uncertainty_fail_stop
+                        .record(MobError::Internal(
+                            "retirement effect has no owner result".to_string(),
+                        )),
                 ));
             };
-            if actor.durable_uncertainty_fail_stop
+            if actor.durable_uncertainty_fail_stop.is_set()
                 || !settlement.is_current()
                 || !actor.spawn_rollback_placement_fences_current(&continuation)
                 || actor
@@ -744,18 +753,19 @@ impl MemberEffectCommit for RetirementCommit {
                     return MemberEffectAck::Settled;
                 }
                 actor.retirements.insert(self.identity, continuation);
-                actor.durable_uncertainty_fail_stop = true;
                 return MemberEffectAck::Retained(MemberEffectRetention::unresumable(
-                    MobError::Internal(
-                        "retirement effect no longer has current authority".to_string(),
-                    ),
+                    actor
+                        .durable_uncertainty_fail_stop
+                        .record(MobError::Internal(
+                            "retirement effect no longer has current authority".to_string(),
+                        )),
                 ));
             }
             actor
                 .pending_routed_effects
                 .append(&mut continuation.routes);
             actor.resume_retirement(continuation, observation).await;
-            if !actor.durable_uncertainty_fail_stop {
+            if !actor.durable_uncertainty_fail_stop.is_set() {
                 actor.notify_spawn_cleanup_waiters();
                 MemberEffectAck::Settled
             } else {
@@ -830,14 +840,13 @@ impl MobActor {
                 .get(&anchor.spawn_ticket)
                 .is_some_and(|current| !Self::pending_anchor_matches(current, &anchor))
             {
-                self.durable_uncertainty_fail_stop = true;
-                self.finish_retirement(
-                    continuation,
-                    Err(MobError::Internal(
-                        "pending spawn cleanup receipt targets a different exact anchor".into(),
-                    )),
-                )
-                .await;
+                let fail_stop_reply =
+                    self.durable_uncertainty_fail_stop
+                        .record(MobError::Internal(
+                            "pending spawn cleanup receipt targets a different exact anchor".into(),
+                        ));
+                self.finish_retirement(continuation, Err(fail_stop_reply))
+                    .await;
                 return;
             }
             match result {
@@ -943,8 +952,9 @@ impl MobActor {
                 },
                 "cancel_pending_spawn_slots",
             ) {
-                self.durable_uncertainty_fail_stop = true;
-                self.finish_retirement(continuation, Err(error)).await;
+                let fail_stop_reply = self.durable_uncertainty_fail_stop.record(error);
+                self.finish_retirement(continuation, Err(fail_stop_reply))
+                    .await;
                 return;
             }
         }
@@ -979,14 +989,13 @@ impl MobActor {
     async fn retirement_observe_pending_task(&mut self, mut continuation: RetirementContinuation) {
         let retire_incarnation = continuation.pending_retire_incarnation.clone();
         let Some(slot) = continuation.pending_slot.as_mut() else {
-            self.durable_uncertainty_fail_stop = true;
-            self.finish_retirement(
-                continuation,
-                Err(MobError::Internal(
+            let fail_stop_reply = self
+                .durable_uncertainty_fail_stop
+                .record(MobError::Internal(
                     "pending spawn custody is missing".into(),
-                )),
-            )
-            .await;
+                ));
+            self.finish_retirement(continuation, Err(fail_stop_reply))
+                .await;
             return;
         };
         if slot.task.as_ref().is_some_and(|task| !task.is_finished()) {
@@ -1015,8 +1024,9 @@ impl MobActor {
         ) {
             Ok(anchor) => anchor,
             Err(error) => {
-                self.durable_uncertainty_fail_stop = true;
-                self.finish_retirement(continuation, Err(error)).await;
+                let fail_stop_reply = self.durable_uncertainty_fail_stop.record(error);
+                self.finish_retirement(continuation, Err(fail_stop_reply))
+                    .await;
                 return;
             }
         };
@@ -1029,14 +1039,13 @@ impl MobActor {
             .get(&anchor.spawn_ticket)
             .is_some_and(|current| !Self::pending_anchor_matches(current, &anchor))
         {
-            self.durable_uncertainty_fail_stop = true;
-            self.finish_retirement(
-                continuation,
-                Err(MobError::Internal(
+            let fail_stop_reply = self
+                .durable_uncertainty_fail_stop
+                .record(MobError::Internal(
                     "pending spawn cleanup anchor was superseded".into(),
-                )),
-            )
-            .await;
+                ));
+            self.finish_retirement(continuation, Err(fail_stop_reply))
+                .await;
             return;
         }
         self.pending_spawn_cleanup_anchors
@@ -1071,14 +1080,13 @@ impl MobActor {
             .get(&anchor.spawn_ticket)
             .is_none_or(|current| !Self::pending_anchor_matches(current, &anchor))
         {
-            self.durable_uncertainty_fail_stop = true;
-            self.finish_retirement(
-                continuation,
-                Err(MobError::Internal(
+            let fail_stop_reply = self
+                .durable_uncertainty_fail_stop
+                .record(MobError::Internal(
                     "pending provision abort lost its exact anchor".into(),
-                )),
-            )
-            .await;
+                ));
+            self.finish_retirement(continuation, Err(fail_stop_reply))
+                .await;
             return;
         }
         match result {
@@ -1150,8 +1158,9 @@ impl MobActor {
         let (obligation, authority, release, display) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
-                self.durable_uncertainty_fail_stop = true;
-                self.finish_retirement(continuation, Err(error)).await;
+                let fail_stop_reply = self.durable_uncertainty_fail_stop.record(error);
+                self.finish_retirement(continuation, Err(fail_stop_reply))
+                    .await;
                 return;
             }
         };
@@ -1194,19 +1203,19 @@ impl MobActor {
                 result.is_ok(),
             )
         {
-            self.durable_uncertainty_fail_stop = true;
-            self.finish_retirement(
-                continuation,
-                Err(MobError::Internal(
+            let fail_stop_reply = self
+                .durable_uncertainty_fail_stop
+                .record(MobError::Internal(
                     "pending release lost exact reservation".into(),
-                )),
-            )
-            .await;
+                ));
+            self.finish_retirement(continuation, Err(fail_stop_reply))
+                .await;
             return;
         }
         if let Err(error) = result {
-            self.durable_uncertainty_fail_stop = true;
-            self.finish_retirement(continuation, Err(error)).await;
+            let fail_stop_reply = self.durable_uncertainty_fail_stop.record(error);
+            self.finish_retirement(continuation, Err(fail_stop_reply))
+                .await;
             return;
         }
         let PendingRemoteCleanup {
@@ -1251,14 +1260,13 @@ impl MobActor {
 
     async fn retirement_finish_pending_slot(&mut self, mut continuation: RetirementContinuation) {
         let Some(slot) = continuation.pending_slot.take() else {
-            self.durable_uncertainty_fail_stop = true;
-            self.finish_retirement(
-                continuation,
-                Err(MobError::Internal(
+            let fail_stop_reply = self
+                .durable_uncertainty_fail_stop
+                .record(MobError::Internal(
                     "pending cancellation lost its owned slot".into(),
-                )),
-            )
-            .await;
+                ));
+            self.finish_retirement(continuation, Err(fail_stop_reply))
+                .await;
             return;
         };
         if let Some(origin) = slot.spawn.respawn_origin.as_ref()
@@ -1270,9 +1278,10 @@ impl MobActor {
                 .await
         {
             continuation.pending_slot = Some(slot);
-            self.durable_uncertainty_fail_stop = true;
             self.respawn_topology_reply_withheld = true;
-            self.finish_retirement(continuation, Err(error)).await;
+            let fail_stop_reply = self.durable_uncertainty_fail_stop.record(error);
+            self.finish_retirement(continuation, Err(fail_stop_reply))
+                .await;
             return;
         }
         (*slot).fail_with(MobError::SpawnCanceled {
@@ -1825,7 +1834,7 @@ impl MobActor {
     /// cleanup plan. The batch owns receivers, never a self-blocking effect
     /// ticket around the final global lifecycle drain.
     pub(super) async fn continue_retirement_batch_after_settlement(&mut self) -> bool {
-        if self.durable_uncertainty_fail_stop {
+        if self.durable_uncertainty_fail_stop.is_set() {
             return false;
         }
         let Some(mut batch) = self.retirement_batch.take() else {
@@ -1942,7 +1951,7 @@ impl MobActor {
         {
             self.fail_reset_to_stopped().await;
         }
-        if !self.respawn_topology_reply_withheld && !self.durable_uncertainty_fail_stop {
+        if !self.respawn_topology_reply_withheld && !self.durable_uncertainty_fail_stop.is_set() {
             Self::answer_retirement_after(batch.after, result);
         }
     }
@@ -2176,13 +2185,6 @@ impl MobActor {
         });
     }
 
-    fn retirement_unwire_error(error: MobError) -> MobError {
-        match error {
-            MobError::RetirementTopologyIncomplete(_) => error,
-            error => MobError::RetirementTopologyIncomplete(error.to_string()),
-        }
-    }
-
     async fn retirement_next_remote_edge(&mut self, mut continuation: RetirementContinuation) {
         while let Some(peer) = continuation.remote_peers.pop() {
             let preparation = match self
@@ -2192,7 +2194,7 @@ impl MobActor {
                     continuation.preserve_topology,
                 )
                 .await
-                .map_err(Self::retirement_unwire_error)
+                .map_err(MobError::into_retirement_topology_incomplete)
             {
                 Ok(preparation) => preparation,
                 Err(error) => {
@@ -2491,8 +2493,7 @@ impl MobActor {
                     Ok(()) if Self::expected_revoke_cleanup_failure(&error).is_some() => Ok(()),
                     Ok(()) => Err(error),
                     Err(error) => {
-                        self.durable_uncertainty_fail_stop = true;
-                        Err(error)
+                        Err(self.durable_uncertainty_fail_stop.record(error))
                     }
                 }
             }
@@ -2500,10 +2501,9 @@ impl MobActor {
                 error,
                 rollback: Err(rollback),
             } => {
-                self.durable_uncertainty_fail_stop = true;
-                Err(MobError::RetirementTopologyIncomplete(format!(
+                Err(self.durable_uncertainty_fail_stop.record(MobError::RetirementTopologyIncomplete(format!(
                     "supervisor revoke failed ({error}); recipient trust rollback failed ({rollback})",
-                )))
+                ))))
             }
             RetirementRevokeObservation::InstallUncertain(error) => Err(self
                 .quarantine_uncertain_recipient_trust_install(
@@ -2680,8 +2680,9 @@ impl MobActor {
                 ) {
                     Ok(authority) => authority,
                     Err(error) => {
-                        self.durable_uncertainty_fail_stop = true;
-                        self.finish_retirement(continuation, Err(error)).await;
+                        let fail_stop_reply = self.durable_uncertainty_fail_stop.record(error);
+                        self.finish_retirement(continuation, Err(fail_stop_reply))
+                            .await;
                         return;
                     }
                 };
@@ -2732,14 +2733,13 @@ impl MobActor {
                 );
             }
             _ => {
-                self.durable_uncertainty_fail_stop = true;
-                self.finish_retirement(
-                    continuation,
-                    Err(MobError::Internal(
-                        "retirement carrier and generated cleanup obligation disagree".into(),
-                    )),
-                )
-                .await;
+                let fail_stop_reply =
+                    self.durable_uncertainty_fail_stop
+                        .record(MobError::Internal(
+                            "retirement carrier and generated cleanup obligation disagree".into(),
+                        ));
+                self.finish_retirement(continuation, Err(fail_stop_reply))
+                    .await;
             }
         }
     }
@@ -2871,7 +2871,7 @@ impl MobActor {
                     continuation.preserve_topology,
                 )
                 .await
-                .map_err(Self::retirement_unwire_error)
+                .map_err(MobError::into_retirement_topology_incomplete)
             {
                 Ok(preparation) => preparation,
                 Err(error) => {
@@ -3388,7 +3388,7 @@ impl MobActor {
                             effect = ?effect.body(),
                             phase = ?self.dsl_authority.state().lifecycle_phase,
                             rejection = %rejection,
-                            "deferring retirement route refusal feedback: the mob machine cannot take it in this phase"
+                            "the mob machine rejected the retirement route's refusal feedback; the route stays on the continuation for the next attempt"
                         );
                         return Err(rejection);
                     }
@@ -4352,14 +4352,13 @@ impl MobActor {
                         result.is_ok(),
                     )
                 {
-                    self.durable_uncertainty_fail_stop = true;
-                    self.finish_retirement(
-                        continuation,
-                        Err(MobError::Internal(
-                            "retirement lost its exact host-release reservation".into(),
-                        )),
-                    )
-                    .await;
+                    let fail_stop_reply =
+                        self.durable_uncertainty_fail_stop
+                            .record(MobError::Internal(
+                                "retirement lost its exact host-release reservation".into(),
+                            ));
+                    self.finish_retirement(continuation, Err(fail_stop_reply))
+                        .await;
                     return;
                 }
                 match result {
@@ -4371,7 +4370,7 @@ impl MobActor {
                 match self
                     .commit_realized_wiring(realized)
                     .await
-                    .map_err(Self::retirement_unwire_error)
+                    .map_err(MobError::into_retirement_topology_incomplete)
                 {
                     Ok(()) => self.retirement_next_placed_edge(continuation).await,
                     Err(error) => self.finish_retirement(continuation, Err(error)).await,
@@ -4420,7 +4419,7 @@ impl MobActor {
                 match self
                     .commit_realized_wiring(realized)
                     .await
-                    .map_err(Self::retirement_unwire_error)
+                    .map_err(MobError::into_retirement_topology_incomplete)
                 {
                     Ok(()) => self.retirement_next_remote_edge(continuation).await,
                     Err(error) => self.finish_retirement(continuation, Err(error)).await,
@@ -4472,8 +4471,9 @@ impl MobActor {
                     match result {
                         Ok(()) => self.retirement_clean_projection(continuation),
                         Err(error) => {
-                            self.durable_uncertainty_fail_stop = true;
-                            self.finish_retirement(continuation, Err(error)).await;
+                            let fail_stop_reply = self.durable_uncertainty_fail_stop.record(error);
+                            self.finish_retirement(continuation, Err(fail_stop_reply))
+                                .await;
                         }
                     }
                 })
@@ -4565,8 +4565,9 @@ impl MobActor {
                     match result {
                         Ok(()) => self.retirement_next_placed_edge(continuation).await,
                         Err(error) => {
-                            self.durable_uncertainty_fail_stop = true;
-                            self.finish_retirement(continuation, Err(error)).await;
+                            let fail_stop_reply = self.durable_uncertainty_fail_stop.record(error);
+                            self.finish_retirement(continuation, Err(fail_stop_reply))
+                                .await;
                         }
                     }
                 })
@@ -4597,8 +4598,9 @@ impl MobActor {
                     match result {
                         Ok(()) => self.retirement_finish_pending_slot(continuation).await,
                         Err(error) => {
-                            self.durable_uncertainty_fail_stop = true;
-                            self.finish_retirement(continuation, Err(error)).await;
+                            let fail_stop_reply = self.durable_uncertainty_fail_stop.record(error);
+                            self.finish_retirement(continuation, Err(fail_stop_reply))
+                                .await;
                         }
                     }
                 })
@@ -4901,7 +4903,7 @@ impl MobActor {
                 }
                 return;
             }
-            if self.respawn_topology_reply_withheld || self.durable_uncertainty_fail_stop {
+            if self.respawn_topology_reply_withheld || self.durable_uncertainty_fail_stop.is_set() {
                 self.retirements
                     .insert(continuation.entry.agent_identity.clone(), continuation);
                 return;
@@ -4933,15 +4935,15 @@ impl MobActor {
                             old_runtime_id: snapshot.old_runtime_id,
                             old_fence_token: snapshot.old_fence_token,
                         };
-                        if self
+                        if let Err(abandon_error) = self
                             .durably_abandon_respawn_topology_if_terminal_exact(
                                 &continuation.entry.agent_identity,
                                 &origin,
                             )
                             .await
-                            .is_err()
                         {
-                            self.durable_uncertainty_fail_stop = true;
+                            self.durable_uncertainty_fail_stop
+                                .record_unreplied(abandon_error);
                             self.respawn_topology_reply_withheld = true;
                             return;
                         }
@@ -5031,7 +5033,11 @@ impl MobActor {
                     self.enqueue_identity_reconcile(continuation.entry.agent_identity);
                 }
                 RetirementReply::SpawnRollback => {
-                    self.durable_uncertainty_fail_stop = true;
+                    self.durable_uncertainty_fail_stop
+                        .record_unreplied(MobError::Internal(format!(
+                            "spawn rollback retirement of '{}' finished without its rollback state",
+                            continuation.entry.agent_identity
+                        )));
                 }
             }
         })
@@ -5262,7 +5268,11 @@ impl MobActor {
     async fn spawn_rollback_next_placed_edge(&mut self, mut continuation: RetirementContinuation) {
         loop {
             let Some(rollback) = continuation.rollback.as_mut() else {
-                self.durable_uncertainty_fail_stop = true;
+                self.durable_uncertainty_fail_stop
+                    .record_unreplied(MobError::Internal(format!(
+                        "spawn rollback of '{}' lost its rollback state at its next placed edge",
+                        continuation.entry.agent_identity
+                    )));
                 return;
             };
             let Some(peer) = rollback
@@ -5291,7 +5301,7 @@ impl MobActor {
             let result = self
                 .prepare_member_unwire_for_retirement(retiring, peer.clone(), false)
                 .await
-                .map_err(Self::retirement_unwire_error);
+                .map_err(MobError::into_retirement_topology_incomplete);
             match result {
                 Ok(wiring_io::WiringPreparation::Settled) => {
                     if let Some(rollback) = continuation.rollback.as_mut() {
@@ -5780,7 +5790,11 @@ impl MobActor {
         observation: SpawnRollbackObservation,
     ) {
         let Some(rollback) = continuation.rollback.as_mut() else {
-            self.durable_uncertainty_fail_stop = true;
+            self.durable_uncertainty_fail_stop
+                .record_unreplied(MobError::Internal(format!(
+                    "spawn rollback of '{}' lost its rollback state while resuming",
+                    continuation.entry.agent_identity
+                )));
             return;
         };
         let result = match observation {
@@ -5893,7 +5907,7 @@ impl MobActor {
             SpawnRollbackObservation::PlacedTrust(realized) => self
                 .commit_realized_wiring(realized)
                 .await
-                .map_err(Self::retirement_unwire_error)
+                .map_err(MobError::into_retirement_topology_incomplete)
                 .map(|()| {
                     if let Some(peer) = rollback.cleanup_peers.get(rollback.placed_cleanup_index) {
                         rollback.placed_edges_cleaned.insert(peer.clone());
@@ -6021,7 +6035,11 @@ impl MobActor {
 
     async fn compensate_spawn_rollback(&mut self, mut continuation: RetirementContinuation) {
         let Some(rollback) = continuation.rollback.as_mut() else {
-            self.durable_uncertainty_fail_stop = true;
+            self.durable_uncertainty_fail_stop
+                .record_unreplied(MobError::Internal(format!(
+                    "spawn rollback of '{}' lost its rollback state while compensating",
+                    continuation.entry.agent_identity
+                )));
             return;
         };
         if let Some(target) = rollback.notices.last().cloned()
