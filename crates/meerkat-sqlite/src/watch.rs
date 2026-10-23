@@ -2146,6 +2146,14 @@ mod tests {
     /// of seconds ([`WatchSource::watch`]), so a minute; a registration that
     /// never returns still fails the row.
     const REGISTRATION_BOUND: Duration = Duration::from_secs(60);
+    /// How long a row waits for released sources to finish their teardown:
+    /// a hang guard, not a latency bound. Dropping a macOS FSEvents source
+    /// joins its run-loop thread, which makes two round trips to the file
+    /// system event service (the current event id, then a purge up to it)
+    /// before it lets go ([`WatchSource::teardown_waits`]), and under load two
+    /// of those teardowns in turn outlasted the 10 s guard. So a minute; a
+    /// teardown that never ends still fails the row.
+    const TEARDOWN_BOUND: Duration = Duration::from_secs(60);
 
     #[test]
     fn a_held_registration_does_not_hold_the_start() {
@@ -2338,7 +2346,7 @@ mod tests {
                 drop(second);
                 observed.release_source_drops();
                 assert!(
-                    observed.wait_source_drops_finished(2, HANG_GUARD),
+                    observed.wait_source_drops_finished(2, TEARDOWN_BOUND),
                     "both sources are dropped once released"
                 );
             },
@@ -2622,7 +2630,7 @@ mod tests {
                 drop(second);
                 observed.release_source_drops();
                 assert!(
-                    observed.wait_source_drops_finished(2, HANG_GUARD),
+                    observed.wait_source_drops_finished(2, TEARDOWN_BOUND),
                     "both observed sources are dropped around the panicking one"
                 );
 
@@ -2649,7 +2657,7 @@ mod tests {
                     "a source queued after the panic went to the unregister thread"
                 );
                 assert!(
-                    observed.wait_source_drops_finished(3, HANG_GUARD),
+                    observed.wait_source_drops_finished(3, TEARDOWN_BOUND),
                     "the unregister thread drops a source queued after the panic"
                 );
                 let unregister = UNREGISTER
