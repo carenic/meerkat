@@ -26200,13 +26200,24 @@ mod tests {
     struct StallThenSucceedClient {
         calls: std::sync::atomic::AtomicUsize,
         activity: std::sync::atomic::AtomicU64,
+        /// How long each read of the stream activity count keeps the
+        /// caller's thread busy.
+        probe_delay: Duration,
     }
 
     impl StallThenSucceedClient {
         fn new() -> Self {
+            Self::with_probe_delay(Duration::ZERO)
+        }
+
+        /// As [`Self::new`], each read of the stream activity count keeping
+        /// the caller's thread busy for `probe_delay`, as on a starved
+        /// runtime.
+        fn with_probe_delay(probe_delay: Duration) -> Self {
             Self {
                 calls: std::sync::atomic::AtomicUsize::new(0),
                 activity: std::sync::atomic::AtomicU64::new(0),
+                probe_delay,
             }
         }
 
@@ -26253,6 +26264,9 @@ mod tests {
         }
 
         fn stream_activity_count(&self) -> Option<u64> {
+            if !self.probe_delay.is_zero() {
+                std::thread::sleep(self.probe_delay);
+            }
             Some(self.activity.load(std::sync::atomic::Ordering::SeqCst))
         }
     }
@@ -27938,7 +27952,11 @@ mod tests {
     #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn model_stream_inactivity_window_wins_over_the_policy_window() {
-        let client = Arc::new(StallThenSucceedClient::new());
+        // Each read of the stream's activity keeps the thread busy past the
+        // model's 30 ms window, as on a starved runtime.
+        let client = Arc::new(StallThenSucceedClient::with_probe_delay(
+            Duration::from_millis(60),
+        ));
         let mut agent = with_test_turn_state_handle(AgentBuilder::new())
             .retry_policy(stall_window_policy(Some(Duration::from_secs(3600))))
             .with_model_defaults_resolver(Arc::new(StallWindowResolver(Some(
