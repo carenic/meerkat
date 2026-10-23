@@ -30528,9 +30528,11 @@ mod tests {
         ] {
             let (directory, service, id, _physical) = compacted_crash_tail(tail).await;
             drop(service);
+            // A byte copy of the stores in the system temp directory: the
+            // second host needs no shared filesystem with the first.
             let copy = tempfile::Builder::new()
-                .prefix(".retention-checkpoint-copy-")
-                .tempdir_in(".")
+                .prefix("retention-checkpoint-copy-")
+                .tempdir()
                 .unwrap();
             for suffix in ["", "-wal", "-shm"] {
                 let source = directory.path().join(format!("runtime.sqlite3{suffix}"));
