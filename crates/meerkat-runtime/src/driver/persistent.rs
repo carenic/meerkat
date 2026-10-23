@@ -3808,6 +3808,128 @@ mod tests {
         }
     }
 
+    /// The requeue disposition an unregister begins with reaches the store with
+    /// the unregister's progress, and cold recovery brings it back. A process
+    /// cut after the begin committed and before the stop: the machine
+    /// lifecycle record is version 6 and names the disposition and its max
+    /// age, the next process's recovery replays it, and the recovered stop
+    /// keeps the eligible queued prompt, marked with the same max age, exactly
+    /// as the interrupted stop would have.
+    #[tokio::test]
+    async fn a_requeue_begin_reaches_the_store_and_its_recovery_keeps_the_same_inputs() {
+        use crate::input_state::InputLifecycleState;
+        use crate::meerkat_machine::dsl as mm_dsl;
+
+        let store = Arc::new(crate::store::InMemoryRuntimeStore::new());
+        let runtime_store: Arc<dyn RuntimeStore> = store.clone();
+        let blobs: Arc<dyn BlobStore> = Arc::new(meerkat_store::MemoryBlobStore::new());
+        let session_id = SessionId::new();
+        let runtime_id = LogicalRuntimeId::for_session(&session_id);
+
+        // The stopping process begins the requeue unregister and commits the
+        // begin, as the unregister persists its progress, then is cut before
+        // its stop.
+        let mut stopping = PersistentRuntimeDriver::new(
+            runtime_id.clone(),
+            Arc::clone(&runtime_store),
+            Arc::clone(&blobs),
+        );
+        recover_after_registration_authority(store.as_ref(), &session_id, &mut stopping).await;
+        let kept = make_prompt("queued when the unregister began");
+        let kept_id = kept.id().clone();
+        assert!(stopping.accept_input(kept).await.unwrap().is_accepted());
+        {
+            let authority = stopping.inner_ref().shared_dsl_authority();
+            let mut authority = authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = authority.state().clone();
+            mm_dsl::MeerkatMachineMutator::apply(
+                &mut *authority,
+                mm_dsl::MeerkatMachineInput::BeginUnregisterSession {
+                    session_id: state.session_id.clone().expect("the session is registered"),
+                    agent_runtime_id: state.active_runtime_id.clone(),
+                    fence_token: state.active_fence_token,
+                    generation: state.active_runtime_generation,
+                    runtime_epoch_id: state.active_runtime_epoch_id.clone(),
+                    queued_inputs: mm_dsl::UnregisterQueuedInputsDisposition::Requeue,
+                    requeue_max_age_ms: 900_000,
+                },
+            )
+            .expect("the unregister drain opens with the requeue disposition");
+        }
+        stopping.sync_control_projection_from_dsl_authority();
+        stopping
+            .persist_current_machine_lifecycle("requeue unregister begin")
+            .await
+            .expect("the begin commits");
+        drop(stopping);
+
+        // The stored record names the disposition and its max age.
+        let bytes = runtime_store
+            .load_machine_lifecycle_record(&runtime_id)
+            .await
+            .unwrap()
+            .expect("the machine lifecycle record");
+        let record: serde_json::Value = serde_json::from_slice(&bytes).expect("the record is JSON");
+        assert_eq!(
+            (
+                record["record_version"].clone(),
+                record["unregister_progress"]["queued_inputs"].clone(),
+            ),
+            (
+                serde_json::json!(crate::store::REQUEUE_MACHINE_LIFECYCLE_STORE_RECORD_VERSION),
+                serde_json::json!({ "disposition": "requeue", "max_age_ms": 900_000 }),
+            ),
+            "the begin's record carries the requeue disposition"
+        );
+
+        // The next process's cold recovery replays the recorded begin, and
+        // its stop keeps the prompt exactly as the interrupted one would have.
+        let mut next = PersistentRuntimeDriver::new(
+            runtime_id.clone(),
+            Arc::clone(&runtime_store),
+            Arc::clone(&blobs),
+        );
+        recover_after_registration_authority(store.as_ref(), &session_id, &mut next).await;
+        {
+            let authority = next.inner_ref().shared_dsl_authority();
+            let authority = authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = authority.state();
+            assert_eq!(
+                (
+                    state.unregister_queued_inputs,
+                    state.unregister_requeue_max_age_ms,
+                ),
+                (mm_dsl::UnregisterQueuedInputsDisposition::Requeue, 900_000),
+                "recovery replays the recorded disposition"
+            );
+        }
+        let active = next.active_input_ids();
+        let before_exit = next.inner_mut().stop_retained_input_ids(&active).unwrap();
+        assert_eq!(before_exit, vec![kept_id.clone()]);
+        next.finalize_runtime_executor_exit(&before_exit)
+            .await
+            .expect("the recovered stop commits");
+        drop(next);
+        let row = runtime_store
+            .load_input_state(&runtime_id, &kept_id)
+            .await
+            .unwrap()
+            .expect("the kept row stays");
+        assert_eq!(
+            (
+                row.seed.phase,
+                row.seed.terminal_outcome.is_none(),
+                row.state.stop_requeue.map(|mark| mark.max_age_ms),
+            ),
+            (InputLifecycleState::Queued, true, Some(900_000)),
+            "the recovered stop keeps the prompt queued and marked"
+        );
+    }
+
     /// A kept input stays a durable queued row until a start runs it. A
     /// session retired, archived or destroyed before then ends it terminal as
     /// any other queued input: retire and archive abandon their pending
