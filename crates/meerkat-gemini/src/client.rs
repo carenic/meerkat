@@ -559,9 +559,9 @@ impl GeminiClient {
                             } => {
                                 let (provider_id, signature) = match meta.as_deref() {
                                     Some(meerkat_core::ProviderMeta::GeminiFunctionCall {
-                                        id,
+                                        provider_id,
                                         thought_signature,
-                                    }) => (Some(id), thought_signature.as_ref()),
+                                    }) => (Some(provider_id), thought_signature.as_ref()),
                                     Some(meerkat_core::ProviderMeta::Gemini {
                                         thought_signature,
                                     }) => (None, Some(thought_signature)),
@@ -2352,8 +2352,8 @@ impl GeminiClient {
                                                 let id = format!("fc_{tool_call_index}");
                                                 tool_call_index += 1;
                                                 let meta = match fc.id {
-                                                    Some(id) => Some(Box::new(meerkat_core::ProviderMeta::GeminiFunctionCall {
-                                                        id,
+                                                    Some(provider_id) => Some(Box::new(meerkat_core::ProviderMeta::GeminiFunctionCall {
+                                                        provider_id,
                                                         thought_signature: part.thought_signature,
                                                     })),
                                                     None => meta,
@@ -5032,11 +5032,18 @@ mod tests {
         let second = &body["contents"][1]["parts"][1];
         assert_eq!(first["functionCall"]["id"], "native-A");
         assert_eq!(second["functionCall"]["id"], "native-B");
+        assert!(first["functionCall"].get("provider_id").is_none());
+        assert!(second["functionCall"].get("provider_id").is_none());
         assert_eq!(first["thoughtSignature"], "opaque-signature");
         assert!(second.get("thoughtSignature").is_none());
         let responses = body["contents"][2]["parts"].as_array().unwrap();
         assert_eq!(responses[0]["functionResponse"]["id"], "native-B");
         assert_eq!(responses[1]["functionResponse"]["id"], "native-A");
+        assert!(
+            responses
+                .iter()
+                .all(|part| part["functionResponse"].get("provider_id").is_none())
+        );
         assert_eq!(
             responses[0]["functionResponse"]["response"]["content"],
             "\"Paris\""
@@ -5048,9 +5055,13 @@ mod tests {
         );
         assert!(
             matches!(&blocks[0], AssistantBlock::ToolUse { meta: Some(meta), .. }
-            if matches!(meta.as_ref(), ProviderMeta::GeminiFunctionCall { id, thought_signature }
-                if id == "native-A" && thought_signature.as_deref() == Some("opaque-signature")))
+            if matches!(meta.as_ref(), ProviderMeta::GeminiFunctionCall { provider_id, thought_signature }
+                if provider_id == "native-A" && thought_signature.as_deref() == Some("opaque-signature")))
         );
+        let stored = serde_json::to_value(&blocks[0]).unwrap();
+        assert_eq!(stored["data"]["id"], "fc_0");
+        assert_eq!(stored["data"]["meta"]["provider_id"], "native-A");
+        assert!(stored["data"]["meta"].get("id").is_none());
     }
 
     #[tokio::test]

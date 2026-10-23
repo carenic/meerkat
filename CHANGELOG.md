@@ -37,11 +37,16 @@ them.
 
 ### Breaking
 
-- `meerkat-contracts`: `WireProviderMeta` gains the
-  `GeminiFunctionCall { id, thought_signature }` variant, serialized with
-  `provider: "gemini_function_call"`. Downstream exhaustive Rust matches
-  and wire decoders must handle this metadata for provider-issued Gemini
-  call IDs. The existing signature-only `Gemini` variant is unchanged.
+- `meerkat-core::ProviderMeta` and `meerkat-contracts::WireProviderMeta` gain
+  the `GeminiFunctionCall { provider_id, thought_signature }` variant,
+  serialized with `provider: "gemini_function_call"` and required
+  `provider_id`. This replaces the unreleased variant's `id` field;
+  downstream exhaustive Rust matches and wire decoders must handle this
+  metadata for provider-issued Gemini call IDs. Persisted transcripts using
+  this metadata cannot be read after downgrading to a runtime or SDK that
+  lacks the variant or its required `provider_id` field. The existing
+  signature-only `Gemini` variant and Gemini's HTTP `functionCall.id` and
+  `functionResponse.id` fields are unchanged.
 
 - `meerkat-schedule`: the occurrence lifecycle carries the admission evidence
   of an occurrence's receipt history (see Fixed, scheduled delivery after a
