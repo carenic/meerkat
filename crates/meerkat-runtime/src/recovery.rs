@@ -1990,11 +1990,24 @@ struct ObservedPersistedLifecycle {
     live_bridge_recovery: crate::live_execution::LiveBridgeRecoveryImage,
 }
 
+/// Project the persisted lifecycle row into what the recovery machine judges.
+///
+/// The archive of a session that is ending (`DriveMode::SessionArchive`)
+/// reads every quiescent persisted runtime as `Retired`: a missing row,
+/// `Idle`, `Stopped` (its executor exited) and `Retired` itself. The session
+/// ends with that archive and no later start resumes its run, so the machine
+/// never continues a run there: it repairs a continuable tail and commits it
+/// as interrupted. The re-asserted phase stays the observed one, and the
+/// persisted current run keeps its own guard. Every other drive reads each
+/// phase as persisted; a `Stopped` runtime is not quiescent there, because a
+/// later start may resume its run.
 fn observe_persisted_lifecycle(
     observation: MachineLifecycleObservation,
     candidate_run_id: &meerkat_core::RunId,
+    mode: DriveMode,
 ) -> ObservedPersistedLifecycle {
-    match observation {
+    let ending_session = mode == DriveMode::SessionArchive;
+    let mut observed = match observation {
         MachineLifecycleObservation::Missing => ObservedPersistedLifecycle {
             lifecycle: mm_dsl::DurableRecoveryObservedLifecycle::MissingRow,
             current_run: mm_dsl::DurableRecoveryObservedRun::NoRun,
@@ -2014,6 +2027,10 @@ fn observe_persisted_lifecycle(
                 Some(RuntimeState::Retired) => (
                     mm_dsl::DurableRecoveryObservedLifecycle::Retired,
                     RuntimeState::Retired,
+                ),
+                Some(RuntimeState::Stopped) if ending_session => (
+                    mm_dsl::DurableRecoveryObservedLifecycle::Retired,
+                    RuntimeState::Stopped,
                 ),
                 Some(_) => (
                     mm_dsl::DurableRecoveryObservedLifecycle::NonQuiescent,
@@ -2055,7 +2072,17 @@ fn observe_persisted_lifecycle(
             unregister_progress: None,
             live_bridge_recovery: crate::live_execution::LiveBridgeRecoveryImage::default(),
         },
+    };
+    if ending_session
+        && matches!(
+            observed.lifecycle,
+            mm_dsl::DurableRecoveryObservedLifecycle::MissingRow
+                | mm_dsl::DurableRecoveryObservedLifecycle::Idle
+        )
+    {
+        observed.lifecycle = mm_dsl::DurableRecoveryObservedLifecycle::Retired;
     }
+    observed
 }
 
 fn durable_tail_lifecycle_reassertion(
@@ -2500,18 +2527,23 @@ pub async fn resolve_held_durable_tail(
     })
 }
 
-/// Who drives a recovery: ordinary recovery, or an operator resolving a held
-/// tail (a dry run unless `apply`).
+/// Who drives a recovery: ordinary recovery, the archive of a session that is
+/// ending, or an operator resolving a held tail (a dry run unless `apply`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DriveMode {
     Recovery,
-    Operator { apply: bool },
+    /// Ordinary recovery for the archive of a session that is ending; it
+    /// reads the persisted runtime as retired (`observe_persisted_lifecycle`).
+    SessionArchive,
+    Operator {
+        apply: bool,
+    },
 }
 
 impl DriveMode {
     fn preparation(self) -> PreparationMode {
         match self {
-            Self::Recovery => PreparationMode::Recovery,
+            Self::Recovery | Self::SessionArchive => PreparationMode::Recovery,
             Self::Operator { .. } => PreparationMode::Operator,
         }
     }
@@ -2605,10 +2637,51 @@ pub async fn recover_durable_tail_retaining_committed_whole_blob(
     Ok((outcome, committed_whole_blob))
 }
 
-/// The recovery drive, ordinary or an operator's. It answers `OtherRun` only
-/// when `expected_run` names a run whose tail the store does not hold, before
-/// anything is written. In operator mode it never rolls back an intent, plans
-/// only an ambiguous candidate, and writes only when `apply` is set.
+/// [`recover_durable_tail_retaining_committed_whole_blob`] for the archive
+/// of a session that is ending.
+///
+/// The caller is an archive that holds the session's turn boundary, its
+/// recovery gate and its runtime archive lease, and the session ends with
+/// that archive: no later start resumes its run. The persisted runtime is
+/// therefore judged as retired here whenever it is quiescent (a missing row,
+/// `Idle`, `Stopped` or `Retired`), and the recovery re-asserts the observed
+/// phase. The machine never continues a run then: a continuable tail is
+/// repaired and committed as interrupted, and its bound inputs are
+/// terminalized in the same commit, so this never answers
+/// [`DurableTailRecoveryOutcome::Continue`]. Ordinary recovery keeps
+/// refusing a `Stopped` runtime, and continues a continuable tail of a
+/// runtime that is not retired, because a later start may resume its run.
+/// Every other guard is unchanged: a persisted current run still refuses,
+/// and the commit is fenced on the exact lifecycle row version the machine
+/// judged.
+pub async fn recover_durable_tail_for_session_archive(
+    store: &dyn RuntimeStore,
+    session_id: &SessionId,
+) -> Result<
+    (
+        DurableTailRecoveryOutcome,
+        Option<crate::store::CommittedWholeBlobSnapshot>,
+    ),
+    DurableTailRecoveryError,
+> {
+    let mut committed_whole_blob = None;
+    let outcome = recover_durable_tail_capturing(
+        store,
+        session_id,
+        &mut committed_whole_blob,
+        None,
+        DriveMode::SessionArchive,
+    )
+    .await?
+    .into_outcome()?;
+    Ok((outcome, committed_whole_blob))
+}
+
+/// The recovery drive: ordinary, an archive's, or an operator's. It answers
+/// `OtherRun` only when `expected_run` names a run whose tail the store does
+/// not hold, before anything is written. In operator mode it never rolls back
+/// an intent, plans only an ambiguous candidate, and writes only when `apply`
+/// is set.
 async fn recover_durable_tail_capturing(
     store: &dyn RuntimeStore,
     session_id: &SessionId,
@@ -2693,7 +2766,9 @@ async fn recover_durable_tail_capturing(
         && candidate.class != DurableTailRecoveryClass::Ambiguous;
 
     let observed = match store.observe_machine_lifecycle(&runtime_id).await {
-        Ok(observation) => observe_persisted_lifecycle(observation, &candidate.candidate_run_id),
+        Ok(observation) => {
+            observe_persisted_lifecycle(observation, &candidate.candidate_run_id, mode)
+        }
         // A store that cannot observe its lifecycle row cannot prove
         // quiescence; the machine refuses undecodable evidence.
         Err(RuntimeStoreError::Unsupported(_)) => ObservedPersistedLifecycle {
@@ -2996,7 +3071,7 @@ async fn recover_durable_tail_capturing(
     };
 
     let operator_repair = match mode {
-        DriveMode::Recovery => None,
+        DriveMode::Recovery | DriveMode::SessionArchive => None,
         DriveMode::Operator { apply } => {
             let plan = operator_plan(
                 &candidate,
@@ -3457,6 +3532,7 @@ mod store_authority_tests {
         let observed = observe_persisted_lifecycle(
             MachineLifecycleObservation::from_raw_record(&encoded),
             &RunId::new(),
+            DriveMode::Recovery,
         );
         let reassertion = durable_tail_lifecycle_reassertion(&observed);
         assert_eq!(
@@ -3464,6 +3540,101 @@ mod store_authority_tests {
             &live_bridge_recovery,
             "durable-tail lifecycle reassertion must not erase V5 bridge truth"
         );
+    }
+
+    /// The archive of a session that is ending reads every quiescent
+    /// persisted runtime (a missing row, `Idle`, `Stopped`, `Retired`) as
+    /// `Retired` and re-asserts the observed phase, so the machine never
+    /// continues a run there. Ordinary recovery and the operator verb read
+    /// each phase as persisted, `Stopped` as not quiescent, and a running
+    /// runtime is not quiescent for any drive. RED before: an archive's
+    /// recovery read an `Idle` runtime as `Idle`, so a continuable tail
+    /// answered `Continue` inside the archive. Unrun: written while Cargo is
+    /// not run.
+    #[test]
+    fn a_session_archive_reads_every_quiescent_persisted_runtime_as_retired() {
+        use crate::meerkat_machine::dsl::DurableRecoveryObservedLifecycle as Observed;
+
+        fn persisted(state: RuntimeState) -> MachineLifecycleObservation {
+            let encoded =
+                MachineLifecycleCommit::new_with_binding_run_unregister_progress_and_live_bridge(
+                    state,
+                    MachineLifecycleBindingFacts::default(),
+                    MachineLifecycleRunFacts::default(),
+                    SupervisorAuthoritySnapshot::UnboundNoReceipt,
+                    None,
+                    crate::live_execution::LiveBridgeRecoveryImage::default(),
+                )
+                .store_record()
+                .encode()
+                .expect("encode a lifecycle image");
+            MachineLifecycleObservation::from_raw_record(&encoded)
+        }
+
+        let run_id = RunId::new();
+        for (state, as_persisted) in [
+            (RuntimeState::Idle, Observed::Idle),
+            (RuntimeState::Stopped, Observed::NonQuiescent),
+            (RuntimeState::Retired, Observed::Retired),
+        ] {
+            let archive =
+                observe_persisted_lifecycle(persisted(state), &run_id, DriveMode::SessionArchive);
+            assert_eq!(archive.lifecycle, Observed::Retired, "{state}");
+            assert_eq!(archive.reassert_state, state, "{state}");
+            assert_eq!(
+                archive.current_run,
+                crate::meerkat_machine::dsl::DurableRecoveryObservedRun::NoRun,
+                "{state}"
+            );
+            assert!(
+                matches!(
+                    archive.expected_version,
+                    MachineLifecycleExpectedVersion::Version(_)
+                ),
+                "{state}"
+            );
+            for mode in [DriveMode::Recovery, DriveMode::Operator { apply: true }] {
+                assert_eq!(
+                    observe_persisted_lifecycle(persisted(state), &run_id, mode).lifecycle,
+                    as_persisted,
+                    "{state} {mode:?}"
+                );
+            }
+        }
+
+        let archive = observe_persisted_lifecycle(
+            MachineLifecycleObservation::Missing,
+            &run_id,
+            DriveMode::SessionArchive,
+        );
+        assert_eq!(archive.lifecycle, Observed::Retired);
+        assert_eq!(archive.reassert_state, RuntimeState::Idle);
+        assert!(matches!(
+            archive.expected_version,
+            MachineLifecycleExpectedVersion::Missing
+        ));
+        assert_eq!(
+            observe_persisted_lifecycle(
+                MachineLifecycleObservation::Missing,
+                &run_id,
+                DriveMode::Recovery,
+            )
+            .lifecycle,
+            Observed::MissingRow
+        );
+
+        for mode in [
+            DriveMode::Recovery,
+            DriveMode::SessionArchive,
+            DriveMode::Operator { apply: true },
+        ] {
+            assert_eq!(
+                observe_persisted_lifecycle(persisted(RuntimeState::Running), &run_id, mode)
+                    .lifecycle,
+                Observed::NonQuiescent,
+                "{mode:?}"
+            );
+        }
     }
 
     #[test]

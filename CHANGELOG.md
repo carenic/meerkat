@@ -696,7 +696,13 @@ them.
   classifies a provisional tail whose run cursor agrees with it, and whose
   bound inputs are all still bound to the run, as continuable and continues it
   without writing anything (`DurableTailRecoveryOutcome::Continue`); a
-  retired runtime commits it as interrupted instead. A tail with no assistant
+  retired runtime commits it as interrupted instead. So does the archive of
+  a session that is ending
+  (`recovery::recover_durable_tail_for_session_archive`), which judges a
+  quiescent persisted runtime (no row, `Idle`, `Stopped` or `Retired`) as
+  retired: an archive never continues a run, and an unbound content input
+  beside a continuable tail holds it there, as beside an interrupted one. A
+  tail with no assistant
   message and no tool result is attributed to its run by the store-issued
   provisional binding on a strict continuation (round zero's first commit, or
   a run's closing save), and by an agreeing cursor after a rewrite.
