@@ -104,6 +104,20 @@ them.
   earlier behaviour. On the wire every new field is optional and omitted when
   absent, so loopback starts and completions and every existing error keep
   their exact JSON.
+- Behaviour-only (not measured by the gate): `meerkat-sqlite`:
+  `watch::sqlite_watch_event_relevant`, and so the `Changed` ticks of
+  `watch::start_sqlite_change_watch`, no longer count a connection's own
+  open and close as a change: no event on the database's `-shm` file (the
+  WAL index), and no creation, removal or metadata change of its `-wal`
+  file. A write to the `-wal` (a commit), every event on the database file
+  or on the directory itself, and an event that names no path still count.
+  0.9.4 counted every event but an access on all three files.
+- Behaviour-only (not measured by the gate): `meerkat-runtime`:
+  `SqliteRuntimeStore::delivery_generation_reader` returns a reader on the
+  fresh-open read path too, where 0.9.4 returned `None`. It keeps no
+  connection, and answers a store notification from its last read while
+  the database and its WAL stat as they did before that read
+  (`DeliveryGenerationReader::read_on_notification`).
 
 ### Added
 
@@ -178,6 +192,11 @@ them.
   is seen as gone, never admitted again. The trait default refuses.
   `MeerkatMachine::accept_existing_input_with_completion_for_attachment_and_member_residency`
   is the same for a mob member's attachment.
+- `meerkat-runtime`: `DeliveryGenerationReader::read_on_notification`, a
+  provided method (it reads by default) that a reader overrides to answer a
+  store notification without opening the database, and
+  `DeliveryStoreWatch::subscribe_sweeps`, which moves for each of the
+  watch's sweeps before its tick does, so an owner reads at every sweep.
 
 ### Changed
 
@@ -190,6 +209,21 @@ them.
 
 ### Fixed
 
+- A quiet store no longer wakes its own readers. The SQLite change watch
+  counted a connection's own open and close (the first connection creates
+  the WAL and the WAL index, the last removes them) as a store change, so a
+  read that opened the database woke the next one. On a quiet store the
+  delivery owner's kept generation reader reopened itself 10 to 30 ms after
+  each idle release, and so held its connection, with the presence lock the
+  maintenance fence waits for, nearly all the time; the fresh-open read
+  path, which Windows takes, could open the database tens of times a
+  second; and a mob event observer's catch-up reads woke it about 90 times
+  a second. Commits still wake them at once, and the watch's sweep still
+  bounds a missed notification. On the fresh-open path, a notification
+  after which the database and its WAL stat as they did before the last
+  read (a platform that reports a read's own open or close as a change of
+  the WAL) is answered from that read without opening the database; a
+  sweep always reads.
 - A graceful mob Shutdown releases a member's identity reconcile lease once
   it has unregistered the member's runtime and the member's session actor has
   exited, so the next incarnation takes that identity at once. Before, every
