@@ -1151,6 +1151,13 @@ impl RuntimeStore for SpiRuntimeStore {
         .await
     }
 
+    /// Forwarded with the re-base itself: the in-memory store implements it,
+    /// so the session service re-bases this store's WholeBlob runs instead
+    /// of taking the fallback.
+    fn supports_whole_blob_run_rebase(&self) -> bool {
+        <InMemoryRuntimeStore as RuntimeStore>::supports_whole_blob_run_rebase(&self.memory)
+    }
+
     /// A run re-base is one in-memory call, so it lands as one host batch
     /// (plus the chunk pre-batches of its documents): the committed
     /// successor, its outbox rows, the old tail's removal and the new tail.
