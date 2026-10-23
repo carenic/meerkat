@@ -287,9 +287,13 @@ them.
   stop mark, and a version 6 record, with its typed unsupported-version error.
   A version 8 row that ended `RequeueExpired` fails earlier in 0.9.4, when it
   decodes the row's abandon reason, which 0.9.4 does not know: a read failure,
-  not the typed error, and the fact is not misread either. Either way a store
-  that holds one does not open after a downgrade (a kept input's row keeps its
-  mark after it runs). In `meerkat-core`'s generated version authority,
+  not the typed error, and the fact is not misread either. After a downgrade,
+  a store that holds a kept input still queued does not open, because 0.9.4's
+  recovery reads every non-terminal row. Once every kept input has run or
+  expired, its row is terminal (a kept input's row keeps its mark after it
+  runs) and the store opens, but each read that decodes such a row still
+  fails: the input's status, a same-key lookup that finds it, and a batch
+  compare-and-swap over it. In `meerkat-core`'s generated version authority,
   `STORED_INPUT_STATE_VERSION` is 8, and `STORED_INPUT_STATE_BASELINE_VERSION`
   (7) and `stored_input_state_version_for_row` are new.
 

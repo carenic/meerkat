@@ -174,9 +174,12 @@ add the arms (or a wildcard) where you match these enums exhaustively.
   record version 6; every other row and record keeps version 7 and version 5.
   0.9.4 refuses a version 8 row with a stop mark, and a version 6 record, with
   its typed unsupported-version error, and fails to read a version 8 row that
-  ended `RequeueExpired`, whose abandon reason it does not know. Either way a
-  store written by a requeue Shutdown does not open in 0.9.4. See
-  [Mobs](/guides/mobs).
+  ended `RequeueExpired`, whose abandon reason it does not know. While a kept
+  input is still queued, a store written by a requeue Shutdown does not open
+  in 0.9.4, whose recovery reads every non-terminal row. Once every kept input
+  has run or expired, the store opens in 0.9.4, but each read that decodes
+  such a row still fails: the input's status, a same-key lookup that finds
+  it, and a batch compare-and-swap over it. See [Mobs](/guides/mobs).
 
 ### Upgrade checklist
 
@@ -191,8 +194,9 @@ add the arms (or a wildcard) where you match these enums exhaustively.
    `accept_schedule_runtime_input_with_reconciliation` on the calling task.
 4. Pass `UnregisterQueuedInputsDisposition::Stop` and `0` where you build
    `BeginUnregisterSession` or `State` of the generated runtime machine.
-5. Before you use `QueuedInputsOnShutdown::Requeue`, note that the store it
-   writes no longer opens in 0.9.4. Treat `RequeuedAcrossStop` as "runs at
+5. Before you use `QueuedInputsOnShutdown::Requeue`, note that 0.9.4 cannot
+   open the store while a kept input is still queued, and cannot read a kept
+   or expired input's row after that. Treat `RequeuedAcrossStop` as "runs at
    the next start" (do not resubmit) and `RequeueExpired` as "resubmit if
    still wanted".
 

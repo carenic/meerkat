@@ -1249,8 +1249,9 @@ ephemeral, event, directed and objective-bound inputs still end as stopped. A
 member's kickoff is bound to its objective, so a kickoff still queued at a
 requeue Shutdown ends as stopped and is recorded failed, as with `Stop`.
 `QueuedInputsOnShutdown::Stop`, the default, ends every queued input as
-stopped, as in 0.9.4. A store written by a requeue Shutdown does not open in
-0.9.4 (see [Upgrading](/guides/upgrading)).
+stopped, as in 0.9.4. 0.9.4 cannot open a store that holds a kept input still
+queued, and cannot read a kept or expired input's row after it ran or expired
+(see [Upgrading](/guides/upgrading)).
 
 A mob restored with an unfinished destroy starts with admission closed before
 `MobBuilder::resume` returns its handle, so nothing is spawned into it while the
