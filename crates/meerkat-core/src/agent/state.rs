@@ -24228,6 +24228,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn max_token_reasoning_usage_after_tool_effect_does_not_complete() {
         let client = Arc::new(ScriptedExtractionClient::new(vec![
@@ -24304,6 +24305,7 @@ mod tests {
         assert_eq!(turn_handle.run_failed_effect_count(), 1);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn max_token_reasoning_usage_with_text_preserves_the_answer() {
         let client = Arc::new(ScriptedExtractionClient::new(vec![
@@ -24333,6 +24335,7 @@ mod tests {
         assert_eq!(agent.session.total_usage().reasoning_tokens, Some(7));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn max_token_reasoning_usage_with_tool_preserves_the_action() {
         let client = Arc::new(ScriptedExtractionClient::new(vec![
@@ -24386,6 +24389,7 @@ mod tests {
         assert_eq!(turn_handle.run_failed_effect_count(), 0);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn generic_fatal_llm_failure_uses_machine_terminal_cause_and_preserves_detail() {
         let mut agent = build_agent(Arc::new(FatalLlmClient)).await;
