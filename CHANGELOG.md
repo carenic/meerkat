@@ -1234,6 +1234,20 @@ them.
 
 ### Fixed
 
+- `meerkat-session`: a member retired while its turn sat between the turn's
+  end-of-run checkpoint and its runtime boundary commit (the retirement's
+  boundary cancel lands between the two) retires instead of stalling. That
+  turn leaves a durable tail ahead of the runtime boundary, and every
+  committed read of the session refused it with a transcript revision
+  conflict, so the retirement's archive failed, the mob never observed the
+  member archived, and the retirement stalled. The archive now settles that
+  tail itself, under the turn boundary and recovery gate it already holds,
+  with the same store-owned recovery a restart runs, and reads the session
+  again, whether or not the live actor is still hosted. A tail the recovery
+  holds or refuses keeps its bytes and ends the archive, and the retirement,
+  with the typed `SessionError::DurableTailHeldForRecovery` or
+  `SessionError::DurableTailRecoveryRefused`.
+
 - `meerkat-gemini`: preserve provider-issued `functionCall.id` through
   streamed tool calls, saved transcripts, assistant replay and matching
   `functionResponse.id`, including parallel calls to the same function.
