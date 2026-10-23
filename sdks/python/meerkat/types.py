@@ -188,6 +188,9 @@ from .generated.types import (
     WireLiveContinuityModeTranscriptOnly as WireLiveContinuityModeTranscriptOnly,
     WireLiveContinuityModeDegraded as WireLiveContinuityModeDegraded,
     WireLiveContinuityModeProviderNativeResume as WireLiveContinuityModeProviderNativeResume,
+    # The advisories on `LiveOpenResult`: an open vocabulary, so an unknown
+    # advisory is kept as the string the server sent.
+    WireLiveOpenAdvisory as WireLiveOpenAdvisory,
     WireControlScope as WireControlScope,
     WireFlowFailureDetail as WireFlowFailureDetail,
     WireFlowTurnOutcome as WireFlowTurnOutcome,

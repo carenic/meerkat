@@ -192,6 +192,7 @@ from .generated.types import (
     WireHostBindPhase,
     WireHostCapabilityFlags,
     WireLiveChannelCapabilities,
+    WireLiveOpenAdvisory,
     WireMemberHistoryPageBody,
     WireMemberLaunchMode,
     WireMemberProgressSnapshot,
@@ -5150,7 +5151,12 @@ class MeerkatClient:
         Wraps `live/open`.
 
         Returns a dict shaped like `meerkat.types.LiveOpenResult` with keys
-        `channel_id`, `transport`, `capabilities`, and `continuity`. The
+        `channel_id`, `transport`, `capabilities`, and `continuity`, and
+        `advisories` when the open went ahead without something (for
+        example `"staged_prompt_refused"`: a run-start hook refused the
+        session's staged create-time prompt, which stays staged for its first
+        text turn). The advisory vocabulary may grow; an unknown advisory is
+        passed through as the string the server sent. The
         `capabilities` value is shaped like
         `meerkat.types.WireLiveChannelCapabilities` (typed booleans:
         `audio_in`, `audio_out`, `text_in`, `text_out`, `image_in`,
@@ -7669,9 +7675,29 @@ class MeerkatClient:
         return continuity
 
     @staticmethod
+    def _parse_live_open_advisories(
+        result: dict[str, Any], context: str
+    ) -> list[WireLiveOpenAdvisory]:
+        """Return what a successful open went ahead without.
+
+        The server omits the field when there is nothing to report, read as
+        ``[]``. The vocabulary may grow: an advisory this SDK does not know is
+        kept as the string the server sent, so a newer server never fails the
+        open. A field that is not a list of non-empty strings is malformed and
+        fails closed.
+        """
+        return list(
+            MeerkatClient._parse_nonempty_string_list(
+                MeerkatClient._require_list_field(result, "advisories", context),
+                f"{context}: advisories",
+            )
+        )
+
+    @staticmethod
     def _parse_live_open_result(raw: Any, context: str) -> LiveOpenResult:
         result = MeerkatClient._require_dict(raw, "result", context)
         return LiveOpenResult(
+            advisories=MeerkatClient._parse_live_open_advisories(result, context),
             capabilities=MeerkatClient._parse_live_channel_capabilities(
                 result.get("capabilities"),
                 f"{context}: capabilities",

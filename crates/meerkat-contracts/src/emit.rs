@@ -300,6 +300,8 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
         "WireLiveProviderInputLatency": schema_for!(crate::wire::WireLiveProviderInputLatency),
         "WireLiveProviderInputLatencyReading": schema_for!(crate::wire::WireLiveProviderInputLatencyReading),
         "WireLiveContinuityMode": schema_for!(crate::wire::WireLiveContinuityMode),
+        // The advisories on `LiveOpenResult`: a named, growing vocabulary.
+        "WireLiveOpenAdvisory": schema_for!(crate::wire::WireLiveOpenAdvisory),
         // G8 (P2): emit `WireLiveTransportBootstrap` at the top level so
         // SDK codegen produces a typed discriminated union (TS) /
         // tagged-variant TypedDict (Python) for `LiveOpenResult.transport`

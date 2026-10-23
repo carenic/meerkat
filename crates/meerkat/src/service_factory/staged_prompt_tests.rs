@@ -589,14 +589,13 @@ async fn a_run_start_veto_keeps_the_staged_prompt_from_the_live_open_for_the_fir
     fixture.service.try_shutdown().await.expect("shutdown");
 }
 
-/// Through the live open projection itself: the realtime seed carries the
-/// staged prompt as a committed user row, once, and a second open projection
-/// commits no second row.
-#[cfg(feature = "live")]
+/// An open that never waits behind a running turn (the mirrored channel and
+/// the concurrent summary open) only tries the session's turn boundary: while
+/// a turn holds it, the delivery answers at once, asks nothing of the actor
+/// and commits nothing, so the prompt stays staged; once the boundary is free
+/// the same delivery commits it once.
 #[tokio::test]
-async fn a_voice_first_open_projection_seeds_the_realtime_model_with_the_staged_prompt() {
-    use crate::session_runtime::live_orchestration::{LiveOrchestrator, LiveSessionAddressing};
-
+async fn a_non_waiting_open_delivers_nothing_while_a_turn_holds_the_boundary() {
     let fixture = Fixture::new();
     let id = fixture
         .materialize(
@@ -605,65 +604,215 @@ async fn a_voice_first_open_projection_seeds_the_realtime_model_with_the_staged_
             DeferredPromptPolicy::Stage,
         )
         .await;
-    let staged_sessions = Arc::new(crate::StagedSessionRegistry::new());
-    let staged_capacity_admissions: crate::session_runtime::admission::StagedCapacityAdmissions =
-        Arc::new(StdMutex::new(std::collections::HashMap::new()));
-    let orchestrator = LiveOrchestrator {
-        service: &fixture.service,
-        staged_sessions: &staged_sessions,
-        staged_capacity_admissions: &staged_capacity_admissions,
-        runtime_adapter: &fixture.machine,
-        host: None,
-        config_runtime: None,
-        default_llm_client: None,
-        agent_llm_client_decorator: None,
-        external_tools: None,
-        archive_runtime_cleanup: crate::session_runtime::runtime_state::ArchiveRuntimeCleanup {
-            runtime_adapter: Arc::clone(&fixture.machine),
-            pending_session_event_streams: None,
-            mcp_state: None,
-            mob_state: None,
-        },
-        realm_id: None,
-        instance_id: None,
-        backend: None,
-        ingress_reconciler: None,
-        actor_witness_capture: Arc::new(
-            |_session_id: SessionId, _actor_witness_slot: crate::LiveSessionActorWitnessSlot| {},
-        ),
-        session_addressing: LiveSessionAddressing::SessionScoped,
-    };
-    let seeded_staged_rows =
-        |config: &meerkat_client::realtime_session::RealtimeSessionOpenConfig| {
-            config
-                .seed_messages()
-                .iter()
-                .filter(|message| {
-                    matches!(
-                        message,
-                        meerkat_core::Message::User(user) if user.text_content().contains("ORBIT-7")
-                    )
-                })
-                .count()
-        };
 
-    let first = orchestrator
-        .realtime_session_open_config(&id, meerkat_contracts::RealtimeTurningMode::ProviderManaged)
+    let boundary = fixture
+        .service
+        .acquire_runtime_turn_finalization_guard(&id)
+        .await;
+    let held = tokio::time::timeout(
+        DEADLINE,
+        fixture.service.try_deliver_staged_prompt_for_live_open(&id),
+    )
+    .await
+    .expect("the delivery never waits for the held turn boundary")
+    .expect("the delivery answers");
+    drop(boundary);
+    let rows_while_held = fixture.user_rows(&id).await;
+    let delivered = fixture
+        .service
+        .try_deliver_staged_prompt_for_live_open(&id)
         .await
-        .expect("the first open projection");
-    let second = orchestrator
-        .realtime_session_open_config(&id, meerkat_contracts::RealtimeTurningMode::ProviderManaged)
-        .await
-        .expect("a second open projection");
+        .expect("the delivery answers");
     let rows = fixture.user_rows(&id).await;
     assert!(
-        seeded_staged_rows(&first) == 1
-            && seeded_staged_rows(&second) == 1
+        matches!(
+            held,
+            meerkat_session::StagedPromptLiveOpenDelivery::TurnBoundaryHeld
+        ) && rows_while_held.is_empty()
+            && matches!(
+                delivered,
+                meerkat_session::StagedPromptLiveOpenDelivery::Delivered
+            )
             && rows == [STAGED.to_string()],
+        "a held boundary defers the delivery without waiting and without committing; a \
+         free one delivers once: held={held:?} rows_while_held={rows_while_held:?} \
+         delivered={delivered:?} rows={rows:?}"
+    );
+    fixture.service.try_shutdown().await.expect("shutdown");
+}
+
+/// The live orchestrator over a fixture's service and machine, for the open
+/// projection rows.
+#[cfg(feature = "live")]
+struct LiveOpenParts {
+    staged_sessions: Arc<crate::StagedSessionRegistry>,
+    staged_capacity_admissions: crate::session_runtime::admission::StagedCapacityAdmissions,
+}
+
+#[cfg(feature = "live")]
+impl LiveOpenParts {
+    fn new() -> Self {
+        Self {
+            staged_sessions: Arc::new(crate::StagedSessionRegistry::new()),
+            staged_capacity_admissions: Arc::new(StdMutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    fn orchestrator<'a>(
+        &'a self,
+        fixture: &'a Fixture,
+    ) -> crate::session_runtime::live_orchestration::LiveOrchestrator<'a, StagedPromptBuilder> {
+        crate::session_runtime::live_orchestration::LiveOrchestrator {
+            service: &fixture.service,
+            staged_sessions: &self.staged_sessions,
+            staged_capacity_admissions: &self.staged_capacity_admissions,
+            runtime_adapter: &fixture.machine,
+            host: None,
+            config_runtime: None,
+            default_llm_client: None,
+            agent_llm_client_decorator: None,
+            external_tools: None,
+            archive_runtime_cleanup: crate::session_runtime::runtime_state::ArchiveRuntimeCleanup {
+                runtime_adapter: Arc::clone(&fixture.machine),
+                pending_session_event_streams: None,
+                mcp_state: None,
+                mob_state: None,
+            },
+            realm_id: None,
+            instance_id: None,
+            backend: None,
+            ingress_reconciler: None,
+            actor_witness_capture: Arc::new(
+                |_session_id: SessionId,
+                 _actor_witness_slot: crate::LiveSessionActorWitnessSlot| {},
+            ),
+            session_addressing:
+                crate::session_runtime::live_orchestration::LiveSessionAddressing::SessionScoped,
+        }
+    }
+}
+
+/// How many of a realtime seed's user rows carry the staged prompt.
+#[cfg(feature = "live")]
+fn seeded_staged_rows(
+    config: &meerkat_client::realtime_session::RealtimeSessionOpenConfig,
+) -> usize {
+    config
+        .seed_messages()
+        .iter()
+        .filter(|message| {
+            matches!(
+                message,
+                meerkat_core::Message::User(user) if user.text_content().contains("ORBIT-7")
+            )
+        })
+        .count()
+}
+
+/// One open projection, dropped before this returns: whether it is marked
+/// with a refused staged prompt, and how many seed rows carry the prompt.
+#[cfg(feature = "live")]
+async fn open_projection_marks(
+    orchestrator: &crate::session_runtime::live_orchestration::LiveOrchestrator<
+        '_,
+        StagedPromptBuilder,
+    >,
+    id: &SessionId,
+) -> (bool, usize) {
+    let projection = orchestrator
+        .live_open_projection_for_session(
+            id,
+            meerkat_contracts::RealtimeTurningMode::ProviderManaged,
+            None,
+        )
+        .await
+        .expect("the open projection");
+    (
+        projection.staged_prompt_refused(),
+        seeded_staged_rows(&projection.open_config),
+    )
+}
+
+/// Through the live open projection itself: the realtime seed carries the
+/// staged prompt as a committed user row, once, and a second open projection
+/// commits no second row. Each projection is dropped before the next: an open
+/// projection holds the service's one open admission until then.
+#[cfg(feature = "live")]
+#[tokio::test]
+async fn a_voice_first_open_projection_seeds_the_realtime_model_with_the_staged_prompt() {
+    let fixture = Fixture::new();
+    let id = fixture
+        .materialize(
+            meerkat_core::Session::new(),
+            STAGED,
+            DeferredPromptPolicy::Stage,
+        )
+        .await;
+    let parts = LiveOpenParts::new();
+    let orchestrator = parts.orchestrator(&fixture);
+
+    let first = seeded_staged_rows(
+        &orchestrator
+            .realtime_session_open_config(
+                &id,
+                meerkat_contracts::RealtimeTurningMode::ProviderManaged,
+            )
+            .await
+            .expect("the first open projection"),
+    );
+    let second = seeded_staged_rows(
+        &orchestrator
+            .realtime_session_open_config(
+                &id,
+                meerkat_contracts::RealtimeTurningMode::ProviderManaged,
+            )
+            .await
+            .expect("a second open projection"),
+    );
+    let rows = fixture.user_rows(&id).await;
+    assert!(
+        first == 1 && second == 1 && rows == [STAGED.to_string()],
         "the realtime seed carries the staged prompt once and no open commits it twice: \
-         first={} second={} rows={rows:?}",
-        seeded_staged_rows(&first),
-        seeded_staged_rows(&second)
+         first={first} second={second} rows={rows:?}"
+    );
+    fixture.service.try_shutdown().await.expect("shutdown");
+}
+
+/// A run-start hook that vetoes the staged prompt at the open marks the open
+/// projection, which the open result reports as the `staged_prompt_refused`
+/// advisory: the seed goes without the prompt and nothing is committed. The
+/// next open, with the hook admitting it, delivers it once and is not marked.
+#[cfg(feature = "live")]
+#[tokio::test]
+async fn a_vetoed_staged_prompt_marks_the_open_for_the_refused_advisory() {
+    let fixture = Fixture::new();
+    let id = fixture
+        .materialize(
+            meerkat_core::Session::new(),
+            STAGED,
+            DeferredPromptPolicy::Stage,
+        )
+        .await;
+    let parts = LiveOpenParts::new();
+    let orchestrator = parts.orchestrator(&fixture);
+
+    fixture.hooks.veto_staged.store(true, Ordering::SeqCst);
+    let (vetoed_marked, vetoed_seeded) = open_projection_marks(&orchestrator, &id).await;
+    let rows_after_veto = fixture.user_rows(&id).await;
+    fixture.hooks.veto_staged.store(false, Ordering::SeqCst);
+    let (admitted_marked, admitted_seeded) = open_projection_marks(&orchestrator, &id).await;
+    let rows = fixture.user_rows(&id).await;
+    assert!(
+        vetoed_marked
+            && vetoed_seeded == 0
+            && rows_after_veto.is_empty()
+            && !admitted_marked
+            && admitted_seeded == 1
+            && rows == [STAGED.to_string()],
+        "a vetoed delivery marks its open and commits nothing; the next open delivers once: \
+         vetoed_marked={vetoed_marked} vetoed_seeded={vetoed_seeded} \
+         rows_after_veto={rows_after_veto:?} admitted_marked={admitted_marked} \
+         admitted_seeded={admitted_seeded} rows={rows:?}"
     );
     fixture.service.try_shutdown().await.expect("shutdown");
 }

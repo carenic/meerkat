@@ -5404,6 +5404,11 @@ class WireLiveTransportBootstrapUnknown(TypedDict, total=False):
 
 WireLiveTransportBootstrap = WireLiveTransportBootstrapWebsocket | WireLiveTransportBootstrapWebrtc | WireLiveTransportBootstrapUnknown
 
+# An advisory on a successful live/open: something the open went ahead
+# without. The vocabulary may grow: a reader keeps an advisory it does not
+# know as it was sent.
+WireLiveOpenAdvisory = Literal['staged_prompt_refused'] | str
+
 @dataclass
 class LiveOpenResult:
     """Response payload for `live/open`.
@@ -5421,6 +5426,7 @@ follow-up); G8 (P2): `transport` typed-mirror.
     channel_id: str
     continuity: WireLiveContinuityMode
     transport: WireLiveTransportBootstrap
+    advisories: Optional[list[WireLiveOpenAdvisory]] = None
 
 
 @dataclass

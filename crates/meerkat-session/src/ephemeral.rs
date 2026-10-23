@@ -3309,6 +3309,13 @@ pub enum StagedPromptLiveOpenDelivery {
     Delivered,
     /// A `RunStarted` hook refused it; it stays staged for the first turn.
     Refused(meerkat_core::error::AgentError),
+    /// The session's turn boundary was held, so an open that never waits
+    /// behind a turn asked nothing of the actor. A turn in flight has already
+    /// consumed a staged prompt; any other holder leaves it staged for the
+    /// next open or the first turn. Only the non-waiting delivery
+    /// (`PersistentSessionService::try_deliver_staged_prompt_for_live_open`)
+    /// answers this.
+    TurnBoundaryHeld,
 }
 
 /// Trait for building agents from session creation requests.
@@ -6631,7 +6638,6 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
             .map_err(SessionError::Agent)
     }
 
-    /// Append externally-produced user content into the canonical transcript.
     /// Deliver the session's staged create-time prompt for a live open: run
     /// the `RunStarted` hooks a turn carrying it would run and, when they
     /// admit it, commit it as the session's next user row, so the realtime
@@ -6661,6 +6667,7 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
             .map_err(SessionError::Agent)
     }
 
+    /// Append externally-produced user content into the canonical transcript.
     pub async fn append_external_user_content(
         &self,
         id: &SessionId,
