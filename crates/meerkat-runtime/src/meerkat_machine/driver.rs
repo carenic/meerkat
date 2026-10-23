@@ -7707,17 +7707,22 @@ pub(crate) fn machine_staged_directed_interaction_ids(
 
 pub(crate) fn machine_validate_run_failed(
     driver: &DriverEntry,
+    run_id: &RunId,
     contributing_work_ids: &[InputId],
 ) -> Result<(), RuntimeDriverError> {
     if contributing_work_ids.is_empty() {
         return Err(RuntimeDriverError::Internal(
-            "run failed requires at least one staged contributor".to_string(),
+            "run failed requires at least one contributor".to_string(),
         ));
     }
 
     for work_id in contributing_work_ids {
         let lifecycle = driver.as_driver().input_phase(work_id);
-        if lifecycle != Some(InputLifecycleState::Staged) {
+        // A resumed run's contributor can already be applied by one of the
+        // run's committed rounds; it still belongs to this run.
+        if lifecycle != Some(InputLifecycleState::Staged)
+            && !driver.input_bound_to_open_run(work_id, run_id)
+        {
             return Err(RuntimeDriverError::Internal(format!(
                 "run failed requires staged contributors, but {work_id:?} is {lifecycle:?}"
             )));
@@ -7727,19 +7732,62 @@ pub(crate) fn machine_validate_run_failed(
     Ok(())
 }
 
+/// The contributors an ended run (failed or cancelled) disposes of: its staged
+/// contributors and, for a resumed run, each input one of `run_id`'s committed
+/// rounds already applied that is still bound to the run.
+///
+/// Only a resumed run holds applied contributors. None of them may stay bound
+/// to the run once it ends: left applied, a later registration would find the
+/// run open and resumable again. The run's realization disposes of them with
+/// the staged ones: a replayed failure returns them to their lanes
+/// (`ReplayAppliedRunContributor`), a machine-terminal failure consumes them,
+/// a run that never began executing consumes them too (they did execute, so
+/// they are never reported as never executed), and a cancellation abandons
+/// them as cancelled.
+///
+/// A resumed run's set lists its bound inputs in admission order, the order
+/// the generated resume plan dispatched them in and so the order of a receipt
+/// the run carries, then any staged input not bound to it. An ordinary run's
+/// set is its staged contributors, unchanged.
+fn machine_ended_run_contributors(
+    driver: &DriverEntry,
+    run_id: &RunId,
+    staged_input_ids: &[InputId],
+) -> Vec<InputId> {
+    let bound = driver.resumed_run_bound_input_ids(run_id);
+    let holds_applied = bound.iter().any(|input_id| {
+        driver.as_driver().input_phase(input_id) != Some(InputLifecycleState::Staged)
+    });
+    if !holds_applied {
+        return staged_input_ids.to_vec();
+    }
+    let mut contributors = bound;
+    for input_id in staged_input_ids {
+        if !contributors.contains(input_id) {
+            contributors.push(input_id.clone());
+        }
+    }
+    contributors
+}
+
 pub(crate) fn machine_validate_run_cancelled(
     driver: &DriverEntry,
+    run_id: &RunId,
     contributing_work_ids: &[InputId],
 ) -> Result<(), RuntimeDriverError> {
     if contributing_work_ids.is_empty() {
         return Err(RuntimeDriverError::Internal(
-            "run cancelled requires at least one staged contributor".to_string(),
+            "run cancelled requires at least one contributor".to_string(),
         ));
     }
 
     for work_id in contributing_work_ids {
         let lifecycle = driver.as_driver().input_phase(work_id);
-        if lifecycle != Some(InputLifecycleState::Staged) {
+        // A resumed run's contributor can already be applied by one of the
+        // run's committed rounds; it still belongs to this run.
+        if lifecycle != Some(InputLifecycleState::Staged)
+            && !driver.input_bound_to_open_run(work_id, run_id)
+        {
             return Err(RuntimeDriverError::Internal(format!(
                 "run cancelled requires staged contributors, but {work_id:?} is {lifecycle:?}"
             )));
@@ -10910,7 +10958,11 @@ pub(crate) async fn cancel_runtime_loop_run(
     let mut driver = driver.lock().await;
     let cancelled_run_id = run_id.clone();
     let staged_input_ids = machine_staged_contributors(&driver);
-    machine_validate_run_cancelled(&driver, &staged_input_ids)
+    // A cancellation abandons every input bound to the run, the ones a
+    // resumed run's committed rounds already applied included.
+    let contributing_input_ids =
+        machine_ended_run_contributors(&driver, &cancelled_run_id, &staged_input_ids);
+    machine_validate_run_cancelled(&driver, &cancelled_run_id, &contributing_input_ids)
         .map_err(RuntimeLoopRunFailError::Rejected)?;
     let terminal_checkpoint = driver
         .begin_terminal_transition("cancelled_run_terminal_commit")
@@ -10918,7 +10970,7 @@ pub(crate) async fn cancel_runtime_loop_run(
     let candidate = crate::input_state::InteractionTerminalCandidate::Cancelled;
     let completion_batch = match driver.stage_input_terminal_completion_batch(
         InteractionTerminalBatchScope::Run(&cancelled_run_id),
-        &staged_input_ids,
+        &contributing_input_ids,
         candidate.clone(),
         false,
     ) {
@@ -10934,7 +10986,7 @@ pub(crate) async fn cancel_runtime_loop_run(
     };
     let interaction_outboxes = match authorized_staged_directed_terminal_outboxes(
         &driver,
-        &staged_input_ids,
+        &contributing_input_ids,
         &completion_batch,
     ) {
         Ok(outboxes) => outboxes,
@@ -10979,7 +11031,7 @@ pub(crate) async fn cancel_runtime_loop_run(
         return Err(RuntimeLoopRunFailError::Rejected(error));
     }
     if let Err(run_err) = driver
-        .machine_realize_run_cancelled(cancelled_run_id.clone(), staged_input_ids)
+        .machine_realize_run_cancelled(cancelled_run_id.clone(), contributing_input_ids)
         .await
     {
         let error = RuntimeDriverError::Internal(format!(
@@ -11015,7 +11067,7 @@ fn machine_terminal_carrier_validation_failed(reason: impl Into<String>) -> Runt
 fn validate_machine_terminal_applied_commit(
     driver: &DriverEntry,
     failed_run_id: &RunId,
-    staged_input_ids: &[InputId],
+    contributing_input_ids: &[InputId],
     error: &meerkat_core::TurnErrorMetadata,
     applied: MachineTerminalAppliedDraft,
 ) -> Result<MachineTerminalAppliedCommit, RuntimeDriverError> {
@@ -11120,7 +11172,7 @@ fn validate_machine_terminal_applied_commit(
     let receipt = applied
         .receipt
         .into_sequenced(driver.terminal_boundary_sequence(failed_run_id)?);
-    machine_validate_run_commit_receipt(driver, failed_run_id, staged_input_ids, &receipt)?;
+    machine_validate_run_commit_receipt(driver, failed_run_id, contributing_input_ids, &receipt)?;
     if receipt.message_count != committed_message_count {
         return Err(machine_terminal_carrier_validation_failed(format!(
             "machine-terminal receipt message count {} did not match boundary message count {committed_message_count}",
@@ -11175,7 +11227,11 @@ async fn fail_runtime_loop_run_inner(
     let mut driver = driver.lock().await;
     let failed_run_id = run_id.clone();
     let staged_input_ids = machine_staged_contributors(&driver);
-    machine_validate_run_failed(&driver, &staged_input_ids)
+    // Every disposition disposes of every input bound to the run, the ones a
+    // resumed run's committed rounds already applied included.
+    let contributing_input_ids =
+        machine_ended_run_contributors(&driver, &failed_run_id, &staged_input_ids);
+    machine_validate_run_failed(&driver, &failed_run_id, &contributing_input_ids)
         .map_err(RuntimeLoopRunFailError::Rejected)?;
     if machine_terminal_failure_observed != machine_terminal_error.is_some() {
         return Err(RuntimeLoopRunFailError::Rejected(
@@ -11208,7 +11264,7 @@ async fn fail_runtime_loop_run_inner(
             validate_machine_terminal_applied_commit(
                 &driver,
                 &failed_run_id,
-                &staged_input_ids,
+                &contributing_input_ids,
                 error,
                 applied,
             )
@@ -11240,7 +11296,7 @@ async fn fail_runtime_loop_run_inner(
         };
         let completion_batch = match driver.stage_input_terminal_completion_batch(
             InteractionTerminalBatchScope::Run(&failed_run_id),
-            &staged_input_ids,
+            &contributing_input_ids,
             candidate,
             true,
         ) {
@@ -11256,7 +11312,7 @@ async fn fail_runtime_loop_run_inner(
         };
         let interaction_outboxes = match authorized_staged_directed_terminal_outboxes(
             &driver,
-            &staged_input_ids,
+            &contributing_input_ids,
             &completion_batch,
         ) {
             Ok(outboxes) => outboxes,
@@ -11300,9 +11356,10 @@ async fn fail_runtime_loop_run_inner(
             );
             return Err(RuntimeLoopRunFailError::Rejected(error));
         }
-        if let Err(error) = driver
-            .machine_realize_terminal_failure_applied_in_memory(&failed_run_id, &staged_input_ids)
-        {
+        if let Err(error) = driver.machine_realize_terminal_failure_applied_in_memory(
+            &failed_run_id,
+            &contributing_input_ids,
+        ) {
             let error = driver.fail_terminal_transition(
                 terminal_checkpoint,
                 "failed_run_applied_terminal_realization",
@@ -11343,7 +11400,7 @@ async fn fail_runtime_loop_run_inner(
             return Err(RuntimeLoopRunFailError::Rejected(error));
         }
     };
-    let replay_plan = machine_build_replay_plan(&driver, &staged_input_ids, "RunFailed");
+    let replay_plan = machine_build_replay_plan(&driver, &contributing_input_ids, "RunFailed");
     if let Err(err) = machine_apply_run_return_projection(
         &mut driver,
         &failed_run_id,
@@ -11362,7 +11419,7 @@ async fn fail_runtime_loop_run_inner(
     let persistence = match driver
         .machine_realize_run_failed(MachineRunFailureRealization {
             run_id: failed_run_id.clone(),
-            contributing_input_ids: staged_input_ids,
+            contributing_input_ids,
             replay_plan,
             terminal_error,
             runtime_apply_failure,
