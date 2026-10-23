@@ -31107,9 +31107,11 @@ mod tests {
         ] {
             let (directory, service, id, _physical) = compacted_crash_tail(tail).await;
             drop(service);
+            // A byte copy of the stores in the system temp directory: the
+            // second host needs no shared filesystem with the first.
             let copy = tempfile::Builder::new()
-                .prefix(".retention-checkpoint-copy-")
-                .tempdir_in(".")
+                .prefix("retention-checkpoint-copy-")
+                .tempdir()
                 .unwrap();
             for suffix in ["", "-wal", "-shm"] {
                 let source = directory.path().join(format!("runtime.sqlite3{suffix}"));
@@ -31236,6 +31238,270 @@ mod tests {
             matches!(recovery, CommittedBoundaryRecovery::Unprovable { .. }),
             "held for reconciliation: {recovery:?}"
         );
+    }
+
+    /// The receipt a live model boundary commits in the middle of a run, as
+    /// every live-boundary path mints it: the run's next checkpoint sequence,
+    /// with no transcript count and no digest. The request-only input that
+    /// joined the model request commits consumed in the same transaction;
+    /// the boundary carries no session, so the runtime authority stays where
+    /// it was. Returns the consumed input.
+    async fn commit_live_boundary_receipt(
+        service: &PersistentSessionService<DummyBuilder>,
+        id: &SessionId,
+        run_id: &RunId,
+        sequence: u64,
+    ) -> InputId {
+        let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(id);
+        let joined = InputId::new();
+        let receipt = meerkat_core::lifecycle::RunBoundaryReceipt {
+            run_id: run_id.clone(),
+            boundary: meerkat_core::lifecycle::run_primitive::RunApplyBoundary::RunCheckpoint,
+            contributing_input_ids: vec![joined.clone()],
+            conversation_digest: None,
+            message_count: 0,
+            sequence,
+            owner_contributions: Vec::new(),
+        };
+        let consumed = StoredInputState {
+            state: meerkat_runtime::input_state::InputState::new_accepted(joined.clone()),
+            seed: meerkat_runtime::input_state::InputStateSeed {
+                phase: InputLifecycleState::Consumed,
+                last_run_id: Some(run_id.clone()),
+                last_boundary_sequence: Some(sequence),
+                terminal_outcome: Some(InputTerminalOutcome::Consumed),
+                attempt_count: 1,
+                admission_sequence: None,
+                recovery_lane: None,
+            },
+        };
+        let consumed = meerkat_runtime::EphemeralRuntimeDriver::new(runtime_id.clone())
+            .recover_input_state_persistence_record(consumed)
+            .expect("a consumed input row passes generated recovery authority");
+        service
+            .runtime_store
+            .commit_prepared_session_boundary(
+                &runtime_id,
+                meerkat_runtime::PreparedRuntimeSessionCommit::success(
+                    None,
+                    receipt,
+                    vec![consumed],
+                    Some(id.clone()),
+                ),
+            )
+            .await
+            .expect("the live boundary commits its receipt");
+        joined
+    }
+
+    async fn input_seed(
+        service: &PersistentSessionService<DummyBuilder>,
+        id: &SessionId,
+        input_id: &InputId,
+    ) -> meerkat_runtime::input_state::InputStateSeed {
+        service
+            .runtime_store
+            .load_input_state(
+                &meerkat_runtime::LogicalRuntimeId::for_session(id),
+                input_id,
+            )
+            .await
+            .expect("load the input row")
+            .expect("the input row exists")
+            .seed
+    }
+
+    async fn committed_receipts(
+        service: &PersistentSessionService<DummyBuilder>,
+        id: &SessionId,
+        run_id: &RunId,
+    ) -> Vec<meerkat_core::lifecycle::RunBoundaryReceipt> {
+        service
+            .runtime_store
+            .load_committed_boundary_receipts(
+                &meerkat_runtime::LogicalRuntimeId::for_session(id),
+                run_id,
+            )
+            .await
+            .expect("load the run's committed receipts")
+    }
+
+    /// A tool loop whose live boundary committed a receipt, then compacted
+    /// and checkpointed, dies before its next boundary commit. The committed
+    /// receipt is the run's own earlier boundary: recovery recovers the
+    /// compacted tail and commits it one sequence past that receipt, which
+    /// it leaves as it was.
+    #[tokio::test]
+    async fn a_compacting_crash_tail_after_a_committed_live_boundary_is_recovered() {
+        let (_directory, service, checkpointer, committed) = retention_checkpoint_fixture().await;
+        let id = committed.id().clone();
+        let run_id = RunId::new();
+        let mut session = committed;
+        session.push(run_stamped_assistant(
+            &run_id,
+            vec![meerkat_core::AssistantBlock::ToolUse {
+                id: "call-round-1".to_string(),
+                name: "probe".into(),
+                args: serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
+                meta: None,
+            }],
+            StopReason::ToolUse,
+        ));
+        session.push(Message::ToolResults {
+            results: vec![ToolResult::new(
+                "call-round-1".to_string(),
+                "ok".to_string(),
+                false,
+            )],
+            created_at: std::time::SystemTime::UNIX_EPOCH.into(),
+        });
+        let first_round = meerkat_core::SessionCheckpointer::checkpoint_run(
+            &checkpointer,
+            &mut session,
+            &run_id,
+            None,
+        )
+        .await
+        .expect("the first round's checkpoint")
+        .expect("a provisional successor");
+        let joined = commit_live_boundary_receipt(&service, &id, &run_id, 1).await;
+        let joined_before = input_seed(&service, &id, &joined).await;
+        compact_and_retire(
+            &mut session,
+            0,
+            meerkat_core::TranscriptHistoryRetention::from_count(4).unwrap(),
+        );
+        completed_after_compaction(&mut session, &run_id);
+        meerkat_core::SessionCheckpointer::checkpoint_run(
+            &checkpointer,
+            &mut session,
+            &run_id,
+            Some(&first_round),
+        )
+        .await
+        .expect("the compacting round's checkpoint")
+        .expect("a provisional successor");
+        assert_eq!(physical_rewrite_count(&service, &id).await, 1);
+
+        let recovery = service
+            .recover_committed_boundary(&id)
+            .await
+            .expect("a crash tail after a committed live boundary is recoverable");
+        assert!(
+            matches!(
+                recovery,
+                CommittedBoundaryRecovery::Recovered { message_count }
+                    if message_count == session.messages().len()
+            ),
+            "the completed run is the recovered boundary: {recovery:?}"
+        );
+        let receipts = committed_receipts(&service, &id, &run_id).await;
+        assert_eq!(
+            receipts
+                .iter()
+                .map(|receipt| receipt.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2],
+            "recovery commits one past the live boundary's receipt: {receipts:?}"
+        );
+        assert_eq!(receipts[0].message_count, 0);
+        assert_eq!(
+            receipts[0].contributing_input_ids,
+            vec![joined.clone()],
+            "the live boundary's receipt is kept as the run committed it"
+        );
+        assert_eq!(receipts[1].message_count, session.messages().len());
+        assert!(
+            !receipts[1].contributing_input_ids.contains(&joined),
+            "the recovered boundary does not consume the joined input again: {receipts:?}"
+        );
+        assert_eq!(
+            input_seed(&service, &id, &joined).await,
+            joined_before,
+            "the consumed input is neither requeued nor terminalized again"
+        );
+    }
+
+    /// The nearest durable shape to a compaction committed inside the run:
+    /// a receipt before the compaction, the compacted transcript committed
+    /// as the boundary by a receipt-less session commit, a receipt after it,
+    /// then rows that only append, and a crash before the run's boundary
+    /// commit. Both receipts are the run's own; recovery commits the strict
+    /// tail one sequence past them.
+    #[tokio::test]
+    async fn an_appending_crash_tail_after_a_committed_compaction_and_live_boundaries_is_recovered()
+    {
+        let (_directory, service, checkpointer, committed) = retention_checkpoint_fixture().await;
+        let id = committed.id().clone();
+        let run_id = RunId::new();
+        let joined_before_compaction =
+            commit_live_boundary_receipt(&service, &id, &run_id, 1).await;
+        let mut session = committed;
+        compact_and_retire(
+            &mut session,
+            0,
+            meerkat_core::TranscriptHistoryRetention::from_count(4).unwrap(),
+        );
+        let mut session = service
+            .persist_detached_head_canonical_session(session, "the run's compaction")
+            .await
+            .expect("the compaction commits as the boundary");
+        assert_eq!(physical_rewrite_count(&service, &id).await, 1);
+        let joined_after_compaction = commit_live_boundary_receipt(&service, &id, &run_id, 2).await;
+        let joined = [joined_before_compaction, joined_after_compaction];
+        let mut joined_before = Vec::new();
+        for input_id in &joined {
+            joined_before.push(input_seed(&service, &id, input_id).await);
+        }
+        completed_after_compaction(&mut session, &run_id);
+        meerkat_core::SessionCheckpointer::checkpoint_run(
+            &checkpointer,
+            &mut session,
+            &run_id,
+            None,
+        )
+        .await
+        .expect("the appending round's checkpoint")
+        .expect("a provisional successor");
+        assert_eq!(
+            physical_rewrite_count(&service, &id).await,
+            1,
+            "the crash tail only appends"
+        );
+
+        let recovery = service
+            .recover_committed_boundary(&id)
+            .await
+            .expect("an appending crash tail after a committed compaction is recoverable");
+        assert!(
+            matches!(
+                recovery,
+                CommittedBoundaryRecovery::Recovered { message_count }
+                    if message_count == session.messages().len()
+            ),
+            "the completed run is the recovered boundary: {recovery:?}"
+        );
+        let receipts = committed_receipts(&service, &id, &run_id).await;
+        assert_eq!(
+            receipts
+                .iter()
+                .map(|receipt| receipt.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "recovery commits one past the run's live boundaries: {receipts:?}"
+        );
+        assert_eq!(receipts[2].message_count, session.messages().len());
+        for (input_id, before) in joined.iter().zip(&joined_before) {
+            assert!(
+                !receipts[2].contributing_input_ids.contains(input_id),
+                "the recovered boundary does not consume a joined input again: {receipts:?}"
+            );
+            assert_eq!(
+                &input_seed(&service, &id, input_id).await,
+                before,
+                "a consumed input is neither requeued nor terminalized again"
+            );
+        }
     }
 
     /// The cap belongs to the session a durable head describes. A fork and a
