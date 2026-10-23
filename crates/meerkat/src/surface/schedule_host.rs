@@ -1398,6 +1398,15 @@ impl SharedScheduleTargetAdapter {
     /// runtime found the earlier admission in it (deduplicated), so the
     /// driver binds and records it exactly as it does for an ordinary
     /// dispatch; a failure, or nothing admitted, binds nothing.
+    ///
+    /// Known limitation: two overlapping occurrences of one on-demand
+    /// schedule can each materialize their own session before either bind
+    /// lands. The occurrence whose bind loses admits into its own session; if
+    /// its process stops before the driver records that session on it, its
+    /// reclaim copies the other occurrence's binding onto it (the reclaim's
+    /// target sync), and its redelivery looks only in that session, where its
+    /// admission is not. An admitted redelivery then ends delivery_failed and
+    /// an unproven late one misfires, although the input was admitted.
     #[cfg(not(target_arch = "wasm32"))]
     async fn deliver_existing_unbound_session(
         &self,
