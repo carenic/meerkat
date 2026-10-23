@@ -149,13 +149,19 @@ per-round commits, and Stop for any other session:
 
 - `rkat-rpc`'s own shutdown, when its input ends (as when a client SDK
   exits), on SIGTERM and on an interrupt;
-- the REST server's shutdown on SIGTERM or an interrupt;
+- the REST server's shutdown on SIGTERM or an interrupt, once its open
+  requests have finished: a run attached to an open request, such as a turn
+  whose request still waits for its answer, runs to its end, or, if the
+  process is killed first, continues at the next open as after a crash;
 - a mob Shutdown (`MobHandle::shutdown()`, or `ShutdownOptions` without
   `with_queued_inputs`, whose default is
   `QueuedInputsOnShutdown::RequeueDurable`), member by member: it suspends
   the running turn of a member whose session commits every round instead of
   cancelling it, an autonomous member's included (see
   [Mobs](/guides/mobs)).
+
+`rkat-mcp`'s shutdown is not one of them: it still cancels its requests in
+flight.
 
 A host that chooses explicitly keeps its choice: an unregister with
 `UnregisterQueuedInputs::Stop`, or a Shutdown with
@@ -181,8 +187,8 @@ process killed during it leaves the run as a crash would.
   the run's inputs end as `requeue_expired` and the run does not continue:
   it is closed as interrupted, with the rounds it committed kept.
   An explicit `max_age` lies between 1 millisecond and 24 hours; the default
-  shutdowns above, and a mob Shutdown, use 15 minutes
-  (`RequeueMaxAge::DEFAULT`).
+  shutdowns above use 15 minutes (`UnregisterQueuedInputs::DEFAULT_MAX_AGE`,
+  and `RequeueMaxAge::DEFAULT` for a mob Shutdown).
 
 Any other way of stopping still ends the run in flight: a graceful stop
 that chooses Stop, an explicit stop or cancel, retiring, destroying or
@@ -477,16 +483,17 @@ Before you run a host store in production, run the host store chapter of the
   run ends, is closed as interrupted although its transcript is whole: it
   shows the interrupted notice, and nothing is lost or run twice. Without
   the compaction, recovery commits such a run as completed.
-- A JSON-RPC or REST client whose turn on a session with per-round commits
-  is in flight when the server stops gracefully, keeping the session's work,
-  gets no typed suspended answer. Its request ends with the
-  session-not-running error of kind `requeued_across_stop` (JSON-RPC
-  `-32003` with `data.input_id`, `data.stopped_at` and
-  `data.resumable: true`; REST `409` `SESSION_NOT_RUNNING`), which is not a
-  terminal run failure, or with a closed connection when the server exits
-  before it answers. The server resumes the run at the session's next start.
-  Read the run's status, for example with `session/input_status`, before you
-  retry: resubmitting the input runs it again.
+- A client of `rkat-rpc` whose turn on a session with per-round commits is
+  in flight when the server shuts down gracefully gets a shutdown error, not
+  the typed `requeued_across_stop` answer: the server stops answering before
+  it suspends the run. The server keeps the run and continues it at the
+  session's next start. Read the run's status, for example with
+  `session/input_status`, before you retry: resubmitting the input runs it
+  again.
+- The REST server's graceful shutdown waits for its open requests before it
+  keeps any work, so it does not suspend a run attached to an open request:
+  that run ends normally, or, if the process is killed first, continues at
+  the next open as after a crash.
 - A run that resumes after a crash during structured-output extraction asks
   the model again from its last round commit, so it publishes `RunCompleted`
   with `extraction_required` a second time under the same run id.
