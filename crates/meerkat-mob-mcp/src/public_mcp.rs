@@ -720,12 +720,8 @@ pub async fn handle_public_tools_call(
                 .map_err(|err| McpToolError::from_mob_destroy(&err))?;
             let destroy_report = reports
                 .destroy_report
-                .map(|report| {
-                    serde_json::to_value(&report).map_err(|err| {
-                        McpToolError::internal(format!("destroy report serialize: {err}"))
-                    })
-                })
-                .transpose()?;
+                .as_ref()
+                .map(meerkat_contracts::WireMobDestroyReport::from);
             let stop_report = reports
                 .stop_report
                 .map(|report| {

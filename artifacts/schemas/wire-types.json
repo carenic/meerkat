@@ -120789,10 +120789,132 @@
     "type": "object"
   },
   "MobDestroyResult": {
+    "$defs": {
+      "WireMemberReloadRefusal": {
+        "description": "Why the runtime refused a member's durability reload.",
+        "oneOf": [
+          {
+            "description": "The runtime's recovery is repair-blocked, for example while a\nboundary commit past its deadline has not reported its durable\noutcome.",
+            "properties": {
+              "evidence_digest": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "kind": {
+                "const": "repair_blocked",
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Forward compatibility: a refusal kind this version does not know.\nThe server never sends it.",
+            "properties": {
+              "kind": {
+                "const": "unknown",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WireMobDestroyMemberRefusal": {
+        "description": "A member whose durability reload the runtime refused during a destroy.",
+        "properties": {
+          "member": {
+            "type": "string"
+          },
+          "refusal": {
+            "$ref": "#/$defs/WireMemberReloadRefusal"
+          }
+        },
+        "required": [
+          "member",
+          "refusal"
+        ],
+        "type": "object"
+      },
+      "WireMobDestroyReport": {
+        "description": "Wire form of a mob destroy's report (`meerkat_mob::MobDestroyReport`),\nfield for field: a destroy result, a lifecycle destroy and the\n`mob_destroy_incomplete` error data carry it. Members are their identity\nstrings. Empty lists are left out, and a missing flag reads as `false`.",
+        "properties": {
+          "errors": {
+            "description": "Cleanup failures, as text.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "events_cleared": {
+            "default": false,
+            "description": "Whether the mob's events were cleared.",
+            "type": "boolean"
+          },
+          "force_destroyed_members": {
+            "description": "Members whose retirement the destroy forced.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "member_reload_refusals": {
+            "description": "Members whose durability reload the runtime refused, with the typed\nrefusal; retry the destroy later.",
+            "items": {
+              "$ref": "#/$defs/WireMobDestroyMemberRefusal"
+            },
+            "type": "array"
+          },
+          "metadata_scrubbed": {
+            "default": false,
+            "description": "Whether the mob's metadata was scrubbed.",
+            "type": "boolean"
+          },
+          "namespace_cleaned": {
+            "default": false,
+            "description": "Whether the mob's storage namespace was cleaned.",
+            "type": "boolean"
+          },
+          "orphaned_remote_members": {
+            "description": "Remote members whose cleanup the destroy could not confirm.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "reloaded_members": {
+            "description": "Members the destroy reloaded from their durable store and retired.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "remote_cleanup_deadline_exceeded": {
+            "default": false,
+            "description": "Whether remote cleanup ran out of its deadline.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      }
+    },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "description": "Response payload for `mob/destroy`.",
     "properties": {
-      "destroy_report": true,
+      "destroy_report": {
+        "$ref": "#/$defs/WireMobDestroyReport"
+      },
       "mob_id": {
         "type": "string"
       },
@@ -122556,6 +122678,124 @@
   },
   "MobLifecycleResult": {
     "$defs": {
+      "WireMemberReloadRefusal": {
+        "description": "Why the runtime refused a member's durability reload.",
+        "oneOf": [
+          {
+            "description": "The runtime's recovery is repair-blocked, for example while a\nboundary commit past its deadline has not reported its durable\noutcome.",
+            "properties": {
+              "evidence_digest": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "kind": {
+                "const": "repair_blocked",
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Forward compatibility: a refusal kind this version does not know.\nThe server never sends it.",
+            "properties": {
+              "kind": {
+                "const": "unknown",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WireMobDestroyMemberRefusal": {
+        "description": "A member whose durability reload the runtime refused during a destroy.",
+        "properties": {
+          "member": {
+            "type": "string"
+          },
+          "refusal": {
+            "$ref": "#/$defs/WireMemberReloadRefusal"
+          }
+        },
+        "required": [
+          "member",
+          "refusal"
+        ],
+        "type": "object"
+      },
+      "WireMobDestroyReport": {
+        "description": "Wire form of a mob destroy's report (`meerkat_mob::MobDestroyReport`),\nfield for field: a destroy result, a lifecycle destroy and the\n`mob_destroy_incomplete` error data carry it. Members are their identity\nstrings. Empty lists are left out, and a missing flag reads as `false`.",
+        "properties": {
+          "errors": {
+            "description": "Cleanup failures, as text.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "events_cleared": {
+            "default": false,
+            "description": "Whether the mob's events were cleared.",
+            "type": "boolean"
+          },
+          "force_destroyed_members": {
+            "description": "Members whose retirement the destroy forced.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "member_reload_refusals": {
+            "description": "Members whose durability reload the runtime refused, with the typed\nrefusal; retry the destroy later.",
+            "items": {
+              "$ref": "#/$defs/WireMobDestroyMemberRefusal"
+            },
+            "type": "array"
+          },
+          "metadata_scrubbed": {
+            "default": false,
+            "description": "Whether the mob's metadata was scrubbed.",
+            "type": "boolean"
+          },
+          "namespace_cleaned": {
+            "default": false,
+            "description": "Whether the mob's storage namespace was cleaned.",
+            "type": "boolean"
+          },
+          "orphaned_remote_members": {
+            "description": "Remote members whose cleanup the destroy could not confirm.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "reloaded_members": {
+            "description": "Members the destroy reloaded from their durable store and retired.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "remote_cleanup_deadline_exceeded": {
+            "default": false,
+            "description": "Whether remote cleanup ran out of its deadline.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
       "WireMobLifecycleAction": {
         "description": "Typed lifecycle action for `mob/lifecycle`. Replaces the prior\n`action: String` discriminator with an exhaustive enum so callers and\nhandlers reason about lifecycle transitions through the type system\nrather than string folklore.",
         "enum": [
@@ -122574,7 +122814,16 @@
       "action": {
         "$ref": "#/$defs/WireMobLifecycleAction"
       },
-      "destroy_report": true,
+      "destroy_report": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/WireMobDestroyReport"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
       "mob_id": {
         "type": "string"
       },
@@ -177066,6 +177315,49 @@
     ],
     "title": "WireMemberRegistrationHookCall"
   },
+  "WireMemberReloadRefusal": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Why the runtime refused a member's durability reload.",
+    "oneOf": [
+      {
+        "description": "The runtime's recovery is repair-blocked, for example while a\nboundary commit past its deadline has not reported its durable\noutcome.",
+        "properties": {
+          "evidence_digest": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "const": "repair_blocked",
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "reason"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "Forward compatibility: a refusal kind this version does not know.\nThe server never sends it.",
+        "properties": {
+          "kind": {
+            "const": "unknown",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      }
+    ],
+    "title": "WireMemberReloadRefusal"
+  },
   "WireMemberRunState": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "enum": [
@@ -177388,6 +177680,332 @@
     ],
     "title": "WireMobBackendKind",
     "type": "string"
+  },
+  "WireMobDestroyIncompleteData": {
+    "$defs": {
+      "WireMemberReloadRefusal": {
+        "description": "Why the runtime refused a member's durability reload.",
+        "oneOf": [
+          {
+            "description": "The runtime's recovery is repair-blocked, for example while a\nboundary commit past its deadline has not reported its durable\noutcome.",
+            "properties": {
+              "evidence_digest": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "kind": {
+                "const": "repair_blocked",
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Forward compatibility: a refusal kind this version does not know.\nThe server never sends it.",
+            "properties": {
+              "kind": {
+                "const": "unknown",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WireMobDestroyMemberRefusal": {
+        "description": "A member whose durability reload the runtime refused during a destroy.",
+        "properties": {
+          "member": {
+            "type": "string"
+          },
+          "refusal": {
+            "$ref": "#/$defs/WireMemberReloadRefusal"
+          }
+        },
+        "required": [
+          "member",
+          "refusal"
+        ],
+        "type": "object"
+      },
+      "WireMobDestroyReport": {
+        "description": "Wire form of a mob destroy's report (`meerkat_mob::MobDestroyReport`),\nfield for field: a destroy result, a lifecycle destroy and the\n`mob_destroy_incomplete` error data carry it. Members are their identity\nstrings. Empty lists are left out, and a missing flag reads as `false`.",
+        "properties": {
+          "errors": {
+            "description": "Cleanup failures, as text.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "events_cleared": {
+            "default": false,
+            "description": "Whether the mob's events were cleared.",
+            "type": "boolean"
+          },
+          "force_destroyed_members": {
+            "description": "Members whose retirement the destroy forced.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "member_reload_refusals": {
+            "description": "Members whose durability reload the runtime refused, with the typed\nrefusal; retry the destroy later.",
+            "items": {
+              "$ref": "#/$defs/WireMobDestroyMemberRefusal"
+            },
+            "type": "array"
+          },
+          "metadata_scrubbed": {
+            "default": false,
+            "description": "Whether the mob's metadata was scrubbed.",
+            "type": "boolean"
+          },
+          "namespace_cleaned": {
+            "default": false,
+            "description": "Whether the mob's storage namespace was cleaned.",
+            "type": "boolean"
+          },
+          "orphaned_remote_members": {
+            "description": "Remote members whose cleanup the destroy could not confirm.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "reloaded_members": {
+            "description": "Members the destroy reloaded from their durable store and retired.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "remote_cleanup_deadline_exceeded": {
+            "default": false,
+            "description": "Whether remote cleanup ran out of its deadline.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "The `data` of a `mob_destroy_incomplete` error: the destroy did not\nfinish, its report says what is left, and it can be retried.",
+    "properties": {
+      "code": {
+        "description": "Always `mob_destroy_incomplete`.",
+        "type": "string"
+      },
+      "destroy_report": {
+        "$ref": "#/$defs/WireMobDestroyReport"
+      },
+      "retryable": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "code",
+      "destroy_report",
+      "retryable"
+    ],
+    "title": "WireMobDestroyIncompleteData",
+    "type": "object"
+  },
+  "WireMobDestroyMemberRefusal": {
+    "$defs": {
+      "WireMemberReloadRefusal": {
+        "description": "Why the runtime refused a member's durability reload.",
+        "oneOf": [
+          {
+            "description": "The runtime's recovery is repair-blocked, for example while a\nboundary commit past its deadline has not reported its durable\noutcome.",
+            "properties": {
+              "evidence_digest": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "kind": {
+                "const": "repair_blocked",
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Forward compatibility: a refusal kind this version does not know.\nThe server never sends it.",
+            "properties": {
+              "kind": {
+                "const": "unknown",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "A member whose durability reload the runtime refused during a destroy.",
+    "properties": {
+      "member": {
+        "type": "string"
+      },
+      "refusal": {
+        "$ref": "#/$defs/WireMemberReloadRefusal"
+      }
+    },
+    "required": [
+      "member",
+      "refusal"
+    ],
+    "title": "WireMobDestroyMemberRefusal",
+    "type": "object"
+  },
+  "WireMobDestroyReport": {
+    "$defs": {
+      "WireMemberReloadRefusal": {
+        "description": "Why the runtime refused a member's durability reload.",
+        "oneOf": [
+          {
+            "description": "The runtime's recovery is repair-blocked, for example while a\nboundary commit past its deadline has not reported its durable\noutcome.",
+            "properties": {
+              "evidence_digest": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "kind": {
+                "const": "repair_blocked",
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Forward compatibility: a refusal kind this version does not know.\nThe server never sends it.",
+            "properties": {
+              "kind": {
+                "const": "unknown",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WireMobDestroyMemberRefusal": {
+        "description": "A member whose durability reload the runtime refused during a destroy.",
+        "properties": {
+          "member": {
+            "type": "string"
+          },
+          "refusal": {
+            "$ref": "#/$defs/WireMemberReloadRefusal"
+          }
+        },
+        "required": [
+          "member",
+          "refusal"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Wire form of a mob destroy's report (`meerkat_mob::MobDestroyReport`),\nfield for field: a destroy result, a lifecycle destroy and the\n`mob_destroy_incomplete` error data carry it. Members are their identity\nstrings. Empty lists are left out, and a missing flag reads as `false`.",
+    "properties": {
+      "errors": {
+        "description": "Cleanup failures, as text.",
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "events_cleared": {
+        "default": false,
+        "description": "Whether the mob's events were cleared.",
+        "type": "boolean"
+      },
+      "force_destroyed_members": {
+        "description": "Members whose retirement the destroy forced.",
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "member_reload_refusals": {
+        "description": "Members whose durability reload the runtime refused, with the typed\nrefusal; retry the destroy later.",
+        "items": {
+          "$ref": "#/$defs/WireMobDestroyMemberRefusal"
+        },
+        "type": "array"
+      },
+      "metadata_scrubbed": {
+        "default": false,
+        "description": "Whether the mob's metadata was scrubbed.",
+        "type": "boolean"
+      },
+      "namespace_cleaned": {
+        "default": false,
+        "description": "Whether the mob's storage namespace was cleaned.",
+        "type": "boolean"
+      },
+      "orphaned_remote_members": {
+        "description": "Remote members whose cleanup the destroy could not confirm.",
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "reloaded_members": {
+        "description": "Members the destroy reloaded from their durable store and retired.",
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "remote_cleanup_deadline_exceeded": {
+        "default": false,
+        "description": "Whether remote cleanup ran out of its deadline.",
+        "type": "boolean"
+      }
+    },
+    "title": "WireMobDestroyReport",
+    "type": "object"
   },
   "WireMobError": {
     "$defs": {

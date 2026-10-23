@@ -2235,12 +2235,45 @@ class MobLifecycleParams:
 
 
 @dataclass
+class WireMobDestroyMemberRefusal:
+    """A member whose durability reload the runtime refused during a destroy."""
+    member: str
+    refusal: WireMemberReloadRefusal
+
+
+@dataclass
+class WireMobDestroyReport:
+    """Wire form of a mob destroy's report (`meerkat_mob::MobDestroyReport`),
+field for field: a destroy result, a lifecycle destroy and the
+`mob_destroy_incomplete` error data carry it. Members are their identity
+strings. Empty lists are left out, and a missing flag reads as `false`."""
+    errors: Optional[list[str]] = None
+    events_cleared: Optional[bool] = None
+    force_destroyed_members: Optional[list[str]] = None
+    member_reload_refusals: Optional[list[WireMobDestroyMemberRefusal]] = None
+    metadata_scrubbed: Optional[bool] = None
+    namespace_cleaned: Optional[bool] = None
+    orphaned_remote_members: Optional[list[str]] = None
+    reloaded_members: Optional[list[str]] = None
+    remote_cleanup_deadline_exceeded: Optional[bool] = None
+
+
+@dataclass
+class WireMobDestroyIncompleteData:
+    """The `data` of a `mob_destroy_incomplete` error: the destroy did not
+finish, its report says what is left, and it can be retried."""
+    code: str
+    destroy_report: WireMobDestroyReport
+    retryable: bool
+
+
+@dataclass
 class MobLifecycleResult:
     """Response payload for `mob/lifecycle`."""
     action: Literal['stop', 'resume', 'complete', 'reset', 'destroy']
     mob_id: str
     ok: bool
-    destroy_report: Optional[Any] = None
+    destroy_report: Optional[WireMobDestroyReport] = None
     stop_report: Optional[Any] = None
 
 
@@ -2973,7 +3006,7 @@ class MobSnapshotResult:
 @dataclass
 class MobDestroyResult:
     """Response payload for `mob/destroy`."""
-    destroy_report: Any
+    destroy_report: WireMobDestroyReport
     mob_id: str
     ok: bool
 
@@ -6773,6 +6806,17 @@ WireMemberState = Any
 
 # Execution status mirroring `meerkat_mob::runtime::MobMemberStatus`.
 WireMobMemberStatus = Literal['active', 'retiring', 'broken', 'completed', 'unknown']
+
+# Why the runtime refused a member's durability reload.
+class WireMemberReloadRefusalRepairBlocked(TypedDict, total=False):
+    evidence_digest: NotRequired[Optional[str]]
+    kind: Required[Literal['repair_blocked']]
+    reason: Required[str]
+
+class WireMemberReloadRefusalUnknown(TypedDict, total=False):
+    kind: Required[Literal['unknown']]
+
+WireMemberReloadRefusal = WireMemberReloadRefusalRepairBlocked | WireMemberReloadRefusalUnknown
 
 # Mob RPC helper wire type for WireMobRuntimeMode.
 WireMobRuntimeMode = Literal['autonomous_host', 'turn_driven']

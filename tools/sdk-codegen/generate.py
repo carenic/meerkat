@@ -108,6 +108,9 @@ MOB_RPC_CONTRACT_TYPES = [
     "MobListResult",
     "MobStatusResult",
     "MobLifecycleParams",
+    "WireMobDestroyMemberRefusal",
+    "WireMobDestroyReport",
+    "WireMobDestroyIncompleteData",
     "MobLifecycleResult",
     "MobSpawnParams",
     "MobSpawnResult",
@@ -553,6 +556,7 @@ MOB_RPC_CONTRACT_ALIAS_TYPES = [
     "WireToolFilter",
     "WireMemberState",
     "WireMobMemberStatus",
+    "WireMemberReloadRefusal",
     "WireMobRuntimeMode",
     "MobSpawnManyFailureCause",
     "MobSpawnManyResultStatus",
@@ -7322,6 +7326,10 @@ def generate_web_mob_types(schemas: dict, output_dir: Path) -> None:
     append_alias("WireMemberRegistrationHookCall")
     append_interface("MobMemberStatusResult")
     append_interface("MobAppendSystemContextResult")
+    append_alias("WireMemberReloadRefusal")
+    append_interface("WireMobDestroyMemberRefusal")
+    append_interface("WireMobDestroyReport")
+    append_interface("WireMobDestroyIncompleteData")
     append_interface("MobLifecycleResult")
     append_alias("ApplicationToolPolicyBinding")
     append_alias("ToolCategoryOverride")

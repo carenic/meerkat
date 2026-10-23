@@ -819,7 +819,7 @@ fn mob_destroy_error_value(e: MobMcpDestroyError) -> serde_json::Value {
         MobMcpDestroyError::Incomplete { report } => serde_json::json!({
             "code": "mob_destroy_incomplete",
             "message": MobMcpDestroyError::incomplete_message(&report),
-            "destroy_report": report,
+            "destroy_report": meerkat_contracts::WireMobDestroyReport::from(&report),
             "retryable": true,
         }),
         MobMcpDestroyError::Mob(error) => mob_error_value(&error),
@@ -2281,8 +2281,8 @@ pub async fn mob_lifecycle(mob_id: &str, action: &str) -> Result<JsValue, JsValu
         .map_err(err_mob_destroy)?;
     let destroy_report = reports
         .destroy_report
-        .map(|report| serde_json::to_value(&report).map_err(|e| err_str("serialize_error", e)))
-        .transpose()?;
+        .as_ref()
+        .map(meerkat_contracts::WireMobDestroyReport::from);
     let stop_report = reports
         .stop_report
         .map(|report| serde_json::to_value(&report).map_err(|e| err_str("serialize_error", e)))

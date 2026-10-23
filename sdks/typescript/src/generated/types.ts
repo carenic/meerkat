@@ -1719,9 +1719,32 @@ export interface MobLifecycleParams {
   mob_id: string;
 }
 
+export interface WireMobDestroyMemberRefusal {
+  member: string;
+  refusal: WireMemberReloadRefusal;
+}
+
+export interface WireMobDestroyReport {
+  errors?: string[];
+  events_cleared?: boolean;
+  force_destroyed_members?: string[];
+  member_reload_refusals?: WireMobDestroyMemberRefusal[];
+  metadata_scrubbed?: boolean;
+  namespace_cleaned?: boolean;
+  orphaned_remote_members?: string[];
+  reloaded_members?: string[];
+  remote_cleanup_deadline_exceeded?: boolean;
+}
+
+export interface WireMobDestroyIncompleteData {
+  code: string;
+  destroy_report: WireMobDestroyReport;
+  retryable: boolean;
+}
+
 export interface MobLifecycleResult {
   action: "stop" | "resume" | "complete" | "reset" | "destroy";
-  destroy_report?: unknown;
+  destroy_report?: WireMobDestroyReport | null;
   mob_id: string;
   ok: boolean;
   stop_report?: unknown;
@@ -2266,7 +2289,7 @@ export interface MobSnapshotResult {
 }
 
 export interface MobDestroyResult {
-  destroy_report: unknown;
+  destroy_report: WireMobDestroyReport;
   mob_id: string;
   ok: boolean;
 }
@@ -3734,6 +3757,18 @@ export type WireToolFilter = "All" | { Allow: string[] } | { Deny: string[] };
 export type WireMemberState = unknown;
 
 export type WireMobMemberStatus = "active" | "retiring" | "broken" | "completed" | "unknown";
+
+export interface WireMemberReloadRefusalRepairBlocked {
+  evidence_digest?: string | null;
+  kind: "repair_blocked";
+  reason: string;
+}
+
+export interface WireMemberReloadRefusalUnknown {
+  kind: "unknown";
+}
+
+export type WireMemberReloadRefusal = WireMemberReloadRefusalRepairBlocked | WireMemberReloadRefusalUnknown;
 
 export type WireMobRuntimeMode = "autonomous_host" | "turn_driven";
 
