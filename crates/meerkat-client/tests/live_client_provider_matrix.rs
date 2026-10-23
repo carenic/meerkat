@@ -30,9 +30,9 @@ use meerkat_core::lifecycle::run_primitive::{
     ReasoningEffort,
 };
 use meerkat_core::model_profile::catalog::ImageGenerationModelRoute;
-use meerkat_core::{Message, StopReason, UserMessage};
+use meerkat_core::{AgentLlmClient, BlockAssistantMessage, Message, StopReason, UserMessage};
 use meerkat_gemini::{GeminiImageOutputOptions, GeminiImageTurnPlan};
-use meerkat_llm_core::{ImageGenerationExecutor, ProviderImageGenerationRequest};
+use meerkat_llm_core::{ImageGenerationExecutor, LlmClientAdapter, ProviderImageGenerationRequest};
 use meerkat_openai::{
     OpenAiImageOutputOptions, OpenAiImageProviderParams, OpenAiImagesApiEndpoint,
     OpenAiImagesApiPlan, OpenAiImagesApiRequestShape, OpenAiResponsesImagePlan,
@@ -40,6 +40,7 @@ use meerkat_openai::{
 use schemars::JsonSchema;
 use serde_json::{Map, Value};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -327,6 +328,92 @@ async fn e2e_smoke_provider_web_search_all_three() -> Result<(), Box<dyn std::er
     if ran == 0 {
         eprintln!("Skipping provider web search smoke: no provider API keys configured");
     }
+    Ok(())
+}
+
+/// The stateless two-step hosted-search loop on the OpenAI API (`store:
+/// false`, the default). The second step's request carries the first step's
+/// `web_search_call` with the sources it consulted and the answer's
+/// `url_citation` annotations, and the API accepts that request.
+#[tokio::test]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
+async fn e2e_openai_web_search_evidence_replays_into_the_next_step()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(api_key) = openai_api_key() else {
+        eprintln!(
+            "Skipping OpenAI web search evidence: missing OPENAI_API_KEY (or RKAT_OPENAI_API_KEY)"
+        );
+        return Ok(());
+    };
+    let web_search = ProviderTag::OpenAi(OpenAiProviderTag {
+        web_search: Some(OpaqueProviderBody::from_value(&serde_json::json!({
+            "type": "web_search"
+        }))),
+        ..Default::default()
+    });
+    let client = Arc::new(OpenAiClient::new(api_key));
+    let adapter = LlmClientAdapter::new(client.clone(), OPENAI_MODEL.to_string())
+        .with_provider_params(Some(web_search.clone()));
+    let question = Message::User(UserMessage::text(
+        "Use the web search tool for this answer. Search for the current title of https://example.com and answer in one short sentence that cites the page.".to_string(),
+    ));
+    let step = AgentLlmClient::stream_response(
+        &adapter,
+        std::slice::from_ref(&question),
+        &[],
+        2048,
+        None,
+        None,
+    )
+    .await?;
+    let history = vec![
+        question,
+        Message::BlockAssistant(BlockAssistantMessage::new(
+            step.blocks().to_vec(),
+            step.stop_reason(),
+        )),
+        Message::User(UserMessage::text(
+            "Which URL did you cite? Answer with the URL only.".to_string(),
+        )),
+    ];
+
+    // The second step's request, as the client lowers and sends it.
+    let request = LlmRequest::new(OPENAI_MODEL, client.project_replay_messages(&history)?)
+        .with_provider_params(web_search);
+    let body = client.build_request_body(&request)?;
+    let input = body["input"]
+        .as_array()
+        .ok_or("the request input is not an array")?;
+    assert!(
+        input.iter().any(|item| item["type"] == "web_search_call"
+            && item["action"]["sources"]
+                .as_array()
+                .is_some_and(|sources| !sources.is_empty())),
+        "step 2 must replay the search call with its sources: {body}"
+    );
+    assert!(
+        input.iter().any(|item| item["type"] == "message"
+            && item["content"][0]["annotations"]
+                .as_array()
+                .is_some_and(|annotations| annotations
+                    .iter()
+                    .any(|annotation| annotation["type"] == "url_citation"))),
+        "step 2 must replay the answer's url_citation annotations: {body}"
+    );
+
+    // The API accepts that request: no 4xx, a successful turn.
+    let mut stream = client.stream(&request);
+    let mut outcome = None;
+    while let Some(event) = stream.next().await {
+        if let LlmEvent::Done { outcome: done } = event? {
+            outcome = Some(done);
+            break;
+        }
+    }
+    assert!(
+        matches!(outcome, Some(LlmDoneOutcome::Success { .. })),
+        "the API must accept step 2: {outcome:?}"
+    );
     Ok(())
 }
 
