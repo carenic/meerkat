@@ -749,7 +749,7 @@ impl Bundle {
                     "mob scope {} changed outside its lock; memory may hold what the host never got",
                     guard.id()
                 );
-                self.realm.poison(&mut **guard, &cause);
+                self.realm.poison(guard, &cause);
                 return Err(SpiError::Misuse(cause));
             }
         }
@@ -1437,11 +1437,7 @@ impl Bundle {
         let mut guards = self.realm.lock_scopes(&self.all_scope_ids()).await;
         for guard in &mut guards {
             self.realm.check_scope(guard).map_err(read_error)?;
-            let mut body = self
-                .realm
-                .load_body(&mut **guard)
-                .await
-                .map_err(read_error)?;
+            let mut body = self.realm.load_body(guard).await.map_err(read_error)?;
             let pinned = self.realm.pinned_values(guard).await.map_err(read_error)?;
             body.extend(pinned);
             let tag = guard.id().family.tag;
