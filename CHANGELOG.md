@@ -1266,6 +1266,9 @@ them.
 
 ### Fixed
 
+- RPC callback tools accept typed content blocks from SDK handlers, which
+  released 0.9.3 and 0.9.4 rejected as non-string results. Mixed text and image
+  results are preserved alongside legacy text and tool error flags.
 - `meerkat-session`, `meerkat-mob`: a member retired while its turn sat
   between the turn's end-of-run checkpoint and its runtime boundary commit
   (the retirement's boundary cancel lands between the two) retires instead of
