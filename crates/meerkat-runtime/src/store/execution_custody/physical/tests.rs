@@ -86,6 +86,8 @@ fn sqlite_upgrade_unlock_failure_retains_physical_gate_until_last_claim() {
             raw_lifetime.try_lock().unwrap();
         }
         assert_admission_busy(&peer);
+        // Released, not only closed: the peer takes custody at once below.
+        let _ = raw_lifetime.unlock();
         drop(raw_lifetime);
 
         let claim = Arc::new(claim);
@@ -128,6 +130,7 @@ fn sqlite_upgrade_restoration_failure_blocks_admission_after_shared_lock_loss() 
     let raw_lifetime = open_lock_file(&owner.lifetime_path).unwrap();
     raw_lifetime.try_lock().unwrap();
     assert_admission_busy(&peer);
+    raw_lifetime.unlock().unwrap();
     drop(raw_lifetime);
 
     let claim = Arc::new(claim);

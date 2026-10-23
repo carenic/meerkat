@@ -478,6 +478,7 @@ mod tests {
         foreign.try_lock().expect("foreign exclusive lock");
         let err = OperationGuard::for_database(&db).expect_err("fence must block foreign ops");
         assert!(matches!(err, SqliteStoreError::MaintenanceFenceHeld { .. }));
+        foreign.unlock().expect("release the foreign fence");
         drop(foreign);
         OperationGuard::for_database(&db).expect("released after drop");
     }
@@ -507,6 +508,7 @@ mod tests {
         let err = OperationGuard::admit_missing_database(&db)
             .expect_err("a foreign fence covers the missing database");
         assert!(matches!(err, SqliteStoreError::MaintenanceFenceHeld { .. }));
+        foreign.unlock().expect("release the foreign fence");
         drop(foreign);
         OperationGuard::admit_missing_database(&db).expect("released after drop");
 
@@ -673,6 +675,7 @@ mod tests {
             .expect("open presence lock file");
         foreign.try_lock().expect("foreign exclusive presence lock");
         assert!(KeptConnectionPresence::acquire(&db).is_none());
+        foreign.unlock().expect("release the foreign presence lock");
         drop(foreign);
         KeptConnectionPresence::acquire(&db).expect("presence after release");
     }

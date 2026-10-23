@@ -3,10 +3,11 @@
 //! A process that a test of this binary spawns gets a copy of every
 //! descriptor the binary has open, and keeps it until it executes its
 //! program. A test that needs a descriptor of its own gone at a given moment
-//! (a lock it released and takes again, a program it wrote and now runs)
-//! therefore runs where no other test spawns anything: alone, in a child
-//! process of the binary, whatever runs the tests (nextest's process per
-//! test, or plain `cargo test`'s threads in one process).
+//! (a program it wrote and now runs) therefore runs where no other test
+//! spawns anything: alone, in a child process of the binary, whatever runs
+//! the tests (nextest's process per test, or plain `cargo test`'s threads in
+//! one process). A file lock needs no such isolation: its holders unlock it
+//! before they close it, and a copy keeps nothing unlocked.
 
 /// Set in the child process a test runs alone in.
 const ALONE_CHILD: &str = "MEERKAT_CORE_TEST_ALONE";
@@ -19,19 +20,6 @@ const ALONE_CHILD_DONE: &str = "meerkat-core test passed alone";
 pub(crate) fn alone_in_child_process(test: &str, body: impl FnOnce()) {
     if std::env::var_os(ALONE_CHILD).is_some() {
         body();
-        println!("\n{ALONE_CHILD_DONE}");
-        return;
-    }
-    run_in_child_process(test);
-}
-
-/// As [`alone_in_child_process`], for an async test's body.
-pub(crate) async fn alone_in_child_process_async(
-    test: &str,
-    body: impl std::future::Future<Output = ()>,
-) {
-    if std::env::var_os(ALONE_CHILD).is_some() {
-        body.await;
         println!("\n{ALONE_CHILD_DONE}");
         return;
     }
