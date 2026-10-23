@@ -551,9 +551,16 @@ async fn kill(chapter: &mut Chapter<'_>, mut writer: Writer) -> Result<Writer, C
 
 /// A superseded writer can neither keep the fence nor make a batch visible;
 /// an exclusive acquire waits out a live holder's lease and no longer.
+///
+/// The row's first renew is the current holder's, which may have sat idle
+/// past its lease during the rows before it. It must succeed: a store
+/// refuses only a superseded token or one it never issued. A holder that
+/// stopped re-acquires instead of resuming on a renew, and that rule is
+/// Core's, not the store's.
 async fn stale_fence(chapter: &mut Chapter<'_>, a: Writer) -> Result<Writer, ConformanceFailure> {
     const STEP: &str = "stale_fence";
     let steps = chapter.steps;
+    // The current holder renews, whether or not its lease lapsed meanwhile.
     steps.wrap(STEP, a.store.renew_fence(a.token).await)?;
     let f = scope_ref(&steps, STEP, ScopeKind::Session, "fence-f")?;
     let first_id = chapter.mint(STEP)?;
