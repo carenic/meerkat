@@ -61,9 +61,9 @@ use meerkat_mob::{
     MobDefinition, MobHandle, MobId, MobRuntimeMode, MobStorage, Profile, ProfileBinding,
     ProfileName, SpawnMemberSpec, ToolConfig,
 };
+use meerkat_runtime::terminal_status::InteractionSelector;
 use meerkat_runtime::{
-    AcceptOutcome, Input, InteractionSelector, LogicalRuntimeId, MeerkatMachine, PromptInput,
-    RuntimeStore,
+    AcceptOutcome, Input, LogicalRuntimeId, MeerkatMachine, PromptInput, RuntimeStore,
 };
 use meerkat_store_conformance::{
     BeforeResume, KillPoint, KilledRun, LongRunPlan, RestartReport, ResumeGate, ResumePointKind,

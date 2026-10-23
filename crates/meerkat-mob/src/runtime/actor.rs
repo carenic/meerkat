@@ -2492,7 +2492,7 @@ async fn terminal_kickoff_outcome(
     meerkat_runtime::completion::CompletionWaitError,
 > {
     use meerkat_runtime::completion::CompletionWaitError;
-    use meerkat_runtime::terminal_status::InputTerminalReceiptRead;
+    use meerkat_runtime::terminal_status::{InputTerminalReceiptRead, InteractionSelector};
 
     let refused = |detail: String| {
         Err(CompletionWaitError::AuthorityUnavailable(format!(
@@ -2500,10 +2500,7 @@ async fn terminal_kickoff_outcome(
         )))
     };
     match adapter
-        .input_terminal_receipt(
-            session_id,
-            meerkat_runtime::InteractionSelector::InputId(input_id.clone()),
-        )
+        .input_terminal_receipt(session_id, InteractionSelector::InputId(input_id.clone()))
         .await
     {
         Ok(Some(read)) => match read.report {
