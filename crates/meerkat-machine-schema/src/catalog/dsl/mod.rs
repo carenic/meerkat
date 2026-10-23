@@ -1575,6 +1575,7 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
                     "CommitCompletedRetainInputs",
                     "HoldIntact",
                     "ContinueRun",
+                    "OperatorRepairAndCommitInterrupted",
                 ],
             ),
             // Typed projections of the persisted machine-lifecycle row and
@@ -3354,6 +3355,9 @@ runtime_internal_inputs!(
         ReleaseResumableRun,
         SettleResumableRun,
         SuspendRunForStop,
+        // The operator's held-tail repair, driven by recovery's
+        // resolve-held-tail primitive on its own fresh authority.
+        AuthorizeOperatorDurableTailRepair,
     ]
 );
 

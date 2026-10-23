@@ -184,6 +184,10 @@ pub enum DurableTailRecoveryDisposition {
     /// run's inputs bound and resumes the run. Declared last so the earlier
     /// variants keep their positions.
     ContinueRun,
+    /// An operator attested a held (ambiguous) tail as an interrupted run
+    /// (`resolve-held-tail`): commit it as interrupted, keeping every durable
+    /// row and answering its open calls as outcome unknown. Declared last.
+    OperatorRepairAndCommitInterrupted,
 }
 
 impl RunId {
@@ -7171,6 +7175,20 @@ macro_rules! meerkat_catalog_machine_dsl {
             // returns to `lane`: a failed run's replayed contributor, or a
             // kept input of a resumable run that is released.
             ReplayAppliedRunContributor { input_id: String, run_id: RunId, lane: Enum<InputLane> },
+            // An operator's attestation that a held (ambiguous) durable tail
+            // is an interrupted run (`resolve-held-tail`), with the durable
+            // observations AuthorizeDurableTailRecovery carries.
+            AuthorizeOperatorDurableTailRepair {
+                session_id: SessionId,
+                candidate_id: String,
+                candidate_run_id: RunId,
+                class: Enum<DurableTailRecoveryClass>,
+                observed_lifecycle: Enum<DurableRecoveryObservedLifecycle>,
+                observed_current_run: Enum<DurableRecoveryObservedRun>,
+                last_committed_sequence: u64,
+                prior_commit: Enum<DurableRecoveryPriorCommit>,
+                input_evidence: Enum<DurableRecoveryInputEvidence>,
+            },
         }
 
         surface_only [
@@ -11077,6 +11095,104 @@ macro_rules! meerkat_catalog_machine_dsl {
         transition AuthorizeDurableTailRecoveryRefuseNonQuiescent {
             per_phase [Initializing, Attached, Running, Stopped, Destroyed]
             on input AuthorizeDurableTailRecovery {
+                session_id,
+                candidate_id,
+                candidate_run_id,
+                class,
+                observed_lifecycle,
+                observed_current_run,
+                last_committed_sequence,
+                prior_commit,
+                input_evidence
+            }
+            update {}
+            to Idle
+            emit DurableTailRecoveryAuthorized {
+                candidate_id: candidate_id,
+                disposition: DurableTailRecoveryDisposition::RefuseRecovery
+            }
+        }
+
+        // Operator resolution of a held tail (`resolve-held-tail`), on the
+        // drive's own fresh authority. Only an ambiguous candidate qualifies,
+        // and only under the admissible core of an ordinary commit: no live or
+        // terminalized run, a quiescent persisted lifecycle with no current
+        // run, no prior commit that covers or contradicts the candidate, and
+        // inputs durable identity can attribute. Everything else is refused.
+        // The commit keeps every durable row: no disposition discards a tail.
+        transition AuthorizeOperatorDurableTailRepair {
+            per_phase [Idle, Retired]
+            on input AuthorizeOperatorDurableTailRepair {
+                session_id,
+                candidate_id,
+                candidate_run_id,
+                class,
+                observed_lifecycle,
+                observed_current_run,
+                last_committed_sequence,
+                prior_commit,
+                input_evidence
+            }
+            guard "operator_repair_admissible" {
+                class == DurableTailRecoveryClass::Ambiguous
+                    && self.current_run_id == None
+                    && self.turn_terminal_run_id != Some(candidate_run_id)
+                    && (observed_lifecycle == DurableRecoveryObservedLifecycle::MissingRow
+                        || observed_lifecycle == DurableRecoveryObservedLifecycle::Idle
+                        || observed_lifecycle == DurableRecoveryObservedLifecycle::Retired)
+                    && observed_current_run == DurableRecoveryObservedRun::NoRun
+                    && (prior_commit == DurableRecoveryPriorCommit::NoPriorCommit
+                        || prior_commit == DurableRecoveryPriorCommit::PrecedesCandidate)
+                    && input_evidence == DurableRecoveryInputEvidence::AllBoundOrInert
+            }
+            update {
+                self.recovered_boundary_sequence = last_committed_sequence + 1;
+                self.turn_terminal_run_id = Some(candidate_run_id);
+            }
+            to Idle
+            emit DurableTailRecoveryCommitAuthorized {
+                candidate_id: candidate_id,
+                disposition: DurableTailRecoveryDisposition::OperatorRepairAndCommitInterrupted,
+                boundary_sequence: self.recovered_boundary_sequence
+            }
+        }
+
+        transition AuthorizeOperatorDurableTailRepairRefuse {
+            per_phase [Idle, Retired]
+            on input AuthorizeOperatorDurableTailRepair {
+                session_id,
+                candidate_id,
+                candidate_run_id,
+                class,
+                observed_lifecycle,
+                observed_current_run,
+                last_committed_sequence,
+                prior_commit,
+                input_evidence
+            }
+            guard "operator_repair_not_admissible" {
+                !(class == DurableTailRecoveryClass::Ambiguous
+                    && self.current_run_id == None
+                    && self.turn_terminal_run_id != Some(candidate_run_id)
+                    && (observed_lifecycle == DurableRecoveryObservedLifecycle::MissingRow
+                        || observed_lifecycle == DurableRecoveryObservedLifecycle::Idle
+                        || observed_lifecycle == DurableRecoveryObservedLifecycle::Retired)
+                    && observed_current_run == DurableRecoveryObservedRun::NoRun
+                    && (prior_commit == DurableRecoveryPriorCommit::NoPriorCommit
+                        || prior_commit == DurableRecoveryPriorCommit::PrecedesCandidate)
+                    && input_evidence == DurableRecoveryInputEvidence::AllBoundOrInert)
+            }
+            update {}
+            to Idle
+            emit DurableTailRecoveryAuthorized {
+                candidate_id: candidate_id,
+                disposition: DurableTailRecoveryDisposition::RefuseRecovery
+            }
+        }
+
+        transition AuthorizeOperatorDurableTailRepairRefuseNonQuiescent {
+            per_phase [Initializing, Attached, Running, Stopped, Destroyed]
+            on input AuthorizeOperatorDurableTailRepair {
                 session_id,
                 candidate_id,
                 candidate_run_id,
@@ -39054,8 +39170,8 @@ macro_rules! meerkat_catalog_machine_dsl {
         }
 
         // A graceful requeue stop keeps the inputs of a run marked resumable:
-        // a run left open by a restart and not resumed yet (A15), or the
-        // in-flight run the stop just suspended (A28). They keep their Staged
+        // a run left open by a restart and not resumed yet, or the
+        // in-flight run the stop just suspended. They keep their Staged
         // or Applied phase and their run, and the stored cursor marks the run
         // again at the next registration.
         transition ClassifyStopInputDispositionRetainResumable {

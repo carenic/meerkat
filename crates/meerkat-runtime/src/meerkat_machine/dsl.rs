@@ -120,8 +120,12 @@ pub enum DurableTailRecoveryDisposition {
     CommitCompletedRetainInputs,
     HoldIntact,
     /// Continue the open run from its last committed round; nothing is
-    /// written. Declared last, as in the catalog.
+    /// written. Declared after the earlier variants, as in the catalog.
     ContinueRun,
+    /// An operator attested a held tail as an interrupted run
+    /// (`resolve-held-tail`); it commits as interrupted, every row kept.
+    /// Declared last, as in the catalog.
+    OperatorRepairAndCommitInterrupted,
 }
 
 /// Typed projection of the PERSISTED machine-lifecycle row observed at

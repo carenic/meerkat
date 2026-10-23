@@ -8718,8 +8718,7 @@ mod tests {
         assert!(!flags.request_immediate_processing);
     }
 
-    // Resumable-run primitives (A15, A18). Unrun until the candidate's
-    // validation: the policy forbids Cargo while the batch is implemented.
+    // Resumable-run primitives.
 
     #[test]
     fn settle_refuses_a_reason_that_needs_a_receipt() {

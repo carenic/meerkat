@@ -919,7 +919,6 @@ meerkat_machine_runtime_internal_inputs!(
         ResolveUnstageableQueuedInput,
         RetryRequested,
         RollbackStaged,
-        ReplayAppliedRunContributor,
         StageForRun,
         StartConversationRun,
         StartImmediateAppend,
@@ -1306,6 +1305,15 @@ meerkat_machine_runtime_internal_inputs!(
         ReleaseResumableRun,
         SettleResumableRun,
         SuspendRunForStop,
+    ],
+    // A replayed failure's, or a released resumable run's, applied
+    // contributor returns to its lane.
+    InputQueueLifecycle => [
+        ReplayAppliedRunContributor,
+    ],
+    // The operator's held-tail repair (resolve-held-tail).
+    FailureRecoveryLifecycle => [
+        AuthorizeOperatorDurableTailRepair,
     ],
 );
 

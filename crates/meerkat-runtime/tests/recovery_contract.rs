@@ -1677,7 +1677,7 @@ async fn whole_blob_closing_rebase_after_a_final_compaction_recovers_as_interrup
 
 /// A run settled without resuming repairs its own tail through the
 /// run-guarded drive, as crash recovery would; a guard naming another run
-/// leaves the tail untouched. Unrun.
+/// leaves the tail untouched.
 #[tokio::test]
 async fn run_guarded_recovery_repairs_only_the_named_runs_tail() {
     use meerkat_core::lifecycle::core_executor::BoundSessionCommit;
@@ -1777,6 +1777,407 @@ async fn run_guarded_recovery_repairs_only_the_named_runs_tail() {
             .unwrap()
             .is_none(),
         "the repair consumes the named run's tail"
+    );
+}
+
+/// An operator resolves a tail recovery holds as ambiguous (a call the
+/// transcript shows without its result): the dry run writes nothing, and the
+/// repair keeps every row, answers the call as outcome unknown, appends a
+/// notice naming the verb and the candidate, and clears the tail.
+#[tokio::test]
+async fn operator_resolves_a_held_tail_through_the_store_traits() {
+    use meerkat_core::lifecycle::core_executor::BoundSessionCommit;
+    use meerkat_core::types::{
+        AssistantBlock, BlockAssistantMessage, Message, StopReason, TranscriptMessageIdentity,
+        UserMessage,
+    };
+    use meerkat_runtime::recovery::{
+        DurableTailRecoveryOutcome, HeldTailRepairVerdict, HeldTailResolution,
+        recover_durable_tail, resolve_held_durable_tail,
+    };
+    use meerkat_runtime::store::{PreparedRuntimeSessionCommit, PreparedWholeBlobProvisionalTail};
+
+    let store = InMemoryRuntimeStore::new();
+    let run_id = RunId::new();
+    let mut committed = meerkat_core::Session::new();
+    committed.push(Message::User(UserMessage::text("invoke a tool")));
+    let session_id = committed.id().clone();
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    let committed_authority = store
+        .commit_prepared_session_boundary(
+            &runtime_id,
+            PreparedRuntimeSessionCommit::snapshot_only(
+                BoundSessionCommit::sealed(Arc::new(committed.clone())).unwrap(),
+            ),
+        )
+        .await
+        .unwrap()
+        .authority()
+        .and_then(|authority| authority.whole_blob())
+        .cloned()
+        .expect("initial boundary returns WholeBlob store authority");
+
+    let mut held = committed;
+    held.push(Message::BlockAssistant(BlockAssistantMessage {
+        blocks: vec![AssistantBlock::ToolUse {
+            id: "held-call".to_string(),
+            name: "durable_tool".to_string(),
+            args: serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
+            meta: None,
+        }],
+        stop_reason: Some(StopReason::ToolUse),
+        identity: TranscriptMessageIdentity::default().with_run_id(run_id.clone()),
+        created_at: meerkat_core::types::message_timestamp_now(),
+        assistant_message_id: None,
+    }));
+    let held_message_count = held.messages().len();
+    let candidate = BoundSessionCommit::sealed(Arc::new(held)).unwrap();
+    store
+        .write_prepared_whole_blob_provisional_tail(
+            &runtime_id,
+            PreparedWholeBlobProvisionalTail::prepare(
+                committed_authority,
+                run_id.clone(),
+                1,
+                &candidate,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(
+            recover_durable_tail(&store, &session_id).await.unwrap(),
+            DurableTailRecoveryOutcome::Held
+        ),
+        "ordinary recovery holds a tail with a dangling call"
+    );
+
+    let HeldTailResolution::Ambiguous(plan) = resolve_held_durable_tail(&store, &session_id, false)
+        .await
+        .expect("the dry run reads the held tail")
+    else {
+        panic!("a dangling-call tail is held as ambiguous");
+    };
+    assert_eq!(plan.verdict, HeldTailRepairVerdict::WouldRepair);
+    assert_eq!(plan.run_id, run_id);
+    assert_eq!(plan.closed_calls, vec!["held-call".to_string()]);
+    assert_eq!(plan.facts.dangling_calls, vec!["held-call".to_string()]);
+    assert_eq!(plan.messages_before, held_message_count);
+    assert_eq!(plan.messages_after, held_message_count + 2);
+    assert!(plan.runtime_quiescent);
+    assert!(
+        store
+            .load_whole_blob_provisional_tail(&runtime_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "the dry run writes nothing"
+    );
+
+    let HeldTailResolution::Ambiguous(applied) =
+        resolve_held_durable_tail(&store, &session_id, true)
+            .await
+            .expect("the repair applies")
+    else {
+        panic!("the held tail is still ambiguous when applied");
+    };
+    assert_eq!(applied.candidate_id, plan.candidate_id);
+    assert_eq!(
+        applied.verdict,
+        HeldTailRepairVerdict::Repaired {
+            boundary_sequence: 1
+        }
+    );
+    assert!(
+        store
+            .load_whole_blob_provisional_tail(&runtime_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "the repair consumes the held tail"
+    );
+    let stored = store
+        .load_session_snapshot(&runtime_id)
+        .await
+        .unwrap()
+        .expect("the repaired body is committed");
+    let stored = meerkat_core::Session::from_persisted_bytes(stored.as_slice()).unwrap();
+    let messages = stored.messages();
+    assert_eq!(messages.len(), held_message_count + 2);
+    let Message::ToolResults { results, .. } = &messages[held_message_count] else {
+        panic!("the dangling call's result follows its call");
+    };
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].tool_use_id, "held-call");
+    assert!(results[0].is_error);
+    assert!(results[0].text_content().contains("outcome_uncertain"));
+    let Message::SystemNotice(notice) = &messages[held_message_count + 1] else {
+        panic!("the operator's notice ends the repaired document");
+    };
+    let body = notice.body.as_deref().unwrap_or_default();
+    assert!(body.contains("resolve-held-tail"));
+    assert!(body.contains(&plan.candidate_id));
+
+    assert!(matches!(
+        recover_durable_tail(&store, &session_id).await.unwrap(),
+        DurableTailRecoveryOutcome::AlreadyAligned { .. }
+    ));
+    assert_eq!(
+        resolve_held_durable_tail(&store, &session_id, false)
+            .await
+            .unwrap(),
+        HeldTailResolution::NoTail
+    );
+}
+
+/// A tail recovery does not hold (an interrupted run that ordinary recovery
+/// repairs) is not the operator's: nothing is written.
+#[tokio::test]
+async fn operator_leaves_a_tail_that_is_not_held() {
+    use meerkat_core::lifecycle::core_executor::BoundSessionCommit;
+    use meerkat_core::types::{
+        AssistantBlock, BlockAssistantMessage, Message, StopReason, ToolResult,
+        TranscriptMessageIdentity, UserMessage,
+    };
+    use meerkat_runtime::recovery::{
+        DurableTailRecoveryClass, HeldTailResolution, resolve_held_durable_tail,
+    };
+    use meerkat_runtime::store::{PreparedRuntimeSessionCommit, PreparedWholeBlobProvisionalTail};
+
+    let store = InMemoryRuntimeStore::new();
+    let run_id = RunId::new();
+    let mut committed = meerkat_core::Session::new();
+    committed.push(Message::User(UserMessage::text("invoke a tool")));
+    let session_id = committed.id().clone();
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    let committed_authority = store
+        .commit_prepared_session_boundary(
+            &runtime_id,
+            PreparedRuntimeSessionCommit::snapshot_only(
+                BoundSessionCommit::sealed(Arc::new(committed.clone())).unwrap(),
+            ),
+        )
+        .await
+        .unwrap()
+        .authority()
+        .and_then(|authority| authority.whole_blob())
+        .cloned()
+        .expect("initial boundary returns WholeBlob store authority");
+    let mut interrupted = committed;
+    interrupted.push(Message::BlockAssistant(BlockAssistantMessage {
+        blocks: vec![AssistantBlock::ToolUse {
+            id: "answered-call".to_string(),
+            name: "durable_tool".to_string(),
+            args: serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
+            meta: None,
+        }],
+        stop_reason: Some(StopReason::ToolUse),
+        identity: TranscriptMessageIdentity::default().with_run_id(run_id.clone()),
+        created_at: meerkat_core::types::message_timestamp_now(),
+        assistant_message_id: None,
+    }));
+    interrupted.push(Message::tool_results(vec![ToolResult::new(
+        "answered-call".to_string(),
+        "durable result".to_string(),
+        false,
+    )]));
+    let candidate = BoundSessionCommit::sealed(Arc::new(interrupted)).unwrap();
+    store
+        .write_prepared_whole_blob_provisional_tail(
+            &runtime_id,
+            PreparedWholeBlobProvisionalTail::prepare(committed_authority, run_id, 1, &candidate)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resolve_held_durable_tail(&store, &session_id, true)
+            .await
+            .unwrap(),
+        HeldTailResolution::NotHeld {
+            class: DurableTailRecoveryClass::InterruptedRepairableCandidate
+        }
+    );
+    assert!(
+        store
+            .load_whole_blob_provisional_tail(&runtime_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "a tail that is not held is left to ordinary recovery"
+    );
+}
+
+/// An interrupted tail next to an unbound content input row is held by
+/// ordinary recovery for its input evidence. The operator verb reports that
+/// hold and writes nothing; it does not answer that ordinary recovery
+/// resolves it.
+#[tokio::test]
+async fn operator_reports_a_tail_ordinary_recovery_holds_for_its_inputs() {
+    use meerkat_core::lifecycle::core_executor::BoundSessionCommit;
+    use meerkat_core::types::{
+        AssistantBlock, BlockAssistantMessage, Message, StopReason, ToolResult,
+        TranscriptMessageIdentity, UserMessage,
+    };
+    use meerkat_runtime::recovery::{
+        DurableTailRecoveryOutcome, HeldTailResolution, recover_durable_tail,
+        resolve_held_durable_tail,
+    };
+    use meerkat_runtime::store::{PreparedRuntimeSessionCommit, PreparedWholeBlobProvisionalTail};
+
+    let store = InMemoryRuntimeStore::new();
+    let run_id = RunId::new();
+    let mut committed = meerkat_core::Session::new();
+    committed.push(Message::User(UserMessage::text("invoke a tool")));
+    let session_id = committed.id().clone();
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    let committed_authority = store
+        .commit_prepared_session_boundary(
+            &runtime_id,
+            PreparedRuntimeSessionCommit::snapshot_only(
+                BoundSessionCommit::sealed(Arc::new(committed.clone())).unwrap(),
+            ),
+        )
+        .await
+        .unwrap()
+        .authority()
+        .and_then(|authority| authority.whole_blob())
+        .cloned()
+        .expect("initial boundary returns WholeBlob store authority");
+    let mut interrupted = committed;
+    interrupted.push(Message::BlockAssistant(BlockAssistantMessage {
+        blocks: vec![AssistantBlock::ToolUse {
+            id: "answered-call".to_string(),
+            name: "durable_tool".to_string(),
+            args: serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
+            meta: None,
+        }],
+        stop_reason: Some(StopReason::ToolUse),
+        identity: TranscriptMessageIdentity::default().with_run_id(run_id.clone()),
+        created_at: meerkat_core::types::message_timestamp_now(),
+        assistant_message_id: None,
+    }));
+    interrupted.push(Message::tool_results(vec![ToolResult::new(
+        "answered-call".to_string(),
+        "durable result".to_string(),
+        false,
+    )]));
+    let candidate = BoundSessionCommit::sealed(Arc::new(interrupted)).unwrap();
+    store
+        .write_prepared_whole_blob_provisional_tail(
+            &runtime_id,
+            PreparedWholeBlobProvisionalTail::prepare(committed_authority, run_id, 1, &candidate)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let unbound = make_prompt("a queued prompt no run is bound to");
+    store
+        .persist_input_state(&runtime_id, &persistable(accepted_unbound_state(&unbound)))
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(
+            recover_durable_tail(&store, &session_id).await.unwrap(),
+            DurableTailRecoveryOutcome::Held
+        ),
+        "ordinary recovery holds an interrupted tail beside an unbound content row"
+    );
+    let HeldTailResolution::HeldOtherwise { reason } =
+        resolve_held_durable_tail(&store, &session_id, true)
+            .await
+            .expect("the operator reads the held tail")
+    else {
+        panic!("a tail ordinary recovery holds for its inputs is held otherwise");
+    };
+    assert!(reason.contains("input rows"));
+    assert!(
+        store
+            .load_whole_blob_provisional_tail(&runtime_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "nothing is written"
+    );
+}
+
+/// Evidence that cannot be verified (a tail whose assistant row names
+/// another run than its store-issued provisional run) is an error to the
+/// operator verb, and nothing is written: quarantined evidence has no
+/// operator path.
+#[tokio::test]
+async fn operator_refuses_a_quarantined_tail() {
+    use meerkat_core::lifecycle::core_executor::BoundSessionCommit;
+    use meerkat_core::types::{
+        AssistantBlock, BlockAssistantMessage, Message, StopReason, TranscriptMessageIdentity,
+        UserMessage,
+    };
+    use meerkat_runtime::recovery::resolve_held_durable_tail;
+    use meerkat_runtime::store::{PreparedRuntimeSessionCommit, PreparedWholeBlobProvisionalTail};
+
+    let store = InMemoryRuntimeStore::new();
+    let mut committed = meerkat_core::Session::new();
+    committed.push(Message::User(UserMessage::text("invoke a tool")));
+    let session_id = committed.id().clone();
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    let committed_authority = store
+        .commit_prepared_session_boundary(
+            &runtime_id,
+            PreparedRuntimeSessionCommit::snapshot_only(
+                BoundSessionCommit::sealed(Arc::new(committed.clone())).unwrap(),
+            ),
+        )
+        .await
+        .unwrap()
+        .authority()
+        .and_then(|authority| authority.whole_blob())
+        .cloned()
+        .expect("initial boundary returns WholeBlob store authority");
+    let mut forked = committed;
+    forked.push(Message::BlockAssistant(BlockAssistantMessage {
+        blocks: vec![AssistantBlock::ToolUse {
+            id: "forked-call".to_string(),
+            name: "durable_tool".to_string(),
+            args: serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
+            meta: None,
+        }],
+        stop_reason: Some(StopReason::ToolUse),
+        identity: TranscriptMessageIdentity::default().with_run_id(RunId::new()),
+        created_at: meerkat_core::types::message_timestamp_now(),
+        assistant_message_id: None,
+    }));
+    let candidate = BoundSessionCommit::sealed(Arc::new(forked)).unwrap();
+    store
+        .write_prepared_whole_blob_provisional_tail(
+            &runtime_id,
+            PreparedWholeBlobProvisionalTail::prepare(
+                committed_authority,
+                RunId::new(),
+                1,
+                &candidate,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        resolve_held_durable_tail(&store, &session_id, true)
+            .await
+            .is_err(),
+        "unverifiable evidence is an error, never a repair"
+    );
+    assert!(
+        store
+            .load_whole_blob_provisional_tail(&runtime_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "nothing is written"
     );
 }
 

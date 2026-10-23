@@ -3043,6 +3043,9 @@ fn recovery_disposition_name(
         // Never committed: continuing a run writes nothing, so no committed
         // recovery names it and `recovery_disposition_from_name` refuses it.
         DurableTailRecoveryDisposition::ContinueRun => "continue_run",
+        DurableTailRecoveryDisposition::OperatorRepairAndCommitInterrupted => {
+            "operator_repair_and_commit_interrupted"
+        }
     }
 }
 
@@ -3061,10 +3064,39 @@ fn recovery_disposition_from_name(
             Ok(DurableTailRecoveryDisposition::CommitCompletedRetainInputs)
         }
         "hold_intact" => Ok(DurableTailRecoveryDisposition::HoldIntact),
+        "operator_repair_and_commit_interrupted" => {
+            Ok(DurableTailRecoveryDisposition::OperatorRepairAndCommitInterrupted)
+        }
         other => Err(RuntimeStoreError::ReadFailed(format!(
             "unknown committed recovery disposition '{other}'"
         ))),
     }
+}
+
+/// Whether a committed recovery of `class` may realize `disposition`, as the
+/// generated authorization arms pair them. A retired runtime repairs a
+/// continuable candidate as interrupted, and an operator repairs an ambiguous
+/// one; nothing else commits those classes.
+fn recovery_class_realizes_disposition(
+    class: crate::meerkat_machine::dsl::DurableTailRecoveryClass,
+    disposition: crate::meerkat_machine::dsl::DurableTailRecoveryDisposition,
+) -> bool {
+    use crate::meerkat_machine::dsl::{DurableTailRecoveryClass, DurableTailRecoveryDisposition};
+    matches!(
+        (class, disposition),
+        (
+            DurableTailRecoveryClass::CompletedCandidate,
+            DurableTailRecoveryDisposition::CommitCompleted
+                | DurableTailRecoveryDisposition::CommitCompletedRetainInputs
+        ) | (
+            DurableTailRecoveryClass::InterruptedRepairableCandidate
+                | DurableTailRecoveryClass::ContinuableCandidate,
+            DurableTailRecoveryDisposition::RepairAndCommitInterrupted
+        ) | (
+            DurableTailRecoveryClass::Ambiguous,
+            DurableTailRecoveryDisposition::OperatorRepairAndCommitInterrupted
+        )
+    )
 }
 
 fn recovery_hash_part(hasher: &mut Sha256, label: &str, bytes: &[u8]) {
@@ -3643,17 +3675,7 @@ impl PreparedRecoveryEvidence {
                     .to_string(),
             ));
         }
-        let valid_disposition = matches!(
-            (class, disposition),
-            (
-                crate::meerkat_machine::dsl::DurableTailRecoveryClass::CompletedCandidate,
-                crate::meerkat_machine::dsl::DurableTailRecoveryDisposition::CommitCompleted
-                    | crate::meerkat_machine::dsl::DurableTailRecoveryDisposition::CommitCompletedRetainInputs
-            ) | (
-                crate::meerkat_machine::dsl::DurableTailRecoveryClass::InterruptedRepairableCandidate,
-                crate::meerkat_machine::dsl::DurableTailRecoveryDisposition::RepairAndCommitInterrupted
-            )
-        );
+        let valid_disposition = recovery_class_realizes_disposition(class, disposition);
         if !valid_disposition {
             return Err(conflict(format!(
                 "recovery class {} cannot realize disposition {}",
@@ -3845,17 +3867,7 @@ impl PreparedRecoveryEvidence {
                 recovered.id()
             )));
         }
-        let valid_disposition = matches!(
-            (class, disposition),
-            (
-                crate::meerkat_machine::dsl::DurableTailRecoveryClass::CompletedCandidate,
-                crate::meerkat_machine::dsl::DurableTailRecoveryDisposition::CommitCompleted
-                    | crate::meerkat_machine::dsl::DurableTailRecoveryDisposition::CommitCompletedRetainInputs
-            ) | (
-                crate::meerkat_machine::dsl::DurableTailRecoveryClass::InterruptedRepairableCandidate,
-                crate::meerkat_machine::dsl::DurableTailRecoveryDisposition::RepairAndCommitInterrupted
-            )
-        );
+        let valid_disposition = recovery_class_realizes_disposition(class, disposition);
         if !valid_disposition {
             return Err(conflict(format!(
                 "recovery class {} cannot realize disposition {}",
@@ -3863,8 +3875,11 @@ impl PreparedRecoveryEvidence {
                 recovery_disposition_name(disposition)
             )));
         }
-        match class {
-            crate::meerkat_machine::dsl::DurableTailRecoveryClass::CompletedCandidate => {
+        // The pairing above admits exactly the committing dispositions; each
+        // either promotes the exact candidate or installs a repaired artifact.
+        match disposition {
+            crate::meerkat_machine::dsl::DurableTailRecoveryDisposition::CommitCompleted
+            | crate::meerkat_machine::dsl::DurableTailRecoveryDisposition::CommitCompletedRetainInputs => {
                 if recovered_blob_sha256 != provisional_candidate_blob_sha256
                     || repaired_document.is_some()
                 {
@@ -3874,7 +3889,8 @@ impl PreparedRecoveryEvidence {
                     ));
                 }
             }
-            crate::meerkat_machine::dsl::DurableTailRecoveryClass::InterruptedRepairableCandidate => {
+            crate::meerkat_machine::dsl::DurableTailRecoveryDisposition::RepairAndCommitInterrupted
+            | crate::meerkat_machine::dsl::DurableTailRecoveryDisposition::OperatorRepairAndCommitInterrupted => {
                 if recovered_blob_sha256 == provisional_candidate_blob_sha256 {
                     return Err(conflict(
                         "interrupted WholeBlob recovery must install a distinct repaired artifact"
@@ -3905,10 +3921,13 @@ impl PreparedRecoveryEvidence {
                     ));
                 }
             }
-            crate::meerkat_machine::dsl::DurableTailRecoveryClass::Ambiguous => {
-                return Err(conflict(
-                    "ambiguous WholeBlob recovery cannot be sealed".to_string(),
-                ));
+            crate::meerkat_machine::dsl::DurableTailRecoveryDisposition::RefuseRecovery
+            | crate::meerkat_machine::dsl::DurableTailRecoveryDisposition::HoldIntact
+            | crate::meerkat_machine::dsl::DurableTailRecoveryDisposition::ContinueRun => {
+                return Err(conflict(format!(
+                    "WholeBlob recovery cannot seal the non-committing disposition {}",
+                    recovery_disposition_name(disposition)
+                )));
             }
         }
         if receipt.run_id != candidate_run_id || receipt.message_count != recovered.messages().len()
@@ -12420,5 +12439,119 @@ mod committing_whole_blob_session_tests {
             .is_none(),
             "untyped compatibility bytes carry no typed session"
         );
+    }
+}
+
+#[cfg(test)]
+mod recovery_disposition_pairing_tests {
+    use std::collections::BTreeSet;
+
+    use super::recovery_class_realizes_disposition;
+    use crate::meerkat_machine::dsl as mm_dsl;
+
+    /// The store admits exactly the (class, disposition) commit pairs the
+    /// generated authorization arms emit, ordinary and operator: a pair the
+    /// machine authorizes is never refused at the seal, and the seal admits
+    /// nothing the machine never authorizes.
+    #[test]
+    fn store_pairing_matches_the_generated_commit_arms() {
+        use mm_dsl::{
+            DurableRecoveryInputEvidence as Evidence,
+            DurableRecoveryObservedLifecycle as Lifecycle, DurableRecoveryPriorCommit as Prior,
+            DurableTailRecoveryClass as Class, DurableTailRecoveryDisposition as Disposition,
+        };
+        let classes = [
+            Class::CompletedCandidate,
+            Class::InterruptedRepairableCandidate,
+            Class::Ambiguous,
+            Class::ContinuableCandidate,
+        ];
+        let mut emitted = BTreeSet::new();
+        for class in classes {
+            for lifecycle in [Lifecycle::MissingRow, Lifecycle::Idle, Lifecycle::Retired] {
+                for prior in [Prior::NoPriorCommit, Prior::PrecedesCandidate] {
+                    for evidence in [Evidence::AllBoundOrInert, Evidence::UnboundContentInput] {
+                        for operator in [false, true] {
+                            let mut authority =
+                                mm_dsl::MeerkatMachineAuthority::recover_from_state(
+                                    mm_dsl::MeerkatMachineState {
+                                        lifecycle_phase: mm_dsl::MeerkatPhase::Idle,
+                                        session_id: Some(mm_dsl::SessionId(
+                                            "session-pairing".to_string(),
+                                        )),
+                                        ..Default::default()
+                                    },
+                                )
+                                .expect("an idle quiescent state must be recoverable");
+                            let session_id = mm_dsl::SessionId("session-pairing".to_string());
+                            let candidate_id = "candidate-pairing".to_string();
+                            let candidate_run_id = mm_dsl::RunId("run-pairing".to_string());
+                            let input = if operator {
+                                mm_dsl::MeerkatMachineInput::AuthorizeOperatorDurableTailRepair {
+                                    session_id,
+                                    candidate_id,
+                                    candidate_run_id,
+                                    class,
+                                    observed_lifecycle: lifecycle,
+                                    observed_current_run: mm_dsl::DurableRecoveryObservedRun::NoRun,
+                                    last_committed_sequence: 0,
+                                    prior_commit: prior,
+                                    input_evidence: evidence,
+                                }
+                            } else {
+                                mm_dsl::MeerkatMachineInput::AuthorizeDurableTailRecovery {
+                                    session_id,
+                                    candidate_id,
+                                    candidate_run_id,
+                                    class,
+                                    observed_lifecycle: lifecycle,
+                                    observed_current_run: mm_dsl::DurableRecoveryObservedRun::NoRun,
+                                    last_committed_sequence: 0,
+                                    prior_commit: prior,
+                                    input_evidence: evidence,
+                                }
+                            };
+                            let transition =
+                                mm_dsl::MeerkatMachineMutator::apply(&mut authority, input)
+                                    .expect("recovery authorization is total over its phases");
+                            for effect in transition.into_effects() {
+                                if let mm_dsl::MeerkatMachineEffect::DurableTailRecoveryCommitAuthorized {
+                                    disposition,
+                                    ..
+                                } = effect
+                                {
+                                    emitted.insert((class, disposition));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (class, disposition) in &emitted {
+            assert!(
+                recovery_class_realizes_disposition(*class, *disposition),
+                "the machine authorizes {class:?} with {disposition:?}, so the seal must admit it"
+            );
+        }
+        let dispositions = [
+            Disposition::RefuseRecovery,
+            Disposition::CommitCompleted,
+            Disposition::RepairAndCommitInterrupted,
+            Disposition::CommitCompletedRetainInputs,
+            Disposition::HoldIntact,
+            Disposition::ContinueRun,
+            Disposition::OperatorRepairAndCommitInterrupted,
+        ];
+        for class in classes {
+            for disposition in dispositions {
+                if recovery_class_realizes_disposition(class, disposition) {
+                    assert!(
+                        emitted.contains(&(class, disposition)),
+                        "the seal admits {class:?} with {disposition:?}, which no arm authorizes"
+                    );
+                }
+            }
+        }
     }
 }

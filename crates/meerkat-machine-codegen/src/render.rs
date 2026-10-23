@@ -470,6 +470,15 @@ const MEERKAT_TRANSITION_ENUM_LATE_TAIL: &[&str] = &[
     "ClassifyStopInputDispositionRetainResumableRunning",
     "ClassifyStopInputDispositionRetainResumableRetired",
     "ClassifyStopInputDispositionRetainResumableStopped",
+    "AuthorizeOperatorDurableTailRepairIdle",
+    "AuthorizeOperatorDurableTailRepairRetired",
+    "AuthorizeOperatorDurableTailRepairRefuseIdle",
+    "AuthorizeOperatorDurableTailRepairRefuseRetired",
+    "AuthorizeOperatorDurableTailRepairRefuseNonQuiescentInitializing",
+    "AuthorizeOperatorDurableTailRepairRefuseNonQuiescentAttached",
+    "AuthorizeOperatorDurableTailRepairRefuseNonQuiescentRunning",
+    "AuthorizeOperatorDurableTailRepairRefuseNonQuiescentStopped",
+    "AuthorizeOperatorDurableTailRepairRefuseNonQuiescentDestroyed",
 ];
 
 #[cfg(not(test))]

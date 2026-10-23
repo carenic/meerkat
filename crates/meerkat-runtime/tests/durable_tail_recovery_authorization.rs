@@ -30,6 +30,11 @@
 //!   candidate): `RefuseRecovery`;
 //! - every non-quiescent phase: `RefuseRecovery`.
 //!
+//! The operator's attestation (`AuthorizeOperatorDurableTailRepair`, driven
+//! by `resolve-held-tail`) repairs only an Ambiguous candidate, inside the
+//! same admissible core, as `OperatorRepairAndCommitInterrupted`, and refuses
+//! everything else.
+//!
 //! No disposition discards the tail; refusal and hold both retain it intact.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
@@ -821,6 +826,7 @@ fn no_disposition_value_discards_the_durable_tail() {
         mm_dsl::DurableTailRecoveryDisposition::CommitCompletedRetainInputs,
         mm_dsl::DurableTailRecoveryDisposition::HoldIntact,
         mm_dsl::DurableTailRecoveryDisposition::ContinueRun,
+        mm_dsl::DurableTailRecoveryDisposition::OperatorRepairAndCommitInterrupted,
     ];
     for disposition in all {
         let retains_every_durable_message = match disposition {
@@ -840,6 +846,9 @@ fn no_disposition_value_discards_the_durable_tail() {
             // Nothing is written: the tail IS the open run, which continues
             // from its last committed round.
             mm_dsl::DurableTailRecoveryDisposition::ContinueRun => true,
+            // The operator's repair keeps every durable row and appends
+            // outcome-unknown results and its notice; it never removes one.
+            mm_dsl::DurableTailRecoveryDisposition::OperatorRepairAndCommitInterrupted => true,
         };
         assert!(
             retains_every_durable_message,
@@ -848,8 +857,7 @@ fn no_disposition_value_discards_the_durable_tail() {
     }
 }
 
-// Same-run resume after a restart (A13, A15). Unrun until the candidate's
-// validation: the policy forbids Cargo while the batch is implemented.
+// Same-run resume after a restart.
 
 /// A durable session's open run at a committed round continues from an Idle
 /// authority: the verdict writes nothing, mints no sequence, and leaves the
@@ -1017,7 +1025,7 @@ fn marked_run_resumes_exclusively_through_prepare_then_resume_run() {
 /// A graceful requeue stop suspends a durable session's in-flight run: the
 /// run stops being current, the pre-run phase returns, and the run is marked
 /// resumable, with no turn terminal. A run whose turn terminal is already
-/// published is never suspended. Unrun.
+/// published is never suspended.
 #[test]
 fn requeue_stop_suspends_a_durable_in_flight_run() {
     let run = mm_dsl::RunId("run-in-flight".to_string());
@@ -1079,4 +1087,245 @@ fn requeue_stop_suspends_a_durable_in_flight_run() {
     assert_eq!(durable.state().current_run_id, None);
     assert_eq!(durable.state().resumable_run_id, Some(run));
     assert_eq!(durable.state().turn_terminal_run_id, None);
+}
+
+/// The operator's attestation (`resolve-held-tail`), driven as the operator
+/// primitive drives it.
+#[allow(clippy::too_many_arguments)]
+fn authorize_operator(
+    authority: &mut mm_dsl::MeerkatMachineAuthority,
+    class: mm_dsl::DurableTailRecoveryClass,
+    observed_lifecycle: mm_dsl::DurableRecoveryObservedLifecycle,
+    observed_current_run: mm_dsl::DurableRecoveryObservedRun,
+    last_committed_sequence: u64,
+    prior_commit: mm_dsl::DurableRecoveryPriorCommit,
+    input_evidence: mm_dsl::DurableRecoveryInputEvidence,
+) -> Verdict {
+    let transition = mm_dsl::MeerkatMachineMutator::apply(
+        authority,
+        mm_dsl::MeerkatMachineInput::AuthorizeOperatorDurableTailRepair {
+            session_id: mm_dsl::SessionId("session-recovery".to_string()),
+            candidate_id: "candidate-held".to_string(),
+            candidate_run_id: mm_dsl::RunId("run-held".to_string()),
+            class,
+            observed_lifecycle,
+            observed_current_run,
+            last_committed_sequence,
+            prior_commit,
+            input_evidence,
+        },
+    )
+    .expect("AuthorizeOperatorDurableTailRepair must be total over machine phases");
+    let mut verdicts = transition
+        .into_effects()
+        .into_iter()
+        .filter_map(|effect| match effect {
+            mm_dsl::MeerkatMachineEffect::DurableTailRecoveryCommitAuthorized {
+                candidate_id,
+                disposition,
+                boundary_sequence,
+            } if candidate_id == "candidate-held" => {
+                Some(Verdict::Commit(disposition, boundary_sequence))
+            }
+            mm_dsl::MeerkatMachineEffect::DurableTailRecoveryAuthorized {
+                candidate_id,
+                disposition,
+            } if candidate_id == "candidate-held" => Some(Verdict::NonCommit(disposition)),
+            _ => None,
+        });
+    let verdict = verdicts
+        .next()
+        .expect("the operator authorization must emit exactly one verdict");
+    assert!(verdicts.next().is_none());
+    verdict
+}
+
+// The operator's held-tail repair (resolve-held-tail).
+
+/// An ambiguous candidate on a quiescent runtime with attributable inputs is
+/// repaired, at one past the last committed receipt.
+#[test]
+fn operator_repairs_an_ambiguous_candidate_on_a_quiescent_runtime() {
+    let mut authority = mm_dsl::MeerkatMachineAuthority::recover_from_state(quiescent_state(
+        mm_dsl::MeerkatPhase::Idle,
+    ))
+    .expect("idle quiescent state must be recoverable");
+    let (lifecycle, run) = quiescent_observation();
+    let (prior_commit, input_evidence) = admitting_evidence();
+    assert_eq!(
+        authorize_operator(
+            &mut authority,
+            mm_dsl::DurableTailRecoveryClass::Ambiguous,
+            lifecycle,
+            run,
+            3,
+            prior_commit,
+            input_evidence,
+        ),
+        Verdict::Commit(
+            mm_dsl::DurableTailRecoveryDisposition::OperatorRepairAndCommitInterrupted,
+            4
+        )
+    );
+    assert_eq!(
+        authority.state().turn_terminal_run_id,
+        Some(mm_dsl::RunId("run-held".to_string()))
+    );
+}
+
+/// Everything outside the admissible core is refused, and a refusal writes no
+/// run fact: a candidate that is not ambiguous (ordinary recovery owns it), a
+/// non-quiescent or undecodable lifecycle, a persisted current run, a prior
+/// commit that covers or contradicts the candidate, and inputs durable
+/// identity cannot attribute or fence.
+#[test]
+fn operator_repair_is_refused_outside_the_admissible_core() {
+    let (lifecycle, run) = quiescent_observation();
+    let (prior_commit, input_evidence) = admitting_evidence();
+    let refused = mm_dsl::DurableTailRecoveryDisposition::RefuseRecovery;
+    let cases = [
+        (
+            mm_dsl::DurableTailRecoveryClass::InterruptedRepairableCandidate,
+            lifecycle,
+            run,
+            prior_commit,
+            input_evidence,
+        ),
+        (
+            mm_dsl::DurableTailRecoveryClass::ContinuableCandidate,
+            lifecycle,
+            run,
+            prior_commit,
+            input_evidence,
+        ),
+        (
+            mm_dsl::DurableTailRecoveryClass::Ambiguous,
+            mm_dsl::DurableRecoveryObservedLifecycle::NonQuiescent,
+            run,
+            prior_commit,
+            input_evidence,
+        ),
+        (
+            mm_dsl::DurableTailRecoveryClass::Ambiguous,
+            mm_dsl::DurableRecoveryObservedLifecycle::Undecodable,
+            run,
+            prior_commit,
+            input_evidence,
+        ),
+        (
+            mm_dsl::DurableTailRecoveryClass::Ambiguous,
+            lifecycle,
+            mm_dsl::DurableRecoveryObservedRun::CandidateRun,
+            prior_commit,
+            input_evidence,
+        ),
+        (
+            mm_dsl::DurableTailRecoveryClass::Ambiguous,
+            lifecycle,
+            run,
+            mm_dsl::DurableRecoveryPriorCommit::MatchesCandidate,
+            input_evidence,
+        ),
+        (
+            mm_dsl::DurableTailRecoveryClass::Ambiguous,
+            lifecycle,
+            run,
+            mm_dsl::DurableRecoveryPriorCommit::DivergesFromCandidate,
+            input_evidence,
+        ),
+        (
+            mm_dsl::DurableTailRecoveryClass::Ambiguous,
+            lifecycle,
+            run,
+            prior_commit,
+            mm_dsl::DurableRecoveryInputEvidence::UnboundContentInput,
+        ),
+        (
+            mm_dsl::DurableTailRecoveryClass::Ambiguous,
+            lifecycle,
+            run,
+            prior_commit,
+            mm_dsl::DurableRecoveryInputEvidence::Unfenceable,
+        ),
+    ];
+    for (class, lifecycle, run, prior_commit, input_evidence) in cases {
+        let mut authority = mm_dsl::MeerkatMachineAuthority::recover_from_state(quiescent_state(
+            mm_dsl::MeerkatPhase::Idle,
+        ))
+        .expect("idle quiescent state must be recoverable");
+        assert_eq!(
+            authorize_operator(
+                &mut authority,
+                class,
+                lifecycle,
+                run,
+                0,
+                prior_commit,
+                input_evidence,
+            ),
+            Verdict::NonCommit(refused),
+            "{class:?} {lifecycle:?} {run:?} {prior_commit:?} {input_evidence:?}"
+        );
+        assert_eq!(authority.state().turn_terminal_run_id, None);
+    }
+}
+
+/// A live or terminalized run in the authority refuses, and so does every
+/// non-quiescent phase.
+#[test]
+fn operator_repair_is_refused_over_live_run_facts_and_non_quiescent_phases() {
+    let (lifecycle, run) = quiescent_observation();
+    let (prior_commit, input_evidence) = admitting_evidence();
+    let refused = Verdict::NonCommit(mm_dsl::DurableTailRecoveryDisposition::RefuseRecovery);
+    let mut terminalized =
+        mm_dsl::MeerkatMachineAuthority::recover_from_state(mm_dsl::MeerkatMachineState {
+            turn_terminal_run_id: Some(mm_dsl::RunId("run-held".to_string())),
+            ..quiescent_state(mm_dsl::MeerkatPhase::Idle)
+        })
+        .expect("an idle state with a terminal witness must be recoverable");
+    assert_eq!(
+        authorize_operator(
+            &mut terminalized,
+            mm_dsl::DurableTailRecoveryClass::Ambiguous,
+            lifecycle,
+            run,
+            0,
+            prior_commit,
+            input_evidence,
+        ),
+        refused
+    );
+    for (phase, state) in [
+        (
+            mm_dsl::MeerkatPhase::Initializing,
+            mm_dsl::MeerkatMachineState {
+                lifecycle_phase: mm_dsl::MeerkatPhase::Initializing,
+                ..Default::default()
+            },
+        ),
+        (
+            mm_dsl::MeerkatPhase::Attached,
+            quiescent_state(mm_dsl::MeerkatPhase::Attached),
+        ),
+        (
+            mm_dsl::MeerkatPhase::Stopped,
+            quiescent_state(mm_dsl::MeerkatPhase::Stopped),
+        ),
+    ] {
+        let mut authority = mm_dsl::MeerkatMachineAuthority::recover_from_state(state)
+            .expect("a non-quiescent phase state must be recoverable");
+        assert_eq!(
+            authorize_operator(
+                &mut authority,
+                mm_dsl::DurableTailRecoveryClass::Ambiguous,
+                lifecycle,
+                run,
+                0,
+                prior_commit,
+                input_evidence,
+            ),
+            refused,
+            "{phase:?}"
+        );
+    }
 }

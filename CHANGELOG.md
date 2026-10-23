@@ -43,7 +43,8 @@ them.
   `meerkat_runtime::recovery::DurableTailRecoveryOutcome` gains `Continue {
   candidate, run_id, receipt }`. The machine enums gain
   `DurableTailRecoveryClass::ContinuableCandidate`,
-  `DurableTailRecoveryDisposition::ContinueRun`,
+  `DurableTailRecoveryDisposition::ContinueRun` and
+  `DurableTailRecoveryDisposition::OperatorRepairAndCommitInterrupted`,
   `RecoveredInputNormalizationReasonKind::ResumableRun`,
   `InputAbandonReason::ResumeRefused` (the `meerkat_machine::dsl` bridge copies
   and the catalog and kernel types). The session document vocabulary gains
@@ -53,7 +54,8 @@ them.
   and `cursor_inputs_open`. `MeerkatMachineState` gains `resumable_run_id`;
   `MeerkatMachineInput` gains `MarkRunResumable`, `ResumeRun`,
   `ReleaseResumableRun`, `SettleResumableRun`, `SuspendRunForStop { run_id,
-  durable_session }` and `ReplayAppliedRunContributor`, and
+  durable_session }`, `ReplayAppliedRunContributor` and
+  `AuthorizeOperatorDurableTailRepair`, and
   `NormalizeRecoveredInputLifecycle` gains `bound_run_resumable`;
   `MeerkatMachineEffect` gains `ResumableRunMarked`, `ResumedRunAuthorized`,
   `ResumableRunReleased`, `ResumableRunSettled` and `RunSuspendedForStop {
@@ -527,9 +529,12 @@ them.
   `queued_inputs` and `requeue_max_age_ms`).
 
 - `meerkat-runtime`: `MeerkatMachineRuntimeInternalInput` gains
-  `ClassifyStopInputDisposition`, appended last. The enum is exhaustive, so a
-  `match` outside the crate needs the arm. The wait-failure enums of
-  `meerkat_machine::dsl` gain the variants above, also appended last.
+  `ClassifyStopInputDisposition`, `MarkRunResumable`, `ResumeRun`,
+  `ReleaseResumableRun`, `SettleResumableRun`, `SuspendRunForStop`,
+  `ReplayAppliedRunContributor` and `AuthorizeOperatorDurableTailRepair`, all
+  appended last, so every 0.9.4 variant keeps its position. The enum is
+  exhaustive, so a `match` outside the crate needs the arms. The wait-failure
+  enums of `meerkat_machine::dsl` gain the variants above, also appended last.
 
 - `meerkat-rest`: `ApiError` gains `SessionNotRunningWithData { message,
   details }` (`409` `SESSION_NOT_RUNNING`), appended last. The enum is
@@ -664,6 +669,20 @@ them.
   run. `recovery::recover_durable_tail_for_run` runs the same recovery for
   one run's tail and leaves another run's tail untouched; the runtime uses
   it to commit as interrupted the tail of a run that ends without resuming.
+- `meerkat-runtime`: `recovery::resolve_held_durable_tail(store, session_id,
+  apply)` resolves a session whose durable tail recovery holds as ambiguous
+  (`DurableTailHeldForRecovery`), through the store traits alone, so it
+  serves a host store as it serves the built-in ones. The dry run writes
+  nothing and reports, as `HeldTailResolution`, the candidate, the
+  classifier's facts, the calls the repair would answer, the inputs it
+  would terminalize and whether the runtime is quiescent. Applied, it
+  commits the tail as interrupted when the machine authorizes it (a
+  quiescent runtime with no current run, no prior commit that covers the
+  tail, attributable inputs): every durable row is kept, the calls without
+  a result are answered with outcome-unknown error results, a notice names
+  `resolve-held-tail` and the candidate, and the recovery row records the
+  operator's disposition and the candidate id. A quarantined session, and a
+  tail held for any other reason, are refused.
 - `meerkat-core`: per-round commits and resumable runs. A run whose agent has
   a session checkpointer commits every tool round twice:
   - The first commit comes after the model call and before any tool of the
