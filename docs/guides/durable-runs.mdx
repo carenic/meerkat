@@ -323,6 +323,9 @@ Before you run a host store in production, run the host store chapter of the
   dedupe key.
 - A run that crashes before its first commit runs its input again as a new
   run.
+- Round commits serve crash recovery only. A run that fails and whose inputs
+  are queued for another attempt discards its round commits and starts again
+  from its inputs, as before 0.9.5.
 - On a WholeBlob realm (`jsonl`, or a host store), a run takes no round
   commits after its first compaction. A crash after that continues the run
   from its last commit before the compaction: the compaction and the rounds

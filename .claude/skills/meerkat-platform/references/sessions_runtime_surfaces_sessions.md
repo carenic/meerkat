@@ -340,7 +340,9 @@ Contract and limits: `docs/guides/durable-runs.mdx`.
   its `durable = true` workers) its open run continues under the same run id;
   no new input is needed. There is no boot sweep: a session nobody opens
   keeps its open run until its next open. A crash before the run's first
-  commit runs its input again as a new run.
+  commit runs its input again as a new run. A run that fails and whose inputs
+  are requeued for another attempt discards its round commits and starts over,
+  as before 0.9.5.
 - Event `run_resumed {run_id, round, resume_point}`: `tools_pending` (the
   saved response stands in for the model call and its calls are dispatched
   again under the same call ids, with no new assistant, tool-call request or
