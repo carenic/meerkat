@@ -389,6 +389,10 @@ To deploy a new version without losing runs in flight:
    continue.
 3. Stop every session without a run in flight gracefully, as before, with
    `UnregisterQueuedInputs::Requeue` if you want their queued prompts kept.
+   A session whose run is waiting to continue, but has not started its
+   resumed round, has no run in flight: a graceful stop with
+   `UnregisterQueuedInputs::Requeue` keeps that run for the next start, and
+   one without it abandons the run's inputs.
 4. Exit the process without unregistering, stopping, cancelling or archiving
    the sessions that have a run in flight, and without shutting down the
    mobs whose workers have one.
