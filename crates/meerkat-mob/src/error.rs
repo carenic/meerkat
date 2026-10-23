@@ -3517,4 +3517,80 @@ mod tests {
             MobFailureClass::RuntimeRejected
         );
     }
+
+    /// A keyed member send's refusals keep one wire class each, the mapping
+    /// the rpc reference states: an invalid key and a conflict name no code of
+    /// their own (the RPC answers invalid params), a host that cannot keep
+    /// the key is a capability gap naming its cause, an unreadable status is
+    /// retryable, and an inconsistent one is internal. None carries a wire
+    /// detail, so the RPC renders the code and the structured data.
+    #[test]
+    fn keyed_member_send_refusals_keep_their_wire_codes_and_kinds() {
+        use MemberSendIdempotencyRefusal as Refusal;
+        use meerkat_contracts::ErrorCode;
+
+        let cases = [
+            (
+                Refusal::InvalidKey {
+                    detail: "the key is empty".to_string(),
+                },
+                None,
+                serde_json::json!({"kind": "invalid_idempotency_key"}),
+            ),
+            (
+                Refusal::Conflict {
+                    delivery_id: "delivery-1".to_string(),
+                    committed_at_ms: 7,
+                },
+                None,
+                serde_json::json!({
+                    "kind": "input_idempotency_conflict",
+                    "delivery_id": "delivery-1",
+                    "committed_at_ms": 7,
+                }),
+            ),
+            (
+                Refusal::NoContinuationService,
+                Some(ErrorCode::CapabilityUnavailable),
+                serde_json::json!({
+                    "kind": "idempotency_unavailable",
+                    "cause": "no_continuation_service",
+                }),
+            ),
+            (
+                Refusal::GovernedRuntime,
+                Some(ErrorCode::CapabilityUnavailable),
+                serde_json::json!({
+                    "kind": "idempotency_unavailable",
+                    "cause": "governed_runtime",
+                }),
+            ),
+            (
+                Refusal::Unavailable {
+                    detail: "the store is busy".to_string(),
+                },
+                Some(ErrorCode::SessionRuntimeUnavailable),
+                serde_json::json!({"kind": "continuation_status_unavailable"}),
+            ),
+            (
+                Refusal::Inconsistent {
+                    detail: "two receipts for one key".to_string(),
+                },
+                Some(ErrorCode::InternalError),
+                serde_json::json!({"kind": "continuation_status_inconsistent"}),
+            ),
+        ];
+        for (refusal, code, data) in cases {
+            let error = MobError::MemberSendIdempotency {
+                identity: AgentIdentity::from("member"),
+                refusal,
+            };
+            assert!(error.wire_detail().is_none(), "{error}");
+            assert_eq!(error.wire_error_code(), code, "{error}");
+            assert_eq!(error.structured_data(), Some(data), "{error}");
+        }
+        assert_eq!(ErrorCode::CapabilityUnavailable.jsonrpc_code(), -32020);
+        assert_eq!(ErrorCode::SessionRuntimeUnavailable.jsonrpc_code(), -32032);
+        assert_eq!(ErrorCode::InternalError.jsonrpc_code(), -32603);
+    }
 }
