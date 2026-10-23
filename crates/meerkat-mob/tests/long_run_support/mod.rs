@@ -53,7 +53,7 @@ use futures::StreamExt as _;
 use meerkat::{AgentFactory, Config, FactoryAgentBuilder, PersistentSessionService};
 use meerkat_client::{LlmClient, LlmDoneOutcome, LlmError, LlmEvent, LlmRequest};
 use meerkat_core::lifecycle::{InputId, RunId};
-use meerkat_core::service::{SessionService as _, SessionServiceControlExt as _};
+use meerkat_core::service::SessionServiceControlExt as _;
 use meerkat_core::types::{SessionId, ToolCallView, ToolDef, ToolResult};
 use meerkat_core::{AgentEvent, AssistantBlock, Message, ToolCallDedupeKey};
 use meerkat_mob::{
