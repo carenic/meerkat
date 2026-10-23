@@ -5090,6 +5090,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pre_native_id_persisted_messages_load_and_replay_without_invented_ids() {
+        // Synthetic persisted JSON derived from the writer/type definitions at
+        // v0.9.4 e91835c5fea0170d0dfc1d297d70269234fd4a16 and pre-#1936
+        // 169a89905500a25ef34c62d26f772724cd40e194, not emitted by today's writer
+        // or captured by executing either historical binary. Those versions
+        // stored only signature metadata or no metadata, never a native ID.
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/pre_native_id_messages.json"
+        ))
+        .unwrap();
+        for explicit_null_meta in [false, true] {
+            let mut persisted = fixture.clone();
+            if explicit_null_meta {
+                persisted[1]["blocks"][1]["data"]["meta"] = Value::Null;
+            }
+            let messages: Vec<Message> = serde_json::from_value(persisted).unwrap();
+            let Message::BlockAssistant(assistant) = &messages[1] else {
+                panic!("legacy assistant row must load");
+            };
+            assert!(matches!(
+                &assistant.blocks[0],
+                AssistantBlock::ToolUse { id, meta: Some(meta), .. }
+                    if id == "fc_0" && matches!(meta.as_ref(),
+                        ProviderMeta::Gemini { thought_signature }
+                            if thought_signature == "legacy-signature")
+            ));
+            assert!(matches!(
+                &assistant.blocks[1],
+                AssistantBlock::ToolUse { id, meta: None, .. } if id == "fc_1"
+            ));
+            let stored = serde_json::to_value(&messages).unwrap();
+            assert_eq!(stored[1]["blocks"], fixture[1]["blocks"]);
+            assert_eq!(stored[2]["results"], fixture[2]["results"]);
+
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let response = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"done\"}]},\"finishReason\":\"STOP\"}]}\n";
+            let (base_url, server) =
+                spawn_gemini_stream_stub("gemini-3.5-flash", response.into(), Arc::clone(&seen))
+                    .await;
+            let client = GeminiClient::new_with_base_url("test-key".into(), base_url);
+            let request = LlmRequest::new("gemini-3.5-flash", messages);
+            let events = client.stream(&request).collect::<Vec<_>>().await;
+            server.abort();
+            assert!(events.iter().all(Result::is_ok));
+            let bodies = seen.lock().unwrap();
+            assert_eq!(bodies.len(), 1);
+            let calls = bodies[0]["contents"][1]["parts"].as_array().unwrap();
+            let responses = bodies[0]["contents"][2]["parts"].as_array().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(responses.len(), 2);
+            assert_eq!(calls[0]["thoughtSignature"], "legacy-signature");
+            assert!(calls[1].get("thoughtSignature").is_none());
+            assert_eq!(
+                calls[0]["functionCall"]["args"],
+                fixture[1]["blocks"][0]["data"]["args"]
+            );
+            assert_eq!(responses[0]["functionResponse"]["name"], "time_zone");
+            assert_eq!(responses[1]["functionResponse"]["name"], "weather");
+            assert_eq!(
+                responses[0]["functionResponse"]["response"]["content"],
+                "UTC+09:00"
+            );
+            assert_eq!(
+                responses[1]["functionResponse"]["response"]["content"],
+                "Clear, 12 C"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .all(|part| part["functionCall"].get("id").is_none())
+            );
+            assert!(
+                responses
+                    .iter()
+                    .all(|part| part["functionResponse"].get("id").is_none())
+            );
+            assert!(
+                responses
+                    .iter()
+                    .all(|part| part.get("thoughtSignature").is_none())
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn mixed_native_and_generated_ids_stay_distinct_across_stream_chunks() {
         let (blocks, body) = function_call_id_roundtrip(vec![
             vec![json!({"functionCall": {"name": "weather", "args": {"city": "Oslo"}}})],
