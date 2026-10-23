@@ -321,7 +321,8 @@ pub(crate) struct StdioChildCustody {
     /// its waiters recheck the slot.
     close_progress: Arc<tokio::sync::watch::Sender<u64>>,
     /// Whether its server completed the MCP initialize handshake. A failed
-    /// connect closes a server that never did with no grace.
+    /// connect closes a server that never did under
+    /// [`NEVER_INITIALIZED_CLOSE`]: a cut EOF grace and the full TERM grace.
     initialized: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     spawned: Arc<tokio::sync::watch::Sender<Option<u32>>>,
