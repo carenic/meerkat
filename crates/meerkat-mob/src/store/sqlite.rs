@@ -4912,6 +4912,12 @@ fn insert_identity_receipt(
 
 #[async_trait]
 impl MobIdentityStore for SqliteMobIdentityStore {
+    // Canonical: `SqliteMobStores::open` canonicalizes the path that
+    // `identity_store` hands on (see `identity_incarnation_custody`).
+    fn incarnation_custody_store(&self) -> Option<&Path> {
+        Some(&self.path)
+    }
+
     #[cfg(feature = "runtime-adapter")]
     fn prepare_runtime_write_fence(
         &self,
@@ -12826,6 +12832,7 @@ mod tests {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
+                durable: false,
             })),
         );
         let mut definition = MobDefinition::explicit("mob");
@@ -15919,6 +15926,7 @@ mod tests {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
+                durable: false,
             };
             store.create("test-profile", &profile).await.unwrap();
         }

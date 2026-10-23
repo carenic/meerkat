@@ -7777,6 +7777,7 @@ fn sample_definition() -> MobDefinition {
             max_inline_peer_notifications: None,
             output_schema: None,
             provider_params: None,
+            durable: false,
         })),
     );
     profiles.insert(
@@ -7801,6 +7802,7 @@ fn sample_definition() -> MobDefinition {
             max_inline_peer_notifications: None,
             output_schema: None,
             provider_params: None,
+            durable: false,
         })),
     );
 
@@ -31868,6 +31870,109 @@ async fn fresh_spawn_refuses_resume_provider_params() {
     );
     assert_eq!(member_build_count(&service, &member).await, 0);
     assert!(handle.get_member(&member).await.expect("read").is_none());
+}
+
+/// The sample definition with its `worker` profile declared durable (and
+/// externally addressable, so a policy auto-spawn of it is admitted up to
+/// the durable check).
+fn durable_worker_definition() -> MobDefinition {
+    let mut definition = sample_definition();
+    let worker = definition
+        .profiles
+        .get_mut(&ProfileName::from("worker"))
+        .and_then(ProfileBinding::as_inline_mut)
+        .expect("inline worker profile");
+    worker.durable = true;
+    worker.external_addressable = true;
+    definition
+}
+
+/// A mob over the mock service reporting that it keeps no durable sessions.
+async fn create_test_mob_without_persistent_sessions(
+    definition: MobDefinition,
+) -> (MobHandle, Arc<MockSessionService>) {
+    let service = Arc::new(MockSessionService::new());
+    service.keep_no_durable_sessions();
+    let _ = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(definition, MobStorage::in_memory())
+        .with_session_service(service.clone())
+        .allow_ephemeral_sessions(true)
+        .create()
+        .await
+        .expect("create a mob without persistent sessions");
+    (handle, service)
+}
+
+/// A durable profile needs a session service that keeps persistent
+/// sessions: on a mob whose service keeps none, its spawn is refused typed
+/// before any session is built, and no member is left behind.
+#[tokio::test]
+async fn a_durable_profile_spawn_without_persistent_sessions_is_refused_typed() {
+    let (handle, service) =
+        create_test_mob_without_persistent_sessions(durable_worker_definition()).await;
+    let member = AgentIdentity::from("durable-worker-1");
+    let mut spec = SpawnMemberSpec::new(ProfileName::from("worker"), member.clone());
+    spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    let error = handle
+        .spawn_spec(spec)
+        .await
+        .expect_err("a durable profile needs persistent sessions");
+    assert!(
+        matches!(
+            &error,
+            MobError::NonDurableService { member_id, profile }
+                if member_id == &member && profile.as_str() == "worker"
+        ),
+        "{error:?}"
+    );
+    assert_eq!(member_build_count(&service, &member).await, 0);
+    assert!(handle.get_member(&member).await.expect("read").is_none());
+
+    // The same mob still spawns an ordinary profile.
+    let ordinary = AgentIdentity::from("ordinary-lead-1");
+    handle
+        .spawn_spec(SpawnMemberSpec::new(
+            ProfileName::from("lead"),
+            ordinary.clone(),
+        ))
+        .await
+        .expect("an ordinary profile needs no persistent sessions");
+    assert!(handle.get_member(&ordinary).await.expect("read").is_some());
+}
+
+/// A policy auto-spawn of a durable profile is refused the same way, before
+/// any session is built.
+#[tokio::test]
+async fn a_durable_policy_auto_spawn_without_persistent_sessions_is_refused_typed() {
+    let (handle, service) =
+        create_test_mob_without_persistent_sessions(durable_worker_definition()).await;
+    handle
+        .set_spawn_policy(Some(Arc::new(StaticWorkerSpawnPolicy)))
+        .await
+        .expect("set spawn policy");
+    let target = AgentIdentity::from("auto-durable-worker");
+    let result = handle
+        .submit_work(
+            AgentRuntimeId::initial(target.clone()),
+            FenceToken::new(0),
+            WorkRef::new(),
+            WorkSpec::new(
+                "work for a durable worker".to_string(),
+                WorkOrigin::External,
+            ),
+        )
+        .await;
+    assert!(
+        matches!(
+            &result,
+            Err(MobError::NonDurableService { member_id, profile })
+                if member_id == &target && profile.as_str() == "worker"
+        ),
+        "{result:?}"
+    );
+    assert!(handle.get_member(&target).await.expect("read").is_none());
+    assert_eq!(service.recorded_create_requests().await.len(), 0);
+    assert_eq!(service.active_session_count().await, 0);
 }
 
 /// Appends its tag to the spec's labels, or fails when it has none.
@@ -81856,6 +81961,7 @@ async fn test_spawn_realm_ref_resolves_from_store() {
         max_inline_peer_notifications: None,
         output_schema: None,
         provider_params: None,
+        durable: false,
     };
     realm_store
         .create("shared-worker", &worker_profile)
@@ -85199,6 +85305,7 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         MobError::ResumeProviderParamsRequireResume { .. } => {
             "resume_provider_params_require_resume".to_string()
         }
+        MobError::NonDurableService { .. } => "non_durable_service".to_string(),
         MobError::MemberRoleMigrationRequired { .. } => {
             "member_role_migration_required".to_string()
         }

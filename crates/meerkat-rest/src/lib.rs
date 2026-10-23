@@ -10691,6 +10691,7 @@ mod tests {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
+                durable: false,
             })),
         );
         let owner_session_id =
@@ -10737,6 +10738,7 @@ mod tests {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
+                durable: false,
             })),
         );
         let handle = meerkat_mob::MobBuilder::new(definition, meerkat_mob::MobStorage::in_memory())
@@ -14006,6 +14008,7 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
+                durable: false,
             })),
         );
         let mut definition = meerkat_mob::MobDefinition::explicit(mob_id.clone());
@@ -17662,6 +17665,7 @@ matching the required schema. Output ONLY the JSON, no additional text or markdo
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
+                durable: false,
             })),
         );
         let mob_id = state

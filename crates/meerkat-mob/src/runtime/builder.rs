@@ -10931,7 +10931,9 @@ impl MobBuilder {
             ));
             let identity_reconcile_holder_id = format!("mob:{}", definition.id);
             let identity_reconcile_incarnation_id =
-                meerkat_core::ops::OperationId::new().to_string();
+                super::identity_incarnation_custody::mint_incarnation_id(
+                    identity.incarnation_custody_store(),
+                );
             let recovered_member_status_observed_at_ms = dsl_authority
                 .state()
                 .member_last_observed_at_ms
@@ -12392,6 +12394,7 @@ mod tests {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
+                durable: false,
             },
             definition_extract: PortableDefinitionExtract {
                 profile_names: vec!["worker".to_string()],

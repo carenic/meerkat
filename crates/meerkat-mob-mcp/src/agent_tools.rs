@@ -5926,6 +5926,7 @@ mod tests {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
+                durable: false,
             })),
         );
         profiles.insert(
@@ -5950,6 +5951,7 @@ mod tests {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
+                durable: false,
             })),
         );
 
@@ -9249,6 +9251,7 @@ mod tests {
                     max_inline_peer_notifications: None,
                     output_schema: None,
                     provider_params: None,
+                    durable: false,
                 },
             ))),
             allow_overlay: None,
@@ -9292,6 +9295,7 @@ mod tests {
                     max_inline_peer_notifications: None,
                     output_schema: None,
                     provider_params: None,
+                    durable: false,
                 },
             ))),
             allow_overlay: None,
@@ -9327,6 +9331,7 @@ mod tests {
                     max_inline_peer_notifications: None,
                     output_schema: None,
                     provider_params: None,
+                    durable: false,
                 },
             ))),
             allow_overlay: None,
@@ -9358,6 +9363,7 @@ mod tests {
                     max_inline_peer_notifications: None,
                     output_schema: None,
                     provider_params: None,
+                    durable: false,
                 },
             ))),
             allow_overlay: None,
@@ -9391,6 +9397,7 @@ mod tests {
                     max_inline_peer_notifications: None,
                     output_schema: None,
                     provider_params: None,
+                    durable: false,
                 },
             ))),
             allow_overlay: Some(vec!["send".to_string()]),
@@ -9425,6 +9432,7 @@ mod tests {
                     max_inline_peer_notifications: None,
                     output_schema: None,
                     provider_params: None,
+                    durable: false,
                 },
             ))),
             allow_overlay: None,

@@ -6073,6 +6073,18 @@ pub const IDENTITY_INTENT_SCAN_PAGE_MAX: usize = 256;
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait MobIdentityStore: Send + Sync {
+    /// The database file a mob takes process custody of before it mints an
+    /// identity-lease incarnation over this store.
+    ///
+    /// While a process holds that custody, an unexpired lease of the same
+    /// mob's incarnation from a process that has exited is reclaimed at
+    /// once instead of waited out. `None`, the default, is a store without
+    /// such a file: a restarted mob waits for every earlier incarnation's
+    /// lease to expire.
+    fn incarnation_custody_store(&self) -> Option<&std::path::Path> {
+        None
+    }
+
     /// Prepare an observation-bound runtime write fence.
     ///
     /// Built-in stores retain their identity-authority serialization guard

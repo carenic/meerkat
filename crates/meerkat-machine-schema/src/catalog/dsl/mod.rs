@@ -3510,6 +3510,7 @@ pub fn mob_machine_schema_metadata() -> MachineSchemaMetadata {
                     "HeldByCurrentIncarnation",
                     "HeldByOtherLiveIncarnation",
                     "HeldByExpiredIncarnation",
+                    "HeldByEndedIncarnation",
                 ],
             ),
             NamedTypeBinding::string_enum(

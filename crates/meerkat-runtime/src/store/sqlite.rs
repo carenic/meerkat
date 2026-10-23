@@ -16431,6 +16431,218 @@ ORDER BY runtime_id";
             .map_err(|err| RuntimeStoreError::Internal(format!("Task join failed: {err}")))?
         }
 
+        async fn commit_prepared_whole_blob_run_rebase(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            rebase: crate::store::PreparedWholeBlobRunRebaseStoreParts,
+        ) -> Result<crate::store::WholeBlobRunRebaseOutcome, RuntimeStoreError> {
+            self.require_whole_blob_session_operation(
+                runtime_id,
+                "commit_prepared_whole_blob_run_rebase",
+            )?;
+            let (issued_committed, issued_tail) = rebase.issued_authorities()?;
+            let (
+                rewrite,
+                expected_tail,
+                _run_id,
+                _candidate_blob_sha256,
+                candidate_bytes,
+                conversation_digest,
+                message_count,
+                candidate_catalog_entry,
+                candidate_compaction_intents,
+            ) = rebase.into_parts();
+            let (
+                expected,
+                successor_session_id,
+                successor_blob_sha256,
+                successor_bytes,
+                mut successor_catalog_entry,
+                compaction_projection_intents,
+            ) = rewrite.into_tuple();
+            if expected.session_id() != &successor_session_id
+                || &LogicalRuntimeId::for_session(&successor_session_id) != runtime_id
+                || candidate_catalog_entry.session_id() != &successor_session_id
+                || candidate_catalog_entry.persistence_profile()
+                    != RuntimeSessionPersistenceProfile::WholeBlobV1
+                || u64::try_from(candidate_catalog_entry.message_count()).ok()
+                    != Some(message_count)
+            {
+                return Err(session_authority_conflict(
+                    runtime_id,
+                    "prepared WholeBlob re-base does not bind this runtime/session",
+                ));
+            }
+            // As for a tail write: the candidate's facts are a pure function
+            // of its bytes, served only for an authority naming its digest.
+            self.whole_blob_transcript_facts.record(
+                runtime_id,
+                issued_tail.candidate_blob_sha256(),
+                crate::store::WholeBlobCommittedTranscriptFacts::new(
+                    conversation_digest.clone(),
+                    message_count,
+                ),
+                None,
+            );
+            let catalog_json = serde_json::to_vec(&candidate_catalog_entry)
+                .map_err(|error| RuntimeStoreError::WriteFailed(error.to_string()))?;
+            let compaction_intents_json = serde_json::to_vec(&candidate_compaction_intents)
+                .map_err(|error| RuntimeStoreError::WriteFailed(error.to_string()))?;
+            let path = self.path.clone();
+            let runtime_id = runtime_id.clone();
+            spawn_blocking_holding_claim(move || {
+                let mut conn = open_runtime_connection(&path)?;
+                let tx = begin_runtime_transaction(&mut conn)?;
+                refuse_whole_blob_write_under_head_authority(
+                    &tx,
+                    &runtime_id,
+                    "whole-BLOB run re-base",
+                )?;
+                let current = load_whole_blob_store_authority(&tx, &runtime_id)?;
+                let current_tail = load_whole_blob_provisional_metadata(&tx, &runtime_id)?
+                    .map(|existing| existing.authority);
+                if current.as_ref() == Some(&issued_committed)
+                    && current_tail.as_ref() == Some(&issued_tail)
+                {
+                    return Ok(crate::store::WholeBlobRunRebaseOutcome::Applied {
+                        committed: issued_committed,
+                        tail: issued_tail,
+                    });
+                }
+                if current.as_ref() != Some(&expected) || current_tail != expected_tail {
+                    return Ok(crate::store::WholeBlobRunRebaseOutcome::Stale);
+                }
+                // The re-base is the compaction's boundary: its intents enter
+                // the outbox in this transaction (below), unless one is
+                // already finalized or held with other content.
+                reject_finalized_compaction_projection_replays(
+                    &tx,
+                    &runtime_id,
+                    &compaction_projection_intents,
+                )?;
+                // Drop the old tail first: an ordinary snapshot write refuses
+                // while a store-owned candidate exists.
+                if current_tail.is_some() {
+                    let deleted = tx
+                        .execute(
+                            "DELETE FROM runtime_whole_blob_provisional_tails WHERE runtime_id = ?1",
+                            params![runtime_id_text(&runtime_id)],
+                        )
+                        .map_err(|error| RuntimeStoreError::WriteFailed(error.to_string()))?;
+                    if deleted != 1 {
+                        return Err(session_authority_conflict(
+                            &runtime_id,
+                            "WholeBlob re-base lost the tail it replaces",
+                        ));
+                    }
+                }
+                let runtime_state = load_runtime_session_catalog_entry_in_txn(&tx, &runtime_id)?
+                    .ok_or_else(|| {
+                        session_authority_conflict(
+                            &runtime_id,
+                            "prepared WholeBlob re-base predecessor has no catalog projection",
+                        )
+                    })?
+                    .runtime_state();
+                successor_catalog_entry.set_runtime_state(runtime_state);
+                let committed = upsert_runtime_snapshot_issued(
+                    &tx,
+                    &runtime_id,
+                    successor_bytes.as_ref(),
+                    &successor_session_id,
+                    &successor_blob_sha256,
+                    &successor_catalog_entry,
+                )?;
+                if committed != issued_committed {
+                    return Err(session_authority_conflict(
+                        &runtime_id,
+                        "WholeBlob re-base issued an authority other than its prepared successor",
+                    ));
+                }
+                insert_compaction_projection_outbox_intents(
+                    &tx,
+                    &runtime_id,
+                    &compaction_projection_intents,
+                )?;
+                let base_revision =
+                    i64::try_from(issued_tail.base_store_revision()).map_err(|_| {
+                        RuntimeStoreError::WriteFailed(format!(
+                            "WholeBlob re-base revision exceeds SQLite INTEGER for runtime {runtime_id}"
+                        ))
+                    })?;
+                let message_count = i64::try_from(message_count).map_err(|_| {
+                    RuntimeStoreError::WriteFailed(format!(
+                        "WholeBlob re-base message count exceeds SQLite INTEGER for runtime {runtime_id}"
+                    ))
+                })?;
+                tx.execute(
+                    r"
+                    INSERT INTO runtime_whole_blob_bodies (blob_sha256, session_snapshot)
+                    VALUES (?1, ?2)
+                    ON CONFLICT(blob_sha256) DO NOTHING
+                    ",
+                    params![issued_tail.candidate_blob_sha256(), candidate_bytes.as_ref()],
+                )
+                .map_err(|error| RuntimeStoreError::WriteFailed(error.to_string()))?;
+                tx.execute(
+                    r"
+                    INSERT INTO runtime_whole_blob_provisional_tails
+                        (runtime_id, authority_version, session_id, base_store_revision,
+                         base_blob_sha256, run_id, candidate_sequence,
+                         candidate_blob_sha256, conversation_digest, message_count,
+                         catalog_json, compaction_intents_json)
+                    VALUES (?1, 1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8, ?9, ?10)
+                    ",
+                    params![
+                        runtime_id_text(&runtime_id),
+                        issued_tail.session_id().to_string(),
+                        base_revision,
+                        issued_tail.base_blob_sha256(),
+                        issued_tail.run_id().0.to_string(),
+                        issued_tail.candidate_blob_sha256(),
+                        conversation_digest,
+                        message_count,
+                        catalog_json,
+                        compaction_intents_json,
+                    ],
+                )
+                .map_err(|error| RuntimeStoreError::WriteFailed(error.to_string()))?;
+                // The replaced tail's candidate body, unless another row still
+                // names it (the new tail or the committed successor may).
+                if let Some(old_tail) = current_tail.as_ref()
+                    && old_tail.candidate_blob_sha256() != issued_tail.candidate_blob_sha256()
+                {
+                    tx.execute(
+                        r"
+                        DELETE FROM runtime_whole_blob_bodies
+                        WHERE blob_sha256 = ?1
+                          AND NOT EXISTS (
+                              SELECT 1 FROM runtime_whole_blob_authority
+                              WHERE blob_sha256 = ?1
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1 FROM runtime_whole_blob_provisional_tails
+                              WHERE candidate_blob_sha256 = ?1
+                                 OR base_blob_sha256 = ?1
+                          )
+                        ",
+                        params![old_tail.candidate_blob_sha256()],
+                    )
+                    .map_err(|error| RuntimeStoreError::WriteFailed(error.to_string()))?;
+                }
+                // The predecessor's committed body went with the snapshot
+                // upsert above: the old tail no longer named it as its base.
+                tx.commit()
+                    .map_err(|error| RuntimeStoreError::WriteFailed(error.to_string()))?;
+                Ok(crate::store::WholeBlobRunRebaseOutcome::Applied {
+                    committed,
+                    tail: issued_tail,
+                })
+            })
+            .await
+            .map_err(|error| RuntimeStoreError::Internal(format!("Task join failed: {error}")))?
+        }
+
         async fn atomic_apply(
             &self,
             runtime_id: &LogicalRuntimeId,
@@ -29397,6 +29609,236 @@ ORDER BY runtime_id";
                 .unwrap();
             assert_eq!(catalog.updated_at(), stored.updated_at());
             assert_eq!(catalog.message_count(), stored.messages().len());
+        }
+
+        // --- WholeBlob run re-base (unrun until the candidate's validation) -
+
+        fn rebase_with_cursor(mut session: Session, run_id: &RunId, round: u64) -> Session {
+            session
+                .set_run_cursor(&meerkat_core::SessionRunCursor::new(
+                    run_id.clone(),
+                    Vec::new(),
+                    round,
+                    meerkat_core::RunResumePoint::AwaitingModel,
+                ))
+                .unwrap();
+            session
+        }
+
+        fn rebase_compact(session: &Session) -> (Session, meerkat_core::TranscriptRewriteCommit) {
+            let mut compacted = session.clone();
+            let parent = compacted.transcript_revision().unwrap();
+            let commit = compacted
+                .commit_transcript_rewrite(
+                    TranscriptRewriteSelection::MessageRange { start: 0, end: 2 },
+                    vec![Message::User(UserMessage::compaction_summary(
+                        "compacted context",
+                    ))],
+                    TranscriptRewriteReason::new("compaction"),
+                    Some("sqlite-rebase-test".to_string()),
+                    Some(parent),
+                )
+                .unwrap();
+            (compacted, commit)
+        }
+
+        async fn rebase_payload(
+            store: &SqliteRuntimeStore,
+            runtime_id: &LogicalRuntimeId,
+            session_id: &meerkat_core::types::SessionId,
+        ) -> crate::store::VerifiedCommittedWholeBlobPayload {
+            let committed = store
+                .load_committed_whole_blob_snapshot(runtime_id)
+                .await
+                .unwrap()
+                .unwrap();
+            crate::store::VerifiedCommittedWholeBlobPayload::from_committed(session_id, committed)
+                .unwrap()
+        }
+
+        /// A committed one-turn base, plus a run that appended a round after
+        /// it and wrote that round as its first provisional tail.
+        async fn rebase_run_with_tail(
+            store: &SqliteRuntimeStore,
+        ) -> (
+            LogicalRuntimeId,
+            Session,
+            RunId,
+            WholeBlobStoreAuthority,
+            WholeBlobProvisionalTailAuthority,
+        ) {
+            let original = session_with_one_turn();
+            let runtime_id = LogicalRuntimeId::for_session(original.id());
+            store
+                .commit_session_snapshot(
+                    &runtime_id,
+                    SerializedSessionSnapshot {
+                        session_snapshot: serde_json::to_vec(&original).unwrap().into(),
+                    },
+                )
+                .await
+                .unwrap();
+            let base = rebase_payload(store, &runtime_id, original.id())
+                .await
+                .store_authority()
+                .clone();
+            let run_id = RunId::new();
+            let mut live = original;
+            live.push(Message::User(UserMessage::text(
+                "next question".to_string(),
+            )));
+            live.push(Message::BlockAssistant(BlockAssistantMessage {
+                blocks: vec![AssistantBlock::Text {
+                    text: "another verbose answer".to_string(),
+                    meta: None,
+                }],
+                stop_reason: Some(StopReason::EndTurn),
+                identity: meerkat_core::types::TranscriptMessageIdentity::default(),
+                created_at: meerkat_core::types::message_timestamp_now(),
+                assistant_message_id: None,
+            }));
+            let live = rebase_with_cursor(live, &run_id, 0);
+            let first = PreparedWholeBlobProvisionalTail::prepare_from_session(
+                base.clone(),
+                run_id.clone(),
+                1,
+                &live,
+            )
+            .unwrap();
+            let tail = store
+                .write_prepared_whole_blob_provisional_tail(&runtime_id, first)
+                .await
+                .unwrap();
+            (runtime_id, live, run_id, base, tail)
+        }
+
+        #[tokio::test]
+        async fn sqlite_run_rebase_commits_the_compacted_base_and_restarts_the_tail_together() {
+            let (_dir, store) = temp_store();
+            let (runtime_id, live, run_id, base, first_tail) = rebase_run_with_tail(&store).await;
+            let (compacted, commit) = rebase_compact(&live);
+            let payload = rebase_payload(&store, &runtime_id, live.id()).await;
+            let rebase = crate::store::PreparedWholeBlobRunRebase::prepare(
+                payload,
+                Some(first_tail),
+                run_id.clone(),
+                compacted.clone(),
+                std::slice::from_ref(&commit),
+            )
+            .unwrap();
+            let outcome = store
+                .commit_prepared_whole_blob_run_rebase(&runtime_id, rebase.store_parts())
+                .await
+                .unwrap();
+            let crate::store::WholeBlobRunRebaseOutcome::Applied { committed, tail } = outcome
+            else {
+                unreachable!("the re-base applies");
+            };
+            assert_eq!(committed.store_revision(), base.store_revision() + 1);
+            assert_eq!(tail.base_store_revision(), committed.store_revision());
+            assert_eq!(tail.candidate_sequence(), 1);
+            assert_eq!(tail.run_id(), &run_id);
+            let stored = store
+                .load_committed_whole_blob_snapshot(&runtime_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.authority(), &committed);
+            assert!(stored.session().try_run_cursor().unwrap().is_none());
+            let loaded = store
+                .load_whole_blob_provisional_tail(&runtime_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(loaded.authority(), &tail);
+            let replay = store
+                .commit_prepared_whole_blob_run_rebase(&runtime_id, rebase.store_parts())
+                .await
+                .unwrap();
+            assert_eq!(
+                replay,
+                crate::store::WholeBlobRunRebaseOutcome::Applied {
+                    committed: committed.clone(),
+                    tail,
+                }
+            );
+            let mut next = compacted;
+            next.push(Message::User(UserMessage::text(
+                "after the compaction".to_string(),
+            )));
+            let next = rebase_with_cursor(next, &run_id, 1);
+            let second = PreparedWholeBlobProvisionalTail::prepare_from_session(
+                committed.clone(),
+                run_id,
+                2,
+                &next,
+            )
+            .unwrap();
+            let second_tail = store
+                .write_prepared_whole_blob_provisional_tail(&runtime_id, second)
+                .await
+                .unwrap();
+            assert_eq!(
+                second_tail.base_store_revision(),
+                committed.store_revision()
+            );
+            assert_eq!(second_tail.candidate_sequence(), 2);
+        }
+
+        #[tokio::test]
+        async fn sqlite_run_rebase_is_stale_once_another_writer_moved_the_tail() {
+            let (_dir, store) = temp_store();
+            let (runtime_id, live, run_id, base, first_tail) = rebase_run_with_tail(&store).await;
+            let (compacted, commit) = rebase_compact(&live);
+            let payload = rebase_payload(&store, &runtime_id, live.id()).await;
+            let rebase = crate::store::PreparedWholeBlobRunRebase::prepare(
+                payload,
+                Some(first_tail),
+                run_id.clone(),
+                compacted,
+                std::slice::from_ref(&commit),
+            )
+            .unwrap();
+            let mut moved = live;
+            moved.push(Message::User(UserMessage::text(
+                "a racing round".to_string(),
+            )));
+            let moved = rebase_with_cursor(moved, &run_id, 1);
+            let racing = PreparedWholeBlobProvisionalTail::prepare_from_session(
+                base.clone(),
+                run_id,
+                2,
+                &moved,
+            )
+            .unwrap();
+            let racing_tail = store
+                .write_prepared_whole_blob_provisional_tail(&runtime_id, racing)
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .commit_prepared_whole_blob_run_rebase(&runtime_id, rebase.store_parts())
+                    .await
+                    .unwrap(),
+                crate::store::WholeBlobRunRebaseOutcome::Stale
+            );
+            assert_eq!(
+                store
+                    .load_whole_blob_store_authority(&runtime_id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                base
+            );
+            assert_eq!(
+                store
+                    .load_whole_blob_provisional_tail(&runtime_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .authority(),
+                &racing_tail
+            );
         }
 
         #[tokio::test]
