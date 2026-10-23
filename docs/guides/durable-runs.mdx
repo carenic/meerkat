@@ -386,13 +386,13 @@ fence:
   new holder then waits out what remained of the old holder's lease before
   the realm serves anything, and by then the old holder has stopped itself.
 - **Renewing.** Core renews the fence once per renew interval, in the
-  background. After a failed renew, or once its lease has run out, the
-  holder writes nothing and dispatches nothing until it acquires the fence
-  again with a new token, which it does by itself before its next write; if
-  another process took the fence or committed meanwhile, the realm stops
-  until it is opened again. A later renew never restores it. A renew
-  answered `FencedOut` means another process holds the fence, and the realm
-  stops until it is opened again.
+  background. After a failed renew, or once its self-fence window has
+  closed, the holder writes nothing and dispatches nothing until it
+  acquires the fence again with a new token, which it does by itself before
+  its next write; if another process took the fence or committed meanwhile,
+  the realm stops until it is opened again. A later renew never restores
+  it. A renew answered `FencedOut` means another process holds the fence,
+  and the realm stops until it is opened again.
 - **Self-fencing.** The holder makes no model call, dispatches no tool and
   commits nothing unless its last successful acquire or renew started less
   than the self-fence window ago. The window is the lease minus the store's

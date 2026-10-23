@@ -244,13 +244,13 @@ The store relies on Core keeping these rules:
   when a stopped holder re-acquires and an exclusive acquire answers `Held`
   with its own token.
 - **Renewing.** The holder renews once per renew interval. After a failed
-  renew, or once its lease has run out, it stops every write and dispatch,
-  and goes on only through a fresh acquire, with a new token, which it makes
-  by itself before its next write; if another process took the fence or
-  committed meanwhile, the realm stops until it is opened again. It never
-  resumes on a later renew. The rule is Core's: a store answers a renew of
-  the current token even when the holder's lease lapsed, and refuses only a
-  token that was superseded or that it never issued.
+  renew, or once its self-fence window has closed, it stops every write and
+  dispatch, and goes on only through a fresh acquire, with a new token,
+  which it makes by itself before its next write; if another process took
+  the fence or committed meanwhile, the realm stops until it is opened
+  again. It never resumes on a later renew. The rule is Core's: a store
+  answers a renew of the current token even when the holder's lease lapsed,
+  and refuses only a token that was superseded or that it never issued.
 - **Self-fencing.** The holder fences itself on its own clock: it makes no
   model call, dispatches nothing and commits nothing unless its last
   successful acquire or renew started less than the self-fence window ago.
@@ -306,12 +306,13 @@ on the database's clock, in a row of their own.
   row.
 - **Retries.** A streaming insert can fail in transport under a burst of
   commits. Retry it a bounded number of times with jittered backoff.
-  Per-row insert ids and the load-time collapse of a repeated commit id make
-  such a retry safe. In one store, transport errors hit about a third of the
-  commits in a burst until it retried up to six times.
+  Per-row insert ids, and a load that keeps one copy of a repeated commit id
+  and of a row written twice under one commit id (rows have stable indices),
+  make such a retry safe. In one store, about a third of the commits in a
+  burst met a transport error until it retried each insert up to six times.
 - **Request size.** A batch of up to 8 MiB grows to about 11 MB as JSON.
-  Split its rows into requests of at most 7 MiB each, and write the commit
-  marker last.
+  Split its rows into requests of at most 7 MiB each as sent, and write the
+  commit marker last.
 - **Load.** Take the scope's committed batches, drop fenced-out batches by
   their marker's commit order, collapse duplicate commit ids, keep the lowest
   commit id per version, and return the highest version's head and its rows
