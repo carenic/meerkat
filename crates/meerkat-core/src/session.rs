@@ -19137,23 +19137,24 @@ mod deferred_tool_failure_tests {
 
     /// The released 0.8.50 authority, which admits only stored input state v3
     /// to v5, rejects a current row; the current authority still admits every
-    /// supported older form, the v6 rows 0.9.0 to 0.9.3 wrote included. An
+    /// supported older form, the v6 rows 0.9.0 to 0.9.3 wrote and the v7 rows
+    /// 0.9.4 wrote included. An
     /// older binary may reject a newer row's content before reaching this
     /// version check, so no specific error is promised.
     #[test]
     fn released_reader_rejects_current_stored_input_state_and_current_admits_older_rows() {
         use crate::generated::session_persistence_version_authority as current;
-        assert_eq!(current::stored_input_state_version(), 7);
+        assert_eq!(current::stored_input_state_version(), 8);
         assert!(
             released_v0_8_50_version_authority::restore_stored_input_state_version(
                 current::stored_input_state_version()
             )
             .is_err()
         );
-        for supported in [3, 4, 5, 6, 7] {
+        for supported in [3, 4, 5, 6, 7, 8] {
             assert_eq!(
                 current::restore_stored_input_state_version(supported),
-                Ok(7)
+                Ok(8)
             );
         }
     }

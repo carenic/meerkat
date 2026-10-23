@@ -3514,11 +3514,11 @@ mod tests {
     fn stored_input_state_unknown_versions_still_fail_closed() {
         let mut fixture =
             serde_json::to_value(StoredInputState::new_accepted(InputId::new())).unwrap();
-        for rejected in [2, 8] {
+        for rejected in [2, 9] {
             fixture["stored_input_state_version"] = serde_json::json!(rejected);
             let error = serde_json::from_value::<StoredInputState>(fixture.clone())
                 .expect_err("unknown historical and future versions must fail closed");
-            assert!(error.to_string().contains("expected current 7"));
+            assert!(error.to_string().contains("expected current 8"));
         }
 
         // 0.8.10 accepted still-retained v3 input rows lazily, so a supported
@@ -3542,10 +3542,12 @@ mod tests {
             serde_json::from_value(fixture).expect("0.8.10 v4 input state must migrate");
         assert!(restored.state.terminal_completion.is_none());
 
+        // The migrated row carries no requeue fact, so it is written at the
+        // baseline version.
         let migrated = serde_json::to_value(restored).unwrap();
         assert_eq!(
             migrated["stored_input_state_version"],
-            meerkat_core::generated::session_persistence_version_authority::STORED_INPUT_STATE_VERSION,
+            meerkat_core::generated::session_persistence_version_authority::stored_input_state_version_for_row(false),
         );
 
         let mut terminal_fixture =
