@@ -1219,6 +1219,7 @@ impl PreparedWholeBlobRecoveryPromotion {
 pub struct PreparedHeadCanonicalProvisionalPromotion {
     checkpoint: meerkat_core::RunCheckpointReceipt,
     authority: HeadCanonicalProvisionalTailAuthority,
+    deferred_transcript_retirement: Option<u64>,
 }
 
 impl PreparedHeadCanonicalProvisionalPromotion {
@@ -1242,7 +1243,23 @@ impl PreparedHeadCanonicalProvisionalPromotion {
         Ok(Self {
             checkpoint,
             authority,
+            deferred_transcript_retirement: None,
         })
+    }
+
+    /// The same promotion, applying the store-side retention cut the run's
+    /// intra-run checkpoints deferred (the live graph's retired count at its
+    /// last checkpoint). The store clamps it to the promoted head, so it can
+    /// never strand the new boundary.
+    #[must_use]
+    pub fn with_deferred_transcript_retirement(mut self, retired: Option<u64>) -> Self {
+        self.deferred_transcript_retirement = retired;
+        self
+    }
+
+    #[must_use]
+    pub const fn deferred_transcript_retirement(&self) -> Option<u64> {
+        self.deferred_transcript_retirement
     }
 
     #[must_use]
@@ -2152,6 +2169,23 @@ pub struct PreparedDurableTailRecoverySource {
     physical_head: meerkat_core::session_store::SessionHead,
     physical_head_cas_token: String,
     physical_session: Arc<meerkat_core::Session>,
+    relation: DurableTailSourceRelation,
+}
+
+/// How a recovery source's physical head relates to its committed runtime
+/// boundary, as the store proved it while loading the source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DurableTailSourceRelation {
+    /// The physical transcript keeps the boundary's exact rows as a prefix.
+    StrictContinuation,
+    /// The physical head descends from the boundary through store-proven
+    /// transcript rewrite occurrences. A rewrite replaced rows, so the
+    /// boundary is no row prefix; the rows the run wrote after its final
+    /// rewrite start at `live_tail_base`.
+    RewriteDescendant { live_tail_base: usize },
+    /// The physical head carries rewrite occurrences the store could not
+    /// prove descend from the boundary.
+    UnprovenRewrite,
 }
 
 impl PreparedDurableTailRecoverySource {
@@ -2161,6 +2195,75 @@ impl PreparedDurableTailRecoverySource {
         provisional_authority: Option<HeadCanonicalProvisionalTailAuthority>,
         committed_materialization: meerkat_core::VerifiedSessionHeadMaterialization,
         physical_materialization: meerkat_core::VerifiedSessionHeadMaterialization,
+    ) -> Result<Self, RuntimeStoreError> {
+        Self::with_relation(
+            runtime_authority,
+            provisional_authority,
+            committed_materialization,
+            physical_materialization,
+            DurableTailSourceRelation::StrictContinuation,
+        )
+    }
+
+    /// A source whose physical head carries transcript rewrite occurrences
+    /// its boundary does not. A rewrite replaced rows the boundary holds, so
+    /// the boundary is no row prefix of the physical head: the strict
+    /// row-prefix check is replaced by the store's descent proof, and the
+    /// relation is taken from that proof alone
+    /// ([`DurableTailSourceRelation::RewriteDescendant`] when it proves the
+    /// descent, [`DurableTailSourceRelation::UnprovenRewrite`] otherwise).
+    #[cfg(feature = "sqlite-store")]
+    pub(crate) fn rewritten(
+        runtime_authority: RuntimeSessionAuthority,
+        provisional_authority: Option<HeadCanonicalProvisionalTailAuthority>,
+        committed_materialization: meerkat_core::VerifiedSessionHeadMaterialization,
+        descent: meerkat_store::sqlite_store::HeadCanonicalRewriteDescent,
+    ) -> Result<Self, RuntimeStoreError> {
+        let conflict = |detail: &str| RuntimeStoreError::SessionPersistenceAuthorityConflict {
+            runtime_id: runtime_authority.session_id().to_string(),
+            detail: detail.to_string(),
+        };
+        let (physical_materialization, verdict) = descent.into_parts();
+        if physical_materialization.head().rewrite_count
+            <= committed_materialization.head().rewrite_count
+        {
+            return Err(conflict(
+                "a rewritten recovery source needs a physical head with more rewrite occurrences than its boundary",
+            ));
+        }
+        let relation = match verdict {
+            meerkat_store::sqlite_store::RewriteDescentVerdict::Proven { live_tail_base } => {
+                DurableTailSourceRelation::RewriteDescendant {
+                    live_tail_base: usize::try_from(live_tail_base).map_err(|_| {
+                        conflict("rewrite descent live-tail base exceeds the host index range")
+                    })?,
+                }
+            }
+            meerkat_store::sqlite_store::RewriteDescentVerdict::Unproven { reason } => {
+                tracing::warn!(
+                    session_id = %runtime_authority.session_id(),
+                    reason = %reason,
+                    "a durable tail carries transcript rewrites the store cannot prove descend from the committed boundary; recovery holds it"
+                );
+                DurableTailSourceRelation::UnprovenRewrite
+            }
+        };
+        Self::with_relation(
+            runtime_authority,
+            provisional_authority,
+            committed_materialization,
+            physical_materialization,
+            relation,
+        )
+    }
+
+    #[cfg(feature = "sqlite-store")]
+    fn with_relation(
+        runtime_authority: RuntimeSessionAuthority,
+        provisional_authority: Option<HeadCanonicalProvisionalTailAuthority>,
+        committed_materialization: meerkat_core::VerifiedSessionHeadMaterialization,
+        physical_materialization: meerkat_core::VerifiedSessionHeadMaterialization,
+        relation: DurableTailSourceRelation,
     ) -> Result<Self, RuntimeStoreError> {
         let committed_session = Arc::clone(committed_materialization.session());
         let physical_head = physical_materialization.head().clone();
@@ -2188,10 +2291,11 @@ impl PreparedDurableTailRecoverySource {
         let boundary_row_prefix = boundary_head.message_row_prefix.as_ref().ok_or_else(|| {
             conflict("runtime boundary has no exact message-row prefix authority".to_string())
         })?;
-        if physical_materialization
-            .exact_row_prefix_at(boundary_head.message_count)
-            .as_ref()
-            != Some(boundary_row_prefix)
+        if relation == DurableTailSourceRelation::StrictContinuation
+            && physical_materialization
+                .exact_row_prefix_at(boundary_head.message_count)
+                .as_ref()
+                != Some(boundary_row_prefix)
         {
             return Err(conflict(
                 "physical recovery materialization does not retain the runtime boundary's exact row prefix"
@@ -2334,7 +2438,12 @@ impl PreparedDurableTailRecoverySource {
             physical_head,
             physical_head_cas_token,
             physical_session,
+            relation,
         })
+    }
+
+    pub(crate) const fn relation(&self) -> DurableTailSourceRelation {
+        self.relation
     }
 
     pub(crate) fn runtime_authority(&self) -> &RuntimeSessionAuthority {

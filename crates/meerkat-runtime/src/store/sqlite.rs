@@ -10385,6 +10385,7 @@ ORDER BY runtime_id";
         expected: &HeadCanonicalProvisionalTailAuthority,
         receipt: &RunBoundaryReceipt,
         runtime_state: Option<RuntimeState>,
+        deferred_transcript_retirement: Option<u64>,
     ) -> Result<HeadCanonicalStoreAuthority, RuntimeStoreError> {
         let stored = load_head_canonical_provisional_tail(tx, runtime_id)?.ok_or_else(|| {
             session_authority_conflict(
@@ -10483,6 +10484,18 @@ ORDER BY runtime_id";
             runtime_id,
             &RuntimeSessionAuthority::HeadCanonical(committed.clone()),
         )?;
+        // The run's intra-run checkpoints pruned no rewrite rows, so the
+        // previous boundary stayed rebuildable until now. With the new
+        // authority written, apply the run's deferred retention cut to the
+        // promoted head; the store clamps it to that head's anchor floor.
+        if let Some(target) = deferred_transcript_retirement {
+            meerkat_store::sqlite_store::retire_head_canonical_rows_for_runtime_in_txn(
+                tx,
+                committed.boundary_head(),
+                target,
+            )
+            .map_err(|error| map_head_canonical_session_store_error(runtime_id, error))?;
+        }
         insert_compaction_projection_outbox_intents(
             tx,
             runtime_id,
@@ -12911,6 +12924,7 @@ ORDER BY runtime_id";
                 runtime_id,
                 "commit_head_canonical_provisional_promotion",
             )?;
+            let deferred_transcript_retirement = promotion.deferred_transcript_retirement();
             let (checkpoint, authority) = promotion.into_parts();
             if authority.session_id() != &session_store_key {
                 return Err(RuntimeStoreError::SessionKeyMismatch {
@@ -13065,6 +13079,7 @@ ORDER BY runtime_id";
                     &authority,
                     &receipt,
                     runtime_state,
+                    deferred_transcript_retirement,
                 )?;
                 if let Some(snapshot) = lifecycle_snapshot.as_ref() {
                     upsert_machine_lifecycle_snapshot(&tx, &runtime_id, snapshot)?;
@@ -14820,25 +14835,48 @@ ORDER BY runtime_id";
                     })?;
                     return Ok(Some(source));
                 }
-                let physical =
-                    meerkat_store::sqlite_store::verify_physical_head_retains_boundary_prefix_for_runtime_in_txn(
-                        &tx,
-                        boundary_head,
-                        &physical_head,
-                    )
-                    .map_err(|error| {
-                        map_head_canonical_session_store_error(
-                            &runtime_id,
-                            error,
+                // A run that compacted rewrote rows the boundary holds, so
+                // its physical head keeps no boundary row prefix: the store
+                // proves the descent through the rewrite occurrences instead.
+                let source = if physical_head.rewrite_count > boundary_head.rewrite_count {
+                    let descent =
+                        meerkat_store::sqlite_store::verify_physical_head_rewrite_descent_for_runtime_in_txn(
+                            &tx,
+                            boundary_head,
+                            &physical_head,
                         )
-                    })?;
-                let source =
+                        .map_err(|error| {
+                            map_head_canonical_session_store_error(
+                                &runtime_id,
+                                error,
+                            )
+                        })?;
+                    PreparedDurableTailRecoverySource::rewritten(
+                        authority,
+                        provisional,
+                        committed,
+                        descent,
+                    )?
+                } else {
+                    let physical =
+                        meerkat_store::sqlite_store::verify_physical_head_retains_boundary_prefix_for_runtime_in_txn(
+                            &tx,
+                            boundary_head,
+                            &physical_head,
+                        )
+                        .map_err(|error| {
+                            map_head_canonical_session_store_error(
+                                &runtime_id,
+                                error,
+                            )
+                        })?;
                     PreparedDurableTailRecoverySource::new(
                         authority,
                         provisional,
                         committed,
                         physical,
-                    )?;
+                    )?
+                };
                 tx.commit().map_err(|error| {
                     RuntimeStoreError::ReadFailed(error.to_string())
                 })?;

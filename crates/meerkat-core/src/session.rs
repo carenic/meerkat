@@ -6708,6 +6708,27 @@ impl Session {
             Some(usize::try_from(rewrite_count).unwrap_or(usize::MAX));
     }
 
+    /// Whether this session keeps more rewrite bodies than `retention`
+    /// because its durable HeadCanonical head does not cover them yet
+    /// ([`Self::retire_transcript_history`] never retires past that head).
+    /// Only a checkpoint that moves the durable head over them lets
+    /// retirement reach the bound.
+    pub(crate) fn durable_head_holds_retirement(
+        &self,
+        retention: TranscriptHistoryRetention,
+    ) -> Result<bool, TranscriptEditError> {
+        if self.history_caches.durable_rewrite_count.is_none() {
+            return Ok(false);
+        }
+        let Some(history) = self.validated_transcript_history_state()? else {
+            return Ok(false);
+        };
+        Ok(
+            history.state().commit_count() - history.state().retired_count()
+                > retention.retained_rewrites(),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn durable_transcript_rewrite_count_for_test(&self) -> Option<usize> {
         self.history_caches.durable_rewrite_count
