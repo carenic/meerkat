@@ -100,6 +100,29 @@ fn sibling_lock_path(db_path: &Path, suffix: &str) -> PathBuf {
     db_path.with_file_name(name)
 }
 
+/// A lock file this process holds an OS lock on, through a descriptor it
+/// opened itself. Dropping it unlocks the file, then closes it. The lock
+/// belongs to the open file description, and a process spawned meanwhile
+/// holds a copy of the descriptor until it executes its program, which would
+/// keep a lock released by the close alone. Each value opened its own
+/// description, so the unlock releases no other holder's lock.
+#[derive(Debug)]
+struct HeldLock(File);
+
+impl std::ops::Deref for HeldLock {
+    type Target = File;
+
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+
+impl Drop for HeldLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 fn open_lock_file(lock_path: &Path) -> Option<File> {
     // Fail-open: if the lock file can neither be opened nor created, no
     // fence can exist on this medium either (see module docs).
@@ -117,7 +140,7 @@ fn open_lock_file(lock_path: &Path) -> Option<File> {
 /// Held for the duration of the operation; dropping it releases the lock.
 #[derive(Debug)]
 pub struct OperationGuard {
-    _lock: Option<File>,
+    _lock: Option<HeldLock>,
 }
 
 impl OperationGuard {
@@ -163,7 +186,9 @@ impl OperationGuard {
                 )));
             }
             match file.try_lock_shared() {
-                Ok(()) => Ok(Self { _lock: Some(file) }),
+                Ok(()) => Ok(Self {
+                    _lock: Some(HeldLock(file)),
+                }),
                 Err(error) if is_would_block(&error) => {
                     Err(SqliteStoreError::MaintenanceFenceHeld {
                         path: db_path.to_path_buf(),
@@ -194,7 +219,9 @@ impl OperationGuard {
             return Ok(Self { _lock: None });
         };
         match file.try_lock_shared() {
-            Ok(()) => Ok(Self { _lock: Some(file) }),
+            Ok(()) => Ok(Self {
+                _lock: Some(HeldLock(file)),
+            }),
             Err(err) if is_would_block(&err) => Err(SqliteStoreError::MaintenanceFenceHeld {
                 path: db_path.to_path_buf(),
             }),
@@ -226,9 +253,14 @@ impl OperationGuard {
             Err(err) if is_would_block(&err) => Err(SqliteStoreError::MaintenanceFenceHeld {
                 path: db_path.to_path_buf(),
             }),
-            // Admitted, or a filesystem without lock support (fail open, as
-            // `for_database`). Dropping the file releases the shared lock.
-            Ok(()) | Err(_) => Ok(()),
+            // Admitted: the shared lock is released at once.
+            Ok(()) => {
+                drop(HeldLock(file));
+                Ok(())
+            }
+            // A filesystem without lock support: fail open, as
+            // `for_database`.
+            Err(_) => Ok(()),
         }
     }
 }
@@ -246,7 +278,7 @@ impl OperationGuard {
 /// exclusively after the fence lock (the module documents the lock order).
 #[derive(Debug)]
 pub struct KeptConnectionPresence {
-    _lock: File,
+    _lock: HeldLock,
 }
 
 impl KeptConnectionPresence {
@@ -281,7 +313,9 @@ impl KeptConnectionPresence {
         };
         let file = open_lock_file(&presence_lock_path(db_path))?;
         file.try_lock_shared().ok()?;
-        Some(Self { _lock: file })
+        Some(Self {
+            _lock: HeldLock(file),
+        })
     }
 }
 
@@ -296,8 +330,8 @@ impl KeptConnectionPresence {
 /// roots.
 #[derive(Debug)]
 pub struct ExclusiveFence {
-    _lock: File,
-    _presence: File,
+    _lock: HeldLock,
+    _presence: HeldLock,
     lock_path: PathBuf,
 }
 
@@ -361,7 +395,7 @@ impl ExclusiveFence {
     /// Record both held locks in the holder registry (see
     /// `held_exclusive_locks`): only a fence that holds both admits its
     /// holder's own operations.
-    fn held(fence: File, presence: File, lock_path: PathBuf) -> Self {
+    fn held(fence: HeldLock, presence: HeldLock, lock_path: PathBuf) -> Self {
         if let Ok(mut held) = held_exclusive_locks().lock() {
             held.insert(registry_key(&lock_path));
         }
@@ -383,7 +417,7 @@ const FENCE_POLL: Duration = Duration::from_millis(25);
 
 /// Take `lock_path` exclusively without waiting; `None` while another holder
 /// has it.
-fn try_lock_exclusive(lock_path: &Path) -> Result<Option<File>, SqliteStoreError> {
+fn try_lock_exclusive(lock_path: &Path) -> Result<Option<HeldLock>, SqliteStoreError> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -391,13 +425,16 @@ fn try_lock_exclusive(lock_path: &Path) -> Result<Option<File>, SqliteStoreError
         .truncate(false)
         .open(lock_path)?;
     match file.try_lock() {
-        Ok(()) => Ok(Some(file)),
+        Ok(()) => Ok(Some(HeldLock(file))),
         Err(err) if is_would_block(&err) => Ok(None),
         Err(err) => Err(SqliteStoreError::Io(std::io::Error::other(err))),
     }
 }
 
 impl Drop for ExclusiveFence {
+    /// The holder registry forgets the fence first, so this process admits
+    /// its own operations no more; its two locks are released after, as
+    /// their fields drop.
     fn drop(&mut self) {
         if let Ok(mut held) = held_exclusive_locks().lock() {
             held.remove(&registry_key(&self.lock_path));

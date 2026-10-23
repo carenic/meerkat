@@ -351,6 +351,12 @@ async fn write_generation_at(state_path: &Path, generation: u64) -> Result<(), C
 /// OS releases a lock when its file closes, including when the holder's
 /// process dies, so an abandoned lock needs no recovery and a lock file nobody
 /// holds is no obstacle.
+///
+/// A holder releases its custody explicitly before its file closes
+/// ([`release_custody`]): the lock belongs to the open file description, and
+/// a process spawned meanwhile holds a copy of the holder's descriptor until
+/// it executes its program, which would keep a custody released by the close
+/// alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Custody {
     Shared,
@@ -376,11 +382,26 @@ fn try_custody(path: &Path, custody: Custody) -> std::io::Result<Option<std::fs:
             Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
             Err(std::fs::TryLockError::Error(error)) => return Err(error),
         }
-        if locks_path(&file, path)? {
-            return Ok(Some(file));
+        match locks_path(&file, path) {
+            Ok(true) => return Ok(Some(file)),
+            // Another file is at the path now: release this one, open again.
+            Ok(false) => release_custody(&file),
+            Err(error) => {
+                release_custody(&file);
+                return Err(error);
+            }
         }
     }
     Ok(None)
+}
+
+/// Release the custody held through `file`, before it closes. The lock
+/// belongs to the open file description, which every copy of the descriptor
+/// shares; unlocking releases it for all of them, so a copy a process spawned
+/// meanwhile still holds keeps nothing. Every custody opened its own
+/// description ([`try_custody`]), so this releases no other holder's custody.
+fn release_custody(file: &std::fs::File) {
+    let _ = file.unlock();
 }
 
 /// Take `custody` of the lock file at `path`, waiting up to `timeout` for an
@@ -431,6 +452,12 @@ impl std::fmt::Debug for ConfigWriterLock {
     }
 }
 
+impl Drop for ConfigWriterLock {
+    fn drop(&mut self) {
+        release_custody(&self._file);
+    }
+}
+
 impl ConfigWriterLock {
     /// Take the exclusive custody at `path`, waiting up to the lock timeout
     /// for current holders.
@@ -468,6 +495,12 @@ impl std::fmt::Debug for ConfigReadLock {
         f.debug_struct("ConfigReadLock")
             .field("path", &self.path)
             .finish_non_exhaustive()
+    }
+}
+
+impl Drop for ConfigReadLock {
+    fn drop(&mut self) {
+        release_custody(&self._file);
     }
 }
 

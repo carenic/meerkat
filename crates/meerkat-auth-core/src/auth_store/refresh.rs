@@ -493,13 +493,36 @@ mod file_lock {
         Busy,
     }
 
+    /// The cross-process lock file, locked exclusively through this
+    /// descriptor. Dropping it unlocks the file, then closes it, whether the
+    /// work under it finished or was cancelled. The lock belongs to the open
+    /// file description, and a process spawned meanwhile holds a copy of the
+    /// descriptor until it executes its program, which would keep a lock
+    /// released by the close alone. It opened its own description, so the
+    /// unlock releases no other holder's lock.
+    struct HeldLock(File);
+
+    impl std::ops::Deref for HeldLock {
+        type Target = File;
+
+        fn deref(&self) -> &File {
+            &self.0
+        }
+    }
+
+    impl Drop for HeldLock {
+        fn drop(&mut self) {
+            let _ = FileExt::unlock(&self.0);
+        }
+    }
+
     /// Take the cross-process lock without parking a thread: poll the
     /// non-blocking lock until `wait` has passed.
     async fn acquire_lock_file(
         lock_dir: &Path,
         lock_path: &Path,
         wait: Duration,
-    ) -> Result<File, LockAdmission> {
+    ) -> Result<HeldLock, LockAdmission> {
         tokio::fs::create_dir_all(lock_dir)
             .await
             .map_err(LockAdmission::Failed)?;
@@ -513,7 +536,7 @@ mod file_lock {
         let deadline = tokio::time::Instant::now() + wait;
         loop {
             if FileExt::try_lock_exclusive(&file).map_err(LockAdmission::Failed)? {
-                return Ok(file);
+                return Ok(HeldLock(file));
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(LockAdmission::Busy);
@@ -574,10 +597,7 @@ mod file_lock {
                         })?;
 
                     let result = refresh_fn().await;
-
-                    let _ = FileExt::unlock(&file);
                     drop(file);
-
                     result
                 })
             })
@@ -612,10 +632,7 @@ mod file_lock {
                         })?;
 
                     let result = mutation_fn().await;
-
-                    let _ = FileExt::unlock(&file);
                     drop(file);
-
                     result
                 })
             })

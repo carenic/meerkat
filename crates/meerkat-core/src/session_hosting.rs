@@ -831,8 +831,22 @@ mod native {
     struct RegistryEntry {
         owner: HostingOwner,
         claim: Weak<ClaimInner>,
-        /// The OS lock is held as long as this file is open.
+        /// The OS lock is held through this file until the entry drops.
         _file: File,
+    }
+
+    /// An entry drops only when the registry removes it, after the last claim
+    /// of its lineage was released: a successor that took the entry over
+    /// keeps it, file and lock included. Its lock is released here, before
+    /// the file closes. The lock belongs to the open file description, and a
+    /// process spawned meanwhile holds a copy of the descriptor until it
+    /// executes its program, which would keep a claim released by the close
+    /// alone. The entry opened that description itself, so the unlock
+    /// releases no other holder's lock.
+    impl Drop for RegistryEntry {
+        fn drop(&mut self) {
+            let _ = self._file.unlock();
+        }
     }
 
     /// Session claims this process holds, keyed by lock path.
@@ -1086,6 +1100,13 @@ mod native {
     impl ExclusiveProcessLock {
         pub fn lock_path(&self) -> &Path {
             &self.path
+        }
+    }
+
+    /// Released before the file closes, as a registry entry's claim is.
+    impl Drop for ExclusiveProcessLock {
+        fn drop(&mut self) {
+            let _ = self._file.unlock();
         }
     }
 

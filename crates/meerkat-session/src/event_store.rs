@@ -2029,6 +2029,18 @@ struct SequenceAllocationLock {
     _lock: std::fs::File,
 }
 
+/// Released before the file closes: the lock belongs to the open file
+/// description, and a process spawned meanwhile holds a copy of the
+/// descriptor until it executes its program, which would keep a lock released
+/// by the close alone. The lock opened its own description, so the unlock
+/// releases no other holder's lock.
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for SequenceAllocationLock {
+    fn drop(&mut self) {
+        let _ = self._lock.unlock();
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 impl FileEventStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
