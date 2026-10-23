@@ -661,6 +661,97 @@ async fn a_host_declared_self_fence_margin_bounds_the_write_window() {
     assert_eq!(fence.window().window, Duration::from_secs(18));
 }
 
+// Unrun until the candidate's validation.
+#[tokio::test]
+async fn a_run_rebase_lands_as_one_batch_and_survives_a_reopen() {
+    use meerkat_core::types::{Message, UserMessage};
+    let host = Arc::new(TestHost::new());
+    let opened = open(&host).await;
+    let mut original = meerkat_core::Session::new();
+    original.push(Message::User(UserMessage::text("hello".to_string())));
+    original.push(Message::User(UserMessage::text("again".to_string())));
+    let runtime_id = LogicalRuntimeId::for_session(original.id());
+    opened
+        .1
+        .commit_session_snapshot(
+            &runtime_id,
+            crate::store::SerializedSessionSnapshot {
+                session_snapshot: serde_json::to_vec(&original).unwrap().into(),
+            },
+        )
+        .await
+        .unwrap();
+    let committed = opened
+        .1
+        .load_committed_whole_blob_snapshot(&runtime_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let payload =
+        crate::store::VerifiedCommittedWholeBlobPayload::from_committed(original.id(), committed)
+            .unwrap();
+    let run_id = meerkat_core::lifecycle::RunId::new();
+    let mut live = original.clone();
+    live.push(Message::User(UserMessage::text("next".to_string())));
+    live.set_run_cursor(&meerkat_core::SessionRunCursor::new(
+        run_id.clone(),
+        Vec::new(),
+        0,
+        meerkat_core::RunResumePoint::AwaitingModel,
+    ))
+    .unwrap();
+    let mut compacted = live.clone();
+    let parent = compacted.transcript_revision().unwrap();
+    let commit = compacted
+        .commit_transcript_rewrite(
+            meerkat_core::TranscriptRewriteSelection::MessageRange { start: 0, end: 2 },
+            vec![Message::User(UserMessage::compaction_summary("compacted"))],
+            meerkat_core::TranscriptRewriteReason::new("compaction"),
+            Some("spi-rebase-test".to_string()),
+            Some(parent),
+        )
+        .unwrap();
+    let rebase = crate::store::PreparedWholeBlobRunRebase::prepare(
+        payload,
+        None,
+        run_id,
+        compacted,
+        std::slice::from_ref(&commit),
+    )
+    .unwrap();
+    let before = host.commit_count();
+    let outcome = opened
+        .1
+        .commit_prepared_whole_blob_run_rebase(&runtime_id, rebase.store_parts())
+        .await
+        .unwrap();
+    let crate::store::WholeBlobRunRebaseOutcome::Applied { committed, tail } = outcome else {
+        unreachable!("the re-base applies");
+    };
+    assert_eq!(
+        host.commit_count(),
+        before + 1,
+        "one batch carries the successor, its outbox rows and the new tail"
+    );
+    let reopened = reopen(&host, opened).await;
+    let loaded_tail = reopened
+        .1
+        .load_whole_blob_provisional_tail(&runtime_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded_tail.authority(), &tail);
+    assert_eq!(
+        reopened
+            .1
+            .load_whole_blob_store_authority(&runtime_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        committed
+    );
+}
+
 // Unrun until the candidate's validation. The K3 re-acquire rule, with the
 // visibility-lag counterexample: renews fail from some point, the lease
 // lapses, another process acquires, and the old writer's connection comes
