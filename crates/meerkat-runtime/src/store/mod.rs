@@ -9762,6 +9762,19 @@ pub trait RuntimeStore: Send + Sync {
         ))
     }
 
+    /// Whether this store implements
+    /// [`Self::commit_prepared_whole_blob_run_rebase`].
+    ///
+    /// The session service re-bases a WholeBlob run after a compaction only
+    /// over a store that answers `true`. Over any other store the run takes
+    /// no round commit after its first rewrite, and its last round commit
+    /// before that rewrite stays its resume point. Unknown and custom stores
+    /// answer `false` by default; a store that implements the operation
+    /// answers `true`, and a decorator forwards both together.
+    fn supports_whole_blob_run_rebase(&self) -> bool {
+        false
+    }
+
     /// Atomically persist session delta + receipt + input state updates.
     ///
     /// All writes MUST commit in a single atomic operation.

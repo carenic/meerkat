@@ -552,6 +552,17 @@ where
         self.runtime_execution_kind = execution_kind;
     }
 
+    /// Stage the inputs that bind to the next run when it starts: the
+    /// runtime batch's contributing inputs.
+    ///
+    /// A durable session's run cursor lists them, with every steer or peer
+    /// input the run later writes into its transcript at a boundary, so
+    /// recovery knows which inputs a resumed run already carries. Cleared with
+    /// the runtime execution kind; a direct (non-runtime) run binds none.
+    pub fn set_run_start_input_ids(&mut self, input_ids: Vec<crate::lifecycle::InputId>) {
+        self.run_start_input_ids = input_ids;
+    }
+
     pub fn set_active_transcript_identity(
         &mut self,
         transcript_identity: Option<TranscriptMessageIdentity>,
@@ -588,11 +599,49 @@ where
         self.active_turn_request_contexts.clear();
         self.active_turn_request_reasoning = None;
         self.runtime_started_run_id = None;
+        self.run_start_input_ids.clear();
+        self.pending_resumed_round = None;
+        self.round_commits = Default::default();
     }
 
     fn reset_runtime_terminal_failure_witness(&mut self) {
         self.runtime_started_run_id = None;
         self.runtime_terminal_failure_witness = None;
+    }
+
+    /// Whether the runtime turn authority ended the current run as a
+    /// hard-failure terminal: the exit the session layer commits from the
+    /// run's latest checkpoint as a machine terminal failure, by the same
+    /// classification as [`Self::record_runtime_terminal_failure_witness`].
+    /// False outside a runtime-backed run and when the authority cannot be
+    /// read.
+    pub(super) fn runtime_turn_ended_in_hard_failure(&self) -> bool {
+        use crate::generated::terminal_surface_mapping::{SurfaceResultClass, classify_terminal};
+
+        let Some(started_run_id) = self.runtime_started_run_id.as_ref() else {
+            return false;
+        };
+        if self.runtime_execution_kind.is_none() {
+            return false;
+        }
+        let Some(turn_state_handle) = self.turn_state_handle.as_deref() else {
+            return false;
+        };
+        runtime_execution_snapshot(turn_state_handle, self.applied_cursor).is_ok_and(|snapshot| {
+            snapshot.turn_terminal
+                && matches!(
+                    classify_terminal(&snapshot.terminal_outcome, snapshot.terminal_cause_kind),
+                    SurfaceResultClass::HardFailure
+                )
+                && validate_runtime_terminal_run_id(
+                    started_run_id,
+                    snapshot.terminal_run_id.as_ref(),
+                )
+                .is_ok()
+                && snapshot
+                    .terminal_cause_kind
+                    .is_some_and(|cause| cause.is_specific_failure_cause())
+        })
     }
 
     fn record_runtime_terminal_failure_witness(&mut self, error: &AgentError) {
@@ -1219,6 +1268,20 @@ where
         self.model_preparation_observer = observer;
     }
 
+    /// Observe each durable round commit, first and second, with the cursor
+    /// it wrote (a first commit's resume point is `ToolsPending`). Called
+    /// after the commit's checkpoint returned its receipt and before any tool
+    /// of a first commit's round is admitted. The callback receives no
+    /// authority and returns no decision.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn __test_set_round_commit_observer(
+        &mut self,
+        observer: Option<crate::agent::RoundCommitObserver>,
+    ) {
+        self.round_commit_observer = observer;
+    }
+
     /// Get the runtime-backed turn-state handle, when this agent was built with one.
     pub fn turn_state_handle(&self) -> Option<Arc<dyn crate::TurnStateHandle>> {
         self.turn_state_handle.clone()
@@ -1290,7 +1353,11 @@ where
         {
             return Ok(crate::ops::terminal_tool_outcome_for_error(call.id, error));
         }
-        let context = self.observed_tool_dispatch_context(self.operation_review.clone());
+        // An external call belongs to no round of the agent's loop: it
+        // carries no dedupe key, whatever round the agent bound last.
+        let context = self
+            .observed_tool_dispatch_context(self.operation_review.clone())
+            .outside_round();
         let outcome = self
             .dispatch_host_tool_call(call, timeout_policy, context)
             .await?;
@@ -1685,6 +1752,9 @@ where
             }
             self.session.push(message);
         }
+        // The input is now in the running turn's transcript: it binds to the
+        // run, and the run's next round commit lists it in its cursor.
+        self.round_commits.bind_input(input_id.clone());
         self.tool_dispatch_context
             .record_boundary_peer_replies(peer_reply_capabilities);
         let mut events = Vec::with_capacity(1 + peer_ingested_events.len());
@@ -2004,6 +2074,29 @@ where
                 identity: self.live_run_identity(),
                 input,
                 request_reasoning: self.active_turn_request_reasoning,
+            },
+        )
+        .await;
+    }
+
+    /// Announce a run that resumes from its run cursor, in place of
+    /// `RunStarted`: the run's terminal is owed on the same sinks as for a
+    /// started run.
+    pub(super) async fn emit_run_resumed_event(
+        &self,
+        run_id: &crate::lifecycle::RunId,
+        cursor: &crate::SessionRunCursor,
+        event_tx: Option<&mpsc::Sender<AgentEvent>>,
+    ) {
+        self.run_lifecycle_publication.announce_start();
+        self.publish_run_lifecycle_event(
+            crate::agent::RunLifecycleEvent::Started,
+            event_tx,
+            AgentEvent::RunResumed {
+                session_id: self.session.id().clone(),
+                run_id: run_id.clone(),
+                round: cursor.round,
+                resume_point: crate::event::RunResumePointKind::from(&cursor.resume_point),
             },
         )
         .await;
@@ -2577,6 +2670,54 @@ where
         scope.agent.run_pending_inner(Some(event_tx)).await
     }
 
+    /// Resume a durable run from its run cursor after a restart.
+    ///
+    /// The session layer calls this, in place of a content or pending run,
+    /// for a session whose provisional tail recovery classified as a
+    /// continuable run. The agent was built over that tail, which carries
+    /// `cursor`; `receipt` is the tail's checkpoint receipt, from which the
+    /// run's checkpoints chain. The run keeps its run id (the turn authority
+    /// must have started the cursor's run), its bound inputs (the cursor's:
+    /// inputs staged with [`Self::set_run_start_input_ids`] must be exactly
+    /// those), its round index, counters, usage account and the turn horizon
+    /// it had used.
+    ///
+    /// - At `ToolsPending` the round's staged assistant message is the
+    ///   round's model response: the model is not asked again, and the
+    ///   message's tool calls are dispatched again under their call ids, with
+    ///   the same dedupe keys, each through the full admission path (pre- and
+    ///   post-tool hooks, visibility, review; no earlier approval is reused).
+    ///   A call that admission refuses now answers outcome-uncertain with the
+    ///   refusal, because it may have taken effect before the restart.
+    ///   Delivery is at least once. Three kinds of call are answered as
+    ///   interrupted, with an outcome-uncertain result, instead of running
+    ///   again: a call whose process `interrupted_calls` shows may have run, a
+    ///   call to one of Core's comms tools that sends to another agent, and a
+    ///   call whose plan is Detached under a runner that cannot resume or
+    ///   repeat it.
+    /// - At `AwaitingModel` the run makes its next model call. Asynchronous
+    ///   operations the run was to wait for ended with the restart; it does
+    ///   not wait for them, and the model is told so.
+    ///
+    /// No run-start hook runs and no `RunStarted` is published: the run
+    /// started before the restart. `RunResumed` announces it instead, and its
+    /// terminal follows as for any run. The tools of a resumed run see no
+    /// current-turn content, as for a pending continuation.
+    pub async fn resume_run(
+        &mut self,
+        cursor: crate::SessionRunCursor,
+        receipt: crate::RunCheckpointReceipt,
+        event_tx: Option<mpsc::Sender<AgentEvent>>,
+        work_authorization: Option<crate::WorkAuthorizationContext>,
+        interrupted_calls: Vec<crate::tool_process::InterruptedToolCall>,
+    ) -> Result<RunResult, AgentError> {
+        let scope = WorkAuthorizationRunScope::new(self, work_authorization);
+        scope
+            .agent
+            .resume_run_inner(cursor, receipt, event_tx, interrupted_calls)
+            .await
+    }
+
     fn push_transcript_append(&mut self, append: ConversationAppend) -> Result<(), AgentError> {
         if append.role != ConversationAppendRole::System && append.identity.is_some() {
             return Err(AgentError::ConfigError(
@@ -2819,7 +2960,7 @@ where
                 .with_live_bridge_admission(admission);
         }
         let loop_result = self
-            .run_loop(Some(run_prompt_input), event_tx.clone(), None)
+            .run_loop(Some(run_prompt_input), event_tx.clone(), None, None)
             .await;
         self.tool_dispatch_context = crate::ToolDispatchContext::default()
             .with_work_authorization(self.tool_dispatch_context.work_authorization().cloned());
@@ -3004,7 +3145,7 @@ where
                     .and_then(|identity| identity.interaction_id),
             );
         let loop_result = self
-            .run_loop(Some(prompt), event_tx.clone(), deferred_callback)
+            .run_loop(Some(prompt), event_tx.clone(), deferred_callback, None)
             .await;
         self.tool_dispatch_context = crate::ToolDispatchContext::default()
             .with_work_authorization(self.tool_dispatch_context.work_authorization().cloned());
@@ -3045,6 +3186,147 @@ where
         }
     }
 
+    async fn resume_run_inner(
+        &mut self,
+        cursor: crate::SessionRunCursor,
+        receipt: crate::RunCheckpointReceipt,
+        event_tx: Option<mpsc::Sender<AgentEvent>>,
+        interrupted_calls: Vec<crate::tool_process::InterruptedToolCall>,
+    ) -> Result<RunResult, AgentError> {
+        self.reset_runtime_terminal_failure_witness();
+        if let Err(err) = self.require_resumed_run_execution_kind() {
+            self.clear_runtime_execution_kind();
+            return Err(err);
+        }
+        if let Err(err) = self.check_resumed_run_inputs(&cursor) {
+            self.clear_runtime_execution_kind();
+            return Err(err);
+        }
+        if let Err(err) = self.admit_mandatory_hook_topology() {
+            self.clear_runtime_execution_kind();
+            return Err(err);
+        }
+        if let Err(error) = self.prepare_compaction_ingress().await {
+            self.clear_runtime_execution_kind();
+            return Err(error);
+        }
+        let event_tx = event_tx.or_else(|| self.default_event_tx.clone());
+
+        // Reset state for new run (allows multi-turn on same agent).
+        self.extraction_state.reset();
+        self.terminal_error_detail = None;
+        self.terminal_error_metadata = None;
+        self.run_completed_hooks_applied = false;
+        self.run_completed_event_emitted = false;
+        self.run_lifecycle_publication.reset();
+        self.run_result_assistant_message = None;
+        self.clear_staged_model_routing_handoff();
+
+        let mut dispatch_metadata = self.turn_tool_dispatch_metadata.clone();
+        if let Some(objective_id) = self
+            .active_transcript_identity
+            .as_ref()
+            .and_then(|identity| identity.objective_id)
+        {
+            dispatch_metadata.insert(
+                crate::agent::TOOL_DISPATCH_OBJECTIVE_ID_KEY.to_string(),
+                serde_json::Value::String(objective_id.to_string()),
+            );
+        }
+        self.tool_dispatch_context = crate::ToolDispatchContext::default()
+            .with_work_authorization(self.tool_dispatch_context.work_authorization().cloned())
+            .with_turn_metadata(dispatch_metadata)
+            .with_runtime_identity(
+                self.session.id().clone(),
+                self.active_transcript_identity
+                    .as_ref()
+                    .and_then(|identity| identity.interaction_id),
+            );
+        let resumed = super::state::ResumedRunStart {
+            cursor,
+            receipt,
+            interrupted_calls,
+        };
+        let loop_result = self
+            .run_loop(None, event_tx.clone(), None, Some(resumed))
+            .await;
+        self.tool_dispatch_context = crate::ToolDispatchContext::default()
+            .with_work_authorization(self.tool_dispatch_context.work_authorization().cloned());
+
+        match loop_result {
+            Ok(mut result) => {
+                if !self.run_completed_hooks_applied
+                    && let Err(err) = self
+                        .run_completed_hooks(&mut result, event_tx.as_ref())
+                        .await
+                {
+                    self.handle_run_failure(&err, event_tx.as_ref()).await;
+                    let err = self.settle_compaction_after_run_error(err).await;
+                    self.clear_runtime_execution_kind();
+                    return Err(err);
+                }
+                if !self.run_completed_event_emitted {
+                    self.emit_run_completed_event(&result, false, event_tx.as_ref())
+                        .await;
+                    self.run_completed_event_emitted = true;
+                }
+                if let Err(err) = self.sync_current_session_control_state() {
+                    self.handle_run_failure(&err, event_tx.as_ref()).await;
+                    let err = self.settle_compaction_after_run_error(err).await;
+                    self.clear_runtime_execution_kind();
+                    return Err(err);
+                }
+                self.clear_runtime_execution_kind();
+                Ok(result)
+            }
+            Err(err) => {
+                self.record_runtime_terminal_failure_witness(&err);
+                self.handle_run_failure(&err, event_tx.as_ref()).await;
+                let err = self.settle_compaction_after_run_error(err).await;
+                self.clear_runtime_execution_kind();
+                Err(err)
+            }
+        }
+    }
+
+    /// A resumed run runs only as the runtime dispatched it. A runtime-stamped
+    /// agent never resumes under a content turn's or a pending
+    /// continuation's execution kind, whose admission is not a resume's: the
+    /// runtime's resumed-run dispatch kind, which arrives with the runtime's
+    /// resume dispatch, is the one this requires. An agent the runtime does
+    /// not stamp (a direct embedding) resumes as its host calls it.
+    fn require_resumed_run_execution_kind(&self) -> Result<(), AgentError> {
+        if !self.runtime_execution_kind_required {
+            return Ok(());
+        }
+        Err(AgentError::InternalError(format!(
+            "a runtime-backed run resumes only under the resumed-run dispatch kind, not {:?}",
+            self.runtime_execution_kind
+        )))
+    }
+
+    /// The inputs the session layer staged for a resumed run must be the
+    /// cursor's bound inputs: a resumed run's batch is exactly the inputs
+    /// bound to the run, and the cursor is their record. Staging none (a
+    /// direct resume) leaves the cursor's.
+    fn check_resumed_run_inputs(&self, cursor: &crate::SessionRunCursor) -> Result<(), AgentError> {
+        if self.run_start_input_ids.is_empty() {
+            return Ok(());
+        }
+        let staged = self.run_start_input_ids.iter().collect::<HashSet<_>>();
+        let bound = cursor.bound_input_ids.iter().collect::<HashSet<_>>();
+        if staged != bound {
+            return Err(AgentError::InternalError(format!(
+                "a resumed run's dispatched inputs ({} staged) are not the {} inputs its cursor \
+                 binds to run {}",
+                staged.len(),
+                bound.len(),
+                cursor.run_id
+            )));
+        }
+        Ok(())
+    }
+
     /// Cancel a run after its execution future has been dropped.
     ///
     /// Discards the run's terminal event; surfaces that stream run events use
@@ -3066,6 +3348,11 @@ where
     /// facts, so neither sink gets a second terminal.
     pub fn cancel_dropped_run(&mut self) -> Option<AgentEvent> {
         self.runtime_terminal_failure_witness = None;
+        // The dropped run's last round commit keeps its cursor in the store;
+        // the live session keeps none, so no later save of it commits one,
+        // and a call the host dispatches next carries no round's key.
+        self.session.clear_run_cursor();
+        self.tool_dispatch_context.clear_round();
         if let Err(error) = self.observe_dropped_run_cancellation() {
             tracing::warn!(%error, "generated authority rejected dropped-run cancellation");
         }
@@ -3083,6 +3370,39 @@ where
                 .mark_tapped(crate::agent::RunLifecycleEvent::Terminal);
         }
         owed.stream.then_some(event)
+    }
+
+    /// End a run whose execution future the host dropped to suspend it, for
+    /// a stop that keeps the session's queued work (a host draining and
+    /// requeueing, for a deploy), and say where the suspended run stood;
+    /// `None` when no run had started.
+    ///
+    /// Unlike [`Self::cancel_dropped_run`] it realizes nothing: no terminal is
+    /// published on the stream or the tap, nothing is applied to the turn
+    /// authority (the runtime suspends the run in its own machine), and
+    /// nothing is written. The agent's run state is cleared, the live session
+    /// keeps no cursor and the dispatch context no round.
+    ///
+    /// [`crate::DroppedRunSuspension::Resumable`]: the run's last round
+    /// commit, cursor included, stays its resume point, and the session layer
+    /// answers the turn with [`AgentError::RunSuspended`].
+    /// [`crate::DroppedRunSuspension::PastFinalSave`]: the run's save without
+    /// the cursor had landed, so its work is committed and nothing is left to
+    /// resume; its inputs must not run again.
+    pub fn suspend_dropped_run(&mut self) -> Option<crate::DroppedRunSuspension> {
+        let run_id = self.runtime_started_run_id.clone();
+        // Read before the run state is cleared below.
+        let past_final_save = self.round_commits.final_save_written();
+        self.runtime_terminal_failure_witness = None;
+        self.session.clear_run_cursor();
+        self.tool_dispatch_context.clear_round();
+        self.clear_runtime_execution_kind();
+        let run_id = run_id?;
+        Some(if past_final_save {
+            crate::DroppedRunSuspension::PastFinalSave { run_id }
+        } else {
+            crate::DroppedRunSuspension::Resumable { run_id }
+        })
     }
 
     fn dropped_run_terminal_event(&self) -> Option<(AgentEvent, crate::agent::OwedRunTerminal)> {
@@ -3335,6 +3655,8 @@ impl Agent<dyn AgentLlmClient, dyn AgentToolDispatcher, dyn AgentSessionStore> {
             event_tap: crate::event_tap::new_event_tap(),
             #[cfg(any(test, feature = "test-support"))]
             model_preparation_observer: None,
+            #[cfg(any(test, feature = "test-support"))]
+            round_commit_observer: None,
             transient_turn_context_state: crate::session::TransientTurnContextStateHandle::new(),
             default_event_tx: None,
             checkpointer: None,
@@ -3343,6 +3665,9 @@ impl Agent<dyn AgentLlmClient, dyn AgentToolDispatcher, dyn AgentSessionStore> {
             // stage a permanent routing handoff nor commit one.
             model_routing_handoff_staging: None,
             latest_run_checkpoint_receipt: None,
+            round_commits: Default::default(),
+            run_start_input_ids: Vec::new(),
+            pending_resumed_round: None,
             tool_application_observations: Default::default(),
             durable_row_floor,
             blob_store: self.blob_store.clone(),
