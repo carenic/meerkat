@@ -4912,6 +4912,10 @@ fn insert_identity_receipt(
 
 #[async_trait]
 impl MobIdentityStore for SqliteMobIdentityStore {
+    fn incarnation_custody_store(&self) -> Option<&Path> {
+        Some(&self.path)
+    }
+
     #[cfg(feature = "runtime-adapter")]
     fn prepare_runtime_write_fence(
         &self,
