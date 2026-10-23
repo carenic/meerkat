@@ -1074,6 +1074,11 @@ struct StoreCheckpointer {
     /// Where a WholeBlob run re-base publishes its rewrite audit receipt;
     /// `None` when the service keeps no event store.
     rewrite_audit: Option<RewriteAuditSink>,
+    /// The run whose re-base committed its rewritten session as the
+    /// session's base, until that run's boundary is promoted or another run
+    /// checkpoints. Its inputs cannot be replayed from the base the run
+    /// started on: the re-base replaced it.
+    rebased_run: std::sync::Mutex<Option<RunId>>,
 }
 
 struct HeadCanonicalProvisionalIntent<'a> {
@@ -1705,6 +1710,36 @@ impl StoreCheckpointer {
         }
     }
 
+    /// Whether `run_id`'s re-base committed its rewritten session as this
+    /// session's base ([`meerkat_core::SessionCheckpointer::rebase_run`]):
+    /// the run's inputs cannot be replayed from the base it started on, so a
+    /// failure of the run consumes them instead of releasing its tail and
+    /// requeueing them. Read beside [`Self::run_checkpoint_receipt`] when the
+    /// run's failure picks its disposition.
+    #[allow(
+        dead_code,
+        reason = "the failed-turn disposition of the resume batch's session layer reads it"
+    )]
+    fn run_rebased(&self, run_id: &RunId) -> bool {
+        self.rebased_run
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            == Some(run_id)
+    }
+
+    /// Forget a re-based run once another run checkpoints or the run's
+    /// boundary is promoted (`None`).
+    fn clear_rebased_run_unless(&self, run_id: Option<&RunId>) {
+        let mut rebased = self
+            .rebased_run
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if rebased.as_ref() != run_id {
+            *rebased = None;
+        }
+    }
+
     async fn run_checkpoint_receipt(
         &self,
         session_id: &SessionId,
@@ -1768,6 +1803,7 @@ impl StoreCheckpointer {
             )));
         }
         *receipt_slot = None;
+        self.clear_rebased_run_unless(None);
         Ok(())
     }
 
@@ -2053,8 +2089,8 @@ impl StoreCheckpointer {
     /// receipt-only replay of the rewrite proof.
     ///
     /// The committed base must still be this actor's: a store that moved
-    /// (`Stale`) or any error fails the round commit with the
-    /// teardown-required class, so the live actor reloads.
+    /// (`Stale`) or any error of the store call or after it fails the round
+    /// commit with the teardown-required class, so the live actor reloads.
     async fn rebase_whole_blob_run(
         &self,
         session: &mut Session,
@@ -2177,6 +2213,11 @@ impl StoreCheckpointer {
                 )));
             }
         };
+        // The store replaced the base the run started on, whatever follows.
+        *self
+            .rebased_run
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(run_id.clone());
         if tail.session_id() != &id
             || tail.run_id() != run_id
             || tail.candidate_sequence() != 1
@@ -2187,9 +2228,21 @@ impl StoreCheckpointer {
                 "the WholeBlob store acknowledged a re-base other than the prepared one for session {id}"
             )));
         }
+        // From here on the store holds the re-based base: every failure is
+        // the reload class, so the live actor never continues on the old one.
+        let receipt = RunCheckpointReceipt::issued(
+            RunCheckpointAuthority::WholeBlob(tail),
+            rebase.conversation_digest().to_string(),
+            rebase.message_count(),
+        )
+        .map_err(|error| {
+            reload(format!(
+                "session {id} re-based, but the re-based tail's receipt facts did not bind: {error}"
+            ))
+        })?;
         *self.whole_blob_base_authority.lock().map_err(|_| {
-            AgentError::InternalError(format!(
-                "WholeBlob actor base authority lock is poisoned for session {id}"
+            reload(format!(
+                "session {id} re-based, but its actor base authority lock is poisoned"
             ))
         })? = Some(committed);
         if let Some(audit) = self.rewrite_audit.as_ref() {
@@ -2208,16 +2261,7 @@ impl StoreCheckpointer {
                 ))
             })?;
         }
-        RunCheckpointReceipt::issued(
-            RunCheckpointAuthority::WholeBlob(tail),
-            rebase.conversation_digest().to_string(),
-            rebase.message_count(),
-        )
-        .map_err(|error| {
-            AgentError::InternalError(format!(
-                "failed to bind the re-based tail's receipt facts for session {id}: {error}"
-            ))
-        })
+        Ok(receipt)
     }
 
     async fn checkpoint_head_canonical(
@@ -2712,6 +2756,8 @@ impl meerkat_core::SessionCheckpointer for StoreCheckpointer {
                 )),
             };
         }
+        // Another run's checkpoint ends what a re-based run's record says.
+        self.clear_rebased_run_unless(Some(run_id));
         let result = match self.runtime_store.session_persistence_profile() {
             RuntimeSessionPersistenceProfile::WholeBlobV1 => {
                 self.checkpoint_whole_blob(session, run_id, previous).await
@@ -2775,6 +2821,7 @@ impl meerkat_core::SessionCheckpointer for StoreCheckpointer {
                 session.id()
             )));
         }
+        self.clear_rebased_run_unless(Some(run_id));
         let result = self.rebase_whole_blob_run(session, run_id, previous).await;
         if let Ok(receipt) = result.as_ref() {
             *self.latest_run_checkpoint_receipt.lock().await = Some(receipt.clone());
@@ -14055,6 +14102,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             latest_run_transcript_retirement: std::sync::Mutex::new(None),
             live_deferred_turn_state: std::sync::OnceLock::new(),
             unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
+            rebased_run: std::sync::Mutex::new(None),
             rewrite_audit: self
                 .event_store
                 .clone()
@@ -18474,6 +18522,7 @@ mod tests {
             latest_run_transcript_retirement: std::sync::Mutex::new(None),
             live_deferred_turn_state: std::sync::OnceLock::new(),
             unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
+            rebased_run: std::sync::Mutex::new(None),
             rewrite_audit: None,
         };
         (runtime_store, session, checkpointer)
@@ -18626,6 +18675,7 @@ mod tests {
             latest_run_transcript_retirement: std::sync::Mutex::new(None),
             live_deferred_turn_state: std::sync::OnceLock::new(),
             unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
+            rebased_run: std::sync::Mutex::new(None),
             rewrite_audit: None,
         };
         assert!(
@@ -18802,6 +18852,7 @@ mod tests {
             latest_run_transcript_retirement: std::sync::Mutex::new(None),
             live_deferred_turn_state: std::sync::OnceLock::new(),
             unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
+            rebased_run: std::sync::Mutex::new(None),
             rewrite_audit: None,
         };
 
@@ -30217,6 +30268,7 @@ mod tests {
             latest_run_transcript_retirement: std::sync::Mutex::new(None),
             live_deferred_turn_state: std::sync::OnceLock::new(),
             unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
+            rebased_run: std::sync::Mutex::new(None),
             rewrite_audit: None,
         };
         let mut provisional = committed.clone();
@@ -30485,6 +30537,7 @@ mod tests {
             latest_run_transcript_retirement: std::sync::Mutex::new(None),
             live_deferred_turn_state: std::sync::OnceLock::new(),
             unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
+            rebased_run: std::sync::Mutex::new(None),
             rewrite_audit: None,
         };
         let mut provisional = committed;
@@ -30566,6 +30619,7 @@ mod tests {
             latest_run_transcript_retirement: std::sync::Mutex::new(None),
             live_deferred_turn_state: std::sync::OnceLock::new(),
             unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
+            rebased_run: std::sync::Mutex::new(None),
             rewrite_audit: None,
         };
         (directory, service, checkpointer, committed)
@@ -31202,6 +31256,7 @@ mod tests {
             latest_run_transcript_retirement: std::sync::Mutex::new(None),
             live_deferred_turn_state: std::sync::OnceLock::new(),
             unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
+            rebased_run: std::sync::Mutex::new(None),
             rewrite_audit: None,
         };
         let mut session = recovered;
@@ -40811,6 +40866,7 @@ mod tests {
             latest_run_transcript_retirement: std::sync::Mutex::new(None),
             live_deferred_turn_state: std::sync::OnceLock::new(),
             unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
+            rebased_run: std::sync::Mutex::new(None),
             rewrite_audit: None,
         });
         service
