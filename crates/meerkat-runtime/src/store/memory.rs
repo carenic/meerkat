@@ -7760,6 +7760,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_single_turn_closing_save_rebases_without_an_earlier_tail() {
+        let store = InMemoryRuntimeStore::new();
+        // A committed base and a single-turn run whose one boundary compacts:
+        // it wrote no round commit, so there is no tail before its closing
+        // save.
+        let mut original = meerkat_core::Session::new();
+        original.push(meerkat_core::types::Message::User(
+            meerkat_core::types::UserMessage::text("hello".to_string()),
+        ));
+        original.push(rebase_assistant("verbose answer"));
+        let runtime_id = LogicalRuntimeId::for_session(original.id());
+        store
+            .commit_session_snapshot(
+                &runtime_id,
+                SerializedSessionSnapshot {
+                    session_snapshot: serde_json::to_vec(&original).unwrap().into(),
+                },
+            )
+            .await
+            .unwrap();
+        let base = rebase_committed_payload(&store, &runtime_id, original.id())
+            .await
+            .store_authority()
+            .clone();
+        let run_id = RunId::new();
+        let mut live = original;
+        live.push(meerkat_core::types::Message::User(
+            meerkat_core::types::UserMessage::text("one long question".to_string()),
+        ));
+        live.push(rebase_assistant("the run's only answer"));
+        let (compacted, commit) = rebase_compact(&live);
+        assert!(compacted.try_run_cursor().unwrap().is_none());
+        let payload = rebase_committed_payload(&store, &runtime_id, live.id()).await;
+        let rebase = super::super::PreparedWholeBlobRunRebase::prepare(
+            payload,
+            None,
+            run_id.clone(),
+            compacted.clone(),
+            std::slice::from_ref(&commit),
+        )
+        .unwrap();
+        let outcome = store
+            .commit_prepared_whole_blob_run_rebase(&runtime_id, rebase.store_parts())
+            .await
+            .unwrap();
+        let super::super::WholeBlobRunRebaseOutcome::Applied { committed, tail } = outcome else {
+            unreachable!("the closing save re-bases on a fresh base");
+        };
+        assert_eq!(committed.store_revision(), base.store_revision() + 1);
+        assert_eq!(tail.run_id(), &run_id);
+        assert_eq!(tail.candidate_sequence(), 1);
+        assert_eq!(tail.base_blob_sha256(), committed.blob_sha256());
+        assert_eq!(tail.candidate_blob_sha256(), committed.blob_sha256());
+        let stored = store
+            .load_committed_whole_blob_snapshot(&runtime_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.session().messages(), compacted.messages());
+        let loaded = store
+            .load_whole_blob_provisional_tail(&runtime_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.authority(), &tail);
+        // An exact replay answers the same pair.
+        assert_eq!(
+            store
+                .commit_prepared_whole_blob_run_rebase(&runtime_id, rebase.store_parts())
+                .await
+                .unwrap(),
+            super::super::WholeBlobRunRebaseOutcome::Applied { committed, tail }
+        );
+    }
+
+    #[tokio::test]
     async fn a_run_rebase_is_stale_once_another_writer_moved_the_tail() {
         let store = InMemoryRuntimeStore::new();
         let (runtime_id, live, run_id, base, first_tail) = rebase_run_with_tail(&store).await;
