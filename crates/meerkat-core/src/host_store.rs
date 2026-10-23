@@ -261,11 +261,29 @@ impl Default for FenceTiming {
 /// it right before each model call and each tool dispatch, not only before
 /// commits.
 pub trait SelfFence: Send + Sync {
+    /// The writer's self-fence window now. A local clock read; no store I/O.
+    fn window(&self) -> SelfFenceWindow;
+}
+
+/// One reading of a writer's self-fence window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelfFenceWindow {
+    /// Time since the start of the last successful acquire or renew.
+    pub elapsed: Duration,
+    /// [`FenceTiming::self_fence_window`]: the lease minus the margin.
+    pub window: Duration,
+    /// Whether a renew failed after that acquire or renew.
+    pub renew_failed: bool,
+}
+
+impl SelfFenceWindow {
     /// Whether the writer may still make a model call or dispatch: no renew
-    /// failed since the last successful acquire or renew, and that one
-    /// started less than [`FenceTiming::self_fence_window`] ago. A local
-    /// clock read; no store I/O.
-    fn window_open(&self) -> bool;
+    /// failed, and the last successful acquire or renew started less than
+    /// the window ago.
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        !self.renew_failed && self.elapsed < self.window
+    }
 }
 
 /// What an acquire answers.
