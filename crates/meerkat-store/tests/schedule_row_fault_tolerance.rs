@@ -1128,7 +1128,8 @@ async fn a_receipt_whose_stage_does_not_decode_is_the_rows_typed_fault() {
 async fn a_receipt_whose_other_fields_do_not_decode_still_yields_its_stage() {
     let cases: [(&str, fn(serde_json::Value) -> Vec<u8>); 2] = [
         ("a runtime outcome of a newer release", |mut receipt| {
-            receipt["runtime_outcome"] = serde_json::json!("an_outcome_of_a_newer_release");
+            receipt["runtime_outcome"] =
+                serde_json::json!({ "kind": "an_outcome_of_a_newer_release" });
             serde_json::to_vec(&receipt).expect("encode the receipt")
         }),
         ("a corrupt timestamp", |mut receipt| {
