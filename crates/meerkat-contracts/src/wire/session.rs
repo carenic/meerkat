@@ -483,7 +483,7 @@ pub enum WireProviderMeta {
         thought_signature: String,
     },
     GeminiFunctionCall {
-        id: String,
+        provider_id: String,
         #[serde(
             default,
             rename = "thoughtSignature",
@@ -524,10 +524,10 @@ impl From<ProviderMeta> for WireProviderMeta {
             ProviderMeta::AnthropicCompaction { content } => Self::AnthropicCompaction { content },
             ProviderMeta::Gemini { thought_signature } => Self::Gemini { thought_signature },
             ProviderMeta::GeminiFunctionCall {
-                id,
+                provider_id,
                 thought_signature,
             } => Self::GeminiFunctionCall {
-                id,
+                provider_id,
                 thought_signature,
             },
             ProviderMeta::OpenAi {
@@ -1085,10 +1085,10 @@ fn wire_provider_meta_to_core(value: WireProviderMeta) -> Option<ProviderMeta> {
             Some(ProviderMeta::Gemini { thought_signature })
         }
         WireProviderMeta::GeminiFunctionCall {
-            id,
+            provider_id,
             thought_signature,
         } => Some(ProviderMeta::GeminiFunctionCall {
-            id,
+            provider_id,
             thought_signature,
         }),
         WireProviderMeta::OpenAi {
@@ -3324,7 +3324,7 @@ mod tests {
                 name: "lookup".into(),
                 args: serde_json::value::to_raw_value(&serde_json::json!({"key": 1})).unwrap(),
                 meta: Some(Box::new(ProviderMeta::GeminiFunctionCall {
-                    id: "native-call".into(),
+                    provider_id: "native-call".into(),
                     thought_signature,
                 })),
             };
@@ -3332,10 +3332,28 @@ mod tests {
             let value = serde_json::to_value(wire).unwrap();
             assert_eq!(value["data"]["id"], "fc_0");
             assert_eq!(value["data"]["meta"]["provider"], "gemini_function_call");
-            assert_eq!(value["data"]["meta"]["id"], "native-call");
+            assert_eq!(value["data"]["meta"]["provider_id"], "native-call");
+            assert!(value["data"]["meta"].get("id").is_none());
             let wire: WireAssistantBlock = serde_json::from_value(value).unwrap();
             assert_eq!(AssistantBlock::try_from(wire).unwrap(), block);
         }
+    }
+
+    #[test]
+    fn gemini_wire_metadata_requires_provider_id_and_preserves_legacy_signature() {
+        for value in [
+            serde_json::json!({"provider": "gemini_function_call"}),
+            serde_json::json!({"provider": "gemini_function_call", "id": "native-call"}),
+            serde_json::json!({"provider": "gemini_function_call", "id": "native-call", "thoughtSignature": "signature"}),
+            serde_json::json!({"provider": "gemini_function_call", "provider_id": null}),
+            serde_json::json!({"provider": "gemini_function_call", "provider_id": 7}),
+        ] {
+            assert!(serde_json::from_value::<WireProviderMeta>(value).is_err());
+        }
+        let legacy = serde_json::json!({"provider": "gemini", "thoughtSignature": "old"});
+        let wire: WireProviderMeta = serde_json::from_value(legacy.clone()).unwrap();
+        let core = wire_provider_meta_to_core(wire).unwrap();
+        assert_eq!(serde_json::to_value(core).unwrap(), legacy);
     }
 
     /// R7-4 (P3 dogma): the wire enum must carry an explicit `Unknown`

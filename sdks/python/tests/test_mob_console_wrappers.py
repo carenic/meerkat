@@ -531,9 +531,9 @@ def test_history_validator_does_not_widen_non_nullable_fields(
         {"provider": "anthropic_redacted", "data": "redacted"},
         {"provider": "anthropic_compaction", "content": "compact"},
         {"provider": "gemini", "thoughtSignature": "thought"},
-        {"provider": "gemini_function_call", "id": "native-call"},
-        {"provider": "gemini_function_call", "id": "native-call", "thoughtSignature": "thought"},
-        {"provider": "gemini_function_call", "id": "native-call", "thoughtSignature": None},
+        {"provider": "gemini_function_call", "provider_id": "native-call"},
+        {"provider": "gemini_function_call", "provider_id": "native-call", "thoughtSignature": "thought"},
+        {"provider": "gemini_function_call", "provider_id": "native-call", "thoughtSignature": None},
         {
             "provider": "open_ai",
             "id": "item-1",
@@ -556,8 +556,11 @@ def test_assistant_validator_accepts_closed_provider_metadata(
 
 @pytest.mark.parametrize("meta", [
     {"provider": "gemini_function_call"},
-    {"provider": "gemini_function_call", "id": 7},
-    {"provider": "gemini_function_call", "id": "native-call", "thoughtSignature": 7},
+    {"provider": "gemini_function_call", "id": "native-call"},
+    {"provider": "gemini_function_call", "id": "native-call", "thoughtSignature": "thought"},
+    {"provider": "gemini_function_call", "provider_id": None},
+    {"provider": "gemini_function_call", "provider_id": 7},
+    {"provider": "gemini_function_call", "provider_id": "native-call", "thoughtSignature": 7},
 ])
 def test_assistant_validator_rejects_invalid_gemini_call_metadata(meta: dict[str, Any]) -> None:
     with pytest.raises(MeerkatError):
