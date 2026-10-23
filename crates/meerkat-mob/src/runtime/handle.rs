@@ -1325,6 +1325,11 @@ pub struct MobMemberSnapshot {
     /// the member is Broken until an explicit repair. Absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration_refusal: Option<crate::MemberRegistrationHookCall>,
+    /// The member's custody restore a mob start deferred instead of failing
+    /// the whole start, and the cause its last attempt met. Every operation
+    /// on the member re-attempts it first. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custody_deferred: Option<crate::MemberCustodyDeferral>,
 }
 
 /// Whether the member currently owns an open execution run.
@@ -1537,7 +1542,36 @@ impl MobMemberSnapshot {
             non_portable_disabled: self.non_portable_disabled.clone(),
             preview_unavailable: self.preview_unavailable.map(wire_preview_unavailable),
             registration_refusal: self.registration_refusal.map(wire_registration_hook_call),
+            custody_deferred: self.custody_deferred.map(wire_custody_deferral),
         })
+    }
+}
+
+/// Project a domain [`crate::MemberCustodyDeferral`] into its closed wire
+/// twin.
+fn wire_custody_deferral(
+    deferral: crate::MemberCustodyDeferral,
+) -> meerkat_contracts::WireMemberCustodyDeferral {
+    meerkat_contracts::WireMemberCustodyDeferral {
+        restore: match deferral.restore {
+            crate::MemberCustodyRestore::StartupBinding => {
+                meerkat_contracts::WireMemberCustodyRestore::StartupBinding
+            }
+            crate::MemberCustodyRestore::CleanupDelivery => {
+                meerkat_contracts::WireMemberCustodyRestore::CleanupDelivery
+            }
+        },
+        cause: match deferral.cause {
+            crate::MemberCustodyDeferralCause::ServedElsewhere => {
+                meerkat_contracts::WireMemberCustodyDeferralCause::ServedElsewhere
+            }
+            crate::MemberCustodyDeferralCause::HostingUnavailable => {
+                meerkat_contracts::WireMemberCustodyDeferralCause::HostingUnavailable
+            }
+            crate::MemberCustodyDeferralCause::DurableTailUnprovable => {
+                meerkat_contracts::WireMemberCustodyDeferralCause::DurableTailUnprovable
+            }
+        },
     }
 }
 
@@ -5777,6 +5811,9 @@ pub struct MobHandle {
     #[cfg(feature = "runtime-adapter")]
     pub(super) runtime_adapter: Option<Arc<meerkat_runtime::MeerkatMachine>>,
     pub(super) restore_diagnostics: Arc<RwLock<HashMap<AgentIdentity, RestoreFailureDiagnostic>>>,
+    /// The member custody restores a start deferred, as the actor publishes
+    /// them; member status reads show a member's entry.
+    pub(super) custody_deferrals: MemberCustodyDeferrals,
     pub(super) supervisor_bridge: Arc<MobSupervisorBridge>,
     /// Read-only projection of the actor-owned MobMachine state. The actor is
     /// the sole writer; handles use this only for non-blocking status/list
@@ -6053,6 +6090,12 @@ impl MobHandle {
         .await?
     }
 }
+
+/// The member custody restores a start deferred, keyed by member: the
+/// actor's deferral registry publishes each entry's restore and last cause
+/// here, and member status reads show them. Volatile, as the registry is.
+pub(crate) type MemberCustodyDeferrals =
+    Arc<std::sync::RwLock<BTreeMap<AgentIdentity, crate::MemberCustodyDeferral>>>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct RestoreFailureDiagnostic {
@@ -7115,6 +7158,19 @@ impl MobHandle {
             .await
             .get(agent_identity)
             .cloned()
+    }
+
+    /// The custody restore a start deferred for `agent_identity`, as the
+    /// actor's deferral registry published it.
+    fn custody_deferral_for(
+        &self,
+        agent_identity: &AgentIdentity,
+    ) -> Option<crate::MemberCustodyDeferral> {
+        let view = match self.custody_deferrals.read() {
+            Ok(view) => view,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        view.get(agent_identity).copied()
     }
 
     fn restore_failure_error(
@@ -15694,6 +15750,7 @@ impl MobHandle {
                 .await??
             }
         };
+        snapshot.custody_deferred = self.custody_deferral_for(identity);
         snapshot.peer_connectivity = match tokio::time::timeout(
             Duration::from_secs(2),
             self.project_member_peer_connectivity(identity, &snapshot),
@@ -19432,6 +19489,7 @@ mod tests {
             non_portable_disabled: None,
             preview_unavailable: None,
             registration_refusal: None,
+            custody_deferred: None,
         }
         .with_current_bridge_session_id(Some(sid.clone()));
         let snapshot_value =
@@ -19474,6 +19532,7 @@ mod tests {
             non_portable_disabled: None,
             preview_unavailable: None,
             registration_refusal: None,
+            custody_deferred: None,
         };
 
         let snapshot_value =
@@ -19518,6 +19577,7 @@ mod tests {
             non_portable_disabled: None,
             preview_unavailable: None,
             registration_refusal: None,
+            custody_deferred: None,
         };
         assert_eq!(
             snapshot.agent_identity(),

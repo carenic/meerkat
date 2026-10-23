@@ -2816,6 +2816,47 @@ pub struct MobMemberStatusResult {
     /// repair. Absent-omitted for byte-compat with released SDKs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration_refusal: Option<WireMemberRegistrationHookCall>,
+    /// Present when a mob start deferred the member's custody restore instead
+    /// of failing the whole start: which restore, and the cause its last
+    /// attempt met. Every operation on the member re-attempts it first.
+    /// Absent-omitted for byte-compat with released SDKs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custody_deferred: Option<WireMemberCustodyDeferral>,
+}
+
+/// A member's custody restore a mob start deferred, as its status shows it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct WireMemberCustodyDeferral {
+    /// The deferred restore.
+    pub restore: WireMemberCustodyRestore,
+    /// The cause its last attempt met.
+    pub cause: WireMemberCustodyDeferralCause,
+}
+
+/// Which startup restore of a member's custody a mob start deferred.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum WireMemberCustodyRestore {
+    /// The operation binding of a member whose restore failed at the start.
+    StartupBinding,
+    /// A retiring member's local cleanup delivery custody.
+    CleanupDelivery,
+}
+
+/// The cause a deferred member custody restore last met.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum WireMemberCustodyDeferralCause {
+    /// Another runtime owner on the realm hosts the member's session.
+    ServedElsewhere,
+    /// The member session's hosting claim cannot be taken on this realm.
+    HostingUnavailable,
+    /// The member's durable tail could not be proven, and its recovery kept
+    /// it.
+    DurableTailUnprovable,
 }
 
 /// The member registration hook call that refused a restored member's
@@ -2945,6 +2986,7 @@ mod member_status_capability_tests {
             non_portable_disabled: None,
             preview_unavailable: None,
             registration_refusal: None,
+            custody_deferred: None,
         };
 
         let json = serde_json::to_string(&result)?;
@@ -4688,6 +4730,7 @@ mod tests {
             non_portable_disabled: None,
             preview_unavailable: None,
             registration_refusal: None,
+            custody_deferred: None,
         }
     }
 
@@ -4705,6 +4748,8 @@ mod tests {
             "lifecycle_capabilities",
             "non_portable_disabled",
             "preview_unavailable",
+            "registration_refusal",
+            "custody_deferred",
         ] {
             assert!(
                 value.get(absent).is_none(),
@@ -4724,6 +4769,50 @@ mod tests {
         assert!(decoded.placement.is_none());
         assert!(decoded.lifecycle_capabilities.is_none());
         assert!(decoded.preview_unavailable.is_none());
+        assert!(decoded.custody_deferred.is_none());
+    }
+
+    /// A deferred custody restore is a closed snake_case object at the top
+    /// level of the status result: the restore and the cause its last
+    /// attempt met.
+    #[test]
+    fn member_status_custody_deferred_round_trips() {
+        for (restore, restore_wire) in [
+            (WireMemberCustodyRestore::StartupBinding, "startup_binding"),
+            (
+                WireMemberCustodyRestore::CleanupDelivery,
+                "cleanup_delivery",
+            ),
+        ] {
+            for (cause, cause_wire) in [
+                (
+                    WireMemberCustodyDeferralCause::ServedElsewhere,
+                    "served_elsewhere",
+                ),
+                (
+                    WireMemberCustodyDeferralCause::HostingUnavailable,
+                    "hosting_unavailable",
+                ),
+                (
+                    WireMemberCustodyDeferralCause::DurableTailUnprovable,
+                    "durable_tail_unprovable",
+                ),
+            ] {
+                let mut status = minimal_member_status();
+                status.custody_deferred = Some(WireMemberCustodyDeferral { restore, cause });
+                let value = serde_json::to_value(&status).expect("serialize member status");
+                assert_eq!(
+                    value["custody_deferred"],
+                    serde_json::json!({ "restore": restore_wire, "cause": cause_wire })
+                );
+                let decoded: MobMemberStatusResult =
+                    serde_json::from_value(value).expect("the deferral decodes");
+                assert_eq!(
+                    decoded.custody_deferred,
+                    Some(WireMemberCustodyDeferral { restore, cause })
+                );
+            }
+        }
     }
 
     /// The preview-unavailable marker is a closed snake_case vocabulary at

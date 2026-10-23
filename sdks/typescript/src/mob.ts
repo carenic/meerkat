@@ -38,6 +38,7 @@ import type {
   WireMemberLifecycleCapabilities,
   WireMemberPreviewUnavailable,
   WireMemberRegistrationHookCall,
+  WireMemberCustodyDeferral,
   WireMobMemberStatus,
   WireMobBackendKind,
   WireMobRuntimeMode,
@@ -147,6 +148,12 @@ export interface MobMemberSnapshot {
    * call that refused it. The member stays broken until an explicit repair.
    */
   registrationRefusal?: WireMemberRegistrationHookCall;
+  /**
+   * Set when a mob start deferred the member's custody restore instead of
+   * failing the whole start: the restore and the cause its last attempt met.
+   * Every operation on the member re-attempts it first.
+   */
+  custodyDeferred?: WireMemberCustodyDeferral;
 }
 
 export interface MobKickoffWaitOptions {
@@ -171,6 +178,8 @@ export interface MobKickoffMemberSnapshot {
   previewUnavailable?: WireMemberPreviewUnavailable;
   /** As on {@link MobMemberSnapshot.registrationRefusal}. */
   registrationRefusal?: WireMemberRegistrationHookCall;
+  /** As on {@link MobMemberSnapshot.custodyDeferred}. */
+  custodyDeferred?: WireMemberCustodyDeferral;
 }
 
 export type MobReadyWaitOptions = MobKickoffWaitOptions;

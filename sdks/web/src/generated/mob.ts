@@ -244,11 +244,21 @@ export type WireMemberPreviewUnavailable = "observation_deadline" | "read_failed
 
 export type WireMemberRegistrationHookCall = "select_destination" | "select_agent_mandate" | "prepare_member_surface" | "verify_member_surface";
 
+export type WireMemberCustodyRestore = "startup_binding" | "cleanup_delivery";
+
+export type WireMemberCustodyDeferralCause = "served_elsewhere" | "hosting_unavailable" | "durable_tail_unprovable";
+
+export interface WireMemberCustodyDeferral {
+  cause: WireMemberCustodyDeferralCause;
+  restore: WireMemberCustodyRestore;
+}
+
 export interface MobMemberStatusResult {
   activity?: Record<string, unknown> | null;
   comms_reachability?: WireReachability | null;
   control_reachability?: WireReachability | null;
   current_session_id?: string | null;
+  custody_deferred?: WireMemberCustodyDeferral | null;
   detached_jobs?: Record<string, unknown> | null;
   error?: string | null;
   external_member?: unknown;

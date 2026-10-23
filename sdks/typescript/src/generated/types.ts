@@ -1830,6 +1830,11 @@ export interface WireMemberProgressSnapshot {
   run_state: "idle" | "run_open" | "unknown";
 }
 
+export interface WireMemberCustodyDeferral {
+  cause: WireMemberCustodyDeferralCause;
+  restore: WireMemberCustodyRestore;
+}
+
 export interface WireMobToolConfig {
   builtins?: boolean;
   comms?: boolean;
@@ -2248,6 +2253,7 @@ export interface MobMemberStatusResult {
   comms_reachability?: WireReachability | null;
   control_reachability?: WireReachability | null;
   current_session_id?: string | null;
+  custody_deferred?: WireMemberCustodyDeferral | null;
   detached_jobs?: Record<string, unknown> | null;
   error?: string | null;
   external_member?: unknown;
@@ -3881,6 +3887,10 @@ export type WireNonPortableResourceKind = "rust_bundles" | "per_spawn_external_t
 export type WireMemberPreviewUnavailable = "observation_deadline" | "read_failed" | "session_absent" | "not_observed_while_retiring";
 
 export type WireMemberRegistrationHookCall = "select_destination" | "select_agent_mandate" | "prepare_member_surface" | "verify_member_surface";
+
+export type WireMemberCustodyRestore = "startup_binding" | "cleanup_delivery";
+
+export type WireMemberCustodyDeferralCause = "served_elsewhere" | "hosting_unavailable" | "durable_tail_unprovable";
 
 export type WireMobRunStatus = "pending" | "running" | "completed" | "failed" | "canceled";
 
