@@ -1355,6 +1355,41 @@ pub struct DurableSessionForkWithProvenance {
     pub prefix_revision: String,
 }
 
+/// The fork instruction policies a durable fork applies.
+///
+/// The activation rows the child copies follow `inherited`, the host's
+/// policy already resolved for the fork's activation window
+/// ([`meerkat_core::ForkInstructionPolicy::effective`]). The skills the
+/// copied rows loaded follow `declared`, the policy as the host declared it:
+/// a child runs without activating them, so a fork without an activation
+/// window strips them under the default instead of refusing. A
+/// [`meerkat_core::DurableSessionForkTarget`] carries its own pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForkInstructionPolicies {
+    pub inherited: meerkat_core::ForkInstructionPolicy,
+    pub declared: meerkat_core::ForkInstructionPolicy,
+}
+
+impl ForkInstructionPolicies {
+    /// The policies of a fork that leaves no activation window: the child is
+    /// committed but not materialized, and activation admits only
+    /// materialized sessions.
+    fn without_activation_window(declared: meerkat_core::ForkInstructionPolicy) -> Self {
+        Self {
+            inherited: declared.effective(meerkat_core::ActivationWindow::None),
+            declared,
+        }
+    }
+
+    /// The policies a durable fork target carries.
+    fn of_target(target: &meerkat_core::DurableSessionForkTarget) -> Self {
+        Self {
+            inherited: target.inherited_instructions,
+            declared: target.declared_instructions,
+        }
+    }
+}
+
 /// Whether rewrite-persistence tracing is armed.
 fn rewrite_materialize_trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -6385,16 +6420,22 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         tool_access_policy: Option<meerkat_core::ops::ToolAccessPolicy>,
         target: Option<meerkat_core::DurableSessionForkTarget>,
     ) -> Result<DurableSessionForkWithProvenance, SessionError> {
-        let inherited_instructions = Self::target_fork_instruction_policy(target.as_ref());
-        let declared_instructions = Self::target_declared_instruction_policy(target.as_ref());
+        // Without a target the default leaves the fork no activation window.
+        let instructions = target.as_ref().map_or_else(
+            || {
+                ForkInstructionPolicies::without_activation_window(
+                    meerkat_core::ForkInstructionPolicy::default(),
+                )
+            },
+            ForkInstructionPolicies::of_target,
+        );
         self.fork_durable_session_with_optional_planned_identity(
             source_session_id,
             message_count,
             None,
             tool_access_policy,
             target,
-            inherited_instructions,
-            declared_instructions,
+            instructions,
         )
         .await
     }
@@ -6407,11 +6448,9 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// the exact same child instead of minting a second branch. Behaviour is
     /// otherwise identical to [`Self::fork_durable_session_with_provenance`].
     ///
-    /// `inherited_instructions` is the fork instruction policy, already
-    /// resolved for the caller's activation window, and
-    /// `declared_instructions` the policy as the host declared it, for a
-    /// fork without a `target`; a target carries its own.
-    #[allow(clippy::too_many_arguments)]
+    /// `instructions` are the fork instruction policies of a fork without a
+    /// `target`, `inherited` already resolved for the caller's activation
+    /// window; a target carries its own.
     pub async fn fork_durable_session_with_planned_identity(
         &self,
         source_session_id: &SessionId,
@@ -6419,23 +6458,18 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         planned_child_session_id: SessionId,
         tool_access_policy: Option<meerkat_core::ops::ToolAccessPolicy>,
         target: Option<meerkat_core::DurableSessionForkTarget>,
-        inherited_instructions: meerkat_core::ForkInstructionPolicy,
-        declared_instructions: meerkat_core::ForkInstructionPolicy,
+        instructions: ForkInstructionPolicies,
     ) -> Result<DurableSessionForkWithProvenance, SessionError> {
-        let inherited_instructions = target.as_ref().map_or(inherited_instructions, |target| {
-            target.inherited_instructions
-        });
-        let declared_instructions = target
+        let instructions = target
             .as_ref()
-            .map_or(declared_instructions, |target| target.declared_instructions);
+            .map_or(instructions, ForkInstructionPolicies::of_target);
         self.fork_durable_session_with_optional_planned_identity(
             source_session_id,
             message_count,
             Some(planned_child_session_id),
             tool_access_policy,
             target,
-            inherited_instructions,
-            declared_instructions,
+            instructions,
         )
         .await
     }
@@ -6489,8 +6523,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         let recovery_gate_bound = bound
             .saturating_sub(started.elapsed())
             .max(Self::TURN_BOUNDARY_FORK_MIN_RECOVERY_GATE_BOUND);
-        let inherited_instructions = target.inherited_instructions;
-        let declared_instructions = target.declared_instructions;
+        let instructions = ForkInstructionPolicies::of_target(&target);
         match self
             .fork_durable_session_with_optional_planned_identity_under(
                 source_session_id,
@@ -6498,8 +6531,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 None,
                 tool_access_policy,
                 Some(target),
-                inherited_instructions,
-                declared_instructions,
+                instructions,
                 ForkSourceBoundary::HeldTurnBoundary {
                     turn_finalization_guard,
                     recovery_gate_bound,
@@ -6650,32 +6682,6 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         Ok(replay.session.take())
     }
 
-    /// The fork instruction policy a durable fork applies: the target's, or,
-    /// without a target, the default resolved for a fork that leaves no
-    /// activation window (the child is committed but not materialized, and
-    /// activation admits only materialized sessions).
-    fn target_fork_instruction_policy(
-        target: Option<&meerkat_core::DurableSessionForkTarget>,
-    ) -> meerkat_core::ForkInstructionPolicy {
-        target.map_or(
-            meerkat_core::ForkInstructionPolicy::default()
-                .effective(meerkat_core::ActivationWindow::None),
-            |target| target.inherited_instructions,
-        )
-    }
-
-    /// The fork instruction policy the host declared for a durable fork:
-    /// the target's, or the default without a target. The skills the
-    /// copied rows loaded follow it.
-    fn target_declared_instruction_policy(
-        target: Option<&meerkat_core::DurableSessionForkTarget>,
-    ) -> meerkat_core::ForkInstructionPolicy {
-        target.map_or(meerkat_core::ForkInstructionPolicy::default(), |target| {
-            target.declared_instructions
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
     async fn fork_durable_session_with_optional_planned_identity(
         &self,
         source_session_id: &SessionId,
@@ -6683,8 +6689,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         planned_child_session_id: Option<SessionId>,
         tool_access_policy: Option<meerkat_core::ops::ToolAccessPolicy>,
         target: Option<meerkat_core::DurableSessionForkTarget>,
-        inherited_instructions: meerkat_core::ForkInstructionPolicy,
-        declared_instructions: meerkat_core::ForkInstructionPolicy,
+        instructions: ForkInstructionPolicies,
     ) -> Result<DurableSessionForkWithProvenance, SessionError> {
         let source_admission = target
             .as_ref()
@@ -6696,8 +6701,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             planned_child_session_id,
             tool_access_policy,
             target,
-            inherited_instructions,
-            declared_instructions,
+            instructions,
             ForkSourceBoundary::Admission(source_admission),
         )
         .await
@@ -6711,8 +6715,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         planned_child_session_id: Option<SessionId>,
         tool_access_policy: Option<meerkat_core::ops::ToolAccessPolicy>,
         target: Option<meerkat_core::DurableSessionForkTarget>,
-        inherited_instructions: meerkat_core::ForkInstructionPolicy,
-        declared_instructions: meerkat_core::ForkInstructionPolicy,
+        instructions: ForkInstructionPolicies,
         boundary: ForkSourceBoundary,
     ) -> Result<DurableSessionForkWithProvenance, SessionError> {
         let caller_turn = matches!(
@@ -6796,8 +6799,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 tool_access_policy,
                 cache_inheritance,
                 target,
-                inherited_instructions,
-                declared_instructions,
+                instructions,
             )
             .await?;
         Ok(DurableSessionForkWithProvenance {
@@ -6818,8 +6820,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         requested_tool_access_policy: Option<meerkat_core::ops::ToolAccessPolicy>,
         cache_inheritance: ForkCacheInheritance,
         target: Option<meerkat_core::DurableSessionForkTarget>,
-        inherited_instructions: meerkat_core::ForkInstructionPolicy,
-        declared_instructions: meerkat_core::ForkInstructionPolicy,
+        instructions: ForkInstructionPolicies,
     ) -> Result<SessionForkResult, SessionError> {
         // The fork instruction policy decides, before anything is committed,
         // what the child does with the activation rows it copied: refuse the
@@ -6828,8 +6829,8 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         let reactivated_instruction_count = forked
             .apply_fork_instruction_policies(
                 &source_session_id,
-                inherited_instructions,
-                declared_instructions,
+                instructions.inherited,
+                instructions.declared,
             )
             .map_err(SessionError::ForkInstructionRefused)?;
         // What the child holds of its source: its effective instruction keys
@@ -6969,7 +6970,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 .skills
                 .into_iter()
                 .partition(|skill| {
-                    declared_instructions
+                    instructions.declared
                         == meerkat_core::ForkInstructionPolicy::ReactivateInherited
                         && source_skills.contains(skill)
                 });
@@ -15556,9 +15557,9 @@ impl<B: SessionAgentBuilder + 'static> SessionServiceTranscriptEditExt
         let _ = req.running_behavior;
         // A generic fork commits a child that is not materialized, and
         // activation admits only materialized sessions: no activation window.
-        let declared_instructions = req.inherited_instructions.unwrap_or_default();
-        let inherited_instructions =
-            declared_instructions.effective(meerkat_core::ActivationWindow::None);
+        let instructions = ForkInstructionPolicies::without_activation_window(
+            req.inherited_instructions.unwrap_or_default(),
+        );
         Ok(self
             .fork_durable_session_with_optional_planned_identity(
                 id,
@@ -15566,8 +15567,7 @@ impl<B: SessionAgentBuilder + 'static> SessionServiceTranscriptEditExt
                 None,
                 req.tool_access_policy,
                 None,
-                inherited_instructions,
-                declared_instructions,
+                instructions,
             )
             .await?
             .fork)
@@ -15597,9 +15597,9 @@ impl<B: SessionAgentBuilder + 'static> SessionServiceTranscriptEditExt
         );
         self.authorize_transcript_edit(id, TranscriptEditKind::Fork)?;
         // Same activation window as `fork_session_at`: none.
-        let declared_instructions = req.inherited_instructions.unwrap_or_default();
-        let inherited_instructions =
-            declared_instructions.effective(meerkat_core::ActivationWindow::None);
+        let instructions = ForkInstructionPolicies::without_activation_window(
+            req.inherited_instructions.unwrap_or_default(),
+        );
         self.persist_transcript_fork(
             id.clone(),
             forked,
@@ -15607,8 +15607,7 @@ impl<B: SessionAgentBuilder + 'static> SessionServiceTranscriptEditExt
             req.tool_access_policy,
             cache_inheritance,
             None,
-            inherited_instructions,
-            declared_instructions,
+            instructions,
         )
         .await
     }
@@ -26757,8 +26756,10 @@ mod tests {
                     SessionId::new(),
                     None,
                     None,
-                    meerkat_core::ForkInstructionPolicy::default(),
-                    meerkat_core::ForkInstructionPolicy::default(),
+                    ForkInstructionPolicies {
+                        inherited: meerkat_core::ForkInstructionPolicy::default(),
+                        declared: meerkat_core::ForkInstructionPolicy::default(),
+                    },
                 )
                 .await
                 .map(|forked| forked.fork.session_id),

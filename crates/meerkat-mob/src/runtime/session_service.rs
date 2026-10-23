@@ -4242,8 +4242,10 @@ where
                 request.planned_child_session_id,
                 None,
                 None,
-                request.inherited_instructions,
-                request.declared_instructions,
+                meerkat_session::ForkInstructionPolicies {
+                    inherited: request.inherited_instructions,
+                    declared: request.declared_instructions,
+                },
             )
             .await?;
         Ok(crate::forked_participant::PlannedForkOutcome {
