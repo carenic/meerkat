@@ -718,9 +718,14 @@ Such a checkpoint's tail always ends with the run's own tool call and its
 results, never with a compaction summary. Intra-run checkpoints never prune
 stored rewrite rows, so the committed boundary stays rebuildable for recovery;
 the boundary commit that promotes the run applies the run's retention cut in
-the same transaction, never past the promoted head's row-lineage anchor. A
-crash after such a checkpoint continues the run (see below); before 0.9.5 it
-closed the run as interrupted.
+the same transaction, never past the promoted head's row-lineage anchor.
+On WholeBlob a compaction re-bases the run: one store call commits the
+compacted document as the session's committed base and restarts the run's
+provisional tail on top of it, so round commits continue after any number of
+compactions. A later failure of a re-based run consumes its inputs instead of
+requeueing them, because they are already part of committed history.
+A crash after an intra-run checkpoint continues the run (see below); before
+0.9.5 it closed the run as interrupted.
 
 A crash or shutdown race can still leave a durable transcript tail — up to and
 including a fully completed turn — whose runtime boundary commit never landed.
@@ -737,17 +742,21 @@ the committed authority is preserved.
   first commit, the staged response is not in the transcript yet), every input
   bound to the run is still bound to it, and the runtime is not retired. A
   tail with no assistant row, such as one written by the first commit of a
-  run's first round or of the round after a compaction, is continuable only
-  on that cursor's evidence: it holds no tool result, the cursor names the
-  store-issued run id with none of its staged calls in the tail, and the store
-  proves the tail's descent. Recovery then writes nothing and settles nothing,
+  run's first round, by the first commit of the round after a compaction, or
+  by a WholeBlob re-base, is continuable only on that cursor's evidence: it
+  holds no tool result, the cursor names the store-issued run id with none of
+  its staged calls in the tail, and the store proves the tail's descent.
+  Recovery then writes nothing and settles nothing,
   and the run continues from its last committed round under the same run id
   (see [Durable runs](/guides/durable-runs#after-a-crash)). A cursor never
   turns a tail that would otherwise be held into a continuable one, and a
   cursor inside a committed body never makes a run continuable. A cursor tail
-  whose bound inputs were settled or requeued, whose run has no bound inputs
-  (a direct or machine-service turn), or whose runtime was retired is closed
-  as interrupted.
+  whose bound inputs were settled, whose run has no bound inputs (a direct or
+  machine-service turn), or whose runtime was retired is closed as
+  interrupted. A run that fails and whose inputs are queued for another
+  attempt discards its tail before they requeue, so it starts over from its
+  inputs; a cursor tail left behind with requeued inputs is held for
+  reconciliation, never committed.
 - A completed tail (single run, `EndTurn` terminal, structurally coherent) is
   committed as a recovered run boundary in one atomic store transaction:
   recovered snapshot, boundary receipt, and input terminalization land

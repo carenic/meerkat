@@ -51,8 +51,12 @@ fails, none of the round's tools has run.
 
 A run that crashes before its first commit, during its first model call, has
 nothing to continue from: its input runs again as a new run, as before 0.9.5.
-On a WholeBlob realm, a run also stops taking round commits at its first
-compaction (see [Limitations](#limitations)).
+
+A compaction during the run keeps the commits going. On a `sqlite` realm the
+next round commits on top of the compacted transcript. On a WholeBlob realm
+the compaction commits the compacted session document as the session's new
+committed base, and the run's round commits continue on top of it, after any
+number of compactions.
 
 ### Cost By Realm Backend
 
@@ -118,7 +122,8 @@ its open run until its next open.
 
 | Situation | What recovery does |
 |-----------|--------------------|
-| A bound input was already settled or requeued, for example by a stop | Closes the run as interrupted, with its content kept |
+| A bound input was already settled, for example by a stop | Closes the run as interrupted, with its content kept |
+| The run failed and its inputs were queued for another attempt | Its round commits were discarded first, so its inputs run again as a new run; a tail left behind with requeued inputs is held for reconciliation, never committed |
 | The runtime was retired | Closes the run as interrupted, with its content kept |
 | The run has no bound inputs (a direct or machine-service turn) | Closes the run as interrupted, with its content kept |
 | The saved transcript and the run cursor disagree | Holds the session for reconciliation |
@@ -152,17 +157,24 @@ A call dispatched again carries the same key as its first dispatch. A tool
 whose effect must not happen twice records the key with the effect, and
 skips a call whose key it has already seen, comparing all four fields.
 
-A Rust tool reads the key with `ToolDispatchContext::tool_call_dedupe_key`,
-which answers `None` outside a run's tool round. `ToolCallDedupeKey::new`
-derives the same key, digest included, from a call's run, round, id, tool
-name and arguments.
+How a tool gets the key depends on where it runs. Core sends the key on no
+wire itself:
 
-The digest matters when the model is asked for a round again after its calls
-had run, as on a WholeBlob realm after a compaction (see
-[Limitations](#limitations)). The model then returns new calls. Providers that
-mint fresh call ids give them new keys. A provider that numbers call ids per
-response can give a new call an old call's id; the digest keeps the two apart
-unless the name and arguments match too.
+- A Rust tool reads it with `ToolDispatchContext::tool_call_dedupe_key`,
+  which answers `None` outside a run's tool round. `ToolCallDedupeKey::new`
+  derives the same key, digest included, from a call's run, round, id, tool
+  name and arguments.
+- For an MCP tool, a host can add the key to the call's metadata in its
+  `McpCallContextProvider::prepare`, which receives the call and its dispatch
+  context.
+- A host that answers callback tools can compute the digest with
+  `meerkat_core::tool_call_digest(name, arguments)` and pair it with the
+  call's `tool_use_id`. The run id and round are not part of a callback
+  request.
+
+The digest keeps calls apart when a provider reuses call ids, as some
+providers number them per response: a call matches an earlier key only when
+its name and arguments match too.
 
 ### Calls Answered As Interrupted
 
@@ -259,13 +271,12 @@ fence:
   background. A renew answered `FencedOut` stops the realm's writes until it
   is opened again; any other failed renew stops writes until a renew
   succeeds.
-- **Self-fencing.** Core writes only while its last successful acquire or
-  renew started less than the self-fence window ago. The window is the lease
-  minus one renew interval. Past it, Core renews first and refuses the write
-  if that fails. Every round commits, so a process that was paused past its
-  window stops at its next commit, before it dispatches a tool or calls the
-  model. In the steady state this is a clock read, with no store request
-  added to a round.
+- **Self-fencing.** The holder makes no model call, dispatches no tool and
+  commits nothing unless its last successful acquire or renew started less
+  than the self-fence window ago. The window is the lease minus one renew
+  interval, so a paused process stops itself before its lease ends. Past the
+  window, Core renews first and goes on only if the renew succeeds. In the
+  steady state this is a clock read, with no store request added to a round.
 
 The store sets the renew interval and the lease with
 `HostStore::fence_timing`:
@@ -325,13 +336,9 @@ Before you run a host store in production, run the host store chapter of the
   run.
 - Round commits serve crash recovery only. A run that fails and whose inputs
   are queued for another attempt discards its round commits and starts again
-  from its inputs, as before 0.9.5.
-- On a WholeBlob realm (`jsonl`, or a host store), a run takes no round
-  commits after its first compaction. A crash after that continues the run
-  from its last commit before the compaction: the compaction and the rounds
-  after it run again, and their tool calls come back as new calls, whose
-  dedupe keys do not match the earlier ones unless the provider reuses call
-  ids. A `sqlite` realm keeps committing every round.
+  from its inputs, as before 0.9.5. On a WholeBlob realm, a run that has
+  compacted has already committed its inputs with the compacted document, so
+  a later failure ends the run without running its inputs again.
 - A WholeBlob realm writes the whole session document at every commit.
 
 ## See Also

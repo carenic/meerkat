@@ -332,17 +332,18 @@ Contract and limits: `docs/guides/durable-runs.mdx`.
   failed first commit dispatches nothing.
 - Cost: `sqlite` (HeadCanonical) writes the round's rows; `jsonl` and
   host-store realms (WholeBlob) write the whole session document at each
-  commit, so the bytes grow with the square of the tool rounds. A WholeBlob
-  run takes no round commits after its first compaction: a crash after that
-  continues from the last commit before the compaction, and the compaction
-  and the later rounds run again with new tool calls.
+  commit, so the bytes grow with the square of the tool rounds. A compaction
+  keeps the commits going: on WholeBlob it re-bases the run (one store call
+  commits the compacted document as the committed base and restarts the run's
+  tail on it).
 - Resume: when the session is opened again (any surface, or a mob rebuilding
   its `durable = true` workers) its open run continues under the same run id;
   no new input is needed. There is no boot sweep: a session nobody opens
   keeps its open run until its next open. A crash before the run's first
   commit runs its input again as a new run. A run that fails and whose inputs
   are requeued for another attempt discards its round commits and starts over,
-  as before 0.9.5.
+  as before 0.9.5; a WholeBlob run that has re-based instead consumes its
+  inputs on failure, since they are already committed.
 - Event `run_resumed {run_id, round, resume_point}`: `tools_pending` (the
   saved response stands in for the model call and its calls are dispatched
   again under the same call ids, with no new assistant, tool-call request or
@@ -360,16 +361,21 @@ Contract and limits: `docs/guides/durable-runs.mdx`.
   them; a graceful unregister that keeps queued work leaves the run to resume
   at the next start.
 - Not resumed, closed as interrupted with content kept: a bound input already
-  settled or requeued, a retired runtime, or a run with no bound inputs
-  (direct and machine-service turns). A cursor that disagrees with the
-  transcript is held (`SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY`).
+  settled, a retired runtime, or a run with no bound inputs (direct and
+  machine-service turns). Held (`SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY`),
+  never committed: a cursor that disagrees with the transcript, and a tail
+  left behind with requeued inputs.
 - Reruns are at least once and pass authorization, approval review and
   pre-tool hooks again. Rust tools read
   `ToolDispatchContext::tool_call_dedupe_key(call) -> Option<ToolCallDedupeKey>`
   (`run_id`, `round`, `call_id`, `call_digest` = lowercase hex SHA-256 of the
   tool name and canonical arguments; `ToolCallDedupeKey::new` derives it) and
   deduplicate on all four fields. MCP tools and host callback tools are
-  dispatched again too, and a callback request is sent again.
+  dispatched again too, and a callback request is sent again. Core sends the
+  key on no wire: a host adds it to an MCP call's metadata in
+  `McpCallContextProvider::prepare(target, call, context)`, and a callback
+  host computes `meerkat_core::tool_call_digest(name, args)` and pairs it with
+  the `tool_use_id` (run id and round are not in a callback request).
 - Not rerun, answered with an `outcome_uncertain` tool error instead: a call
   whose process custody shows the process may have run, a Core comms tool
   that sends to another agent (every comms tool but `peers`), and a call that

@@ -142,7 +142,9 @@ impl AgentToolDispatcher for PaymentTools {
 
 `ToolCallDedupeKey::new(run_id, round, call_id, tool_name, arguments)` derives
 the same key, digest included, from its parts, for a tool that records keys
-outside the dispatch.
+outside the dispatch. Core sends the key on no wire itself. For an MCP tool, a
+host can add it to the call's metadata in its `McpCallContextProvider::prepare`,
+which receives the call and the same dispatch context.
 
 ### Multimodal tool results
 

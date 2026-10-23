@@ -89,10 +89,10 @@ Contract, obligations and conformance: `docs/reference/host-store-spi.mdx`.
   then waits out what remained of its lease before serving anything. Core
   renews every renew interval (default 10 s, at least 1 s) under a lease
   (default 30 s, from 3 intervals to 1 hour) that the store sizes with
-  `fence_timing()`, and writes only while its last successful acquire or
-  renew started less than the lease minus one interval ago. `FencedOut`
-  stops every write until the realm is reopened; another failed renew stops
-  writes until a renew succeeds.
+  `fence_timing()`. It makes no model call, dispatches nothing and writes
+  nothing unless its last successful acquire or renew started less than the
+  lease minus one interval ago. `FencedOut` stops every write until the realm
+  is reopened; another failed renew stops writes until a renew succeeds.
 - Opening lists every head once. A session body loads at open only when
   recovery must act on it (unsettled inputs, an open run cursor, a current
   run), otherwise on first use, and stays loaded until the session is
@@ -101,9 +101,10 @@ Contract, obligations and conformance: `docs/reference/host-store-spi.mdx`.
   larger values itself. An unknown commit outcome is settled before the
   scope's next version. A refused batch, or one still unknown after the retry
   budget, poisons the scopes it touched until the realm is reopened.
-- The runtime store is WholeBlob, with the cost and the post-compaction rule
-  above. An interactive OAuth login in progress is process-local: after a
-  restart or a takeover, start it again; completed credentials are kept.
+- The runtime store is WholeBlob, with the cost above; a compaction re-bases
+  a run's commits rather than stopping them. An interactive OAuth login in
+  progress is process-local: after a restart or a takeover, start it again;
+  completed credentials are kept.
 - Test a store with the host store chapter of `meerkat-store-conformance`.
 
 On a JSONL realm, if the session index (`sessions_jsonl/session_index.sqlite3`)
