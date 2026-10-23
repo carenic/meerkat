@@ -132,7 +132,11 @@ actor's life, with Stop, Shutdown and Destroy available. `MobError` is
 `#[non_exhaustive]`.
 
 Shutdown report: `shutdown_with_report(ShutdownOptions)`
-(`ShutdownOptions::default().with_deadline(deadline)` bounds its waits)
+(`ShutdownOptions::default().with_deadline(deadline)` bounds its waits;
+since 0.9.5 `.with_queued_inputs(QueuedInputsOnShutdown::Requeue(max_age))`
+keeps durable queued prompts for the next start, whose waiters get
+`BoundedTurnFailure::RequeuedAcrossStop`, or `RequeueExpired` when older than
+`max_age` at that start)
 returns a `MobShutdownReport` with per-member `members`
 (`MemberShutdownOutcome`), `runs` and `run_starts`; `is_clean()` is true when
 every member is `Unregistered`. Since 0.9.4 `UnregisterPending { stage,
