@@ -505,3 +505,44 @@ async fn mcp_status_answers_a_phase_while_the_lifecycle_owner_is_busy() {
     assert_eq!(status.phase, HostMcpAuthPhase::Authorized);
     drop(held);
 }
+
+/// A stored credential without a secret (a corrupt record): the use path
+/// refuses it with reauth, and the status says the same instead of
+/// filtering the record out as absent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_status_reports_reauth_for_a_stored_credential_without_a_secret() {
+    let fixture = McpOAuthFixture::spawn().await.unwrap();
+    let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+    let store = Arc::new(EphemeralTokenStore::new());
+    let service = HostAuthService::new(
+        ProviderAuthPersistence::new(store.clone(), Arc::new(InMemoryCoordinator::new())),
+        runtime.provider_auth_runtime_authority(),
+    );
+    let target = logged_in(&fixture, &service).await;
+    let key = service
+        .mcp_target_in_service_realm(&target)
+        .unwrap()
+        .token_key()
+        .unwrap();
+    let mut tokens = meerkat_providers::auth_store::TokenStore::load(store.as_ref(), &key)
+        .await
+        .unwrap()
+        .expect("the login stored a credential");
+    tokens.primary_secret = None;
+    meerkat_providers::auth_store::TokenStore::save(store.as_ref(), &key, &tokens)
+        .await
+        .unwrap();
+    let used = service
+        .mcp_oauth_authority()
+        .unwrap()
+        .stored_bearer_token(&target)
+        .await;
+    assert!(
+        matches!(used, Err(meerkat::McpOAuthError::ReauthRequired { .. })),
+        "positive control: the use path refuses a secret-less credential: {used:?}"
+    );
+    assert_eq!(
+        service.mcp_status(&target).await.unwrap().phase,
+        HostMcpAuthPhase::ReauthRequired
+    );
+}

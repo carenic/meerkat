@@ -1405,9 +1405,11 @@ impl HostAuthService {
     /// credential and its pending attempt. A stored credential's phase and
     /// fields come from one read through the use path's own rule
     /// ([`McpOAuthAuthority::stored_credential_status`]): like a use, that
-    /// read may restore the credential's lifecycle from its durable marker.
+    /// read may restore the credential's lifecycle from its durable marker,
+    /// and in a process that has not used the credential yet that restoration
+    /// can make one bounded credential-store lookup, as connector status does.
     /// It never waits for the credential's lifecycle owner: while the owner
-    /// is busy, the stored credential's own expiry decides. It performs no
+    /// is busy, the stored credential's own reading decides. It performs no
     /// refresh and no network I/O.
     pub async fn mcp_status(
         &self,
@@ -1424,7 +1426,6 @@ impl HostAuthService {
             .await?
             .filter(|tokens| {
                 tokens.auth_mode == meerkat_providers::auth_store::PersistedAuthMode::McpOauth
-                    && tokens.primary_secret.is_some()
                     && meerkat_providers::mcp_oauth::stored_credential_matches_selection(
                         target, tokens,
                     )
@@ -1454,11 +1455,13 @@ impl HostAuthService {
             return Ok(absent(attempt));
         };
         let expired = tokens.expires_at.is_some_and(|at| at <= Utc::now());
-        let durable_phase = if expired && tokens.refresh_token.is_none() {
-            HostMcpAuthPhase::ReauthRequired
-        } else {
-            HostMcpAuthPhase::Authorized
-        };
+        // A record without a secret is refused at use: reauth, never absent.
+        let durable_phase =
+            if tokens.primary_secret.is_none() || (expired && tokens.refresh_token.is_none()) {
+                HostMcpAuthPhase::ReauthRequired
+            } else {
+                HostMcpAuthPhase::Authorized
+            };
         let used = match &authority {
             Some(authority) => authority.stored_credential_status(target).await?,
             None => None,
