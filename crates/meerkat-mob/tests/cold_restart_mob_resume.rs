@@ -6440,19 +6440,6 @@ async fn a_destructive_reset_right_after_a_reply_does_not_race_its_boundary_comm
 // and a tuple divergence that still fail-stops the start.
 // ---------------------------------------------------------------------------
 
-/// The id of the mob the persistent store at `paths` holds, read before any
-/// start.
-#[cfg(feature = "test-support")]
-async fn created_mob_id(paths: &Paths) -> MobId {
-    MobStorage::persistent(&paths.mob_db_path)
-        .expect("open mob storage")
-        .created_definition()
-        .await
-        .expect("read the created definition")
-        .expect("the store holds a created mob")
-        .id
-}
-
 /// Adopt `identity`, a member of `handle`'s mob, as an intent-managed
 /// identity on its own session `session_id`, at its existing baseline.
 #[cfg(feature = "test-support")]
@@ -6792,13 +6779,13 @@ async fn a_retiring_members_tuple_divergence_still_fail_stops_the_start() {
     let paths = Paths::new(temp.path());
     let tail = crash_with_a_retiring_member_tail(temp.path(), &paths).await;
     let other_owner_claim = tail.another_owner_hosts_the_session();
-    let mob_id = created_mob_id(&paths).await;
     let identity = AgentIdentity::from("w-1");
     let (service, store) = persistent_head_canonical_service(&paths, tail.runtime_store.clone());
 
     meerkat_mob::fault_next_restore_tuple_for_test(
-        &mob_id,
+        &tail.mob_id,
         &identity,
+        meerkat_mob::MemberCustodyRestore::CleanupDelivery,
         meerkat_mob::RestoreTupleFault::FenceToken,
     );
     let refused = MobBuilder::for_resume(
