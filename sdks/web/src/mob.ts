@@ -1697,9 +1697,17 @@ export class Mob {
    *
    *  Returns the typed {@link MobLifecycleResult} from the WASM boundary
    *  (carrying the typed destroy_report for a destroy action), parsed
-   *  fail-closed — a malformed payload throws instead of being dropped. */
+   *  fail-closed: a malformed payload throws instead of being dropped. A
+   *  refused action rejects with a {@link MeerkatError}; a destroy that did
+   *  not finish has code `mob_destroy_incomplete`, and its `data` carries
+   *  the report. */
   async lifecycle(action: MobLifecycleAction): Promise<MobLifecycleResult> {
-    const json = await this.bindings.mob_lifecycle(this.mobId, action);
+    let json: string;
+    try {
+      json = await this.bindings.mob_lifecycle(this.mobId, action);
+    } catch (error) {
+      throw MeerkatError.fromWasm(error);
+    }
     const raw = parseJsonPayload(json, 'Invalid mob/lifecycle response');
     if (
       typeof raw !== 'object' ||

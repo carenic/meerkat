@@ -816,11 +816,16 @@ fn err_bounded_member_run(error: meerkat_mob::BoundedMemberRunError) -> JsValue 
 
 fn mob_destroy_error_value(e: MobMcpDestroyError) -> serde_json::Value {
     match e {
+        // The typed incomplete data rides under `data`, exactly as RPC sends
+        // it in `error.data`: the Web SDK's `MeerkatError.fromWasm` keeps an
+        // envelope's `data`. The top-level report and flag stay for callers
+        // that read the raw envelope.
         MobMcpDestroyError::Incomplete { report } => serde_json::json!({
             "code": "mob_destroy_incomplete",
             "message": MobMcpDestroyError::incomplete_message(&report),
             "destroy_report": meerkat_contracts::WireMobDestroyReport::from(&report),
             "retryable": true,
+            "data": MobMcpDestroyError::incomplete_error_data(&report),
         }),
         MobMcpDestroyError::Mob(error) => mob_error_value(&error),
     }
