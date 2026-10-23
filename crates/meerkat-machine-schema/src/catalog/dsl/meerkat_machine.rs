@@ -8817,6 +8817,16 @@ macro_rules! meerkat_catalog_machine_dsl {
         disposition RequestCommsDrainExitForUnregister => external seam OwnerRealizationOnly,
         disposition RequestCompletionWaiterResolutionForUnregister => external seam OwnerRealizationOnly,
         disposition StopInputDispositionClassified => local seam NoOwnerRealization,
+        // Same-run resume: run-lifecycle bookkeeping the owning runtime
+        // reads from the authority itself (as TurnRunStarted and
+        // SubmitRunPrimitive); the driver sequences any follow-up input
+        // (normalization, abandonment, the stop saga) on its own, and no
+        // owner realizes these effects.
+        disposition ResumableRunMarked => local seam NoOwnerRealization,
+        disposition ResumedRunAuthorized => local seam NoOwnerRealization,
+        disposition ResumableRunReleased => local seam NoOwnerRealization,
+        disposition ResumableRunSettled => local seam NoOwnerRealization,
+        disposition RunSuspendedForStop => local seam NoOwnerRealization,
 
         // =====================================================================
         // Helpers
