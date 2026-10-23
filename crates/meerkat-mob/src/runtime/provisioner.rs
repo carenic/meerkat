@@ -2920,6 +2920,43 @@ async fn run_pre_boundary_step_test_gate(session_id: &SessionId) {
     }
 }
 
+/// Test hook: the next durability reload the turn-finalization boundary of a
+/// session's disposal asks for answers the runtime's repair-blocked refusal,
+/// once.
+#[cfg(test)]
+pub(crate) mod disposal_reload_test_hooks {
+    use meerkat_core::types::SessionId;
+    use std::sync::{Mutex, PoisonError};
+
+    static REFUSED_BOUNDARY_RELOADS: Mutex<Vec<SessionId>> = Mutex::new(Vec::new());
+
+    /// The reason of the refusal [`refuse_next_boundary_reload`] arms.
+    pub(crate) const INJECTED_REFUSAL: &str =
+        "injected repair-blocked refusal of the disposal's reload";
+
+    /// The next reload the disposal of `session` asks for at its
+    /// turn-finalization boundary is refused as repair-blocked, once.
+    pub(crate) fn refuse_next_boundary_reload(session: &SessionId) {
+        REFUSED_BOUNDARY_RELOADS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(session.clone());
+    }
+
+    pub(super) fn take_boundary_reload_refusal(session: &SessionId) -> bool {
+        let mut armed = REFUSED_BOUNDARY_RELOADS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match armed.iter().position(|candidate| candidate == session) {
+            Some(index) => {
+                armed.remove(index);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 #[cfg(test)]
 fn recovered_ops_after_hook_test_gates()
 -> &'static std::sync::Mutex<HashMap<SessionId, (oneshot::Sender<()>, oneshot::Receiver<()>)>> {
@@ -4117,6 +4154,16 @@ impl MemberSessionDisposalArc {
                     )?;
                     recovered_cold_successor = Some((registration, existing_ops_binding));
                 } else {
+                    #[cfg(test)]
+                    if disposal_reload_test_hooks::take_boundary_reload_refusal(session_id) {
+                        return Err(DurabilityReloadFailure::Refused(
+                            meerkat_runtime::RuntimeDriverError::RecoveryRepairBlocked {
+                                evidence_digest: None,
+                                reason: disposal_reload_test_hooks::INJECTED_REFUSAL.to_string(),
+                            },
+                        )
+                        .into_retire_error(session_id));
+                    }
                     let prior_ops_binding = Self::recoverable_ops_binding_witness(
                         self.ops_adapter.as_ref(),
                         session_id,

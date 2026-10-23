@@ -8,7 +8,9 @@
 //! and detaches the cold successor. A reload the runtime refuses, or a
 //! session that degrades after the stage's reload check, sticks the
 //! retirement with the typed `MemberReloadRepairBlocked`, which a redrive
-//! completes.
+//! completes. A destroy whose disposal of a member meets such a refused
+//! reload reports the refusal typed in its report, as its own reload passes
+//! do.
 
 use super::*;
 use crate::runtime::actor::retirement_stage_hold;
@@ -237,4 +239,56 @@ async fn a_member_that_degrades_after_the_ingress_reload_check_sticks_until_a_re
         .await
         .expect("a plain redrive reloads the member and completes the retirement");
     assert_retired(&mob, &member, &session).await;
+}
+
+/// A destroy whose disposal of a member meets a durability reload the
+/// runtime refuses as repair-blocked (a member that degraded after the
+/// destroy's own reloads; here the disposal's reload is answered with the
+/// refusal) answers `Incomplete` with the member in `member_reload_refusals`,
+/// typed as its reload passes report it, beside the refusal's text in
+/// `errors`. Once the refusal clears, the same destroy completes and reports
+/// no refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_destroy_whose_disposal_reload_is_refused_reports_the_refusal_typed() {
+    use crate::runtime::provisioner::disposal_reload_test_hooks as disposal;
+    let mob = create_isolation_mob(1).await;
+    let member = mob.member(0).clone();
+    let session = mob.session(0).clone();
+    disposal::refuse_next_boundary_reload(&session);
+
+    let refused = tokio::time::timeout(STEP, mob.handle.destroy())
+        .await
+        .expect("the destroy answers");
+    let report = match refused {
+        Err(crate::MobDestroyError::Incomplete { report }) => report,
+        other => panic!("a refused disposal reload makes the destroy incomplete: {other:?}"),
+    };
+    assert!(
+        matches!(
+            report.errors.as_slice(),
+            [error] if error.starts_with(&format!("{member}: "))
+                && error.contains(disposal::INJECTED_REFUSAL)
+        ),
+        "the refusal keeps its text entry: {report:?}"
+    );
+    assert_eq!(
+        report.member_reload_refusals,
+        vec![crate::MobDestroyMemberRefusal {
+            member: member.clone(),
+            refusal: crate::MemberReloadRefusal::RepairBlocked {
+                reason: disposal::INJECTED_REFUSAL.to_string(),
+                evidence_digest: None,
+            },
+        }],
+        "the refusal is typed in the report: {report:?}"
+    );
+
+    let report = tokio::time::timeout(STEP, mob.handle.destroy())
+        .await
+        .expect("the retried destroy answers")
+        .expect("the retried destroy completes");
+    assert!(
+        report.member_reload_refusals.is_empty(),
+        "a completed destroy reports no refusal: {report:?}"
+    );
 }

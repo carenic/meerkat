@@ -149,7 +149,11 @@ them.
   authority_retained: true, live_shell_discarded: false}` and its wire code
   `SessionBusy`, as for `MemberReloadRefused`, which
   `MobHandle::reload_member_registration` still answers for the same
-  refusal.
+  refusal. A destroy that meets the same refusal while it archives a
+  member's session (the member degraded after the destroy's own reload
+  passes) now reports this variant's text in the member's `errors` entry,
+  where it reported a session error, and lists the member in
+  `MobDestroyReport::member_reload_refusals` as its reload passes do.
 - `meerkat-mob`: the structured data of `MobError::MemberRetirementStuck`
   (kind `mob_retirement_stuck`) gains `cause_data`, the cause's own
   structured data, when the cause has some: for example kind

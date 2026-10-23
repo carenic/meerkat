@@ -46687,6 +46687,29 @@ impl MobActor {
         }
     }
 
+    /// The typed refusal of the member reload that aborted the destroy's
+    /// disposal of a member: the runtime refused as repair-blocked the reload
+    /// the disposal asked for while archiving the member's session (the
+    /// member degraded after the destroy's own reload passes). The report
+    /// lists it as those passes list theirs. Any other disposal failure is
+    /// text only.
+    fn destroy_disposal_reload_refusal(
+        report: &DisposalReport,
+    ) -> Option<super::handle::MemberReloadRefusal> {
+        let (_, error) = report.aborted_at.as_ref()?;
+        match error.retirement_root_cause() {
+            MobError::MemberReloadRepairBlocked {
+                reason,
+                evidence_digest,
+                ..
+            } => Some(super::handle::MemberReloadRefusal::RepairBlocked {
+                reason: reason.clone(),
+                evidence_digest: evidence_digest.clone(),
+            }),
+            _ => None,
+        }
+    }
+
     fn destroy_disposal_failure(report: &DisposalReport) -> Option<String> {
         if let Some((step, error)) = &report.aborted_at {
             return Some(format!("disposal aborted at {step}: {error}"));
@@ -49338,6 +49361,14 @@ impl MobActor {
             let disposal_report = boxed_arm_future(|| self.dispose_member_for_destroy(&ctx)).await;
             if let Some(error) = Self::destroy_disposal_failure(&disposal_report) {
                 report.push_error(format!("{}: {error}", entry.agent_identity));
+                if let Some(refusal) = Self::destroy_disposal_reload_refusal(&disposal_report) {
+                    report
+                        .member_reload_refusals
+                        .push(super::handle::MobDestroyMemberRefusal {
+                            member: entry.agent_identity.clone(),
+                            refusal,
+                        });
+                }
                 return Err(super::handle::MobDestroyError::Incomplete {
                     report: report.clone(),
                 });

@@ -1238,7 +1238,10 @@ destroy later. The SDKs read that report typed, as a `WireMobDestroyReport`:
 `mobDestroyIncompleteReport(error)` in TypeScript and `@rkat/web`. A refusal
 in the reload pass before the destroy starts leaves the mob unchanged. A
 refusal later in the destroy comes after its cleanup has begun: the mob's
-admission is closed, and some members may already be retired. Any other
+admission is closed, and some members may already be retired. A member that
+degrades only after those reloads, and whose reload the runtime refuses while
+the destroy archives its session, is listed the same way; its `errors` entry
+then carries the text of `MobError::MemberReloadRepairBlocked`. Any other
 reload failure stays text in `errors` only.
 
 A retire reloads such a member as well, at its quiesce stage. When the runtime
