@@ -6248,6 +6248,105 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         }
     }
 
+    /// Settle the durable tail a run of this live session left when it ended
+    /// without its boundary commit, before a native tool application settles
+    /// its returned effects into the live actor.
+    ///
+    /// Per-round commits keep a run's rounds in a provisional tail. A run
+    /// that ends without its boundary commit (the hard interrupt of a
+    /// shutdown's application drain, a stop, another failure) leaves that
+    /// tail for recovery, which closes the run as interrupted with its
+    /// content kept. While the tail stands, the store refuses the ordinary
+    /// whole-session save that makes the application's settled effects
+    /// durable. Those effects come from IO that already ran, and the
+    /// application's custody is what kept this actor past the ended turn, so
+    /// a refused save would lose them with the actor.
+    ///
+    /// The caller holds the turn-finalization boundary (no boundary commit is
+    /// pending) and the recovery gate, and this service hosts the live actor
+    /// the application entered. The same store-owned, machine-authorized
+    /// durable-tail recovery a restart runs settles the tail here: a run that
+    /// ended is committed as interrupted, and the live actor is brought to
+    /// that committed boundary in place before the effects are applied, so
+    /// the save keeps the run's rounds and adds the effects after them. A
+    /// recovery that holds or refuses the tail, or would continue its run,
+    /// leaves it intact, and the save is refused as before.
+    async fn settle_ended_run_tail_before_tool_application_settlement(
+        &self,
+        id: &SessionId,
+    ) -> Result<(), SessionError> {
+        let runtime_id = Self::runtime_id_for_session(id);
+        let tail_stands = match self.runtime_store.session_persistence_profile() {
+            RuntimeSessionPersistenceProfile::WholeBlobV1 => self
+                .runtime_store
+                .load_whole_blob_provisional_tail(&runtime_id)
+                .await
+                .map(|tail| tail.is_some()),
+            RuntimeSessionPersistenceProfile::HeadCanonicalV1 => self
+                .runtime_store
+                .load_head_canonical_provisional_tail(&runtime_id)
+                .await
+                .map(|tail| tail.is_some()),
+            _ => Ok(false),
+        };
+        match tail_stands {
+            Ok(true) => {}
+            Ok(false) => return Ok(()),
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %id,
+                    %error,
+                    "could not observe the provisional tail before a tool application settles"
+                );
+                return Ok(());
+            }
+        }
+        match self.store_owned_durable_tail_recovery_outcome(id).await {
+            Ok((meerkat_runtime::recovery::DurableTailRecoveryOutcome::Committed { .. }, _)) => {
+                tracing::info!(
+                    session_id = %id,
+                    "settled the durable tail of an ended run before a tool application settles"
+                );
+                self.note_live_authority_advanced(id);
+                self.discard_stale_live_session_if_needed(
+                    id,
+                    LiveStalenessPosition::TurnBoundaryHeld,
+                )
+                .await?;
+            }
+            Ok((
+                meerkat_runtime::recovery::DurableTailRecoveryOutcome::AlreadyAligned { .. },
+                _,
+            )) => {}
+            Ok((meerkat_runtime::recovery::DurableTailRecoveryOutcome::Held, _)) => {
+                tracing::warn!(
+                    session_id = %id,
+                    "durable-tail recovery held the tail a tool application's settlement meets"
+                );
+            }
+            Ok((meerkat_runtime::recovery::DurableTailRecoveryOutcome::Refused, _)) => {
+                tracing::warn!(
+                    session_id = %id,
+                    "durable-tail recovery refused the tail a tool application's settlement meets"
+                );
+            }
+            Ok((meerkat_runtime::recovery::DurableTailRecoveryOutcome::Continue { .. }, _)) => {
+                tracing::info!(
+                    session_id = %id,
+                    "the tail a tool application's settlement meets is an open run to continue; it is left intact"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %id,
+                    %error,
+                    "durable-tail recovery failed before a tool application settles"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Settle, inside an archive that holds the session's quiescent runtime
     /// turn boundary and its recovery gate, the durable tail a turn left ahead
     /// of the runtime boundary, so the archive can read the session again.
@@ -16888,6 +16987,13 @@ impl<B: SessionAgentBuilder + 'static> SessionService for PersistentSessionServi
                 let failures = outcome.settlement_failures();
                 let _mutation_guard = self
                     .live_persist_mutation_guard(&id)
+                    .await
+                    .map_err(|error| error.with_settlement_failures(failures.clone()))?;
+                // A run that ended without its boundary commit (the model
+                // turn this application's custody outlived) may have left a
+                // provisional tail, which refuses the save below. Settle it
+                // first, under the guards just taken.
+                self.settle_ended_run_tail_before_tool_application_settlement(&id)
                     .await
                     .map_err(|error| error.with_settlement_failures(failures.clone()))?;
                 if self.inner.live_session_actor_witness(&id).await.as_ref()
