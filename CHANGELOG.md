@@ -115,6 +115,14 @@ them.
   `SessionBusy`, as for `MemberReloadRefused`, which
   `MobHandle::reload_member_registration` still answers for the same
   refusal.
+- `meerkat-mob`: the structured data of `MobError::MemberRetirementStuck`
+  (kind `mob_retirement_stuck`) gains `cause_data`, the cause's own
+  structured data, when the cause has some: for example kind
+  `mob_member_reload_repair_blocked` for a retirement whose member reload
+  the runtime refused, which a redrive completes once the runtime's
+  evidence settles. A client routes on that kind instead of parsing the
+  `cause` text, which is unchanged; a cause without structured data adds
+  no key.
 - `meerkat-schedule`: `ScheduleTargetDelivery::deliver_existing_occurrence`,
   a defaulted method the driver calls to redeliver a reclaimed occurrence
   whose earlier attempt recorded its dispatch, with `ExistingDelivery`

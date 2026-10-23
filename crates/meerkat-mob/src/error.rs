@@ -641,7 +641,9 @@ pub enum MobError {
     /// The member's retirement durably started and then stopped at `stage`
     /// with the typed `cause`. The member stays `Retiring`, owned by the mob
     /// actor's stuck-retirement registry. Retrying a plain retirement does not
-    /// drive it; `MobHandle::redrive_retirement` or a mob resume does.
+    /// drive it; `MobHandle::redrive_retirement` or a mob resume does. Its
+    /// structured data carries the cause's text as `cause` and, when the
+    /// cause has structured data, that data as `cause_data`.
     #[error("member retirement for '{member_id}' is stuck at {stage}: {cause}")]
     MemberRetirementStuck {
         member_id: AgentIdentity,
@@ -1992,15 +1994,25 @@ impl MobError {
                 member_id,
                 stage,
                 cause,
-            } => Some(serde_json::json!({
-                "kind": "mob_retirement_stuck",
-                "member_id": member_id.as_str(),
-                "stage": stage,
-                "cause": cause.to_string(),
-                "retryable": false,
-                "redrive": true,
-                "authority_retained": true,
-            })),
+            } => {
+                let mut data = serde_json::json!({
+                    "kind": "mob_retirement_stuck",
+                    "member_id": member_id.as_str(),
+                    "stage": stage,
+                    "cause": cause.to_string(),
+                    "retryable": false,
+                    "redrive": true,
+                    "authority_retained": true,
+                });
+                // The cause's own data, so a client routes on its kind
+                // rather than on the cause's text.
+                if let (Some(cause_data), Some(fields)) =
+                    (cause.structured_data(), data.as_object_mut())
+                {
+                    fields.insert("cause_data".to_string(), cause_data);
+                }
+                Some(data)
+            }
             Self::MemberRetirementAdmissionPending { member_id, stage } => {
                 Some(serde_json::json!({
                     "kind": "mob_retirement_admission_pending",
