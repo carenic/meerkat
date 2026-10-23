@@ -960,6 +960,12 @@ fn documented_event_catalog_covers_core_agent_event_discriminators() {
             run_id: meerkat_core::lifecycle::RunId::new(),
             input_ids: vec![meerkat_core::lifecycle::InputId::new()],
         }),
+        AgentEvent::RunResumed {
+            session_id: SessionId::new(),
+            run_id: meerkat_core::lifecycle::RunId::new(),
+            round: 2,
+            resume_point: meerkat_core::RunResumePointKind::ToolsPending,
+        },
     ];
 
     for event in events {

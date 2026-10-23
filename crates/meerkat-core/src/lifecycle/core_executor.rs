@@ -307,6 +307,16 @@ pub enum CoreExecutorError {
     #[error("Run was cancelled")]
     Cancelled,
 
+    /// The applied run was suspended by a stop that keeps the session's
+    /// queued work ([`AgentError::RunSuspended`]): it is neither cancelled
+    /// nor failed. Its turn stopped at an await point and wrote nothing more,
+    /// so its last round commit stays its resume point. The runtime loop
+    /// realizes no terminal for it and leaves its inputs as they are; it is
+    /// never a cancellation, which realizes `RunCancelled` and abandons the
+    /// inputs, and never an apply failure, which requeues them.
+    #[error("Run {run_id} was suspended; it resumes from its last round commit")]
+    Suspended { run_id: RunId },
+
     /// Internal error.
     #[error("Internal error: {0}")]
     Internal(String),
@@ -387,6 +397,11 @@ impl CoreExecutorError {
         if let SessionError::Agent(agent_error) = error.primary_error() {
             match agent_error.primary_error() {
                 AgentError::Cancelled => return Self::Cancelled,
+                AgentError::RunSuspended { run_id } => {
+                    return Self::Suspended {
+                        run_id: run_id.clone(),
+                    };
+                }
                 AgentError::StickyModelFallbackAuthorityUnknown { message } => {
                     return Self::session_unavailable_requires_teardown(message.clone());
                 }
@@ -423,6 +438,15 @@ impl CoreExecutorError {
 
     pub fn is_cancelled(&self) -> bool {
         matches!(self, Self::Cancelled)
+    }
+
+    /// The suspended run's id, when the applied run was suspended
+    /// ([`Self::Suspended`]).
+    pub fn suspended_run_id(&self) -> Option<&RunId> {
+        match self {
+            Self::Suspended { run_id } => Some(run_id),
+            _ => None,
+        }
     }
 
     pub fn requires_runtime_teardown(&self) -> bool {
@@ -467,6 +491,9 @@ impl CoreExecutorError {
             }
             Self::Stopped => CoreApplyFailureCause::executor_stopped(),
             Self::Cancelled => CoreApplyFailureCause::runtime_turn("cancelled"),
+            Self::Suspended { run_id } => CoreApplyFailureCause::executor_internal(format!(
+                "suspended run {run_id} escaped runtime-loop handling"
+            )),
             Self::Internal(message) => CoreApplyFailureCause::executor_internal(message.clone()),
         }
     }
@@ -2230,6 +2257,29 @@ mod tests {
             err.apply_failure_cause().kind,
             CoreApplyFailureCauseKind::RuntimeTurn
         );
+    }
+
+    /// A run suspended by a stop that keeps the session's queued work stays
+    /// typed at the executor boundary, with its run id: it is neither a
+    /// cancellation, which realizes `RunCancelled` and abandons the inputs,
+    /// nor an apply failure, which requeues them.
+    #[test]
+    fn suspended_session_error_remains_typed_at_runtime_executor_boundary() {
+        let run_id = RunId::new();
+        let err = CoreExecutorError::apply_failed_from_session_error(SessionError::Agent(
+            AgentError::RunSuspended {
+                run_id: run_id.clone(),
+            },
+        ));
+
+        assert_eq!(err.suspended_run_id(), Some(&run_id));
+        assert!(!err.is_cancelled(), "a suspension is not a cancellation");
+        assert!(!err.requires_runtime_teardown());
+        assert!(
+            !matches!(err, CoreExecutorError::ApplyFailed { .. }),
+            "a suspension is not an apply failure: {err:?}"
+        );
+        assert_eq!(CoreExecutorError::Cancelled.suspended_run_id(), None);
     }
 
     #[test]
