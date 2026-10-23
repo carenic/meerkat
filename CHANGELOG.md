@@ -1262,6 +1262,19 @@ them.
   `ExecutionCustodyLost` like any other run; its binding stays on the record
   and nothing reuses it, so the next run is admitted afresh.
 
+- `meerkat-mob`: `MobHandle::run_flow_with_role_targets_and_external_identity`
+  admits a role-targeted flow run under a caller idempotency key in one call.
+  The run id is derived from the mob, the flow and the key, so a replay with
+  the same activation parameters and role targets returns the same run, in
+  flight or ended, without admitting it again. After a restart that is the run
+  the recovery canceled with `ExecutionCustodyLost`: it does not run again, so
+  a new attempt takes a new key. The same key with other activation
+  parameters or other role targets is refused with
+  `MobError::FlowRunIdempotencyConflict`, whose structured data is
+  `{"kind": "flow_run_idempotency_conflict", "run_id": ..., "flow_id": ...}`,
+  and no second run is admitted. A new key admits the binding exactly as
+  `run_flow_with_role_targets` does.
+
 - `rkat-rpc`: `turn/start`, `session/create` (for its first turn) and
   `mob/turn_start` take `session_events`. With `false`, the turn's events are
   not written as `session/event` notifications; absent or `true` keeps them.
@@ -1364,6 +1377,12 @@ them.
   events once, on a subscription if one is open, instead of also writing a
   `session/event` copy that the SDK parsed and dropped. Streaming calls are
   unchanged.
+
+- `meerkat-mob`: a keyed flow run admission whose key already names a run
+  with other activation parameters is refused with the typed
+  `MobError::FlowRunIdempotencyConflict` instead of an internal error, for
+  every keyed admission. A schedule delivery that meets such a key conflict
+  records it as `MobRejected` instead of an internal error.
 
 ### Fixed
 

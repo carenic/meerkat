@@ -85340,6 +85340,7 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         MobError::BoundFlowTargetsUnavailable { .. } => {
             "bound_flow_targets_unavailable".to_string()
         }
+        MobError::FlowRunIdempotencyConflict { .. } => "flow_run_idempotency_conflict".to_string(),
         MobError::TopologyViolation { .. } => "topology_violation".to_string(),
         MobError::BridgeDeliveryRejected { cause, .. } => {
             format!("bridge_delivery_rejected:{cause}")

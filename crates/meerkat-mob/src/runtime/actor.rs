@@ -58364,14 +58364,19 @@ impl MobActor {
             }
         }
         if let Some(existing) = self.run_store.get_run(&run_id).await? {
-            if existing.mob_id != self.definition.id
-                || existing.flow_id != flow_id
-                || existing.activation_params != activation_params
+            // A stable run id is derived from the mob and the flow, so a
+            // different mob or flow under it is an integrity failure.
+            if existing.mob_id != self.definition.id || existing.flow_id != flow_id {
+                return Err(MobError::Internal(format!(
+                    "stable external flow run '{run_id}' was reused for a different mob or flow"
+                )));
+            }
+            // The same key with other activation params or other role targets
+            // is the caller's conflict: the first run stands, typed.
+            if existing.activation_params != activation_params
                 || existing.role_targets.as_ref() != role_targets.as_deref()
             {
-                return Err(MobError::Internal(format!(
-                    "stable external flow run '{run_id}' was reused for different mob, flow, activation parameters, or role targets"
-                )));
+                return Err(MobError::FlowRunIdempotencyConflict { run_id, flow_id });
             }
             let terminal =
                 crate::run::mob_machine_run_status_is_terminal(&existing.run_id, &existing.status)?;
