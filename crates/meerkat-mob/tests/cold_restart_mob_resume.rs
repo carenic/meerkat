@@ -3810,6 +3810,27 @@ fn assert_custody_deferred_for_the_hosted_member(
     );
 }
 
+/// The member's status shows its deferred cleanup delivery restore and the
+/// cause the restore's last attempt met.
+#[cfg(feature = "test-support")]
+async fn assert_retiring_custody_deferred_for(
+    handle: &MobHandle,
+    member: &AgentIdentity,
+    cause: meerkat_mob::MemberCustodyDeferralCause,
+) {
+    let status = handle
+        .member_status(member)
+        .await
+        .expect("the deferred member's status");
+    assert_eq!(
+        status
+            .custody_deferred
+            .map(|deferral| (deferral.restore, deferral.cause)),
+        Some((meerkat_mob::MemberCustodyRestore::CleanupDelivery, cause)),
+        "the member's status shows its deferred cleanup delivery and the cause it met"
+    );
+}
+
 /// A mob restarted over [`crash_with_a_retiring_member_tail`] while another
 /// runtime owner on the realm hosts the retiring member's session.
 #[cfg(feature = "test-support")]
@@ -3891,6 +3912,12 @@ impl DeferredRetiringMember {
             MobMemberStatus::Retiring,
             "the deferred member stays Retiring"
         );
+        assert_retiring_custody_deferred_for(
+            &self.handle,
+            &self.identity,
+            meerkat_mob::MemberCustodyDeferralCause::ServedElsewhere,
+        )
+        .await;
         assert!(
             members.iter().any(|entry| entry.agent_identity == "lead-1"),
             "the healthy lead is still listed: {members:?}"
@@ -4917,6 +4944,12 @@ async fn a_mob_start_defers_a_retiring_member_without_a_tail_another_owner_hosts
         "{status:?}"
     );
     let identity = AgentIdentity::from("w-1");
+    assert_retiring_custody_deferred_for(
+        &handle,
+        &identity,
+        meerkat_mob::MemberCustodyDeferralCause::ServedElsewhere,
+    )
+    .await;
     let error = handle
         .retire(identity.clone())
         .await
@@ -5009,6 +5042,12 @@ async fn a_mob_start_defers_a_retiring_members_unprovable_durable_tail() {
                 && entry.status == MobMemberStatus::Retiring),
         "the deferred member stays Retiring: {members:?}"
     );
+    assert_retiring_custody_deferred_for(
+        &handle,
+        &identity,
+        meerkat_mob::MemberCustodyDeferralCause::DurableTailUnprovable,
+    )
+    .await;
     let head_after = store_2
         .load_head(&w1_sid)
         .await
