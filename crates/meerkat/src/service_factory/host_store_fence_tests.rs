@@ -54,10 +54,10 @@ struct FenceControl {
 
 impl FenceControl {
     /// Close the writer's window while the next host commit is in flight:
-    /// the commit passed the write path's own fence check and lands, and
-    /// the window is closed by the time it answers.
+    /// the commit has passed the write path's own fence check when the host
+    /// sees it, and the renews fail only from then on, so the commit lands
+    /// and the window is closed by the time it answers.
     fn close_during_next_commit(&self) {
-        self.fail_renews.store(true, Ordering::SeqCst);
         self.hold_next_commit.store(true, Ordering::SeqCst);
     }
 }
@@ -205,6 +205,7 @@ impl HostStore for FenceHost {
         if self.control.hold_next_commit.swap(false, Ordering::SeqCst) {
             // The writer passed its own fence check before this commit; its
             // window closes while the commit is in flight.
+            self.control.fail_renews.store(true, Ordering::SeqCst);
             let _ = tokio::time::timeout(Duration::from_secs(5), async {
                 while !self.control.renew_failed.load(Ordering::SeqCst) {
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -411,6 +412,7 @@ impl SessionAgentBuilder for FenceBuilder {
 /// What a run whose window closed during one of its round commits did.
 struct FencedRun {
     failed: bool,
+    error: String,
     model_requests: usize,
     dispatched: usize,
     lease_live_after: bool,
@@ -495,6 +497,10 @@ async fn run_with_window_closing_during(closes_during: ClosesDuring) -> FencedRu
     .expect("the turn ends");
     FencedRun {
         failed: turn.is_err(),
+        error: turn
+            .err()
+            .map(|error| format!("{error:?}"))
+            .unwrap_or_default(),
         model_requests: client.requests.load(Ordering::SeqCst),
         dispatched: tools.dispatched.load(Ordering::SeqCst),
         lease_live_after: realm.lease_is_live(),
@@ -515,12 +521,22 @@ async fn a_writer_past_its_fence_window_makes_no_model_call_and_dispatches_no_to
     let first = run_with_window_closing_during(ClosesDuring::FirstCommit).await;
     assert!(!first.lease_live_after, "the window closed");
     assert!(first.failed, "the run stops at the closed window");
+    assert!(
+        first.error.contains("self-fence window closed"),
+        "the dispatch fence refused it, not the write path: {}",
+        first.error
+    );
     assert_eq!(first.dispatched, 0, "the round's call is never dispatched");
     assert_eq!(first.model_requests, 1, "no model call follows");
 
     let second = run_with_window_closing_during(ClosesDuring::SecondCommit).await;
     assert!(!second.lease_live_after, "the window closed");
     assert!(second.failed, "the run stops at the closed window");
+    assert!(
+        second.error.contains("self-fence window closed"),
+        "the dispatch fence refused it, not the write path: {}",
+        second.error
+    );
     assert_eq!(
         second.dispatched, 1,
         "the call ran once, before the window closed"
