@@ -13244,7 +13244,10 @@ mod tests {
         );
         let primitive = resumed_run_primitive(&guard, &run_id, std::slice::from_ref(&input_id))
             .expect("a run's own staged input describes its resumed batch");
-        assert_eq!(primitive.contributing_input_ids(), &[input_id.clone()]);
+        assert_eq!(
+            primitive.contributing_input_ids(),
+            std::slice::from_ref(&input_id)
+        );
         assert_eq!(
             primitive
                 .turn_metadata()
