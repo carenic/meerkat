@@ -3523,6 +3523,11 @@ mod store_authority_tests {
             dangling_tool_use_ids: Vec::new(),
             orphan_tool_result_count: 0,
             messages_after_terminal: false,
+            // A tail written without a run cursor, as observe_durable_tail
+            // records it before the cursor is read: the candidate id binds
+            // nothing for it, so these rows keep their pre-cursor identity.
+            run_cursor: DurableTailRunCursor::Absent,
+            cursor_inputs_open: false,
         }
     }
 
