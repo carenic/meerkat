@@ -342,7 +342,14 @@ a `DurableResumeRequest`:
 - the mob, the worker's identity and its profile;
 - the worker's session and the run id;
 - the run's bound inputs;
-- the run's WorkGraph attention projection, when it carries one.
+- the run's WorkGraph attention projection, when it carries one;
+- when the run carries a projection that cannot be decoded,
+  `attention_projection_unreadable`, the decode error as text, with no
+  projection.
+
+A gate that decides from the projection must not treat a run whose
+projection is unreadable as one without attention: it answers `Unavailable`
+or `Superseded` then.
 
 The gate answers with a `DurableResumeVerdict`:
 
