@@ -39,7 +39,7 @@ them.
 
 - Behaviour-only (not measured by the gate): RPC `session/stream_open` and
   `mob/stream_open` now reserve bounded terminal delivery capacity. The process
-  admits at most 256 active or queued terminal obligations; further opens return
+  admits at most 4096 active or queued terminal obligations; further opens return
   `BUDGET_EXHAUSTED` until capacity is released. Terminal diagnostic details are
   limited to 1 KiB of UTF-8 text, preserving a 16 KiB terminal wire bound.
 

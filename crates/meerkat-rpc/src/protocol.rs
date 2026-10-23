@@ -42,7 +42,7 @@ const RPC_OUTBOUND_MAX_ERROR_MESSAGE_BYTES: usize = 4 * 1024;
 const RPC_OUTBOUND_MAX_METHOD_BYTES: usize = 256;
 const RPC_OUTBOUND_MAX_ID_BYTES: usize = 1024;
 const RPC_STREAM_TERMINAL_MAX_WIRE_BYTES: usize = 16 * 1024;
-const RPC_STREAM_TERMINAL_MAX_INFLIGHT: usize = 256;
+const RPC_STREAM_TERMINAL_MAX_INFLIGHT: usize = 4096;
 // A control character can expand to six JSON bytes. Leave room for that
 // worst case as well as the fixed stream/session identifiers and envelope.
 const RPC_STREAM_TERMINAL_MAX_DETAIL_BYTES: usize = 1024;
@@ -1012,6 +1012,85 @@ mod tests {
         );
         assert!(response.id.is_none(), "oversized echo ids fail closed");
         assert!(serde_json::to_vec(&response).unwrap().len() <= RPC_CONTROL_ERROR_MAX_WIRE_BYTES);
+    }
+
+    #[test]
+    fn stream_terminal_production_limit_accepts_4096_and_reuses_released_slots() {
+        // Use the production constructor and limit on an isolated pool so this
+        // boundary test cannot exhaust other tests' process-wide admission.
+        let admission = RpcStreamTerminalAdmission::new(RPC_STREAM_TERMINAL_MAX_INFLIGHT);
+        let mut reservations = (0..4096)
+            .map(|_| {
+                admission
+                    .try_reserve()
+                    .expect("all 4096 streams must be admitted")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(
+                admission.try_reserve(),
+                Err(RpcOutboundAdmissionError::Backpressured {
+                    max_inflight: 4096,
+                    ..
+                })
+            ),
+            "stream 4097 must be refused"
+        );
+        assert_eq!(admission.0.available_count(), 0);
+        assert_eq!(admission.0.available_memory_bytes(), 0);
+
+        let queued = reservations
+            .pop()
+            .unwrap()
+            .session_notification(&serde_json::json!({"ended": true, "outcome": "remote_end"}))
+            .expect("existing reservation can become a terminal while the pool is full");
+        assert!(
+            admission.try_reserve().is_err(),
+            "queued terminal still owns its slot"
+        );
+        drop(reservations.pop().unwrap());
+        assert_eq!(admission.0.available_count(), 1);
+        reservations.push(
+            admission
+                .try_reserve()
+                .expect("released active slot is reusable"),
+        );
+        assert!(admission.try_reserve().is_err());
+        drop(queued);
+        assert_eq!(admission.0.available_count(), 1);
+        reservations.push(
+            admission
+                .try_reserve()
+                .expect("written terminal slot is reusable"),
+        );
+        assert!(admission.try_reserve().is_err());
+
+        drop(reservations);
+        assert_eq!(admission.0.available_count(), 4096);
+        assert_eq!(
+            admission.0.available_memory_bytes(),
+            admission.0.capacity_bytes
+        );
+        let reused = (0..4096)
+            .map(|_| {
+                admission
+                    .try_reserve()
+                    .expect("every released slot is reusable")
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            admission.try_reserve(),
+            Err(RpcOutboundAdmissionError::Backpressured {
+                max_inflight: 4096,
+                ..
+            })
+        ));
+        drop(reused);
+        assert_eq!(admission.0.available_count(), 4096);
+        assert_eq!(
+            admission.0.available_memory_bytes(),
+            admission.0.capacity_bytes
+        );
     }
 
     #[test]
