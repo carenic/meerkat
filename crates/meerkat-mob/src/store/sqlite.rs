@@ -3700,6 +3700,11 @@ impl SqliteIdentityRuntimeWriteFence {
                 });
             }
         };
+        #[cfg(test)]
+        let busy_timeout = conn
+            .pragma_query_value(None, "busy_timeout", |row| row.get::<_, u64>(0))
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::MAX);
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate);
         #[cfg(test)]
         identity_fence_test_hooks::fence_attempt(&self.path, || {
@@ -3709,6 +3714,7 @@ impl SqliteIdentityRuntimeWriteFence {
                 started,
                 waited: started.elapsed(),
                 took_lock: tx.is_ok(),
+                busy_timeout,
             }
         });
         let tx = match tx {
@@ -3786,6 +3792,9 @@ pub(crate) mod identity_fence_test_hooks {
         /// refused.
         pub(crate) waited: Duration,
         pub(crate) took_lock: bool,
+        /// The attempt's connection's effective `PRAGMA busy_timeout`: the
+        /// longest it waits for mob.db's write lock.
+        pub(crate) busy_timeout: Duration,
     }
 
     #[derive(Default)]
@@ -16521,15 +16530,20 @@ mod identity_fence_contention_tests {
 
     /// C2: with mob.db held until the fence has answered, the bounded-wait
     /// entry answers the contended Backoff once its wait is spent, without
-    /// running the operation: it waited at least the bound, and it answered
-    /// while mob.db was still held, so it gave up on its bound and not when
-    /// the lock came free. A fence without a bound waits until
-    /// [`HOLD_GUARD`] ends the hold and then runs the operation, which fails
-    /// the Backoff, nothing-ran and ordering checks.
+    /// running the operation. Its wait is bounded on both sides without a
+    /// wall-clock window: its one attempt ran with exactly the bound as its
+    /// connection's busy timeout (so it waits no longer), and waited at least
+    /// the bound itself, the injected late return aside (so it waits no
+    /// less). The non-blocking entry runs with no busy timeout. That the
+    /// fence answered while mob.db was still held shows only that it
+    /// answered before [`HOLD_GUARD`] ended the hold: a fence without a
+    /// bound would wait for that guard, then run the operation and fail the
+    /// Backoff, nothing-ran and ordering checks.
     #[tokio::test]
     async fn a_bounded_fence_answers_backoff_once_its_wait_is_spent() {
         let bound = IDENTITY_RUNTIME_WRITE_FENCE_WAIT;
         let adopted = adopted_identity().await;
+        identity_fence_test_hooks::record_fence_attempts(&adopted.path);
         let fence = adopted.runtime_fence(&cold_observation(&adopted.session.session_id).await);
         // The call returns late, as on a loaded host.
         let fence: Arc<dyn RuntimeStoreWriteFence> = Arc::new(ReturnsLate {
@@ -16540,8 +16554,14 @@ mod identity_fence_contention_tests {
         let holder = hold_mob_db_until(&adopted.path, released);
         let (outcome, ran, took) = blocking_fence_call(fence).await;
         let answered_at = Instant::now();
+        // The non-blocking entry, while mob.db is still held.
+        let unblocked = adopted
+            .runtime_fence(&cold_observation(&adopted.session.session_id).await)
+            .execute_if_current(Box::new(|| Ok(())));
         drop(release);
         let released_at = holder.join().unwrap();
+        let attempts = identity_fence_test_hooks::fence_attempts(&adopted.path);
+        identity_fence_test_hooks::release(&adopted.path);
         assert_eq!(
             outcome.unwrap(),
             RuntimeStoreWriteFenceOutcome::Backoff {
@@ -16549,10 +16569,31 @@ mod identity_fence_contention_tests {
             }
         );
         assert!(!ran, "a refused fence runs nothing");
-        assert!(took >= bound, "the fence waited its bound: {took:?}");
+        assert!(took >= bound + LATE_RETURN, "{took:?}");
+        let [blocking, non_blocking] = attempts.as_slice() else {
+            panic!("one attempt per entry: {attempts:?}");
+        };
+        assert!(blocking.blocking && !blocking.took_lock, "{blocking:?}");
+        assert_eq!(
+            blocking.busy_timeout, bound,
+            "the bounded entry waits at most its bound"
+        );
+        assert!(
+            blocking.waited >= bound,
+            "the fence itself waited its bound: {blocking:?}"
+        );
+        assert!(
+            !non_blocking.blocking && !non_blocking.took_lock,
+            "{non_blocking:?}"
+        );
+        assert_eq!(non_blocking.busy_timeout, Duration::ZERO);
+        assert!(
+            matches!(unblocked, Ok(RuntimeStoreWriteFenceOutcome::Backoff { .. })),
+            "{unblocked:?}"
+        );
         assert!(
             answered_at < released_at,
-            "the fence answered while mob.db was still held"
+            "the fence answered before the hold's guard ended it"
         );
     }
 
