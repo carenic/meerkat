@@ -41141,6 +41141,12 @@ impl MobActor {
             let _ = reply_tx.send(Err(error));
             return;
         }
+        // A Broken member's session is restored only through its custody
+        // restore; a live open would recover it outside that restore.
+        if let Err(error) = self.ensure_member_not_broken(&agent_identity).await {
+            let _ = reply_tx.send(Err(error));
+            return;
+        }
         let lane = match self.member_live_lane(&agent_identity).await {
             Ok(lane) => lane,
             Err(error) => {

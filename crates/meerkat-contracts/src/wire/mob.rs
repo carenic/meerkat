@@ -2842,6 +2842,7 @@ pub struct WireMemberCustodyDeferral {
 /// same.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(from = "String", into = "String")]
+#[non_exhaustive]
 pub enum WireMemberCustodyRestore {
     /// The operation binding of a member whose restore failed at the start.
     StartupBinding,
@@ -2887,6 +2888,7 @@ impl From<WireMemberCustodyRestore> for String {
 /// the value as it was sent, and is written back the same.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(from = "String", into = "String")]
+#[non_exhaustive]
 pub enum WireMemberCustodyDeferralCause {
     /// Another runtime owner on the realm hosts the member's session.
     ServedElsewhere,
