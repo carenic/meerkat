@@ -526,6 +526,12 @@ them.
   unless the mob's start deferred the member's custody restore. Code that
   builds the result with a struct literal sets it.
 
+- Behaviour-only (not measured by the gate): RPC `session/stream_open` and
+  `mob/stream_open` now reserve bounded terminal delivery capacity. The process
+  admits at most 4096 active or queued terminal obligations; further opens return
+  `BUDGET_EXHAUSTED` until capacity is released. Terminal diagnostic details are
+  limited to 1 KiB of UTF-8 text, preserving a 16 KiB terminal wire bound.
+
 ### Added
 
 - `meerkat_core::host_store`: the host store SPI, a small storage interface
@@ -1847,6 +1853,11 @@ them.
   external mob operator tools were already bound to no authority, hidden and
   denying every call; the factory's own mob tools (`delegate`,
   `mob_spawn_member` and the rest) still mounted beside them.
+
+- RPC session and mob streams retain their machine-authorized terminal
+  notification when ordinary outbound byte or message admission is saturated.
+  Reserved capacity follows the stream through close races, pending delivery and
+  transport disconnect, without blocking the agent event producer.
 
 ## [0.9.4] - 2026-10-20
 
