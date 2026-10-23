@@ -119,6 +119,15 @@ impl std::fmt::Display for McpOAuthNetworkStage {
     }
 }
 
+/// The deadline `bound` from now. A bound too large to add (a host passing
+/// `Duration::MAX` to mean "no bound") saturates to a deadline about 30 years
+/// out instead of panicking, as `tokio::time::timeout` does.
+fn deadline_after(bound: Duration) -> tokio::time::Instant {
+    const FAR_FUTURE: Duration = Duration::from_secs(86_400 * 365 * 30);
+    let now = tokio::time::Instant::now();
+    now.checked_add(bound).unwrap_or_else(|| now + FAR_FUTURE)
+}
+
 /// How long the MCP OAuth owner waits on the network.
 ///
 /// Each network stage ([`McpOAuthNetworkStage`], and a refresh's token
@@ -133,6 +142,8 @@ impl std::fmt::Display for McpOAuthNetworkStage {
 /// [`McpOAuthError::CommitUnsettled`]. The defaults are
 /// [`MCP_OAUTH_STAGE_BOUND`], [`MCP_OAUTH_START_BOUND`],
 /// [`MCP_OAUTH_COMPLETION_BOUND`] and [`MCP_OAUTH_COMMIT_OBSERVATION_BOUND`].
+/// Any bound is accepted: one too large to add to the current time, such as
+/// `Duration::MAX`, saturates and never panics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct McpOAuthNetworkBounds {
     stage: Duration,
@@ -1998,7 +2009,7 @@ impl McpOAuthAuthority {
         phase_deadline: tokio::time::Instant,
         work: impl std::future::Future<Output = Result<T, McpOAuthError>>,
     ) -> Result<T, McpOAuthError> {
-        let deadline = phase_deadline.min(tokio::time::Instant::now() + self.bounds.stage);
+        let deadline = phase_deadline.min(deadline_after(self.bounds.stage));
         tokio::time::timeout_at(deadline, work)
             .await
             .unwrap_or_else(|_| {
@@ -2307,7 +2318,7 @@ impl McpOAuthAuthority {
         let _admission = acquire_admission_lock(target.binding_slug()).await;
         // Every network stage below (a join's issuer metadata, or discovery,
         // preflight and registration) ends by this deadline.
-        let start_deadline = tokio::time::Instant::now() + self.bounds.start;
+        let start_deadline = deadline_after(self.bounds.start);
         if let Some((state, record)) = authority
             .pending_connector_browser_attempt(&credential_identity)
             .map_err(McpOAuthError::Flow)?
@@ -2755,7 +2766,7 @@ impl McpOAuthAuthority {
         };
         // Every network stage below ends by this deadline, never past the
         // attempt's own validity: a later result would be refused anyway.
-        let completion_deadline = (tokio::time::Instant::now() + self.bounds.completion).min(
+        let completion_deadline = deadline_after(self.bounds.completion).min(
             tokio::time::Instant::from_std(admitted.created_at + MCP_INTERACTIVE_LOGIN_TIMEOUT),
         );
         // The wake-up is registered before the attempt is verified, so a
@@ -2930,7 +2941,7 @@ impl McpOAuthAuthority {
         );
         // The commit's work is owned by the credential coordinator and runs to
         // its own end; this completion observes it for a bounded time.
-        let observed_until = tokio::time::Instant::now() + self.bounds.commit_observation;
+        let observed_until = deadline_after(self.bounds.commit_observation);
         let observed = retire
             .unless_retired(target, async {
                 Ok(tokio::time::timeout_at(observed_until, commit).await)

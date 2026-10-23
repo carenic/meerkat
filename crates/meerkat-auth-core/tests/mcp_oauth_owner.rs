@@ -7701,6 +7701,43 @@ async fn a_slow_provider_inside_its_bounds_still_logs_in() {
     assert_eq!(store.list().await.unwrap().len(), 1);
 }
 
+/// A host may pass `Duration::MAX` to mean "no bound". Every deadline built
+/// from a bound saturates, so a login under such bounds completes instead of
+/// panicking when the deadline is computed.
+#[tokio::test]
+async fn bounds_of_duration_max_never_panic_and_still_log_in() {
+    let (base, state) = spawn_oauth_fixture().await;
+    let store = Arc::new(EphemeralTokenStore::new());
+    let authority = with_bounds(
+        split_authority(&state, store.clone()),
+        McpOAuthNetworkBounds::default()
+            .with_stage(Duration::MAX)
+            .with_start(Duration::MAX)
+            .with_completion(Duration::MAX)
+            .with_commit_observation(Duration::MAX),
+    );
+    let target = split_target(&base, "unbounded-host");
+    let start = within(
+        Duration::from_secs(10),
+        "a start under Duration::MAX bounds",
+        authority.login_start_registered(&target, &registered_base(), None),
+    )
+    .await
+    .unwrap();
+    within(
+        Duration::from_secs(10),
+        "a completion under Duration::MAX bounds",
+        authority.login_complete_registered(
+            &target,
+            registered_callback(&start, &start.state, &handle_of(&start)),
+        ),
+    )
+    .await
+    .expect("a login under Duration::MAX bounds completes");
+    assert_eq!(state.token_requests.lock().len(), 1);
+    assert_eq!(store.list().await.unwrap().len(), 1);
+}
+
 /// GUARD: dropping a start before it returns admits no attempt.
 #[tokio::test]
 async fn dropping_a_start_admits_no_attempt() {
