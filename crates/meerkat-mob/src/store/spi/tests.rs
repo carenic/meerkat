@@ -613,14 +613,15 @@ fn keyed_entry_names_are_injective_and_verified() {
     );
 }
 
-// Unrun until the candidate's validation. The terminal run snapshot and
-// its terminal event commit in ONE batch over the run and mob scopes, as
-// the SQLite store commits them in one transaction.
-#[tokio::test]
-async fn a_terminal_run_and_its_event_commit_in_one_batch() {
-    let host = Arc::new(MemoryHost::default());
-    let process = start(&host, "mob").await;
-    let storage = process.stores.storage();
+/// A running run, the completed state its terminal CAS moves to, and the
+/// authority input of that move.
+fn running_run() -> (
+    MobRun,
+    RunId,
+    flow_run::State,
+    flow_run::State,
+    mob_dsl::MobMachineInput,
+) {
     let run = MobRun::authority_backed_for_steps(
         RunId::new(),
         MobId::from("mob"),
@@ -639,18 +640,31 @@ async fn a_terminal_run_and_its_event_commit_in_one_batch() {
             ),
         )
         .expect("the completed run state");
+    (run, run_id, expected_flow_state, completed, input)
+}
+
+fn flow_completed(run_id: &RunId) -> NewMobEvent {
+    event(
+        MobEventKind::FlowCompleted {
+            run_id: run_id.clone(),
+            flow_id: FlowId::from("flow-a"),
+            structured_output: None,
+        },
+        None,
+    )
+}
+
+// Unrun until the candidate's validation. The terminal run snapshot and
+// its terminal event commit in ONE batch over the run and mob scopes, as
+// the SQLite store commits them in one transaction.
+#[tokio::test]
+async fn a_terminal_run_and_its_event_commit_in_one_batch() {
+    let host = Arc::new(MemoryHost::default());
+    let process = start(&host, "mob").await;
+    let storage = process.stores.storage();
+    let (run, run_id, expected_flow_state, completed, input) = running_run();
     storage.runs.create_run(run).await.expect("create the run");
     let before = host.batches().len();
-    let terminal = || {
-        event(
-            MobEventKind::FlowCompleted {
-                run_id: run_id.clone(),
-                flow_id: FlowId::from("flow-a"),
-                structured_output: None,
-            },
-            None,
-        )
-    };
     let stored = storage
         .runs
         .cas_run_snapshot_and_append_terminal_event_with_authority(
@@ -661,7 +675,7 @@ async fn a_terminal_run_and_its_event_commit_in_one_batch() {
             &completed,
             vec![input.clone()],
             storage.events.as_ref(),
-            terminal(),
+            flow_completed(&run_id),
         )
         .await
         .expect("the terminal commit");
@@ -692,7 +706,7 @@ async fn a_terminal_run_and_its_event_commit_in_one_batch() {
             &completed,
             vec![input],
             storage.events.as_ref(),
-            terminal(),
+            flow_completed(&run_id),
         )
         .await
         .expect("a lost CAS is not an error");
@@ -715,6 +729,65 @@ async fn a_terminal_run_and_its_event_commit_in_one_batch() {
             .filter(|event| matches!(&event.kind, MobEventKind::FlowCompleted { .. }))
             .count(),
         1
+    );
+}
+
+// Unrun until the candidate's validation. A terminal event refused after its
+// run's terminal snapshot won in memory commits neither side: the run and
+// mob scopes are poisoned instead of the run committing alone.
+#[tokio::test]
+async fn a_refused_terminal_event_commits_neither_side() {
+    let host = Arc::new(MemoryHost::default());
+    let process = start(&host, "mob").await;
+    let storage = process.stores.storage();
+    let (run, run_id, expected_flow_state, completed, input) = running_run();
+    storage.runs.create_run(run).await.expect("create the run");
+    let before = host.batches().len();
+    process.stores.bundle.events.fail_next_terminal_append();
+    let refused = storage
+        .runs
+        .cas_run_snapshot_and_append_terminal_event_with_authority(
+            &run_id,
+            MobRunStatus::Running,
+            &expected_flow_state,
+            MobRunStatus::Completed,
+            &completed,
+            vec![input],
+            storage.events.as_ref(),
+            flow_completed(&run_id),
+        )
+        .await;
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(host.batches().len(), before, "nothing reached the host");
+    assert!(
+        storage.runs.get_run(&run_id).await.is_err(),
+        "the run scope is poisoned"
+    );
+    assert!(
+        storage.events.replay_all().await.is_err(),
+        "the mob scope is poisoned"
+    );
+    // A restart serves what the host holds: the run still running, and no
+    // terminal event.
+    drop(storage);
+    drop(process);
+    let process = start(&host, "mob").await;
+    let storage = process.stores.storage();
+    let run = storage
+        .runs
+        .get_run(&run_id)
+        .await
+        .expect("read the run")
+        .expect("the run");
+    assert_eq!(run.status, MobRunStatus::Running);
+    assert!(
+        storage
+            .events
+            .replay_all()
+            .await
+            .expect("replay")
+            .iter()
+            .all(|event| !matches!(&event.kind, MobEventKind::FlowCompleted { .. }))
     );
 }
 

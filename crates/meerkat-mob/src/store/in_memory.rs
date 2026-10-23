@@ -164,6 +164,9 @@ pub struct InMemoryMobEventStore {
     /// broadcast: (entered, release).
     #[cfg(test)]
     broadcast_gate: std::sync::Mutex<Option<BroadcastTestGate>>,
+    /// Refuses the next append of a terminal flow event.
+    #[cfg(test)]
+    fail_next_terminal_append: AtomicBool,
 }
 
 #[cfg(test)]
@@ -189,6 +192,12 @@ impl InMemoryMobEventStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((entered_tx, release_rx));
         (entered_rx, release_tx)
+    }
+
+    /// Refuse the next append of a terminal flow event.
+    pub(crate) fn fail_next_terminal_append(&self) {
+        self.fail_next_terminal_append
+            .store(true, Ordering::Relaxed);
     }
 
     async fn pass_broadcast_test_gate(&self) {
@@ -229,6 +238,8 @@ impl Default for InMemoryMobEventStore {
             active_reconciliation_poll_failures: AtomicU64::new(0),
             #[cfg(test)]
             broadcast_gate: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            fail_next_terminal_append: AtomicBool::new(false),
         }
     }
 }
@@ -313,6 +324,16 @@ impl InMemoryMobEventStore {
 
     #[cfg(any(test, feature = "test-support"))]
     fn forced_append_error(&self, event: &NewMobEvent) -> Option<MobStoreError> {
+        #[cfg(test)]
+        if terminal_event_identity(&event.kind).is_some()
+            && self
+                .fail_next_terminal_append
+                .swap(false, Ordering::Relaxed)
+        {
+            return Some(MobStoreError::Internal(
+                "forced mob event store terminal append failure".to_string(),
+            ));
+        }
         if self.fail_member_retired_appends.load(Ordering::Relaxed)
             && matches!(event.kind, MobEventKind::MemberRetired { .. })
         {
