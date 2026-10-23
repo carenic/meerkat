@@ -18332,9 +18332,8 @@ impl MeerkatMachine {
                 tracing::error!("prepare_bindings: unexpected command result variant");
                 Err(RuntimeBindingsError::SessionNotFound(session_id))
             }
-            Err(err) => Err(RuntimeBindingsError::PrepareFailed(
-                session_id,
-                err.to_string(),
+            Err(err) => Err(RuntimeBindingsError::from_preparation_error(
+                session_id, &err,
             )),
         }
     }
@@ -18415,10 +18414,10 @@ impl MeerkatMachine {
             // found": a typed machine rejection (e.g. a PrepareBindings
             // guard) must reach the caller verbatim — the field spent a
             // debugging cycle on "not found in runtime adapter after
-            // registration" that was actually a binding guard rejection.
-            Err(err) => Err(RuntimeBindingsError::PrepareFailed(
-                session_id,
-                err.to_string(),
+            // registration" that was actually a binding guard rejection. A
+            // hosting refusal keeps its typed session error.
+            Err(err) => Err(RuntimeBindingsError::from_preparation_error(
+                session_id, &err,
             )),
         }
     }

@@ -4703,6 +4703,263 @@ async fn a_mob_start_settles_the_durable_tail_of_a_member_whose_restore_failed()
     let _ = handle.shutdown().await;
 }
 
+/// Lifetime 1 of a retiring-member start: a mob with a lead and worker
+/// `w-1`, one committed worker turn, then (with `durable_tail`) a second turn
+/// whose durable row lands while its runtime boundary commit does not, and a
+/// retirement of `w-1` started under the power cut, then a crash. Returns
+/// the worker's session.
+#[cfg(feature = "test-support")]
+async fn retiring_member_after_a_crash(
+    paths: &Paths,
+    power_store: &Arc<PowerCutRuntimeStore>,
+    durable_tail: bool,
+    label: &str,
+) -> meerkat_core::types::SessionId {
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = power_store.clone();
+    let (service_1, store_1) = persistent_head_canonical_service(paths, runtime_store.clone());
+    let storage_1 = MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage");
+    let handle_1 = MobBuilder::new(mob_definition(MobRuntimeMode::TurnDriven), storage_1)
+        .with_session_service(service_1.clone())
+        .with_default_llm_client(openai_test_client())
+        .create()
+        .await
+        .expect("create persistent mob");
+    handle_1
+        .spawn_spec(SpawnMemberSpec::new("lead", AgentIdentity::from("lead-1")))
+        .await
+        .expect("spawn lead");
+    handle_1
+        .spawn_spec(SpawnMemberSpec::new("worker", AgentIdentity::from("w-1")))
+        .await
+        .expect("spawn worker");
+    let identity = AgentIdentity::from("w-1");
+    let w1_sid = handle_1
+        .resolve_bridge_session_id(&identity)
+        .await
+        .expect("w1 session id");
+    let lead_sid = handle_1
+        .resolve_bridge_session_id(&AgentIdentity::from("lead-1"))
+        .await
+        .expect("lead session id");
+    let mut runtime_release_witnesses = Vec::new();
+    for session_id in [&lead_sid, &w1_sid] {
+        let runtime = service_1
+            .comms_runtime(session_id)
+            .await
+            .unwrap_or_else(|| panic!("comms runtime missing for {session_id}"));
+        runtime_release_witnesses.push(Arc::downgrade(&runtime));
+    }
+    send_and_wait(
+        &handle_1,
+        service_1.as_ref(),
+        "w-1",
+        "PRE_CUT_TAIL_TURN token-alpha",
+        label,
+    )
+    .await;
+    wait_for_head_canonical_authority_convergence(
+        store_1.as_ref(),
+        runtime_store.as_ref(),
+        &w1_sid,
+        "PRE_CUT_TAIL_TURN",
+        label,
+    )
+    .await;
+    power_store.set_cut(true);
+    if durable_tail {
+        let send_result = tokio::time::timeout(Duration::from_secs(30), async {
+            handle_1
+                .member(&identity)
+                .await
+                .expect("member handle")
+                .send(
+                    "POST_CUT_TAIL_TURN token-omega".to_string(),
+                    HandlingMode::Queue,
+                )
+                .await
+        })
+        .await;
+        eprintln!("[{label}] send during cut => {send_result:?}");
+        wait_for_row_contains(store_1.as_ref(), &w1_sid, "POST_CUT_TAIL_TURN", label).await;
+        power_store
+            .wait_for_prepared_boundary_commit_rejection()
+            .await;
+    }
+    let retire_result =
+        tokio::time::timeout(Duration::from_secs(10), handle_1.retire(identity.clone())).await;
+    eprintln!("[{label}] retire during cut => {retire_result:?}");
+    handle_1
+        .crash_stop_preserving_durable_work_for_test()
+        .await
+        .expect("crash-stop lifetime-1 actor");
+    service_1
+        .try_shutdown()
+        .await
+        .expect("shutdown first session service");
+    drop(handle_1);
+    drop(service_1);
+    drop(store_1);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while runtime_release_witnesses
+            .iter()
+            .any(|runtime| runtime.upgrade().is_some())
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("every old session runtime is released before lifetime 2");
+    power_store.set_cut(false);
+    w1_sid
+}
+
+/// The refused start's error, whether the builder refused or handed back a
+/// handle whose status reports the refusal.
+#[cfg(feature = "test-support")]
+async fn refused_start_error(
+    refused: Result<meerkat_mob::MobHandle, meerkat_mob::MobError>,
+) -> meerkat_mob::MobError {
+    match refused {
+        Err(error) => error,
+        Ok(handle) => {
+            let status = handle.status().await;
+            let _ = handle.shutdown().await;
+            match status {
+                Err(error) => error,
+                Ok(state) => panic!("the start must be refused, not {state:?}"),
+            }
+        }
+    }
+}
+
+/// The member's startup recovery failure inside a refused start's error.
+#[cfg(feature = "test-support")]
+fn startup_recovery_cause(
+    error: &meerkat_mob::MobError,
+) -> (
+    &AgentIdentity,
+    &meerkat_core::types::SessionId,
+    &meerkat_mob::MobError,
+) {
+    let failure = match error {
+        meerkat_mob::MobError::SharedLifecycleFailure(failure) => failure.as_ref(),
+        other => other,
+    };
+    let meerkat_mob::MobError::MemberStartupRecoveryFailed {
+        member_id,
+        session_id,
+        cause,
+    } = failure
+    else {
+        panic!("a refused start must report the member's startup recovery failure: {error:?}");
+    };
+    (member_id, session_id, cause.as_ref())
+}
+
+/// A retiring member whose session another runtime owner hosts, with no
+/// durable tail, is refused where the start prepares its cleanup delivery's
+/// runtime bindings. The refusal's cause is the typed hosting refusal for
+/// that session, not an internal preparation error.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mob_start_names_the_hosting_refusal_for_a_retiring_member_without_a_tail() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let power_store = Arc::new(PowerCutRuntimeStore::with_hosting_root(
+        &paths.realm_db_path,
+        temp.path(),
+    ));
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = power_store.clone();
+    let w1_sid = retiring_member_after_a_crash(&paths, &power_store, false, "hosted-no-tail").await;
+
+    power_store.forward_hosting_capability();
+    let capability = meerkat_runtime::RuntimeStore::hosting_capability(runtime_store.as_ref());
+    assert!(capability.is_cross_process(), "{capability:?}");
+    let other_owner = meerkat_runtime::SessionHostingAuthority::new(
+        capability,
+        meerkat_runtime::HostingOwner::mint(),
+    );
+    let _other_owner_claim = other_owner
+        .grant(&w1_sid)
+        .expect("another runtime owner takes the retiring member's hosting claim");
+    let (service_2, _store_2) = persistent_head_canonical_service(&paths, runtime_store.clone());
+    let refused = MobBuilder::for_resume(
+        MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage"),
+    )
+    .with_session_service(service_2.clone())
+    .with_default_llm_client(openai_test_client())
+    .notify_orchestrator_on_resume(false)
+    .resume()
+    .await;
+    let error = refused_start_error(refused).await;
+    let (member, session, cause) = startup_recovery_cause(&error);
+    assert_eq!(member, &AgentIdentity::from("w-1"));
+    assert_eq!(session, &w1_sid);
+    assert!(
+        matches!(
+            cause,
+            meerkat_mob::MobError::SessionError(
+                meerkat_core::service::SessionError::ServedElsewhere { id }
+            ) if id == &w1_sid
+        ),
+        "the cause is the typed hosting refusal, not an internal preparation error: {cause:?}"
+    );
+}
+
+/// A retiring member whose durable tail its recovery keeps (the store-owned
+/// recovery could not prove it) is refused with the typed unprovable-tail
+/// error naming the member and its session; the tail stays as the crash
+/// left it.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mob_start_names_a_retiring_members_unprovable_durable_tail() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let power_store = Arc::new(PowerCutRuntimeStore::new(&paths.realm_db_path));
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = power_store.clone();
+    let w1_sid = retiring_member_after_a_crash(&paths, &power_store, true, "unprovable-tail").await;
+
+    let (service_2, store_2) = persistent_head_canonical_service(&paths, runtime_store.clone());
+    let head_before = store_2
+        .load_head(&w1_sid)
+        .await
+        .expect("load the physical head")
+        .expect("the physical head exists");
+    let persistent_owner: Arc<dyn MobSessionService> = service_2.clone();
+    let keeping_tails = FailingOnceSessionService::new(persistent_owner, None, None, 0, false);
+    keeping_tails.keep_durable_tails_unsettled();
+    let refused = MobBuilder::for_resume(
+        MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage"),
+    )
+    .with_session_service(keeping_tails)
+    .with_default_llm_client(openai_test_client())
+    .notify_orchestrator_on_resume(false)
+    .resume()
+    .await;
+    let error = refused_start_error(refused).await;
+    let (member, session, cause) = startup_recovery_cause(&error);
+    assert_eq!(member, &AgentIdentity::from("w-1"));
+    assert_eq!(session, &w1_sid);
+    assert!(
+        matches!(
+            cause,
+            meerkat_mob::MobError::MemberDurableTailUnprovable { member_id, session_id }
+                if member_id == &AgentIdentity::from("w-1") && session_id == &w1_sid
+        ),
+        "the cause is the typed unprovable tail: {cause:?}"
+    );
+    let head_after = store_2
+        .load_head(&w1_sid)
+        .await
+        .expect("load the physical head after the refusal")
+        .expect("the physical head still exists");
+    assert_eq!(
+        meerkat_core::session_store::session_head_cas_token(&head_after).unwrap(),
+        meerkat_core::session_store::session_head_cas_token(&head_before).unwrap(),
+        "the refused start leaves the tail as the crash left it"
+    );
+}
+
 /// #1813: the same start while another runtime owner on the realm hosts that
 /// member's session does not settle the other owner's tail. The start
 /// refuses, logging the member, its session and the remedy at ERROR, and the

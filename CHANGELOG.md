@@ -37,6 +37,15 @@ them.
 
 ### Breaking
 
+- `meerkat-runtime`: `RuntimeBindingsError` gains the variant
+  `Hosting(SessionId, SessionError)` and is now `#[non_exhaustive]`. Binding
+  preparation for a session another runtime owner hosts, or whose hosting
+  claim cannot be taken, returns it with the typed
+  `SessionError::ServedElsewhere` or `SessionError::HostingUnavailable`
+  instead of a `PrepareFailed` message. The gate's findings: an added enum
+  variant and an enum marked non-exhaustive. A downstream match needs a
+  wildcard arm; `rejected_before_effect` stays false for the new variant.
+
 - `meerkat-schedule`: the occurrence lifecycle carries the admission evidence
   of an occurrence's receipt history (see Fixed, scheduled delivery after a
   lost executor). `OccurrenceLifecycleInput::ClassifyDue` and `Claim` gain the
@@ -281,6 +290,14 @@ them.
 
 ### Fixed
 
+- `meerkat-mob`: a mob start that cannot restore a member because another
+  runtime owner hosts its session reports the typed hosting refusal as the
+  startup failure's cause wherever the start prepares the member's runtime
+  bindings, not an internal preparation error. A member whose durable tail
+  its store-owned recovery kept (it could not prove the tail) is reported as
+  `MobError::MemberDurableTailUnprovable`, naming the member and its session
+  and carrying the `tail_held_for_recovery` resume hold, instead of a bare
+  transcript revision conflict. The start still refuses in both cases.
 - `meerkat-mob`: a mob restarted while another runtime owner on the realm
   hosts a retiring member's session now starts and runs. The start restores
   the retiring member's local cleanup delivery, which settles the session's

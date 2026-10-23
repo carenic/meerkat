@@ -673,6 +673,7 @@ pub struct FailingOnceSessionService {
     archive_failures_fired: AtomicU64,
     fail_projection_drain: bool,
     projection_drain_failed_once: AtomicBool,
+    keep_durable_tails: AtomicBool,
 }
 
 impl FailingOnceSessionService {
@@ -696,7 +697,15 @@ impl FailingOnceSessionService {
             archive_failures_fired: AtomicU64::new(0),
             fail_projection_drain,
             projection_drain_failed_once: AtomicBool::new(false),
+            keep_durable_tails: AtomicBool::new(false),
         })
+    }
+
+    /// Keep every durable tail at a cold start: the settle answers as the
+    /// store-owned recovery does for a tail it cannot prove (it keeps the
+    /// tail intact), without running it.
+    pub fn keep_durable_tails_unsettled(&self) {
+        self.keep_durable_tails.store(true, Ordering::SeqCst);
     }
 
     /// True once the injected failure has fired.
@@ -941,6 +950,9 @@ impl meerkat_mob::MobSessionService for FailingOnceSessionService {
         &self,
         session_id: &meerkat_core::SessionId,
     ) -> Result<(), meerkat_core::service::SessionError> {
+        if self.keep_durable_tails.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         self.inner
             .settle_durable_tail_before_cold_start(session_id)
             .await

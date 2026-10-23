@@ -56609,6 +56609,97 @@ async fn a_fresh_executor_attachment_publishes_only_after_its_settlement() {
     );
 }
 
+/// Binding preparation for a session another runtime owner hosts refuses
+/// with the typed hosting refusal, not a preparation string, on every
+/// preparation seam. The refusal is not claimed as no-effect (a caller keeps
+/// its cleanup open), and the refused owner publishes no registration.
+#[cfg(feature = "sqlite-store")]
+#[tokio::test]
+async fn binding_preparation_for_a_session_another_owner_hosts_refuses_typed() {
+    use crate::session_hosting::HostingPaths;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn RuntimeStore> = Arc::new(
+        crate::store::SqliteRuntimeStore::new(dir.path().join("runtime.sqlite3"))
+            .unwrap()
+            .with_hosting_paths(HostingPaths {
+                hosting_lock_dir: dir.path().join("hosting"),
+                cold_delivery_lock: dir.path().join("delivery").join("cold-delivery.lock"),
+                database: None,
+            }),
+    );
+    let host = MeerkatMachine::persistent(Arc::clone(&store), memory_blob_store()).unwrap();
+    let other = Arc::new(
+        MeerkatMachine::persistent(Arc::clone(&store), memory_blob_store())
+            .expect("separate machines may share one store"),
+    );
+    let session_id = SessionId::new();
+    host.register_session(session_id.clone())
+        .await
+        .expect("the first owner registers");
+
+    let local = other
+        .prepare_local_session_bindings(session_id.clone())
+        .await
+        .expect_err("another runtime owner's local bindings are refused");
+    let authoritative = other
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect_err("another runtime owner's bindings are refused");
+    let Err(materialization) = other
+        .prepare_local_session_materialization_with_mode(
+            session_id.clone(),
+            crate::LocalSessionMaterializationMode::Ordinary,
+        )
+        .await
+    else {
+        panic!("another runtime owner's materialization is refused");
+    };
+    for (seam, error) in [
+        ("local bindings", &local),
+        ("bindings", &authoritative),
+        ("materialization", &materialization),
+    ] {
+        assert!(
+            matches!(
+                error,
+                crate::meerkat_machine::RuntimeBindingsError::Hosting(
+                    refused,
+                    meerkat_core::SessionError::ServedElsewhere { id },
+                ) if refused == &session_id && id == &session_id
+            ),
+            "{seam}: the typed hosting refusal: {error:?}"
+        );
+        assert!(
+            !error.rejected_before_effect(),
+            "{seam}: a hosting refusal is not claimed as no-effect"
+        );
+    }
+    assert!(
+        !other.contains_session(&session_id).await,
+        "the refused owner published no registration"
+    );
+    assert!(matches!(
+        crate::meerkat_machine::RuntimeBindingsError::from_preparation_error(
+            session_id.clone(),
+            &RuntimeDriverError::HostingUnavailable {
+                session_id: session_id.clone(),
+            },
+        ),
+        crate::meerkat_machine::RuntimeBindingsError::Hosting(
+            _,
+            meerkat_core::SessionError::HostingUnavailable { .. },
+        )
+    ));
+    assert!(matches!(
+        crate::meerkat_machine::RuntimeBindingsError::from_preparation_error(
+            session_id,
+            &RuntimeDriverError::Destroyed,
+        ),
+        crate::meerkat_machine::RuntimeBindingsError::PrepareFailed(..)
+    ));
+}
+
 /// #1813 (ADR's R6 objection): hosting claims are owner-scoped. Two
 /// MeerkatMachines may share one store for distinct runtimes, and each is a
 /// distinct runtime owner. A session one hosts is refused to the other
