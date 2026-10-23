@@ -8770,6 +8770,40 @@ pub async fn shutdown_all_mcp_sessions(state: &AppState) {
     }
 }
 
+/// Unregister every current runtime registration at the server's graceful
+/// shutdown (SIGTERM or Ctrl+C), each until its teardown is terminal, with the
+/// runtime's graceful shutdown disposition
+/// ([`meerkat_runtime::MeerkatMachine::graceful_shutdown_queued_inputs`]): a
+/// runtime with a persistence store requeues, so a session's eligible queued
+/// prompts stay queued for its next start and the runtime's stop keeps the
+/// run in flight of a session that commits each round; a runtime without one
+/// stops them. The server calls it before it cancels the requests still
+/// tracked, which would cancel such a run first. A teardown that fails is
+/// logged, and the rest still run.
+pub async fn unregister_runtime_sessions_for_shutdown(state: &AppState) {
+    let queued_inputs = state.runtime_adapter.graceful_shutdown_queued_inputs();
+    for registration in state
+        .runtime_adapter
+        .current_session_registration_witnesses()
+        .await
+    {
+        if let Err(error) = state
+            .runtime_adapter
+            .unregister_session_registration_until_terminal_with_queued_inputs_if_current(
+                &registration,
+                queued_inputs,
+            )
+            .await
+        {
+            tracing::warn!(
+                session_id = %registration.session_id(),
+                %error,
+                "runtime registration teardown failed during REST shutdown"
+            );
+        }
+    }
+}
+
 /// API error types
 #[derive(Debug)]
 pub enum ApiError {
@@ -11248,6 +11282,158 @@ mod tests {
             *calls.borrow(),
             2,
             "the waiting continue ran its own turn after the first one"
+        );
+    }
+
+    /// One tracked `POST /sessions/{id}/messages` (with `X-Meerkat-Request-Id`)
+    /// on a task: its status and JSON body.
+    fn spawn_tracked_rest_continue(
+        state: &AppState,
+        session_id: &SessionId,
+        request_id: &'static str,
+        prompt: &'static str,
+    ) -> tokio::task::JoinHandle<(StatusCode, Value)> {
+        use axum::body::Body;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let app = router(state.clone());
+        let session_id = session_id.to_string();
+        tokio::spawn(async move {
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!("/sessions/{session_id}/messages"))
+                        .header("content-type", "application/json")
+                        .header("x-meerkat-request-id", request_id)
+                        .body(Body::from(
+                            json!({ "session_id": session_id, "prompt": prompt }).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            (status, body)
+        })
+    }
+
+    /// The REST server's graceful shutdown keeps a durable session's work for
+    /// its next start. It unregisters every registration with the runtime's
+    /// graceful disposition (Requeue on this persistent realm) before it
+    /// cancels the requests still tracked, so neither tracked continue is
+    /// cancelled: the one running and the one queued behind it are both
+    /// answered `409` `SESSION_NOT_RUNNING` with `requeued_across_stop`. A
+    /// server started again on the realm runs each of them once when the
+    /// session is opened again, ahead of the new continue.
+    ///
+    /// Unrun. The queued continue's answer needs only the requeue; the running
+    /// continue's answer and its run at the next start also need the runtime
+    /// stop to suspend a run that commits each round, and the start to resume
+    /// it.
+    #[tokio::test]
+    async fn rest_graceful_shutdown_keeps_a_durable_sessions_turns_for_the_next_start() {
+        // Bounds a failure only; the passing path never waits for it.
+        const FAILURE_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
+        let temp = TempDir::new().unwrap();
+        let session_id = {
+            let mut state = load_rest_state_with_capacity(&temp, 4).await;
+            let calls = Arc::new(tokio::sync::watch::channel(0).0);
+            let release = Arc::new(tokio::sync::Semaphore::new(0));
+            state.llm_client_override = Some(Arc::new(BlockingMockLlmClient {
+                calls: Arc::clone(&calls),
+                release: Arc::clone(&release),
+            }));
+            let session_id = create_deferred_rest_runtime_session(&state).await;
+            let running = spawn_tracked_rest_continue(
+                &state,
+                &session_id,
+                "shutdown-running",
+                "the running turn",
+            );
+            wait_for_rest_llm_calls(&calls, 1, "the running turn reaches the LLM").await;
+            let mut queued = spawn_tracked_rest_continue(
+                &state,
+                &session_id,
+                "shutdown-queued",
+                "the queued turn",
+            );
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(300), &mut queued)
+                    .await
+                    .is_err(),
+                "the second continue waits queued behind the running turn"
+            );
+
+            // The server's shutdown order after its HTTP drain.
+            state.shutdown_schedule_host().await;
+            unregister_runtime_sessions_for_shutdown(&state).await;
+            state.request_executor.shutdown_and_abort_stragglers().await;
+
+            let running = tokio::time::timeout(FAILURE_BOUND, running)
+                .await
+                .expect("the running continue is answered by the shutdown")
+                .expect("running continue task");
+            let queued = tokio::time::timeout(FAILURE_BOUND, queued)
+                .await
+                .expect("the queued continue is answered by the shutdown")
+                .expect("queued continue task");
+            let kept = |(status, body): &(StatusCode, Value)| {
+                *status == StatusCode::CONFLICT
+                    && body["code"] == "SESSION_NOT_RUNNING"
+                    && body["details"]["kind"] == "requeued_across_stop"
+            };
+            assert!(
+                kept(&running) && kept(&queued),
+                "both tracked continues are kept across the stop, not cancelled: \
+                 running={running:?} queued={queued:?}"
+            );
+            assert_eq!(*calls.borrow(), 1, "nothing ran after the stop");
+            session_id
+        };
+
+        let mut reopened = load_rest_state_with_capacity(&temp, 4).await;
+        reopened.llm_client_override = Some(Arc::new(MockLlmClient));
+        let (status, body) = tokio::time::timeout(
+            FAILURE_BOUND,
+            spawn_tracked_rest_continue(
+                &reopened,
+                &session_id,
+                "after-restart",
+                "after the restart",
+            ),
+        )
+        .await
+        .expect("the continue after the restart finishes")
+        .expect("continue task");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let session = reopened
+            .session_service
+            .load_authoritative_session(&session_id)
+            .await
+            .expect("load the session")
+            .expect("the session is committed");
+        let user_rows: Vec<String> = session
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                meerkat_core::Message::User(user)
+                    if !user.transcript_role.is_injected_context() =>
+                {
+                    Some(user.text_content())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            user_rows,
+            ["the running turn", "the queued turn", "after the restart"],
+            "the kept run and the kept prompt each run once at the next start, ahead of \
+             the new continue"
         );
     }
 

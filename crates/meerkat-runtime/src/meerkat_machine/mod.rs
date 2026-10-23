@@ -1460,6 +1460,11 @@ impl UnregisterQueuedInputs {
     /// The longest max age a requeue may carry.
     pub const MAX_AGE_CAP: std::time::Duration = std::time::Duration::from_hours(24);
 
+    /// The max age of the requeue a graceful process shutdown uses when its
+    /// host names none ([`MeerkatMachine::graceful_shutdown_queued_inputs`]):
+    /// 15 minutes.
+    pub const DEFAULT_MAX_AGE: std::time::Duration = std::time::Duration::from_mins(15);
+
     /// Check the disposition every unregister entry point checks before it
     /// starts anything. A requeue's max age is recorded in whole
     /// milliseconds, so a max age under one millisecond (zero included) is
@@ -12684,6 +12689,28 @@ impl MeerkatMachine {
     #[must_use]
     pub fn has_runtime_persistence(&self) -> bool {
         self.store.is_some()
+    }
+
+    /// What a graceful process shutdown that names no disposition does with
+    /// each session it unregisters, as `rkat-rpc`'s shutdown and the REST
+    /// server's shutdown do. A runtime with a persistence store serves
+    /// sessions that commit each round, so it requeues
+    /// ([`UnregisterQueuedInputs::Requeue`] with
+    /// [`UnregisterQueuedInputs::DEFAULT_MAX_AGE`]): eligible queued inputs
+    /// stay queued for the next start, and the runtime's stop decides per run
+    /// whether a run in flight continues there or ends as before. A runtime
+    /// without one stops ([`UnregisterQueuedInputs::Stop`]), as every
+    /// unregister did before. An unregister that names no disposition is
+    /// unchanged: it still stops.
+    #[must_use]
+    pub fn graceful_shutdown_queued_inputs(&self) -> UnregisterQueuedInputs {
+        if self.has_runtime_persistence() {
+            UnregisterQueuedInputs::Requeue {
+                max_age: UnregisterQueuedInputs::DEFAULT_MAX_AGE,
+            }
+        } else {
+            UnregisterQueuedInputs::Stop
+        }
     }
 
     fn normalize_destroyed_error(err: RuntimeDriverError) -> RuntimeDriverError {

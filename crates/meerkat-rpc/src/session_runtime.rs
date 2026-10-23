@@ -13279,10 +13279,17 @@ impl SessionRuntime {
     }
 
     /// Unregister every current runtime registration until terminal, keeping
-    /// the first failure and still tearing down the rest.
+    /// the first failure and still tearing down the rest. Each unregister
+    /// takes the runtime's graceful shutdown disposition
+    /// ([`MeerkatMachine::graceful_shutdown_queued_inputs`]): a runtime with a
+    /// persistence store requeues, so a session's eligible queued prompts
+    /// stay queued for the next start and the runtime's stop keeps the run in
+    /// flight of a session that commits each round; a runtime without one
+    /// stops, as before.
     async fn unregister_runtime_registrations_for_shutdown(
         &self,
     ) -> Result<(), meerkat_core::SessionError> {
+        let queued_inputs = self.runtime_adapter.graceful_shutdown_queued_inputs();
         let mut first_error = None;
         for registration in self
             .runtime_adapter
@@ -13291,7 +13298,10 @@ impl SessionRuntime {
         {
             if let Err(error) = self
                 .runtime_adapter
-                .unregister_session_registration_until_terminal_if_current(&registration)
+                .unregister_session_registration_until_terminal_with_queued_inputs_if_current(
+                    &registration,
+                    queued_inputs,
+                )
                 .await
             {
                 tracing::warn!(
@@ -33818,6 +33828,145 @@ mod tests {
         assert!(
             sessions.is_empty(),
             "All sessions should be removed after shutdown"
+        );
+    }
+
+    /// rkat-rpc's graceful shutdown keeps a durable session's work for its
+    /// next start. The runtime's shutdown unregisters every registration with
+    /// the runtime's graceful disposition (Requeue on this persistent
+    /// runtime), so neither the running turn nor the turn queued behind it is
+    /// cancelled: both are answered `requeued_across_stop`. A runtime started
+    /// again on the same stores runs each of them once when the session is
+    /// opened again, ahead of the new turn.
+    ///
+    /// Unrun. The queued turn's answer needs only the requeue; the running
+    /// turn's answer and its run at the next start also need the runtime stop
+    /// to suspend a run that commits each round, and the start to resume it.
+    #[tokio::test]
+    async fn a_graceful_shutdown_keeps_a_durable_sessions_turns_for_the_next_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let store: Arc<dyn meerkat::SessionStore> = Arc::new(meerkat::MemoryStore::new());
+        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+        let blob_store: Arc<dyn meerkat_core::BlobStore> =
+            Arc::new(meerkat_store::MemoryBlobStore::new());
+        // One process start over the shared stores.
+        let start = || {
+            Arc::new(
+                SessionRuntime::new(
+                    temp_factory(&temp),
+                    Config::default(),
+                    4,
+                    meerkat::PersistenceBundle::new(
+                        Arc::clone(&store),
+                        Arc::clone(&runtime_store),
+                        Arc::clone(&blob_store),
+                    )
+                    .expect("construct runtime authority"),
+                    crate::router::NotificationSink::noop(),
+                )
+                .expect("compose the RPC session runtime"),
+            )
+        };
+        let calls = Arc::new(BlockingLlmCallWitness::default());
+        let blocking: Arc<dyn LlmClient> = Arc::new(BlockingMockLlmClient {
+            calls: Arc::clone(&calls),
+            release: Arc::new(Notify::new()),
+        });
+        let runtime = start();
+        runtime.set_default_llm_client(Some(Arc::clone(&blocking)));
+        let session_id = runtime
+            .create_session(
+                AgentBuildConfig {
+                    llm_client_override: Some(Arc::clone(&blocking)),
+                    ..AgentBuildConfig::new("claude-sonnet-4-5")
+                },
+                None,
+                None,
+                Vec::new(),
+            )
+            .await
+            .expect("create the session");
+        let turn = |prompt: &'static str| {
+            let runtime = Arc::clone(&runtime);
+            let session_id = session_id.clone();
+            tokio::spawn(async move {
+                let (event_tx, _event_rx) = mpsc::channel(100);
+                runtime
+                    .start_turn_via_runtime(
+                        &session_id,
+                        prompt.into(),
+                        Vec::new(),
+                        event_tx,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+            })
+        };
+        let running = turn("the running turn");
+        wait_for_llm_calls(&calls, 1, "the running turn").await;
+        let mut queued = turn("the queued turn");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut queued)
+                .await
+                .is_err(),
+            "the second turn waits queued behind the running one"
+        );
+
+        runtime
+            .try_shutdown()
+            .await
+            .expect("the runtime shuts down");
+        let running = tokio::time::timeout(TEST_ASYNC_WITNESS_TIMEOUT, running)
+            .await
+            .expect("the running turn is answered by the shutdown")
+            .expect("running turn task");
+        let queued = tokio::time::timeout(TEST_ASYNC_WITNESS_TIMEOUT, queued)
+            .await
+            .expect("the queued turn is answered by the shutdown")
+            .expect("queued turn task");
+        let kept = |result: &Result<RunResult, RpcError>| {
+            matches!(
+                result,
+                Err(error) if error
+                    .data
+                    .as_ref()
+                    .is_some_and(|data| data["kind"] == "requeued_across_stop")
+            )
+        };
+        assert!(
+            kept(&running) && kept(&queued),
+            "both turns are kept across the stop, not cancelled: running={running:?} \
+             queued={queued:?}"
+        );
+        assert_eq!(
+            calls.load(AtomicOrdering::SeqCst),
+            1,
+            "nothing ran after the stop"
+        );
+        drop(runtime);
+
+        let restarted = start();
+        restarted.set_default_llm_client(Some(Arc::new(MockLlmClient)));
+        runtime_turn(&restarted, &session_id, "after the restart").await;
+        let session = restarted
+            .load_persisted_session(&session_id)
+            .await
+            .expect("load the persisted session")
+            .expect("the session is persisted");
+        let users: Vec<String> = user_channel_messages(&session)
+            .into_iter()
+            .filter(|(injected, _)| !injected)
+            .map(|(_, text)| text)
+            .collect();
+        assert_eq!(
+            users,
+            ["the running turn", "the queued turn", "after the restart"],
+            "the kept run and the kept turn each run once at the next start, ahead of the \
+             new turn"
         );
     }
 

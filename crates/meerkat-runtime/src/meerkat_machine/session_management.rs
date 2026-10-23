@@ -7760,6 +7760,37 @@ impl MeerkatMachine {
         .require_completed()
     }
 
+    /// [`Self::unregister_session_registration_until_terminal_if_current`]
+    /// with the unregister's disposition for the run in flight and the inputs
+    /// queued behind it ([`UnregisterQueuedInputs`]), recorded as
+    /// [`Self::observe_unregister_session_registration_with_queued_inputs_if_current`]
+    /// records it: a call that joins an unregister already in progress keeps
+    /// the disposition that unregister began with. A graceful process
+    /// shutdown passes [`MeerkatMachine::graceful_shutdown_queued_inputs`].
+    pub async fn unregister_session_registration_until_terminal_with_queued_inputs_if_current(
+        &self,
+        registration: &RuntimeSessionRegistrationWitness,
+        queued_inputs: UnregisterQueuedInputs,
+    ) -> Result<bool, RuntimeDriverError> {
+        let queued_inputs = queued_inputs
+            .recorded()
+            .map_err(RuntimeDriverError::QueuedInputsRefused)?;
+        if !registration.belongs_to(self) {
+            return Ok(false);
+        }
+        self.join_or_start_unregister_teardown_with_queued_inputs(
+            registration.session_id(),
+            Some(registration.epoch_id()),
+            UnregisterTeardownCaller::Explicit,
+            UnregisterTeardownAdmission::AnyCurrentRegistration,
+            Some(registration),
+            UnregisterTeardownWait::UntilTerminal,
+            queued_inputs,
+        )
+        .await?
+        .require_completed()
+    }
+
     /// Close one exact current registration while it is quiescent, or finish
     /// its orphaned drain, then await its owned teardown to terminal completion.
     ///
