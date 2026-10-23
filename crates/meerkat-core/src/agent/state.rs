@@ -8422,20 +8422,19 @@ where
                 );
             }
 
-            // Emit execution complete
+            // Emit execution complete: the execution fact, without the body.
             emit_phase_event!(
                 self,
                 ctx,
                 AgentEvent::ToolExecutionCompleted {
                     id: tc.id.clone(),
                     name: tc.name.clone(),
-                    content: tool_result.content.clone(),
                     is_error: tool_result.is_error,
                     duration_ms,
                 }
             );
 
-            // Emit result received
+            // Emit result received: the only carrier of the result body.
             emit_phase_event!(
                 self,
                 ctx,
@@ -18385,7 +18384,7 @@ mod tests {
 
         let mut saw_timeout_completion = false;
         while let Ok(event) = rx.try_recv() {
-            if let crate::event::AgentEvent::ToolExecutionCompleted {
+            if let crate::event::AgentEvent::ToolResultReceived {
                 name,
                 is_error,
                 content,
@@ -18554,7 +18553,7 @@ mod tests {
         .expect("the run succeeds");
         let mut completed = None;
         while let Ok(event) = rx.try_recv() {
-            if let crate::event::AgentEvent::ToolExecutionCompleted { name, content, .. } = event
+            if let crate::event::AgentEvent::ToolResultReceived { name, content, .. } = event
                 && name == "slow_tool"
             {
                 completed = Some(crate::types::text_content(&content));

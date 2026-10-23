@@ -540,7 +540,6 @@ fn agent_event_all_variants_roundtrip() {
         AgentEvent::ToolExecutionCompleted {
             id: "tc2".to_string(),
             name: "shell".to_string(),
-            content: ContentBlock::text_vec("ok".to_string()),
             is_error: false,
             duration_ms: 100,
         },
@@ -825,7 +824,6 @@ fn documented_event_catalog_covers_core_agent_event_discriminators() {
         AgentEvent::ToolExecutionCompleted {
             id: "tool-1".to_string(),
             name: "search".to_string(),
-            content: ContentBlock::text_vec("ok".to_string()),
             is_error: false,
             duration_ms: 1,
         },
