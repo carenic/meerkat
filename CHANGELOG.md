@@ -957,6 +957,8 @@ them.
   version table, as a host of an earlier release does. `meerkat-runtime`:
   `MemberObservationHost` gains `visible_tool_names`, whose default
   answers `Unavailable`.
+- `meerkat-core`: `interaction::SENDER_TAINT_MARKER`, the line a model reads
+  after peer content whose sender declared it tainted.
 
 - Supervisor bridge protocol 7 (`meerkat-contracts`): a `Resume`
   `MaterializeMember` may set `report_adopted_first_turn`. The member host
@@ -1693,6 +1695,14 @@ them.
   included, and every tool result, under every policy. The rows are now
   decided by their typed activation identity and by the tool call that
   produced them, never by their text (see Breaking).
+- A prompt-context fork child now reads the peer traffic in its source's
+  history: whom the source heard from (or wrote to), the text of a peer
+  message, a status and a payload preview (a request's params, a
+  response's result) when the notice has them, and the sender's taint
+  marker. The child was given only each notice's title ("Peer message",
+  "Peer request: review"). The means to answer a peer (request and
+  delivery ids, reply instructions) are not carried: the child is not
+  the addressee.
 
 - A turn-driven `MobHandle::fork_helper` (the default helper mode) now sees
   its fork context. The helper is created without an initial message, so

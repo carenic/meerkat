@@ -3081,7 +3081,7 @@ impl SystemNoticeBlock {
                     sender_taint,
                     Some(crate::comms::SenderContentTaint::Tainted)
                 ) {
-                    lines.push("[sender declared this content tainted]".to_string());
+                    lines.push(crate::interaction::SENDER_TAINT_MARKER.to_string());
                 }
                 lines.join("\n")
             }
