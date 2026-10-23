@@ -190,6 +190,13 @@ them.
 
 ### Fixed
 
+- `meerkat-core`: a model call is no longer aborted as a stalled stream before
+  it ran. The stream inactivity watchdog checked its window before it first
+  polled the call, so on a starved runtime its first check could come a whole
+  window after the call started and abort a call that had never run; the
+  turn then spent a retry on it, or failed once its retries were spent. The
+  call now runs once first, and its inactivity counts from then.
+
 - `meerkat-core`: a tool call admitted after its deadline now times out
   instead of entering its body. A call waiting for a dispatch slot whose
   deadline passed in the same scheduler turn the slot came free (a starved

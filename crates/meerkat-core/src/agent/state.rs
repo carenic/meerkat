@@ -2783,11 +2783,21 @@ where
             // a timer that fires always finds its deadline reached (a paused
             // test clock cannot leave the loop re-arming forever).
             let model_call_started = crate::time_compat::Instant::now();
-            let wait_outcome = {
+            let wait_outcome = 'wait: {
                 let call_fut = request_attempt.stream_response(assistant_message_id);
                 let mut call_fut = std::pin::pin!(call_fut);
                 let call_started = crate::time_compat::DeadlineInstant::now();
-                let mut last_activity = call_started;
+                // The call runs once before any deadline is checked, and its
+                // inactivity counts from then: a starved runtime can reach the
+                // first check a whole stall window after the call started, and
+                // a call that never ran has not stalled.
+                if let std::task::Poll::Ready(result) =
+                    std::future::poll_fn(|cx| std::task::Poll::Ready(call_fut.as_mut().poll(cx)))
+                        .await
+                {
+                    break 'wait LlmCallWait::Completed(result);
+                }
+                let mut last_activity = crate::time_compat::DeadlineInstant::now();
                 let mut last_count = stream_activity_count();
                 loop {
                     let now = crate::time_compat::DeadlineInstant::now();
