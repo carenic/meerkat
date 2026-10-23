@@ -15912,7 +15912,7 @@ mod identity_fence_contention_tests {
         MeerkatMachine, RuntimeSessionLifecycleObservation, RuntimeSessionRegistrationOutcome,
         RuntimeStoreError, RuntimeStoreWriteFenceOutcome,
     };
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     /// How long the holder keeps mob.db's write lock: a slow status commit.
@@ -16037,48 +16037,103 @@ mod identity_fence_contention_tests {
         holder
     }
 
-    /// Wraps a fence: just before its `at`-th call, mob.db is held for
-    /// [`HOLD`]. Records when each call started and when each operation ran,
-    /// and counts the calls that returned. Each call can be made to take
-    /// `call_delay` first, as on a loaded host.
+    /// As [`hold_mob_db`], holding the lock until `release` fires or its
+    /// sender is gone.
+    fn hold_mob_db_until(
+        path: &Path,
+        release: std::sync::mpsc::Receiver<()>,
+    ) -> std::thread::JoinHandle<Instant> {
+        let (holding, held) = std::sync::mpsc::channel();
+        let path = path.to_path_buf();
+        let holder = std::thread::spawn(move || {
+            let mut conn = Connection::open(&path).unwrap();
+            let lock = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            holding.send(()).unwrap();
+            let _ = release.recv();
+            drop(lock);
+            Instant::now()
+        });
+        held.recv().unwrap();
+        holder
+    }
+
+    /// When a [`HoldMobDbAt`] releases mob.db.
+    enum Release {
+        /// After [`HOLD`]: for a caller that waits inside one fence call.
+        AfterHold,
+        /// Just before this fence call runs, the holder gone by then: for a
+        /// caller that retries between attempts, however slow its calls.
+        AtCall(usize),
+    }
+
+    /// Wraps a fence: just before its `at`-th call, mob.db is held until its
+    /// [`Release`]. Records when each call started and when each operation
+    /// ran, and counts the calls that returned. Each call can be made to
+    /// take `call_delay` first, as on a loaded host.
     struct HoldMobDbAt {
         inner: Arc<dyn RuntimeStoreWriteFence>,
         path: PathBuf,
         at: usize,
+        release: Release,
         call_delay: Duration,
         call_starts: std::sync::Mutex<Vec<Instant>>,
         operations: std::sync::Mutex<Vec<Instant>>,
         /// How many calls have returned.
         returned: tokio::sync::watch::Sender<usize>,
         holder: std::sync::Mutex<Option<std::thread::JoinHandle<Instant>>>,
+        /// Ends a [`Release::AtCall`] hold.
+        release_signal: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        /// When a [`Release::AtCall`] hold ended.
+        released: std::sync::Mutex<Option<Instant>>,
     }
 
     impl HoldMobDbAt {
         fn new(inner: Arc<dyn RuntimeStoreWriteFence>, path: &Path, at: usize) -> Arc<Self> {
-            Self::with_call_delay(inner, path, at, Duration::ZERO)
+            Self::build(inner, path, at, Release::AfterHold, Duration::ZERO)
         }
 
-        /// As [`Self::new`], every call taking `call_delay` before it runs.
-        fn with_call_delay(
+        /// Holds mob.db from the `at`-th call until just before the
+        /// `release_at`-th call runs; every call takes `call_delay` first.
+        fn until_call(
             inner: Arc<dyn RuntimeStoreWriteFence>,
             path: &Path,
             at: usize,
+            release_at: usize,
+            call_delay: Duration,
+        ) -> Arc<Self> {
+            assert!(release_at > at, "the hold spans at least one call");
+            Self::build(inner, path, at, Release::AtCall(release_at), call_delay)
+        }
+
+        fn build(
+            inner: Arc<dyn RuntimeStoreWriteFence>,
+            path: &Path,
+            at: usize,
+            release: Release,
             call_delay: Duration,
         ) -> Arc<Self> {
             Arc::new(Self {
                 inner,
                 path: path.to_path_buf(),
                 at,
+                release,
                 call_delay,
                 call_starts: std::sync::Mutex::new(Vec::new()),
                 operations: std::sync::Mutex::new(Vec::new()),
                 returned: tokio::sync::watch::Sender::new(0),
                 holder: std::sync::Mutex::new(None),
+                release_signal: std::sync::Mutex::new(None),
+                released: std::sync::Mutex::new(None),
             })
         }
 
         /// When the holder released mob.db.
         fn released_at(&self) -> Instant {
+            if let Some(released) = *self.released.lock().unwrap() {
+                return released;
+            }
             self.holder
                 .lock()
                 .unwrap()
@@ -16103,8 +16158,22 @@ mod identity_fence_contention_tests {
                 starts.push(Instant::now());
                 starts.len()
             };
-            if call == self.at {
-                *self.holder.lock().unwrap() = Some(hold_mob_db(&self.path, HOLD));
+            match self.release {
+                Release::AfterHold if call == self.at => {
+                    *self.holder.lock().unwrap() = Some(hold_mob_db(&self.path, HOLD));
+                }
+                Release::AtCall(_) if call == self.at => {
+                    let (release, released) = std::sync::mpsc::channel();
+                    *self.release_signal.lock().unwrap() = Some(release);
+                    *self.holder.lock().unwrap() = Some(hold_mob_db_until(&self.path, released));
+                }
+                Release::AtCall(release_at) if call == release_at => {
+                    // The holder is gone before this call runs.
+                    drop(self.release_signal.lock().unwrap().take());
+                    let holder = self.holder.lock().unwrap().take().expect("the holder ran");
+                    *self.released.lock().unwrap() = Some(holder.join().unwrap());
+                }
+                _ => {}
             }
             if !self.call_delay.is_zero() {
                 std::thread::sleep(self.call_delay);
@@ -16151,39 +16220,14 @@ mod identity_fence_contention_tests {
         }
     }
 
-    /// Counts ticks of a task on the test's runtime until it is aborted.
-    fn ticker() -> (Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
-        let ticks = Arc::new(AtomicUsize::new(0));
-        let task = tokio::spawn({
-            let ticks = Arc::clone(&ticks);
-            async move {
-                loop {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                    ticks.fetch_add(1, Ordering::SeqCst);
-                }
-            }
-        });
-        (ticks, task)
-    }
-
-    /// A read issued while the writer paused between two attempts finished
-    /// well before the writer's next attempt: the writer released its lock
-    /// for the pause. `next_start` is the start of that next attempt.
-    fn assert_read_ran_during_the_pause(read_at: Instant, next_start: Instant) {
-        let margin = next_start.saturating_duration_since(read_at);
-        assert!(
-            margin >= Duration::from_millis(10),
-            "the read finished {margin:?} before the next attempt; a writer that keeps its \
-             lock across the pause lets it run only just before that attempt"
-        );
-    }
-
     /// RED-3: the in-memory store's fenced lifecycle CAS (the first fence
     /// call of a registration) meets mob.db held. It retries until the holder
-    /// releases and registers; a plain read of the same store issued during
-    /// a 40 ms pause runs in that pause, and a ticker on this one-thread
-    /// runtime keeps ticking.
-    #[tokio::test]
+    /// releases and registers; a plain read of the same store, issued on this
+    /// one-thread runtime when the fourth call returned, runs at once, in the
+    /// 40 ms pause that follows. On the paused clock the pauses take no wall
+    /// time, the hold ends at a call, and the read's wait is exact, however
+    /// slow the calls are.
+    #[tokio::test(start_paused = true)]
     async fn an_in_memory_lifecycle_cas_waits_out_a_held_identity_fence_with_its_lock_released() {
         // The pause after the fourth Backoff is 40 ms (5, 10, 20, 40).
         const READ_AFTER_CALLS: usize = 4;
@@ -16201,13 +16245,13 @@ mod identity_fence_contention_tests {
             .unwrap();
         // Every call slowed as on a loaded host: the hold must not depend on
         // how many calls fit in it.
-        let fence = HoldMobDbAt::with_call_delay(
+        let fence = HoldMobDbAt::until_call(
             adopted.runtime_fence(&observed),
             &adopted.path,
             1,
+            READ_AFTER_CALLS + 2,
             LOADED_CALL,
         );
-        let (ticks, ticker) = ticker();
         let reader = tokio::spawn({
             let store = store.clone();
             let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&session_id);
@@ -16217,29 +16261,23 @@ mod identity_fence_contention_tests {
                     .wait_for(|returned| *returned >= READ_AFTER_CALLS)
                     .await
                     .unwrap();
+                let issued = tokio::time::Instant::now();
                 meerkat_runtime::RuntimeStore::load_machine_lifecycle_record(
                     store.as_ref(),
                     &runtime_id,
                 )
                 .await
                 .unwrap();
-                Instant::now()
+                (issued.elapsed(), Instant::now())
             }
         });
 
-        let ticks_before = ticks.load(Ordering::SeqCst);
         let outcome = machine
             .register_session_if_runtime_lifecycle_current(observed, fence.clone())
             .await;
-        let ticked = ticks.load(Ordering::SeqCst) - ticks_before;
-        ticker.abort();
         assert!(
             matches!(outcome, RuntimeSessionRegistrationOutcome::Applied { .. }),
             "the fenced registration rides out the held lock: {outcome:?}"
-        );
-        assert!(
-            ticked > 5,
-            "the runtime's only thread kept running other tasks: {ticked} ticks"
         );
         let released_at = fence.released_at();
         let operations = fence.operations();
@@ -16258,16 +16296,22 @@ mod identity_fence_contention_tests {
             "the CAS retried the contended fence: {} calls",
             starts.len()
         );
-        let read_at = reader.await.unwrap();
-        assert_read_ran_during_the_pause(read_at, starts[READ_AFTER_CALLS]);
+        let (read_waited, read_at) = reader.await.unwrap();
+        assert!(read_at < released_at, "the read ran while mob.db was held");
+        assert_eq!(
+            read_waited,
+            Duration::ZERO,
+            "the read ran at once, in the pause: the CAS released its lock for the pause"
+        );
         assert!(machine.contains_session(&session_id).await);
     }
 
     /// RED-4: the live-map publication (the second fence call) meets mob.db
     /// held. It retries until the holder releases and publishes; a read of
-    /// the machine's session map issued during a 40 ms pause runs in that
-    /// pause and sees nothing published yet.
-    #[tokio::test]
+    /// the machine's session map, issued when the fifth call returned, runs
+    /// at once, in the 40 ms pause that follows, and sees nothing published
+    /// yet. The clock is paused as for the lifecycle CAS above.
+    #[tokio::test(start_paused = true)]
     async fn a_registration_publication_waits_out_a_held_identity_fence_with_the_map_released() {
         // Call 1 is the CAS; the publication's attempts are calls 2, 3, ...,
         // and the pause after its fourth Backoff (call 5) is 40 ms.
@@ -16288,13 +16332,13 @@ mod identity_fence_contention_tests {
             .unwrap();
         // Every call slowed as on a loaded host: the hold must not depend on
         // how many calls fit in it.
-        let fence = HoldMobDbAt::with_call_delay(
+        let fence = HoldMobDbAt::until_call(
             adopted.runtime_fence(&observed),
             &adopted.path,
             2,
+            READ_AFTER_CALLS + 2,
             LOADED_CALL,
         );
-        let (ticks, ticker) = ticker();
         let reader = tokio::spawn({
             let machine = Arc::clone(&machine);
             let session_id = session_id.clone();
@@ -16304,24 +16348,18 @@ mod identity_fence_contention_tests {
                     .wait_for(|returned| *returned >= READ_AFTER_CALLS)
                     .await
                     .unwrap();
+                let issued = tokio::time::Instant::now();
                 let published = machine.contains_session(&session_id).await;
-                (published, Instant::now())
+                (published, issued.elapsed(), Instant::now())
             }
         });
 
-        let ticks_before = ticks.load(Ordering::SeqCst);
         let outcome = machine
             .register_session_if_runtime_lifecycle_current(observed, fence.clone())
             .await;
-        let ticked = ticks.load(Ordering::SeqCst) - ticks_before;
-        ticker.abort();
         assert!(
             matches!(outcome, RuntimeSessionRegistrationOutcome::Applied { .. }),
             "the publication rides out the held lock: {outcome:?}"
-        );
-        assert!(
-            ticked > 5,
-            "the runtime's only thread kept running other tasks: {ticked} ticks"
         );
         let released_at = fence.released_at();
         let operations = fence.operations();
@@ -16336,12 +16374,17 @@ mod identity_fence_contention_tests {
             "the publication retried the contended fence: {} calls",
             starts.len()
         );
-        let (published_during_wait, read_at) = reader.await.unwrap();
+        let (published_during_wait, read_waited, read_at) = reader.await.unwrap();
         assert!(
             !published_during_wait,
             "nothing is published before the fence admits the publication"
         );
-        assert_read_ran_during_the_pause(read_at, starts[READ_AFTER_CALLS]);
+        assert!(read_at < released_at, "the read ran while mob.db was held");
+        assert_eq!(
+            read_waited,
+            Duration::ZERO,
+            "the read ran at once, in the pause: the publication released the map for the pause"
+        );
         assert!(machine.contains_session(&session_id).await);
     }
 
