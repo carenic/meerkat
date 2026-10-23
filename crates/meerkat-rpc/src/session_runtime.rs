@@ -1094,6 +1094,16 @@ impl SessionService for RpcMobSessionService {
             .await
     }
 
+    async fn acknowledge_runtime_compaction_finalization(
+        &self,
+        id: &SessionId,
+        authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+    ) -> Result<(), SessionError> {
+        self.service
+            .acknowledge_runtime_compaction_finalization(id, authority)
+            .await
+    }
+
     async fn abort_uncommitted_compaction_projections(
         &self,
         id: &SessionId,

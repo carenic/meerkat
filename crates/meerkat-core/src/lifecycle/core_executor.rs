@@ -2053,6 +2053,30 @@ pub trait CoreExecutor: Send + Sync {
         ))
     }
 
+    /// Adopt the runtime's HeadCanonical compaction-outbox finalization on the
+    /// live actor.
+    ///
+    /// After a compacting run's boundary, the runtime finalizes the committed
+    /// compaction projection intents in a store-owned, metadata-only head
+    /// mutation (`authority` names the resulting committed head). The live
+    /// actor removed the same intents from its own session when it reconciled
+    /// them, so its HeadCanonical metadata baseline must adopt that commit;
+    /// otherwise its next boundary preparation names a predecessor the store
+    /// no longer holds and is refused. The runtime asks only for a
+    /// HeadCanonical store, after every intent finalized. Every store-backed
+    /// executor that reconciles committed compaction projections should
+    /// implement this hook. The default refuses, typed; the runtime logs a
+    /// refusal and carries on, leaving the unadopted actor to the store's
+    /// refusal of its next preparation and the resync that follows.
+    async fn acknowledge_compaction_finalization(
+        &mut self,
+        _authority: &CommittedSessionBoundaryAuthority,
+    ) -> Result<(), CoreExecutorError> {
+        Err(CoreExecutorError::Internal(
+            "executor cannot adopt a HeadCanonical compaction finalization".to_string(),
+        ))
+    }
+
     /// Reconcile and finalize semantic-memory compaction stages named by the
     /// exact RuntimeStore atomic outbox. The empty slice is authoritative: a
     /// durable implementation must use it to abort any invisible stage left by

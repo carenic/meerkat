@@ -3527,6 +3527,20 @@ pub trait SessionService: Send + Sync {
         }
     }
 
+    /// Adopt the runtime's HeadCanonical compaction-outbox finalization (a
+    /// store-owned, metadata-only head commit named by `authority`) as the
+    /// live actor's metadata baseline. Runtime-backed durable services
+    /// override this; others refuse it, typed.
+    async fn acknowledge_runtime_compaction_finalization(
+        &self,
+        _id: &SessionId,
+        _authority: &crate::lifecycle::core_executor::CommittedSessionBoundaryAuthority,
+    ) -> Result<(), SessionError> {
+        Err(SessionError::Unsupported(
+            "acknowledge_runtime_compaction_finalization".to_string(),
+        ))
+    }
+
     /// Abort a live compaction transaction after the runtime boundary was
     /// rejected and its authoritative outbox was observed empty.
     async fn abort_uncommitted_compaction_projections(

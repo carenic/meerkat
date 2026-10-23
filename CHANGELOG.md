@@ -1035,6 +1035,21 @@ them.
   advisory, so the warning is a hint: the build itself is unchanged. It also
   shows once for a profile the mob gained since the member's previous build.
 
+- `meerkat-core`: `CoreExecutor::acknowledge_compaction_finalization` and
+  `SessionService::acknowledge_runtime_compaction_finalization` adopt the
+  runtime's HeadCanonical compaction-outbox finalization (a store-owned,
+  metadata-only head commit) on the live actor, and
+  `Session::acknowledge_head_canonical_compaction_finalization` rebases the
+  actor's metadata baseline over the compaction intents key. Both trait
+  methods refuse by default; the store-backed executors and session services
+  implement them. `meerkat-session`:
+  `SessionAgent::acknowledge_head_canonical_compaction_finalization` (refusing
+  by default) and `PersistentSessionService::acknowledge_runtime_compaction_finalization`.
+  A `SessionService` wrapper or `CoreExecutor` that forwards the compaction
+  reconcile should forward the new method too: otherwise the runtime logs the
+  refusal, the live actor is not adopted, and its next checkpoint after such
+  a compaction is refused once and resyncs, as before.
+
 - `meerkat-mob`: `MobSessionService` gains `fork_source_tools`, the visible
   tool names a fork notice compares, read from the set the session task
   publishes at each command and turn boundary, so a source that is in the
@@ -1315,6 +1330,15 @@ them.
 
 ### Fixed
 
+- `meerkat-runtime`, `meerkat-session`: a live HeadCanonical session serves
+  its next turn after a compaction that staged memory. After a compacting
+  run's boundary, the runtime finalizes the compaction's projection intents
+  in a metadata-only head commit that the live actor never prepared, so the
+  actor's next checkpoint or boundary preparation (its next turn, or a live
+  context append) was refused with "prepared metadata transition does not
+  extend the observed head identity", until a resync on a later input. The
+  live actor now adopts that commit as its metadata baseline after every
+  finalization, after a run and in startup recovery.
 - RPC callback tools accept typed content blocks from SDK handlers, which
   released 0.9.3 and 0.9.4 rejected as non-string results. Mixed text and image
   results are preserved alongside legacy text and tool error flags.

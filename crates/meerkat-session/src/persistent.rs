@@ -13713,6 +13713,96 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         Ok(())
     }
 
+    /// Adopt the runtime's store-owned HeadCanonical compaction-outbox
+    /// finalization on the live actor.
+    ///
+    /// After a compacting run's boundary the runtime removes the finalized
+    /// compaction projection intents from the committed head in a
+    /// metadata-only mutation; `authority` names that committed head. The live
+    /// agent already removed the same intents from its own session
+    /// ([`Self::reconcile_runtime_compaction_projections`]), so its
+    /// HeadCanonical metadata baseline adopts the committed identity over
+    /// exactly that key (`Session::acknowledge_head_canonical_compaction_finalization`).
+    /// Without it, the actor's next boundary preparation names a predecessor
+    /// the store no longer holds and is refused. With no live actor there is
+    /// nothing to adopt: a later materialization reads the finalized head.
+    ///
+    /// The committed head is re-read and must still be the one `authority`
+    /// names. Any divergence is an error, which the runtime logs: the store
+    /// refuses the unadopted actor's next boundary preparation, and the turn
+    /// resyncs from durable state.
+    pub async fn acknowledge_runtime_compaction_finalization(
+        &self,
+        id: &SessionId,
+        authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+    ) -> Result<(), SessionError> {
+        let meerkat_core::CommittedSessionBoundaryAuthority::HeadCanonical {
+            session_id,
+            committed_head_token,
+        } = authority
+        else {
+            return Err(SessionError::Agent(AgentError::InternalError(format!(
+                "compaction finalization of session {id} named a non-HeadCanonical authority"
+            ))));
+        };
+        if session_id != id {
+            return Err(SessionError::Agent(AgentError::InternalError(format!(
+                "compaction finalization authority names session {session_id}, not {id}"
+            ))));
+        }
+        if self.runtime_store.session_persistence_profile()
+            != RuntimeSessionPersistenceProfile::HeadCanonicalV1
+        {
+            return Err(SessionError::Agent(AgentError::InternalError(format!(
+                "compaction finalization adoption for session {id} requires a HeadCanonical runtime store"
+            ))));
+        }
+        let loaded = self
+            .runtime_store
+            .load_session_boundary_authority(&Self::runtime_id_for_session(id))
+            .await
+            .map_err(|error| {
+                SessionError::Agent(AgentError::InternalError(format!(
+                    "failed to load the finalized compaction authority of session {id}: {error}"
+                )))
+            })?
+            .ok_or_else(|| {
+                SessionError::Agent(AgentError::InternalError(format!(
+                    "the finalized compaction authority of session {id} disappeared"
+                )))
+            })?;
+        let committed = loaded.head_canonical().ok_or_else(|| {
+            SessionError::Agent(AgentError::InternalError(format!(
+                "compaction finalization of session {id} loaded a WholeBlob authority"
+            )))
+        })?;
+        if committed.session_id() != id || committed.committed_head_token() != committed_head_token
+        {
+            return Err(SessionError::Agent(AgentError::InternalError(format!(
+                "the committed head of session {id} moved after its compaction finalization"
+            ))));
+        }
+        let committed_metadata_identity = committed
+            .boundary_head()
+            .metadata_identity()
+            .cloned()
+            .ok_or_else(|| {
+                SessionError::Agent(AgentError::InternalError(format!(
+                    "the compaction-finalized head of session {id} carries no metadata identity"
+                )))
+            })?;
+        match self
+            .inner
+            .acknowledge_head_canonical_compaction_finalization(id, committed_metadata_identity)
+            .await
+        {
+            Ok(()) | Err(SessionError::NotFound { .. }) => Ok(()),
+            Err(error) => Err(SessionError::Agent(AgentError::InternalError(format!(
+                "the live actor of session {id} could not adopt its compaction finalization: {error}; live actor reload required"
+            )))),
+        }
+    }
+
     /// Abort the live invisible compaction stage after a rejected runtime
     /// atomic boundary with an authoritatively empty outbox.
     pub async fn abort_uncommitted_compaction_projections(
@@ -15429,6 +15519,15 @@ impl<B: SessionAgentBuilder + 'static> SessionService for PersistentSessionServi
         intents: Vec<meerkat_core::CompactionProjectionIntent>,
     ) -> Result<(), SessionError> {
         PersistentSessionService::reconcile_runtime_compaction_projections(self, id, intents).await
+    }
+
+    async fn acknowledge_runtime_compaction_finalization(
+        &self,
+        id: &SessionId,
+        authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+    ) -> Result<(), SessionError> {
+        PersistentSessionService::acknowledge_runtime_compaction_finalization(self, id, authority)
+            .await
     }
 
     async fn abort_uncommitted_compaction_projections(
