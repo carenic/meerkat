@@ -354,7 +354,7 @@ call without its result, and holds the tail rather than guess what happened
 The same answer can come from a tail this command does not resolve, for
 example one whose input rows cannot be attributed to its run; for those,
 the command answers `held_otherwise` with the reason. Since 0.9.5 an
-operator can resolve such a hold:
+operator can resolve a hold over ambiguous evidence:
 
 1. Stop every host of the session. The repair is refused while the
    session's persisted runtime state shows it in use (for example attached
@@ -391,9 +391,12 @@ owns: name that runtime database with `--runtime-store`, or, for a realm
 kept in a host's own database, use the library call below. It refuses a
 missing database, or one with another schema version than the `rkat`
 binary's, without creating or migrating anything. Without `--apply` it
-writes nothing: it checks the database read-only before it opens it, and
-refuses one whose switch to another storage profile is still in progress
-instead of completing it. `--json` prints the report as one JSON object.
+writes nothing to the session: it checks the database read-only before it
+opens it, and refuses one whose switch to another storage profile is still
+in progress instead of completing it. As for `repair-wholeblob`, the only
+writes an open can make are SQLite's own: the `.mfence` lock sibling, the
+WAL sidecars, and the journal-mode conversion to WAL for a database not
+already in WAL mode. `--json` prints the report as one JSON object.
 
 Applied, the repair commits the held tail as interrupted, through the same
 recovery commit as a crash:
@@ -434,11 +437,12 @@ their results. The results after the tail's last assistant message are
 paired with its calls by position, since providers repeat call ids across
 responses; when that pairing does not leave exactly the calls the
 transcript shows without a result, the command answers with an error too.
-An answer this version of `rkat` does not know also exits with an error. With `--json`, an answer that fails the command
-(`held_otherwise`, `refused`, or an unknown answer) still prints its report
-to standard output, and the error's message goes to standard error. An
-error before any answer (the store cannot be opened, or the evidence cannot
-be verified) prints only the error.
+An answer this version of `rkat` does not know also exits with an error.
+With `--json`, an answer that fails the command (`held_otherwise`,
+`refused`, or an unknown answer) still prints its report to standard
+output, and the error's message goes to standard error. An error before any
+answer (the store cannot be opened, or the evidence cannot be verified)
+prints only the error.
 
 Only this hold has an operator path. A session answering
 `SESSION_DURABLE_EVIDENCE_QUARANTINED` stays quarantined;
