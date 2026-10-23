@@ -285,6 +285,12 @@ them.
   stream that ends inside a line before its finish is still an incomplete
   response, also when it ends inside a character.
 
+- The TypeScript SDK decodes a child process's stderr as one stream, so a
+  character that a pipe read split stays intact in the stderr that a
+  `PROCESS_EXITED` or `ARCHIVE_EXTRACT_FAILED` error carries (it became
+  U+FFFD), and the stderr tail of a `PROCESS_EXITED` error never starts with
+  half of a surrogate pair.
+
 - A graceful mob Shutdown releases a member's identity reconcile lease once
   it has unregistered the member's runtime and the member's session actor has
   exited, so the next incarnation takes that identity at once. Before, every
