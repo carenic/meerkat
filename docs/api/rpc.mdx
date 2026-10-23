@@ -1516,6 +1516,67 @@ Queue a runtime-backed external event for an existing session.
 ```
 </CodeGroup>
 
+An optional `idempotency_key` makes the call safe to retry. A retry under the
+same key admits nothing new: it answers `outcome_type` `deduplicated` and
+names the first admission in `existing_id`. The same key with other event
+content is refused with `-32602` and `data.code` `INPUT_IDEMPOTENCY_CONFLICT`,
+naming the first admission in `data.existing_id`; the first admission stands.
+The key is scoped to the session and kept for the session's life, across
+restarts. Object key order inside `payload` does not matter. The key is
+canonical text: non-empty, no surrounding whitespace, no control characters,
+at most 256 bytes; any other key is refused with `-32602`. A server older than
+contract 0.9.5 ignores the field and admits the call unkeyed, so a raw JSON
+caller checks the `contract_version` from `initialize` before relying on it.
+
+### mob/member_send keys
+
+`mob/member_send` takes the same optional `idempotency_key`, deduplicated for
+the member identity: it survives a respawn. A keyed send is committed as a
+member continuation and the result carries `continuation`, a receipt and a
+delivery status, not a turn:
+
+```json
+{
+  "mob_id": "mob-1",
+  "agent_identity": "worker-1",
+  "member_ref": "...",
+  "handling_mode": "queue",
+  "continuation": {
+    "delivery_id": "continuation:...",
+    "committed_at_ms": 1792000000000,
+    "status": { "state": "admitted", "session_id": "...", "input_id": "..." }
+  }
+}
+```
+
+- A replay of the key repeats `delivery_id` and `committed_at_ms`; `status`
+  may advance.
+- Keys never expire. A key stays bound for the member identity across
+  respawns and across a re-creation of the mob under the same id (after a
+  destroy or a crash stop): its replay answers the first delivery and its
+  status, `stranded` when the incarnation it was bound to never admitted it.
+  Send new content under a new key.
+- `pending`: committed, not admitted yet. A `pending` that survives a server
+  restart is not proof of loss; do not resend it under a new key.
+- `admitted`: queued in `session_id` as `input_id`, not proof that a turn ran.
+  Follow it with `session/input_status`.
+- `stranded`: committed and never admitted, because the member incarnation it
+  was bound to was replaced. This is final: resend the content under a new key.
+- `refused`: settled as refused, never admitted; `reason` names why.
+
+Other content under a used key is refused with `-32602` and `data.kind`
+`input_idempotency_conflict`, naming the first delivery in `data.delivery_id`.
+A keyed send differs from an unkeyed one: the member's delivery owner admits
+it with system origin, it is ordered only among keyed sends, `render_metadata`
+is refused with a key (`-32602`), and a host without a continuation service or
+a governed runtime refuses it with `-32020` and `data.kind`
+`idempotency_unavailable` (`data.cause` `no_continuation_service` or
+`governed_runtime`). A first keyed send to a member without a session binding
+is refused with `-32020` before anything is committed. A status read that
+cannot be made now answers `-32032` (`data.kind`
+`continuation_status_unavailable`): the commit stands, retry the same key.
+`-32603` with `data.kind` `continuation_status_inconsistent` is not retryable.
+
 ### session/peer_response_terminal
 
 Admit a correlated terminal peer response through the typed runtime ingress.
@@ -3266,7 +3327,7 @@ and `data`, never on the message text.
 | -32700 | Parse error | Invalid JSON |
 | -32600 | Invalid request | Not a valid JSON-RPC request, or a request the target's current state does not admit (for example a `turn/start` on a retired runtime) |
 | -32601 | Method not found | Unknown method |
-| -32602 | Invalid params | Missing or invalid parameters. An input idempotency conflict names the input the key is bound to in `data.existing_id` |
+| -32602 | Invalid params | Missing or invalid parameters. An input idempotency conflict has `data.code` `INPUT_IDEMPOTENCY_CONFLICT` and names the input the key is bound to in `data.existing_id`; a keyed `mob/member_send` conflict has `data.kind` `input_idempotency_conflict` and `data.delivery_id` |
 | -32603 | Internal error | Server error |
 | -32001 | Session not found | Session ID does not exist |
 | -32002 | Session busy | The session cannot take this request now, for example a `turn/interrupt` while a deferred session is being materialized, a session hosted by another process, or a runtime teardown still in progress. A `turn/start` on a session with a running turn is queued, not refused. Also a refused `mob/claim_callback_route`, with `data` `{"mob_id", "reason"}`: `claim_token_mismatch` (the token is not the mob's), `not_claimable` (the mob has no claim token), or `held_by_open_connection` (another open connection holds the mob's callback route; once that connection closes, the first claim presenting the token wins) |

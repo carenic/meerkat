@@ -18123,4 +18123,804 @@ provider_params = { provider_tag = { provider = "anthropic", cache_control = "di
         );
         assert_eq!(forked["message_count"], 2);
     }
+
+    /// the optional caller idempotency key on `session/external_event`
+    /// and `mob/member_send`. Every row drives the wire (JSON params), so it
+    /// compiles against a contract that has no such field yet.
+    mod caller_idempotency_key {
+        use super::*;
+
+        #[cfg(feature = "mob")]
+        const STATUS_WAIT: Duration = Duration::from_secs(60);
+
+        /// A router over in-memory stores. With `realm`, construction arms
+        /// the runtime's delivery owner, so committed continuations drain;
+        /// without it nothing drains them until the test arms the owner.
+        async fn keyed_router(
+            realm: bool,
+        ) -> (MethodRouter, Arc<SessionRuntime>, tempfile::TempDir) {
+            let temp = tempfile::tempdir().unwrap();
+            let factory = AgentFactory::new(temp.path().join("sessions"));
+            let config = anthropic_test_config();
+            let store: Arc<dyn meerkat::SessionStore> = Arc::new(meerkat::MemoryStore::new());
+            let runtime = SessionRuntime::new(
+                factory,
+                config.clone(),
+                10,
+                runtime_backed_persistence(store),
+                NotificationSink::noop(),
+            )
+            .expect("compose the RPC session runtime");
+            runtime.set_default_llm_client(Some(Arc::new(MockLlmClient::anthropic())));
+            let config_store: Arc<dyn ConfigStore> =
+                Arc::new(MemoryConfigStore::new(config, meerkat_models::canonical()));
+            runtime.set_config_runtime(Arc::new(ConfigRuntime::new(
+                Arc::clone(&config_store),
+                temp.path().join("config_state.json"),
+            )));
+            if realm {
+                runtime.set_realm_context(
+                    Some(meerkat_core::connection::RealmId::global()),
+                    None,
+                    None,
+                );
+            }
+            let runtime = Arc::new(runtime);
+            let router =
+                MethodRouter::new(Arc::clone(&runtime), config_store, NotificationSink::noop())
+                    .expect("construct runtime authority");
+            (router, runtime, temp)
+        }
+
+        async fn create_session(router: &MethodRouter) -> String {
+            let resp = router
+                .dispatch(make_request(
+                    "session/create",
+                    serde_json::json!({ "prompt": "Hello" }),
+                ))
+                .await
+                .unwrap();
+            result_value(&resp)["session_id"]
+                .as_str()
+                .expect("session id")
+                .to_string()
+        }
+
+        fn external_event_params(
+            session_id: &str,
+            key: Option<&str>,
+            payload: serde_json::Value,
+        ) -> serde_json::Value {
+            let mut params = serde_json::json!({
+                "session_id": session_id,
+                "kind": "generic_json",
+                "event_type": "inbox.item",
+                "payload": payload,
+            });
+            if let Some(key) = key {
+                params["idempotency_key"] = serde_json::json!(key);
+            }
+            params
+        }
+
+        async fn external_event(
+            router: &MethodRouter,
+            session_id: &str,
+            key: Option<&str>,
+            payload: serde_json::Value,
+        ) -> RpcResponse {
+            router
+                .dispatch(make_request(
+                    "session/external_event",
+                    external_event_params(session_id, key, payload),
+                ))
+                .await
+                .unwrap()
+        }
+
+        fn error_data(resp: &RpcResponse) -> serde_json::Value {
+            resp.error
+                .as_ref()
+                .unwrap_or_else(|| panic!("expected an error response, got {resp:?}"))
+                .data
+                .clone()
+                .unwrap_or(serde_json::Value::Null)
+        }
+
+        /// the same key with the same payload names the first admission
+        /// and admits nothing new.
+        #[tokio::test]
+        async fn external_event_same_key_same_payload_returns_the_first_admission() {
+            use meerkat_runtime::SessionServiceRuntimeExt as _;
+            let (router, runtime, _temp) = keyed_router(false).await;
+            let session_id = create_session(&router).await;
+            let payload = serde_json::json!({ "item": "msg-1", "body": "hello" });
+            let first = result_value(
+                &external_event(&router, &session_id, Some("inbox:msg-1"), payload.clone()).await,
+            );
+            assert_eq!(first["outcome_type"], "accepted", "{first}");
+            let first_id = first["input_id"]
+                .as_str()
+                .expect("first input id")
+                .to_string();
+            let replay = result_value(
+                &external_event(&router, &session_id, Some("inbox:msg-1"), payload).await,
+            );
+            assert_eq!(
+                replay["outcome_type"], "deduplicated",
+                "a retry under the same key admits nothing new: {replay}"
+            );
+            assert_eq!(
+                replay["existing_id"].as_str(),
+                Some(first_id.as_str()),
+                "the retry names the first admission: {replay}"
+            );
+            // Indexed in the caller namespace the REST surface shares.
+            let parsed = meerkat_core::SessionId::parse(&session_id).expect("session id");
+            let row = runtime
+                .runtime_adapter()
+                .input_state_by_idempotency_key(&parsed, "caller:inbox:msg-1")
+                .await
+                .expect("lookup")
+                .expect("the admission holds caller:<key>");
+            assert_eq!(row.state.input_id.to_string(), first_id);
+        }
+
+        /// the same key with another payload is the typed
+        /// INPUT_IDEMPOTENCY_CONFLICT naming the first admission, and the
+        /// first admission stands.
+        #[tokio::test]
+        async fn external_event_same_key_other_payload_is_input_idempotency_conflict() {
+            let (router, _runtime, _temp) = keyed_router(false).await;
+            let session_id = create_session(&router).await;
+            let first = result_value(
+                &external_event(
+                    &router,
+                    &session_id,
+                    Some("inbox:msg-2"),
+                    serde_json::json!({ "body": "original" }),
+                )
+                .await,
+            );
+            assert_eq!(first["outcome_type"], "accepted", "{first}");
+            let first_id = first["input_id"]
+                .as_str()
+                .expect("first input id")
+                .to_string();
+
+            let conflict = external_event(
+                &router,
+                &session_id,
+                Some("inbox:msg-2"),
+                serde_json::json!({ "body": "changed" }),
+            )
+            .await;
+            assert_eq!(
+                conflict.error.as_ref().map(|error| error.code),
+                Some(crate::error::INVALID_PARAMS),
+                "a changed payload under a used key is refused: {conflict:?}"
+            );
+            let data = error_data(&conflict);
+            assert_eq!(data["code"], "INPUT_IDEMPOTENCY_CONFLICT", "{data}");
+            assert_eq!(
+                data["existing_id"].as_str(),
+                Some(first_id.as_str()),
+                "{data}"
+            );
+
+            let replay = result_value(
+                &external_event(
+                    &router,
+                    &session_id,
+                    Some("inbox:msg-2"),
+                    serde_json::json!({ "body": "original" }),
+                )
+                .await,
+            );
+            assert_eq!(replay["outcome_type"], "deduplicated", "{replay}");
+            assert_eq!(replay["existing_id"].as_str(), Some(first_id.as_str()));
+        }
+
+        /// the key outlives the input: after the event was consumed by a
+        /// turn, a retry still names the first admission.
+        #[tokio::test]
+        async fn external_event_key_replays_after_the_input_completed() {
+            let (router, _runtime, _temp) = keyed_router(false).await;
+            let session_id = create_session(&router).await;
+            let payload = serde_json::json!({ "body": "consumed by the next turn" });
+            let first = result_value(
+                &external_event(&router, &session_id, Some("inbox:msg-3"), payload.clone()).await,
+            );
+            assert_eq!(first["outcome_type"], "accepted", "{first}");
+            let first_id = first["input_id"]
+                .as_str()
+                .expect("first input id")
+                .to_string();
+
+            let turn = router
+                .dispatch(make_request(
+                    "turn/start",
+                    serde_json::json!({ "session_id": session_id, "prompt": "continue" }),
+                ))
+                .await
+                .unwrap();
+            assert!(turn.error.is_none(), "the next turn runs: {turn:?}");
+
+            let replay = result_value(
+                &external_event(&router, &session_id, Some("inbox:msg-3"), payload).await,
+            );
+            assert_eq!(
+                replay["outcome_type"], "deduplicated",
+                "the key is not released when its input completes: {replay}"
+            );
+            assert_eq!(replay["existing_id"].as_str(), Some(first_id.as_str()));
+        }
+
+        /// Guard (a single key space for all sessions would fail it): the key is
+        /// scoped to its session.
+        #[tokio::test]
+        async fn external_event_key_is_scoped_to_one_session() {
+            let (router, _runtime, _temp) = keyed_router(false).await;
+            let first_session = create_session(&router).await;
+            let second_session = create_session(&router).await;
+            let payload = serde_json::json!({ "body": "same key, two sessions" });
+            for session_id in [&first_session, &second_session] {
+                let admitted = result_value(
+                    &external_event(&router, session_id, Some("inbox:shared"), payload.clone())
+                        .await,
+                );
+                assert_eq!(
+                    admitted["outcome_type"], "accepted",
+                    "each session admits its own keyed event: {admitted}"
+                );
+            }
+        }
+
+        /// an invalid key is refused before
+        /// anything is admitted, by the one canonical-key rule.
+        #[tokio::test]
+        async fn external_event_invalid_key_is_refused_before_admission() {
+            let (router, _runtime, _temp) = keyed_router(false).await;
+            let session_id = create_session(&router).await;
+            let too_long = "k".repeat(257);
+            for key in ["", " padded", "bell\u{7}", too_long.as_str()] {
+                let refused = external_event(
+                    &router,
+                    &session_id,
+                    Some(key),
+                    serde_json::json!({ "body": "never admitted" }),
+                )
+                .await;
+                let error = refused
+                    .error
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("key {key:?} must be refused: {refused:?}"));
+                assert_eq!(error.code, crate::error::INVALID_PARAMS, "{error:?}");
+                assert!(
+                    error.message.contains("idempotency_key must be canonical"),
+                    "the one canonical-key rule refuses it: {error:?}"
+                );
+            }
+            let admitted = result_value(
+                &external_event(
+                    &router,
+                    &session_id,
+                    Some("inbox:valid"),
+                    serde_json::json!({ "body": "admitted" }),
+                )
+                .await,
+            );
+            assert_eq!(admitted["outcome_type"], "accepted", "{admitted}");
+        }
+
+        /// payload equality is the event identity's: object key order
+        /// is not content (serde_json without preserve_order sorts maps), so
+        /// a retry whose payload keys arrive reordered replays.
+        #[tokio::test]
+        async fn external_event_reordered_payload_keys_replay() {
+            let (router, _runtime, _temp) = keyed_router(false).await;
+            let session_id = create_session(&router).await;
+            let raw_request = |payload_json: &str| {
+                RpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: Some(RpcId::Num(1)),
+                method: "session/external_event".to_string(),
+                params: Some(
+                    RawValue::from_string(format!(
+                        r#"{{"session_id":"{session_id}","kind":"generic_json","event_type":"inbox.item","idempotency_key":"inbox:order","payload":{payload_json}}}"#
+                    ))
+                    .unwrap(),
+                ),
+            }
+            };
+            let first = result_value(
+                &router
+                    .dispatch(raw_request(r#"{"a":1,"b":{"c":2,"d":[3,4]}}"#))
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(first["outcome_type"], "accepted", "{first}");
+            let replay = result_value(
+                &router
+                    .dispatch(raw_request(r#"{"b":{"d":[3,4],"c":2},"a":1}"#))
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(
+                replay["outcome_type"], "deduplicated",
+                "reordered object keys are the same payload: {replay}"
+            );
+            assert_eq!(replay["existing_id"], first["input_id"]);
+        }
+
+        #[cfg(feature = "mob")]
+        async fn create_mob_with_worker(router: &MethodRouter, mob: &str) -> String {
+            let create_resp = router
+                .dispatch(make_request(
+                    "mob/create",
+                    serde_json::json!({
+                        "definition": {
+                            "id": mob,
+                            "profiles": {
+                                "worker": {
+                                    "model": "claude-sonnet-4-5",
+                                    "external_addressable": true,
+                                    "tools": { "comms": true }
+                                }
+                            }
+                        }
+                    }),
+                ))
+                .await
+                .unwrap();
+            let mob_id = result_value(&create_resp)["mob_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let spawn_resp = router
+                .dispatch(make_request(
+                    "mob/spawn",
+                    serde_json::json!({
+                        "mob_id": mob_id,
+                        "profile": "worker",
+                        "agent_identity": "worker-1",
+                        "runtime_mode": "turn_driven"
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(result_value(&spawn_resp)["agent_identity"], "worker-1");
+            mob_id
+        }
+
+        #[cfg(feature = "mob")]
+        async fn member_send(
+            router: &MethodRouter,
+            mob_id: &str,
+            content: &str,
+            key: Option<&str>,
+        ) -> RpcResponse {
+            let mut params = serde_json::json!({
+                "mob_id": mob_id,
+                "agent_identity": "worker-1",
+                "content": content,
+            });
+            if let Some(key) = key {
+                params["idempotency_key"] = serde_json::json!(key);
+            }
+            router
+                .dispatch(make_request("mob/member_send", params))
+                .await
+                .unwrap()
+        }
+
+        #[cfg(feature = "mob")]
+        fn delivery(sent: &serde_json::Value) -> (String, u64, String) {
+            let continuation = &sent["continuation"];
+            (
+                continuation["delivery_id"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("a keyed send answers its receipt: {sent}"))
+                    .to_string(),
+                continuation["committed_at_ms"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("a keyed send answers its commit time: {sent}")),
+                continuation["status"]["state"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("a keyed send answers its status: {sent}"))
+                    .to_string(),
+            )
+        }
+
+        /// Replay `key` until its status is `admitted`, returning that answer.
+        #[cfg(feature = "mob")]
+        async fn replay_until_admitted(
+            router: &MethodRouter,
+            mob_id: &str,
+            content: &str,
+            key: &str,
+        ) -> serde_json::Value {
+            tokio::time::timeout(STATUS_WAIT, async {
+                loop {
+                    let replay =
+                        result_value(&member_send(router, mob_id, content, Some(key)).await);
+                    if replay["continuation"]["status"]["state"] == "admitted" {
+                        return replay;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("the keyed send is admitted")
+        }
+
+        /// the first answer is a receipt with a pending or admitted
+        /// status; on replay delivery_id and committed_at_ms are identical,
+        /// the status may advance, and nothing new is admitted.
+        #[cfg(feature = "mob")]
+        #[tokio::test]
+        async fn member_send_same_key_same_content_returns_the_first_receipt() {
+            let (router, _runtime, _temp) = keyed_router(true).await;
+            let mob_id = create_mob_with_worker(&router, "mob-keyed-send").await;
+            let content = "Ingest item 7.";
+            let first = result_value(&member_send(&router, &mob_id, content, Some("item-7")).await);
+            let (delivery_id, committed_at_ms, state) = delivery(&first);
+            assert!(
+                state == "pending" || state == "admitted",
+                "the first answer reports pending or admitted: {first}"
+            );
+            let admitted = replay_until_admitted(&router, &mob_id, content, "item-7").await;
+            let (replayed_id, replayed_at, _) = delivery(&admitted);
+            assert_eq!(
+                replayed_id, delivery_id,
+                "a replay names the first delivery"
+            );
+            assert_eq!(
+                replayed_at, committed_at_ms,
+                "a replay keeps the first commit time"
+            );
+            let input_id = admitted["continuation"]["status"]["input_id"].clone();
+            assert!(input_id.is_string(), "admitted names its input: {admitted}");
+            let session_id = admitted["continuation"]["status"]["session_id"].clone();
+            assert!(
+                session_id.is_string(),
+                "admitted names its session: {admitted}"
+            );
+            let again = result_value(&member_send(&router, &mob_id, content, Some("item-7")).await);
+            assert_eq!(
+                again["continuation"]["status"]["input_id"], input_id,
+                "one admission, however often the key is replayed: {again}"
+            );
+            // Admitted means queued in that session's ledger; the host
+            // follows it with session/input_status.
+            let followed = result_value(
+                &router
+                    .dispatch(make_request(
+                        "session/input_status",
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "selector": { "by": "input_id", "value": input_id },
+                        }),
+                    ))
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(
+                followed["state"]["input_id"], input_id,
+                "the admitted pair names a row session/input_status reads: {followed}"
+            );
+        }
+
+        /// the first answer reports pending or admitted, and an admitted
+        /// answer names its session and input.
+        #[cfg(feature = "mob")]
+        #[tokio::test]
+        async fn member_send_first_answer_reports_pending_or_admitted() {
+            let (router, _runtime, _temp) = keyed_router(true).await;
+            let mob_id = create_mob_with_worker(&router, "mob-keyed-first").await;
+            let first = result_value(
+                &member_send(&router, &mob_id, "Ingest item 6.", Some("item-6")).await,
+            );
+            let (_, _, state) = delivery(&first);
+            match state.as_str() {
+                "pending" => {}
+                "admitted" => {
+                    let status = &first["continuation"]["status"];
+                    assert!(status["session_id"].is_string(), "{first}");
+                    assert!(status["input_id"].is_string(), "{first}");
+                }
+                other => panic!("the first answer is pending or admitted, got {other}: {first}"),
+            }
+        }
+
+        /// other content under a used key is the typed conflict, naming
+        /// the first delivery.
+        #[cfg(feature = "mob")]
+        #[tokio::test]
+        async fn member_send_same_key_other_content_is_input_idempotency_conflict() {
+            let (router, _runtime, _temp) = keyed_router(true).await;
+            let mob_id = create_mob_with_worker(&router, "mob-keyed-conflict").await;
+            let first =
+                result_value(&member_send(&router, &mob_id, "original", Some("item-8")).await);
+            let (delivery_id, _, _) = delivery(&first);
+            let conflict = member_send(&router, &mob_id, "changed", Some("item-8")).await;
+            assert_eq!(
+                conflict.error.as_ref().map(|error| error.code),
+                Some(crate::error::INVALID_PARAMS),
+                "{conflict:?}"
+            );
+            let data = error_data(&conflict);
+            assert_eq!(data["kind"], "input_idempotency_conflict", "{data}");
+            assert_eq!(
+                data["delivery_id"].as_str(),
+                Some(delivery_id.as_str()),
+                "{data}"
+            );
+        }
+
+        /// a respawn does not reopen the key: the replay names the first
+        /// delivery and its admission, and nothing new is committed.
+        #[cfg(feature = "mob")]
+        #[tokio::test]
+        async fn member_send_key_survives_a_member_respawn() {
+            let (router, _runtime, _temp) = keyed_router(true).await;
+            let mob_id = create_mob_with_worker(&router, "mob-keyed-respawn").await;
+            let content = "Ingest item 9.";
+            let first = result_value(&member_send(&router, &mob_id, content, Some("item-9")).await);
+            let (delivery_id, committed_at_ms, _) = delivery(&first);
+            let admitted = replay_until_admitted(&router, &mob_id, content, "item-9").await;
+            let input_id = admitted["continuation"]["status"]["input_id"].clone();
+
+            let respawn = router
+                .dispatch(make_request(
+                    "mob/respawn",
+                    serde_json::json!({ "mob_id": mob_id, "agent_identity": "worker-1" }),
+                ))
+                .await
+                .unwrap();
+            assert!(respawn.error.is_none(), "respawn: {respawn:?}");
+
+            let replay =
+                result_value(&member_send(&router, &mob_id, content, Some("item-9")).await);
+            let (replayed_id, replayed_at, state) = delivery(&replay);
+            assert_eq!(replayed_id, delivery_id);
+            assert_eq!(replayed_at, committed_at_ms);
+            assert_eq!(state, "admitted", "the first admission stands: {replay}");
+            assert_eq!(replay["continuation"]["status"]["input_id"], input_id);
+        }
+
+        /// a keyed send committed but not drained when its incarnation
+        /// is replaced answers `stranded`, typed, on every replay; the same
+        /// content under a new key is then delivered once to the new
+        /// incarnation.
+        #[cfg(feature = "mob")]
+        #[tokio::test]
+        async fn member_send_key_stranded_by_a_respawn_answers_stranded_then_a_new_key_delivers_once()
+         {
+            let (router, runtime, _temp) = keyed_router(false).await;
+            let mob_id = create_mob_with_worker(&router, "mob-keyed-strand").await;
+            let content = "Ingest item 10.";
+            let first =
+                result_value(&member_send(&router, &mob_id, content, Some("item-10")).await);
+            let (delivery_id, _, state) = delivery(&first);
+            assert_eq!(state, "pending", "no delivery owner drains it yet: {first}");
+
+            let respawn = router
+                .dispatch(make_request(
+                    "mob/respawn",
+                    serde_json::json!({ "mob_id": mob_id, "agent_identity": "worker-1" }),
+                ))
+                .await
+                .unwrap();
+            assert!(respawn.error.is_none(), "respawn: {respawn:?}");
+
+            let stranded =
+                result_value(&member_send(&router, &mob_id, content, Some("item-10")).await);
+            let (stranded_id, _, state) = delivery(&stranded);
+            assert_eq!(stranded_id, delivery_id);
+            assert_eq!(
+                state, "stranded",
+                "never admitted, incarnation replaced: {stranded}"
+            );
+
+            runtime.set_realm_context(
+                Some(meerkat_core::connection::RealmId::global()),
+                None,
+                None,
+            );
+            runtime.arm_runtime_delivery_owner();
+            let resent =
+                result_value(&member_send(&router, &mob_id, content, Some("item-10b")).await);
+            let (resent_id, _, _) = delivery(&resent);
+            assert_ne!(resent_id, delivery_id, "a new key is a new delivery");
+            replay_until_admitted(&router, &mob_id, content, "item-10b").await;
+            let still =
+                result_value(&member_send(&router, &mob_id, content, Some("item-10")).await);
+            assert_eq!(
+                still["continuation"]["status"]["state"], "stranded",
+                "a stranded delivery stays stranded: {still}"
+            );
+        }
+
+        /// The drain's restart path: a keyed send committed while no
+        /// delivery owner runs is admitted exactly once by the owner that
+        /// arms later; replays name that one admission.
+        #[cfg(feature = "mob")]
+        #[tokio::test]
+        async fn member_send_key_committed_before_the_drain_is_admitted_once_when_an_owner_arms() {
+            let (router, runtime, _temp) = keyed_router(false).await;
+            let mob_id = create_mob_with_worker(&router, "mob-keyed-arm").await;
+            let content = "Ingest item 11.";
+            let first =
+                result_value(&member_send(&router, &mob_id, content, Some("item-11")).await);
+            let (delivery_id, committed_at_ms, state) = delivery(&first);
+            assert_eq!(state, "pending", "{first}");
+            runtime.set_realm_context(
+                Some(meerkat_core::connection::RealmId::global()),
+                None,
+                None,
+            );
+            runtime.arm_runtime_delivery_owner();
+            let admitted = replay_until_admitted(&router, &mob_id, content, "item-11").await;
+            let (replayed_id, replayed_at, _) = delivery(&admitted);
+            assert_eq!(replayed_id, delivery_id);
+            assert_eq!(replayed_at, committed_at_ms);
+            let input_id = admitted["continuation"]["status"]["input_id"].clone();
+            let again =
+                result_value(&member_send(&router, &mob_id, content, Some("item-11")).await);
+            assert_eq!(again["continuation"]["status"]["input_id"], input_id);
+        }
+
+        /// render_metadata has no slot on the keyed door and is refused
+        /// with a key, before anything commits.
+        #[cfg(feature = "mob")]
+        #[tokio::test]
+        async fn member_send_key_with_render_metadata_is_refused() {
+            let (router, _runtime, _temp) = keyed_router(true).await;
+            let mob_id = create_mob_with_worker(&router, "mob-keyed-render").await;
+            let refused = router
+                .dispatch(make_request(
+                    "mob/member_send",
+                    serde_json::json!({
+                        "mob_id": mob_id,
+                        "agent_identity": "worker-1",
+                        "content": "styled",
+                        "render_metadata": { "class": "system_notice" },
+                        "idempotency_key": "item-12",
+                    }),
+                ))
+                .await
+                .unwrap();
+            let error = refused.error.as_ref().expect("refused");
+            assert_eq!(error.code, crate::error::INVALID_PARAMS, "{error:?}");
+            assert!(
+                error
+                    .message
+                    .contains("render_metadata does not combine with idempotency_key"),
+                "{error:?}"
+            );
+            // The refused call committed nothing: the key is still free.
+            let accepted =
+                result_value(&member_send(&router, &mob_id, "styled", Some("item-12")).await);
+            assert!(
+                accepted["continuation"]["delivery_id"].is_string(),
+                "the key commits its first delivery now: {accepted}"
+            );
+        }
+
+        /// Without the caller namespace this row would fail: a caller key never
+        /// meets another continuation producer's key for the same member.
+        #[cfg(feature = "mob")]
+        #[tokio::test]
+        async fn member_send_caller_key_never_meets_a_host_continuation_key() {
+            let (router, _runtime, _temp) = keyed_router(true).await;
+            let mob_id = create_mob_with_worker(&router, "mob-keyed-namespace").await;
+            let service = router
+                .mob_state
+                .continuation_service()
+                .expect("the RPC mob state binds its continuation service");
+            let owner = meerkat::ContinuationOwner::Member {
+                mob_id: mob_id.clone(),
+                identity: "worker-1".to_string(),
+            };
+            service
+                .submit(
+                    &owner,
+                    meerkat::ContinuationDelivery {
+                        key: meerkat::ContinuationKey::new("shared-key").expect("key"),
+                        result: meerkat::ContinuationResultRef {
+                            producer: meerkat::ContinuationProducer::Host {
+                                namespace: "tasks".into(),
+                            },
+                            producer_id: "op-1".into(),
+                            result_digest: "sha256:result".into(),
+                            summary: None,
+                        },
+                        body: "a host result".into(),
+                        handling: meerkat::ContinuationHandling::Queue,
+                    },
+                    1,
+                )
+                .await
+                .expect("a host continuation commits");
+            let sent = result_value(
+                &member_send(&router, &mob_id, "caller content", Some("shared-key")).await,
+            );
+            assert!(
+                sent["continuation"]["delivery_id"].is_string(),
+                "the caller key commits its own delivery: {sent}"
+            );
+        }
+
+        /// an invalid key is refused by the one rule.
+        #[cfg(feature = "mob")]
+        #[tokio::test]
+        async fn member_send_invalid_key_is_refused_before_commit() {
+            let (router, _runtime, _temp) = keyed_router(true).await;
+            let mob_id = create_mob_with_worker(&router, "mob-keyed-invalid").await;
+            let too_long = "k".repeat(257);
+            for key in ["", " padded", "bell\u{7}", too_long.as_str()] {
+                let refused = member_send(&router, &mob_id, "never committed", Some(key)).await;
+                let error = refused
+                    .error
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("key {key:?} must be refused: {refused:?}"));
+                assert_eq!(error.code, crate::error::INVALID_PARAMS, "{error:?}");
+                assert!(
+                    error.message.contains("idempotency_key must be canonical"),
+                    "the one canonical-key rule refuses it: {error:?}"
+                );
+            }
+        }
+
+        /// A first keyed send to a member the mob does not hold is refused,
+        /// typed, before anything commits: the key binds nothing for that
+        /// identity.
+        #[cfg(feature = "mob")]
+        #[tokio::test]
+        async fn member_send_key_to_an_unknown_member_is_refused_before_commit() {
+            let (router, _runtime, _temp) = keyed_router(true).await;
+            let mob_id = create_mob_with_worker(&router, "mob-keyed-unknown").await;
+            let refused = router
+                .dispatch(make_request(
+                    "mob/member_send",
+                    serde_json::json!({
+                        "mob_id": mob_id,
+                        "agent_identity": "ghost-1",
+                        "content": "never committed",
+                        "idempotency_key": "item-17",
+                    }),
+                ))
+                .await
+                .unwrap();
+            let error = refused
+                .error
+                .as_ref()
+                .expect("an unknown member is refused");
+            assert_ne!(error.code, crate::error::INTERNAL_ERROR, "typed: {error:?}");
+            let service = router
+                .mob_state
+                .continuation_service()
+                .expect("the RPC mob state binds its continuation service");
+            let status = service
+                .continuation_status(
+                    &meerkat::ContinuationOwner::Member {
+                        mob_id: mob_id.clone(),
+                        identity: "ghost-1".to_string(),
+                    },
+                    &meerkat::ContinuationKey::new(format!(
+                        "{}item-17",
+                        meerkat_mob_mcp::MEMBER_SEND_CONTINUATION_KEY_PREFIX
+                    ))
+                    .expect("key"),
+                )
+                .await
+                .expect("status");
+            assert_eq!(
+                status,
+                meerkat::ContinuationStatus::NotCommitted,
+                "nothing was committed"
+            );
+        }
+    }
 }

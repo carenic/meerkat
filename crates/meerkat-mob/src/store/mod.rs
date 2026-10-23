@@ -763,15 +763,12 @@ impl MobDeliveryIdentity {
             ("idempotency_key", self.idempotency_key.as_str()),
             ("correlation_id", self.correlation_id.as_str()),
         ] {
-            if value.is_empty()
-                || value.trim() != value
-                || value.len() > MOB_EXTERNAL_DELIVERY_KEY_MAX_BYTES
-                || value.chars().any(char::is_control)
-            {
-                return Err(MobStoreError::Serialization(format!(
-                    "mob delivery {field} must be canonical nonempty text no longer than {MOB_EXTERNAL_DELIVERY_KEY_MAX_BYTES} bytes"
-                )));
-            }
+            meerkat_runtime::validate_canonical_key_text(
+                &format!("mob delivery {field}"),
+                value,
+                MOB_EXTERNAL_DELIVERY_KEY_MAX_BYTES,
+            )
+            .map_err(|error| MobStoreError::Serialization(error.to_string()))?;
         }
         let correlation_id = uuid::Uuid::parse_str(&self.correlation_id).map_err(|_| {
             MobStoreError::Serialization(

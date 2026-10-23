@@ -83,6 +83,24 @@ them.
   and so does the `PartialOrd` order of `OccurrenceLifecycleEffectVariant::*`
   and `OccurrenceLifecycleInputVariant::*`; match them by variant name, not
   by numeric cast or position.
+- `meerkat-contracts`: `SessionExternalEventParams` and `MobMemberSendParams`
+  gain the field `idempotency_key: Option<String>`, and `MobMemberSendResult`
+  gains `continuation: Option<WireContinuationReceipt>` (see Added). Code that
+  builds them with struct literals sets the new fields; `None` keeps the
+  earlier behaviour. The accept-input params that no method took are removed:
+  `wire::runtime::SessionAcceptInputParams`, `WireRunPrimitive`,
+  `WireStagedRunInput`, `WireConversationAppend` and
+  `WireConversationAppendRole`.
+- `meerkat-runtime`: the continuation admission index can release a
+  reservation (see Fixed, continuations on a retired address).
+  `ContinuationAdmissionTransition` gains the variant `Release`,
+  `ContinuationAdmissionOutcome` gains the variant `Released`, and
+  `ContinuationAdmissionTransition::next` answers
+  `Option<ContinuationAdmissionEntry>` (`Holds(entry)`, or `Released` for a
+  legal release) instead of `Option<ContinuationAdmission>`. A store that
+  implements `RuntimeStore::transition_continuation_admission` itself
+  removes the entry for `Released`, in the same transaction; a store that
+  forwards the transition is unchanged.
 - `meerkat-auth-core` (hosted MCP OAuth, #1808): `McpOAuthError` gains the
   variant `RemoteCustodyRequired { server_name }`, a refusal: an attempt
   started on a registered `https` redirect was completed without the host's
@@ -535,6 +553,49 @@ them.
   is seen as gone, never admitted again. The trait default refuses.
   `MeerkatMachine::accept_existing_input_with_completion_for_attachment_and_member_residency`
   is the same for a mob member's attachment.
+- An optional caller idempotency key on `session/external_event`, on
+  `POST /sessions/{id}/external-events` and on `mob/member_send` (and the
+  `meerkat_mob_member_send` MCP tool), so a retried submit never admits twice.
+  - External events: the key is kept in the session's input index with the
+    admission, under the `caller:` namespace that RPC and REST share. A retry
+    answers `deduplicated` naming the first admission; the same key with
+    other content is refused as `INPUT_IDEMPOTENCY_CONFLICT` (RPC `-32602`
+    with `data.code`, REST `409`). The key survives restarts and the input's
+    completion, and is scoped to one session.
+  - Member sends: the key is kept for the member identity in the
+    continuation key ledger, so it survives a respawn and a re-creation of
+    the mob under the same id (keys never expire; a replay there answers the
+    first delivery, `stranded` when it was never admitted). A keyed send is
+    committed as a member continuation and answered with `continuation`
+    (`WireContinuationReceipt`: `delivery_id`, `committed_at_ms` and a
+    `WireContinuationStatus` of `pending`, `admitted` with its session and
+    input, `stranded` or `refused`). It is admitted with system origin, is
+    ordered only among keyed sends, refuses `render_metadata`, and is refused
+    on a governed runtime or a host without a continuation service. Other
+    content under a used key is refused as `input_idempotency_conflict`. A
+    first commit is bound to the mob the send was admitted against: when that
+    mob is destroyed and created again under the id before the commit, the
+    send answers that the member was not found and commits nothing.
+  - `meerkat-runtime`: `IdempotencyKey::caller`, `validate_canonical_key_text`,
+    `CanonicalKeyTextError`, `CALLER_IDEMPOTENCY_KEY_MAX_BYTES` (256) and
+    `CALLER_IDEMPOTENCY_KEY_NAMESPACE`; `MobDeliveryIdentity::validate` now
+    calls the same rule. `meerkat-mob`: `MobError::MemberSendIdempotency` and
+    `MemberSendIdempotencyRefusal`. `meerkat-mob-mcp`:
+    `MobMcpState::mob_member_send_keyed`, `MEMBER_SEND_CONTINUATION_NAMESPACE`
+    and `MEMBER_SEND_CONTINUATION_KEY_PREFIX`. `meerkat`:
+    `surface::wire_input_state`, the one projection of a stored input state.
+  - Python SDK: `idempotency_key` on `send_external_event`,
+    `send_mob_member_content` and `Member.send`; TypeScript SDK:
+    `idempotencyKey` on `sendExternalEvent` and `MemberSendOptions`. Both
+    refuse a key against a server older than contract 0.9.5, which would drop
+    it.
+- `meerkat`: `RuntimeDeliveryHost::observe_address` (defaulted: derived from
+  `resolve_address`), `ContinuationHostBindings::observe_address`,
+  `JobRuntimeDeliveryApplier::with_address_observer`, and the variants
+  `ContinuationAdmitError::AddressRetired`,
+  `JobOutboxProjectionError::AddressRetired` and
+  `BlockedDeliveryReason::AddressRetired`. `meerkat-runtime`:
+  `ContinuationAdmissionEntry`.
 - `MobHandle::drain_stopped_runs(until)` waits, up to `until`, for the run
   each member of a Stopped mob had when it was called, and reports for each
   member whether that run ended (with the terminal it recorded), was still
@@ -819,6 +880,11 @@ them.
   (inherited_instructions on a session fork call) to reactivate_inherited".
   It said only that `reactivate_inherited` carries them into the child. The
   cause, the keys and the error code are unchanged.
+- RPC: an input idempotency conflict carries `data.code`
+  `INPUT_IDEMPOTENCY_CONFLICT` beside `data.existing_id`. REST: the
+  external-events route answers it with `409` and the same code; it was a
+  `500`. The browser runtime refuses unknown member-send option fields, so a
+  key it cannot keep is refused, never dropped.
 - `meerkat-mob`: the error a command gets when its durable mutation's outcome
   stays uncertain, and the mob's actor fail-stops, can now arrive shared in
   `MobError::SharedLifecycleFailure`: it is the error the actor records as the
@@ -855,6 +921,26 @@ them.
   replayed, and `annotations: []`. No API change.
 
 ### Fixed
+
+- Continuations on a retired address. A continuation whose drain reserved it
+  before a crash, on an address that retired since, no longer reads
+  `pending` forever: the delivery owner settles the reservation from the
+  reserved session's input ledger, under that session's custody, so it reads
+  admitted when the input is there and stranded when it is not (another
+  input under the key keeps the reservation, reported in the owner's pass).
+  A `stranded` status is now final: a drain that resolved the address before
+  it retired observes the address again after its reservation and before
+  the admission, releases the reservation and admits nothing, and a status
+  read reads the admission index again after it observed the retirement, so
+  a resend under a new key is the only delivery. A host's
+  `RuntimeDeliveryHost::observe_address` must agree on Retired with the
+  continuation status read; both shipped hosts delegate to the bound
+  resolver. A governed host original follows the same rules: its drain
+  observes the address after the binder bound it and before native
+  admission, and on a retired address releases the reservation and
+  withdraws the binder's custody; the owner settles its reservation on a
+  retired address by the reserved input id, since a governed admission is
+  indexed under its qualified key.
 
 - `meerkat`: a host that composes consent notices no longer refuses a
   retained completion of another producer drained before it binds its

@@ -474,6 +474,8 @@ pub use wire::{
     WireConnectorVerifiedAccount,
     WireContentBlock,
     WireContentInput,
+    WireContinuationReceipt,
+    WireContinuationStatus,
     WireControlScope,
     WireDesiredLocalCallbackTool,
     WireDeviceCompleteResult,

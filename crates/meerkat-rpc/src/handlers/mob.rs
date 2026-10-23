@@ -1286,6 +1286,40 @@ pub async fn handle_member_send(
         Ok(content) => content,
         Err(error) => return invalid_params(id, error),
     };
+    if let Some(key) = params.idempotency_key.as_deref() {
+        // A keyed send is a member continuation, which has no render slot.
+        if params.render_metadata.is_some() {
+            return invalid_params(id, "render_metadata does not combine with idempotency_key");
+        }
+        return match state
+            .mob_member_send_keyed(
+                &mob_id,
+                agent_identity.clone(),
+                content,
+                params.handling_mode.into(),
+                key,
+            )
+            .await
+        {
+            Ok(continuation) => {
+                let identity_str = agent_identity.to_string();
+                RpcResponse::success(
+                    id,
+                    MobMemberSendResult {
+                        mob_id: mob_id.to_string(),
+                        agent_identity: identity_str.clone(),
+                        member_ref: meerkat_contracts::WireMemberRef::encode(
+                            mob_id.as_str(),
+                            &identity_str,
+                        ),
+                        handling_mode: params.handling_mode,
+                        continuation: Some(continuation),
+                    },
+                )
+            }
+            Err(err) => mob_call_error(id, &err),
+        };
+    }
     match state
         .mob_member_send(
             &mob_id,
@@ -1308,6 +1342,7 @@ pub async fn handle_member_send(
                         &identity_str,
                     ),
                     handling_mode: receipt.handling_mode.into(),
+                    continuation: None,
                 },
             )
         }
@@ -1376,6 +1411,7 @@ pub async fn handle_ingress_interaction(
         agent_identity: identity_str.clone(),
         member_ref: meerkat_contracts::WireMemberRef::encode(mob_id.as_str(), &identity_str),
         handling_mode: receipt.handling_mode.into(),
+        continuation: None,
     };
     RpcResponse::success(
         id,

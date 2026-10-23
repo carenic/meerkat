@@ -587,9 +587,10 @@ pub use handles::{
     RuntimeTurnStateHandle,
 };
 pub use identifiers::{
+    CALLER_IDEMPOTENCY_KEY_MAX_BYTES, CALLER_IDEMPOTENCY_KEY_NAMESPACE, CanonicalKeyTextError,
     CausationId, ConversationId, CorrelationId, EventCodeId, IdempotencyKey, InputKind, KindId,
     LogicalRuntimeId, LogicalRuntimeIdError, MemberDeliveryAddress, PolicyVersion,
-    ProjectionRuleId, RuntimeEventId, SchemaId, SupersessionKey,
+    ProjectionRuleId, RuntimeEventId, SchemaId, SupersessionKey, validate_canonical_key_text,
 };
 pub use ingress_types::{ContentShape, RequestId, ReservationKey};
 pub use input::{
@@ -1148,8 +1149,8 @@ pub use service_ext::{SessionServiceRuntimeExt, persistent_runtime_pre_dequeue_h
 pub use store::{
     CommittedRecoveryBoundary, CommittedWholeBlobMetadata, CommittedWholeBlobProvisionalTail,
     CommittedWholeBlobSnapshot, CommittingWholeBlobSession, ContinuationAdmission,
-    ContinuationAdmissionOutcome, ContinuationAdmissionTransition, ContinuationKeyBinding,
-    DeliveryGenerationReader, FencedPreparedRuntimeSessionCommitOutcome,
+    ContinuationAdmissionEntry, ContinuationAdmissionOutcome, ContinuationAdmissionTransition,
+    ContinuationKeyBinding, DeliveryGenerationReader, FencedPreparedRuntimeSessionCommitOutcome,
     HeadCanonicalProvisionalTailAuthority, HeadCanonicalRuntimeAuthorityActivation,
     HeadCanonicalStoreAuthority, InMemoryRuntimeStore, InputIdempotencyIndexConstraint,
     InputStateRow, KEPT_DELIVERY_READER_IDLE, KeyedRuntimeDeliveryCasOutcome,

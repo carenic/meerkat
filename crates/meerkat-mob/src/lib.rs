@@ -124,8 +124,8 @@ pub use error::{
     FlowStepDispatchRejectKind, ForkSourceUnavailableCause, ForkedParticipantLeaseOperation,
     ForkedParticipantOwnerHostRejection, ForkedParticipantSourceRejection,
     IncarnationInconsistency, MemberProvisionFailureCause, MemberRegistrationHookCall,
-    MemberRuntimeDetachment, MobDefinitionProjectionMismatchKind, MobError, MobFailureClass,
-    OperatorAuthorityCeilingRefusal, RuntimeEffectKind,
+    MemberRuntimeDetachment, MemberSendIdempotencyRefusal, MobDefinitionProjectionMismatchKind,
+    MobError, MobFailureClass, OperatorAuthorityCeilingRefusal, RuntimeEffectKind,
 };
 pub use event::{
     AttributedEvent, FlowCancelClass, ForkJobTerminalEvent, MemberWireEdge, MobEvent, MobEventKind,

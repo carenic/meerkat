@@ -18,21 +18,21 @@ use tokio_with_wasm::alias::sync::Mutex;
 
 use super::{
     AuthOAuthFlowSnapshotUpdate, CommittedWholeBlobProvisionalTail, CommittedWholeBlobSnapshot,
-    ContinuationAdmission, ContinuationAdmissionOutcome, ContinuationAdmissionTransition,
-    ContinuationKeyBinding, ExactInputStateObservation, FencedInputStateBatchCasOutcome,
-    FencedMachineLifecycleCasOutcome, InputStateBatchCasImplementationProfile,
-    InputStateBatchCasOutcome, InputStateRow, KeyedRuntimeDeliveryCasOutcome,
-    MachineLifecycleCasOutcome, MachineLifecycleCommit, MachineLifecycleExpectedVersion,
-    MachineLifecycleObservation, MachineLifecycleStoreRecord, PreparedRecoveryInputSnapshot,
-    PreparedRecoveryInputStateMutation, PreparedRuntimeSessionCommitResult,
-    PreparedWholeBlobProvisionalTail, PreparedWholeBlobRewriteStoreParts,
-    PreparedWholeBlobSnapshot, PreparedWholeBlobSnapshotCas, RecoveryInputSetRevision,
-    RecoveryInputStateMutation, RuntimeDeliveryAuthorityCasOutcome, RuntimeDeliveryAuthorityRecord,
-    RuntimeDeliveryStoreRecord, RuntimeSessionAuthority, RuntimeSessionAuthorityReadCost,
-    RuntimeSessionPersistenceProfile, RuntimeSessionResumeObservation, RuntimeStore,
-    RuntimeStoreError, RuntimeStoreWriteFence, RuntimeStoreWriteFenceOutcome,
-    SerializedSessionSnapshot, WholeBlobProvisionalTailAuthority, WholeBlobSnapshotCasOutcome,
-    WholeBlobStoreAuthority, classify_machine_lifecycle_record,
+    ContinuationAdmission, ContinuationAdmissionEntry, ContinuationAdmissionOutcome,
+    ContinuationAdmissionTransition, ContinuationKeyBinding, ExactInputStateObservation,
+    FencedInputStateBatchCasOutcome, FencedMachineLifecycleCasOutcome,
+    InputStateBatchCasImplementationProfile, InputStateBatchCasOutcome, InputStateRow,
+    KeyedRuntimeDeliveryCasOutcome, MachineLifecycleCasOutcome, MachineLifecycleCommit,
+    MachineLifecycleExpectedVersion, MachineLifecycleObservation, MachineLifecycleStoreRecord,
+    PreparedRecoveryInputSnapshot, PreparedRecoveryInputStateMutation,
+    PreparedRuntimeSessionCommitResult, PreparedWholeBlobProvisionalTail,
+    PreparedWholeBlobRewriteStoreParts, PreparedWholeBlobSnapshot, PreparedWholeBlobSnapshotCas,
+    RecoveryInputSetRevision, RecoveryInputStateMutation, RuntimeDeliveryAuthorityCasOutcome,
+    RuntimeDeliveryAuthorityRecord, RuntimeDeliveryStoreRecord, RuntimeSessionAuthority,
+    RuntimeSessionAuthorityReadCost, RuntimeSessionPersistenceProfile,
+    RuntimeSessionResumeObservation, RuntimeStore, RuntimeStoreError, RuntimeStoreWriteFence,
+    RuntimeStoreWriteFenceOutcome, SerializedSessionSnapshot, WholeBlobProvisionalTailAuthority,
+    WholeBlobSnapshotCasOutcome, WholeBlobStoreAuthority, classify_machine_lifecycle_record,
     complete_compaction_projection_intent, decoded_prepared_machine_lifecycle_replacement,
     execute_runtime_store_write_fence, parsed_whole_blob_snapshot, prepare_input_state_batch_cas,
     prepare_machine_lifecycle_replacement, prepare_recovery_input_state_mutations,
@@ -2774,10 +2774,18 @@ impl RuntimeStore for InMemoryRuntimeStore {
         let Some(next) = transition.next(current.as_ref()) else {
             return Ok(ContinuationAdmissionOutcome::Rejected { current });
         };
-        inner
-            .continuation_admissions
-            .insert(entry_key, next.clone());
-        Ok(ContinuationAdmissionOutcome::Transitioned(next))
+        match next {
+            ContinuationAdmissionEntry::Holds(next) => {
+                inner
+                    .continuation_admissions
+                    .insert(entry_key, next.clone());
+                Ok(ContinuationAdmissionOutcome::Transitioned(next))
+            }
+            ContinuationAdmissionEntry::Released => {
+                inner.continuation_admissions.remove(&entry_key);
+                Ok(ContinuationAdmissionOutcome::Released)
+            }
+        }
     }
 
     async fn compare_and_swap_runtime_delivery_authority_with_key_binding(

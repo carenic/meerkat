@@ -125362,6 +125362,17 @@
             "description": "Identity-native member identity (0.6).",
             "type": "string"
           },
+          "continuation": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WireContinuationReceipt"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The receipt and current delivery status of a keyed send; absent for an\nunkeyed send."
+          },
           "handling_mode": {
             "$ref": "#/$defs/WireHandlingMode"
           },
@@ -125397,6 +125408,96 @@
           "member_ref"
         ],
         "type": "object"
+      },
+      "WireContinuationReceipt": {
+        "description": "The receipt of a keyed member send: the durable continuation it was\ncommitted as, and that continuation's delivery status when answered.",
+        "properties": {
+          "committed_at_ms": {
+            "description": "When the key was first committed, in Unix milliseconds; identical on\nevery replay of the key.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "delivery_id": {
+            "description": "The committed delivery; identical on every replay of the key.",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/$defs/WireContinuationStatus",
+            "description": "The delivery status read for this answer; it may advance between\nreplays."
+          }
+        },
+        "required": [
+          "delivery_id",
+          "committed_at_ms",
+          "status"
+        ],
+        "type": "object"
+      },
+      "WireContinuationStatus": {
+        "description": "Delivery status of a keyed member send. `stranded` is final and means the\ncontent was never admitted: resend it under a new key. A `pending` that\nsurvives a gateway restart is not proof of loss; do not resend it under a\nnew key.",
+        "oneOf": [
+          {
+            "properties": {
+              "state": {
+                "const": "pending",
+                "type": "string"
+              }
+            },
+            "required": [
+              "state"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "input_id": {
+                "type": "string"
+              },
+              "session_id": {
+                "type": "string"
+              },
+              "state": {
+                "const": "admitted",
+                "type": "string"
+              }
+            },
+            "required": [
+              "state",
+              "session_id",
+              "input_id"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "state": {
+                "const": "stranded",
+                "type": "string"
+              }
+            },
+            "required": [
+              "state"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "reason": {
+                "type": "string"
+              },
+              "state": {
+                "const": "refused",
+                "type": "string"
+              }
+            },
+            "required": [
+              "state",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "WireHandlingMode": {
         "description": "Public handling mode for mob member delivery.",
@@ -129215,6 +129316,13 @@
         "$ref": "#/$defs/WireHandlingMode",
         "default": "queue"
       },
+      "idempotency_key": {
+        "description": "Optional caller idempotency key, deduplicated for the member identity\n(it survives a respawn). A keyed send is committed as a member\ncontinuation and answered with a receipt and a delivery status\n(`continuation`), not a turn: the member's delivery owner admits it\nwith system origin, it is ordered only among keyed sends, it refuses\n`render_metadata`, and a governed runtime refuses it. A replay keeps\n`delivery_id` and `committed_at_ms`; its status may advance. Other\ncontent under a used key is refused as `input_idempotency_conflict`.\nCanonical text: non-empty, no surrounding whitespace, no control\ncharacters, at most 256 bytes.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
       "mob_id": {
         "type": "string"
       },
@@ -129239,6 +129347,96 @@
   },
   "MobMemberSendResult": {
     "$defs": {
+      "WireContinuationReceipt": {
+        "description": "The receipt of a keyed member send: the durable continuation it was\ncommitted as, and that continuation's delivery status when answered.",
+        "properties": {
+          "committed_at_ms": {
+            "description": "When the key was first committed, in Unix milliseconds; identical on\nevery replay of the key.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "delivery_id": {
+            "description": "The committed delivery; identical on every replay of the key.",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/$defs/WireContinuationStatus",
+            "description": "The delivery status read for this answer; it may advance between\nreplays."
+          }
+        },
+        "required": [
+          "delivery_id",
+          "committed_at_ms",
+          "status"
+        ],
+        "type": "object"
+      },
+      "WireContinuationStatus": {
+        "description": "Delivery status of a keyed member send. `stranded` is final and means the\ncontent was never admitted: resend it under a new key. A `pending` that\nsurvives a gateway restart is not proof of loss; do not resend it under a\nnew key.",
+        "oneOf": [
+          {
+            "properties": {
+              "state": {
+                "const": "pending",
+                "type": "string"
+              }
+            },
+            "required": [
+              "state"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "input_id": {
+                "type": "string"
+              },
+              "session_id": {
+                "type": "string"
+              },
+              "state": {
+                "const": "admitted",
+                "type": "string"
+              }
+            },
+            "required": [
+              "state",
+              "session_id",
+              "input_id"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "state": {
+                "const": "stranded",
+                "type": "string"
+              }
+            },
+            "required": [
+              "state"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "reason": {
+                "type": "string"
+              },
+              "state": {
+                "const": "refused",
+                "type": "string"
+              }
+            },
+            "required": [
+              "state",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "WireHandlingMode": {
         "description": "Public handling mode for mob member delivery.",
         "enum": [
@@ -129258,6 +129456,17 @@
       "agent_identity": {
         "description": "Identity-native member identity (0.6).",
         "type": "string"
+      },
+      "continuation": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/WireContinuationReceipt"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "The receipt and current delivery status of a keyed send; absent for an\nunkeyed send."
       },
       "handling_mode": {
         "$ref": "#/$defs/WireHandlingMode"
@@ -151273,6 +151482,13 @@
       }
     ],
     "properties": {
+      "idempotency_key": {
+        "description": "Optional caller idempotency key. A retry under the same key admits\nnothing new and names the first admission (`deduplicated`, with its\n`existing_id`); the same key with other event content is refused as\n`INPUT_IDEMPOTENCY_CONFLICT`. Scoped to this session and kept for the\nsession's life. Canonical text: non-empty, no surrounding whitespace,\nno control characters, at most 256 bytes. A server older than contract\n0.9.5 ignores the field, so check `contract_version` before relying on\nit.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
       "session_id": {
         "type": "string"
       }
@@ -159760,6 +159976,167 @@
     ],
     "description": "Wire-safe content input (mirrors `ContentInput`).",
     "title": "WireContentInput"
+  },
+  "WireContinuationReceipt": {
+    "$defs": {
+      "WireContinuationStatus": {
+        "description": "Delivery status of a keyed member send. `stranded` is final and means the\ncontent was never admitted: resend it under a new key. A `pending` that\nsurvives a gateway restart is not proof of loss; do not resend it under a\nnew key.",
+        "oneOf": [
+          {
+            "properties": {
+              "state": {
+                "const": "pending",
+                "type": "string"
+              }
+            },
+            "required": [
+              "state"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "input_id": {
+                "type": "string"
+              },
+              "session_id": {
+                "type": "string"
+              },
+              "state": {
+                "const": "admitted",
+                "type": "string"
+              }
+            },
+            "required": [
+              "state",
+              "session_id",
+              "input_id"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "state": {
+                "const": "stranded",
+                "type": "string"
+              }
+            },
+            "required": [
+              "state"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "reason": {
+                "type": "string"
+              },
+              "state": {
+                "const": "refused",
+                "type": "string"
+              }
+            },
+            "required": [
+              "state",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "The receipt of a keyed member send: the durable continuation it was\ncommitted as, and that continuation's delivery status when answered.",
+    "properties": {
+      "committed_at_ms": {
+        "description": "When the key was first committed, in Unix milliseconds; identical on\nevery replay of the key.",
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "delivery_id": {
+        "description": "The committed delivery; identical on every replay of the key.",
+        "type": "string"
+      },
+      "status": {
+        "$ref": "#/$defs/WireContinuationStatus",
+        "description": "The delivery status read for this answer; it may advance between\nreplays."
+      }
+    },
+    "required": [
+      "delivery_id",
+      "committed_at_ms",
+      "status"
+    ],
+    "title": "WireContinuationReceipt",
+    "type": "object"
+  },
+  "WireContinuationStatus": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Delivery status of a keyed member send. `stranded` is final and means the\ncontent was never admitted: resend it under a new key. A `pending` that\nsurvives a gateway restart is not proof of loss; do not resend it under a\nnew key.",
+    "oneOf": [
+      {
+        "properties": {
+          "state": {
+            "const": "pending",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "input_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "state": {
+            "const": "admitted",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "session_id",
+          "input_id"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "state": {
+            "const": "stranded",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "reason": {
+            "type": "string"
+          },
+          "state": {
+            "const": "refused",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "reason"
+        ],
+        "type": "object"
+      }
+    ],
+    "title": "WireContinuationStatus"
   },
   "WireControlScope": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",

@@ -85441,6 +85441,9 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         MobError::OperatorAuthorityCeilingRefused { reason, .. } => {
             format!("operator_authority_ceiling_refused:{reason:?}")
         }
+        MobError::MemberSendIdempotency { refusal, .. } => {
+            format!("member_send_idempotency:{}", refusal.kind())
+        }
     }
 }
 

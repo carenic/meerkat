@@ -27,6 +27,8 @@ from .live import LiveChannel, LiveNotification, parse_live_notification
 from .mob import (
     MemberDeliveryReceipt,
     MemberRespawnReceipt,
+    MemberSendContinuation,
+    MemberSendContinuationStatus,
     Mob,
     MobBoundedHelperResult,
     MobBoundedHelperResultStatus,
@@ -530,6 +532,8 @@ __all__ = [
     "MobSpawnSpec",
     "MemberDeliveryReceipt",
     "MemberRespawnReceipt",
+    "MemberSendContinuation",
+    "MemberSendContinuationStatus",
     "MobPeerConnectivity",
     "MobPeerConnectivitySnapshot",
     "MobUnreachablePeer",

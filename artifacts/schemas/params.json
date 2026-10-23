@@ -33161,6 +33161,13 @@
         "$ref": "#/$defs/WireHandlingMode",
         "default": "queue"
       },
+      "idempotency_key": {
+        "description": "Optional caller idempotency key, deduplicated for the member identity\n(it survives a respawn). A keyed send is committed as a member\ncontinuation and answered with a receipt and a delivery status\n(`continuation`), not a turn: the member's delivery owner admits it\nwith system origin, it is ordered only among keyed sends, it refuses\n`render_metadata`, and a governed runtime refuses it. A replay keeps\n`delivery_id` and `committed_at_ms`; its status may advance. Other\ncontent under a used key is refused as `input_idempotency_conflict`.\nCanonical text: non-empty, no surrounding whitespace, no control\ncharacters, at most 256 bytes.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
       "mob_id": {
         "type": "string"
       },

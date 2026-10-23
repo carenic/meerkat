@@ -13,6 +13,8 @@ pub use ephemeral_runtime::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 mod fatal_error;
+mod input_state_projection;
+pub use input_state_projection::wire_input_state;
 #[cfg(all(
     feature = "session-store",
     feature = "live",

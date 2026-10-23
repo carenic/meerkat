@@ -3949,6 +3949,7 @@ fn make_runtime_external_event_input(
     event_type: &str,
     payload: Value,
     blocks: Option<Vec<meerkat_contracts::WireContentBlock>>,
+    idempotency_key: Option<meerkat_runtime::IdempotencyKey>,
 ) -> Result<meerkat_runtime::Input, ApiError> {
     if event_type.trim().is_empty() {
         return Err(ApiError::BadRequest(
@@ -3980,7 +3981,7 @@ fn make_runtime_external_event_input(
                 },
                 durability: meerkat_runtime::InputDurability::Durable,
                 visibility: meerkat_runtime::InputVisibility::default(),
-                idempotency_key: None,
+                idempotency_key,
                 supersession_key: None,
                 correlation_id: None,
             },
@@ -4005,6 +4006,16 @@ enum RestSessionExternalEventEnvelope {
     PeerResponseTerminal {},
 }
 
+/// The `/external-events` body: the event envelope plus the optional caller
+/// idempotency key, which parameterizes admission and is not event content.
+#[derive(Debug, Deserialize)]
+struct RestSessionExternalEventBody {
+    #[serde(default)]
+    idempotency_key: Option<String>,
+    #[serde(flatten)]
+    event: RestSessionExternalEventEnvelope,
+}
+
 use meerkat_contracts::wire::RestPeerResponseTerminalRequest as RestPeerResponseTerminalBody;
 
 /// Queue an external event into the runtime without waking an idle session.
@@ -4016,7 +4027,7 @@ async fn post_external_event(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
-    Json(event): Json<RestSessionExternalEventEnvelope>,
+    Json(body): Json<RestSessionExternalEventBody>,
 ) -> Result<(StatusCode, Json<Value>), Response> {
     // Webhook auth resolved once at startup, stored in AppState.
     webhook::verify_webhook(&headers, &state.webhook_auth)
@@ -4025,12 +4036,20 @@ async fn post_external_event(
     let session_id =
         resolve_session_id_for_state(&id, &state).map_err(IntoResponse::into_response)?;
 
-    let input = match event {
+    // The one canonical rule checks a caller key and stores it in the caller
+    // namespace, shared with the RPC surface, apart from Core's own keys.
+    let idempotency_key = body
+        .idempotency_key
+        .as_deref()
+        .map(meerkat_runtime::IdempotencyKey::caller)
+        .transpose()
+        .map_err(|error| ApiError::BadRequest(error.to_string()).into_response())?;
+    let input = match body.event {
         RestSessionExternalEventEnvelope::GenericJson {
             event_type,
             payload,
             blocks,
-        } => make_runtime_external_event_input(&event_type, payload, blocks),
+        } => make_runtime_external_event_input(&event_type, payload, blocks, idempotency_key),
         RestSessionExternalEventEnvelope::PeerResponseTerminal {} => Err(ApiError::BadRequest(
             "peer_response_terminal is reserved on /external-events; use /peer-response-terminal"
                 .to_string(),
@@ -4358,6 +4377,21 @@ async fn admit_runtime_input_via_webhook(
             })),
         )
             .into_response()),
+        // The caller reused a key for other content: typed, naming the input
+        // the key is bound to.
+        Err(meerkat_runtime::RuntimeDriverError::InputIdempotencyConflict { existing_id }) => {
+            Err((
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": format!(
+                        "input idempotency conflicts with existing input {existing_id}"
+                    ),
+                    "code": "INPUT_IDEMPOTENCY_CONFLICT",
+                    "existing_id": existing_id.to_string(),
+                })),
+            )
+                .into_response())
+        }
         Err(err) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": err.to_string()})),
@@ -10768,6 +10802,7 @@ mod tests {
         let generic_input = make_runtime_external_event_input(
             "archived_webhook_input",
             json!({"archived": true}),
+            None,
             None,
         )
         .expect("external event input");

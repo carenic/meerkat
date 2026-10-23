@@ -1659,6 +1659,14 @@ pub enum MobError {
         agent_identity: AgentIdentity,
         reason: OperatorAuthorityCeilingRefusal,
     },
+
+    /// A keyed member send (a member send with a caller idempotency key) was
+    /// refused, or its answer could not be made; nothing new was committed.
+    #[error("keyed send to member '{identity}': {refusal}")]
+    MemberSendIdempotency {
+        identity: AgentIdentity,
+        refusal: MemberSendIdempotencyRefusal,
+    },
 }
 
 /// Why a member's operator authority ceiling was refused
@@ -1687,6 +1695,105 @@ impl std::fmt::Display for OperatorAuthorityCeilingRefusal {
                 "the member is not placed on a member host; a ceiling bounds only a placed \
                  member's recorded authority",
             ),
+        }
+    }
+}
+
+/// Why a keyed member send was refused or could not be answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MemberSendIdempotencyRefusal {
+    /// The key is not canonical key text.
+    InvalidKey { detail: String },
+    /// The key is bound to other content; the first delivery stands.
+    Conflict {
+        delivery_id: String,
+        committed_at_ms: u64,
+    },
+    /// No continuation service is bound on this host, so it cannot keep the
+    /// key for the member identity.
+    NoContinuationService,
+    /// The runtime admits work through a native work authorization host,
+    /// which refuses continuations.
+    GovernedRuntime,
+    /// The continuation authority cannot be read now. The commit, if any,
+    /// stands: retry the same key.
+    Unavailable { detail: String },
+    /// The continuation authority holds facts that cannot all be true.
+    Inconsistent { detail: String },
+}
+
+impl std::fmt::Display for MemberSendIdempotencyRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidKey { detail } => f.write_str(detail),
+            Self::Conflict { delivery_id, .. } => write!(
+                f,
+                "the idempotency key is bound to other content (delivery {delivery_id})"
+            ),
+            Self::NoContinuationService => {
+                f.write_str("this host binds no continuation service to keep the key")
+            }
+            Self::GovernedRuntime => f.write_str("a governed runtime refuses keyed member sends"),
+            Self::Unavailable { detail } => {
+                write!(f, "continuation status unavailable: {detail}")
+            }
+            Self::Inconsistent { detail } => {
+                write!(f, "continuation authority is inconsistent: {detail}")
+            }
+        }
+    }
+}
+
+impl MemberSendIdempotencyRefusal {
+    /// The typed wire kind of this refusal.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::InvalidKey { .. } => "invalid_idempotency_key",
+            Self::Conflict { .. } => "input_idempotency_conflict",
+            Self::NoContinuationService | Self::GovernedRuntime => "idempotency_unavailable",
+            Self::Unavailable { .. } => "continuation_status_unavailable",
+            Self::Inconsistent { .. } => "continuation_status_inconsistent",
+        }
+    }
+
+    fn structured_data(&self) -> serde_json::Value {
+        match self {
+            Self::Conflict {
+                delivery_id,
+                committed_at_ms,
+            } => serde_json::json!({
+                "kind": self.kind(),
+                "delivery_id": delivery_id,
+                "committed_at_ms": committed_at_ms,
+            }),
+            Self::NoContinuationService => serde_json::json!({
+                "kind": self.kind(),
+                "cause": "no_continuation_service",
+            }),
+            Self::GovernedRuntime => serde_json::json!({
+                "kind": self.kind(),
+                "cause": "governed_runtime",
+            }),
+            Self::InvalidKey { .. } | Self::Unavailable { .. } | Self::Inconsistent { .. } => {
+                serde_json::json!({ "kind": self.kind() })
+            }
+        }
+    }
+
+    /// The wire class: an invalid key and a conflict stay invalid params; an
+    /// unavailable door is a capability gap; an unreadable status is
+    /// retryable; an inconsistent one is internal and not retryable.
+    fn error_code(&self) -> Option<meerkat_contracts::ErrorCode> {
+        match self {
+            Self::InvalidKey { .. } | Self::Conflict { .. } => None,
+            Self::NoContinuationService | Self::GovernedRuntime => {
+                Some(meerkat_contracts::ErrorCode::CapabilityUnavailable)
+            }
+            Self::Unavailable { .. } => {
+                Some(meerkat_contracts::ErrorCode::SessionRuntimeUnavailable)
+            }
+            Self::Inconsistent { .. } => Some(meerkat_contracts::ErrorCode::InternalError),
         }
     }
 }
@@ -2013,6 +2120,7 @@ impl MobError {
     /// layer to reclassify authentication itself.
     pub fn structured_data(&self) -> Option<serde_json::Value> {
         match self {
+            Self::MemberSendIdempotency { refusal, .. } => Some(refusal.structured_data()),
             Self::SharedRetirementFailure(error) | Self::SharedLifecycleFailure(error) => {
                 error.structured_data()
             }
@@ -2403,6 +2511,7 @@ impl MobError {
                 Self::ForkContextTooLarge { .. } => {
                     Some(meerkat_contracts::ErrorCode::InvalidParams)
                 }
+                Self::MemberSendIdempotency { refusal, .. } => refusal.error_code(),
                 _ => None,
             })
     }
@@ -4106,5 +4215,81 @@ mod tests {
             not_advanced.failure_class(),
             MobFailureClass::RuntimeRejected
         );
+    }
+
+    /// A keyed member send's refusals keep one wire class each, the mapping
+    /// the rpc reference states: an invalid key and a conflict name no code of
+    /// their own (the RPC answers invalid params), a host that cannot keep
+    /// the key is a capability gap naming its cause, an unreadable status is
+    /// retryable, and an inconsistent one is internal. None carries a wire
+    /// detail, so the RPC renders the code and the structured data.
+    #[test]
+    fn keyed_member_send_refusals_keep_their_wire_codes_and_kinds() {
+        use MemberSendIdempotencyRefusal as Refusal;
+        use meerkat_contracts::ErrorCode;
+
+        let cases = [
+            (
+                Refusal::InvalidKey {
+                    detail: "the key is empty".to_string(),
+                },
+                None,
+                serde_json::json!({"kind": "invalid_idempotency_key"}),
+            ),
+            (
+                Refusal::Conflict {
+                    delivery_id: "delivery-1".to_string(),
+                    committed_at_ms: 7,
+                },
+                None,
+                serde_json::json!({
+                    "kind": "input_idempotency_conflict",
+                    "delivery_id": "delivery-1",
+                    "committed_at_ms": 7,
+                }),
+            ),
+            (
+                Refusal::NoContinuationService,
+                Some(ErrorCode::CapabilityUnavailable),
+                serde_json::json!({
+                    "kind": "idempotency_unavailable",
+                    "cause": "no_continuation_service",
+                }),
+            ),
+            (
+                Refusal::GovernedRuntime,
+                Some(ErrorCode::CapabilityUnavailable),
+                serde_json::json!({
+                    "kind": "idempotency_unavailable",
+                    "cause": "governed_runtime",
+                }),
+            ),
+            (
+                Refusal::Unavailable {
+                    detail: "the store is busy".to_string(),
+                },
+                Some(ErrorCode::SessionRuntimeUnavailable),
+                serde_json::json!({"kind": "continuation_status_unavailable"}),
+            ),
+            (
+                Refusal::Inconsistent {
+                    detail: "two receipts for one key".to_string(),
+                },
+                Some(ErrorCode::InternalError),
+                serde_json::json!({"kind": "continuation_status_inconsistent"}),
+            ),
+        ];
+        for (refusal, code, data) in cases {
+            let error = MobError::MemberSendIdempotency {
+                identity: AgentIdentity::from("member"),
+                refusal,
+            };
+            assert!(error.wire_detail().is_none(), "{error}");
+            assert_eq!(error.wire_error_code(), code, "{error}");
+            assert_eq!(error.structured_data(), Some(data), "{error}");
+        }
+        assert_eq!(ErrorCode::CapabilityUnavailable.jsonrpc_code(), -32020);
+        assert_eq!(ErrorCode::SessionRuntimeUnavailable.jsonrpc_code(), -32032);
+        assert_eq!(ErrorCode::InternalError.jsonrpc_code(), -32603);
     }
 }

@@ -479,6 +479,20 @@ class _RkatRpcRelease:
     binary_sha256: str
 
 
+# The first server contract that keeps a caller idempotency key. An older
+# server ignores the field on session/external_event and admits the call
+# unkeyed, so the SDK refuses to send a key to it.
+_CALLER_IDEMPOTENCY_KEY_MIN_CONTRACT = (0, 9, 5)
+
+
+def _contract_parts(version: str) -> tuple[int, ...] | None:
+    core = version.split("-", 1)[0].split("+", 1)[0]
+    try:
+        return tuple(int(part) for part in core.split("."))
+    except ValueError:
+        return None
+
+
 def _is_sha256_hex(value: object) -> bool:
     return (
         isinstance(value, str)
@@ -795,6 +809,7 @@ class MeerkatClient:
         self._request_id = 0
         self._capabilities: list[Capability] | None = None
         self._methods: set[str] = set()
+        self._server_contract_version = ""
         self._dispatcher: _StdoutDispatcher | None = None
         self._stderr_tail: _StderrTail | None = None
         self._tool_registry = ToolRegistry()
@@ -987,6 +1002,7 @@ class MeerkatClient:
         if isinstance(result, ServerCapabilities):  # pragma: no cover - typing aid
             result = result.__dict__
         server_version = result.get("contract_version", "")
+        self._server_contract_version = str(server_version)
         if not self._check_version_compatible(server_version, CONTRACT_VERSION):
             raise MeerkatError(
                 "VERSION_MISMATCH",
@@ -1843,6 +1859,17 @@ class MeerkatClient:
         result = await self._request("session/read", {"session_id": session_id})
         return self._parse_session_details(result)
 
+    def _require_caller_idempotency_key_support(self) -> None:
+        """Refuse a caller key before sending it to a server that would drop it."""
+        parts = _contract_parts(self._server_contract_version)
+        if parts is None or parts < _CALLER_IDEMPOTENCY_KEY_MIN_CONTRACT:
+            minimum = ".".join(str(part) for part in _CALLER_IDEMPOTENCY_KEY_MIN_CONTRACT)
+            raise CapabilityUnavailableError(
+                "CAPABILITY_UNAVAILABLE",
+                f"idempotency_key needs a server contract >= {minimum}; "
+                f"this server reports {self._server_contract_version or 'none'}",
+            )
+
     async def send_external_event(
         self,
         session_id: str,
@@ -1850,8 +1877,17 @@ class MeerkatClient:
         payload: Any,
         *,
         blocks: list[ContentBlock] | None = None,
+        idempotency_key: str | None = None,
     ) -> ExternalEventOutcome:
-        """Append a durable external event input to a session runtime."""
+        """Append a durable external event input to a session runtime.
+
+        With ``idempotency_key`` a retry admits nothing new: it answers
+        ``outcome_type`` ``deduplicated`` naming the first admission in
+        ``existing_id``. The same key with other event content raises the
+        typed ``INPUT_IDEMPOTENCY_CONFLICT`` refusal. Object key order inside
+        ``payload`` does not matter. The key is scoped to the session and kept
+        for its life; it needs a server contract of 0.9.5 or later.
+        """
         params: dict[str, Any] = {
             "session_id": session_id,
             "kind": "generic_json",
@@ -1860,6 +1896,9 @@ class MeerkatClient:
         }
         if blocks is not None:
             params["blocks"] = blocks
+        if idempotency_key is not None:
+            self._require_caller_idempotency_key_support()
+            params["idempotency_key"] = idempotency_key
         return await self._request("session/external_event", params)
 
     async def send_peer_response_terminal(
@@ -3109,17 +3148,36 @@ class MeerkatClient:
         *,
         handling_mode: Literal["queue", "steer"] = "queue",
         render_metadata: RenderMetadata | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        result = await self._request(
-            "mob/member_send",
-            {
-                "mob_id": mob_id,
-                "agent_identity": agent_identity,
-                "content": content,
-                "handling_mode": handling_mode,
-                "render_metadata": render_metadata,
-            },
-        )
+        """Send content to a mob member.
+
+        With ``idempotency_key`` the send is deduplicated for the member
+        identity (it survives a respawn and a re-creation of the mob under
+        the same id; keys never expire) and committed as a member
+        continuation. The answer then carries ``continuation``: a receipt and
+        a delivery status, not a turn. ``delivery_id`` and ``committed_at_ms``
+        repeat on every replay; ``status`` may advance (``pending``,
+        ``admitted`` with ``session_id`` and ``input_id``, ``stranded`` or
+        ``refused``). ``admitted`` means queued in that session; follow it with
+        ``session/input_status``. ``stranded`` is final: resend under a new
+        key. A ``pending`` that survives a server restart is not proof of loss;
+        do not resend it under a new key. A keyed send is admitted with system
+        origin, is ordered only among keyed sends, refuses ``render_metadata``,
+        is refused on a governed runtime, and needs a server contract of 0.9.5
+        or later.
+        """
+        params: dict[str, Any] = {
+            "mob_id": mob_id,
+            "agent_identity": agent_identity,
+            "content": content,
+            "handling_mode": handling_mode,
+            "render_metadata": render_metadata,
+        }
+        if idempotency_key is not None:
+            self._require_caller_idempotency_key_support()
+            params["idempotency_key"] = idempotency_key
+        result = await self._request("mob/member_send", params)
         member_ref = result.get("member_ref")
         if not isinstance(member_ref, str) or not member_ref:
             raise MeerkatError(
@@ -3144,7 +3202,7 @@ class MeerkatClient:
                 "INVALID_RESPONSE",
                 "Invalid mob/member_send response: missing agent_identity",
             )
-        return {
+        receipt: dict[str, Any] = {
             "mob_id": resolved_mob_id,
             "agent_identity": resolved_identity,
             "member_ref": member_ref,
@@ -3152,6 +3210,53 @@ class MeerkatClient:
                 receipt_handling_mode,
                 "Invalid mob/member_send response: invalid handling_mode",
             ),
+        }
+        continuation = result.get("continuation")
+        if continuation is not None:
+            receipt["continuation"] = self._parse_member_send_continuation(continuation)
+        elif idempotency_key is not None:
+            raise MeerkatError(
+                "INVALID_RESPONSE",
+                "Invalid mob/member_send response: a keyed send answers its continuation",
+            )
+        return receipt
+
+    @staticmethod
+    def _parse_member_send_continuation(raw: Any) -> dict[str, Any]:
+        context = "Invalid mob/member_send response: invalid continuation"
+        if not isinstance(raw, dict):
+            raise MeerkatError("INVALID_RESPONSE", context)
+        delivery_id = raw.get("delivery_id")
+        committed_at_ms = raw.get("committed_at_ms")
+        status = raw.get("status")
+        if (
+            not isinstance(delivery_id, str)
+            or not delivery_id
+            or isinstance(committed_at_ms, bool)
+            or not isinstance(committed_at_ms, int)
+            or not isinstance(status, dict)
+        ):
+            raise MeerkatError("INVALID_RESPONSE", context)
+        state = status.get("state")
+        parsed: dict[str, Any] = {"state": state}
+        if state == "admitted":
+            session_id = status.get("session_id")
+            input_id = status.get("input_id")
+            if not isinstance(session_id, str) or not isinstance(input_id, str):
+                raise MeerkatError("INVALID_RESPONSE", context)
+            parsed["session_id"] = session_id
+            parsed["input_id"] = input_id
+        elif state == "refused":
+            reason = status.get("reason")
+            if not isinstance(reason, str):
+                raise MeerkatError("INVALID_RESPONSE", context)
+            parsed["reason"] = reason
+        elif state not in ("pending", "stranded"):
+            raise MeerkatError("INVALID_RESPONSE", context)
+        return {
+            "delivery_id": delivery_id,
+            "committed_at_ms": committed_at_ms,
+            "status": parsed,
         }
 
     async def spawn_mob_member(

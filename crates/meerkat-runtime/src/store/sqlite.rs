@@ -21,21 +21,22 @@ mod inner {
     use crate::runtime_state::RuntimeState;
     use crate::store::{
         AuthOAuthFlowSnapshotUpdate, CommittedRecoveryBoundary, CommittedWholeBlobProvisionalTail,
-        CommittedWholeBlobSnapshot, ContinuationAdmission, ContinuationAdmissionOutcome,
-        ContinuationAdmissionTransition, ContinuationKeyBinding, ExactInputStateObservation,
-        FencedInputStateBatchCasOutcome, FencedMachineLifecycleCasOutcome,
-        HeadCanonicalProvisionalTailAuthority, HeadCanonicalRuntimeAuthorityActivation,
-        HeadCanonicalStoreAuthority, InputStateBatchCasImplementationProfile,
-        InputStateBatchCasOutcome, InputStateRow, KeyedRuntimeDeliveryCasOutcome,
-        MachineLifecycleCasOutcome, MachineLifecycleCommit, MachineLifecycleExpectedVersion,
-        MachineLifecycleObservation, MachineLifecycleObservationVersion, MachineLifecycleSnapshot,
-        MachineLifecycleStoreRecord, PreparedDurableTailRecoverySource,
-        PreparedHeadCanonicalProvisionalTail, PreparedRecoveryInputSnapshot,
-        PreparedRecoveryInputStateMutation, PreparedRecoveryReceiptSource,
-        PreparedRuntimeSessionCommit, PreparedRuntimeSessionCommitPayload,
-        PreparedRuntimeSessionCommitResult, PreparedWholeBlobProvisionalTail,
-        PreparedWholeBlobRewriteStoreParts, PreparedWholeBlobSnapshotCas, RecoveryCommitStatus,
-        RecoveryInputSetRevision, RecoveryInputStateMutation, RuntimeDeliveryAuthorityCasOutcome,
+        CommittedWholeBlobSnapshot, ContinuationAdmission, ContinuationAdmissionEntry,
+        ContinuationAdmissionOutcome, ContinuationAdmissionTransition, ContinuationKeyBinding,
+        ExactInputStateObservation, FencedInputStateBatchCasOutcome,
+        FencedMachineLifecycleCasOutcome, HeadCanonicalProvisionalTailAuthority,
+        HeadCanonicalRuntimeAuthorityActivation, HeadCanonicalStoreAuthority,
+        InputStateBatchCasImplementationProfile, InputStateBatchCasOutcome, InputStateRow,
+        KeyedRuntimeDeliveryCasOutcome, MachineLifecycleCasOutcome, MachineLifecycleCommit,
+        MachineLifecycleExpectedVersion, MachineLifecycleObservation,
+        MachineLifecycleObservationVersion, MachineLifecycleSnapshot, MachineLifecycleStoreRecord,
+        PreparedDurableTailRecoverySource, PreparedHeadCanonicalProvisionalTail,
+        PreparedRecoveryInputSnapshot, PreparedRecoveryInputStateMutation,
+        PreparedRecoveryReceiptSource, PreparedRuntimeSessionCommit,
+        PreparedRuntimeSessionCommitPayload, PreparedRuntimeSessionCommitResult,
+        PreparedWholeBlobProvisionalTail, PreparedWholeBlobRewriteStoreParts,
+        PreparedWholeBlobSnapshotCas, RecoveryCommitStatus, RecoveryInputSetRevision,
+        RecoveryInputStateMutation, RuntimeDeliveryAuthorityCasOutcome,
         RuntimeDeliveryAuthorityRecord, RuntimeDeliveryStoreRecord, RuntimeSessionAuthority,
         RuntimeSessionAuthorityReadCost, RuntimeSessionPersistenceProfile,
         RuntimeSessionResumeObservation, RuntimeStore, RuntimeStoreError, RuntimeStoreWriteFence,
@@ -15985,6 +15986,22 @@ ORDER BY runtime_id";
             let current = load_continuation_admission_in(&tx, address, delivery_id)?;
             let Some(next) = transition.next(current.as_ref()) else {
                 return Ok(ContinuationAdmissionOutcome::Rejected { current });
+            };
+            let next = match next {
+                ContinuationAdmissionEntry::Holds(next) => next,
+                ContinuationAdmissionEntry::Released => {
+                    tx.execute(
+                        r"
+                        DELETE FROM runtime_continuation_admissions
+                        WHERE runtime_id = ?1 AND delivery_id = ?2
+                        ",
+                        params![runtime_id_text(address), delivery_id],
+                    )
+                    .map_err(|error| RuntimeStoreError::WriteFailed(error.to_string()))?;
+                    tx.commit()
+                        .map_err(|error| RuntimeStoreError::WriteFailed(error.to_string()))?;
+                    return Ok(ContinuationAdmissionOutcome::Released);
+                }
             };
             let state = match &next {
                 ContinuationAdmission::Reserved { .. } => "reserved",

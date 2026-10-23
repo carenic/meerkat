@@ -9183,3 +9183,199 @@ def test_parse_compaction_completed_unknown_summary_source_kinds():
     event = parse_event(malformed)
     assert isinstance(event, UnknownEvent)
     assert event.type == "malformed_event"
+
+
+# Caller idempotency keys on session/external_event and mob/member_send.
+
+
+@pytest.mark.asyncio
+async def test_send_external_event_passes_the_idempotency_key_to_a_095_server() -> None:
+    client = MeerkatClient()
+    client._server_contract_version = "0.9.5"
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_request(method: str, params: dict[str, object]) -> dict[str, object]:
+        calls.append((method, params))
+        return {"outcome_type": "deduplicated", "existing_id": "input-1"}
+
+    client._request = fake_request  # type: ignore[method-assign]
+
+    outcome = await client.send_external_event(
+        "s1", "inbox.item", {"id": 1}, idempotency_key="item-1"
+    )
+
+    assert outcome == {"outcome_type": "deduplicated", "existing_id": "input-1"}
+    assert calls == [
+        (
+            "session/external_event",
+            {
+                "session_id": "s1",
+                "kind": "generic_json",
+                "event_type": "inbox.item",
+                "payload": {"id": 1},
+                "idempotency_key": "item-1",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_send_external_event_refuses_a_key_against_an_older_server() -> None:
+    client = MeerkatClient()
+    client._server_contract_version = "0.9.4"
+    calls: list[str] = []
+
+    async def fake_request(method: str, _params: dict[str, object]) -> dict[str, object]:
+        calls.append(method)
+        return {}
+
+    client._request = fake_request  # type: ignore[method-assign]
+
+    with pytest.raises(CapabilityUnavailableError) as raised:
+        await client.send_external_event("s1", "inbox.item", {}, idempotency_key="item-1")
+    assert raised.value.code == "CAPABILITY_UNAVAILABLE"
+    assert "0.9.5" in raised.value.message
+    assert calls == [], "a key an older server would drop is never sent"
+
+
+@pytest.mark.asyncio
+async def test_send_external_event_without_a_key_needs_no_contract_check() -> None:
+    client = MeerkatClient()
+    client._server_contract_version = "0.9.4"
+    calls: list[dict[str, object]] = []
+
+    async def fake_request(_method: str, params: dict[str, object]) -> dict[str, object]:
+        calls.append(params)
+        return {"outcome_type": "accepted"}
+
+    client._request = fake_request  # type: ignore[method-assign]
+
+    await client.send_external_event("s1", "inbox.item", {})
+    assert "idempotency_key" not in calls[0]
+
+
+@pytest.mark.asyncio
+async def test_send_mob_member_content_parses_the_keyed_continuation() -> None:
+    client = MeerkatClient()
+    client._server_contract_version = "0.9.5"
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_request(method: str, params: dict[str, object]) -> dict[str, object]:
+        calls.append((method, params))
+        return {
+            "mob_id": "mob-1",
+            "agent_identity": "agent-a",
+            "member_ref": _make_member_ref("mob-1", "agent-a"),
+            "handling_mode": "queue",
+            "continuation": {
+                "delivery_id": "continuation:abc",
+                "committed_at_ms": 1792000000000,
+                "status": {"state": "admitted", "session_id": "s-1", "input_id": "i-1"},
+            },
+        }
+
+    client._request = fake_request  # type: ignore[method-assign]
+
+    receipt = await client.send_mob_member_content(
+        "mob-1", "agent-a", "Ingest item 1.", idempotency_key="item-1"
+    )
+
+    assert receipt["continuation"] == {
+        "delivery_id": "continuation:abc",
+        "committed_at_ms": 1792000000000,
+        "status": {"state": "admitted", "session_id": "s-1", "input_id": "i-1"},
+    }
+    assert calls[0][1]["idempotency_key"] == "item-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status",
+    [
+        {"state": "pending"},
+        {"state": "stranded"},
+        {"state": "refused", "reason": "authority_denied"},
+    ],
+)
+async def test_send_mob_member_content_parses_every_continuation_state(
+    status: dict[str, object],
+) -> None:
+    client = MeerkatClient()
+    client._server_contract_version = "0.10.0"
+
+    async def fake_request(_method: str, _params: dict[str, object]) -> dict[str, object]:
+        return {
+            "mob_id": "mob-1",
+            "agent_identity": "agent-a",
+            "member_ref": _make_member_ref("mob-1", "agent-a"),
+            "handling_mode": "queue",
+            "continuation": {
+                "delivery_id": "continuation:abc",
+                "committed_at_ms": 1,
+                "status": status,
+            },
+        }
+
+    client._request = fake_request  # type: ignore[method-assign]
+
+    receipt = await client.send_mob_member_content(
+        "mob-1", "agent-a", "x", idempotency_key="item-1"
+    )
+    assert receipt["continuation"]["status"] == status
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "continuation",
+    [
+        None,
+        {"delivery_id": "", "committed_at_ms": 1, "status": {"state": "pending"}},
+        {"delivery_id": "d", "committed_at_ms": True, "status": {"state": "pending"}},
+        {"delivery_id": "d", "committed_at_ms": 1, "status": {"state": "lost"}},
+        {"delivery_id": "d", "committed_at_ms": 1, "status": {"state": "admitted"}},
+        {"delivery_id": "d", "committed_at_ms": 1, "status": {"state": "refused"}},
+    ],
+)
+async def test_send_mob_member_content_refuses_a_malformed_keyed_answer(
+    continuation: object,
+) -> None:
+    client = MeerkatClient()
+    client._server_contract_version = "0.9.5"
+
+    async def fake_request(_method: str, _params: dict[str, object]) -> dict[str, object]:
+        answer: dict[str, object] = {
+            "mob_id": "mob-1",
+            "agent_identity": "agent-a",
+            "member_ref": _make_member_ref("mob-1", "agent-a"),
+            "handling_mode": "queue",
+        }
+        if continuation is not None:
+            answer["continuation"] = continuation
+        return answer
+
+    client._request = fake_request  # type: ignore[method-assign]
+
+    with pytest.raises(MeerkatError) as raised:
+        await client.send_mob_member_content(
+            "mob-1", "agent-a", "x", idempotency_key="item-1"
+        )
+    assert raised.value.code == "INVALID_RESPONSE"
+
+
+@pytest.mark.asyncio
+async def test_send_mob_member_content_refuses_a_key_against_an_older_server() -> None:
+    client = MeerkatClient()
+    client._server_contract_version = "0.9.4"
+    calls: list[str] = []
+
+    async def fake_request(method: str, _params: dict[str, object]) -> dict[str, object]:
+        calls.append(method)
+        return {}
+
+    client._request = fake_request  # type: ignore[method-assign]
+
+    with pytest.raises(CapabilityUnavailableError):
+        await client.send_mob_member_content(
+            "mob-1", "agent-a", "x", idempotency_key="item-1"
+        )
+    assert calls == []

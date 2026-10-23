@@ -849,6 +849,7 @@ SessionExternalEventEnvelope = SessionExternalEventEnvelopeGenericJson | Session
 # catalogued params type rather than supplied by an undocumented wrapper
 # extension.
 class SessionExternalEventParamsGenericJson(TypedDict, total=False):
+    idempotency_key: NotRequired[Optional[str]]
     session_id: Required[str]
     blocks: NotRequired[Optional[list[WireContentBlock]]]
     event_type: Required[str]
@@ -856,6 +857,7 @@ class SessionExternalEventParamsGenericJson(TypedDict, total=False):
     payload: Required[Any]
 
 class SessionExternalEventParamsPeerResponseTerminal(TypedDict, total=False):
+    idempotency_key: NotRequired[Optional[str]]
     session_id: Required[str]
     display_name: NotRequired[Optional[PeerName]]
     kind: Required[Literal['peer_response_terminal']]
@@ -2789,7 +2791,17 @@ class MobMemberSendParams:
     content: WireContentInput
     mob_id: str
     handling_mode: Optional[WireHandlingMode] = None
+    idempotency_key: Optional[str] = None
     render_metadata: Optional[dict[str, Any]] = None
+
+
+@dataclass
+class WireContinuationReceipt:
+    """The receipt of a keyed member send: the durable continuation it was
+committed as, and that continuation's delivery status when answered."""
+    committed_at_ms: int
+    delivery_id: str
+    status: WireContinuationStatus
 
 
 @dataclass
@@ -2799,6 +2811,7 @@ class MobMemberSendResult:
     handling_mode: WireHandlingMode
     member_ref: WireMemberRef
     mob_id: str
+    continuation: Optional[WireContinuationReceipt] = None
 
 
 @dataclass
@@ -7028,6 +7041,27 @@ WireMemberPreviewUnavailable = Literal['observation_deadline', 'read_failed', 's
 # The member registration hook call that refused a restored member's
 # registration.
 WireMemberRegistrationHookCall = Literal['select_destination', 'select_agent_mandate', 'prepare_member_surface', 'verify_member_surface']
+
+# Delivery status of a keyed member send. `stranded` is final and means the
+# content was never admitted: resend it under a new key. A `pending` that
+# survives a gateway restart is not proof of loss; do not resend it under a
+# new key.
+class WireContinuationStatusPending(TypedDict, total=False):
+    state: Required[Literal['pending']]
+
+class WireContinuationStatusAdmitted(TypedDict, total=False):
+    input_id: Required[str]
+    session_id: Required[str]
+    state: Required[Literal['admitted']]
+
+class WireContinuationStatusStranded(TypedDict, total=False):
+    state: Required[Literal['stranded']]
+
+class WireContinuationStatusRefused(TypedDict, total=False):
+    reason: Required[str]
+    state: Required[Literal['refused']]
+
+WireContinuationStatus = WireContinuationStatusPending | WireContinuationStatusAdmitted | WireContinuationStatusStranded | WireContinuationStatusRefused
 
 # Lifecycle status of a flow run on the wire. Mirrors
 # `meerkat_mob::MobRunStatus` so consumers branch on a closed type rather than
