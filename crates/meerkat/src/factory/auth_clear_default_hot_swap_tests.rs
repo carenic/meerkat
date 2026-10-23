@@ -52,7 +52,10 @@ const MODEL_A: &str = "gpt-5.4";
 const MODEL_B: &str = "gpt-5.5";
 const TEST_REALM: &str = "default";
 const TEST_BINDING: &str = "default_openai";
-const TEST_ACCOUNT: &str = "account_a";
+/// The managed-store scenario's credential account. A credential account
+/// names one process-wide lease and login lifecycle (realm and account), so
+/// no other test of this lib may configure it.
+const TEST_ACCOUNT: &str = "hot_swap_account_a";
 const ANSWER: &str = "answered";
 
 fn configured_binding() -> AuthBindingRef {
