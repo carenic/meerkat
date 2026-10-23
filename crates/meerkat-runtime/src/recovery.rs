@@ -1299,9 +1299,22 @@ struct ObservedPersistedLifecycle {
     live_bridge_recovery: crate::live_execution::LiveBridgeRecoveryImage,
 }
 
+/// How a recovery reads a persisted `Stopped` lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoppedLifecycle {
+    /// Ordinary recovery: a `Stopped` runtime is not quiescent, because a
+    /// later start may resume its run.
+    NonQuiescent,
+    /// The archive of a session that is ending: the executor exited, no later
+    /// start resumes a run, and the archive holds the session's gates, so a
+    /// `Stopped` runtime is quiescent as a `Retired` one is.
+    QuiescentForSessionArchive,
+}
+
 fn observe_persisted_lifecycle(
     observation: MachineLifecycleObservation,
     candidate_run_id: &meerkat_core::RunId,
+    stopped: StoppedLifecycle,
 ) -> ObservedPersistedLifecycle {
     match observation {
         MachineLifecycleObservation::Missing => ObservedPersistedLifecycle {
@@ -1324,6 +1337,18 @@ fn observe_persisted_lifecycle(
                     mm_dsl::DurableRecoveryObservedLifecycle::Retired,
                     RuntimeState::Retired,
                 ),
+                // An archive of an ending session judges a stopped runtime
+                // as the quiescent terminal it is there, and re-asserts
+                // `Stopped` (recovery never invents a phase). The persisted
+                // current run keeps its own guard.
+                Some(RuntimeState::Stopped)
+                    if stopped == StoppedLifecycle::QuiescentForSessionArchive =>
+                {
+                    (
+                        mm_dsl::DurableRecoveryObservedLifecycle::Retired,
+                        RuntimeState::Stopped,
+                    )
+                }
                 Some(_) => (
                     mm_dsl::DurableRecoveryObservedLifecycle::NonQuiescent,
                     RuntimeState::Idle,
@@ -1676,7 +1701,8 @@ pub async fn recover_durable_tail(
     store: &dyn RuntimeStore,
     session_id: &SessionId,
 ) -> Result<DurableTailRecoveryOutcome, DurableTailRecoveryError> {
-    recover_durable_tail_capturing(store, session_id, &mut None).await
+    recover_durable_tail_capturing(store, session_id, &mut None, StoppedLifecycle::NonQuiescent)
+        .await
 }
 
 /// [`recover_durable_tail`], additionally returning the exact committed
@@ -1698,8 +1724,46 @@ pub async fn recover_durable_tail_retaining_committed_whole_blob(
     DurableTailRecoveryError,
 > {
     let mut committed_whole_blob = None;
-    let outcome =
-        recover_durable_tail_capturing(store, session_id, &mut committed_whole_blob).await?;
+    let outcome = recover_durable_tail_capturing(
+        store,
+        session_id,
+        &mut committed_whole_blob,
+        StoppedLifecycle::NonQuiescent,
+    )
+    .await?;
+    Ok((outcome, committed_whole_blob))
+}
+
+/// [`recover_durable_tail_retaining_committed_whole_blob`] for the archive
+/// of a session that is ending.
+///
+/// The caller is an archive that holds the session's turn boundary, its
+/// recovery gate and its runtime archive lease, and the session ends with
+/// that archive: no later start resumes its run. A persisted `Stopped`
+/// lifecycle (the executor exited, no run bound) is therefore quiescent
+/// here, as `Retired` is, and the recovery re-asserts `Stopped`. Ordinary
+/// recovery keeps refusing a `Stopped` runtime, because a later start may
+/// resume its run. Every other guard is unchanged: a persisted current run
+/// still refuses, and the commit is fenced on the exact lifecycle row
+/// version the machine judged.
+pub async fn recover_durable_tail_for_session_archive(
+    store: &dyn RuntimeStore,
+    session_id: &SessionId,
+) -> Result<
+    (
+        DurableTailRecoveryOutcome,
+        Option<crate::store::CommittedWholeBlobSnapshot>,
+    ),
+    DurableTailRecoveryError,
+> {
+    let mut committed_whole_blob = None;
+    let outcome = recover_durable_tail_capturing(
+        store,
+        session_id,
+        &mut committed_whole_blob,
+        StoppedLifecycle::QuiescentForSessionArchive,
+    )
+    .await?;
     Ok((outcome, committed_whole_blob))
 }
 
@@ -1707,6 +1771,7 @@ async fn recover_durable_tail_capturing(
     store: &dyn RuntimeStore,
     session_id: &SessionId,
     aligned_committed_whole_blob: &mut Option<crate::store::CommittedWholeBlobSnapshot>,
+    stopped: StoppedLifecycle,
 ) -> Result<DurableTailRecoveryOutcome, DurableTailRecoveryError> {
     let runtime_id = LogicalRuntimeId::for_session(session_id);
     let mut preparation = load_recovery_preparation(store, &runtime_id, session_id).await?;
@@ -1759,7 +1824,9 @@ async fn recover_durable_tail_capturing(
     };
 
     let observed = match store.observe_machine_lifecycle(&runtime_id).await {
-        Ok(observation) => observe_persisted_lifecycle(observation, &candidate.candidate_run_id),
+        Ok(observation) => {
+            observe_persisted_lifecycle(observation, &candidate.candidate_run_id, stopped)
+        }
         // A store that cannot observe its lifecycle row cannot prove
         // quiescence; the machine refuses undecodable evidence.
         Err(RuntimeStoreError::Unsupported(_)) => ObservedPersistedLifecycle {
@@ -2405,6 +2472,7 @@ mod store_authority_tests {
         let observed = observe_persisted_lifecycle(
             MachineLifecycleObservation::from_raw_record(&encoded),
             &RunId::new(),
+            StoppedLifecycle::NonQuiescent,
         );
         let reassertion = durable_tail_lifecycle_reassertion(&observed);
         assert_eq!(
