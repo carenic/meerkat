@@ -218,7 +218,10 @@ them.
   this metadata cannot be read after downgrading to a runtime or SDK that
   lacks the variant or its required `provider_id` field. The existing
   signature-only `Gemini` variant and Gemini's HTTP `functionCall.id` and
-  `functionResponse.id` fields are unchanged.
+  `functionResponse.id` fields are unchanged. The new variant is declared
+  between `Gemini` and `OpenAi`, so in both enums the implicit discriminants
+  of `OpenAi`, `OpenAiResponse` and `OpenAiAssistantMessage` move up by one;
+  their serialized `provider` tags are unchanged.
 
 - `meerkat-schedule`: the occurrence lifecycle carries the admission evidence
   of an occurrence's receipt history (see Fixed, scheduled delivery after a
@@ -701,6 +704,17 @@ them.
   exhaustive, so a `match` outside the crate needs the arms. The wait-failure
   enums of `meerkat_machine::dsl` gain the variants above, also appended last.
 
+- `meerkat-machine-schema`, `meerkat-runtime`: the runtime machine's generated
+  variant enums gain the new inputs and effects, appended last.
+  `MeerkatMachineInputVariant` gains `ClassifyStopInputDisposition`,
+  `MarkRunResumable`, `ResumeRun`, `ReleaseResumableRun`, `SettleResumableRun`,
+  `SuspendRunForStop`, `ReplayAppliedRunContributor` and
+  `AuthorizeOperatorDurableTailRepair`, and `MeerkatMachineEffectVariant` gains
+  `StopInputDispositionClassified`, `ResumableRunMarked`,
+  `ResumedRunAuthorized`, `ResumableRunReleased`, `ResumableRunSettled` and
+  `RunSuspendedForStop`. Both enums are exhaustive, so a `match` outside the
+  crates needs the arms.
+
 - `meerkat-rest`: `ApiError` gains `SessionNotRunningWithData { message,
   details }` (`409` `SESSION_NOT_RUNNING`), appended last. The enum is
   exhaustive, so a `match` outside the crate needs the arm.
@@ -781,14 +795,25 @@ them.
   `STORED_INPUT_STATE_VERSION` is 8, and `STORED_INPUT_STATE_BASELINE_VERSION`
   (7) and `stored_input_state_version_for_row` are new.
 
+- `meerkat-machine-schema`: `SessionPersistenceVersionAuthorityMachineState`
+  gains the public field `stored_input_state_baseline_version` (initially 7,
+  the baseline above). Code that builds the state with a struct literal sets
+  it.
+
 - `meerkat-runtime`: `RuntimeBindingsError` gains the variant
   `Hosting(SessionId, SessionError)` and is now `#[non_exhaustive]`. Binding
   preparation for a session another runtime owner hosts, or whose hosting
   claim cannot be taken, returns it with the typed
   `SessionError::ServedElsewhere` or `SessionError::HostingUnavailable`
   instead of a `PrepareFailed` message. The gate's findings: an added enum
-  variant and an enum marked non-exhaustive. A downstream match needs a
-  wildcard arm; `rejected_before_effect` stays false for the new variant.
+  variant, an enum marked non-exhaustive, and the enum no longer
+  `UnwindSafe` or `RefUnwindSafe` (`SessionError` can carry a boxed
+  `dyn Error`). A downstream match needs a wildcard arm;
+  `rejected_before_effect` stays false for the new variant.
+
+- `meerkat-rpc`: `NotificationSink` now holds the bounded outbound byte and
+  message admission of RPC notifications (see Fixed), whose semaphores are
+  not unwind safe, so it is no longer `UnwindSafe` or `RefUnwindSafe`.
 
 - `meerkat-contracts`: `MobMemberStatusResult` gains the field
   `custody_deferred: Option<WireMemberCustodyDeferral>`, absent from the wire
@@ -883,6 +908,10 @@ them.
   params deny unknown fields) and ignores it on `session/create`, so the
   Python and TypeScript SDKs send it only to a server whose contract version
   is 0.9.5 or later.
+
+- `meerkat-rpc`: `SessionRuntime::start_turn_via_runtime_with_request_context`
+  takes a tenth parameter, `session_events: bool`, the request's opt-out of its
+  turn's `session/event` copies (`true` keeps the earlier behaviour).
 
 ### Added
 
