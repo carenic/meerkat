@@ -473,12 +473,16 @@ Before you run a host store in production, run the host store chapter of the
   run ends, is closed as interrupted although its transcript is whole: it
   shows the interrupted notice, and nothing is lost or run twice. Without
   the compaction, recovery commits such a run as completed.
-- A client of `rkat-rpc` whose turn is running when the server shuts down
-  gracefully gets a shutdown error, not a typed answer, although the server
-  keeps the run of a session with per-round commits and continues it at the
-  session's next open. Read the input's state with `session/input_status`
-  before you retry, so that it does not run twice. A typed answer for this
-  case is planned.
+- A JSON-RPC or REST client whose turn on a session with per-round commits
+  is in flight when the server stops gracefully, keeping the session's work,
+  gets no typed suspended answer. Its request ends with the
+  session-not-running error of kind `requeued_across_stop` (JSON-RPC
+  `-32003` with `data.input_id`, `data.stopped_at` and
+  `data.resumable: true`; REST `409` `SESSION_NOT_RUNNING`), which is not a
+  terminal run failure, or with a closed connection when the server exits
+  before it answers. The server resumes the run at the session's next start.
+  Read the run's status, for example with `session/input_status`, before you
+  retry: resubmitting the input runs it again.
 - A run that resumes after a crash during structured-output extraction asks
   the model again from its last round commit, so it publishes `RunCompleted`
   with `extraction_required` a second time under the same run id.
