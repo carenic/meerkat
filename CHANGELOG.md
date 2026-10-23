@@ -1304,7 +1304,8 @@ them.
     asks the target, a busy one too, whether it admitted the delivery. It
     records that input's outcome when the target did, and ends `misfired`
     with nothing delivered when it did not. A mob target answers from its
-    durable external-delivery record and begins none;
+    durable external-delivery record and begins none, and so does a mob
+    member's identity target, on every surface (JSON-RPC and CLI included);
   - no dispatch was recorded (a crash before the dispatch start was
     recorded): the misfire policy decides, as before.
   The evidence is read from the occurrence's receipt history in both stores,
