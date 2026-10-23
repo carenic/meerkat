@@ -37,11 +37,10 @@ async fn destroy_to_terminal(handle: &MobHandle) {
     let mut attempts = 0_u32;
     loop {
         attempts += 1;
-        let answer = tokio::time::timeout_at(started + DESTROY_GUARD, handle.destroy())
-            .await
-            .unwrap_or_else(|_| {
-                panic!("the mob destroy did not finish in {DESTROY_GUARD:?} ({attempts} attempts)")
-            });
+        let Ok(answer) = tokio::time::timeout_at(started + DESTROY_GUARD, handle.destroy()).await
+        else {
+            panic!("the mob destroy did not finish in {DESTROY_GUARD:?} ({attempts} attempts)");
+        };
         match answer {
             Ok(_) => return,
             Err(crate::runtime::handle::MobDestroyError::Incomplete { report })
