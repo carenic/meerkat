@@ -37,6 +37,16 @@ them.
 
 ### Breaking
 
+- `meerkat-runtime`: `RuntimeSessionQuiescentClose` is now
+  `#[non_exhaustive]` and gains `ClosedOrphanedDrain`.
+  `MeerkatMachine::unregister_session_registration_until_terminal_if_quiescent`
+  returns that variant after completing an orphaned drain or pending
+  finalization, which may abandon held inputs with reason `Stopped`.
+  `Closed` now identifies only a genuinely quiescent close. Downstream
+  matches must handle the new variant and include a wildcard for future
+  variants; callers requiring non-interruption must not treat
+  `ClosedOrphanedDrain` as `Closed`.
+
 - `meerkat-contracts`: `WireProviderMeta` gains the
   `GeminiFunctionCall { id, thought_signature }` variant, serialized with
   `provider: "gemini_function_call"`. Downstream exhaustive Rust matches

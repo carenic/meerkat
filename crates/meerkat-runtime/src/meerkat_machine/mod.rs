@@ -1551,14 +1551,11 @@ pub enum RuntimeSessionUnregisterUseAdmission {
 /// Typed answer of the same-registration quiescent close admission
 /// ([`MeerkatMachine::unregister_session_registration_until_terminal_if_quiescent`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RuntimeSessionQuiescentClose {
-    /// The exact registration's owned unregister teardown completed. Either
-    /// it held no non-terminal input and no run, and `BeginUnregisterSession`
-    /// committed while its mutation gate still excluded ingress; or its drain
-    /// window had lost its owner and no run was in flight. In that second
-    /// case the teardown, like any unregister, abandons every input the drain
-    /// still held (reason `Stopped`) and resolves its completion as
-    /// runtime-terminated, so a later resume does not run it.
+    /// The exact registration held no non-terminal input and no run. Its
+    /// owned unregister teardown completed after `BeginUnregisterSession`
+    /// committed while its mutation gate still excluded ingress.
     Closed,
     /// The exact registration holds a non-terminal input or a run. Nothing
     /// was staged: the registration and its running owner keep serving, and
@@ -1570,6 +1567,13 @@ pub enum RuntimeSessionQuiescentClose {
     AlreadyClosing,
     /// The supplied registration is absent or no longer current.
     NotCurrent,
+    /// The exact registration's orphaned drain or pending finalization was
+    /// completed with no run in flight. This is not a quiescent admission:
+    /// the teardown abandons any inputs the drain still held (reason
+    /// `Stopped`) and resolves their completions as runtime-terminated, so a
+    /// later resume does not run them. This variant also applies when the
+    /// orphaned drain held no inputs.
+    ClosedOrphanedDrain,
 }
 
 /// The wait a caller dispatched on after starting or joining an owned
