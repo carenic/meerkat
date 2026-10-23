@@ -792,8 +792,9 @@ impl RequeueMaxAge {
     /// The longest accepted bound, the runtime's
     /// [`UnregisterQueuedInputs::MAX_AGE_CAP`](meerkat_runtime::UnregisterQueuedInputs::MAX_AGE_CAP).
     pub const CAP: Duration = meerkat_runtime::UnregisterQueuedInputs::MAX_AGE_CAP;
-    /// The bound a requeue uses when the caller names none.
-    pub const DEFAULT: Duration = Duration::from_mins(15);
+    /// The bound a requeue uses when the caller names none, the runtime's
+    /// [`UnregisterQueuedInputs::DEFAULT_MAX_AGE`](meerkat_runtime::UnregisterQueuedInputs::DEFAULT_MAX_AGE).
+    pub const DEFAULT: Duration = meerkat_runtime::UnregisterQueuedInputs::DEFAULT_MAX_AGE;
 
     /// A bound of `max_age`, checked by the runtime's own rule
     /// ([`UnregisterQueuedInputs::check`](meerkat_runtime::UnregisterQueuedInputs::check)).
