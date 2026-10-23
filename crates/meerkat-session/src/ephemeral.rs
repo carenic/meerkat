@@ -1578,6 +1578,26 @@ struct LiveSessionActorIncarnation {
     transient_turn_context_state: meerkat_core::TransientTurnContextStateHandle,
 }
 
+/// A session's turn finalization boundary was held when a non-waiting caller
+/// tried to take it: a turn (or another boundary holder) has it now. Nothing
+/// was asked of the actor. It grants nothing and prescribes no retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the session's turn boundary is held")]
+pub struct TurnBoundaryHeld;
+
+/// Why a non-waiting controller pin returned no client.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum TryPinControllerError {
+    /// The session's turn boundary is held now; nothing was asked of the
+    /// actor.
+    #[error("the session's turn boundary is held")]
+    TurnBoundaryHeld,
+    /// The exact actor could not be pinned: it is gone, replaced or failed.
+    #[error(transparent)]
+    Session(SessionError),
+}
+
 /// One-shot publication cell for the exact actor inserted by a service create.
 ///
 /// The slot lives at the ephemeral registry boundary so both native and wasm
@@ -7812,6 +7832,30 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
             return Err(SessionError::NotFound { id: id.clone() });
         }
         Ok(controller)
+    }
+
+    /// [`Self::pin_controller_client_for_actor`] for a caller that must not
+    /// wait behind a turn: the session's turn finalization boundary is only
+    /// tried, never waited for. A held boundary answers
+    /// [`TryPinControllerError::TurnBoundaryHeld`] at once and nothing is
+    /// asked of the actor. Under the boundary the actor is between turns, so
+    /// it answers the pin command at once. The boundary is released before
+    /// this returns; the caller retains the returned pin.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn try_pin_controller_client_for_actor(
+        &self,
+        expected_actor: &LiveSessionActorWitness,
+    ) -> Result<meerkat_core::ControllerModelClient, TryPinControllerError> {
+        let Ok(_turn_finalization_guard) = self
+            .turn_finalization_gate_for_session(expected_actor.session_id())
+            .await
+            .try_lock_owned()
+        else {
+            return Err(TryPinControllerError::TurnBoundaryHeld);
+        };
+        self.pin_controller_client_for_actor(expected_actor)
+            .await
+            .map_err(TryPinControllerError::Session)
     }
 
     /// Attach one reviewed MCP server to the exact live actor's own router.
@@ -15008,6 +15052,71 @@ mod archive_shutdown_drain_tests {
             .archive(&other_session_id)
             .await
             .expect("cleanup unrelated session");
+    }
+
+    /// The non-waiting controller pin: while a turn runs (it holds the
+    /// session's turn boundary) the pin answers at once that the boundary is
+    /// held and sends nothing to the actor; once the turn ends it reaches the
+    /// idle actor.
+    #[tokio::test]
+    async fn try_pin_answers_busy_while_a_turn_runs_and_reaches_the_idle_actor() {
+        let hooks = DrainProbeHooks::new();
+        let service = Arc::new(EphemeralSessionService::new(
+            DrainProbeBuilder {
+                hooks: hooks.clone(),
+            },
+            1,
+        ));
+        let created = service
+            .create_session(create_request())
+            .await
+            .expect("create session");
+        let session_id = created.session_id;
+        let witness = service
+            .live_session_actor_witness(&session_id)
+            .await
+            .expect("live actor witness");
+
+        let turn_service = Arc::clone(&service);
+        let turn_session = session_id.clone();
+        let turn = tokio::spawn(async move {
+            turn_service
+                .start_turn(&turn_session, start_turn_request())
+                .await
+        });
+        tokio::time::timeout(WAITER_TIMEOUT, hooks.entered_run.notified())
+            .await
+            .expect("turn should enter the probe run");
+        let busy = tokio::time::timeout(
+            Duration::from_secs(2),
+            service.try_pin_controller_client_for_actor(&witness),
+        )
+        .await
+        .expect("a running turn is never waited for");
+        assert!(
+            matches!(busy, Err(TryPinControllerError::TurnBoundaryHeld)),
+            "a running turn holds the boundary: {:?}",
+            busy.as_ref().err()
+        );
+
+        hooks.release_run.add_permits(1);
+        tokio::time::timeout(WAITER_TIMEOUT, turn)
+            .await
+            .expect("turn task should finish")
+            .expect("turn task should not panic")
+            .expect("the turn completes");
+        let pinned = tokio::time::timeout(
+            WAITER_TIMEOUT,
+            service.try_pin_controller_client_for_actor(&witness),
+        )
+        .await
+        .expect("an idle actor answers");
+        assert!(
+            !matches!(pinned, Err(TryPinControllerError::TurnBoundaryHeld)),
+            "a free boundary reaches the actor: {:?}",
+            pinned.as_ref().err()
+        );
+        service.archive(&session_id).await.expect("cleanup");
     }
 
     #[tokio::test]

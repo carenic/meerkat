@@ -214,6 +214,13 @@ pub use continuation::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use continuation::{
+    BoundHostOriginal, GovernedAdmissionOutcome, HostOriginalAdmission, HostOriginalBinder,
+    HostOriginalBinderReadiness, HostOriginalFacts, HostOriginalLookup, HostOriginalReadiness,
+    HostOriginalRecord, HostOriginalRef, HostOriginalRefusal, HostOriginalSettlement,
+    RESERVED_HOST_NAMESPACE_PREFIX, governed_admission_outcome, is_reserved_host_namespace,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use continuation::{
     ContinuationAdmitError, ContinuationBindError, ContinuationBinding,
     ContinuationBindingGeneration, ContinuationHostBindings, RetainedJobFacts, RetainedJobLookup,
     RetainedJobRecord, RetainedJobSource, retained_admission_outcome,
