@@ -916,6 +916,10 @@ pub(crate) struct RunRoundCommits {
     /// store-issued provisional run id), but a checkpoint without the cursor
     /// is attributable only by such a message.
     run_row_since_rewrite: bool,
+    /// The run was asked to stop at a boundary and stay resumable
+    /// ([`crate::agent::CancelAfterBoundaryCommand::suspend_for_run`]): a
+    /// cancelled exit then writes no closing checkpoint.
+    keep_resume_point: bool,
     /// The run rewrote its transcript since the committed base its round
     /// commits chain from. A session without a durable HeadCanonical head (a
     /// WholeBlob session) is recovered only from a strict continuation of
@@ -2072,7 +2076,10 @@ where
     /// result, a failed write fails the run. After a failure the run's own
     /// error stands and the write's is logged, unless the write's error
     /// requires the session's teardown. A run whose own failure requires the
-    /// session's teardown writes nothing more.
+    /// session's teardown writes nothing more, and neither does a run
+    /// cancelled at a boundary by a suspension (see
+    /// [`crate::agent::CancelAfterBoundaryCommand::suspend_for_run`]), whose
+    /// last round commit stays its resume point.
     pub(super) async fn close_run_cursor_at_exit(
         &mut self,
         result: Result<RunResult, AgentError>,
@@ -2087,6 +2094,14 @@ where
         // unknown, a writer past its fence) writes nothing more: the live
         // actor reloads, and recovery reads the last round commit.
         if matches!(&result, Err(error) if error.requires_session_teardown()) {
+            return result;
+        }
+        // A run suspended at a boundary (a host draining and requeueing its
+        // work) stays resumable: its last round commit, cursor included,
+        // stays its resume point.
+        if self.round_commits.keep_resume_point
+            && matches!(&result, Err(error) if matches!(error.primary_error(), AgentError::Cancelled))
+        {
             return result;
         }
         let promotes = self.run_exit_promotes_latest_checkpoint(&result);
@@ -5751,21 +5766,31 @@ where
         // most once per boundary regardless of how many commands queued. A
         // disconnected producer simply means no request is pending.
         let mut requested = false;
+        let mut plain_cancel = false;
         while let Ok(command) = self.cancel_after_boundary_rx.try_recv() {
             // Commands are attachment/run capabilities, not SessionId-level
             // wishes. Discard stale commands instead of carrying them across a
             // turn transition and cancelling the successor run.
             if command.expected_run_id() == run_id {
                 requested = true;
+                plain_cancel |= !command.suspends_run();
             }
         }
         if !requested {
             return Ok(());
         }
 
-        if self.turn_active_run_id()?.as_ref() != Some(run_id)
-            || self.turn_cancel_after_boundary()?
-        {
+        if self.turn_active_run_id()?.as_ref() != Some(run_id) {
+            return Ok(());
+        }
+        // A suspension keeps the run's last round commit as its resume point;
+        // a plain cancel, observed before or after it, ends the run for good.
+        if plain_cancel {
+            self.round_commits.keep_resume_point = false;
+        } else if !self.turn_cancel_after_boundary()? {
+            self.round_commits.keep_resume_point = true;
+        }
+        if self.turn_cancel_after_boundary()? {
             return Ok(());
         }
 

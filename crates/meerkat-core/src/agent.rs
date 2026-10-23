@@ -793,17 +793,38 @@ pub struct ExternalToolUpdate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CancelAfterBoundaryCommand {
     expected_run_id: RunId,
+    suspend: bool,
 }
 
 impl CancelAfterBoundaryCommand {
     /// Bind a cooperative-cancel command to one exact run incarnation.
     pub fn for_run(expected_run_id: RunId) -> Self {
-        Self { expected_run_id }
+        Self {
+            expected_run_id,
+            suspend: false,
+        }
+    }
+
+    /// Stop one exact run at its next boundary and keep it resumable: a
+    /// durable run that stops this way writes no closing checkpoint, so its
+    /// last round commit, cursor included, stays its resume point. A host
+    /// that drains and requeues its work sends this; a plain
+    /// [`Self::for_run`] for the same run, sent before or after, wins.
+    pub fn suspend_for_run(expected_run_id: RunId) -> Self {
+        Self {
+            expected_run_id,
+            suspend: true,
+        }
     }
 
     /// Exact run incarnation this command is authorized to affect.
     pub fn expected_run_id(&self) -> &RunId {
         &self.expected_run_id
+    }
+
+    /// Whether the run stops resumable ([`Self::suspend_for_run`]).
+    pub const fn suspends_run(&self) -> bool {
+        self.suspend
     }
 }
 

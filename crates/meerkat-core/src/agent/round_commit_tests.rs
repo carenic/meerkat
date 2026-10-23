@@ -138,6 +138,9 @@ struct RecordingTools {
     dispatched: Mutex<Vec<(String, Option<ToolCallDedupeKey>)>>,
     hang_on: Option<&'static str>,
     entered: Notify,
+    /// Ask the running run to stop at its next boundary from the first
+    /// dispatch: `true` suspends it, `false` cancels it.
+    boundary_stop: Mutex<Option<(meerkat_core::CancelAfterBoundarySender, bool)>>,
 }
 
 impl RecordingTools {
@@ -147,7 +150,16 @@ impl RecordingTools {
             dispatched: Mutex::new(Vec::new()),
             hang_on,
             entered: Notify::new(),
+            boundary_stop: Mutex::new(None),
         })
+    }
+
+    fn stop_at_next_boundary(
+        &self,
+        sender: meerkat_core::CancelAfterBoundarySender,
+        suspend: bool,
+    ) {
+        *self.boundary_stop.lock().unwrap() = Some((sender, suspend));
     }
 
     fn probes() -> Vec<ToolDef> {
@@ -184,6 +196,15 @@ impl AgentToolDispatcher for RecordingTools {
             .lock()
             .unwrap()
             .push((call.id.to_string(), context.tool_call_dedupe_key(call)));
+        let boundary_stop = self.boundary_stop.lock().unwrap().take();
+        if let (Some((sender, suspend)), Some(run_id)) = (boundary_stop, context.run_id()) {
+            let command = if suspend {
+                meerkat_core::CancelAfterBoundaryCommand::suspend_for_run(run_id.clone())
+            } else {
+                meerkat_core::CancelAfterBoundaryCommand::for_run(run_id.clone())
+            };
+            sender.send(command).expect("the agent holds the receiver");
+        }
         if self.hang_on == Some(call.name) {
             self.entered.notify_one();
             std::future::pending::<()>().await;
@@ -950,6 +971,61 @@ async fn a_run_capped_after_a_round_closes_its_cursor() {
         closing.messages().last(),
         Some(Message::ToolResults { .. })
     ));
+}
+
+/// A run a host suspends at a boundary (it drains and requeues its work)
+/// stops resumable: its exit writes no closing checkpoint, so its last round
+/// commit, cursor included, stays its resume point. A plain boundary cancel
+/// ends the run for good: its exit writes the closing checkpoint without the
+/// cursor.
+#[tokio::test]
+async fn a_suspended_run_keeps_its_last_round_commit_and_a_cancelled_one_closes() {
+    for suspend in [true, false] {
+        let client = ScriptedClient::new(vec![
+            Step::Tools(vec![("call-1", "probe", "{}")]),
+            Step::Answer("never asked"),
+        ]);
+        let tools = RecordingTools::new(RecordingTools::probes(), None);
+        let checkpointer = RecordingCheckpointer::new();
+        let mut agent = build_agent(
+            fresh_session(),
+            &client,
+            &tools,
+            Some(Arc::clone(&checkpointer)),
+            true,
+            None,
+        )
+        .await;
+        tools.stop_at_next_boundary(agent.cancel_after_boundary_handle(), suspend);
+
+        let error = agent
+            .run("start".into())
+            .await
+            .expect_err("the run stops at its next boundary");
+        assert!(
+            matches!(error.primary_error(), AgentError::Cancelled),
+            "{error}"
+        );
+        assert_eq!(client.calls(), 1, "no model call after the stop");
+        let commits = checkpointer.commits();
+        let (last, _) = commits.last().expect("the round committed");
+        if suspend {
+            assert_eq!(commits.len(), 2, "both round commits, no closing write");
+            let cursor = cursor_of(last).expect("the resume point keeps its cursor");
+            assert!(matches!(cursor.resume_point, RunResumePoint::AwaitingModel));
+            assert_eq!(cursor.round, 0);
+        } else {
+            assert_eq!(
+                commits.len(),
+                3,
+                "both round commits, then the closing write"
+            );
+            assert!(
+                cursor_of(last).is_none(),
+                "a cancelled run claims no open round"
+            );
+        }
+    }
 }
 
 /// The cursor lists the inputs the session layer staged for the run; a run
