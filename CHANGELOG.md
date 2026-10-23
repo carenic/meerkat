@@ -181,6 +181,13 @@ them.
 
 ### Changed
 
+- `meerkat-store`: the refusal of a runtime commit over a session saved whole
+  outside the runtime, by a pre-0.9 build or by a non-runtime service sharing a
+  realm's SQLite session store, names that cause and that a runtime-backed host
+  cannot adopt such a session. It said only "legacy whole-blob session exists
+  without a canonical head". The session's data stays intact, and the error
+  variant is unchanged.
+
 - `meerkat-core`: the `FORK_INSTRUCTION_REFUSED` message for a fork the
   policy refuses (cause `policy_refuses`) names the setting that changes it:
   "to carry them into the child, set the host's fork_instruction_policy
