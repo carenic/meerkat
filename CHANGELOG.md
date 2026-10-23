@@ -1325,9 +1325,14 @@ them.
   refusal before the run) leaves the prompt pending, so it lands exactly once,
   also for a session persisted with a staged prompt by an earlier release. A
   turn whose input carries directed interaction custody is refused with the new
-  `AgentError::StagedPromptDirectedTurnRefused` while a prompt is staged. The
-  realtime seed still carries no staged prompt: in a voice-first session it
-  lands with the first later text turn.
+  `AgentError::StagedPromptDirectedTurnRefused` while a prompt is staged. A
+  live open that finds the prompt still staged (a voice-first session)
+  delivers it instead: the run-start hooks a turn carrying it would run admit
+  it, and it is committed as the session's newest user row before the
+  realtime seed is read, so the realtime model receives it once. A later
+  first text turn does not deliver it again, a prompt a text turn already
+  delivered is never delivered by a later open, and a hook that refuses it at
+  the open keeps it staged for the first text turn.
 - `meerkat-mob`: a member retirement whose member session degraded after
   its quiesce stage, for example a retire that waited there on a boundary
   commit that then passed its deadline, no longer sticks at its ingress

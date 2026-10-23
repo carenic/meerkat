@@ -8501,6 +8501,27 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         Ok(outcome)
     }
 
+    /// Deliver the session's staged create-time prompt for a live open (see
+    /// [`crate::EphemeralSessionService::deliver_staged_prompt_for_live_open`])
+    /// and persist the session before the realtime seed is read. The prompt
+    /// is committed and its consumption made durable in one write; a failed
+    /// write discards the live session, so the durable session keeps the
+    /// prompt staged and nothing is delivered twice.
+    pub async fn deliver_staged_prompt_for_live_open(
+        &self,
+        id: &SessionId,
+    ) -> Result<crate::StagedPromptLiveOpenDelivery, SessionError> {
+        let _mutation_guard = self.live_persist_mutation_guard(id).await?;
+        let delivery = self.inner.deliver_staged_prompt_for_live_open(id).await?;
+        if matches!(delivery, crate::StagedPromptLiveOpenDelivery::Delivered)
+            && let Err(error) = self.persist_full_session(id).await
+        {
+            let _ = self.discard_live_session_unfenced(id).await;
+            return Err(error);
+        }
+        Ok(delivery)
+    }
+
     pub async fn append_external_user_content(
         &self,
         id: &SessionId,

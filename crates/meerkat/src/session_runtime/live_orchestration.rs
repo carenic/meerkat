@@ -2089,6 +2089,32 @@ mod orchestrator {
             }
         }
 
+        /// A live open that finds the session's create-time prompt still
+        /// staged (a deferred session whose first interaction is this open)
+        /// delivers it now: the `RunStarted` hooks a turn carrying it would
+        /// run admit it, and it is committed as the session's newest user row
+        /// before the realtime seed is read, so the realtime model receives
+        /// it once. A hook that refuses it keeps it staged for the first text
+        /// turn, and the open goes ahead without it. Only the open
+        /// projections call this; refresh never does.
+        async fn deliver_staged_prompt_for_open(
+            &self,
+            session_id: &SessionId,
+        ) -> Result<(), SessionError> {
+            if let meerkat_session::StagedPromptLiveOpenDelivery::Refused(refusal) = self
+                .service
+                .deliver_staged_prompt_for_live_open(session_id)
+                .await?
+            {
+                tracing::warn!(
+                    %session_id,
+                    %refusal,
+                    "a run-start hook refused the staged create-time prompt at live open; it stays staged for the first text turn"
+                );
+            }
+            Ok(())
+        }
+
         /// Recover a persisted-only session into the live service map so
         /// realtime-open paths can resolve it. Materializes a deferred
         /// staged session in place; falls back to durable-snapshot
@@ -2199,6 +2225,7 @@ mod orchestrator {
             // seed acknowledgement; no payload-bearing waiter is queued.
             let open_projection_lease = admit_open_projection(self.service)?;
             Box::pin(self.recover_live_session_for_realtime_open(session_id)).await?;
+            Box::pin(self.deliver_staged_prompt_for_open(session_id)).await?;
             let (session, canonical_user_image_decoded_bytes) = match self
                 .service
                 .export_realtime_open_session_snapshot_with_image_usage(session_id)
@@ -2258,6 +2285,7 @@ mod orchestrator {
         ) -> Result<RealtimeSessionOpenProjection, RealtimeSessionOpenProjectionError> {
             let open_projection_lease = admit_open_projection(self.service)?;
             Box::pin(self.recover_live_session_for_realtime_open(session_id)).await?;
+            Box::pin(self.deliver_staged_prompt_for_open(session_id)).await?;
             let snapshot = match self
                 .service
                 .export_realtime_open_session_snapshot_without_waiting_for_turn(session_id)
@@ -2468,6 +2496,7 @@ mod orchestrator {
         ) -> Result<RealtimeSessionOpenProjection, RealtimeSessionOpenProjectionError> {
             let lease = admit_open_projection(self.service)?;
             Box::pin(self.recover_live_session_for_realtime_open(session_id)).await?;
+            Box::pin(self.deliver_staged_prompt_for_open(session_id)).await?;
             let session = self
                 .service
                 .export_realtime_refresh_session_snapshot(session_id)
@@ -2532,6 +2561,7 @@ mod orchestrator {
             RealtimeSessionOpenProjectionError,
         > {
             Box::pin(self.recover_live_session_for_realtime_open(session_id)).await?;
+            Box::pin(self.deliver_staged_prompt_for_open(session_id)).await?;
             let committed = self
                 .service
                 .observe_live_context_committed_boundary(session_id)
