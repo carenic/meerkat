@@ -130,6 +130,12 @@ async fn an_overlapping_decision_passes_while_one_holds_read_custody() {
 #[tokio::test]
 async fn a_held_writer_refuses_the_decision_until_it_releases() {
     let fixture = Installed::new().await;
+    // A process another test spawns holds a copy of every descriptor this
+    // process has open until it executes its program. This lock stands for
+    // such a copy of the writer custody the fixture took and released while
+    // installing.
+    let inherited = std::fs::File::open(fixture.lock_path()).unwrap();
+    inherited.lock().unwrap();
     let writer = ConfigWriterLock::try_hold(&fixture.lock_path())
         .unwrap()
         .expect("writer custody");
@@ -139,6 +145,7 @@ async fn a_held_writer_refuses_the_decision_until_it_releases() {
     );
     drop(writer);
     assert_eq!(fixture.installed.check(&fixture.server), Ok(()));
+    drop(inherited);
 }
 
 #[tokio::test]
