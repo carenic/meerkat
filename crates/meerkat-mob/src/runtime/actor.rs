@@ -2393,14 +2393,17 @@ enum KickoffCompletion {
         session_id: SessionId,
         input_id: meerkat_core::lifecycle::InputId,
     },
+    /// The admission refused the kickoff input: nothing will run it.
+    Refused(String),
 }
 
 #[cfg(feature = "runtime-adapter")]
 impl KickoffCompletion {
     /// What the waiter of an admission of a kickoff input waits on: the
-    /// handle the admission answered, or, for a deduplicated admission of an
-    /// input already terminal, that input's receipt. `None` only for an
-    /// admission that answered neither.
+    /// handle the admission answered, for a deduplicated admission of an
+    /// input already terminal that input's receipt, and for a refused
+    /// admission its refusal. `None` only for an accepted admission that
+    /// answered no handle.
     fn of_admission(
         adapter: &Arc<meerkat_runtime::MeerkatMachine>,
         session_id: &SessionId,
@@ -2415,6 +2418,9 @@ impl KickoffCompletion {
                     session_id: session_id.clone(),
                     input_id: existing_id.clone(),
                 })
+            }
+            (None, meerkat_runtime::AcceptOutcome::Rejected { reason, .. }) => {
+                Some(Self::Refused(format!("{reason:?}")))
             }
             (None, _) => None,
         }
@@ -2433,6 +2439,11 @@ impl KickoffCompletion {
                 session_id,
                 input_id,
             } => terminal_kickoff_outcome(&adapter, &session_id, &input_id).await,
+            Self::Refused(reason) => Err(
+                meerkat_runtime::completion::CompletionWaitError::AuthorityUnavailable(format!(
+                    "the kickoff input was refused at admission: {reason}"
+                )),
+            ),
         }
     }
 }
