@@ -70,9 +70,10 @@ name: CI
 #                     (scripts/pre-push-unit.sh) for the test scope
 #   closure-check   - cargo check --all-features (lib and bin targets) over
 #                     the reverse-dependency closure of the changed packages
-#   rustdoc         - cargo doc --workspace --no-deps with rustdoc's lints
-#                     denied (RUSTDOCFLAGS=-Dwarnings, default features):
-#                     every crate's documentation and its intra-doc links
+#   rustdoc         - (x2) cargo doc --workspace --no-deps with rustdoc's
+#                     lints denied (RUSTDOCFLAGS=-Dwarnings), one leg with
+#                     default features and one with --all-features: every
+#                     crate's documentation and its intra-doc links
 #   feature-check   - (xN, two per clippy shard) compile-only checks of the
 #                     shard's packages under their Bazel feature sets (tests
 #                     included) and the `make test-minimal` /
@@ -2109,17 +2110,25 @@ jobs:
           retention-days: 3
 
   rustdoc:
-    name: Rustdoc (whole workspace)
+    name: Rustdoc (whole workspace, ${{ matrix.features }} features)
     needs: changes
     # Push only, like the closure check: every crate documented with
-    # rustdoc's lints denied, under default features (the build docs.rs
-    # makes of a published crate). A broken, private or redundant intra-doc
-    # link, a bare URL or an unclosed HTML tag fails it. A pull request names
-    # it in deferred_to_push: it documents meerkat-mob and every crate built
-    # on it, which does not fit the pull-request budget.
+    # rustdoc's lints denied, in two parallel legs, default features and
+    # --all-features (feature-gated docs included). A broken, private or
+    # redundant intra-doc link, a bare URL or an unclosed HTML tag fails it.
+    # It documents the whole workspace, where Cargo unifies features across
+    # members, so an error that only a crate documented alone shows
+    # (`cargo doc -p <crate>`, the way docs.rs builds a published crate) is
+    # outside it. A pull request names it in deferred_to_push: it documents
+    # meerkat-mob and every crate built on it, which does not fit the
+    # pull-request budget.
     if: ${{ needs.changes.outputs.rustdoc == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [default, all]
     env:
       RUSTC_WRAPPER: sccache
     steps:
@@ -2147,10 +2156,17 @@ jobs:
           cache-on-failure: true
 
       # --keep-going reports every crate that fails, not only the first.
-      - name: Document the workspace with rustdoc's lints denied
+      - name: Document the workspace with rustdoc's lints denied (${{ matrix.features }} features)
         env:
           RUSTDOCFLAGS: -Dwarnings
-        run: ./scripts/repo-cargo doc --workspace --no-deps --keep-going
+          FEATURES: ${{ matrix.features }}
+        run: |
+          set -euo pipefail
+          case "${FEATURES}" in
+            default) ./scripts/repo-cargo doc --workspace --no-deps --keep-going ;;
+            all) ./scripts/repo-cargo doc --workspace --no-deps --keep-going --all-features ;;
+            *) echo "::error::unexpected rustdoc features '${FEATURES}'"; exit 1 ;;
+          esac
 
       - name: Upload sccache server log
         if: ${{ always() }}
@@ -2158,7 +2174,7 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: sccache-log-rustdoc-${{ github.run_id }}-${{ github.run_attempt }}
+          name: sccache-log-rustdoc-${{ matrix.features }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: /home/runner/work/_temp/sccache.log
           if-no-files-found: ignore
           retention-days: 3

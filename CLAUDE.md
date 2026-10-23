@@ -539,8 +539,10 @@ and its CI must be green before a release tag (`require_ci_green`):
 - `closure-check` (push only): `cargo check --all-features` (lib and bin
   targets) over the reverse-dependency closure of the changed packages.
 - `rustdoc` (push only): `cargo doc --workspace --no-deps --keep-going`
-  with `RUSTDOCFLAGS=-Dwarnings` (default features), so a broken or
-  private intra-doc link anywhere in the workspace fails the push.
+  with `RUSTDOCFLAGS=-Dwarnings`, in two parallel legs (default features
+  and `--all-features`), so a broken or private intra-doc link anywhere in
+  the workspace fails the push. It documents the whole workspace, so an
+  error that only `cargo doc -p <crate>` shows is outside it.
 - `governed-jsonl` and `mcp-confinement-positive` (push; a pull request
   runs a lane when it touches the lane's inputs, `GUARD_LANE_INPUTS` in
   `scripts/ci-cargo-lanes.mjs` (the files that define its selected cases,

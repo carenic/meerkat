@@ -388,6 +388,21 @@ fn pull_requests_leave_the_chain_and_closure_lanes_to_the_push() {
             "{job} runs exactly when the plan selects it"
         );
     }
+    // The workspace rustdoc runs two parallel legs: default features and
+    // --all-features.
+    let rustdoc_legs = jobs
+        .get("rustdoc")
+        .and_then(|job| job.pointer("/strategy/matrix/features"))
+        .and_then(serde_json::Value::as_array)
+        .expect("the rustdoc job's features matrix");
+    assert_eq!(
+        rustdoc_legs,
+        &vec![
+            serde_json::Value::from("default"),
+            serde_json::Value::from("all")
+        ],
+        "the rustdoc lane runs a default-features leg and an all-features leg"
+    );
     // Each of these lanes runs in two waves (long rows first): the job holds
     // the first wave, its -rest copy the rest.
     for (job, rows) in [
@@ -436,10 +451,10 @@ fn pull_requests_leave_the_chain_and_closure_lanes_to_the_push() {
         "a push plan left lanes to a later push",
         "forbid_failure \"Closure check\" \"${CLOSURE_CHECK_RESULT}\"",
         "forbid_failure \"Rustdoc\" \"${RUSTDOC_RESULT}\"",
-        // Every crate documented with rustdoc's lints denied, under default
-        // features.
+        // Every crate documented with rustdoc's lints denied, once per leg.
         "RUSTDOCFLAGS: -Dwarnings",
-        "run: ./scripts/repo-cargo doc --workspace --no-deps --keep-going",
+        "default) ./scripts/repo-cargo doc --workspace --no-deps --keep-going ;;",
+        "all) ./scripts/repo-cargo doc --workspace --no-deps --keep-going --all-features ;;",
         "forbid_failure \"Governed JSONL\" \"${GOVERNED_JSONL_RESULT}\"",
         "forbid_failure \"MCP confinement positive\" \"${MCP_CONFINEMENT_POSITIVE_RESULT}\"",
         "left to the push (main or release/**): ${DEFERRED_TO_PUSH}",
