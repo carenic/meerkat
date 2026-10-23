@@ -125,9 +125,13 @@ it does. The fence takes the presence lock after its fence lock, and creates
 its owner calls into the host, at its next read, which the fence refuses, or
 after a second without a read (`KEPT_DELIVERY_READER_IDLE`), so the fence gets
 the database well inside the default wait. A fence wait shorter than that
-second can meet an idle reader and refuse.
-Windows keeps the fresh-open read path, one verified open per tick, because
-no CI lane runs the kept reader on Windows. Maintenance from a binary older
+second can meet an idle reader and refuse. A closed reader stays closed until
+another connection commits or the store watch's sweep (every 5 seconds)
+reads: the reader's own open and close are no change to the watch.
+Windows keeps the fresh-open read path, one verified open per read, because
+no CI lane runs the kept reader on Windows. There, a store notification after
+which the database and its WAL stat as they did before the last read is
+answered from that read without an open. Maintenance from a binary older
 than 0.9.4 takes only the fence lock and does not wait for a kept connection:
 run maintenance with the same release as the hosts.
 

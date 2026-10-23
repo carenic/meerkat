@@ -3347,6 +3347,25 @@ mod hosting {
             drop(handle);
         }
 
+        /// A stat that fails never answers a notification from the last read:
+        /// on the platform shape whose own open and close notify a WAL change,
+        /// a notification after the arming read opens the database again
+        /// (paused time).
+        #[tokio::test(start_paused = true)]
+        async fn a_fresh_read_owner_whose_stat_fails_reads_its_notifications() {
+            let (fixture, path, capability) = watched_store();
+            hooks::force_fresh_reads(&path);
+            hooks::fail_file_stamps(&path);
+            let handle = arm_registered(&fixture, &path, &capability, NO_SWEEP, true);
+            let mut passes = handle.subscribe_passes();
+            first_pass(&mut passes).await;
+            wait_real("a notification's read", EVENT_GUARD, || {
+                hooks::verified_opens(&path) >= 2
+            })
+            .await;
+            drop(handle);
+        }
+
         /// Holds the host calls made through it, once armed, until the test
         /// opens it, and says when it holds one.
         struct HostGate {

@@ -8753,6 +8753,18 @@ pub trait DeliveryGenerationReader: Send {
     /// [`RuntimeStore::load_delivery_generation`] reads it.
     async fn read(&mut self) -> Result<u64, RuntimeStoreError>;
 
+    /// The generation, read for a store notification: a file change the
+    /// store's watch reported, never its sweep. A reader may answer from its
+    /// last read when it can tell, without opening the database, that nothing
+    /// a read could see has changed since that read began; a notification of
+    /// a read's own open or close, on a platform that reports one, then costs
+    /// no open. The default reads. The owner reads a sweep through
+    /// [`Self::read`], which always reads: the sweep bounds how long a change
+    /// the reader cannot tell apart waits.
+    async fn read_on_notification(&mut self) -> Result<u64, RuntimeStoreError> {
+        self.read().await
+    }
+
     /// Whether the reader keeps a connection open now.
     fn keeps_connection(&self) -> bool;
 
