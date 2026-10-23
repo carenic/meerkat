@@ -415,7 +415,7 @@ fn locks_path(file: &std::fs::File, path: &Path) -> std::io::Result<bool> {
     }
 }
 
-/// A config document's exclusive (writer) custody; see [`Custody`]. Every
+/// A config document's exclusive (writer) custody; see `Custody`. Every
 /// `ConfigRuntime` writer holds it across the document mutation and the
 /// generation publication.
 pub struct ConfigWriterLock {
@@ -456,7 +456,7 @@ impl ConfigWriterLock {
     }
 }
 
-/// A config document's shared (reader) custody; see [`Custody`]. It excludes
+/// A config document's shared (reader) custody; see `Custody`. It excludes
 /// writers for as long as it is held, and never other readers.
 pub struct ConfigReadLock {
     path: PathBuf,
@@ -658,37 +658,78 @@ tier = \"r2\"\n";
 
     #[tokio::test]
     async fn a_writer_excludes_writers_and_readers_and_never_unlinks() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("config_state.lock");
-        let held = ConfigWriterLock::acquire(&path).await.unwrap();
-        let waiter = ConfigWriterLock::acquire_within(&path, Duration::from_millis(200)).await;
-        assert!(matches!(waiter, Err(ConfigRuntimeError::LockTimeout)));
-        assert!(ConfigWriterLock::try_hold(&path).unwrap().is_none());
-        assert!(ConfigReadLock::try_hold(&path).unwrap().is_none());
-        let reader = ConfigReadLock::acquire_within(&path, Duration::from_millis(200)).await;
-        assert!(matches!(reader, Err(ConfigRuntimeError::LockTimeout)));
-        drop(held);
-        assert!(path.exists(), "the lock file keeps its identity");
-        ConfigWriterLock::try_hold(&path)
-            .unwrap()
-            .expect("released custody is free");
+        crate::process_isolation_tests::alone_in_child_process_async(
+            "config_runtime::tests::a_writer_excludes_writers_and_readers_and_never_unlinks",
+            async {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("config_state.lock");
+                let held = ConfigWriterLock::acquire(&path).await.unwrap();
+                let waiter =
+                    ConfigWriterLock::acquire_within(&path, Duration::from_millis(200)).await;
+                assert!(matches!(waiter, Err(ConfigRuntimeError::LockTimeout)));
+                assert!(ConfigWriterLock::try_hold(&path).unwrap().is_none());
+                assert!(ConfigReadLock::try_hold(&path).unwrap().is_none());
+                let reader =
+                    ConfigReadLock::acquire_within(&path, Duration::from_millis(200)).await;
+                assert!(matches!(reader, Err(ConfigRuntimeError::LockTimeout)));
+                drop(held);
+                assert!(path.exists(), "the lock file keeps its identity");
+                ConfigWriterLock::try_hold(&path)
+                    .unwrap()
+                    .expect("released custody is free");
+            },
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn readers_share_custody_and_exclude_writers() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("config_state.lock");
-        let first = ConfigReadLock::acquire(&path).await.unwrap();
-        let second = ConfigReadLock::try_hold(&path)
-            .unwrap()
-            .expect("a reader never excludes another reader");
-        assert!(ConfigWriterLock::try_hold(&path).unwrap().is_none());
-        drop(first);
-        assert!(ConfigWriterLock::try_hold(&path).unwrap().is_none());
-        drop(second);
-        ConfigWriterLock::try_hold(&path)
-            .unwrap()
-            .expect("free once the last reader released");
+        crate::process_isolation_tests::alone_in_child_process_async(
+            "config_runtime::tests::readers_share_custody_and_exclude_writers",
+            async {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("config_state.lock");
+                let first = ConfigReadLock::acquire(&path).await.unwrap();
+                let second = ConfigReadLock::try_hold(&path)
+                    .unwrap()
+                    .expect("a reader never excludes another reader");
+                assert!(ConfigWriterLock::try_hold(&path).unwrap().is_none());
+                drop(first);
+                assert!(ConfigWriterLock::try_hold(&path).unwrap().is_none());
+                drop(second);
+                ConfigWriterLock::try_hold(&path)
+                    .unwrap()
+                    .expect("free once the last reader released");
+            },
+        )
+        .await;
+    }
+
+    /// Why those tests run alone: custody belongs to the open file
+    /// description, so a copy of the holder's descriptor (what a process
+    /// spawned meanwhile holds until it executes its program) keeps the
+    /// custody after the holder released it, until the copy is gone.
+    #[tokio::test]
+    async fn a_copy_of_the_holders_descriptor_keeps_the_custody() {
+        crate::process_isolation_tests::alone_in_child_process_async(
+            "config_runtime::tests::a_copy_of_the_holders_descriptor_keeps_the_custody",
+            async {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("config_state.lock");
+                let held = ConfigWriterLock::acquire(&path).await.unwrap();
+                let copy = held._file.try_clone().unwrap();
+                drop(held);
+                assert!(
+                    ConfigWriterLock::try_hold(&path).unwrap().is_none(),
+                    "the copy still holds the released custody"
+                );
+                drop(copy);
+                ConfigWriterLock::try_hold(&path)
+                    .unwrap()
+                    .expect("free once the copy is gone");
+            },
+        )
+        .await;
     }
 
     #[tokio::test]

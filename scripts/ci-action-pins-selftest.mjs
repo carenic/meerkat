@@ -184,8 +184,16 @@ try {
     };
     const platform = (image) => `platform(\n    exec_properties = {\n        "container-image": "${image}",\n    },\n)\n`;
     assert.deepEqual(bazel("bazel-pinned", platform(`docker://${pinned}`)), []);
-    const [excepted] = UNPINNED_IMAGES.keys();
-    assert.deepEqual(bazel("bazel-excepted", platform(excepted)), [], "a named exception passes");
+    // A named exception passes. The repository needs none today, so this case
+    // adds a synthetic one for itself and removes it again.
+    const excepted = "docker://registry.example.invalid/meerkat-ci-selftest:1";
+    assert.ok(!UNPINNED_IMAGES.has(excepted));
+    UNPINNED_IMAGES.set(excepted, "selftest-only exception");
+    try {
+      assert.deepEqual(bazel("bazel-excepted", platform(excepted)), [], "a named exception passes");
+    } finally {
+      UNPINNED_IMAGES.delete(excepted);
+    }
     const problems = bazel("bazel-unpinned", platform("docker://docker.io/library/buildpack-deps:bullseye"));
     assert.deepEqual(problems, [
       "tools/bazel/platforms/BUILD.bazel:3: `docker://docker.io/library/buildpack-deps:bullseye` names its image without an @sha256: digest",

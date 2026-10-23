@@ -106,8 +106,12 @@ MOB_RPC_CONTRACT_TYPES = [
     "MobCreateParams",
     "MobCreateResult",
     "MobListResult",
+    "WireMobLifecycleFailure",
     "MobStatusResult",
     "MobLifecycleParams",
+    "WireMobDestroyMemberRefusal",
+    "WireMobDestroyReport",
+    "WireMobDestroyIncompleteData",
     "MobLifecycleResult",
     "MobSpawnParams",
     "MobSpawnResult",
@@ -553,6 +557,7 @@ MOB_RPC_CONTRACT_ALIAS_TYPES = [
     "WireToolFilter",
     "WireMemberState",
     "WireMobMemberStatus",
+    "WireMemberReloadRefusal",
     "WireMobRuntimeMode",
     "MobSpawnManyFailureCause",
     "MobSpawnManyResultStatus",
@@ -758,6 +763,9 @@ MOB_RPC_PROMOTED_SCHEMA_DEFS = frozenset(
         # unreachable peer rows to opaque object maps.
         "WirePeerConnectivitySnapshot",
         "WireUnreachablePeer",
+        # A `mob/list` row's failure: keep it typed instead of widening it to
+        # an opaque object map.
+        "WireMobLifecycleFailure",
         *BRIDGE_NESTED_CONTRACT_TYPES,
         *BRIDGE_NESTED_ALIAS_TYPES,
         *BRIDGE_REJECTION_NESTED_ALIAS_TYPES,
@@ -3821,6 +3829,7 @@ def generate_python_types(schemas: dict, output_dir: Path, *, has_comms: bool = 
     types_content += "    command: Required[str]\n"
     types_content += "    args: NotRequired[list[str]]\n"
     types_content += "    env: NotRequired[dict[str, str]]\n"
+    types_content += "    cwd: NotRequired[str]\n"
     types_content += "    connect_timeout_secs: NotRequired[int]\n"
     types_content += "    tool_names: NotRequired[dict[str, str]]\n\n"
     types_content += "\nclass McpHttpServerConfig(TypedDict, total=False):\n"
@@ -7294,6 +7303,7 @@ def generate_web_mob_types(schemas: dict, output_dir: Path) -> None:
     append_alias("WirePeerConnectivity")
     append_alias("WireNonPortableResourceKind")
     append_interface("WireMemberLifecycleCapabilities")
+    append_interface("WireMobLifecycleFailure")
     append_interface("MobStatusResult")
     lines.append("export interface MobListResult {")
     lines.append("  mobs: MobStatusResult[];")
@@ -7326,6 +7336,10 @@ def generate_web_mob_types(schemas: dict, output_dir: Path) -> None:
     append_alias("WireMemberRegistrationHookCall")
     append_interface("MobMemberStatusResult")
     append_interface("MobAppendSystemContextResult")
+    append_alias("WireMemberReloadRefusal")
+    append_interface("WireMobDestroyMemberRefusal")
+    append_interface("WireMobDestroyReport")
+    append_interface("WireMobDestroyIncompleteData")
     append_interface("MobLifecycleResult")
     append_alias("ApplicationToolPolicyBinding")
     append_alias("ToolCategoryOverride")

@@ -324,6 +324,18 @@ it enforces two limits:
   carried-over lane keeps its attempt's clock. Past the ceiling a run's jobs
   are stuck. Waiting for runners alone never fails it.
 
+Both limits hold every lane a pull request plans for ordinary reasons. An
+exact-profile lane (`governed-jsonl`, `mcp-confinement-positive`) that the
+plan runs only because the change touches its inputs or changes its
+definition (`GUARD_LANE_INPUTS`, `GUARD_LANE_DEFINITIONS`; the plan exports
+the reason as `guard_lane_reasons`) is outside both: the confinement lane's
+cold build alone takes 27.5-32.5 minutes. The gate still requires it to
+succeed, its own `timeout-minutes` (40 on a pull request) bounds it, and the
+gate names it, with its seconds and the reason, in a `Guard lane outside the
+budget` warning and the `guard_lanes_outside_budget` output. A guard lane run
+on every Rust change (a push, a dispatch, a release projection) or for an
+unknown diff stays in the budget.
+
 Runner queue wait is reported, not budgeted: at 300 s or more on the critical
 path (`CI_QUEUE_WARN_SECONDS`) the gate emits a `CI runner queue wait`
 warning. The account runs at most 40 hosted jobs at once, shared by every

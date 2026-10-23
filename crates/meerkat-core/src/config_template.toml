@@ -67,7 +67,7 @@ google_search = true
 # Crossing providers additionally requires policy.cross_provider = true.
 enabled = false
 # [[model_fallback.chain]]
-# model = "claude-opus-4-8"
+# model = "<model-id>"
 # provider = "anthropic"
 # auth_binding = { realm = "anthropic", binding = "default" }
 

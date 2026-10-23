@@ -66,6 +66,14 @@ pub struct McpConnection {
 /// shutdown.
 const STDIO_KILL_BACKSTOP: Duration = Duration::from_secs(10);
 
+/// How a failed connect closes a server that never completed initialize:
+/// its EOF grace (capped by the custody's own) and its TERM grace (`None`
+/// keeps the custody's own). The EOF grace is long enough to observe a
+/// server exiting on its own (its exit status is a setup diagnostic) and
+/// short enough that the connect ends just past its own deadline; keeping
+/// the TERM grace lets a server's SIGTERM handler finish its startup work.
+const NEVER_INITIALIZED_CLOSE: (Duration, Option<Duration>) = (Duration::from_millis(250), None);
+
 /// How long a close waits for a remote (process-free) connection's client to
 /// end: the default stdio close bound, so a remote close is bounded like a
 /// stdio one. Past it the close fails with [`McpError::CloseTimedOut`].
@@ -312,6 +320,10 @@ pub(crate) struct StdioChildCustody {
     /// Bumped whenever a close's state changes after its task started, so
     /// its waiters recheck the slot.
     close_progress: Arc<tokio::sync::watch::Sender<u64>>,
+    /// Whether its server completed the MCP initialize handshake. A failed
+    /// connect closes a server that never did under
+    /// [`NEVER_INITIALIZED_CLOSE`]: a cut EOF grace and the full TERM grace.
+    initialized: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     spawned: Arc<tokio::sync::watch::Sender<Option<u32>>>,
     #[cfg(all(test, unix))]
@@ -336,9 +348,10 @@ enum CustodySlot {
     Vacant,
     Held(StdioChild),
     /// A close task, started by a `terminate`, owns the process; its phase
-    /// deadlines count from `started`.
+    /// deadlines count from `started`, and it ends within `bound`.
     Closing {
         started: tokio::time::Instant,
+        bound: Duration,
     },
     /// That close task finished. Its receipt stays here, shared, for every
     /// caller that asks: the `terminate` that started the close and every
@@ -609,19 +622,33 @@ impl StdioChildCustody {
     }
 
     /// Spawn the server and take custody of it; returns its stdout and stdin
-    /// for the MCP transport.
+    /// for the MCP transport. A configured working directory
+    /// ([`McpStdioConfig::cwd`](meerkat_core::mcp_config::McpStdioConfig::cwd))
+    /// must be an existing directory: otherwise nothing is spawned, and the
+    /// launch never falls back to another directory.
     async fn spawn(
         &self,
+        server: &str,
         stdio: &meerkat_core::mcp_config::McpStdioConfig,
         profile: &McpStdioLaunchProfile,
         entry: &mut PhysicalEntry,
     ) -> Result<(tokio::process::ChildStdout, tokio::process::ChildStdin), McpError> {
+        // Inspected before custody is taken, so a slow filesystem never holds
+        // the custody lock; the refusal is reported after the custody's own.
+        let cwd_refusal = stdio.cwd.as_deref().and_then(working_directory_refusal);
         // Acquire custody before spawning; nothing in this spawn awaits, so
         // nothing separates creating the child from installing its owner.
         let mut slot = lock_slot(&self.slot);
         // A custody closed before any spawn refuses one.
         if matches!(*slot, CustodySlot::Retired) {
             return Err(McpError::RouterShutDown);
+        }
+        if let Some(reason) = cwd_refusal {
+            return Err(meerkat_core::McpStdioCwdError {
+                server: server.to_owned(),
+                reason,
+            }
+            .into());
         }
         // Binding validates the exact launch and retained backend before any
         // process exists. Required isolation has no Command fallback.
@@ -682,6 +709,11 @@ impl StdioChildCustody {
                 cmd.args(&stdio.args);
                 for (key, value) in &stdio.env {
                     cmd.env(key, value);
+                }
+                // The configured working directory, exactly as written; the
+                // child's change into it failing fails the spawn.
+                if let Some(cwd) = &stdio.cwd {
+                    cmd.current_dir(cwd);
                 }
                 cmd.stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
@@ -813,8 +845,19 @@ impl StdioChildCustody {
         started: tokio::time::Instant,
         first: impl std::future::Future<Output = T> + Send + 'static,
     ) -> (Option<T>, Result<Arc<McpStdioCloseReceipt>, CustodyNotHeld>) {
+        self.terminate_after_under(started, first, self.bounds)
+            .await
+    }
+
+    /// [`Self::terminate_after`] under `bounds`.
+    async fn terminate_after_under<T: Send + 'static>(
+        &self,
+        started: tokio::time::Instant,
+        first: impl std::future::Future<Output = T> + Send + 'static,
+        bounds: McpStdioCloseBounds,
+    ) -> (Option<T>, Result<Arc<McpStdioCloseReceipt>, CustodyNotHeld>) {
         let mut progress = self.close_progress.subscribe();
-        let mut first_output = match self.start_close(started, first) {
+        let mut first_output = match self.start_close_under(started, first, bounds) {
             Ok(first_output) => first_output,
             Err((first, not_held)) => return (Some(first.await), Err(not_held)),
         };
@@ -851,10 +894,29 @@ impl StdioChildCustody {
         T: Send + 'static,
         F: std::future::Future<Output = T> + Send + 'static,
     {
+        self.start_close_under(started, first, self.bounds)
+    }
+
+    /// [`Self::start_close`] under `bounds`.
+    #[allow(clippy::type_complexity)]
+    fn start_close_under<T, F>(
+        &self,
+        started: tokio::time::Instant,
+        first: F,
+        bounds: McpStdioCloseBounds,
+    ) -> Result<tokio::sync::oneshot::Receiver<T>, (F, CustodyNotHeld)>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = T> + Send + 'static,
+    {
         let mut never_spawned = None;
         let held = {
             let mut slot = lock_slot(&self.slot);
-            match std::mem::replace(&mut *slot, CustodySlot::Closing { started }) {
+            let closing = CustodySlot::Closing {
+                started,
+                bound: bounds.close_bound(),
+            };
+            match std::mem::replace(&mut *slot, closing) {
                 CustodySlot::Held(held) => Ok(held),
                 // Closed before any spawn: no process may start after it.
                 CustodySlot::Vacant | CustodySlot::Retired => {
@@ -887,7 +949,6 @@ impl StdioChildCustody {
             guard: Arc::clone(&self.guard),
             finished: false,
         };
-        let bounds = self.bounds;
         let (first_done, first_output) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let mut held = held;
@@ -916,7 +977,7 @@ impl StdioChildCustody {
     /// [`McpStdioCloseBounds::close_bound`]. `None` when no close runs.
     fn close_deadline(&self) -> Option<tokio::time::Instant> {
         match &*lock_slot(&self.slot) {
-            CustodySlot::Closing { started } => Some(*started + self.bounds.close_bound()),
+            CustodySlot::Closing { started, bound } => Some(*started + *bound),
             CustodySlot::Vacant
             | CustodySlot::Held(_)
             | CustodySlot::Closed(_)
@@ -951,6 +1012,48 @@ impl StdioChildCustody {
             }
         };
         Self::tell_guard(never_spawned, crate::McpAttemptProcessEnd::NotSpawned);
+    }
+
+    /// Record that this custody's server completed the MCP initialize
+    /// handshake.
+    pub(crate) fn mark_initialized(&self) {
+        self.initialized
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The close of a failed connect. A server that never completed
+    /// initialize closes under [`NEVER_INITIALIZED_CLOSE`]: a cut EOF grace
+    /// (enough to observe a server exiting on its own) and its TERM grace,
+    /// so the connect ends just past its own deadline. One that did complete
+    /// initialize keeps this custody's graces.
+    pub(crate) async fn terminate_failed_connect(
+        &self,
+    ) -> Result<Arc<McpStdioCloseReceipt>, CustodyNotHeld> {
+        let bounds = if self.initialized.load(std::sync::atomic::Ordering::Acquire) {
+            self.bounds
+        } else {
+            let (eof_grace, term_grace) = NEVER_INITIALIZED_CLOSE;
+            McpStdioCloseBounds {
+                eof_grace: self.bounds.eof_grace.min(eof_grace),
+                term_grace: term_grace.unwrap_or(self.bounds.term_grace),
+            }
+        };
+        self.terminate_after_under(tokio::time::Instant::now(), std::future::ready(()), bounds)
+            .await
+            .1
+    }
+
+    /// [`Self::terminate_failed_connect`], or, when another call already
+    /// started the close, wait for that close to finish.
+    pub(crate) async fn terminate_failed_connect_or_join(
+        &self,
+    ) -> Result<Arc<McpStdioCloseReceipt>, CustodyNotHeld> {
+        match self.terminate_failed_connect().await {
+            Err(CustodyNotHeld::ClosingElsewhere | CustodyNotHeld::ClosedElsewhere) => {
+                self.join_close().await
+            }
+            terminated => terminated,
+        }
     }
 
     /// [`Self::terminate`], or, when another call already started the close,
@@ -1657,6 +1760,22 @@ fn launch_configuration<'a>(
     std::borrow::Cow::Owned(launch)
 }
 
+/// Why a configured working directory cannot be launched in now: nothing
+/// at the path, something other than a directory, or a path that could not
+/// be inspected. `None` for an existing directory (symbolic links followed,
+/// as the process's change into it follows them).
+fn working_directory_refusal(cwd: &str) -> Option<meerkat_core::McpStdioCwdRefusal> {
+    use meerkat_core::McpStdioCwdRefusal;
+    match std::fs::metadata(cwd) {
+        Ok(metadata) if metadata.is_dir() => None,
+        Ok(_) => Some(McpStdioCwdRefusal::NotADirectory),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Some(McpStdioCwdRefusal::Missing)
+        }
+        Err(_) => Some(McpStdioCwdRefusal::Inaccessible),
+    }
+}
+
 /// The connection error of work its caller-held attempt cancelled.
 fn attempt_cancelled() -> McpError {
     McpError::ConnectionFailed {
@@ -1834,10 +1953,11 @@ impl McpConnection {
         mut entry: PhysicalEntry,
         attempt: Option<&crate::McpConnectAttempt>,
     ) -> Result<Self, McpError> {
-        // An invalid access ceiling or secret declaration is refused before
-        // any process or transport effect.
+        // An invalid access ceiling, secret declaration or working directory
+        // is refused before any process or transport effect.
         config.validate_access()?;
         config.validate_secret_env()?;
+        config.validate_cwd()?;
         // So is an attempt its router's close index refused.
         client_custody.admit()?;
         if let McpTransportConfig::Http(http) = &config.transport {
@@ -1876,7 +1996,9 @@ impl McpConnection {
                 // dropped as soon as the process exists; the connection keeps
                 // the nonsecret `config`.
                 let launch = launch_configuration(stdio, config, secrets);
-                let spawned = custody.spawn(&launch, profile, &mut entry).await;
+                let spawned = custody
+                    .spawn(&config.name, &launch, profile, &mut entry)
+                    .await;
                 drop(launch);
                 let (stdout, stdin) = spawned?;
                 match client
@@ -1887,6 +2009,7 @@ impl McpConnection {
                     .await
                 {
                     Ok(service) => {
+                        custody.mark_initialized();
                         if let Some(record) = custody.diagnostics_record() {
                             record.mark_initialized();
                         }
@@ -1913,7 +2036,7 @@ impl McpConnection {
                                 record.transport_end(),
                             ));
                         }
-                        if let Ok(receipt) = custody.terminate().await {
+                        if let Ok(receipt) = custody.terminate_failed_connect().await {
                             trace_close_receipt(&config.name, &receipt);
                             if let Some(record) = custody.diagnostics_record() {
                                 record.attach_exit(&receipt);
@@ -2547,16 +2670,10 @@ impl McpConnection {
         control: Option<Arc<dyn McpAttachmentAuthority>>,
         attempt: Option<&crate::McpConnectAttempt>,
     ) -> Result<(Self, Vec<Arc<ToolDef>>), McpError> {
-        let timeout_secs = config
-            .connect_timeout_secs
-            .unwrap_or(Self::DEFAULT_CONNECT_TIMEOUT_SECS);
-        let mut timeout = Duration::from_secs(timeout_secs as u64);
-        if matches!(auth_mode, McpAuthMode::Interactive) {
-            timeout += meerkat_auth_core::MCP_INTERACTIVE_LOGIN_TIMEOUT;
-        }
+        let deadline = ConnectDeadline::for_connect(config, auth_mode, auth_resolver.is_some());
 
         let server_name = config.name.clone();
-        let connected = tokio::time::timeout(timeout, async {
+        let connected = tokio::time::timeout(deadline.total(), async {
             let conn = Self::connect_with_custody(
                 config,
                 auth_mode,
@@ -2595,12 +2712,7 @@ impl McpConnection {
         .await;
         let timed_out = connected.is_err();
         let attempt = connected
-            .map_err(|_| McpError::ConnectionFailed {
-                reason: format!(
-                    "Timed out connecting to '{}' ({timeout_secs}s)",
-                    config.name
-                ),
-            })
+            .map_err(|_| deadline.timed_out(&config.name))
             .flatten();
         if timed_out
             && let Some(record) = stdio_custody
@@ -2615,7 +2727,7 @@ impl McpConnection {
         {
             // The attempt future (and any connection it held) is gone; the
             // process it spawned is not until its owner observes the exit.
-            if let Ok(receipt) = custody.terminate().await {
+            if let Ok(receipt) = custody.terminate_failed_connect().await {
                 trace_close_receipt(&server_name, &receipt);
             }
             if let Some(record) = custody.diagnostics_record() {
@@ -2945,7 +3057,7 @@ impl McpConnection {
         };
         let close = match custody {
             None => None,
-            Some(custody) => match custody.terminate_or_join().await {
+            Some(custody) => match custody.terminate_failed_connect_or_join().await {
                 Ok(receipt) => {
                     trace_close_receipt(&config.name, &receipt);
                     Some(McpServerCloseOutcome::Stdio(receipt))
@@ -4189,11 +4301,288 @@ fn mcp_auth_error_to_connection_failed(error: McpOAuthError) -> McpError {
     }
 }
 
+/// How long one MCP connect attempt may take: the server's configured
+/// connect timeout, plus the interactive login window when the attempt can
+/// open a login.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConnectDeadline {
+    connect_timeout: Duration,
+    login_window: Option<Duration>,
+}
+
+impl ConnectDeadline {
+    pub(crate) fn for_connect(
+        config: &McpServerConfig,
+        auth_mode: McpAuthMode,
+        has_auth_resolver: bool,
+    ) -> Self {
+        let connect_timeout = Duration::from_secs(u64::from(
+            config
+                .connect_timeout_secs
+                .unwrap_or(McpConnection::DEFAULT_CONNECT_TIMEOUT_SECS),
+        ));
+        // Only a remote server with an auth resolver, under the interactive
+        // mode, can open a login during its connect. A stdio server never
+        // can, and a remote server without a resolver has none to open.
+        let can_open_login = matches!(auth_mode, McpAuthMode::Interactive)
+            && has_auth_resolver
+            && matches!(config.transport, McpTransportConfig::Http(_));
+        let login_window =
+            can_open_login.then_some(meerkat_auth_core::MCP_INTERACTIVE_LOGIN_TIMEOUT);
+        Self {
+            connect_timeout,
+            login_window,
+        }
+    }
+
+    pub(crate) fn total(self) -> Duration {
+        self.connect_timeout + self.login_window.unwrap_or_default()
+    }
+
+    /// The error of an attempt that ran out of this deadline. It names the
+    /// deadline the attempt actually had.
+    pub(crate) fn timed_out(self, server: &str) -> McpError {
+        let total = self.total().as_secs();
+        let reason = match self.login_window {
+            None => format!("Timed out connecting to '{server}' after {total}s"),
+            Some(window) => format!(
+                "Timed out connecting to '{server}' after {total}s ({}s connect timeout and the {}s interactive login window)",
+                self.connect_timeout.as_secs(),
+                window.as_secs()
+            ),
+        };
+        McpError::ConnectionFailed { reason }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 pub mod tests {
     use super::*;
     use crate::protocol::{extract_content_blocks, tool_error_reason};
+
+    fn with_connect_timeout(mut config: McpServerConfig, secs: u32) -> McpServerConfig {
+        config.connect_timeout_secs = Some(secs);
+        config
+    }
+
+    /// A stdio server can never open a login, so an interactive-mode connect
+    /// of one is bounded by its own connect timeout, not by the interactive
+    /// login window: a server that never speaks MCP fails within it.
+    #[tokio::test]
+    async fn a_stdio_connect_under_interactive_auth_is_bounded_by_its_connect_timeout() {
+        let config = with_connect_timeout(
+            McpServerConfig::stdio("idle-stdio", "sleep", vec!["30".into()], HashMap::new()),
+            1,
+        );
+        let started = std::time::Instant::now();
+        let connected = tokio::time::timeout(
+            Duration::from_secs(10),
+            McpConnection::connect_and_enumerate_with_mcp_auth(
+                &config,
+                McpAuthMode::Interactive,
+                None,
+            ),
+        )
+        .await
+        .expect("a stdio connect never waits for an interactive login window");
+        let Err(error) = connected else {
+            panic!("a stdio server that never speaks MCP never connects");
+        };
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(error.to_string().contains("after 1s"), "{error}");
+    }
+
+    /// A remote server without an auth resolver cannot open a login either:
+    /// its connect is bounded by its connect timeout.
+    #[tokio::test]
+    async fn a_remote_connect_without_an_auth_resolver_is_bounded_by_its_connect_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        // Accepts every connection and never answers.
+        let silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let config = with_connect_timeout(
+            McpServerConfig::streamable_http("silent-remote", url, HashMap::new()),
+            1,
+        );
+        let connected = tokio::time::timeout(
+            Duration::from_secs(10),
+            McpConnection::connect_and_enumerate_with_mcp_auth(
+                &config,
+                McpAuthMode::Interactive,
+                None,
+            ),
+        )
+        .await
+        .expect("a connect that cannot open a login never waits for its window");
+        silent.abort();
+        let Err(error) = connected else {
+            panic!("a server that never answers never connects");
+        };
+        assert!(error.to_string().contains("after 1s"), "{error}");
+    }
+
+    /// Only a remote connect with an auth resolver, under the interactive
+    /// mode, can open a login and so gets the interactive login window.
+    #[test]
+    fn only_a_remote_connect_with_an_auth_resolver_gets_the_interactive_login_window() {
+        let stdio = with_connect_timeout(
+            McpServerConfig::stdio("local", "/bin/true", vec![], HashMap::new()),
+            1,
+        );
+        let remote = with_connect_timeout(
+            McpServerConfig::streamable_http(
+                "remote",
+                "https://mcp.example/mcp".to_owned(),
+                HashMap::new(),
+            ),
+            1,
+        );
+        let one = Duration::from_secs(1);
+        let window = meerkat_auth_core::MCP_INTERACTIVE_LOGIN_TIMEOUT;
+        for (config, mode, resolver, expected) in [
+            (&stdio, McpAuthMode::Interactive, true, one),
+            (&stdio, McpAuthMode::Interactive, false, one),
+            (&remote, McpAuthMode::Interactive, false, one),
+            (&remote, McpAuthMode::Stored, true, one),
+            (&remote, McpAuthMode::Interactive, true, one + window),
+        ] {
+            assert_eq!(
+                ConnectDeadline::for_connect(config, mode, resolver).total(),
+                expected,
+                "{} {mode:?} resolver={resolver}",
+                config.name
+            );
+        }
+    }
+
+    /// A stdio server that never completed initialize is closed with a cut
+    /// EOF grace when its connect fails: a connect bounded by its connect
+    /// timeout ends just past it (here at about 1.25 s), not after the
+    /// close's full EOF grace.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stdio_server_that_never_initializes_is_closed_promptly_when_its_connect_fails() {
+        let config = with_connect_timeout(
+            McpServerConfig::stdio(
+                "never-initializes",
+                "sleep",
+                vec!["30".into()],
+                HashMap::new(),
+            ),
+            1,
+        );
+        let started = std::time::Instant::now();
+        let connected = tokio::time::timeout(
+            Duration::from_secs(20),
+            McpConnection::connect_and_enumerate_with_custody(
+                &config,
+                McpAuthMode::Stored,
+                None,
+                None,
+                Some(StdioChildCustody::with_bounds(McpStdioCloseBounds::DEFAULT)),
+                &McpStdioLaunchProfile::trusted_host(),
+                None,
+            ),
+        )
+        .await
+        .expect("the failed connect returns");
+        assert!(
+            connected.is_err(),
+            "a server that never speaks MCP never connects"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the connect timeout is 1 s; the close took the EOF grace: {elapsed:?}"
+        );
+    }
+
+    /// The control: a stdio server that completed initialize keeps its close
+    /// grace even when its connect then fails (here its tools/list never
+    /// answers): it is stopped only at the end of its EOF grace.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_initialized_stdio_server_keeps_its_close_grace_when_its_connect_fails() {
+        // Answers initialize, never tools/list, and ignores stdin EOF.
+        let script = r#"while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"sh-fixture","version":"0"}}}\n' "$id" ;;
+  esac
+done
+sleep 30
+"#;
+        let config = with_connect_timeout(
+            McpServerConfig::stdio(
+                "initialized-then-silent",
+                "/bin/sh",
+                vec!["-c".to_owned(), script.to_owned()],
+                HashMap::new(),
+            ),
+            1,
+        );
+        let eof_grace = Duration::from_millis(1500);
+        let started = std::time::Instant::now();
+        let connected = tokio::time::timeout(
+            Duration::from_secs(20),
+            McpConnection::connect_and_enumerate_with_custody(
+                &config,
+                McpAuthMode::Stored,
+                None,
+                None,
+                Some(StdioChildCustody::with_bounds(
+                    McpStdioCloseBounds::new(eof_grace, Duration::from_secs(5))
+                        .expect("bounds within the maximum"),
+                )),
+                &McpStdioLaunchProfile::trusted_host(),
+                None,
+            ),
+        )
+        .await
+        .expect("the failed connect returns");
+        assert!(connected.is_err(), "tools/list never answers");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(1) + eof_grace,
+            "an initialized server was closed before its EOF grace: {elapsed:?}"
+        );
+    }
+
+    /// A connect that runs out of time names the deadline it actually had,
+    /// login window included.
+    #[test]
+    fn a_connect_timeout_names_its_effective_deadline() {
+        let stdio = with_connect_timeout(
+            McpServerConfig::stdio("local", "/bin/true", vec![], HashMap::new()),
+            1,
+        );
+        let remote = with_connect_timeout(
+            McpServerConfig::streamable_http(
+                "remote",
+                "https://mcp.example/mcp".to_owned(),
+                HashMap::new(),
+            ),
+            1,
+        );
+        let local = ConnectDeadline::for_connect(&stdio, McpAuthMode::Interactive, true)
+            .timed_out("local")
+            .to_string();
+        assert!(local.contains("after 1s"), "{local}");
+        let windowed = ConnectDeadline::for_connect(&remote, McpAuthMode::Interactive, true)
+            .timed_out("remote")
+            .to_string();
+        assert!(windowed.contains("after 301s"), "{windowed}");
+        assert!(
+            windowed.contains("300s interactive login window"),
+            "{windowed}"
+        );
+    }
 
     /// A connection states only the account its owners state: the host's
     /// `none` declaration, the connector binding's account, or the OAuth
@@ -5159,11 +5548,13 @@ pub mod tests {
         let custody = StdioChildCustody::with_bounds(McpStdioCloseBounds::IMMEDIATE);
         let pipes = custody
             .spawn(
+                "sleeper",
                 &meerkat_core::mcp_config::McpStdioConfig {
                     command: "/bin/sh".to_string(),
                     args: vec!["-c".to_string(), "exec sleep 60".to_string()],
                     env: HashMap::new(),
                     secret_env: std::collections::BTreeSet::new(),
+                    cwd: None,
                 },
                 &McpStdioLaunchProfile::trusted_host(),
                 &mut PhysicalEntry::default(),
@@ -5457,11 +5848,16 @@ pub mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn failed_handshake_returns_after_the_stdio_server_exits() {
-        // Closes its stdout (the handshake fails on EOF) but keeps running.
+        // Closes its stdout (the handshake fails on EOF) but keeps running,
+        // and ignores SIGTERM, so a close still outlasts the connect's
+        // timeout below.
         let config = McpServerConfig::stdio(
             "closes-stdout",
             "/bin/sh",
-            vec!["-c".to_string(), "exec >&-; exec sleep 60".to_string()],
+            vec![
+                "-c".to_string(),
+                "trap '' TERM; exec >&-; exec sleep 60".to_string(),
+            ],
             HashMap::new(),
         );
         let custody = StdioChildCustody::with_bounds(graces(200, 200));
@@ -5960,6 +6356,7 @@ pub mod tests {
         };
         let (stdout, stdin) = custody
             .spawn(
+                &config.name,
                 stdio,
                 &McpStdioLaunchProfile::trusted_host(),
                 &mut PhysicalEntry::default(),
@@ -6810,3 +7207,7 @@ mod process_confinement_tests;
 #[cfg(all(test, feature = "workspace-tests"))]
 #[path = "service_secret_tests.rs"]
 mod service_secret_tests;
+
+#[cfg(test)]
+#[path = "stdio_cwd_tests.rs"]
+mod stdio_cwd_tests;

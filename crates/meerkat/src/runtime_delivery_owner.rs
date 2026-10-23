@@ -415,6 +415,7 @@ impl RuntimeDeliveryOwner {
             last_delivery_generation: None,
             generation_reader,
             generation_reader_idle_at: None,
+            answered_sweeps: 0,
             cold,
             awaiting: HashMap::new(),
             stop: Some(stop_rx),
@@ -610,6 +611,8 @@ enum StoreWake {
     Watching {
         _watch: OwnedStoreWatch,
         ticks: watch::Receiver<u64>,
+        /// The watch's sweeps, counted before the tick each moves.
+        sweeps: watch::Receiver<u64>,
     },
     Unavailable(String),
 }
@@ -653,6 +656,7 @@ impl StoreWake {
                 Ok(None) => Self::NotShared,
                 Ok(Some(watch)) => Self::Watching {
                     ticks: watch.subscribe_ticks(),
+                    sweeps: watch.subscribe_sweeps(),
                     _watch: OwnedStoreWatch {
                         watch: Some(watch),
                         retained: Arc::clone(retained),
@@ -692,6 +696,25 @@ impl StoreWake {
             Self::NotShared => None,
             #[cfg(not(target_arch = "wasm32"))]
             Self::Watching { .. } => None,
+        }
+    }
+
+    /// Whether the watch swept since the sweep count `answered`, which this
+    /// moves on to the current count. The watch counts a sweep before it
+    /// moves the tick, so a sweep among the ticks being answered is counted.
+    fn swept_since(&self, answered: &mut u64) -> bool {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Watching { sweeps, .. } => {
+                let sweeps = *sweeps.borrow();
+                let swept = sweeps != *answered;
+                *answered = sweeps;
+                swept
+            }
+            Self::NotShared | Self::Unavailable(_) => {
+                let _ = answered;
+                false
+            }
         }
     }
 
@@ -742,6 +765,10 @@ struct OwnerLoop {
     /// ([`KEPT_DELIVERY_READER_IDLE`] after its last read); `None` while it
     /// keeps nothing.
     generation_reader_idle_at: Option<tokio::time::Instant>,
+    /// The store watch's sweep count when the owner last answered its ticks:
+    /// a sweep since reads, while ticks that were file notifications only
+    /// may be answered without opening the database.
+    answered_sweeps: u64,
     cold: ColdDeliveryOwnership,
     /// The handle's retirement request. `None` once the handle is gone
     /// without one (detached): the owner then runs on its other signals.
@@ -786,16 +813,22 @@ struct AwaitingWait {
 }
 
 impl OwnerLoop {
-    /// The store's delivery generation, through the kept reader when there is
-    /// one. A read that leaves a connection kept restarts its idle bound.
-    async fn read_delivery_generation(&mut self) -> Result<u64, RuntimeDeliveryError> {
+    /// The store's delivery generation, through the store's reader when there
+    /// is one. A read that leaves a connection kept restarts its idle bound.
+    async fn read_delivery_generation(
+        &mut self,
+        purpose: GenerationRead,
+    ) -> Result<u64, RuntimeDeliveryError> {
         let Some(reader) = self.generation_reader.as_mut() else {
             return self.ownership.inbox().delivery_generation().await;
         };
         let reader = reader
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let read = reader.read().await;
+        let read = match purpose {
+            GenerationRead::Read => reader.read().await,
+            GenerationRead::Notification => reader.read_on_notification().await,
+        };
         self.generation_reader_idle_at = reader
             .keeps_connection()
             .then(|| tokio::time::Instant::now() + KEPT_DELIVERY_READER_IDLE);
@@ -829,10 +862,18 @@ impl OwnerLoop {
                 wake.reconcile = true;
             }
         }
+        // Ticks that carried no sweep were file notifications only: the
+        // reader may answer them without opening the database. A sweep reads.
+        let swept = self.store_watch.swept_since(&mut self.answered_sweeps);
         if !wake.reconcile {
             // One row read. Writes by sessions and other stores tick the
             // watch too; they cost only this read.
-            match self.read_delivery_generation().await {
+            let purpose = if swept {
+                GenerationRead::Read
+            } else {
+                GenerationRead::Notification
+            };
+            match self.read_delivery_generation(purpose).await {
                 Ok(current) if self.last_delivery_generation == Some(current) => {}
                 Ok(_) | Err(_) => wake.reconcile = true,
             }
@@ -881,6 +922,16 @@ impl OwnerLoop {
         }
         Some(due)
     }
+}
+
+/// Why the owner reads the store's delivery generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenerationRead {
+    /// A reconcile, or ticks among which the watch swept: the reader reads.
+    Read,
+    /// Ticks that were file notifications only: the reader may answer from
+    /// its last read ([`DeliveryGenerationReader::read_on_notification`]).
+    Notification,
 }
 
 /// Which signals fired since the previous pass.
@@ -1218,7 +1269,7 @@ async fn run_pass(
     if wake.reconcile {
         // Record the generation BEFORE reading the backlog, so a commit
         // landing during the read moves it again and wakes the next pass.
-        if let Ok(current) = owner.read_delivery_generation().await {
+        if let Ok(current) = owner.read_delivery_generation(GenerationRead::Read).await {
             owner.last_delivery_generation = Some(current);
         }
         match owner

@@ -36,6 +36,12 @@ impl MobReadHandle {
         self.handle.status_observation_snapshot()
     }
 
+    /// The mob's lifecycle as observed without asking its actor:
+    /// [`MobHandle::lifecycle_observation`].
+    pub fn lifecycle_observation(&self) -> super::MobLifecycleObservation {
+        self.handle.lifecycle_observation()
+    }
+
     /// Current member binding projected from the existing machine and roster.
     pub async fn get_member(
         &self,

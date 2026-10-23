@@ -282,6 +282,20 @@ test-group = 'mob-real-comms-macos'
 retries = 2
 
 [[profile.fast.overrides]]
+# MCP OAuth bound rows: each holds one network stage while the rest of its
+# login runs under a 300 ms test stage bound. A saturated lane that delays a
+# loopback request past 300 ms fails them without a real cause, so reserve the
+# lane instead of raising the bound.
+filter = 'test(=a_stalled_token_exchange_ends_typed_with_the_code_sent) or test(=a_stalled_userinfo_ends_typed_after_the_code_was_redeemed) or test(=a_stalled_start_discovery_ends_typed_admits_nothing_and_frees_the_target) or test(=a_stalled_refresh_fails_transient_and_lets_a_relogin_commit_land) or test(=a_stalled_refresh_under_the_file_lock_lets_a_relogin_commit_land) or test(=a_commit_held_past_its_observation_bound_is_unsettled_then_settles) or test(=a_commit_not_admitted_within_its_bound_is_retired_and_publishes_nothing) or test(=host_service_mcp_authority_bounds_a_stalled_token_endpoint)'
+threads-required = "num-cpus"
+
+[[profile.default.overrides]]
+# The workspace unit lane uses the default profile and discovers these tests
+# too.
+filter = 'test(=a_stalled_token_exchange_ends_typed_with_the_code_sent) or test(=a_stalled_userinfo_ends_typed_after_the_code_was_redeemed) or test(=a_stalled_start_discovery_ends_typed_admits_nothing_and_frees_the_target) or test(=a_stalled_refresh_fails_transient_and_lets_a_relogin_commit_land) or test(=a_stalled_refresh_under_the_file_lock_lets_a_relogin_commit_land) or test(=a_commit_held_past_its_observation_bound_is_unsettled_then_settles) or test(=a_commit_not_admitted_within_its_bound_is_retired_and_publishes_nothing) or test(=host_service_mcp_authority_bounds_a_stalled_token_endpoint)'
+threads-required = "num-cpus"
+
+[[profile.fast.overrides]]
 # Dense mob-topology materialization is intentionally a high-blast stress test:
 # it spawns 300 local members and installs 45k directional trust writes while
 # asserting a wall-clock budget. Keep the test concurrent internally, but do

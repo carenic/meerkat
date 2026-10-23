@@ -114,7 +114,7 @@ async fn send_token_request(
         // The host egress profile's own resolver refused the endpoint.
         match crate::http_egress::egress_refusal_in(&e) {
             Some(refusal) => OAuthError::EgressRefused(refusal),
-            None => OAuthError::Network(e.to_string()),
+            None => super::credential_request_error(e),
         }
     })?;
     let status = resp.status();
@@ -126,10 +126,7 @@ async fn send_token_request(
             body,
         });
     }
-    let wire: TokenResponseWire = resp
-        .json()
-        .await
-        .map_err(|e| OAuthError::Network(format!("decode: {e}")))?;
+    let wire: TokenResponseWire = resp.json().await.map_err(super::credential_decode_error)?;
     Ok(OAuthTokenResult {
         access_token: wire.access_token,
         refresh_token: wire.refresh_token,
@@ -203,6 +200,32 @@ mod tests {
             0,
             "no grant, refresh token or device code reached the redirect target"
         );
+    }
+
+    /// A token endpoint that accepts the request and never answers ends the
+    /// exchange as [`OAuthError::Timeout`]. Virtual time.
+    #[tokio::test(start_paused = true)]
+    async fn a_token_request_its_endpoint_never_answers_is_oauth_timeout() {
+        let address = crate::auth_oauth::redirect_fixture::spawn_slow_endpoint(None).await;
+        let http = credential_http_client().unwrap();
+        let endpoints = endpoints(&format!("http://{address}/token"));
+        let bound = crate::auth_oauth::CREDENTIAL_REQUEST_TIMEOUT * 10;
+        let error = tokio::time::timeout(
+            bound,
+            exchange_authorization_code(&http, &endpoints, "code", "verifier", None),
+        )
+        .await
+        .expect("the client ends the exchange itself")
+        .unwrap_err();
+        assert!(matches!(error, OAuthError::Timeout), "{error:?}");
+        let error = tokio::time::timeout(
+            bound,
+            exchange_refresh_token(&http, &endpoints, "refresh-secret", None),
+        )
+        .await
+        .expect("the client ends the refresh itself")
+        .unwrap_err();
+        assert!(matches!(error, OAuthError::Timeout), "{error:?}");
     }
 
     #[test]

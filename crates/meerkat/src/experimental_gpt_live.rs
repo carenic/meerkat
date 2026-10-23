@@ -1380,6 +1380,7 @@ fn live_factory_failure_class(error: &meerkat_client::FactoryError) -> &'static 
             ConnectionTargetError::BindingInvalid { .. } => "invalid_binding",
             ConnectionTargetError::ProviderMismatch { .. } => "binding_provider_mismatch",
             ConnectionTargetError::AmbiguousCredentialAccountBindings { .. } => "ambiguous_binding",
+            ConnectionTargetError::NoCredentialAccountRoute { .. } => "no_credential_account_route",
             ConnectionTargetError::RealmChain(_) => "invalid_realm_chain",
         },
         FactoryError::ClientBuild(error) => live_provider_failure_class(error),

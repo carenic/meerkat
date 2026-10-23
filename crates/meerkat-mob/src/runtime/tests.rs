@@ -23500,11 +23500,15 @@ async fn test_rotate_supervisor_pending_commit_conflict_fails_closed_without_loc
     assert!(
         matches!(
             &error,
-            MobError::Internal(reason)
-                if reason.contains("exact reread found divergent supervisor authority")
-                    && reason.contains("fail-stopping for cold recovery")
+            MobError::SharedLifecycleFailure(cause) if matches!(
+                cause.as_ref(),
+                MobError::Internal(reason)
+                    if reason.contains("exact reread found divergent supervisor authority")
+                        && reason.contains("fail-stopping for cold recovery")
+            )
         ),
-        "operation-anchor CAS divergence must be a durable fail-stop, got: {error:?}",
+        "operation-anchor CAS divergence must be a durable fail-stop, its reply the recorded cause \
+         shared, got: {error:?}",
     );
     let after_conflict = runtime_metadata
         .load_supervisor_authority(&mob_id)
@@ -23578,11 +23582,15 @@ async fn test_rotate_supervisor_receipt_checkpoint_conflict_does_not_reauthorize
     assert!(
         matches!(
             &error,
-            MobError::Internal(reason)
-                if reason.contains("exact reread found divergent supervisor authority")
-                    && reason.contains("fail-stopping for cold recovery")
+            MobError::SharedLifecycleFailure(cause) if matches!(
+                cause.as_ref(),
+                MobError::Internal(reason)
+                    if reason.contains("exact reread found divergent supervisor authority")
+                        && reason.contains("fail-stopping for cold recovery")
+            )
         ),
-        "receipt-checkpoint CAS divergence must be a durable fail-stop, got: {error:?}",
+        "receipt-checkpoint CAS divergence must be a durable fail-stop, its reply the recorded cause \
+         shared, got: {error:?}",
     );
     let attempted_public_peer_id = external
         .authorized_supervisor_peer_id()
@@ -47531,6 +47539,179 @@ async fn test_reload_discard_cancelled_waiter_retry_rebinds_existing_cold_succes
     assert!(!provisioner.ops_binding_present_for_test(&session_id));
 }
 
+/// A reload at a retirement's ingress detach (a member that degraded after
+/// its quiesce) carries the member's bound operation into the cold successor
+/// as a retention request. The detach acts on that successor, and the
+/// disposal that follows (the session archive stage) rebinds and retires the
+/// retained operation: nothing of the operation binding is left once the
+/// member's session is disposed.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reload_at_the_ingress_detach_hands_its_retained_operation_to_the_disposal() {
+    struct FailingBoundaryExecutor;
+    #[async_trait::async_trait]
+    impl meerkat_core::lifecycle::core_executor::CoreExecutor for FailingBoundaryExecutor {
+        async fn apply(
+            &mut self,
+            run_id: meerkat_core::RunId,
+            primitive: meerkat_core::lifecycle::run_primitive::RunPrimitive,
+        ) -> Result<
+            meerkat_core::lifecycle::core_executor::CoreApplyOutput,
+            meerkat_core::lifecycle::core_executor::CoreExecutorError,
+        > {
+            Ok(
+                meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_untyped_snapshot(
+                    meerkat_core::lifecycle::run_receipt::RunBoundaryReceiptDraft {
+                        run_id,
+                        boundary:
+                            meerkat_core::lifecycle::run_primitive::RunApplyBoundary::RunStart,
+                        contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                        conversation_digest: None,
+                        message_count: 0,
+                    },
+                    None,
+                    None,
+                ),
+            )
+        }
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+            Ok(())
+        }
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+            Ok(())
+        }
+    }
+    let service = Arc::new(MockSessionService::new());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let adapter = Arc::new(
+        meerkat_runtime::MeerkatMachine::persistent_without_blobs(runtime_store)
+            .expect("construct runtime authority"),
+    );
+    service.set_runtime_adapter(Arc::clone(&adapter));
+    let provisioner = Arc::new(super::provisioner::SessionBackend::new(
+        service,
+        Some(Arc::clone(&adapter)),
+        None,
+    ));
+    let session = Session::new();
+    let session_id = session.id().clone();
+    provision_runtime_backed_disposal_fixture(
+        provisioner.as_ref(),
+        session,
+        "ingress-stage-reload",
+    )
+    .await;
+    adapter
+        .ensure_session_with_executor(session_id.clone(), Box::new(FailingBoundaryExecutor))
+        .await
+        .expect("replace fixture executor");
+    let exact_operation_id = provisioner
+        .ops_binding_operation_id_for_test(&session_id)
+        .expect("fixture publishes one exact mob-child operation");
+    adapter
+        .persist_current_ops_lifecycle_for_test(&session_id)
+        .await
+        .expect("persist exact pre-fault mob-child operation authority");
+    assert!(
+        adapter
+            .force_session_durability_reload_required_for_test(&session_id)
+            .await
+    );
+    meerkat_runtime::SessionServiceRuntimeExt::accept_input(
+        adapter.as_ref(),
+        &session_id,
+        meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::new(
+            "trigger degraded teardown",
+            None,
+        )),
+    )
+    .await
+    .expect_err("degraded admission must start teardown");
+
+    // The ingress stage's reload: the registration current for the retiring
+    // member's session, through the quiesce's reload helper.
+    let registration = adapter
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("the degraded registration is current");
+    let settlement = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::provisioner::MemberSessionDisposalArc::reload_durability_degraded_registration_settlement_until(
+            &adapter,
+            Some(&provisioner.session_ops_adapter()),
+            &registration,
+            &session_id,
+            Instant::now() + Duration::from_secs(5),
+        ),
+    )
+    .await
+    .expect("the reload settles")
+    .expect("the reload is not refused");
+    let meerkat_runtime::ReloadRequiredRegistrationSettlement::Discarded { successor } = settlement
+    else {
+        panic!("the degraded registration is discarded: {settlement:?}");
+    };
+    let successor_registry = adapter
+        .ops_lifecycle_registry_if_current_registration(&successor)
+        .await
+        .expect("the published successor is current");
+    assert!(
+        meerkat_core::ops_lifecycle::OpsLifecycleRegistry::snapshot(
+            successor_registry.as_ref(),
+            &exact_operation_id,
+        )
+        .expect("read the retained operation")
+        .is_some(),
+        "the reload retains the member's bound operation in the successor"
+    );
+    // The ingress detach on the successor, as the stage runs it.
+    match adapter
+        .update_peer_ingress_context(&session_id, false, None)
+        .await
+    {
+        Ok(_)
+        | Err(
+            meerkat_runtime::RuntimeDriverError::NotFound { .. }
+            | meerkat_runtime::RuntimeDriverError::Destroyed
+            | meerkat_runtime::RuntimeDriverError::NotReady { .. },
+        ) => {}
+        Err(error) => panic!("the successor's ingress detaches: {error}"),
+    }
+    assert!(matches!(
+        adapter.peer_ingress_owner(&session_id).await,
+        meerkat_runtime::PeerIngressOwner::Unattached
+    ));
+    assert_eq!(
+        adapter
+            .current_session_registration_witness(&session_id)
+            .await
+            .as_ref(),
+        Some(&successor),
+        "the detach leaves the published successor current"
+    );
+
+    // The session archive stage's disposal consumes the retention.
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        provisioner.dispose_inline_for_recovery_test(&session_id),
+    )
+    .await
+    .expect("the disposal stays bounded")
+    .expect("the disposal rebinds and retires the retained operation");
+    assert!(!adapter.contains_session(&session_id).await);
+    assert!(
+        !provisioner.ops_binding_present_for_test(&session_id),
+        "no operation binding of the member's session is left"
+    );
+}
+
 #[cfg(feature = "runtime-adapter")]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_reload_recovery_cancel_after_hook_reuses_terminal_receipt() {
@@ -48585,8 +48766,12 @@ async fn test_retire_member_waits_for_active_runtime_turn_before_unregister() {
             meerkat_core::lifecycle::core_executor::CoreApplyOutput,
             meerkat_core::lifecycle::core_executor::CoreExecutorError,
         > {
+            // apply runs on the runtime's serving thread, and the test may
+            // release it as soon as it sees the start. notify_waiters keeps
+            // no permit, so register for the release before announcing.
+            let allow_finish = self.allow_finish.notified();
             self.apply_started.notify_waiters();
-            self.allow_finish.notified().await;
+            allow_finish.await;
 
             Ok(
                 meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_untyped_snapshot(
@@ -48787,8 +48972,12 @@ async fn test_retire_member_cancels_visible_retired_drain_run_before_archive() {
             meerkat_core::lifecycle::core_executor::CoreApplyOutput,
             meerkat_core::lifecycle::core_executor::CoreExecutorError,
         > {
+            // apply runs on the runtime's serving thread, and the test may
+            // release it as soon as it sees the start. notify_waiters keeps
+            // no permit, so register for the release before announcing.
+            let allow_finish = self.allow_finish.notified();
             self.apply_started.notify_waiters();
-            self.allow_finish.notified().await;
+            allow_finish.await;
             Ok(
                 meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_untyped_snapshot(
                     meerkat_core::lifecycle::run_receipt::RunBoundaryReceiptDraft {
@@ -49280,8 +49469,12 @@ async fn test_retire_member_bounds_wedged_exact_control_and_retry_converges() {
             meerkat_core::lifecycle::core_executor::CoreApplyOutput,
             meerkat_core::lifecycle::core_executor::CoreExecutorError,
         > {
+            // apply runs on the runtime's serving thread, and the test may
+            // release it as soon as it sees the start. notify_waiters keeps
+            // no permit, so register for the release before announcing.
+            let allow_finish = self.allow_finish.notified();
             self.apply_started.notify_waiters();
-            self.allow_finish.notified().await;
+            allow_finish.await;
             Ok(
                 meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_untyped_snapshot(
                     meerkat_core::lifecycle::run_receipt::RunBoundaryReceiptDraft {
@@ -56295,8 +56488,11 @@ fn test_flow_canceled_cleanup_requires_terminalization_proof() {
 #[test]
 fn test_lifecycle_commands_admit_on_live_authority_not_clone_probe() {
     let source = include_str!("actor.rs");
-    let start = source
-        .find("MobCommand::Stop { reply_tx }")
+    let stop_body = source
+        .find("StopInlineStage::PlacedCompletionCleanup")
+        .expect("Stop command arm exists");
+    let start = source[..stop_body]
+        .rfind("MobCommand::Stop")
         .expect("Stop command arm exists");
     let end = source[start..]
         .find("MobCommand::RotateSupervisor")
@@ -57913,7 +58109,8 @@ async fn test_spawn_rejects_reserved_flow_member_prefix() {
 /// A mob actor that fail-stops on an uncertain durable mutation (here a
 /// failed run's terminal event append) reports why, typed, to a status read
 /// and to an explicit resume, as a startup recovery failure does, instead of
-/// a closed reply channel.
+/// a closed reply channel: the durability fail-stop, with that mutation's
+/// own error as its cause.
 #[tokio::test]
 async fn an_in_loop_durability_fail_stop_reports_why_to_status_and_resume() {
     let events = Arc::new(FaultInjectedMobEventStore::new());
@@ -57947,15 +58144,14 @@ async fn an_in_loop_durability_fail_stop_reports_why_to_status_and_resume() {
         let MobError::SharedLifecycleFailure(failure) = &error else {
             panic!("{call} must report the fail-stop, typed: {error:?}");
         };
+        let MobError::DurabilityFailStop { cause, .. } = failure.as_ref() else {
+            panic!("{call} must name the durability fail-stop: {failure:?}");
+        };
+        let rendered = cause.to_string();
         assert!(
-            matches!(
-                failure.as_ref(),
-                MobError::AdmissionClosed {
-                    reason: crate::runtime::MobAdmissionCloseReason::DurabilityFailStop,
-                    ..
-                }
-            ),
-            "{call} must name the durability fail-stop: {failure:?}"
+            rendered.contains("terminal event append failed") && rendered.contains("FlowFailed"),
+            "{call} must name the uncertain mutation, the failed run's terminal event \
+             append: {rendered}"
         );
     }
 }
@@ -84796,6 +84992,9 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         MobError::InvalidTransition { from, to } => {
             format!("invalid_transition:{}->{}", from.as_str(), to.as_str())
         }
+        MobError::DrainRequiresStoppedMob { state } => {
+            format!("drain_requires_stopped_mob:{}", state.as_str())
+        }
         MobError::MobMachineRejected { context, .. } => {
             format!("mob_machine_rejected:{context}")
         }
@@ -84845,6 +85044,7 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         MobError::MemberStartupRecoveryFailed { .. } => {
             "member_startup_recovery_failed".to_string()
         }
+        MobError::DurabilityFailStop { .. } => "durability_fail_stop".to_string(),
         MobError::SpawnMemberAdmissionDenied { .. } => "spawn_member_admission_denied".to_string(),
         MobError::BridgeRequestTimedOut { .. } => "bridge_request_timed_out".to_string(),
         MobError::ForkSourceUnavailable { .. } => "fork_source_unavailable".to_string(),
@@ -84858,6 +85058,7 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         MobError::MemberAdmissionBacklogFull { .. } => "member_admission_backlog_full".to_string(),
         MobError::ActorCommandTimedOut { .. } => "actor_command_timed_out".to_string(),
         MobError::MemberReloadRefused { .. } => "member_reload_refused".to_string(),
+        MobError::MemberReloadRepairBlocked { .. } => "member_reload_repair_blocked".to_string(),
         MobError::HeldProvisionUnsupported { .. } => "held_provision_unsupported".to_string(),
         MobError::RespawnPredecessorRestrictionsUnavailable { .. } => {
             "respawn_predecessor_restrictions_unavailable".to_string()
@@ -92535,6 +92736,9 @@ async fn test_running_steer_without_override_resolves_applied_identity_as_none()
 /// #1102 actor-loop isolation, per-member admission lanes, bounded
 /// deliveries, and the member registration reload primitive.
 mod actor_isolation;
+/// A bounded drain of a Stopped mob's runs.
+#[cfg(feature = "runtime-adapter")]
+mod run_drain;
 /// A graceful Shutdown releases the identity leases of the members it
 /// unregistered.
 mod shutdown_lease_release;
@@ -92571,6 +92775,9 @@ mod continuation_resolver;
 /// recovery over real persistent stores.
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod delivery_scope_gates;
+/// Each in-loop durability fail-stop records its own cause.
+#[cfg(not(target_arch = "wasm32"))]
+mod fail_stop_cause;
 /// #1497 fork job terminals are committed once and validated on every read.
 mod fork_job_terminal;
 /// Producer bridge Part B: held spawns.
@@ -92582,6 +92789,9 @@ mod host_outage_recovery;
 /// commits hold the mob database's write lock across a slow fsync.
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod identity_fence_contention;
+/// A mob's lifecycle as its handles observe it without asking its actor.
+#[cfg(not(target_arch = "wasm32"))]
+mod lifecycle_observation;
 /// Member binding history reads over real persistent stores, on the running
 /// mob and on its stopped store.
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]

@@ -3062,10 +3062,10 @@ mod usage_aggregation_semantics {
     /// assertions below must stay identical to that page.
     fn documented_session() -> Vec<TurnUsage> {
         vec![
-            documented_call("claude-opus-5", 1000, 4000, 0, 200),
-            documented_call("claude-opus-5", 300, 0, 4000, 150),
-            documented_call("claude-opus-5", 120, 0, 4300, 90),
-            documented_call("claude-opus-5", 200, 0, 4500, 60),
+            documented_call("test-anthropic-model", 1000, 4000, 0, 200),
+            documented_call("test-anthropic-model", 300, 0, 4000, 150),
+            documented_call("test-anthropic-model", 120, 0, 4300, 90),
+            documented_call("test-anthropic-model", 200, 0, 4500, 60),
         ]
     }
 
@@ -3132,9 +3132,9 @@ mod usage_aggregation_semantics {
 
     #[test]
     fn per_call_usage_owns_provider_and_model_attribution() {
-        let call = documented_call("claude-opus-5", 120, 0, 4300, 90);
+        let call = documented_call("test-anthropic-model", 120, 0, 4300, 90);
         assert_eq!(call.accounting().provider, Provider::Anthropic);
-        assert_eq!(call.accounting().model, "claude-opus-5");
+        assert_eq!(call.accounting().model, "test-anthropic-model");
         assert_eq!(call.presented_tokens(), 4420);
         assert_eq!(call.normalized_total_tokens(), 4510);
         assert_eq!(
@@ -3146,10 +3146,10 @@ mod usage_aggregation_semantics {
 
     #[test]
     fn turn_usage_serializes_provider_and_model_beside_the_counters() {
-        let call = documented_call("claude-opus-5", 120, 0, 4300, 90);
+        let call = documented_call("test-anthropic-model", 120, 0, 4300, 90);
         let json = serde_json::to_value(&call).unwrap();
         assert_eq!(json["accounting"]["provider"], json!("anthropic"));
-        assert_eq!(json["accounting"]["model"], json!("claude-opus-5"));
+        assert_eq!(json["accounting"]["model"], json!("test-anthropic-model"));
         assert_eq!(json["accounting"]["presented_tokens"], json!(4420));
         assert_eq!(json["input_tokens"], json!(120));
 

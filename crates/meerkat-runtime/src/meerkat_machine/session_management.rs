@@ -5928,7 +5928,7 @@ impl MeerkatMachine {
     /// held.
     ///
     /// This is the typed claim-release event a caller refused with
-    /// [`RuntimeBindingsError::RegistrationOwned`](crate::RuntimeBindingsError::RegistrationOwned) awaits before re-attempting
+    /// [`RuntimeBindingsError::RegistrationOwned`] awaits before re-attempting
     /// materialization. It waits on the claim's own change notification; it
     /// never polls or times out. A replacement registration is observed
     /// afresh.

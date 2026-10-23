@@ -1127,11 +1127,35 @@ pub enum WireMobLifecycleStatus {
 }
 
 /// One active mob row returned by `mob/list`.
+///
+/// `failure` present means the mob's actor has stopped; `status` is the last
+/// machine phase. The actor admits no command until a restart recovers the
+/// mob from its durable state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MobStatusResult {
     pub mob_id: String,
+    /// The last machine phase the mob's actor published.
     pub status: WireMobLifecycleStatus,
+    /// Present means the mob's actor has stopped; `status` is the last
+    /// machine phase. Why the actor stopped, typed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<WireMobLifecycleFailure>,
+}
+
+/// Why a mob's actor has stopped, on a `mob/list` row: the fields a failed
+/// `mob/spawn_many` row carries.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct WireMobLifecycleFailure {
+    /// The mob failure cause, as the mob's machine classifies it.
+    pub cause: MobSpawnManyFailureCause,
+    pub message: String,
+    /// Stable classification supplied by the canonical failure owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<crate::ErrorCode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_data: Option<Value>,
 }
 
 /// Response payload for `mob/list`.
@@ -2175,7 +2199,7 @@ pub struct MobLifecycleResult {
     pub action: WireMobLifecycleAction,
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub destroy_report: Option<Value>,
+    pub destroy_report: Option<WireMobDestroyReport>,
     /// For `stop`: what the stop did to each member's run and whether its
     /// run starts are held (#1500). A member reported `not_holdable` may
     /// still start a turn while the mob is stopped. A member reported
@@ -2961,7 +2985,96 @@ mod member_status_capability_tests {
 pub struct MobDestroyResult {
     pub mob_id: String,
     pub ok: bool,
-    pub destroy_report: Value,
+    pub destroy_report: WireMobDestroyReport,
+}
+
+/// Wire form of a mob destroy's report (`meerkat_mob::MobDestroyReport`),
+/// field for field: a destroy result, a lifecycle destroy and the
+/// `mob_destroy_incomplete` error data carry it. Members are their identity
+/// strings. Empty lists are left out, and a missing flag reads as `false`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct WireMobDestroyReport {
+    /// Members whose retirement the destroy forced.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub force_destroyed_members: Vec<String>,
+    /// Remote members whose cleanup the destroy could not confirm.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub orphaned_remote_members: Vec<String>,
+    /// Whether remote cleanup ran out of its deadline.
+    #[serde(default)]
+    pub remote_cleanup_deadline_exceeded: bool,
+    /// Whether the mob's metadata was scrubbed.
+    #[serde(default)]
+    pub metadata_scrubbed: bool,
+    /// Whether the mob's events were cleared.
+    #[serde(default)]
+    pub events_cleared: bool,
+    /// Whether the mob's storage namespace was cleaned.
+    #[serde(default)]
+    pub namespace_cleaned: bool,
+    /// Cleanup failures, as text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
+    /// Members the destroy reloaded from their durable store and retired.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reloaded_members: Vec<String>,
+    /// Members whose durability reload the runtime refused, with the typed
+    /// refusal; retry the destroy later.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub member_reload_refusals: Vec<WireMobDestroyMemberRefusal>,
+}
+
+/// A member whose durability reload the runtime refused during a destroy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct WireMobDestroyMemberRefusal {
+    pub member: String,
+    pub refusal: WireMemberReloadRefusal,
+}
+
+/// Why the runtime refused a member's durability reload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WireMemberReloadRefusal {
+    /// The runtime's recovery is repair-blocked, for example while a
+    /// boundary commit past its deadline has not reported its durable
+    /// outcome.
+    RepairBlocked {
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence_digest: Option<String>,
+    },
+    /// Forward compatibility: a refusal kind this version does not know.
+    /// The server never sends it.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The `data` of a `mob_destroy_incomplete` error: the destroy did not
+/// finish, its report says what is left, and it can be retried.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct WireMobDestroyIncompleteData {
+    /// Always `mob_destroy_incomplete`.
+    pub code: String,
+    pub destroy_report: WireMobDestroyReport,
+    pub retryable: bool,
+}
+
+impl WireMobDestroyIncompleteData {
+    /// The `code` of this error data.
+    pub const CODE: &'static str = "mob_destroy_incomplete";
+
+    /// The retryable incomplete-destroy data for `destroy_report`.
+    pub fn new(destroy_report: WireMobDestroyReport) -> Self {
+        Self {
+            code: Self::CODE.to_string(),
+            destroy_report,
+            retryable: true,
+        }
+    }
 }
 
 /// Request payload for `mob/claim_callback_route`.
@@ -5074,5 +5187,49 @@ mod tests {
             "agent_identity": "worker",
         }))
         .expect_err("close without channel_id must be rejected");
+    }
+}
+
+#[cfg(test)]
+mod destroy_report_tests {
+    use super::{WireMemberReloadRefusal, WireMobDestroyIncompleteData, WireMobDestroyReport};
+
+    #[test]
+    fn an_unknown_member_reload_refusal_kind_parses_as_unknown() -> Result<(), serde_json::Error> {
+        let report: WireMobDestroyReport = serde_json::from_value(serde_json::json!({
+            "member_reload_refusals": [
+                {"member": "m", "refusal": {"kind": "a_later_kind", "detail": 1}}
+            ]
+        }))?;
+        assert_eq!(
+            report
+                .member_reload_refusals
+                .iter()
+                .map(|refused| &refused.refusal)
+                .collect::<Vec<_>>(),
+            [&WireMemberReloadRefusal::Unknown]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_destroy_data_carries_its_code_and_is_retryable() -> Result<(), serde_json::Error>
+    {
+        assert_eq!(
+            serde_json::to_value(WireMobDestroyIncompleteData::new(
+                WireMobDestroyReport::default()
+            ))?,
+            serde_json::json!({
+                "code": "mob_destroy_incomplete",
+                "destroy_report": {
+                    "remote_cleanup_deadline_exceeded": false,
+                    "metadata_scrubbed": false,
+                    "events_cleared": false,
+                    "namespace_cleaned": false,
+                },
+                "retryable": true,
+            })
+        );
+        Ok(())
     }
 }

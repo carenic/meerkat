@@ -742,3 +742,927 @@ fn team_incarnation() -> meerkat_core::service::MobIncarnationId {
         .parse()
         .expect("canonical mob incarnation id")
 }
+
+/// Two incarnations of the mob `team`: the one a stopped mob ran at, and the
+/// one of a mob the host created again under the id.
+fn earlier_incarnation() -> meerkat_core::service::MobIncarnationId {
+    "1f0c6a9e-4b2d-4c3e-8a71-5d9b2e4f6a10"
+        .parse()
+        .expect("canonical mob incarnation id")
+}
+
+fn current_incarnation() -> meerkat_core::service::MobIncarnationId {
+    "8c2e4a61-7d3f-4e59-b1a2-6f0d9c3b5e27"
+        .parse()
+        .expect("canonical mob incarnation id")
+}
+
+fn later_incarnation() -> meerkat_core::service::MobIncarnationId {
+    "3d7b9f15-2a6c-4f80-9e14-c5a8b0d2e963"
+        .parse()
+        .expect("canonical mob incarnation id")
+}
+
+fn incarnation_of(address: &str) -> Option<meerkat_core::service::MobIncarnationId> {
+    LogicalRuntimeId::new(address.to_string())
+        .member_address()
+        .expect("member address")
+        .expect("a member address")
+        .incarnation
+}
+
+/// A concurrent submit through a second service, run just before the
+/// resolver answers: it binds the key between the commit's ledger read and
+/// its claim. `then` is what the resolver answers afterwards.
+struct RacingSubmit {
+    racer: ContinuationOwnerService,
+    delivery: ContinuationDelivery,
+    then: Option<meerkat_core::service::MobIncarnationId>,
+}
+
+/// A mob resolver test double for incarnations: the member's current address
+/// names the incarnation of the mob the host holds under the id, which the
+/// test moves as a host does when it holds a mob created again. Armed with a
+/// [`RacingSubmit`], its next answer first lets the racer bind the key.
+struct IncarnationResolver {
+    current: Mutex<Option<meerkat_core::service::MobIncarnationId>>,
+    race: tokio::sync::Mutex<Option<RacingSubmit>>,
+}
+
+impl IncarnationResolver {
+    fn at(incarnation: meerkat_core::service::MobIncarnationId) -> Arc<Self> {
+        Arc::new(Self {
+            current: Mutex::new(Some(incarnation)),
+            race: tokio::sync::Mutex::new(None),
+        })
+    }
+
+    fn hold(&self, incarnation: meerkat_core::service::MobIncarnationId) {
+        *self.current.lock().expect("lock") = Some(incarnation);
+    }
+}
+
+#[async_trait::async_trait]
+impl ContinuationAddressResolver for IncarnationResolver {
+    async fn current_address(
+        &self,
+        owner: &ContinuationOwner,
+    ) -> Result<Option<LogicalRuntimeId>, String> {
+        let ContinuationOwner::Member { mob_id, identity } = owner else {
+            return Err("member resolver".into());
+        };
+        let answer = *self.current.lock().expect("lock");
+        let race = self.race.lock().await.take();
+        if let Some(race) = race {
+            race.racer
+                .submit(owner, race.delivery, 1)
+                .await
+                .expect("the racer binds the key");
+            *self.current.lock().expect("lock") = race.then;
+        }
+        let Some(incarnation) = answer else {
+            return Ok(None);
+        };
+        member_delivery_address(mob_id, incarnation, identity, 1)
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
+    async fn resolve_address(
+        &self,
+        _address: &LogicalRuntimeId,
+    ) -> Result<AddressResolution, String> {
+        Ok(AddressResolution::NotServed)
+    }
+
+    async fn observe_address(
+        &self,
+        _address: &LogicalRuntimeId,
+    ) -> Result<AddressObservation, String> {
+        Ok(AddressObservation::MayServe)
+    }
+}
+
+fn team_lead() -> ContinuationOwner {
+    ContinuationOwner::Member {
+        mob_id: "team".into(),
+        identity: "lead".into(),
+    }
+}
+
+/// A member commit bound to a mob incarnation binds a new key only while the
+/// owner's current address names that incarnation: a caller of an earlier
+/// incarnation commits nothing for the mob created again under the id.
+#[tokio::test]
+async fn a_member_commit_binds_a_new_key_only_at_its_own_incarnation() {
+    let store: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());
+    let resolver = IncarnationResolver::at(current_incarnation());
+    let (continuations, _) = service(store, resolver);
+    let owner = team_lead();
+
+    assert_eq!(
+        continuations
+            .submit_for_member_incarnation(
+                &owner,
+                earlier_incarnation(),
+                delivery("task-1", "result"),
+                1,
+            )
+            .await,
+        Err(ContinuationSubmitError::OwnerRetired),
+        "a caller of the earlier incarnation binds nothing"
+    );
+    assert_eq!(
+        continuations
+            .continuation_status(&owner, &ContinuationKey::new("task-1").expect("key"))
+            .await
+            .expect("status"),
+        ContinuationStatus::NotCommitted
+    );
+    let receipt = continuations
+        .submit_for_member_incarnation(
+            &owner,
+            current_incarnation(),
+            delivery("task-1", "result"),
+            2,
+        )
+        .await
+        .expect("the current incarnation binds the key");
+    assert_eq!(
+        incarnation_of(&receipt.address),
+        Some(current_incarnation())
+    );
+}
+
+/// A key already bound, read from the ledger before the owner is resolved:
+/// bound at the caller's incarnation it replays; bound at another one it
+/// replays only for a caller of the current incarnation (a key an earlier
+/// incarnation bound, reused), and is `OwnerRetired` for a stale caller.
+#[tokio::test]
+async fn a_bound_key_replays_for_its_own_or_the_current_incarnation_only() {
+    let store: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());
+    let resolver = IncarnationResolver::at(earlier_incarnation());
+    let (continuations, _) = service(store, resolver.clone());
+    let owner = team_lead();
+    let earlier = continuations
+        .submit_for_member_incarnation(
+            &owner,
+            earlier_incarnation(),
+            delivery("task-1", "result"),
+            1,
+        )
+        .await
+        .expect("bind at the earlier incarnation");
+    resolver.hold(current_incarnation());
+
+    assert_eq!(
+        continuations
+            .submit_for_member_incarnation(
+                &owner,
+                earlier_incarnation(),
+                delivery("task-1", "result"),
+                2,
+            )
+            .await
+            .expect("a key bound at the caller's incarnation replays"),
+        earlier
+    );
+    assert_eq!(
+        continuations
+            .submit_for_member_incarnation(
+                &owner,
+                current_incarnation(),
+                delivery("task-1", "result"),
+                3,
+            )
+            .await
+            .expect("the current incarnation reusing the key replays it, as submit does"),
+        earlier
+    );
+    let current = continuations
+        .submit_for_member_incarnation(
+            &owner,
+            current_incarnation(),
+            delivery("task-2", "result"),
+            4,
+        )
+        .await
+        .expect("bind at the current incarnation");
+    assert_eq!(
+        continuations
+            .submit_for_member_incarnation(
+                &owner,
+                earlier_incarnation(),
+                delivery("task-2", "result"),
+                5,
+            )
+            .await,
+        Err(ContinuationSubmitError::OwnerRetired),
+        "a stale caller does not replay the current incarnation's receipt"
+    );
+    assert_eq!(
+        incarnation_of(&current.address),
+        Some(current_incarnation())
+    );
+}
+
+/// A key a concurrent submit binds between the commit's ledger read and its
+/// claim follows the same rule: replayed while the owner's current address
+/// names the caller's incarnation, `OwnerRetired` once it names another.
+#[tokio::test]
+async fn a_key_bound_by_a_racing_submit_follows_the_same_rule() {
+    let store: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());
+    let (racer, _) = service(
+        store.clone(),
+        IncarnationResolver::at(earlier_incarnation()),
+    );
+    let resolver = IncarnationResolver::at(current_incarnation());
+    let (continuations, _) = service(store.clone(), resolver.clone());
+    let owner = team_lead();
+
+    *resolver.race.lock().await = Some(RacingSubmit {
+        racer,
+        delivery: delivery("task-1", "result"),
+        then: Some(current_incarnation()),
+    });
+    let replayed = continuations
+        .submit_for_member_incarnation(
+            &owner,
+            current_incarnation(),
+            delivery("task-1", "result"),
+            2,
+        )
+        .await
+        .expect("the current incarnation replays the racer's binding");
+    assert_eq!(
+        incarnation_of(&replayed.address),
+        Some(earlier_incarnation()),
+        "the replay is the racer's first receipt"
+    );
+
+    let (racer, _) = service(store, IncarnationResolver::at(earlier_incarnation()));
+    *resolver.race.lock().await = Some(RacingSubmit {
+        racer,
+        delivery: delivery("task-2", "result"),
+        then: Some(later_incarnation()),
+    });
+    assert_eq!(
+        continuations
+            .submit_for_member_incarnation(
+                &owner,
+                current_incarnation(),
+                delivery("task-2", "result"),
+                3,
+            )
+            .await,
+        Err(ContinuationSubmitError::OwnerRetired),
+        "once the host holds yet another incarnation, the caller is stale"
+    );
+}
+
+/// A session owner has no mob incarnation: binding a commit to one leaves it
+/// unchanged, exactly a plain submit.
+#[tokio::test]
+async fn a_session_owner_is_unchanged_by_a_member_incarnation() {
+    let store: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());
+    let (continuations, _) = service(store, Arc::new(SessionAddressResolver));
+    let owner = ContinuationOwner::Session {
+        session_id: SessionId::new(),
+    };
+    let receipt = continuations
+        .submit_for_member_incarnation(
+            &owner,
+            earlier_incarnation(),
+            delivery("task-1", "result"),
+            1,
+        )
+        .await
+        .expect("a session owner commits");
+    assert_eq!(
+        continuations
+            .submit(&owner, delivery("task-1", "result"), 2)
+            .await
+            .expect("replay"),
+        receipt
+    );
+}
+
+/// A retained completion bound to a mob incarnation follows the same rule
+/// as a submission: a caller of an earlier incarnation commits nothing.
+#[tokio::test]
+async fn a_retained_completion_binds_only_at_its_own_incarnation() {
+    let store: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());
+    let (continuations, _) = service(store, IncarnationResolver::at(current_incarnation()));
+    let owner = team_lead();
+    let jobs = OneJob(meerkat::RetainedJobFacts {
+        owner_session_id: SessionId::new(),
+        retained_work: Some(retained_identity()),
+        result_digest: "sha256:result".into(),
+    });
+    let record =
+        meerkat::RetainedJobRecord::from_owner(&jobs, ContinuationProducer::ForkOff, "job-1")
+            .await
+            .expect("read")
+            .expect("committed job");
+
+    assert_eq!(
+        continuations
+            .submit_retained_completion_for_member_incarnation(
+                &owner,
+                earlier_incarnation(),
+                fork_completion("sha256:result"),
+                &record,
+                1,
+            )
+            .await,
+        Err(ContinuationSubmitError::OwnerRetired)
+    );
+    assert_eq!(
+        continuations
+            .continuation_status(
+                &owner,
+                &ContinuationKey::new("fork_off:job-1").expect("key")
+            )
+            .await
+            .expect("status"),
+        ContinuationStatus::NotCommitted
+    );
+    let receipt = continuations
+        .submit_retained_completion_for_member_incarnation(
+            &owner,
+            current_incarnation(),
+            fork_completion("sha256:result"),
+            &record,
+            2,
+        )
+        .await
+        .expect("the current incarnation commits the job's outcome");
+    assert_eq!(
+        incarnation_of(&receipt.address),
+        Some(current_incarnation())
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Host-originated continuations on a governed runtime: the submit side.
+//
+// The rows below assert behaviour only. How a host continuation is committed
+// from its namespace's committed owner, and how that owner holds it, lives in
+// `host_continuation_shape`, the one place that changes when the governed
+// admission shape lands.
+// ---------------------------------------------------------------------------
+
+const INGEST_NAMESPACE: &str = "app.ingest";
+const OBSERVATION: &str = "observation-1";
+const OBSERVATION_DIGEST: &str = "sha256:observation-1";
+
+/// One external observation under its host namespace, keyed `key`.
+fn observation(key: &str, result_digest: &str) -> ContinuationDelivery {
+    ContinuationDelivery {
+        key: ContinuationKey::new(key).expect("key"),
+        result: ContinuationResultRef {
+            producer: ContinuationProducer::Host {
+                namespace: INGEST_NAMESPACE.into(),
+            },
+            producer_id: OBSERVATION.into(),
+            result_digest: result_digest.into(),
+            summary: None,
+        },
+        body: "a new item arrived".into(),
+        handling: ContinuationHandling::Queue,
+    }
+}
+
+/// A continuation service whose runtime has a native work authorization
+/// host installed.
+fn governed_service(store: Arc<dyn RuntimeStore>) -> ContinuationOwnerService {
+    let governed = meerkat_runtime::MeerkatMachine::ephemeral()
+        .with_native_work_authorization_host(Arc::new(RefusingWorkAuthority))
+        .expect("install the native work authorization host");
+    ContinuationOwnerService::new(
+        RuntimeDeliveryInbox::new(store),
+        Arc::new(SessionAddressResolver),
+        Arc::new(governed),
+    )
+}
+
+async fn status_of(
+    continuations: &ContinuationOwnerService,
+    owner: &ContinuationOwner,
+    key: &str,
+) -> ContinuationStatus {
+    continuations
+        .continuation_status(owner, &ContinuationKey::new(key).expect("key"))
+        .await
+        .expect("status")
+}
+
+/// On a governed runtime a host continuation commits when its namespace's
+/// committed owner confirms it, and a replay returns the original receipt
+/// byte for byte. The public submit keeps refusing every host continuation:
+/// the namespace owner's confirmation is the only way in.
+#[tokio::test]
+async fn a_governed_runtime_commits_a_host_continuation_its_namespace_owner_confirms() {
+    let store: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());
+    let continuations = governed_service(store);
+    let session_id = SessionId::new();
+    let owner = ContinuationOwner::Session {
+        session_id: session_id.clone(),
+    };
+    let source = host_continuation_shape::NamespaceOwner::holding(
+        INGEST_NAMESPACE,
+        &session_id,
+        OBSERVATION_DIGEST,
+    );
+    let receipt = host_continuation_shape::commit(
+        &continuations,
+        &owner,
+        observation("ingest:1", OBSERVATION_DIGEST),
+        &source,
+    )
+    .await
+    .expect("a confirmed host continuation commits on a governed runtime");
+    assert_eq!(
+        host_continuation_shape::commit(
+            &continuations,
+            &owner,
+            observation("ingest:1", OBSERVATION_DIGEST),
+            &source,
+        )
+        .await
+        .expect("replay"),
+        receipt,
+        "a replay returns the original receipt"
+    );
+    assert_eq!(
+        status_of(&continuations, &owner, "ingest:1").await,
+        ContinuationStatus::Pending {
+            receipt,
+            sequence: 1,
+            admitted: None
+        }
+    );
+    assert_eq!(
+        continuations
+            .submit(&owner, observation("ingest:2", OBSERVATION_DIGEST), 1)
+            .await
+            .expect_err("the public submit carries no confirmation"),
+        ContinuationSubmitError::NoAdmissibleWorkBinding
+    );
+    assert_eq!(
+        status_of(&continuations, &owner, "ingest:2").await,
+        ContinuationStatus::NotCommitted
+    );
+}
+
+/// On a governed runtime a host continuation its namespace's committed owner
+/// does not confirm commits nothing, refused with the existing typed
+/// reasons: no owner holds it (`NoAdmissibleWorkBinding`), or the delivery
+/// names other content or another owner than the one it was committed for
+/// (`Invalid`).
+#[tokio::test]
+async fn a_governed_runtime_commits_no_host_continuation_its_namespace_owner_does_not_confirm() {
+    let store: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());
+    let continuations = governed_service(store);
+    let session_id = SessionId::new();
+    let owner = ContinuationOwner::Session {
+        session_id: session_id.clone(),
+    };
+    let other_namespace = host_continuation_shape::NamespaceOwner::holding(
+        "app.other",
+        &session_id,
+        OBSERVATION_DIGEST,
+    );
+    assert_eq!(
+        host_continuation_shape::commit(
+            &continuations,
+            &owner,
+            observation("ingest:1", OBSERVATION_DIGEST),
+            &other_namespace,
+        )
+        .await
+        .expect_err("an owner of another namespace confirms nothing"),
+        ContinuationSubmitError::NoAdmissibleWorkBinding
+    );
+    let forgotten = host_continuation_shape::NamespaceOwner::holding(
+        INGEST_NAMESPACE,
+        &session_id,
+        OBSERVATION_DIGEST,
+    );
+    forgotten.forget();
+    assert_eq!(
+        host_continuation_shape::commit(
+            &continuations,
+            &owner,
+            observation("ingest:1", OBSERVATION_DIGEST),
+            &forgotten,
+        )
+        .await
+        .expect_err("an owner that holds it no more confirms nothing"),
+        ContinuationSubmitError::NoAdmissibleWorkBinding
+    );
+    let source = host_continuation_shape::NamespaceOwner::holding(
+        INGEST_NAMESPACE,
+        &session_id,
+        OBSERVATION_DIGEST,
+    );
+    assert!(
+        matches!(
+            host_continuation_shape::commit(
+                &continuations,
+                &owner,
+                observation("ingest:1", "sha256:another-observation"),
+                &source,
+            )
+            .await,
+            Err(ContinuationSubmitError::Invalid(_))
+        ),
+        "other content than the owner committed"
+    );
+    assert!(
+        matches!(
+            host_continuation_shape::commit(
+                &continuations,
+                &ContinuationOwner::Session {
+                    session_id: SessionId::new()
+                },
+                observation("ingest:1", OBSERVATION_DIGEST),
+                &source,
+            )
+            .await,
+            Err(ContinuationSubmitError::Invalid(_))
+        ),
+        "owed to another owner than the owner committed it for"
+    );
+    assert_eq!(
+        status_of(&continuations, &owner, "ingest:1").await,
+        ContinuationStatus::NotCommitted,
+        "nothing was committed"
+    );
+}
+
+/// Without a native work authorization host nothing changes: a host
+/// continuation commits plainly or from its namespace owner, and each replay
+/// returns its original receipt.
+#[tokio::test]
+async fn an_ungoverned_runtime_commits_host_continuations_as_before() {
+    let store: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());
+    let (continuations, _) = service(store, Arc::new(SessionAddressResolver));
+    let session_id = SessionId::new();
+    let owner = ContinuationOwner::Session {
+        session_id: session_id.clone(),
+    };
+    let plain = continuations
+        .submit(&owner, observation("ingest:plain", OBSERVATION_DIGEST), 1)
+        .await
+        .expect("a plain host continuation commits");
+    assert_eq!(
+        continuations
+            .submit(&owner, observation("ingest:plain", OBSERVATION_DIGEST), 2)
+            .await
+            .expect("replay"),
+        plain
+    );
+    let source = host_continuation_shape::NamespaceOwner::holding(
+        INGEST_NAMESPACE,
+        &session_id,
+        OBSERVATION_DIGEST,
+    );
+    let owned = host_continuation_shape::commit(
+        &continuations,
+        &owner,
+        observation("ingest:owned", OBSERVATION_DIGEST),
+        &source,
+    )
+    .await
+    .expect("a host continuation commits from its namespace owner");
+    assert_eq!(
+        host_continuation_shape::commit(
+            &continuations,
+            &owner,
+            observation("ingest:owned", OBSERVATION_DIGEST),
+            &source,
+        )
+        .await
+        .expect("replay"),
+        owned
+    );
+    assert_ne!(plain.delivery_id, owned.delivery_id);
+}
+
+/// The original the observation's namespace owner names.
+fn original_work() -> meerkat_runtime::OriginalWorkRef {
+    meerkat_runtime::OriginalWorkRef {
+        authority: meerkat_core::PrincipalRef::in_domain(
+            meerkat_core::PrincipalKind::ServiceAccount,
+            "source-owner",
+            meerkat_core::TrustDomainId::new("host-test").expect("domain"),
+        )
+        .expect("qualified"),
+        work: meerkat_authorization_contracts::evidence::EvidenceId::new(OBSERVATION).expect("id"),
+    }
+}
+
+/// A namespace owner holding exactly one host original, as a test sets it.
+struct HoldsOriginal {
+    namespace: String,
+    facts: meerkat::HostOriginalFacts,
+}
+
+impl HoldsOriginal {
+    fn of(owner: &ContinuationOwner, delivery: ContinuationDelivery) -> Self {
+        let ContinuationProducer::Host { namespace } = &delivery.result.producer else {
+            panic!("a host original has a host namespace");
+        };
+        Self {
+            namespace: namespace.clone(),
+            facts: meerkat::HostOriginalFacts::new(owner.clone(), delivery, original_work()),
+        }
+    }
+
+    async fn record(&self) -> meerkat::HostOriginalRecord {
+        meerkat::HostOriginalRecord::from_owner(
+            self,
+            self.namespace.clone(),
+            self.facts.delivery.result.producer_id.clone(),
+        )
+        .await
+        .expect("read the namespace owner")
+        .expect("the namespace owner holds it")
+    }
+}
+
+#[async_trait::async_trait]
+impl meerkat::RetainedJobSource for HoldsOriginal {
+    async fn retained_job(
+        &self,
+        _producer: &ContinuationProducer,
+        _job_id: &str,
+    ) -> meerkat::RetainedJobLookup {
+        meerkat::RetainedJobLookup::Absent
+    }
+
+    async fn host_original(
+        &self,
+        namespace: &str,
+        producer_id: &str,
+    ) -> meerkat::HostOriginalLookup {
+        if namespace == self.namespace && producer_id == self.facts.delivery.result.producer_id {
+            meerkat::HostOriginalLookup::Found(self.facts.clone())
+        } else {
+            meerkat::HostOriginalLookup::Absent
+        }
+    }
+}
+
+/// A host original in a Core-owned namespace never commits, on either
+/// posture, whatever a namespace owner answers for it (here one that holds
+/// it exactly).
+#[tokio::test]
+async fn a_host_original_in_a_reserved_namespace_never_commits_whatever_its_source_says() {
+    for governed in [true, false] {
+        let store: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());
+        let continuations = if governed {
+            governed_service(store)
+        } else {
+            service(store, Arc::new(SessionAddressResolver)).0
+        };
+        let owner = ContinuationOwner::Session {
+            session_id: SessionId::new(),
+        };
+        let mut consent = observation("consent:1", OBSERVATION_DIGEST);
+        consent.result.producer = ContinuationProducer::Host {
+            namespace: "meerkat.consent".into(),
+        };
+        let source = HoldsOriginal::of(&owner, consent.clone());
+        let record = source.record().await;
+        assert!(
+            matches!(
+                continuations
+                    .submit_host_original(&owner, consent, &record, 1)
+                    .await,
+                Err(ContinuationSubmitError::Invalid(_))
+            ),
+            "governed {governed}"
+        );
+        assert_eq!(
+            status_of(&continuations, &owner, "consent:1").await,
+            ContinuationStatus::NotCommitted,
+            "governed {governed}"
+        );
+    }
+}
+
+/// The record binds the exact delivery its namespace owner holds: another
+/// key or another body than the owner holds never commits; nor does a
+/// steering host original on a governed runtime (an ungoverned one commits
+/// it, as any continuation).
+#[tokio::test]
+async fn a_host_original_commits_only_as_its_namespace_owner_holds_it() {
+    let store: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());
+    let continuations = governed_service(store);
+    let owner = ContinuationOwner::Session {
+        session_id: SessionId::new(),
+    };
+    let held = observation("ingest:1", OBSERVATION_DIGEST);
+    let source = HoldsOriginal::of(&owner, held.clone());
+    let record = source.record().await;
+    let mut other_key = held.clone();
+    other_key.key = ContinuationKey::new("ingest:2").expect("key");
+    let mut other_body = held.clone();
+    other_body.body = "another body".into();
+    for (case, delivery) in [("another key", other_key), ("another body", other_body)] {
+        let key = delivery.key.as_str().to_string();
+        assert!(
+            matches!(
+                continuations
+                    .submit_host_original(&owner, delivery, &record, 1)
+                    .await,
+                Err(ContinuationSubmitError::Invalid(_))
+            ),
+            "{case}"
+        );
+        assert_eq!(
+            status_of(&continuations, &owner, &key).await,
+            ContinuationStatus::NotCommitted,
+            "{case}"
+        );
+    }
+
+    let steering = ContinuationDelivery {
+        handling: ContinuationHandling::Steer,
+        ..observation("ingest:steer", OBSERVATION_DIGEST)
+    };
+    let source = HoldsOriginal::of(&owner, steering.clone());
+    let record = source.record().await;
+    assert!(matches!(
+        continuations
+            .submit_host_original(&owner, steering.clone(), &record, 1)
+            .await,
+        Err(ContinuationSubmitError::Invalid(_))
+    ));
+    assert_eq!(
+        status_of(&continuations, &owner, "ingest:steer").await,
+        ContinuationStatus::NotCommitted
+    );
+    let (ungoverned, _) = service(
+        Arc::new(InMemoryRuntimeStore::new()),
+        Arc::new(SessionAddressResolver),
+    );
+    ungoverned
+        .submit_host_original(&owner, steering, &record, 1)
+        .await
+        .expect("an ungoverned runtime commits a steering host original");
+}
+
+/// A host original and a plain continuation never share a key: whichever
+/// commits first, the other entry under the same key is a conflict, never a
+/// replay.
+#[tokio::test]
+async fn a_host_original_never_aliases_a_plain_continuation_under_its_key() {
+    let (continuations, _) = service(
+        Arc::new(InMemoryRuntimeStore::new()),
+        Arc::new(SessionAddressResolver),
+    );
+    let owner = ContinuationOwner::Session {
+        session_id: SessionId::new(),
+    };
+    let plain_first = observation("ingest:plain-first", OBSERVATION_DIGEST);
+    continuations
+        .submit(&owner, plain_first.clone(), 1)
+        .await
+        .expect("a plain continuation commits");
+    let record = HoldsOriginal::of(&owner, plain_first.clone())
+        .record()
+        .await;
+    assert!(matches!(
+        continuations
+            .submit_host_original(&owner, plain_first, &record, 1)
+            .await,
+        Err(ContinuationSubmitError::Conflict { .. })
+    ));
+
+    let original_first = observation("ingest:original-first", OBSERVATION_DIGEST);
+    let record = HoldsOriginal::of(&owner, original_first.clone())
+        .record()
+        .await;
+    let receipt = continuations
+        .submit_host_original(&owner, original_first.clone(), &record, 1)
+        .await
+        .expect("a host original commits");
+    assert_eq!(
+        continuations
+            .submit_host_original(&owner, original_first.clone(), &record, 2)
+            .await
+            .expect("replay"),
+        receipt,
+        "a replay returns the original receipt byte for byte"
+    );
+    assert!(matches!(
+        continuations.submit(&owner, original_first, 1).await,
+        Err(ContinuationSubmitError::Conflict { .. })
+    ));
+}
+
+/// The only code of the host continuation rows that depends on the governed
+/// admission shape: how a host continuation is committed from its
+/// namespace's committed owner, and how that owner holds it. The rows above
+/// assert behaviour only and do not change when the shape lands.
+///
+/// The shape: a host original is committed through
+/// `ContinuationOwnerService::submit_host_original` from its namespace
+/// owner's record (`HostOriginalRecord::from_owner`). The namespace owner
+/// holds the exact delivery, under the key its host commits it with.
+mod host_continuation_shape {
+    use super::*;
+
+    /// The committed owner of one host namespace, holding at most the one
+    /// observation of these rows; a test edits it.
+    pub(super) struct NamespaceOwner {
+        namespace: String,
+        /// The session the observation is owed to, and its result digest.
+        held: Mutex<Option<(SessionId, String)>>,
+        /// The key its host commits the observation under.
+        key: Mutex<Option<ContinuationKey>>,
+    }
+
+    impl NamespaceOwner {
+        /// An owner of `namespace` holding the observation owed to
+        /// `session`, with the result `result_digest`.
+        pub(super) fn holding(namespace: &str, session: &SessionId, result_digest: &str) -> Self {
+            Self {
+                namespace: namespace.into(),
+                held: Mutex::new(Some((session.clone(), result_digest.into()))),
+                key: Mutex::new(None),
+            }
+        }
+
+        /// The owner holds the observation no more.
+        pub(super) fn forget(&self) {
+            *self.held.lock().expect("lock") = None;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl meerkat::RetainedJobSource for NamespaceOwner {
+        async fn retained_job(
+            &self,
+            _producer: &ContinuationProducer,
+            _job_id: &str,
+        ) -> meerkat::RetainedJobLookup {
+            meerkat::RetainedJobLookup::Absent
+        }
+
+        async fn host_original(
+            &self,
+            namespace: &str,
+            producer_id: &str,
+        ) -> meerkat::HostOriginalLookup {
+            if namespace != self.namespace || producer_id != OBSERVATION {
+                return meerkat::HostOriginalLookup::Absent;
+            }
+            let Some((session, result_digest)) = self.held.lock().expect("lock").clone() else {
+                return meerkat::HostOriginalLookup::Absent;
+            };
+            let key = self.key.lock().expect("lock").clone();
+            let key = key.unwrap_or_else(|| ContinuationKey::new("ingest:1").expect("key"));
+            let mut delivery = observation(key.as_str(), &result_digest);
+            delivery.result.producer = ContinuationProducer::Host {
+                namespace: self.namespace.clone(),
+            };
+            meerkat::HostOriginalLookup::Found(meerkat::HostOriginalFacts::new(
+                ContinuationOwner::Session {
+                    session_id: session,
+                },
+                delivery,
+                original_work(),
+            ))
+        }
+    }
+
+    /// Commit `delivery` for `owner` from its namespace owner's record.
+    pub(super) async fn commit(
+        continuations: &ContinuationOwnerService,
+        owner: &ContinuationOwner,
+        delivery: ContinuationDelivery,
+        source: &NamespaceOwner,
+    ) -> Result<meerkat::ContinuationReceipt, ContinuationSubmitError> {
+        // The host's namespace owner holds the original under the key its
+        // host commits it with.
+        *source.key.lock().expect("lock") = Some(delivery.key.clone());
+        let ContinuationProducer::Host { namespace } = &delivery.result.producer else {
+            return Err(ContinuationSubmitError::Invalid("not a host".into()));
+        };
+        let record = meerkat::HostOriginalRecord::from_owner(
+            source,
+            namespace.clone(),
+            delivery.result.producer_id.clone(),
+        )
+        .await
+        .map_err(ContinuationSubmitError::Unavailable)?
+        .ok_or(ContinuationSubmitError::NoAdmissibleWorkBinding)?;
+        continuations
+            .submit_host_original(owner, delivery, &record, 1)
+            .await
+    }
+}

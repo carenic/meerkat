@@ -24572,7 +24572,7 @@ pub enum EventSubscriptionRejectReasonKind {
 
 /// Typed work-origin classification for
 /// [`MobMachineInput::SubmitWork`] / [`MobMachineEffect::RequestRuntimeIngress`].
-/// Closed mirror of [`crate::ids::WorkOrigin`] — the DSL uses this enum as
+/// Closed mirror of `meerkat_mob::ids::WorkOrigin` - the DSL uses this enum as
 /// guard-visible truth instead of the former `origin == "External"` /
 /// `origin == "Internal"` string compares. The `Ingest` variant is only
 /// valid on the receiving side of the admission seam
@@ -24933,7 +24933,7 @@ pub enum MobFrameSeedDisposition {
 }
 
 /// Fallible reverse mapping: the `Ingest` variant has no counterpart in the
-/// shell-side [`crate::ids::WorkOrigin`] (which only classifies mob-submitted
+/// shell-side `meerkat_mob::ids::WorkOrigin` (which only classifies mob-submitted
 /// work lanes); callers on the mob-domain side assert it away and surface a
 /// domain error if the DSL ever produces it back across the seam.
 /// Typed member lifecycle notice kind. Replaces the former literal-string

@@ -230,12 +230,16 @@ mod held_spawn;
 mod identity_local_services;
 #[cfg(any(test, feature = "test-support"))]
 mod identity_recovery_test_support;
+mod lifecycle_observation;
 #[cfg(feature = "openai-live")]
 mod live_bridge_operation;
 mod member_creation;
 #[cfg(any(test, feature = "test-support"))]
 mod member_status_test_support;
 mod read_handle;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use actor::fail_stop_next_actor_start_for_test;
 pub(crate) use handle::MemberTurnLlmIdentityAppliedSender;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
@@ -335,6 +339,8 @@ mod remote_flow_ticket;
 mod remote_turn_reconciler;
 mod retirement_settlement;
 mod roster_authority;
+#[cfg(feature = "runtime-adapter")]
+mod run_drain;
 pub(crate) mod scope_gate;
 mod session_service;
 mod spawn_policy;
@@ -351,6 +357,7 @@ pub use tools::{AGENT_MOB_TOOL_NAMES, agent_mob_tool_names};
 pub mod topology;
 mod transaction;
 pub mod turn_executor;
+mod uncertain_durability;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 pub(crate) mod upcall_responder;
 
@@ -467,20 +474,20 @@ pub use handle::{
     InitializeAdaptiveRunRequest, MEMBER_ADMISSION_LANE_CAPACITY, MEMBER_RELOAD_TOTAL_TIMEOUT,
     MemberAdmissionBacklogGauge, MemberAdmissionBacklogSnapshot, MemberBoundedTurnResult,
     MemberDeliveryReceipt, MemberHandle, MemberInputAdmission, MemberPreviewUnavailable,
-    MemberReloadDisposition, MemberReloadOutcome, MemberRespawnReceipt, MemberRunState,
-    MemberTargetAbsence, MemberTurnEventSender, MemberTurnHandle, MemberTurnOptions,
-    MobActorTaskWait, MobActorTaskWatch, MobDestroyError, MobDestroyReport, MobEventsSubscription,
-    MobEventsSubscriptionConfig, MobEventsView, MobHandle, MobMachineStateChanges,
-    MobMemberEndpointOwner, MobMemberEndpointStatus, MobMemberListEntry, MobMemberPeerEndpoint,
-    MobMemberSnapshot, MobMemberStatus, MobPeerConnectivitySnapshot, MobRespawnError,
-    MobSpawnManyFailure, MobUnreachablePeer, MobWireMembersBatchReport, OwnedMemberTargetAdmission,
-    PeerMessageReceipt, PeerTarget, PreviousMemberCleanupReport, ResumedMemberView,
-    SpawnContinuityIntent, SpawnCustomizationContext, SpawnMemberAdmission,
-    SpawnMemberAdmissionObservations, SpawnMemberCustomizer, SpawnMemberCustomizerChain,
-    SpawnMemberSpec, SpawnResult, SpawnSource, SpawnSystemPromptOverride, SpawnToolAdmission,
-    SupervisorRotationReport, WithheldToolBundle, WorkAdmissionStage, WorkBoundedTurnResult,
-    WorkDeliveryReceipt, WorkTurnHandle, mob_error_wire_code, profile_to_wire,
-    stored_realm_profile_to_wire,
+    MemberReloadDisposition, MemberReloadOutcome, MemberReloadRefusal, MemberRespawnReceipt,
+    MemberRunState, MemberTargetAbsence, MemberTurnEventSender, MemberTurnHandle,
+    MemberTurnOptions, MobActorTaskWait, MobActorTaskWatch, MobDestroyError,
+    MobDestroyMemberRefusal, MobDestroyReport, MobEventsSubscription, MobEventsSubscriptionConfig,
+    MobEventsView, MobHandle, MobMachineStateChanges, MobMemberEndpointOwner,
+    MobMemberEndpointStatus, MobMemberListEntry, MobMemberPeerEndpoint, MobMemberSnapshot,
+    MobMemberStatus, MobPeerConnectivitySnapshot, MobRespawnError, MobSpawnManyFailure,
+    MobUnreachablePeer, MobWireMembersBatchReport, OwnedMemberTargetAdmission, PeerMessageReceipt,
+    PeerTarget, PreviousMemberCleanupReport, ResumedMemberView, SpawnContinuityIntent,
+    SpawnCustomizationContext, SpawnMemberAdmission, SpawnMemberAdmissionObservations,
+    SpawnMemberCustomizer, SpawnMemberCustomizerChain, SpawnMemberSpec, SpawnResult, SpawnSource,
+    SpawnSystemPromptOverride, SpawnToolAdmission, SupervisorRotationReport, WithheldToolBundle,
+    WorkAdmissionStage, WorkBoundedTurnResult, WorkDeliveryReceipt, WorkTurnHandle,
+    mob_error_wire_code, profile_to_wire, stored_realm_profile_to_wire,
 };
 pub(crate) use handle::{
     CanonicalOpsOwnerContext, ExactTurnCompletionSender, FlowOperationCustody, MemberSpawnReceipt,
@@ -494,6 +501,7 @@ pub use identity_local_services::{
     IdentityLocalExternalToolsError, IdentityLocalExternalToolsProvider,
     IdentityLocalMaterializationKey,
 };
+pub use lifecycle_observation::MobLifecycleObservation;
 #[cfg(feature = "openai-live")]
 pub use live_bridge_operation::{
     DEFAULT_LIVE_BRIDGE_OUTPUT_BYTES, DurableMemberLiveBridgeOperationExecutor,

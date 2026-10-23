@@ -5,10 +5,10 @@
 // BuildBuddy mode violated: a build-relevant change always yields lanes.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import {
   CI_ROW_STEPS,
   rowStepBindings,
@@ -244,6 +244,13 @@ function assertEventSplit(plan, label) {
     assert.equal(plan.closure_check, plan.rust_changed, `${label}: the push checks the closure on a Rust change`);
     assert.equal(plan.governed_jsonl, plan.rust_changed, `${label}: the push runs governed JSONL on a Rust change`);
     assert.equal(plan.mcp_confinement_positive, plan.rust_changed, `${label}: the push runs the confinement lane on a Rust change`);
+    // Every Rust change is an ordinary reason: the CI gate keeps such a lane
+    // in a pull request's budget (a push enforces none).
+    assert.deepEqual(
+      plan.guard_lane_reasons,
+      plan.rust_changed ? { governed_jsonl: ["every_rust_change"], mcp_confinement_positive: ["every_rust_change"] } : {},
+      `${label}: the push's guard lane reasons`,
+    );
     return;
   }
   assert.equal(plan.event, "pull_request", `${label}: event`);
@@ -260,6 +267,20 @@ function assertEventSplit(plan, label) {
       plan.rust_changed && (touchesGuardLane(lane, plan.changed_paths) || plan.guard_definitions_changed.includes(lane));
     assert.equal(plan[lane], runs, `${label}: ${lane} runs in a pull request only on its own inputs or definition`);
     assert.equal(deferred[lane], plan.rust_changed && !runs, `${label}: ${lane} deferral`);
+    // The reason the plan exports for the CI gate's budget is the one that
+    // planned the lane; an unknown diff is the only other one.
+    const reasons = plan.guard_lane_reasons[lane];
+    assert.equal(reasons !== undefined, plan[lane], `${label}: ${lane} has a reason exactly when it runs`);
+    if (reasons && reasons.join() !== "diff_unknown") {
+      assert.deepEqual(
+        reasons,
+        [
+          ...(plan.guard_definitions_changed.includes(lane) ? ["definition_changed"] : []),
+          ...(touchesGuardLane(lane, plan.changed_paths) ? ["inputs_changed"] : []),
+        ],
+        `${label}: ${lane}'s reasons`,
+      );
+    }
   }
   assert.equal(deferred.closure_check, plan.rust_changed);
   for (const suite of plan.integration_suites) {
@@ -628,6 +649,11 @@ function assertArchivedLanes(plan, label) {
       const plan = planFor([path], ["--event", "pull_request", "--base-tree", baseTree]);
       assert.deepEqual(plan.guard_definitions_changed, lanes, `${label}: changed definitions`);
       for (const lane of Object.keys(GUARD_LANE_INPUTS)) assert.equal(plan[lane], lanes.includes(lane), `${label}: ${lane}`);
+      assert.deepEqual(
+        plan.guard_lane_reasons,
+        Object.fromEntries(lanes.map((lane) => [lane, ["definition_changed"]])),
+        `${label}: the definition is the reason (none for a comment or an edit elsewhere)`,
+      );
       assertLanes(plan, label);
     }
   } finally {
@@ -641,6 +667,39 @@ function assertArchivedLanes(plan, label) {
   assert.equal(unknown.diff, "no diff base supplied");
   assert.deepEqual(unknown.guard_definitions_changed, Object.keys(GUARD_LANE_INPUTS), "no diff: every definition may have changed");
   for (const lane of Object.keys(GUARD_LANE_INPUTS)) assert.equal(unknown[lane], true, `no diff: ${lane} runs`);
+  // Its only reason is the unknown diff, never a changed definition: the CI
+  // gate keeps it in the budget.
+  assert.equal(unknown.mode, "workspace");
+  assert.deepEqual(
+    unknown.guard_lane_reasons,
+    { governed_jsonl: ["diff_unknown"], mcp_confinement_positive: ["diff_unknown"] },
+    "no diff: every lane runs for the unknown diff alone",
+  );
+  // A workspace-mode pull request with a known diff runs a guard lane for
+  // its inputs or definition like any other pull request: a Makefile change
+  // plans the whole workspace, and so does Cargo.toml.
+  const bothTree = mkdtempSync(join(tmpdir(), "ci-lanes-guard-reasons-"));
+  try {
+    const makefile = readFileSync(resolve(root, "Makefile"), "utf8");
+    const count = makefile.match(/^CONFINEMENT_MCP_POSITIVE_COUNT := (\d+)$/m);
+    assert.ok(count, "the Makefile counts the confinement lane's MCP cases");
+    writeFileSync(join(bothTree, "Makefile"), makefile.replace(count[0], `CONFINEMENT_MCP_POSITIVE_COUNT := ${Number(count[1]) + 1}`));
+    const both = planFor(["Makefile", "crates/meerkat-mcp/src/process_confinement_tests.rs"], ["--event", "pull_request", "--base-tree", bothTree]);
+    assert.equal(both.mode, "workspace", "a Makefile change plans the workspace");
+    assert.deepEqual(
+      both.guard_lane_reasons,
+      { mcp_confinement_positive: ["definition_changed", "inputs_changed"] },
+      "a lane whose definition and inputs both changed carries both reasons",
+    );
+    assertLanes(both, "a definition and an input of the confinement lane");
+  } finally {
+    rmSync(bothTree, { recursive: true, force: true });
+  }
+  const inputs = planFor(["Cargo.toml", "crates/meerkat-rpc/src/governed_jsonl/tests.rs"], ["--event", "pull_request"]);
+  assert.equal(inputs.mode, "workspace", "a Cargo.toml change plans the workspace");
+  assert.deepEqual(inputs.guard_lane_reasons, { governed_jsonl: ["inputs_changed"] }, "a workspace-mode pull request's inputs reason");
+  assert.equal(inputs.governed_jsonl, true);
+  assert.equal(inputs.mcp_confinement_positive, false);
 }
 
 // The default nextest profile's selection in every TOML spelling: a change to
@@ -908,6 +967,7 @@ for (const path of [
   const lines = Object.fromEntries(github.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
   assert.equal(lines.event, "pull_request");
   for (const key of ["closure_check", "governed_jsonl", "mcp_confinement_positive"]) assert.equal(lines[key], "false", key);
+  assert.equal(lines.guard_lane_reasons, "{}", "no guard lane ran, so no reason");
   assert.equal(lines.closure_test_count, "0");
   assert.equal(lines.feature_check_count, "0");
   assert.match(lines.deferred_to_push, /^17 closure-tests rows; the closure check; \d+ feature-combination jobs; /);
@@ -974,6 +1034,11 @@ for (const path of [
   assert.equal(pushLines.event, "push");
   assert.equal(pushLines.deferred_to_push, "");
   for (const key of ["closure_check", "governed_jsonl", "mcp_confinement_positive"]) assert.equal(pushLines[key], "true", key);
+  assert.deepEqual(
+    JSON.parse(pushLines.guard_lane_reasons),
+    { governed_jsonl: ["every_rust_change"], mcp_confinement_positive: ["every_rust_change"] },
+    "the push's reasons, as the gate reads them",
+  );
   // A change to the web runtime's own inputs still runs its lanes in the
   // pull request.
   for (const path of ["crates/meerkat-web-runtime/src/lib.rs", "sdks/web/src/runtime.ts", "crates/meerkat-contracts/src/lib.rs"]) {
@@ -1256,6 +1321,64 @@ for (const path of [
   assertLanes(plan, "embedded skill doc");
 }
 
+// A crate can link a file of another crate into its own directory, such as a
+// test fixture both crates' tests read. Git records the link, not the file
+// it names, so the planner resolves the link: a change to that file selects
+// the linking crate as well as the file's own crate, and a pull request runs
+// the linking crate's unit lane. The row adds such a link (staged, not
+// committed) in a scratch worktree of HEAD and plans there with this
+// checkout's classifier. Its caches stay in the scratch directory
+// (XDG_CACHE_HOME), and repo-cargo takes this checkout's Cargo home and lane
+// name, so cargo metadata there downloads nothing and leaves no lane behind.
+{
+  const scratch = mkdtempSync(join(tmpdir(), "ci-lanes-cross-crate-link-"));
+  // A unique name: concurrent runs share the repository's worktree list.
+  const tree = join(scratch, basename(scratch));
+  const git = (args, cwd) => {
+    const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+    assert.equal(result.status, 0, `git ${args.join(" ")}: ${result.stderr}`);
+  };
+  const printed = spawnSync(join(root, "scripts/repo-cargo"), ["--print-env"], { cwd: root, encoding: "utf8" });
+  assert.equal(printed.status, 0, `repo-cargo --print-env: ${printed.stderr}`);
+  const cargo = Object.fromEntries(
+    printed.stdout.split("\n").filter((line) => line.includes("=")).map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]),
+  );
+  assert.ok(cargo.CARGO_HOME && cargo.lane_key, "repo-cargo names its Cargo home and lane");
+  const env = { ...process.env, XDG_CACHE_HOME: join(scratch, "cache"), CARGO_HOME: cargo.CARGO_HOME, RUST_LANE_ID: cargo.lane_key };
+  const target = "crates/meerkat-core/tests/fixtures/v0_8_8_manifest.json";
+  const sibling = "crates/meerkat-core/tests/fixtures/v0_8_8_slim_session.json";
+  const link = "crates/meerkat-runtime/tests/fixtures/cross_crate_link_selftest.json";
+  let added = false;
+  try {
+    git(["worktree", "add", "--quiet", "--detach", tree, "HEAD"], root);
+    added = true;
+    for (const path of [target, sibling]) assert.ok(existsSync(join(tree, path)), `${path} exists at HEAD`);
+    assert.ok(!existsSync(join(tree, link)), `${link} is free at HEAD`);
+    mkdirSync(dirname(join(tree, link)), { recursive: true });
+    symlinkSync(relative(dirname(join(tree, link)), join(tree, target)), join(tree, link));
+    git(["add", "--", link], tree);
+    const planIn = (path) => {
+      const result = spawnSync("node", [classifier, "--format", "json", "--event", "pull_request", "--", path], {
+        cwd: tree,
+        encoding: "utf8",
+        env,
+        maxBuffer: 64 * 1024 * 1024,
+      });
+      assert.equal(result.status, 0, `classifier failed in the scratch worktree: ${result.stderr}`);
+      return JSON.parse(result.stdout);
+    };
+    const linked = planIn(target);
+    assert.deepEqual(linked.packages, ["meerkat-core", "meerkat-runtime"], "a linked fixture selects its own crate and the linking crate");
+    assert.ok(linked.unit_packages.includes("meerkat-runtime"), "the linking crate's unit lane runs in the pull request");
+    assertLanes(linked, "a fixture another crate links");
+    assert.deepEqual(planIn(sibling).packages, ["meerkat-core"], "a fixture no link names selects its own crate alone");
+    assert.deepEqual(planIn(link).packages, ["meerkat-runtime"], "the link itself selects the crate that holds it");
+  } finally {
+    if (added) spawnSync("git", ["worktree", "remove", "--force", tree], { cwd: root });
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
 // Generated-contract and SDK-host flags.
 {
   const plan = planFor(["artifacts/schemas/version.json", "sdks/python/meerkat/client.py"]);
@@ -1313,6 +1436,7 @@ for (const path of [
     "closure_check",
     "governed_jsonl",
     "mcp_confinement_positive",
+    "guard_lane_reasons",
     "deferred_to_push",
     "shard_count",
     "shard_matrix",

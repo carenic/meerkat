@@ -149,13 +149,15 @@ mod native {
 
     /// A running wake watch over a shared store's database. Its tick
     /// receiver moves once per coalesced file notification and once per
-    /// sweep interval without one. Dropping the watch stops it (the watch
-    /// thread exits at its next wait); [`Self::stop`] also says what the
-    /// stop left with the process.
+    /// sweep interval without one; its sweep receiver moves once per sweep,
+    /// before the tick receiver moves for it. Dropping the watch stops it
+    /// (the watch thread exits at its next wait); [`Self::stop`] also says
+    /// what the stop left with the process.
     pub struct DeliveryStoreWatch {
         #[cfg(feature = "sqlite-store")]
         watch: meerkat_sqlite::watch::SqliteChangeWatch,
         ticks: crate::tokio::sync::watch::Receiver<u64>,
+        sweeps: crate::tokio::sync::watch::Receiver<u64>,
     }
 
     impl std::fmt::Debug for DeliveryStoreWatch {
@@ -169,6 +171,14 @@ mod native {
         /// more.
         pub fn subscribe_ticks(&self) -> crate::tokio::sync::watch::Receiver<u64> {
             self.ticks.clone()
+        }
+
+        /// Observe which ticks were sweeps: this receiver moves for a sweep
+        /// before the tick receiver does. A tick that moved no sweep was a
+        /// file notification, which a reader may answer without opening the
+        /// database; a sweep reads.
+        pub fn subscribe_sweeps(&self) -> crate::tokio::sync::watch::Receiver<u64> {
+            self.sweeps.clone()
         }
 
         /// Stop the watch as dropping it does, without waiting: its thread
@@ -241,19 +251,28 @@ mod native {
             .as_ref()
             .ok_or_else(|| "the shared store names no database file to watch".to_string())?;
         let (ticks_tx, ticks) = crate::tokio::sync::watch::channel(0_u64);
+        let (sweeps_tx, sweeps) = crate::tokio::sync::watch::channel(0_u64);
         let watch = meerkat_sqlite::watch::start_sqlite_change_watch(
             database,
             "meerkat-delivery-store-watch",
             sweep,
-            move |_tick| {
+            move |tick| {
                 if ticks_tx.is_closed() {
                     return meerkat_sqlite::watch::SqliteWatchControl::Stop;
+                }
+                // The sweep first: an owner that sees the tick sees its sweep.
+                if tick == meerkat_sqlite::watch::SqliteWatchTick::Sweep {
+                    sweeps_tx.send_modify(|count| *count = count.wrapping_add(1));
                 }
                 ticks_tx.send_modify(|count| *count = count.wrapping_add(1));
                 meerkat_sqlite::watch::SqliteWatchControl::Handled
             },
         )?;
-        Ok(Some(DeliveryStoreWatch { watch, ticks }))
+        Ok(Some(DeliveryStoreWatch {
+            watch,
+            ticks,
+            sweeps,
+        }))
     }
 }
 

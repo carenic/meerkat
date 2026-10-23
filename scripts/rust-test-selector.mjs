@@ -141,7 +141,7 @@ function crateDirPackageForPath(normalized, dirs) {
   return null;
 }
 
-const embeddedInputCache = new WeakMap();
+const linkInputCache = new WeakMap();
 
 // A crate can embed repo-owned documents through tracked symlinks, for example
 // `meerkat/embedded_skills/**` -> `.claude/skills/**` behind `include_str!`.
@@ -150,11 +150,20 @@ const embeddedInputCache = new WeakMap();
 // it as docs-only. Resolve every tracked symlink inside a crate directory and
 // treat its target as an input of that crate. The mapping is derived from the
 // symlinks themselves so new embedded documents need no selector change.
+// The same holds for a file of another crate that a crate links into its own
+// directory, such as a test fixture that two crates' tests share: the file
+// lies in its own crate's directory, but the linking crate reads it too, so
+// a change to it selects both crates.
 // A license file name: LICENSE, LICENSE-MIT, LICENSE-APACHE, LICENSE.md, ...
 const LICENSE_LINK_RE = /^LICENSE(?:[-.][A-Za-z0-9.-]+)?$/;
 
-export function embeddedInputs(dirs) {
-  let inputs = embeddedInputCache.get(dirs);
+// Every input a tracked symlink inside a crate directory makes:
+// `{ path, pkg, owner, isDirectory }`, where `pkg` is the crate holding the
+// link and `owner` the crate whose directory holds the target (null outside
+// every crate), in target path order. A target outside the repository, a
+// link to its own crate's file and a per-crate license link make no input.
+export function linkInputs(dirs) {
+  let inputs = linkInputCache.get(dirs);
   if (inputs) return inputs;
   inputs = [];
   const crateDirs = dirs.map(([dir]) => dir).filter((dir) => dir !== ".");
@@ -178,20 +187,48 @@ export function embeddedInputs(dirs) {
     // compiles them, so they are not embedded inputs of any one package (the
     // first crate in path order used to claim the repo-root license files).
     if (LICENSE_LINK_RE.test(basename(link)) && !path.includes("/") && LICENSE_LINK_RE.test(path)) continue;
-    if (crateDirPackageForPath(path, dirs)) continue;
+    const owner = crateDirPackageForPath(path, dirs);
+    if (owner === pkg) continue;
     let isDirectory = false;
     try {
       isDirectory = statSync(resolve(root, path)).isDirectory();
     } catch {
       // A dangling link still names an exact input path.
     }
-    inputs.push({ path, pkg, isDirectory });
+    inputs.push({ path, pkg, owner, isDirectory });
   }
   inputs.sort((a, b) => a.path.localeCompare(b.path));
-  embeddedInputCache.set(dirs, inputs);
+  linkInputCache.set(dirs, inputs);
   return inputs;
 }
 
+// The link inputs outside every crate directory: the repo-owned documents a
+// crate embeds. scripts/rust-embedded-inputs.mjs prints these for the agent
+// gates, which map a path inside a crate directory to that crate.
+export function embeddedInputs(dirs) {
+  return linkInputs(dirs).filter((input) => input.owner === null);
+}
+
+// Every package a change to `file` selects: the crate whose directory holds
+// it, then, in name order, each crate that reads it through a tracked symlink
+// (an embedded document, or a file of another crate linked into its own
+// directory). `inputs` defaults to the repository's own link inputs.
+export function packagesForFile(file, dirs, inputs = linkInputs(dirs)) {
+  const normalized = normalizePath(file);
+  const owner = crateDirPackageForPath(normalized, dirs);
+  const readers = new Map();
+  for (const input of inputs) {
+    if (input.pkg === owner) continue;
+    if (normalized === input.path || (input.isDirectory && normalized.startsWith(`${input.path}/`))) {
+      readers.set(input.pkg.name, input.pkg);
+    }
+  }
+  const linked = [...readers.keys()].sort().map((name) => readers.get(name));
+  return owner ? [owner, ...linked] : linked;
+}
+
+// One package for `file`: the crate whose directory holds it, else the first
+// crate that embeds it from outside every crate directory.
 export function packageForFile(file, dirs) {
   const normalized = normalizePath(file);
   const owner = crateDirPackageForPath(normalized, dirs);

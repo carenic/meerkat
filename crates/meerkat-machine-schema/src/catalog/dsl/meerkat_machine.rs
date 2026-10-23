@@ -358,7 +358,7 @@ pub struct SessionToolVisibilityState {
 }
 
 /// Typed mirror of
-/// [`crate::meerkat_machine_types::SessionLlmCapabilitySurface`] — structural
+/// `meerkat_runtime::SessionLlmCapabilitySurface` - structural
 /// projection of the boolean capability matrix plus optional call timeout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct SessionLlmCapabilitySurface {
@@ -376,7 +376,7 @@ pub struct SessionLlmCapabilitySurface {
 }
 
 /// Typed capability-surface resolution status. Closed mirror of
-/// [`crate::meerkat_machine_types::SessionLlmCapabilitySurfaceStatus`] —
+/// `meerkat_runtime::SessionLlmCapabilitySurfaceStatus` -
 /// replaces the former JSON-stringified wrapper the DSL used to carry the
 /// two-state discriminant across the seam.
 ///
@@ -391,7 +391,7 @@ pub enum SessionLlmCapabilitySurfaceStatus {
 }
 
 /// Typed mirror of
-/// [`crate::meerkat_machine_types::SessionToolVisibilityDelta`] — structural
+/// `meerkat_runtime::SessionToolVisibilityDelta` - structural
 /// projection using typed `ToolFilter` mirrors plus the two boolean change
 /// flags. Replaces the former `format!("{id:?}")` Debug-stringified wrapper.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -2398,7 +2398,7 @@ pub enum OpLifecycleRejectReasonKind {
 }
 
 /// Typed input-abandonment reason. Closed mirror of the discriminant set of
-/// [`crate::input_state::InputAbandonReason`] — replaces the former
+/// `meerkat_runtime::input_state::InputAbandonReason` - replaces the former
 /// `format!("{reason:?}")` Debug round-trip in the DSL's
 /// `input_abandon_reason` map.
 ///

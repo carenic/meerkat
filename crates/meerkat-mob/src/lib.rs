@@ -277,8 +277,9 @@ pub use runtime::remote_member_operator_tool_defs_for_test;
 #[cfg(feature = "runtime-adapter")]
 pub use runtime::run_mobpack_callable;
 pub use runtime::stop_report::{
-    HostRunStartHoldReason, MemberRunStarts, MemberStopOutcome, MemberStopRun, MobStopReport,
-    NotHoldableReason,
+    HostRunStartHoldReason, MemberRunDrain, MemberRunDrainOutcome, MemberRunStarts,
+    MemberStopOutcome, MemberStopRun, MobRunDrainReport, MobStopReport, NotHoldableReason,
+    StopOptions,
 };
 pub use runtime::{AGENT_MOB_TOOL_NAMES, agent_mob_tool_names};
 pub use runtime::{
@@ -307,19 +308,19 @@ pub use runtime::{
     MemberAdmissionBacklogGauge, MemberAdmissionBacklogSnapshot, MemberBoundedTurnResult,
     MemberDeliveryReceipt, MemberHandle, MemberHistoryPageDomain, MemberInputAdmission,
     MemberLiveStatusDomain, MemberOperatorAuthorityCeiling, MemberPreviewUnavailable,
-    MemberReloadDisposition, MemberReloadOutcome, MemberRespawnReceipt, MemberRunState,
-    MemberSessionActivity, MemberShutdownOutcome, MemberStatusSessionView, MemberStatusViewSource,
-    MemberTargetAbsence, MemberTurnEventSender, MemberTurnHandle, MemberTurnOptions,
-    MemberUnregisterSettlement, MemberUnregisterState, MobActorTaskWait, MobActorTaskWatch,
-    MobBuilder, MobDestroyError, MobDestroyReport, MobEventRouterConfig, MobEventRouterHandle,
-    MobEventsSubscription, MobEventsSubscriptionConfig, MobHandle, MobMachineStateChanges,
-    MobMemberEndpointOwner, MobMemberEndpointStatus, MobMemberPeerEndpoint, MobMemberSnapshot,
-    MobMemberStatus, MobPeerConnectivitySnapshot, MobRespawnError, MobSessionService,
-    MobShutdownReport, MobSpawnManyFailure, MobState, MobUnreachablePeer,
-    MobWireMembersBatchReport, OwnedMemberTargetAdmission, PeerMessageReceipt, PeerTarget,
-    PreviousMemberCleanupReport, ResumeRejectionKind, ResumeSessionLoad, ResumeVerdictTerminality,
-    ResumedMemberView, RetirementSettlement, RetirementSettlementWatch, RetirementStage,
-    SessionResumeAuthority, SessionResumeLifecycle, SessionResumeMaterialization,
+    MemberReloadDisposition, MemberReloadOutcome, MemberReloadRefusal, MemberRespawnReceipt,
+    MemberRunState, MemberSessionActivity, MemberShutdownOutcome, MemberStatusSessionView,
+    MemberStatusViewSource, MemberTargetAbsence, MemberTurnEventSender, MemberTurnHandle,
+    MemberTurnOptions, MemberUnregisterSettlement, MemberUnregisterState, MobActorTaskWait,
+    MobActorTaskWatch, MobBuilder, MobDestroyError, MobDestroyMemberRefusal, MobDestroyReport,
+    MobEventRouterConfig, MobEventRouterHandle, MobEventsSubscription, MobEventsSubscriptionConfig,
+    MobHandle, MobMachineStateChanges, MobMemberEndpointOwner, MobMemberEndpointStatus,
+    MobMemberPeerEndpoint, MobMemberSnapshot, MobMemberStatus, MobPeerConnectivitySnapshot,
+    MobRespawnError, MobSessionService, MobShutdownReport, MobSpawnManyFailure, MobState,
+    MobUnreachablePeer, MobWireMembersBatchReport, OwnedMemberTargetAdmission, PeerMessageReceipt,
+    PeerTarget, PreviousMemberCleanupReport, ResumeRejectionKind, ResumeSessionLoad,
+    ResumeVerdictTerminality, ResumedMemberView, RetirementSettlement, RetirementSettlementWatch,
+    RetirementStage, SessionResumeAuthority, SessionResumeLifecycle, SessionResumeMaterialization,
     SessionResumePreparationReceipt, SessionResumeRejection, SessionResumeVerdict, ShutdownOptions,
     SpawnContinuityIntent, SpawnCustomizationContext, SpawnMemberAdmission,
     SpawnMemberAdmissionObservations, SpawnMemberCustomizer, SpawnMemberCustomizerChain,
@@ -361,7 +362,8 @@ pub use runtime::{
 pub use runtime::{
     ForkSupervisorExitForTest, IdentityRecoveryFailStopPoint, MemberStatusDeadlineTestObservation,
     MemberTurnAdmissionTestStage, arm_identity_recovery_fail_stop_for_test,
-    member_operator_tool_defs_for_test, member_status_deadline_after_snapshot_wait_for_test,
+    fail_stop_next_actor_start_for_test, member_operator_tool_defs_for_test,
+    member_status_deadline_after_snapshot_wait_for_test,
 };
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 pub use runtime::{HeldSpawn, HeldSpawnSettlement, HeldSpawnStart, abort_all_held};
@@ -369,7 +371,7 @@ pub use runtime::{HeldSpawn, HeldSpawnSettlement, HeldSpawnStart, abort_all_held
 pub use runtime::{
     MemberDestinationSelection, MemberRuntimeBuildIdentity, MemberRuntimeRegistrationHook,
 };
-pub use runtime::{MobBeforeActivation, MobReadHandle};
+pub use runtime::{MobBeforeActivation, MobLifecycleObservation, MobReadHandle};
 pub use runtime::{MobpackCallableConfig, MobpackRunOutcome, MobpackRunSpec};
 pub use runtime::{SpawnBasePromptSource, StaticSpawnBasePromptSource};
 #[cfg(all(any(test, feature = "test-support"), feature = "runtime-adapter"))]
