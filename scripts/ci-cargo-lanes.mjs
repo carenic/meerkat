@@ -274,6 +274,7 @@ import {
   packageDir,
   packageDirs,
   packageForFile,
+  packagesForFile,
   readMetadata,
   root,
   workspacePackages,
@@ -2071,19 +2072,19 @@ function plan(args) {
         // compiles in through include macros) that the selector maps to a
         // package from outside its directory. Only documentation that lives
         // inside the crate directory is not a build input, unless the crate
-        // compiles it in (the reader inventory lists it).
-        const owner = packageForFile(path, dirs);
-        if (owner) {
-          const insideOwner = path.startsWith(`${packageDir(owner)}/`);
+        // compiles it in (the reader inventory lists it). A file another crate
+        // links into its own directory selects that crate as well.
+        for (const pkg of packagesForFile(path, dirs)) {
+          const insidePackage = path.startsWith(`${packageDir(pkg)}/`);
           const isDoc = /\.(md|mdx)$/.test(path);
-          const compiledIn = compiledInDocs.has(`${path}\0${owner.name}`);
-          if (!insideOwner || !isDoc || compiledIn) seeds.add(owner.name);
+          const compiledIn = compiledInDocs.has(`${path}\0${pkg.name}`);
+          if (!insidePackage || !isDoc || compiledIn) seeds.add(pkg.name);
         }
         continue;
       }
-      const owner = packageForFile(path, dirs);
-      if (owner) {
-        seeds.add(owner.name);
+      const pathPackages = packagesForFile(path, dirs);
+      if (pathPackages.length > 0) {
+        for (const pkg of pathPackages) seeds.add(pkg.name);
       } else {
         result.unmapped_rust_paths.push(path);
       }
@@ -2519,14 +2520,38 @@ function plan(args) {
     : changed === null
       ? Object.keys(GUARD_LANE_DEFINITIONS)
       : changedGuardDefinitions(args, changedPaths);
-  const guardRuns = (lane) =>
-    !deferToPush || touchesGuardLane(lane, changedPaths) || result.guard_definitions_changed.includes(lane);
+  // Why each exact-profile lane runs, typed: the one predicate that plans
+  // the lane, so a lane runs exactly when it has a reason. The CI gate reads
+  // the reasons for its pull-request budget, which leaves out a lane that
+  // runs only because the change touches its inputs (inputs_changed) or
+  // changes its definition (definition_changed): its own cold build takes
+  // 27-33 minutes (ci.yml's mcp-confinement-positive job), and the gate names
+  // it in a warning instead. Every other reason keeps the lane in the
+  // budget: a plan that runs it on every Rust change (every_rust_change: a
+  // push, a dispatch or a release projection), and a pull request whose diff
+  // is unknown (diff_unknown), where any definition only may have changed;
+  // that plan carries no other reason.
+  const guardReasons = (lane) => {
+    if (!result.rust_changed) return [];
+    if (!deferToPush) return ["every_rust_change"];
+    if (changed === null) return ["diff_unknown"];
+    return [
+      ...(result.guard_definitions_changed.includes(lane) ? ["definition_changed"] : []),
+      ...(touchesGuardLane(lane, changedPaths) ? ["inputs_changed"] : []),
+    ];
+  };
+  result.guard_lane_reasons = Object.fromEntries(
+    Object.keys(GUARD_LANE_DEFINITIONS)
+      .map((lane) => [lane, guardReasons(lane)])
+      .filter(([, reasons]) => reasons.length > 0),
+  );
+  const guardRuns = (lane) => Object.hasOwn(result.guard_lane_reasons, lane);
   result.closure_check = result.rust_changed && !deferToPush;
   // Every crate's documentation, with rustdoc's lints denied: the push
   // runs it on a Rust change, like the closure check.
   result.rustdoc = result.rust_changed && !deferToPush;
-  result.governed_jsonl = result.rust_changed && guardRuns("governed_jsonl");
-  result.mcp_confinement_positive = result.rust_changed && guardRuns("mcp_confinement_positive");
+  result.governed_jsonl = guardRuns("governed_jsonl");
+  result.mcp_confinement_positive = guardRuns("mcp_confinement_positive");
   deferred.closure_check = result.rust_changed && deferToPush;
   deferred.rustdoc = result.rust_changed && deferToPush;
   deferred.governed_jsonl = result.rust_changed && !result.governed_jsonl;
@@ -2829,6 +2854,7 @@ function githubOutput(result) {
   scalar("rustdoc", String(result.rustdoc));
   scalar("governed_jsonl", String(result.governed_jsonl));
   scalar("mcp_confinement_positive", String(result.mcp_confinement_positive));
+  scalar("guard_lane_reasons", JSON.stringify(result.guard_lane_reasons));
   scalar("deferred_to_push", deferredSummary(result.deferred_to_push));
   // Each two-wave lane's first wave keeps the lane's matrix name; its rest
   // is the _rest matrix of the twin job that waits for the stagger job. The

@@ -2699,7 +2699,7 @@ const DEFAULT_STREAM_READ_TIMEOUT_MS: u64 = 5_000;
 /// its wire `name`, the human-readable `description`, the `input_schema`
 /// builder, and — co-located here rather than in a separate string-keyed
 /// catalog — its [`RequestLifecycle`] classification. The rendered
-/// `tools/list` JSON (see [`base_tools_list`]) and the lifecycle lookup (see
+/// `tools/list` JSON (see `base_tools_list`) and the lifecycle lookup (see
 /// [`mcp_tool_request_lifecycle`]) are both read-only projections of this
 /// single typed table, so a tool's lifecycle can never drift from where its
 /// name/description/schema are declared.
@@ -2908,7 +2908,7 @@ fn contributed_tool_lifecycles() -> Vec<(Vec<String>, RequestLifecycle)> {
 /// classification straight off the typed [`BaseToolDescriptor`] co-located
 /// with the tool's name/description/schema; contributed tools read the
 /// lifecycle their owning surface declares in
-/// [`contributed_tool_lifecycles`]. Unknown names resolve to `None` — the
+/// `contributed_tool_lifecycles`. Unknown names resolve to `None` - the
 /// caller must fail closed (reject the call as an unknown tool) instead of
 /// classifying an unadvertised name under a default lifecycle.
 pub fn mcp_tool_request_lifecycle(tool_name: &str) -> Option<RequestLifecycle> {

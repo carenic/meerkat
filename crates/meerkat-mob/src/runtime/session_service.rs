@@ -1531,7 +1531,7 @@ pub trait MobSessionService:
     }
 
     /// Whether this service implements the runtime-owned turn application
-    /// boundary used by [`MeerkatMachine`]. Merely exposing a runtime adapter
+    /// boundary used by [`MeerkatMachine`](meerkat_runtime::MeerkatMachine). Merely exposing a runtime adapter
     /// is not sufficient: some hosts use that adapter only for lifecycle or
     /// comms authority and still execute turns through the direct
     /// [`SessionService::start_turn`] path.
@@ -2304,7 +2304,7 @@ pub trait MobSessionService:
     /// member's archive closes its own session's gate.
     async fn cancel_all_checkpointers(&self) {}
 
-    /// Re-enable checkpointer gates cancelled by [`cancel_all_checkpointers`].
+    /// Re-enable checkpointer gates cancelled by [`Self::cancel_all_checkpointers`].
     ///
     /// The mob's Resume and Reset call this to restore persistence.
     async fn rearm_all_checkpointers(&self) {}

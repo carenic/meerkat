@@ -220,7 +220,10 @@ impl MobActor {
             return;
         }
         let Some(pending) = self.pending_resume_rollback.take() else {
-            self.durable_uncertainty_fail_stop = true;
+            self.durable_uncertainty_fail_stop
+                .record_unreplied(MobError::Internal(
+                    "resume rollback lost its settled continuation".to_string(),
+                ));
             tracing::error!("resume rollback lost its settled continuation");
             return;
         };
@@ -235,7 +238,10 @@ impl MobActor {
     fn report_explicit_resume_cleanup_held(&mut self, error: MobError) {
         let Some(pending) = self.pending_resume_rollback.as_mut() else {
             tracing::error!(%error, "resume cleanup error has no retained continuation");
-            self.durable_uncertainty_fail_stop = true;
+            self.durable_uncertainty_fail_stop
+                .record_unreplied(MobError::Internal(format!(
+                    "resume cleanup error has no retained continuation: {error}"
+                )));
             return;
         };
         pending.in_flight = false;

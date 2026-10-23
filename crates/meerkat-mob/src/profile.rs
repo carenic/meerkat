@@ -307,7 +307,22 @@ pub struct Profile {
     /// listed field is re-applied from the (possibly updated) profile when a
     /// durable member session resumes, instead of being restored from
     /// persisted metadata. Unlisted fields keep durable truth.
+    ///
+    /// The credential binding follows the provider: the durable binding is
+    /// kept while the provider is unchanged, and a profile that moves the
+    /// member to another provider resolves that provider's binding from the
+    /// member's realm, as a fresh member would. A binding backed by a
+    /// credential account keeps its account or refuses typed.
     #[serde(default)]
+    // The schema keeps the 0.9.1 text of this field: 0.9.1 hosts compare a
+    // pack's bundled LayerDecision schema with their own, doc text included
+    // (meerkat-mob-pack's 0.9.1 schema golden).
+    #[cfg_attr(
+        feature = "schema",
+        schemars(
+            description = "Profile fields that win over durable session metadata on resume.\n\nSurfaces the typed [`meerkat_core::service::ResumeOverrideMask`]: a\nlisted field is re-applied from the (possibly updated) profile when a\ndurable member session resumes, instead of being restored from\npersisted metadata. Unlisted fields keep durable truth."
+        )
+    )]
     pub resume_overrides: Vec<ResumeOverrideField>,
     /// Skill references to load for this profile.
     #[serde(default)]
@@ -380,7 +395,19 @@ pub struct Profile {
 pub enum ResumeOverrideField {
     /// Re-apply the profile `model` on resume.
     Model,
-    /// Re-apply the profile `provider` (and self-hosted binding) on resume.
+    /// Re-apply the profile `provider` (and self-hosted server) on resume.
+    ///
+    /// The durable credential binding is kept only when the provider is
+    /// unchanged. A changed provider resolves its binding as a fresh member
+    /// would: from the member's realm, keeping the durable credential account
+    /// when the durable binding has one.
+    // The schema keeps the 0.9.1 text of this variant (see `resume_overrides`).
+    #[cfg_attr(
+        feature = "schema",
+        schemars(
+            description = "Re-apply the profile `provider` (and self-hosted binding) on resume."
+        )
+    )]
     Provider,
     /// Re-apply the profile `provider_params` on resume.
     ProviderParams,

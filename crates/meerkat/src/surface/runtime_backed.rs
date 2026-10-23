@@ -229,7 +229,7 @@ pub(crate) fn install_default_mcp_auth_resolver(
     )
 }
 
-/// [`install_default_mcp_auth_resolver`] for a host's builder whose sessions
+/// `install_default_mcp_auth_resolver` for a host's builder whose sessions
 /// run in `storage`'s realm but whose configuration is a snapshot, without
 /// the head config store and realm inheritance that let the builder name a
 /// server's defining realm (such a builder's own custody answers every

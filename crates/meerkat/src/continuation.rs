@@ -127,13 +127,34 @@ pub enum ContinuationHandling {
 
 /// The committed payload of a continuation row: the delivery, and the
 /// retained work of the run that dispatched it when a Meerkat producer
-/// committed it from its job's record.
+/// committed it from its job's record. A host original
+/// ([`ContinuationOwnerService::submit_host_original`]) carries the marker
+/// instead: its authority is bound for the admitting session at each
+/// admission attempt, never stored here. The marker goes only with a `Host`
+/// producer and never together with retained work.
 #[derive(Serialize, Deserialize)]
 struct ContinuationRow {
     #[serde(flatten)]
     delivery: ContinuationDelivery,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     retained_work: Option<meerkat_core::retained_work::RetainedWorkIdentity>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    host_original: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Host namespaces Core owns (consent notices are `meerkat.consent`). No host
+/// original is ever committed, confirmed, offered or admitted in one, whatever
+/// a host's source answers for it.
+pub const RESERVED_HOST_NAMESPACE_PREFIX: &str = "meerkat.";
+
+/// Whether `namespace` is a Core-owned host namespace
+/// ([`RESERVED_HOST_NAMESPACE_PREFIX`]).
+pub fn is_reserved_host_namespace(namespace: &str) -> bool {
+    namespace.starts_with(RESERVED_HOST_NAMESPACE_PREFIX)
 }
 
 /// What a continuation delivers into its owner's conversation.
@@ -511,6 +532,7 @@ impl ContinuationOwnerService {
         owner: &ContinuationOwner,
         delivery: &ContinuationDelivery,
         retained_work: Option<&meerkat_core::retained_work::RetainedWorkIdentity>,
+        host_original: bool,
     ) -> Result<String, ContinuationSubmitError> {
         let owner = serde_json::to_vec(owner).map_err(unavailable)?;
         let delivery = serde_json::to_vec(delivery).map_err(unavailable)?;
@@ -522,6 +544,11 @@ impl ContinuationOwnerService {
         if let Some(retained_work) = retained_work.as_deref() {
             parts.push(b"retained-work");
             parts.push(retained_work);
+        }
+        // Domain-separated: a host original is never the same submission as
+        // a plain continuation of the same delivery under the same key.
+        if host_original {
+            parts.push(b"host-original");
         }
         Ok(delivery_digest_hex(&parts))
     }
@@ -587,25 +614,196 @@ impl ContinuationOwnerService {
         if self.runtime.has_native_work_authorization_host() {
             return Err(ContinuationSubmitError::NoAdmissibleWorkBinding);
         }
-        self.commit(owner, delivery, None, committed_at_ms).await
+        self.commit(owner, delivery, None, false, committed_at_ms, None)
+            .await
     }
 
+    /// Commit a host original for `owner`: a continuation of a `Host`
+    /// namespace that its committed owner holds exactly
+    /// ([`HostOriginalRecord::from_owner`]). On a runtime with a native work
+    /// authorization host it is admitted only through that namespace owner's
+    /// binder, confirmed again at each admission attempt; elsewhere it is
+    /// admitted as any continuation. Replays and conflicts follow
+    /// [`Self::submit`]. A host original is never the same submission as a
+    /// plain continuation under the same key: choose one entry per key.
+    ///
+    /// The record is checked for consistency here, not trusted as a gate:
+    /// the drain confirms the row again against the bound namespace owner.
+    ///
+    /// # Errors
+    /// [`ContinuationSubmitError::Invalid`] for a reserved or empty namespace,
+    /// a delivery or owner other than the record's, or (on a governed
+    /// runtime) handling other than `Queue`; otherwise as [`Self::submit`].
+    pub async fn submit_host_original(
+        &self,
+        owner: &ContinuationOwner,
+        delivery: ContinuationDelivery,
+        original: &HostOriginalRecord,
+        committed_at_ms: u64,
+    ) -> Result<ContinuationReceipt, ContinuationSubmitError> {
+        let ContinuationProducer::Host { namespace } = &delivery.result.producer else {
+            return Err(ContinuationSubmitError::Invalid(
+                "a host original is delivered under its host namespace".into(),
+            ));
+        };
+        if namespace.is_empty() || is_reserved_host_namespace(namespace) {
+            return Err(ContinuationSubmitError::Invalid(format!(
+                "host namespace {namespace:?} is reserved or empty"
+            )));
+        }
+        if *namespace != original.namespace
+            || delivery.result.producer_id != original.producer_id
+            || delivery != original.facts.delivery
+            || *owner != original.facts.owner
+        {
+            return Err(ContinuationSubmitError::Invalid(
+                "the delivery is not the host original its namespace owner committed".into(),
+            ));
+        }
+        if self.runtime.has_native_work_authorization_host()
+            && delivery.handling != ContinuationHandling::Queue
+        {
+            return Err(ContinuationSubmitError::Invalid(
+                "a governed host original joins its owner after the current turn (queue)".into(),
+            ));
+        }
+        self.commit(owner, delivery, None, true, committed_at_ms, None)
+            .await
+    }
+
+    /// [`Self::submit`] for a member owner, bound only to the member's mob
+    /// incarnation `incarnation`. A handle kept from an earlier incarnation of
+    /// the mob (one whose actor stopped, while the host now holds a mob
+    /// created again under its id) commits nothing for the current
+    /// incarnation's member.
+    ///
+    /// The incarnation is checked inside the commit, on the address the commit
+    /// binds, so no destroy and re-create can slip between the check and the
+    /// commit:
+    /// - the key is not bound yet: it binds only while the owner's current
+    ///   address names `incarnation`, and is
+    ///   [`ContinuationSubmitError::OwnerRetired`] otherwise;
+    /// - the key is bound at `incarnation`: replayed, or a conflict, as for
+    ///   [`Self::submit`];
+    /// - the key is bound at another incarnation:
+    ///   [`ContinuationSubmitError::OwnerRetired`] while the current address
+    ///   does not name `incarnation` (this caller is stale); replayed, or a
+    ///   conflict, as for [`Self::submit`], while it does (the current
+    ///   incarnation reusing a key an earlier one bound).
+    ///
+    /// A [`ContinuationOwner::Session`] owner has no mob incarnation and is
+    /// unchanged: for it this is [`Self::submit`].
+    pub async fn submit_for_member_incarnation(
+        &self,
+        owner: &ContinuationOwner,
+        incarnation: MobIncarnationId,
+        delivery: ContinuationDelivery,
+        committed_at_ms: u64,
+    ) -> Result<ContinuationReceipt, ContinuationSubmitError> {
+        if self.runtime.has_native_work_authorization_host() {
+            return Err(ContinuationSubmitError::NoAdmissibleWorkBinding);
+        }
+        self.commit(
+            owner,
+            delivery,
+            None,
+            false,
+            committed_at_ms,
+            Self::member_incarnation(owner, incarnation),
+        )
+        .await
+    }
+
+    /// The incarnation a member owner's commit is bound to; `None` for a
+    /// session owner, which has none.
+    fn member_incarnation(
+        owner: &ContinuationOwner,
+        incarnation: MobIncarnationId,
+    ) -> Option<MobIncarnationId> {
+        match owner {
+            ContinuationOwner::Member { .. } => Some(incarnation),
+            ContinuationOwner::Session { .. } => None,
+        }
+    }
+
+    /// Whether `address` is a member address of mob incarnation `incarnation`.
+    /// An address minted before 0.9.4 names no incarnation, so it names none
+    /// a caller expects.
+    fn address_names_incarnation(
+        address: &LogicalRuntimeId,
+        incarnation: MobIncarnationId,
+    ) -> Result<bool, ContinuationSubmitError> {
+        address
+            .member_address()
+            .map(|member| member.is_some_and(|member| member.incarnation == Some(incarnation)))
+            .map_err(|error| ContinuationSubmitError::Invalid(error.to_string()))
+    }
+
+    /// Whether the owner's current address names `incarnation`. An owner with
+    /// no current address names none.
+    async fn current_address_names_incarnation(
+        &self,
+        owner: &ContinuationOwner,
+        incarnation: MobIncarnationId,
+    ) -> Result<bool, ContinuationSubmitError> {
+        match self
+            .resolver
+            .current_address(owner)
+            .await
+            .map_err(ContinuationSubmitError::Unavailable)?
+        {
+            Some(address) => Self::address_names_incarnation(&address, incarnation),
+            None => Ok(false),
+        }
+    }
+
+    /// A key already bound: replayed, or a conflict, as for [`Self::submit`].
+    /// For a commit bound to `expected`, a binding at another incarnation is
+    /// [`ContinuationSubmitError::OwnerRetired`] unless the owner's current
+    /// address names `expected` (see [`Self::submit_for_member_incarnation`]).
+    async fn replay_bound_key(
+        &self,
+        owner: &ContinuationOwner,
+        key: &ContinuationKey,
+        binding: &meerkat_runtime::ContinuationKeyBinding,
+        digest: &str,
+        expected: Option<MobIncarnationId>,
+    ) -> Result<ContinuationReceipt, ContinuationSubmitError> {
+        if let Some(expected) = expected
+            && !Self::address_names_incarnation(&binding.address, expected)?
+            && !self
+                .current_address_names_incarnation(owner, expected)
+                .await?
+        {
+            return Err(ContinuationSubmitError::OwnerRetired);
+        }
+        Self::replay_or_conflict(owner, key, binding, digest)
+    }
+
+    /// `expected`: the mob incarnation a member owner's commit is bound to
+    /// (see [`Self::submit_for_member_incarnation`]); `None` binds whatever
+    /// the owner's current address names.
     async fn commit(
         &self,
         owner: &ContinuationOwner,
         delivery: ContinuationDelivery,
         retained_work: Option<meerkat_core::retained_work::RetainedWorkIdentity>,
+        host_original: bool,
         committed_at_ms: u64,
+        expected: Option<MobIncarnationId>,
     ) -> Result<ContinuationReceipt, ContinuationSubmitError> {
         let ledger_owner = owner.ledger_owner();
-        let digest = Self::submission_digest(owner, &delivery, retained_work.as_ref())?;
+        let digest =
+            Self::submission_digest(owner, &delivery, retained_work.as_ref(), host_original)?;
         if let Some(binding) = self
             .inbox
             .continuation_key_binding(&ledger_owner, delivery.key.as_str())
             .await
             .map_err(unavailable)?
         {
-            return Self::replay_or_conflict(owner, &delivery.key, &binding, &digest);
+            return self
+                .replay_bound_key(owner, &delivery.key, &binding, &digest, expected)
+                .await;
         }
         let Some(address) = self
             .resolver
@@ -615,6 +813,11 @@ impl ContinuationOwnerService {
         else {
             return Err(ContinuationSubmitError::OwnerRetired);
         };
+        if let Some(expected) = expected
+            && !Self::address_names_incarnation(&address, expected)?
+        {
+            return Err(ContinuationSubmitError::OwnerRetired);
+        }
         let delivery_id = Self::delivery_id(&address, &delivery.key)?;
         let key = delivery.key.clone();
         let source = match &delivery.result.producer {
@@ -625,6 +828,7 @@ impl ContinuationOwnerService {
         let payload = serde_json::to_vec(&ContinuationRow {
             delivery,
             retained_work,
+            host_original,
         })
         .map_err(unavailable)?;
         let submission = RuntimeDeliverySubmission::new(
@@ -655,7 +859,8 @@ impl ContinuationOwnerService {
                 Ok(Self::receipt(owner, &key, &binding))
             }
             KeyedSubmitOutcome::AlreadyBound(binding) => {
-                Self::replay_or_conflict(owner, &key, &binding, &digest)
+                self.replay_bound_key(owner, &key, &binding, &digest, expected)
+                    .await
             }
         }
     }
@@ -684,6 +889,51 @@ impl ContinuationOwnerService {
         job: &RetainedJobRecord,
         committed_at_ms: u64,
     ) -> Result<ContinuationReceipt, ContinuationSubmitError> {
+        self.check_retained_completion(owner, &delivery, job)?;
+        self.commit(
+            owner,
+            delivery,
+            job.facts.retained_work.clone(),
+            false,
+            committed_at_ms,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::submit_retained_completion`] for a member owner, bound only to
+    /// the member's mob incarnation `incarnation`, exactly as
+    /// [`Self::submit_for_member_incarnation`] binds a submission. A
+    /// [`ContinuationOwner::Session`] owner is unchanged: for it this is
+    /// [`Self::submit_retained_completion`].
+    pub async fn submit_retained_completion_for_member_incarnation(
+        &self,
+        owner: &ContinuationOwner,
+        incarnation: MobIncarnationId,
+        delivery: ContinuationDelivery,
+        job: &RetainedJobRecord,
+        committed_at_ms: u64,
+    ) -> Result<ContinuationReceipt, ContinuationSubmitError> {
+        self.check_retained_completion(owner, &delivery, job)?;
+        self.commit(
+            owner,
+            delivery,
+            job.facts.retained_work.clone(),
+            false,
+            committed_at_ms,
+            Self::member_incarnation(owner, incarnation),
+        )
+        .await
+    }
+
+    /// The delivery names exactly `job`'s committed outcome, owed to `owner`,
+    /// and a governed runtime can admit it.
+    fn check_retained_completion(
+        &self,
+        owner: &ContinuationOwner,
+        delivery: &ContinuationDelivery,
+        job: &RetainedJobRecord,
+    ) -> Result<(), ContinuationSubmitError> {
         let owed_elsewhere = match owner {
             ContinuationOwner::Session { session_id } => &job.facts.owner_session_id != session_id,
             ContinuationOwner::Member { .. } => false,
@@ -700,13 +950,7 @@ impl ContinuationOwnerService {
         if self.runtime.has_native_work_authorization_host() && job.facts.retained_work.is_none() {
             return Err(ContinuationSubmitError::NoAdmissibleWorkBinding);
         }
-        self.commit(
-            owner,
-            delivery,
-            job.facts.retained_work.clone(),
-            committed_at_ms,
-        )
-        .await
+        Ok(())
     }
 
     /// Read-only: whether the expected retained completion (`delivery` with
@@ -748,8 +992,9 @@ impl ContinuationOwnerService {
                 "the delivery does not name the job's committed outcome".into(),
             ));
         }
-        let digest = Self::submission_digest(owner, delivery, job.facts.retained_work.as_ref())
-            .map_err(|error| ContinuationObserveError::Unavailable(error.to_string()))?;
+        let digest =
+            Self::submission_digest(owner, delivery, job.facts.retained_work.as_ref(), false)
+                .map_err(|error| ContinuationObserveError::Unavailable(error.to_string()))?;
         let Some(binding) = self
             .inbox
             .continuation_key_binding(&owner.ledger_owner(), delivery.key.as_str())
@@ -955,9 +1200,13 @@ pub enum RetainedJobLookup {
 
 /// The committed owner of fork_off and council jobs (the mob runtime), and
 /// of the `Host` namespaces a host composes into it (its committed setup
-/// results): the one place a retained completion's job is confirmed. It
-/// answers [`RetainedJobLookup::Absent`] for any producer or namespace it
-/// does not own.
+/// results and its host originals): the one place a retained completion's
+/// job, and a host original, is confirmed. It answers
+/// [`RetainedJobLookup::Absent`] (and [`HostOriginalLookup::Absent`]) for any
+/// producer or namespace it does not own. A composed source forwards the host
+/// original methods for its declared namespaces only; Core refuses the
+/// reserved namespaces ([`RESERVED_HOST_NAMESPACE_PREFIX`]) whatever a source
+/// answers.
 #[async_trait::async_trait]
 pub trait RetainedJobSource: Send + Sync {
     /// What this owner committed about `producer`'s job `job_id`.
@@ -966,6 +1215,305 @@ pub trait RetainedJobSource: Send + Sync {
         producer: &ContinuationProducer,
         job_id: &str,
     ) -> RetainedJobLookup;
+
+    /// What this owner committed about host original `producer_id` in its
+    /// `namespace`: the exact continuation, the owner it is owed to and the
+    /// original it binds. The default owns no host original.
+    async fn host_original(&self, namespace: &str, producer_id: &str) -> HostOriginalLookup {
+        let _ = (namespace, producer_id);
+        HostOriginalLookup::Absent
+    }
+
+    /// The trusted host's binder of host originals in `namespace`: the one
+    /// way a governed runtime admits them. `None`, the default, offers none,
+    /// and such host originals are refused there.
+    fn host_original_binder(&self, namespace: &str) -> Option<Arc<dyn HostOriginalBinder>> {
+        let _ = namespace;
+        None
+    }
+}
+
+/// What the committed owner of a host namespace holds about one host
+/// original: the exact continuation it owes (key, result reference, body
+/// and handling), the owner it is owed to, and the original whose authority
+/// a binding must name. Facts only: nothing here grants authority.
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct HostOriginalFacts {
+    pub owner: ContinuationOwner,
+    pub delivery: ContinuationDelivery,
+    pub original_work: meerkat_runtime::OriginalWorkRef,
+}
+
+impl HostOriginalFacts {
+    pub fn new(
+        owner: ContinuationOwner,
+        delivery: ContinuationDelivery,
+        original_work: meerkat_runtime::OriginalWorkRef,
+    ) -> Self {
+        Self {
+            owner,
+            delivery,
+            original_work,
+        }
+    }
+}
+
+impl std::fmt::Debug for HostOriginalFacts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostOriginalFacts")
+            .field("owner", &self.owner)
+            .field("delivery", &self.delivery)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A namespace owner's answer for one host original.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostOriginalLookup {
+    /// The owner holds it and committed these facts.
+    Found(HostOriginalFacts),
+    /// The owner definitively holds no such original in that namespace.
+    Absent,
+    /// The owner could not be read now; retryable, never a verdict.
+    Unavailable(String),
+}
+
+/// A namespace owner's committed record of one host original, read from it.
+/// Process-only and minted only through [`HostOriginalRecord::from_owner`].
+/// Any source can be passed, so it is a consistency check at submit, not a
+/// gate: the drain confirms the row again against the bound owner.
+pub struct HostOriginalRecord {
+    namespace: String,
+    producer_id: String,
+    facts: HostOriginalFacts,
+}
+
+impl HostOriginalRecord {
+    /// Read host original `producer_id` of `namespace` from its committed
+    /// owner.
+    ///
+    /// # Errors
+    /// The owner could not be read.
+    pub async fn from_owner(
+        owner: &dyn RetainedJobSource,
+        namespace: impl Into<String>,
+        producer_id: impl Into<String>,
+    ) -> Result<Option<Self>, String> {
+        let namespace = namespace.into();
+        let producer_id = producer_id.into();
+        match owner.host_original(&namespace, &producer_id).await {
+            HostOriginalLookup::Found(facts) => Ok(Some(Self {
+                namespace,
+                producer_id,
+                facts,
+            })),
+            HostOriginalLookup::Absent => Ok(None),
+            HostOriginalLookup::Unavailable(error) => Err(error),
+        }
+    }
+
+    /// The committed facts.
+    pub fn facts(&self) -> &HostOriginalFacts {
+        &self.facts
+    }
+}
+
+impl std::fmt::Debug for HostOriginalRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostOriginalRecord")
+            .field("namespace", &self.namespace)
+            .field("producer_id", &self.producer_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What Core confirmed for one host original, handed to its binder.
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct HostOriginalRef {
+    pub namespace: String,
+    pub producer_id: String,
+    pub owner: ContinuationOwner,
+    pub original_work: meerkat_runtime::OriginalWorkRef,
+}
+
+impl std::fmt::Debug for HostOriginalRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostOriginalRef")
+            .field("namespace", &self.namespace)
+            .field("producer_id", &self.producer_id)
+            .field("owner", &self.owner)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The native admission a bound host original's settlement is promoted for:
+/// the admitting session and the input its native admission accepted as new
+/// work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct HostOriginalAdmission {
+    pub session: SessionId,
+    pub input: InputId,
+    pub deduplicated: bool,
+}
+
+/// The host's settlement custody for one bound host original (for example
+/// its pending candidate of the original). Core calls
+/// [`Self::accepted`] at most once, only when native admission ACCEPTED that
+/// exact bound input as new work. Dropping it unsettled is the host's
+/// withdrawal: Core drops it only when nothing was handed to native
+/// admission, or native admission settled `NotAdmitted`, or a replay
+/// deduplicated onto an existing input. When the admission is unresolved it
+/// is handed to [`HostOriginalBinder::retain_unresolved`] instead.
+pub trait HostOriginalSettlement: Send + Sync {
+    /// Promote the host's custody for the admission. An error is reported
+    /// (a warn trace), never a refusal: the input was admitted. On an error
+    /// Core still applies and acknowledges the delivery and never calls this
+    /// again; the host keeps its candidate pending and settles it from the
+    /// native record (`with_admitted_original` / `durable_admitted_original`)
+    /// within its own bound, the same obligation as an `AdmissionPending`
+    /// answer of its source.
+    fn accepted(self: Box<Self>, admission: &HostOriginalAdmission) -> Result<(), String>;
+}
+
+/// One bound host original with its host settlement custody.
+#[non_exhaustive]
+pub struct BoundHostOriginal {
+    /// Core's exact continuation input with only its authority association
+    /// set and the trusted ingress observation attached (for example through
+    /// `bind_scoped_original`, passing Core's admission key as its event key).
+    pub input: meerkat_runtime::Input,
+    pub settlement: Box<dyn HostOriginalSettlement>,
+}
+
+impl BoundHostOriginal {
+    pub fn new(input: meerkat_runtime::Input, settlement: Box<dyn HostOriginalSettlement>) -> Self {
+        Self { input, settlement }
+    }
+}
+
+impl std::fmt::Debug for BoundHostOriginal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoundHostOriginal")
+            .field("input", &self.input.id())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why a binder bound nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HostOriginalRefusal {
+    /// The host's actual verdict: the original is never admitted for this
+    /// owner and session. Terminal for the row (`AuthorityDenied`).
+    Denied,
+    /// The binder does not own this original: an immutably missing binding.
+    NotOwned,
+    /// Not answerable now, for a typed cause (a held turn boundary, a session
+    /// that is not live, contention): the row stays pending.
+    NotReady(meerkat_core::authorization::ControllerReadinessFailure),
+    /// The host could not be read now; the row stays pending.
+    Unavailable(String),
+}
+
+/// A binder's bounded precheck of an owner, for setup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HostOriginalBinderReadiness {
+    /// The binder could bind for the owner's current session now.
+    Ready,
+    /// The binder's actual verdict for this owner now.
+    Denied,
+    /// Not answerable now, for a typed cause.
+    NotReady(meerkat_core::authorization::ControllerReadinessFailure),
+}
+
+/// What a runtime will do with the host originals of one namespace for one
+/// owner, as its BOUND composition answers at setup. Advisory: the decisive
+/// verdict is per original, at native admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HostOriginalReadiness {
+    /// No native work authorization host: host continuations are admitted
+    /// as they always were.
+    Ungoverned,
+    /// Governed, but no continuation services are bound yet: ask again after
+    /// binding.
+    Unbound,
+    /// Governed, and the namespace is reserved or the bound source offers no
+    /// binder for it: every host original is refused (`NoAdmissibleWorkBinding`).
+    NotOffered,
+    /// Governed, and the bound source offers a binder: its precheck now.
+    Offered(HostOriginalBinderReadiness),
+}
+
+/// The trusted host's binder of host originals in the namespaces its source
+/// owns: on a governed runtime, the one way a host original is admitted.
+///
+/// Contract:
+/// - [`Self::bind`] and [`Self::readiness`] are bounded. They never await a
+///   member turn, an identity lifecycle operation, a writer holding the
+///   host's roster or entries, or anything that waits on the delivery owner
+///   (which drains every runtime in one sequential pass). When they cannot
+///   answer now they answer `NotReady` with a typed cause. Pin the session's
+///   controller without waiting (the session services' non-waiting pins), or
+///   keep a pin retained per live actor, refreshed off the drain path and
+///   announced with [`ContinuationHostBindings::source_custody_changed`].
+/// - [`Self::bind`] binds Core's exact input for the session's CURRENT
+///   destination and pinned controller, fresh at each attempt: it sets only
+///   the authority association (naming `original.original_work`) and the
+///   trusted ingress observation. With `bind_scoped_original`, pass Core's
+///   admission key (the input's idempotency key) as its event key. Core
+///   refuses any other change. Attach the ingress observation only through
+///   `Input::with_ingress_context` or `bind_scoped_original`, which check it
+///   against the final input: an observation of another input set on the
+///   header directly is refused by native admission and leaves the row
+///   pending. The original is in the host's own source custody before
+///   `bind` returns.
+/// - Core never makes a governed session live, on any sink: a session with
+///   no live actor (a cold session) is the host's to recover through its own
+///   governed recovery, which binds its destination and agent before the
+///   agent is constructed. Until then [`Self::bind`] answers
+///   `NotReady(ExecutorUnavailable)` and [`Self::readiness`] answers
+///   `NotReady(ExecutorUnavailable)` (so the setup signal reads
+///   `Offered(NotReady(..))`). The host's executor attachment (or
+///   [`ContinuationHostBindings::source_custody_changed`]) wakes the delivery
+///   owner for the next attempt. A host that wants ingestion to wake a cold
+///   session runs its own recovery; Core never does. A pending host original
+///   holds its session's later deliveries in order until it settles, so a
+///   cold session's later rows wait for the host's recovery too.
+/// - A binder may make bounded host-side checks before it binds, such as
+///   re-checking that the owner covers the source's audience from a snapshot
+///   or a try-read of the registered roster row. Such a check answers
+///   `Denied` only on an actual failure (terminal for the row) and `NotReady`
+///   when the state cannot be read now. It covers the member and session
+///   being bound and stops at the bind: an admitted row is never refused
+///   later.
+#[async_trait::async_trait]
+pub trait HostOriginalBinder: Send + Sync {
+    /// Bind `input`, Core's continuation input for the confirmed host original
+    /// `original`, for `session`.
+    async fn bind(
+        &self,
+        original: &HostOriginalRef,
+        session: &SessionId,
+        input: meerkat_runtime::Input,
+    ) -> Result<BoundHostOriginal, HostOriginalRefusal>;
+
+    /// The binder's bounded precheck for `owner` in `namespace`. It never
+    /// enrolls, binds or admits anything, and never waits on a busy member.
+    async fn readiness(
+        &self,
+        namespace: &str,
+        owner: &ContinuationOwner,
+    ) -> HostOriginalBinderReadiness;
+
+    /// Keep the custody of a bound host original whose native admission is
+    /// unresolved (the input may have been admitted): the host settles it
+    /// later from the runtime's own record of the admission.
+    fn retain_unresolved(&self, settlement: Box<dyn HostOriginalSettlement>, detail: &str);
 }
 
 /// The continuation services a host composition binds once its mob runtime
@@ -1203,6 +1751,34 @@ impl ContinuationHostBindings {
             .map(|bound| Arc::clone(&bound.job_source))
     }
 
+    /// What `runtime` will do with host originals of `namespace` owed to
+    /// `owner`, as THIS binding's composition answers now: the setup-time
+    /// signal a host reads before committing any. It reads the bound source,
+    /// so setup and delivery cannot disagree about the composition. It
+    /// enrolls, binds and admits nothing; the binder's precheck is bounded.
+    pub async fn host_original_readiness(
+        &self,
+        runtime: &meerkat_runtime::MeerkatMachine,
+        namespace: &str,
+        owner: &ContinuationOwner,
+    ) -> HostOriginalReadiness {
+        if !runtime.has_native_work_authorization_host() {
+            return HostOriginalReadiness::Ungoverned;
+        }
+        if namespace.is_empty() || is_reserved_host_namespace(namespace) {
+            return HostOriginalReadiness::NotOffered;
+        }
+        let Some(source) = self.job_source() else {
+            return HostOriginalReadiness::Unbound;
+        };
+        match source.host_original_binder(namespace) {
+            Some(binder) => {
+                HostOriginalReadiness::Offered(binder.readiness(namespace, owner).await)
+            }
+            None => HostOriginalReadiness::NotOffered,
+        }
+    }
+
     /// Resolve `address` through the bound resolver, or as a plain session
     /// address when none is bound. A resolver failure is never a verdict:
     /// the address reads as not served, so its rows stay pending.
@@ -1326,6 +1902,59 @@ pub trait ContinuationDeliverySink: Send + Sync {
             "this continuation sink does not admit retained work".into(),
         ))
     }
+
+    /// Whether this sink admits governed host originals
+    /// ([`Self::admit_governed`]). A governed runtime refuses a host original
+    /// typed, never leaving it pending, on a sink that answers `false`, the
+    /// default.
+    fn admits_governed(&self) -> bool {
+        false
+    }
+
+    /// Prepare `session` for a governed host original before its binder
+    /// binds it, as [`Self::admit_retained`] prepares a cold session (for
+    /// example settling a crash-window provisional tail). It never makes a
+    /// governed session live, on any sink: liveness belongs to the host, and
+    /// its executor attachment wakes the delivery owner. The default prepares
+    /// nothing.
+    async fn prepare_governed(&self, session: &SessionId) -> Result<(), ContinuationAdmitError> {
+        let _ = session;
+        Ok(())
+    }
+
+    /// Admit the bound governed host original `input` into `session`, with
+    /// `custody` settled by native admission exactly once
+    /// (`MeerkatMachine::accept_input_with_completion_and_custody`). The raw
+    /// native result is returned; the caller classifies it and acts on the
+    /// recorded settlement. The default admits nothing and settles the custody
+    /// `NotAdmitted`.
+    async fn admit_governed(
+        &self,
+        session: &SessionId,
+        input: meerkat_runtime::Input,
+        custody: Box<dyn meerkat_runtime::input_admission_custody::NativeInputAdmissionCustody>,
+    ) -> Result<GovernedAdmissionOutcome, meerkat_runtime::RuntimeDriverError> {
+        let _ = (session, input);
+        let _ = custody.settle(
+            meerkat_runtime::input_admission_custody::NativeInputAdmissionSettlement::NotAdmitted,
+        );
+        Err(meerkat_runtime::RuntimeDriverError::Internal(
+            "this continuation sink does not admit governed host originals".into(),
+        ))
+    }
+
+    /// The row `session` holds under the exact input id `input_id`, read from
+    /// live state and then the durable witness. The default cannot read one
+    /// and answers an error, which keeps the delivery pending: it never reads
+    /// as "nothing admitted".
+    async fn admitted_input_by_id(
+        &self,
+        session: &SessionId,
+        input_id: &InputId,
+    ) -> Result<Option<meerkat_runtime::input_state::StoredInputState>, String> {
+        let _ = (session, input_id);
+        Err("this continuation sink cannot read an admission by its input id".into())
+    }
 }
 
 /// Admits continuations straight into a session's runtime registration: a
@@ -1401,6 +2030,34 @@ impl ContinuationDeliverySink for MachineContinuationSink {
                 .map(|(outcome, _completion)| outcome),
         )
     }
+
+    fn admits_governed(&self) -> bool {
+        true
+    }
+
+    async fn admit_governed(
+        &self,
+        session: &SessionId,
+        input: meerkat_runtime::Input,
+        custody: Box<dyn meerkat_runtime::input_admission_custody::NativeInputAdmissionCustody>,
+    ) -> Result<GovernedAdmissionOutcome, meerkat_runtime::RuntimeDriverError> {
+        self.runtime
+            .accept_input_with_completion_and_custody(session, input, custody)
+            .await
+            .map(|(outcome, _completion)| outcome.into())
+    }
+
+    async fn admitted_input_by_id(
+        &self,
+        session: &SessionId,
+        input_id: &InputId,
+    ) -> Result<Option<meerkat_runtime::input_state::StoredInputState>, String> {
+        use meerkat_runtime::SessionServiceRuntimeExt as _;
+        self.runtime
+            .input_state(session, input_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// Classify a retained-resume admission: only a terminal policy refusal is
@@ -1418,6 +2075,67 @@ pub fn retained_admission_outcome(
         ))),
         Err(meerkat_runtime::RuntimeDriverError::RetainedResumeRefused { reason }) => {
             Err(ContinuationAdmitError::Refused(reason.into()))
+        }
+        Err(meerkat_runtime::RuntimeDriverError::ControllerReadinessUnavailable { reason }) => {
+            Err(ContinuationAdmitError::NotReady(reason))
+        }
+        Err(error) => Err(ContinuationAdmitError::Failed(error.to_string())),
+    }
+}
+
+/// What native admission did with one bound governed host original.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GovernedAdmissionOutcome {
+    /// Accepted as new work under this input id.
+    Accepted(InputId),
+    /// Deduplicated onto this existing input.
+    Deduplicated(InputId),
+    /// Neither (for example rejected), with its rendering.
+    NotAccepted(String),
+}
+
+impl From<meerkat_runtime::AcceptOutcome> for GovernedAdmissionOutcome {
+    fn from(outcome: meerkat_runtime::AcceptOutcome) -> Self {
+        match outcome {
+            meerkat_runtime::AcceptOutcome::Accepted { input_id, .. } => Self::Accepted(input_id),
+            meerkat_runtime::AcceptOutcome::Deduplicated { existing_id, .. } => {
+                Self::Deduplicated(existing_id)
+            }
+            other => Self::NotAccepted(format!("{other:?}")),
+        }
+    }
+}
+
+/// Classify a governed host original's native admission: only an actual
+/// refusal verdict is [`ContinuationAdmitError::Refused`] (a denial is
+/// `AuthorityDenied`, malformed facts `NoAdmissibleWorkBinding`); a runtime
+/// that is not ready keeps its typed cause; anything else is retryable.
+/// Classification only: the host's custody follows the native admission
+/// settlement, never this result.
+pub fn governed_admission_outcome(
+    outcome: Result<GovernedAdmissionOutcome, meerkat_runtime::RuntimeDriverError>,
+) -> Result<InputId, ContinuationAdmitError> {
+    use meerkat_core::authorization::{ControllerReadinessFailure, OperationRefusalKind};
+    use meerkat_runtime::RuntimeDeliveryRefusalReason;
+    match outcome {
+        Ok(GovernedAdmissionOutcome::Accepted(input_id)) => Ok(input_id),
+        Ok(GovernedAdmissionOutcome::Deduplicated(existing_id)) => Ok(existing_id),
+        Ok(GovernedAdmissionOutcome::NotAccepted(detail)) => Err(ContinuationAdmitError::Failed(
+            format!("governed host original admission was not accepted: {detail}"),
+        )),
+        Err(meerkat_runtime::RuntimeDriverError::InputRefused { refusal }) => {
+            match refusal.kind() {
+                OperationRefusalKind::Denied => Err(ContinuationAdmitError::Refused(
+                    RuntimeDeliveryRefusalReason::AuthorityDenied,
+                )),
+                OperationRefusalKind::MalformedFacts => Err(ContinuationAdmitError::Refused(
+                    RuntimeDeliveryRefusalReason::NoAdmissibleWorkBinding,
+                )),
+                OperationRefusalKind::ReprepareRequired => Err(ContinuationAdmitError::NotReady(
+                    ControllerReadinessFailure::PolicyChanged,
+                )),
+            }
         }
         Err(meerkat_runtime::RuntimeDriverError::ControllerReadinessUnavailable { reason }) => {
             Err(ContinuationAdmitError::NotReady(reason))
@@ -1453,6 +2171,10 @@ pub fn retained_admission_outcome(
 /// before the runtime was governed (historical rows) and rows from any other
 /// submitter; [`ContinuationOwnerService::submit`] already refuses new ones
 /// on a governed runtime without committing them.
+///
+/// A host original row (the marker set by
+/// [`ContinuationOwnerService::submit_host_original`]) is routed first, on
+/// every posture, to [`admit_host_original`].
 pub(crate) async fn admit_continuation_row(
     inbox: &RuntimeDeliveryInbox,
     address: &LogicalRuntimeId,
@@ -1465,6 +2187,10 @@ pub(crate) async fn admit_continuation_row(
     let outcome = async {
         let row: ContinuationRow = serde_json::from_slice(record.submission.payload())
             .map_err(|error| format!("continuation delivery payload is invalid: {error}"))?;
+        if row.host_original {
+            return admit_host_original(inbox, address, record, sink, session, job_source, row)
+                .await;
+        }
         let retained = if sink.governs_work_authority() {
             // Only a Meerkat-minted completion carries a native work
             // binding, and only its committed job owner can confirm it.
@@ -1561,6 +2287,531 @@ async fn verify_committed_job(
     Ok(())
 }
 
+/// The exact input a continuation row is admitted as, under `admission_key`
+/// with `input_id`: a durable content input, or a notice admitted exactly as a
+/// detached job's completion record.
+fn continuation_prompt(
+    delivery: &ContinuationDelivery,
+    admission_key: &str,
+    input_id: InputId,
+) -> meerkat_runtime::PromptInput {
+    let handling = match delivery.handling {
+        ContinuationHandling::Queue => meerkat_core::types::HandlingMode::Queue,
+        ContinuationHandling::Steer => meerkat_core::types::HandlingMode::Steer,
+    };
+    match &delivery.body {
+        ContinuationBody::Content { content } => meerkat_runtime::PromptInput::continuation(
+            input_id,
+            admission_key.to_string(),
+            content.clone(),
+            handling,
+        ),
+        ContinuationBody::Notice {
+            notice_kind,
+            body,
+            blocks,
+        } => {
+            let mut prompt = meerkat_runtime::PromptInput::detached_job_completed(
+                admission_key.to_string(),
+                meerkat_core::types::SystemNoticeMessage::with_blocks(
+                    *notice_kind,
+                    body.clone(),
+                    blocks.clone(),
+                ),
+            );
+            prompt.header.id = input_id;
+            prompt
+        }
+    }
+}
+
+/// Where a governed host original's refusal came from, for operators: the
+/// delivery row keeps only the three typed reasons. Reported only as the
+/// `refusal_origin` field of a warn trace, with the variant's Debug name:
+/// `RowShape`, `ReservedNamespace`, `OwnerConfirmation`, `BinderDenied` (a
+/// binder's `Denied`, and its `NotOwned` with the `NoAdmissibleWorkBinding`
+/// reason), `BoundInput` or `NativeRefused`. Diagnostic only: no decision may
+/// read it, and a later typed origin would be a new additive API.
+#[derive(Debug, Clone, Copy)]
+enum HostOriginalRefusalOrigin {
+    RowShape,
+    ReservedNamespace,
+    OwnerConfirmation,
+    BinderDenied,
+    BoundInput,
+    NativeRefused,
+}
+
+fn refused_host_original(
+    origin: HostOriginalRefusalOrigin,
+    reason: meerkat_runtime::RuntimeDeliveryRefusalReason,
+    delivery_id: &RuntimeDeliveryId,
+    detail: &str,
+) -> ContinuationAdmitError {
+    tracing::warn!(
+        delivery_id = %delivery_id,
+        refusal_origin = ?origin,
+        refusal_reason = ?reason,
+        detail,
+        "host original refused"
+    );
+    ContinuationAdmitError::Refused(reason)
+}
+
+/// Records the native admission settlement of one bound host original. It
+/// only records: the drain acts on the settlement after admission returns.
+struct RecordedHostOriginalSettlement(
+    Arc<
+        std::sync::Mutex<
+            Option<meerkat_runtime::input_admission_custody::NativeInputAdmissionSettlement>,
+        >,
+    >,
+);
+
+impl meerkat_runtime::input_admission_custody::NativeInputAdmissionCustody
+    for RecordedHostOriginalSettlement
+{
+    fn settle(
+        self: Box<Self>,
+        settlement: meerkat_runtime::input_admission_custody::NativeInputAdmissionSettlement,
+    ) -> Option<meerkat_runtime::input_admission_custody::NativeInputAdmissionCompletion> {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(settlement);
+        None
+    }
+}
+
+/// Whether `state`, the row a session holds under `input_id`, is this host
+/// original's admission: Core's continuation input under that id and the
+/// admission key, with the row's OWN recorded association (none for a row an
+/// ungoverned sink admitted), as an exact replay. Never decided by key alone.
+fn verify_admitted_host_original(
+    state: &meerkat_runtime::input_state::InputState,
+    delivery: &ContinuationDelivery,
+    admission_key: &str,
+    input_id: &InputId,
+) -> Result<(), ContinuationAdmitError> {
+    let mut expected = continuation_prompt(delivery, admission_key, input_id.clone());
+    expected.header.authority_association = state
+        .authority_contributors
+        .iter()
+        .find(|contributor| contributor.input_id() == &state.input_id)
+        .map(|own| own.association().clone());
+    meerkat_runtime::verify_exact_replay(state, &meerkat_runtime::Input::Prompt(expected)).map_err(
+        |error| {
+            ContinuationAdmitError::Failed(format!(
+                "input {} is not this host original's admission under key {admission_key}: {error}",
+                state.input_id
+            ))
+        },
+    )
+}
+
+/// The checks a bound host original must pass before anything is reserved or
+/// handed to native admission: it is exactly the input Core handed over with
+/// only its authority association set and its trusted ingress observation
+/// attached; the association names this session's runtime, a controller
+/// grant lineage and model, and the confirmed original; the ingress names the
+/// association's requester, actor and realm, with a controller client of the
+/// association's selection.
+fn check_bound_host_original(
+    handed: &meerkat_runtime::PromptInput,
+    bound: &meerkat_runtime::Input,
+    session: &SessionId,
+    original_work: &meerkat_runtime::OriginalWorkRef,
+) -> Result<(), String> {
+    let header = bound.header();
+    if header.retained_resume.is_some() {
+        return Err("a bound host original carries no retained resume".into());
+    }
+    let association = header
+        .authority_association
+        .as_ref()
+        .ok_or("the bound host original carries no authority association")?;
+    let ingress = header
+        .ingress_context
+        .as_ref()
+        .ok_or("the bound host original carries no trusted ingress observation")?;
+    let mut expected = handed.clone();
+    expected.header.authority_association = Some(association.clone());
+    let expected = serde_json::to_vec(&meerkat_runtime::Input::Prompt(expected))
+        .map_err(|error| error.to_string())?;
+    if serde_json::to_vec(bound).map_err(|error| error.to_string())? != expected {
+        return Err("the bound input is not the continuation input it was handed".into());
+    }
+    let claims = association.candidate();
+    if claims.controller_grant_lineage.is_empty() {
+        return Err("the binding names no controller grant lineage".into());
+    }
+    let model = claims
+        .controller_model
+        .as_ref()
+        .ok_or("the binding names no controller model")?;
+    if claims.target.logical_runtime.as_str() != LogicalRuntimeId::for_session(session).to_string()
+    {
+        return Err("the binding targets another runtime than the admitting session's".into());
+    }
+    if claims.original_work != *original_work {
+        return Err("the binding names another original than its namespace owner confirmed".into());
+    }
+    if ingress.requester() != &claims.requester
+        || ingress.ingress_actor() != &claims.ingress_actor
+        || ingress.realm() != &claims.ingress_namespace.realm
+    {
+        return Err("the ingress observation names other principals than the binding".into());
+    }
+    match ingress.controller_client() {
+        Some(client) if client.selection() == model => Ok(()),
+        _ => Err(
+            "the ingress observation carries no controller client of the binding's model".into(),
+        ),
+    }
+}
+
+/// Admit one host original row ([`ContinuationOwnerService::submit_host_original`]).
+///
+/// 1. The admission index first, on every posture: an `Applied` row is
+///    acknowledged, and a `Reserved` row whose reserved session holds the
+///    reserved input id is verified as this exact admission (with the row's
+///    own recorded association) and applied. Neither the namespace owner nor
+///    the binder is asked, so an admitted input is never refused later.
+/// 2. Static checks on the paths that still admit: a `Host` producer, no
+///    retained work, no reserved namespace. An ungoverned sink then admits a
+///    plain continuation. A governed sink needs `Queue` handling and a sink
+///    that admits governed host originals.
+/// 3. The BOUND namespace owner confirms the exact delivery, and the key
+///    ledger binds its owner and key to this row.
+/// 4. The session is prepared (never made live here: liveness is the
+///    host's), and the owner's binder binds Core's exact input fresh for it;
+///    Core checks the bound input.
+/// 5. A fresh id is reserved, and native admission settles the host's
+///    custody: promoted only on an accepted admission of the bound id,
+///    dropped when nothing was admitted or a replay deduplicated, retained
+///    unresolved otherwise.
+async fn admit_host_original(
+    inbox: &RuntimeDeliveryInbox,
+    address: &LogicalRuntimeId,
+    record: &meerkat_runtime::RuntimeDeliveryRecord,
+    sink: &dyn ContinuationDeliverySink,
+    session: &SessionId,
+    job_source: Option<&dyn RetainedJobSource>,
+    row: ContinuationRow,
+) -> Result<(), ContinuationAdmitError> {
+    use HostOriginalRefusalOrigin as Origin;
+    use meerkat_runtime::RuntimeDeliveryRefusalReason::{AuthorityDenied, NoAdmissibleWorkBinding};
+    use meerkat_runtime::input_admission_custody::NativeInputAdmissionSettlement;
+    let delivery_id = record.submission.delivery_id();
+    let delivery = row.delivery;
+    let admission_key = delivery.admission_key(delivery_id);
+    let transition = |transition: ContinuationAdmissionTransition| async move {
+        match inbox
+            .transition_continuation_admission(address, delivery_id, transition.clone())
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            ContinuationAdmissionOutcome::Transitioned(_) => Ok::<(), String>(()),
+            ContinuationAdmissionOutcome::Rejected { current } => Err(format!(
+                "continuation admission index rejected {transition:?} over {current:?}"
+            )),
+        }
+    };
+
+    // 1. The admission index first.
+    let reserved_id = match inbox
+        .continuation_admission(address, delivery_id)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        Some(ContinuationAdmission::Applied { .. }) => return Ok(()),
+        Some(ContinuationAdmission::Reserved {
+            session_id: reserved,
+            input_id,
+        }) => match sink
+            .admitted_input_by_id(&reserved, &input_id)
+            .await
+            .map_err(ContinuationAdmitError::Failed)?
+        {
+            Some(admitted) => {
+                verify_admitted_host_original(
+                    &admitted.state,
+                    &delivery,
+                    &admission_key,
+                    &input_id,
+                )?;
+                transition(ContinuationAdmissionTransition::Apply {
+                    session_id: reserved,
+                    input_id,
+                })
+                .await?;
+                return Ok(());
+            }
+            None => {
+                if reserved != *session {
+                    transition(ContinuationAdmissionTransition::Repoint {
+                        from: reserved,
+                        session_id: session.clone(),
+                        input_id: input_id.clone(),
+                    })
+                    .await?;
+                }
+                Some(input_id)
+            }
+        },
+        None => None,
+    };
+
+    // 2. Static checks on the paths that still admit.
+    let namespace = match &delivery.result.producer {
+        ContinuationProducer::Host { namespace }
+            if !namespace.is_empty() && row.retained_work.is_none() =>
+        {
+            namespace.clone()
+        }
+        _ => {
+            return Err(refused_host_original(
+                Origin::RowShape,
+                NoAdmissibleWorkBinding,
+                delivery_id,
+                "a host original row names a non-host producer or carries retained work",
+            ));
+        }
+    };
+    if is_reserved_host_namespace(&namespace) {
+        return Err(refused_host_original(
+            Origin::ReservedNamespace,
+            NoAdmissibleWorkBinding,
+            delivery_id,
+            "a reserved host namespace",
+        ));
+    }
+    if !sink.governs_work_authority() {
+        // Ungoverned: the plain admission it always was.
+        return admit_continuation(inbox, address, record, sink, session, delivery, None).await;
+    }
+    if delivery.handling != ContinuationHandling::Queue || !sink.admits_governed() {
+        return Err(refused_host_original(
+            Origin::RowShape,
+            NoAdmissibleWorkBinding,
+            delivery_id,
+            "a governed host original needs queue handling and a sink that admits it",
+        ));
+    }
+
+    // 3. The bound namespace owner confirms the exact delivery.
+    let source = job_source.ok_or_else(|| {
+        ContinuationAdmitError::Failed(
+            "no retained job source is configured for this governed runtime".into(),
+        )
+    })?;
+    let facts = match source
+        .host_original(&namespace, &delivery.result.producer_id)
+        .await
+    {
+        HostOriginalLookup::Found(facts) => facts,
+        HostOriginalLookup::Absent => {
+            return Err(refused_host_original(
+                Origin::OwnerConfirmation,
+                NoAdmissibleWorkBinding,
+                delivery_id,
+                "its namespace owner holds no such host original",
+            ));
+        }
+        HostOriginalLookup::Unavailable(error) => {
+            return Err(ContinuationAdmitError::Failed(error));
+        }
+    };
+    let ledger_digest =
+        ContinuationOwnerService::submission_digest(&facts.owner, &delivery, None, true)
+            .map_err(|error| ContinuationAdmitError::Failed(error.to_string()))?;
+    let bound_to_row = inbox
+        .continuation_key_binding(&facts.owner.ledger_owner(), delivery.key.as_str())
+        .await
+        .map_err(|error| error.to_string())?
+        .is_some_and(|binding| {
+            binding.address == *address
+                && binding.delivery_id == delivery_id.as_str()
+                && binding.submission_digest == ledger_digest
+        });
+    if facts.delivery != delivery || !bound_to_row {
+        return Err(refused_host_original(
+            Origin::OwnerConfirmation,
+            NoAdmissibleWorkBinding,
+            delivery_id,
+            "its namespace owner committed another continuation or owner",
+        ));
+    }
+    let Some(binder) = source.host_original_binder(&namespace) else {
+        return Err(refused_host_original(
+            Origin::OwnerConfirmation,
+            NoAdmissibleWorkBinding,
+            delivery_id,
+            "its namespace owner offers no binder",
+        ));
+    };
+
+    // 4. Prepare the session (never made live here), then bind fresh for it.
+    sink.prepare_governed(session).await?;
+    let input_id = reserved_id.clone().unwrap_or_else(InputId::new);
+    let handed = continuation_prompt(&delivery, &admission_key, input_id.clone());
+    let original = HostOriginalRef {
+        namespace,
+        producer_id: delivery.result.producer_id.clone(),
+        owner: facts.owner.clone(),
+        original_work: facts.original_work.clone(),
+    };
+    let bound = match binder
+        .bind(
+            &original,
+            session,
+            meerkat_runtime::Input::Prompt(handed.clone()),
+        )
+        .await
+    {
+        Ok(bound) => bound,
+        Err(HostOriginalRefusal::Denied) => {
+            return Err(refused_host_original(
+                Origin::BinderDenied,
+                AuthorityDenied,
+                delivery_id,
+                "its binder denied it",
+            ));
+        }
+        Err(HostOriginalRefusal::NotOwned) => {
+            return Err(refused_host_original(
+                Origin::BinderDenied,
+                NoAdmissibleWorkBinding,
+                delivery_id,
+                "its binder does not own it",
+            ));
+        }
+        Err(HostOriginalRefusal::NotReady(reason)) => {
+            return Err(ContinuationAdmitError::NotReady(reason));
+        }
+        Err(HostOriginalRefusal::Unavailable(error)) => {
+            return Err(ContinuationAdmitError::Failed(error));
+        }
+    };
+    let BoundHostOriginal {
+        input: bound_input,
+        settlement,
+    } = bound;
+    if let Err(detail) =
+        check_bound_host_original(&handed, &bound_input, session, &facts.original_work)
+    {
+        // Never handed to native admission: dropping the custody withdraws it.
+        drop(settlement);
+        return Err(refused_host_original(
+            Origin::BoundInput,
+            NoAdmissibleWorkBinding,
+            delivery_id,
+            &detail,
+        ));
+    }
+
+    // 5. Reserve a fresh id, then admit with native custody.
+    if reserved_id.is_none() {
+        transition(ContinuationAdmissionTransition::Reserve {
+            session_id: session.clone(),
+            input_id: input_id.clone(),
+        })
+        .await?;
+    }
+    let recorded = Arc::new(std::sync::Mutex::new(None));
+    let result = sink
+        .admit_governed(
+            session,
+            bound_input,
+            Box::new(RecordedHostOriginalSettlement(Arc::clone(&recorded))),
+        )
+        .await;
+    let settled = *recorded
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match (settled, result) {
+        (
+            Some(NativeInputAdmissionSettlement::Admitted),
+            Ok(GovernedAdmissionOutcome::Accepted(admitted)),
+        ) if admitted == input_id => {
+            let admission = HostOriginalAdmission {
+                session: session.clone(),
+                input: admitted.clone(),
+                deduplicated: false,
+            };
+            if let Err(error) = settlement.accepted(&admission) {
+                // The input was admitted: the promotion failure is reported,
+                // never a refusal.
+                tracing::warn!(
+                    delivery_id = %delivery_id,
+                    input_id = %admitted,
+                    error,
+                    "host original admitted, but its host custody was not promoted"
+                );
+            }
+            transition(ContinuationAdmissionTransition::Apply {
+                session_id: session.clone(),
+                input_id: admitted,
+            })
+            .await?;
+            Ok(())
+        }
+        (
+            Some(NativeInputAdmissionSettlement::Admitted),
+            Ok(GovernedAdmissionOutcome::Deduplicated(existing_id)),
+        ) => {
+            // A replay onto an existing input: the retry's custody is
+            // withdrawn, and the existing input stands for this delivery only
+            // as its exact admission.
+            drop(settlement);
+            let existing = sink
+                .admitted_input_by_id(session, &existing_id)
+                .await
+                .map_err(ContinuationAdmitError::Failed)?
+                .ok_or_else(|| {
+                    ContinuationAdmitError::Failed(format!(
+                        "session {session} named input {existing_id} for host original key \
+                         {admission_key} but holds no such row"
+                    ))
+                })?;
+            verify_admitted_host_original(
+                &existing.state,
+                &delivery,
+                &admission_key,
+                &existing_id,
+            )?;
+            transition(ContinuationAdmissionTransition::Apply {
+                session_id: session.clone(),
+                input_id: existing_id,
+            })
+            .await?;
+            Ok(())
+        }
+        (Some(NativeInputAdmissionSettlement::NotAdmitted), result) => {
+            drop(settlement);
+            match governed_admission_outcome(result) {
+                Err(ContinuationAdmitError::Refused(reason)) => Err(refused_host_original(
+                    Origin::NativeRefused,
+                    reason,
+                    delivery_id,
+                    "native admission refused it",
+                )),
+                Err(error) => Err(error),
+                Ok(other) => Err(ContinuationAdmitError::Failed(format!(
+                    "native admission settled not admitted for input {other}"
+                ))),
+            }
+        }
+        (settled, result) => {
+            // Admission may have happened: the custody stays with the host,
+            // and the next attempt recovers by the reserved id.
+            let detail = format!("native admission settled {settled:?}: {result:?}");
+            binder.retain_unresolved(settlement, &detail);
+            Err(ContinuationAdmitError::Failed(detail))
+        }
+    }
+}
+
 async fn admit_continuation(
     inbox: &RuntimeDeliveryInbox,
     address: &LogicalRuntimeId,
@@ -1572,35 +2823,8 @@ async fn admit_continuation(
 ) -> Result<(), ContinuationAdmitError> {
     let delivery_id = record.submission.delivery_id();
     let admission_key = delivery.admission_key(delivery_id);
-    let handling = match delivery.handling {
-        ContinuationHandling::Queue => meerkat_core::types::HandlingMode::Queue,
-        ContinuationHandling::Steer => meerkat_core::types::HandlingMode::Steer,
-    };
     let continuation_input = |input_id: InputId| {
-        meerkat_runtime::Input::Prompt(match &delivery.body {
-            ContinuationBody::Content { content } => meerkat_runtime::PromptInput::continuation(
-                input_id,
-                admission_key.clone(),
-                content.clone(),
-                handling,
-            ),
-            ContinuationBody::Notice {
-                notice_kind,
-                body,
-                blocks,
-            } => {
-                let mut prompt = meerkat_runtime::PromptInput::detached_job_completed(
-                    admission_key.clone(),
-                    meerkat_core::types::SystemNoticeMessage::with_blocks(
-                        *notice_kind,
-                        body.clone(),
-                        blocks.clone(),
-                    ),
-                );
-                prompt.header.id = input_id;
-                prompt
-            }
-        })
+        meerkat_runtime::Input::Prompt(continuation_prompt(&delivery, &admission_key, input_id))
     };
     let transition = |transition: ContinuationAdmissionTransition| async move {
         match inbox

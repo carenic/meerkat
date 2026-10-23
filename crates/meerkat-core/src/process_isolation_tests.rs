@@ -1,0 +1,57 @@
+//! Running a test's body alone in a child process of the test binary.
+//!
+//! A process that a test of this binary spawns gets a copy of every
+//! descriptor the binary has open, and keeps it until it executes its
+//! program. A test that needs a descriptor of its own gone at a given moment
+//! (a lock it released and takes again, a program it wrote and now runs)
+//! therefore runs where no other test spawns anything: alone, in a child
+//! process of the binary, whatever runs the tests (nextest's process per
+//! test, or plain `cargo test`'s threads in one process).
+
+/// Set in the child process a test runs alone in.
+const ALONE_CHILD: &str = "MEERKAT_CORE_TEST_ALONE";
+/// Printed by that child once the test's body has passed.
+const ALONE_CHILD_DONE: &str = "meerkat-core test passed alone";
+
+/// Run `body`, the body of the test `test` (its path in this binary, such as
+/// `confinement::tests::a_row`), alone in a child process of this test
+/// binary, and require it to pass there.
+pub(crate) fn alone_in_child_process(test: &str, body: impl FnOnce()) {
+    if std::env::var_os(ALONE_CHILD).is_some() {
+        body();
+        println!("\n{ALONE_CHILD_DONE}");
+        return;
+    }
+    run_in_child_process(test);
+}
+
+/// As [`alone_in_child_process`], for an async test's body.
+pub(crate) async fn alone_in_child_process_async(
+    test: &str,
+    body: impl std::future::Future<Output = ()>,
+) {
+    if std::env::var_os(ALONE_CHILD).is_some() {
+        body.await;
+        println!("\n{ALONE_CHILD_DONE}");
+        return;
+    }
+    run_in_child_process(test);
+}
+
+fn run_in_child_process(test: &str) {
+    #[allow(clippy::disallowed_methods)] // the test re-runs its own binary
+    let output = std::process::Command::new(
+        std::env::current_exe().unwrap_or_else(|error| panic!("the test binary: {error}")),
+    )
+    .args(["--exact", test, "--nocapture", "--test-threads=1"])
+    .env(ALONE_CHILD, "1")
+    .output()
+    .unwrap_or_else(|error| panic!("{test} could not start alone: {error}"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains(ALONE_CHILD_DONE),
+        "{test} failed alone in its child process ({}):\n{stdout}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

@@ -11105,7 +11105,7 @@ impl MobBuilder {
                 composition_binding,
                 pending_routed_effects: Vec::new(),
                 destroy_cleanup_active: false,
-                durable_uncertainty_fail_stop: false,
+                durable_uncertainty_fail_stop: Default::default(),
                 #[cfg(any(test, feature = "test-support"))]
                 crash_stop_reply_tx: None,
                 direct_member_adoption_pending: recovered_direct_member_adoption_pending,

@@ -941,7 +941,11 @@ impl MobActor {
                 // trust projection on the next wire/restore. Only an
                 // unexplained loss while the actor keeps running is durable
                 // uncertainty.
-                self.durable_uncertainty_fail_stop = true;
+                self.durable_uncertainty_fail_stop.record_unreplied(
+                    MobError::ExternalMemberCleanupUncertain {
+                        reason: format!("{context} effects were abandoned before settlement"),
+                    },
+                );
             }
         }
     }
@@ -1306,7 +1310,10 @@ impl MobActor {
                 %ticket,
                 "wiring effect completion has no matching custody"
             );
-            self.durable_uncertainty_fail_stop = true;
+            self.durable_uncertainty_fail_stop
+                .record_unreplied(MobError::Internal(
+                    "wiring effect completion has no matching custody".to_string(),
+                ));
             return;
         };
         let WireRealized { plan, execution } = realized;

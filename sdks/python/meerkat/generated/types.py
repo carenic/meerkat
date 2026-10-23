@@ -313,6 +313,7 @@ class McpStdioConfig:
     """Stdio transport configuration"""
     command: str
     args: Optional[list[str]] = None
+    cwd: Optional[str] = None
     env: Optional[dict[str, str]] = None
     secret_env: Optional[list[str]] = None
 
@@ -333,6 +334,7 @@ class McpStdioServerConfig(TypedDict, total=False):
     command: Required[str]
     args: NotRequired[list[str]]
     env: NotRequired[dict[str, str]]
+    cwd: NotRequired[str]
     connect_timeout_secs: NotRequired[int]
     tool_names: NotRequired[dict[str, str]]
 
@@ -762,12 +764,27 @@ WireScopeEvidence = WireScopeEvidenceTokenEndpointResponse | WireScopeEvidenceRe
 # `error.data.reason`, REST body `reason`. Hosts branch on it, never on the
 # error text. One native mapping (`HostAuthError::reason`) owns it; the
 # existing status codes and RPC error codes are unchanged.
-WireAuthErrorReason = Literal['realm_not_found', 'binding_not_found', 'mcp_server_not_configured', 'account_selection_required', 'unknown_strategy', 'device_poll_in_progress', 'device_code_already_admitted', 'device_expiry_invalid', 'missing_scopes', 'slot_occupied', 'slot_account_mismatch', 'slot_context_mismatch', 'slot_mode_mismatch', 'unverified_connector_publication', 'reauth_required', 'configuration_invalid', 'credential_access_denied', 'credential_interaction_required', 'credential_access_pending', 'credential_store_unavailable'] | Literal['invalid_target'] | Literal['binding_invalid'] | Literal['binding_inherited'] | Literal['flow_unsupported'] | Literal['mcp_server_mismatch'] | Literal['attempt_missing'] | Literal['attempt_mismatch'] | Literal['account_mismatch'] | Literal['credential_mismatch'] | Literal['verification_unavailable'] | Literal['authorization_required'] | Literal['callback_unavailable'] | Literal['upstream_failure'] | Literal['infrastructure']
+WireAuthErrorReason = Literal['realm_not_found', 'binding_not_found', 'mcp_server_not_configured', 'account_selection_required', 'unknown_strategy', 'device_poll_in_progress', 'device_code_already_admitted', 'device_expiry_invalid', 'missing_scopes', 'slot_occupied', 'slot_account_mismatch', 'slot_context_mismatch', 'slot_mode_mismatch', 'unverified_connector_publication', 'reauth_required', 'configuration_invalid', 'credential_access_denied', 'credential_interaction_required', 'credential_access_pending', 'credential_store_unavailable'] | Literal['invalid_target'] | Literal['binding_invalid'] | Literal['binding_inherited'] | Literal['flow_unsupported'] | Literal['mcp_server_mismatch'] | Literal['attempt_missing'] | Literal['attempt_mismatch'] | Literal['account_mismatch'] | Literal['credential_mismatch'] | Literal['verification_unavailable'] | Literal['authorization_required'] | Literal['callback_unavailable'] | Literal['upstream_failure'] | Literal['infrastructure'] | Literal['commit_unsettled']
+
+# A stable sub-kind of some auth errors, carried beside their `reason`
+# for hosts that must act on it. `remote_custody_required` (reason
+# `invalid_target`): an attempt started on a registered `https` redirect
+# was completed without the handle its start returned, with another one,
+# or through a path that cannot carry it, for example after the host or
+# the runtime restarted. The attempt stays pending: cancel it by its
+# reference and start again. `upstream_timeout` (reason
+# `upstream_failure`): a network stage of an MCP login got no answer within
+# its bound before the authorization code was sent; nothing was published
+# and the attempt is gone, so start again. `upstream_timeout_after_code`
+# (reason `upstream_failure`): the same after the code was sent, so it may
+# be spent at the provider; any tokens it issued were never stored.
+WireAuthErrorDetail = Literal['remote_custody_required', 'upstream_timeout', 'upstream_timeout_after_code']
 
 @dataclass
 class WireAuthErrorData:
     """`error.data` of an auth RPC error."""
     reason: WireAuthErrorReason
+    detail: Optional[WireAuthErrorDetail] = None
 
 
 @dataclass
@@ -775,6 +792,7 @@ class WireAuthErrorBody:
     """Body of a REST auth endpoint error."""
     error: str
     reason: WireAuthErrorReason
+    detail: Optional[WireAuthErrorDetail] = None
 
 
 # The recorded consent transition a notice reports.
@@ -952,9 +970,12 @@ LoginCancelParams = LoginCancelParamsMcpLoginCancelParams | LoginCancelParamsMcp
 
 # Request payload for `auth/login/complete`. For an MCP target, issuer,
 # client and resource come from the admitted attempt named by `state`;
-# nothing else is echoed. `Debug` redacts `code` and `state`.
+# nothing else is echoed. `Debug` redacts `code`, `state` and
+# `host_attempt_handle`.
 class LoginCompleteParamsProviderLoginTarget(TypedDict, total=False):
     code: Required[str]
+    host_attempt_handle: NotRequired[Optional[str]]
+    iss: NotRequired[Optional[str]]
     redirect_uri: Required[str]
     state: Required[str]
     binding_id: Required[str]
@@ -964,12 +985,16 @@ class LoginCompleteParamsProviderLoginTarget(TypedDict, total=False):
 
 class LoginCompleteParamsMcpLoginTarget(TypedDict, total=False):
     code: Required[str]
+    host_attempt_handle: NotRequired[Optional[str]]
+    iss: NotRequired[Optional[str]]
     redirect_uri: Required[str]
     state: Required[str]
     mcp: Required[WireMcpAuthTarget]
 
 class LoginCompleteParamsConnectorLoginTarget(TypedDict, total=False):
     code: Required[str]
+    host_attempt_handle: NotRequired[Optional[str]]
+    iss: NotRequired[Optional[str]]
     redirect_uri: Required[str]
     state: Required[str]
     connector: Required[WireConnectorAuthTarget]
@@ -2221,10 +2246,25 @@ class MobListResult:
 
 
 @dataclass
+class WireMobLifecycleFailure:
+    """Why a mob's actor has stopped, on a `mob/list` row: the fields a failed
+`mob/spawn_many` row carries."""
+    cause: MobSpawnManyFailureCause
+    message: str
+    code: Optional[Literal['SESSION_NOT_FOUND', 'SCHEDULE_NOT_FOUND', 'SESSION_BUSY', 'SESSION_NOT_RUNNING', 'REQUEST_CANCELLED', 'PROVIDER_ERROR', 'BUDGET_EXHAUSTED', 'HOOK_DENIED', 'AGENT_ERROR', 'CAPABILITY_UNAVAILABLE', 'SKILL_NOT_FOUND', 'SKILL_RESOLUTION_FAILED', 'INVALID_PARAMS', 'INTERNAL_ERROR', 'DUPLICATE_INPUT', 'SUPERVISOR_ROTATION_INCOMPLETE'] | Literal['SCOPE_DENIED'] | Literal['HOST_UNAVAILABLE'] | Literal['STALE_CURSOR'] | Literal['STALE_FENCE'] | Literal['MEMBER_RELOAD_REQUIRED'] | Literal['INPUT_REFUSED'] | Literal['INPUT_NOT_READY'] | Literal['SESSION_RUNTIME_UNAVAILABLE'] | Literal['APPROVAL_STORE_UNAVAILABLE'] | Literal['APPROVAL_CONFLICT'] | Literal['APPROVAL_COMMIT_UNKNOWN'] | Literal['STALE_DELIVERY_SCOPE'] | Literal['FORK_INSTRUCTION_REFUSED']] = None
+    structured_data: Optional[Any] = None
+
+
+@dataclass
 class MobStatusResult:
-    """One active mob row returned by `mob/list`."""
+    """One active mob row returned by `mob/list`.
+
+`failure` present means the mob's actor has stopped; `status` is the last
+machine phase. The actor admits no command until a restart recovers the
+mob from its durable state."""
     mob_id: str
     status: Literal['Creating', 'Running', 'Stopped', 'Completed', 'Destroyed']
+    failure: Optional[WireMobLifecycleFailure] = None
 
 
 @dataclass
@@ -2235,12 +2275,45 @@ class MobLifecycleParams:
 
 
 @dataclass
+class WireMobDestroyMemberRefusal:
+    """A member whose durability reload the runtime refused during a destroy."""
+    member: str
+    refusal: WireMemberReloadRefusal
+
+
+@dataclass
+class WireMobDestroyReport:
+    """Wire form of a mob destroy's report (`meerkat_mob::MobDestroyReport`),
+field for field: a destroy result, a lifecycle destroy and the
+`mob_destroy_incomplete` error data carry it. Members are their identity
+strings. Empty lists are left out, and a missing flag reads as `false`."""
+    errors: Optional[list[str]] = None
+    events_cleared: Optional[bool] = None
+    force_destroyed_members: Optional[list[str]] = None
+    member_reload_refusals: Optional[list[WireMobDestroyMemberRefusal]] = None
+    metadata_scrubbed: Optional[bool] = None
+    namespace_cleaned: Optional[bool] = None
+    orphaned_remote_members: Optional[list[str]] = None
+    reloaded_members: Optional[list[str]] = None
+    remote_cleanup_deadline_exceeded: Optional[bool] = None
+
+
+@dataclass
+class WireMobDestroyIncompleteData:
+    """The `data` of a `mob_destroy_incomplete` error: the destroy did not
+finish, its report says what is left, and it can be retried."""
+    code: str
+    destroy_report: WireMobDestroyReport
+    retryable: bool
+
+
+@dataclass
 class MobLifecycleResult:
     """Response payload for `mob/lifecycle`."""
     action: Literal['stop', 'resume', 'complete', 'reset', 'destroy']
     mob_id: str
     ok: bool
-    destroy_report: Optional[Any] = None
+    destroy_report: Optional[WireMobDestroyReport] = None
     stop_report: Optional[Any] = None
 
 
@@ -2973,7 +3046,7 @@ class MobSnapshotResult:
 @dataclass
 class MobDestroyResult:
     """Response payload for `mob/destroy`."""
-    destroy_report: Any
+    destroy_report: WireMobDestroyReport
     mob_id: str
     ok: bool
 
@@ -6433,23 +6506,27 @@ class WireMcpAuthStatus:
 
 
 # `POST /auth/login/start` success body. Host-channel data: the
-# authorize URL and state must never reach an agent, tool result,
-# transcript or log.
+# authorize URL, state and host attempt handle must never reach an agent,
+# tool result, transcript or log.
 class WireLoginStartProviderLoginStart(TypedDict, total=False):
     authorize_url: Required[str]
+    host_attempt_handle: NotRequired[Optional[str]]
     redirect_uri: Required[str]
     state: Required[str]
     provider: Required[Literal['anthropic', 'openai', 'google', 'copilot']]
 
 class WireLoginStartMcpLoginStart(TypedDict, total=False):
     authorize_url: Required[str]
+    host_attempt_handle: NotRequired[Optional[str]]
     redirect_uri: Required[str]
     state: Required[str]
+    attempt_ref: NotRequired[Optional[str]]
     disposition: Required[Literal['started', 'joined']]
     mcp: Required[WireMcpAuthTarget]
 
 class WireLoginStartConnectorSlotTarget(TypedDict, total=False):
     authorize_url: Required[str]
+    host_attempt_handle: NotRequired[Optional[str]]
     redirect_uri: Required[str]
     state: Required[str]
     connector: Required[WireConnectorSlot]
@@ -6773,6 +6850,17 @@ WireMemberState = Any
 
 # Execution status mirroring `meerkat_mob::runtime::MobMemberStatus`.
 WireMobMemberStatus = Literal['active', 'retiring', 'broken', 'completed', 'unknown']
+
+# Why the runtime refused a member's durability reload.
+class WireMemberReloadRefusalRepairBlocked(TypedDict, total=False):
+    evidence_digest: NotRequired[Optional[str]]
+    kind: Required[Literal['repair_blocked']]
+    reason: Required[str]
+
+class WireMemberReloadRefusalUnknown(TypedDict, total=False):
+    kind: Required[Literal['unknown']]
+
+WireMemberReloadRefusal = WireMemberReloadRefusalRepairBlocked | WireMemberReloadRefusalUnknown
 
 # Mob RPC helper wire type for WireMobRuntimeMode.
 WireMobRuntimeMode = Literal['autonomous_host', 'turn_driven']

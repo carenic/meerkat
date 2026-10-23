@@ -13,6 +13,10 @@
     not(feature = "session-store"),
     allow(dead_code, unused_imports, unused_variables)
 )]
+// The clap-derive doc comments below are rkat's --help text, so their
+// placeholders (`<state-root>`, `<id>`, ...) stay literal: rustdoc would
+// read them as unclosed HTML tags.
+#![allow(rustdoc::invalid_html_tags)]
 
 mod cli_parse;
 mod exit_status;
@@ -3802,6 +3806,8 @@ enum MobCommands {
         #[arg(long)]
         model: Option<String>,
         /// Auth binding to use (REALM:BINDING[:PROFILE]).
+        // --help text: `[:PROFILE]` is an optional part, not a doc link.
+        #[allow(rustdoc::broken_intra_doc_links)]
         #[arg(long)]
         auth_binding: Option<String>,
         /// Label attached to the certified bounded result.
@@ -3833,6 +3839,8 @@ enum MobCommands {
         #[arg(long)]
         model: Option<String>,
         /// Auth binding to use (REALM:BINDING[:PROFILE]).
+        // --help text: `[:PROFILE]` is an optional part, not a doc link.
+        #[allow(rustdoc::broken_intra_doc_links)]
         #[arg(long)]
         auth_binding: Option<String>,
         /// Label attached to the certified bounded result.
@@ -13141,6 +13149,13 @@ impl meerkat_mob::MobSessionService for RunMobSessionService {
         <EphemeralSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::discard_live_session_under_runtime_turn_boundary(&self.inner, session_id).await
     }
 
+    /// The wrapped service owns the session actors, so the exit of a removed
+    /// one is awaited there.
+    async fn await_removed_actor_exit(&self, session_id: &SessionId) {
+        meerkat_mob::MobSessionService::await_removed_actor_exit(self.inner.as_ref(), session_id)
+            .await;
+    }
+
     async fn subscribe_session_events(
         &self,
         session_id: &SessionId,
@@ -16994,6 +17009,13 @@ impl meerkat_mob::MobSessionService for MobCliSessionService {
         session_id: &SessionId,
     ) -> Result<(), meerkat_core::service::SessionError> {
         <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::discard_live_session_under_runtime_turn_boundary(&self.inner, session_id).await
+    }
+
+    /// The wrapped persistent service owns the session actors, so the exit
+    /// of a removed one is awaited there.
+    async fn await_removed_actor_exit(&self, session_id: &SessionId) {
+        meerkat_mob::MobSessionService::await_removed_actor_exit(self.inner.as_ref(), session_id)
+            .await;
     }
 
     async fn subscribe_session_events(
@@ -22027,8 +22049,9 @@ impl meerkat::HostConfigLayer for DeployConfigLayers {
 
 /// Whether the deploy runtime provides a typed capability that gates a pack
 /// deploy knob. Mirrors the token-based runtime surface in
-/// [`runtime_capabilities`] but in the typed [`CapabilityId`] vocabulary the
-/// deploy policy gates against.
+/// [`runtime_capabilities`] but in the typed
+/// [`CapabilityId`](meerkat_contracts::capability::CapabilityId) vocabulary
+/// the deploy policy gates against.
 #[cfg(feature = "mob")]
 fn deploy_runtime_provides_capability(
     capability: meerkat_contracts::capability::CapabilityId,
@@ -22105,7 +22128,8 @@ fn runtime_capabilities(
     caps
 }
 
-/// K18: required capabilities are compared by typed [`MobpackCapabilityId`],
+/// K18: required capabilities are compared by typed
+/// [`MobpackCapabilityId`](meerkat_contracts::capability::MobpackCapabilityId),
 /// never by raw token string. A requirement that does not classify into the
 /// typed vocabulary (`Unknown`) can never be satisfied and fails closed.
 #[cfg(feature = "mob")]

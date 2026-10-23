@@ -641,13 +641,28 @@ pub fn resolve_effective_turn_config(
         config_generation: metadata
             .config_generation
             .or(realm_defaults.config_generation),
-        // Phase 3: persisted auth_binding re-entered at resume time so
-        // the binding re-resolves through the same realm entry unless this
-        // recovery request explicitly sets or clears it.
-        auth_binding: match &overrides.auth_binding {
-            Some(TurnMetadataOverride::Clear) => None,
-            Some(TurnMetadataOverride::Set(value)) => Some(value.clone()),
-            None => metadata.auth_binding.clone(),
+        // Phase 3: persisted auth_binding re-entered at resume time so the
+        // binding re-resolves through the same realm entry, unless this
+        // recovery request sets or clears it. It follows the one rule every
+        // identity change uses: a provider change drops the persisted binding
+        // and the new provider resolves its own route. A provider the build
+        // recomputes from the model is not known here, so only an explicit
+        // binding is passed on and the build settles the rest against the
+        // provider it resolves.
+        auth_binding: match llm_binding.provider {
+            Some(provider) => crate::session::resolve_session_auth_binding(
+                metadata.provider,
+                metadata.auth_binding.as_ref(),
+                provider,
+                overrides
+                    .auth_binding
+                    .as_ref()
+                    .map(TurnMetadataOverride::as_ref),
+            ),
+            None => match &overrides.auth_binding {
+                Some(TurnMetadataOverride::Set(value)) => Some(value.clone()),
+                Some(TurnMetadataOverride::Clear) | None => None,
+            },
         },
         // Durable mob-member identity is carried forward verbatim at resume so
         // mob ownership routing keeps recognizing the member after restart.
@@ -1075,6 +1090,62 @@ mod tests {
         assert!(!recovered.build.resume_override_mask.provider);
     }
 
+    /// The surface recovery merge follows the one binding rule: a provider
+    /// override that changes provider drops the persisted binding, a model
+    /// override that recomputes the provider leaves the binding to the build,
+    /// and the same provider keeps it.
+    #[test]
+    fn build_recovered_session_restores_the_persisted_binding_only_for_its_provider() {
+        let mut session = sample_session();
+        let mut metadata = session.session_metadata().expect("session metadata");
+        let persisted_ref = auth_binding("persisted", "anthropic");
+        metadata.auth_binding = Some(persisted_ref.clone());
+        session
+            .set_session_metadata(metadata)
+            .expect("updated session metadata");
+        let recover = |overrides: SurfaceSessionRecoveryOverrides| {
+            build_recovered_session(
+                session.clone(),
+                &overrides,
+                SurfaceSessionRecoveryContext::default(),
+            )
+            .expect("recovered session")
+        };
+
+        let switched = recover(SurfaceSessionRecoveryOverrides {
+            model: Some("test-openai-other".to_string()),
+            provider: Some(Provider::OpenAI),
+            ..Default::default()
+        });
+        assert_eq!(switched.build.provider, Some(Provider::OpenAI));
+        assert_eq!(
+            switched.build.auth_binding, None,
+            "the persisted Anthropic binding does not ride into an OpenAI resume"
+        );
+        assert!(!switched.build.resume_override_mask.auth_binding);
+
+        let same_provider = recover(SurfaceSessionRecoveryOverrides {
+            model: Some("test-anthropic-other".to_string()),
+            provider: Some(Provider::Anthropic),
+            ..Default::default()
+        });
+        assert_eq!(same_provider.build.auth_binding, Some(persisted_ref));
+
+        let recomputed = recover(SurfaceSessionRecoveryOverrides {
+            model: Some("test-openai-other".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(
+            recomputed.build.provider, None,
+            "a model-only override recomputes the provider from the model"
+        );
+        assert_eq!(
+            recomputed.build.auth_binding, None,
+            "a provider recomputed from the model leaves the binding to the build"
+        );
+        assert!(!recomputed.build.resume_override_mask.auth_binding);
+    }
+
     #[test]
     fn build_recovered_session_auth_binding_override_and_clear_stay_explicit() {
         let mut session = sample_session();
@@ -1474,7 +1545,7 @@ mod tests {
     fn build_recovered_session_model_override_clears_persisted_self_hosted_binding() {
         let mut session = sample_session();
         let mut metadata = session.session_metadata().expect("session metadata");
-        metadata.model = "gemma-4-e2b".to_string();
+        metadata.model = "test-self-hosted-edge".to_string();
         metadata.provider = Provider::SelfHosted;
         metadata.self_hosted_server_id = Some("local".to_string());
         session
@@ -1484,14 +1555,14 @@ mod tests {
         let recovered = build_recovered_session(
             session,
             &SurfaceSessionRecoveryOverrides {
-                model: Some("gemma-4-31b".to_string()),
+                model: Some("test-self-hosted-large".to_string()),
                 ..Default::default()
             },
             SurfaceSessionRecoveryContext::default(),
         )
         .expect("recovered session with model override");
 
-        assert_eq!(recovered.model, "gemma-4-31b");
+        assert_eq!(recovered.model, "test-self-hosted-large");
         assert_eq!(
             recovered.build.provider, None,
             "model-only overrides should recompute provider from the new model"

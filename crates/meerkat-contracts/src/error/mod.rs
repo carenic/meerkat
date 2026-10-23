@@ -463,10 +463,11 @@ pub fn agent_transport_error_code(error: &meerkat_core::AgentError) -> ErrorCode
         | AgentError::ToolCallBudgetExceeded { .. } => ErrorCode::BudgetExhausted,
         // A turn refused by its instruction activation history (a fork child
         // that never activated its inherited keys) keeps the code its former
-        // configuration-string form had.
-        AgentError::ConfigError(_) | AgentError::InstructionActivation(_) => {
-            ErrorCode::InvalidParams
-        }
+        // configuration-string form had. A directed turn refused while a
+        // staged create-time prompt is pending is refused the same way.
+        AgentError::ConfigError(_)
+        | AgentError::InstructionActivation(_)
+        | AgentError::StagedPromptDirectedTurnRefused => ErrorCode::InvalidParams,
         AgentError::HookDenied { .. } => ErrorCode::HookDenied,
         AgentError::Llm { .. } | AgentError::BuildError(_) => ErrorCode::ProviderError,
         AgentError::SessionNotFound(_) => ErrorCode::SessionNotFound,

@@ -2254,26 +2254,25 @@ impl GeminiClient {
                 Err(LlmError::from_http_response(status_code, text, &headers))
             };
             let mut stream = stream_result?;
-            let mut buffer = String::with_capacity(512);
+            let mut lines = meerkat_llm_core::streaming::Utf8LineBuffer::with_capacity(512);
             let mut tool_call_index: u32 = 0;
 
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|_| LlmError::ConnectionReset)?;
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                lines.push(&chunk);
 
                 let chunk_yielded = std::cell::Cell::new(false);
                 let mut chunk_consumed_line = false;
-                while let Some(newline_pos) = buffer.find('\n') {
+                while let Some(line) = lines.next_line() {
                     chunk_consumed_line = true;
-                    let line = buffer[..newline_pos].trim();
+                    let line = line?;
+                    let line = line.trim();
                     let data = line.strip_prefix("data: ");
                     let parsed_response = if let Some(d) = data {
                         self.parse_stream_line_for_wire(d)?
                     } else {
                         None
                     };
-
-                    buffer.drain(..=newline_pos);
 
                     if let Some(resp) = parsed_response {
                         // Read before the candidates are consumed (#1888).
@@ -3793,6 +3792,138 @@ mod tests {
             "https://example.com"
         );
         Ok(())
+    }
+
+    /// Serves each element of `chunks` as a separate paced HTTP body chunk of
+    /// raw bytes, so one character can straddle two network reads.
+    async fn paced_byte_gemini_sse(State(chunks): State<Vec<Vec<u8>>>) -> impl IntoResponse {
+        let body_stream = async_stream::stream! {
+            for chunk in chunks {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                yield Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(chunk));
+            }
+        };
+        (
+            [("content-type", "text/event-stream")],
+            axum::body::Body::from_stream(body_stream),
+        )
+    }
+
+    /// The streamed text and terminal outcome of one paced Gemini byte stream.
+    async fn stream_gemini_paced_bytes(chunks: Vec<Vec<u8>>) -> (String, Option<LlmDoneOutcome>) {
+        let app = Router::new()
+            .route(
+                "/v1beta/models/gemini-2.5-flash:streamGenerateContent",
+                post(paced_byte_gemini_sse),
+            )
+            .with_state(chunks);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+        let client =
+            GeminiClient::new_with_base_url("test-key".to_string(), format!("http://{addr}"));
+        let request = LlmRequest::new(
+            "gemini-2.5-flash",
+            vec![Message::User(UserMessage::text("hello".to_string()))],
+        );
+        let mut stream = client.stream(&request);
+        let mut text = String::new();
+        let mut done = None;
+        while let Some(event) = stream.next().await {
+            match event.expect("stream event") {
+                LlmEvent::TextDelta { delta, .. } => text.push_str(&delta),
+                LlmEvent::Done { outcome } => {
+                    done = Some(outcome);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        handle.abort();
+        (text, done)
+    }
+
+    /// `payload` cut into two network chunks inside each multi-byte character
+    /// of `text` (a 3-byte one 1|2 and 2|1, a 4-byte one 1|3, 2|2 and 3|1),
+    /// and on each side of the line break that ends the line holding `text`.
+    fn utf8_split_cases(payload: &str, text: &str) -> Vec<(String, Vec<Vec<u8>>)> {
+        let bytes = payload.as_bytes();
+        let start = payload.find(text).expect("payload holds the text");
+        let mut cases = Vec::new();
+        for (offset, ch) in text.char_indices().filter(|(_, ch)| ch.len_utf8() > 1) {
+            for split in 1..ch.len_utf8() {
+                let at = start + offset + split;
+                cases.push((
+                    format!(
+                        "U+{:04X} split {split}|{}",
+                        ch as u32,
+                        ch.len_utf8() - split
+                    ),
+                    vec![bytes[..at].to_vec(), bytes[at..].to_vec()],
+                ));
+            }
+        }
+        let line_end = start + payload[start..].find('\n').expect("a line break");
+        for (side, at) in [("before", line_end), ("after", line_end + 1)] {
+            cases.push((
+                format!("chunk boundary {side} the line break"),
+                vec![bytes[..at].to_vec(), bytes[at..].to_vec()],
+            ));
+        }
+        cases
+    }
+
+    const SPLIT_TEXT: &str = "don\u{2019}t panic \u{1F642}";
+
+    fn split_gemini_payload(text_json: &str) -> String {
+        format!(
+            "data: {{\"candidates\":[{{\"content\":{{\"parts\":[{{\"text\":\"{text_json}\"}}]}},\"finishReason\":\"STOP\"}}],\"usageMetadata\":{{\"promptTokenCount\":3,\"candidatesTokenCount\":4}}}}\n\n"
+        )
+    }
+
+    /// A character split across network chunks reaches the Gemini text
+    /// exactly, never as U+FFFD, wherever the chunk boundary falls.
+    /// (Fails-old: each chunk was decoded on its own, so a split character
+    /// became U+FFFD.)
+    #[tokio::test]
+    async fn stream_text_split_inside_a_multibyte_character_arrives_exact() {
+        let payload = split_gemini_payload(SPLIT_TEXT);
+        let mut failures = Vec::new();
+        for (case, chunks) in utf8_split_cases(&payload, SPLIT_TEXT) {
+            let (text, done) = stream_gemini_paced_bytes(chunks).await;
+            if text != SPLIT_TEXT || !matches!(done, Some(LlmDoneOutcome::Success { .. })) {
+                failures.push(format!("{case}: {text:?} {done:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// A complete line that is not valid UTF-8 fails the stream as a parse
+    /// error; its bytes are never replaced with U+FFFD. (Fails-old: the
+    /// invalid byte became U+FFFD in the text and the turn succeeded.)
+    #[tokio::test]
+    async fn stream_line_with_invalid_utf8_is_a_stream_parse_error() {
+        let mut payload = split_gemini_payload("bad \u{0001} byte").into_bytes();
+        let marker = payload
+            .iter()
+            .position(|byte| *byte == 0x01)
+            .expect("marker byte");
+        payload[marker] = 0xFF;
+        let (text, done) = stream_gemini_paced_bytes(vec![payload]).await;
+        assert!(!text.contains('\u{FFFD}'), "{text:?}");
+        assert!(
+            matches!(
+                &done,
+                Some(LlmDoneOutcome::Error {
+                    error: LlmError::StreamParseError { .. }
+                })
+            ),
+            "{done:?}"
+        );
     }
 
     #[test]

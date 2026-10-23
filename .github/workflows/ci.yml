@@ -239,14 +239,14 @@ env:
   # toolchain wrapper path is identical across runs and lanes.
   RUST_LANE_ID: ci
   # Compiled objects live in the GCS bucket named by the repository variable
-  # MEERKAT_SCCACHE_GCS_BUCKET (default: the project bucket below), selected
-  # per job by .github/actions/setup-sccache-ci; with the GCP identity
-  # unavailable (fork pull requests) a lane runs with a local disk cache
-  # only. The GitHub Actions cache is 10 GB per repository and one
+  # MEERKAT_SCCACHE_GCS_BUCKET, selected per job by
+  # .github/actions/setup-sccache-ci; with the variable unset or the GCP
+  # identity unavailable (fork pull requests) a lane runs with a local disk
+  # cache only. The GitHub Actions cache is 10 GB per repository and one
   # workspace-mode run exceeds it, so writes failed at the quota and every run
   # stayed cold; it now keeps only the cargo registry. Debuginfo is off
   # (above) so the objects stay small.
-  SCCACHE_GCS_BUCKET_NAME: ${{ vars.MEERKAT_SCCACHE_GCS_BUCKET || 'meerkat-sccache-king-dnn-training-dev' }}
+  SCCACHE_GCS_BUCKET_NAME: ${{ vars.MEERKAT_SCCACHE_GCS_BUCKET }}
   # Pull-request wall-clock budget, split by who controls the time. It exists
   # to catch runaway CI (a lane that grows, aggregate drift), not to police a
   # single lane; every lane's own timeout-minutes does that.
@@ -265,6 +265,19 @@ env:
   # 3167 s with every lane green and 2817 s of runner queue).
   # Queue wait on the critical path at or above CI_QUEUE_WARN_SECONDS is a
   # warning with a typed verdict (queue_delayed), never a failure.
+  #
+  # Both budgets hold every lane a pull request plans for ordinary reasons.
+  # An exact-profile lane (governed-jsonl, mcp-confinement-positive) that
+  # the plan ran only because the change touched its inputs or changed its
+  # definition (the plan's guard_lane_reasons, from GUARD_LANE_INPUTS and
+  # GUARD_LANE_DEFINITIONS in scripts/ci-cargo-lanes.mjs) is outside them:
+  # the confinement lane's cold build alone takes 27.5-32.5 minutes, so such
+  # a pull request could never pass otherwise. It still must succeed, its
+  # own timeout-minutes (40 on a pull request) bounds it, and the gate names
+  # it, with its seconds and the reason, in a "Guard lane outside the
+  # budget" warning. A guard lane run on every Rust change (a push, a
+  # dispatch, a release projection) or for an unknown diff is planned for an
+  # ordinary reason and stays in the budget.
   #
   # Sizing. The owner's cap is 20 minutes from the start of the pre-push
   # hook to a green CI gate. The hook now takes about a minute (49-55 s of
@@ -322,6 +335,7 @@ jobs:
       rustdoc: ${{ steps.plan.outputs.rustdoc }}
       governed_jsonl: ${{ steps.plan.outputs.governed_jsonl }}
       mcp_confinement_positive: ${{ steps.plan.outputs.mcp_confinement_positive }}
+      guard_lane_reasons: ${{ steps.plan.outputs.guard_lane_reasons }}
       deferred_to_push: ${{ steps.plan.outputs.deferred_to_push }}
       reader_not_run: ${{ steps.plan.outputs.reader_not_run }}
       shard_count: ${{ steps.plan.outputs.shard_count }}
@@ -1292,7 +1306,12 @@ jobs:
     # The push's build is cold after a change below the facade: 32.5 minutes
     # on main push 39213218053 and 27.5 on dispatch 39211283488, against the
     # 40 a pull request keeps. A push or dispatch gets 50, about 54% above
-    # the slower run.
+    # the slower run. That cold build cannot fit the gate's pull-request
+    # budget (1760 s on pull-request run 39919235188), so a pull request
+    # that runs this lane for its inputs or definition leaves it out of the
+    # budget and names it in a warning (the gate's "Enforce lane execution
+    # budget" step); the 40 minutes here are then its runaway bound, and the
+    # gate still requires it to succeed.
     if: ${{ needs.changes.outputs.mcp_confinement_positive == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ github.event_name == 'pull_request' && 40 || 50 }}
@@ -3235,6 +3254,23 @@ jobs:
         # launder an execution overrun. Terminals use per-attempt clocks: a
         # re-run lane gets a fresh clock, a carried-over lane keeps its own
         # attempt's clock.
+        #
+        # One exception, on a pull request only: an exact-profile lane
+        # (governed JSONL, MCP confinement positive) that the plan ran only
+        # because the change touched its inputs or changed its definition
+        # (every reason in guard_lane_reasons is inputs_changed or
+        # definition_changed) and that succeeded is left out of both budgets
+        # and of their critical paths. Its cold build alone exceeds them (the
+        # confinement lane's job comment), so such a pull request could never
+        # pass otherwise. The lane check above still requires it to succeed,
+        # its own timeout-minutes still bounds it, and this step names it,
+        # with its seconds and the reason, in a "Guard lane outside the budget"
+        # warning, the summary, the lane table and the
+        # guard_lanes_outside_budget output. The plan's reasons are read, never
+        # inferred here: a lane it ran on every Rust change or for an unknown
+        # diff stays in the budget, and a reasons output that is missing or
+        # unreadable, a lane GUARD_LANE_JOBS cannot name, or a named lane
+        # with no completed job fails a pull request.
         if: ${{ !cancelled() }}
         shell: bash
         env:
@@ -3247,6 +3283,10 @@ jobs:
           CLASSIFICATION_JOB_NAME: Change classification
           ROOT_JOB_NAMES: Change classification,Format + governance
           STAGGER_JOB_NAME: Stagger the short rows
+          # Why the plan ran each exact-profile lane, and those lanes' job
+          # names (exact matches).
+          GUARD_LANE_REASONS: ${{ needs.changes.outputs.guard_lane_reasons }}
+          GUARD_LANE_JOBS: governed_jsonl=Governed JSONL,mcp_confinement_positive=MCP confinement positive (Linux)
           # Seconds to wait before each retry of a GitHub API request that
           # answered with a server error (5xx). Any other failure, or a
           # server error after the last retry, still fails a measurement the
@@ -3302,6 +3342,39 @@ jobs:
           classification_name = os.environ["CLASSIFICATION_JOB_NAME"]
           root_names = set(os.environ["ROOT_JOB_NAMES"].split(","))
           stagger_name = os.environ["STAGGER_JOB_NAME"]
+
+          # On a pull request, the exact-profile lanes the plan ran only
+          # because the change touched their inputs or changed their
+          # definition, by job name, with their reasons. Read from the plan,
+          # never inferred; fails closed.
+          EXEMPT_REASONS = {"definition_changed", "inputs_changed"}
+          guard_jobs = {}
+          for entry in os.environ.get("GUARD_LANE_JOBS", "").split(","):
+              lane_id, _, job_name = entry.partition("=")
+              if lane_id and job_name:
+                  guard_jobs[lane_id] = job_name
+          exempt = {}
+          if enforce:
+              raw_reasons = os.environ.get("GUARD_LANE_REASONS", "")
+              try:
+                  plan_reasons = json.loads(raw_reasons)
+                  if not isinstance(plan_reasons, dict) or not all(
+                      isinstance(reasons, list) and all(isinstance(reason, str) for reason in reasons)
+                      for reasons in plan_reasons.values()
+                  ):
+                      raise ValueError("expected an object of reason lists")
+              except ValueError as error:
+                  print(f"::error::the plan's guard_lane_reasons is unreadable ({raw_reasons!r}): {error}")
+                  sys.exit(1)
+              for lane_id, reasons in plan_reasons.items():
+                  if lane_id not in guard_jobs:
+                      print(
+                          f"::error::the plan ran guard lane {lane_id} ({', '.join(reasons)}), "
+                          f"which GUARD_LANE_JOBS does not name."
+                      )
+                      sys.exit(1)
+                  if reasons and set(reasons) <= EXEMPT_REASONS:
+                      exempt[guard_jobs[lane_id]] = reasons
 
           def collect_lanes():
               # Start of every attempt so far; a carried-over job belongs to the
@@ -3399,10 +3472,28 @@ jobs:
               # budgeted.
               lane["exec_terminal"] = max(0, lane["terminal"] - lane["path_queued"])
 
-          exec_critical = max(lanes, key=lambda lane: lane["exec_path"])
-          critical = max(lanes, key=lambda lane: lane["terminal"])
-          runaway_critical = max(lanes, key=lambda lane: lane["exec_terminal"])
-          slowest = max(lanes, key=lambda lane: lane["duration"])
+          # A lane the plan ran for its inputs or definition is outside the
+          # budget only when it succeeded; failed or cancelled, it is
+          # measured like any other.
+          for job_name, reasons in exempt.items():
+              if not any(lane["name"] == job_name for lane in lanes):
+                  print(
+                      f"::error::the plan ran {job_name} ({', '.join(reasons)}), but this attempt "
+                      f"has no completed job of that name."
+                  )
+                  sys.exit(1)
+          for lane in lanes:
+              lane["outside_budget"] = lane["name"] in exempt and lane["conclusion"] == "success"
+          budgeted = [lane for lane in lanes if not lane["outside_budget"]]
+          outside = [lane for lane in lanes if lane["outside_budget"]]
+          if not budgeted:
+              print("::error::no completed lane is left in the lane execution budget.")
+              sys.exit(1)
+
+          exec_critical = max(budgeted, key=lambda lane: lane["exec_path"])
+          critical = max(budgeted, key=lambda lane: lane["terminal"])
+          runaway_critical = max(budgeted, key=lambda lane: lane["exec_terminal"])
+          slowest = max(budgeted, key=lambda lane: lane["duration"])
           exec_path = exec_critical["exec_path"]
           terminal = critical["terminal"]
           queued = critical["path_queued"]
@@ -3423,8 +3514,18 @@ jobs:
               "| lane | attempt | queued s | ran s | exec path s | terminal s | terminal excl. queue s | result |",
               "| --- | --- | --- | --- | --- | --- | --- | --- |",
           ] + [
-              f"| {r['name']} | {r['attempt']} | {r['queued']} | {r['duration']} | {r['exec_path']} | {r['terminal']} | {r['exec_terminal']} | {r['conclusion']} |"
+              f"| {r['name']} | {r['attempt']} | {r['queued']} | {r['duration']} | {r['exec_path']} | {r['terminal']} | {r['exec_terminal']} | {r['conclusion']}{' (outside the budget)' if r['outside_budget'] else ''} |"
               for r in rows[:12]
+          ]
+          because = {"definition_changed": "changed its definition", "inputs_changed": "touched its inputs"}
+          outside_notes = [
+              f"{lane['name']} ran {lane['duration']} s (execution path {lane['exec_path']} s, "
+              f"push-to-terminal excluding runner queue {lane['exec_terminal']} s) outside the lane "
+              f"budgets: the plan ran it because the change "
+              f"{' and '.join(because[reason] for reason in exempt[lane['name']])} "
+              f"({', '.join(exempt[lane['name']])}); it is still required to succeed, and its own "
+              f"timeout-minutes bounds it."
+              for lane in outside
           ]
           verdict = (
               f"Lane execution: {exec_path}/{max_exec} s (execution critical path: {exec_critical['name']}); "
@@ -3433,13 +3534,21 @@ jobs:
               f"push-to-terminal excluding runner queue: {exec_terminal}/{max_terminal} s "
               f"(critical path: {runaway_critical['name']}); "
               f"slowest lane: {slowest['name']}, ran {slowest['duration']} s; verdict: {verdict_type}"
+              + "".join(f"; outside the budget: {lane['name']}, ran {lane['duration']} s" for lane in outside)
           )
           print(verdict)
           print("\n".join(table))
+          for note in outside_notes:
+              print(f"::warning title=Guard lane outside the budget::{note}")
           summary = os.environ.get("GITHUB_STEP_SUMMARY")
           if summary:
               with open(summary, "a", encoding="utf-8") as handle:
-                  handle.write(f"### Lane execution budget\n\n{verdict}\n\n" + "\n".join(table) + "\n")
+                  handle.write(
+                      f"### Lane execution budget\n\n{verdict}\n\n"
+                      + "".join(f"Guard lane outside the budget: {note}\n\n" for note in outside_notes)
+                      + "\n".join(table)
+                      + "\n"
+                  )
           output = os.environ.get("GITHUB_OUTPUT")
           if output:
               with open(output, "a", encoding="utf-8") as handle:
@@ -3449,6 +3558,21 @@ jobs:
                       f"terminal_excluding_queue_seconds={exec_terminal}\n"
                       f"queue_seconds={queued}\n"
                       f"budget_verdict={verdict_type}\n"
+                      "guard_lanes_outside_budget="
+                      + json.dumps(
+                          [
+                              {
+                                  "job": lane["name"],
+                                  "reasons": exempt[lane["name"]],
+                                  "ran_seconds": lane["duration"],
+                                  "exec_path_seconds": lane["exec_path"],
+                                  "terminal_excluding_queue_seconds": lane["exec_terminal"],
+                              }
+                              for lane in outside
+                          ],
+                          separators=(",", ":"),
+                      )
+                      + "\n"
                   )
           if queued >= queue_warn:
               print(

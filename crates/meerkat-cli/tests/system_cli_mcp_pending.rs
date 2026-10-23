@@ -115,7 +115,7 @@ async fn write_slow_mcp_config(
     let stub_path = project_dir.join("slow-mcp-server.sh");
     tokio::fs::write(&stub_path, "#!/bin/sh\nexec 2>/dev/null\nsleep 60\n").await?;
     let mcp_toml = format!(
-        "[[servers]]\nname = \"king-search\"\ncommand = \"/bin/sh\"\nargs = [\"{}\"]\nconnect_timeout_secs = 2\n",
+        "[[servers]]\nname = \"slow-search\"\ncommand = \"/bin/sh\"\nargs = [\"{}\"]\nconnect_timeout_secs = 2\n",
         stub_path.display()
     );
     tokio::fs::write(project_dir.join(".rkat/mcp.toml"), mcp_toml).await?;

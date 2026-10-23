@@ -504,7 +504,7 @@ impl MobHandle {
 /// [`MobHandle::durable_identity_members`]), or with no running mob through
 /// [`crate::MobStorage::read_member_binding_history`]. It is a history fact:
 /// it authorizes nothing, and only the reads construct one (and, for a
-/// host's test doubles, [`Self::for_test`] under `test-support`).
+/// host's test doubles, `Self::for_test` under `test-support`).
 ///
 /// The journal is the mob's own: spawn, reset and session-binding recovery
 /// events bind an incarnation to a session, and a retirement or a mob reset

@@ -823,7 +823,17 @@ fn refresh_error_from_mutation(error: CredentialMutationError) -> RefreshError {
         CredentialMutationError::CredentialAccess { refusal, detail } => {
             RefreshError::CredentialAccess { refusal, detail }
         }
-        other => RefreshError::Refresh(other.to_string()),
+        // Every other mutation failure is a refresh failure with its text. A
+        // failed publication rollback cannot reach this path: the
+        // shared-refresh adoption mutation never compensates through one, and
+        // a lost owner is classified by the refresh rules like any failure.
+        error @ (CredentialMutationError::Operation(_)
+        | CredentialMutationError::TokenStore(_)
+        | CredentialMutationError::AuthLifecycle(_)
+        | CredentialMutationError::LockFailed(_)
+        | CredentialMutationError::SlotRefused(_)
+        | CredentialMutationError::Cancelled
+        | CredentialMutationError::RollbackFailed(_)) => RefreshError::Refresh(error.to_string()),
     }
 }
 
@@ -2455,6 +2465,7 @@ mod tests {
         .expect("runtime AuthLeaseHandle is certified by generated AuthMachine authority")
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     fn fixture_refresh_observation_time(expires_at: u64) -> u64 {
         if expires_at == u64::MAX {
@@ -2464,6 +2475,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     fn mark_tokens_lifecycle_published_for_transition_for_test(
         tokens: &PersistedTokens,
@@ -2487,6 +2499,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     fn mark_lease_tokens_lifecycle_published_for_test(
         lease_key: &LeaseKey,
@@ -6027,6 +6040,49 @@ mod tests {
         #[tokio::test]
         async fn existing_maintenance_rejects_newer_locked_row_after_owner_replacement() {
             assert_locked_newer_publication(true).await;
+        }
+    }
+
+    /// Every credential-mutation error reaches a refresh caller through a
+    /// named arm. A failed publication rollback and a lost owner cannot reach
+    /// this path today (its mutation never compensates through a publication
+    /// rollback); they keep the refresh failure text they had.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn resolver_maps_every_mutation_error_explicitly() {
+        assert!(matches!(
+            refresh_error_from_mutation(CredentialMutationError::StalePreparation),
+            RefreshError::StalePreparation
+        ));
+        assert!(matches!(
+            refresh_error_from_mutation(CredentialMutationError::CredentialAccess {
+                refusal: meerkat_core::auth::TokenStoreRefusal::Pending,
+                detail: "busy".into(),
+            }),
+            RefreshError::CredentialAccess {
+                refusal: meerkat_core::auth::TokenStoreRefusal::Pending,
+                ..
+            }
+        ));
+        for error in [
+            CredentialMutationError::Operation("operation".into()),
+            CredentialMutationError::TokenStore("store".into()),
+            CredentialMutationError::AuthLifecycle("lifecycle".into()),
+            CredentialMutationError::LockFailed("lock".into()),
+            CredentialMutationError::SlotRefused(
+                meerkat_core::auth::token_store::CredentialSlotRefusal::Occupied,
+            ),
+            CredentialMutationError::Cancelled,
+            CredentialMutationError::RollbackFailed("rollback".into()),
+        ] {
+            let text = error.to_string();
+            assert!(
+                matches!(
+                    refresh_error_from_mutation(error),
+                    RefreshError::Refresh(ref reason) if *reason == text
+                ),
+                "{text}"
+            );
         }
     }
 }

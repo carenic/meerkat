@@ -10,7 +10,7 @@
 //! `placement`. Each call maps to exactly one [`MemberOperatorOp`] variant,
 //! rides the member's own comms runtime to the controlling supervisor bridge
 //! (`member_operator_forwarder`), and reconstructs the exact agent-visible
-//! `ToolResult`/`ToolError` from the typed [`UpcallToolOutcome`] envelope so
+//! `ToolResult`/`ToolError` from the typed `UpcallToolOutcome` envelope so
 //! behavior is call-for-call identical to a local dispatch.
 //!
 //! No authority claim rides the wire: admission is MobMachine-owned

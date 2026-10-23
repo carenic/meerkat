@@ -22,7 +22,8 @@ refuses while any pool instance was made from another template. The executor
 key, endpoint and CA secret names must all differ.
 
 Environment:
-  MEERKAT_GCP_PROJECT_ID                 GCP project (default: king-dnn-training-dev)
+  MEERKAT_GCP_PROJECT_ID                 GCP project (required; GCP_PROJECT_ID is
+                                         read when it is unset)
   MEERKAT_GCP_ZONE                       GCP zone (default: europe-west1-b)
   MEERKAT_GCP_BUILDBUDDY_MIG             MIG name (default: meerkat-bb-exec)
   MEERKAT_GCP_BUILDBUDDY_TEMPLATE        Instance template name (default: derived)
@@ -54,7 +55,16 @@ project-wide secretAccessor binding for it is removed.
 EOF
 }
 
-project="${MEERKAT_GCP_PROJECT_ID:-${GCP_PROJECT_ID:-king-dnn-training-dev}}"
+project="${MEERKAT_GCP_PROJECT_ID:-${GCP_PROJECT_ID:-}}"
+if [[ -z "${project}" ]]; then
+  case "${1:-}" in
+    -h | --help) ;;
+    *)
+      echo "error: MEERKAT_GCP_PROJECT_ID must name the GCP project of the BuildBuddy executor pool" >&2
+      exit 2
+      ;;
+  esac
+fi
 zone="${MEERKAT_GCP_ZONE:-europe-west1-b}"
 mig="${MEERKAT_GCP_BUILDBUDDY_MIG:-meerkat-bb-exec}"
 template=""
@@ -71,7 +81,6 @@ executor_image="${MEERKAT_BUILDBUDDY_EXECUTOR_IMAGE:-}"
 intended_executor_image="buildbuddy.bbcr.io/public/buildbuddy-executor-enterprise:enterprise-v2.265.0"
 ci_image="${MEERKAT_BUILDBUDDY_CI_IMAGE:-}"
 ci_image="${ci_image#docker://}"
-intended_ci_image="europe-west1-docker.pkg.dev/king-dnn-training-dev/meerkat-ci/meerkat-ci-rust:1.94.0"
 api_key_secret="${MEERKAT_BUILDBUDDY_API_KEY_SECRET:-meerkat-bb-executor-api-key}"
 endpoint_secret="${MEERKAT_BUILDBUDDY_ENDPOINT_SECRET:-meerkat-bb-control-endpoint}"
 ca_secret="${MEERKAT_BUILDBUDDY_CA_SECRET:-meerkat-bb-control-ca}"
@@ -154,7 +163,7 @@ require_pinned_images() {
     die "MEERKAT_BUILDBUDDY_EXECUTOR_IMAGE must pin the executor image by digest (<repository>[:tag]@sha256:<64 hex>); got '${executor_image}'. Resolve the digest of ${intended_executor_image} and set it."
   fi
   if ! [[ "${ci_image}" =~ ^[A-Za-z0-9._/:-]+@sha256:[0-9a-f]{64}$ ]]; then
-    die "MEERKAT_BUILDBUDDY_CI_IMAGE must pin the action image by digest (<repository>[:tag]@sha256:<64 hex>); got '${ci_image}'. Resolve the digest of ${intended_ci_image} and set it."
+    die "MEERKAT_BUILDBUDDY_CI_IMAGE must pin the action image by digest (<repository>[:tag]@sha256:<64 hex>); got '${ci_image}'. Resolve the digest of the image that scripts/gcp-buildbuddy-ci-image image prints and set it."
   fi
 }
 

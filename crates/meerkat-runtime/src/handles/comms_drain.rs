@@ -24,7 +24,7 @@ impl RuntimeCommsDrainHandle {
 
     /// Construct a handle backed by an ephemeral DSL authority.
     ///
-    /// See [`RuntimeTurnStateHandle::ephemeral`].
+    /// See [`HandleDslAuthority::ephemeral`].
     pub fn ephemeral() -> Self {
         Self::new(Arc::new(HandleDslAuthority::ephemeral()))
     }

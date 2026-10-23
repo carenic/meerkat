@@ -862,6 +862,17 @@ pub enum AgentError {
     /// the child. No model request was made.
     #[error("instruction activation refused the turn: {0}")]
     InstructionActivation(crate::InstructionActivationError),
+
+    /// A deferred session's staged create-time prompt is still pending and
+    /// the turn's input carries directed interaction custody. Delivering the
+    /// prompt in that turn would put text in its `RunStarted` content that the
+    /// directed input's own projection does not carry, so the turn is refused
+    /// before it starts and the prompt stays pending for the next turn whose
+    /// input is not directed. No model request was made.
+    #[error(
+        "a staged create-time prompt is pending; a turn whose input carries directed interaction custody cannot deliver it"
+    )]
+    StagedPromptDirectedTurnRefused,
 }
 
 impl From<crate::OperationAuthorizationError> for AgentError {

@@ -29,7 +29,7 @@
 //!
 //! # Storage census
 //!
-//! [`census_storage_footprint`] measures what each session actually costs on
+//! `census_storage_footprint` measures what each session actually costs on
 //! disk — durable bytes against live-transcript bytes, the
 //! `session_strand_messages` pool split into live prefixes and retained
 //! copies (with `session_strand_links` supersessions counted so a
