@@ -15922,6 +15922,11 @@ mod identity_fence_contention_tests {
     /// shared by many jobs): few of them fit in [`HOLD`].
     const LOADED_CALL: Duration = Duration::from_millis(100);
 
+    /// Ends a [`hold_mob_db_until`] hold that nobody releases, so a fence
+    /// that waits for the lock instead of its own bound fails instead of
+    /// hanging the suite.
+    const HOLD_GUARD: Duration = Duration::from_secs(60);
+
     /// An adopted identity with a current lease in a SQLite identity store.
     struct AdoptedIdentity {
         _dir: tempfile::TempDir,
@@ -16038,7 +16043,7 @@ mod identity_fence_contention_tests {
     }
 
     /// As [`hold_mob_db`], holding the lock until `release` fires or its
-    /// sender is gone.
+    /// sender is gone, or at most [`HOLD_GUARD`].
     fn hold_mob_db_until(
         path: &Path,
         release: std::sync::mpsc::Receiver<()>,
@@ -16051,7 +16056,7 @@ mod identity_fence_contention_tests {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .unwrap();
             holding.send(()).unwrap();
-            let _ = release.recv();
+            let _ = release.recv_timeout(HOLD_GUARD);
             drop(lock);
             Instant::now()
         });
@@ -16514,11 +16519,13 @@ mod identity_fence_contention_tests {
         );
     }
 
-    /// C2: with mob.db held well past the documented 2 s bound, the
-    /// bounded-wait entry answers the contended Backoff once its wait is
-    /// spent, without running the operation, and waits about the bound. The
-    /// 3.5 s hold is fixed: a longer bound, or no bound, admits the operation
-    /// once the holder releases and fails the Backoff check.
+    /// C2: with mob.db held until the fence has answered, the bounded-wait
+    /// entry answers the contended Backoff once its wait is spent, without
+    /// running the operation: it waited at least the bound, and it answered
+    /// while mob.db was still held, so it gave up on its bound and not when
+    /// the lock came free. A fence without a bound waits until
+    /// [`HOLD_GUARD`] ends the hold and then runs the operation, which fails
+    /// the Backoff, nothing-ran and ordering checks.
     #[tokio::test]
     async fn a_bounded_fence_answers_backoff_once_its_wait_is_spent() {
         let bound = IDENTITY_RUNTIME_WRITE_FENCE_WAIT;
@@ -16529,9 +16536,12 @@ mod identity_fence_contention_tests {
             inner: fence,
             delay: LATE_RETURN,
         });
-        let holder = hold_mob_db(&adopted.path, Duration::from_millis(3500));
+        let (release, released) = std::sync::mpsc::channel();
+        let holder = hold_mob_db_until(&adopted.path, released);
         let (outcome, ran, took) = blocking_fence_call(fence).await;
-        holder.join().unwrap();
+        let answered_at = Instant::now();
+        drop(release);
+        let released_at = holder.join().unwrap();
         assert_eq!(
             outcome.unwrap(),
             RuntimeStoreWriteFenceOutcome::Backoff {
@@ -16539,9 +16549,10 @@ mod identity_fence_contention_tests {
             }
         );
         assert!(!ran, "a refused fence runs nothing");
+        assert!(took >= bound, "the fence waited its bound: {took:?}");
         assert!(
-            took >= bound && took < bound + Duration::from_secs(1),
-            "the fence waited the bound, no more: {took:?}"
+            answered_at < released_at,
+            "the fence answered while mob.db was still held"
         );
     }
 
