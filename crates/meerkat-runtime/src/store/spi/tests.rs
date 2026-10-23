@@ -752,6 +752,106 @@ async fn a_run_rebase_lands_as_one_batch_and_survives_a_reopen() {
     );
 }
 
+// Unrun until the candidate's validation. The host store runtime store
+// answers the session service's re-base check (a WholeBlob store that
+// re-bases runs), so a run's closing save after a final compaction takes the
+// re-base delegate, one host batch, and not the fallback, which takes no
+// round commit after a rewrite.
+#[tokio::test]
+async fn a_closing_rebase_takes_the_delegate_and_not_the_fallback() {
+    use meerkat_core::types::{Message, UserMessage};
+    let host = Arc::new(TestHost::new());
+    let opened = open(&host).await;
+    // What the session service's checkpointer reads before it re-bases.
+    assert_eq!(
+        <SpiRuntimeStore as crate::store::RuntimeSessionAuthorityOps>::session_persistence_profile(
+            &opened.1
+        ),
+        crate::store::RuntimeSessionPersistenceProfile::WholeBlobV1
+    );
+    assert!(RuntimeStore::supports_whole_blob_run_rebase(&opened.1));
+    // A single-turn run whose one boundary compacts: its closing save
+    // carries no cursor, and no earlier tail exists.
+    let mut original = meerkat_core::Session::new();
+    original.push(Message::User(UserMessage::text("hello".to_string())));
+    original.push(Message::User(UserMessage::text("again".to_string())));
+    let runtime_id = LogicalRuntimeId::for_session(original.id());
+    opened
+        .1
+        .commit_session_snapshot(
+            &runtime_id,
+            crate::store::SerializedSessionSnapshot {
+                session_snapshot: serde_json::to_vec(&original).unwrap().into(),
+            },
+        )
+        .await
+        .unwrap();
+    let committed = opened
+        .1
+        .load_committed_whole_blob_snapshot(&runtime_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let payload =
+        crate::store::VerifiedCommittedWholeBlobPayload::from_committed(original.id(), committed)
+            .unwrap();
+    let run_id = meerkat_core::lifecycle::RunId::new();
+    let mut live = original;
+    live.push(Message::User(UserMessage::text("the question".to_string())));
+    let parent = live.transcript_revision().unwrap();
+    let commit = live
+        .commit_transcript_rewrite(
+            meerkat_core::TranscriptRewriteSelection::MessageRange { start: 0, end: 2 },
+            vec![Message::User(UserMessage::compaction_summary("compacted"))],
+            meerkat_core::TranscriptRewriteReason::new("compaction"),
+            Some("spi-closing-rebase-test".to_string()),
+            Some(parent),
+        )
+        .unwrap();
+    assert!(live.try_run_cursor().unwrap().is_none());
+    let rebase = crate::store::PreparedWholeBlobRunRebase::prepare(
+        payload,
+        None,
+        run_id.clone(),
+        live,
+        std::slice::from_ref(&commit),
+    )
+    .unwrap();
+    let before = host.commit_count();
+    let outcome = opened
+        .1
+        .commit_prepared_whole_blob_run_rebase(&runtime_id, rebase.store_parts())
+        .await
+        .unwrap();
+    let crate::store::WholeBlobRunRebaseOutcome::Applied { committed, tail } = outcome else {
+        unreachable!("the closing save re-bases");
+    };
+    assert_eq!(host.commit_count(), before + 1, "one host batch");
+    assert_eq!(tail.run_id(), &run_id);
+    assert_eq!(tail.candidate_sequence(), 1);
+    assert_eq!(tail.candidate_blob_sha256(), committed.blob_sha256());
+    let reopened = reopen(&host, opened).await;
+    assert_eq!(
+        reopened
+            .1
+            .load_whole_blob_provisional_tail(&runtime_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .authority(),
+        &tail
+    );
+    assert_eq!(
+        reopened
+            .1
+            .load_whole_blob_store_authority(&runtime_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        committed
+    );
+}
+
 // Unrun until the candidate's validation. The K3 re-acquire rule, with the
 // visibility-lag counterexample: renews fail from some point, the lease
 // lapses, another process acquires, and the old writer's connection comes
