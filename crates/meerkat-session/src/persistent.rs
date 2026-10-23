@@ -320,6 +320,7 @@ fn durable_session_restore_error(
 fn session_id_from_event(event: &meerkat_core::event::AgentEvent) -> Option<SessionId> {
     match event {
         meerkat_core::event::AgentEvent::RunStarted { session_id, .. }
+        | meerkat_core::event::AgentEvent::RunResumed { session_id, .. }
         | meerkat_core::event::AgentEvent::RunCompleted { session_id, .. }
         | meerkat_core::event::AgentEvent::ExtractionSucceeded { session_id, .. }
         | meerkat_core::event::AgentEvent::ExtractionFailed { session_id, .. }
