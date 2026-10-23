@@ -1581,3 +1581,138 @@ async fn a_feature_probe_that_never_answers_fails_the_spawn_before_anything_is_r
     }
     scripted.shutdown();
 }
+
+/// A placed context-fork child whose live runtime is gone is revived like
+/// any placed member: the controller re-issues its recorded tuple as a
+/// Resume without a fork, the member host answers it from the recorded row,
+/// and the child keeps the seed recorded at its first build. Nothing records
+/// a second seed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_placed_context_fork_child_is_revived_from_its_recorded_row() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let mut opts = HostFixtureOptions::named("xhe-b2m1-host").with_member_build();
+    opts.member_llm_client = Some(scripted_member_client_completing("b2m1-reply"));
+    opts.record_member_creates = true;
+    let fixture = spawn_host_daemon_fixture(opts)
+        .await
+        .expect("spawn member-build host fixture");
+    let controlling = create_controlling_mob("xhe-b2m1").await;
+    let report = controlling.bind_fixture(&fixture).await;
+    b2_placed_source_with_a_turn(
+        &controlling,
+        "source-b2m1",
+        &report.host_id,
+        "b2m1-tail-marker",
+    )
+    .await;
+
+    // A turn-driven fork child without a first input: its turns ride the
+    // controller's deliveries, and a failed delivery triggers the revival.
+    let mut spec = placed_spawn_spec("worker", "child-b2m1", &report.host_id);
+    spec.launch_mode = meerkat_mob::MemberLaunchMode::Fork {
+        source_member_id: identity("source-b2m1"),
+        fork_context: meerkat_mob::ForkContext::LastMessages { count: 2 },
+    };
+    controlling
+        .handle
+        .spawn_spec(spec)
+        .await
+        .expect("the placed fork child spawns");
+    let before = fixture
+        .host_binding_record(controlling.mob_id.as_str())
+        .await
+        .materialized
+        .get("child-b2m1")
+        .cloned()
+        .expect("the child's materialized row");
+    assert!(
+        before.prompt_context_fork_digest.is_some(),
+        "the child was materialized with its fork"
+    );
+    let seeds = || {
+        fixture
+            .failing_create
+            .as_ref()
+            .expect("the fixture records member creates")
+            .recorded_creates()
+            .into_iter()
+            .filter(|create| {
+                create
+                    .mob_member_binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.member == "child-b2m1")
+            })
+            .filter_map(|create| create.fork_seed)
+            .collect::<Vec<_>>()
+    };
+    let seeded = seeds();
+    assert_eq!(
+        seeded.len(),
+        1,
+        "the first build records the seed: {seeded:?}"
+    );
+
+    // Kill the child's live runtime on its member host; its durable row
+    // stays.
+    let session_id = meerkat_core::SessionId::parse(&before.session_id).expect("session id");
+    fixture
+        .member_session_service()
+        .discard_live_session(&session_id)
+        .await
+        .expect("discard the child's live session");
+    let member = controlling
+        .handle
+        .member(&identity("child-b2m1"))
+        .await
+        .expect("child handle");
+    let _first = member.send("b2m1-are-you-there", HandlingMode::Queue).await;
+    wait_until("the fork child to revive on its member host", || async {
+        fixture
+            .member_session_service()
+            .has_live_session(&session_id)
+            .await
+            .unwrap_or(false)
+    })
+    .await;
+    member
+        .send("b2m1-task-after-revival", HandlingMode::Queue)
+        .await
+        .expect("the revived fork child serves a turn");
+
+    // The child holds the context recorded at its first build: one fork
+    // notice.
+    let rows = b2_placed_rows_after_turn(
+        &fixture,
+        &controlling,
+        "child-b2m1",
+        "b2m1-task-after-revival",
+    )
+    .await;
+    assert_eq!(b2_fork_notices(&rows).len(), 1, "one fork notice: {rows:?}");
+    // The revival was answered from the row: the same tuple and fork, and no
+    // second seed.
+    let after = fixture
+        .host_binding_record(controlling.mob_id.as_str())
+        .await
+        .materialized
+        .get("child-b2m1")
+        .cloned()
+        .expect("the child's row survives the revival");
+    assert_eq!(
+        (
+            after.generation,
+            after.fence_token,
+            &after.session_id,
+            &after.prompt_context_fork_digest
+        ),
+        (
+            before.generation,
+            before.fence_token,
+            &before.session_id,
+            &before.prompt_context_fork_digest
+        ),
+        "the revival keeps the recorded tuple and fork"
+    );
+    assert_eq!(seeds(), seeded, "a revival records no second seed");
+    fixture.shutdown().await;
+}

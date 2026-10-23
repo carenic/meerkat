@@ -19163,6 +19163,30 @@ mod tests {
     use super::*;
     use crate::ids::Generation;
 
+    /// A failed fork-context probe is classified by what failed it: a
+    /// probe whose bridge request timed out is a transport failure, as
+    /// the timeout itself is, and `spawn_many` observes it as one.
+    #[test]
+    fn a_probe_failed_by_a_bridge_timeout_is_a_transport_failure() {
+        let timeout = || MobError::BridgeRequestTimedOut {
+            request_envelope_id: "probe-envelope".to_string(),
+            timeout_ms: 10_000,
+        };
+        let failed = MobError::HostFeaturesProbeFailed {
+            host_id: "host-a".to_string(),
+            cause: Arc::new(timeout()),
+        };
+        assert_eq!(
+            failed.failure_class(),
+            crate::error::MobFailureClass::Transport
+        );
+        assert_eq!(failed.failure_class(), timeout().failure_class());
+        assert_eq!(
+            spawn_many_failure_observation(&failed),
+            mob_dsl::MobSpawnManyFailureObservationKind::CommsError
+        );
+    }
+
     /// A scoped retire's refusal travels as a step outcome, so a joiner keeps
     /// seeing a stale fence or a moved session that the actor answered as a
     /// shared retirement failure, and a stuck retirement as stuck.

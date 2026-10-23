@@ -2019,6 +2019,86 @@ async fn a_spawn_many_row_whose_fork_is_refused_keeps_its_typed_refusal() {
     fixture.finish().await;
 }
 
+/// The budget twin: a `spawn_many` row whose fork context does not fit the
+/// child's budget fails alone, before any effect. Its error keeps the
+/// typed `ForkContextTooLarge`, the wire code (`INVALID_PARAMS`) and the
+/// structured kind, the spawn-many cause is `internal`, and the other row
+/// spawns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_spawn_many_row_whose_fork_context_is_too_large_keeps_its_typed_refusal() {
+    let fixture = Fixture::restored_member_with_policy(
+        meerkat_core::ForkInstructionPolicy::ReactivateInherited,
+    )
+    .await;
+    // The source's newest row is an activation whose body alone fills the
+    // budget: `reactivate_inherited` carries it, so it cannot fit.
+    let body = "x".repeat(meerkat_core::MAX_INSTRUCTION_BODY_BYTES);
+    let mut large = request("large-1", InstructionActivationExpectation::Absent);
+    large.revision.content_sha256 = InstructionContentDigest::for_body(&body);
+    large.body = body;
+    fixture
+        .activate(large)
+        .await
+        .expect("the large activation applies");
+
+    let rows = tokio::time::timeout(
+        WAIT,
+        fixture.handle.spawn_many(vec![
+            context_fork_spec(
+                "too-large-row",
+                &fixture.identity,
+                crate::launch::ForkContext::FullHistory,
+            )
+            .with_initial_message("the forked task"),
+            SpawnMemberSpec::new(ProfileName::from("lead"), AgentIdentity::from("plain-row")),
+        ]),
+    )
+    .await
+    .expect("spawn_many answers")
+    .expect("the batch is admitted");
+    let [refused, plain] = rows.as_slice() else {
+        panic!("one result per row: {rows:?}");
+    };
+    let failure = refused.as_ref().expect_err("the fork row is refused");
+    match failure.error() {
+        MobError::ForkContextTooLarge {
+            source_member_id,
+            max_bytes,
+            required_bytes,
+        } => {
+            assert_eq!(source_member_id, &fixture.identity);
+            assert!(required_bytes > max_bytes, "{required_bytes} > {max_bytes}");
+        }
+        other => panic!("expected the typed budget refusal, got {other:?}"),
+    }
+    assert_eq!(
+        failure.cause(),
+        meerkat_contracts::MobSpawnManyFailureCause::Internal
+    );
+    assert_eq!(
+        failure.error().wire_error_code(),
+        Some(meerkat_contracts::ErrorCode::InvalidParams)
+    );
+    assert_eq!(
+        failure
+            .error()
+            .structured_data()
+            .and_then(|data| data.get("kind").cloned()),
+        Some(serde_json::json!("fork_context_too_large"))
+    );
+    assert!(plain.is_ok(), "the other row spawns: {plain:?}");
+    assert!(
+        fixture
+            .handle
+            .get_member(&AgentIdentity::from("too-large-row"))
+            .await
+            .expect("roster read")
+            .is_none(),
+        "the refused row is not seated"
+    );
+    fixture.finish().await;
+}
+
 /// `reactivate_inherited` carries the source's activated instructions, body
 /// included, and the notice says so. The source's system prompt is never
 /// carried, under any policy.
