@@ -551,6 +551,17 @@ them.
 
 ### Added
 
+- `meerkat-runtime`: a WholeBlob run re-bases at a compaction.
+  `PreparedWholeBlobRunRebase::prepare` proves the compacted document's
+  descent from the committed base (the run's own appended rounds included)
+  and prepares the committed successor without the run cursor and the
+  provisional candidate with it; `RuntimeStore::commit_prepared_whole_blob_run_rebase`
+  commits the successor and restarts the run's provisional tail on it (same
+  run, candidate sequence one) in one transaction, comparing both the
+  committed authority and the current tail, and answers
+  `WholeBlobRunRebaseOutcome::Stale` without writing when another writer
+  moved either. The in-memory and SQLite stores implement it; the default
+  answers `Unsupported`.
 - `MemberBinding::labels()`: the application labels the incarnation was
   spawned with, as its spawn recorded them (a member reset keeps them). Every
   read of the member binding history carries them, the store-level
