@@ -1344,7 +1344,11 @@ impl SpiRealm {
     }
 
     /// Fold the scope's rows into its row entries (a body loads when
-    /// Core opens the scope). Unreferenced chunks the scope owns are deleted
+    /// Core opens the scope). A chunked entry's value is read once the
+    /// whole window is folded, and only for an entry that survives it: a
+    /// commit that replaces or removes a chunked entry deletes the chunk in
+    /// the same batch, while the superseded row stays in the window until a
+    /// checkpoint drops it. Unreferenced chunks the scope owns are deleted
     /// afterwards, best effort. The scope counts as loaded only once the
     /// adapter has installed the answered values in its memory and called
     /// [`ScopeState::mark_loaded`], so a call dropped in between leaves it
@@ -1389,15 +1393,22 @@ impl SpiRealm {
                                             "{scope} nests a spill inside a spill"
                                         )));
                                     }
-                                    self.fold(op, &mut values, &mut stamps).await?;
+                                    Self::fold(op, &mut values, &mut stamps)?;
                                 }
                             }
                             row_chunks.push((index, chunk));
                         }
-                        op => self.fold(op, &mut values, &mut stamps).await?,
+                        op => Self::fold(op, &mut values, &mut stamps)?,
                     }
                 }
                 index += 1;
+            }
+        }
+        for (key, stamp) in &mut stamps {
+            if let Some(chunk) = &stamp.chunk {
+                let value = Arc::new(self.read_chunk(chunk).await?);
+                stamp.shared = Some(Arc::clone(&value));
+                values.insert(key.clone(), value);
             }
         }
         state.rows = stamps;
@@ -1406,8 +1417,9 @@ impl SpiRealm {
         Ok(values)
     }
 
-    async fn fold(
-        &self,
+    /// Fold one row op into the entries. A chunked entry gets its stamp
+    /// here; [`Self::load_body`] reads its value after the fold.
+    fn fold(
         op: RowOp,
         values: &mut BTreeMap<String, Arc<Vec<u8>>>,
         stamps: &mut BTreeMap<String, Stamp>,
@@ -1429,16 +1441,15 @@ impl SpiRealm {
                 values.insert(key, value);
             }
             RowOp::PutChunk(key, chunk) => {
-                let value = Arc::new(self.read_chunk(&chunk).await?);
                 let stamp = Stamp {
                     digest: chunk.sha256,
                     len: chunk.len,
                     op_bytes: op_bytes(&key, chunk.name.as_str().len() + 40),
                     chunk: Some(chunk),
-                    shared: Some(Arc::clone(&value)),
+                    shared: None,
                 };
-                stamps.insert(key.clone(), stamp);
-                values.insert(key, value);
+                values.remove(&key);
+                stamps.insert(key, stamp);
             }
             RowOp::Reset => {
                 values.clear();
