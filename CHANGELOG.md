@@ -122,22 +122,18 @@ them.
   `ClaimPendingAfterUnprovenDispatch`, `TargetProbeBusyExistingRedelivery`,
   `ReclaimExhaustedAfterAdmission`, `ReclaimExhaustedAfterUnprovenDispatch`,
   `UnprovenLateNotAdmittedFromClaimed` and
-  `UnprovenLateNotAdmittedFromDispatching`. So their implicit discriminants
-  change (`EffectKind::*`, `InputKind::*`,
-  `OccurrenceLifecycleInputVariant::*` and `TransitionId::*`), and so does
-  the `PartialOrd` order of `OccurrenceLifecycleInputVariant::*`; match them
-  by variant name, not by numeric cast or position. The input structs
+  `UnprovenLateNotAdmittedFromDispatching`. Every new variant is appended
+  after the 0.9.4 ones, so the 0.9.4 variants keep their implicit
+  discriminants (`EffectKind::*`, `InputKind::*`,
+  `OccurrenceLifecycleInputVariant::*` and `TransitionId::*`) and their
+  `PartialOrd` order. The input structs
   `ClassifyDue` and `Claim` gain the public field `admission_evidence`, and
   `ResolveTargetProbe` gains `redelivery` (struct literals need them).
 - `meerkat-machine-schema` (`catalog::dsl::occurrence_lifecycle`): the
   occurrence machine's DSL enums gain the same variants and input fields
   (`OccurrenceLifecycleEffectVariant` and `OccurrenceLifecycleInputVariant`
-  included), so their implicit discriminants change
-  (`OccurrenceLifecycleEffect::*`, `OccurrenceLifecycleEffectVariant::*`,
-  `OccurrenceLifecycleInput::*` and `OccurrenceLifecycleInputVariant::*`)
-  and so does the `PartialOrd` order of `OccurrenceLifecycleEffectVariant::*`
-  and `OccurrenceLifecycleInputVariant::*`; match them by variant name, not
-  by numeric cast or position.
+  included), declared after the 0.9.4 ones, so the 0.9.4 variants keep their
+  implicit discriminants and their `PartialOrd` order.
 - `meerkat-contracts`: `SessionExternalEventParams` and `MobMemberSendParams`
   gain the field `idempotency_key: Option<String>`, and `MobMemberSendResult`
   gains `continuation: Option<WireContinuationReceipt>` (see Added). Code that
