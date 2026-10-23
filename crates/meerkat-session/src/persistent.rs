@@ -12774,10 +12774,12 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 tool_use_id,
                 tool_name,
                 args,
+                dedupe_key,
             }) => Some(CoreApplyTerminal::CallbackPending {
                 tool_use_id: tool_use_id.clone(),
                 tool_name: tool_name.clone(),
                 args: args.clone(),
+                dedupe_key: dedupe_key.as_deref().cloned(),
             }),
             SessionError::Agent(AgentError::CallbackBatchPending { pending_tool_calls }) => {
                 Some(CoreApplyTerminal::CallbackBatchPending {

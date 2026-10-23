@@ -46,6 +46,7 @@ from .mob import (
 )
 from .session import DeferredSession, Session
 from .streaming import EventStream, EventSubscription
+from .tools import ToolCallDedupeKey
 
 # Domain types (clean, Wire-free public names)
 from .types import (
@@ -546,6 +547,7 @@ __all__ = [
     "MobUnreachablePeer",
     "EventStream",
     "EventSubscription",
+    "ToolCallDedupeKey",
     # Types
     "CONTRACT_VERSION",
     "AttributedEvent",

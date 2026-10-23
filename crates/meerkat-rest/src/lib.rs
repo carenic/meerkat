@@ -4873,6 +4873,7 @@ fn callback_pending_api_error(
     tool_use_id: String,
     tool_name: String,
     args: Value,
+    dedupe_key: Option<meerkat_core::ToolCallDedupeKey>,
     session_created: bool,
 ) -> ApiError {
     callback_batch_pending_api_error(
@@ -4883,6 +4884,7 @@ fn callback_pending_api_error(
             tool_name,
             args,
             settlement_failures: Vec::new(),
+            dedupe_key,
         }],
         session_created,
     )
@@ -4962,12 +4964,14 @@ fn completion_outcome_to_api_result(
             tool_use_id,
             tool_name,
             args,
+            dedupe_key,
         } => Err(callback_pending_api_error(
             session_id,
             realm,
             tool_use_id,
             tool_name,
             args,
+            dedupe_key,
             session_created,
         )),
         meerkat_runtime::completion::CompletionOutcome::CallbackBatchPending {

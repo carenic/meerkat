@@ -837,6 +837,10 @@ class MeerkatClient:
             @client.tool("search", description="Search the web")
             async def handle_search(arguments: dict) -> str:
                 return f"Results for {arguments.get('q', '')}"
+
+        A handler that declares a ``dedupe_key`` parameter also receives the
+        call's :class:`ToolCallDedupeKey` (``None`` when the call has none). A
+        resumed run that dispatches the same call again sends the same key.
         """
 
         def decorator(fn: Any) -> Any:

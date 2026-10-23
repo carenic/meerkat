@@ -117,6 +117,12 @@ pub struct WirePendingToolCall {
     pub args: serde_json::Value,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub settlement_failures: Vec<meerkat_core::ops::ToolDispatchSettlementFailure>,
+    /// The call's dedupe key, present when an agent-loop round dispatched
+    /// it. A resumed run that asks for the same call again asks with the
+    /// same key, so the caller can recognize the repeat and deduplicate on
+    /// all four fields. Absent for a call outside an agent-loop round.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedupe_key: Option<meerkat_core::ToolCallDedupeKey>,
 }
 
 /// Canonical typed contract for a turn that suspended on external tool
@@ -167,6 +173,7 @@ impl WireCallbackPending {
     }
 
     /// Build a pending contract for a single blocked tool call.
+    #[allow(clippy::too_many_arguments)]
     pub fn single(
         session_id: SessionId,
         session_ref: Option<String>,
@@ -175,6 +182,7 @@ impl WireCallbackPending {
         tool_use_id: String,
         tool_name: String,
         args: serde_json::Value,
+        dedupe_key: Option<meerkat_core::ToolCallDedupeKey>,
     ) -> Self {
         Self::many(
             session_id,
@@ -186,6 +194,7 @@ impl WireCallbackPending {
                 tool_name,
                 args,
                 settlement_failures: Vec::new(),
+                dedupe_key,
             }],
         )
     }

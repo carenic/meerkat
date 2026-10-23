@@ -2945,6 +2945,7 @@ impl McpConnection {
             name,
             args,
             metadata,
+            None,
             enter,
         )
         .await
@@ -2953,13 +2954,14 @@ impl McpConnection {
     /// [`Self::call_tool_result_entering`] under `admission` instead of this
     /// connection's own ceiling: the router passes the checked route it
     /// resolved the call through, which admits exactly that route's
-    /// selected operations.
+    /// selected operations, and the call's dedupe key when it has one.
     pub(crate) async fn call_tool_result_admitted(
         &self,
         admission: CallAdmission<'_>,
         name: &str,
         args: &Value,
         metadata: Option<serde_json::Map<String, Value>>,
+        dedupe_key: Option<&meerkat_core::ToolCallDedupeKey>,
         enter: impl FnOnce() -> Result<Option<crate::transport::protected::SendCustody>, McpError>,
     ) -> Result<CallToolResult, McpError> {
         call_tool_on(
@@ -2972,6 +2974,7 @@ impl McpConnection {
             name,
             args,
             metadata,
+            dedupe_key,
             enter,
         )
         .await
@@ -3911,6 +3914,7 @@ pub(crate) async fn call_tool_on(
     name: &str,
     args: &Value,
     metadata: Option<serde_json::Map<String, Value>>,
+    dedupe_key: Option<&meerkat_core::ToolCallDedupeKey>,
     enter: impl FnOnce() -> Result<Option<crate::transport::protected::SendCustody>, McpError>,
 ) -> Result<CallToolResult, McpError> {
     // The host access policy is the connection's own ceiling: an operation it
@@ -3923,10 +3927,16 @@ pub(crate) async fn call_tool_on(
             operation: name.to_owned(),
         });
     }
-    let params = match args.as_object().cloned() {
+    let mut params = match args.as_object().cloned() {
         Some(arguments) => CallToolRequestParams::new(name.to_string()).with_arguments(arguments),
         None => CallToolRequestParams::new(name.to_string()),
     };
+    // The call's dedupe key is Core's own `_meta` entry, on the request
+    // itself: the host's protected metadata joins it at the final
+    // serializer, and never carries its name (the router refuses that).
+    if let Some(key) = dedupe_key {
+        params.meta = Some(tool_call_dedupe_key_meta(key)?);
+    }
     // A dropped session is never resumed under another session.
     if session_expiry.expired() {
         return Err(session_dead(server));
@@ -3966,6 +3976,20 @@ pub(crate) async fn call_tool_on(
             message: "unexpected MCP tools/call response".into(),
         }),
     }
+}
+
+/// The `_meta` of a `tools/call` that carries `key`: its one entry,
+/// [`meerkat_core::TOOL_CALL_DEDUPE_KEY_META_KEY`], holds the key's
+/// `{run_id, round, call_id, call_digest}` unchanged.
+pub(crate) fn tool_call_dedupe_key_meta(
+    key: &meerkat_core::ToolCallDedupeKey,
+) -> Result<rmcp::model::Meta, McpError> {
+    let value = serde_json::to_value(key)
+        .map_err(|_| McpError::Serialization("invalid tool call dedupe key".into()))?;
+    Ok(rmcp::model::Meta(serde_json::Map::from_iter([(
+        meerkat_core::TOOL_CALL_DEDUPE_KEY_META_KEY.to_string(),
+        value,
+    )])))
 }
 
 /// The typed host status for a request that an OAuth connection's server

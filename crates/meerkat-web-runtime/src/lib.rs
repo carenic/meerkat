@@ -1170,6 +1170,10 @@ struct JsToolEntry {
 /// Requires initialized runtime state.
 /// The `callback` receives a JSON string of tool arguments and must return
 /// a `Promise<string>` resolving to JSON `{"content": "...", "is_error": false}`.
+/// A call that an agent-loop round dispatched also passes a second argument:
+/// the call's dedupe key as a JSON string
+/// `{"run_id": "...", "round": 0, "call_id": "...", "call_digest": "..."}`.
+/// Other calls pass `undefined`, and a one-argument callback ignores it.
 ///
 /// Example (JS):
 /// ```js
@@ -1375,6 +1379,15 @@ impl meerkat_core::AgentToolDispatcher for JsToolDispatcher {
         &self,
         call: meerkat_core::ToolCallView<'_>,
     ) -> Result<meerkat_core::ops::ToolDispatchOutcome, meerkat_core::error::ToolError> {
+        self.dispatch_with_context(call, &meerkat_core::ToolDispatchContext::default())
+            .await
+    }
+
+    async fn dispatch_with_context(
+        &self,
+        call: meerkat_core::ToolCallView<'_>,
+        context: &meerkat_core::ToolDispatchContext,
+    ) -> Result<meerkat_core::ops::ToolDispatchOutcome, meerkat_core::error::ToolError> {
         // Fire-and-forget tools defer the real work to the host: the host
         // watches ToolCallRequested events in the stream and acts on the call
         // asynchronously. Rule 8: do NOT fabricate an `is_error:false`
@@ -1405,9 +1418,23 @@ impl meerkat_core::AgentToolDispatcher for JsToolDispatcher {
 
         let args_str = call.args.get();
         let js_args = JsValue::from_str(args_str);
-        let promise_val = callback.call1(&JsValue::NULL, &js_args).map_err(|e| {
-            meerkat_core::error::ToolError::execution_failed(format!("JS callback threw: {e:?}"))
-        })?;
+        // The call's dedupe key, as a JSON string second argument, when an
+        // agent-loop round dispatched the call; `undefined` otherwise.
+        let js_dedupe_key = match context.tool_call_dedupe_key(call) {
+            Some(key) => JsValue::from_str(&serde_json::to_string(&key).map_err(|e| {
+                meerkat_core::error::ToolError::execution_failed(format!(
+                    "invalid tool call dedupe key: {e}"
+                ))
+            })?),
+            None => JsValue::UNDEFINED,
+        };
+        let promise_val = callback
+            .call2(&JsValue::NULL, &js_args, &js_dedupe_key)
+            .map_err(|e| {
+                meerkat_core::error::ToolError::execution_failed(format!(
+                    "JS callback threw: {e:?}"
+                ))
+            })?;
         let promise = js_sys::Promise::from(promise_val);
         let result_val = wasm_bindgen_futures::JsFuture::from(promise)
             .await

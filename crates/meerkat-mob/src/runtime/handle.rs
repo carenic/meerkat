@@ -4947,6 +4947,7 @@ pub(super) fn bounded_runtime_turn_result(
             tool_use_id,
             tool_name,
             args,
+            ..
         } => {
             return Err(BoundedTurnFailure::CallbackPending {
                 session_id,
@@ -5040,6 +5041,7 @@ fn bounded_direct_session_failure(
                 tool_use_id,
                 tool_name,
                 args,
+                ..
             },
         ) => BoundedTurnFailure::CallbackPending {
             session_id,
@@ -5114,6 +5116,7 @@ pub(crate) fn legacy_exact_turn_result(
             tool_use_id,
             tool_name,
             args,
+            ..
         } => Err(MobError::CallbackPending {
             session_id,
             tool_use_id,
@@ -5163,6 +5166,7 @@ pub(crate) fn legacy_direct_session_error(
                 tool_use_id,
                 tool_name,
                 args,
+                ..
             },
         ) => MobError::CallbackPending {
             session_id: session_id.clone(),

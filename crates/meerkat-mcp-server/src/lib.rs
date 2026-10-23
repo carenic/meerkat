@@ -2524,6 +2524,7 @@ fn format_agent_result(
             tool_use_id,
             tool_name,
             args,
+            dedupe_key,
         })) => {
             // Pending state is a typed terminal-control fact, not a success
             // envelope. Serialize the canonical `WireCallbackPending` contract
@@ -2539,6 +2540,7 @@ fn format_agent_result(
                 tool_use_id,
                 tool_name,
                 args,
+                dedupe_key.map(|key| *key),
             );
             let mut payload = serde_json::to_value(&pending)
                 .map_err(|err| format!("Failed to serialize callback pending contract: {err}"))?;
@@ -2568,6 +2570,7 @@ fn format_agent_result(
                         tool_name: call.tool_name,
                         args: call.args,
                         settlement_failures: call.settlement_failures,
+                        dedupe_key: call.dedupe_key,
                     })
                     .collect(),
             );

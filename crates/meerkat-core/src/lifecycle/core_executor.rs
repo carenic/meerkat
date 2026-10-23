@@ -490,6 +490,9 @@ pub enum CoreApplyTerminal {
         tool_use_id: String,
         tool_name: String,
         args: Value,
+        /// The call's dedupe key, as on
+        /// [`crate::error::PendingCallbackToolCall`].
+        dedupe_key: Option<crate::ToolCallDedupeKey>,
     },
     /// The run committed one assistant batch containing multiple external
     /// callback calls. All results must be supplied as one exact set.
@@ -1474,6 +1477,8 @@ impl CoreApplyOutput {
         )
     }
 
+    /// A callback-pending terminal with no dedupe key; a call that has one
+    /// builds [`CoreApplyTerminal::CallbackPending`] with it instead.
     pub fn with_callback_pending(
         receipt: RunBoundaryReceiptDraft,
         untyped_snapshot: Option<Vec<u8>>,
@@ -1488,6 +1493,7 @@ impl CoreApplyOutput {
                 tool_use_id: tool_use_id.into(),
                 tool_name: tool_name.into(),
                 args,
+                dedupe_key: None,
             }),
         )
     }

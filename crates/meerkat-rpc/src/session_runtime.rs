@@ -14826,17 +14826,25 @@ fn completion_outcome_to_rpc_result(
             tool_use_id,
             tool_name,
             args,
-        } => Err(RpcError {
-            code: error::INTERNAL_ERROR,
-            message: format!("callback pending for tool '{tool_name}'"),
-            data: Some(serde_json::json!({
+            dedupe_key,
+        } => {
+            let mut data = serde_json::json!({
                 "session_id": session_id.to_string(),
                 "resumable": true,
                 "tool_use_id": tool_use_id,
                 "tool_name": tool_name,
                 "args": args,
-            })),
-        }),
+            });
+            // The call's dedupe key rides beside the call, only when it has one.
+            if let (Some(key), Some(fields)) = (dedupe_key, data.as_object_mut()) {
+                fields.insert("dedupe_key".to_string(), serde_json::json!(key));
+            }
+            Err(RpcError {
+                code: error::INTERNAL_ERROR,
+                message: format!("callback pending for tool '{tool_name}'"),
+                data: Some(data),
+            })
+        }
         CompletionOutcome::CallbackBatchPending { pending_tool_calls } => {
             let first = pending_tool_calls.first();
             let tool_name = first

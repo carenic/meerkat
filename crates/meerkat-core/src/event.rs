@@ -491,6 +491,7 @@ impl AgentErrorReason {
                 tool_use_id,
                 tool_name,
                 args,
+                ..
             } => Some(Self::CallbackPending {
                 tool_use_id: tool_use_id.clone(),
                 tool_name: tool_name.clone(),

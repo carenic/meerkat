@@ -1262,6 +1262,18 @@ impl AgentToolDispatcher for CallbackToolDispatcher {
     }
 
     async fn dispatch(&self, call: ToolCallView<'_>) -> Result<ToolDispatchOutcome, ToolError> {
+        self.dispatch_with_context(call, &meerkat_core::ToolDispatchContext::default())
+            .await
+    }
+
+    /// A `tool/execute` request to the route that registers the tool. The
+    /// request carries the call's dedupe key when an agent-loop round
+    /// dispatched it, and omits the field otherwise.
+    async fn dispatch_with_context(
+        &self,
+        call: ToolCallView<'_>,
+        context: &meerkat_core::ToolDispatchContext,
+    ) -> Result<ToolDispatchOutcome, ToolError> {
         if !self.is_known(call.name) {
             if let CallbackRouteSource::MobSlot(slot) = &self.route
                 && slot.live_route().is_none()
@@ -1308,6 +1320,8 @@ impl AgentToolDispatcher for CallbackToolDispatcher {
             tool_use_id: &'a str,
             name: &'a str,
             arguments: &'a RawValue,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            dedupe_key: Option<meerkat_core::ToolCallDedupeKey>,
         }
 
         let route = self.call_route(call.name)?;
@@ -1316,6 +1330,7 @@ impl AgentToolDispatcher for CallbackToolDispatcher {
             tool_use_id: call.id,
             name: call.name,
             arguments: call.args,
+            dedupe_key: context.tool_call_dedupe_key(call),
         };
         let (params_raw, outbound_permit) = RpcOutboundAdmission::production()
             .admit_json(
@@ -1391,7 +1406,9 @@ impl AgentToolDispatcher for CallbackToolDispatcher {
         plan: &meerkat_core::ResolvedToolExecutionPlan,
     ) -> Result<ToolDispatchOutcome, ToolError> {
         match plan.mode() {
-            meerkat_core::ToolExecutionMode::Fast => self.dispatch(call).await,
+            meerkat_core::ToolExecutionMode::Fast => {
+                self.dispatch_with_context(call, context).await
+            }
             meerkat_core::ToolExecutionMode::Detached => {
                 self.submit_detached(call, context, plan).await
             }

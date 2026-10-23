@@ -341,12 +341,14 @@ fn completion_outcome_to_cli_runtime_turn_result(
             tool_use_id,
             tool_name,
             args,
+            dedupe_key,
         } => {
             let pending_tool_calls = vec![meerkat_core::error::PendingCallbackToolCall {
                 tool_use_id,
                 tool_name: tool_name.clone(),
                 args: args.clone(),
                 settlement_failures: Vec::new(),
+                dedupe_key,
             }];
             Ok(CliRuntimeTurnResult::CallbackPending(CliCallbackPending {
                 session_id: session_id.clone(),
@@ -426,6 +428,7 @@ fn callback_pending_contract(
                 tool_name: call.tool_name.clone(),
                 args: call.args.clone(),
                 settlement_failures: call.settlement_failures.clone(),
+                dedupe_key: call.dedupe_key.clone(),
             })
             .collect(),
     )

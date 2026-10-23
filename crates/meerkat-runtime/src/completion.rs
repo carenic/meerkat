@@ -176,6 +176,10 @@ pub enum CompletionOutcome {
         tool_use_id: String,
         tool_name: String,
         args: Value,
+        /// The call's dedupe key, as on
+        /// [`meerkat_core::error::PendingCallbackToolCall`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dedupe_key: Option<meerkat_core::ToolCallDedupeKey>,
     },
     /// One assistant tool-use batch is waiting on multiple external callbacks.
     CallbackBatchPending {
@@ -282,6 +286,7 @@ pub fn interaction_terminal_event(
             tool_use_id,
             tool_name,
             args,
+            dedupe_key,
         } => AgentEvent::InteractionCallbackPending {
             interaction_id,
             pending_tool_calls: vec![meerkat_core::error::PendingCallbackToolCall {
@@ -289,6 +294,7 @@ pub fn interaction_terminal_event(
                 tool_name: tool_name.clone(),
                 args: args.clone(),
                 settlement_failures: Vec::new(),
+                dedupe_key,
             }],
             tool_name,
             args,
@@ -300,6 +306,7 @@ pub fn interaction_terminal_event(
                     tool_name: "callback_batch".to_string(),
                     args: Value::Null,
                     settlement_failures: Vec::new(),
+                    dedupe_key: None,
                 },
             );
             AgentEvent::InteractionCallbackPending {
@@ -965,10 +972,12 @@ fn authorized_completion_outcome(
                 tool_use_id,
                 tool_name,
                 args,
+                dedupe_key,
             }) => CompletionOutcome::CallbackPending {
                 tool_use_id: tool_use_id.clone(),
                 tool_name: tool_name.clone(),
                 args: args.clone(),
+                dedupe_key: dedupe_key.clone(),
             },
             Some(CoreApplyTerminal::CallbackBatchPending { pending_tool_calls }) => {
                 CompletionOutcome::CallbackBatchPending {

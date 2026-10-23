@@ -15,6 +15,11 @@ pub struct PendingCallbackToolCall {
     pub args: serde_json::Value,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub settlement_failures: Vec<crate::ops::ToolDispatchSettlementFailure>,
+    /// The call's dedupe key, present when an agent-loop round dispatched
+    /// it. A resumed run that asks for the same call again asks with the
+    /// same key, so the host can recognize the repeat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedupe_key: Option<crate::ToolCallDedupeKey>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -763,6 +768,9 @@ pub enum AgentError {
         tool_use_id: String,
         tool_name: String,
         args: serde_json::Value,
+        /// The call's dedupe key, as on [`PendingCallbackToolCall`]; boxed
+        /// so the error stays small.
+        dedupe_key: Option<Box<crate::ToolCallDedupeKey>>,
     },
 
     /// Multiple callback tools from one assistant batch are pending together.
@@ -1052,6 +1060,7 @@ impl AgentError {
                 tool_use_id: call.tool_use_id,
                 tool_name: call.tool_name,
                 args: call.args,
+                dedupe_key: call.dedupe_key.map(Box::new),
             }
         } else {
             Self::CallbackBatchPending {

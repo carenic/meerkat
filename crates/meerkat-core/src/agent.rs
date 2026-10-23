@@ -2217,9 +2217,10 @@ impl ToolDispatchContext {
     /// tool round (no run or no round bound) and for arguments that are not
     /// JSON.
     ///
-    /// An in-process tool reads it here. Core puts it on no wire: a host
-    /// that wants an MCP server to see it adds it to the call's metadata from
-    /// its `McpCallContextProvider`, which receives this context and the call.
+    /// An in-process tool reads it here. Core's MCP client sends it as the
+    /// `tools/call` `_meta` entry [`crate::TOOL_CALL_DEDUPE_KEY_META_KEY`],
+    /// and a callback tool receives it as the `dedupe_key` of its request or
+    /// pending call.
     #[must_use]
     pub fn tool_call_dedupe_key(
         &self,

@@ -9098,6 +9098,11 @@ where
                         tool_name: callback_tool.to_owned(),
                         args: callback_args.clone(),
                         settlement_failures: error.settlement_failures().cloned().collect(),
+                        // The round's key for this call: the host answering
+                        // it sees the same key if a resumed run asks again.
+                        dedupe_key: self
+                            .tool_dispatch_context
+                            .tool_call_dedupe_key(tc.as_view()),
                     });
                     continue;
                 }
