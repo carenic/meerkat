@@ -670,6 +670,9 @@ pub(crate) async fn terminalize_async_stop_once(
 ) -> Result<(), RuntimeDriverError> {
     let (completion_input_ids, requeued_input_ids, candidate_owner_input_id, termination_reason) = {
         let mut driver = driver.lock().await;
+        // Inputs a store-owned durable-tail recovery consumed are not
+        // pending: adopt them before this stop names its batch.
+        driver.adopt_durable_consumed_inputs(completions).await?;
         let active_input_ids = driver.as_driver().active_input_ids();
         let termination_reason = generated_runtime_termination_reason(&driver).to_string();
         // `Stopped` must still replay RuntimeExecutorExited so an interrupted

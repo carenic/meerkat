@@ -2412,6 +2412,17 @@ impl MeerkatMachine {
             "MeerkatMachine::retire_runtime_control_plane start"
         );
 
+        // An input that a store-owned durable-tail recovery consumed outside
+        // this driver is not pending work. Adopt that terminal before the
+        // retire counts what is pending, so neither a runtime loop's drain
+        // nor the sweep below abandons it over the consumed row.
+        driver
+            .lock()
+            .await
+            .adopt_durable_consumed_inputs(Some(&completions))
+            .await
+            .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
+
         let staged_dsl = self
             .stage_session_dsl_transition(
                 &session_id,
