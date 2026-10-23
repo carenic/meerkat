@@ -2179,7 +2179,14 @@ pub struct PreparedDurableTailRecoverySource {
 
 /// How a recovery source's physical head relates to its committed runtime
 /// boundary, as the store proved it while loading the source.
+///
+/// Only the SQLite RuntimeStore adapter (`store/sqlite.rs`) loads a
+/// durable-tail source, through source constructors that exist only with
+/// `sqlite-store`; every other backend refuses the load. Without the
+/// feature the recovery code that reads a relation still compiles, but no
+/// relation is ever constructed, which is expected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "sqlite-store"), allow(dead_code))]
 pub(crate) enum DurableTailSourceRelation {
     /// The physical transcript keeps the boundary's exact rows as a prefix.
     StrictContinuation,
