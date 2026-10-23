@@ -2,7 +2,7 @@
 //! bridge responder, acceptor-registry driver, and R8 persistence driver
 //! (multi-host mobs D6, §7.2 steps 1 & 3).
 //!
-//! The actor owns the generated [`MobHostBindingAuthority`] for the whole
+//! The actor owns the generated `MobHostBindingAuthority` for the whole
 //! daemon process (mob-keyed, A14) and serializes every mutation through one
 //! tokio task — the `MobActor` single-owner discipline. The shell observes
 //! typed envelope facts (sender match, address match, bootstrap-token
@@ -5945,7 +5945,7 @@ pub struct MobHostActorConfig {
     pub member_host: Option<HostMemberSubstrate>,
     /// Cadence of the actor's own capability maintenance pass.
     ///
-    /// `None` uses [`FORKED_PARTICIPANT_SWEEP_INTERVAL`]. This is a composition
+    /// `None` uses `FORKED_PARTICIPANT_SWEEP_INTERVAL`. This is a composition
     /// input rather than a hidden constant so a harness can drive the REAL
     /// periodic arm on a short cadence instead of waiting out production
     /// timing — no extra task, no test-only loop, the same single `select!`
