@@ -93,14 +93,27 @@
 //! [`FENCE_RENEW_INTERVAL_SECS`]. A shorter lease shortens the wait at a
 //! restart and at a takeover; a longer interval renews less often.
 //!
+//! The host also declares the longest one commit takes on its backend
+//! ([`FenceTiming::max_commit_latency`], [`FENCE_MAX_COMMIT_LATENCY_SECS`]
+//! by default). A fenced write that meets a commit in flight on the
+//! authority it checks waits that long before it reports the write as
+//! backed off, so a host whose commits are slower declares a longer bound
+//! instead of failing those writes.
+//!
 //! # Writer rules (Core's side)
 //!
 //! - A writer acquires with [`AcquireMode::Exclusive`]; a live holder makes
 //!   that answer [`HostStoreError::Held`] with what remains of its lease, so
 //!   two processes never fence each other back and forth. Only an explicit
 //!   takeover uses [`AcquireMode::Takeover`].
-//! - A holder renews once per renew interval and stops writing as soon as a
-//!   renew fails.
+//! - A holder renews at least once per renew interval and stops writing as
+//!   soon as a renew fails.
+//! - **A holder that stopped re-acquires; it never resumes on a later
+//!   renew.** Once a renew failed or its window closed, an acquire made
+//!   meanwhile may have missed its last renew (the store's visibility lag)
+//!   and seen its lease lapse; a renew that then succeeds proves nothing.
+//!   It resumes only after a fresh fenced acquire, which acquires are
+//!   ordered against: a token higher than any acquired before.
 //! - A holder fences itself on its own clock: it makes no model call and
 //!   dispatches nothing unless its last successful acquire or renew started
 //!   less than [`FenceTiming::self_fence_window`] ago, the lease minus the
@@ -109,18 +122,23 @@
 //!   store I/O per round, and there is no fence check on the per round
 //!   path. Core exposes the window through [`SelfFence`], so the run loop
 //!   checks it right before each model call and each tool dispatch.
-//! - **The host's obligation on the margin:** it exceeds the store's
-//!   visibility lag. A renew written just before a takeover can stay
-//!   invisible to the new holder for that long, so the new holder's wait
-//!   ([`FenceGrant::superseded_lease`]) may end that much before the old
-//!   holder's real lease; the old holder must have fenced itself by then.
+//! - **The host's obligation on the margin:** it is at least one renew
+//!   interval plus twice the store's visibility lag (the time from the
+//!   start of a write until every acquire and renew sees it). A takeover
+//!   can miss the renews started in the lag before it, so the lease it
+//!   waits out ([`FenceGrant::superseded_lease`]) can come from a renew an
+//!   interval or more older than the old holder's last one; and a renew
+//!   started in the lag after the takeover can still confirm the old
+//!   token. With no visibility lag, the default margin of one renew
+//!   interval is enough.
 //! - After an acquire that supersedes a live holder, the new writer waits
 //!   out what remained of that holder's recorded lease
 //!   ([`FenceGrant::superseded_lease`]) before it makes a model call or
 //!   dispatches anything. By then the old holder has fenced itself: the
 //!   store started that lease no earlier than the holder started the
-//!   acquire or renew it came from, and the holder stops a renew interval
-//!   before the lease ends.
+//!   acquire or renew it came from, and the holder stops the self-fence
+//!   margin before the lease ends, which covers the renews the takeover
+//!   could not see.
 //! - The bulk load of heads ([`HostStore::list_heads`]) runs after the
 //!   acquire and before the first commit, so it observes one cut.
 
@@ -157,6 +175,11 @@ pub const FENCE_LEASE_SECS: u64 = 30;
 /// renew does not make a live holder fence itself.
 pub const FENCE_MIN_LEASE_RENEWALS: u32 = 3;
 
+/// The longest one commit takes by default, in seconds. A host declares its
+/// own bound through [`HostStore::fence_timing`]
+/// ([`FenceTiming::try_with_max_commit_latency`]).
+pub const FENCE_MAX_COMMIT_LATENCY_SECS: u64 = 2;
+
 const _: () =
     assert!(FENCE_LEASE_SECS >= FENCE_RENEW_INTERVAL_SECS * FENCE_MIN_LEASE_RENEWALS as u64);
 
@@ -169,6 +192,7 @@ pub struct FenceTiming {
     renew_interval: Duration,
     lease: Duration,
     self_fence_margin: Duration,
+    max_commit_latency: Duration,
 }
 
 impl FenceTiming {
@@ -189,9 +213,11 @@ impl FenceTiming {
 
     /// A timing as [`Self::try_new`] with a host-declared self-fence margin:
     /// a holder writes only while its last successful acquire or renew
-    /// started less than `lease - self_fence_margin` ago. The margin lies
-    /// strictly between zero and the lease, and it must exceed the store's
-    /// visibility lag (see the writer rules in the module documentation).
+    /// started less than `lease - self_fence_margin` ago. The margin is at
+    /// least one renew interval and leaves a window of at least two; the
+    /// host's obligation is a margin of at least one renew interval plus
+    /// twice the store's visibility lag (see the writer rules in the module
+    /// documentation).
     pub fn try_with_margin(
         renew_interval: Duration,
         lease: Duration,
@@ -210,15 +236,44 @@ impl FenceTiming {
                 Self::MAX_LEASE
             )));
         }
-        if self_fence_margin.is_zero() || self_fence_margin >= lease {
+        // At least one renew interval (a store with a visibility lag needs
+        // more, see the writer rules), and a window of at least two renew
+        // intervals, so a holder that renews on time never closes its own
+        // window between two renews.
+        let longest_margin = lease.saturating_sub(renew_interval.saturating_mul(2));
+        if self_fence_margin < renew_interval || self_fence_margin > longest_margin {
             return Err(HostStoreError::Invalid(format!(
-                "a self-fence margin of {self_fence_margin:?} lies outside zero to the lease {lease:?}"
+                "a self-fence margin of {self_fence_margin:?} lies outside {renew_interval:?} to \
+                 {longest_margin:?} (one renew interval to the lease minus two)"
             )));
         }
         Ok(Self {
             renew_interval,
             lease,
             self_fence_margin,
+            max_commit_latency: Duration::from_secs(FENCE_MAX_COMMIT_LATENCY_SECS),
+        })
+    }
+
+    /// This timing with a host-declared longest commit: how long one
+    /// [`HostStore::commit`] can take on the host's backend. A fenced write
+    /// that meets a commit in flight on the authority it checks waits this
+    /// long before it reports the write as backed off. The bound is longer
+    /// than zero and at most the lease.
+    pub fn try_with_max_commit_latency(
+        self,
+        max_commit_latency: Duration,
+    ) -> Result<Self, HostStoreError> {
+        if max_commit_latency.is_zero() || max_commit_latency > self.lease {
+            return Err(HostStoreError::Invalid(format!(
+                "a longest commit of {max_commit_latency:?} is not longer than zero and at most \
+                 the lease of {:?}",
+                self.lease
+            )));
+        }
+        Ok(Self {
+            max_commit_latency,
+            ..self
         })
     }
 
@@ -244,6 +299,13 @@ impl FenceTiming {
     pub const fn self_fence_window(self) -> Duration {
         self.lease.saturating_sub(self.self_fence_margin)
     }
+
+    /// The host-declared longest commit: [`FENCE_MAX_COMMIT_LATENCY_SECS`]
+    /// unless the host declared another
+    /// ([`Self::try_with_max_commit_latency`]).
+    pub const fn max_commit_latency(self) -> Duration {
+        self.max_commit_latency
+    }
 }
 
 impl Default for FenceTiming {
@@ -252,6 +314,7 @@ impl Default for FenceTiming {
             renew_interval: Duration::from_secs(FENCE_RENEW_INTERVAL_SECS),
             lease: Duration::from_secs(FENCE_LEASE_SECS),
             self_fence_margin: Duration::from_secs(FENCE_RENEW_INTERVAL_SECS),
+            max_commit_latency: Duration::from_secs(FENCE_MAX_COMMIT_LATENCY_SECS),
         }
     }
 }
@@ -868,18 +931,52 @@ pub trait HostStore: Send + Sync {
 mod tests {
     use super::*;
 
-    // UNRUN (Policy v1.1): written for the frozen candidate.
+    // Unrun until the candidate's validation.
     #[test]
     fn a_declared_self_fence_margin_sets_the_window() {
         let secs = Duration::from_secs;
         let default = FenceTiming::default();
         assert_eq!(default.self_fence_margin(), default.renew_interval());
         assert_eq!(default.self_fence_window(), secs(20));
-        let declared = FenceTiming::try_with_margin(secs(10), secs(30), secs(12));
-        assert_eq!(declared.map(FenceTiming::self_fence_window), Ok(secs(18)));
         let plain = FenceTiming::try_new(secs(2), secs(6));
         assert_eq!(plain.map(FenceTiming::self_fence_margin), Ok(secs(2)));
+        // The host's 10 s margin on a 30 s lease, at 10 s and at 5 s renews.
+        let host = FenceTiming::try_with_margin(secs(10), secs(30), secs(10));
+        assert_eq!(host.map(FenceTiming::self_fence_window), Ok(secs(20)));
+        let faster = FenceTiming::try_with_margin(secs(5), secs(30), secs(10));
+        assert_eq!(faster.map(FenceTiming::self_fence_window), Ok(secs(20)));
+        // Below one renew interval.
+        assert!(FenceTiming::try_with_margin(secs(10), secs(30), secs(4)).is_err());
         assert!(FenceTiming::try_with_margin(secs(10), secs(30), Duration::ZERO).is_err());
+        // A window under two renew intervals.
+        assert!(FenceTiming::try_with_margin(secs(10), secs(30), secs(12)).is_err());
         assert!(FenceTiming::try_with_margin(secs(10), secs(30), secs(30)).is_err());
+    }
+
+    // Unrun until the candidate's validation.
+    #[test]
+    fn a_declared_longest_commit_is_kept_within_the_lease() {
+        let secs = Duration::from_secs;
+        assert_eq!(FenceTiming::default().max_commit_latency(), secs(2));
+        let slow = FenceTiming::default().try_with_max_commit_latency(secs(10));
+        assert_eq!(
+            slow.clone().map(FenceTiming::max_commit_latency),
+            Ok(secs(10))
+        );
+        // The rest of the timing is unchanged.
+        assert_eq!(
+            slow.map(FenceTiming::self_fence_window),
+            Ok(FenceTiming::default().self_fence_window())
+        );
+        assert!(
+            FenceTiming::default()
+                .try_with_max_commit_latency(Duration::ZERO)
+                .is_err()
+        );
+        assert!(
+            FenceTiming::default()
+                .try_with_max_commit_latency(secs(31))
+                .is_err()
+        );
     }
 }

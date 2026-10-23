@@ -46,6 +46,17 @@ pub(crate) struct Faults {
     pub(crate) conflict: u32,
     /// Renews that answer `Unavailable`.
     pub(crate) renew_unavailable: u32,
+    /// Acquires that answer `Unavailable`.
+    pub(crate) acquire_unavailable: u32,
+    /// Head loads that answer `Unavailable`.
+    pub(crate) load_head_unavailable: u32,
+    /// Retries of a batch that already landed that answer `Unavailable`
+    /// instead of `Ok`.
+    pub(crate) landed_retry_unavailable: u32,
+    /// How long every renew takes before it answers.
+    pub(crate) renew_delay: Option<Duration>,
+    /// How long the next listing call takes before it answers (once).
+    pub(crate) list_delay: Option<Duration>,
 }
 
 /// The test host store.
@@ -56,6 +67,8 @@ pub(crate) struct TestHost {
     pub(crate) faults: Mutex<Faults>,
     /// When set, every commit waits here until notified.
     pub(crate) commit_gate: Mutex<Option<std::sync::Arc<tokio::sync::Notify>>>,
+    /// Commits that started, counted before they wait at the gate.
+    pub(crate) commits_started: std::sync::atomic::AtomicU64,
 }
 
 impl TestHost {
@@ -69,6 +82,7 @@ impl TestHost {
             timing,
             faults: Mutex::new(Faults::default()),
             commit_gate: Mutex::new(None),
+            commits_started: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -109,6 +123,13 @@ impl TestHost {
 #[async_trait]
 impl HostStore for TestHost {
     async fn acquire_fence(&self, mode: AcquireMode) -> Result<FenceGrant, HostStoreError> {
+        {
+            let mut faults = self.faults();
+            if faults.acquire_unavailable > 0 {
+                faults.acquire_unavailable -= 1;
+                return Err(HostStoreError::Unavailable("injected".into()));
+            }
+        }
         let now = Instant::now();
         let mut state = self.state();
         let remaining = state
@@ -132,12 +153,16 @@ impl HostStore for TestHost {
     }
 
     async fn renew_fence(&self, token: FenceToken) -> Result<(), HostStoreError> {
-        {
+        let delay = {
             let mut faults = self.faults();
             if faults.renew_unavailable > 0 {
                 faults.renew_unavailable -= 1;
                 return Err(HostStoreError::Unavailable("injected".into()));
             }
+            faults.renew_delay
+        };
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
         }
         let mut state = self.state();
         if token.get() != state.token {
@@ -154,6 +179,13 @@ impl HostStore for TestHost {
     }
 
     async fn load_head(&self, scope: &ScopeRef) -> Result<Option<VersionedHead>, HostStoreError> {
+        {
+            let mut faults = self.faults();
+            if faults.load_head_unavailable > 0 {
+                faults.load_head_unavailable -= 1;
+                return Err(HostStoreError::Unavailable("injected".into()));
+            }
+        }
         Ok(self
             .state()
             .scopes
@@ -171,6 +203,10 @@ impl HostStore for TestHost {
         after: Option<&ScopeName>,
         limit: usize,
     ) -> Result<HeadPage, HostStoreError> {
+        let delay = self.faults().list_delay.take();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         let state = self.state();
         let mut heads = Vec::new();
         let mut more = false;
@@ -226,6 +262,8 @@ impl HostStore for TestHost {
     }
 
     async fn commit(&self, batch: &CommitBatch) -> Result<(), HostStoreError> {
+        self.commits_started
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let gate = self
             .commit_gate
             .lock()
@@ -261,6 +299,11 @@ impl HostStore for TestHost {
         };
         let mut state = self.state();
         if state.landed.contains(batch.commit_id().as_str()) {
+            let mut faults = self.faults();
+            if faults.landed_retry_unavailable > 0 {
+                faults.landed_retry_unavailable -= 1;
+                return Err(HostStoreError::Unavailable("injected".into()));
+            }
             return Ok(());
         }
         if batch.fence().get() < state.token {

@@ -44,6 +44,10 @@
 //!   is not, so an interactive login in progress does not survive a
 //!   restart (the user starts it again). Completed credentials are kept by
 //!   the credential stores and are not affected.
+//! - Temporary councils are process-local too: they have no host store
+//!   adapter, and the default council store declares itself process-bound,
+//!   so a council that requires durable custody is refused and a
+//!   process-bound one does not survive a restart.
 //! - The WholeBlob candidate document is written whole at every per-round
 //!   commit, so the bytes a run writes grow with the square of its rounds
 //!   (S1). Its chunks are replaced, not accumulated.
@@ -64,7 +68,8 @@ use std::time::Duration;
 use meerkat_core::host_store::{FenceToken, HostStoreError};
 
 pub use realm::{
-    ScopeCell, ScopeDelta, ScopeFamily, ScopeGuard, ScopeId, ScopeState, SpiRealm, SpiRealmConfig,
+    ArmedScopes, ScopeCell, ScopeDelta, ScopeFamily, ScopeGuard, ScopeId, ScopeState, SpiRealm,
+    SpiRealmConfig,
 };
 pub use runtime::{RUNTIME_FAMILY, SpiRuntimeStore};
 pub use session::SpiSessionStore;
@@ -95,6 +100,17 @@ pub enum SpiError {
     /// The host store failed.
     #[error("host store: {0}")]
     Host(#[from] HostStoreError),
+    /// One call's change does not fit one batch: its heads and rows
+    /// exceed the byte budget even with every large row set spilled to a
+    /// chunk. The scopes it touched are poisoned like any failed batch's.
+    #[error(
+        "host store batch too large: {head_bytes} head bytes and {row_bytes} row bytes exceed the {budget} byte budget"
+    )]
+    TooLarge {
+        head_bytes: usize,
+        row_bytes: usize,
+        budget: usize,
+    },
     /// Host data does not decode or is inconsistent.
     #[error("host store data is invalid: {0}")]
     Corrupt(String),

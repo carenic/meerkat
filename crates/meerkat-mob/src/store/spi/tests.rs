@@ -1,5 +1,5 @@
-//! Rows for the mob host store adapter. UNRUN (Policy v1.1): written for the
-//! frozen candidate, which the validation owner runs.
+//! Rows for the mob host store adapter, unrun until the candidate's
+//! validation.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use meerkat_core::host_store::{
-    AcquireMode, CommitBatch, CommitId, FenceGrant, FenceToken, HeadPage, HostStore,
+    AcquireMode, CommitBatch, CommitId, FenceGrant, FenceTiming, FenceToken, HeadPage, HostStore,
     HostStoreError, Row, RowIndex, ScopeHead, ScopeKind, ScopeName, ScopeRef, ScopeVersion,
     VersionedHead,
 };
@@ -47,6 +47,12 @@ struct HostState {
 #[derive(Debug, Default)]
 struct MemoryHost {
     state: StdMutex<HostState>,
+    /// The fence timing it declares; the default when unset.
+    timing: Option<FenceTiming>,
+    /// When set, every commit waits here until notified.
+    commit_gate: StdMutex<Option<Arc<tokio::sync::Notify>>>,
+    /// Commits that started, counted before they wait at the gate.
+    commits_started: std::sync::atomic::AtomicU64,
 }
 
 impl MemoryHost {
@@ -62,6 +68,21 @@ impl MemoryHost {
 
     fn batches(&self) -> Vec<BatchRecord> {
         self.state().batches.clone()
+    }
+
+    #[cfg_attr(not(feature = "runtime-adapter"), allow(dead_code))]
+    fn with_timing(timing: FenceTiming) -> Self {
+        Self {
+            timing: Some(timing),
+            ..Self::default()
+        }
+    }
+
+    fn set_commit_gate(&self, gate: Option<Arc<tokio::sync::Notify>>) {
+        *self
+            .commit_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = gate;
     }
 }
 
@@ -150,7 +171,21 @@ impl HostStore for MemoryHost {
             .collect())
     }
 
+    fn fence_timing(&self) -> FenceTiming {
+        self.timing.unwrap_or_default()
+    }
+
     async fn commit(&self, batch: &CommitBatch) -> Result<(), HostStoreError> {
+        self.commits_started
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let gate = self
+            .commit_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(gate) = gate {
+            gate.notified().await;
+        }
         let mut state = self.state();
         if let Some(error) = state.fail_next_commit.take() {
             return Err(error);
@@ -284,7 +319,7 @@ fn event(kind: MobEventKind, timestamp: Option<DateTime<Utc>>) -> NewMobEvent {
     }
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[tokio::test]
 async fn reopen_restores_the_exact_export_after_each_mutating_call() {
     let host = Arc::new(MemoryHost::default());
@@ -367,7 +402,7 @@ async fn reopen_restores_the_exact_export_after_each_mutating_call() {
     );
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[tokio::test]
 async fn a_write_over_two_scopes_commits_one_batch() {
     let host = Arc::new(MemoryHost::default());
@@ -411,7 +446,7 @@ async fn a_write_over_two_scopes_commits_one_batch() {
     );
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[tokio::test]
 async fn an_event_append_writes_only_the_new_event() {
     let host = Arc::new(MemoryHost::default());
@@ -442,7 +477,7 @@ async fn an_event_append_writes_only_the_new_event() {
     );
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[tokio::test]
 async fn a_failed_batch_poisons_its_scopes_and_only_them() {
     let host = Arc::new(MemoryHost::default());
@@ -490,7 +525,7 @@ async fn a_failed_batch_poisons_its_scopes_and_only_them() {
         .expect("another storage appends");
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[tokio::test]
 async fn subscribers_receive_committed_events_in_cursor_order() {
     let host = Arc::new(MemoryHost::default());
@@ -511,7 +546,7 @@ async fn subscribers_receive_committed_events_in_cursor_order() {
     assert_eq!(cursors, vec![1, 2, 3]);
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[tokio::test]
 async fn the_mob_families_are_claimed_once_per_realm() {
     let host = Arc::new(MemoryHost::default());
@@ -539,7 +574,7 @@ async fn the_mob_families_are_claimed_once_per_realm() {
     );
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[test]
 fn entries_of_an_unknown_format_are_refused() {
     let newer = br#"{"v":2,"d":{"mob_id":null,"finalized":false}}"#;
@@ -561,7 +596,7 @@ fn entries_of_an_unknown_format_are_refused() {
     );
 }
 
-// UNRUN (Policy v1.1).
+// Unrun until the candidate's validation.
 #[test]
 fn keyed_entry_names_are_injective_and_verified() {
     let left = hashed_name(G_SUPERVISOR, &MobId::from("a/b")).expect("name");
@@ -576,4 +611,207 @@ fn keyed_entry_names_are_injective_and_verified() {
         decode_group::<MobId, u64>(&body, G_SUPERVISOR).is_err(),
         "an entry whose name does not hash from its key is refused"
     );
+}
+
+// Unrun until the candidate's validation. The terminal run snapshot and
+// its terminal event commit in ONE batch over the run and mob scopes, as
+// the SQLite store commits them in one transaction.
+#[tokio::test]
+async fn a_terminal_run_and_its_event_commit_in_one_batch() {
+    let host = Arc::new(MemoryHost::default());
+    let process = start(&host, "mob").await;
+    let storage = process.stores.storage();
+    let run = MobRun::authority_backed_for_steps(
+        RunId::new(),
+        MobId::from("mob"),
+        FlowId::from("flow-a"),
+        [StepId::from("step-1")],
+        MobRunStatus::Running,
+        serde_json::json!({"a": 1}),
+    )
+    .expect("an authority-backed run");
+    let run_id = run.run_id.clone();
+    let expected_flow_state = run.flow_state.clone();
+    let (completed, input) = run
+        .flow_run_command_projection_for_test(
+            crate::run::MobMachineFlowRunCommand::TerminalizeCompleted(
+                crate::run::flow_run::inputs::TerminalizeCompleted {},
+            ),
+        )
+        .expect("the completed run state");
+    storage.runs.create_run(run).await.expect("create the run");
+    let before = host.batches().len();
+    let terminal = || {
+        event(
+            MobEventKind::FlowCompleted {
+                run_id: run_id.clone(),
+                flow_id: FlowId::from("flow-a"),
+                structured_output: None,
+            },
+            None,
+        )
+    };
+    let stored = storage
+        .runs
+        .cas_run_snapshot_and_append_terminal_event_with_authority(
+            &run_id,
+            MobRunStatus::Running,
+            &expected_flow_state,
+            MobRunStatus::Completed,
+            &completed,
+            vec![input.clone()],
+            storage.events.as_ref(),
+            terminal(),
+        )
+        .await
+        .expect("the terminal commit");
+    assert!(stored.is_some(), "the winning CAS commits the event");
+    let batches = host.batches();
+    assert_eq!(
+        batches.len(),
+        before + 1,
+        "one batch for the run and its event"
+    );
+    let kinds: HashSet<ScopeKind> = batches[before]
+        .scopes
+        .iter()
+        .map(|scope| scope.kind)
+        .collect();
+    assert!(
+        kinds.contains(&ScopeKind::Mob) && kinds.contains(&ScopeKind::Record),
+        "{kinds:?}"
+    );
+    // A lost CAS appends nothing and writes nothing.
+    let lost = storage
+        .runs
+        .cas_run_snapshot_and_append_terminal_event_with_authority(
+            &run_id,
+            MobRunStatus::Running,
+            &expected_flow_state,
+            MobRunStatus::Completed,
+            &completed,
+            vec![input],
+            storage.events.as_ref(),
+            terminal(),
+        )
+        .await
+        .expect("a lost CAS is not an error");
+    assert!(lost.is_none());
+    assert_eq!(host.batches().len(), before + 1);
+    // Both sides survive a restart together.
+    let process = restart_and_compare(&host, "mob", process).await;
+    let storage = process.stores.storage();
+    let run = storage
+        .runs
+        .get_run(&run_id)
+        .await
+        .expect("read the run")
+        .expect("the run");
+    assert_eq!(run.status, MobRunStatus::Completed);
+    let events = storage.events.replay_all().await.expect("replay");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(&event.kind, MobEventKind::FlowCompleted { .. }))
+            .count(),
+        1
+    );
+}
+
+// Unrun until the candidate's validation. A write dropped while its
+// batch is in flight still lands it, publishes its event and records the
+// scope's witness, so the next call neither conflicts nor refuses the scope
+// as changed outside its lock.
+#[tokio::test]
+async fn a_write_dropped_during_its_commit_settles_and_the_scope_serves() {
+    let host = Arc::new(MemoryHost::default());
+    let process = start(&host, "mob").await;
+    let storage = process.stores.storage();
+    let mut live = storage.events.subscribe().expect("subscribe");
+    let gate = Arc::new(tokio::sync::Notify::new());
+    host.set_commit_gate(Some(Arc::clone(&gate)));
+    let started = host
+        .commits_started
+        .load(std::sync::atomic::Ordering::Acquire);
+    let append = {
+        let events = Arc::clone(&storage.events);
+        tokio::spawn(async move { events.append(event(MobEventKind::MobCompleted, None)).await })
+    };
+    while host
+        .commits_started
+        .load(std::sync::atomic::Ordering::Acquire)
+        == started
+    {
+        tokio::task::yield_now().await;
+    }
+    append.abort();
+    assert!(append.await.expect_err("aborted").is_cancelled());
+    host.set_commit_gate(None);
+    gate.notify_one();
+    // The next call waits for the scope's lock until the handed-off commit
+    // settled, then finds the witness it recorded.
+    storage
+        .events
+        .append(event(MobEventKind::MobCompleted, None))
+        .await
+        .expect("the next append commits on top of the dropped one");
+    let replayed = storage.events.replay_all().await.expect("the scope serves");
+    assert_eq!(replayed.len(), 2);
+    assert_eq!(
+        live.try_recv().expect("the dropped write's event").cursor,
+        1
+    );
+    assert_eq!(live.try_recv().expect("the next event").cursor, 2);
+    let process = restart_and_compare(&host, "mob", process).await;
+    assert_eq!(
+        process
+            .stores
+            .storage()
+            .events
+            .replay_all()
+            .await
+            .expect("replay")
+            .len(),
+        2
+    );
+}
+
+// Unrun until the candidate's validation. The identity write fence of
+// a host store realm declares the host's longest commit as its Backoff
+// retry bound, and answers Backoff while a commit holds the identity scope.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test]
+async fn the_identity_write_fence_declares_the_hosts_longest_commit() {
+    use meerkat_runtime::{
+        RuntimeStoreError, RuntimeStoreWriteFence, RuntimeStoreWriteFenceOutcome,
+    };
+
+    struct Admit;
+    impl RuntimeStoreWriteFence for Admit {
+        fn execute_if_current(
+            &self,
+            operation: Box<dyn FnOnce() -> Result<(), RuntimeStoreError> + '_>,
+        ) -> Result<RuntimeStoreWriteFenceOutcome, RuntimeStoreError> {
+            operation().map(|()| RuntimeStoreWriteFenceOutcome::Applied)
+        }
+    }
+
+    let timing = FenceTiming::default()
+        .try_with_max_commit_latency(Duration::from_secs(10))
+        .expect("a 10 s longest commit");
+    let host = Arc::new(MemoryHost::with_timing(timing));
+    let process = start(&host, "mob").await;
+    let bundle = &process.stores.bundle;
+    let fence = stores::SpiIdentityRuntimeWriteFence::over(bundle, Arc::new(Admit));
+    assert_eq!(fence.backoff_retry_bound(), Duration::from_secs(10));
+    let held = bundle.realm.cell(&bundle.identity_scope).lock_owned().await;
+    assert!(matches!(
+        fence.execute_if_current(Box::new(|| Ok::<(), RuntimeStoreError>(()))),
+        Ok(RuntimeStoreWriteFenceOutcome::Backoff { .. })
+    ));
+    drop(held);
+    assert!(matches!(
+        fence.execute_if_current(Box::new(|| Ok::<(), RuntimeStoreError>(()))),
+        Ok(RuntimeStoreWriteFenceOutcome::Applied)
+    ));
 }

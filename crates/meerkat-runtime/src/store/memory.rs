@@ -2060,7 +2060,7 @@ impl super::RuntimeSessionAuthorityOps for InMemoryRuntimeStore {
                 // store lock released between attempts; the prepared
                 // snapshot stays here until an attempt commits it.
                 let mut pending = Some(prepared);
-                let mut retry = super::FenceBackoffRetry::default();
+                let mut retry = super::FenceBackoffRetry::for_fence(write_fence.as_deref());
                 loop {
                     let mut inner = self.inner.lock().await;
                     let session = pending
@@ -3616,7 +3616,7 @@ impl RuntimeStore for InMemoryRuntimeStore {
     ) -> Result<FencedInputStateBatchCasOutcome, RuntimeStoreError> {
         // A fence that answers Backoff is tried again with the store lock
         // released between attempts; each attempt re-reads the rows.
-        let mut retry = super::FenceBackoffRetry::default();
+        let mut retry = super::FenceBackoffRetry::for_fence(Some(write_fence.as_ref()));
         loop {
             let prepared = prepare_input_state_batch_cas(expected, replacements)?;
             if prepared.is_empty() {
@@ -3747,7 +3747,7 @@ impl RuntimeStore for InMemoryRuntimeStore {
     ) -> Result<FencedInputStateBatchCasOutcome, RuntimeStoreError> {
         // A fence that answers Backoff is tried again with the store lock
         // released between attempts; each attempt re-reads the rows.
-        let mut retry = super::FenceBackoffRetry::default();
+        let mut retry = super::FenceBackoffRetry::for_fence(Some(write_fence.as_ref()));
         loop {
             let prepared = prepare_recovery_input_state_mutations(mutations)?;
             let mut inner = self.inner.lock().await;
@@ -4027,7 +4027,7 @@ impl RuntimeStore for InMemoryRuntimeStore {
             .fetch_add(1, Ordering::AcqRel);
         // A fence that answers Backoff is tried again with the store lock
         // released between attempts; each attempt re-reads the row.
-        let mut retry = super::FenceBackoffRetry::default();
+        let mut retry = super::FenceBackoffRetry::for_fence(Some(write_fence.as_ref()));
         loop {
             let replacement = prepare_machine_lifecycle_replacement(replacement.clone())?;
             let mut inner = self.inner.lock().await;
@@ -4809,6 +4809,82 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    /// Answers Backoff until `busy_for` has passed since its first call, as a
+    /// host store identity fence does while a slow host commit holds the
+    /// identity scope, and declares `bound` as its Backoff retry bound.
+    struct SlowCommitFence {
+        busy_until: std::sync::Mutex<Option<tokio::time::Instant>>,
+        busy_for: std::time::Duration,
+        bound: std::time::Duration,
+    }
+
+    impl RuntimeStoreWriteFence for SlowCommitFence {
+        fn execute_if_current(
+            &self,
+            operation: Box<dyn FnOnce() -> Result<(), RuntimeStoreError> + '_>,
+        ) -> Result<RuntimeStoreWriteFenceOutcome, RuntimeStoreError> {
+            let now = tokio::time::Instant::now();
+            let busy_until = *self
+                .busy_until
+                .lock()
+                .unwrap()
+                .get_or_insert(now + self.busy_for);
+            if now < busy_until {
+                return Ok(RuntimeStoreWriteFenceOutcome::Backoff {
+                    reason: "a host store commit is in flight".to_string(),
+                });
+            }
+            operation().map(|()| RuntimeStoreWriteFenceOutcome::Applied)
+        }
+
+        fn backoff_retry_bound(&self) -> std::time::Duration {
+            self.bound
+        }
+    }
+
+    // Unrun until the candidate's validation. A fenced write waits out a
+    // host commit slower than the default bound when the fence declares a
+    // longer one (a host store's declared longest commit), and backs off
+    // under the default.
+    #[tokio::test(start_paused = true)]
+    async fn a_fenced_write_waits_out_a_slow_commit_under_its_declared_bound() {
+        for (bound, admitted) in [
+            (std::time::Duration::from_secs(10), true),
+            (crate::store::FENCE_BACKOFF_RETRY_BOUND, false),
+        ] {
+            let store = InMemoryRuntimeStore::new();
+            let runtime_id = LogicalRuntimeId::new("fenced-slow-commit");
+            let fence = Arc::new(SlowCommitFence {
+                busy_until: std::sync::Mutex::new(None),
+                busy_for: std::time::Duration::from_secs(3),
+                bound,
+            });
+            let outcome = store
+                .compare_and_swap_machine_lifecycle_with_fence(
+                    &runtime_id,
+                    MachineLifecycleExpectedVersion::Missing,
+                    lifecycle_commit(&runtime_id, RuntimeState::Idle, 1, 1),
+                    fence,
+                )
+                .await
+                .unwrap();
+            if admitted {
+                assert!(
+                    matches!(outcome, FencedMachineLifecycleCasOutcome::Applied { .. }),
+                    "{outcome:?}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        outcome,
+                        FencedMachineLifecycleCasOutcome::FenceBackoff { .. }
+                    ),
+                    "{outcome:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

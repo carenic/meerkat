@@ -6372,6 +6372,16 @@ pub trait RuntimeStoreWriteFence: Send + Sync {
     ) -> Result<RuntimeStoreWriteFenceOutcome, RuntimeStoreError> {
         self.execute_if_current(operation)
     }
+
+    /// How long a caller that holds an async lock retries this fence while
+    /// it answers [`RuntimeStoreWriteFenceOutcome::Backoff`], releasing the
+    /// lock between attempts, before it reports the Backoff. The default is
+    /// two seconds. A fence whose authority guard waits for a host store
+    /// commit answers the host's declared longest commit
+    /// ([`meerkat_core::host_store::FenceTiming::max_commit_latency`]).
+    fn backoff_retry_bound(&self) -> std::time::Duration {
+        FENCE_BACKOFF_RETRY_BOUND
+    }
 }
 
 /// Which entry of a [`RuntimeStoreWriteFence`] a fenced write goes through.
@@ -6515,7 +6525,8 @@ fn execute_optional_target_write_through<T>(
 }
 
 /// How long a fenced write whose caller holds an async lock retries a fence
-/// that answers [`RuntimeStoreWriteFenceOutcome::Backoff`].
+/// that answers [`RuntimeStoreWriteFenceOutcome::Backoff`], unless the fence
+/// declares another bound ([`RuntimeStoreWriteFence::backoff_retry_bound`]).
 ///
 /// Such a caller cannot wait inside the fence: the wait would block its
 /// thread while it holds a lock other tasks need. Between attempts it
@@ -6536,8 +6547,10 @@ const FENCE_BACKOFF_MAX_PAUSE: std::time::Duration = std::time::Duration::from_m
 /// Each attempt takes the caller's lock, re-observes what it writes and
 /// runs one fence attempt. After an attempt the fence answered with
 /// Backoff, the caller releases the lock and calls [`Self::pause`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct FenceBackoffRetry {
+    /// How long the retries last: the fence's declared bound.
+    bound: std::time::Duration,
     /// Set at the first pause, so a write the fence admits at once reads no
     /// clock.
     deadline: Option<crate::tokio::time::Instant>,
@@ -6545,13 +6558,24 @@ pub(crate) struct FenceBackoffRetry {
 }
 
 impl FenceBackoffRetry {
+    /// The retry policy for writes through `fence`, bounded by
+    /// [`RuntimeStoreWriteFence::backoff_retry_bound`] (the default bound
+    /// when there is no fence, which never answers Backoff).
+    pub(crate) fn for_fence(fence: Option<&dyn RuntimeStoreWriteFence>) -> Self {
+        Self {
+            bound: fence.map_or(FENCE_BACKOFF_RETRY_BOUND, |fence| {
+                fence.backoff_retry_bound()
+            }),
+            deadline: None,
+            pause: std::time::Duration::ZERO,
+        }
+    }
+
     /// Wait before the next attempt and return `true`, or return `false`
     /// once the bound has passed: the caller then reports the Backoff.
     pub(crate) async fn pause(&mut self) -> bool {
         let now = crate::tokio::time::Instant::now();
-        let deadline = *self
-            .deadline
-            .get_or_insert_with(|| now + FENCE_BACKOFF_RETRY_BOUND);
+        let deadline = *self.deadline.get_or_insert_with(|| now + self.bound);
         if now >= deadline {
             return false;
         }
