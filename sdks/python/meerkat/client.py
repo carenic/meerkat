@@ -6906,6 +6906,16 @@ class MeerkatClient:
                     field,
                     context,
                 )
+        elif provider == "open_ai_assistant_message":
+            MeerkatClient._require_present_string_field(meta, "id", context)
+            # The phase is advisory: a phase this SDK does not know is kept
+            # as given, never refused.
+            for field in ("phase", "response_id"):
+                MeerkatClient._validate_nullable_response_string(
+                    meta,
+                    field,
+                    context,
+                )
         elif provider != "unknown":
             raise MeerkatError(
                 "INVALID_RESPONSE",

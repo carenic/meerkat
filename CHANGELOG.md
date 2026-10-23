@@ -35,6 +35,18 @@ them.
 
 ## [Unreleased]
 
+### Fixed
+
+- Python SDK: a history row or assistant block whose provider metadata is
+  `open_ai_assistant_message` is read instead of refused. Core has stored
+  that metadata on every OpenAI Responses assistant message with an item id
+  since 0.9.0, but the SDK's closed provider-metadata check did not list it,
+  so reading such a session's history failed with `INVALID_RESPONSE`
+  ("unsupported provider metadata"). The check now takes the variant's `id`,
+  its optional `response_id` and its optional `phase` (`commentary` or
+  `final_answer`), and keeps any other phase string as given. The TypeScript
+  and Web SDKs never refused it.
+
 ## [0.9.5] - 2026-10-23
 
 ### Breaking
