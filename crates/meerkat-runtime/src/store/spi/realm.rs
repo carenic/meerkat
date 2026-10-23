@@ -1,13 +1,13 @@
 //! One realm over a host store: the fence, the lease, the scopes and the
 //! commit engine every host store adapter of the process shares.
 //!
-//! A process opens ONE [`SpiRealm`] per realm (M3): it acquires the fence,
+//! A process opens ONE [`SpiRealm`] per realm: it acquires the fence,
 //! renews it, keeps the local lease clock, lists every head once, and owns
 //! the per-scope journal state. The runtime adapter
 //! ([`super::SpiRuntimeStore`]) and the mob adapter (in meerkat-mob) both
 //! commit through it, so the second adapter never fences out the first.
 //!
-//! # Concurrency (M1)
+//! # Concurrency
 //!
 //! There is no realm-wide lock on the commit path. Each scope has its own
 //! async mutex ([`ScopeCell`]); a call locks the cells of the scopes it
@@ -17,7 +17,9 @@
 //! exclusive for cross-scope reads); the realm itself never serializes two
 //! scopes' commits.
 //!
-//! # Fencing (K3 writer rules, A9/K2-1)
+//! # Fencing
+//!
+//! The realm keeps the writer rules of [`meerkat_core::host_store`]:
 //!
 //! - Open acquires with [`AcquireMode::Exclusive`] by default: a live holder
 //!   answers [`SpiError::Held`] with what remains of its lease. After an
@@ -48,14 +50,14 @@
 //!   so a writer past its window dispatches no tool and makes no model call
 //!   after its next commit point.
 //!
-//! # Failure (D3)
+//! # Failure
 //!
 //! A batch that is refused, or whose outcome stays unknown after the retry
 //! budget, poisons every scope it touched: the process may hold state the
 //! host does not, so those scopes refuse every later call until the process
 //! reopens the realm. A fence loss poisons the whole realm. An unknown
 //! outcome is always settled (by retrying the same batch, or by reading the
-//! head's commit id) before a scope's next version is written (C-2), and a
+//! head's commit id) before a scope's next version is written, and a
 //! poisoned scope writes no next version at all. A batch whose outcome stays
 //! unknown is remembered as such, so a later re-acquire does not read it as
 //! another writer's.
@@ -107,7 +109,7 @@ pub const BATCH_BUDGET: usize = MAX_BATCH_BYTES - 512 * 1024;
 pub const CHUNK_ROWS_PER_BATCH: usize = 7;
 
 /// A checkpoint is written once the rows appended since the last one pass
-/// `max(CHECKPOINT_FACTOR x live bytes, CHECKPOINT_MIN_BYTES)` (S4).
+/// `max(CHECKPOINT_FACTOR x live bytes, CHECKPOINT_MIN_BYTES)`.
 pub const CHECKPOINT_FACTOR: u64 = 4;
 
 /// See [`CHECKPOINT_FACTOR`].
@@ -371,7 +373,7 @@ impl ScopeState {
     }
 
     /// Whether the next commit should carry the scope's full image, so the
-    /// journal writes a checkpoint (S4: rows since the last checkpoint pass
+    /// journal writes a checkpoint (rows since the last checkpoint pass
     /// `max(4 x live bytes, 4 MiB)`).
     #[must_use]
     pub fn wants_full_image(&self) -> bool {
@@ -536,7 +538,7 @@ pub struct SpiRealm {
     counter: AtomicU64,
     lease_start: StdMutex<Instant>,
     /// Set when a renew failed or the window was seen closed; cleared only
-    /// by a fresh fenced acquire (the K3 re-acquire rule), never by a renew.
+    /// by a fresh fenced acquire, never by a renew.
     stopped: AtomicBool,
     /// Commits hold it shared; a re-acquire holds it exclusive, so no batch
     /// carrying the old token is in flight when the token changes.
@@ -609,7 +611,7 @@ fn op_bytes(key: &str, value_len: usize) -> u64 {
 
 impl SpiRealm {
     /// Acquire the realm's fence, start renewing it, wait out a superseded
-    /// holder's lease, and list every head (C-5: after the acquire, before
+    /// holder's lease, and list every head (after the acquire, before
     /// the first commit). Chunks whose owner no longer exists are deleted.
     ///
     /// # Errors
@@ -714,7 +716,7 @@ impl SpiRealm {
     }
 
     /// Refuse a cross-scope read while the realm or any scope is poisoned:
-    /// a poisoned scope's memory may be ahead of the host (D3).
+    /// a poisoned scope's memory may be ahead of the host.
     pub fn check_cross_scope_read(&self) -> Result<(), SpiError> {
         self.check_realm()?;
         if self.has_poisoned_scopes() {
@@ -779,7 +781,7 @@ impl SpiRealm {
     }
 
     /// Make sure this writer may write before a mutation: a no-op while its
-    /// window is open, otherwise a fresh fenced acquire (K3: a stopped
+    /// window is open, otherwise a fresh fenced acquire (a stopped
     /// holder re-acquires; it never resumes on a later renew).
     ///
     /// # Errors
@@ -970,7 +972,7 @@ impl SpiRealm {
 
     /// Record a batch whose outcome stays unknown: each scope it touched
     /// may be at its previous or its next version. Its scopes are
-    /// poisoned (D3); this keeps a re-acquire from reading the batch as
+    /// poisoned; this keeps a re-acquire from reading the batch as
     /// another writer's.
     fn record_unsettled(&self, batch: &CommitBatch) {
         let mut uncertain = lock(&self.uncertain);
@@ -1341,7 +1343,7 @@ impl SpiRealm {
         Ok(out)
     }
 
-    /// Fold the scope's rows into its row entries (D2: a body loads when
+    /// Fold the scope's rows into its row entries (a body loads when
     /// Core opens the scope). Unreferenced chunks the scope owns are deleted
     /// afterwards, best effort. The scope counts as loaded only once the
     /// adapter has installed the answered values in its memory and called
@@ -1539,7 +1541,7 @@ impl SpiRealm {
     ///
     /// # Errors
     /// The memory side already changed, so every failure poisons what may
-    /// now differ from the host (D3): a failed or unknown batch poisons the
+    /// now differ from the host: a failed or unknown batch poisons the
     /// scopes it would have changed (not the ones only locked to read), a
     /// failure before any batch was sent poisons every scope whose delta
     /// names an entry, and a fence loss poisons the realm.
@@ -1712,7 +1714,7 @@ impl SpiRealm {
 
     /// Commit `batch`, settling an unknown or unavailable outcome by
     /// retrying the same batch (same commit id) and by reading the first
-    /// scope's head, within the retry budget (C-2).
+    /// scope's head, within the retry budget.
     async fn commit_settled(&self, batch: &CommitBatch) -> Result<(), SpiError> {
         let deadline = Instant::now() + self.config.commit_retry_budget;
         let mut attempt: u32 = 0;
@@ -2120,7 +2122,7 @@ impl SpiRealm {
         }))
     }
 
-    /// Keep the main batch within [`BATCH_BUDGET`] (M5): spill the largest
+    /// Keep the main batch within [`BATCH_BUDGET`]: spill the largest
     /// scopes' rows into chunks, each replaced by one spill row.
     fn fit_batch(&self, plans: &mut [ScopePlan]) -> Result<(), SpiError> {
         loop {

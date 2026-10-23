@@ -9,12 +9,12 @@
 //! 2. a mutation checks the self-fence first ([`SpiRealm::ensure_lease`]),
 //!    so a writer past its window changes nothing;
 //! 3. lock the named scopes in order, refuse poisoned ones, and load a body
-//!    that is not resident yet (D2); a mutation checks the self-fence again,
+//!    that is not resident yet; a mutation checks the self-fence again,
 //!    since the lock waits may have outlasted the window;
 //! 4. run the in-memory method, recording every map entry it touches; from
 //!    here until the hand-off, a dropped call poisons the locked scopes
 //!    ([`ArmedScopes`]);
-//! 5. refuse and poison when it touched a scope it did not lock (M2);
+//! 5. refuse and poison when it touched a scope it did not lock;
 //! 6. export the touched entries and hand them, with the scopes and the
 //!    gate, to a task that commits them to the host as one batch
 //!    ([`SpiRealm::commit`]) and adopts it, or poisons, whether or not the
@@ -176,7 +176,7 @@ fn memory_error(error: RuntimeStoreError) -> SpiError {
     SpiError::Corrupt(error.to_string())
 }
 
-/// Whether a runtime's body loads at boot (D2): recovery must act on it.
+/// Whether a runtime's body loads at boot: recovery must act on it.
 /// An archived runtime never loads at boot.
 fn needs_body_at_boot(pinned: &BTreeMap<String, Arc<Vec<u8>>>) -> Result<bool, SpiError> {
     if let Some(catalog) = pinned.get("cat") {
@@ -245,7 +245,7 @@ pub struct SpiRuntimeStore {
     realm: Arc<SpiRealm>,
     memory: InMemoryRuntimeStore,
     /// Shared by single-scope calls, exclusive for cross-scope reads and the
-    /// controller custody (M1, M8).
+    /// controller custody.
     gate: Arc<RwLock<()>>,
     /// The mob host records; a change lands here only after its batch did,
     /// on the task that committed it.
@@ -277,7 +277,7 @@ fn find<'a>(guards: &'a mut [ScopeGuard], id: &ScopeId) -> Result<&'a mut ScopeS
 impl SpiRuntimeStore {
     /// Open the runtime store over a realm: claim its families, import every
     /// realm record and every runtime's pinned entries, and load the bodies
-    /// recovery must act on (D2). Every other body loads on first use.
+    /// recovery must act on. Every other body loads on first use.
     ///
     /// # Errors
     /// Host failures and data that does not decode.
@@ -410,7 +410,7 @@ impl SpiRuntimeStore {
             .commit_detached(deltas)
             .await
             .map_err(SpiError::into_write)?;
-        // D2: an archived runtime with nothing left for recovery leaves
+        // An archived runtime with nothing left for recovery leaves
         // memory once its archive is durable.
         for runtime_id in runtimes {
             let id = ScopeId::new(RUNTIME_FAMILY, runtime_id.clone());
@@ -469,7 +469,7 @@ impl SpiRuntimeStore {
     /// Turn what a call touched into one delta per changed locked scope
     /// (paired with its index among `guards`), and name the runtimes whose
     /// archive may let their body leave memory. A touch outside the locked
-    /// scopes is refused (M2) and poisons that scope, or the realm when the
+    /// scopes is refused and poisons that scope, or the realm when the
     /// scope is busy.
     async fn prepare_commit(
         &self,
@@ -636,7 +636,7 @@ impl SpiRuntimeStore {
 
 /// The controller custody of an [`SpiRuntimeStore`]: the in-memory custody
 /// plus the realm gate held exclusive, so no host commit is in flight while
-/// a controller visits the runtimes (M8).
+/// a controller visits the runtimes.
 struct SpiControllerCustody<'a> {
     inner: Box<dyn crate::store::RuntimeStoreControllerCustody + 'a>,
     _gate: tokio::sync::RwLockWriteGuard<'a, ()>,
@@ -1735,7 +1735,7 @@ impl RuntimeStore for SpiRuntimeStore {
         .await
     }
 
-    // Mob host bindings and revocations (M9): the adapter's own record
+    // Mob host bindings and revocations: the adapter's own record
     // scopes, one per mob for each, with the SQLite store's semantics
     // (`runtime_mob_host_bindings` and `runtime_mob_host_revocations`): CAS
     // compares the full record bytes, an insert supersedes the mob's revoke

@@ -323,6 +323,35 @@ async fn reference_host_store_leases() {
     ));
 }
 
+// Unrun until the candidate's validation.
+// A renew of the current token after its lease lapsed: nothing superseded
+// the token, so the store accepts the renew and the lease is live again.
+// Stopping such a writer is Core's rule, not the store's: its self-fence
+// window (`SelfFenceWindow`) closed before the lease lapsed, and a renew
+// does not reopen it; only a fresh fenced acquire does.
+#[tokio::test]
+async fn reference_host_store_accepts_a_lapsed_current_token_renew() {
+    let store = InMemoryHostStore::new();
+    let grant = store
+        .acquire_fence(AcquireMode::Exclusive)
+        .await
+        .expect("an empty realm grants");
+    store.lapse_fence_leases();
+    assert_eq!(
+        store.renew_fence(grant.token).await,
+        Ok(()),
+        "the store accepts a renew of the current token after its lease lapsed"
+    );
+    assert_eq!(
+        store.acquire_fence(AcquireMode::Exclusive).await,
+        Err(HostStoreError::Held {
+            holder: grant.token,
+            remaining: FenceTiming::default().lease(),
+        }),
+        "the accepted renew made the holder's lease live again"
+    );
+}
+
 #[tokio::test]
 async fn reference_host_store_leases_follow_the_host_timing() {
     let timing =

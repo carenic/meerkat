@@ -852,7 +852,7 @@ async fn a_closing_rebase_takes_the_delegate_and_not_the_fallback() {
     );
 }
 
-// Unrun until the candidate's validation. The K3 re-acquire rule, with the
+// Unrun until the candidate's validation. The re-acquire rule, with the
 // visibility-lag counterexample: renews fail from some point, the lease
 // lapses, another process acquires, and the old writer's connection comes
 // back. A renew that now succeeded would prove nothing (the new acquire may
