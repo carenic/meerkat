@@ -5807,6 +5807,19 @@ impl DriverEntry {
         }
     }
 
+    /// Reload the `Consumed` terminals a store-owned durable-tail recovery
+    /// committed for inputs this driver still holds as non-terminal
+    /// (`PersistentRuntimeDriver::adopt_durable_consumed_inputs`).
+    /// An ephemeral runtime keeps no durable rows, so nothing is reloaded.
+    pub(crate) async fn adopt_durable_consumed_inputs(
+        &mut self,
+    ) -> Result<Vec<InputId>, RuntimeDriverError> {
+        match self {
+            DriverEntry::Ephemeral(_) => Ok(Vec::new()),
+            DriverEntry::Persistent(driver) => driver.adopt_durable_consumed_inputs().await,
+        }
+    }
+
     pub(crate) fn prepare_destroy_lifecycle(
         &mut self,
     ) -> Result<PreparedDestroy, RuntimeDriverError> {

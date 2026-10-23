@@ -1429,6 +1429,146 @@ async fn whole_blob_provisional_recovery_promotes_store_owned_candidate() {
     );
 }
 
+/// The retire after an archive's settle leaves the input that settle's
+/// recovery consumed consumed.
+///
+/// The archive takes its runtime lease on a session no start registered
+/// again. The lease's registration recovers the run's input as pending: its
+/// run's boundary receipt is missing, so the input goes back to the queue,
+/// still naming the run. The archive's recovery then commits the run's
+/// completed tail and consumes that input at the store level. Reloading the
+/// committed terminals into the lease's driver leaves the retire under the
+/// same lease nothing to abandon: the row stays consumed, and the sweep
+/// stages no runtime-terminated carrier for it (a directed input would
+/// otherwise tell its sender that work which ran was terminated). RED
+/// before: the retire's sweep abandoned the input as retired over the
+/// consumed row. Unrun: written while Cargo is not run.
+#[tokio::test]
+async fn the_retire_after_an_archive_settle_leaves_the_inputs_its_recovery_consumed() {
+    use meerkat_core::lifecycle::core_executor::BoundSessionCommit;
+    use meerkat_core::types::{
+        AssistantBlock, BlockAssistantMessage, Message, StopReason, TranscriptMessageIdentity,
+        UserMessage,
+    };
+    use meerkat_runtime::recovery::{
+        DurableTailRecoveryDisposition, DurableTailRecoveryOutcome,
+        recover_durable_tail_for_session_archive,
+    };
+    use meerkat_runtime::store::{PreparedRuntimeSessionCommit, PreparedWholeBlobProvisionalTail};
+
+    let store = Arc::new(InMemoryRuntimeStore::new());
+    let run_id = RunId::new();
+    let input = make_prompt("the run's prompt");
+    let mut committed = meerkat_core::Session::new();
+    committed.push(Message::User(UserMessage::text("the run's prompt")));
+    let session_id = committed.id().clone();
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    let committed_authority = store
+        .commit_prepared_session_boundary(
+            &runtime_id,
+            PreparedRuntimeSessionCommit::snapshot_only(
+                BoundSessionCommit::sealed(Arc::new(committed.clone())).unwrap(),
+            ),
+        )
+        .await
+        .unwrap()
+        .authority()
+        .and_then(|authority| authority.whole_blob())
+        .cloned()
+        .expect("initial boundary returns WholeBlob store authority");
+
+    // The run answered, and its end-of-run save landed; its boundary did not.
+    let mut answered = committed;
+    answered.push(Message::BlockAssistant(BlockAssistantMessage {
+        blocks: vec![AssistantBlock::Text {
+            text: "the answer".to_string(),
+            meta: None,
+        }],
+        stop_reason: Some(StopReason::EndTurn),
+        identity: TranscriptMessageIdentity::default().with_run_id(run_id.clone()),
+        created_at: meerkat_core::types::message_timestamp_now(),
+        assistant_message_id: None,
+    }));
+    store
+        .write_prepared_whole_blob_provisional_tail(
+            &runtime_id,
+            PreparedWholeBlobProvisionalTail::prepare(
+                committed_authority,
+                run_id.clone(),
+                1,
+                &BoundSessionCommit::sealed(Arc::new(answered)).unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    store
+        .persist_input_state(
+            &runtime_id,
+            &persistable(applied_pending_state(&input, &run_id, 1)),
+        )
+        .await
+        .unwrap();
+
+    let machine =
+        MeerkatMachine::persistent(store.clone() as Arc<dyn RuntimeStore>, memory_blob_store())
+            .expect("persistent machine");
+    let deadline = meerkat_core::time_compat::Instant::now() + std::time::Duration::from_secs(10);
+    let lease = machine
+        .prepare_session_archive_lease_before(&session_id, deadline)
+        .await
+        .expect("the archive's lease prepares")
+        .expect("a durable session leaves the archive a runtime to retire");
+
+    let (DurableTailRecoveryOutcome::Committed { disposition, .. }, _) =
+        recover_durable_tail_for_session_archive(store.as_ref(), &session_id)
+            .await
+            .expect("the archive's recovery answers")
+    else {
+        panic!("the archive's recovery must commit the run's completed tail");
+    };
+    assert_eq!(disposition, DurableTailRecoveryDisposition::CommitCompleted);
+    let terminal_of = |rows: &[StoredInputState]| {
+        rows.iter()
+            .find(|row| &row.state.input_id == input.id())
+            .map(|row| (row.seed.phase, row.seed.terminal_outcome.clone()))
+    };
+    let consumed = Some((
+        InputLifecycleState::Consumed,
+        Some(InputTerminalOutcome::Consumed),
+    ));
+    let rows = store.load_input_states_strict(&runtime_id).await.unwrap();
+    assert_eq!(
+        terminal_of(&rows),
+        consumed,
+        "the recovery consumes the run's input"
+    );
+
+    let reloaded = machine
+        .reload_recovered_input_terminals_with_archive_lease(&lease)
+        .await
+        .expect("the lease's driver reloads the committed terminals");
+    assert_eq!(reloaded, vec![input.id().clone()]);
+
+    machine
+        .retire_session_with_archive_lease_before(lease, deadline)
+        .await
+        .expect("the archive's runtime retire commits");
+    let rows = store.load_input_states_strict(&runtime_id).await.unwrap();
+    assert_eq!(
+        terminal_of(&rows),
+        consumed,
+        "the retire leaves the consumed input consumed: its sweep abandons nothing, so no \
+         runtime-terminated carrier is staged for it"
+    );
+    assert_eq!(
+        load_runtime_state(store.as_ref(), &runtime_id)
+            .await
+            .unwrap(),
+        Some(RuntimeState::Retired)
+    );
+}
+
 #[tokio::test]
 async fn whole_blob_interrupted_recovery_installs_one_sealed_repair_artifact() {
     use meerkat_core::lifecycle::core_executor::BoundSessionCommit;

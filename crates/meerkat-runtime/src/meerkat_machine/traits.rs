@@ -2136,6 +2136,32 @@ impl MeerkatMachine {
         Ok(recovered_from_quiescent_archive)
     }
 
+    /// Reload into `lease`'s driver the input terminals a store-owned
+    /// durable-tail recovery committed while the lease held the session.
+    ///
+    /// An archive settles a durable tail at the store level, and the recovery
+    /// consumes the input rows bound to the run whose tail it commits. The
+    /// lease's driver still holds those inputs as pending: without the reload,
+    /// the retire under the same lease would abandon them as retired over the
+    /// consumed rows, and send a directed input a runtime-terminated terminal
+    /// for work that ran. Each consumed row is adopted in memory through the
+    /// generated authority; nothing is written. Returns the inputs reloaded.
+    /// A reload that fails requires a registration-authorized cold reload of
+    /// the lease's runtime, so the retire cannot write over the consumed rows;
+    /// the error ends the archive.
+    pub async fn reload_recovered_input_terminals_with_archive_lease(
+        &self,
+        lease: &super::MachineSessionArchiveLease,
+    ) -> Result<Vec<meerkat_core::lifecycle::InputId>, RuntimeControlPlaneError> {
+        lease
+            .driver
+            .lock()
+            .await
+            .adopt_durable_consumed_inputs()
+            .await
+            .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))
+    }
+
     /// Archive-only sibling that supplies an owned, quiescent stored-session
     /// publisher when the restarted runtime has no attached executor. The
     /// lease-retained live publisher always wins when present.

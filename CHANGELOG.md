@@ -1385,6 +1385,18 @@ them.
   still refuses a `Stopped` runtime, because a later start may resume its
   run.
 
+- `meerkat-runtime`, `meerkat-session`: the retire that follows an archive's
+  settle of a durable tail no longer abandons the inputs that settle
+  consumed. The archive's recovery commits the tail at the store level and
+  consumes the input rows bound to its run, while the archive's runtime
+  lease driver still held those inputs as pending. The retire under that
+  lease then wrote `Abandoned { Retired }` over the consumed rows, and a
+  directed input's sender was told the work was terminated although it ran,
+  so a peer could send it again. After a committed settle the archive now
+  reloads those terminals into the lease's driver
+  (`MeerkatMachine::reload_recovered_input_terminals_with_archive_lease`), and
+  the retire leaves them consumed.
+
 - `meerkat-gemini`: preserve provider-issued `functionCall.id` through
   streamed tool calls, saved transcripts, assistant replay and matching
   `functionResponse.id`, including parallel calls to the same function.

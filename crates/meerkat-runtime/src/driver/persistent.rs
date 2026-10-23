@@ -2457,6 +2457,42 @@ impl PersistentRuntimeDriver {
         Ok(abandoned)
     }
 
+    /// Reload from the store the `Consumed` terminals a store-owned
+    /// durable-tail recovery committed for inputs this driver still holds as
+    /// non-terminal. The recovery consumes the rows bound to the run whose
+    /// tail it commits, outside this driver; each such input is adopted in
+    /// memory through the generated authority. Nothing is written, because
+    /// the store already holds the terminal rows. Returns the adopted inputs.
+    ///
+    /// A reload that fails leaves this driver's view of those rows unknown, so
+    /// it requires a registration-authorized cold reload: no later mutation
+    /// through this driver can write over the consumed rows.
+    pub(crate) async fn adopt_durable_consumed_inputs(
+        &mut self,
+    ) -> Result<Vec<InputId>, RuntimeDriverError> {
+        const OPERATION: &str = "reload of durable-tail recovery terminals";
+        let rows = match self.store.load_input_states(&self.runtime_id).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                return Err(self.mark_durability_reload_required(OPERATION, error.to_string()));
+            }
+        };
+        let mut adopted = Vec::new();
+        for row in rows {
+            let crate::store::InputStateRow::Decoded(stored) = row else {
+                continue;
+            };
+            match self.inner.adopt_durable_consumed_input(&stored) {
+                Ok(true) => adopted.push(stored.state.input_id.clone()),
+                Ok(false) => {}
+                Err(error) => {
+                    return Err(self.mark_durability_reload_required(OPERATION, error.to_string()));
+                }
+            }
+        }
+        Ok(adopted)
+    }
+
     pub(crate) async fn abandon_queued_input(
         &mut self,
         input_id: &meerkat_core::lifecycle::InputId,

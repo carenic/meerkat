@@ -3594,6 +3594,30 @@ impl<'a> MachineSessionArchiveProtocol<'a> {
             .map_err(|error| archive_runtime_control_error(id, error))
     }
 
+    /// Reload into the archive's lease driver the input terminals the
+    /// archive's own durable-tail recovery just committed, so the retire
+    /// under that lease does not abandon, over the consumed rows, inputs the
+    /// recovered run consumed.
+    async fn reload_recovered_input_terminals(
+        &self,
+        id: &SessionId,
+        lease: &meerkat_runtime::MachineSessionArchiveLease,
+    ) -> Result<(), SessionError> {
+        let reloaded = self
+            .runtime_adapter
+            .reload_recovered_input_terminals_with_archive_lease(lease)
+            .await
+            .map_err(|error| archive_runtime_control_error(id, error))?;
+        if !reloaded.is_empty() {
+            tracing::info!(
+                session_id = %id,
+                inputs = reloaded.len(),
+                "reloaded the input terminals the archive's durable-tail recovery committed into its runtime lease"
+            );
+        }
+        Ok(())
+    }
+
     fn require_shared_runtime_store(
         &self,
         id: &SessionId,
@@ -5682,10 +5706,20 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// [`SessionError::DurableTailRecoveryRefused`]; both keep the tail
     /// intact. Without a recorded provisional tail, or outside HeadCanonical,
     /// nothing here settles the conflict, which is returned unchanged.
+    ///
+    /// A committed recovery consumes, at the store level, the input rows bound
+    /// to the run whose tail it commits. The archive's runtime lease driver
+    /// still holds them as pending, so the archive reloads the committed
+    /// terminals into it before anything else: the retire under the same
+    /// lease then leaves those inputs consumed, instead of abandoning them as
+    /// retired over the consumed rows and telling a directed sender that work
+    /// which ran was terminated.
     async fn settle_durable_tail_under_archive_gates(
         &self,
         id: &SessionId,
         conflict: SessionError,
+        machine_archive: &MachineSessionArchiveProtocol<'_>,
+        archive_lease: Option<&meerkat_runtime::MachineSessionArchiveLease>,
     ) -> Result<(), SessionError> {
         if self.runtime_store.session_persistence_profile()
             != RuntimeSessionPersistenceProfile::HeadCanonicalV1
@@ -5718,6 +5752,11 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                     "settled the durable tail an ended turn left ahead of its runtime boundary before archiving the session"
                 );
                 self.note_live_authority_advanced(id);
+                if let Some(lease) = archive_lease {
+                    machine_archive
+                        .reload_recovered_input_terminals(id, lease)
+                        .await?;
+                }
                 Ok(())
             }
             (meerkat_runtime::recovery::DurableTailRecoveryOutcome::AlreadyAligned { .. }, _) => {
@@ -14856,8 +14895,13 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 .await
             {
                 Err(conflict) if Self::is_transcript_revision_conflict_error(&conflict) => {
-                    self.settle_durable_tail_under_archive_gates(id, conflict)
-                        .await?;
+                    self.settle_durable_tail_under_archive_gates(
+                        id,
+                        conflict,
+                        &machine_archive,
+                        candidate_lease.as_ref(),
+                    )
+                    .await?;
                     let _ = self
                         .discard_stale_live_session_if_needed(
                             id,
@@ -14943,8 +14987,13 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                     // it under the held gates and read once more.
                     match self.load_persisted_session_for_archive(id).await {
                         Err(conflict) if Self::is_transcript_revision_conflict_error(&conflict) => {
-                            self.settle_durable_tail_under_archive_gates(id, conflict)
-                                .await?;
+                            self.settle_durable_tail_under_archive_gates(
+                                id,
+                                conflict,
+                                &machine_archive,
+                                archive_lease.as_ref(),
+                            )
+                            .await?;
                             self.load_persisted_session_for_archive(id).await?
                         }
                         loaded => loaded?,
