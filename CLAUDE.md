@@ -377,6 +377,7 @@ and its CI must be green before a release tag (`require_ci_green`):
   every lane that compiles the meerkat-mob chain or sweeps the
   reverse-dependency closure to the push and names it (`deferred_to_push`,
   printed by the gate): the `closure-tests` rows, `closure-check`,
+  `rustdoc`,
   `feature-check`, `governed-jsonl` and `mcp-confinement-positive` (unless
   it touches their own inputs or changes their definition), the
   integration suites whose package compiles meerkat-mob, the feature suites
@@ -537,6 +538,11 @@ and its CI must be green before a release tag (`require_ci_green`):
   an input or the stack), and credits only whole-workspace rows.
 - `closure-check` (push only): `cargo check --all-features` (lib and bin
   targets) over the reverse-dependency closure of the changed packages.
+- `rustdoc` (push only): `cargo doc --workspace --no-deps --keep-going`
+  with `RUSTDOCFLAGS=-Dwarnings`, in two parallel legs (default features
+  and `--all-features`), so a broken or private intra-doc link anywhere in
+  the workspace fails the push. It documents the whole workspace, so an
+  error that only `cargo doc -p <crate>` shows is outside it.
 - `governed-jsonl` and `mcp-confinement-positive` (push; a pull request
   runs a lane when it touches the lane's inputs, `GUARD_LANE_INPUTS` in
   `scripts/ci-cargo-lanes.mjs` (the files that define its selected cases,

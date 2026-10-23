@@ -54,6 +54,9 @@
 // so no pull request fits the 20-minute cap from the start of the pre-push
 // hook to a green CI gate with them. The plan lists what a pull request left
 // to the push (deferred_to_push), and the push plan runs all of it.
+// The workspace rustdoc (`doc --workspace --no-deps` with rustdoc's lints
+// denied) is left to the push the same way: it documents meerkat-mob and
+// every crate built on it.
 //
 // A push runs no unit lane of its own: the rows a pull request's unit lane
 // would run (the same shards, so the same `-p` sets, because Cargo unifies
@@ -2217,6 +2220,7 @@ function plan(args) {
   const deferred = {
     closure_test_rows: 0,
     closure_check: false,
+    rustdoc: false,
     feature_check_jobs: 0,
     integration_suites: [],
     unit_feature_suites: [],
@@ -2543,9 +2547,13 @@ function plan(args) {
   );
   const guardRuns = (lane) => Object.hasOwn(result.guard_lane_reasons, lane);
   result.closure_check = result.rust_changed && !deferToPush;
+  // Every crate's documentation, with rustdoc's lints denied: the push
+  // runs it on a Rust change, like the closure check.
+  result.rustdoc = result.rust_changed && !deferToPush;
   result.governed_jsonl = guardRuns("governed_jsonl");
   result.mcp_confinement_positive = guardRuns("mcp_confinement_positive");
   deferred.closure_check = result.rust_changed && deferToPush;
+  deferred.rustdoc = result.rust_changed && deferToPush;
   deferred.governed_jsonl = result.rust_changed && !result.governed_jsonl;
   deferred.mcp_confinement_positive = result.rust_changed && !result.mcp_confinement_positive;
 
@@ -2811,6 +2819,7 @@ function deferredSummary(deferred) {
   if (deferred.governed_jsonl) parts.push("governed JSONL");
   if (deferred.mcp_confinement_positive) parts.push("MCP confinement positive");
   if (deferred.example_web_wasm) parts.push("the web wasm build and browser suites");
+  if (deferred.rustdoc) parts.push("the workspace rustdoc");
   return parts.join("; ");
 }
 
@@ -2842,6 +2851,7 @@ function githubOutput(result) {
   scalar("closure_count", String(result.closure.length));
   scalar("closure_flags", result.closure_flags);
   scalar("closure_check", String(result.closure_check));
+  scalar("rustdoc", String(result.rustdoc));
   scalar("governed_jsonl", String(result.governed_jsonl));
   scalar("mcp_confinement_positive", String(result.mcp_confinement_positive));
   scalar("guard_lane_reasons", JSON.stringify(result.guard_lane_reasons));

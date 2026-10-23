@@ -319,7 +319,7 @@ try {
       plan: { mode: "none" },
       component_results: {
         ...goodAttestation.component_results,
-        ...Object.fromEntries(["clippy", "unit", "integration", "governed_jsonl", "mcp_confinement_positive", "main_unit", "closure_check", "wasm_check", "sdk_host"].map((lane) => [lane, "skipped"])),
+        ...Object.fromEntries(["clippy", "unit", "integration", "governed_jsonl", "mcp_confinement_positive", "main_unit", "closure_check", "rustdoc", "wasm_check", "sdk_host"].map((lane) => [lane, "skipped"])),
       },
     }],
     ["a packages-mode run", { plan: { mode: "packages" } }],
@@ -549,10 +549,10 @@ if (args[0] === "api") {
     CLOSURE_TEST_COUNT: "0", TEST_SCOPE_COUNT: "0", HOOK_BINARY_COUNT: "0", HOOK_RETAINED_COUNT: "0",
     MAIN_UNIT_PACKED_RESULT: "skipped", MAIN_UNIT_ARCHIVE_BUILD_RESULT: "skipped", MAIN_UNIT_ARCHIVE_RUN_RESULT: "skipped",
     MAIN_ARCHIVE_BUILD_COUNT: "0", MAIN_ARCHIVE_RUN_COUNT: "0",
-    CLOSURE_CHECK_RESULT: "skipped", FEATURE_CHECK_RESULT: "skipped", FEATURE_CHECK_COUNT: "0",
+    CLOSURE_CHECK_RESULT: "skipped", RUSTDOC_RESULT: "skipped", FEATURE_CHECK_RESULT: "skipped", FEATURE_CHECK_COUNT: "0",
     WASM: "false", WASM_CHECK_RESULT: "skipped", SDK_HOST_RESULT: "skipped", EXAMPLE_WEB_RESULT: "skipped",
     WASM_TIMERS_RESULT: "skipped", BAZEL_GRAPH_RESULT: "success", RUST_CHANGED: "false", IS_MAIN_PUSH: "true",
-    IS_PULL_REQUEST: "false", PLAN_EVENT: "push", CLOSURE_CHECK: "false", GOVERNED_JSONL: "false",
+    IS_PULL_REQUEST: "false", PLAN_EVENT: "push", CLOSURE_CHECK: "false", RUSTDOC: "false", GOVERNED_JSONL: "false",
     MCP_CONFINEMENT_POSITIVE: "false", DEFERRED_TO_PUSH: "", READER_NOT_RUN: "",
     SDK_HOST: "false", BAZEL_GRAPH: "true", EXAMPLES_BROWSER: "false", EXAMPLE_WEB: "false", EXAMPLE_WEB_WASM: "false",
     MODE: "release-projection", REASON: "release projection", SHARD_COUNT: "0", UNIT_SHARD_COUNT: "6",
@@ -626,11 +626,12 @@ if (args[0] === "api") {
   };
   const pullRequestGate = {
     ...rustGate, IS_MAIN_PUSH: "false", IS_PULL_REQUEST: "true", PLAN_EVENT: "pull_request",
-    DEFERRED_TO_PUSH: "17 closure-tests rows; the closure check; governed JSONL; MCP confinement positive",
+    DEFERRED_TO_PUSH: "17 closure-tests rows; the closure check; governed JSONL; MCP confinement positive; the workspace rustdoc",
   };
   const pushGate = {
-    ...rustGate, CLOSURE_CHECK: "true", GOVERNED_JSONL: "true", MCP_CONFINEMENT_POSITIVE: "true",
-    CLOSURE_CHECK_RESULT: "success", GOVERNED_JSONL_RESULT: "success", MCP_CONFINEMENT_POSITIVE_RESULT: "success",
+    ...rustGate, CLOSURE_CHECK: "true", RUSTDOC: "true", GOVERNED_JSONL: "true", MCP_CONFINEMENT_POSITIVE: "true",
+    CLOSURE_CHECK_RESULT: "success", RUSTDOC_RESULT: "success", GOVERNED_JSONL_RESULT: "success",
+    MCP_CONFINEMENT_POSITIVE_RESULT: "success",
     CLOSURE_TEST_COUNT: "17", CLOSURE_TESTS_RESULT: "success", MAIN_UNIT_PACKED_RESULT: "success",
     WASM_CHECK_RESULT: "success", SDK_HOST_RESULT: "success", EXAMPLE_WEB_RESULT: "success",
     WASM_TIMERS_RESULT: "success", BAZEL_GRAPH_RESULT: "success",
@@ -671,12 +672,16 @@ if (args[0] === "api") {
   assert.match(unitOnMainRun.stdout, /the push runs its unit rows in the main unit lane: core/);
   for (const [label, env] of [
     ["a push plan without the closure check", { ...pushGate, CLOSURE_CHECK: "false", CLOSURE_CHECK_RESULT: "skipped" }],
+    ["a push plan without the workspace rustdoc", { ...pushGate, RUSTDOC: "false", RUSTDOC_RESULT: "skipped" }],
     ["a push plan without governed JSONL", { ...pushGate, GOVERNED_JSONL: "false", GOVERNED_JSONL_RESULT: "skipped" }],
     ["a push plan without the confinement lane", { ...pushGate, MCP_CONFINEMENT_POSITIVE: "false", MCP_CONFINEMENT_POSITIVE_RESULT: "skipped" }],
     ["a push plan that left lanes to a later push", { ...pushGate, DEFERRED_TO_PUSH: "the closure check" }],
     ["a pull-request plan on a push", { ...pushGate, PLAN_EVENT: "pull_request" }],
     ["a push whose closure check did not run", { ...pushGate, CLOSURE_CHECK_RESULT: "skipped" }],
+    ["a push whose workspace rustdoc did not run", { ...pushGate, RUSTDOC_RESULT: "skipped" }],
+    ["a push whose workspace rustdoc failed", { ...pushGate, RUSTDOC_RESULT: "failure" }],
     ["a pull request whose skipped closure check failed", { ...pullRequestGate, CLOSURE_CHECK_RESULT: "failure" }],
+    ["a pull request whose skipped workspace rustdoc failed", { ...pullRequestGate, RUSTDOC_RESULT: "failure" }],
     ["a pull request whose governed JSONL lane failed", { ...pullRequestGate, GOVERNED_JSONL_RESULT: "failure" }],
     ["unit rows on main whose packed main unit lane did not run", { ...unitOnMainGate, MAIN_UNIT_PACKED_RESULT: "skipped" }],
     ["unit rows on main whose packed main unit lane failed", { ...unitOnMainGate, MAIN_UNIT_PACKED_RESULT: "failure" }],

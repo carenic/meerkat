@@ -242,6 +242,7 @@ function assertEventSplit(plan, label) {
       assert.equal(shard.targets, "--all-targets", `${label}: ${shard.name} lints every target on the push`);
     }
     assert.equal(plan.closure_check, plan.rust_changed, `${label}: the push checks the closure on a Rust change`);
+    assert.equal(plan.rustdoc, plan.rust_changed, `${label}: the push runs the workspace rustdoc on a Rust change`);
     assert.equal(plan.governed_jsonl, plan.rust_changed, `${label}: the push runs governed JSONL on a Rust change`);
     assert.equal(plan.mcp_confinement_positive, plan.rust_changed, `${label}: the push runs the confinement lane on a Rust change`);
     // Every Rust change is an ordinary reason: the CI gate keeps such a lane
@@ -259,6 +260,7 @@ function assertEventSplit(plan, label) {
   assert.deepEqual(plan.closure_test_rows, [], `${label}: no closure-tests row in a pull request`);
   assert.deepEqual(plan.feature_check_jobs, [], `${label}: no feature-combination job in a pull request`);
   assert.equal(plan.closure_check, false, `${label}: no closure check in a pull request`);
+  assert.equal(plan.rustdoc, false, `${label}: no workspace rustdoc in a pull request`);
   // An exact-profile lane runs in a pull request exactly when it touches
   // that lane's own inputs or changes its definition; otherwise the push
   // runs it.
@@ -283,6 +285,7 @@ function assertEventSplit(plan, label) {
     }
   }
   assert.equal(deferred.closure_check, plan.rust_changed);
+  assert.equal(deferred.rustdoc, plan.rust_changed);
   for (const suite of plan.integration_suites) {
     assert.equal(chain(suite.packages[0]), false, `${label}: integration suite ${suite.name} compiles meerkat-mob`);
   }
@@ -966,11 +969,12 @@ for (const path of [
   assert.equal(github.status, 0, github.stderr);
   const lines = Object.fromEntries(github.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
   assert.equal(lines.event, "pull_request");
-  for (const key of ["closure_check", "governed_jsonl", "mcp_confinement_positive"]) assert.equal(lines[key], "false", key);
+  for (const key of ["closure_check", "rustdoc", "governed_jsonl", "mcp_confinement_positive"]) assert.equal(lines[key], "false", key);
   assert.equal(lines.guard_lane_reasons, "{}", "no guard lane ran, so no reason");
   assert.equal(lines.closure_test_count, "0");
   assert.equal(lines.feature_check_count, "0");
   assert.match(lines.deferred_to_push, /^17 closure-tests rows; the closure check; \d+ feature-combination jobs; /);
+  assert.match(lines.deferred_to_push, /; the workspace rustdoc$/);
   assert.match(lines.deferred_to_push, /; the Clippy of meerkat-integration-tests, meerkat-rpc, rkat \(mob chain invalidated\); /);
   // A packages-mode pull request lints a chain head itself (lib and bin
   // targets) while meerkat-mob's build stays cached: a change to the heads,
@@ -1033,7 +1037,7 @@ for (const path of [
   );
   assert.equal(pushLines.event, "push");
   assert.equal(pushLines.deferred_to_push, "");
-  for (const key of ["closure_check", "governed_jsonl", "mcp_confinement_positive"]) assert.equal(pushLines[key], "true", key);
+  for (const key of ["closure_check", "rustdoc", "governed_jsonl", "mcp_confinement_positive"]) assert.equal(pushLines[key], "true", key);
   assert.deepEqual(
     JSON.parse(pushLines.guard_lane_reasons),
     { governed_jsonl: ["every_rust_change"], mcp_confinement_positive: ["every_rust_change"] },
@@ -1434,6 +1438,7 @@ for (const path of [
     "closure_count",
     "closure_flags",
     "closure_check",
+    "rustdoc",
     "governed_jsonl",
     "mcp_confinement_positive",
     "guard_lane_reasons",
@@ -1953,7 +1958,7 @@ for (const path of [
   for (const job of ["ratchets", "integration", "governed-jsonl", "closure-check", "sdk-host", "example-web", "wasm-timers", "bazel-graph"]) {
     assert.ok(jobLines(workflow, job).includes("    needs: [changes, stagger]"), `${job} is a short lane: it waits for the stagger job`);
   }
-  for (const job of ["wasm-check", "governance-gates", "mcp-confinement-positive", "tlc-audits", "main-unit-archive-build", "clippy", "main-unit", "closure-tests", "feature-check"]) {
+  for (const job of ["wasm-check", "governance-gates", "mcp-confinement-positive", "tlc-audits", "main-unit-archive-build", "clippy", "main-unit", "closure-tests", "feature-check", "rustdoc"]) {
     assert.ok(jobLines(workflow, job).includes("    needs: changes"), `${job} starts with the first wave`);
   }
   const gate = jobLines(workflow, "gate");
