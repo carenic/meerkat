@@ -484,6 +484,8 @@ pub struct SpiRealm {
     config: SpiRealmConfig,
     timing: FenceTiming,
     fence: FenceToken,
+    /// What the open waited out of a superseded holder's lease.
+    superseded_lease: Duration,
     writer: String,
     counter: AtomicU64,
     lease_start: StdMutex<Instant>,
@@ -554,6 +556,7 @@ impl SpiRealm {
             host,
             timing,
             fence: grant.token,
+            superseded_lease: grant.superseded_lease,
             writer: uuid::Uuid::now_v7().simple().to_string(),
             counter: AtomicU64::new(0),
             lease_start: StdMutex::new(started),
@@ -595,6 +598,14 @@ impl SpiRealm {
     #[must_use]
     pub fn timing(&self) -> FenceTiming {
         self.timing
+    }
+
+    /// What remained of the superseded holder's recorded lease, which the
+    /// open waited out before it served anything; zero when the acquire
+    /// superseded no live holder.
+    #[must_use]
+    pub fn superseded_lease(&self) -> Duration {
+        self.superseded_lease
     }
 
     /// The realm poison cause, when the fence was lost.
