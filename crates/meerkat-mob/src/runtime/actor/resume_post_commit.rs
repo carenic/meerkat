@@ -33,7 +33,10 @@ impl MobActor {
             // the member keeps its deferral (and its state), and the resume
             // proceeds; any other failure is retained as for a binding below.
             for identity in self.deferred_member_custody.identities() {
-                match self.reattempt_deferred_member_custody(&identity).await {
+                match self
+                    .reattempt_deferred_member_custody_unprompted(&identity)
+                    .await
+                {
                     Ok(()) | Err(MobError::MemberCustodyDeferred { .. }) => {}
                     Err(error) => self.retain_resume_post_commit_error(error),
                 }

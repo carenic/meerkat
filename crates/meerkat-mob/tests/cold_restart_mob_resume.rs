@@ -4533,30 +4533,37 @@ async fn a_mob_whose_retiring_member_has_a_durable_tail_restarts() {
     let _ = handle_2.shutdown().await;
 }
 
-/// A refused mob start names the member whose session another runtime owner
-/// hosts, that session, and the typed hosting refusal as its cause.
+/// An operation on a retiring member whose cleanup delivery custody the start
+/// deferred refuses with the typed deferral: it names the member, its session,
+/// the deferred restore and the hosting refusal it met again.
 #[cfg(feature = "test-support")]
-fn assert_startup_refusal_names_the_hosted_member(
+fn assert_custody_deferred_for_the_hosted_member(
     error: &meerkat_mob::MobError,
     member: &AgentIdentity,
     session: &meerkat_core::types::SessionId,
 ) {
-    let failure = match error {
-        meerkat_mob::MobError::SharedLifecycleFailure(failure) => failure.as_ref(),
+    let deferral = match error {
+        meerkat_mob::MobError::SharedRetirementFailure(shared) => shared.as_ref(),
         other => other,
     };
-    let meerkat_mob::MobError::MemberStartupRecoveryFailed {
+    let meerkat_mob::MobError::MemberCustodyDeferred {
         member_id,
         session_id,
+        restore,
         cause,
-    } = failure
+    } = deferral
     else {
-        panic!("a refused start must report the member's startup recovery failure: {error:?}");
+        panic!("an operation on a member whose custody is deferred must refuse typed: {error:?}");
     };
     assert_eq!(member_id, member, "the refusal names the member");
     assert_eq!(
         session_id, session,
         "the refusal names the member's session"
+    );
+    assert_eq!(
+        *restore,
+        meerkat_mob::MemberCustodyRestore::CleanupDelivery,
+        "the refusal names the deferred restore"
     );
     assert!(
         matches!(
@@ -4565,272 +4572,181 @@ fn assert_startup_refusal_names_the_hosted_member(
                 meerkat_core::service::SessionError::ServedElsewhere { id }
             ) if id == session
         ),
-        "the refusal's cause is the typed hosting refusal for that session: {cause:?}"
+        "the deferral's cause is the typed hosting refusal for that session: {cause:?}"
     );
 }
 
-/// #1813: a mob start never settles a durable tail on a member session that
-/// another runtime owner hosts. The retiring member's last turn leaves a
-/// durable tail (a power cut between its rows and its runtime boundary), and
-/// before the next start another runtime owner on the realm (another process,
-/// here a second owner in this one) takes the member session's hosting
-/// claim. That owner may still commit the tail itself, so the start must not
-/// adopt it: it refuses and leaves the tail as it was, and its caller gets the
-/// refusal typed, naming the member, its session and the hosting refusal.
-/// Once that owner lets go, the next start settles the tail under its own
-/// claim and runs, the healthy lead included.
+/// The member's status shows its deferred cleanup delivery restore and the
+/// cause the restore's last attempt met.
+#[cfg(feature = "test-support")]
+async fn assert_retiring_custody_deferred_for(
+    handle: &MobHandle,
+    member: &AgentIdentity,
+    cause: meerkat_mob::MemberCustodyDeferralCause,
+) {
+    let status = handle
+        .member_status(member)
+        .await
+        .expect("the deferred member's status");
+    assert_eq!(
+        status
+            .custody_deferred
+            .map(|deferral| (deferral.restore, deferral.cause)),
+        Some((meerkat_mob::MemberCustodyRestore::CleanupDelivery, cause)),
+        "the member's status shows its deferred cleanup delivery and the cause it met"
+    );
+}
+
+/// A mob restarted over [`crash_with_a_retiring_member_tail`] while another
+/// runtime owner on the realm hosts the retiring member's session.
+#[cfg(feature = "test-support")]
+struct DeferredRetiringMember {
+    tail: ActiveMemberTail,
+    service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    store: Arc<SqliteSessionStore>,
+    handle: MobHandle,
+    identity: AgentIdentity,
+    other_owner_claim: Option<meerkat_runtime::HostingClaim>,
+}
+
+/// Start the mob while another runtime owner hosts its retiring member
+/// `w-1`'s session. The start defers that member's cleanup delivery custody
+/// and runs: the mob is Running, `w-1` is still Retiring next to the healthy
+/// lead, and its durable tail is exactly as the cut left it.
+#[cfg(feature = "test-support")]
+async fn start_with_a_retiring_members_custody_deferred(
+    temp: &Path,
+    paths: &Paths,
+) -> DeferredRetiringMember {
+    start_with_custody_deferred_after(temp, paths, MemberAtCrash::Retiring).await
+}
+
+/// [`start_with_a_retiring_members_custody_deferred`] over a crash that left
+/// the member `at_crash`, which is one of the retiring postures.
+#[cfg(feature = "test-support")]
+async fn start_with_custody_deferred_after(
+    temp: &Path,
+    paths: &Paths,
+    at_crash: MemberAtCrash,
+) -> DeferredRetiringMember {
+    let tail = crash_with_a_member_tail(temp, paths, at_crash).await;
+    let other_owner_claim = tail.another_owner_hosts_the_session();
+    let (service, store) = persistent_head_canonical_service(paths, tail.runtime_store.clone());
+    let handle = MobBuilder::for_resume(
+        MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage"),
+    )
+    .with_session_service(service.clone())
+    .with_default_llm_client(openai_test_client())
+    .notify_orchestrator_on_resume(false)
+    .resume()
+    .await
+    .unwrap_or_else(|error| {
+        panic!("the mob must start while another runtime owner hosts a retiring member: {error}")
+    });
+    let status = handle.status().await;
+    assert!(
+        matches!(status, Ok(meerkat_mob::MobState::Running)),
+        "a start that defers one retiring member's custody runs: {status:?}"
+    );
+    let deferred = DeferredRetiringMember {
+        tail,
+        service,
+        store,
+        handle,
+        identity: AgentIdentity::from("w-1"),
+        other_owner_claim: Some(other_owner_claim),
+    };
+    deferred
+        .assert_still_retiring_with_its_tail_untouched()
+        .await;
+    deferred
+}
+
+#[cfg(feature = "test-support")]
+impl DeferredRetiringMember {
+    /// The member is still rostered as Retiring next to the healthy lead, and
+    /// its tail is exactly as the cut left it: nothing settled a tail that
+    /// another runtime owner hosts.
+    async fn assert_still_retiring_with_its_tail_untouched(&self) {
+        let members = self.handle.list_members_including_retiring().await;
+        let member = members
+            .iter()
+            .find(|entry| entry.agent_identity == self.identity)
+            .unwrap_or_else(|| panic!("the deferred member stays rostered: {members:?}"));
+        assert_eq!(
+            member.status,
+            MobMemberStatus::Retiring,
+            "the deferred member stays Retiring"
+        );
+        assert_retiring_custody_deferred_for(
+            &self.handle,
+            &self.identity,
+            meerkat_mob::MemberCustodyDeferralCause::ServedElsewhere,
+        )
+        .await;
+        assert!(
+            members.iter().any(|entry| entry.agent_identity == "lead-1"),
+            "the healthy lead is still listed: {members:?}"
+        );
+        assert_eq!(
+            self.tail.committed_token_now().await,
+            self.tail.committed_token,
+            "nothing settled the durable tail another runtime owner hosts"
+        );
+        assert_eq!(
+            self.tail.physical_token_now(&self.store).await,
+            self.tail.ahead_token,
+            "the durable tail stays where the cut left it"
+        );
+    }
+
+    /// The other runtime owner lets go of the member's session.
+    fn release_the_other_owner(&mut self) {
+        drop(self.other_owner_claim.take());
+    }
+
+    /// The member's retirement completed: it is no longer rostered.
+    async fn assert_retired(&self) {
+        let members = self.handle.list_members_including_retiring().await;
+        assert!(
+            !members
+                .iter()
+                .any(|entry| entry.agent_identity == self.identity),
+            "the member's retirement completed: {members:?}"
+        );
+    }
+}
+
+/// A mob start never settles a durable tail on a retiring member's session
+/// that another runtime owner hosts, and it no longer refuses the whole mob
+/// for it either. The retiring member's last turn leaves a durable tail (a
+/// power cut between its rows and its runtime boundary), and before the next
+/// start another runtime owner on the realm (another process, here a second
+/// owner in this one) takes the member session's hosting claim. That owner
+/// may still commit the tail itself. The start defers the member's cleanup
+/// delivery custody instead: the mob runs with its healthy lead, the member
+/// stays Retiring, and the tail stays as it was. Once that owner lets go, the
+/// next start settles the tail under its own claim.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread")]
-async fn a_mob_start_refuses_a_durable_tail_another_runtime_owner_hosts() {
-    // nextest runs each test in its own process: the actor's startup refusal
-    // is logged at ERROR, so show it.
+async fn a_mob_start_defers_a_retiring_members_custody_another_runtime_owner_hosts() {
+    // nextest runs each test in its own process: show refusals logged at ERROR.
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::ERROR)
         .with_writer(std::io::stderr)
         .try_init();
     let temp = tempfile::tempdir().expect("temp dir");
     let paths = Paths::new(temp.path());
-    let power_store = Arc::new(PowerCutRuntimeStore::with_hosting_root(
-        &paths.realm_db_path,
-        temp.path(),
-    ));
-    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = power_store.clone();
-
-    // ---------------- Lifetime 1 ----------------
-    let (service_1, store_1) = persistent_head_canonical_service(&paths, runtime_store.clone());
-    let storage_1 = MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage");
-    let handle_1 = MobBuilder::new(mob_definition(MobRuntimeMode::TurnDriven), storage_1)
-        .with_session_service(service_1.clone())
-        .with_default_llm_client(openai_test_client())
-        .create()
-        .await
-        .expect("create persistent mob");
-    handle_1
-        .spawn_spec(SpawnMemberSpec::new("lead", AgentIdentity::from("lead-1")))
-        .await
-        .expect("spawn lead");
-    handle_1
-        .spawn_spec(SpawnMemberSpec::new("worker", AgentIdentity::from("w-1")))
-        .await
-        .expect("spawn worker");
-    let identity = AgentIdentity::from("w-1");
-    let w1_sid = handle_1
-        .resolve_bridge_session_id(&identity)
-        .await
-        .expect("w1 session id");
-    let lead_sid = handle_1
-        .resolve_bridge_session_id(&AgentIdentity::from("lead-1"))
-        .await
-        .expect("lead session id");
-    let mut runtime_release_witnesses = Vec::new();
-    for session_id in [&lead_sid, &w1_sid] {
-        let runtime = service_1
-            .comms_runtime(session_id)
-            .await
-            .unwrap_or_else(|| panic!("comms runtime missing for {session_id}"));
-        runtime_release_witnesses.push(Arc::downgrade(&runtime));
-    }
-
-    send_and_wait(
-        &handle_1,
-        service_1.as_ref(),
-        "w-1",
-        "PRE_CUT_TAIL_TURN token-alpha",
-        "hosted-tail-lifetime1",
-    )
-    .await;
-    wait_for_head_canonical_authority_convergence(
-        store_1.as_ref(),
-        runtime_store.as_ref(),
-        &w1_sid,
-        "PRE_CUT_TAIL_TURN",
-        "hosted-tail-pre-cut-boundary",
-    )
-    .await;
-
-    // The next turn's durable row lands; its runtime boundary commit does not.
-    power_store.set_cut(true);
-    let send_result = tokio::time::timeout(Duration::from_secs(30), async {
-        handle_1
-            .member(&identity)
-            .await
-            .expect("member handle")
-            .send(
-                "POST_CUT_TAIL_TURN token-omega".to_string(),
-                HandlingMode::Queue,
-            )
-            .await
-    })
-    .await;
-    eprintln!("[hosted-tail] send during cut => {send_result:?}");
-    wait_for_row_contains(
-        store_1.as_ref(),
-        &w1_sid,
-        "POST_CUT_TAIL_TURN",
-        "hosted-tail-row",
-    )
-    .await;
-    power_store
-        .wait_for_prepared_boundary_commit_rejection()
-        .await;
-    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&w1_sid);
-    let committed_token = || async {
-        runtime_store
-            .load_session_boundary_authority(&runtime_id)
-            .await
-            .expect("load runtime session authority")
-            .expect("runtime session authority present")
-            .head_canonical()
-            .expect("head-canonical boundary authority")
-            .committed_head_token()
-            .to_string()
-    };
-    let tail_committed_token = committed_token().await;
-    let ahead_head = store_1
-        .load_head(&w1_sid)
-        .await
-        .expect("load ahead physical head")
-        .expect("ahead physical head exists");
-    let ahead_token = meerkat_core::session_store::session_head_cas_token(&ahead_head)
-        .expect("ahead physical head has a canonical token");
-    assert_ne!(
-        ahead_token, tail_committed_token,
-        "the physical head must be ahead of the retained runtime authority"
-    );
-
-    // The member's retirement starts with the tail in place, then the process
-    // dies before it finishes.
-    let retire_result =
-        tokio::time::timeout(Duration::from_secs(10), handle_1.retire(identity.clone())).await;
-    eprintln!("[hosted-tail] retire during cut => {retire_result:?}");
-    handle_1
-        .crash_stop_preserving_durable_work_for_test()
-        .await
-        .expect("crash-stop lifetime-1 actor");
-    service_1
-        .try_shutdown()
-        .await
-        .expect("shutdown first session service");
-    drop(handle_1);
-    drop(service_1);
-    drop(store_1);
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while runtime_release_witnesses
-            .iter()
-            .any(|runtime| runtime.upgrade().is_some())
-        {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("every old session runtime is released before lifetime 2");
-
-    // ---------------- Lifetime 2 ----------------
-    // Power is back, and the realm's sessions are hosted with OS-locked
-    // claims. Another runtime owner on the realm hosts the retiring member's
-    // session before this start.
-    power_store.set_cut(false);
-    power_store.forward_hosting_capability();
-    let capability = meerkat_runtime::RuntimeStore::hosting_capability(runtime_store.as_ref());
-    assert!(
-        capability.is_cross_process(),
-        "the realm store must offer cross-process hosting claims: {capability:?}"
-    );
-    let other_owner = meerkat_runtime::SessionHostingAuthority::new(
-        capability,
-        meerkat_runtime::HostingOwner::mint(),
-    );
-    let other_owner_claim = other_owner
-        .grant(&w1_sid)
-        .expect("another runtime owner takes the retiring member's hosting claim");
-
-    let (service_2, store_2) = persistent_head_canonical_service(&paths, runtime_store.clone());
-    let refused = MobBuilder::for_resume(
-        MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage"),
-    )
-    .with_session_service(service_2.clone())
-    .with_default_llm_client(openai_test_client())
-    .notify_orchestrator_on_resume(false)
-    .resume()
-    .await;
-    let refused_status = match &refused {
-        Ok(handle) => Some(handle.status().await),
-        Err(_) => None,
-    };
-    let refused_error = refused.as_ref().err().map(ToString::to_string);
-    eprintln!(
-        "[hosted-tail] start while hosted elsewhere => error {refused_error:?}, status \
-         {refused_status:?}"
-    );
-
-    // Never another owner's tail: the runtime authority and the physical head
-    // are exactly as the cut left them.
-    assert_eq!(
-        committed_token().await,
-        tail_committed_token,
-        "a mob start must not settle a durable tail on a session another runtime owner hosts"
-    );
-    let head_after_refusal = store_2
-        .load_head(&w1_sid)
-        .await
-        .expect("load the physical head after the refused start")
-        .expect("the physical head still exists");
-    assert_eq!(
-        meerkat_core::session_store::session_head_cas_token(&head_after_refusal)
-            .expect("the physical head has a canonical token"),
-        ahead_token,
-        "the refused start must leave the durable tail where the cut left it"
-    );
-    // The start refuses rather than run without the member's cleanup
-    // delivery.
-    assert!(
-        !matches!(refused_status, Some(Ok(meerkat_mob::MobState::Running))),
-        "a mob start that could not restore a retiring member's cleanup delivery must not run: \
-         {refused_status:?}"
-    );
-    // The caller learns why, typed: the member, its session and the refusal.
-    // A handle the builder already handed back reports it from a status read,
-    // from an explicit resume and from every status read after that.
-    match &refused {
-        Err(error) => assert_startup_refusal_names_the_hosted_member(error, &identity, &w1_sid),
-        Ok(handle) => {
-            match &refused_status {
-                Some(Err(error)) => {
-                    assert_startup_refusal_names_the_hosted_member(error, &identity, &w1_sid);
-                }
-                other => {
-                    panic!("status after the refused start must report the refusal: {other:?}")
-                }
-            }
-            match handle.resume().await {
-                Err(error) => {
-                    assert_startup_refusal_names_the_hosted_member(&error, &identity, &w1_sid);
-                }
-                Ok(()) => {
-                    panic!("an explicit resume after the refused start must report the refusal")
-                }
-            }
-            match handle.status().await {
-                Err(error) => {
-                    assert_startup_refusal_names_the_hosted_member(&error, &identity, &w1_sid);
-                }
-                Ok(state) => {
-                    panic!("status after the refused resume must report the refusal, not {state:?}")
-                }
-            }
-        }
-    }
-    if let Ok(handle) = refused {
-        let _ = handle.shutdown().await;
-    }
+    let mut deferred = start_with_a_retiring_members_custody_deferred(temp.path(), &paths).await;
+    let _ = deferred.handle.shutdown().await;
 
     // The other owner lets go; the next start settles the tail under its own
     // claim and runs.
-    drop(other_owner_claim);
-    let handle_3 = MobBuilder::for_resume(
+    deferred.release_the_other_owner();
+    let restarted = MobBuilder::for_resume(
         MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage again"),
     )
-    .with_session_service(service_2.clone())
+    .with_session_service(deferred.service.clone())
     .with_default_llm_client(openai_test_client())
     .notify_orchestrator_on_resume(false)
     .resume()
@@ -4838,28 +4754,145 @@ async fn a_mob_start_refuses_a_durable_tail_another_runtime_owner_hosts() {
     .unwrap_or_else(|error| {
         panic!("the mob must start once no other runtime owner hosts the member: {error}")
     });
-    let status = handle_3.status().await;
+    let status = restarted.status().await;
     assert!(
         matches!(status, Ok(meerkat_mob::MobState::Running)),
         "the restarted mob must admit commands: {status:?}"
     );
-    assert!(
-        handle_3
-            .get_member(&AgentIdentity::from("lead-1"))
-            .await
-            .expect("read the roster")
-            .is_some(),
-        "the healthy lead is still rostered after the refused start"
-    );
     wait_for_head_canonical_authority_convergence(
-        store_2.as_ref(),
-        runtime_store.as_ref(),
-        &w1_sid,
+        deferred.store.as_ref(),
+        deferred.tail.runtime_store.as_ref(),
+        &deferred.tail.session_id,
         "POST_CUT_TAIL_TURN",
-        "hosted-tail-adopted-boundary",
+        "deferred-tail-adopted-boundary",
     )
     .await;
-    let _ = handle_3.shutdown().await;
+    let _ = restarted.shutdown().await;
+}
+
+/// An explicit retire of a member whose cleanup delivery custody the start
+/// deferred re-attempts the restore first. While another runtime owner hosts
+/// the member's session the retire refuses, typed, and touches nothing; once
+/// that owner lets go, the next retire restores the custody under this
+/// owner's claim and the retirement completes.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retire_of_a_deferred_member_completes_once_the_other_owner_lets_go() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::ERROR)
+        .with_writer(std::io::stderr)
+        .try_init();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let mut deferred = start_with_a_retiring_members_custody_deferred(temp.path(), &paths).await;
+
+    let error = deferred
+        .handle
+        .retire(deferred.identity.clone())
+        .await
+        .expect_err("a retire while another runtime owner hosts the session refuses");
+    assert_custody_deferred_for_the_hosted_member(
+        &error,
+        &deferred.identity,
+        &deferred.tail.session_id,
+    );
+    deferred
+        .assert_still_retiring_with_its_tail_untouched()
+        .await;
+
+    deferred.release_the_other_owner();
+    deferred
+        .handle
+        .retire(deferred.identity.clone())
+        .await
+        .expect("once the other owner lets go, the retire restores the custody and completes");
+    deferred.assert_retired().await;
+    let _ = deferred.handle.shutdown().await;
+}
+
+/// The same for a typed re-drive of the member's started retirement
+/// (`MobHandle::redrive_retirement`).
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_redrive_of_a_deferred_retirement_completes_once_the_other_owner_lets_go() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::ERROR)
+        .with_writer(std::io::stderr)
+        .try_init();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let mut deferred = start_with_a_retiring_members_custody_deferred(temp.path(), &paths).await;
+
+    let error = deferred
+        .handle
+        .redrive_retirement(deferred.identity.clone())
+        .await
+        .expect_err("a re-drive while another runtime owner hosts the session refuses");
+    assert_custody_deferred_for_the_hosted_member(
+        &error,
+        &deferred.identity,
+        &deferred.tail.session_id,
+    );
+    deferred
+        .assert_still_retiring_with_its_tail_untouched()
+        .await;
+
+    deferred.release_the_other_owner();
+    deferred
+        .handle
+        .redrive_retirement(deferred.identity.clone())
+        .await
+        .expect("once the other owner lets go, the re-drive restores the custody and completes");
+    deferred.assert_retired().await;
+    let _ = deferred.handle.shutdown().await;
+}
+
+/// The backoff wake re-attempts a deferred custody restore on its own. While
+/// another runtime owner hosts the retiring member's session each re-attempt
+/// fails and touches nothing; once that owner lets go, the next wake restores
+/// the custody and hands the member's started retirement to the stuck
+/// re-drive queue, whose re-drive completes it with no caller retiring the
+/// member.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deferred_retirement_completes_once_the_backoff_wake_restores_its_custody() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::ERROR)
+        .with_writer(std::io::stderr)
+        .try_init();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let mut deferred = start_with_a_retiring_members_custody_deferred(temp.path(), &paths).await;
+
+    // Several backoff periods (250 ms, doubling) pass with the claim held.
+    sleep(Duration::from_millis(1_800)).await;
+    deferred
+        .assert_still_retiring_with_its_tail_untouched()
+        .await;
+
+    deferred.release_the_other_owner();
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let members = deferred.handle.list_members_including_retiring().await;
+        if !members
+            .iter()
+            .any(|entry| entry.agent_identity == deferred.identity)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the backoff wake must restore the custody and the queued re-drive must complete \
+             the retirement: {members:?}"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+    let status = deferred.handle.status().await;
+    assert!(
+        matches!(status, Ok(meerkat_mob::MobState::Running)),
+        "the mob keeps running: {status:?}"
+    );
+    let _ = deferred.handle.shutdown().await;
 }
 
 /// What a process death leaves on an active member's session: the member's
@@ -4950,10 +4983,44 @@ impl ActiveMemberTail {
     }
 }
 
+/// What member `w-1` is doing when the process dies over its durable tail.
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MemberAtCrash {
+    /// Active, its turn cut by the power loss.
+    Active,
+    /// Retiring: its retirement started with the tail in place (as a
+    /// reconciler's retirement of a member mid-turn does) and the process
+    /// died before it finished.
+    Retiring,
+    /// Retiring as above, and an intent-managed identity: adopted at its
+    /// baseline before the cut, so the identity reconcile acts on it after a
+    /// start.
+    RetiringAdopted,
+}
+
 /// Leave an [`ActiveMemberTail`] on member `w-1` of a mob led by `lead-1`.
 #[cfg(feature = "test-support")]
 async fn crash_with_an_active_member_tail(temp: &Path, paths: &Paths) -> ActiveMemberTail {
-    crash_with_an_active_member(temp, paths, true).await
+    crash_with_a_member(temp, paths, MemberAtCrash::Active, true).await
+}
+
+/// Leave the same durable tail on member `w-1`, whose retirement started
+/// before the process died: the tail record of a retiring member.
+#[cfg(feature = "test-support")]
+async fn crash_with_a_retiring_member_tail(temp: &Path, paths: &Paths) -> ActiveMemberTail {
+    crash_with_a_member_tail(temp, paths, MemberAtCrash::Retiring).await
+}
+
+/// Leave a durable tail on member `w-1`, doing what `at_crash` says when the
+/// process dies.
+#[cfg(feature = "test-support")]
+async fn crash_with_a_member_tail(
+    temp: &Path,
+    paths: &Paths,
+    at_crash: MemberAtCrash,
+) -> ActiveMemberTail {
+    crash_with_a_member(temp, paths, at_crash, true).await
 }
 
 /// Crash a mob led by `lead-1` with member `w-1` active after one committed
@@ -4964,6 +5031,19 @@ async fn crash_with_an_active_member_tail(temp: &Path, paths: &Paths) -> ActiveM
 async fn crash_with_an_active_member(
     temp: &Path,
     paths: &Paths,
+    durable_tail: bool,
+) -> ActiveMemberTail {
+    crash_with_a_member(temp, paths, MemberAtCrash::Active, durable_tail).await
+}
+
+/// Crash a mob led by `lead-1` with member `w-1` doing what `at_crash` says,
+/// after one committed turn and, with `durable_tail`, a second turn whose
+/// durable rows land while its runtime boundary commit does not.
+#[cfg(feature = "test-support")]
+async fn crash_with_a_member(
+    temp: &Path,
+    paths: &Paths,
+    at_crash: MemberAtCrash,
     durable_tail: bool,
 ) -> ActiveMemberTail {
     let power_store = Arc::new(PowerCutRuntimeStore::with_hosting_root(
@@ -5022,6 +5102,10 @@ async fn crash_with_an_active_member(
         "active-tail-pre-cut-boundary",
     )
     .await;
+    if at_crash == MemberAtCrash::RetiringAdopted {
+        adopt_at_baseline(&handle_1, &identity, &w1_sid).await;
+        await_identity_converged(&handle_1, &identity, 1).await;
+    }
 
     // The next turn's durable row lands; its runtime boundary commit does not.
     if durable_tail {
@@ -5059,7 +5143,15 @@ async fn crash_with_an_active_member(
     );
     let mob_id = handle_1.mob_id().clone();
 
-    // The process dies with the member active and its tail in place.
+    if matches!(
+        at_crash,
+        MemberAtCrash::Retiring | MemberAtCrash::RetiringAdopted
+    ) {
+        let retire_result =
+            tokio::time::timeout(Duration::from_secs(10), handle_1.retire(identity.clone())).await;
+        eprintln!("[active-tail] retire during cut => {retire_result:?}");
+    }
+    // The process dies with the member's tail in place.
     handle_1
         .crash_stop_preserving_durable_work_for_test()
         .await
@@ -5571,56 +5663,16 @@ async fn retiring_member_after_a_crash(
     w1_sid
 }
 
-/// The refused start's error, whether the builder refused or handed back a
-/// handle whose status reports the refusal.
-#[cfg(feature = "test-support")]
-async fn refused_start_error(
-    refused: Result<meerkat_mob::MobHandle, meerkat_mob::MobError>,
-) -> meerkat_mob::MobError {
-    match refused {
-        Err(error) => error,
-        Ok(handle) => {
-            let status = handle.status().await;
-            let _ = handle.shutdown().await;
-            match status {
-                Err(error) => error,
-                Ok(state) => panic!("the start must be refused, not {state:?}"),
-            }
-        }
-    }
-}
-
-/// The member's startup recovery failure inside a refused start's error.
-#[cfg(feature = "test-support")]
-fn startup_recovery_cause(
-    error: &meerkat_mob::MobError,
-) -> (
-    &AgentIdentity,
-    &meerkat_core::types::SessionId,
-    &meerkat_mob::MobError,
-) {
-    let failure = match error {
-        meerkat_mob::MobError::SharedLifecycleFailure(failure) => failure.as_ref(),
-        other => other,
-    };
-    let meerkat_mob::MobError::MemberStartupRecoveryFailed {
-        member_id,
-        session_id,
-        cause,
-    } = failure
-    else {
-        panic!("a refused start must report the member's startup recovery failure: {error:?}");
-    };
-    (member_id, session_id, cause.as_ref())
-}
-
 /// A retiring member whose session another runtime owner hosts, with no
-/// durable tail, is refused where the start prepares its cleanup delivery's
-/// runtime bindings. The refusal's cause is the typed hosting refusal for
-/// that session, not an internal preparation error.
+/// durable tail, meets the typed hosting refusal where the start prepares its
+/// cleanup delivery's runtime bindings. That refusal can clear, so the start
+/// defers the member instead of failing: the mob runs, a retire refuses with
+/// the deferral carrying the typed hosting refusal (not an internal
+/// preparation error, which would still fail the start), and once the other
+/// owner lets go the retire completes.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread")]
-async fn a_mob_start_names_the_hosting_refusal_for_a_retiring_member_without_a_tail() {
+async fn a_mob_start_defers_a_retiring_member_without_a_tail_another_owner_hosts() {
     let temp = tempfile::tempdir().expect("temp dir");
     let paths = Paths::new(temp.path());
     let power_store = Arc::new(PowerCutRuntimeStore::with_hosting_root(
@@ -5637,40 +5689,61 @@ async fn a_mob_start_names_the_hosting_refusal_for_a_retiring_member_without_a_t
         capability,
         meerkat_runtime::HostingOwner::mint(),
     );
-    let _other_owner_claim = other_owner
+    let other_owner_claim = other_owner
         .grant(&w1_sid)
         .expect("another runtime owner takes the retiring member's hosting claim");
     let (service_2, _store_2) = persistent_head_canonical_service(&paths, runtime_store.clone());
-    let refused = MobBuilder::for_resume(
+    let handle = MobBuilder::for_resume(
         MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage"),
     )
     .with_session_service(service_2.clone())
     .with_default_llm_client(openai_test_client())
     .notify_orchestrator_on_resume(false)
     .resume()
-    .await;
-    let error = refused_start_error(refused).await;
-    let (member, session, cause) = startup_recovery_cause(&error);
-    assert_eq!(member, &AgentIdentity::from("w-1"));
-    assert_eq!(session, &w1_sid);
+    .await
+    .unwrap_or_else(|error| {
+        panic!("the start defers the hosted retiring member and runs: {error}")
+    });
+    let status = handle.status().await;
     assert!(
-        matches!(
-            cause,
-            meerkat_mob::MobError::SessionError(
-                meerkat_core::service::SessionError::ServedElsewhere { id }
-            ) if id == &w1_sid
-        ),
-        "the cause is the typed hosting refusal, not an internal preparation error: {cause:?}"
+        matches!(status, Ok(meerkat_mob::MobState::Running)),
+        "{status:?}"
     );
+    let identity = AgentIdentity::from("w-1");
+    assert_retiring_custody_deferred_for(
+        &handle,
+        &identity,
+        meerkat_mob::MemberCustodyDeferralCause::ServedElsewhere,
+    )
+    .await;
+    let error = handle
+        .retire(identity.clone())
+        .await
+        .expect_err("a retire while another runtime owner hosts the session refuses");
+    assert_custody_deferred_for_the_hosted_member(&error, &identity, &w1_sid);
+
+    drop(other_owner_claim);
+    handle
+        .retire(identity.clone())
+        .await
+        .expect("once the other owner lets go, the retire completes");
+    let members = handle.list_members_including_retiring().await;
+    assert!(
+        !members.iter().any(|entry| entry.agent_identity == identity),
+        "the member's retirement completed: {members:?}"
+    );
+    let _ = handle.shutdown().await;
 }
 
 /// A retiring member whose durable tail its recovery keeps (the store-owned
-/// recovery could not prove it) is refused with the typed unprovable-tail
-/// error naming the member and its session; the tail stays as the crash
+/// recovery could not prove it) meets the typed unprovable-tail error at
+/// start. A later recovery can still prove the tail, so the start defers the
+/// member instead of failing: the mob runs, a retire refuses with the
+/// deferral carrying the unprovable tail, and the tail stays as the crash
 /// left it.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread")]
-async fn a_mob_start_names_a_retiring_members_unprovable_durable_tail() {
+async fn a_mob_start_defers_a_retiring_members_unprovable_durable_tail() {
     let temp = tempfile::tempdir().expect("temp dir");
     let paths = Paths::new(temp.path());
     let power_store = Arc::new(PowerCutRuntimeStore::new(&paths.realm_db_path));
@@ -5686,36 +5759,72 @@ async fn a_mob_start_names_a_retiring_members_unprovable_durable_tail() {
     let persistent_owner: Arc<dyn MobSessionService> = service_2.clone();
     let keeping_tails = FailingOnceSessionService::new(persistent_owner, None, None, 0, false);
     keeping_tails.keep_durable_tails_unsettled();
-    let refused = MobBuilder::for_resume(
+    let handle = MobBuilder::for_resume(
         MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage"),
     )
     .with_session_service(keeping_tails)
     .with_default_llm_client(openai_test_client())
     .notify_orchestrator_on_resume(false)
     .resume()
-    .await;
-    let error = refused_start_error(refused).await;
-    let (member, session, cause) = startup_recovery_cause(&error);
-    assert_eq!(member, &AgentIdentity::from("w-1"));
-    assert_eq!(session, &w1_sid);
+    .await
+    .unwrap_or_else(|error| panic!("the start defers the retiring member and runs: {error}"));
+    let status = handle.status().await;
+    assert!(
+        matches!(status, Ok(meerkat_mob::MobState::Running)),
+        "{status:?}"
+    );
+    let identity = AgentIdentity::from("w-1");
+    let error = handle
+        .retire(identity.clone())
+        .await
+        .expect_err("a retire while the member's tail stays unprovable refuses");
+    let deferral = match &error {
+        meerkat_mob::MobError::SharedRetirementFailure(shared) => shared.as_ref(),
+        other => other,
+    };
     assert!(
         matches!(
-            cause,
-            meerkat_mob::MobError::MemberDurableTailUnprovable { member_id, session_id }
-                if member_id == &AgentIdentity::from("w-1") && session_id == &w1_sid
+            deferral,
+            meerkat_mob::MobError::MemberCustodyDeferred {
+                member_id,
+                session_id,
+                restore: meerkat_mob::MemberCustodyRestore::CleanupDelivery,
+                cause,
+            } if member_id == &identity
+                && session_id == &w1_sid
+                && matches!(
+                    cause.as_ref(),
+                    meerkat_mob::MobError::MemberDurableTailUnprovable { member_id, session_id }
+                        if member_id == &identity && session_id == &w1_sid
+                )
         ),
-        "the cause is the typed unprovable tail: {cause:?}"
+        "the retire refuses with the deferral carrying the typed unprovable tail: {error:?}"
     );
+    let members = handle.list_members_including_retiring().await;
+    assert!(
+        members
+            .iter()
+            .any(|entry| entry.agent_identity == identity
+                && entry.status == MobMemberStatus::Retiring),
+        "the deferred member stays Retiring: {members:?}"
+    );
+    assert_retiring_custody_deferred_for(
+        &handle,
+        &identity,
+        meerkat_mob::MemberCustodyDeferralCause::DurableTailUnprovable,
+    )
+    .await;
     let head_after = store_2
         .load_head(&w1_sid)
         .await
-        .expect("load the physical head after the refusal")
+        .expect("load the physical head after the deferred retire")
         .expect("the physical head still exists");
     assert_eq!(
         meerkat_core::session_store::session_head_cas_token(&head_after).unwrap(),
         meerkat_core::session_store::session_head_cas_token(&head_before).unwrap(),
-        "the refused start leaves the tail as the crash left it"
+        "the deferred start and retire leave the tail as the crash left it"
     );
+    let _ = handle.shutdown().await;
 }
 
 /// The operation binding restore an operation on a Broken member refused
@@ -7856,4 +7965,418 @@ async fn a_resumed_pending_session_records_the_start_of_its_first_turn() {
         "a resume after the first turn ran does not reopen it"
     );
     lifetime.handle.shutdown().await.expect("shutdown mob");
+}
+
+// ---------------------------------------------------------------------------
+// Deferred cleanup custody: the identity reconcile's retirement, a destroy,
+// and a tuple divergence that still fail-stops the start.
+// ---------------------------------------------------------------------------
+
+/// Adopt `identity`, a member of `handle`'s mob, as an intent-managed
+/// identity on its own session `session_id`, at its existing baseline.
+#[cfg(feature = "test-support")]
+async fn adopt_at_baseline(
+    handle: &MobHandle,
+    identity: &AgentIdentity,
+    session_id: &meerkat_core::types::SessionId,
+) {
+    use meerkat_mob::identity::{
+        AdoptMemberIdentityDeclaration, DesiredExecution, DesiredSessionAuthorityPolicy,
+        DesiredSessionTarget, IdentityAdoptionId, IdentityAdoptionOutcome,
+        IdentityAdoptionPrecondition, IdentityConvergenceMode, IdentityDeclarationScopeId,
+        IdentityProfileMemberDeclaration, IdentityWiringCustody,
+    };
+    let adoption = AdoptMemberIdentityDeclaration {
+        mob_id: handle.mob_id().clone(),
+        agent_identity: identity.clone(),
+        request_id: IdentityAdoptionId::new(format!("adopt-{identity}")).expect("adoption id"),
+        precondition: IdentityAdoptionPrecondition::ExpectedAbsent,
+        declaration_scope: IdentityDeclarationScopeId::new("deferred-custody")
+            .expect("declaration scope"),
+        declaration_revision: 1,
+        session: DesiredSessionTarget {
+            session_id: session_id.clone(),
+            lineage_id: meerkat_core::SessionLineageId::for_session(session_id),
+            lineage_generation: meerkat_core::SessionGeneration::INITIAL,
+            authority_policy: DesiredSessionAuthorityPolicy::RequireExisting,
+        },
+        member: IdentityProfileMemberDeclaration {
+            profile_name: ProfileName::from("worker"),
+            profile_override: None,
+            model_override: None,
+            external_addressable_override: None,
+            context: None,
+            labels: None,
+            additional_instructions: None,
+            system_prompt_override: None,
+            tool_access_policy: None,
+            auth_binding: None,
+            budget_limits: None,
+            runtime_mode: Some(meerkat_contracts::wire::WireMobRuntimeMode::TurnDriven),
+            required_env_keys: Vec::new(),
+            required_local_callback_tools: Vec::new(),
+            execution: DesiredExecution::ControllingSession,
+        },
+        wiring_custody: IdentityWiringCustody::ExternalManaged,
+        owned_wiring: std::collections::BTreeSet::new(),
+        convergence: IdentityConvergenceMode::CancelActive,
+    };
+    let outcome = handle
+        .adopt_member_identity_declaration(adoption)
+        .await
+        .expect("adopt the member at its baseline");
+    assert!(
+        matches!(
+            outcome.adoption,
+            IdentityAdoptionOutcome::Adopted {
+                desired_revision: 1
+            }
+        ),
+        "{:?}",
+        outcome.adoption
+    );
+}
+
+/// The identity reconcile's latest convergence status for `identity`.
+#[cfg(feature = "test-support")]
+async fn identity_convergence(
+    handle: &MobHandle,
+    identity: &AgentIdentity,
+) -> Option<meerkat_mob::identity::IdentityConvergenceStatus> {
+    match handle
+        .identity_convergence_status(identity)
+        .await
+        .expect("read the identity convergence")
+    {
+        meerkat_mob::identity::IdentityStoredObservation::Valid(status) => Some(status),
+        _ => None,
+    }
+}
+
+/// Wait until the identity reconcile converges `identity` at intent
+/// `revision`.
+#[cfg(feature = "test-support")]
+async fn await_identity_converged(handle: &MobHandle, identity: &AgentIdentity, revision: u64) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let status = identity_convergence(handle, identity).await;
+        if status.as_ref().is_some_and(|status| {
+            status.intent_revision == Some(revision)
+                && status.active_intent_revision == Some(revision)
+                && status.decision
+                    == Some(meerkat_mob::identity::IdentityReconcileDecision::Converged)
+        }) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the identity converges at revision {revision}; latest status: {status:?}"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Declare a tool change for the adopted deferred member (shell enabled), so
+/// the identity reconcile replaces its materialization: revision 2.
+#[cfg(feature = "test-support")]
+async fn declare_a_tool_change(deferred: &DeferredRetiringMember) {
+    use meerkat_mob::identity::{
+        ApplyMemberToolDeclaration, IdentityConvergenceMode, IdentityIntent,
+        IdentityStoredObservation, MemberToolCommitOutcome, MemberToolMutationId,
+    };
+    let record = match deferred
+        .handle
+        .identity_intent(&deferred.identity)
+        .await
+        .expect("read the identity intent")
+    {
+        IdentityStoredObservation::Valid(record) => record,
+        other => panic!("the adoption persists the intent: {other:?}"),
+    };
+    let mut declaration = match &record.intent {
+        IdentityIntent::Present { member, .. } => member.material.member_tool_declaration(),
+        IdentityIntent::Absent { .. } => panic!("the adoption persists a present intent"),
+    };
+    declaration.category_overrides.shell = meerkat_core::ToolCategoryOverride::Enable;
+    let update = deferred
+        .handle
+        .apply_member_tool_declaration(ApplyMemberToolDeclaration {
+            mob_id: deferred.handle.mob_id().clone(),
+            agent_identity: deferred.identity.clone(),
+            request_id: MemberToolMutationId::new("shell-for-the-deferred-member")
+                .expect("mutation id"),
+            expected_intent_revision: record.intent_revision,
+            declaration,
+            convergence: IdentityConvergenceMode::CancelActive,
+        })
+        .await
+        .expect("apply the tool declaration");
+    assert!(
+        matches!(
+            update.commit,
+            MemberToolCommitOutcome::Committed {
+                desired_revision: 2
+            }
+        ),
+        "{:?}",
+        update.commit
+    );
+}
+
+/// The identity reconcile never acts on a member whose cleanup delivery
+/// custody the start deferred. The member is intent-managed and was retiring
+/// when the process died over its durable tail; after the start another
+/// runtime owner still hosts its session. A tool change asks the reconcile
+/// to replace the member's materialization, but a member whose retirement
+/// was durably admitted reads as unavailable to the reconcile until that
+/// retirement completes, so the reconcile backs off: it neither retires the
+/// materialization (RetireMemberMaterialization) nor realizes the member
+/// again, and the member stays Retiring with its tail untouched. Once that
+/// owner lets go, the deferred custody is restored under this owner's claim
+/// and the retirement completes; the reconcile then realizes the member at
+/// the new revision on the same session, past the settled tail.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_identity_reconcile_waits_out_a_deferred_retirement_and_converges_once_the_other_owner_lets_go()
+ {
+    use meerkat_mob::identity::IdentityReconcileDecision as Decision;
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::ERROR)
+        .with_writer(std::io::stderr)
+        .try_init();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let mut deferred =
+        start_with_custody_deferred_after(temp.path(), &paths, MemberAtCrash::RetiringAdopted)
+            .await;
+
+    declare_a_tool_change(&deferred).await;
+    // The crashed process left the identity's actuation lease held; the
+    // reconcile awaits its expiry (a lease lasts at most 30 s) before it acts.
+    let deadline = Instant::now() + Duration::from_secs(75);
+    let mut seen = Vec::new();
+    let waited = loop {
+        let status = identity_convergence(&deferred.handle, &deferred.identity).await;
+        if let Some(status) = &status {
+            if seen.last() != Some(&status.decision) {
+                seen.push(status.decision);
+            }
+            if status.intent_revision == Some(2)
+                && status.decision == Some(Decision::Backoff)
+                && status.detail.as_deref().is_some_and(|detail| {
+                    detail.contains("member retirement was durably admitted but has not completed")
+                })
+            {
+                break status.clone();
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the reconcile waits out the deferred retirement; decisions seen {seen:?}, latest \
+             status: {status:?}"
+        );
+        sleep(Duration::from_millis(10)).await;
+    };
+    eprintln!("[identity-reconcile] decisions seen {seen:?}; waiting: {waited:?}");
+    assert!(
+        !seen.iter().any(|decision| matches!(
+            decision,
+            Some(Decision::RetireMemberMaterialization | Decision::EnsureMemberMaterialization)
+        )),
+        "the reconcile never acts on the deferred member: {seen:?}"
+    );
+    deferred
+        .assert_still_retiring_with_its_tail_untouched()
+        .await;
+
+    deferred.release_the_other_owner();
+    let deadline = Instant::now() + Duration::from_secs(150);
+    loop {
+        let status = identity_convergence(&deferred.handle, &deferred.identity).await;
+        if status.as_ref().is_some_and(|status| {
+            status.intent_revision == Some(2)
+                && status.active_intent_revision == Some(2)
+                && status.decision == Some(Decision::Converged)
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "once the other owner lets go, the retirement completes and the reconcile realizes \
+             the member at revision 2; latest status: {status:?}"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        deferred
+            .handle
+            .resolve_bridge_session_id(&deferred.identity)
+            .await,
+        Some(deferred.tail.session_id.clone()),
+        "the reconcile realizes the member again on its own session"
+    );
+    wait_for_head_canonical_authority_convergence(
+        deferred.store.as_ref(),
+        deferred.tail.runtime_store.as_ref(),
+        &deferred.tail.session_id,
+        "POST_CUT_TAIL_TURN",
+        "identity-reconcile-tail-settled",
+    )
+    .await;
+    let _ = deferred.handle.shutdown().await;
+}
+
+/// A destroy acts on every member, so it re-attempts every deferred custody
+/// restore before it acts on any. While another runtime owner hosts the
+/// retiring member's session, the destroy refuses whole, typed, before it
+/// reloads, writes or retires anything: no partial cleanup is reported, the
+/// mob still runs with its healthy lead, and the member stays Retiring with
+/// its tail untouched. Once that owner lets go, the retried destroy restores
+/// the custody under this owner's claim and completes, the member's
+/// retirement with it.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_destroy_with_a_deferred_member_refuses_whole_and_completes_once_the_other_owner_lets_go()
+{
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::ERROR)
+        .with_writer(std::io::stderr)
+        .try_init();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let mut deferred = start_with_a_retiring_members_custody_deferred(temp.path(), &paths).await;
+
+    let refused = deferred
+        .handle
+        .destroy()
+        .await
+        .expect_err("a destroy while another runtime owner hosts the member's session refuses");
+    let meerkat_mob::MobDestroyError::Mob(error) = &refused else {
+        panic!("the destroy refuses before any partial cleanup: {refused:?}");
+    };
+    assert_custody_deferred_for_the_hosted_member(
+        error,
+        &deferred.identity,
+        &deferred.tail.session_id,
+    );
+    let status = deferred.handle.status().await;
+    assert!(
+        matches!(status, Ok(meerkat_mob::MobState::Running)),
+        "nothing is destroyed: the mob still runs: {status:?}"
+    );
+    let lead = deferred
+        .handle
+        .list_members_including_retiring()
+        .await
+        .into_iter()
+        .find(|entry| entry.agent_identity == "lead-1")
+        .expect("the healthy lead stays rostered");
+    assert_eq!(
+        lead.status,
+        MobMemberStatus::Active,
+        "the destroy retired nothing: the lead is still active"
+    );
+    deferred
+        .assert_still_retiring_with_its_tail_untouched()
+        .await;
+
+    deferred.release_the_other_owner();
+    deferred
+        .handle
+        .destroy()
+        .await
+        .expect("once the other owner lets go, the retried destroy completes");
+    let status = deferred.handle.status().await;
+    assert!(
+        matches!(status, Ok(meerkat_mob::MobState::Destroyed)),
+        "the retried destroy destroyed the mob: {status:?}"
+    );
+}
+
+/// A tuple divergence on a retiring member is no hosting refusal: the start
+/// still fail-stops on it, typed, instead of deferring the member. The
+/// member's roster entry is read with a fence token one past the generated
+/// authority's (a deterministic test fault), so the cleanup restore's tuple
+/// check fails before any custody restore is attempted, and nothing settles
+/// the tail. With the fault spent, the next start defers the member as
+/// usual.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retiring_members_tuple_divergence_still_fail_stops_the_start() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::ERROR)
+        .with_writer(std::io::stderr)
+        .try_init();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let tail = crash_with_a_retiring_member_tail(temp.path(), &paths).await;
+    let other_owner_claim = tail.another_owner_hosts_the_session();
+    let identity = AgentIdentity::from("w-1");
+    let (service, store) = persistent_head_canonical_service(&paths, tail.runtime_store.clone());
+
+    meerkat_mob::fault_next_restore_tuple_for_test(
+        &tail.mob_id,
+        &identity,
+        meerkat_mob::MemberCustodyRestore::CleanupDelivery,
+        meerkat_mob::RestoreTupleFault::FenceToken,
+    );
+    let refused = MobBuilder::for_resume(
+        MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage"),
+    )
+    .with_session_service(service.clone())
+    .with_default_llm_client(openai_test_client())
+    .notify_orchestrator_on_resume(false)
+    .resume()
+    .await;
+    // The actor fail-stops in its startup recovery: the start answers that
+    // failure, or a handle whose status answers it, typed.
+    let error = match refused {
+        Ok(handle) => {
+            let status = handle.status().await;
+            let error = status.expect_err("a start over a diverged tuple must fail-stop, not run");
+            drop(handle);
+            error
+        }
+        Err(error) => error,
+    };
+    let cause = match &error {
+        meerkat_mob::MobError::SharedLifecycleFailure(shared) => shared.as_ref(),
+        other => other,
+    };
+    assert!(
+        matches!(
+            cause,
+            meerkat_mob::MobError::Internal(detail)
+                if detail == "local cleanup delivery tuple diverges from generated authority"
+        ),
+        "the start fail-stops on the tuple divergence itself, never a deferral: {error:?}"
+    );
+    assert_eq!(
+        tail.committed_token_now().await,
+        tail.committed_token,
+        "nothing settled the tail"
+    );
+    assert_eq!(
+        tail.physical_token_now(&store).await,
+        tail.ahead_token,
+        "the tail stays where the cut left it"
+    );
+
+    // The fault is spent: the next start defers the member as usual.
+    let handle = MobBuilder::for_resume(
+        MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage again"),
+    )
+    .with_session_service(service.clone())
+    .with_default_llm_client(openai_test_client())
+    .notify_orchestrator_on_resume(false)
+    .resume()
+    .await
+    .unwrap_or_else(|error| panic!("with the fault spent, the start defers and runs: {error}"));
+    let status = handle.status().await;
+    assert!(
+        matches!(status, Ok(meerkat_mob::MobState::Running)),
+        "with the fault spent, the start runs: {status:?}"
+    );
+    let _ = handle.shutdown().await;
+    drop(other_owner_claim);
 }

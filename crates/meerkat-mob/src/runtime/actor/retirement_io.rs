@@ -4784,6 +4784,55 @@ impl MobActor {
         true
     }
 
+    /// Hand a retiring member's durably started retirement to the stuck
+    /// re-drive queue once its deferred cleanup delivery custody is restored
+    /// outside any retirement start (the backoff wake, an explicit resume).
+    /// A start re-drives no started retirement on its own, and while its
+    /// custody was deferred no retirement of the member could start, so it is
+    /// recorded as stuck at admission, with the cause it was deferred for,
+    /// and queued. A member no longer retiring, or whose retirement is in
+    /// flight or already stuck, needs no record.
+    pub(super) async fn redrive_custody_restored_retirement(
+        &mut self,
+        identity: &AgentIdentity,
+        cause: Arc<MobError>,
+    ) {
+        if self.retirements.contains_key(identity) {
+            return;
+        }
+        if !self.stuck_retirements.contains_key(identity) {
+            let Some(entry) = self.roster.read().await.get(identity).cloned() else {
+                return;
+            };
+            let retiring = self
+                .dsl_authority
+                .state()
+                .runtime_retire_pending_sessions
+                .contains_key(&mob_dsl::AgentRuntimeId::from_domain(
+                    &entry.agent_runtime_id,
+                ));
+            if !retiring {
+                return;
+            }
+            self.stuck_retirements.insert(
+                identity.clone(),
+                StuckRetirement {
+                    entry,
+                    stage: super::super::RetirementStage::ADMISSION,
+                    cause,
+                    registration_refused: false,
+                },
+            );
+        }
+        if self.enqueue_stuck_retirement_redrive(identity) {
+            tracing::info!(
+                mob_id = %self.definition.id,
+                agent_identity = %identity,
+                "member cleanup custody restored; its started retirement is queued for re-drive"
+            );
+        }
+    }
+
     /// Start the next queued stuck-retirement re-drive, if the mob is running
     /// and the member's retirement is not already in flight. Returns whether
     /// one was started.

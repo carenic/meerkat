@@ -1744,9 +1744,26 @@ them.
   `MobError::MemberDurableTailUnprovable`, naming the member and its session
   and carrying the `tail_held_for_recovery` resume hold, instead of a bare
   transcript revision conflict. Where the start still fails on such a
-  member, that typed cause is what it reports; a member whose restore
-  already failed at that start is deferred instead (see the entry next to
-  this one).
+  member, that typed cause is what it reports; a retiring member, or one whose
+  restore already failed, is deferred instead (see the entries next to this
+  one).
+
+- `meerkat-mob`: a mob restarted while another runtime owner on the realm
+  hosts a retiring member's session now starts and runs. The start restores
+  the retiring member's local cleanup delivery, which settles the session's
+  durable tail under this owner's hosting claim. When that claim was refused
+  (`SessionError::ServedElsewhere` or `HostingUnavailable`), or the tail's
+  recovery could not prove it (now `MobError::MemberDurableTailUnprovable`),
+  the whole start failed with `MobError::MemberStartupRecoveryFailed` until
+  that owner let go. The start now defers that one member: the mob runs, the
+  member stays Retiring with its tail untouched, and every operation on it
+  (retire, `MobHandle::redrive_retirement`, respawn, destroy, the identity
+  reconcile's retirement) re-attempts the restore first and, while it still
+  fails, answers `MobError::MemberCustodyDeferred` without acting; a destroy
+  refuses before it retires anything. The mob also re-attempts the restore
+  on its own, on the identity reconcile's backoff (250 ms doubling to 60 s),
+  and once it succeeds the member's started retirement is re-driven and
+  completes. Any other restore failure still fails the start.
 
 ## [0.9.4] - 2026-10-20
 

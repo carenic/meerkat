@@ -31467,8 +31467,18 @@ impl MobActor {
     /// local members whose stopped/completed phase permits later cleanup.
     /// This realizes existing generated tuples without recreating serving
     /// bindings or resuming the mob.
+    ///
+    /// A retiring member whose restore fails for a cause that can clear
+    /// without this owner acting ([`MobError::is_deferrable_custody_cause`]:
+    /// another runtime owner hosts its session, the session's hosting claim
+    /// is unavailable, or its durable tail is kept unprovable) does not fail
+    /// the start. Its restore is deferred ([`Self::defer_member_custody`]):
+    /// the member stays Retiring with its tail untouched, every operation
+    /// that acts on it re-attempts the restore first, and the identity
+    /// reconcile's backoff wake re-attempts it too. Every other failure, and
+    /// any failure of a member that is not retiring, still fails the start.
     #[cfg(feature = "runtime-adapter")]
-    async fn restore_local_cleanup_composition_delivery(&self) -> Result<(), MobError> {
+    async fn restore_local_cleanup_composition_delivery(&mut self) -> Result<(), MobError> {
         let Some(io) = self.resume_operation_binding_io() else {
             return Ok(());
         };
@@ -31496,15 +31506,13 @@ impl MobActor {
             if state.member_placement.contains_key(&identity) {
                 continue;
             }
-            let cleanup_session =
-                state
-                    .runtime_retire_pending_sessions
-                    .get(&runtime)
-                    .or_else(|| {
-                        matches!(self.dsl_state(), MobState::Stopped | MobState::Completed)
-                            .then(|| state.member_session_bindings.get(&identity))
-                            .flatten()
-                    });
+            let retiring_session = state.runtime_retire_pending_sessions.get(&runtime);
+            let retiring = retiring_session.is_some();
+            let cleanup_session = retiring_session.or_else(|| {
+                matches!(self.dsl_state(), MobState::Stopped | MobState::Completed)
+                    .then(|| state.member_session_bindings.get(&identity))
+                    .flatten()
+            });
             let Some(cleanup_session) = cleanup_session else {
                 continue;
             };
@@ -31534,16 +31542,32 @@ impl MobActor {
                     "local cleanup delivery tuple diverges from generated authority".into(),
                 ));
             }
-            // The start fails before admission on the first member that
-            // fails, in roster (identity) order; name that member and its
-            // session for the caller.
-            self.restore_member_local_cleanup_delivery(&io, &entry, session)
+            match self
+                .restore_member_local_cleanup_delivery(&io, &entry, session)
                 .await
-                .map_err(|cause| MobError::MemberStartupRecoveryFailed {
-                    member_id: entry.agent_identity.clone(),
-                    session_id: session.clone(),
-                    cause: Arc::new(cause),
-                })?;
+            {
+                Ok(()) => {}
+                // A retiring member's restore that can succeed later defers
+                // that member only; the start goes on.
+                Err(cause) if retiring && cause.is_deferrable_custody_cause() => {
+                    self.defer_member_custody(
+                        entry.agent_identity.clone(),
+                        session.clone(),
+                        crate::MemberCustodyRestore::CleanupDelivery,
+                        cause,
+                    );
+                }
+                // Otherwise the start fails before admission on the first
+                // member that fails, in roster (identity) order; name that
+                // member and its session for the caller.
+                Err(cause) => {
+                    return Err(MobError::MemberStartupRecoveryFailed {
+                        member_id: entry.agent_identity.clone(),
+                        session_id: session.clone(),
+                        cause: Arc::new(cause),
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -31612,7 +31636,7 @@ impl MobActor {
     }
 
     #[cfg(not(feature = "runtime-adapter"))]
-    async fn restore_local_cleanup_composition_delivery(&self) -> Result<(), MobError> {
+    async fn restore_local_cleanup_composition_delivery(&mut self) -> Result<(), MobError> {
         Ok(())
     }
 
@@ -31738,6 +31762,29 @@ impl MobActor {
         Ok(())
     }
 
+    /// Re-attempt `identity`'s deferred custody restore where no operation
+    /// acting on the member asked for it: the backoff wake, and an explicit
+    /// resume. Answers as [`Self::reattempt_deferred_member_custody`]. When a
+    /// retiring member's cleanup delivery is restored this way, its durably
+    /// started retirement, which nothing re-drives after a start, is handed
+    /// to the stuck re-drive queue, which completes it.
+    pub(super) async fn reattempt_deferred_member_custody_unprompted(
+        &mut self,
+        identity: &AgentIdentity,
+    ) -> Result<(), MobError> {
+        let Some(deferred) = self.deferred_member_custody.get(identity) else {
+            return Ok(());
+        };
+        let restore = deferred.restore;
+        let cause = Arc::clone(&deferred.cause);
+        self.reattempt_deferred_member_custody(identity).await?;
+        if restore == crate::MemberCustodyRestore::CleanupDelivery {
+            self.redrive_custody_restored_retirement(identity, cause)
+                .await;
+        }
+        Ok(())
+    }
+
     /// The deferred custody re-attempts share the identity reconcile's backoff
     /// deadline wake: the time until the earliest due entry, or `None` with no
     /// entry, or while a Shutdown's runtime teardown or a resume's topology
@@ -31762,7 +31809,10 @@ impl MobActor {
         }
         let due = self.deferred_member_custody.due(Instant::now());
         for identity in due {
-            match self.reattempt_deferred_member_custody(&identity).await {
+            match self
+                .reattempt_deferred_member_custody_unprompted(&identity)
+                .await
+            {
                 Ok(()) => {}
                 // Still deferred: reported at the identity reconcile's
                 // power-of-two checkpoints, so a long deferral stays visible
