@@ -7687,36 +7687,30 @@ async fn a_member_retired_after_its_runtime_stopped_over_a_cancelled_turns_tail_
     let _ = handle.shutdown().await;
 }
 
-/// The archive of a member's session whose kept run never registered again
-/// completes, though that run was kept open with an input queued behind it.
-///
-/// The member's run commits one tool round and is held at its next model
-/// request; a second input queues behind it; then the host dies. The store
-/// keeps what a stop that keeps a durable run leaves: the run's continuable
-/// tail with its input bound to the run, and the queued input. The next
-/// process archives the member's session before anything registers its
-/// runtime again, through the machine-protocol archive a mob retire and a
-/// surface's archive both reach (a mob retire of a member whose startup
-/// restore was deferred is refused before it gets there). The archive ends
-/// the work the runtime kept for a later start through its lease's driver
-/// (the kept run's input and the queued input, both cancelled) and commits
-/// the tail as interrupted. RED before: nothing ended that work, so the
-/// archive's recovery held the continuable tail beside the queued input and
-/// the archive ended with `DurableTailHeldForRecovery`.
+/// What a host that died inside member `w-1`'s kept run left in the store.
 #[cfg(feature = "test-support")]
-#[tokio::test(flavor = "multi_thread")]
-async fn an_archive_before_a_kept_run_registers_again_ends_the_work_it_kept() {
-    use meerkat_runtime::input_state::{InputAbandonReason, InputTerminalOutcome};
+struct KeptRunCrash {
+    runtime_store: Arc<dyn meerkat_runtime::RuntimeStore>,
+    session_id: meerkat_core::types::SessionId,
+    runtime_id: meerkat_runtime::LogicalRuntimeId,
+    /// The run the provisional tail belongs to.
+    kept_run: meerkat_core::lifecycle::RunId,
+}
 
-    let temp = tempfile::tempdir().expect("temp dir");
-    let paths = Paths::new(temp.path());
+/// Crash a mob led by `lead-1` while member `w-1`'s run has committed one
+/// tool round and is held at its next model request; with `queue_behind`, a
+/// second input queues behind the held run first. Nothing the run would
+/// still write reaches the store, which keeps what a stop that keeps a
+/// durable run leaves: the run's continuable tail with its input bound to
+/// the run (and the queued input). The power is back on when this returns.
+#[cfg(feature = "test-support")]
+async fn crash_inside_a_kept_run(paths: &Paths, queue_behind: bool) -> KeptRunCrash {
     let power_store = Arc::new(PowerCutRuntimeStore::new(&paths.realm_db_path));
     let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = power_store.clone();
 
-    // ---------------- Lifetime 1 ----------------
     let client_1 = Arc::new(HoldingToolLoopClient::new(2));
     let (service_1, store_1) = persistent_head_canonical_service_with(
-        &paths,
+        paths,
         runtime_store.clone(),
         Config::default(),
         client_1.clone(),
@@ -7768,21 +7762,22 @@ async fn an_archive_before_a_kept_run_registers_again_ends_the_work_it_kept() {
     tokio::time::timeout(Duration::from_secs(30), client_1.wait_until_holding())
         .await
         .expect("the run commits its tool round and reaches its held model request");
-    assert!(
-        runtime_store
-            .load_head_canonical_provisional_tail(&runtime_id)
-            .await
-            .expect("load the provisional tail")
-            .is_some(),
-        "the run's committed round left a provisional tail"
-    );
-    member
-        .send(
-            "QUEUED_BEHIND_THE_KEPT_RUN token-queued".to_string(),
-            HandlingMode::Queue,
-        )
+    let kept_run = runtime_store
+        .load_head_canonical_provisional_tail(&runtime_id)
         .await
-        .expect("an input queues behind the held run");
+        .expect("load the provisional tail")
+        .expect("the run's committed round left a provisional tail")
+        .run_id()
+        .clone();
+    if queue_behind {
+        member
+            .send(
+                "QUEUED_BEHIND_THE_KEPT_RUN token-queued".to_string(),
+                HandlingMode::Queue,
+            )
+            .await
+            .expect("an input queues behind the held run");
+    }
 
     // The host dies: nothing the run would still write reaches the store.
     power_store.set_cut(true);
@@ -7809,10 +7804,47 @@ async fn an_archive_before_a_kept_run_registers_again_ends_the_work_it_kept() {
     .await
     .expect("process-loss fixture waits for every old session runtime to be released");
 
-    // ---------------- Lifetime 2 ----------------
+    power_store.set_cut(false);
+    KeptRunCrash {
+        runtime_store,
+        session_id: w1_sid,
+        runtime_id,
+        kept_run,
+    }
+}
+
+/// The archive of a member's session whose kept run never registered again
+/// completes, though that run was kept open with an input queued behind it.
+///
+/// The member's run commits one tool round and is held at its next model
+/// request; a second input queues behind it; then the host dies. The store
+/// keeps what a stop that keeps a durable run leaves: the run's continuable
+/// tail with its input bound to the run, and the queued input. The next
+/// process archives the member's session before anything registers its
+/// runtime again, through the machine-protocol archive a mob retire and a
+/// surface's archive both reach (a mob retire of a member whose startup
+/// restore was deferred is refused before it gets there). The archive ends
+/// the work the runtime kept for a later start through its lease's driver
+/// (the kept run's input and the queued input, both cancelled) and commits
+/// the tail as interrupted. RED before: nothing ended that work, so the
+/// archive's recovery held the continuable tail beside the queued input and
+/// the archive ended with `DurableTailHeldForRecovery`.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_archive_before_a_kept_run_registers_again_ends_the_work_it_kept() {
+    use meerkat_runtime::input_state::{InputAbandonReason, InputTerminalOutcome};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let KeptRunCrash {
+        runtime_store,
+        session_id: w1_sid,
+        runtime_id,
+        ..
+    } = crash_inside_a_kept_run(&paths, true).await;
+
     // Nothing registers the member's runtime again before its session is
     // archived.
-    power_store.set_cut(false);
     let (service_2, store_2) = persistent_head_canonical_service(&paths, runtime_store.clone());
     let archived = tokio::time::timeout(
         Duration::from_secs(60),
@@ -7869,6 +7901,117 @@ async fn an_archive_before_a_kept_run_registers_again_ends_the_work_it_kept() {
 
     let archived_session = service_2
         .load_revivable_retired_session(&w1_sid)
+        .await
+        .expect("read the member's archived session")
+        .expect("the member's session is archived");
+    assert!(
+        matches!(
+            archived_session.messages().last(),
+            Some(meerkat_core::Message::SystemNotice(_))
+        ),
+        "the kept run is closed with the interrupted notice: {:?}",
+        archived_session.messages().last()
+    );
+    let history =
+        to_string(archived_session.messages()).expect("serialize the archived transcript");
+    assert_eq!(
+        history.matches(HoldingToolLoopClient::LOOP_MARKER).count(),
+        1,
+        "the archived session keeps the kept run's prompt exactly once: {history}"
+    );
+}
+
+/// The archive of a member's session whose kept run never registered again,
+/// with nothing queued behind that run, commits the run's tail as interrupted
+/// and consumes the run's input.
+///
+/// The member's run commits one tool round and is held at its next model
+/// request; then the host dies with nothing queued behind it. The next
+/// process archives the member's session before anything registers its
+/// runtime again. The archive's recovery runs first: every input it sees is
+/// bound to the kept run, so it repairs the continuable tail, commits it as
+/// interrupted and consumes the run's input; nothing holds the tail, so no
+/// work is ended. RED before: the archive cancelled the kept run's input
+/// before its recovery, so the input ended `Abandoned { Cancelled }`.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_archive_of_a_kept_run_with_nothing_queued_consumes_its_input() {
+    use meerkat_runtime::input_state::{InputAbandonReason, InputTerminalOutcome};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let crash = crash_inside_a_kept_run(&paths, false).await;
+    let (service, store) = persistent_head_canonical_service(&paths, crash.runtime_store.clone());
+
+    let archived = tokio::time::timeout(
+        Duration::from_secs(60),
+        service.archive_with_mob_lifecycle_authority(&crash.session_id),
+    )
+    .await
+    .expect("the archive ends within its bound");
+    assert!(
+        archived.is_ok(),
+        "the archive of a session whose kept run never registered again must complete: \
+         {archived:?}"
+    );
+    assert!(
+        crash
+            .runtime_store
+            .load_head_canonical_provisional_tail(&crash.runtime_id)
+            .await
+            .expect("load the provisional tail")
+            .is_none(),
+        "the archive settled the kept run's tail"
+    );
+    assert_eq!(
+        committed_head_token(crash.runtime_store.as_ref(), &crash.session_id).await,
+        physical_head_token(&store, &crash.session_id).await,
+        "the runtime authority names the physical head"
+    );
+
+    let rows = crash
+        .runtime_store
+        .load_input_states_strict(&crash.runtime_id)
+        .await
+        .expect("read the member's input rows");
+    let run_inputs = rows
+        .iter()
+        .filter(|row| row.seed.last_run_id.as_ref() == Some(&crash.kept_run))
+        .collect::<Vec<_>>();
+    assert!(
+        !run_inputs.is_empty(),
+        "the kept run's input is recorded with its run: {rows:?}"
+    );
+    assert!(
+        run_inputs.iter().all(|row| matches!(
+            row.seed.terminal_outcome,
+            Some(InputTerminalOutcome::Consumed)
+        )),
+        "the kept run's input ends consumed: {rows:?}"
+    );
+    let ended_with = |reason: &InputAbandonReason| {
+        rows.iter()
+            .filter(|row| {
+                matches!(
+                    &row.seed.terminal_outcome,
+                    Some(InputTerminalOutcome::Abandoned { reason: ended }) if ended == reason
+                )
+            })
+            .count()
+    };
+    assert_eq!(
+        ended_with(&InputAbandonReason::Cancelled),
+        0,
+        "the archive cancels nothing: {rows:?}"
+    );
+    assert_eq!(
+        ended_with(&InputAbandonReason::Retired),
+        0,
+        "the archive's retire sweep abandons nothing: {rows:?}"
+    );
+
+    let archived_session = service
+        .load_revivable_retired_session(&crash.session_id)
         .await
         .expect("read the member's archived session")
         .expect("the member's session is archived");
