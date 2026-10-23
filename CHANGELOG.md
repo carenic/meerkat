@@ -192,6 +192,9 @@ them.
   so they hold across controlling restarts, and a respawn keeps them unless
   its request (or the spawn customizer) sets a ceiling of its own; a respawn
   whose recorded facts cannot be read is refused before anything is retired.
+  A member's own spawns (`spawn_member`, `spawn_many_members`) inherit its
+  recorded authority as an upper bound: a ceiling on the child's request, or
+  one the spawn customizer sets, can narrow it but never widen it.
   With no ceiling nothing changes: a placed member keeps manage scope over its
   mob, including the privileged spawn arguments, and records the same facts as
   before. A ceiling that narrows the spawn profiles but keeps manage scope, or

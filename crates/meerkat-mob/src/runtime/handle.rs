@@ -6561,6 +6561,12 @@ pub struct SpawnMemberSpec {
     /// default authority, except on a respawn, which keeps the authority its
     /// predecessor recorded.
     pub(crate) operator_authority_ceiling: Option<super::MemberOperatorAuthorityCeiling>,
+    /// The upper bound a member-initiated spawn inherits from the member that
+    /// asked for it: that member's recorded operator authority. Set only by
+    /// the member operator upcall lane and never taken from caller-supplied
+    /// arguments; the spawn folds it into `operator_authority_ceiling` after
+    /// the customizer, so nothing can widen past it.
+    pub(crate) inherited_operator_authority_bound: Option<super::MemberOperatorAuthorityCeiling>,
 }
 
 impl std::fmt::Debug for SpawnMemberSpec {
@@ -6612,6 +6618,10 @@ impl std::fmt::Debug for SpawnMemberSpec {
             .field(
                 "operator_authority_ceiling",
                 &self.operator_authority_ceiling,
+            )
+            .field(
+                "inherited_operator_authority_bound",
+                &self.inherited_operator_authority_bound,
             )
             .finish()
     }
@@ -6674,6 +6684,7 @@ impl SpawnMemberSpec {
             fork_overlay: super::ForkOverlayOrigin::default(),
             fork_build_inheritance: None,
             operator_authority_ceiling: None,
+            inherited_operator_authority_bound: None,
         }
     }
 

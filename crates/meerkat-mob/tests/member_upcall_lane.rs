@@ -936,6 +936,16 @@ mod ceiling_api {
         )
     }
 
+    /// A narrowed ceiling that keeps `worker`, a profile with mob tools, so
+    /// the member can spawn a child that holds operator authority itself.
+    pub fn narrowed_keeping_mob_tools(spec: SpawnMemberSpec) -> SpawnMemberSpec {
+        spec.with_operator_authority_ceiling(
+            unrestricted()
+                .without_manage()
+                .with_spawn_profiles(["worker"]),
+        )
+    }
+
     /// A ceiling that narrows the spawn profiles and keeps manage scope.
     pub fn profiles_with_manage(spec: SpawnMemberSpec) -> SpawnMemberSpec {
         spec.with_operator_authority_ceiling(unrestricted().with_spawn_profiles(["quiet-worker"]))
@@ -945,6 +955,11 @@ mod ceiling_api {
     /// authority.
     pub fn manage_without_create(spec: SpawnMemberSpec) -> SpawnMemberSpec {
         spec.with_operator_authority_ceiling(unrestricted().without_create())
+    }
+
+    /// `ceiling` without create authority.
+    pub fn without_create(ceiling: Ceiling) -> Ceiling {
+        ceiling.without_create()
     }
 
     pub fn ceiling_of(spec: &SpawnMemberSpec) -> Option<Ceiling> {
@@ -975,7 +990,9 @@ mod ceiling_api {
     }
 }
 
-use ceiling_api::{manage_without_create, narrowed, profiles_with_manage};
+use ceiling_api::{
+    manage_without_create, narrowed, narrowed_keeping_mob_tools, profiles_with_manage,
+};
 
 /// Every profile of the fixture mob, in the recorded (sorted) order.
 const ALL_PROFILES: [&str; 5] = [
@@ -1079,25 +1096,36 @@ async fn upcall_as_current_b2(
     request_id: &str,
     op: MemberOperatorOp,
 ) -> BridgeReply {
+    upcall_as(harness, &harness.member, "b2", request_id, op).await
+}
+
+/// Send `op` from `endpoint` as `member`'s current incarnation.
+async fn upcall_as(
+    harness: &UpcallHarness,
+    endpoint: &support::PeerCommsEndpoint,
+    member: &str,
+    request_id: &str,
+    op: MemberOperatorOp,
+) -> BridgeReply {
     let payload = harness
         .scripted
         .received_materialize_payloads()
         .into_iter()
         .rev()
-        .find(|payload| payload.spec.agent_identity == "b2")
-        .expect("b2 materialization payload");
+        .find(|payload| payload.spec.agent_identity == member)
+        .unwrap_or_else(|| panic!("{member} materialization payload"));
     let session = harness
         .controlling
         .handle
-        .member_status(&meerkat_mob::AgentIdentity::from("b2"))
+        .member_status(&meerkat_mob::AgentIdentity::from(member))
         .await
-        .expect("b2 status")
+        .unwrap_or_else(|error| panic!("{member} status: {error}"))
         .current_session_id
-        .expect("placed b2 has a member session")
+        .unwrap_or_else(|| panic!("placed {member} has a member session"))
         .to_string();
     let command = raw_member_operator_command_at(
         MemberOperatorRequesterResidency {
-            agent_identity: "b2",
+            agent_identity: member,
             generation: payload.generation,
             fence_token: payload.fence_token,
             host_id: &harness.host_id,
@@ -1107,11 +1135,31 @@ async fn upcall_as_current_b2(
         request_id,
         op,
     );
-    harness
-        .member
+    endpoint
         .send_bridge_command_raw(&harness.supervisor, &command, REPLY_TIMEOUT)
         .await
         .expect("upcall reply")
+}
+
+/// A probe endpoint the scripted host acknowledges as `member`, trusted by
+/// the controlling host's supervisor, so a row can send upcalls as that
+/// member and answer its lifecycle traffic.
+async fn probe_member(
+    harness: &UpcallHarness,
+    label: &str,
+    member: &str,
+) -> std::sync::Arc<support::PeerCommsEndpoint> {
+    let endpoint = std::sync::Arc::new(
+        spawn_peer_comms_endpoint(&format!("{label}-member-{member}"), true, None).await,
+    );
+    harness
+        .scripted
+        .script_member_identity(member, member_identity_of(&endpoint));
+    harness
+        .scripted
+        .bind_member_endpoint(member, std::sync::Arc::clone(&endpoint));
+    endpoint.trust(harness.supervisor.clone()).await;
+    endpoint
 }
 
 /// The tool outcome a completed upcall reply carries.
@@ -1412,6 +1460,18 @@ async fn narrowed_placed_member_is_refused_list_and_retire() {
         &reply,
         "retire_member of a member it does not own, without manage scope",
     );
+    // A flow run needs manage scope too, so a narrowed member cannot
+    // provision members through a flow either.
+    let reply = upcall(
+        &harness,
+        "req-ceiling-run-flow",
+        MemberOperatorOp::MobRunFlow {
+            flow_id: "any-flow".to_string(),
+            params: None,
+        },
+    )
+    .await;
+    assert_access_denied(&reply, "mob_run_flow without manage scope");
     assert!(
         has_member(&harness.controlling, "c0").await,
         "the refused retire left c0 in place"
@@ -1733,5 +1793,209 @@ async fn respawn_of_a_default_placed_member_keeps_the_default_authority() {
     .await;
     assert_admitted(&reply, "the default replacement's list_members");
 
+    harness.scripted.shutdown();
+}
+
+// ===========================================================================
+// A member's own spawns inherit its recorded ceiling as an upper bound: a
+// narrowed member whose ceiling keeps a profile with mob tools cannot hand a
+// child more authority than it holds, and a customizer can narrow the bound
+// but never widen it.
+// ===========================================================================
+
+/// The facts a child records under [`narrowed_keeping_mob_tools`]'s bound.
+fn bounded_child_facts(mob_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "principal_token": "<minted>",
+        "can_create_mobs": true,
+        "can_mutate_profiles": true,
+        "can_run_adaptive_packs": false,
+        "spawn_profile_scope": { mob_id: ["worker"] },
+    })
+}
+
+/// The child c1 of a member narrowed to `worker`, spawned through b2's
+/// upcall and answering as its own probe endpoint, is held to b2's bound.
+async fn assert_child_is_bounded(
+    harness: &UpcallHarness,
+    child: &support::PeerCommsEndpoint,
+    label: &str,
+) {
+    let reply = upcall_as(
+        harness,
+        child,
+        "c1",
+        &format!("req-{label}-child-list"),
+        MemberOperatorOp::ListMembers,
+    )
+    .await;
+    assert_access_denied(
+        &reply,
+        "the child's list_members (it holds no manage scope)",
+    );
+    let reply = upcall_as(
+        harness,
+        child,
+        "c1",
+        &format!("req-{label}-child-out"),
+        spawn_member_op("quiet-worker", "c2", |_| {}),
+    )
+    .await;
+    assert_access_denied(&reply, "the child's spawn of a profile outside the bound");
+    let reply = upcall_as(
+        harness,
+        child,
+        "c1",
+        &format!("req-{label}-child-arg"),
+        spawn_member_op("worker", "c3", |spec| {
+            PrivilegedSpawnArg::RuntimeMode.set(spec);
+        }),
+    )
+    .await;
+    assert_access_denied(&reply, "the child's spawn with a privileged argument");
+    assert_eq!(
+        recorded_facts(&harness.controlling, "c1").await,
+        bounded_child_facts(harness.controlling.mob_id.as_str()),
+        "the child records its requester's bound"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn narrowed_members_child_is_bounded_by_its_ceiling() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let harness = upcall_harness_composed("bound-child", None, narrowed_keeping_mob_tools).await;
+    let child = probe_member(&harness, "bound-child", "c1").await;
+    let reply = upcall(
+        &harness,
+        "req-bound-child-spawn",
+        spawn_member_op("worker", "c1", |_| {}),
+    )
+    .await;
+    assert_admitted(&reply, "the narrowed member's spawn of a profile it keeps");
+    assert_child_is_bounded(&harness, &child, "bound-child").await;
+    harness.scripted.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn narrowed_members_spawn_many_child_is_bounded_by_its_ceiling() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let harness = upcall_harness_composed("bound-many", None, narrowed_keeping_mob_tools).await;
+    let child = probe_member(&harness, "bound-many", "c1").await;
+    let MemberOperatorOp::SpawnMember(child_spec) = spawn_member_op("worker", "c1", |_| {}) else {
+        unreachable!("spawn_member_op builds a SpawnMember op");
+    };
+    let reply = upcall(
+        &harness,
+        "req-bound-many-spawn",
+        MemberOperatorOp::SpawnManyMembers {
+            specs: vec![*child_spec],
+        },
+    )
+    .await;
+    let outcome = tool_outcome(&reply);
+    assert!(
+        outcome["kind"] == "ok" && outcome["is_error"] == false,
+        "the narrowed member's spawn_many of a profile it keeps must be admitted, got {outcome}"
+    );
+    assert_child_is_bounded(&harness, &child, "bound-many").await;
+    harness.scripted.shutdown();
+}
+
+/// Sets `ceiling` on the spawn request of `identity`, whatever its source.
+struct IdentityCeilingCustomizer {
+    identity: &'static str,
+    ceiling: ceiling_api::Ceiling,
+}
+
+impl SpawnMemberCustomizer for IdentityCeilingCustomizer {
+    fn customize_spawn(
+        &self,
+        _ctx: &SpawnCustomizationContext,
+        spec: &mut SpawnMemberSpec,
+    ) -> Result<(), meerkat_mob::MobError> {
+        if spec.identity == self.identity {
+            ceiling_api::set_ceiling(spec, self.ceiling.clone());
+        }
+        Ok(())
+    }
+}
+
+/// A customizer ceiling wider than the requester's bound (manage, every
+/// profile) and narrower in one dimension (no create) yields their
+/// intersection: the bound's profiles without manage, and no create.
+#[tokio::test(flavor = "multi_thread")]
+async fn customizer_ceiling_cannot_widen_an_inherited_bound() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let customizer = std::sync::Arc::new(IdentityCeilingCustomizer {
+        identity: "c1",
+        ceiling: ceiling_api::without_create(ceiling_api::unrestricted()),
+    });
+    let harness = upcall_harness_composed(
+        "bound-customizer",
+        Some(customizer as std::sync::Arc<dyn SpawnMemberCustomizer>),
+        narrowed_keeping_mob_tools,
+    )
+    .await;
+    let reply = upcall(
+        &harness,
+        "req-bound-customizer-spawn",
+        spawn_member_op("worker", "c1", |_| {}),
+    )
+    .await;
+    assert_admitted(&reply, "the narrowed member's spawn of a profile it keeps");
+    let mut expected = bounded_child_facts(harness.controlling.mob_id.as_str());
+    expected["can_create_mobs"] = serde_json::Value::from(false);
+    assert_eq!(
+        recorded_facts(&harness.controlling, "c1").await,
+        expected,
+        "the child records the intersection of the bound and the customizer's ceiling"
+    );
+    harness.scripted.shutdown();
+}
+
+/// A member without a ceiling bounds its child by nothing more than the
+/// default: the child records the default facts, as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn default_members_child_keeps_the_default_authority() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let harness = upcall_harness("bound-default").await;
+    let reply = upcall(
+        &harness,
+        "req-bound-default-spawn",
+        spawn_member_op("worker", "c1", |_| {}),
+    )
+    .await;
+    assert_admitted(&reply, "a default member's spawn");
+    assert_eq!(
+        recorded_facts(&harness.controlling, "c1").await,
+        default_facts(harness.controlling.mob_id.as_str()),
+        "a default member's child records the default facts"
+    );
+    harness.scripted.shutdown();
+}
+
+/// The bound is recorded with the child, so the child's respawn keeps it.
+#[tokio::test(flavor = "multi_thread")]
+async fn inherited_bound_survives_the_childs_respawn() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let harness = upcall_harness_composed("bound-respawn", None, narrowed_keeping_mob_tools).await;
+    let child = probe_member(&harness, "bound-respawn", "c1").await;
+    let reply = upcall(
+        &harness,
+        "req-bound-respawn-spawn",
+        spawn_member_op("worker", "c1", |_| {}),
+    )
+    .await;
+    assert_admitted(&reply, "the narrowed member's spawn of a profile it keeps");
+
+    let responder = spawn_scripted_member_turn_responder(std::sync::Arc::clone(&child));
+    harness
+        .controlling
+        .handle
+        .respawn(meerkat_mob::AgentIdentity::from("c1"), None)
+        .await
+        .expect("c1 respawns");
+    responder.shutdown_and_join().await;
+    assert_child_is_bounded(&harness, &child, "bound-respawn").await;
     harness.scripted.shutdown();
 }

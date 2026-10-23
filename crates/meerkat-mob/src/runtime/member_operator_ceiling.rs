@@ -40,9 +40,15 @@ use crate::ids::ProfileName;
 /// [`OperatorAuthorityCeilingRefusal::SpawnProfilesWithManage`].
 ///
 /// A ceiling binds only a placed member: set on a spawn without a placement,
-/// it is refused with [`OperatorAuthorityCeilingRefusal::UnplacedMember`]. It
-/// binds the member it is set on, not the members that member spawns; each
-/// spawn request carries its own.
+/// it is refused with [`OperatorAuthorityCeilingRefusal::UnplacedMember`].
+///
+/// It also bounds every member that member spawns itself (its
+/// `spawn_member` and `spawn_many_members` upcalls): the child is compiled
+/// with at most the authority recorded for the member that asked for it. A
+/// ceiling on the child's own spawn request, or one a spawn customizer sets,
+/// can narrow that bound but never widen it, so a narrowed member cannot
+/// regain authority through a member it spawns. A member without a ceiling
+/// bounds its children by nothing more than the default.
 ///
 /// The narrowed facts are recorded with the member, so the narrowing holds
 /// across restarts of the controlling host. A respawn keeps them, unless the
@@ -174,10 +180,40 @@ impl MemberOperatorAuthorityCeiling {
     /// scope, the recorded spawn profiles are the ceiling: a respawn never
     /// gains a profile its predecessor could not spawn.
     pub(crate) fn recorded_in(facts: &WireMobToolAuthorityContext, mob_id: &str) -> Option<Self> {
-        let manage = facts.managed_mob_scope.contains(mob_id);
+        Self::from_recorded_facts(
+            mob_id,
+            &facts.managed_mob_scope,
+            &facts.spawn_profile_scope,
+            facts.can_create_mobs,
+            facts.can_mutate_profiles,
+        )
+    }
+
+    /// [`Self::recorded_in`] over the facts a member operator upcall re-mints
+    /// its authority from: the bound a member's own spawns inherit.
+    pub(crate) fn recorded_in_upcall_facts(
+        facts: &meerkat_runtime::mob_operator_authority::MobOperatorAuthorityFacts,
+        mob_id: &str,
+    ) -> Option<Self> {
+        Self::from_recorded_facts(
+            mob_id,
+            &facts.managed_mob_scope,
+            &facts.spawn_profile_scope,
+            facts.can_create_mobs,
+            facts.can_mutate_profiles,
+        )
+    }
+
+    fn from_recorded_facts(
+        mob_id: &str,
+        managed_mob_scope: &BTreeSet<String>,
+        spawn_profile_scope: &std::collections::BTreeMap<String, BTreeSet<String>>,
+        can_create_mobs: bool,
+        can_mutate_profiles: bool,
+    ) -> Option<Self> {
+        let manage = managed_mob_scope.contains(mob_id);
         let spawn_profiles = (!manage).then(|| {
-            facts
-                .spawn_profile_scope
+            spawn_profile_scope
                 .get(mob_id)
                 .into_iter()
                 .flatten()
@@ -187,10 +223,26 @@ impl MemberOperatorAuthorityCeiling {
         let recorded = Self {
             spawn_profiles,
             manage,
-            create: facts.can_create_mobs,
-            mutate: facts.can_mutate_profiles,
+            create: can_create_mobs,
+            mutate: can_mutate_profiles,
         };
         (!recorded.is_unrestricted()).then_some(recorded)
+    }
+
+    /// The most authority both `self` and `bound` allow: the spawn profiles
+    /// both keep, and manage, create and mutate only when both keep them.
+    pub(crate) fn intersect(&self, bound: &Self) -> Self {
+        let spawn_profiles = match (&self.spawn_profiles, &bound.spawn_profiles) {
+            (None, None) => None,
+            (Some(profiles), None) | (None, Some(profiles)) => Some(profiles.clone()),
+            (Some(own), Some(bounded)) => Some(own.intersection(bounded).cloned().collect()),
+        };
+        Self {
+            spawn_profiles,
+            manage: self.manage && bound.manage,
+            create: self.create && bound.create,
+            mutate: self.mutate && bound.mutate,
+        }
     }
 }
 
@@ -227,6 +279,43 @@ mod tests {
             caller_provenance: None,
             audit_invocation_id: None,
         }
+    }
+
+    /// Intersecting keeps only what both allow, so a wider ceiling never
+    /// widens a bound and a narrower one narrows it.
+    #[test]
+    fn intersect_keeps_only_what_both_allow() {
+        let bound = MemberOperatorAuthorityCeiling::unrestricted()
+            .without_manage()
+            .with_spawn_profiles(["a", "b"]);
+        assert_eq!(
+            MemberOperatorAuthorityCeiling::unrestricted().intersect(&bound),
+            bound,
+            "a ceiling that lowers nothing does not widen the bound"
+        );
+        assert_eq!(
+            MemberOperatorAuthorityCeiling::unrestricted()
+                .without_create()
+                .intersect(&bound),
+            bound.clone().without_create(),
+            "a narrower dimension narrows the bound, a wider one does not widen it"
+        );
+        assert_eq!(
+            MemberOperatorAuthorityCeiling::unrestricted()
+                .without_manage()
+                .with_spawn_profiles(["b", "c"])
+                .intersect(&bound),
+            MemberOperatorAuthorityCeiling::unrestricted()
+                .without_manage()
+                .with_spawn_profiles(["b"]),
+            "spawn profiles are intersected"
+        );
+        let manage_only = MemberOperatorAuthorityCeiling::unrestricted().without_mutate();
+        assert_eq!(
+            manage_only.intersect(&MemberOperatorAuthorityCeiling::unrestricted()),
+            manage_only,
+            "an unrestricted bound keeps the request's ceiling"
+        );
     }
 
     #[test]

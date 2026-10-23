@@ -31568,6 +31568,15 @@ impl MobActor {
         {
             reject_spawn_before_custody!("customize_spawn_spec", error);
         }
+        // A member-initiated spawn is bounded by the authority recorded for the
+        // member that asked for it. The customizer has run: its ceiling, or
+        // the request's, can narrow that bound and never widen it.
+        if let Some(bound) = spec.inherited_operator_authority_bound.take() {
+            spec.operator_authority_ceiling = Some(match spec.operator_authority_ceiling.take() {
+                Some(ceiling) => ceiling.intersect(&bound),
+                None => bound,
+            });
+        }
         // A ceiling bounds the authority the controlling host records for a
         // placed member. A local member's operator authority is set by its
         // own session build, so a ceiling there would be ignored: refuse it.
@@ -31765,6 +31774,8 @@ impl MobActor {
             resume_provider_params,
             // Refused above: a ceiling binds only a placed member.
             operator_authority_ceiling: _,
+            // Folded into the ceiling above.
+            inherited_operator_authority_bound: _,
         } = spec;
         let agent_identity = AgentIdentity::from(identity.as_str());
         self.inline_step_watchdog
@@ -33894,6 +33905,8 @@ impl MobActor {
             fork_build_inheritance: _,
             resume_provider_params: _,
             operator_authority_ceiling,
+            // Folded into the ceiling before the placed lane.
+            inherited_operator_authority_bound: _,
         } = spec;
         let Some(host) = placement else {
             fail!(MobError::Internal(
@@ -35386,6 +35399,7 @@ impl MobActor {
             resume_provider_params: _,
             // Nor a ceiling: customizers never run on a policy auto-spawn.
             operator_authority_ceiling: _,
+            inherited_operator_authority_bound: _,
         } = member_spec;
 
         if agent_identity.is_system_reserved() {

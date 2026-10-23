@@ -1404,11 +1404,21 @@ holds across controlling restarts and member revivals. A respawn (`respawn` or
 `respawn_with_successor_spec`) keeps it: a spawn customizer sees the recorded
 ceiling on the respawn request, and a ceiling set on that request replaces it.
 When the record cannot be read, the respawn is refused before anything is
-retired. A ceiling binds only the member it is set on; the members that member
-spawns get the ceiling of their own spawn request. A ceiling on a spawn
-without a placement is refused (`UnplacedMember`), since a local member's
-operator authority is set by its own session build. The JSON-RPC, REST and
-SDK spawn surfaces do not carry a ceiling.
+retired.
+
+A ceiling also bounds every member that member spawns itself (its
+`spawn_member` and `spawn_many_members` calls): the child is compiled with at
+most the authority recorded for the member that asked for it. A ceiling on the
+child's own spawn request, or one a spawn customizer sets, can narrow that
+bound but never widen it, so a narrowed member cannot regain authority through
+a member it spawns, and the bound holds across the child's restarts and
+respawns. A member without a ceiling bounds its children by nothing more than
+the default. A flow run needs manage scope, so a member without it cannot
+provision members through a flow either.
+
+A ceiling on a spawn without a placement is refused (`UnplacedMember`), since
+a local member's operator authority is set by its own session build. The
+JSON-RPC, REST and SDK spawn surfaces do not carry a ceiling.
 
 ### Placed-member portability
 
