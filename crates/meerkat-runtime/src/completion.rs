@@ -176,6 +176,10 @@ pub enum CompletionOutcome {
         tool_use_id: String,
         tool_name: String,
         args: Value,
+        /// The call's dedupe key, as on
+        /// [`meerkat_core::error::PendingCallbackToolCall`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dedupe_key: Option<meerkat_core::ToolCallDedupeKey>,
     },
     /// One assistant tool-use batch is waiting on multiple external callbacks.
     CallbackBatchPending {
@@ -282,6 +286,7 @@ pub fn interaction_terminal_event(
             tool_use_id,
             tool_name,
             args,
+            dedupe_key,
         } => AgentEvent::InteractionCallbackPending {
             interaction_id,
             pending_tool_calls: vec![meerkat_core::error::PendingCallbackToolCall {
@@ -289,6 +294,7 @@ pub fn interaction_terminal_event(
                 tool_name: tool_name.clone(),
                 args: args.clone(),
                 settlement_failures: Vec::new(),
+                dedupe_key,
             }],
             tool_name,
             args,
@@ -300,6 +306,7 @@ pub fn interaction_terminal_event(
                     tool_name: "callback_batch".to_string(),
                     args: Value::Null,
                     settlement_failures: Vec::new(),
+                    dedupe_key: None,
                 },
             );
             AgentEvent::InteractionCallbackPending {
@@ -826,6 +833,7 @@ impl CompletionHandle {
                 tool_use_id,
                 tool_name,
                 args,
+                dedupe_key: None,
             },
             crate::meerkat_machine::dsl::RuntimeCompletionResultClass::CallbackPending,
             crate::meerkat_machine::dsl::RuntimeCompletionTerminalObservation::CallbackPending,
@@ -965,10 +973,12 @@ fn authorized_completion_outcome(
                 tool_use_id,
                 tool_name,
                 args,
+                dedupe_key,
             }) => CompletionOutcome::CallbackPending {
                 tool_use_id: tool_use_id.clone(),
                 tool_name: tool_name.clone(),
                 args: args.clone(),
+                dedupe_key: dedupe_key.clone(),
             },
             Some(CoreApplyTerminal::CallbackBatchPending { pending_tool_calls }) => {
                 CompletionOutcome::CallbackBatchPending {
@@ -1719,6 +1729,7 @@ impl CompletionRegistry {
                     tool_use_id,
                     tool_name,
                     args,
+                    dedupe_key: None,
                 },
                 cleanup_observation,
                 None,
@@ -2122,12 +2133,14 @@ mod tests {
                 tool_name: "ask_a".to_string(),
                 args: serde_json::json!({"tool_use_id": "call-a", "question": "a"}),
                 settlement_failures: Vec::new(),
+                dedupe_key: None,
             },
             meerkat_core::error::PendingCallbackToolCall {
                 tool_use_id: "call-b".to_string(),
                 tool_name: "ask_b".to_string(),
                 args: serde_json::json!({"tool_use_id": "call-b", "question": "b"}),
                 settlement_failures: Vec::new(),
+                dedupe_key: None,
             },
         ];
 
@@ -2150,6 +2163,45 @@ mod tests {
         assert_eq!(tool_name, "ask_a");
         assert_eq!(args, calls[0].args);
         assert_eq!(pending_tool_calls, calls);
+    }
+
+    /// A single pending callback call's dedupe key reaches the
+    /// `interaction_callback_pending` event's pending call unchanged, and a
+    /// call without one projects none. (Unrun until the candidate's
+    /// validation.)
+    #[test]
+    fn callback_terminal_event_carries_the_pending_call_dedupe_key() {
+        let interaction_id = meerkat_core::interaction::InteractionId(uuid::Uuid::new_v4());
+        let arguments =
+            serde_json::value::RawValue::from_string(r#"{"question":"a"}"#.to_string()).unwrap();
+        let key = meerkat_core::ToolCallDedupeKey::new(
+            meerkat_core::RunId::new(),
+            5,
+            "call-a",
+            "ask_a",
+            &arguments,
+        )
+        .unwrap();
+        for dedupe_key in [Some(key), None] {
+            let event = interaction_terminal_event(
+                interaction_id,
+                CompletionOutcome::CallbackPending {
+                    tool_use_id: "call-a".to_string(),
+                    tool_name: "ask_a".to_string(),
+                    args: serde_json::json!({"question": "a"}),
+                    dedupe_key: dedupe_key.clone(),
+                },
+            );
+            let meerkat_core::event::AgentEvent::InteractionCallbackPending {
+                pending_tool_calls,
+                ..
+            } = event
+            else {
+                panic!("expected callback-pending interaction event");
+            };
+            assert_eq!(pending_tool_calls.len(), 1);
+            assert_eq!(pending_tool_calls[0].dedupe_key, dedupe_key);
+        }
     }
 
     #[tokio::test]
@@ -2976,6 +3028,7 @@ mod tests {
                 tool_use_id,
                 tool_name,
                 args,
+                ..
             } => {
                 assert_eq!(tool_use_id, "call-1");
                 assert_eq!(tool_name, "browser");

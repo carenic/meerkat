@@ -4342,6 +4342,10 @@ pub enum BoundedTurnFailure {
         tool_use_id: String,
         tool_name: String,
         args: serde_json::Value,
+        /// The call's dedupe key, as on
+        /// [`meerkat_core::error::PendingCallbackToolCall`]; boxed so the
+        /// failure stays small.
+        dedupe_key: Option<Box<meerkat_core::ToolCallDedupeKey>>,
     },
     CallbackBatchPending {
         session_id: SessionId,
@@ -4947,12 +4951,14 @@ pub(super) fn bounded_runtime_turn_result(
             tool_use_id,
             tool_name,
             args,
+            dedupe_key,
         } => {
             return Err(BoundedTurnFailure::CallbackPending {
                 session_id,
                 tool_use_id,
                 tool_name,
                 args,
+                dedupe_key: dedupe_key.map(Box::new),
             });
         }
         meerkat_runtime::completion::CompletionOutcome::CallbackBatchPending {
@@ -5040,12 +5046,14 @@ fn bounded_direct_session_failure(
                 tool_use_id,
                 tool_name,
                 args,
+                dedupe_key,
             },
         ) => BoundedTurnFailure::CallbackPending {
             session_id,
             tool_use_id,
             tool_name,
             args,
+            dedupe_key,
         },
         meerkat_core::service::SessionError::Agent(
             meerkat_core::error::AgentError::CallbackBatchPending { pending_tool_calls },
@@ -5114,11 +5122,13 @@ pub(crate) fn legacy_exact_turn_result(
             tool_use_id,
             tool_name,
             args,
+            dedupe_key,
         } => Err(MobError::CallbackPending {
             session_id,
             tool_use_id,
             tool_name,
             args,
+            dedupe_key: dedupe_key.map(Box::new),
         }),
         meerkat_runtime::completion::CompletionOutcome::CallbackBatchPending {
             pending_tool_calls,
@@ -5163,12 +5173,14 @@ pub(crate) fn legacy_direct_session_error(
                 tool_use_id,
                 tool_name,
                 args,
+                dedupe_key,
             },
         ) => MobError::CallbackPending {
             session_id: session_id.clone(),
             tool_use_id,
             tool_name,
             args,
+            dedupe_key,
         },
         meerkat_core::service::SessionError::Agent(
             meerkat_core::error::AgentError::CallbackBatchPending { pending_tool_calls },
@@ -21285,6 +21297,7 @@ mod tests {
                     tool_use_id: "call-81".to_string(),
                     tool_name: "ask_user".to_string(),
                     args: serde_json::json!({"question": "continue?"}),
+                    dedupe_key: None,
                 },
             ),
             callback_session.clone(),
@@ -21308,6 +21321,7 @@ mod tests {
             tool_name: "ask_batch".to_string(),
             args: serde_json::json!({"question": "continue all?"}),
             settlement_failures: Vec::new(),
+            dedupe_key: None,
         }];
         let batch = bounded_direct_session_failure(
             meerkat_core::service::SessionError::Agent(
@@ -21411,6 +21425,85 @@ mod tests {
                 assert!(!last_output.text().contains("private-direct-tail"));
             }
             other => panic!("expected bounded direct extraction failure, got {other:?}"),
+        }
+    }
+
+    /// A member turn's single pending callback call keeps its dedupe key on
+    /// the mob's typed failures, from the runtime completion and from a
+    /// direct session error, for a bounded waiter and for the legacy mob
+    /// error alike, so a host answering the call sees the key. (Unrun until
+    /// the candidate's validation.)
+    #[test]
+    fn a_member_callback_pending_failure_keeps_the_dedupe_key() {
+        let spec = BoundedResultSpec::new("callback-key", 64).expect("bounded spec");
+        let session_id = exact_turn_test_session(91);
+        let arguments =
+            serde_json::value::RawValue::from_string(r#"{"question":"continue?"}"#.to_string())
+                .expect("valid arguments");
+        let key = meerkat_core::ToolCallDedupeKey::new(
+            meerkat_core::RunId::new(),
+            1,
+            "call-91",
+            "ask_user",
+            &arguments,
+        )
+        .expect("valid dedupe key");
+        let outcome = || meerkat_runtime::completion::CompletionOutcome::CallbackPending {
+            tool_use_id: "call-91".to_string(),
+            tool_name: "ask_user".to_string(),
+            args: serde_json::json!({"question": "continue?"}),
+            dedupe_key: Some(key.clone()),
+        };
+        let agent_error = || {
+            meerkat_core::service::SessionError::Agent(
+                meerkat_core::error::AgentError::CallbackPending {
+                    tool_use_id: "call-91".to_string(),
+                    tool_name: "ask_user".to_string(),
+                    args: serde_json::json!({"question": "continue?"}),
+                    dedupe_key: Some(Box::new(key.clone())),
+                },
+            )
+        };
+
+        let bounded_failures = [
+            bounded_runtime_turn_result(outcome(), &session_id, session_id.clone(), &spec)
+                .expect_err("a pending callback call is a bounded failure"),
+            bounded_direct_session_failure(agent_error(), session_id.clone(), &spec),
+        ];
+        for failure in bounded_failures {
+            match failure {
+                BoundedTurnFailure::CallbackPending {
+                    tool_use_id,
+                    dedupe_key,
+                    ..
+                } => {
+                    assert_eq!(tool_use_id, "call-91");
+                    assert_eq!(dedupe_key.as_deref(), Some(&key));
+                }
+                other => panic!("expected a bounded callback-pending failure, got {other:?}"),
+            }
+        }
+
+        let mob_errors = [
+            legacy_exact_turn_result(ExactTurnCompletion {
+                session_id: session_id.clone(),
+                terminal: ExactTurnTerminal::Runtime(outcome()),
+            })
+            .expect_err("a pending callback call is a mob error"),
+            legacy_direct_session_error(&session_id, agent_error()),
+        ];
+        for error in mob_errors {
+            match error {
+                MobError::CallbackPending {
+                    tool_use_id,
+                    dedupe_key,
+                    ..
+                } => {
+                    assert_eq!(tool_use_id, "call-91");
+                    assert_eq!(dedupe_key.as_deref(), Some(&key));
+                }
+                other => panic!("expected a callback-pending mob error, got {other:?}"),
+            }
         }
     }
 

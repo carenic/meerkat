@@ -341,12 +341,14 @@ fn completion_outcome_to_cli_runtime_turn_result(
             tool_use_id,
             tool_name,
             args,
+            dedupe_key,
         } => {
             let pending_tool_calls = vec![meerkat_core::error::PendingCallbackToolCall {
                 tool_use_id,
                 tool_name: tool_name.clone(),
                 args: args.clone(),
                 settlement_failures: Vec::new(),
+                dedupe_key,
             }];
             Ok(CliRuntimeTurnResult::CallbackPending(CliCallbackPending {
                 session_id: session_id.clone(),
@@ -426,6 +428,7 @@ fn callback_pending_contract(
                 tool_name: call.tool_name.clone(),
                 args: call.args.clone(),
                 settlement_failures: call.settlement_failures.clone(),
+                dedupe_key: call.dedupe_key.clone(),
             })
             .collect(),
     )
@@ -26118,6 +26121,7 @@ default_model = "gemma"
                 tool_use_id: "call-1".to_string(),
                 tool_name: "external_mock".into(),
                 args: serde_json::json!({ "value": "browser" }),
+                dedupe_key: None,
             },
             &session_id,
             &realm,
@@ -26145,6 +26149,52 @@ default_model = "gemma"
         assert_eq!(
             pending_json["pending_tool_calls"][0]["tool_name"],
             "external_mock"
+        );
+        assert!(
+            pending_json["pending_tool_calls"][0]
+                .get("dedupe_key")
+                .is_none(),
+            "a call without a dedupe key omits the field"
+        );
+    }
+
+    /// The CLI's pending output carries a pending callback call's dedupe key
+    /// unchanged. (Unrun until the candidate's validation.)
+    #[test]
+    fn completion_outcome_to_cli_runtime_turn_result_carries_the_callback_dedupe_key() {
+        let session_id = SessionId::new();
+        let realm = meerkat_core::connection::RealmId::parse("test-realm")
+            .expect("test-realm is a valid realm id");
+        let arguments = serde_json::value::RawValue::from_string(r#"{"value":"browser"}"#.into())
+            .expect("valid arguments");
+        let key = meerkat_core::ToolCallDedupeKey::new(
+            meerkat_core::RunId::new(),
+            2,
+            "call-1",
+            "external_mock",
+            &arguments,
+        )
+        .expect("valid dedupe key");
+        let result = completion_outcome_to_cli_runtime_turn_result(
+            meerkat_runtime::completion::CompletionOutcome::CallbackPending {
+                tool_use_id: "call-1".to_string(),
+                tool_name: "external_mock".into(),
+                args: serde_json::json!({ "value": "browser" }),
+                dedupe_key: Some(key.clone()),
+            },
+            &session_id,
+            &realm,
+            true,
+        )
+        .expect("callback pending should surface as resumable CLI metadata");
+        let CliRuntimeTurnResult::CallbackPending(pending) = result else {
+            panic!("expected callback pending CLI turn result");
+        };
+        let pending_json = serde_json::to_value(callback_pending_contract(&pending))
+            .expect("callback pending contract should serialize");
+        assert_eq!(
+            pending_json["pending_tool_calls"][0]["dedupe_key"],
+            serde_json::to_value(&key).expect("key serializes")
         );
     }
 

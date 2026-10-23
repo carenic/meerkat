@@ -725,6 +725,139 @@ impl CallbackToolDispatcher {
         })
     }
 
+    /// Send one `tool/execute` request to the route that registers the
+    /// tool and await its result. The request carries `dedupe_key`, the
+    /// call's dedupe key, when there is one, and omits the field otherwise.
+    async fn send_tool_execute(
+        &self,
+        call: ToolCallView<'_>,
+        dedupe_key: Option<meerkat_core::ToolCallDedupeKey>,
+    ) -> Result<ToolDispatchOutcome, ToolError> {
+        if !self.is_known(call.name) {
+            if let CallbackRouteSource::MobSlot(slot) = &self.route
+                && slot.live_route().is_none()
+            {
+                return Err(ToolError::unavailable(
+                    call.name,
+                    meerkat_core::ToolUnavailableReason::CallbackRouteUnclaimed,
+                ));
+            }
+            return Err(ToolError::not_found(call.name));
+        }
+
+        // This permit remains local across queueing and the response timeout,
+        // providing a process-global hard cap on both callback dispatch tasks
+        // and entries in the server's pending-callback map.
+        let _invocation_permit = CallbackInvocationAdmission::production().try_acquire()?;
+        if call.id.len() > CALLBACK_REQUEST_MAX_TOOL_USE_ID_BYTES {
+            return Err(ToolError::invalid_arguments(
+                call.name,
+                format!(
+                    "tool_use_id exceeds the {CALLBACK_REQUEST_MAX_TOOL_USE_ID_BYTES}-byte callback limit"
+                ),
+            ));
+        }
+        if call.name.len() > CALLBACK_REQUEST_MAX_TOOL_NAME_BYTES {
+            return Err(ToolError::invalid_arguments(
+                call.name,
+                format!(
+                    "tool name exceeds the {CALLBACK_REQUEST_MAX_TOOL_NAME_BYTES}-byte callback limit"
+                ),
+            ));
+        }
+        if call.args.get().len() > CALLBACK_REQUEST_MAX_PARAMS_BYTES {
+            return Err(ToolError::invalid_arguments(
+                call.name,
+                format!(
+                    "tool arguments exceed the {CALLBACK_REQUEST_MAX_PARAMS_BYTES}-byte callback limit"
+                ),
+            ));
+        }
+
+        #[derive(Serialize)]
+        struct CallbackParams<'a> {
+            tool_use_id: &'a str,
+            name: &'a str,
+            arguments: &'a RawValue,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            dedupe_key: Option<meerkat_core::ToolCallDedupeKey>,
+        }
+
+        let route = self.call_route(call.name)?;
+        let request_id = Self::next_id(&route);
+        let params = CallbackParams {
+            tool_use_id: call.id,
+            name: call.name,
+            arguments: call.args,
+            dedupe_key,
+        };
+        let (params_raw, outbound_permit) = RpcOutboundAdmission::production()
+            .admit_json(
+                &params,
+                CALLBACK_REQUEST_MAX_PARAMS_BYTES,
+                CALLBACK_REQUEST_ENVELOPE_BYTES,
+            )
+            .map_err(|error| {
+                ToolError::execution_failed(format!(
+                    "callback request rejected by outbound admission: {error}"
+                ))
+            })?;
+
+        let request = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(request_id),
+            method: "tool/execute".to_string(),
+            params: Some(params_raw),
+        };
+
+        let (response_tx, response_rx) = oneshot::channel();
+
+        route
+            .tx
+            .send(CallbackRequestEnvelope::new(
+                request,
+                response_tx,
+                outbound_permit,
+            ))
+            .await
+            // The route's owning connection is gone: the tool is unavailable
+            // to this session. It never falls back to another connection.
+            .map_err(|_| ToolError::unavailable(call.name, self.route_gone_reason()))?;
+
+        let response_handoff = tokio::time::timeout(CALLBACK_TIMEOUT, response_rx)
+            .await
+            .map_err(|_| callback_timeout_error(call.name))?
+            // The owning connection closed and failed its pending callbacks.
+            .map_err(|_| ToolError::unavailable(call.name, self.route_gone_reason()))?;
+
+        let response = response_handoff.response();
+
+        if let Some(error) = response.error.as_ref() {
+            let message = error.message.clone();
+            drop(response_handoff);
+            return Err(ToolError::execution_failed(message));
+        }
+
+        let result_raw = response.result.as_deref().ok_or_else(|| {
+            ToolError::execution_failed("Callback response missing result".to_string())
+        })?;
+
+        #[derive(serde::Deserialize)]
+        struct CallbackResult {
+            #[serde(default)]
+            content: String,
+            #[serde(default)]
+            is_error: bool,
+        }
+
+        let parsed: CallbackResult = serde_json::from_str(result_raw.get()).map_err(|e| {
+            ToolError::execution_failed(format!("Failed to parse callback result: {e}"))
+        })?;
+        let outcome = ToolResult::new(call.id.to_string(), parsed.content, parsed.is_error).into();
+        drop(response_handoff);
+        Ok(outcome)
+    }
+
     async fn submit_detached(
         &self,
         call: ToolCallView<'_>,
@@ -1262,126 +1395,18 @@ impl AgentToolDispatcher for CallbackToolDispatcher {
     }
 
     async fn dispatch(&self, call: ToolCallView<'_>) -> Result<ToolDispatchOutcome, ToolError> {
-        if !self.is_known(call.name) {
-            if let CallbackRouteSource::MobSlot(slot) = &self.route
-                && slot.live_route().is_none()
-            {
-                return Err(ToolError::unavailable(
-                    call.name,
-                    meerkat_core::ToolUnavailableReason::CallbackRouteUnclaimed,
-                ));
-            }
-            return Err(ToolError::not_found(call.name));
-        }
+        self.send_tool_execute(call, None).await
+    }
 
-        // This permit remains local across queueing and the response timeout,
-        // providing a process-global hard cap on both callback dispatch tasks
-        // and entries in the server's pending-callback map.
-        let _invocation_permit = CallbackInvocationAdmission::production().try_acquire()?;
-        if call.id.len() > CALLBACK_REQUEST_MAX_TOOL_USE_ID_BYTES {
-            return Err(ToolError::invalid_arguments(
-                call.name,
-                format!(
-                    "tool_use_id exceeds the {CALLBACK_REQUEST_MAX_TOOL_USE_ID_BYTES}-byte callback limit"
-                ),
-            ));
-        }
-        if call.name.len() > CALLBACK_REQUEST_MAX_TOOL_NAME_BYTES {
-            return Err(ToolError::invalid_arguments(
-                call.name,
-                format!(
-                    "tool name exceeds the {CALLBACK_REQUEST_MAX_TOOL_NAME_BYTES}-byte callback limit"
-                ),
-            ));
-        }
-        if call.args.get().len() > CALLBACK_REQUEST_MAX_PARAMS_BYTES {
-            return Err(ToolError::invalid_arguments(
-                call.name,
-                format!(
-                    "tool arguments exceed the {CALLBACK_REQUEST_MAX_PARAMS_BYTES}-byte callback limit"
-                ),
-            ));
-        }
-
-        #[derive(Serialize)]
-        struct CallbackParams<'a> {
-            tool_use_id: &'a str,
-            name: &'a str,
-            arguments: &'a RawValue,
-        }
-
-        let route = self.call_route(call.name)?;
-        let request_id = Self::next_id(&route);
-        let params = CallbackParams {
-            tool_use_id: call.id,
-            name: call.name,
-            arguments: call.args,
-        };
-        let (params_raw, outbound_permit) = RpcOutboundAdmission::production()
-            .admit_json(
-                &params,
-                CALLBACK_REQUEST_MAX_PARAMS_BYTES,
-                CALLBACK_REQUEST_ENVELOPE_BYTES,
-            )
-            .map_err(|error| {
-                ToolError::execution_failed(format!(
-                    "callback request rejected by outbound admission: {error}"
-                ))
-            })?;
-
-        let request = RpcRequest {
-            jsonrpc: "2.0".to_string(),
-            id: Some(request_id),
-            method: "tool/execute".to_string(),
-            params: Some(params_raw),
-        };
-
-        let (response_tx, response_rx) = oneshot::channel();
-
-        route
-            .tx
-            .send(CallbackRequestEnvelope::new(
-                request,
-                response_tx,
-                outbound_permit,
-            ))
+    /// A `tool/execute` request that carries the call's dedupe key when an
+    /// agent-loop round dispatched it.
+    async fn dispatch_with_context(
+        &self,
+        call: ToolCallView<'_>,
+        context: &meerkat_core::ToolDispatchContext,
+    ) -> Result<ToolDispatchOutcome, ToolError> {
+        self.send_tool_execute(call, context.tool_call_dedupe_key(call))
             .await
-            // The route's owning connection is gone: the tool is unavailable
-            // to this session. It never falls back to another connection.
-            .map_err(|_| ToolError::unavailable(call.name, self.route_gone_reason()))?;
-
-        let response_handoff = tokio::time::timeout(CALLBACK_TIMEOUT, response_rx)
-            .await
-            .map_err(|_| callback_timeout_error(call.name))?
-            // The owning connection closed and failed its pending callbacks.
-            .map_err(|_| ToolError::unavailable(call.name, self.route_gone_reason()))?;
-
-        let response = response_handoff.response();
-
-        if let Some(error) = response.error.as_ref() {
-            let message = error.message.clone();
-            drop(response_handoff);
-            return Err(ToolError::execution_failed(message));
-        }
-
-        let result_raw = response.result.as_deref().ok_or_else(|| {
-            ToolError::execution_failed("Callback response missing result".to_string())
-        })?;
-
-        #[derive(serde::Deserialize)]
-        struct CallbackResult {
-            #[serde(default)]
-            content: String,
-            #[serde(default)]
-            is_error: bool,
-        }
-
-        let parsed: CallbackResult = serde_json::from_str(result_raw.get()).map_err(|e| {
-            ToolError::execution_failed(format!("Failed to parse callback result: {e}"))
-        })?;
-        let outcome = ToolResult::new(call.id.to_string(), parsed.content, parsed.is_error).into();
-        drop(response_handoff);
-        Ok(outcome)
     }
 
     async fn dispatch_resolved_with_context(
@@ -1391,7 +1416,9 @@ impl AgentToolDispatcher for CallbackToolDispatcher {
         plan: &meerkat_core::ResolvedToolExecutionPlan,
     ) -> Result<ToolDispatchOutcome, ToolError> {
         match plan.mode() {
-            meerkat_core::ToolExecutionMode::Fast => self.dispatch(call).await,
+            meerkat_core::ToolExecutionMode::Fast => {
+                self.dispatch_with_context(call, context).await
+            }
             meerkat_core::ToolExecutionMode::Detached => {
                 self.submit_detached(call, context, plan).await
             }
@@ -2263,6 +2290,106 @@ mod tests {
         let result = handle.await.unwrap().unwrap();
         assert_eq!(result.result.text_content(), "results here");
         assert!(!result.result.is_error);
+    }
+
+    /// Answer one `tool/execute` request with a plain result.
+    fn answer_tool_execute(
+        request: RpcRequest,
+        response_tx: oneshot::Sender<CallbackResponseHandoff>,
+    ) {
+        assert!(
+            response_tx
+                .send(CallbackResponseHandoff::unmetered_for_test(
+                    RpcResponse::success(
+                        request.id,
+                        serde_json::json!({"content":"done","is_error":false}),
+                    )
+                ))
+                .is_ok()
+        );
+    }
+
+    /// A callback tool's `tool/execute` request carries the call's dedupe
+    /// key, unchanged, as `params.dedupe_key`. (Unrun until the candidate's
+    /// validation.)
+    #[tokio::test]
+    async fn a_keyed_tool_execute_request_carries_the_dedupe_key() {
+        let (callback_tx, mut callback_rx) = mpsc::channel(10);
+        let id_counter = Arc::new(AtomicU64::new(0));
+        let tools = Arc::new(StdRwLock::new(vec![make_tool_def("search")]));
+        let dispatcher = CallbackToolDispatcher::new(tools, callback_tx, id_counter, vec![]);
+        let args = RawValue::from_string("{\"q\":\"test\"}".to_string()).unwrap();
+        let key = meerkat_core::ToolCallDedupeKey::new(
+            meerkat_core::RunId::new(),
+            3,
+            "tc-keyed",
+            "search",
+            &args,
+        )
+        .unwrap();
+        let expected = serde_json::to_value(&key).unwrap();
+
+        let handle = tokio::spawn(async move {
+            let call = ToolCallView {
+                id: "tc-keyed",
+                name: "search",
+                args: &args,
+            };
+            dispatcher.send_tool_execute(call, Some(key)).await
+        });
+
+        let (request, response_tx, _outbound_permit) =
+            callback_rx.recv().await.unwrap().into_parts();
+        assert_eq!(request.method, "tool/execute");
+        let params: serde_json::Value =
+            serde_json::from_str(request.params.as_deref().unwrap().get()).unwrap();
+        assert_eq!(params["tool_use_id"], "tc-keyed");
+        assert_eq!(params["dedupe_key"], expected);
+        assert_eq!(params["dedupe_key"]["call_id"], "tc-keyed");
+        assert_eq!(params["dedupe_key"]["round"], 3);
+        answer_tool_execute(request, response_tx);
+
+        let result = handle.await.unwrap().unwrap();
+        assert_eq!(result.result.text_content(), "done");
+    }
+
+    /// A call without a dedupe key (outside an agent-loop round) sends a
+    /// `tool/execute` request with no `dedupe_key` field, through either
+    /// dispatch entry. (Unrun until the candidate's validation.)
+    #[tokio::test]
+    async fn an_unkeyed_tool_execute_request_omits_the_dedupe_key() {
+        for with_context in [false, true] {
+            let (callback_tx, mut callback_rx) = mpsc::channel(10);
+            let id_counter = Arc::new(AtomicU64::new(0));
+            let tools = Arc::new(StdRwLock::new(vec![make_tool_def("search")]));
+            let dispatcher = CallbackToolDispatcher::new(tools, callback_tx, id_counter, vec![]);
+
+            let handle = tokio::spawn(async move {
+                let args = RawValue::from_string("{\"q\":\"test\"}".to_string()).unwrap();
+                let call = ToolCallView {
+                    id: "tc-plain",
+                    name: "search",
+                    args: &args,
+                };
+                if with_context {
+                    let context = meerkat_core::ToolDispatchContext::default();
+                    dispatcher.dispatch_with_context(call, &context).await
+                } else {
+                    dispatcher.dispatch(call).await
+                }
+            });
+
+            let (request, response_tx, _outbound_permit) =
+                callback_rx.recv().await.unwrap().into_parts();
+            let params: serde_json::Value =
+                serde_json::from_str(request.params.as_deref().unwrap().get()).unwrap();
+            assert_eq!(params["tool_use_id"], "tc-plain");
+            assert!(params.get("dedupe_key").is_none(), "{params}");
+            answer_tool_execute(request, response_tx);
+
+            let result = handle.await.unwrap().unwrap();
+            assert_eq!(result.result.text_content(), "done");
+        }
     }
 
     #[tokio::test]

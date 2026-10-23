@@ -261,6 +261,7 @@ export type {
   TranscriptRewriteSelection,
   TranscriptToolResultContentBlockReplacement,
   TranscriptUserContentBlockReplacement,
+  ToolCallDedupeKey,
   TurnAuthBindingOverride,
   TurnOptions,
   TurnToolOverlay,

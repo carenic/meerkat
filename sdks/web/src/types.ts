@@ -758,8 +758,60 @@ export interface ToolCallbackResult {
   is_error: boolean;
 }
 
-/** A tool callback function. */
-export type ToolCallback = (args: string) => Promise<ToolCallbackResult>;
+/**
+ * The dedupe key of one tool call, a tool callback's second argument when an
+ * agent-loop round dispatched the call. A resumed run that dispatches the
+ * same call again passes the same key, so a tool with effects that must not
+ * repeat deduplicates on all four fields.
+ */
+export interface ToolCallDedupeKey {
+  run_id: string;
+  round: number;
+  call_id: string;
+  call_digest: string;
+}
+
+/**
+ * A tool callback function. `dedupeKey` is the call's
+ * {@link ToolCallDedupeKey}, or `undefined` when the call has none.
+ */
+export type ToolCallback = (
+  args: string,
+  dedupeKey?: ToolCallDedupeKey,
+) => Promise<ToolCallbackResult>;
+
+/**
+ * Parse the dedupe key the WASM runtime passes a tool callback: a JSON
+ * string, or `undefined`. Unknown fields are ignored; an absent or malformed
+ * value is `undefined`, because the key is advisory and never fails the
+ * call.
+ */
+export function parseToolCallDedupeKey(raw: unknown): ToolCallDedupeKey | undefined {
+  if (typeof raw !== 'string') {
+    return undefined;
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+  const { run_id, round, call_id, call_digest } = value as Record<string, unknown>;
+  if (
+    typeof run_id !== 'string' ||
+    typeof round !== 'number' ||
+    !Number.isSafeInteger(round) ||
+    round < 0 ||
+    typeof call_id !== 'string' ||
+    typeof call_digest !== 'string'
+  ) {
+    return undefined;
+  }
+  return { run_id, round, call_id, call_digest };
+}
 
 // ─── Flow types ─────────────────────────────────────────────────
 

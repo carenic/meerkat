@@ -9285,6 +9285,11 @@ where
                         tool_name: callback_tool.to_owned(),
                         args: callback_args.clone(),
                         settlement_failures: error.settlement_failures().cloned().collect(),
+                        // The round's key for this call: the host answering
+                        // it sees the same key if a resumed run asks again.
+                        dedupe_key: self
+                            .tool_dispatch_context
+                            .tool_call_dedupe_key(tc.as_view()),
                     });
                     continue;
                 }
@@ -21011,19 +21016,21 @@ mod tests {
             .run("ask for approval".to_string().into())
             .await
             .expect_err("callback tool dispatch must return the external terminal");
-        match error {
+        let dedupe_key = match error {
             AgentError::CallbackPending {
                 tool_use_id,
                 tool_name,
                 args,
+                dedupe_key,
             } => {
                 assert_eq!(tool_use_id, "callback-call");
                 assert_eq!(tool_name, "ask_user");
                 assert_eq!(args["question"], "approve?");
                 assert!(args.get("tool_use_id").is_none());
+                dedupe_key
             }
             other => panic!("expected callback-pending terminal, got {other:?}"),
-        }
+        };
 
         let assistant_run_id = agent
             .session()
@@ -21036,6 +21043,24 @@ mod tests {
                 _ => None,
             })
             .expect("callback continuation must retain its run-stamped assistant tool call");
+        // The pending call carries its round's dedupe key, the one a resumed
+        // run would ask with again: the run, round 0, the provider call id
+        // and the digest of the call's name and arguments. (Unrun until the
+        // candidate's validation.)
+        let dedupe_key =
+            dedupe_key.expect("a loop round's pending callback call carries its dedupe key");
+        assert_eq!(dedupe_key.run_id, assistant_run_id);
+        assert_eq!(dedupe_key.round, 0);
+        assert_eq!(dedupe_key.call_id, "callback-call");
+        assert_eq!(
+            dedupe_key.call_digest,
+            crate::tool_call_digest(
+                "ask_user",
+                &serde_json::value::RawValue::from_string(r#"{"question":"approve?"}"#.to_string())
+                    .unwrap(),
+            )
+            .unwrap()
+        );
         assert!(
             agent
                 .session()

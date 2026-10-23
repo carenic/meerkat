@@ -618,6 +618,29 @@ them.
   checkpointer returns no receipt only for a session that has never committed
   a boundary, and runtime-backed sessions commit their first boundary at
   creation.
+- The pending callback call carries its dedupe key (see Added, dedupe key
+  delivery). `meerkat-core`: `PendingCallbackToolCall` gains the field
+  `dedupe_key: Option<ToolCallDedupeKey>`, the struct variant
+  `AgentError::CallbackPending` gains `dedupe_key:
+  Option<Box<ToolCallDedupeKey>>`, and the struct variant
+  `CoreApplyTerminal::CallbackPending` gains `dedupe_key:
+  Option<ToolCallDedupeKey>`. `meerkat-runtime`: the struct variant
+  `CompletionOutcome::CallbackPending` gains `dedupe_key:
+  Option<ToolCallDedupeKey>`. `meerkat-mob`: the struct variants
+  `MobError::CallbackPending` and `BoundedTurnFailure::CallbackPending` gain
+  `dedupe_key: Option<Box<ToolCallDedupeKey>>`, so a host answering a
+  member's callback from either sees the key, as the batch variants already
+  carry it on each `PendingCallbackToolCall`. `meerkat-contracts`:
+  `WirePendingToolCall` gains `dedupe_key: Option<ToolCallDedupeKey>`, and
+  `WireCallbackPending::single` takes the key as its eighth argument. Rust
+  code that builds these with struct literals names the new field
+  (`dedupe_key: None` for a call outside an agent-loop round), and a pattern
+  that lists every field adds it or `..`. On the wire the field is optional
+  and omitted when absent, so readers that ignore unknown fields are
+  unaffected. A pending callback call persisted with a dedupe key cannot be
+  finalized after downgrading to a runtime that lacks the field: its stored
+  candidate digest no longer verifies there. A row without a key keeps its
+  bytes.
 
 ### Added
 
@@ -738,6 +761,35 @@ them.
     `AgentError::RunSuspended { run_id }`, which a core executor reports as
     `CoreExecutorError::Suspended { run_id }`: neither a cancellation nor an
     apply failure.
+
+- Dedupe key delivery: a tool outside the process receives a call's
+  `ToolCallDedupeKey` too, unchanged, as `{run_id, round, call_id,
+  call_digest}`, so it can recognize a call a resumed run dispatches again
+  (see per-round commits).
+  - MCP: Core's MCP client sends it on every `tools/call` that has one as the
+    `_meta` entry `io.meerkat/tool_call_dedupe_key`
+    (`meerkat_core::TOOL_CALL_DEDUPE_KEY_META_KEY`), beside the metadata the
+    host's `McpCallContextProvider` prepares. Core owns the name: a
+    preparation that uses it is refused before transport
+    (`McpCallContextError::Denied`), as one that uses `io.meerkat/origin` is.
+  - Callback tools: the `tool/execute` request carries it as
+    `params.dedupe_key`, and a pending callback call (`PendingCallbackToolCall`,
+    `WirePendingToolCall`) as `dedupe_key`: in the
+    `interaction_callback_pending` event, the MCP server's
+    `pending_tool_calls`, the REST `CALLBACK_PENDING` details, the CLI's
+    pending output, the RPC callback-pending error data and a mob member's
+    callback-pending failure (`MobError::CallbackPending`,
+    `BoundedTurnFailure::CallbackPending`). A Web runtime JS tool callback
+    gets it as an optional second argument, a JSON string.
+  - SDKs: each exports `ToolCallDedupeKey`. The Python SDK passes it to a
+    callback handler that declares a `dedupe_key` parameter; the TypeScript
+    SDK passes it as a handler's optional second argument; the Web SDK passes
+    it as `ToolCallback`'s optional second argument
+    (`parseToolCallDedupeKey` reads the runtime's JSON form). Unknown fields
+    are ignored, and a missing or malformed key is no key, never a failed
+    call.
+  - A call outside an agent-loop round has no key, and every channel omits
+    the field.
 
 - `meerkat_core::host_store`: the host store SPI, a small storage interface
   a host implements so that Core can keep a realm's durable state in the

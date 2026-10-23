@@ -165,6 +165,11 @@ pub(crate) enum InteractionTerminalCandidate {
         tool_use_id: Option<String>,
         tool_name: String,
         args: serde_json::Value,
+        /// The call's dedupe key. Absent for a call outside an agent-loop
+        /// round and on rows written before keys existed; skipped when
+        /// absent, so such a row re-serializes byte-identically.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dedupe_key: Option<meerkat_core::ToolCallDedupeKey>,
     },
     CallbackBatchPending {
         pending_tool_calls: Vec<meerkat_core::error::PendingCallbackToolCall>,
@@ -223,10 +228,12 @@ impl InteractionTerminalCandidate {
                 tool_use_id,
                 tool_name,
                 args,
+                dedupe_key,
             }) => Self::CallbackPending {
                 tool_use_id: Some(tool_use_id.clone()),
                 tool_name: tool_name.clone(),
                 args: args.clone(),
+                dedupe_key: dedupe_key.clone(),
             },
             Some(CoreApplyTerminal::CallbackBatchPending { pending_tool_calls }) => {
                 Self::CallbackBatchPending {
@@ -253,6 +260,7 @@ impl InteractionTerminalCandidate {
                 tool_use_id,
                 tool_name,
                 args,
+                dedupe_key,
             } => Some(CoreApplyTerminal::CallbackPending {
                 // A v0.8.7 row never recorded the id; empty means "identity
                 // unknown, pre-0.8.8 row". Durable-callback consumers that
@@ -261,6 +269,7 @@ impl InteractionTerminalCandidate {
                 tool_use_id: tool_use_id.clone().unwrap_or_default(),
                 tool_name: tool_name.clone(),
                 args: args.clone(),
+                dedupe_key: dedupe_key.clone(),
             }),
             Self::CallbackBatchPending { pending_tool_calls } => {
                 Some(CoreApplyTerminal::CallbackBatchPending {
@@ -1136,6 +1145,7 @@ pub(crate) fn interaction_terminal_candidate_matches_event(
                 tool_use_id,
                 tool_name,
                 args,
+                dedupe_key,
             },
             AgentEvent::InteractionCallbackPending {
                 tool_name: event_tool,
@@ -1154,6 +1164,7 @@ pub(crate) fn interaction_terminal_candidate_matches_event(
                                 tool_name: tool_name.clone(),
                                 args: args.clone(),
                                 settlement_failures: Vec::new(),
+                                dedupe_key: dedupe_key.clone(),
                             }]
                     }
                     // A v0.8.7 candidate pairs with a v0.8.7 finalized event
@@ -1167,6 +1178,7 @@ pub(crate) fn interaction_terminal_candidate_matches_event(
                                     tool_name: tool_name.clone(),
                                     args: args.clone(),
                                     settlement_failures: Vec::new(),
+                                    dedupe_key: dedupe_key.clone(),
                                 }]
                     }
                 }
@@ -3467,6 +3479,7 @@ mod tests {
             tool_use_id: None,
             tool_name: "external".to_string(),
             args: args.clone(),
+            dedupe_key: None,
         };
         let event = |pending_tool_calls| AgentEvent::InteractionCallbackPending {
             interaction_id,
@@ -3481,6 +3494,7 @@ mod tests {
             tool_name: "external".to_string(),
             args: args.clone(),
             settlement_failures: Vec::new(),
+            dedupe_key: None,
         }]);
         assert!(interaction_terminal_candidate_matches_event(
             &legacy_candidate,
@@ -3499,6 +3513,7 @@ mod tests {
             tool_use_id: Some("call-9".to_string()),
             tool_name: "external".to_string(),
             args: args.clone(),
+            dedupe_key: None,
         };
         assert!(!interaction_terminal_candidate_matches_event(
             &modern_candidate,
@@ -3511,11 +3526,77 @@ mod tests {
             tool_name: "external".to_string(),
             args: args.clone(),
             settlement_failures: Vec::new(),
+            dedupe_key: None,
         }]);
         assert!(interaction_terminal_candidate_matches_event(
             &modern_candidate,
             interaction_id,
             &exact_event,
+            false,
+        ));
+    }
+
+    /// A candidate whose call has a dedupe key keeps it through the durable
+    /// row (it re-serializes byte-identically under its digest and projects
+    /// back to the same core terminal) and pairs only with an event whose
+    /// pending call carries the same key. (Unrun until the candidate's
+    /// validation.)
+    #[test]
+    fn keyed_callback_candidate_keeps_its_dedupe_key_and_pairs_only_with_it() {
+        let interaction_id = InteractionId(uuid::Uuid::new_v4());
+        let args = serde_json::json!({"value": 1});
+        let raw_args = serde_json::value::RawValue::from_string(args.to_string()).unwrap();
+        let key = meerkat_core::ToolCallDedupeKey::new(
+            meerkat_core::RunId::new(),
+            2,
+            "call-9",
+            "external",
+            &raw_args,
+        )
+        .unwrap();
+        let candidate = InteractionTerminalCandidate::CallbackPending {
+            tool_use_id: Some("call-9".to_string()),
+            tool_name: "external".to_string(),
+            args: args.clone(),
+            dedupe_key: Some(key.clone()),
+        };
+
+        let encoded = serde_json::to_vec(&candidate).unwrap();
+        let decoded: InteractionTerminalCandidate = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(
+            interaction_terminal_payload_digest(&decoded).unwrap(),
+            interaction_terminal_payload_digest(&candidate).unwrap(),
+        );
+        assert!(matches!(
+            decoded.core_apply_terminal(),
+            Some(meerkat_core::lifecycle::core_executor::CoreApplyTerminal::CallbackPending {
+                dedupe_key: Some(ref restored),
+                ..
+            }) if *restored == key
+        ));
+
+        let event = |dedupe_key| AgentEvent::InteractionCallbackPending {
+            interaction_id,
+            tool_name: "external".to_string(),
+            args: args.clone(),
+            pending_tool_calls: vec![meerkat_core::error::PendingCallbackToolCall {
+                tool_use_id: "call-9".to_string(),
+                tool_name: "external".to_string(),
+                args: args.clone(),
+                settlement_failures: Vec::new(),
+                dedupe_key,
+            }],
+        };
+        assert!(interaction_terminal_candidate_matches_event(
+            &candidate,
+            interaction_id,
+            &event(Some(key)),
+            false,
+        ));
+        assert!(!interaction_terminal_candidate_matches_event(
+            &candidate,
+            interaction_id,
+            &event(None),
             false,
         ));
     }
@@ -3731,6 +3812,7 @@ mod tests {
                 tool_name: "external".to_string(),
                 args: serde_json::json!({"value": 1}),
                 settlement_failures: Vec::new(),
+                dedupe_key: None,
             }],
         };
         let event = AgentEvent::InteractionFailed {

@@ -14826,17 +14826,25 @@ fn completion_outcome_to_rpc_result(
             tool_use_id,
             tool_name,
             args,
-        } => Err(RpcError {
-            code: error::INTERNAL_ERROR,
-            message: format!("callback pending for tool '{tool_name}'"),
-            data: Some(serde_json::json!({
+            dedupe_key,
+        } => {
+            let mut data = serde_json::json!({
                 "session_id": session_id.to_string(),
                 "resumable": true,
                 "tool_use_id": tool_use_id,
                 "tool_name": tool_name,
                 "args": args,
-            })),
-        }),
+            });
+            // The call's dedupe key rides beside the call, only when it has one.
+            if let (Some(key), Some(fields)) = (dedupe_key, data.as_object_mut()) {
+                fields.insert("dedupe_key".to_string(), serde_json::json!(key));
+            }
+            Err(RpcError {
+                code: error::INTERNAL_ERROR,
+                message: format!("callback pending for tool '{tool_name}'"),
+                data: Some(data),
+            })
+        }
         CompletionOutcome::CallbackBatchPending { pending_tool_calls } => {
             let first = pending_tool_calls.first();
             let tool_name = first
@@ -37229,6 +37237,7 @@ mod tests {
                 tool_use_id: "call-1".to_string(),
                 tool_name: "external_mock".to_string(),
                 args: serde_json::json!({ "value": "browser" }),
+                dedupe_key: None,
             },
             &session_id,
         )
@@ -37242,6 +37251,43 @@ mod tests {
         assert_eq!(data["tool_use_id"], "call-1");
         assert_eq!(data["tool_name"], "external_mock");
         assert_eq!(data["args"], serde_json::json!({ "value": "browser" }));
+        assert!(
+            data.get("dedupe_key").is_none(),
+            "a call without a dedupe key omits the field"
+        );
+    }
+
+    /// A pending callback call's dedupe key reaches the RPC error data
+    /// unchanged. (Unrun until the candidate's validation.)
+    #[test]
+    fn completion_outcome_to_rpc_result_carries_the_callback_dedupe_key() {
+        let session_id = SessionId::new();
+        let arguments = serde_json::value::RawValue::from_string(r#"{"value":"browser"}"#.into())
+            .expect("valid arguments");
+        let key = meerkat_core::ToolCallDedupeKey::new(
+            meerkat_core::RunId::new(),
+            1,
+            "call-1",
+            "external_mock",
+            &arguments,
+        )
+        .expect("valid dedupe key");
+        let err = completion_outcome_to_rpc_result(
+            meerkat_runtime::completion::CompletionOutcome::CallbackPending {
+                tool_use_id: "call-1".to_string(),
+                tool_name: "external_mock".to_string(),
+                args: serde_json::json!({ "value": "browser" }),
+                dedupe_key: Some(key.clone()),
+            },
+            &session_id,
+        )
+        .expect_err("callback pending should map to an RPC error");
+        let data = err.data.expect("callback pending error data");
+        assert_eq!(data["tool_use_id"], "call-1");
+        assert_eq!(
+            data["dedupe_key"],
+            serde_json::to_value(&key).expect("key serializes")
+        );
     }
 
     #[test]

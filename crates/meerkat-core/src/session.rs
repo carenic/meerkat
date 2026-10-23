@@ -3545,7 +3545,14 @@ impl SessionRunCursor {
 ///
 /// Build it with [`ToolCallDedupeKey::new`], which computes the digest, so
 /// every producer derives the same key for the same call.
+///
+/// Every kind of tool receives it unchanged: an in-process tool from
+/// [`crate::ToolDispatchContext::tool_call_dedupe_key`], an MCP tool as the
+/// `tools/call` `_meta` entry [`crate::TOOL_CALL_DEDUPE_KEY_META_KEY`], and a
+/// callback tool as the `dedupe_key` of its request or pending call. A call
+/// outside an agent-loop round has no key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub struct ToolCallDedupeKey {
     /// The run the call belongs to.

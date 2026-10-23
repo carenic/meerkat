@@ -8,6 +8,7 @@ import type {
   ToolCallback,
   MobStatus,
 } from './types.js';
+import { parseToolCallDedupeKey } from './types.js';
 import { parseInitResult } from './generated/runtime.js';
 import type { MobListResult as WireMobListResult } from './generated/mob.js';
 
@@ -105,7 +106,7 @@ export interface WasmModule {
     name: string,
     description: string,
     schemaJson: string,
-    callback: (args: string) => Promise<string>,
+    callback: (args: string, dedupeKey?: string) => Promise<string>,
   ) => void;
   register_js_tool: (
     name: string,
@@ -263,7 +264,8 @@ export class MeerkatRuntime {
    * @param name - Tool name.
    * @param description - Human-readable tool description.
    * @param schema - JSON Schema for tool input.
-   * @param callback - Receives tool arguments as JSON string, returns result.
+   * @param callback - Receives tool arguments as JSON string, and the call's
+   *   dedupe key when an agent-loop round dispatched it; returns result.
    */
   static registerTool(
     wasm: WasmModule,
@@ -276,7 +278,8 @@ export class MeerkatRuntime {
       name,
       description,
       JSON.stringify(schema),
-      async (args: string) => JSON.stringify(await callback(args)),
+      async (args: string, dedupeKey?: string) =>
+        JSON.stringify(await callback(args, parseToolCallDedupeKey(dedupeKey))),
     );
   }
 
@@ -340,7 +343,8 @@ export class MeerkatRuntime {
       name,
       description,
       JSON.stringify(schema),
-      async (args: string) => JSON.stringify(await callback(args)),
+      async (args: string, dedupeKey?: string) =>
+        JSON.stringify(await callback(args, parseToolCallDedupeKey(dedupeKey))),
     );
   }
 

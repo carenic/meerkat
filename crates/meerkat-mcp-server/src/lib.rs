@@ -2524,6 +2524,7 @@ fn format_agent_result(
             tool_use_id,
             tool_name,
             args,
+            dedupe_key,
         })) => {
             // Pending state is a typed terminal-control fact, not a success
             // envelope. Serialize the canonical `WireCallbackPending` contract
@@ -2539,6 +2540,7 @@ fn format_agent_result(
                 tool_use_id,
                 tool_name,
                 args,
+                dedupe_key.map(|key| *key),
             );
             let mut payload = serde_json::to_value(&pending)
                 .map_err(|err| format!("Failed to serialize callback pending contract: {err}"))?;
@@ -2568,6 +2570,7 @@ fn format_agent_result(
                         tool_name: call.tool_name,
                         args: call.args,
                         settlement_failures: call.settlement_failures,
+                        dedupe_key: call.dedupe_key,
                     })
                     .collect(),
             );
@@ -9496,12 +9499,14 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
                     physical_outcome: meerkat_core::LiveBridgeEffectOutcome::Unknown,
                     failure_kind: meerkat_core::ToolDispatchTerminalErrorKind::Unavailable,
                 }],
+                dedupe_key: None,
             },
             meerkat_core::error::PendingCallbackToolCall {
                 tool_use_id: "callback-b".to_string(),
                 tool_name: "ask_b".to_string(),
                 args: json!({"question": "b"}),
                 settlement_failures: Vec::new(),
+                dedupe_key: None,
             },
         ];
         let payload = format_agent_result(
@@ -9536,6 +9541,49 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
                 .is_none(),
             "tool_use_id must not be smuggled into callback args"
         );
+    }
+
+    /// The `pending_tool_calls` of a single pending callback call carry its
+    /// dedupe key unchanged, and a call without one omits the field. (Unrun
+    /// until the candidate's validation.)
+    #[test]
+    fn test_format_agent_result_carries_the_callback_dedupe_key() {
+        let session_id = meerkat::SessionId::new();
+        let arguments = serde_json::value::RawValue::from_string(r#"{"question":"a"}"#.into())
+            .expect("valid arguments");
+        let key = meerkat_core::ToolCallDedupeKey::new(
+            meerkat_core::RunId::new(),
+            0,
+            "callback-a",
+            "ask_a",
+            &arguments,
+        )
+        .expect("valid dedupe key");
+        for dedupe_key in [Some(key.clone()), None] {
+            let payload = format_agent_result(
+                Err(SessionError::Agent(meerkat::AgentError::CallbackPending {
+                    tool_use_id: "callback-a".to_string(),
+                    tool_name: "ask_a".to_string(),
+                    args: json!({"question": "a"}),
+                    dedupe_key: dedupe_key.clone().map(Box::new),
+                })),
+                &session_id,
+            )
+            .expect("a pending callback call stays a resumable MCP result");
+            let raw = payload["content"][0]["text"]
+                .as_str()
+                .expect("wrapped MCP payload text");
+            let decoded: Value = serde_json::from_str(raw).expect("valid wrapped JSON");
+            assert_eq!(decoded["status"], "pending_tool_call");
+            let call = &decoded["pending_tool_calls"][0];
+            match &dedupe_key {
+                Some(key) => assert_eq!(
+                    call["dedupe_key"],
+                    serde_json::to_value(key).expect("key serializes")
+                ),
+                None => assert!(call.get("dedupe_key").is_none(), "{call}"),
+            }
+        }
     }
 
     #[test]

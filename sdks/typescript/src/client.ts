@@ -512,6 +512,7 @@ import type {
   UpdateScheduleRequest,
   TurnOptions,
   TurnToolOverlay,
+  ToolCallDedupeKey,
   Usage,
   ReadyWorkFilter,
   WorkGraphEventFilter,
@@ -1046,7 +1047,10 @@ export class MeerkatClient {
     {
       description: string;
       inputSchema: Record<string, unknown>;
-      handler: (args: Record<string, unknown>) => Promise<string | ContentBlock[]>;
+      handler: (
+        args: Record<string, unknown>,
+        dedupeKey?: ToolCallDedupeKey,
+      ) => Promise<string | ContentBlock[]>;
     }
   >();
   // Typed faults from post-connect tool registration. `registerTool` is sync and
@@ -1073,12 +1077,20 @@ export class MeerkatClient {
    * Handlers may return a plain string or a `ContentBlock[]` for multimodal
    * tool results. Block arrays are forwarded faithfully to the runtime as
    * `WireToolResultContent` (no string coercion).
+   *
+   * A handler's optional second argument is the call's
+   * {@link ToolCallDedupeKey}, present when an agent-loop round dispatched
+   * the call. A resumed run that dispatches the same call again passes the
+   * same key.
    */
   registerTool(
     name: string,
     description: string,
     inputSchema: Record<string, unknown>,
-    handler: (args: Record<string, unknown>) => Promise<string | ContentBlock[]>,
+    handler: (
+      args: Record<string, unknown>,
+      dedupeKey?: ToolCallDedupeKey,
+    ) => Promise<string | ContentBlock[]>,
   ): void {
     this.toolHandlers.set(name, { description, inputSchema, handler });
     // A fresh declaration supersedes any stale fault from a prior failed attempt.
@@ -4824,6 +4836,30 @@ export class MeerkatClient {
       params,
     );
     return MeerkatClient.parseLiveRefreshResult(result);
+  }
+
+  /**
+   * The `dedupe_key` of a `tool/execute` request. Unknown fields are
+   * ignored; an absent value, or one that is not a complete key, is
+   * `undefined`: the key is advisory and never fails the call.
+   */
+  static parseToolCallDedupeKey(raw: unknown): ToolCallDedupeKey | undefined {
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+      return undefined;
+    }
+    const value = raw as Record<string, unknown>;
+    const { run_id, round, call_id, call_digest } = value;
+    if (
+      typeof run_id !== "string" ||
+      typeof round !== "number" ||
+      !Number.isSafeInteger(round) ||
+      round < 0 ||
+      typeof call_id !== "string" ||
+      typeof call_digest !== "string"
+    ) {
+      return undefined;
+    }
+    return { run_id, round, call_id, call_digest };
   }
 
   /**
@@ -8697,8 +8733,9 @@ export class MeerkatClient {
 
       if (handler) {
         const args = (params.arguments ?? {}) as Record<string, unknown>;
+        const dedupeKey = MeerkatClient.parseToolCallDedupeKey(params.dedupe_key);
         handler
-          .handler(args)
+          .handler(args, dedupeKey)
           .then((content) => {
             this.writeCallbackResponse(child, requestId, { content, is_error: false });
           })
