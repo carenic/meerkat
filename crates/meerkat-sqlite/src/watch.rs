@@ -301,15 +301,18 @@ impl RegistrationCustody {
         self.thread.as_ref().map(RegistrationThread::describe)
     }
 
-    /// Stop the notifications, once the stop flag is set: drop a registered
-    /// source, and join the thread if it has returned. A registration still
-    /// running discards its result when it ends.
+    /// Stop the notifications, once the stop flag is set: unregister a
+    /// registered source ([`unregister`]), and join the thread if it has
+    /// returned. A registration still running discards its result when it
+    /// ends.
     fn stop(&mut self) {
         let source = match &mut *lock(&self.slot) {
             RegistrationSlot::Registered(source) => source.take(),
             _ => None,
         };
-        drop(source);
+        if let Some(source) = source {
+            unregister(source);
+        }
         if self
             .thread
             .as_ref()
@@ -452,6 +455,56 @@ impl Drop for SqliteChangeWatch {
 
 /// Registration threads still running after their watch was dropped.
 static RETAINED_REGISTRATIONS: OnceLock<Mutex<Vec<RegistrationThread>>> = OnceLock::new();
+
+/// The process's unregister thread, `sqlite-watch-unregister`: the queue it
+/// drops sources from, in turn, and the thread itself, which lives as long as
+/// the process. `None` when it could not start.
+static UNREGISTER: OnceLock<Option<Unregister>> = OnceLock::new();
+
+struct Unregister {
+    queue: mpsc::Sender<Box<dyn WatchSource>>,
+    _thread: thread::JoinHandle<()>,
+}
+
+/// Drop a stopped watch's notification source. A source whose drop waits on
+/// the platform ([`WatchSource::teardown_waits`]) goes to the process's one
+/// unregister thread, which drops such sources in turn, so no thread that
+/// stops a watch (a runtime worker shutting down, a watch's own worker) waits
+/// on the platform. However many watches stop at once, that is one thread;
+/// their sources wait in its queue. Until the thread drops it, a source can
+/// still notify, which only wakes its own stopped watch: its worker returns
+/// at that wake without a tick, and a watch started meanwhile on the same
+/// database has its own source and wake. Any other source, or every source
+/// when the thread cannot start, is dropped here.
+fn unregister(source: Box<dyn WatchSource>) {
+    if !source.teardown_waits() {
+        drop(source);
+        return;
+    }
+    let unregister = UNREGISTER.get_or_init(|| {
+        let (queue, sources) = mpsc::channel::<Box<dyn WatchSource>>();
+        thread::Builder::new()
+            .name("sqlite-watch-unregister".to_string())
+            .spawn(move || {
+                for source in sources {
+                    drop(source);
+                }
+            })
+            .map(|thread| Unregister {
+                queue,
+                _thread: thread,
+            })
+            .ok()
+    });
+    let source = match unregister {
+        Some(unregister) => match unregister.queue.send(source) {
+            Ok(()) => return,
+            Err(mpsc::SendError(source)) => source,
+        },
+        None => source,
+    };
+    drop(source);
+}
 
 fn retained() -> &'static Mutex<Vec<RegistrationThread>> {
     RETAINED_REGISTRATIONS.get_or_init(Mutex::default)
@@ -638,6 +691,12 @@ trait WatchSource: Send {
     /// which has no bound: macOS FSEvents registration can take tens of
     /// seconds.
     fn watch(&mut self, directory: &Path) -> Result<(), String>;
+
+    /// Whether dropping this source can wait on the platform, so a stopped
+    /// watch hands it to the unregister thread ([`unregister`]).
+    fn teardown_waits(&self) -> bool {
+        false
+    }
 }
 
 /// notify's recommended watcher: FSEvents on macOS, inotify on Linux.
@@ -675,6 +734,13 @@ impl WatchSource for NotifySource {
         self.0
             .watch(directory, RecursiveMode::NonRecursive)
             .map_err(|error| format!("cannot watch {}: {error}", directory.display()))
+    }
+
+    /// macOS FSEvents: dropping the watcher joins its run-loop thread, which
+    /// makes two round trips to the file-system event service (the current
+    /// event id, then a purge up to it) before it lets go.
+    fn teardown_waits(&self) -> bool {
+        cfg!(target_os = "macos")
     }
 }
 
@@ -1246,6 +1312,14 @@ pub mod test_support {
             *lock(&self.observation.registered) += 1;
             self.observation.changed.notify_all();
             Ok(())
+        }
+
+        /// The platform's answer, or that a test holds this source's drop.
+        fn teardown_waits(&self) -> bool {
+            self.inner
+                .as_ref()
+                .is_some_and(|inner| inner.teardown_waits())
+                || lock(&self.observation.drops).held
         }
     }
 

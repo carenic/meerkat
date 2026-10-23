@@ -532,6 +532,11 @@ them.
 
 ### Fixed
 
+- `meerkat-sqlite`: on macOS, dropping a SQLite store watch no longer blocks
+  the dropping thread on file-system event service round trips. A stopped
+  watch's FSEvents source is dropped on the process's one unregister thread;
+  sources stopped together wait in its queue.
+
 - `meerkat-core`, `meerkat-session`, `meerkat-runtime`, `meerkat-store`: a
   long run of a HeadCanonical session kept every compaction's transcript
   rewrite in memory until the run ended, because retirement may not pass the
