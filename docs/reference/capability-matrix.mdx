@@ -102,10 +102,13 @@ failures -32010 (exit 20), budget exhaustion -32011 (exit 21), hook denial
 -32603 (exit 1). The CLI exit status is always the `cli_exit_code()` of the
 same `ErrorCode`.
 
-`FailedWithData` has two typed exceptions: a runtime teardown in progress
-answers `SESSION_BUSY` (-32002, exit 11), and, since 0.9.4, a fork whose source
+`FailedWithData` has three typed exceptions: a runtime teardown in progress
+answers `SESSION_BUSY` (-32002, exit 11); since 0.9.4, a fork whose source
 has session metadata but no build state answers `INVALID_PARAMS` (-32602,
-exit 2) with the data kind `fork_source_build_state_missing`.
+exit 2) with the data kind `fork_source_build_state_missing`; and, since
+0.9.5, a session-scoped live open of a mob member's session (live, or one it
+would restore from storage) answers `INVALID_PARAMS` (-32602, exit 2) with the
+data kind `mob_member_session_addressed_by_id`.
 
 Temporary councils are agent-internal mob orchestration, not a public wire
 family. Where the host can deliver a later completion to the convener (a mob

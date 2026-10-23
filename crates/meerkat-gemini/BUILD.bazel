@@ -59,6 +59,7 @@ rust_library(
     compile_data = [
         "Cargo.toml",
         "src/runtime/mod.rs",
+        "tests/fixtures/pre_native_id_messages.json",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
@@ -97,6 +98,7 @@ rust_library(
     compile_data = [
         "Cargo.toml",
         "src/runtime/mod.rs",
+        "tests/fixtures/pre_native_id_messages.json",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = [
@@ -143,6 +145,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/runtime/mod.rs",
+        "tests/fixtures/pre_native_id_messages.json",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
@@ -156,6 +159,10 @@ rust_test(
     ],
     size = "medium",
     data = [
+        "//:test_fixtures",
+        "//tests/fixtures/machine-dsl-tests:package_runfiles",
+        "//tests/fixtures/mcp-test-server:package_runfiles",
+        "//tests/fixtures/surface-build-fixtures:package_runfiles",
         ":package_runfiles",
     ],
     env = {
@@ -202,6 +209,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/runtime/mod.rs",
+        "tests/fixtures/pre_native_id_messages.json",
     ],
     srcs = [
         "tests/live_video_uri_smoke.rs",
@@ -263,6 +271,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/runtime/mod.rs",
+        "tests/fixtures/pre_native_id_messages.json",
     ],
     srcs = [
         "tests/oauth_resolve.rs",

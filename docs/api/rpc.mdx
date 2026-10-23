@@ -2019,11 +2019,20 @@ control. Check `runtime/capabilities.features.multi_host_mobs` rather than
 inferring support from generic `mobs` or the server version.
 
 `mob/member_live_open` supports WebSocket transport only for both local and
-placed members. A request for `transport: "webrtc"` is rejected; WebRTC uses
-the session-scoped `live/open` and `live/webrtc/answer` flow below only when
-the caller can address the owning session directly. In multi-host v1,
+placed members. A request for `transport: "webrtc"` is rejected, and the
+session-scoped `live/open` and `live/webrtc/answer` flow below refuses a
+member's session, so WebRTC to a mob member is not available in 0.9.5:
+`mob/member_live_open` over WebSocket is the route. In multi-host v1,
 controller `session/*` methods do not proxy a placed member's host-local
-session, so there is no controller-side WebRTC path to a placed member.
+session either.
+
+The session-scoped `live/open` opens no live channel on a mob member's
+session, live or not, and never restores one from storage: the member's mob
+does both, after checking the member (not retiring, in cleanup or revoke, and
+restored). It answers `INVALID_PARAMS` (-32602) with data kind
+`mob_member_session_addressed_by_id` (and the session, mob and member), and
+nothing is opened or restored. Open the member's channel with
+`mob/member_live_open`.
 
 Durable member role migration is not part of `mob/spawn`, profiles, or any
 public JSON-RPC/SDK params. The one-shot `resume_from_role` declaration exists
@@ -3242,6 +3251,14 @@ are routing fields; scoped streams can additionally carry `scope_id` and
 `scope_path`. None of these flattens or replaces `event.payload`.
 
 ### session/stream_end notifications
+
+Session and mob streams reserve terminal delivery capacity before opening.
+The process admits at most 4096 active or queued terminal obligations; an
+additional `session/stream_open` or `mob/stream_open` returns `BUDGET_EXHAUSTED`
+until capacity is released. Each terminal is bounded to 16 KiB, with diagnostic
+detail limited to 1 KiB of UTF-8 text. Data-event admission cannot consume these
+reservations. A slow reader retains its terminal reservation until the
+transport writes or discards the notification.
 
 An explicit session stream terminates with this notification:
 

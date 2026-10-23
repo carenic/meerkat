@@ -103,9 +103,17 @@
 //!   renew fails.
 //! - A holder fences itself on its own clock: it makes no model call and
 //!   dispatches nothing unless its last successful acquire or renew started
-//!   less than [`FenceTiming::self_fence_window`] ago, the lease minus a
-//!   margin of one renew interval. This takes no store I/O per round, and
-//!   there is no fence check on the per round path.
+//!   less than [`FenceTiming::self_fence_window`] ago, the lease minus the
+//!   host-declared self-fence margin ([`FenceTiming::self_fence_margin`],
+//!   one renew interval unless the host declares another). This takes no
+//!   store I/O per round, and there is no fence check on the per round
+//!   path. Core exposes the window through [`SelfFence`], so the run loop
+//!   checks it right before each model call and each tool dispatch.
+//! - **The host's obligation on the margin:** it exceeds the store's
+//!   visibility lag. A renew written just before a takeover can stay
+//!   invisible to the new holder for that long, so the new holder's wait
+//!   ([`FenceGrant::superseded_lease`]) may end that much before the old
+//!   holder's real lease; the old holder must have fenced itself by then.
 //! - After an acquire that supersedes a live holder, the new writer waits
 //!   out what remained of that holder's recorded lease
 //!   ([`FenceGrant::superseded_lease`]) before it makes a model call or
@@ -160,6 +168,7 @@ const _: () =
 pub struct FenceTiming {
     renew_interval: Duration,
     lease: Duration,
+    self_fence_margin: Duration,
 }
 
 impl FenceTiming {
@@ -175,6 +184,19 @@ impl FenceTiming {
     /// [`FENCE_MIN_LEASE_RENEWALS`] intervals and at most
     /// [`Self::MAX_LEASE`].
     pub fn try_new(renew_interval: Duration, lease: Duration) -> Result<Self, HostStoreError> {
+        Self::try_with_margin(renew_interval, lease, renew_interval)
+    }
+
+    /// A timing as [`Self::try_new`] with a host-declared self-fence margin:
+    /// a holder writes only while its last successful acquire or renew
+    /// started less than `lease - self_fence_margin` ago. The margin lies
+    /// strictly between zero and the lease, and it must exceed the store's
+    /// visibility lag (see the writer rules in the module documentation).
+    pub fn try_with_margin(
+        renew_interval: Duration,
+        lease: Duration,
+        self_fence_margin: Duration,
+    ) -> Result<Self, HostStoreError> {
         if renew_interval < Self::MIN_RENEW_INTERVAL {
             return Err(HostStoreError::Invalid(format!(
                 "a fence renew interval of {renew_interval:?} is shorter than {:?}",
@@ -188,9 +210,15 @@ impl FenceTiming {
                 Self::MAX_LEASE
             )));
         }
+        if self_fence_margin.is_zero() || self_fence_margin >= lease {
+            return Err(HostStoreError::Invalid(format!(
+                "a self-fence margin of {self_fence_margin:?} lies outside zero to the lease {lease:?}"
+            )));
+        }
         Ok(Self {
             renew_interval,
             lease,
+            self_fence_margin,
         })
     }
 
@@ -204,11 +232,17 @@ impl FenceTiming {
         self.lease
     }
 
+    /// The host-declared self-fence margin: one renew interval unless the
+    /// host declared another ([`Self::try_with_margin`]).
+    pub const fn self_fence_margin(self) -> Duration {
+        self.self_fence_margin
+    }
+
     /// How long after the start of its last successful acquire or renew a
     /// holder may still make a model call or dispatch, on its own clock: the
-    /// lease minus a margin of one renew interval.
+    /// lease minus the self-fence margin.
     pub const fn self_fence_window(self) -> Duration {
-        self.lease.saturating_sub(self.renew_interval)
+        self.lease.saturating_sub(self.self_fence_margin)
     }
 }
 
@@ -217,7 +251,38 @@ impl Default for FenceTiming {
         Self {
             renew_interval: Duration::from_secs(FENCE_RENEW_INTERVAL_SECS),
             lease: Duration::from_secs(FENCE_LEASE_SECS),
+            self_fence_margin: Duration::from_secs(FENCE_RENEW_INTERVAL_SECS),
         }
+    }
+}
+
+/// A writer's self-fence on its own clock (the writer rules in the module
+/// documentation). Core's host store realm implements it; the run loop asks
+/// it right before each model call and each tool dispatch, not only before
+/// commits.
+pub trait SelfFence: Send + Sync {
+    /// The writer's self-fence window now. A local clock read; no store I/O.
+    fn window(&self) -> SelfFenceWindow;
+}
+
+/// One reading of a writer's self-fence window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelfFenceWindow {
+    /// Time since the start of the last successful acquire or renew.
+    pub elapsed: Duration,
+    /// [`FenceTiming::self_fence_window`]: the lease minus the margin.
+    pub window: Duration,
+    /// Whether a renew failed after that acquire or renew.
+    pub renew_failed: bool,
+}
+
+impl SelfFenceWindow {
+    /// Whether the writer may still make a model call or dispatch: no renew
+    /// failed, and the last successful acquire or renew started less than
+    /// the window ago.
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        !self.renew_failed && self.elapsed < self.window
     }
 }
 
@@ -797,4 +862,24 @@ pub trait HostStore: Send + Sync {
     /// acting again (obligation 3). [`HostStoreError::Indeterminate`] means
     /// the outcome is unknown; Core retries with the same batch.
     async fn commit(&self, batch: &CommitBatch) -> Result<(), HostStoreError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // UNRUN (Policy v1.1): written for the frozen candidate.
+    #[test]
+    fn a_declared_self_fence_margin_sets_the_window() {
+        let secs = Duration::from_secs;
+        let default = FenceTiming::default();
+        assert_eq!(default.self_fence_margin(), default.renew_interval());
+        assert_eq!(default.self_fence_window(), secs(20));
+        let declared = FenceTiming::try_with_margin(secs(10), secs(30), secs(12));
+        assert_eq!(declared.map(FenceTiming::self_fence_window), Ok(secs(18)));
+        let plain = FenceTiming::try_new(secs(2), secs(6));
+        assert_eq!(plain.map(FenceTiming::self_fence_margin), Ok(secs(2)));
+        assert!(FenceTiming::try_with_margin(secs(10), secs(30), Duration::ZERO).is_err());
+        assert!(FenceTiming::try_with_margin(secs(10), secs(30), secs(30)).is_err());
+    }
 }

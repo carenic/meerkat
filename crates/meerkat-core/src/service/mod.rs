@@ -608,6 +608,45 @@ impl SessionError {
         )
     }
 
+    /// Structured-data `kind` of [`Self::mob_member_session_addressed_by_id`].
+    pub const MOB_MEMBER_SESSION_ADDRESSED_BY_ID_KIND: &'static str =
+        "mob_member_session_addressed_by_id";
+
+    /// A session-scoped surface (a live channel opened by session id, and
+    /// the reads that recover a session for it) refused to restore a mob
+    /// member's session from storage. The member's mob restores that
+    /// session, and its live channel opens through the mob's member live
+    /// surface, which first checks the member. Nothing was restored.
+    /// Surfaces answer the invalid-params class.
+    pub fn mob_member_session_addressed_by_id(
+        session_id: &SessionId,
+        mob_id: &str,
+        member: &str,
+    ) -> Self {
+        Self::FailedWithData {
+            message: format!(
+                "session {session_id} belongs to member '{member}' of mob '{mob_id}' and is not \
+                 live; open its live channel through the mob's member live surface"
+            ),
+            data: serde_json::json!({
+                "kind": Self::MOB_MEMBER_SESSION_ADDRESSED_BY_ID_KIND,
+                "session_id": session_id.to_string(),
+                "mob_id": mob_id,
+                "member": member,
+            }),
+        }
+    }
+
+    /// Whether this error is a [`Self::mob_member_session_addressed_by_id`].
+    pub fn is_mob_member_session_addressed_by_id(&self) -> bool {
+        matches!(
+            self.primary_error(),
+            Self::FailedWithData { data, .. }
+                if data.get("kind").and_then(serde_json::Value::as_str)
+                    == Some(Self::MOB_MEMBER_SESSION_ADDRESSED_BY_ID_KIND)
+        )
+    }
+
     /// Structured-data `kind` of a [`Self::ServedElsewhere`] refusal on the
     /// wire, where it travels under the session-busy code.
     pub const SERVED_ELSEWHERE_KIND: &'static str = "session_served_elsewhere";

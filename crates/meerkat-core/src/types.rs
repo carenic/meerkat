@@ -869,7 +869,7 @@ pub enum ProviderMeta {
     /// The enclosing tool-use ID remains Meerkat's internal correlation key.
     GeminiFunctionCall {
         /// Opaque `functionCall.id` supplied by the provider, never a fallback.
-        id: String,
+        provider_id: String,
         /// A signature belongs to the call part, not its function response.
         #[serde(
             default,
@@ -3081,7 +3081,7 @@ impl SystemNoticeBlock {
                     sender_taint,
                     Some(crate::comms::SenderContentTaint::Tainted)
                 ) {
-                    lines.push("[sender declared this content tainted]".to_string());
+                    lines.push(crate::interaction::SENDER_TAINT_MARKER.to_string());
                 }
                 lines.join("\n")
             }

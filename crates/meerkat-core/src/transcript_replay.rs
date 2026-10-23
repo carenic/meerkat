@@ -1250,7 +1250,7 @@ mod tests {
             name: "lookup".into(),
             args: serde_json::value::to_raw_value(&serde_json::json!({})).unwrap(),
             meta: Some(Box::new(ProviderMeta::GeminiFunctionCall {
-                id: "provider-call".into(),
+                provider_id: "provider-call".into(),
                 thought_signature: Some("opaque-signature".into()),
             })),
         };

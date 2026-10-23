@@ -872,10 +872,11 @@ pub(crate) use orchestrator::unrecorded_live_row_identity;
     not(target_arch = "wasm32")
 ))]
 pub use orchestrator::{
-    LiveOrchestrator, LiveSessionIngressReconciler, LiveTransportContext, LiveTruncateCursor,
-    build_live_projection_snapshot, continuity_from_snapshot, live_audio_config_from_capabilities,
-    live_close_result_from_machine_authority, live_refresh_result_from_machine_authority,
-    live_ws_audio_format_param, wire_live_status_from_machine_authority,
+    LiveOrchestrator, LiveSessionAddressing, LiveSessionIngressReconciler, LiveTransportContext,
+    LiveTruncateCursor, build_live_projection_snapshot, continuity_from_snapshot,
+    live_audio_config_from_capabilities, live_close_result_from_machine_authority,
+    live_refresh_result_from_machine_authority, live_ws_audio_format_param,
+    wire_live_status_from_machine_authority,
 };
 
 #[cfg(all(
@@ -950,6 +951,24 @@ mod orchestrator {
         ResultRecovery,
     }
 
+    /// How the surface that owns a [`LiveOrchestrator`] addresses the
+    /// sessions it opens and recovers.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum LiveSessionAddressing {
+        /// Sessions addressed by their id alone (a session-scoped
+        /// `live/open` and the reads behind it). Such a surface neither
+        /// restores a mob member's session from storage nor opens a live
+        /// channel on one: the member's mob restores it and opens its
+        /// channels after checking the member (eligible, not retiring or in
+        /// cleanup or revoke, not Broken). Both are refused with
+        /// [`SessionError::mob_member_session_addressed_by_id`].
+        SessionScoped,
+        /// Mob member sessions addressed through their mob, which checked
+        /// the member before it asked (the member live host).
+        MobMember,
+    }
+
     /// Surface-agnostic live-channel orchestrator.
     ///
     /// Borrows the resolved infrastructure from a calling surface
@@ -1002,6 +1021,10 @@ mod orchestrator {
         /// ingress reconciliation can attach its runtime executor.
         pub actor_witness_capture:
             crate::session_runtime::staged_promotion::ActorWitnessSlotCaptureFn,
+        /// How this surface addresses sessions: a session-scoped one never
+        /// restores a mob member's session from storage
+        /// ([`Self::recover_live_session_for_realtime_open`]).
+        pub session_addressing: LiveSessionAddressing,
     }
 
     /// Per-call transport-stage inputs for the open/verb pipeline methods
@@ -2034,6 +2057,38 @@ mod orchestrator {
             }
         }
 
+        /// Refuse, on a [`LiveSessionAddressing::SessionScoped`] surface, to
+        /// open a live channel on a mob member's session, live or not. A
+        /// session-scoped open checks nothing of the member, while the mob's
+        /// member live surface opens only an eligible member that is not
+        /// retiring, in cleanup or revoke, or Broken. The read is the
+        /// authoritative durable metadata view (no transcript rows); a
+        /// session without durable metadata is no member's and is left to
+        /// the open's own lookups.
+        pub async fn refuse_mob_member_session_by_id(
+            &self,
+            session_id: &SessionId,
+        ) -> Result<(), SessionError> {
+            if self.session_addressing != LiveSessionAddressing::SessionScoped {
+                return Ok(());
+            }
+            let Some(metadata) = self
+                .service
+                .load_authoritative_session_metadata(session_id)
+                .await?
+            else {
+                return Ok(());
+            };
+            match metadata.mob_member_binding() {
+                Some(binding) => Err(SessionError::mob_member_session_addressed_by_id(
+                    session_id,
+                    &binding.mob_id,
+                    &binding.member,
+                )),
+                None => Ok(()),
+            }
+        }
+
         /// Recover a persisted-only session into the live service map so
         /// realtime-open paths can resolve it. Materializes a deferred
         /// staged session in place; falls back to durable-snapshot
@@ -2043,6 +2098,15 @@ mod orchestrator {
         /// mid-turn answers none until the turn ends, and the channel mint
         /// only needs the registration to exist and the store's lifecycle
         /// authority to still be live.
+        ///
+        /// A [`LiveSessionAddressing::SessionScoped`] surface never restores
+        /// a mob member's session from storage: that would register and
+        /// materialize the member's session outside its mob's custody,
+        /// whose restore may have deferred it. It refuses with
+        /// [`SessionError::mob_member_session_addressed_by_id`] before
+        /// anything is created. A member session that is live already is
+        /// found above and is not restored here; opening a channel on it is
+        /// refused at the open ([`Self::refuse_mob_member_session_by_id`]).
         pub async fn recover_live_session_for_realtime_open(
             &self,
             session_id: &SessionId,
@@ -2067,6 +2131,17 @@ mod orchestrator {
                 .ok_or_else(|| SessionError::NotFound {
                     id: session_id.clone(),
                 })?;
+            if self.session_addressing == LiveSessionAddressing::SessionScoped
+                && let Some(binding) = session
+                    .session_metadata()
+                    .and_then(|metadata| metadata.mob_member_binding)
+            {
+                return Err(SessionError::mob_member_session_addressed_by_id(
+                    session_id,
+                    &binding.mob_id,
+                    &binding.member,
+                ));
+            }
             let keep_alive = session
                 .session_metadata()
                 .ok_or_else(|| {
@@ -3345,6 +3420,13 @@ mod orchestrator {
             if requested_transport != Some(LiveOpenTransport::Webrtc) {
                 return Err(super::ExperimentalLiveChannelOpenError::InvalidTransport);
             }
+            self.refuse_mob_member_session_by_id(session_id)
+                .await
+                .map_err(|refusal| {
+                    super::ExperimentalLiveChannelOpenError::Open(LiveOpenError::SessionStateFault(
+                        refusal,
+                    ))
+                })?;
             let mut pending = authority
                 .prepare_open(session_id, execution_identity)
                 .await
@@ -4136,6 +4218,11 @@ mod orchestrator {
                 }
                 Err(error) => return Err(LiveOpenError::SessionStateFault(error)),
             }
+            // A session-scoped surface opens no mob member's session; the
+            // refusal comes before the projection takes the open admission.
+            self.refuse_mob_member_session_by_id(session_id)
+                .await
+                .map_err(LiveOpenError::SessionStateFault)?;
 
             // S2 — #302: refuse up front when no realtime session factory
             // is wired, BEFORE any admission or host registration.
@@ -4322,6 +4409,11 @@ mod orchestrator {
                     },
                 ));
             }
+            // Every open from a projection, recovery reopens included, passes
+            // here: a session-scoped surface opens no mob member's session.
+            self.refuse_mob_member_session_by_id(session_id)
+                .await
+                .map_err(LiveOpenError::SessionStateFault)?;
             #[cfg(feature = "openai-live")]
             if let Some(summary) = prepared_projection.summary.as_ref() {
                 summary
