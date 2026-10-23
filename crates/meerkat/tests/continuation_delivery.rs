@@ -4219,6 +4219,12 @@ impl meerkat::ContinuationAddressResolver for RetiringResolver {
         &self,
         owner: &ContinuationOwner,
     ) -> Result<Option<LogicalRuntimeId>, String> {
+        // A member of the mob `team`, at its first generation.
+        if let ContinuationOwner::Member { mob_id, identity } = owner {
+            return meerkat::member_delivery_address(mob_id, team_incarnation(), identity, 1)
+                .map(Some)
+                .map_err(|error| error.to_string());
+        }
         meerkat::ContinuationAddressResolver::current_address(&SessionAddressResolver, owner).await
     }
 
@@ -4256,6 +4262,8 @@ impl meerkat::ContinuationAddressResolver for RetiringResolver {
 struct RetiringHost {
     sink: Arc<RecordingSink>,
     retirements: Arc<Retirements>,
+    /// The committed owner of host namespaces, when the host composes one.
+    job_source: Option<Arc<FakeJobs>>,
     /// Addresses served by another session than their own (a repoint).
     served_by: Mutex<HashMap<LogicalRuntimeId, SessionId>>,
     elsewhere: Mutex<std::collections::HashSet<SessionId>>,
@@ -4269,9 +4277,27 @@ struct RetiringHost {
 
 impl RetiringHost {
     fn new(sink: Arc<RecordingSink>, retirements: Arc<Retirements>) -> Arc<Self> {
+        Self::composed(sink, retirements, None)
+    }
+
+    /// As [`Self::new`], with `jobs` as the host's job source.
+    fn with_jobs(
+        sink: Arc<RecordingSink>,
+        retirements: Arc<Retirements>,
+        jobs: Arc<FakeJobs>,
+    ) -> Arc<Self> {
+        Self::composed(sink, retirements, Some(jobs))
+    }
+
+    fn composed(
+        sink: Arc<RecordingSink>,
+        retirements: Arc<Retirements>,
+        job_source: Option<Arc<FakeJobs>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             sink,
             retirements,
+            job_source,
             served_by: Mutex::new(HashMap::new()),
             elsewhere: Mutex::new(std::collections::HashSet::new()),
             held_route: Mutex::new(None),
@@ -4340,6 +4366,12 @@ impl RuntimeDeliveryHost for RetiringHost {
         _session_id: &SessionId,
     ) -> Option<Arc<dyn ContinuationDeliverySink>> {
         Some(self.sink.clone() as Arc<dyn ContinuationDeliverySink>)
+    }
+
+    fn retained_job_source(&self) -> Option<Arc<dyn RetainedJobSource>> {
+        self.job_source
+            .clone()
+            .map(|jobs| jobs as Arc<dyn RetainedJobSource>)
     }
 }
 
@@ -7077,4 +7109,303 @@ use governed_fixture::{FakeBinder, Tamper};
 /// The binder the namespace owner offers.
 fn binder_of(jobs: &FakeJobs) -> Arc<FakeBinder> {
     jobs.binder.lock().expect("lock").clone().expect("a binder")
+}
+
+// ---------------------------------------------------------------------------
+// Retired addresses meet governed host originals: a stranded answer stays
+// final on the binder's path too, and a reservation left on a retired address
+// is settled by the reserved id, as the drain recovers it.
+// ---------------------------------------------------------------------------
+
+/// The member `lead` of the mob `team`, owed the observation.
+fn lead_of_team() -> ContinuationOwner {
+    ContinuationOwner::Member {
+        mob_id: "team".into(),
+        identity: "lead".into(),
+    }
+}
+
+/// The observation committed for the member `lead`, whose namespace owner
+/// holds it for that member, on a fixture whose status read sees the
+/// retirements: the receipt and the owner.
+async fn a_member_observation(
+    cut: &RetiringFixture,
+    session: &SessionId,
+) -> (meerkat::ContinuationReceipt, Arc<FakeJobs>) {
+    let jobs = ingest_owner(session);
+    jobs.change_original(OBSERVATION, |facts| facts.owner = lead_of_team());
+    let receipt = host_continuation_shape::commit(
+        &cut.fixture.continuations,
+        &lead_of_team(),
+        observation_delivery(),
+        &jobs,
+    )
+    .await
+    .expect("commit the member's observation from its namespace owner");
+    assert!(
+        LogicalRuntimeId::new(receipt.address.clone())
+            .member_address()
+            .expect("address")
+            .is_some(),
+        "the observation is owed at a member address"
+    );
+    (receipt, jobs)
+}
+
+/// The drain resolved the member's address and parked at its session's
+/// route; then the address retired (a respawn, or the mob created again
+/// under its id) and a status read answered stranded. Released, the drain
+/// binds the observation and reserves it, observes the retire before native
+/// admission, releases the reservation and withdraws the binder's custody:
+/// nothing is admitted after the stranded answer.
+#[tokio::test]
+async fn a_member_host_original_whose_address_retires_before_native_admission_admits_nothing() {
+    let cut = RetiringFixture::memory();
+    let session = SessionId::new();
+    let (receipt, jobs) = a_member_observation(&cut, &session).await;
+    let address = LogicalRuntimeId::new(receipt.address.clone());
+    let sink = Arc::new(RecordingSink::governed());
+    let host = RetiringHost::with_jobs(
+        sink.clone(),
+        Arc::clone(&cut.retirements),
+        Arc::clone(&jobs),
+    );
+    host.serve(&address, session.clone());
+    let (entered, release) = host.hold_next_route();
+    let handle = cut.fixture.owner().arm(host).expect("arm");
+    let mut passes = handle.subscribe_passes();
+    tokio::time::timeout(EVENT_GUARD, entered)
+        .await
+        .expect("the drain reached the member's session route")
+        .expect("route hold");
+
+    cut.retirements.retire(&address);
+    let stranded = cut.status(&lead_of_team(), OBSERVATION_KEY).await;
+    assert!(
+        matches!(stranded, ContinuationStatus::Stranded { .. }),
+        "never admitted, and the address retired: {stranded:?}"
+    );
+
+    release.send(()).expect("release the drain");
+    wait_for_reconcile(&mut passes).await;
+    assert!(
+        sink.governed_inputs().is_empty(),
+        "nothing reaches native admission after a stranded answer: {:?}",
+        sink.governed_admissions()
+    );
+    assert_eq!(
+        cut.admission_entry(&address, &receipt.delivery_id).await,
+        None,
+        "the reservation is released"
+    );
+    let binder = binder_of(&jobs);
+    assert_eq!(binder.calls(), 1, "bound once, before the observation");
+    assert!(
+        custody_dropped_once(&binder),
+        "the binder's custody is withdrawn, never promoted or retained"
+    );
+    let still = cut.status(&lead_of_team(), OBSERVATION_KEY).await;
+    assert!(
+        matches!(still, ContinuationStatus::Stranded { .. }),
+        "a stranded continuation stays stranded: {still:?}"
+    );
+}
+
+/// The same through a repoint: an earlier attempt left a reservation in s1
+/// with nothing admitted, and the member's address now resolves to s2. The
+/// address retires while the drain is parked, so a status read sees the
+/// reservation and answers pending. Released, the drain repoints the reserved
+/// id to s2, binds for s2, observes the retire, releases the repointed
+/// reservation and withdraws the custody: nothing is admitted, and the
+/// continuation reads stranded.
+#[tokio::test]
+async fn a_repointed_member_host_original_whose_address_retires_releases_its_reservation() {
+    let cut = RetiringFixture::memory();
+    let (s1, s2) = (SessionId::new(), SessionId::new());
+    let (receipt, jobs) = a_member_observation(&cut, &s2).await;
+    let address = LogicalRuntimeId::new(receipt.address.clone());
+    cut.fixture
+        .admission(
+            &address,
+            &receipt.delivery_id,
+            ContinuationAdmissionTransition::Reserve {
+                session_id: s1.clone(),
+                input_id: InputId::new(),
+            },
+        )
+        .await;
+    let sink = Arc::new(RecordingSink::governed());
+    let host = RetiringHost::with_jobs(
+        sink.clone(),
+        Arc::clone(&cut.retirements),
+        Arc::clone(&jobs),
+    );
+    host.serve(&address, s2.clone());
+    let (entered, release) = host.hold_next_route();
+    let handle = cut.fixture.owner().arm(host).expect("arm");
+    let mut passes = handle.subscribe_passes();
+    tokio::time::timeout(EVENT_GUARD, entered)
+        .await
+        .expect("the drain reached the serving session's route")
+        .expect("route hold");
+
+    cut.retirements.retire(&address);
+    let reserved = cut.status(&lead_of_team(), OBSERVATION_KEY).await;
+    assert!(
+        matches!(reserved, ContinuationStatus::Pending { admitted: None, .. }),
+        "a reservation exists, so the read is not stranded: {reserved:?}"
+    );
+
+    release.send(()).expect("release the drain");
+    wait_for_reconcile(&mut passes).await;
+    assert!(
+        sink.governed_inputs().is_empty(),
+        "nothing reaches native admission after the retire: {:?}",
+        sink.governed_admissions()
+    );
+    assert_eq!(
+        cut.admission_entry(&address, &receipt.delivery_id).await,
+        None,
+        "the repointed reservation is released"
+    );
+    let binder = binder_of(&jobs);
+    assert_eq!(binder.calls(), 1, "bound once, for s2");
+    assert!(
+        custody_dropped_once(&binder),
+        "the binder's custody is withdrawn, never promoted or retained"
+    );
+    let stranded = cut.status(&lead_of_team(), OBSERVATION_KEY).await;
+    assert!(
+        matches!(stranded, ContinuationStatus::Stranded { .. }),
+        "never admitted, and the address retired: {stranded:?}"
+    );
+}
+
+/// A reservation an attempt left before a crash, on a member address that
+/// retired since, whose bound observation reached the reserved session under
+/// the reserved id. A governed admission is indexed under its qualified key,
+/// so only a read by the reserved id finds it: the owner reads it so,
+/// verifies it with the row's own recorded binding and records it, and the
+/// continuation reads admitted. Nobody is asked, and nothing is admitted
+/// again.
+#[tokio::test]
+async fn a_governed_reservation_on_a_retired_address_with_its_bound_row_reads_admitted() {
+    let cut = RetiringFixture::memory();
+    let session = SessionId::new();
+    let (receipt, jobs) = a_member_observation(&cut, &session).await;
+    let address = LogicalRuntimeId::new(receipt.address.clone());
+    let reserved = InputId::new();
+    cut.fixture
+        .admission(
+            &address,
+            &receipt.delivery_id,
+            ContinuationAdmissionTransition::Reserve {
+                session_id: session.clone(),
+                input_id: reserved.clone(),
+            },
+        )
+        .await;
+    let sink = Arc::new(RecordingSink::governed());
+    let binder = binder_of(&jobs);
+    sink.holds_by_id_only(
+        &session,
+        &binder.bind_now(
+            &governed_fixture::original_work(),
+            &session,
+            continuation_input(reserved.clone(), &receipt.delivery_id, "a new item arrived"),
+        ),
+    );
+    cut.retirements.retire(&address);
+
+    let handle = cut
+        .fixture
+        .owner()
+        .arm(RetiringHost::with_jobs(
+            sink.clone(),
+            Arc::clone(&cut.retirements),
+            Arc::clone(&jobs),
+        ))
+        .expect("arm");
+    let mut passes = handle.subscribe_passes();
+    wait_for_reconcile(&mut passes).await;
+
+    assert_eq!(
+        cut.status(&lead_of_team(), OBSERVATION_KEY).await,
+        ContinuationStatus::Pending {
+            receipt,
+            sequence: 1,
+            admitted: Some((session, reserved)),
+        },
+        "the reserved session holds the bound observation"
+    );
+    assert!(
+        sink.governed_inputs().is_empty(),
+        "nothing is admitted again"
+    );
+    assert_eq!(binder.calls(), 0, "the binder is never asked");
+    assert!(custody_untouched(&binder), "no custody is made or moved");
+}
+
+/// Pins the documented corner of the settle: the reserved session holds the
+/// bound observation under ANOTHER input id (native admission deduplicated
+/// the retry onto it, and the attempt crashed before it applied that id).
+/// A governed admission is indexed under its qualified key, which only a
+/// fresh bind derives, and a retired address is never bound again, so
+/// neither the reserved id nor the raw key finds it: the owner releases the
+/// reservation, and the continuation reads stranded. Keeping the reservation
+/// instead would leave every governed reservation without its row pending
+/// forever, so changing this is a reviewed decision.
+#[tokio::test]
+async fn a_governed_reservation_on_a_retired_address_deduplicated_onto_another_input_reads_stranded()
+ {
+    let cut = RetiringFixture::memory();
+    let session = SessionId::new();
+    let (receipt, jobs) = a_member_observation(&cut, &session).await;
+    let address = LogicalRuntimeId::new(receipt.address.clone());
+    cut.fixture
+        .admission(
+            &address,
+            &receipt.delivery_id,
+            ContinuationAdmissionTransition::Reserve {
+                session_id: session.clone(),
+                input_id: InputId::new(),
+            },
+        )
+        .await;
+    let sink = Arc::new(RecordingSink::governed());
+    let binder = binder_of(&jobs);
+    sink.holds_by_id_only(
+        &session,
+        &binder.bind_now(
+            &governed_fixture::original_work(),
+            &session,
+            continuation_input(InputId::new(), &receipt.delivery_id, "a new item arrived"),
+        ),
+    );
+    cut.retirements.retire(&address);
+
+    let handle = cut
+        .fixture
+        .owner()
+        .arm(RetiringHost::with_jobs(
+            sink.clone(),
+            Arc::clone(&cut.retirements),
+            Arc::clone(&jobs),
+        ))
+        .expect("arm");
+    let mut passes = handle.subscribe_passes();
+    wait_for_reconcile(&mut passes).await;
+
+    let status = cut.status(&lead_of_team(), OBSERVATION_KEY).await;
+    assert!(
+        matches!(status, ContinuationStatus::Stranded { .. }),
+        "neither read finds the deduplicated input: {status:?}"
+    );
+    assert_eq!(
+        cut.admission_entry(&address, &receipt.delivery_id).await,
+        None,
+        "the reservation is released"
+    );
+    assert!(sink.governed_inputs().is_empty(), "nothing is admitted");
+    assert_eq!(binder.calls(), 0, "the binder is never asked");
 }
