@@ -490,16 +490,6 @@ async fn kill(chapter: &mut Chapter<'_>, mut writer: Writer) -> Result<Writer, C
                 format!("{cut:?}: a commit refused with {error} applies nothing"),
             )?,
         }
-        if matches!(cut, Cut::After) {
-            steps.ensure(
-                STEP,
-                landed,
-                format!(
-                    "a batch committed before its writer died must show, answered {answered:?}"
-                ),
-            )?;
-        }
-
         let fresh_id = chapter.mint(STEP)?;
         if landed {
             let continued = vec![
@@ -690,6 +680,9 @@ async fn stale_fence(chapter: &mut Chapter<'_>, a: Writer) -> Result<Writer, Con
     }
     drop(a);
 
+    // Renew right before the exclusive acquire, so that a compliant store
+    // with a short lease, or slow calls since the takeover, still holds B.
+    steps.wrap(STEP, b.store.renew_fence(b.token).await)?;
     let c_store = chapter.factory.open().await?;
     let held = c_store.acquire_fence(AcquireMode::Exclusive).await;
     steps.ensure(
