@@ -3290,13 +3290,10 @@ mod hosting {
             // connection, so the WAL stays and no read changes it.
             let held = meerkat_sqlite::open(&path, meerkat_sqlite::ConnectionProfile::PRIMARY)
                 .expect("a held connection");
+            // Commits before the owner arms grow the WAL (an update that
+            // rewrites a row unchanged writes nothing).
             for _ in 0..8 {
-                held.execute(
-                    "UPDATE runtime_delivery_generation SET generation = generation \
-                     WHERE singleton = 1",
-                    [],
-                )
-                .expect("grow the WAL");
+                move_the_delivery_generation(&held);
             }
             let busy: i64 = held
                 .query_row("PRAGMA wal_checkpoint(RESTART)", [], |row| row.get(0))
