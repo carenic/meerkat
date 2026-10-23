@@ -1663,10 +1663,15 @@ impl SqliteScheduleStore {
                             };
                             write_receipt_in_txn(&tx, &receipt)?;
                             let expired = mutator.occurrence().clone();
-                            // A machine refusal of the follow-up claim is this
+                            // The machine refuses the follow-up claim at the
+                            // reclaim cap past the misfire deadline by design:
+                            // the expired row then classifies as exhausted, and
+                            // this scan resolves it with no fault. The evidence
+                            // read above still holds, since the expiry's receipt
+                            // is no dispatch evidence. Any other refusal is this
                             // row's typed fault, never a silent skip: the expiry
-                            // above stays committed and the row re-enters the
-                            // scan on the next tick.
+                            // stays committed and the row re-enters the scan on
+                            // the next tick.
                             let claim_mutator = match claim_occurrence_for_sqlite(
                                 expired,
                                 &request,
@@ -1677,12 +1682,28 @@ impl SqliteScheduleStore {
                                 Err(error) => {
                                     let write = mutator.into_authorized_write();
                                     write_occurrence_in_txn(&tx, write.occurrence())?;
+                                    let expired = write.occurrence().clone();
                                     transition_writes.push(write);
-                                    row_faults.push(claim_row_fault(
-                                        &occurrence,
-                                        ScheduleStoreRowFaultKind::DueClassification,
-                                        format!("lease-expiry reclaim: {error}"),
-                                    ));
+                                    match expired
+                                        .classify_due_action(store_now_utc, admission_evidence)
+                                    {
+                                        Ok(Some(OccurrenceDueAction::ReclaimExhausted)) => {
+                                            match resolve_reclaim_exhausted_in_txn(
+                                                &tx,
+                                                &expired,
+                                                admission_evidence,
+                                                store_now_utc,
+                                            )? {
+                                                Ok(write) => transition_writes.push(write),
+                                                Err(fault) => row_faults.push(fault),
+                                            }
+                                        }
+                                        _ => row_faults.push(claim_row_fault(
+                                            &occurrence,
+                                            ScheduleStoreRowFaultKind::DueClassification,
+                                            format!("lease-expiry reclaim: {error}"),
+                                        )),
+                                    }
                                     continue;
                                 }
                             };
