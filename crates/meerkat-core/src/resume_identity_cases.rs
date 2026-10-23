@@ -98,21 +98,21 @@ pub fn resume_identity_cases() -> Vec<ResumeIdentityCase> {
     let env_default = binding("env_default", "default", BindingOrigin::SyntheticEnvDefault);
 
     let durable_openai = identity(
-        "gpt-5.4",
+        "test-openai-default",
         Provider::OpenAI,
         None,
         durable_params.clone(),
         Some(openai.clone()),
     );
     let durable_env_default = identity(
-        "gpt-5.4",
+        "test-openai-default",
         Provider::OpenAI,
         None,
         durable_params.clone(),
         Some(env_default),
     );
     let durable_self_hosted = identity(
-        "muse-glimmer-30b",
+        "test-self-hosted-default",
         Provider::SelfHosted,
         Some("muse_vllm"),
         durable_params,
@@ -120,28 +120,28 @@ pub fn resume_identity_cases() -> Vec<ResumeIdentityCase> {
     );
 
     let same_provider = identity(
-        "gpt-5.5",
+        "test-openai-other",
         Provider::OpenAI,
         None,
         build_params.clone(),
         None,
     );
     let provider_change = identity(
-        "claude-sonnet-4-6",
+        "test-anthropic-default",
         Provider::Anthropic,
         None,
         build_params.clone(),
         None,
     );
     let explicit_binding = identity(
-        "claude-sonnet-4-6",
+        "test-anthropic-default",
         Provider::Anthropic,
         None,
         build_params.clone(),
         Some(anthropic.clone()),
     );
     let server_change = identity(
-        "cerebras-gpt-oss-120b",
+        "test-self-hosted-other",
         Provider::SelfHosted,
         None,
         build_params,
