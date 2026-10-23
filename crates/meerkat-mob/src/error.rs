@@ -1104,6 +1104,14 @@ pub enum MobError {
         unavailable: Vec<AgentIdentity>,
     },
 
+    /// A keyed flow run admission named a key whose run was admitted with
+    /// other activation params or other role targets. The first run stands;
+    /// no second run was admitted.
+    #[error(
+        "flow run '{run_id}' of flow '{flow_id}' was admitted under this idempotency key with other activation params or role targets"
+    )]
+    FlowRunIdempotencyConflict { run_id: RunId, flow_id: FlowId },
+
     /// Topology policy denied a dispatch edge.
     #[error("topology violation: {from_role} -> {to_role}")]
     TopologyViolation {
@@ -2428,6 +2436,11 @@ impl MobError {
                 "required": required,
                 "available": available,
                 "unavailable": unavailable,
+            })),
+            Self::FlowRunIdempotencyConflict { run_id, flow_id } => Some(serde_json::json!({
+                "kind": "flow_run_idempotency_conflict",
+                "run_id": run_id.to_string(),
+                "flow_id": flow_id.as_str(),
             })),
             Self::SharedRetirementFailure(error) | Self::SharedLifecycleFailure(error) => {
                 error.structured_data()

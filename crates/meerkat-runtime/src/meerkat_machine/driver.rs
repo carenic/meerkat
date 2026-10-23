@@ -5915,6 +5915,39 @@ impl DriverEntry {
         }
     }
 
+    /// Reload the `Consumed` terminals a store-owned durable-tail recovery
+    /// committed for inputs this driver still holds as non-terminal
+    /// (`PersistentRuntimeDriver::adopt_durable_consumed_inputs`). Every sweep
+    /// of the pending inputs (retire, reset, destroy, stop, the queued-input
+    /// cancel point, a replaced attachment's predecessor work) runs it before
+    /// it names the inputs it ends. An adopted input leaves the active set, so
+    /// no sweep answers its process-local waiters any more: they fail here
+    /// with `AuthorityUnavailable`, because the run that consumed the input
+    /// was committed outside this runtime and its result does not reach them.
+    /// An ephemeral runtime keeps no durable rows, so nothing is reloaded.
+    pub(crate) async fn adopt_durable_consumed_inputs(
+        &mut self,
+        completions: Option<&SharedCompletionRegistry>,
+    ) -> Result<Vec<InputId>, RuntimeDriverError> {
+        let adopted = match self {
+            DriverEntry::Ephemeral(_) => return Ok(Vec::new()),
+            DriverEntry::Persistent(driver) => driver.adopt_durable_consumed_inputs().await?,
+        };
+        if !adopted.is_empty()
+            && let Some(completions) = completions
+        {
+            completions.lock().await.fail_inputs(
+                adopted.iter().cloned(),
+                crate::completion::CompletionWaitError::AuthorityUnavailable(
+                    "a durable-tail recovery outside this runtime consumed the input with the \
+                     run it committed; read the session's committed history for its result"
+                        .to_string(),
+                ),
+            );
+        }
+        Ok(adopted)
+    }
+
     pub(crate) fn prepare_destroy_lifecycle(
         &mut self,
     ) -> Result<PreparedDestroy, RuntimeDriverError> {

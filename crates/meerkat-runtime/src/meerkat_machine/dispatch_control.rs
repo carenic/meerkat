@@ -126,11 +126,17 @@ impl MeerkatMachine {
         &self,
         session_id: &SessionId,
         driver: &SharedDriver,
+        completions: &SharedCompletionRegistry,
         runless_terminal: &mut super::RunlessTerminalAnnouncement,
     ) -> Result<MutationGuardedResetCommit, RuntimeControlPlaneError> {
         let reason = "runtime reset";
         let (completion_input_ids, prepared_terminals, ended_run) = {
             let mut drv = driver.lock().await;
+            // Inputs a store-owned durable-tail recovery consumed are not
+            // pending: adopt them before this sweep names its batch.
+            drv.adopt_durable_consumed_inputs(Some(completions))
+                .await
+                .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
             // A run the session left open never resumes past a reset: its
             // mark ends here, and the reset's sweep abandons its bound inputs
             // with every other non-terminal input. Every failure below marks
@@ -261,13 +267,13 @@ impl MeerkatMachine {
             .realize_reset_under_mutation_guard(
                 &lease.session_id,
                 &driver,
+                &completions,
                 &mut super::RunlessTerminalAnnouncement::default(),
             )
             .await
             .map_err(|error| RuntimeDriverError::Internal(error.to_string()))?;
         debug_assert!(committed.completion_input_ids.is_empty());
         debug_assert!(committed.candidate_owner_input_id.is_none());
-        let _ = completions;
         Ok(committed.report)
     }
 
@@ -1017,6 +1023,7 @@ impl MeerkatMachine {
                             .realize_reset_under_mutation_guard(
                                 &session_id,
                                 &driver,
+                                &completions,
                                 &mut runless_terminal,
                             )
                             .await?;
@@ -1238,6 +1245,12 @@ impl MeerkatMachine {
                         .and_then(|entry| entry.composition_signal_dispatcher.clone());
                     let mut drv = driver.lock().await;
                     let reason = "runtime destroyed";
+                    // Inputs a store-owned durable-tail recovery consumed are
+                    // not pending: adopt them before this sweep names its
+                    // batch.
+                    drv.adopt_durable_consumed_inputs(Some(&completions))
+                        .await
+                        .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
                     // A run the session left open never resumes past a
                     // destroy: its mark ends here, and the destroy's sweep
                     // abandons its bound inputs with the rest. Every failure

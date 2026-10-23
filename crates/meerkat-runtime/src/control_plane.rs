@@ -676,6 +676,9 @@ pub(crate) async fn terminalize_async_stop_once(
         termination_reason,
     ) = {
         let mut driver = driver.lock().await;
+        // Inputs a store-owned durable-tail recovery consumed are not
+        // pending: adopt them before this stop names its batch.
+        driver.adopt_durable_consumed_inputs(completions).await?;
         // A run the session left open and has not resumed ends with the stop,
         // as an in-flight run does: its bound inputs are abandoned as
         // cancelled and its mark ends, before the stop classifies the rest. A

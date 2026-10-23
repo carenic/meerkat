@@ -13498,11 +13498,13 @@ Ok::<(), RuntimeDriverError>(())
         // an abandoned hand-back releases M first and then tells.
         let abandonment = crate::tokio::spawn({
             let driver = Arc::clone(&driver);
+            let completions = Arc::clone(&completions);
             let reason = reason.clone();
             let mut runless_terminal = self.runless_terminal_announcement();
             async move {
                 let outcome = Self::abandon_retired_pending_inputs_owing(
                     &driver,
+                    &completions,
                     reason,
                     &mut runless_terminal,
                 )
@@ -13583,10 +13585,16 @@ Ok::<(), RuntimeDriverError>(())
     /// of its committed terminal outbox.
     async fn abandon_retired_pending_inputs_owing(
         driver: &SharedDriver,
+        completions: &SharedCompletionRegistry,
         reason: String,
         runless_terminal: &mut super::RunlessTerminalAnnouncement,
     ) -> Result<(usize, Vec<InputId>, Option<InputId>), RuntimeDriverError> {
         let mut driver = driver.lock().await;
+        // Inputs a store-owned durable-tail recovery consumed are not
+        // pending: adopt them before this sweep names its batch.
+        driver
+            .adopt_durable_consumed_inputs(Some(completions))
+            .await?;
         let completion_input_ids = driver.as_driver().active_input_ids();
         let prepared = driver.prepare_runless_runtime_terminated_interaction_outboxes(
             &completion_input_ids,
@@ -13680,11 +13688,13 @@ Ok::<(), RuntimeDriverError>(())
         // abandoned hand-back releases M first and then tells.
         let abandonment = crate::tokio::spawn({
             let driver = Arc::clone(&driver);
+            let completions = Arc::clone(&completions);
             let reason = reason.clone();
             let mut runless_terminal = self.runless_terminal_announcement();
             async move {
                 let outcome = Self::abandon_queued_inputs_owing(
                     &driver,
+                    &completions,
                     &dsl_authority,
                     reason,
                     &mut runless_terminal,
@@ -13767,6 +13777,7 @@ Ok::<(), RuntimeDriverError>(())
     /// stops the walk.
     async fn abandon_queued_inputs_owing(
         driver: &SharedDriver,
+        completions: &SharedCompletionRegistry,
         dsl_authority: &Arc<std::sync::Mutex<dsl::MeerkatMachineAuthority>>,
         reason: String,
         runless_terminal: &mut super::RunlessTerminalAnnouncement,
@@ -13778,6 +13789,14 @@ Ok::<(), RuntimeDriverError>(())
         use crate::input_state::InputAbandonReason;
 
         let mut driver_guard = driver.lock().await;
+        // Inputs a store-owned durable-tail recovery consumed are not
+        // queued: adopt them before this sweep reads the lane.
+        if let Err(error) = driver_guard
+            .adopt_durable_consumed_inputs(Some(completions))
+            .await
+        {
+            return (None, Vec::new(), Some(error));
+        }
         let (current_run, lane) = {
             let authority = dsl_authority
                 .lock()

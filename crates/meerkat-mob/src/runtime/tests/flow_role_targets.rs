@@ -3,7 +3,9 @@
 //! with role targets dispatches each step only to the bound members of its
 //! role; every refusal is typed and comes from the actor's admission, and a
 //! bound member lost after admission fails the run with the
-//! `InsufficientTargets` class before the step dispatches anything.
+//! `InsufficientTargets` class before the step dispatches anything. A keyed
+//! admission replays to the run its key names and refuses the key, typed,
+//! for other activation params or another binding.
 
 use super::*;
 use crate::error::FlowRoleTargetRefusal;
@@ -752,4 +754,399 @@ async fn bound_run_interrupted_by_restart_cancels_custody_lost_and_keeps_binding
         "the resume must not execute the bound run again"
     );
     assert_eq!(dispatched_in(&replayed, &run_id, "start"), names(&["w-a1"]));
+}
+
+/// A caller delivery identity for a keyed admission. The correlation id is
+/// fresh on every call: a keyed flow run neither stores nor compares it.
+fn delivery_key(key: &str) -> crate::store::MobExternalDeliveryIdentity {
+    crate::store::MobExternalDeliveryIdentity::new(key, Uuid::new_v4().to_string())
+        .expect("a canonical delivery identity")
+}
+
+fn flow_started_count(events: &[MobEvent], run_id: &RunId) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(
+                &event.kind,
+                MobEventKind::FlowStarted { run_id: id, .. } if id == run_id
+            )
+        })
+        .count()
+}
+
+fn step_dispatch_count(events: &[MobEvent], run_id: &RunId) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(
+                &event.kind,
+                MobEventKind::StepDispatched { run_id: id, .. } if id == run_id
+            )
+        })
+        .count()
+}
+
+/// A keyed bound admission replayed with the same key, activation params and
+/// binding (members in another order, a fresh correlation id) returns the same
+/// run, in flight and after it ended, without admitting it again. The run id is
+/// the one the key derives.
+#[tokio::test]
+async fn keyed_bound_replay_with_the_same_key_returns_the_same_run() {
+    let (handle, service) = create_test_mob(review_definition(CollectionPolicy::All)).await;
+    spawn_members(&handle, REVIEWER, &["rev-a1", "rev-a2", "rev-b1"]).await;
+    service.set_flow_turn_delay_ms(300);
+    let params = serde_json::json!({ "candidate": "abc123" });
+
+    let first = handle
+        .run_flow_with_role_targets_and_external_identity(
+            flow_id("review"),
+            params.clone(),
+            bind(&[(REVIEWER, &["rev-a1", "rev-a2"])]),
+            &delivery_key("issue-a-review-1"),
+        )
+        .await
+        .expect("admit the keyed bound run");
+    assert_eq!(
+        first,
+        RunId::for_work_execution(handle.mob_id(), &flow_id("review"), "issue-a-review-1"),
+        "a keyed run's id is the one its key derives"
+    );
+    let in_flight = handle
+        .run_flow_with_role_targets_and_external_identity(
+            flow_id("review"),
+            params.clone(),
+            bind(&[(REVIEWER, &["rev-a2", "rev-a1"])]),
+            &delivery_key("issue-a-review-1"),
+        )
+        .await
+        .expect("replay while the run is in flight");
+    assert_eq!(in_flight, first);
+
+    let terminal = wait_for_run_terminal(&handle, &first, Duration::from_secs(10)).await;
+    assert_eq!(terminal.status, MobRunStatus::Completed);
+    let after_end = handle
+        .run_flow_with_role_targets_and_external_identity(
+            flow_id("review"),
+            params,
+            bind(&[(REVIEWER, &["rev-a1", "rev-a2"])]),
+            &delivery_key("issue-a-review-1"),
+        )
+        .await
+        .expect("replay after the run ended");
+    assert_eq!(after_end, first);
+
+    assert_eq!(handle.list_runs(None).await.expect("list runs").len(), 1);
+    let events = handle.events().replay_all().await.expect("replay events");
+    assert_eq!(flow_started_count(&events, &first), 1);
+    assert_eq!(
+        step_dispatch_count(&events, &first),
+        2,
+        "each bound reviewer is dispatched once"
+    );
+    assert_eq!(
+        dispatched_in(&events, &first, "review"),
+        names(&["rev-a1", "rev-a2"])
+    );
+}
+
+/// The same key with another binding is the typed conflict: the first run
+/// stands, and no second run is admitted.
+#[tokio::test]
+async fn keyed_bound_run_refuses_a_changed_binding_under_the_same_key() {
+    let (handle, _service) = create_test_mob(review_definition(CollectionPolicy::All)).await;
+    spawn_members(&handle, REVIEWER, &["rev-a1", "rev-a2", "rev-b1"]).await;
+    let params = serde_json::json!({ "candidate": "abc123" });
+    let first = handle
+        .run_flow_with_role_targets_and_external_identity(
+            flow_id("review"),
+            params.clone(),
+            bind(&[(REVIEWER, &["rev-a1", "rev-a2"])]),
+            &delivery_key("issue-a-review-1"),
+        )
+        .await
+        .expect("admit the keyed bound run");
+
+    let refused = handle
+        .run_flow_with_role_targets_and_external_identity(
+            flow_id("review"),
+            params,
+            bind(&[(REVIEWER, &["rev-a1", "rev-b1"])]),
+            &delivery_key("issue-a-review-1"),
+        )
+        .await;
+    assert!(
+        matches!(
+            &refused,
+            Err(MobError::FlowRunIdempotencyConflict { run_id, flow_id })
+                if run_id == &first && flow_id.as_str() == "review"
+        ),
+        "a changed binding under the same key is the typed conflict: {refused:?}"
+    );
+    assert_eq!(handle.list_runs(None).await.expect("list runs").len(), 1);
+    let events = handle.events().replay_all().await.expect("replay events");
+    assert_eq!(flow_started_count(&events, &first), 1);
+    let terminal = wait_for_run_terminal(&handle, &first, Duration::from_secs(10)).await;
+    assert_eq!(
+        terminal.role_targets.as_ref(),
+        Some(&bind(&[(REVIEWER, &["rev-a1", "rev-a2"])])),
+        "the first binding stands"
+    );
+}
+
+/// The same key with other activation params is the typed conflict too.
+#[tokio::test]
+async fn keyed_bound_run_refuses_changed_activation_params_under_the_same_key() {
+    let (handle, _service) = create_test_mob(review_definition(CollectionPolicy::All)).await;
+    spawn_members(&handle, REVIEWER, &["rev-a1", "rev-a2"]).await;
+    let binding = bind(&[(REVIEWER, &["rev-a1", "rev-a2"])]);
+    let first = handle
+        .run_flow_with_role_targets_and_external_identity(
+            flow_id("review"),
+            serde_json::json!({ "candidate": "abc123" }),
+            binding.clone(),
+            &delivery_key("issue-a-review-1"),
+        )
+        .await
+        .expect("admit the keyed bound run");
+
+    let refused = handle
+        .run_flow_with_role_targets_and_external_identity(
+            flow_id("review"),
+            serde_json::json!({ "candidate": "def456" }),
+            binding,
+            &delivery_key("issue-a-review-1"),
+        )
+        .await;
+    assert!(
+        matches!(
+            &refused,
+            Err(MobError::FlowRunIdempotencyConflict { run_id, .. }) if run_id == &first
+        ),
+        "changed activation params under the same key are the typed conflict: {refused:?}"
+    );
+    assert_eq!(handle.list_runs(None).await.expect("list runs").len(), 1);
+    let events = handle.events().replay_all().await.expect("replay events");
+    assert_eq!(flow_started_count(&events, &first), 1);
+}
+
+/// A runtime that dies after admitting a keyed bound run, before the caller
+/// read the answer: on resume the run is Canceled with the custody-lost cause
+/// and keeps its binding, and the caller's replay with the same key returns
+/// that run. Nothing runs again and no second run is admitted.
+#[tokio::test]
+async fn keyed_bound_run_crash_between_admission_and_receipt_returns_the_same_bound_run() {
+    let events = Arc::new(FaultInjectedMobEventStore::new());
+    let incarnation = CrashableMobIncarnation::new();
+    let setup_events = events.clone();
+    let binding = bind(&[("worker", &["w-a1"])]);
+    let admitted = binding.clone();
+    let params = serde_json::json!({ "candidate": "abc123" });
+    let admitted_params = params.clone();
+    let (handle, service, runs, specs, runtime_metadata, identity, identity_status) = incarnation
+        .install(async move {
+            let (handle, service, runs, specs, runtime_metadata, identity, identity_status) =
+                create_test_mob_with_recoverable_fault_events(
+                    sample_definition_with_single_step_flow(60_000, 8),
+                    setup_events.clone(),
+                )
+                .await;
+            spawn_members(&handle, "worker", &["w-a1", "w-b1"]).await;
+            service.set_flow_turn_never_terminal(true);
+            // The answer is dropped: the caller never reads the run id.
+            let _ = handle
+                .run_flow_with_role_targets_and_external_identity(
+                    flow_id("demo"),
+                    admitted_params,
+                    admitted,
+                    &delivery_key("issue-a-review-1"),
+                )
+                .await
+                .expect("admit the keyed bound run");
+            let run_id =
+                RunId::for_work_execution(handle.mob_id(), &flow_id("demo"), "issue-a-review-1");
+            let deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                let running = runs
+                    .get_run(&run_id)
+                    .await
+                    .expect("read run row")
+                    .is_some_and(|run| run.status == MobRunStatus::Running);
+                let replayed = setup_events
+                    .replay_all()
+                    .await
+                    .expect("replay pre-crash events");
+                if running && !dispatched_in(&replayed, &run_id, "start").is_empty() {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the keyed bound run never reached a dispatched Running step before the crash"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            (
+                handle,
+                service,
+                runs,
+                specs,
+                runtime_metadata,
+                identity,
+                identity_status,
+            )
+        })
+        .await;
+
+    let mob_id = handle.mob_id().clone();
+    assert!(
+        !handle.command_tx.is_closed(),
+        "the executing incarnation must be live before the simulated process death"
+    );
+    incarnation.crash().await;
+    assert!(
+        handle.command_tx.is_closed(),
+        "the simulated process death must leave no live actor behind"
+    );
+    drop(handle);
+    await_supervisor_route_release(&mob_id).await;
+
+    let resumed = cold_resume_after_terminal_append_fail_stop(
+        events.clone(),
+        runs,
+        specs,
+        runtime_metadata,
+        identity,
+        identity_status,
+        service,
+    )
+    .await;
+    let expected = RunId::for_work_execution(&mob_id, &flow_id("demo"), "issue-a-review-1");
+    let replayed = resumed
+        .run_flow_with_role_targets_and_external_identity(
+            flow_id("demo"),
+            params,
+            binding.clone(),
+            &delivery_key("issue-a-review-1"),
+        )
+        .await
+        .expect("the replay after the restart answers with the admitted run");
+    assert_eq!(replayed, expected);
+
+    let recovered = resumed
+        .flow_status(expected.clone())
+        .await
+        .expect("query the converged run")
+        .expect("the converged run stays queryable");
+    assert_eq!(recovered.status, MobRunStatus::Canceled);
+    assert_eq!(recovered.role_targets.as_ref(), Some(&binding));
+    assert_eq!(resumed.list_runs(None).await.expect("list runs").len(), 1);
+    let replayed_events = events.replay_all().await.expect("replay events");
+    let cancel_cause = replayed_events
+        .iter()
+        .find_map(|event| match &event.kind {
+            MobEventKind::FlowCanceled {
+                run_id: id, cause, ..
+            } if id == &expected => Some(*cause),
+            _ => None,
+        })
+        .expect("the converged run has a FlowCanceled carrier");
+    assert_eq!(cancel_cause, Some(FlowCancelClass::ExecutionCustodyLost));
+    assert_eq!(flow_started_count(&replayed_events, &expected), 1);
+    assert_eq!(
+        step_dispatch_count(&replayed_events, &expected),
+        1,
+        "the replay must not run the bound run again"
+    );
+}
+
+/// Without a key nothing changes: two identical role-targeted admissions are
+/// two runs with fresh ids.
+#[tokio::test]
+async fn unkeyed_bound_runs_keep_fresh_run_ids() {
+    let (handle, _service) = create_test_mob(review_definition(CollectionPolicy::All)).await;
+    spawn_members(&handle, REVIEWER, &["rev-a1", "rev-a2"]).await;
+    let mut run_ids = BTreeSet::new();
+    for _ in 0..2 {
+        let run_id = handle
+            .run_flow_with_role_targets(
+                flow_id("review"),
+                serde_json::json!({ "candidate": "abc123" }),
+                bind(&[(REVIEWER, &["rev-a1", "rev-a2"])]),
+                None,
+            )
+            .await
+            .expect("admit an unkeyed bound run");
+        run_ids.insert(run_id.to_string());
+    }
+    assert_eq!(run_ids.len(), 2, "each unkeyed admission is its own run");
+    assert_eq!(handle.list_runs(None).await.expect("list runs").len(), 2);
+}
+
+/// A replay is not admitted again: a bound member retired after the first
+/// admission does not refuse a replay, which returns the existing run.
+#[tokio::test]
+async fn keyed_bound_replay_does_not_readmit_after_a_membership_change() {
+    let (handle, _service) = create_test_mob(review_definition(CollectionPolicy::All)).await;
+    spawn_members(&handle, REVIEWER, &["rev-a1", "rev-a2"]).await;
+    let params = serde_json::json!({ "candidate": "abc123" });
+    let binding = bind(&[(REVIEWER, &["rev-a1", "rev-a2"])]);
+    let first = handle
+        .run_flow_with_role_targets_and_external_identity(
+            flow_id("review"),
+            params.clone(),
+            binding.clone(),
+            &delivery_key("issue-a-review-1"),
+        )
+        .await
+        .expect("admit the keyed bound run");
+    let terminal = wait_for_run_terminal(&handle, &first, Duration::from_secs(10)).await;
+    assert_eq!(terminal.status, MobRunStatus::Completed);
+    handle
+        .retire(AgentIdentity::from("rev-a2"))
+        .await
+        .expect("retire a bound reviewer after the run");
+
+    let replay = handle
+        .run_flow_with_role_targets_and_external_identity(
+            flow_id("review"),
+            params,
+            binding,
+            &delivery_key("issue-a-review-1"),
+        )
+        .await
+        .expect("a replay returns the existing run instead of admitting again");
+    assert_eq!(replay, first);
+    assert_eq!(handle.list_runs(None).await.expect("list runs").len(), 1);
+}
+
+/// The existing keyed role-wide admission gets the same typed conflict: the
+/// same key with other activation params is no longer an internal error.
+#[tokio::test]
+async fn external_identity_conflict_is_typed() {
+    let (handle, _service) = create_test_mob(review_definition(CollectionPolicy::All)).await;
+    spawn_members(&handle, REVIEWER, &["rev-a1"]).await;
+    let first = handle
+        .run_flow_with_external_identity(
+            flow_id("review"),
+            serde_json::json!({ "candidate": "abc123" }),
+            &delivery_key("issue-a-review-1"),
+        )
+        .await
+        .expect("admit the keyed role-wide run");
+
+    let refused = handle
+        .run_flow_with_external_identity(
+            flow_id("review"),
+            serde_json::json!({ "candidate": "def456" }),
+            &delivery_key("issue-a-review-1"),
+        )
+        .await;
+    assert!(
+        matches!(
+            &refused,
+            Err(MobError::FlowRunIdempotencyConflict { run_id, .. }) if run_id == &first
+        ),
+        "the keyed role-wide conflict is typed: {refused:?}"
+    );
+    assert_eq!(handle.list_runs(None).await.expect("list runs").len(), 1);
 }

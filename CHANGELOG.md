@@ -1765,6 +1765,19 @@ them.
   before 0.9.5 refuses the field on `turn/start` and `mob/turn_start` and
   ignores it on `session/create`.
 
+- `meerkat-mob`: `MobHandle::run_flow_with_role_targets_and_external_identity`
+  admits a role-targeted flow run under a caller idempotency key in one call.
+  The run id is derived from the mob, the flow and the key, so a replay with
+  the same activation parameters and role targets returns the same run, in
+  flight or ended, without admitting it again. After a restart that is the run
+  the recovery canceled with `ExecutionCustodyLost`: it does not run again, so
+  a new attempt takes a new key. The same key with other activation
+  parameters or other role targets is refused with
+  `MobError::FlowRunIdempotencyConflict`, whose structured data is
+  `{"kind": "flow_run_idempotency_conflict", "run_id": ..., "flow_id": ...}`,
+  and no second run is admitted. A new key admits the binding exactly as
+  `run_flow_with_role_targets` does.
+
 ### Changed
 
 - `meerkat-session`: materializing a durable session whose durable-tail
@@ -1908,6 +1921,12 @@ them.
   events once, on a subscription if one is open, instead of also writing a
   `session/event` copy that the SDK parsed and dropped. Streaming calls are
   unchanged.
+
+- `meerkat-mob`: a keyed flow run admission whose key already names a run
+  with other activation parameters is refused with the typed
+  `MobError::FlowRunIdempotencyConflict` instead of an internal error, for
+  every keyed admission. A schedule delivery that meets such a key conflict
+  records it as `MobRejected` instead of an internal error.
 
 ### Fixed
 
@@ -2649,6 +2668,42 @@ them.
   marker. An unresolved gap at source end or close uses the reserved error
   terminal with its dropped count. This remains bounded, best-effort delivery;
   it does not replay lost events or change mob-stream overflow behavior.
+
+- `meerkat-runtime`: a sweep of a runtime's pending inputs no longer abandons
+  inputs that a store-owned durable-tail recovery already consumed. That
+  recovery commits a tail at the store level and consumes the input rows
+  bound to its run, outside the registered runtime's driver: an archive
+  settles a tail it meets under its runtime lease, and an observation of a
+  hosted session settles the tail a turn left when its boundary was
+  cancelled (for example by a retirement). The driver still held those
+  inputs as pending, so the next retire, reset, destroy, stop or
+  queued-input cancel sweep wrote its abandonment (`Abandoned { Retired }`
+  for a retire) over the consumed rows, and a directed input's sender was
+  told that work which ran was terminated, so a peer could send it again.
+  Every such sweep, and a replaced executor attachment's cleanup of its
+  predecessor's inputs, now first adopts the `Consumed` terminals the store
+  holds for inputs the driver still holds as pending, and leaves them
+  consumed. A process-local waiter of such an input fails with
+  `CompletionWaitError::AuthorityUnavailable` instead of being told the
+  runtime terminated it; the input's result is in the session's committed
+  history. An adoption that fails requires a registration-authorized cold
+  reload of the runtime and fails the sweep.
+
+- `meerkat-gemini`: a tool result's `functionResponse.response` uses
+  Gemini's documented keys. A successful call's text is sent as
+  `{"output": text}` and a failed call's as `{"error": text}`. Every result
+  was sent as `{"content": text, "error": <is_error>}`, which names an
+  `error` key even on success and no `output`, so the model could take a
+  successful call as one that produced no output. The function response's
+  `name` and `id`, the image parts that follow it and its lack of a thought
+  signature are unchanged. The request bytes of every Gemini tool
+  continuation change, so a resumed session takes one prompt-cache miss.
+
+- `meerkat-gemini`: under authorization, a request that asks for Gemini's
+  native search reaches the policy as the `GoogleSearch` hosted capability.
+  The request names the tool `google_search`, which the capability check did
+  not map, so the policy saw an unknown provider-native tool and a governed
+  Gemini web search was refused as malformed.
 
 ### Known limitations
 

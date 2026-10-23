@@ -3012,10 +3012,12 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         MobError::MemberCommsName(_) | MobError::ConditionEval { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
         }
-        // Role-targets admission and bound-target dispatch refusals belong to
-        // flow runs; spawn-many provisioning never admits or runs a flow.
-        // Classify as Internal to keep the match total.
-        MobError::FlowRoleTargetsRefused { .. } | MobError::BoundFlowTargetsUnavailable { .. } => {
+        // Role-targets admission, bound-target dispatch and keyed flow run
+        // refusals belong to flow runs; spawn-many provisioning never admits
+        // or runs a flow. Classify as Internal to keep the match total.
+        MobError::FlowRoleTargetsRefused { .. }
+        | MobError::BoundFlowTargetsUnavailable { .. }
+        | MobError::FlowRunIdempotencyConflict { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
         }
         // Flow-step dispatch classification never runs during spawn-many
@@ -11779,6 +11781,36 @@ impl MobHandle {
             params,
             scoped_event_tx,
             None,
+            None,
+            Some(Arc::new(role_targets)),
+        )
+        .await
+    }
+
+    /// [`Self::run_flow_with_role_targets`] under a caller idempotency key,
+    /// in one admission.
+    ///
+    /// The run id is derived from this mob, the flow and the key, so a replay
+    /// with the same activation params and role targets returns the same run,
+    /// in flight or terminal, without admitting it again. After a restart
+    /// that is the run the recovery canceled with `ExecutionCustodyLost`; it
+    /// is not run again, so a new attempt takes a new key. The same key with
+    /// other activation params or other role targets is refused with
+    /// `MobError::FlowRunIdempotencyConflict`, never a second run. A new key
+    /// admits the binding exactly as [`Self::run_flow_with_role_targets`]
+    /// does.
+    pub async fn run_flow_with_role_targets_and_external_identity(
+        &self,
+        flow_id: FlowId,
+        params: serde_json::Value,
+        role_targets: crate::run::FlowRoleTargets,
+        identity: &crate::store::MobExternalDeliveryIdentity,
+    ) -> Result<RunId, MobError> {
+        self.run_flow_with_stream_and_external_identity(
+            flow_id,
+            params,
+            None,
+            Some(identity),
             None,
             Some(Arc::new(role_targets)),
         )
