@@ -136,9 +136,11 @@ carried. Under the default, the source's activated instructions, the
 skills it loaded with `load_skill` (each named in their place) and
 host-injected context such as memory recall are left out; under `refuse`
 a fork whose context holds an activation or a loaded skill is refused;
-under `reactivate_inherited` they are carried. The context fits a byte
-budget, newest rows first, and a fork whose newest row alone does not fit
-is refused with `fork_context_too_large`.
+under `reactivate_inherited` they are carried. A peer message in that
+conversation keeps its sender, its text and its sender's taint marker, but
+not the ids or instructions to answer it: the child is not its addressee.
+The context fits a byte budget, newest rows first, and a fork whose newest
+row alone does not fit is refused with `fork_context_too_large`.
 
 A fork child is told what it was given. Before its first input it gets a
 fork notice (a `fork_boundary` system notice) that names its source and,

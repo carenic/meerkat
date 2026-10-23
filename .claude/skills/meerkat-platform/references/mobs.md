@@ -335,7 +335,11 @@ bodies, skill bodies the source loaded with `load_skill` (a line names
 each skill) and host-injected context rows (memory recall) are left out;
 under `Refuse` such a fork is refused with `ForkInstructionRefused`
 (`refusal.skills` names the skills); under `ReactivateInherited` they are
-carried. The rows fit a byte budget, newest first (half the child model's
+carried. A copied comms notice keeps its title, its sender (or recipient),
+its text, a status and payload preview and the sender's taint marker
+(`interaction::SENDER_TAINT_MARKER`), never its request or delivery id or
+reply instructions.
+The rows fit a byte budget, newest first (half the child model's
 window at four bytes per token, at most 256 KiB); a newest row that alone
 does not fit is refused before anything is spawned with
 `MobError::ForkContextTooLarge` (`INVALID_PARAMS`, data kind

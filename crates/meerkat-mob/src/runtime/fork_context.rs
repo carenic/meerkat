@@ -31,7 +31,7 @@ use meerkat_core::fork_notice::{
     ForkNoticeKind, ForkNoticeSource, ForkSeed, ForkSeedSourceTools, InstructionKeyRef,
 };
 use meerkat_core::skills::{LOAD_SKILL_TOOL_NAME, SkillKey, SkillName, SourceUuid};
-use meerkat_core::types::{SystemNoticeBlock, TranscriptUserRole};
+use meerkat_core::types::{SystemNoticeBlock, SystemNoticeDirection, TranscriptUserRole};
 use meerkat_core::{
     ForkInstructionPolicy, ForkInstructionRefusal, ForkInstructionRefusalCause,
     InstructionContentDigest, InstructionKey, InstructionNamespace,
@@ -272,11 +272,13 @@ impl ForkContextPlan {
                 WireSessionMessage::SystemNotice { .. } if fork_notice_rows.contains(&index) => {
                     Vec::new()
                 }
-                WireSessionMessage::SystemNotice { body, .. } => {
-                    vec![format!(
+                WireSessionMessage::SystemNotice { body, blocks, .. } => {
+                    let mut lines = vec![format!(
                         "[system_notice]: {}",
                         body.clone().unwrap_or_default()
-                    )]
+                    )];
+                    lines.extend(blocks.iter().filter_map(copied_comms_text));
+                    lines
                 }
                 WireSessionMessage::BlockAssistant { blocks, .. } => {
                     // Both `Text` (display) and `Transcript` (spoken) lanes
@@ -572,7 +574,16 @@ fn tool_result_line(result: &WireToolResult) -> Option<String> {
     if text.is_empty() {
         return None;
     }
-    let preview = if text.len() > 200 {
+    Some(format!(
+        "[tool_result({})]: {}",
+        result.tool_use_id,
+        preview(text)
+    ))
+}
+
+/// `text` cut to about 200 bytes, as a tool result is shown.
+fn preview(text: String) -> String {
+    if text.len() > 200 {
         // Find a valid UTF-8 char boundary at or before byte 200
         let end = text
             .char_indices()
@@ -583,8 +594,60 @@ fn tool_result_line(result: &WireToolResult) -> Option<String> {
         format!("{}...", &text[..end])
     } else {
         text
+    }
+}
+
+/// What a copied comms block gives the child: whom the source heard from
+/// (or wrote to) and what was said, a status and a payload preview when the
+/// block has them, and the sender's taint declaration. The child is not the
+/// addressee: the request and delivery ids and the reply instructions the
+/// source's model was given are not carried, so the child has no means to
+/// answer a peer on its source's behalf.
+fn copied_comms_text(block: &SystemNoticeBlock) -> Option<String> {
+    let SystemNoticeBlock::Comms {
+        direction,
+        peer,
+        sender_taint,
+        status,
+        payload,
+        content,
+        ..
+    } = block
+    else {
+        return None;
     };
-    Some(format!("[tool_result({})]: {preview}", result.tool_use_id))
+    let peer = peer.as_ref().map_or_else(
+        || "a peer".to_string(),
+        |peer| match peer.display_name.as_deref().map(str::trim) {
+            Some(name) if !name.is_empty() => name.to_string(),
+            _ => peer.id.to_string(),
+        },
+    );
+    let mut lines = vec![match direction {
+        SystemNoticeDirection::Outgoing => format!("to {peer}:"),
+        SystemNoticeDirection::Incoming | SystemNoticeDirection::Internal => {
+            format!("from {peer}:")
+        }
+    }];
+    lines.extend(
+        content
+            .iter()
+            .map(|block| block.text_projection().into_owned())
+            .filter(|text| !text.trim().is_empty()),
+    );
+    if let Some(status) = status {
+        lines.push(format!("status: {status}"));
+    }
+    if let Some(payload) = payload {
+        lines.push(format!("payload: {}", preview(payload.to_string())));
+    }
+    if matches!(
+        sender_taint,
+        Some(meerkat_core::comms::SenderContentTaint::Tainted)
+    ) {
+        lines.push(meerkat_core::interaction::SENDER_TAINT_MARKER.to_string());
+    }
+    Some(lines.join("\n"))
 }
 
 #[cfg(test)]
