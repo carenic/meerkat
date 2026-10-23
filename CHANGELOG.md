@@ -1085,6 +1085,11 @@ them.
   deadline passed in the same scheduler turn the slot came free (a starved
   runtime notices both at once) was admitted and ran.
 
+- `meerkat-sqlite`: on macOS, dropping a SQLite store watch no longer blocks
+  the dropping thread on file-system event service round trips. A stopped
+  watch's FSEvents source is dropped on the process's one unregister thread;
+  sources stopped together wait in its queue.
+
 ## [0.9.4] - 2026-10-20
 
 ### Breaking
