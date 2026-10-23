@@ -387,6 +387,15 @@ Contract and limits: `docs/guides/durable-runs.mdx`.
   whose process custody shows the process may have run, a Core comms tool
   that sends to another agent (every comms tool but `peers`), and a call that
   would run detached under a runner that declares itself non-resumable.
+- Deploys: a graceful unregister (even with `UnregisterQueuedInputs::Requeue`,
+  which keeps only queued prompts) or a mob Shutdown cancels a run in flight,
+  and it never continues. To keep runs through a deploy: stop new work, stop
+  idle sessions gracefully (`is_active` false; Rust
+  `MeerkatMachine::current_run(&session_id)` is `None`), then exit without
+  unregistering busy sessions or shutting down their mobs. The next process
+  continues each run from its last committed round when its session is
+  opened (mobs reopen durable workers); waiting callers see the process end;
+  a host-store open answers `Held` until the old lease (default 30 s) ends.
 - Durable workers and the mob resume gate: `references/mobs.md`. Realms in a
   host's own database: `references/sessions_runtime_surfaces_storage_config.md`.
 
