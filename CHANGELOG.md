@@ -523,6 +523,13 @@ them.
   `[[model_fallback.chain]]` example names a placeholder model
   (`model = "<model-id>"`) instead of a real model id.
 
+- `meerkat-store`: the refusal of a runtime commit over a session saved whole
+  outside the runtime, by a pre-0.9 build or by a non-runtime service sharing a
+  realm's SQLite session store, names that cause and that a runtime-backed host
+  cannot adopt such a session. It said only "legacy whole-blob session exists
+  without a canonical head". The session's data stays intact, and the error
+  variant is unchanged.
+
 ### Fixed
 
 - `meerkat-core`, `meerkat-session`, `meerkat-runtime`, `meerkat-store`: a

@@ -8372,9 +8372,14 @@ pub fn apply_prepared_head_canonical_mutation_in_txn(
                 .map_err(into_session_store_error)?
                 .is_some();
             if legacy_blob_exists {
+                // A plain save wrote this session whole: a pre-0.9 build, or
+                // a non-runtime service sharing this store (one without a
+                // session checkpointer saves through `SessionStore::save`).
                 return Err(prepared_head_conflict(
                     mutation,
-                    "legacy whole-blob session exists without a canonical head",
+                    "<legacy whole-blob session without a canonical head: saved outside the \
+                     runtime, by a pre-0.9 build or by a non-runtime service sharing this SQLite \
+                     session store; a runtime-backed host cannot adopt it>",
                 ));
             }
         }
@@ -12112,6 +12117,47 @@ mod tests {
         assert_eq!(
             component_rows, 0,
             "ordinary System rows must not mint out-of-band component events"
+        );
+    }
+
+    /// A session saved whole through the plain store API, as a pre-0.9 build
+    /// or a non-runtime service sharing this store saves it, has no canonical
+    /// head. The first runtime commit cannot adopt it and is refused, and the
+    /// refusal names that cause.
+    #[tokio::test]
+    async fn a_runtime_root_over_a_session_saved_outside_the_runtime_names_the_cause() {
+        let (_dir, store) = temp_store();
+        let mut session = Session::new();
+        session.push(user("saved by a non-runtime service"));
+        store
+            .save(&session)
+            .await
+            .expect("the plain save writes the whole session");
+        let root = PreparedHeadCanonicalMutation::prepare_root(&session).expect("prepare root");
+        let error = incremental(&store)
+            .apply_prepared_head_canonical_mutation(&root)
+            .await
+            .expect_err("a whole session without a canonical head is not adopted");
+        assert!(
+            matches!(error, SessionStoreError::TranscriptRevisionConflict { .. }),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("saved outside the runtime"),
+            "the refusal names the cause: {message}"
+        );
+        assert!(
+            message.contains("a non-runtime service sharing this SQLite session store"),
+            "the refusal names the sharing service: {message}"
+        );
+        assert!(
+            store
+                .load(session.id())
+                .await
+                .expect("load after the refusal")
+                .is_some_and(|loaded| loaded.messages() == session.messages()),
+            "the refused session's data stays intact"
         );
     }
 
