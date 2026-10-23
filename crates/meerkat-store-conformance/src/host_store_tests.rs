@@ -219,11 +219,9 @@ async fn fence_blind_store_fails_the_host_store_chapter() {
         .await
         .expect_err("a store that ignores fence tokens must fail");
     assert_eq!(failure.chapter(), "host_store");
-    assert!(
-        ["kill", "stale_fence", "takeover_unknown_commit"].contains(&failure.step()),
-        "a fence blind store failed at {}",
-        failure.step()
-    );
+    // The kill row retries an unlanded batch under the superseded token
+    // first, before the stale fence row.
+    assert_eq!(failure.step(), "kill");
 }
 
 #[tokio::test]
@@ -512,24 +510,25 @@ impl ScriptedCore {
             .collect()
     }
 
-    /// The scripted model asks for the same tool with the same arguments
-    /// each time, so a call's digest follows from its id.
+    /// The arguments the scripted model gives a call, the same each time
+    /// the model is asked for its round.
+    fn arguments(call: &str) -> Box<RawValue> {
+        RawValue::from_string(format!("{{\"call\":\"{call}\"}}")).expect("valid json")
+    }
+
     fn key(run_id: &RunId, round: u64, call: String) -> ToolCallDedupeKey {
-        ToolCallDedupeKey {
-            run_id: run_id.clone(),
-            round,
-            call_digest: format!("digest-{call}"),
-            call_id: call,
-        }
+        let arguments = Self::arguments(&call);
+        ToolCallDedupeKey::new(run_id.clone(), round, call, "scripted_tool", &arguments)
+            .expect("valid arguments")
     }
 
     fn staged_message(plan: &LongRunPlan, round: u64) -> BlockAssistantMessage {
         let blocks = Self::calls(plan, round)
             .into_iter()
             .map(|id| AssistantBlock::ToolUse {
+                args: Self::arguments(&id),
                 id,
                 name: "scripted_tool".to_string(),
-                args: RawValue::from_string("{}".to_string()).expect("valid json"),
                 meta: None,
             })
             .collect();

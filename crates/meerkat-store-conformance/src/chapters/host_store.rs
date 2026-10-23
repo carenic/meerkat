@@ -883,7 +883,7 @@ async fn same_version_twice(
         .commit(STEP, writer, base_id.clone(), created)
         .await?;
     let x_id = chapter.mint(STEP)?;
-    let x = batch(
+    let batch_x = batch(
         &steps,
         STEP,
         x_id.clone(),
@@ -894,7 +894,7 @@ async fn same_version_twice(
         ],
     )?;
     let y_id = chapter.mint(STEP)?;
-    let y = batch(
+    let batch_y = batch(
         &steps,
         STEP,
         y_id.clone(),
@@ -904,8 +904,8 @@ async fn same_version_twice(
             update(&u, ScopeVersion::FIRST, Some("y"), Vec::new()),
         ],
     )?;
-    steps.wrap(STEP, writer.store.commit(&x).await)?;
-    let refused = match writer.store.commit(&y).await {
+    steps.wrap(STEP, writer.store.commit(&batch_x).await)?;
+    let refused = match writer.store.commit(&batch_y).await {
         Ok(()) => false,
         Err(HostStoreError::Conflict { scope, current }) if scope == s && current == Some(V2) => {
             true

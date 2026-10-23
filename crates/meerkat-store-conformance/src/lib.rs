@@ -48,13 +48,18 @@
 //!   honesty, and the dangling session→blob reference shape (`NotFound`,
 //!   never silent success).
 //!
+//! - [`chapters::host_store`]: every `meerkat_core::host_store::HostStore`
+//!   (a host provided store): the nine obligations of the host store
+//!   contract, accepting both the at commit and the at load ways to meet
+//!   them, at a scale of 210 scopes, through a [`HostStoreFactory`] whose
+//!   every open stands for a new process. The in crate
+//!   [`InMemoryHostStore`] is the reference that passes it.
 //! - [`chapters::long_run`] / [`chapters::durable_worker`]: Core over any
 //!   store, through a [`LongRunHarness`] or [`DurableWorkerHarness`]: a run
 //!   (or a durable worker) killed at any point of a round resumes from its
 //!   last durable commit under the same run id and identity, or is requeued
 //!   when nothing of it is durable, and its input finishes with every round
-//!   once and one receipt. [`InMemoryHostStore`] is the reference host
-//!   store, and a [`HostStoreFactory`] hands out its handles.
+//!   once and one receipt.
 //!
 //! Chapters contain **no provider-specific code**: everything is expressed
 //! through the `meerkat-core` trait contracts, so a downstream backend runs
