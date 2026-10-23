@@ -55,7 +55,7 @@ fn sample_metadata() -> RuntimeTurnMetadata {
         ],
         transient_turn_context: None,
         transient_turn_context_appends: Vec::new(),
-        model: Some(ModelId::new("claude-opus-4-8")),
+        model: Some(ModelId::new("test-anthropic-configured")),
         provider: Some(Provider::Anthropic),
         self_hosted_server_id: None,
         provider_params: Some(TurnMetadataOverride::Set(ProviderParamsOverride {
@@ -350,25 +350,25 @@ fn merge_collection_fields_accumulate() {
 #[test]
 fn merge_identical_scalars_is_ok() {
     let mut left = RuntimeTurnMetadata {
-        model: Some(ModelId::new("claude-opus-4-8")),
+        model: Some(ModelId::new("test-anthropic-configured")),
         ..Default::default()
     };
     let right = RuntimeTurnMetadata {
-        model: Some(ModelId::new("claude-opus-4-8")),
+        model: Some(ModelId::new("test-anthropic-configured")),
         ..Default::default()
     };
     left.merge(right).expect("matching scalars do not conflict");
-    assert_eq!(left.model, Some(ModelId::new("claude-opus-4-8")));
+    assert_eq!(left.model, Some(ModelId::new("test-anthropic-configured")));
 }
 
 #[test]
 fn merge_scalar_conflict_refuses_model() {
     let mut left = RuntimeTurnMetadata {
-        model: Some(ModelId::new("claude-opus-4-8")),
+        model: Some(ModelId::new("test-anthropic-configured")),
         ..Default::default()
     };
     let right = RuntimeTurnMetadata {
-        model: Some(ModelId::new("claude-sonnet-4-6")),
+        model: Some(ModelId::new("test-anthropic-fourth")),
         ..Default::default()
     };
     let err: TurnMetadataMergeConflict = left.merge(right).expect_err("conflict expected");

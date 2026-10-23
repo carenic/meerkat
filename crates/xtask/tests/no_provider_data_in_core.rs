@@ -62,70 +62,123 @@ fn core_does_not_depend_on_meerkat_models() {
 ///   `"gemma-4`;
 /// - an Anthropic model family: `"claude-opus`, `"claude-sonnet`,
 ///   `"claude-haiku`, `"claude-fable`;
+/// - either of those as the last segment of a provider-qualified id:
+///   `"anthropic/claude-opus-5"`, `"models/gemini-3-pro"`;
 /// - the open-weight `gpt-oss` family anywhere in the id;
-/// - an open-weight parameter count closing the id: `"...-30b"`, `"...-1.5b"`.
+/// - an open-weight parameter count as a segment of the id:
+///   `"...-30b"`, `"...-1.5b"`, `"...-8b-instruct"`, `".../...-8B-Instruct"`.
+///
+/// Families outside these shapes and provider-qualified ids of other
+/// families are out of scope unless they carry a parameter count.
 ///
 /// `rest` runs from just after the opening quote; `literal` stops at the
 /// closing quote or line end.
 fn model_name_shape(rest: &str, literal: &str) -> Option<&'static str> {
+    if let Some(shape) = family_shape(rest) {
+        return Some(shape);
+    }
+    if let Some((_, last)) = literal.rsplit_once('/')
+        && family_shape(last).is_some()
+    {
+        return Some("a provider-qualified model id");
+    }
+    if literal.contains("gpt-oss") {
+        return Some("the gpt-oss model family");
+    }
+    if has_parameter_count_segment(literal) {
+        return Some("an open-weight parameter count");
+    }
+    None
+}
+
+/// A provider family and a version, or an Anthropic model family, at the
+/// start of `text`.
+fn family_shape(text: &str) -> Option<&'static str> {
     for prefix in ["gpt-", "claude-", "gemini-", "gemma-"] {
-        if let Some(tail) = rest.strip_prefix(prefix)
+        if let Some(tail) = text.strip_prefix(prefix)
             && tail.chars().next().is_some_and(|c| c.is_ascii_digit())
         {
             return Some("a provider family and a version");
         }
     }
-    if let Some(tail) = rest.strip_prefix("claude-")
+    if let Some(tail) = text.strip_prefix("claude-")
         && ["opus", "sonnet", "haiku", "fable"]
             .iter()
             .any(|family| tail.starts_with(family))
     {
         return Some("an Anthropic model family");
     }
-    if literal.contains("gpt-oss") {
-        return Some("the gpt-oss model family");
-    }
-    if is_parameter_count_id(literal) {
-        return Some("an open-weight parameter count");
-    }
     None
 }
 
-/// An id without whitespace that ends in `-<digits>b` or
-/// `-<digits>.<digits>b`, the way open-weight model ids name their size.
-fn is_parameter_count_id(literal: &str) -> bool {
-    if literal.is_empty() || literal.len() > 64 || literal.contains(char::is_whitespace) {
+/// An id without whitespace, at most 64 chars and not a UUID, with a segment
+/// after its first (split on `-` and `/`) that is `<digits>b` or
+/// `<digits>.<digits>b` (either case), the way open-weight model ids name
+/// their size.
+fn has_parameter_count_segment(literal: &str) -> bool {
+    if literal.is_empty()
+        || literal.len() > 64
+        || literal.contains(char::is_whitespace)
+        || is_uuid(literal)
+    {
         return false;
     }
-    let Some(body) = literal.strip_suffix('b') else {
-        return false;
-    };
-    let Some((_, count)) = body.rsplit_once('-') else {
-        return false;
-    };
-    let (whole, fraction) = match count.split_once('.') {
-        Some((whole, fraction)) => (whole, Some(fraction)),
-        None => (count, None),
-    };
     let digits = |part: &str| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit());
-    digits(whole) && fraction.is_none_or(digits)
+    literal.split(['-', '/']).skip(1).any(|segment| {
+        let Some(count) = segment
+            .strip_suffix('b')
+            .or_else(|| segment.strip_suffix('B'))
+        else {
+            return false;
+        };
+        match count.split_once('.') {
+            Some((whole, fraction)) => digits(whole) && digits(fraction),
+            None => digits(count),
+        }
+    })
 }
 
-/// The first provider model-name literal in `text`, with its line and shape.
-/// Without regex dependencies: each double quote opens a candidate literal
-/// that runs to the next double quote or line end.
-fn first_violation(text: &str) -> Option<String> {
+/// The 8-4-4-4-12 hexadecimal shape of a UUID.
+fn is_uuid(literal: &str) -> bool {
+    let groups: Vec<&str> = literal.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .zip([8, 4, 4, 4, 12])
+            .all(|(group, len)| group.len() == len && group.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// Every provider model-name literal in `text`: its line, the literal and its
+/// shape. Without regex dependencies: each double quote opens a candidate
+/// literal that runs to the next double quote or line end.
+fn violations(text: &str) -> Vec<(usize, String, &'static str)> {
+    let mut found = Vec::new();
     for (idx, _) in text.match_indices('"') {
         let rest = &text[idx + 1..];
         let literal = rest.split(['"', '\n']).next().unwrap_or_default();
         if let Some(shape) = model_name_shape(rest, literal) {
             let line = text[..idx].lines().count();
-            let snippet: String = literal.chars().take(64).collect();
-            return Some(format!("line {line}: \"{snippet}\" ({shape})"));
+            found.push((line, literal.chars().take(64).collect(), shape));
         }
     }
-    None
+    found
 }
+
+/// The first provider model-name literal in `text`, as the ban reports it.
+fn first_violation(text: &str) -> Option<String> {
+    violations(text)
+        .into_iter()
+        .next()
+        .map(|(line, literal, shape)| format!("line {line}: \"{literal}\" ({shape})"))
+}
+
+/// Literals the ban leaves in place, each with its reason. An entry that no
+/// longer matches a literal fails the ban, so the list cannot go stale.
+const ALLOWED: &[(&str, &str, &str)] = &[(
+    "crates/meerkat-core/tests/fixtures/v0_8_10_recovery_migration_session.json",
+    "gpt-5.5",
+    "a session document a released 0.8.10 build wrote; its provenance file pins its bytes by sha256",
+)];
 
 /// Each shape the ban recognises, and the synthetic ids it leaves alone.
 #[test]
@@ -172,6 +225,22 @@ fn the_ban_recognises_each_model_name_shape() {
             "let model = \"local-mixer-1.5b\";",
             "an open-weight parameter count",
         ),
+        (
+            "let model = \"anthropic/claude-opus-5\";",
+            "a provider-qualified model id",
+        ),
+        (
+            "let model = \"models/gemini-3-pro\";",
+            "a provider-qualified model id",
+        ),
+        (
+            "let model = \"open-mixer-8b-instruct\";",
+            "an open-weight parameter count",
+        ),
+        (
+            "let model = \"open-org/Mixer-3.1-8B-Instruct\";",
+            "an open-weight parameter count",
+        ),
     ] {
         let found = first_violation(text);
         assert!(
@@ -190,40 +259,79 @@ fn the_ban_recognises_each_model_name_shape() {
         "let name = \"gemma\";",
         "let name = \"gpt-like\";",
         "let name = \"abc-b\";",
+        "let id = \"0190e1b2-123b-7b5e-9f2a-3c4d5e6f7a8b\";",
+        "let path = \"crates/meerkat-core/src\";",
+        "let model = \"models/test-model\";",
     ] {
         assert_eq!(first_violation(text), None, "{text} is not a model name");
     }
 }
 
-/// (b) No file under crates/meerkat-core/src may contain a provider model-name
-/// literal (the shapes of [`model_name_shape`]). This is a tombstone-class
-/// textual ban: the presence of such a literal anywhere in core IS the
-/// violation, regardless of context - real model names are provider data and
-/// belong in meerkat-models (tests included; core tests use the synthetic
-/// `model_profile::test_catalog` fixture).
+/// (b) No file under crates/meerkat-core/src or crates/meerkat-core/tests may
+/// contain a provider model-name literal (the shapes of [`model_name_shape`])
+/// outside [`ALLOWED`]. This is a tombstone-class textual ban: the presence
+/// of such a literal anywhere in core IS the violation, regardless of
+/// context - real model names are provider data and belong in meerkat-models
+/// (tests included; core tests use the synthetic `model_profile::test_catalog`
+/// fixture).
 #[test]
 fn core_sources_contain_no_provider_model_literals() {
-    let src_root = repo_root().join("crates/meerkat-core/src");
+    let root = repo_root();
     let mut files = Vec::new();
-    collect_files(&src_root, &mut files);
-    assert!(
-        !files.is_empty(),
-        "crates/meerkat-core/src must not be empty"
-    );
+    for dir in ["crates/meerkat-core/src", "crates/meerkat-core/tests"] {
+        let before = files.len();
+        collect_files(&root.join(dir), &mut files);
+        assert!(files.len() > before, "{dir} must not be empty");
+    }
 
-    let mut violations = Vec::new();
+    let mut violations_found = Vec::new();
+    let mut allowed_used = vec![false; ALLOWED.len()];
     for path in files {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue; // non-UTF-8 assets cannot carry the literal pattern we ban
         };
-        if let Some(found) = first_violation(&text) {
-            violations.push(format!("{} ({found})", path.display()));
+        let relative = path
+            .strip_prefix(&root)
+            .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let mut remaining = Vec::new();
+        for (line, literal, shape) in violations(&text) {
+            match ALLOWED
+                .iter()
+                .position(|(file, allowed, _)| *file == relative && *allowed == literal)
+            {
+                Some(index) => allowed_used[index] = true,
+                None => remaining.push(format!("line {line}: \"{literal}\" ({shape})")),
+            }
+        }
+        if let Some(found) = remaining.first() {
+            violations_found.push(format!(
+                "{} ({found}{})",
+                path.display(),
+                if remaining.len() > 1 {
+                    format!(", and {} more", remaining.len() - 1)
+                } else {
+                    String::new()
+                }
+            ));
         }
     }
+    let stale: Vec<String> = ALLOWED
+        .iter()
+        .zip(&allowed_used)
+        .filter(|(_, used)| !**used)
+        .map(|((file, literal, reason), _)| format!("{file}: \"{literal}\" ({reason})"))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "ALLOWED entries that match no literal any more; remove them:\n  {}",
+        stale.join("\n  ")
+    );
+    let violations = violations_found;
 
     assert!(
         violations.is_empty(),
-        "provider model-name literals found under crates/meerkat-core/src:\n  {}\n\
+        "provider model-name literals found under crates/meerkat-core/src and tests:\n  {}\n\
          \n\
          PRINCIPLE: meerkat-core must contain ZERO provider-specific model\n\
          data — including model-name string literals in tests, fixtures, and\n\
