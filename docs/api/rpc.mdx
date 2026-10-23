@@ -3243,6 +3243,14 @@ are routing fields; scoped streams can additionally carry `scope_id` and
 
 ### session/stream_end notifications
 
+Session and mob streams reserve terminal delivery capacity before opening.
+The process admits at most 256 active or queued terminal obligations; an
+additional `session/stream_open` or `mob/stream_open` returns `BUDGET_EXHAUSTED`
+until capacity is released. Each terminal is bounded to 16 KiB, with diagnostic
+detail limited to 1 KiB of UTF-8 text. Data-event admission cannot consume these
+reservations. A slow reader retains its terminal reservation until the
+transport writes or discards the notification.
+
 An explicit session stream terminates with this notification:
 
 ```json

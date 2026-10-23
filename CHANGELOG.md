@@ -37,6 +37,12 @@ them.
 
 ### Breaking
 
+- Behaviour-only (not measured by the gate): RPC `session/stream_open` and
+  `mob/stream_open` now reserve bounded terminal delivery capacity. The process
+  admits at most 256 active or queued terminal obligations; further opens return
+  `BUDGET_EXHAUSTED` until capacity is released. Terminal diagnostic details are
+  limited to 1 KiB of UTF-8 text, preserving a 16 KiB terminal wire bound.
+
 - `meerkat-schedule`: the occurrence lifecycle carries the admission evidence
   of an occurrence's receipt history (see Fixed, scheduled delivery after a
   lost executor). `OccurrenceLifecycleInput::ClassifyDue` and `Claim` gain the
@@ -1114,6 +1120,11 @@ them.
   (7) and `stored_input_state_version_for_row` are new.
 
 ### Fixed
+
+- RPC session and mob streams retain their machine-authorized terminal
+  notification when ordinary outbound byte or message admission is saturated.
+  Reserved capacity follows the stream through close races, pending delivery and
+  transport disconnect, without blocking the agent event producer.
 
 - Continuations on a retired address. A continuation whose drain reserved it
   before a crash, on an address that retired since, no longer reads
