@@ -10,6 +10,9 @@
 //!   mutation through to the host as one batch before it answers.
 //! - [`SpiSessionStore`] is the realm's session slot: reads of the committed
 //!   documents and the catalog through the runtime store, writes refused.
+//! - [`chapter::large_documents`] is a check a host runs against its own
+//!   store: Core's adapter puts 20 MiB documents through a round commit, a
+//!   re-base and a restart, and reads them back byte-exact.
 //!
 //! # Layout
 //!
@@ -54,6 +57,7 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
+pub mod chapter;
 pub mod codec;
 pub mod realm;
 mod runtime;

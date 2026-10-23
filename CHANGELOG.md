@@ -838,7 +838,10 @@ them.
   and the user starts it again. Completed credentials are not affected.
   Temporary councils are process-local too: the default council store
   declares itself process-bound, so a council that requires durable custody
-  is refused.
+  is refused. A host checks its own store against the adapter with
+  `meerkat_runtime::store::spi::chapter::large_documents`: 20 MiB documents
+  go through a base commit, a round commit, a re-base and a restart, and
+  read back byte-exact.
 - `meerkat-store-conformance`: `chapters::host_store` checks a host store
   against those obligations through a `HostStoreFactory`, whose every open
   stands for a new process: reopen; a kill before, during and after a commit;
