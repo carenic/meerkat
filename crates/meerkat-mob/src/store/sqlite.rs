@@ -15918,6 +15918,10 @@ mod identity_fence_contention_tests {
     /// How long the holder keeps mob.db's write lock: a slow status commit.
     const HOLD: Duration = Duration::from_millis(300);
 
+    /// How long one fence call takes on a heavily loaded host (a CI runner
+    /// shared by many jobs): few of them fit in [`HOLD`].
+    const LOADED_CALL: Duration = Duration::from_millis(100);
+
     /// An adopted identity with a current lease in a SQLite identity store.
     struct AdoptedIdentity {
         _dir: tempfile::TempDir,
@@ -16035,11 +16039,13 @@ mod identity_fence_contention_tests {
 
     /// Wraps a fence: just before its `at`-th call, mob.db is held for
     /// [`HOLD`]. Records when each call started and when each operation ran,
-    /// and counts the calls that returned.
+    /// and counts the calls that returned. Each call can be made to take
+    /// `call_delay` first, as on a loaded host.
     struct HoldMobDbAt {
         inner: Arc<dyn RuntimeStoreWriteFence>,
         path: PathBuf,
         at: usize,
+        call_delay: Duration,
         call_starts: std::sync::Mutex<Vec<Instant>>,
         operations: std::sync::Mutex<Vec<Instant>>,
         /// How many calls have returned.
@@ -16049,10 +16055,21 @@ mod identity_fence_contention_tests {
 
     impl HoldMobDbAt {
         fn new(inner: Arc<dyn RuntimeStoreWriteFence>, path: &Path, at: usize) -> Arc<Self> {
+            Self::with_call_delay(inner, path, at, Duration::ZERO)
+        }
+
+        /// As [`Self::new`], every call taking `call_delay` before it runs.
+        fn with_call_delay(
+            inner: Arc<dyn RuntimeStoreWriteFence>,
+            path: &Path,
+            at: usize,
+            call_delay: Duration,
+        ) -> Arc<Self> {
             Arc::new(Self {
                 inner,
                 path: path.to_path_buf(),
                 at,
+                call_delay,
                 call_starts: std::sync::Mutex::new(Vec::new()),
                 operations: std::sync::Mutex::new(Vec::new()),
                 returned: tokio::sync::watch::Sender::new(0),
@@ -16088,6 +16105,9 @@ mod identity_fence_contention_tests {
             };
             if call == self.at {
                 *self.holder.lock().unwrap() = Some(hold_mob_db(&self.path, HOLD));
+            }
+            if !self.call_delay.is_zero() {
+                std::thread::sleep(self.call_delay);
             }
         }
 
@@ -16179,7 +16199,14 @@ mod identity_fence_contention_tests {
             .observe_cold_runtime_lifecycle(&session_id)
             .await
             .unwrap();
-        let fence = HoldMobDbAt::new(adopted.runtime_fence(&observed), &adopted.path, 1);
+        // Every call slowed as on a loaded host: the hold must not depend on
+        // how many calls fit in it.
+        let fence = HoldMobDbAt::with_call_delay(
+            adopted.runtime_fence(&observed),
+            &adopted.path,
+            1,
+            LOADED_CALL,
+        );
         let (ticks, ticker) = ticker();
         let reader = tokio::spawn({
             let store = store.clone();
@@ -16259,7 +16286,14 @@ mod identity_fence_contention_tests {
             .observe_cold_runtime_lifecycle(&session_id)
             .await
             .unwrap();
-        let fence = HoldMobDbAt::new(adopted.runtime_fence(&observed), &adopted.path, 2);
+        // Every call slowed as on a loaded host: the hold must not depend on
+        // how many calls fit in it.
+        let fence = HoldMobDbAt::with_call_delay(
+            adopted.runtime_fence(&observed),
+            &adopted.path,
+            2,
+            LOADED_CALL,
+        );
         let (ticks, ticker) = ticker();
         let reader = tokio::spawn({
             let machine = Arc::clone(&machine);
