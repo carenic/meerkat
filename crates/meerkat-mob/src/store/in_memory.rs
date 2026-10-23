@@ -165,7 +165,7 @@ pub struct InMemoryMobEventStore {
     #[cfg(test)]
     broadcast_gate: std::sync::Mutex<Option<BroadcastTestGate>>,
     /// Refuses the next append of a terminal flow event.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fail_next_terminal_append: AtomicBool,
 }
 
@@ -238,7 +238,7 @@ impl Default for InMemoryMobEventStore {
             active_reconciliation_poll_failures: AtomicU64::new(0),
             #[cfg(test)]
             broadcast_gate: std::sync::Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             fail_next_terminal_append: AtomicBool::new(false),
         }
     }
@@ -324,7 +324,6 @@ impl InMemoryMobEventStore {
 
     #[cfg(any(test, feature = "test-support"))]
     fn forced_append_error(&self, event: &NewMobEvent) -> Option<MobStoreError> {
-        #[cfg(test)]
         if terminal_event_identity(&event.kind).is_some()
             && self
                 .fail_next_terminal_append
