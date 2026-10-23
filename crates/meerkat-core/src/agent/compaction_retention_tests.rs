@@ -423,9 +423,9 @@ async fn a_long_run_without_a_checkpointer_keeps_what_its_durable_head_lacks() {
 /// validated, for a session with a durable HeadCanonical head. A session
 /// without one (WholeBlob) keeps its graph as it is, so the first turn after a
 /// resume neither retires nor validates a graph its run did not change. A
-/// graph held only as unverified bytes is not parsed there, and the checkpoint
-/// still refuses it. A held graph the durable head covers retires to the
-/// retention.
+/// graph without the session's validation marker, held or not, is not read
+/// there, and the checkpoint still refuses it. A held graph the durable head
+/// covers retires to the retention.
 #[tokio::test]
 async fn retirement_after_a_checkpoint_needs_a_durable_head_and_a_held_graph() {
     let retention =
@@ -482,12 +482,31 @@ async fn retirement_after_a_checkpoint_needs_a_durable_head_and_a_held_graph() {
         unverified.validated_transcript_history_state().is_err(),
         "a HeadCanonical checkpoint's graph read still refuses an unverified graph"
     );
+    // That read cached the parsed graph without verifying it. Holding a graph
+    // is not enough: without the session's validation marker it is still left
+    // alone, and it is unchanged.
+    assert_eq!(
+        unverified
+            .retire_transcript_history_after_checkpoint(retention)
+            .expect("a cached but unverified graph is not read here"),
+        None,
+        "a held graph without the session's validation marker is left alone"
+    );
+    let cached = unverified
+        .transcript_history_state()
+        .expect("graph decodes")
+        .expect("graph present");
+    assert_eq!(
+        (cached.commit_count(), cached.retired_count()),
+        (TOOL_TURNS, 0),
+        "the unverified graph is unchanged"
+    );
     assert!(
         unverified.to_persisted_bytes().is_err(),
         "a WholeBlob checkpoint still refuses an unverified graph"
     );
 
-    let mut covered = held.clone();
+    let mut covered = held;
     covered.note_durable_transcript_rewrites(TOOL_TURNS as u64);
     assert_eq!(
         covered
