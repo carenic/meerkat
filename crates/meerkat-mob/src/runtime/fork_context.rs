@@ -655,7 +655,11 @@ fn copied_comms_text(block: &SystemNoticeBlock) -> Option<String> {
 mod tests {
     use super::*;
     use meerkat_core::comms::{PeerId, SenderContentTaint};
-    use meerkat_core::interaction::InteractionId;
+    use meerkat_core::interaction::{
+        InteractionId, ResponseStatus, format_peer_lifecycle_projection,
+        format_peer_message_projection, format_peer_request_projection,
+        format_peer_response_projection,
+    };
     use meerkat_core::types::{
         CommsNoticeKind, ContentBlock, InstructionActivationId, InstructionActivationIdentity,
         InstructionRevisionId, InstructionRevisionRef, SessionId, SystemNoticeDirection,
@@ -768,12 +772,22 @@ mod tests {
         })
     }
 
-    fn incoming_peer_block(kind: CommsNoticeKind, text: &str) -> SystemNoticeBlock {
+    /// The typed block of an incoming peer input as the source's runtime
+    /// records it. An envelope without blocks of its own is stored with the
+    /// runtime's rendered admission text as its content (the comms bridge's
+    /// `peer_rendered_body`), so `admitted_text` is that text. Only a message
+    /// names its delivery.
+    fn incoming_peer_block(
+        kind: CommsNoticeKind,
+        peer_id: PeerId,
+        admitted_text: String,
+    ) -> SystemNoticeBlock {
+        let delivery_id = matches!(kind, CommsNoticeKind::Message).then(InteractionId::new);
         SystemNoticeBlock::Comms {
             kind,
             direction: SystemNoticeDirection::Incoming,
             peer: Some(SystemNoticePeer {
-                id: PeerId::new(),
+                id: peer_id,
                 display_name: Some("reviewer".to_string()),
             }),
             sender_taint: None,
@@ -783,9 +797,9 @@ mod tests {
             summary: None,
             payload: None,
             content: vec![ContentBlock::Text {
-                text: text.to_string(),
+                text: admitted_text,
             }],
-            delivery_id: Some(InteractionId::new()),
+            delivery_id,
             in_reply_to: None,
         }
     }
@@ -1011,66 +1025,155 @@ mod tests {
     /// not only the notice's title.
     #[test]
     fn a_copied_peer_message_carries_its_sender_and_text() {
+        let message = incoming_peer_block(
+            CommsNoticeKind::Message,
+            PeerId::new(),
+            format_peer_message_projection("reviewer", "PEER-ASKED-FOR-THE-NUMBERS"),
+        );
         let text = rendered(
-            vec![peer_notice(
-                "Peer message",
-                incoming_peer_block(CommsNoticeKind::Message, "PEER-ASKED-FOR-THE-NUMBERS"),
-            )],
+            vec![peer_notice("Peer message", message)],
             ForkInstructionPolicy::RequireExplicitActivation,
         );
         assert!(
-            text.contains("PEER-ASKED-FOR-THE-NUMBERS") && text.contains("reviewer"),
+            text.contains("PEER-ASKED-FOR-THE-NUMBERS") && text.contains("from reviewer:"),
             "the copied peer message names its sender and carries its text: {text}"
         );
     }
 
     /// A copied peer request carries what was asked and by whom, but not
-    /// the source's means to answer it: the child is not the addressee, so
-    /// neither the request id nor the reply instructions reach it.
+    /// the source's means to answer it. A live request's content is the
+    /// runtime's rendering for the source's model: its id and a ready
+    /// `send_response` call. The child is not the addressee, so neither
+    /// reaches it.
     #[test]
     fn a_copied_peer_request_carries_no_reply_affordance() {
+        let peer_id = PeerId::new();
+        let params = json!({"draft": "DRAFT-PARAM"});
+        let mut request = incoming_peer_block(
+            CommsNoticeKind::Request,
+            peer_id,
+            format_peer_request_projection(
+                peer_id,
+                Some("reviewer"),
+                "REQUEST-ID-7",
+                "review",
+                &params,
+            ),
+        );
         let SystemNoticeBlock::Comms {
-            kind,
-            direction,
-            peer,
-            sender_taint,
-            content,
-            delivery_id,
-            in_reply_to,
+            request_id,
+            intent,
+            payload,
             ..
-        } = incoming_peer_block(CommsNoticeKind::Request, "PLEASE-REVIEW-THE-DRAFT")
+        } = &mut request
         else {
             unreachable!("the helper builds a comms block");
         };
-        let request = SystemNoticeBlock::Comms {
-            kind,
-            direction,
-            peer,
-            sender_taint,
-            request_id: Some("REQUEST-ID-7".to_string()),
-            intent: Some("review".to_string()),
-            status: None,
-            summary: None,
-            payload: Some(json!({"draft": "DRAFT-PARAM"})),
-            content,
-            delivery_id,
-            in_reply_to,
-        };
+        *request_id = Some("REQUEST-ID-7".to_string());
+        *intent = Some("review".to_string());
+        *payload = Some(params);
         let text = rendered(
             vec![peer_notice("Peer request: review", request)],
             ForkInstructionPolicy::RequireExplicitActivation,
         );
         assert!(
-            text.contains("PLEASE-REVIEW-THE-DRAFT")
-                && text.contains("DRAFT-PARAM")
-                && text.contains("reviewer"),
+            text.contains("Peer request: review")
+                && text.contains("from reviewer:")
+                && text.contains("DRAFT-PARAM"),
             "the copied request carries what was asked and by whom: {text}"
         );
         assert!(
             !text.contains("REQUEST-ID-7")
                 && !text.contains("send_response")
+                && !text.contains("in_reply_to")
                 && !text.contains("Delivery ID"),
             "the copied request carries no means to answer it: {text}"
+        );
+    }
+
+    /// A copied peer response carries its sender, its status and a preview
+    /// of its result. The request it answers is the source's own, so its id
+    /// is not carried, and the result is cut like a tool result.
+    #[test]
+    fn a_copied_peer_response_carries_no_request_id_and_a_capped_result() {
+        let tail = format!("{}RESULT-TAIL", "x".repeat(400));
+        let result = json!({"summary": "RESULT-HEAD", "tail": tail});
+        let mut response = incoming_peer_block(
+            CommsNoticeKind::ResponseTerminal,
+            PeerId::new(),
+            format_peer_response_projection(
+                "reviewer",
+                "REQUEST-ID-9",
+                ResponseStatus::Completed,
+                &result,
+            ),
+        );
+        let SystemNoticeBlock::Comms {
+            request_id,
+            status,
+            payload,
+            ..
+        } = &mut response
+        else {
+            unreachable!("the helper builds a comms block");
+        };
+        *request_id = Some("REQUEST-ID-9".to_string());
+        *status = Some("completed".to_string());
+        *payload = Some(result);
+        let text = rendered(
+            vec![peer_notice("Peer response terminal", response)],
+            ForkInstructionPolicy::RequireExplicitActivation,
+        );
+        assert!(
+            text.contains("from reviewer:")
+                && text.contains("status: completed")
+                && text.contains("RESULT-HEAD"),
+            "the copied response carries its sender, status and result preview: {text}"
+        );
+        assert!(
+            !text.contains("REQUEST-ID-9") && !text.contains("RESULT-TAIL"),
+            "the copied response carries no request id and only a capped result: {text}"
+        );
+    }
+
+    /// A copied lifecycle notice gives the child its kind (in the title), its
+    /// sender and its params, not the runtime's note to the source's model on
+    /// whether to answer it.
+    #[test]
+    fn a_copied_peer_lifecycle_notice_carries_its_params_not_the_runtime_note() {
+        let peer_id = PeerId::new();
+        let params = json!({"phase": "KICKOFF-PARAM"});
+        let mut notice = incoming_peer_block(
+            CommsNoticeKind::Lifecycle,
+            peer_id,
+            format_peer_lifecycle_projection(
+                Some(peer_id),
+                Some("reviewer"),
+                "mob.kickoff_started",
+                &params,
+            ),
+        );
+        let SystemNoticeBlock::Comms {
+            intent, payload, ..
+        } = &mut notice
+        else {
+            unreachable!("the helper builds a comms block");
+        };
+        *intent = Some("mob.kickoff_started".to_string());
+        *payload = Some(params);
+        let text = rendered(
+            vec![peer_notice("Peer lifecycle: mob.kickoff_started", notice)],
+            ForkInstructionPolicy::RequireExplicitActivation,
+        );
+        assert!(
+            text.contains("Peer lifecycle: mob.kickoff_started")
+                && text.contains("from reviewer:")
+                && text.contains("KICKOFF-PARAM"),
+            "the copied lifecycle notice carries its kind, sender and params: {text}"
+        );
+        assert!(
+            !text.contains("send_response") && !text.contains("Peer lifecycle notice from"),
+            "the runtime's note to the source's model is not copied: {text}"
         );
     }
 
@@ -1078,37 +1181,15 @@ mod tests {
     /// marker, so the child reads it with the same caution.
     #[test]
     fn a_copied_tainted_peer_message_keeps_its_taint_marker() {
-        let SystemNoticeBlock::Comms {
-            kind,
-            direction,
-            peer,
-            request_id,
-            intent,
-            status,
-            summary,
-            payload,
-            content,
-            delivery_id,
-            in_reply_to,
-            ..
-        } = incoming_peer_block(CommsNoticeKind::Message, "PEER-PASTED-A-WEB-PAGE")
-        else {
+        let mut tainted = incoming_peer_block(
+            CommsNoticeKind::Message,
+            PeerId::new(),
+            format_peer_message_projection("reviewer", "PEER-PASTED-A-WEB-PAGE"),
+        );
+        let SystemNoticeBlock::Comms { sender_taint, .. } = &mut tainted else {
             unreachable!("the helper builds a comms block");
         };
-        let tainted = SystemNoticeBlock::Comms {
-            kind,
-            direction,
-            peer,
-            sender_taint: Some(SenderContentTaint::Tainted),
-            request_id,
-            intent,
-            status,
-            summary,
-            payload,
-            content,
-            delivery_id,
-            in_reply_to,
-        };
+        *sender_taint = Some(SenderContentTaint::Tainted);
         let text = rendered(
             vec![peer_notice("Peer message", tainted)],
             ForkInstructionPolicy::RequireExplicitActivation,
