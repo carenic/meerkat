@@ -1521,6 +1521,160 @@ async fn whole_blob_interrupted_recovery_installs_one_sealed_repair_artifact() {
     );
 }
 
+/// A WholeBlob run whose final boundary compacts saves its end as a
+/// cursor-less re-base: the committed base and the tail are one document. A
+/// crash before the boundary commit leaves that tail. Recovery reads it as a
+/// strict continuation with no run rows and no cursor, repairs it as an
+/// interrupted run and terminalizes the run's bound input: the document keeps
+/// every row the run wrote, exactly once, plus one interruption notice, and
+/// the input never runs again. Unrun until the candidate's validation.
+#[tokio::test]
+async fn whole_blob_closing_rebase_after_a_final_compaction_recovers_as_interrupted() {
+    use meerkat_core::lifecycle::core_executor::BoundSessionCommit;
+    use meerkat_core::types::{
+        AssistantBlock, BlockAssistantMessage, Message, StopReason, TranscriptMessageIdentity,
+        UserMessage,
+    };
+    use meerkat_runtime::recovery::{
+        DurableTailRecoveryDisposition, DurableTailRecoveryOutcome, recover_durable_tail,
+    };
+    use meerkat_runtime::store::{
+        PreparedRuntimeSessionCommit, PreparedWholeBlobRunRebase,
+        VerifiedCommittedWholeBlobPayload, WholeBlobRunRebaseOutcome,
+    };
+
+    let store = InMemoryRuntimeStore::new();
+    let mut committed = meerkat_core::Session::new();
+    committed.push(Message::User(UserMessage::text("earlier context")));
+    committed.push(Message::User(UserMessage::text("more earlier context")));
+    let session_id = committed.id().clone();
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    store
+        .commit_prepared_session_boundary(
+            &runtime_id,
+            PreparedRuntimeSessionCommit::snapshot_only(
+                BoundSessionCommit::sealed(Arc::new(committed.clone())).unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+
+    // The run: one prompt and its answer, then a compaction at its final
+    // boundary. No round commit came after the compaction.
+    let run_id = RunId::new();
+    let input = make_prompt("the question");
+    let mut live = committed;
+    live.push(Message::User(UserMessage::text("the question")));
+    live.push(Message::BlockAssistant(BlockAssistantMessage {
+        blocks: vec![AssistantBlock::Text {
+            text: "the answer".to_string(),
+            meta: None,
+        }],
+        stop_reason: Some(StopReason::EndTurn),
+        identity: TranscriptMessageIdentity::default().with_run_id(run_id.clone()),
+        created_at: meerkat_core::types::message_timestamp_now(),
+        assistant_message_id: None,
+    }));
+    let parent = live.transcript_revision().unwrap();
+    let commit = live
+        .commit_transcript_rewrite(
+            meerkat_core::TranscriptRewriteSelection::MessageRange { start: 0, end: 2 },
+            vec![Message::User(UserMessage::compaction_summary(
+                "earlier context, compacted",
+            ))],
+            meerkat_core::TranscriptRewriteReason::new("compaction"),
+            Some("closing-rebase".to_string()),
+            Some(parent),
+        )
+        .unwrap();
+    let compacted_messages = live.messages().to_vec();
+
+    // The run's input is bound to it, pending consumption by its boundary.
+    store
+        .persist_input_state(
+            &runtime_id,
+            &persistable(applied_pending_state(&input, &run_id, 1)),
+        )
+        .await
+        .unwrap();
+
+    // The end-of-run save: no cursor, written as a re-base with no earlier
+    // tail (a single-turn run takes no round commit).
+    let base = store
+        .load_committed_whole_blob_snapshot(&runtime_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let payload = VerifiedCommittedWholeBlobPayload::from_committed(&session_id, base).unwrap();
+    let rebase = PreparedWholeBlobRunRebase::prepare(
+        payload,
+        None,
+        run_id.clone(),
+        live,
+        std::slice::from_ref(&commit),
+    )
+    .unwrap();
+    let WholeBlobRunRebaseOutcome::Applied {
+        committed: rebased,
+        tail,
+    } = store
+        .commit_prepared_whole_blob_run_rebase(&runtime_id, rebase.store_parts())
+        .await
+        .unwrap()
+    else {
+        panic!("the closing save re-bases");
+    };
+    assert_eq!(tail.candidate_blob_sha256(), rebased.blob_sha256());
+
+    // The process crashes before the boundary commit; the restart recovers.
+    let DurableTailRecoveryOutcome::Committed {
+        disposition,
+        recovered,
+        ..
+    } = recover_durable_tail(&store, &session_id)
+        .await
+        .expect("the closing save recovers")
+    else {
+        panic!("the closing save must commit as an interrupted run");
+    };
+    assert_eq!(
+        disposition,
+        DurableTailRecoveryDisposition::RepairAndCommitInterrupted
+    );
+    // Nothing lost or duplicated: the compacted document, then one notice.
+    let messages = recovered.messages();
+    assert_eq!(messages.len(), compacted_messages.len() + 1);
+    assert_eq!(
+        &messages[..compacted_messages.len()],
+        compacted_messages.as_slice()
+    );
+    assert!(matches!(messages.last(), Some(Message::SystemNotice(_))));
+    let stored = store
+        .load_session_snapshot(&runtime_id)
+        .await
+        .unwrap()
+        .expect("the repaired body is committed");
+    let stored = meerkat_core::Session::from_persisted_bytes(stored.as_slice()).unwrap();
+    assert_eq!(stored.messages(), messages);
+    assert!(
+        store
+            .load_whole_blob_provisional_tail(&runtime_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "the recovery consumes the tail"
+    );
+    // The run's input is terminal: it never runs again.
+    let rows = store.load_input_states_strict(&runtime_id).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0].state.input_id, input.id());
+    assert_eq!(rows[0].seed.phase, InputLifecycleState::Consumed);
+    assert_eq!(
+        rows[0].seed.terminal_outcome,
+        Some(InputTerminalOutcome::Consumed)
+    );
+}
+
 #[tokio::test]
 async fn whole_blob_recovery_uses_latest_same_run_candidate_sequence() {
     use meerkat_core::lifecycle::core_executor::BoundSessionCommit;
