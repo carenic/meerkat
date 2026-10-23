@@ -2468,6 +2468,7 @@ class WireMobProfile:
     model: str
     auto_compact_threshold: Optional[int] = None
     backend: Optional[WireMobBackendKind] = None
+    durable: Optional[bool] = None
     external_addressable: Optional[bool] = None
     image_generation_provider: Optional[Provider] = None
     max_inline_peer_notifications: Optional[int] = None
@@ -3022,6 +3023,7 @@ retired `clear_*` split wire form) fail closed at the serde boundary via
     provider: Optional[str] = None
     provider_params: Optional[dict[str, Any]] = None
     self_hosted_server_id: Optional[str] = None
+    session_events: Optional[bool] = None
     skill_refs: Optional[list[SkillKey]] = None
     structured_output_retries: Optional[int] = None
     system_prompt: Optional[str] = None
@@ -3687,6 +3689,7 @@ class MobProfileInput:
     model: str
     auto_compact_threshold: Optional[int] = None
     backend: Optional[WireMobBackendKind] = None
+    durable: Optional[bool] = None
     external_addressable: Optional[bool] = None
     image_generation_provider: Optional[Provider] = None
     max_inline_peer_notifications: Optional[int] = None
@@ -3999,6 +4002,7 @@ vocabulary; `RuntimeBinding` is machine-owned."""
     model: str
     provider: Provider
     auto_compact_threshold: Optional[int] = None
+    durable: Optional[bool] = None
     external_addressable: Optional[bool] = None
     image_generation_provider: Optional[Provider] = None
     max_inline_peer_notifications: Optional[int] = None
@@ -7795,6 +7799,11 @@ class WireProviderMetaGemini(TypedDict, total=False):
     provider: Required[Literal['gemini']]
     thoughtSignature: Required[str]
 
+class WireProviderMetaGeminiFunctionCall(TypedDict, total=False):
+    provider: Required[Literal['gemini_function_call']]
+    provider_id: Required[str]
+    thoughtSignature: NotRequired[Optional[str]]
+
 class WireProviderMetaOpenAi(TypedDict, total=False):
     encrypted_content: NotRequired[Optional[str]]
     id: Required[str]
@@ -7815,7 +7824,7 @@ class WireProviderMetaOpenAiAssistantMessage(TypedDict, total=False):
 class WireProviderMetaUnknown(TypedDict, total=False):
     provider: Required[Literal['unknown']]
 
-WireProviderMeta = WireProviderMetaAnthropic | WireProviderMetaAnthropicRedacted | WireProviderMetaAnthropicCompaction | WireProviderMetaGemini | WireProviderMetaOpenAi | WireProviderMetaOpenAiResponse | WireProviderMetaOpenAiAssistantMessage | WireProviderMetaUnknown
+WireProviderMeta = WireProviderMetaAnthropic | WireProviderMetaAnthropicRedacted | WireProviderMetaAnthropicCompaction | WireProviderMetaGemini | WireProviderMetaGeminiFunctionCall | WireProviderMetaOpenAi | WireProviderMetaOpenAiResponse | WireProviderMetaOpenAiAssistantMessage | WireProviderMetaUnknown
 
 # Wire projection of `meerkat_core::TranscriptSource`. Lane provenance
 # for spoken-transcript blocks.

@@ -1886,6 +1886,7 @@ export interface WireMobToolConfig {
 export interface WireMobProfile {
   auto_compact_threshold?: number | null;
   backend?: WireMobBackendKind | null;
+  durable?: boolean;
   external_addressable?: boolean;
   image_generation_provider?: Provider | null;
   max_inline_peer_notifications?: number | null;
@@ -2283,6 +2284,7 @@ export interface MobTurnStartParams {
   provider?: string | null;
   provider_params?: Record<string, unknown> | null;
   self_hosted_server_id?: string | null;
+  session_events?: boolean | null;
   skill_refs?: SkillKey[] | null;
   structured_output_retries?: number | null;
   system_prompt?: string | null;
@@ -2748,6 +2750,7 @@ export interface MobOrchestratorInput {
 export interface MobProfileInput {
   auto_compact_threshold?: number | null;
   backend?: WireMobBackendKind | null;
+  durable?: boolean;
   external_addressable?: boolean;
   image_generation_provider?: Provider | null;
   max_inline_peer_notifications?: number | null;
@@ -2956,6 +2959,7 @@ export interface OutputSchema {
 
 export interface PortableProfile {
   auto_compact_threshold?: number | null;
+  durable?: boolean;
   external_addressable?: boolean;
   image_generation_provider?: Provider | null;
   max_inline_peer_notifications?: number | null;
@@ -6891,6 +6895,12 @@ export interface WireProviderMetaGemini {
   thoughtSignature: string;
 }
 
+export interface WireProviderMetaGeminiFunctionCall {
+  provider: "gemini_function_call";
+  provider_id: string;
+  thoughtSignature?: string | null;
+}
+
 export interface WireProviderMetaOpenAi {
   encrypted_content?: string | null;
   id: string;
@@ -6915,7 +6925,7 @@ export interface WireProviderMetaUnknown {
   provider: "unknown";
 }
 
-export type WireProviderMeta = WireProviderMetaAnthropic | WireProviderMetaAnthropicRedacted | WireProviderMetaAnthropicCompaction | WireProviderMetaGemini | WireProviderMetaOpenAi | WireProviderMetaOpenAiResponse | WireProviderMetaOpenAiAssistantMessage | WireProviderMetaUnknown;
+export type WireProviderMeta = WireProviderMetaAnthropic | WireProviderMetaAnthropicRedacted | WireProviderMetaAnthropicCompaction | WireProviderMetaGemini | WireProviderMetaGeminiFunctionCall | WireProviderMetaOpenAi | WireProviderMetaOpenAiResponse | WireProviderMetaOpenAiAssistantMessage | WireProviderMetaUnknown;
 
 export interface WireTranscriptSourceSpoken {
   kind: "spoken";

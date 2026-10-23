@@ -540,12 +540,13 @@ export type OutputSchema = {
 
 export type PeerId = string;
 
-export interface PendingCallbackToolCall {
+export type PendingCallbackToolCall = {
   args: unknown;
+  dedupe_key?: ToolCallDedupeKey | null;
   settlement_failures?: ToolDispatchSettlementFailure[];
   tool_name: string;
   tool_use_id: string;
-}
+};
 
 export type PresentedTokenConvention = "anthropic_disjoint_input_components" | "open_ai_input_includes_cached_subset" | "gemini_prompt_includes_cached_subset" | "open_ai_compatible_prompt_includes_cache_details" | "host_declared_inclusive_input_total";
 
@@ -718,6 +719,8 @@ export type RunInput = {
 } | {
   kind: "pending_tool_results";
 };
+
+export type RunResumePointKind = "tools_pending" | "awaiting_model";
 
 export interface RuntimeAppendOrigin {
   append_ordinal: number;
@@ -971,6 +974,13 @@ export interface SystemTime {
 export type TokenAggregationProvenance = "sum_disjoint_provider_components" | "provider_inclusive_input_total";
 
 export type ToolCallArguments = Record<string, unknown>;
+
+export interface ToolCallDedupeKey {
+  call_digest: string;
+  call_id: string;
+  round: number;
+  run_id: RunId;
+}
 
 export type ToolConfigChangeDomain = "tool_scope" | "deferred_catalog";
 
@@ -1302,7 +1312,6 @@ export interface ToolExecutionStartedEvent {
 }
 
 export interface ToolExecutionCompletedEvent {
-  content: ContentBlock[];
   duration_ms: number;
   id: string;
   is_error: boolean;
@@ -1521,6 +1530,14 @@ export interface RequestReasoningLoweredEvent {
   type: "request_reasoning_lowered";
 }
 
+export interface RunResumedEvent {
+  resume_point: RunResumePointKind;
+  round: number;
+  run_id: RunId;
+  session_id: SessionId;
+  type: "run_resumed";
+}
+
 export const KNOWN_AGENT_EVENT_TYPES = [
   "run_started",
   "run_completed",
@@ -1572,7 +1589,8 @@ export const KNOWN_AGENT_EVENT_TYPES = [
   "boundary_append_applied",
   "boundary_appends_discarded",
   "live_channel_closed",
-  "request_reasoning_lowered"
+  "request_reasoning_lowered",
+  "run_resumed"
 ] as const;
 
 export type KnownAgentEventType = typeof KNOWN_AGENT_EVENT_TYPES[number];
@@ -1628,4 +1646,5 @@ export type AgentEvent =
   LiveChannelClosedEvent |
   OperationObservationFailedEvent |
   HookLaunchRefusedEvent |
-  RequestReasoningLoweredEvent;
+  RequestReasoningLoweredEvent |
+  RunResumedEvent;
