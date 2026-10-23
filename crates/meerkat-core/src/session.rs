@@ -3476,7 +3476,10 @@ impl SessionRunCursor {
 ///
 /// A resumed run dispatches the calls of a round whose results were not
 /// committed again, under the same key, so a tool with external effects can
-/// recognize a repeat.
+/// recognize a repeat. A round that had no committed model response is asked
+/// of the model again, and a provider may reuse a call id for a different
+/// call; the digest of the call's tool name and arguments keeps such calls
+/// apart, so a repeat is only a call with the same name and arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ToolCallDedupeKey {
     /// The run the call belongs to.
@@ -3485,6 +3488,8 @@ pub struct ToolCallDedupeKey {
     pub round: u64,
     /// Provider tool call id.
     pub call_id: String,
+    /// Digest of the call's tool name and canonical arguments.
+    pub call_digest: String,
 }
 
 /// Durable control state for deferred first-turn prompt and staged callback tool results.
