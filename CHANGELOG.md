@@ -267,6 +267,20 @@ them.
   It said only that `reactivate_inherited` carries them into the child. The
   cause, the keys and the error code are unchanged.
 
+- OpenAI Responses on the public OpenAI API keeps a hosted web search's
+  evidence from one stateless step to the next (`store: false`, the
+  default). A request with the hosted `web_search` tool now also asks for
+  the sources each search consulted (`include` gains
+  `web_search_call.action.sources`), and later steps replay the search call
+  with those sources and the answer's `url_citation` annotations on its text
+  instead of `annotations: []`. Only citations whose range fits the replayed
+  text go back, and a message whose citations came from several text parts
+  replays none. The text of the pages never comes back; for that, opt in to
+  `store: true` (stored continuation) or use the Meerkat `web_search`
+  fallback tool. The ChatGPT backend, Azure OpenAI and GitHub Copilot
+  Responses wires keep their request shape: no sources asked for or
+  replayed, and `annotations: []`. No API change.
+
 ### Fixed
 
 - Streamed model text keeps a character that a network chunk boundary split

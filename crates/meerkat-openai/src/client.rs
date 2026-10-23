@@ -200,6 +200,17 @@ impl OpenAiBackendWire {
     fn admits_prompt_cache_fields(&self) -> bool {
         self.backend_kind().admits_prompt_cache_fields()
     }
+
+    /// Whether this wire carries a hosted web search's evidence from one
+    /// stateless step to the next: it asks for the sources each search
+    /// consulted and replays them with the answer's `url_citation`
+    /// annotations. Only the public OpenAI API wire does, the one a live
+    /// provider row proves accepts them back. The ChatGPT backend, Azure
+    /// OpenAI and Copilot wires keep the shape they had before: no sources
+    /// asked for or replayed, and `annotations: []`.
+    fn carries_web_search_evidence(&self) -> bool {
+        matches!(self, Self::PublicOpenAi)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -331,6 +342,120 @@ pub(crate) fn web_search_message_annotations(value: &Value) -> Option<Vec<Value>
         .cloned()
         .collect::<Vec<_>>();
     (!web_citations.is_empty()).then_some(web_citations)
+}
+
+/// The `include` entry that asks for the sources a hosted web search
+/// consulted, inside its `web_search_call` item.
+const WEB_SEARCH_SOURCES_INCLUDE: &str = "web_search_call.action.sources";
+
+/// Add `field` to a Responses request's `include` list, once.
+fn include_response_field(body: &mut Value, field: &str) {
+    match body.get_mut("include").and_then(Value::as_array_mut) {
+        Some(include) => {
+            if !include.iter().any(|entry| entry.as_str() == Some(field)) {
+                include.push(Value::String(field.to_owned()));
+            }
+        }
+        None => body["include"] = serde_json::json!([field]),
+    }
+}
+
+/// Whether `content` is a `message_annotations` block holding at least one
+/// `url_citation`: the web-search citations of one assistant message,
+/// captured beside its text.
+fn is_web_search_citations(content: &Value) -> bool {
+    content.get("type").and_then(Value::as_str) == Some("message_annotations")
+        && content
+            .get("annotations")
+            .and_then(web_search_message_annotations)
+            .is_some()
+}
+
+/// A replayed `web_search_call` as a wire not proven to accept its sources
+/// receives it: `action.sources` removed, the rest as captured.
+fn without_web_search_sources(item: &Value) -> Value {
+    let mut item = item.clone();
+    if let Some(action) = item.get_mut("action").and_then(Value::as_object_mut) {
+        action.remove("sources");
+    }
+    item
+}
+
+/// The `url_citation` annotations captured beside the assistant messages of
+/// one replayed assistant turn, by message item id.
+#[derive(Default)]
+struct WebSearchCitations<'a> {
+    by_message: HashMap<&'a str, &'a [Value]>,
+    /// Messages with more than one citations block. Each block came from its
+    /// own text part, whose indices count from the start of that part, and
+    /// the parts were joined at capture, so none of them can be placed.
+    several: HashSet<&'a str>,
+}
+
+impl<'a> WebSearchCitations<'a> {
+    fn of(blocks: &'a [AssistantBlock]) -> Self {
+        let mut citations = Self::default();
+        for block in blocks {
+            let AssistantBlock::ServerToolContent {
+                id: Some(id),
+                content,
+                ..
+            } = block
+            else {
+                continue;
+            };
+            if !is_web_search_citations(content) {
+                continue;
+            }
+            let Some(annotations) = content.get("annotations").and_then(Value::as_array) else {
+                continue;
+            };
+            if citations
+                .by_message
+                .insert(id.as_str(), annotations.as_slice())
+                .is_some()
+            {
+                citations.several.insert(id.as_str());
+            }
+        }
+        citations
+    }
+
+    /// The annotations replayed on message `id`, whose text is `text`: its
+    /// `url_citation` entries whose character range fits the text. A range
+    /// that does not fit is dropped, never moved.
+    fn for_message(&self, id: &str, text: &str) -> Vec<Value> {
+        if self.several.contains(id) {
+            return Vec::new();
+        }
+        let Some(annotations) = self.by_message.get(id) else {
+            return Vec::new();
+        };
+        let chars = text.chars().count();
+        annotations
+            .iter()
+            .filter(|annotation| {
+                annotation.get("type").and_then(Value::as_str) == Some("url_citation")
+                    && citation_fits(annotation, chars)
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+/// Whether a citation's `start_index..end_index` lies within a text of
+/// `chars` characters.
+fn citation_fits(annotation: &Value, chars: usize) -> bool {
+    let index = |field: &str| {
+        annotation
+            .get(field)
+            .and_then(Value::as_u64)
+            .and_then(|index| usize::try_from(index).ok())
+    };
+    matches!(
+        (index("start_index"), index("end_index")),
+        (Some(start), Some(end)) if start <= end && end <= chars
+    )
 }
 
 fn project_openai_content_blocks(
@@ -486,6 +611,7 @@ fn project_openai_assistant_blocks(
     replay_application: &mut meerkat_core::ReplayApplication<'_>,
     message: meerkat_core::ReplayMessageIndex,
     mode: OpenAiReplayProjectionMode,
+    web_search_evidence: bool,
     blocks: &[AssistantBlock],
 ) -> Result<Vec<AssistantBlock>, LlmError> {
     let mut projected = Vec::with_capacity(blocks.len());
@@ -533,6 +659,19 @@ fn project_openai_assistant_blocks(
             }
             AssistantBlock::ServerToolContent { content, .. }
                 if openai_server_tool_content_replayable(mode, content) =>
+            {
+                Some(meerkat_core::ReplayWireFamily::OpenAi.strip_foreign_metadata(block.clone()))
+            }
+            // A message's web-search citations, on a wire that carries search
+            // evidence: the Responses lowering puts them back on that
+            // message's text; they are never an input item of their own.
+            AssistantBlock::ServerToolContent {
+                id: Some(_),
+                content,
+                ..
+            } if web_search_evidence
+                && matches!(mode, OpenAiReplayProjectionMode::Responses)
+                && is_web_search_citations(content) =>
             {
                 Some(meerkat_core::ReplayWireFamily::OpenAi.strip_foreign_metadata(block.clone()))
             }
@@ -592,14 +731,25 @@ pub(crate) fn project_openai_replay_messages_for_capabilities(
     image_input: bool,
     image_tool_results: bool,
 ) -> Result<Vec<Message>, LlmError> {
-    project_openai_replay_messages_for_target(messages, mode, image_input, image_tool_results)
+    project_openai_replay_messages_for_target(
+        messages,
+        mode,
+        image_input,
+        image_tool_results,
+        false,
+    )
 }
 
+/// `web_search_evidence`: whether the target wire carries a hosted web
+/// search's evidence across steps
+/// (`OpenAiBackendWire::carries_web_search_evidence`); only then do an
+/// assistant message's citations stay in its replayed history.
 pub(crate) fn project_openai_replay_messages_for_target(
     messages: &[Message],
     mode: OpenAiReplayProjectionMode,
     image_input: bool,
     image_tool_results: bool,
+    web_search_evidence: bool,
 ) -> Result<Vec<Message>, LlmError> {
     let mut projected = Vec::with_capacity(messages.len());
     // Responses can now accept image parts in `function_call_output.output`.
@@ -696,6 +846,7 @@ pub(crate) fn project_openai_replay_messages_for_target(
                     &mut replay_application,
                     message_index,
                     mode,
+                    web_search_evidence,
                     &assistant.blocks,
                 )?;
                 if blocks.is_empty() {
@@ -968,18 +1119,21 @@ impl OpenAiClient {
         let wire_tag = self.wire_openai_tag(request);
         let cache_breakpoints =
             ResponsesCacheBreakpoints::for_request(request, wire_tag.as_deref());
+        let web_search_evidence = self.backend_wire.carries_web_search_evidence();
         let (input, instructions, _) = if self.is_chatgpt_backend_wire() {
             Self::validate_chatgpt_system_messages(&request.messages)?;
             Self::convert_to_responses_input_with_system_mode(
                 &request.messages,
                 SystemMessageMode::ExtractToInstructions,
                 cache_breakpoints,
+                web_search_evidence,
             )?
         } else {
             Self::convert_to_responses_input_with_system_mode(
                 &request.messages,
                 SystemMessageMode::IncludeInInput,
                 cache_breakpoints,
+                web_search_evidence,
             )?
         };
         let reasoning_enabled = Self::request_supports_reasoning_payload(request);
@@ -1169,6 +1323,7 @@ impl OpenAiClient {
         }
 
         // Inject provider-native web search tool from typed tag.
+        let mut hosted_web_search = false;
         if let Some(web_search) = wire_tag.as_deref().and_then(|t| t.web_search.as_ref()) {
             let ws_value = web_search.as_value();
             if ws_value.is_object() {
@@ -1176,7 +1331,14 @@ impl OpenAiClient {
                     Some(arr) => arr.push(ws_value),
                     None => body["tools"] = Value::Array(vec![ws_value]),
                 }
+                hosted_web_search = true;
             }
+        }
+        // With `store: false` OpenAI keeps nothing of a search, so a later
+        // step sees only what the replayed `web_search_call` item holds: ask
+        // for the sources the search consulted, so they ride along in it.
+        if hosted_web_search && web_search_evidence {
+            include_response_field(&mut body, WEB_SEARCH_SOURCES_INCLUDE);
         }
 
         self.apply_tool_choice(request, &mut body)?;
@@ -1498,11 +1660,15 @@ impl OpenAiClient {
     /// history before this point so Responses replay keeps OpenAI reasoning and
     /// final hosted-tool items together, while provider switches and Chat
     /// Completions mode do not receive OpenAI-private transcript state.
-    fn convert_to_responses_input(messages: &[Message]) -> Result<Vec<Value>, LlmError> {
+    fn convert_to_responses_input(
+        messages: &[Message],
+        web_search_evidence: bool,
+    ) -> Result<Vec<Value>, LlmError> {
         Self::convert_to_responses_input_with_system_mode(
             messages,
             SystemMessageMode::IncludeInInput,
             ResponsesCacheBreakpoints::None,
+            web_search_evidence,
         )
         .map(|(input, _, _)| input)
     }
@@ -1672,10 +1838,16 @@ impl OpenAiClient {
         Some(item)
     }
 
+    /// `web_search_evidence`: the target wire carries a hosted web search's
+    /// evidence (`OpenAiBackendWire::carries_web_search_evidence`). Then an
+    /// assistant message's text replays with its `url_citation` annotations
+    /// and a `web_search_call` with its sources; otherwise the message
+    /// replays `annotations: []` and the call without `action.sources`.
     fn convert_to_responses_input_with_system_mode(
         messages: &[Message],
         system_mode: SystemMessageMode,
         cache_breakpoints: ResponsesCacheBreakpoints,
+        web_search_evidence: bool,
     ) -> Result<
         (
             Vec<Value>,
@@ -1787,6 +1959,11 @@ impl OpenAiClient {
                     }
                 }
                 Message::BlockAssistant(a) => {
+                    let citations = if web_search_evidence {
+                        WebSearchCitations::of(&a.blocks)
+                    } else {
+                        WebSearchCitations::default()
+                    };
                     // BlockAssistantMessage format - render blocks as items
                     for block in &a.blocks {
                         match block {
@@ -1810,7 +1987,8 @@ impl OpenAiClient {
                                     {
                                         item["id"] = Value::String(id.clone());
                                         item["status"] = Value::String("completed".into());
-                                        item["content"] = serde_json::json!([{"type":"output_text","text":text,"annotations":[]}]);
+                                        let annotations = citations.for_message(id, text);
+                                        item["content"] = serde_json::json!([{"type":"output_text","text":text,"annotations":annotations}]);
                                         if let Some(phase) = phase {
                                             item["phase"] =
                                                 serde_json::to_value(phase).map_err(|error| {
@@ -1838,7 +2016,15 @@ impl OpenAiClient {
                                 }
                             }
                             AssistantBlock::ServerToolContent { content, .. } => {
-                                items.push(content.clone());
+                                match content.get("type").and_then(Value::as_str) {
+                                    // Its citations ride on their message's
+                                    // text (the `Text` arm above).
+                                    Some("message_annotations") => {}
+                                    Some("web_search_call") if !web_search_evidence => {
+                                        items.push(without_web_search_sources(content));
+                                    }
+                                    _ => items.push(content.clone()),
+                                }
                             }
                             // Unknown future variants are omitted unless the
                             // OpenAI projection explicitly admits them above.
@@ -2074,7 +2260,10 @@ impl OpenAiClient {
                 "content": Self::image_prompt(&request)
             })]
         } else {
-            Self::convert_to_responses_input(&request.projected_messages)?
+            Self::convert_to_responses_input(
+                &request.projected_messages,
+                self.backend_wire.carries_web_search_evidence(),
+            )?
         };
         let mut tool = serde_json::Map::new();
         tool.insert(
@@ -3334,11 +3523,12 @@ impl LlmClient for OpenAiClient {
     }
 
     fn project_replay_messages(&self, messages: &[Message]) -> Result<Vec<Message>, LlmError> {
-        project_openai_replay_messages_for_capabilities(
+        project_openai_replay_messages_for_target(
             messages,
             OpenAiReplayProjectionMode::Responses,
             self.supports_image_input,
             true,
+            self.backend_wire.carries_web_search_evidence(),
         )
     }
 
@@ -3422,6 +3612,7 @@ impl LlmClient for OpenAiClient {
             &request.messages,
             system_mode,
             ResponsesCacheBreakpoints::EveryInput,
+            self.backend_wire.carries_web_search_evidence(),
         )?;
         let ttl = if tag
             .prompt_cache_options
@@ -6563,20 +6754,23 @@ mod tests {
 
     #[test]
     fn test_request_input_rejects_video_tool_results() {
-        let err = OpenAiClient::convert_to_responses_input(&[Message::ToolResults {
-            results: vec![meerkat_core::ToolResult::with_blocks(
-                "tool_1".to_string(),
-                vec![ContentBlock::Video {
-                    media_type: "video/mp4".to_string(),
-                    duration_ms: 12_000,
-                    data: meerkat_core::VideoData::Inline {
-                        data: "AAAA".to_string(),
-                    },
-                }],
-                false,
-            )],
-            created_at: meerkat_core::types::message_timestamp_now(),
-        }])
+        let err = OpenAiClient::convert_to_responses_input(
+            &[Message::ToolResults {
+                results: vec![meerkat_core::ToolResult::with_blocks(
+                    "tool_1".to_string(),
+                    vec![ContentBlock::Video {
+                        media_type: "video/mp4".to_string(),
+                        duration_ms: 12_000,
+                        data: meerkat_core::VideoData::Inline {
+                            data: "AAAA".to_string(),
+                        },
+                    }],
+                    false,
+                )],
+                created_at: meerkat_core::types::message_timestamp_now(),
+            }],
+            true,
+        )
         .expect_err("video tool results should be rejected");
 
         match err {
@@ -10294,3 +10488,7 @@ mod tests {
 #[cfg(test)]
 #[path = "authorization_tests.rs"]
 mod authorization_tests;
+
+#[cfg(test)]
+#[path = "web_search_evidence_tests.rs"]
+mod web_search_evidence_tests;
