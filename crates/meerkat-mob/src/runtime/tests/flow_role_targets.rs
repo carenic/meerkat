@@ -532,22 +532,26 @@ async fn bound_run_provisions_no_flow_member() {
     );
 }
 
-/// Admit a prepare-then-review run with every bound member Active, then
-/// retire `rev-a2` while the prepare step's turn is still in flight, so the
-/// review step selects its targets after the retire.
+/// Admit a prepare-then-review run binding three issue-A reviewers with every
+/// bound member Active, then retire `rev-a2` while the prepare step's turn is
+/// still in flight, so the review step selects its targets after the retire
+/// with two bound reviewers left (`rev-a1`, `rev-a3`).
 async fn run_with_reviewer_retired_after_admission(
     review_policy: CollectionPolicy,
 ) -> (MobHandle, RunId, crate::run::MobRun) {
     let (handle, service) = create_test_mob(prepare_then_review_definition(review_policy)).await;
     spawn_members(&handle, "worker", &["coder-a"]).await;
-    spawn_members(&handle, REVIEWER, &["rev-a1", "rev-a2", "rev-b1"]).await;
+    spawn_members(&handle, REVIEWER, &["rev-a1", "rev-a2", "rev-a3", "rev-b1"]).await;
     service.set_flow_turn_delay_ms(3_000);
 
     let run_id = handle
         .run_flow_with_role_targets(
             flow_id("prepare_review"),
             serde_json::json!({}),
-            bind(&[("worker", &["coder-a"]), (REVIEWER, &["rev-a1", "rev-a2"])]),
+            bind(&[
+                ("worker", &["coder-a"]),
+                (REVIEWER, &["rev-a1", "rev-a2", "rev-a3"]),
+            ]),
             None,
         )
         .await
@@ -569,9 +573,10 @@ async fn run_with_reviewer_retired_after_admission(
 
 /// RED row (revert the bound branch of the flow engine's target selection):
 /// a bound member lost after admission leaves an all-policy review step one
-/// producer short. The run fails with the `InsufficientTargets` class, naming
-/// the lost member, before the review step dispatches any turn; the other
-/// issue's reviewer is never substituted in.
+/// producer short (three required, two available). The run fails with the
+/// `InsufficientTargets` class, naming the lost member, before the review
+/// step dispatches any turn; the other issue's reviewer is never substituted
+/// in.
 #[tokio::test]
 async fn bound_member_retired_after_admission_fails_the_run_typed_before_dispatch() {
     let (handle, run_id, terminal) =
@@ -594,7 +599,8 @@ async fn bound_member_retired_after_admission_fails_the_run_typed_before_dispatc
     assert!(
         matches!(
             failures.as_slice(),
-            [(FlowFailureClass::InsufficientTargets, reason)] if reason.contains("rev-a2")
+            [(FlowFailureClass::InsufficientTargets, reason)]
+                if reason.contains("required 3") && reason.contains("unavailable [rev-a2]")
         ),
         "the shortfall must fail the run once, typed, naming the lost member: {failures:?}"
     );
@@ -604,9 +610,10 @@ async fn bound_member_retired_after_admission_fails_the_run_typed_before_dispatc
     );
 }
 
-/// A bound quorum step runs on the bound members still Active when it
-/// dispatches: the quorum of one is met by `rev-a1` alone after `rev-a2` was
-/// retired, and issue B's reviewer is never substituted in.
+/// A bound quorum step runs on every bound member still Active when it
+/// dispatches, not on the first one: after `rev-a2` was retired, the quorum
+/// of one fans out to both `rev-a1` and `rev-a3`, and issue B's reviewer is
+/// never substituted in.
 #[tokio::test]
 async fn bound_quorum_step_runs_on_the_remaining_bound_members_without_substitution() {
     let (handle, run_id, terminal) =
@@ -615,7 +622,7 @@ async fn bound_quorum_step_runs_on_the_remaining_bound_members_without_substitut
     assert_eq!(terminal.status, MobRunStatus::Completed);
     assert_eq!(
         dispatched_to(&handle, &run_id, "review").await,
-        names(&["rev-a1"])
+        names(&["rev-a1", "rev-a3"])
     );
 }
 
