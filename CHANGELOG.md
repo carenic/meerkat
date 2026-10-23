@@ -391,7 +391,10 @@ them.
     input, `stranded` or `refused`). It is admitted with system origin, is
     ordered only among keyed sends, refuses `render_metadata`, and is refused
     on a governed runtime or a host without a continuation service. Other
-    content under a used key is refused as `input_idempotency_conflict`.
+    content under a used key is refused as `input_idempotency_conflict`. A
+    first commit is bound to the mob the send was admitted against: when that
+    mob is destroyed and created again under the id before the commit, the
+    send answers that the member was not found and commits nothing.
   - `meerkat-runtime`: `IdempotencyKey::caller`, `validate_canonical_key_text`,
     `CanonicalKeyTextError`, `CALLER_IDEMPOTENCY_KEY_MAX_BYTES` (256) and
     `CALLER_IDEMPOTENCY_KEY_NAMESPACE`; `MobDeliveryIdentity::validate` now

@@ -6136,14 +6136,21 @@ impl MobMcpState {
     /// replay answers the first receipt even after the member was replaced.
     /// Only a first commit checks the member: it must exist and hold a
     /// session binding, because a peer-only member would never be served.
-    /// Every answer carries the delivery status read after the commit.
+    /// The commit is bound to the mob incarnation the send was admitted
+    /// against ([`meerkat::ContinuationOwnerService::submit_for_member_incarnation`]),
+    /// as every operator call acts through the handle it was admitted
+    /// against: a mob destroyed and created again under the id in between
+    /// gets nothing committed for its member. Every answer carries the
+    /// delivery status read after the commit.
     ///
     /// # Errors
     /// [`MobError::MemberSendIdempotency`] for an invalid key, a conflict, a
     /// host without a continuation service, a governed runtime, or a status
     /// read that cannot be made; [`MobError::MemberNotFound`] and
     /// [`MobError::DeliveryScopeUnavailable`] for a first commit to a member
-    /// that does not exist or has no session binding.
+    /// that does not exist or has no session binding, and
+    /// [`MobError::MemberNotFound`] when the mob it was admitted against is no
+    /// longer the one under the id.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn mob_member_send_keyed(
         &self,
@@ -6238,7 +6245,7 @@ impl MobMcpState {
             });
         self.pause_agent_call().await;
         let receipt = service
-            .submit(&owner, delivery, committed_at_ms)
+            .submit_for_member_incarnation(&owner, handle.incarnation(), delivery, committed_at_ms)
             .await
             .map_err(|error| match error {
                 meerkat::ContinuationSubmitError::Conflict { existing } => {
