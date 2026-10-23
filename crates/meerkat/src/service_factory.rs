@@ -862,6 +862,20 @@ impl SessionAgent for FactoryAgent {
         Ok(prepared)
     }
 
+    fn acknowledge_head_canonical_compaction_finalization(
+        &mut self,
+        committed: &meerkat_core::SessionHeadMetadataIdentity,
+    ) -> Result<(), meerkat_core::error::AgentError> {
+        self.agent
+            .session_mut()
+            .acknowledge_head_canonical_compaction_finalization(committed)
+            .map_err(|error| {
+                meerkat_core::error::AgentError::InternalError(format!(
+                    "the live session could not adopt its HeadCanonical compaction finalization: {error}"
+                ))
+            })
+    }
+
     fn acknowledge_head_canonical_runtime_boundary(
         &mut self,
         successor_head_token: &str,

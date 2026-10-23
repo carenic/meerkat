@@ -4414,6 +4414,19 @@ impl DriverEntry {
         }
     }
 
+    /// The committed HeadCanonical head authority; see
+    /// `PersistentRuntimeDriver::committed_head_canonical_authority`.
+    pub(crate) async fn committed_head_canonical_authority(
+        &self,
+    ) -> Result<meerkat_core::CommittedSessionBoundaryAuthority, RuntimeDriverError> {
+        match self {
+            DriverEntry::Ephemeral(_) => Err(RuntimeDriverError::Internal(
+                "ephemeral runtime holds no committed HeadCanonical authority".to_string(),
+            )),
+            DriverEntry::Persistent(driver) => driver.committed_head_canonical_authority().await,
+        }
+    }
+
     pub(crate) async fn load_compaction_checkpoint_snapshot(
         &self,
     ) -> Result<Option<Arc<Vec<u8>>>, RuntimeDriverError> {

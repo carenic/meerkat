@@ -913,6 +913,17 @@ impl CoreExecutor for SessionRuntimeExecutor {
             .map_err(|error| CoreExecutorError::Internal(error.to_string()))
     }
 
+    async fn acknowledge_compaction_finalization(
+        &mut self,
+        authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+    ) -> Result<(), CoreExecutorError> {
+        self.runtime
+            .core_session_service()
+            .acknowledge_runtime_compaction_finalization(&self.session_id, authority)
+            .await
+            .map_err(|error| CoreExecutorError::Internal(error.to_string()))
+    }
+
     async fn abort_uncommitted_compaction_projections(&mut self) -> Result<(), CoreExecutorError> {
         self.runtime
             .core_session_service()
@@ -1275,6 +1286,16 @@ impl CoreExecutor for MobRpcRuntimeExecutor {
     ) -> Result<(), CoreExecutorError> {
         self.session_service
             .reconcile_runtime_compaction_projections(&self.session_id, intents.to_vec())
+            .await
+            .map_err(|error| CoreExecutorError::Internal(error.to_string()))
+    }
+
+    async fn acknowledge_compaction_finalization(
+        &mut self,
+        authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+    ) -> Result<(), CoreExecutorError> {
+        self.session_service
+            .acknowledge_runtime_compaction_finalization(&self.session_id, authority)
             .await
             .map_err(|error| CoreExecutorError::Internal(error.to_string()))
     }

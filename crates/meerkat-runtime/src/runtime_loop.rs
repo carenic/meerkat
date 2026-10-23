@@ -656,6 +656,26 @@ pub(crate) async fn reconcile_loaded_compaction_projection_outbox(
                 .mark_compaction_projection_finalized(&intent.projection)
                 .await?;
         }
+        // That metadata-only commit is the store's, so the live actor never
+        // prepared it: its HeadCanonical metadata baseline still names the
+        // head that carried the intents, while its own session already
+        // dropped them in the executor reconciliation above. Adopt the
+        // committed head once every intent is finalized, or the actor's next
+        // boundary preparation names a predecessor the store no longer holds.
+        if !intents.is_empty() {
+            let authority = {
+                let driver = driver.lock().await;
+                driver.committed_head_canonical_authority().await?
+            };
+            executor
+                .acknowledge_compaction_finalization(&authority)
+                .await
+                .map_err(|error| {
+                    crate::RuntimeDriverError::Internal(format!(
+                        "the live actor could not adopt the HeadCanonical compaction finalization: {error}"
+                    ))
+                })?;
+        }
         return Ok(None);
     }
     let authoritative_snapshot = {

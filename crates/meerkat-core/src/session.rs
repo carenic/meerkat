@@ -6968,6 +6968,30 @@ impl Session {
             )
     }
 
+    /// Adopt the runtime's store-owned finalization of committed compaction
+    /// projection intents as this actor's HeadCanonical preparation baseline.
+    ///
+    /// After a compacting run's boundary, the runtime removes the finalized
+    /// intents from the committed head in a metadata-only mutation, and this
+    /// actor removes the same intents from its own map
+    /// ([`Self::complete_compaction_projection_intent`]). So this actor's live
+    /// value for exactly that key, applied to its current baseline, must hash
+    /// to the committed boundary identity; any divergence fails closed.
+    /// Mutation intent for every other key is retained. Adopting a baseline
+    /// that already equals `committed` changes nothing.
+    pub fn acknowledge_head_canonical_compaction_finalization(
+        &mut self,
+        committed: &SessionHeadMetadataIdentity,
+    ) -> Result<(), String> {
+        self.history_caches
+            .head_canonical_metadata
+            .rebase_control_commit_baseline(
+                &[crate::memory::SESSION_COMPACTION_PROJECTION_INTENTS_KEY],
+                &self.metadata,
+                committed,
+            )
+    }
+
     pub(crate) fn validate_head_canonical_metadata_acknowledgement(
         &self,
         projection: &Arc<SessionHeadMetadataProjection>,

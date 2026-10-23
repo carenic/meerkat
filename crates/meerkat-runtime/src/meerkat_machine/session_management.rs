@@ -749,6 +749,15 @@ impl meerkat_core::lifecycle::CoreExecutor for MachineManagedPostStopExecutor {
             .await
     }
 
+    async fn acknowledge_compaction_finalization(
+        &mut self,
+        authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+    ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+        self.inner
+            .acknowledge_compaction_finalization(authority)
+            .await
+    }
+
     async fn abort_uncommitted_compaction_projections(
         &mut self,
     ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {

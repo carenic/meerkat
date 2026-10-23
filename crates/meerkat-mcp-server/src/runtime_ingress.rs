@@ -2718,6 +2718,17 @@ impl CoreExecutor for McpSessionRuntimeExecutor {
             .map_err(|error| CoreExecutorError::Internal(error.to_string()))
     }
 
+    async fn acknowledge_compaction_finalization(
+        &mut self,
+        authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+    ) -> Result<(), CoreExecutorError> {
+        self.context
+            .service
+            .acknowledge_runtime_compaction_finalization(&self.session_id, authority)
+            .await
+            .map_err(|error| CoreExecutorError::Internal(error.to_string()))
+    }
+
     async fn abort_uncommitted_compaction_projections(&mut self) -> Result<(), CoreExecutorError> {
         self.context
             .service

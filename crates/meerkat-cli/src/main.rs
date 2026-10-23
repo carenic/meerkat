@@ -12500,6 +12500,20 @@ impl meerkat_core::lifecycle::CoreExecutor for CliRuntimeExecutor {
             })
     }
 
+    async fn acknowledge_compaction_finalization(
+        &mut self,
+        authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+    ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+        self.service
+            .acknowledge_runtime_compaction_finalization(&self.session_id, authority)
+            .await
+            .map_err(|error| {
+                meerkat_core::lifecycle::core_executor::CoreExecutorError::Internal(
+                    error.to_string(),
+                )
+            })
+    }
+
     async fn abort_uncommitted_compaction_projections(
         &mut self,
     ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
@@ -12775,6 +12789,16 @@ impl SessionService for RunMobSessionService {
     ) -> Result<(), meerkat_core::service::SessionError> {
         self.inner
             .reconcile_runtime_compaction_projections(id, intents)
+            .await
+    }
+
+    async fn acknowledge_runtime_compaction_finalization(
+        &self,
+        id: &SessionId,
+        authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+    ) -> Result<(), meerkat_core::service::SessionError> {
+        self.inner
+            .acknowledge_runtime_compaction_finalization(id, authority)
             .await
     }
 
@@ -16621,6 +16645,16 @@ impl SessionService for MobCliSessionService {
     ) -> Result<(), meerkat_core::service::SessionError> {
         self.inner
             .reconcile_runtime_compaction_projections(id, intents)
+            .await
+    }
+
+    async fn acknowledge_runtime_compaction_finalization(
+        &self,
+        id: &SessionId,
+        authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+    ) -> Result<(), meerkat_core::service::SessionError> {
+        self.inner
+            .acknowledge_runtime_compaction_finalization(id, authority)
             .await
     }
 
