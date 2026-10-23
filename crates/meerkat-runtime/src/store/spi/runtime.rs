@@ -17,7 +17,14 @@
 //!
 //! Which scopes each method names is written beside it; the capture, not the
 //! list, decides what is committed, and a touch outside the list is a typed
-//! refusal. Mob host bindings and their revocations are this adapter's own
+//! refusal.
+//!
+//! **One call, one batch.** Every change one in-memory call makes to a
+//! runtime lands in the same host batch. In particular a run boundary commit
+//! removes the run's provisional tail and consumes its inputs in ONE batch,
+//! as the SQLite store does in one transaction: a resumable run's boundary
+//! has therefore never committed while its tail survives, and the input
+//! requeue on a release relies on it. Mob host bindings and their revocations are this adapter's own
 //! record scopes (the in-memory store does not support them); they follow
 //! the SQLite store's semantics exactly (`SqliteRuntimeStore`'s
 //! `*_mob_host_*` methods).
@@ -850,6 +857,13 @@ impl RuntimeStore for SpiRuntimeStore {
     /// a session of this store while this one serves it.
     fn hosting_capability(&self) -> crate::session_hosting::HostingCapability {
         crate::session_hosting::HostingCapability::ProcessLocal
+    }
+
+    /// The realm's self-fence: its window closes when a renew fails or the
+    /// last successful acquire or renew started more than the lease minus
+    /// the host-declared margin ago.
+    fn self_fence(&self) -> Option<Arc<dyn meerkat_core::host_store::SelfFence>> {
+        Some(Arc::clone(&self.realm) as Arc<dyn meerkat_core::host_store::SelfFence>)
     }
 
     async fn commit_prepared_session_boundary_with_fence(

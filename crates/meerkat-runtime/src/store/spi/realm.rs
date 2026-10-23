@@ -30,8 +30,9 @@
 //! - **Self-fence on the local clock:** a mutation runs only while the last
 //!   renew did not fail and the last successful acquire or renew *started*
 //!   less than the lease minus the host-declared margin ago
-//!   ([`SpiRealmConfig::self_fence_margin`], at least one renew interval:
-//!   [`FenceTiming::self_fence_window`] by default). Otherwise the call
+//!   ([`FenceTiming::self_fence_window`]). The realm is the process's
+//!   [`SelfFence`]: the run loop reads the same window right before each
+//!   model call and each tool dispatch. Otherwise the call
 //!   renews synchronously first, and refuses when that fails. In the steady
 //!   state this is a local clock read: no store I/O is added to a round.
 //!   Every per-round commit of a run (commits A and B) is such a mutation,
@@ -58,7 +59,7 @@ use std::time::{Duration, Instant};
 use meerkat_core::host_store::{
     AcquireMode, CommitBatch, CommitId, FenceTiming, FenceToken, HostStore, HostStoreError,
     MAX_BATCH_BYTES, MAX_ROW_BYTES, Row, RowIndex, ScopeKind, ScopeName, ScopeRef, ScopeUpdate,
-    ScopeVersion,
+    ScopeVersion, SelfFence, SelfFenceWindow,
 };
 use std::sync::atomic::AtomicBool;
 use tokio::sync::{Mutex, OwnedMutexGuard};
@@ -121,14 +122,6 @@ pub struct SpiRealmConfig {
     /// How long an unknown or unavailable commit is retried before the
     /// scopes it touched are poisoned.
     pub commit_retry_budget: Duration,
-    /// The host-declared self-fence margin: writes stop once the last
-    /// successful acquire or renew started more than `lease - margin` ago.
-    /// It must exceed the store's visibility lag (a renew written just
-    /// before a takeover can be invisible to the new holder for that long).
-    /// `None` uses one renew interval
-    /// ([`FenceTiming::self_fence_window`]); a declared margin shorter than
-    /// one renew interval is raised to it.
-    pub self_fence_margin: Option<Duration>,
 }
 
 impl Default for SpiRealmConfig {
@@ -137,27 +130,7 @@ impl Default for SpiRealmConfig {
             acquire: AcquireMode::Exclusive,
             renew_timeout: Duration::from_secs(5),
             commit_retry_budget: Duration::from_secs(30),
-            self_fence_margin: None,
         }
-    }
-}
-
-impl SpiRealmConfig {
-    /// The window after the start of the last successful acquire or renew
-    /// in which this writer may still write, under `timing`.
-    fn self_fence_window(&self, timing: FenceTiming) -> Result<Duration, SpiError> {
-        let margin = self
-            .self_fence_margin
-            .map_or(timing.renew_interval(), |margin| {
-                margin.max(timing.renew_interval())
-            });
-        if margin >= timing.lease() {
-            return Err(SpiError::Misuse(format!(
-                "a self-fence margin of {margin:?} leaves no write window in a lease of {:?}",
-                timing.lease()
-            )));
-        }
-        Ok(timing.lease() - margin)
     }
 }
 
@@ -545,6 +518,16 @@ impl std::fmt::Debug for SpiRealm {
     }
 }
 
+impl SelfFence for SpiRealm {
+    fn window(&self) -> SelfFenceWindow {
+        SelfFenceWindow {
+            elapsed: self.lease_started().elapsed(),
+            window: self.self_fence_window,
+            renew_failed: self.renew_failed.load(Ordering::Acquire),
+        }
+    }
+}
+
 fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
@@ -577,7 +560,7 @@ impl SpiRealm {
         config: SpiRealmConfig,
     ) -> Result<Arc<Self>, SpiError> {
         let timing = host.fence_timing();
-        let self_fence_window = config.self_fence_window(timing)?;
+        let self_fence_window = timing.self_fence_window();
         let started = Instant::now();
         let grant = match host.acquire_fence(config.acquire).await {
             Ok(grant) => grant,
@@ -702,12 +685,11 @@ impl SpiRealm {
     /// Whether this writer may write: its last renew did not fail, and its
     /// last successful acquire or renew started less than the self-fence
     /// window ago (the lease minus the host-declared margin,
-    /// [`SpiRealmConfig::self_fence_margin`]). A local clock read only, no
+    /// [`FenceTiming::self_fence_window`]). A local clock read only, no
     /// store I/O.
     #[must_use]
     pub fn lease_is_live(&self) -> bool {
-        !self.renew_failed.load(Ordering::Acquire)
-            && self.lease_started().elapsed() < self.self_fence_window
+        SelfFence::window(self).is_open()
     }
 
     /// Make sure the local lease is live before a mutation: a no-op while it

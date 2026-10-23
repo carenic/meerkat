@@ -637,27 +637,18 @@ async fn controller_custody_refuses_while_a_commit_is_in_flight() {
 // UNRUN (Policy v1.1).
 #[tokio::test]
 async fn a_host_declared_self_fence_margin_bounds_the_write_window() {
-    let host = Arc::new(TestHost::new());
-    let refused = SpiRealm::open(
-        Arc::clone(&host) as _,
-        SpiRealmConfig {
-            self_fence_margin: Some(Duration::from_secs(30)),
-            ..SpiRealmConfig::default()
-        },
+    use meerkat_core::host_store::SelfFence;
+    let timing = FenceTiming::try_with_margin(
+        Duration::from_secs(10),
+        Duration::from_secs(30),
+        Duration::from_secs(12),
     )
-    .await;
-    assert!(
-        matches!(refused, Err(SpiError::Misuse(_))),
-        "a margin of the whole lease leaves no write window"
-    );
-    let realm = SpiRealm::open(
-        Arc::clone(&host) as _,
-        SpiRealmConfig {
-            self_fence_margin: Some(Duration::from_secs(10)),
-            ..SpiRealmConfig::default()
-        },
-    )
-    .await
-    .expect("a 10 s margin on a 30 s lease opens");
-    assert!(realm.lease_is_live());
+    .expect("a 12 s margin on a 30 s lease");
+    let host = Arc::new(TestHost::with_timing(timing));
+    let (realm, store) = open(&host).await;
+    let window = realm.window();
+    assert_eq!(window.window, Duration::from_secs(18));
+    assert!(window.is_open());
+    let fence = RuntimeStore::self_fence(&store).expect("a host store realm fences itself");
+    assert_eq!(fence.window().window, Duration::from_secs(18));
 }

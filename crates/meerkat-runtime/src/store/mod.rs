@@ -9442,6 +9442,15 @@ pub trait RuntimeStore: Send + Sync {
         crate::session_hosting::HostingCapability::None
     }
 
+    /// The self-fence of a store whose writes hold a host store fence
+    /// ([`meerkat_core::host_store::SelfFence`]), or `None`, the default. The
+    /// run loop's checkpointer reads its window right before each model call
+    /// and each tool dispatch. Decorators must forward their inner store's
+    /// fence.
+    fn self_fence(&self) -> Option<std::sync::Arc<dyn meerkat_core::host_store::SelfFence>> {
+        None
+    }
+
     /// Load the exact generated runtime-delivery authority record.
     async fn load_runtime_delivery_authority(
         &self,
