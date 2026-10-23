@@ -1275,16 +1275,21 @@ impl OpenAiCompatibleClient {
                     // turn is complete and trailing bytes are not a fault -
                     // exactly the reachability this branch had when `Done` was
                     // emitted at `finish_reason`. A partial line cut inside a
-                    // character is as incomplete as any other; the error says
-                    // where its decoding stops instead of replacing the bytes.
+                    // character is as incomplete as any other; the error keeps
+                    // its text up to the cut and says where decoding stops,
+                    // instead of replacing the bytes.
                     if latched_stop.is_none() && !saw_done_sentinel {
-                        let partial = match lines.finish() {
-                            Ok(tail) => tail
-                                .map(|tail| tail.trim().to_owned())
-                                .filter(|tail| !tail.is_empty()),
-                            Err(error) => Some(error.to_string()),
+                        let partial = match String::from_utf8(lines.take_partial_line()) {
+                            Ok(text) => text.trim().to_owned(),
+                            Err(error) => {
+                                let valid = error.utf8_error().valid_up_to();
+                                let mut bytes = error.into_bytes();
+                                bytes.truncate(valid);
+                                let text = String::from_utf8(bytes).unwrap_or_default();
+                                format!("{} (not valid UTF-8 from byte {valid})", text.trim_start())
+                            }
                         };
-                        if let Some(partial) = partial {
+                        if !partial.is_empty() {
                             Err::<(), _>(LlmError::IncompleteResponse {
                                 message: format!(
                                     "chat completions stream ended with an incomplete SSE buffer: {partial}"
@@ -2794,9 +2799,10 @@ mod tests {
 
     /// A stream that ends inside a line before the finish is an incomplete
     /// response, retried like any other cut stream, also when it ends inside a
-    /// character: the error says where decoding stops instead of carrying
-    /// U+FFFD. After the finish the cut bytes are trailing bytes of a complete
-    /// turn. (Fails-old on the message only: it carried U+FFFD.)
+    /// character: the error keeps the line's text up to the cut and says where
+    /// decoding stops, instead of carrying U+FFFD. After the finish the cut
+    /// bytes are trailing bytes of a complete turn. (Fails-old on the message
+    /// only: it carried U+FFFD.)
     #[tokio::test]
     async fn chat_completions_stream_cut_inside_a_character_is_an_incomplete_response() {
         let cut = |payload: &str| {
@@ -2816,7 +2822,8 @@ mod tests {
                     panic!("expected IncompleteResponse, got {error:?}");
                 };
                 assert!(
-                    !message.contains('\u{FFFD}') && message.contains("not valid UTF-8"),
+                    !message.contains('\u{FFFD}')
+                        && message.contains(r#""content":"don (not valid UTF-8 from byte "#),
                     "{message}"
                 );
             }

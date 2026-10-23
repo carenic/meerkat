@@ -43,6 +43,10 @@ pub fn ensure_terminal_done(mut stream: LlmStream<'_>) -> LlmStream<'_> {
 #[derive(Debug, Default)]
 pub struct Utf8LineBuffer {
     bytes: Vec<u8>,
+    /// How many leading bytes are known to hold no `\n`. The next search
+    /// starts there, so a long line that arrives in many chunks has each of
+    /// its bytes searched once.
+    scanned: usize,
 }
 
 impl Utf8LineBuffer {
@@ -51,6 +55,7 @@ impl Utf8LineBuffer {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             bytes: Vec::with_capacity(capacity),
+            scanned: 0,
         }
     }
 
@@ -62,7 +67,15 @@ impl Utf8LineBuffer {
     /// The next complete line, without its `\n`, or `None` while no
     /// complete line is buffered.
     pub fn next_line(&mut self) -> Option<Result<String, LlmError>> {
-        let end = self.bytes.iter().position(|byte| *byte == b'\n')?;
+        let Some(offset) = self.bytes[self.scanned..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+        else {
+            self.scanned = self.bytes.len();
+            return None;
+        };
+        let end = self.scanned + offset;
+        self.scanned = 0;
         let mut line: Vec<u8> = self.bytes.drain(..=end).collect();
         line.pop();
         Some(decode_stream_line(line))
@@ -73,10 +86,20 @@ impl Utf8LineBuffer {
     /// character cut off by the end of the stream is an error, like any
     /// other invalid line.
     pub fn finish(&mut self) -> Result<Option<String>, LlmError> {
-        if self.bytes.is_empty() {
+        let rest = self.take_partial_line();
+        if rest.is_empty() {
             return Ok(None);
         }
-        decode_stream_line(std::mem::take(&mut self.bytes)).map(Some)
+        decode_stream_line(rest).map(Some)
+    }
+
+    /// At the end of the stream, for a reader that only reports what was
+    /// left: the bytes after the last `\n`, undecoded, leaving the buffer
+    /// empty. [`Self::finish`] is the strict form that decodes them as one
+    /// final line.
+    pub fn take_partial_line(&mut self) -> Vec<u8> {
+        self.scanned = 0;
+        std::mem::take(&mut self.bytes)
     }
 }
 
@@ -151,6 +174,26 @@ mod utf8_line_tests {
             Some("data: last \u{1F642}".to_owned())
         );
         assert_eq!(tail.finish().expect("nothing left"), None);
+    }
+
+    /// The bytes after the last line break come back undecoded for a reader
+    /// that only reports them; the buffer is empty after, and reads on.
+    #[test]
+    fn a_partial_line_is_taken_undecoded() {
+        let mut lines = Utf8LineBuffer::default();
+        lines.push(b"data: one\ndata: cut \xE2\x80");
+        assert_eq!(
+            lines.next_line().map(|line| line.expect("valid line")),
+            Some("data: one".to_owned())
+        );
+        assert!(lines.next_line().is_none());
+        assert_eq!(lines.take_partial_line(), b"data: cut \xE2\x80".to_vec());
+        assert_eq!(lines.finish().expect("nothing left"), None);
+        lines.push(b"next\n");
+        assert_eq!(
+            lines.next_line().map(|line| line.expect("valid line")),
+            Some("next".to_owned())
+        );
     }
 }
 
