@@ -500,7 +500,9 @@ surface, not the old live-adapter/docs-refresh snapshot:
   content is never discarded. While a session is held, resume fails with
   JSON-RPC -32003 (`SESSION_NOT_RUNNING`, HTTP 409) and data
   `{durable_resume_hold, session_error_code, session_id, content_retained: true}`:
-  `SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY` (`tail_held_for_recovery`),
+  `SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY` (`tail_held_for_recovery`; an
+  operator resolves an ambiguous held tail with
+  `rkat session resolve-held-tail <session-id>`, then `--apply`),
   `SESSION_DURABLE_TAIL_RECOVERY_REFUSED` (`recovery_refused`, 0.8.11: retry
   after the conflicting runtime quiesces),
   `SESSION_DURABLE_EVIDENCE_QUARANTINED` (`evidence_quarantined`), and

@@ -2967,6 +2967,35 @@ enum SessionCommands {
         json: bool,
     },
 
+    /// Report, and with --apply resolve, a session's held durable tail
+    ///
+    /// Reports why durable-tail recovery holds the session's tail as
+    /// ambiguous (the run's rows, its last stop, the calls without a result,
+    /// the run cursor) and what the repair keeps, answers and ends. With
+    /// --apply, a repair the runtime machine authorizes commits the tail as
+    /// an interrupted run: every row is kept, the open calls are answered as
+    /// outcome unknown, and the inputs bound to the run end. Stop every host
+    /// of the session first: the repair is refused while the persisted
+    /// lifecycle row is not quiescent, and an idle live host is not
+    /// detected. A refusal is never retried.
+    ResolveHeldTail {
+        /// Session ID
+        id: String,
+        /// Commit the repair (default: report only)
+        #[arg(long)]
+        apply: bool,
+        /// Open this runtime database directly instead of the realm's runtime
+        /// store from the CLI scope (a SQLite realm's session database, a
+        /// JSONL realm's `runtime.sqlite3`). Hosts that open one runtime
+        /// SQLite file themselves name it here; the session id must then be
+        /// a full session UUID.
+        #[arg(long, value_name = "FILE")]
+        runtime_store: Option<PathBuf>,
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Export a persisted session as an ATIF trajectory.
     ExportAtif {
         /// Session ID, short handle, or realm-qualified session reference.
@@ -4552,6 +4581,12 @@ async fn cli_main() -> anyhow::Result<ExitCode> {
                 )
                 .await
             }
+            SessionCommands::ResolveHeldTail {
+                id,
+                apply,
+                runtime_store,
+                json,
+            } => resolve_held_tail_session(&id, apply, runtime_store, json, &cli_scope).await,
             SessionCommands::ExportAtif { id, output } => {
                 let destination = export_session_atif(&id, output, &cli_scope).await?;
                 println!("Wrote ATIF trajectory to {}", destination.display());
@@ -17926,6 +17961,338 @@ async fn repair_wholeblob_session(
             }
         }
         Ok(())
+    }
+}
+
+/// Report, and with `apply` resolve, a session's held durable tail
+/// (`rkat session resolve-held-tail`).
+///
+/// A thin wrapper over the runtime's operator primitive
+/// [`meerkat_runtime::recovery::resolve_held_durable_tail`]: the runtime
+/// machine decides whether the repair is authorized, and this command only
+/// opens the store, asks once, and reports. A refusal is never retried.
+async fn resolve_held_tail_session(
+    id: &str,
+    apply: bool,
+    runtime_store: Option<PathBuf>,
+    json: bool,
+    scope: &RuntimeScope,
+) -> anyhow::Result<()> {
+    #[cfg(not(feature = "session-store"))]
+    {
+        let _ = (id, apply, runtime_store, json, scope);
+        anyhow::bail!("resolving a held durable tail requires the session-store feature");
+    }
+    #[cfg(feature = "session-store")]
+    {
+        // As for `repair-wholeblob`, open only the runtime database that
+        // holds the session's durable authority, with none of a host's
+        // open-time maintenance: no realm manifest write, no other store, no
+        // migration, no activation. The database's own rows decide its
+        // persistence profile, so a head-canonical database and a WholeBlob
+        // one both open. No actor can own the session in this process; the
+        // operator stops every host of the session first, and the repair is
+        // refused while the persisted lifecycle row is not quiescent.
+        let (session_id, database) = match runtime_store {
+            Some(path) => {
+                let session_id = SessionId::parse(id).map_err(|error| {
+                    anyhow::anyhow!(
+                        "--runtime-store takes a full session UUID, not a realm-scoped locator: \
+                         '{id}': {error}"
+                    )
+                })?;
+                (session_id, path)
+            }
+            None => (
+                resolve_scoped_session_id(id, scope)?,
+                realm_runtime_database_for_operator(scope)?,
+            ),
+        };
+        let store = meerkat_runtime::store::SqliteRuntimeStore::open_existing(database.clone())
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "cannot open the runtime store {}: {error}",
+                    database.display()
+                )
+            })?;
+        let resolution =
+            meerkat_runtime::recovery::resolve_held_durable_tail(&store, &session_id, apply)
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("the durable tail of session {session_id} stays held: {error}")
+                })?;
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&held_tail_resolution_json(
+                    &session_id,
+                    apply,
+                    &resolution
+                ))?
+            );
+        } else {
+            print_held_tail_resolution(&session_id, &resolution);
+        }
+        match held_tail_resolution_failure(&session_id, &resolution) {
+            Some(failure) => Err(anyhow::anyhow!(failure)),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The realm's runtime database, where the realm's manifest places it: a
+/// SQLite realm keeps its runtime store in the session database, a JSONL
+/// realm in `runtime.sqlite3`. The manifest is read without creating or
+/// updating the realm.
+#[cfg(feature = "session-store")]
+fn realm_runtime_database_for_operator(scope: &RuntimeScope) -> anyhow::Result<PathBuf> {
+    let realm = scope.locator.realm.as_str();
+    let paths = meerkat_store::realm_paths_in(&scope.locator.state_root, realm);
+    let pin = meerkat_store::read_realm_manifest_pin(&paths.manifest_path).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot read the manifest of realm '{realm}' under {}: {error}; point --state-root \
+             at the realms root and --realm at an existing realm, or name the runtime database \
+             with --runtime-store",
+            scope.locator.state_root.display()
+        )
+    })?;
+    let Some(manifest) = pin.as_builtin() else {
+        anyhow::bail!(
+            "an external storage provider owns the runtime store of realm '{realm}'; name its \
+             runtime database with --runtime-store"
+        );
+    };
+    match manifest.backend {
+        // A SQLite realm's runtime store shares the session database.
+        RealmBackend::Sqlite => Ok(paths.sessions_sqlite_path),
+        #[cfg(feature = "jsonl-store")]
+        RealmBackend::Jsonl => Ok(paths.runtime_sqlite_path),
+        // A memory realm keeps nothing durable, and this rkat opens no other
+        // backend's runtime database.
+        #[allow(unreachable_patterns)]
+        other => anyhow::bail!(
+            "realm '{realm}' ({} backend) has no runtime database this rkat can open",
+            other.as_str()
+        ),
+    }
+}
+
+/// The wire name of a durable-tail recovery class.
+#[cfg(feature = "session-store")]
+fn durable_tail_recovery_class_name(
+    class: meerkat_runtime::recovery::DurableTailRecoveryClass,
+) -> &'static str {
+    use meerkat_runtime::recovery::DurableTailRecoveryClass as Class;
+    match class {
+        Class::CompletedCandidate => "completed_candidate",
+        Class::InterruptedRepairableCandidate => "interrupted_repairable_candidate",
+        Class::Ambiguous => "ambiguous",
+        Class::ContinuableCandidate => "continuable_candidate",
+    }
+}
+
+/// The `--json` report of `rkat session resolve-held-tail`.
+#[cfg(feature = "session-store")]
+fn held_tail_resolution_json(
+    session_id: &SessionId,
+    apply: bool,
+    resolution: &meerkat_runtime::recovery::HeldTailResolution,
+) -> serde_json::Value {
+    use meerkat_runtime::recovery::{HeldTailRepairVerdict, HeldTailResolution};
+    let mut report = serde_json::Map::new();
+    report.insert("session_id".into(), session_id.to_string().into());
+    report.insert("apply".into(), apply.into());
+    match resolution {
+        HeldTailResolution::NoTail => {
+            report.insert("resolution".into(), "no_tail".into());
+        }
+        HeldTailResolution::NotHeld { class } => {
+            report.insert("resolution".into(), "not_held".into());
+            report.insert(
+                "class".into(),
+                durable_tail_recovery_class_name(*class).into(),
+            );
+        }
+        HeldTailResolution::HeldOtherwise { reason } => {
+            report.insert("resolution".into(), "held_otherwise".into());
+            report.insert("reason".into(), reason.clone().into());
+        }
+        HeldTailResolution::Ambiguous(repair) => {
+            let (verdict, boundary_sequence) = match repair.verdict {
+                HeldTailRepairVerdict::WouldRepair => ("would_repair", None),
+                HeldTailRepairVerdict::Refused => ("refused", None),
+                HeldTailRepairVerdict::Repaired { boundary_sequence } => {
+                    ("repaired", Some(boundary_sequence))
+                }
+                _ => ("unknown", None),
+            };
+            let facts = &repair.facts;
+            let mut repair_json = serde_json::json!({
+                "candidate_id": repair.candidate_id,
+                "run_id": repair.run_id.to_string(),
+                "facts": {
+                    "run_rows": facts.run_rows,
+                    "last_stop": facts.last_stop,
+                    "dangling_calls": facts.dangling_calls,
+                    "orphan_results": facts.orphan_results,
+                    "rows_after_terminal_reply": facts.rows_after_terminal_reply,
+                    "run_cursor": facts.run_cursor,
+                    "cursor_inputs_bound": facts.cursor_inputs_bound,
+                },
+                "messages_before": repair.messages_before,
+                "messages_after": repair.messages_after,
+                "closed_calls": repair.closed_calls,
+                "terminalized_inputs": repair
+                    .terminalized_inputs
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                "runtime_quiescent": repair.runtime_quiescent,
+                "verdict": verdict,
+            });
+            if let (Some(sequence), Some(object)) = (boundary_sequence, repair_json.as_object_mut())
+            {
+                object.insert("boundary_sequence".into(), sequence.into());
+            }
+            report.insert("resolution".into(), "ambiguous".into());
+            report.insert("repair".into(), repair_json);
+        }
+        _ => {
+            report.insert("resolution".into(), "unknown".into());
+        }
+    }
+    serde_json::Value::Object(report)
+}
+
+/// The human report of `rkat session resolve-held-tail`.
+#[cfg(feature = "session-store")]
+fn print_held_tail_resolution(
+    session_id: &SessionId,
+    resolution: &meerkat_runtime::recovery::HeldTailResolution,
+) {
+    use meerkat_runtime::recovery::{HeldTailRepairVerdict, HeldTailResolution};
+    let yes_no = |value: bool| if value { "yes" } else { "no" };
+    match resolution {
+        HeldTailResolution::NoTail => {
+            println!("session {session_id}: no durable tail is held; nothing to resolve");
+        }
+        HeldTailResolution::NotHeld { class } => {
+            println!(
+                "session {session_id}: the durable tail is not held ({}); ordinary recovery \
+                 commits or continues it when the session next resumes. Nothing was written.",
+                durable_tail_recovery_class_name(*class)
+            );
+        }
+        HeldTailResolution::HeldOtherwise { reason } => {
+            println!(
+                "session {session_id}: the durable tail is held for a reason this command does \
+                 not resolve: {reason}"
+            );
+        }
+        HeldTailResolution::Ambiguous(repair) => {
+            let facts = &repair.facts;
+            println!(
+                "session {session_id}: held durable tail, candidate {}, run {}",
+                repair.candidate_id, repair.run_id
+            );
+            println!("why it is held:");
+            println!("  run rows: {}", facts.run_rows);
+            println!("  last stop: {}", facts.last_stop);
+            println!(
+                "  calls without a result: {} [{}]",
+                facts.dangling_calls.len(),
+                facts.dangling_calls.join(", ")
+            );
+            println!("  results that answer no call: {}", facts.orphan_results);
+            println!(
+                "  rows after the terminal reply: {}",
+                yes_no(facts.rows_after_terminal_reply)
+            );
+            println!(
+                "  run cursor: {}; inputs bound to the run: {}",
+                facts.run_cursor,
+                yes_no(facts.cursor_inputs_bound)
+            );
+            println!("repair:");
+            println!(
+                "  keeps all {} messages ({} after the repair)",
+                repair.messages_before, repair.messages_after
+            );
+            println!(
+                "  answers {} calls as outcome unknown [{}]",
+                repair.closed_calls.len(),
+                repair.closed_calls.join(", ")
+            );
+            println!(
+                "  ends {} inputs bound to the run [{}]",
+                repair.terminalized_inputs.len(),
+                repair
+                    .terminalized_inputs
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            println!(
+                "  persisted lifecycle quiescent: {}",
+                yes_no(repair.runtime_quiescent)
+            );
+            match repair.verdict {
+                HeldTailRepairVerdict::WouldRepair => println!(
+                    "verdict: the runtime machine authorizes the repair; nothing was written. \
+                     Run again with --apply to commit it."
+                ),
+                HeldTailRepairVerdict::Refused => {
+                    println!("verdict: refused; nothing was written");
+                }
+                HeldTailRepairVerdict::Repaired { boundary_sequence } => println!(
+                    "verdict: repaired; the tail is committed as an interrupted run at boundary \
+                     sequence {boundary_sequence}"
+                ),
+                other => println!("verdict: {other:?}"),
+            }
+        }
+        other => println!("session {session_id}: {other:?}"),
+    }
+}
+
+/// The failure a resolution ends `rkat session resolve-held-tail` with, if
+/// any: a tail held for another reason, a refused repair, or an answer this
+/// rkat does not know. The command never retries.
+#[cfg(feature = "session-store")]
+fn held_tail_resolution_failure(
+    session_id: &SessionId,
+    resolution: &meerkat_runtime::recovery::HeldTailResolution,
+) -> Option<String> {
+    use meerkat_runtime::recovery::{HeldTailRepairVerdict, HeldTailResolution};
+    match resolution {
+        HeldTailResolution::NoTail | HeldTailResolution::NotHeld { .. } => None,
+        HeldTailResolution::HeldOtherwise { reason } => Some(format!(
+            "the durable tail of session {session_id} is held for a reason this command does not \
+             resolve: {reason}"
+        )),
+        HeldTailResolution::Ambiguous(repair) => match repair.verdict {
+            HeldTailRepairVerdict::WouldRepair | HeldTailRepairVerdict::Repaired { .. } => None,
+            HeldTailRepairVerdict::Refused if !repair.runtime_quiescent => Some(format!(
+                "the repair of session {session_id}'s held durable tail was refused: the \
+                 persisted lifecycle row is not quiescent (a runtime is attached or running, or \
+                 a run is current); stop every host of the session first, then run the command \
+                 again"
+            )),
+            HeldTailRepairVerdict::Refused => Some(format!(
+                "the repair of session {session_id}'s held durable tail was refused by the \
+                 runtime machine: a prior recovery commit covers or contradicts the tail, or the \
+                 run's inputs are not attributable to it; nothing was written"
+            )),
+            other => Some(format!(
+                "the repair of session {session_id}'s held durable tail answered a verdict this \
+                 rkat does not know: {other:?}"
+            )),
+        },
+        other => Some(format!(
+            "the durable tail of session {session_id} answered a resolution this rkat does not \
+             know: {other:?}"
+        )),
     }
 }
 

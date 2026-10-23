@@ -340,6 +340,7 @@ rkat session list [--limit <N>] [--offset <N>] [--label <KEY=VALUE>]
 rkat session show <SESSION_ID>
 rkat session export-atif <SESSION_ID> [--output <FILE>]
 rkat session repair-wholeblob <SESSION_ID> [--apply [--accept-shorter]] [--runtime-store <FILE>] [--json]
+rkat session resolve-held-tail <SESSION_ID> [--apply] [--runtime-store <FILE>] [--json]
 rkat session delete <SESSION_ID>
 rkat session interrupt <SESSION_ID>
 ```
@@ -355,6 +356,14 @@ committed session boundary.
 `session repair-wholeblob` diagnoses, and with `--apply` repairs, a WholeBlob
 session whose every send reports `reload_required`; see
 [Storage operations](/guides/storage-operations#repair-a-wholeblob-session-wedged-on-its-audited-endpoint).
+
+`session resolve-held-tail` reports why durable-tail recovery holds a
+session's tail as ambiguous (`tail_held_for_recovery`) and what the repair
+keeps, answers and ends. With `--apply` it commits a repair the runtime
+machine authorizes as an interrupted run. Stop every host of the session
+first: the repair is refused while the persisted lifecycle row is not
+quiescent, and an idle live host is not detected. The command never retries.
+See [Storage operations](/guides/storage-operations).
 
 Meerkat supports ordinary durable-state opens from 0.8.10 onward. For an older
 SQLite realm, stop every process that can access it and run the explicit

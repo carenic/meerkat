@@ -816,6 +816,25 @@ them.
   - A call outside an agent-loop round has no key, and every channel omits
     the field.
 
+- `rkat`: `rkat session resolve-held-tail <id> [--apply] [--runtime-store
+  <FILE>] [--json]` resolves a session whose durable tail recovery holds as
+  ambiguous, through `recovery::resolve_held_durable_tail`. It opens only a
+  runtime database: the realm's (a SQLite realm's session database or a
+  JSONL realm's `runtime.sqlite3`, as the realm manifest says, which it only
+  reads), or the file `--runtime-store` names, with a full session UUID. By
+  default it writes nothing to the session and reports why the tail is held
+  (the run's rows, its last stop, the calls without a result, the run
+  cursor), what the repair keeps, answers and ends, whether the persisted
+  lifecycle row is quiescent, and the machine's verdict; `--apply` commits a
+  repair the machine authorizes. It exits non-zero when the tail is held for
+  another reason or the repair is refused (a repair needs every host of the
+  session stopped; an idle live host is not detected), and it never retries.
+  `meerkat-runtime`: `SqliteRuntimeStore::open_existing` opens an existing
+  runtime database in the persistence profile its rows claim, without a
+  host's open-time maintenance: it refuses typed a schema other than this
+  binary's (runtime store, and for head-canonical the co-tenant session
+  store), an unpinned head-canonical profile and a pending activation, and
+  it never migrates, activates or rewrites a boundary.
 - `meerkat_core::host_store`: the host store SPI, a small storage interface
   a host implements so that Core can keep a realm's durable state in the
   host's own database, an append only store such as BigQuery included. A

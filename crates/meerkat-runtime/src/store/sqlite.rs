@@ -11939,16 +11939,112 @@ ORDER BY runtime_id";
             Self::new_whole_blob(path)
         }
 
+        /// Open an EXISTING runtime database for an operator verb, in the
+        /// persistence profile its own rows claim, without the maintenance a
+        /// host's open performs.
+        ///
+        /// A database with a durable head-canonical claim (the profile pin, a
+        /// head-canonical authority or an activation) opens as the
+        /// head-canonical store co-located with its session store; any other
+        /// opens as a WholeBlob runtime database, as
+        /// [`Self::open_existing_whole_blob`] opens it. Read-only preflights
+        /// run first and refuse typed:
+        /// - a missing database (`NotFound`);
+        /// - a runtime-store schema other than this binary's;
+        /// - for a head-canonical database, a co-tenant session-store schema
+        ///   other than this binary's, an unpinned profile, or a
+        ///   head-canonical activation still pending.
+        ///
+        /// A head-canonical database then opens without any of a host's
+        /// open-time maintenance: no schema is created or migrated, no pin is
+        /// written, no activation runs (the owning host stages the realm's
+        /// inline media before it activates), and no runtime authority still
+        /// in the flat boundary form is rewritten (such an authority refuses
+        /// typed at the first read or commit that needs it instead). What
+        /// remains is what any open of the same file writes: the WAL
+        /// journal-mode conversion of a database not yet in WAL mode, and the
+        /// `<file>.mfence` lock sibling and the WAL sidecars.
+        pub fn open_existing(path: impl Into<PathBuf>) -> Result<Self, RuntimeStoreError> {
+            let path = path.into();
+            validate_runtime_database_file(&path)?;
+            if !path.is_file() {
+                return Err(RuntimeStoreError::NotFound(format!(
+                    "no runtime database at {}",
+                    path.display()
+                )));
+            }
+            let head_canonical = {
+                let conn = Self::open_existing_read_only(&path)?;
+                Self::preflight_existing_runtime_schema_in(&conn, &path)?;
+                let head_canonical = head_canonical_profile_has_durable_claim(&conn)?;
+                if head_canonical {
+                    Self::preflight_existing_schema_domain_in(
+                        &conn,
+                        &path,
+                        &meerkat_store::sqlite_store::SESSION_STORE_DOMAIN,
+                        "session-store schema",
+                        "session-store schema ledger entry; open it once with the host that owns it",
+                    )?;
+                    Self::refuse_head_canonical_host_maintenance_in(&conn, &path)?;
+                }
+                head_canonical
+            };
+            if !head_canonical {
+                return Self::new_whole_blob(path);
+            }
+            let (path, execution_custody) = bind_runtime_execution_custody(path)?;
+            Ok(Self::head_canonical_store(path, execution_custody))
+        }
+
+        /// Refuse an operator open of a head-canonical database that a host's
+        /// open would still maintain: an unpinned profile, or a head-canonical
+        /// activation still pending (the skip test of the activation pass).
+        fn refuse_head_canonical_host_maintenance_in(
+            conn: &Connection,
+            path: &Path,
+        ) -> Result<(), RuntimeStoreError> {
+            let pending = || {
+                RuntimeStoreError::Unsupported(format!(
+                    "runtime database {} has a head-canonical activation pending; open it once \
+                     with the host that owns it before resolving a held tail",
+                    path.display()
+                ))
+            };
+            if !head_canonical_profile_is_pinned(conn)? {
+                return Err(pending());
+            }
+            for runtime_id in head_canonical_activation_candidate_ids(conn)? {
+                let authority = load_head_canonical_authority(conn, &runtime_id)?;
+                let marker = load_head_canonical_activation_marker(conn, &runtime_id)?;
+                if !matches!(
+                    (
+                        authority.as_ref(),
+                        marker.as_ref().map(|marker| marker.state)
+                    ),
+                    (Some(_), None | Some(HeadCanonicalActivationState::Complete))
+                ) {
+                    return Err(pending());
+                }
+            }
+            Ok(())
+        }
+
         /// Read the recorded runtime-store schema version over a read-only
         /// connection and refuse an older database typed, so an operator
         /// diagnose never runs a migration.
         fn preflight_existing_runtime_schema_read_only(
             path: &Path,
         ) -> Result<(), RuntimeStoreError> {
+            let conn = Self::open_existing_read_only(path)?;
+            Self::preflight_existing_runtime_schema_in(&conn, path)
+        }
+
+        /// A read-only connection for an operator open's preflights.
+        fn open_existing_read_only(path: &Path) -> Result<Connection, RuntimeStoreError> {
             // #1551: even a read-only connection names sidecars after this
             // path; refuse an unsafe database file before opening it.
             meerkat_sqlite::validate_database_file(path).map_err(map_shared_sqlite_error)?;
-            let conn = Connection::open_with_flags(
+            Connection::open_with_flags(
                 path,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
                     | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -11958,11 +12054,39 @@ ORDER BY runtime_id";
                     "read-only preflight of {} failed: {error}",
                     path.display()
                 ))
-            })?;
+            })
+        }
+
+        fn preflight_existing_runtime_schema_in(
+            conn: &Connection,
+            path: &Path,
+        ) -> Result<(), RuntimeStoreError> {
+            Self::preflight_existing_schema_domain_in(
+                conn,
+                path,
+                &RUNTIME_STORE_DOMAIN,
+                "schema",
+                "runtime-store schema ledger entry; it is not a meerkat runtime store",
+            )
+        }
+
+        /// Compare one schema domain's recorded version with this binary's
+        /// over the caller's read-only connection, refusing an older, newer
+        /// or absent domain typed, so an operator open never migrates or
+        /// creates that domain. `schema` names the domain's version in the
+        /// refusal, and `absent` completes the refusal of a domain with no
+        /// ledger entry.
+        fn preflight_existing_schema_domain_in(
+            conn: &Connection,
+            path: &Path,
+            domain: &meerkat_sqlite::SchemaDomain,
+            schema: &str,
+            absent: &str,
+        ) -> Result<(), RuntimeStoreError> {
             let recorded: Option<i64> = conn
                 .query_row(
                     "SELECT version FROM meerkat_schema WHERE domain = ?1",
-                    [RUNTIME_STORE_DOMAIN.name],
+                    [domain.name],
                     |row| row.get(0),
                 )
                 .optional()
@@ -11972,19 +12096,19 @@ ORDER BY runtime_id";
                         path.display()
                     ))
                 })?;
-            let current = i64::try_from(RUNTIME_STORE_DOMAIN.migrations.len()).unwrap_or(i64::MAX);
+            let current = domain.supported_version();
             match recorded {
                 Some(version) if version == current => Ok(()),
                 Some(version) if version < current => Err(RuntimeStoreError::Unsupported(format!(
-                    "runtime database {} records schema version {version} but this binary expects {current}; the repair does not migrate a store in place, open it once with the gateway that owns it (or a matching rkat run) before repairing",
+                    "runtime database {} records {schema} version {version} but this binary expects {current}; the repair does not migrate a store in place, open it once with the gateway that owns it (or a matching rkat run) before repairing",
                     path.display()
                 ))),
                 Some(version) => Err(RuntimeStoreError::Unsupported(format!(
-                    "runtime database {} records schema version {version}, newer than this binary's {current}; use a matching or newer rkat",
+                    "runtime database {} records {schema} version {version}, newer than this binary's {current}; use a matching or newer rkat",
                     path.display()
                 ))),
                 None => Err(RuntimeStoreError::Unsupported(format!(
-                    "runtime database {} has no runtime-store schema ledger entry; it is not a meerkat runtime store",
+                    "runtime database {} has no {absent}",
                     path.display()
                 ))),
             }
@@ -12094,7 +12218,16 @@ ORDER BY runtime_id";
             repair_flat_physical_head_boundaries(&mut conn)?;
             drop(conn);
             let (path, execution_custody) = bind_runtime_execution_custody(path)?;
-            Ok(Self {
+            Ok(Self::head_canonical_store(path, execution_custody))
+        }
+
+        /// The head-canonical store over its bound database, once the
+        /// database is open and maintained.
+        fn head_canonical_store(
+            path: PathBuf,
+            execution_custody: crate::store::RuntimeStoreExecutionCustody,
+        ) -> Self {
+            Self {
                 path,
                 execution_custody,
                 session_persistence_profile: RuntimeSessionPersistenceProfile::HeadCanonicalV1,
@@ -12112,7 +12245,7 @@ ORDER BY runtime_id";
                 input_persist_ack_loss: crate::store::InputPersistAckLossFault::default(),
                 #[cfg(test)]
                 machine_lifecycle_commit_pause: std::sync::Mutex::new(None),
-            })
+            }
         }
 
         /// Convert a standalone WholeBlob runtime database in place to the
@@ -22488,6 +22621,171 @@ ORDER BY runtime_id";
                     .unwrap()
                     .is_some(),
                 "marker-first retry must install the exact current authority"
+            );
+        }
+
+        fn schema_ledger_version(path: &Path, domain: &str) -> i64 {
+            let conn = Connection::open(path).unwrap();
+            conn.query_row(
+                "SELECT version FROM meerkat_schema WHERE domain = ?1",
+                params![domain],
+                |row| row.get(0),
+            )
+            .unwrap()
+        }
+
+        fn set_schema_ledger_version(path: &Path, domain: &str, version: i64) {
+            let conn = Connection::open(path).unwrap();
+            conn.execute(
+                "UPDATE meerkat_schema SET version = ?2 WHERE domain = ?1",
+                params![domain, version],
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn open_existing_opens_each_database_in_the_profile_its_rows_claim() {
+            let dir = TempDir::new().unwrap();
+            let whole_blob = dir.path().join("runtime.sqlite3");
+            drop(SqliteRuntimeStore::new_whole_blob(&whole_blob).unwrap());
+            let head_canonical = dir.path().join("sessions.sqlite3");
+            drop(SqliteRuntimeStore::new_head_canonical(&head_canonical).unwrap());
+            let head_canonical_before = std::fs::read(&head_canonical).unwrap();
+
+            let opened = SqliteRuntimeStore::open_existing(&whole_blob).unwrap();
+            assert_eq!(
+                RuntimeStore::session_persistence_profile(&opened),
+                RuntimeSessionPersistenceProfile::WholeBlobV1
+            );
+            let opened = SqliteRuntimeStore::open_existing(&head_canonical).unwrap();
+            assert_eq!(
+                RuntimeStore::session_persistence_profile(&opened),
+                RuntimeSessionPersistenceProfile::HeadCanonicalV1
+            );
+            drop(opened);
+            assert_eq!(
+                std::fs::read(&head_canonical).unwrap(),
+                head_canonical_before,
+                "a pinned, activated database opens without any host maintenance"
+            );
+
+            let missing = dir.path().join("missing.sqlite3");
+            assert!(matches!(
+                SqliteRuntimeStore::open_existing(&missing),
+                Err(RuntimeStoreError::NotFound(_))
+            ));
+            assert!(!missing.exists(), "a refused open creates no database");
+        }
+
+        #[test]
+        fn open_existing_refuses_an_older_runtime_schema_without_migrating_it() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("runtime.sqlite3");
+            drop(SqliteRuntimeStore::new_whole_blob(&path).unwrap());
+            let current = schema_ledger_version(&path, RUNTIME_STORE_DOMAIN.name);
+            set_schema_ledger_version(&path, RUNTIME_STORE_DOMAIN.name, current - 1);
+            let before = std::fs::read(&path).unwrap();
+
+            let refused = SqliteRuntimeStore::open_existing(&path);
+            assert!(
+                matches!(
+                    &refused,
+                    Err(RuntimeStoreError::Unsupported(message))
+                        if message.contains("records schema version")
+                ),
+                "{:?}",
+                refused.as_ref().err()
+            );
+            assert_eq!(
+                schema_ledger_version(&path, RUNTIME_STORE_DOMAIN.name),
+                current - 1,
+                "the refused open migrates nothing"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+
+        #[test]
+        fn open_existing_refuses_an_older_session_schema_without_migrating_it() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("sessions.sqlite3");
+            drop(SqliteRuntimeStore::new_head_canonical(&path).unwrap());
+            let session_domain = meerkat_store::sqlite_store::SESSION_STORE_DOMAIN.name;
+            let current = schema_ledger_version(&path, session_domain);
+            set_schema_ledger_version(&path, session_domain, current - 1);
+            let before = std::fs::read(&path).unwrap();
+
+            let refused = SqliteRuntimeStore::open_existing(&path);
+            assert!(
+                matches!(
+                    &refused,
+                    Err(RuntimeStoreError::Unsupported(message))
+                        if message.contains("records session-store schema version")
+                ),
+                "{:?}",
+                refused.as_ref().err()
+            );
+            assert_eq!(
+                schema_ledger_version(&path, session_domain),
+                current - 1,
+                "the refused open migrates nothing"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+
+        #[test]
+        fn open_existing_refuses_a_pending_activation_and_leaves_it_pending() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("sessions.sqlite3");
+            drop(SqliteRuntimeStore::new_head_canonical(&path).unwrap());
+            let session_id = Session::new().id().clone();
+            let runtime_id = LogicalRuntimeId::for_session(&session_id);
+            {
+                let mut conn = open_runtime_connection(&path).unwrap();
+                let tx = begin_runtime_transaction(&mut conn).unwrap();
+                tx.execute(
+                    r"
+                    INSERT INTO runtime_head_canonical_activations (
+                        runtime_id, activation_version, state, session_id,
+                        started_at_ms, updated_at_ms
+                    ) VALUES (?1, 1, 'in_progress', ?2, 1, 1)
+                    ",
+                    params![runtime_id_text(&runtime_id), session_id.to_string()],
+                )
+                .unwrap();
+                tx.commit().unwrap();
+            }
+            let before = std::fs::read(&path).unwrap();
+
+            let refused = SqliteRuntimeStore::open_existing(&path);
+            assert!(
+                matches!(
+                    &refused,
+                    Err(RuntimeStoreError::Unsupported(message))
+                        if message.contains("head-canonical activation pending")
+                ),
+                "{:?}",
+                refused.as_ref().err()
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "the refused open leaves the activation to the owning host"
+            );
+            let conn = Connection::open(&path).unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT state FROM runtime_head_canonical_activations WHERE runtime_id = ?1",
+                    params![runtime_id_text(&runtime_id)],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+                "in_progress"
+            );
+            assert!(
+                load_head_canonical_authority(&conn, &runtime_id)
+                    .unwrap()
+                    .is_none(),
+                "the refused open installs no authority"
             );
         }
 
