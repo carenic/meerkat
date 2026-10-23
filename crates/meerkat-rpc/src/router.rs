@@ -35,7 +35,9 @@ use crate::error;
 use crate::handlers;
 use crate::handlers::RpcResponseExt;
 use crate::protocol::{
-    RpcNotification, RpcRequest, RpcResponse, bounded_collection_limit, bounded_collection_offset,
+    RpcNotification, RpcOutboundAdmission, RpcRequest, RpcResponse, RpcStreamTerminalAdmission,
+    RpcStreamTerminalReservation, bounded_collection_limit, bounded_collection_offset,
+    bounded_stream_terminal_detail,
 };
 use crate::session_runtime::SessionRuntime;
 use meerkat::surface::RequestContext;
@@ -314,6 +316,8 @@ use meerkat_contracts::wire::BlobGetParams;
 #[derive(Clone)]
 pub struct NotificationSink {
     tx: mpsc::Sender<RpcNotification>,
+    outbound_admission: RpcOutboundAdmission,
+    stream_terminal_admission: RpcStreamTerminalAdmission,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -358,21 +362,29 @@ struct MobStreamEventNotificationParams<'a> {
 impl NotificationSink {
     /// Create a new notification sink backed by the given channel sender.
     pub fn new(tx: mpsc::Sender<RpcNotification>) -> Self {
-        Self { tx }
+        Self {
+            tx,
+            outbound_admission: RpcOutboundAdmission::production(),
+            stream_terminal_admission: RpcStreamTerminalAdmission::production(),
+        }
     }
 
     /// Create a no-op sink that discards all notifications.
     /// Used in test/CLI contexts where no RPC transport exists.
     pub fn noop() -> Self {
         let (tx, _rx) = mpsc::channel(1);
-        Self { tx }
+        Self::new(tx)
     }
 
     /// Emit one notification of `method` with `params`, best effort and
     /// without waiting: a full channel or a closed transport drops it.
     /// Returns whether the notification was queued on the connection.
     pub(crate) fn emit_notification<T: Serialize>(&self, method: &str, params: &T) -> bool {
-        match RpcNotification::try_new(method, params) {
+        match RpcNotification::try_new_with_admission(
+            method,
+            params,
+            self.outbound_admission.clone(),
+        ) {
             Ok(notification) => self.tx.try_send(notification).is_ok(),
             Err(error) => {
                 tracing::warn!(error = %error, method, "dropping notification at outbound RPC admission");
@@ -387,7 +399,11 @@ impl NotificationSink {
             session_id: session_id.to_string(),
             event,
         };
-        let notification = match RpcNotification::try_new("session/event", &params) {
+        let notification = match RpcNotification::try_new_with_admission(
+            "session/event",
+            &params,
+            self.outbound_admission.clone(),
+        ) {
             Ok(notification) => notification,
             Err(error) => {
                 tracing::warn!(error = %error, "dropping session event at outbound RPC admission");
@@ -420,7 +436,11 @@ impl NotificationSink {
             session_id: session_id.to_string(),
             event,
         };
-        let notification = match RpcNotification::try_new("session/stream_event", &params) {
+        let notification = match RpcNotification::try_new_with_admission(
+            "session/stream_event",
+            &params,
+            self.outbound_admission.clone(),
+        ) {
             Ok(notification) => notification,
             Err(error) => {
                 tracing::warn!(error = %error, "dropping session stream event at outbound RPC admission");
@@ -452,7 +472,11 @@ impl NotificationSink {
             scope_id,
             scope_path,
         };
-        let notification = match RpcNotification::try_new("session/stream_event", &params) {
+        let notification = match RpcNotification::try_new_with_admission(
+            "session/stream_event",
+            &params,
+            self.outbound_admission.clone(),
+        ) {
             Ok(notification) => notification,
             Err(error) => {
                 tracing::warn!(error = %error, "dropping scoped session stream event at outbound RPC admission");
@@ -463,7 +487,11 @@ impl NotificationSink {
     }
 
     /// Emit a machine-authorized terminal notification for a session stream.
-    async fn emit_session_stream_end(&self, terminal: &SessionStreamTerminalAuthority) {
+    async fn emit_session_stream_end(
+        &self,
+        terminal: &SessionStreamTerminalAuthority,
+        reservation: RpcStreamTerminalReservation,
+    ) {
         let mut params = serde_json::json!({
             "stream_id": terminal.stream_id.as_str(),
             "session_id": terminal.session_id.as_str(),
@@ -486,10 +514,10 @@ impl NotificationSink {
             }
             (None, None) => {}
         }
-        let notification = match RpcNotification::try_new("session/stream_end", &params) {
+        let notification = match reservation.session_notification(&params) {
             Ok(notification) => notification,
             Err(error) => {
-                tracing::warn!(error = %error, "dropping session stream terminal at outbound RPC admission");
+                tracing::warn!(error = %error, "session stream terminal exceeded its reserved wire budget");
                 return;
             }
         };
@@ -512,7 +540,11 @@ impl NotificationSink {
             sequence,
             event,
         };
-        let notification = match RpcNotification::try_new("mob/stream_event", &params) {
+        let notification = match RpcNotification::try_new_with_admission(
+            "mob/stream_event",
+            &params,
+            self.outbound_admission.clone(),
+        ) {
             Ok(notification) => notification,
             Err(error) => {
                 tracing::warn!(error = %error, "dropping mob stream event at outbound RPC admission");
@@ -527,7 +559,11 @@ impl NotificationSink {
     }
 
     #[cfg(feature = "mob")]
-    async fn emit_mob_stream_end(&self, terminal: &MobStreamTerminalAuthority) {
+    async fn emit_mob_stream_end(
+        &self,
+        terminal: &MobStreamTerminalAuthority,
+        reservation: RpcStreamTerminalReservation,
+    ) {
         let mut params = serde_json::json!({
             "stream_id": terminal.stream_id.as_str(),
             "ended": true,
@@ -549,10 +585,10 @@ impl NotificationSink {
             }
             (None, None) => {}
         }
-        let notification = match RpcNotification::try_new("mob/stream_end", &params) {
+        let notification = match reservation.mob_notification(&params) {
             Ok(notification) => notification,
             Err(error) => {
-                tracing::warn!(error = %error, "dropping mob stream terminal at outbound RPC admission");
+                tracing::warn!(error = %error, "mob stream terminal exceeded its reserved wire budget");
                 return;
             }
         };
@@ -601,6 +637,7 @@ impl std::fmt::Display for StreamRef {
 
 struct StreamForwarder {
     terminal: StreamTerminal,
+    terminal_reservation: RpcStreamTerminalReservation,
     state: StreamForwarderState,
 }
 
@@ -753,7 +790,11 @@ async fn attach_stream_forwarder_task(
         }
     }
     if let Some(task) = task {
-        task.abort();
+        // The forwarder can remove itself before its task handle is attached,
+        // while its reserved terminal is waiting for a slow reader. Aborting
+        // here would discard that terminal. Explicit close already signals
+        // stop_tx; terminal sends remain bounded by their reservations.
+        drop(task);
     }
 }
 
@@ -804,6 +845,7 @@ async fn record_session_stream_terminal_authority(
     observation: meerkat_runtime::meerkat_machine::dsl::RpcEventStreamTerminalObservationKind,
     detail: Option<String>,
 ) -> Result<SessionStreamTerminalAuthority, String> {
+    let detail = bounded_stream_terminal_detail(detail);
     let stream_id = stream_id.as_string();
     let mut authority = authority.lock().await;
     let transition = meerkat_runtime::meerkat_machine::dsl::MeerkatMachineMutator::apply(
@@ -856,7 +898,6 @@ async fn emit_authorized_session_stream_terminal(
     let terminal =
         record_session_stream_terminal_authority(stream_authority, &stream_id, observation, detail)
             .await;
-    active_session_streams.lock().await.remove(&stream_id);
     let terminal = match terminal {
         Ok(terminal) => terminal,
         Err(error) => {
@@ -867,7 +908,12 @@ async fn emit_authorized_session_stream_terminal(
             return;
         }
     };
-    notification_sink.emit_session_stream_end(&terminal).await;
+    let forwarder = active_session_streams.lock().await.remove(&stream_id);
+    if let Some(forwarder) = forwarder {
+        notification_sink
+            .emit_session_stream_end(&terminal, forwarder.terminal_reservation)
+            .await;
+    }
 }
 
 async fn resolve_session_stream_close_authority(
@@ -962,6 +1008,7 @@ async fn record_mob_stream_terminal_authority(
     observation: meerkat_runtime::meerkat_machine::dsl::RpcEventStreamTerminalObservationKind,
     detail: Option<String>,
 ) -> Result<MobStreamTerminalAuthority, String> {
+    let detail = bounded_stream_terminal_detail(detail);
     let stream_id = stream_id.as_string();
     let mut authority = authority.lock().await;
     let transition = meerkat_runtime::meerkat_machine::dsl::MeerkatMachineMutator::apply(
@@ -1042,7 +1089,7 @@ async fn emit_authorized_mob_stream_serialization_terminal(
         // No observation variant models a serialization fault yet; the
         // queue-overflow observation is the closest terminal-*error* class
         // (vs. TransportEnded, which would mislabel this as a clean remote
-        // end). The true cause is recorded verbatim in the detail.
+        // end). The cause is recorded in the bounded diagnostic detail.
         meerkat_runtime::meerkat_machine::dsl::RpcEventStreamTerminalObservationKind::NotificationQueueOverflow,
         Some(format!(
             "authoritative mob stream event failed to serialize: {serialize_error}"
@@ -1063,7 +1110,6 @@ async fn emit_authorized_mob_stream_terminal(
     let terminal =
         record_mob_stream_terminal_authority(stream_authority, &stream_id, observation, detail)
             .await;
-    active_mob_streams.lock().await.remove(&stream_id);
     let terminal = match terminal {
         Ok(terminal) => terminal,
         Err(error) => {
@@ -1074,7 +1120,12 @@ async fn emit_authorized_mob_stream_terminal(
             return;
         }
     };
-    notification_sink.emit_mob_stream_end(&terminal).await;
+    let forwarder = active_mob_streams.lock().await.remove(&stream_id);
+    if let Some(forwarder) = forwarder {
+        notification_sink
+            .emit_mob_stream_end(&terminal, forwarder.terminal_reservation)
+            .await;
+    }
 }
 
 async fn resolve_mob_stream_close_authority(
@@ -4605,6 +4656,20 @@ impl MethodRouter {
             }
         };
 
+        let terminal_reservation = match self
+            .notification_sink
+            .stream_terminal_admission
+            .try_reserve()
+        {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                return RpcResponse::error(
+                    id,
+                    error::BUDGET_EXHAUSTED,
+                    format!("Cannot reserve event stream terminal delivery: {error}"),
+                );
+            }
+        };
         let stream_id = StreamRef::mint();
         let open_authority = match resolve_session_stream_open_authority(
             &self.stream_authority,
@@ -4633,6 +4698,7 @@ impl MethodRouter {
             stream_id,
             StreamForwarder {
                 terminal: StreamTerminal::Session(session_id.clone()),
+                terminal_reservation,
                 state: StreamForwarderState::Active {
                     stop_tx: Some(stop_tx),
                     task: None,
@@ -4648,6 +4714,15 @@ impl MethodRouter {
             loop {
                 tokio::select! {
                     _ = &mut stop_rx => {
+                        break;
+                    }
+                    _ = notification_sink.tx.closed() => {
+                        emit_authorized_session_stream_terminal(
+                            &notification_sink, &active_session_streams, &stream_authority,
+                            stream_id_for_task,
+                            meerkat_runtime::meerkat_machine::dsl::RpcEventStreamTerminalObservationKind::NotificationReceiverGone,
+                            Some("transport stream notification receiver closed".to_string()),
+                        ).await;
                         break;
                     }
                     event = stream.next() => {
@@ -4749,15 +4824,17 @@ impl MethodRouter {
                 );
             }
         };
-        if let Some(mut stream) = self.active_session_streams.lock().await.remove(&stream_id) {
-            stop_stream_forwarder(&mut stream);
-        }
-        if let Some(terminal) = close_authority.terminal.as_ref()
-            && !close_authority.already_closed
-        {
-            self.notification_sink
-                .emit_session_stream_end(terminal)
-                .await;
+        // Only the caller receiving the machine terminal effect owns teardown.
+        // An already-closed result emits no replacement effect: its original
+        // issuer may still be waiting to claim this forwarder's reservation.
+        if let Some(terminal) = close_authority.terminal.as_ref() {
+            let stream = self.active_session_streams.lock().await.remove(&stream_id);
+            if let Some(mut stream) = stream {
+                stop_stream_forwarder(&mut stream);
+                self.notification_sink
+                    .emit_session_stream_end(terminal, stream.terminal_reservation)
+                    .await;
+            }
         }
 
         let result = meerkat_contracts::SessionStreamCloseResult {
@@ -4795,6 +4872,16 @@ impl MethodRouter {
         let stream_authority = self.stream_authority.clone();
         let stream_id_for_task = stream_id;
 
+        let terminal_reservation = match notification_sink.stream_terminal_admission.try_reserve() {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                return RpcResponse::error(
+                    id,
+                    error::BUDGET_EXHAUSTED,
+                    format!("Cannot reserve event stream terminal delivery: {error}"),
+                );
+            }
+        };
         let opened = if let Some(agent_identity) = params.agent_identity {
             // Per-member stream: subscribe to a specific member's agent events.
             let identity = meerkat_mob::AgentIdentity::from(agent_identity.as_str());
@@ -4828,6 +4915,7 @@ impl MethodRouter {
                 stream_id,
                 StreamForwarder {
                     terminal: StreamTerminal::Mob,
+                    terminal_reservation,
                     state: StreamForwarderState::Active {
                         stop_tx: Some(stop_tx),
                         task: None,
@@ -4842,6 +4930,15 @@ impl MethodRouter {
                 loop {
                     tokio::select! {
                         _ = &mut stop_rx => {
+                            break;
+                        }
+                        _ = notification_sink.tx.closed() => {
+                            emit_authorized_mob_stream_terminal(
+                                &notification_sink, &active_mob_streams, &stream_authority,
+                                stream_id_for_task,
+                                meerkat_runtime::meerkat_machine::dsl::RpcEventStreamTerminalObservationKind::NotificationReceiverGone,
+                                Some("transport stream notification receiver closed".to_string()),
+                            ).await;
                             break;
                         }
                         event = stream.next() => {
@@ -4932,6 +5029,7 @@ impl MethodRouter {
                 stream_id,
                 StreamForwarder {
                     terminal: StreamTerminal::Mob,
+                    terminal_reservation,
                     state: StreamForwarderState::Active {
                         stop_tx: Some(stop_tx),
                         task: None,
@@ -4945,6 +5043,15 @@ impl MethodRouter {
                 loop {
                     tokio::select! {
                         _ = &mut stop_rx => {
+                            break;
+                        }
+                        _ = notification_sink.tx.closed() => {
+                            emit_authorized_mob_stream_terminal(
+                                &notification_sink, &active_mob_streams, &stream_authority,
+                                stream_id_for_task,
+                                meerkat_runtime::meerkat_machine::dsl::RpcEventStreamTerminalObservationKind::NotificationReceiverGone,
+                                Some("transport stream notification receiver closed".to_string()),
+                            ).await;
                             break;
                         }
                         event = router_handle.event_rx.recv() => {
@@ -5062,13 +5169,16 @@ impl MethodRouter {
                     );
                 }
             };
-        if let Some(mut stream) = self.active_mob_streams.lock().await.remove(&stream_id) {
-            stop_stream_forwarder(&mut stream);
-        }
-        if let Some(terminal) = close_authority.terminal.as_ref()
-            && !close_authority.already_closed
-        {
-            self.notification_sink.emit_mob_stream_end(terminal).await;
+        // Already-closed callers must not abort the issuer that still owns
+        // the machine terminal effect and the pending reservation handoff.
+        if let Some(terminal) = close_authority.terminal.as_ref() {
+            let stream = self.active_mob_streams.lock().await.remove(&stream_id);
+            if let Some(mut stream) = stream {
+                stop_stream_forwarder(&mut stream);
+                self.notification_sink
+                    .emit_mob_stream_end(terminal, stream.terminal_reservation)
+                    .await;
+            }
         }
 
         let result = meerkat_contracts::MobStreamCloseResult {
@@ -8359,57 +8469,161 @@ mod tests {
 
     #[tokio::test]
     async fn session_stream_close_trusts_machine_terminal_over_active_map() {
-        let (router, _notif_rx) = test_router().await;
-
-        let create_resp = router
-            .dispatch(make_request(
-                "session/create",
-                serde_json::json!({
-                    "prompt": "deferred stream terminal fixture",
-                    "initial_turn": "deferred"
-                }),
-            ))
+        for overflow in [false, true] {
+            let (mut router, mut notif_rx) = test_router().await;
+            router.notification_sink.stream_terminal_admission = RpcStreamTerminalAdmission::new(1);
+            let stream_ref = StreamRef::mint();
+            let session_id = SessionId::new();
+            resolve_session_stream_open_authority(
+                &router.stream_authority,
+                &stream_ref,
+                &session_id,
+            )
             .await
             .unwrap();
-        let session_id = result_value(&create_resp)["session_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
+            router.active_session_streams.lock().await.insert(
+                stream_ref,
+                reserved_test_stream_forwarder(
+                    &router.notification_sink,
+                    StreamTerminal::Session(session_id.clone()),
+                ),
+            );
+            let (recorded_tx, recorded_rx) = oneshot::channel();
+            let (resume_tx, resume_rx) = oneshot::channel();
+            let (delivered_tx, delivered_rx) = oneshot::channel();
+            let task = tokio::spawn({
+                let authority = router.stream_authority.clone();
+                let streams = router.active_session_streams.clone();
+                let sink = router.notification_sink.clone();
+                async move {
+                    let (observation, detail) = if overflow {
+                        (
+                            meerkat_runtime::meerkat_machine::dsl::RpcEventStreamTerminalObservationKind::NotificationQueueOverflow,
+                            Some("synthetic queue overflow".to_string()),
+                        )
+                    } else {
+                        (
+                            meerkat_runtime::meerkat_machine::dsl::RpcEventStreamTerminalObservationKind::TransportEnded,
+                            None,
+                        )
+                    };
+                    let terminal = record_session_stream_terminal_authority(
+                        &authority,
+                        &stream_ref,
+                        observation,
+                        detail,
+                    )
+                    .await
+                    .unwrap();
+                    // Pause at the real forwarder's boundary between recording
+                    // the machine effect and claiming its physical reservation.
+                    recorded_tx.send(()).unwrap();
+                    resume_rx.await.unwrap();
+                    let forwarder = streams
+                        .lock()
+                        .await
+                        .remove(&stream_ref)
+                        .expect("the terminal sender still owns its reservation");
+                    sink.emit_session_stream_end(&terminal, forwarder.terminal_reservation)
+                        .await;
+                    delivered_tx.send(()).unwrap();
+                }
+            });
+            attach_stream_forwarder_task(&router.active_session_streams, stream_ref, task).await;
+            tokio::time::timeout(Duration::from_secs(1), recorded_rx)
+                .await
+                .unwrap()
+                .unwrap();
 
-        let open_resp = router
-            .dispatch(make_request(
-                "session/stream_open",
-                serde_json::json!({ "session_id": session_id }),
-            ))
-            .await
-            .unwrap();
-        let stream_id = result_value(&open_resp)["stream_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let stream_ref = StreamRef::parse(&stream_id).unwrap();
-        assert_eq!(router.active_session_streams.lock().await.len(), 1);
-
-        record_session_stream_terminal_authority(
-            &router.stream_authority,
-            &stream_ref,
-            meerkat_runtime::meerkat_machine::dsl::RpcEventStreamTerminalObservationKind::TransportEnded,
-            None,
-        )
-        .await
-        .expect("machine should accept remote terminal observation");
-
-        let close_resp = router
-            .dispatch(make_request(
-                "session/stream_close",
-                serde_json::json!({ "stream_id": stream_id }),
-            ))
-            .await
-            .unwrap();
-        let closed = result_value(&close_resp);
-        assert_eq!(closed["closed"], true);
-        assert_eq!(closed["already_closed"], true);
-        assert_eq!(router.active_session_streams.lock().await.len(), 0);
+            for _ in 0..2 {
+                let close_resp = router
+                    .dispatch(make_request(
+                        "session/stream_close",
+                        serde_json::json!({ "stream_id": stream_ref.as_string() }),
+                    ))
+                    .await
+                    .unwrap();
+                let closed = result_value(&close_resp);
+                assert_eq!(closed["closed"], true);
+                assert_eq!(closed["already_closed"], true);
+                assert!(
+                    router
+                        .active_session_streams
+                        .lock()
+                        .await
+                        .contains_key(&stream_ref),
+                    "already-closed callers must not abort the authoritative terminal sender"
+                );
+                assert!(
+                    router
+                        .notification_sink
+                        .stream_terminal_admission
+                        .try_reserve()
+                        .is_err(),
+                    "pending terminal custody must retain the bounded reservation"
+                );
+                assert!(
+                    notif_rx.try_recv().is_err(),
+                    "close must not fabricate a replacement terminal"
+                );
+            }
+            resume_tx
+                .send(())
+                .expect("close must leave the terminal sender alive");
+            tokio::time::timeout(Duration::from_secs(1), delivered_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            let terminal = notif_rx.try_recv().expect("original terminal delivered");
+            assert_eq!(terminal.method, "session/stream_end");
+            assert_eq!(
+                notification_params!(terminal)["stream_id"],
+                stream_ref.as_string()
+            );
+            assert_eq!(
+                notification_params!(terminal)["session_id"],
+                session_id.to_string()
+            );
+            assert_eq!(
+                notification_params!(terminal)["outcome"],
+                if overflow {
+                    "terminal_error"
+                } else {
+                    "remote_end"
+                }
+            );
+            if overflow {
+                assert_eq!(
+                    notification_params!(terminal)["error"]["code"],
+                    "stream_queue_overflow"
+                );
+                assert_eq!(
+                    notification_params!(terminal)["error"]["message"],
+                    "synthetic queue overflow"
+                );
+            }
+            assert!(router.active_session_streams.lock().await.is_empty());
+            assert!(
+                notif_rx.try_recv().is_err(),
+                "terminal must be delivered only once"
+            );
+            assert!(
+                router
+                    .notification_sink
+                    .stream_terminal_admission
+                    .try_reserve()
+                    .is_err(),
+                "the queued terminal retains its reservation until written or dropped"
+            );
+            drop(terminal);
+            assert!(
+                router
+                    .notification_sink
+                    .stream_terminal_admission
+                    .try_reserve()
+                    .is_ok()
+            );
+        }
     }
 
     #[tokio::test]
@@ -10555,6 +10769,523 @@ mod tests {
         assert_eq!(first.method, "session/stream_event");
     }
 
+    fn reserved_test_stream_forwarder(
+        sink: &NotificationSink,
+        terminal: StreamTerminal,
+    ) -> StreamForwarder {
+        StreamForwarder {
+            terminal,
+            terminal_reservation: sink
+                .stream_terminal_admission
+                .try_reserve()
+                .expect("terminal reservation"),
+            state: StreamForwarderState::Active {
+                stop_tx: None,
+                task: None,
+            },
+        }
+    }
+
+    async fn assert_idempotent_close_preserves_pending_terminal(terminal: StreamTerminal) {
+        let (mut router, mut notif_rx) = test_router().await;
+        router.notification_sink.stream_terminal_admission = RpcStreamTerminalAdmission::new(1);
+        let router = Arc::new(router);
+        let stream_ref = StreamRef::mint();
+        let (streams, close_method, terminal_method) = match &terminal {
+            StreamTerminal::Session(session_id) => {
+                resolve_session_stream_open_authority(
+                    &router.stream_authority,
+                    &stream_ref,
+                    session_id,
+                )
+                .await
+                .unwrap();
+                (
+                    router.active_session_streams.clone(),
+                    "session/stream_close",
+                    "session/stream_end",
+                )
+            }
+            #[cfg(feature = "mob")]
+            StreamTerminal::Mob => {
+                resolve_mob_stream_open_authority(&router.stream_authority, &stream_ref)
+                    .await
+                    .unwrap();
+                (
+                    router.active_mob_streams.clone(),
+                    "mob/stream_close",
+                    "mob/stream_end",
+                )
+            }
+        };
+        streams.lock().await.insert(
+            stream_ref,
+            reserved_test_stream_forwarder(&router.notification_sink, terminal.clone()),
+        );
+        // Stop the first real close handler after it obtains the canonical
+        // terminal effect but before it can take the physical reservation.
+        let streams_guard = streams.lock().await;
+        let first_close = tokio::spawn({
+            let router = router.clone();
+            async move {
+                router
+                    .dispatch(make_request(
+                        close_method,
+                        serde_json::json!({ "stream_id": stream_ref.as_string() }),
+                    ))
+                    .await
+                    .unwrap()
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let closed = {
+                    let authority = router.stream_authority.lock().await;
+                    match &terminal {
+                        StreamTerminal::Session(_) => authority
+                            .state()
+                            .closed_session_event_streams
+                            .contains(&stream_ref.as_string()),
+                        #[cfg(feature = "mob")]
+                        StreamTerminal::Mob => authority
+                            .state()
+                            .closed_mob_event_streams
+                            .contains(&stream_ref.as_string()),
+                    }
+                };
+                if closed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first close has the machine terminal effect");
+        let repeated_close = tokio::time::timeout(
+            Duration::from_secs(1),
+            router.dispatch(make_request(
+                close_method,
+                serde_json::json!({ "stream_id": stream_ref.as_string() }),
+            )),
+        )
+        .await
+        .expect("already-closed caller must not compete for terminal custody")
+        .unwrap();
+        assert_eq!(result_value(&repeated_close)["closed"], true);
+        assert_eq!(result_value(&repeated_close)["already_closed"], true);
+        assert!(streams_guard.contains_key(&stream_ref));
+        assert!(!first_close.is_finished());
+        assert!(
+            router
+                .notification_sink
+                .stream_terminal_admission
+                .try_reserve()
+                .is_err()
+        );
+        drop(streams_guard);
+        let first_close = tokio::time::timeout(Duration::from_secs(1), first_close)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result_value(&first_close)["closed"], true);
+        assert_eq!(result_value(&first_close)["already_closed"], false);
+        let notification = notif_rx
+            .try_recv()
+            .expect("canonical explicit-close terminal");
+        assert_eq!(notification.method, terminal_method);
+        assert_eq!(
+            notification_params!(notification)["stream_id"],
+            stream_ref.as_string()
+        );
+        assert_eq!(
+            notification_params!(notification)["outcome"],
+            "explicit_close"
+        );
+        assert!(streams.lock().await.is_empty());
+        assert!(
+            notif_rx.try_recv().is_err(),
+            "only the effect owner emits a terminal"
+        );
+        assert!(
+            router
+                .notification_sink
+                .stream_terminal_admission
+                .try_reserve()
+                .is_err()
+        );
+        drop(notification);
+        assert!(
+            router
+                .notification_sink
+                .stream_terminal_admission
+                .try_reserve()
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_stream_idempotent_close_preserves_pending_explicit_terminal() {
+        assert_idempotent_close_preserves_pending_terminal(StreamTerminal::Session(
+            SessionId::new(),
+        ))
+        .await;
+    }
+
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn mob_stream_idempotent_close_preserves_pending_explicit_terminal() {
+        assert_idempotent_close_preserves_pending_terminal(StreamTerminal::Mob).await;
+    }
+
+    #[tokio::test]
+    async fn stream_task_attachment_preserves_pending_terminal_delivery() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut sink = NotificationSink::new(tx);
+        sink.stream_terminal_admission = RpcStreamTerminalAdmission::new(1);
+        let authority = Arc::new(Mutex::new(new_rpc_stream_authority()));
+        let active_streams = Arc::new(Mutex::new(HashMap::new()));
+        let session_id = SessionId::new();
+        let stream_id = StreamRef::mint();
+        active_streams.lock().await.insert(
+            stream_id,
+            reserved_test_stream_forwarder(&sink, StreamTerminal::Session(session_id.clone())),
+        );
+        resolve_session_stream_open_authority(&authority, &stream_id, &session_id)
+            .await
+            .unwrap();
+        assert!(sink.emit_notification("synthetic/occupied", &serde_json::json!({})));
+        let task = tokio::spawn({
+            let sink = sink.clone();
+            let authority = authority.clone();
+            let active_streams = active_streams.clone();
+            async move {
+                emit_authorized_session_stream_terminal(&sink, &active_streams, &authority,
+                    stream_id, meerkat_runtime::meerkat_machine::dsl::RpcEventStreamTerminalObservationKind::TransportEnded, None).await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !active_streams.lock().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("forwarder reaches terminal send before handle attachment");
+        attach_stream_forwarder_task(&active_streams, stream_id, task).await;
+        drop(rx.recv().await.expect("occupied notification"));
+        let terminal = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("late task attachment must not abort terminal delivery")
+            .unwrap();
+        assert_eq!(terminal.method, "session/stream_end");
+        assert_eq!(notification_params!(terminal)["outcome"], "remote_end");
+        drop(terminal);
+        assert!(sink.stream_terminal_admission.try_reserve().is_ok());
+    }
+
+    #[tokio::test]
+    async fn closed_transport_releases_terminal_reservation() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let mut sink = NotificationSink::new(tx);
+        sink.stream_terminal_admission = RpcStreamTerminalAdmission::new(1);
+        let authority = Arc::new(Mutex::new(new_rpc_stream_authority()));
+        let active_streams = Arc::new(Mutex::new(HashMap::new()));
+        let session_id = SessionId::new();
+        let stream_id = StreamRef::mint();
+        active_streams.lock().await.insert(
+            stream_id,
+            reserved_test_stream_forwarder(&sink, StreamTerminal::Session(session_id.clone())),
+        );
+        resolve_session_stream_open_authority(&authority, &stream_id, &session_id)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), emit_authorized_session_stream_terminal(
+            &sink, &active_streams, &authority, stream_id,
+            meerkat_runtime::meerkat_machine::dsl::RpcEventStreamTerminalObservationKind::NotificationReceiverGone,
+            Some("transport receiver closed".to_string()))).await.expect("closed transport cannot retain the slot");
+        assert!(active_streams.lock().await.is_empty());
+        assert!(sink.stream_terminal_admission.try_reserve().is_ok());
+    }
+
+    #[tokio::test]
+    async fn session_stream_terminal_survives_production_count_and_byte_admission_saturation() {
+        for (message_count, wire_bytes) in [(256, 1), (8, 8 * 1024 * 1024)] {
+            // Exercise the real production byte/count admission, isolated so
+            // parallel tests do not starve each other's process-global pool.
+            // The notification queue itself has normal production capacity.
+            let admission = RpcOutboundAdmission::isolated_production();
+            let (tx, mut rx) = mpsc::channel(crate::NOTIFICATION_CHANNEL_CAPACITY);
+            let mut sink = NotificationSink::new(tx);
+            sink.outbound_admission = admission.clone();
+            sink.stream_terminal_admission = RpcStreamTerminalAdmission::new(1);
+            let authority = Arc::new(Mutex::new(new_rpc_stream_authority()));
+            let active_streams = Arc::new(Mutex::new(HashMap::new()));
+            let session_id = SessionId::new();
+            let stream_id = StreamRef::mint();
+            active_streams.lock().await.insert(
+                stream_id,
+                reserved_test_stream_forwarder(&sink, StreamTerminal::Session(session_id.clone())),
+            );
+            resolve_session_stream_open_authority(&authority, &stream_id, &session_id)
+                .await
+                .expect("stream admitted before data saturation");
+            let held: Vec<_> = (0..message_count)
+                .map(|_| {
+                    admission
+                        .try_admit(wire_bytes)
+                        .expect("production data permit")
+                })
+                .collect();
+            assert!(matches!(
+                admission.try_admit(1),
+                Err(crate::protocol::RpcOutboundAdmissionError::Backpressured { .. })
+            ));
+            let event = EventEnvelope::new_session(
+                session_id.clone(),
+                1,
+                None,
+                AgentEvent::TextDelta {
+                    delta: "synthetic burst".to_string(),
+                    assistant_message_id: None,
+                },
+            );
+            let emit = tokio::time::timeout(
+                Duration::from_secs(1),
+                sink.emit_session_stream_event(&stream_id, 1, &session_id, &event),
+            )
+            .await
+            .expect("data producer must not wait for admission");
+            assert_eq!(emit, StreamEmitStatus::Overflow);
+            let (observation, detail) = terminal_observation_from_emit_status(emit).unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                emit_authorized_session_stream_terminal(
+                    &sink,
+                    &active_streams,
+                    &authority,
+                    stream_id,
+                    observation,
+                    Some(detail.to_string()),
+                ),
+            )
+            .await
+            .expect("reserved terminal can queue while all data permits remain held");
+            let notification = rx.try_recv().expect("overflow has an observable terminal");
+            assert_eq!(notification.method, "session/stream_end");
+            assert_eq!(
+                notification_params!(notification)["outcome"],
+                "terminal_error"
+            );
+            assert_eq!(
+                notification_params!(notification)["error"]["code"],
+                "stream_queue_overflow"
+            );
+            assert!(active_streams.lock().await.is_empty());
+            assert!(
+                admission.try_admit(1).is_err(),
+                "test still holds the full data budget"
+            );
+            assert!(
+                sink.stream_terminal_admission.try_reserve().is_err(),
+                "queued terminal retains its slot"
+            );
+            drop(notification);
+            assert!(sink.stream_terminal_admission.try_reserve().is_ok());
+            drop(held);
+        }
+    }
+
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn mob_stream_terminal_survives_production_admission_saturation() {
+        let admission = RpcOutboundAdmission::isolated_production();
+        let (tx, mut rx) = mpsc::channel(crate::NOTIFICATION_CHANNEL_CAPACITY);
+        let mut sink = NotificationSink::new(tx);
+        sink.outbound_admission = admission.clone();
+        sink.stream_terminal_admission = RpcStreamTerminalAdmission::new(1);
+        let authority = Arc::new(Mutex::new(new_rpc_stream_authority()));
+        let active_streams = Arc::new(Mutex::new(HashMap::new()));
+        let stream_id = StreamRef::mint();
+        active_streams.lock().await.insert(
+            stream_id,
+            reserved_test_stream_forwarder(&sink, StreamTerminal::Mob),
+        );
+        resolve_mob_stream_open_authority(&authority, &stream_id)
+            .await
+            .expect("admitted mob stream");
+        let held: Vec<_> = (0..256)
+            .map(|_| admission.try_admit(1).expect("data permit"))
+            .collect();
+        let emit = sink
+            .emit_mob_stream_event(&stream_id, 1, &serde_json::json!({"type": "synthetic"}))
+            .await;
+        assert_eq!(emit, StreamEmitStatus::Overflow);
+        let (observation, detail) = terminal_observation_from_emit_status(emit).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            emit_authorized_mob_stream_terminal(
+                &sink,
+                &active_streams,
+                &authority,
+                stream_id,
+                observation,
+                Some(detail.to_string()),
+            ),
+        )
+        .await
+        .expect("mob terminal bypasses saturated data admission");
+        let terminal = rx.try_recv().expect("mob terminal queued");
+        assert_eq!(terminal.method, "mob/stream_end");
+        assert_eq!(
+            notification_params!(terminal)["error"]["code"],
+            "stream_queue_overflow"
+        );
+        assert!(admission.try_admit(1).is_err());
+        assert!(active_streams.lock().await.is_empty());
+        drop(terminal);
+        assert!(sink.stream_terminal_admission.try_reserve().is_ok());
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn session_stream_open_refuses_unfunded_terminals_and_reuses_written_capacity() {
+        let (mut router, mut rx) = test_router().await;
+        router.notification_sink.stream_terminal_admission = RpcStreamTerminalAdmission::new(1);
+        let create = router
+            .dispatch(make_request(
+                "session/create",
+                serde_json::json!({
+                    "prompt": "synthetic deferred stream", "initial_turn": "deferred"
+                }),
+            ))
+            .await
+            .unwrap();
+        let session_id = result_value(&create)["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let open = router
+            .dispatch(make_request(
+                "session/stream_open",
+                serde_json::json!({"session_id": session_id}),
+            ))
+            .await
+            .unwrap();
+        let stream_id = result_value(&open)["stream_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let rejected = router
+            .dispatch(make_request(
+                "session/stream_open",
+                serde_json::json!({"session_id": session_id}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(error_code(&rejected), error::BUDGET_EXHAUSTED);
+        assert_eq!(router.active_session_streams.lock().await.len(), 1);
+        let close = router
+            .dispatch(make_request(
+                "session/stream_close",
+                serde_json::json!({"stream_id": stream_id}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(result_value(&close)["closed"], true);
+        let terminal = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let notification = rx.recv().await.expect("notification receiver");
+                if notification.method == "session/stream_end" {
+                    break notification;
+                }
+            }
+        })
+        .await
+        .expect("explicit close terminal");
+        let still_full = router
+            .dispatch(make_request(
+                "session/stream_open",
+                serde_json::json!({"session_id": session_id}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(error_code(&still_full), error::BUDGET_EXHAUSTED);
+        drop(terminal);
+        let reopened = router
+            .dispatch(make_request(
+                "session/stream_open",
+                serde_json::json!({"session_id": session_id}),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            reopened.error.is_none(),
+            "written terminal releases admission"
+        );
+        let new_id = result_value(&reopened)["stream_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        router
+            .dispatch(make_request(
+                "session/stream_close",
+                serde_json::json!({"stream_id": new_id}),
+            ))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn disconnected_idle_session_stream_releases_terminal_capacity() {
+        let (mut router, rx) = test_router().await;
+        router.notification_sink.stream_terminal_admission = RpcStreamTerminalAdmission::new(1);
+        let create = router
+            .dispatch(make_request(
+                "session/create",
+                serde_json::json!({
+                    "prompt": "synthetic idle stream", "initial_turn": "deferred"
+                }),
+            ))
+            .await
+            .unwrap();
+        let session_id = result_value(&create)["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let open = router
+            .dispatch(make_request(
+                "session/stream_open",
+                serde_json::json!({"session_id": session_id}),
+            ))
+            .await
+            .unwrap();
+        assert!(open.error.is_none());
+        assert!(
+            router
+                .notification_sink
+                .stream_terminal_admission
+                .try_reserve()
+                .is_err()
+        );
+        drop(rx);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if router
+                    .notification_sink
+                    .stream_terminal_admission
+                    .try_reserve()
+                    .is_ok()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("disconnect releases capacity even without another source event");
+        assert!(router.active_session_streams.lock().await.is_empty());
+    }
+
     #[tokio::test]
     async fn session_stream_overflow_emits_terminal_error_outcome() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -10563,6 +11294,10 @@ mod tests {
         let active_streams = Arc::new(Mutex::new(HashMap::new()));
         let session_id = SessionId::new();
         let stream_id = StreamRef::mint();
+        active_streams.lock().await.insert(
+            stream_id,
+            reserved_test_stream_forwarder(&sink, StreamTerminal::Session(session_id.clone())),
+        );
         resolve_session_stream_open_authority(&authority, &stream_id, &session_id)
             .await
             .expect("machine should accept session stream open");
@@ -10749,6 +11484,10 @@ mod tests {
         let authority = Arc::new(Mutex::new(new_rpc_stream_authority()));
         let active_streams = Arc::new(Mutex::new(HashMap::new()));
         let stream_id = StreamRef::mint();
+        active_streams.lock().await.insert(
+            stream_id,
+            reserved_test_stream_forwarder(&sink, StreamTerminal::Mob),
+        );
         resolve_mob_stream_open_authority(&authority, &stream_id)
             .await
             .expect("machine should accept mob stream open");
@@ -11449,64 +12188,145 @@ mod tests {
     #[cfg(feature = "mob")]
     #[tokio::test]
     async fn mob_stream_close_trusts_machine_terminal_over_active_map() {
-        let (router, _notif_rx) = test_router().await;
+        for overflow in [false, true] {
+            let (mut router, mut notif_rx) = test_router().await;
+            router.notification_sink.stream_terminal_admission = RpcStreamTerminalAdmission::new(1);
+            let stream_ref = StreamRef::mint();
+            resolve_mob_stream_open_authority(&router.stream_authority, &stream_ref)
+                .await
+                .unwrap();
+            router.active_mob_streams.lock().await.insert(
+                stream_ref,
+                reserved_test_stream_forwarder(&router.notification_sink, StreamTerminal::Mob),
+            );
+            let (recorded_tx, recorded_rx) = oneshot::channel();
+            let (resume_tx, resume_rx) = oneshot::channel();
+            let (delivered_tx, delivered_rx) = oneshot::channel();
+            let task = tokio::spawn({
+                let authority = router.stream_authority.clone();
+                let streams = router.active_mob_streams.clone();
+                let sink = router.notification_sink.clone();
+                async move {
+                    let (observation, detail) = if overflow {
+                        (
+                            meerkat_runtime::meerkat_machine::dsl::RpcEventStreamTerminalObservationKind::NotificationQueueOverflow,
+                            Some("synthetic queue overflow".to_string()),
+                        )
+                    } else {
+                        (
+                            meerkat_runtime::meerkat_machine::dsl::RpcEventStreamTerminalObservationKind::TransportEnded,
+                            None,
+                        )
+                    };
+                    let terminal = record_mob_stream_terminal_authority(
+                        &authority,
+                        &stream_ref,
+                        observation,
+                        detail,
+                    )
+                    .await
+                    .unwrap();
+                    recorded_tx.send(()).unwrap();
+                    resume_rx.await.unwrap();
+                    let forwarder = streams
+                        .lock()
+                        .await
+                        .remove(&stream_ref)
+                        .expect("the terminal sender still owns its reservation");
+                    sink.emit_mob_stream_end(&terminal, forwarder.terminal_reservation)
+                        .await;
+                    delivered_tx.send(()).unwrap();
+                }
+            });
+            attach_stream_forwarder_task(&router.active_mob_streams, stream_ref, task).await;
+            tokio::time::timeout(Duration::from_secs(1), recorded_rx)
+                .await
+                .unwrap()
+                .unwrap();
 
-        let create_resp = router
-            .dispatch(make_request(
-                "mob/create",
-                serde_json::json!({
-                    "definition": {
-                        "id": "stale-active-mob",
-                        "profiles": {
-                            "worker": {
-                                "model": "claude-sonnet-4-6",
-                                "tools": { "comms": true }
-                            }
-                        }
-                    }
-                }),
-            ))
-            .await
-            .unwrap();
-        let mob_id = result_value(&create_resp)["mob_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-
-        let open_resp = router
-            .dispatch(make_request(
-                "mob/stream_open",
-                serde_json::json!({ "mob_id": mob_id }),
-            ))
-            .await
-            .unwrap();
-        let stream_id = result_value(&open_resp)["stream_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let stream_ref = StreamRef::parse(&stream_id).unwrap();
-        assert_eq!(router.active_mob_streams.lock().await.len(), 1);
-
-        record_mob_stream_terminal_authority(
-            &router.stream_authority,
-            &stream_ref,
-            meerkat_runtime::meerkat_machine::dsl::RpcEventStreamTerminalObservationKind::TransportEnded,
-            None,
-        )
-        .await
-        .expect("machine should accept mob terminal observation");
-
-        let close_resp = router
-            .dispatch(make_request(
-                "mob/stream_close",
-                serde_json::json!({ "stream_id": stream_id }),
-            ))
-            .await
-            .unwrap();
-        let closed = result_value(&close_resp);
-        assert_eq!(closed["closed"], true);
-        assert_eq!(closed["already_closed"], true);
-        assert_eq!(router.active_mob_streams.lock().await.len(), 0);
+            for _ in 0..2 {
+                let close_resp = router
+                    .dispatch(make_request(
+                        "mob/stream_close",
+                        serde_json::json!({ "stream_id": stream_ref.as_string() }),
+                    ))
+                    .await
+                    .unwrap();
+                let closed = result_value(&close_resp);
+                assert_eq!(closed["closed"], true);
+                assert_eq!(closed["already_closed"], true);
+                assert!(
+                    router
+                        .active_mob_streams
+                        .lock()
+                        .await
+                        .contains_key(&stream_ref),
+                    "already-closed callers must not abort the authoritative terminal sender"
+                );
+                assert!(
+                    router
+                        .notification_sink
+                        .stream_terminal_admission
+                        .try_reserve()
+                        .is_err()
+                );
+                assert!(
+                    notif_rx.try_recv().is_err(),
+                    "close must not fabricate a replacement terminal"
+                );
+            }
+            resume_tx
+                .send(())
+                .expect("close must leave the terminal sender alive");
+            tokio::time::timeout(Duration::from_secs(1), delivered_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            let terminal = notif_rx.try_recv().expect("original terminal delivered");
+            assert_eq!(terminal.method, "mob/stream_end");
+            assert_eq!(
+                notification_params!(terminal)["stream_id"],
+                stream_ref.as_string()
+            );
+            assert_eq!(
+                notification_params!(terminal)["outcome"],
+                if overflow {
+                    "terminal_error"
+                } else {
+                    "remote_end"
+                }
+            );
+            if overflow {
+                assert_eq!(
+                    notification_params!(terminal)["error"]["code"],
+                    "stream_queue_overflow"
+                );
+                assert_eq!(
+                    notification_params!(terminal)["error"]["message"],
+                    "synthetic queue overflow"
+                );
+            }
+            assert!(router.active_mob_streams.lock().await.is_empty());
+            assert!(
+                notif_rx.try_recv().is_err(),
+                "terminal must be delivered only once"
+            );
+            assert!(
+                router
+                    .notification_sink
+                    .stream_terminal_admission
+                    .try_reserve()
+                    .is_err()
+            );
+            drop(terminal);
+            assert!(
+                router
+                    .notification_sink
+                    .stream_terminal_admission
+                    .try_reserve()
+                    .is_ok()
+            );
+        }
     }
 
     #[cfg(feature = "mob")]
