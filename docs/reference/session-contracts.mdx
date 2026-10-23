@@ -719,10 +719,13 @@ results, never with a compaction summary. Intra-run checkpoints never prune
 stored rewrite rows, so the committed boundary stays rebuildable for recovery;
 the boundary commit that promotes the run applies the run's retention cut in
 the same transaction, never past the promoted head's row-lineage anchor.
-On WholeBlob a compaction re-bases the run: one store call commits the
-compacted document as the session's committed base and restarts the run's
-provisional tail on top of it, so round commits continue after any number of
-compactions. A later failure of a re-based run consumes its inputs instead of
+On WholeBlob the run's first round commit after a compaction re-bases the
+run: one store call commits the session document as it stands at that
+commit, the compaction included, as the session's committed base and
+restarts the run's provisional tail on top of it, so round commits continue
+after any number of compactions. A crash between the compaction and that
+commit continues the run from its previous commit, and the compaction runs
+again. A later failure of a re-based run consumes its inputs instead of
 requeueing them, because they are already part of committed history.
 A crash after an intra-run checkpoint continues the run (see below); before
 0.9.5 it closed the run as interrupted.
@@ -753,10 +756,13 @@ the committed authority is preserved.
   cursor inside a committed body never makes a run continuable. A cursor tail
   whose bound inputs were settled, whose run has no bound inputs (a direct or
   machine-service turn), or whose runtime was retired is closed as
-  interrupted. A run that fails and whose inputs are queued for another
-  attempt discards its tail before they requeue, so it starts over from its
-  inputs; a cursor tail left behind with requeued inputs is held for
-  reconciliation, never committed.
+  interrupted. So is the tail of a run settled without continuing: stopped
+  before it continued, refused by a durable worker's resume gate, or kept by
+  a requeue stop past its max age. The abandonment of its inputs commits
+  first, then the tail is closed as interrupted, never discarded. A run that
+  fails and whose inputs are queued for another attempt discards its tail
+  before they requeue, so it starts over from its inputs; a cursor tail left
+  behind with requeued inputs is held for reconciliation, never committed.
 - A completed tail (single run, `EndTurn` terminal, structurally coherent) is
   committed as a recovered run boundary in one atomic store transaction:
   recovered snapshot, boundary receipt, and input terminalization land
@@ -764,12 +770,22 @@ the committed authority is preserved.
   recovered turn.
 - An interrupted tail is closed as interrupted: content preserved, a typed
   recovery notice appended, the original run terminalized, never requeued.
+  Since 0.9.5, when the tail's run cursor holds a round's staged model
+  response, the response is written into the transcript before the notice,
+  with an `outcome_uncertain` tool error result for each of its tool calls,
+  which says only that the call's outcome is unknown: the calls may have
+  run.
 - Anything else, including any tail carrying a dangling `tool_use`, is held
   intact for reconciliation. A dangling call proves intent, not execution;
   its external side effect may already have fired, so recovery never closes
   it with synthetic results. A tail whose last turn stopped for a reason
   other than `EndTurn` or `ToolUse` (for example `MaxTokens` or `PauseTurn`)
-  is held the same way: that turn did not reach a natural end.
+  is held the same way: that turn did not reach a natural end. Since 0.9.5
+  an operator can resolve a tail held as ambiguous:
+  `rkat session resolve-held-tail` commits it as interrupted, keeps every
+  row, and answers each call without a result with an `outcome_uncertain`
+  tool error, which says only that its outcome is unknown (see
+  [Storage Operations](/guides/storage-operations#resolve-a-durable-tail-held-for-recovery)).
 
 A session whose transcript has rewrite occurrences (compaction) is recovered
 the same way: a completed tail becomes a recovered run boundary, an
@@ -806,7 +822,8 @@ resume fails typed rather than with internal-error prose:
 
 - `SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY` - the durable tail exists but
   machine-authorized recovery has not promoted it yet; it awaits
-  reconciliation.
+  reconciliation. An operator resolves a tail held as ambiguous with
+  `rkat session resolve-held-tail`.
 - `SESSION_DURABLE_TAIL_RECOVERY_REFUSED` - machine-authorized recovery was
   refused by conflicting persisted runtime facts (another live runtime, or
   boundary receipts that already cover or contradict the tail); retry after
@@ -877,6 +894,15 @@ not resubmit it; after the restart, the same
 idempotency key re-attaches to it. Only a durable prompt in the queue lane
 that is neither directed nor bound to an objective is kept: a member's kickoff,
 and any other objective-bound input, ends as stopped, as without the option.
+The same stop, like an unregister with `UnregisterQueuedInputs::Requeue`, also
+keeps the run in flight of a session that commits every round: the turn
+stops at once, the
+run's inputs stay bound to it with the same waiter answer and max age, and
+the run continues from its last committed round at the session's next start
+(see [Durable runs](/guides/durable-runs#graceful-stops-and-deploys)). A
+graceful shutdown that does not choose a disposition, a mob Shutdown
+included, uses this stop with a 15 minute max age for sessions that commit
+every round.
 
 - The generated wait-failure resolver classes such a wait: session not
   running, reason `requeued_across_stop`, resumable, and the surface's

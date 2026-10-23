@@ -142,9 +142,13 @@ impl AgentToolDispatcher for PaymentTools {
 
 `ToolCallDedupeKey::new(run_id, round, call_id, tool_name, arguments)` derives
 the same key, digest included, from its parts, for a tool that records keys
-outside the dispatch. Core sends the key on no wire itself. For an MCP tool, a
-host can add it to the call's metadata in its `McpCallContextProvider::prepare`,
-which receives the call and the same dispatch context.
+outside the dispatch. MCP tools and callback tools receive the same key:
+Core's MCP client adds it to the `tools/call` request's `_meta` under
+`io.meerkat/tool_call_dedupe_key` (`meerkat_core::TOOL_CALL_DEDUPE_KEY_META_KEY`),
+and callback requests carry it as `dedupe_key`. An `McpCallContextProvider`
+whose metadata uses that name is refused with `McpCallContextError::Denied`,
+as for `io.meerkat/origin`, and the model gets an `access_denied` tool error
+for that call.
 
 ### Multimodal tool results
 

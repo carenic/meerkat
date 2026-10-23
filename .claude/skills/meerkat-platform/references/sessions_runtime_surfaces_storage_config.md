@@ -91,18 +91,32 @@ Contract, obligations and conformance: `docs/reference/host-store-spi.mdx`.
   (default 30 s, from 3 intervals to 1 hour) that the store sizes with
   `fence_timing()`. It makes no model call, dispatches nothing and writes
   nothing unless its last successful acquire or renew started less than the
-  lease minus one interval ago. `FencedOut` stops every write until the realm
-  is reopened; another failed renew stops writes until a renew succeeds.
+  lease minus the self-fence margin ago. The margin defaults to one interval;
+  a store declares its own with `FenceTiming::try_with_margin`, at least
+  `renew interval + 2 x visibility lag`, and the window must stay at least
+  two intervals. A store also declares its longest commit
+  (`try_with_max_commit_latency`, default 2 s, at most the lease): a fenced
+  write that meets a commit in flight waits up to that long before it backs
+  off. `FencedOut` stops every write until the realm is reopened;
+  after any other failed renew, or a lease that ran out, the holder writes
+  and dispatches nothing until it re-acquires the fence, which it does by
+  itself before its next write (a later renew never restores it); if
+  another process took the fence or committed meanwhile, the realm stops
+  until it is reopened.
 - Opening lists every head once. A session body loads at open only when
   recovery must act on it (unsettled inputs, an open run cursor, a current
   run), otherwise on first use, and stays loaded until the session is
   archived.
-- Limits: 8 MiB of heads and rows per batch, 1 MiB per row; Core chunks
-  larger values itself. An unknown commit outcome is settled before the
+- Limits: 8 MiB of heads and rows per batch, 1 MiB per row. Core writes
+  large values first as digest-keyed chunk scopes, then one commit batch that
+  refers to them; a change that cannot fit fails whole with a typed size
+  error, never truncated or partly committed. An unknown commit outcome is
+  settled before the
   scope's next version. A refused batch, or one still unknown after the retry
   budget, poisons the scopes it touched until the realm is reopened.
-- The runtime store is WholeBlob, with the cost above; a compaction re-bases
-  a run's commits rather than stopping them. An interactive OAuth login in
+- The runtime store is WholeBlob, with the cost above; the run's next round
+  commit after a compaction re-bases the run rather than stopping its
+  commits. An interactive OAuth login in
   progress is process-local: after a restart or a takeover, start it again;
   completed credentials are kept.
 - Test a store with the host store chapter of `meerkat-store-conformance`.

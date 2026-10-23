@@ -329,13 +329,16 @@ Contract and limits: `docs/guides/durable-runs.mdx`.
   tool call without its result. The final round (no tool calls) ends with the
   normal end-of-run save, which clears the cursor. Structured-output
   extraction takes no round commits. A failed round commit ends the run; a
-  failed first commit dispatches nothing.
+  failed first commit dispatches nothing. Exception: a round whose model
+  response contains an image takes only the second commit (the cursor cannot
+  hold images); a crash during its tools re-asks the model for that round.
 - Cost: `sqlite` (HeadCanonical) writes the round's rows; `jsonl` and
   host-store realms (WholeBlob) write the whole session document at each
   commit, so the bytes grow with the square of the tool rounds. A compaction
-  keeps the commits going: on WholeBlob it re-bases the run (one store call
-  commits the compacted document as the committed base and restarts the run's
-  tail on it).
+  keeps the commits going: on WholeBlob the run's next round commit re-bases
+  it (one store call commits the document, compaction included, as the
+  committed base and restarts the run's tail on it; a crash before that
+  commit continues from the previous one and compacts again).
 - Resume: when the session is opened again (any surface, or a mob rebuilding
   its `durable = true` workers) its open run continues under the same run id;
   no new input is needed. There is no boot sweep: a session nobody opens
@@ -347,7 +350,9 @@ Contract and limits: `docs/guides/durable-runs.mdx`.
 - Event `run_resumed {run_id, round, resume_point}`: `tools_pending` (the
   saved response stands in for the model call and its calls are dispatched
   again under the same call ids, with no new assistant, tool-call request or
-  turn-completed events for it) or `awaiting_model` (the next model call).
+  turn-completed events for it) or `awaiting_model` (the next model call;
+  asynchronous work the run was waiting for ended with the process, and a
+  system notice tells the model those results will not arrive).
 - Carried over: turn and tool-call counts, the run's usage and its elapsed
   time (the budget continues; downtime is not charged). Lost: the round in
   progress; its model call is billed but its usage is not recorded.
@@ -357,29 +362,62 @@ Contract and limits: `docs/guides/durable-runs.mdx`.
   still queue and run after it. Bound inputs are the start input plus every
   steer or peer input applied at a committed round; an input applied only in
   the lost round is redelivered. A stop before the resume abandons them as
-  cancelled and fails the run; retire, destroy, reset and unregister abandon
+  cancelled and fails the run, which is closed as interrupted with its
+  committed rounds kept; retire, destroy, reset and unregister abandon
   them; a graceful unregister that keeps queued work leaves the run to resume
-  at the next start.
+  at the next start, unless a bound input is older than the stop's max age
+  by then.
 - Not resumed, closed as interrupted with content kept: a bound input already
   settled, a retired runtime, or a run with no bound inputs (direct and
-  machine-service turns). Held (`SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY`),
+  machine-service turns). A run settled without resuming (a stop first, a
+  refused resume, a requeue stop past its max age) is closed the same way,
+  never discarded: committed rounds stay, a round's staged response is
+  written with an `outcome_uncertain` error result per tool call (the calls
+  may have run), the interrupted notice is appended, and its inputs never
+  run again. Held (`SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY`),
   never committed: a cursor that disagrees with the transcript, and a tail
   left behind with requeued inputs.
 - Reruns are at least once and pass authorization, approval review and
-  pre-tool hooks again. Rust tools read
+  pre- and post-tool hooks again. Rust tools read
   `ToolDispatchContext::tool_call_dedupe_key(call) -> Option<ToolCallDedupeKey>`
   (`run_id`, `round`, `call_id`, `call_digest` = lowercase hex SHA-256 of the
   tool name and canonical arguments; `ToolCallDedupeKey::new` derives it) and
   deduplicate on all four fields. MCP tools and host callback tools are
-  dispatched again too, and a callback request is sent again. Core sends the
-  key on no wire: a host adds it to an MCP call's metadata in
-  `McpCallContextProvider::prepare(target, call, context)`, and a callback
-  host computes `meerkat_core::tool_call_digest(name, args)` and pairs it with
-  the `tool_use_id` (run id and round are not in a callback request).
+  dispatched again too, and a callback request is sent again. Core delivers
+  the key to every call of a run's tool round, per-round commits or not: MCP
+  `tools/call` requests carry it in `_meta` under
+  `io.meerkat/tool_call_dedupe_key` (`{run_id, round, call_id,
+  call_digest}`; host metadata using that name is refused), and RPC
+  `tool/execute`, `pending_tool_calls` entries and Web JS tool callbacks (2nd
+  argument) carry an optional `dedupe_key` with the same fields. Calls
+  outside a run's tool round and detached callback jobs carry none.
 - Not rerun, answered with an `outcome_uncertain` tool error instead: a call
   whose process custody shows the process may have run, a Core comms tool
   that sends to another agent (every comms tool but `peers`), and a call that
   would run detached under a runner that declares itself non-resumable.
+- Graceful stop for a deploy: an unregister with
+  `UnregisterQueuedInputs::Requeue { max_age }` (or a mob Shutdown with
+  `QueuedInputsOnShutdown::Requeue(max_age)`) keeps the run of a session
+  with per-round commits in flight like a crash: the turn stops at once
+  (work since the last round commit is redone), its inputs stay bound with
+  waiters answered `requeued_across_stop`, and the run continues at the next
+  open, before the kept queued prompts; if a bound input is older than
+  `max_age` (from admission; unregister: no default, 1 ms to 24 h; mob:
+  15 min default) at that start, the inputs end `requeue_expired` instead
+  and the run is closed as interrupted, its committed rounds kept. No
+  Requeue, an explicit stop/cancel, retire, destroy, reset, a requeue stop
+  that meets a steer being written into the turn, or a session without
+  per-round commits still ends the run. Requeue (15 min) is the default of
+  every graceful shutdown that does not choose, for sessions with per-round
+  commits: `rkat-rpc` (input end, SIGTERM, interrupt; its client sees a
+  shutdown error, not `requeued_across_stop`), REST (SIGTERM, interrupt,
+  before its HTTP drain: a run in flight at the signal is suspended and a
+  request waiting on it is answered `409` `requeued_across_stop`; a run that
+  a request starts after the signal is drained, not suspended) and a mob
+  Shutdown without `with_queued_inputs` (its default
+  `QueuedInputsOnShutdown::RequeueDurable`, per member); an explicit `Stop`
+  keeps 0.9.4 behaviour, and a host's own unregister without a disposition
+  stops (`UnregisterQueuedInputs::default()` is `Stop`).
 - Durable workers and the mob resume gate: `references/mobs.md`. Realms in a
   host's own database: `references/sessions_runtime_surfaces_storage_config.md`.
 
@@ -393,7 +431,7 @@ yet", not as a crash.
 
 | `session_error_code` | `durable_resume_hold` | Meaning and action |
 |---|---|---|
-| `SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY` | `tail_held_for_recovery` | A verified tail lies past the last committed boundary. The next start or attach of the session (a turn, resume or external event on a cold session) recovers it; plain reads (`session/read`, history, status) never do. A tail ending in a tool call without its result stays held, because the call may already have run (0.8.9) |
+| `SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY` | `tail_held_for_recovery` | A verified tail lies past the last committed boundary. The next start or attach of the session (a turn, resume or external event on a cold session) recovers it; plain reads (`session/read`, history, status) never do. A tail ending in a tool call without its result stays held, because the call may already have run (0.8.9). Since 0.9.5 an operator resolves a tail held as ambiguous with `rkat session resolve-held-tail <id> [--apply] [--runtime-store <FILE>] [--json]` (dry run by default; sqlite and jsonl realms, or a runtime file by `--runtime-store` with a full session UUID; refused while the persisted runtime state is in use or has a current run; stop every host first; exit 0 for nothing held, not held, a dry run and a repair): apply commits it as interrupted, keeps every row, answers each call without a result with an `outcome_uncertain` tool error, ends the inputs bound to the run and appends a notice naming the command. Library hosts: `meerkat_runtime::recovery::resolve_held_durable_tail(store, session_id, apply)` |
 | `SESSION_DURABLE_TAIL_RECOVERY_REFUSED` | `recovery_refused` | Another live runtime or contradicting receipts blocked recovery; retry after it quiesces |
 | `SESSION_DURABLE_EVIDENCE_QUARANTINED` | `evidence_quarantined` | Evidence is forked or unverifiable; investigate before repair |
 | `SESSION_WHOLEBLOB_AUDITED_ENDPOINT_DIVERGENCE` | `audited_endpoint_divergence` | A WholeBlob document fails its audited-endpoint guard; repair it with the CLI below |
@@ -403,6 +441,8 @@ rkat session repair-wholeblob <session-id> --json          # diagnose only (defa
 rkat session repair-wholeblob <session-id> --apply         # re-anchor, keeps every message
 rkat session repair-wholeblob <uuid> --apply --accept-shorter   # only if the live transcript is shorter
 rkat session repair-wholeblob <uuid> --runtime-store /path/runtime.sqlite --json
+rkat session resolve-held-tail <session-id>                  # held ambiguous tail: dry run (default)
+rkat session resolve-held-tail <session-id> --apply          # commit it as interrupted, rows kept
 ```
 
 WholeBlob runtime databases are the `runtime.sqlite3` of JSONL-backed realms

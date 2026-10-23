@@ -64,7 +64,7 @@ pub trait HostStore: Send + Sync {
 | Operation | What it does |
 |-----------|--------------|
 | `acquire_fence(mode)` | Answers a token higher than any acquired before in the realm, durably, and records the new holder's lease. With `AcquireMode::Exclusive`, a live holder makes it answer `Held`. With `AcquireMode::Takeover`, it supersedes any holder and reports what remained of that holder's lease in `FenceGrant::superseded_lease` (zero when no holder was live) |
-| `renew_fence(token)` | Confirms that no token higher than `token` exists, and records a new lease for its holder from now. Answers `FencedOut` when a higher token exists |
+| `renew_fence(token)` | Confirms that no token higher than `token` exists, and records a new lease for its holder from now, also when that holder's last lease has lapsed. Answers `FencedOut` when a higher token exists |
 | `fence_timing()` | The renew interval and the lease this store records (see [Fence Leases](#fence-leases)). Defaults to `FenceTiming::default()` |
 | `load_head(scope)` | The scope's visible head as a `VersionedHead { version, commit_id, head }`, or `None` when the scope was never created or was deleted |
 | `list_heads(kind, after, limit)` | Visible scopes of `kind` whose names sort after `after` (from the first when `None`), in name order by the bytes of their names, each with its visible head, at most `limit`. `HeadPage::next` names where to read on, and is `None` when the listing has ended. It serves listings and Core's bulk load at open |
@@ -112,10 +112,17 @@ create as `Invalid`.
 | Scope name | 512 bytes, not empty, no control characters | `MAX_SCOPE_NAME_BYTES` |
 | Commit id | 128 bytes, not empty, no control characters | `MAX_COMMIT_ID_BYTES` |
 
-Core keeps every batch within these limits. It stores a larger value as
-chunks in scopes of their own, committed before the batch that refers to
-them. A chunk that nothing refers to is garbage, not corruption, and Core
-deletes such chunks when it opens the realm.
+Core keeps every batch within these limits. It writes a large value first,
+as chunks in scopes of their own keyed by the value's digest, in as many
+batches as the value needs; then one commit batch, which alone fits the
+limits, makes the change visible by referring to the chunks and drops the
+chunks it supersedes. Your store therefore sees chunk batches before the
+commit batch that uses them. A chunk that no committed head refers to, for
+example one left by a commit that failed, is garbage, not corruption; Core
+deletes such chunks when it opens the realm and in a background sweep. A
+change that cannot be written this way, or that your store refuses for size
+with `Invalid`, fails as a whole with a typed size error: Core never
+truncates a value and never commits part of a change.
 
 ## Errors
 
@@ -134,9 +141,10 @@ retrying the same batch or by loading the head.
 
 ## Obligations
 
-These nine obligations are the whole contract. Each lists the ways a store
-may meet it, including the ways of an append-only store, one without updates
-or transactions.
+These nine obligations, with the self-fence margin rule under
+[Fence Leases](#fence-leases), are the whole contract. Each lists the ways a
+store may meet it, including the ways of an append-only store, one without
+updates or transactions.
 
 1. **All or nothing.** A load shows a batch completely, in every scope it
    touches, or not at all. Valid ways:
@@ -194,37 +202,68 @@ The store records a lease for the holder of the highest token. It lasts
 `FenceTiming::lease` from the holder's last acquire or renew, as the store's
 own clock saw it, and the holder counts as live while it lasts.
 
-The host sizes the lease and the renew interval for its backend with
-`HostStore::fence_timing`, built with `FenceTiming::try_new(renew_interval,
-lease)`:
+The host sizes the timing for its backend with `HostStore::fence_timing`,
+built with `FenceTiming::try_new(renew_interval, lease)` or, to declare the
+self-fence margin, `FenceTiming::try_with_margin(renew_interval, lease,
+self_fence_margin)`, and then, to declare the longest commit,
+`.try_with_max_commit_latency(max_commit_latency)`:
 
 | Setting | Default | Bounds |
 |---------|---------|--------|
 | Renew interval | 10 s (`FENCE_RENEW_INTERVAL_SECS`) | At least 1 s (`FenceTiming::MIN_RENEW_INTERVAL`) |
 | Lease | 30 s (`FENCE_LEASE_SECS`) | At least 3 renew intervals (`FENCE_MIN_LEASE_RENEWALS`), at most 1 hour (`FenceTiming::MAX_LEASE`) |
+| Self-fence margin | One renew interval (`try_new`) | At least 1 renew interval, and the lease minus the margin at least 2 renew intervals |
+| Longest commit | 2 s (`FENCE_MAX_COMMIT_LATENCY_SECS`) | Longer than zero, at most the lease |
 
-`FenceTiming::self_fence_window` is the lease minus one renew interval. A
-shorter lease shortens the wait for the next process after a holder died, and
-at a takeover. A longer renew interval renews less often.
+`FenceTiming::self_fence_window` is the lease minus the self-fence margin,
+and `try_with_margin` refuses a margin below one renew interval or a window
+below two renew intervals. The margin must be at least the renew interval
+plus twice your store's visibility lag. A renew written just before a
+takeover can stay invisible to the new holder for up to that lag, and the
+holder renews only once per interval, so the new holder's wait can end
+before the old holder's real lease; the margin makes the old holder stop
+first. A store whose writes become visible after a few seconds declares a
+margin larger by twice that. A shorter lease shortens the wait for the next
+process after a holder died, and at a takeover. A longer renew interval
+renews less often.
+
+The longest commit is how long one `commit` can take on your backend
+(`FenceTiming::max_commit_latency`). A fenced write of Core's that meets a
+commit still in flight on the fence it checks waits up to that long before
+it reports the write as backed off, so a store whose commits are slower
+declares a longer bound instead of failing those writes.
 
 ### Core's Writer Rules
 
 The store relies on Core keeping these rules:
 
 - **Exclusive acquire.** Core acquires with `AcquireMode::Exclusive`, so two
-  processes never fence each other back and forth. Only an explicit takeover
-  uses `AcquireMode::Takeover`.
-- **Renewing.** The holder renews once per renew interval and stops writing
-  when a renew fails.
+  processes never fence each other back and forth. Apart from Core taking
+  over its own recorded lease (below), only an explicit takeover uses
+  `AcquireMode::Takeover`. Core takes over its own recorded lease
+  when a stopped holder re-acquires and an exclusive acquire answers `Held`
+  with its own token.
+- **Renewing.** The holder renews once per renew interval. After a failed
+  renew, or once its self-fence window has closed, it stops every write and
+  dispatch, and goes on only through a fresh acquire, with a new token,
+  which it makes by itself before its next write; if another process took
+  the fence or committed meanwhile, the realm stops until it is opened
+  again. It never resumes on a later renew. The rule is Core's: a store
+  answers a renew of the current token even when the holder's lease lapsed,
+  and refuses only a token that was superseded or that it never issued.
 - **Self-fencing.** The holder fences itself on its own clock: it makes no
-  model call and dispatches nothing unless its last successful acquire or
-  renew started less than the self-fence window ago. This takes no store
-  request per round, and the per-round path makes no fence check.
+  model call, dispatches nothing and commits nothing unless its last
+  successful acquire or renew started less than the self-fence window ago.
+  It checks the clock before each commit, before each model call, and right
+  before each tool call starts, after the round's pre-tool hooks; a call
+  refused there never starts, and the round commits none of its results. A
+  check takes no store request; the per-round path sends no fence request to
+  the store.
 - **Takeover wait.** After an acquire that supersedes a live holder, the new
   holder waits out `FenceGrant::superseded_lease` before it makes a model
   call or dispatches anything. By then the old holder has fenced itself: the
   store started that lease no earlier than the holder started the acquire or
-  renew it came from, and the holder stops one renew interval before the
+  renew it came from, and the holder stops the self-fence margin before the
   lease ends.
 - **Bulk load.** Core loads the heads with `list_heads` after the acquire
   and before its first commit, so the load observes one cut.
@@ -265,6 +304,15 @@ on the database's clock, in a row of their own.
 - **Commit.** Append the batch with one pending-stream batch commit, or
   append its rows tagged with the commit id and close them with a marker
   row.
+- **Retries.** A streaming insert can fail in transport under a burst of
+  commits. Retry it a bounded number of times with jittered backoff.
+  Per-row insert ids, and a load that keeps one copy of a repeated commit id
+  and of a row written twice under one commit id (rows have stable indices),
+  make such a retry safe. In one store, about a third of the commits in a
+  burst met a transport error until it retried each insert up to six times.
+- **Request size.** A batch of up to 8 MiB grows to about 11 MB as JSON.
+  Split its rows into requests of at most 7 MiB each as sent, and write the
+  commit marker last.
 - **Load.** Take the scope's committed batches, drop fenced-out batches by
   their marker's commit order, collapse duplicate commit ids, keep the lowest
   commit id per version, and return the highest version's head and its rows
@@ -298,7 +346,7 @@ Its rows run in order:
 | Acquire on an empty realm | An exclusive acquire supersedes no lease |
 | Reopen | A new process loads what an earlier one committed: heads, versions, commit ids and rows |
 | Kill | A writer dies before, during or after a batch over two scopes; the next writer sees it in both or neither, and settles an unknown batch the way Core does |
-| Stale fence | A superseded writer can neither keep the fence nor make a batch visible; an exclusive acquire waits out a live holder's lease and no longer |
+| Stale fence | The current holder's first renew succeeds, even if its lease lapsed during the rows before; a superseded writer can neither keep the fence nor make a batch visible; an exclusive acquire waits out a live holder's lease and no longer |
 | Takeover with a commit in flight | The old writer's in-flight commit shows wholly or never, the same to every load |
 | Same version twice | Every load resolves two batches for one version the same way, and the loser is invisible in all its scopes |
 | Retry | A commit id sent again acts once, from the same handle or a new one |

@@ -61,7 +61,7 @@ Important semantics:
 - topology rules can enforce strict role-level communication policy.
 - `runtime_mode` omitted means `autonomous_host` (new default).
 - profile `durable = true` (0.9.5+) spawns durable workers: each member gets a durable identity a host re-attaches after a restart (`durable_identity_members()`). A mob without persistent sessions refuses the spawn with `NonDurableService` (`CAPABILITY_UNAVAILABLE`, data kind `mob_non_durable_service`). `durable` is a profile field only (no spawn flag; an explicit Rust continuity intent wins), and a host older than 0.9.5 refuses a profile that sets it.
-- a rebuilt durable worker's open run continues from its last committed round under the same run id (per-round commits: `references/sessions_runtime_surfaces_sessions.md`). `MobBuilder::with_durable_resume_gate(gate)` lets a host decide first: `DurableResumeGate::check(&DurableResumeRequest { mob_id, agent_identity, profile, session_id, run_id, bound_input_ids, attention_projection })` answers `DurableResumeVerdict::Continue`, `Superseded { reason }` (the run is settled like a stop: bound inputs abandoned as refused resumes, run failed) or `Unavailable { reason }` (asked again, 3 attempts of 8 s each over about 30 s, then settled like `Superseded`). The gate must be cancel-safe and idempotent and map its own failures to `Unavailable`. Only durable workers are asked; no gate = continue. The mob binds the gate when it registers the worker, so a session another surface opens before the mob rebuilds the worker resumes unasked: build mobs before serving other surfaces.
+- a rebuilt durable worker's open run continues from its last committed round under the same run id (per-round commits: `references/sessions_runtime_surfaces_sessions.md`). `MobBuilder::with_durable_resume_gate(gate)` lets a host decide first: `DurableResumeGate::check(&DurableResumeRequest { mob_id, agent_identity, profile, session_id, run_id, bound_input_ids, attention_projection })` answers `DurableResumeVerdict::Continue`, `Superseded { reason }` (the run is settled like a stop: bound inputs abandoned as refused resumes, run failed and closed as interrupted with its committed rounds kept) or `Unavailable { reason }` (asked again, 3 attempts of 8 s each over about 30 s, then settled like `Superseded`). The gate must be cancel-safe and idempotent and map its own failures to `Unavailable`. Only durable workers are asked; no gate = continue. The mob binds the gate when it registers the worker, so a session another surface opens before the mob rebuilds the worker resumes unasked: build mobs before serving other surfaces.
 
 ## Rust SDK (detailed)
 
@@ -135,9 +135,22 @@ actor's life, with Stop, Shutdown and Destroy available. `MobError` is
 
 Shutdown report: `shutdown_with_report(ShutdownOptions)`
 (`ShutdownOptions::default().with_deadline(deadline)` bounds its waits;
-since 0.9.5 `.with_queued_inputs(QueuedInputsOnShutdown::Requeue(max_age))`
-keeps durable queued prompts that are neither directed nor bound to an
-objective (never a member's kickoff) for the next start, whose waiters get
+since 0.9.5 the default `QueuedInputsOnShutdown::RequeueDurable`, which
+`shutdown()` takes too, resolves per member to
+`Requeue(RequeueMaxAge::DEFAULT)` (15 min) when the member's session commits
+every round (persistent session service and a runtime persistence store) and
+to `Stop` (0.9.4 behaviour) otherwise or when the member is already retiring;
+`.with_queued_inputs(QueuedInputsOnShutdown::Requeue(max_age))` or `Stop`
+applies to every member. Under Requeue the Shutdown holds run starts and
+cancels no running turn: a run that commits every round is suspended at its
+last committed round and continues at the next start (an autonomous member's
+too, its kickoff kept open and resumed under the same objective, unless the
+member is retiring or host-placed; a Stop with
+`StopOptions::default().leave_runs_running()` before the Shutdown leaves that
+kickoff open for the Shutdown to decide, while a plain Stop closes it; a run
+with no round commits is cancelled), and durable queued prompts that are
+neither directed nor bound to an objective (never a member's kickoff) are
+kept to run after it; their waiters get
 `BoundedTurnFailure::RequeuedAcrossStop`, or `RequeueExpired` when older than
 `max_age` at that start)
 returns a `MobShutdownReport` with per-member `members`

@@ -485,6 +485,13 @@ the registered tool and `arguments` contains its JSON arguments. In the result,
 omitted. A client can instead return a JSON-RPC `error` for the same request
 ID; the server projects it as a tool-execution error.
 
+Since 0.9.5 a request for a call made in a run's tool round also carries
+`dedupe_key`, an object with `run_id`, `round`, `call_id` and `call_digest`.
+A durable run that continues after a restart sends the same call again, with
+the same key. A tool whose effect must not happen twice records the key with
+the effect and answers a repeat from that record; see
+[Durable Runs: Tools That Run Again](/guides/durable-runs#tools-that-run-again).
+
 Keep reading and answering reverse requests while waiting for the turn's
 result, or the turn cannot finish its callback. This foreground RPC exchange
 is neither MCP's `pending_tool_calls`/`meerkat_resume` continuation nor the
