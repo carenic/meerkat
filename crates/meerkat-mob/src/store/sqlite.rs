@@ -12826,6 +12826,7 @@ mod tests {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
+                durable: false,
             })),
         );
         let mut definition = MobDefinition::explicit("mob");
@@ -15919,6 +15920,7 @@ mod tests {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
+                durable: false,
             };
             store.create("test-profile", &profile).await.unwrap();
         }

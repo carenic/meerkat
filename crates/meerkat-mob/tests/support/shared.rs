@@ -4142,6 +4142,7 @@ pub fn controlling_mob_definition(mob_id: meerkat_mob::MobId) -> meerkat_mob::Mo
             max_inline_peer_notifications: None,
             output_schema: None,
             provider_params: None,
+            durable: false,
         })),
     );
 
@@ -4177,6 +4178,7 @@ pub fn controlling_mob_definition(mob_id: meerkat_mob::MobId) -> meerkat_mob::Mo
         max_inline_peer_notifications: None,
         output_schema: None,
         provider_params: None,
+        durable: false,
     };
     profiles.insert(
         meerkat_mob::ProfileName::from("worker"),
@@ -5019,6 +5021,7 @@ pub fn sample_portable_member_spec(
             max_inline_peer_notifications: None,
             output_schema: None,
             provider_params: None,
+            durable: false,
         },
         definition_extract: PortableDefinitionExtract {
             models: std::collections::BTreeMap::new(),

@@ -1209,6 +1209,31 @@ in-flight resume work. Cleanup failures retain exact retry authority; an
 unproven cleanup is not a successful cancellation. Compensation preserves
 durable session documents and refuses to remove a successor attachment.
 
+### Durable workers
+
+Since 0.9.5 a profile can make its members durable workers:
+
+```toml
+[profiles.worker]
+model = "claude-sonnet-4-6"
+durable = true
+```
+
+A spawn of a durable profile records the member with a durable identity
+(`SpawnContinuityIntent::DurableIdentity`, keyed by its `AgentIdentity`), so
+after a restart a host finds the worker with `durable_identity_members` (see
+the next section) and re-attaches it. A durable worker needs a mob whose
+session service keeps persistent sessions. On any other mob the spawn is
+refused with `NonDurableService` (error code `CAPABILITY_UNAVAILABLE`,
+structured data kind `mob_non_durable_service`) before anything is created,
+instead of spawning a worker that would not survive a restart. `durable` lives
+on the profile only, with no separate spawn flag, and an explicit continuity
+intent on a Rust spawn wins over it. A host older than 0.9.5 refuses a profile
+that sets it.
+
+A durable worker restarts like every member of a persisted mob: it is rebuilt
+on its session, and a run it was in continues from its last committed round.
+
 ### Member binding history (Rust hosts)
 
 Since 0.9.4 a Rust host can ask which incarnation of a member held which

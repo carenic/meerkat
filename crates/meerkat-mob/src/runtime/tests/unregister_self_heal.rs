@@ -152,6 +152,7 @@ fn definition(mob_id: &str) -> MobDefinition {
             max_inline_peer_notifications: None,
             output_schema: None,
             provider_params: None,
+            durable: false,
         })),
     );
     let mut definition = MobDefinition::explicit(MobId::from(mob_id.to_string()));

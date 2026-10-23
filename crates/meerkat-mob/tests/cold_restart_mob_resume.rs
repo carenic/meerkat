@@ -187,6 +187,7 @@ fn mob_definition(lead_mode: MobRuntimeMode) -> MobDefinition {
             max_inline_peer_notifications: None,
             output_schema: None,
             provider_params: None,
+            durable: false,
         })),
     );
     profiles.insert(
@@ -211,6 +212,7 @@ fn mob_definition(lead_mode: MobRuntimeMode) -> MobDefinition {
             max_inline_peer_notifications: None,
             output_schema: None,
             provider_params: None,
+            durable: false,
         })),
     );
 

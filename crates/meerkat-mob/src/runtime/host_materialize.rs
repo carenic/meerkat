@@ -687,6 +687,7 @@ fn decompile_portable_spec_with_env(
         max_inline_peer_notifications: spec.profile.max_inline_peer_notifications,
         output_schema,
         provider_params: spec.profile.provider_params.clone().map(Into::into),
+        durable: spec.profile.durable,
     };
     let category_overrides = spec.overlay.tool_category_overrides;
     profile.tools.builtins = category_overrides.builtins.resolve(profile.tools.builtins);
@@ -3380,6 +3381,7 @@ mod tests {
                 max_inline_peer_notifications: Some(3),
                 output_schema: None,
                 provider_params: None,
+                durable: false,
             },
             definition_extract: PortableDefinitionExtract {
                 models: BTreeMap::new(),

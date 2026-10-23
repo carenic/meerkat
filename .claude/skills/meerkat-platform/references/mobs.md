@@ -60,6 +60,7 @@ Important semantics:
 - `wiring.auto_wire_orchestrator` and `wiring.role_wiring` shape default graph edges.
 - topology rules can enforce strict role-level communication policy.
 - `runtime_mode` omitted means `autonomous_host` (new default).
+- profile `durable = true` (0.9.5+) spawns durable workers: each member gets a durable identity a host re-attaches after a restart (`durable_identity_members()`). A mob without persistent sessions refuses the spawn with `NonDurableService` (`CAPABILITY_UNAVAILABLE`).
 
 ## Rust SDK (detailed)
 
