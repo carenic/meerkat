@@ -2455,10 +2455,7 @@ impl MobActor {
                     // contract was violated: surface the failure so the
                     // caller can compensate (asserted by
                     // `test_role_wiring_failure_is_returned_to_spawn_caller`).
-                    return Err(match wire_error {
-                        MobError::WiringError(_) => wire_error,
-                        other => MobError::WiringError(other.to_string()),
-                    });
+                    return Err(wire_error.into_wiring_error());
                 }
             }
         }

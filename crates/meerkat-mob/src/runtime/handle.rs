@@ -2677,6 +2677,8 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         }
         // A closed mob refuses the whole batch before any row is provisioned.
         MobError::AdmissionClosed { .. } => mob_dsl::MobSpawnManyFailureObservationKind::Internal,
+        // The close's answer, not the cause's.
+        MobError::DurabilityFailStop { .. } => mob_dsl::MobSpawnManyFailureObservationKind::Internal,
         // So does a shutting-down one.
         MobError::ShutdownInProgress { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal

@@ -10867,10 +10867,7 @@ impl MobActor {
             )
             .await;
         if retirement_cleanup {
-            result.map_err(|error| match error {
-                MobError::RetirementTopologyIncomplete(_) => error,
-                other => MobError::RetirementTopologyIncomplete(other.to_string()),
-            })
+            result.map_err(MobError::into_retirement_topology_incomplete)
         } else {
             result
         }

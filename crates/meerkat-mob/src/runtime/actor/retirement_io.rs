@@ -1998,13 +1998,6 @@ impl MobActor {
         });
     }
 
-    fn retirement_unwire_error(error: MobError) -> MobError {
-        match error {
-            MobError::RetirementTopologyIncomplete(_) => error,
-            error => MobError::RetirementTopologyIncomplete(error.to_string()),
-        }
-    }
-
     async fn retirement_next_remote_edge(&mut self, mut continuation: RetirementContinuation) {
         while let Some(peer) = continuation.remote_peers.pop() {
             let preparation = match self
@@ -2014,7 +2007,7 @@ impl MobActor {
                     continuation.preserve_topology,
                 )
                 .await
-                .map_err(Self::retirement_unwire_error)
+                .map_err(MobError::into_retirement_topology_incomplete)
             {
                 Ok(preparation) => preparation,
                 Err(error) => {
@@ -2693,7 +2686,7 @@ impl MobActor {
                     continuation.preserve_topology,
                 )
                 .await
-                .map_err(Self::retirement_unwire_error)
+                .map_err(MobError::into_retirement_topology_incomplete)
             {
                 Ok(preparation) => preparation,
                 Err(error) => {
@@ -4209,7 +4202,7 @@ impl MobActor {
                 match self
                     .commit_realized_wiring(realized)
                     .await
-                    .map_err(Self::retirement_unwire_error)
+                    .map_err(MobError::into_retirement_topology_incomplete)
                 {
                     Ok(()) => self.retirement_next_placed_edge(continuation).await,
                     Err(error) => self.finish_retirement(continuation, Err(error)).await,
@@ -4258,7 +4251,7 @@ impl MobActor {
                 match self
                     .commit_realized_wiring(realized)
                     .await
-                    .map_err(Self::retirement_unwire_error)
+                    .map_err(MobError::into_retirement_topology_incomplete)
                 {
                     Ok(()) => self.retirement_next_remote_edge(continuation).await,
                     Err(error) => self.finish_retirement(continuation, Err(error)).await,
@@ -5129,7 +5122,7 @@ impl MobActor {
             let result = self
                 .prepare_member_unwire_for_retirement(retiring, peer.clone(), false)
                 .await
-                .map_err(Self::retirement_unwire_error);
+                .map_err(MobError::into_retirement_topology_incomplete);
             match result {
                 Ok(wiring_io::WiringPreparation::Settled) => {
                     if let Some(rollback) = continuation.rollback.as_mut() {
@@ -5731,7 +5724,7 @@ impl MobActor {
             SpawnRollbackObservation::PlacedTrust(realized) => self
                 .commit_realized_wiring(realized)
                 .await
-                .map_err(Self::retirement_unwire_error)
+                .map_err(MobError::into_retirement_topology_incomplete)
                 .map(|()| {
                     if let Some(peer) = rollback.cleanup_peers.get(rollback.placed_cleanup_index) {
                         rollback.placed_edges_cleaned.insert(peer.clone());

@@ -753,6 +753,19 @@ pub enum MobError {
         cause: Arc<MobError>,
     },
 
+    /// The mob's actor fail-stopped because the outcome of a durable mutation
+    /// stayed uncertain: `cause` is that mutation's own error (the first one,
+    /// when several stayed uncertain). The actor closed its admission with
+    /// [`MobAdmissionCloseReason::DurabilityFailStop`](crate::runtime::MobAdmissionCloseReason::DurabilityFailStop)
+    /// and admits no command until a restart replays the mob's durable state.
+    ///
+    /// It classifies as that close, not as its cause: the actionable fact is
+    /// that the mob needs a restart. It carries no durable resume hold, even
+    /// when its cause does, so a host does not park a member on a hold that
+    /// only the restart releases.
+    #[error("mob '{mob_id}' fail-stopped after an uncertain durable mutation: {cause}")]
+    DurabilityFailStop { mob_id: MobId, cause: Arc<MobError> },
+
     /// The member's runtime registration is durability-degraded: a durable
     /// commit could not be reconciled with the live shell, so the runtime
     /// refuses every ordinary input until a registration-authorized cold
@@ -1904,6 +1917,17 @@ impl MobError {
             // meerkat's own key, so a reader of that key classifies the
             // failure exactly as it would the cause alone. Every typed
             // classifier above and below delegates to the cause.
+            // The close's reason and the cause's own data. The cause's hold
+            // is deliberately NOT lifted to the top-level key, which
+            // `durable_resume_hold` reads: a fail-stop parks nothing.
+            Self::DurabilityFailStop { mob_id, cause } => Some(serde_json::json!({
+                "kind": "mob_durability_fail_stop",
+                "mob_id": mob_id.as_str(),
+                "reason": "durability_fail_stop",
+                "cause": cause.to_string(),
+                "cause_data": cause.structured_data(),
+                "actor_stopped": true,
+            })),
             Self::MemberStartupRecoveryFailed {
                 member_id,
                 session_id,
@@ -2147,6 +2171,9 @@ impl MobError {
             | Self::SharedLifecycleFailure(error)
             | Self::MemberRetirementStuck { cause: error, .. }
             | Self::MemberStartupRecoveryFailed { cause: error, .. } => error.durable_resume_hold(),
+            // Restart, do not park: the cause's hold belongs to a mutation
+            // the stopped actor never retries.
+            Self::DurabilityFailStop { .. } => None,
             other => other
                 .structured_data()
                 .as_ref()
@@ -2166,6 +2193,8 @@ impl MobError {
                 Self::SharedRetirementFailure(error)
                 | Self::SharedLifecycleFailure(error)
                 | Self::MemberStartupRecoveryFailed { cause: error, .. } => error.wire_error_code(),
+                // The close's answer (AdmissionClosed carries no code).
+                Self::DurabilityFailStop { .. } => None,
                 Self::SessionError(
                     meerkat_core::SessionError::RuntimeUnavailable { .. }
                     | meerkat_core::SessionError::HostingUnavailable { .. },
@@ -2222,6 +2251,7 @@ impl MobError {
             | Self::MemberStartupRecoveryFailed { cause: error, .. } => {
                 error.bridge_rejection_cause()
             }
+            Self::DurabilityFailStop { .. } => None,
             // Cloned: `BridgeRejectionCause` carries payload variants since V4.
             Self::BridgeCommandRejected { cause, .. } => Some(cause.clone()),
             _ => None,
@@ -2250,6 +2280,7 @@ impl MobError {
             | Self::MemberStartupRecoveryFailed { cause: error, .. } => {
                 error.is_closed_runtime_effect_refusal()
             }
+            Self::DurabilityFailStop { .. } => false,
             _ => false,
         }
     }
@@ -2263,6 +2294,35 @@ impl MobError {
                 cause.retirement_root_cause()
             }
             other => other,
+        }
+    }
+
+    /// This error with [`Self::SharedLifecycleFailure`] peeled: the error a
+    /// shared lifecycle failure carries (through nested ones), or this error
+    /// itself. A match on a variant that a fail-stop's triggering reply can
+    /// arrive wrapped in reads through this.
+    pub fn without_shared_lifecycle_wrapper(&self) -> &MobError {
+        match self {
+            Self::SharedLifecycleFailure(error) => error.without_shared_lifecycle_wrapper(),
+            other => other,
+        }
+    }
+
+    /// This error as a retirement topology cleanup failure: one already is
+    /// comes back unchanged, any other is wrapped with its rendering.
+    pub(crate) fn into_retirement_topology_incomplete(self) -> MobError {
+        match self {
+            Self::RetirementTopologyIncomplete(_) => self,
+            other => Self::RetirementTopologyIncomplete(other.to_string()),
+        }
+    }
+
+    /// This error as a wiring failure: one already is comes back unchanged,
+    /// any other is wrapped with its rendering.
+    pub(crate) fn into_wiring_error(self) -> MobError {
+        match self {
+            Self::WiringError(_) => self,
+            other => Self::WiringError(other.to_string()),
         }
     }
 
@@ -2298,6 +2358,8 @@ impl MobError {
             Self::SharedRetirementFailure(error)
             | Self::SharedLifecycleFailure(error)
             | Self::MemberStartupRecoveryFailed { cause: error, .. } => error.failure_class(),
+            // The close's answer: AdmissionClosed falls to MobRejected.
+            Self::DurabilityFailStop { .. } => MobFailureClass::MobRejected,
             Self::MobNotFound(_)
             | Self::ProfileNotFound(_)
             | Self::MemberNotFound(_)
@@ -2409,6 +2471,7 @@ impl MobError {
             Self::SharedRetirementFailure(error)
             | Self::SharedLifecycleFailure(error)
             | Self::MemberStartupRecoveryFailed { cause: error, .. } => error.wire_detail(),
+            Self::DurabilityFailStop { .. } => None,
             Self::ScopeDenied(denial) => Some(WireMobErrorDetail::ScopeDenied(
                 WireScopeDeniedDetail::from(denial),
             )),
@@ -2846,6 +2909,10 @@ mod tests {
                 member_id: AgentIdentity::from("m"),
                 session_id: meerkat_core::types::SessionId::new(),
                 cause: Arc::new(MobError::Internal("restore failed".to_string())),
+            },
+            MobError::DurabilityFailStop {
+                mob_id: MobId::from("mob"),
+                cause: Arc::new(MobError::Internal("append outcome unknown".to_string())),
             },
             MobError::KickoffWaitTimedOut {
                 pending_member_ids: vec![AgentIdentity::from("m")],
