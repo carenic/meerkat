@@ -83,6 +83,36 @@ describe("standalone subscription terminal errors", () => {
   }
 
   for (const scope of ["session", "mob", "member"]) {
+    it(`${scope} preserves the last canonical sequence across a gap marker and terminal error`, async () => {
+      const client = new MeerkatClient(fixture);
+      await client.connect();
+      try {
+        const sub = await openSubscription(client, scope, "queued-gap-terminal-error");
+        const iterator = sub[Symbol.asyncIterator]();
+        const first = (await iterator.next()).value;
+        assert.equal((scope === "mob" ? first.envelope : first).seq, 41);
+        assert.deepEqual([sub.lastRpcSequence, sub.lastEventSeq], [7, 41]);
+        const marker = (await iterator.next()).value;
+        const markerEnvelope = scope === "mob" ? marker.envelope : marker;
+        assert.equal(markerEnvelope.seq, 0);
+        assert.deepEqual(markerEnvelope.payload, {
+          type: "stream_truncated", reason: { kind: "stream_lagged", dropped: 1 },
+        });
+        assert.deepEqual([sub.lastRpcSequence, sub.lastEventSeq], [9, 41]);
+        await assert.rejects(iterator.next(), (error) => {
+          assert.ok(error instanceof EventSubscriptionError);
+          assert.equal(error.code, "stream_queue_overflow");
+          assert.deepEqual([error.lastRpcSequence, error.lastEventSeq], [9, 41]);
+          assert.equal(error.details.last_rpc_sequence, 9);
+          assert.equal(error.details.last_event_seq, 41);
+          assert.deepEqual(error.terminalOutcome, sub.terminalOutcome);
+          return true;
+        });
+      } finally {
+        await client.close();
+      }
+    });
+
     for (const [scenario, code, message, outcome] of [
       ["queued-terminal-error", "stream_queue_overflow", "synthetic stream overflow", "terminal_error"],
       ["queued-unknown-error", "future_stream_code", "future detail: preserve exactly", "future_terminal_outcome"],

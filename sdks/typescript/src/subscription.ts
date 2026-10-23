@@ -81,7 +81,9 @@ export class EventSubscription<T> implements AsyncIterable<T> {
     return this.deliveredRpcSequence;
   }
 
-  /** Canonical envelope seq of the last delivered event, not a replay cursor. */
+  /** Last delivered canonical event seq, not a replay cursor.
+   * Gap markers do not replace it.
+   */
   get lastEventSeq(): number | undefined {
     return this.deliveredEventSeq;
   }
@@ -127,7 +129,10 @@ export class EventSubscription<T> implements AsyncIterable<T> {
         ? event as Record<string, unknown> : undefined;
       const envelope = (record?.envelope ?? record) as Record<string, unknown> | undefined;
       this.deliveredRpcSequence = delivery.rpcSequence;
-      this.deliveredEventSeq = typeof envelope?.seq === "number" ? envelope.seq : undefined;
+      const payload = envelope?.payload as Record<string, unknown> | undefined;
+      if (payload?.type !== "stream_truncated") {
+        this.deliveredEventSeq = typeof envelope?.seq === "number" ? envelope.seq : undefined;
+      }
       yield event;
     }
   }

@@ -91,6 +91,35 @@ async def test_subscription_drains_events_before_typed_terminal_error(scope, sce
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("scope", ["session", "mob", "member"])
+async def test_gap_marker_preserves_last_canonical_event_sequence_on_terminal_error(scope):
+    from meerkat import EventSubscriptionError, MeerkatClient
+    from meerkat.events import StreamTruncated
+
+    async with MeerkatClient(str(FAKE_RPC)) as client:
+        sub = await open_subscription(client, scope, "queued-gap-terminal-error")
+        iterator = sub.__aiter__()
+        first = await anext(iterator)
+        first_envelope = first.envelope if scope == "mob" else first
+        assert first_envelope.seq == 41
+        assert (sub.last_rpc_sequence, sub.last_event_seq) == (7, 41)
+        marker = await anext(iterator)
+        marker_envelope = marker.envelope if scope == "mob" else marker
+        assert marker_envelope.seq == 0
+        assert isinstance(marker_envelope.payload, StreamTruncated)
+        assert marker_envelope.payload.reason.dropped == 1
+        assert (sub.last_rpc_sequence, sub.last_event_seq) == (9, 41)
+        with pytest.raises(EventSubscriptionError) as failure:
+            await anext(iterator)
+        error = failure.value
+        assert error.code == "stream_queue_overflow"
+        assert (error.last_rpc_sequence, error.last_event_seq) == (9, 41)
+        assert error.details["last_rpc_sequence"] == 9
+        assert error.details["last_event_seq"] == 41
+        assert error.terminal_outcome == sub.terminal_outcome
+
+
+@pytest.mark.asyncio
 async def test_received_terminal_error_survives_dispatcher_transport_cleanup():
     from meerkat import EventSubscriptionError
     from meerkat.event_envelope import parse_agent_event_envelope

@@ -20,7 +20,7 @@ from .errors import (
     MeerkatError,
     meerkat_error_from_jsonrpc_code,
 )
-from .events import Event, TextDelta
+from .events import Event, StreamTruncated, TextDelta
 
 if TYPE_CHECKING:
     from .session import Session
@@ -643,7 +643,10 @@ class EventSubscription:
 
     @property
     def last_event_seq(self) -> int | None:
-        """Canonical envelope seq of the last delivered event, not a cursor."""
+        """Last delivered canonical event seq, not a replay cursor.
+
+        Gap markers do not replace it.
+        """
         return self._last_event_seq
 
     async def __aenter__(self) -> EventSubscription:
@@ -699,5 +702,6 @@ class EventSubscription:
             event = self._parse_event_fn(delivery.event)
             envelope = getattr(event, "envelope", event)
             self._last_rpc_sequence = delivery.rpc_sequence
-            self._last_event_seq = getattr(envelope, "seq", None)
+            if not isinstance(getattr(envelope, "payload", None), StreamTruncated):
+                self._last_event_seq = getattr(envelope, "seq", None)
             yield event
