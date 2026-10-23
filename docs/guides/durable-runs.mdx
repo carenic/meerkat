@@ -19,8 +19,7 @@ This page covers:
 - what happens after a crash;
 - what a tool sees when its call runs again;
 - durable workers in mobs;
-- keeping a realm in your own database through the host store SPI;
-- restarting a host without losing the runs in flight.
+- keeping a realm in your own database through the host store SPI.
 
 The SPI contract itself is in the [Host Store SPI reference](/reference/host-store-spi).
 
@@ -366,64 +365,6 @@ Before you run a host store in production, run the host store chapter of the
 `meerkat-store-conformance` crate against it (see
 [Conformance](/reference/host-store-spi#conformance)).
 
-## Restarting A Host Without Losing In-Flight Runs
-
-A graceful stop does not carry a run in flight across a restart.
-Unregistering a session cancels its running turn, even with
-`UnregisterQueuedInputs::Requeue`, which keeps only the prompts still queued
-behind it, and a mob Shutdown does the same for its members. The run ends,
-its inputs are not run again, and nothing continues after the restart. A
-process that exits without unregistering leaves the run exactly as a crash
-does, and the next process continues it from its last committed round.
-
-To deploy a new version without losing runs in flight:
-
-1. Stop admitting new work to the host: route new requests elsewhere, or
-   refuse them.
-2. Find the sessions with a run in flight. A session's `is_active`, in the
-   session list and read results (`SessionSummary::is_active` and
-   `SessionInfo::is_active` in Rust), is true while a turn is running. A Rust
-   host can also ask `MeerkatMachine::current_run(&session_id)` for the id
-   of the running run. Only persistent sessions (`sqlite`, `jsonl` or
-   host-store realms) keep their runs; an ephemeral session has nothing to
-   continue.
-3. Stop every session without a run in flight gracefully, as before, with
-   `UnregisterQueuedInputs::Requeue` if you want their queued prompts kept.
-   A session whose run is waiting to continue, but has not started its
-   resumed round, has no run in flight: a graceful stop with
-   `UnregisterQueuedInputs::Requeue` keeps that run for the next start, and
-   one without it abandons the run's inputs.
-4. Exit the process without unregistering, stopping, cancelling or archiving
-   the sessions that have a run in flight, and without shutting down the
-   mobs whose workers have one.
-5. In the new process, open those sessions again; a mob that rebuilds its
-   durable workers opens theirs itself. Each run continues under the same run
-   id from its last committed round, as described in
-   [After A Crash](#after-a-crash).
-
-What to expect:
-
-- **The round in progress runs again.** A round whose model response was not
-  committed asks the model again. A round whose tool calls were committed,
-  but not their results, dispatches the calls again, at least once and with
-  the same dedupe keys, except the calls
-  [answered as interrupted](#calls-answered-as-interrupted).
-- **Waiting callers see the process end.** A caller waiting on such a run
-  sees its connection or wait fail, not the `requeued_across_stop` answer a
-  graceful stop gives kept prompts. Read the session again after the restart
-  for the result.
-- **Callback suspensions keep waiting.** A run suspended on callback tools
-  waits for their results after the restart, as after any restart.
-- **A host store waits out the old lease.** On a host-store realm the new
-  process cannot open the realm while the old process's lease lasts, 30
-  seconds by default: the open fails with `Held`, naming the time left. Open
-  again after it, or take over. A mob restarted over a persistent store takes
-  its identities' leases at once when it can prove that the earlier process
-  ended (see
-  [Mobs: cold resume and cancellation](/guides/mobs#cold-resume-and-cancellation)).
-- **Nothing resumes by itself.** Meerkat does not look for open runs at
-  start-up: a session nobody opens keeps its run until it is opened.
-
 ## Limitations
 
 - The usage of a model call in a lost round is not recorded, although the
@@ -434,9 +375,6 @@ What to expect:
   run.
 - A round whose model response contains an image takes no first commit; a
   crash during its tools asks the model again for that round.
-- A graceful stop cancels the runs in flight. To keep them through a deploy,
-  see
-  [Restarting A Host Without Losing In-Flight Runs](#restarting-a-host-without-losing-in-flight-runs).
 - Round commits serve crash recovery only. A run that fails and whose inputs
   are queued for another attempt discards its round commits and starts again
   from its inputs, as before 0.9.5. On a WholeBlob realm, a run that has
