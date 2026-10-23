@@ -2793,6 +2793,10 @@ them.
   not map, so the policy saw an unknown provider-native tool and a governed
   Gemini web search was refused as malformed.
 
+### Security
+
+- tokio updated to 1.53.3 for RUSTSEC-2026-0386.
+
 ### Upgrade notes
 
 - Upgrade Core and its SDKs together: an SDK before 0.9.5 misreads a 0.9.5
