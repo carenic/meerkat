@@ -37,6 +37,12 @@ them.
 
 ### Breaking
 
+- `meerkat-contracts`: `WireProviderMeta` gains the
+  `GeminiFunctionCall { id, thought_signature }` variant, serialized with
+  `provider: "gemini_function_call"`. Downstream exhaustive Rust matches
+  and wire decoders must handle this metadata for provider-issued Gemini
+  call IDs. The existing signature-only `Gemini` variant is unchanged.
+
 - `meerkat-schedule`: the occurrence lifecycle carries the admission evidence
   of an occurrence's receipt history (see Fixed, scheduled delivery after a
   lost executor). `OccurrenceLifecycleInput::ClassifyDue` and `Claim` gain the
@@ -1156,6 +1162,12 @@ them.
   (7) and `stored_input_state_version_for_row` are new.
 
 ### Fixed
+
+- `meerkat-gemini`: preserve provider-issued `functionCall.id` through
+  streamed tool calls, saved transcripts, assistant replay and matching
+  `functionResponse.id`, including parallel calls to the same function.
+  Meerkat's internal tool correlation IDs remain separate and are never
+  emitted as provider IDs when Gemini omitted the optional field.
 
 - Continuations on a retired address. A continuation whose drain reserved it
   before a crash, on an address that retired since, no longer reads

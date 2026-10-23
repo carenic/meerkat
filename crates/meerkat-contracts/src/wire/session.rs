@@ -482,6 +482,15 @@ pub enum WireProviderMeta {
         #[serde(rename = "thoughtSignature")]
         thought_signature: String,
     },
+    GeminiFunctionCall {
+        id: String,
+        #[serde(
+            default,
+            rename = "thoughtSignature",
+            skip_serializing_if = "Option::is_none"
+        )]
+        thought_signature: Option<String>,
+    },
     OpenAi {
         id: String,
         #[serde(default)]
@@ -514,6 +523,13 @@ impl From<ProviderMeta> for WireProviderMeta {
             ProviderMeta::AnthropicRedacted { data } => Self::AnthropicRedacted { data },
             ProviderMeta::AnthropicCompaction { content } => Self::AnthropicCompaction { content },
             ProviderMeta::Gemini { thought_signature } => Self::Gemini { thought_signature },
+            ProviderMeta::GeminiFunctionCall {
+                id,
+                thought_signature,
+            } => Self::GeminiFunctionCall {
+                id,
+                thought_signature,
+            },
             ProviderMeta::OpenAi {
                 id,
                 encrypted_content,
@@ -1068,6 +1084,13 @@ fn wire_provider_meta_to_core(value: WireProviderMeta) -> Option<ProviderMeta> {
         WireProviderMeta::Gemini { thought_signature } => {
             Some(ProviderMeta::Gemini { thought_signature })
         }
+        WireProviderMeta::GeminiFunctionCall {
+            id,
+            thought_signature,
+        } => Some(ProviderMeta::GeminiFunctionCall {
+            id,
+            thought_signature,
+        }),
         WireProviderMeta::OpenAi {
             id,
             encrypted_content,
@@ -3290,6 +3313,28 @@ mod tests {
             // `AssistantBlock` is `PartialEq` (custom impl handles
             // `ToolUse.args` via byte-equivalence on the underlying JSON).
             assert_eq!(case, back, "round trip lost data for {snapshot}");
+        }
+    }
+
+    #[test]
+    fn gemini_native_call_metadata_roundtrips_through_wire_json() {
+        for thought_signature in [None, Some("opaque-signature".to_string())] {
+            let block = AssistantBlock::ToolUse {
+                id: "fc_0".into(),
+                name: "lookup".into(),
+                args: serde_json::value::to_raw_value(&serde_json::json!({"key": 1})).unwrap(),
+                meta: Some(Box::new(ProviderMeta::GeminiFunctionCall {
+                    id: "native-call".into(),
+                    thought_signature,
+                })),
+            };
+            let wire: WireAssistantBlock = block.clone().into();
+            let value = serde_json::to_value(wire).unwrap();
+            assert_eq!(value["data"]["id"], "fc_0");
+            assert_eq!(value["data"]["meta"]["provider"], "gemini_function_call");
+            assert_eq!(value["data"]["meta"]["id"], "native-call");
+            let wire: WireAssistantBlock = serde_json::from_value(value).unwrap();
+            assert_eq!(AssistantBlock::try_from(wire).unwrap(), block);
         }
     }
 
