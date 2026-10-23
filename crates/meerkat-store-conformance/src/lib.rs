@@ -54,12 +54,13 @@
 //!   them, at a scale of 210 scopes, through a [`HostStoreFactory`] whose
 //!   every open stands for a new process. The in crate
 //!   [`InMemoryHostStore`] is the reference that passes it.
-//! - [`chapters::long_run`] / [`chapters::durable_worker`]: Core over any
-//!   store, through a [`LongRunHarness`] or [`DurableWorkerHarness`]: a run
-//!   (or a durable worker) killed at any point of a round resumes from its
-//!   last durable commit under the same run id and identity, or is requeued
-//!   when nothing of it is durable, and its input finishes with every round
-//!   once and one receipt.
+//! - [`chapters::long_run`] / [`chapters::compacted_long_run`] /
+//!   [`chapters::durable_worker`]: Core over any store, through a
+//!   [`LongRunHarness`] or [`DurableWorkerHarness`]: a run (or a durable
+//!   worker) killed at any point of a round, after any number of
+//!   compactions, resumes from its last durable commit under the same run id
+//!   and identity, or is requeued when nothing of it is durable, and its
+//!   input finishes with every round once and one receipt.
 //!
 //! Chapters contain **no provider-specific code**: everything is expressed
 //! through the `meerkat-core` trait contracts, so a downstream backend runs
@@ -97,8 +98,8 @@ pub use failure::ConformanceFailure;
 pub use host_store_memory::InMemoryHostStore;
 pub use long_run::{
     BeforeResume, DurableWorkerHarness, KillPoint, KilledRun, KilledWorker, LongRunHarness,
-    LongRunPlan, RestartReport, RestartedWorker, ResumeGate, ResumedRun, UnrepeatableTool, call_id,
-    resumes, takes_first_commit,
+    LongRunPlan, RestartReport, RestartedWorker, ResumeGate, ResumePointKind, ResumedRun, RoundSet,
+    UnrepeatableTool, call_id, resumes, takes_first_commit,
 };
 pub use wrappers::{
     DefaultRangeVerbIncrementalStore, ForwardingSessionStore, SwallowingSessionStore,

@@ -591,10 +591,17 @@ them.
   under the same run id: after a round's first commit it dispatches that
   round's calls again under the same dedupe keys without asking the model, and
   a started call of an unrepeatable tool gets the typed interrupted result
-  instead; otherwise the model is asked again for the round. A kill in round 0
-  before any commit requeues the input as a new run. Either way the input
-  finishes with every round once and one receipt, and over a store with fence
-  leases every restart waits out the killed process's lease.
+  instead; otherwise the model is asked again for the round. Every tool round
+  takes its first commit, round 0 and a callback batch included, except a
+  round whose assistant message carries an image. A kill in round 0 before its
+  first commit requeues the input as a new run. Either way the input finishes
+  with every round once and one receipt, and over a store with fence leases
+  every restart waits out the killed process's lease.
+  `chapters::compacted_long_run` kills runs after one to five compactions:
+  each resumes at its last committed round, never at a round before a
+  compaction, and a run whose compaction races another writer stops
+  dispatching and its input runs again as a new run, with nothing lost or
+  duplicated.
 - `MemberBinding::labels()`: the application labels the incarnation was
   spawned with, as its spawn recorded them (a member reset keeps them). Every
   read of the member binding history carries them, the store-level

@@ -15,15 +15,17 @@
 //! is asked for that round; the last round answers without tool calls.
 //!
 //! A round makes two commits: the first stages the assistant message with
-//! its tool calls, the second commits the message with their results. A
-//! round takes no first commit when the run's live tail holds no assistant
-//! message of the run yet: round 0, and the round right after a compaction.
-//! A callback batch takes none either. [`takes_first_commit`] encodes that
-//! rule. A killed run resumes only when one of its commits is durable;
-//! otherwise its input is requeued and runs again as a new run.
+//! its tool calls, the second commits the message with their results. Every
+//! tool round takes both, round 0, the round right after a compaction and a
+//! callback batch included, except a round whose assistant message carries
+//! an image, which takes no first commit. [`takes_first_commit`] encodes
+//! that rule. A compaction commits the rewritten transcript as the run's new
+//! base, and later round commits continue from it. A killed run resumes
+//! only when one of its commits is durable; otherwise its input is requeued
+//! and runs again as a new run.
 
 use async_trait::async_trait;
-use meerkat_core::{RunId, RunResumePoint, ToolCallDedupeKey};
+use meerkat_core::{RunId, ToolCallDedupeKey};
 
 use crate::failure::ConformanceFailure;
 
@@ -64,6 +66,12 @@ pub enum KillPoint {
     DuringUnrepeatableTool(UnrepeatableTool),
     /// While the round's calls, all external callback tools, run.
     DuringCallbackTools,
+    /// Not a kill: before the round's compaction commits, a second Core over
+    /// the same store takes the fence over and commits the session with one
+    /// message of its own. The run's compaction commit is refused (stale or
+    /// fenced out), and the run dispatches nothing more. The restart runs
+    /// over the same store after that.
+    RebaseRace,
 }
 
 /// What happens after the restart and before the killed run resumes.
@@ -81,6 +89,54 @@ pub enum BeforeResume {
     Retire,
 }
 
+/// A set of round indices below 64.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RoundSet(u64);
+
+impl RoundSet {
+    /// No rounds.
+    pub const EMPTY: Self = Self(0);
+
+    /// This set and `round`. A round of 64 or more is not representable and
+    /// leaves the set unchanged.
+    #[must_use]
+    pub const fn with(self, round: u64) -> Self {
+        if round < 64 {
+            Self(self.0 | (1 << round))
+        } else {
+            self
+        }
+    }
+
+    /// Whether `round` is in the set.
+    #[must_use]
+    pub const fn contains(self, round: u64) -> bool {
+        round < 64 && self.0 & (1 << round) != 0
+    }
+
+    /// The highest round in the set, if any.
+    #[must_use]
+    pub const fn last(self) -> Option<u64> {
+        if self.0 == 0 {
+            None
+        } else {
+            Some(63 - self.0.leading_zeros() as u64)
+        }
+    }
+
+    /// How many rounds the set holds.
+    #[must_use]
+    pub const fn len(self) -> u32 {
+        self.0.count_ones()
+    }
+
+    /// Whether the set holds no round.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
 /// One long run row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LongRunPlan {
@@ -92,27 +148,34 @@ pub struct LongRunPlan {
     pub kill_round: u64,
     /// Where in that round.
     pub kill_point: KillPoint,
-    /// Compact the transcript in the kill round, before its model call.
-    pub compact_in_kill_round: bool,
+    /// The rounds before whose model call the harness compacts the
+    /// transcript.
+    pub compactions: RoundSet,
+    /// The rounds whose assistant message carries an image besides its tool
+    /// calls.
+    pub image_rounds: RoundSet,
     /// What happens between the restart and the resume.
     pub before_resume: BeforeResume,
 }
 
-/// Whether round `round` of `plan` takes its first commit: not round 0, not
-/// the round right after a compaction, and not a callback batch.
+/// Whether round `round` of `plan` takes its first commit: every tool round
+/// does, except one whose assistant message carries an image.
 #[must_use]
 pub fn takes_first_commit(plan: &LongRunPlan, round: u64) -> bool {
-    let kill_round = round == plan.kill_round;
-    round > 0
-        && !(kill_round && plan.compact_in_kill_round)
-        && !(kill_round && plan.kill_point == KillPoint::DuringCallbackTools)
+    !plan.image_rounds.contains(round)
 }
 
 /// Whether the killed run resumes: some commit of it is durable. A kill in
 /// round 0 resumes only after that round's first commit; otherwise the
-/// input is requeued, exactly as when no round was committed.
+/// input is requeued, exactly as when no round was committed. After a
+/// compaction race the input is requeued too.
 #[must_use]
 pub fn resumes(plan: &LongRunPlan) -> bool {
+    // Every commit of the other writer drops the run's provisional rounds,
+    // so after a compaction race nothing of the run is continuable.
+    if plan.kill_point == KillPoint::RebaseRace {
+        return false;
+    }
     plan.kill_round > 0 || (takes_first_commit(plan, 0) && plan.kill_point != KillPoint::ModelCall)
 }
 
@@ -126,20 +189,35 @@ pub struct KilledRun {
     pub dispatched: Vec<ToolCallDedupeKey>,
 }
 
+/// Where a resumed run continues, as its run resumed event names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumePointKind {
+    /// The round's first commit is the last one: its calls are dispatched
+    /// again without asking the model.
+    ToolsPending,
+    /// The round's second commit is the last one: the model is asked for the
+    /// next round.
+    AwaitingModel,
+}
+
 /// The run resumed event of a restarted process.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumedRun {
     /// The run that resumed.
     pub run_id: RunId,
+    /// The round of the run's last commit, as its cursor holds it: the
+    /// round whose calls are pending, or the round whose results were the
+    /// last committed.
+    pub round: u64,
     /// Where it resumed.
-    pub resume_point: RunResumePoint,
+    pub resume_point: ResumePointKind,
 }
 
 /// What the restarted process did, from the restart until its session was
 /// idle again. "The input's run" is the run that carried the killed run's
 /// input to its end: the killed run when it resumed, or the new run of its
 /// requeued input.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestartReport {
     /// The run resumed event, if the restarted process resumed a run.
     pub resumed: Option<ResumedRun>,
@@ -166,6 +244,9 @@ pub struct RestartReport {
     pub transcript_results: Vec<String>,
     /// The run receipts the store holds for the input, over all its runs.
     pub receipts: usize,
+    /// How many messages of the other writer of a compaction race the
+    /// session's final transcript holds; zero in every other row.
+    pub other_writer_messages: usize,
     /// Whether every input bound to the killed run is terminal in the store.
     pub inputs_settled: bool,
 }
@@ -219,7 +300,7 @@ pub struct KilledWorker {
 }
 
 /// The durable worker after the restart.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestartedWorker {
     /// The worker's durable identity, as its mob names it.
     pub identity: String,
