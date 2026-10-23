@@ -72,9 +72,10 @@ them.
   and meerkat-mob's `MobMachineInput` variant and the kernel's input struct)
   gains the field `keeps_durable_run: bool`, appended last, so code that
   builds it literally must set it (`false` keeps the earlier behavior).
-  `AutonomousShutdownMemberActionKind` (meerkat-machine-schema and the
-  kernel) gains `KeepForResume`, appended last; an exhaustive match needs the
-  new arm. The kernel `generated::mob::TransitionId` gains
+  `AutonomousShutdownMemberActionKind` (meerkat-machine-schema,
+  meerkat-mob's `machines::mob_machine` and the kernel) gains
+  `KeepForResume`, appended last; an exhaustive match needs the new arm. The
+  kernel `generated::mob::TransitionId` gains
   `ResolveAutonomousShutdownMemberActionKeepForResumeRunning`,
   `ResolveAutonomousShutdownMemberActionKeepForResumeStopped` and
   `ResolveAutonomousShutdownMemberActionKeepForResumeCompleted`, appended

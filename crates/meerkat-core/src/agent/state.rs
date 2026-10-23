@@ -2217,17 +2217,6 @@ where
         }
     }
 
-    /// The round state's run, round index and whether a round commit is its
-    /// latest checkpoint.
-    #[cfg(test)]
-    pub(crate) fn round_commit_state_for_test(&self) -> (Option<RunId>, u64, bool) {
-        (
-            self.round_commits.run_id.clone(),
-            self.round_commits.round,
-            self.round_commits.cursor_written,
-        )
-    }
-
     async fn publish_pending_sticky_model_fallback(&mut self) -> Result<(), AgentError> {
         let pending = self
             .pending_sticky_model_fallback_activation
