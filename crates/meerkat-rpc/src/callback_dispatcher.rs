@@ -22,12 +22,13 @@ use serde_json::value::RawValue;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use async_trait::async_trait;
+use meerkat_contracts::WireToolResultContent;
 use meerkat_core::AgentToolDispatcher;
 use meerkat_core::ToolDispatchOutcome;
 use meerkat_core::agent::ExternalToolUpdate;
 use meerkat_core::error::ToolError;
 use meerkat_core::event::{ExternalToolDelta, ExternalToolDeltaPhase, ToolConfigChangeOperation};
-use meerkat_core::types::{ToolCallView, ToolDef, ToolResult};
+use meerkat_core::types::{ContentBlock, ToolCallView, ToolDef, ToolResult};
 use meerkat_core::{ToolCatalogCapabilities, ToolCatalogEntry};
 
 use crate::protocol::{RpcId, RpcOutboundAdmission, RpcOutboundPermit, RpcRequest, RpcResponse};
@@ -845,7 +846,7 @@ impl CallbackToolDispatcher {
         #[derive(serde::Deserialize)]
         struct CallbackResult {
             #[serde(default)]
-            content: String,
+            content: Option<WireToolResultContent>,
             #[serde(default)]
             is_error: bool,
         }
@@ -853,7 +854,25 @@ impl CallbackToolDispatcher {
         let parsed: CallbackResult = serde_json::from_str(result_raw.get()).map_err(|e| {
             ToolError::execution_failed(format!("Failed to parse callback result: {e}"))
         })?;
-        let outcome = ToolResult::new(call.id.to_string(), parsed.content, parsed.is_error).into();
+        let result = match parsed.content {
+            None => ToolResult::new(call.id.to_string(), String::new(), parsed.is_error),
+            Some(WireToolResultContent::Text(text)) => {
+                ToolResult::new(call.id.to_string(), text, parsed.is_error)
+            }
+            Some(WireToolResultContent::Blocks(blocks)) => {
+                let content = blocks
+                    .into_iter()
+                    .map(ContentBlock::try_from)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| {
+                        ToolError::execution_failed(format!(
+                            "Failed to convert callback result content: {error}"
+                        ))
+                    })?;
+                ToolResult::with_blocks(call.id.to_string(), content, parsed.is_error)
+            }
+        };
+        let outcome = result.into();
         drop(response_handoff);
         Ok(outcome)
     }
@@ -2389,6 +2408,127 @@ mod tests {
 
             let result = handle.await.unwrap().unwrap();
             assert_eq!(result.result.text_content(), "done");
+        }
+    }
+
+    async fn dispatch_callback_result(
+        payload: serde_json::Value,
+    ) -> Result<ToolDispatchOutcome, ToolError> {
+        let (callback_tx, mut callback_rx) = mpsc::channel(1);
+        let tools = Arc::new(StdRwLock::new(vec![make_tool_def("capture")]));
+        let dispatcher =
+            CallbackToolDispatcher::new(tools, callback_tx, Arc::new(AtomicU64::new(0)), vec![]);
+        let args = RawValue::from_string("{}".to_string()).unwrap();
+        let call = ToolCallView {
+            id: "tc-content",
+            name: "capture",
+            args: &args,
+        };
+        let respond = async move {
+            let (request, response_tx, _outbound_permit) =
+                callback_rx.recv().await.unwrap().into_parts();
+            assert!(
+                response_tx
+                    .send(CallbackResponseHandoff::unmetered_for_test(
+                        RpcResponse::success(request.id, payload)
+                    ))
+                    .is_ok()
+            );
+        };
+        let (result, ()) = tokio::join!(dispatcher.dispatch(call), respond);
+        result
+    }
+
+    #[tokio::test]
+    async fn callback_result_preserves_legacy_text_and_error_flag() {
+        for is_error in [false, true] {
+            let result = dispatch_callback_result(serde_json::json!({
+                "content": "legacy result", "is_error": is_error,
+            }))
+            .await
+            .unwrap()
+            .result;
+            assert_eq!(result.tool_use_id, "tc-content");
+            assert_eq!(result.text_content(), "legacy result");
+            assert_eq!(result.content.len(), 1);
+            assert_eq!(result.is_error, is_error);
+        }
+    }
+
+    #[tokio::test]
+    async fn callback_result_preserves_text_and_inline_image_blocks() {
+        let result = dispatch_callback_result(serde_json::json!({
+            "content": [
+                {"type": "text", "text": "Captured frame"},
+                {"type": "image", "media_type": "image/png", "source": "inline", "data": "AQID"},
+            ],
+            "is_error": false,
+        }))
+        .await
+        .unwrap()
+        .result;
+        assert_eq!(result.tool_use_id, "tc-content");
+        assert_eq!(
+            result.content,
+            vec![
+                meerkat_core::ContentBlock::Text {
+                    text: "Captured frame".to_string(),
+                },
+                meerkat_core::ContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: meerkat_core::ImageData::Inline {
+                        data: "AQID".to_string(),
+                    },
+                },
+            ]
+        );
+        assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn callback_result_preserves_error_blocks() {
+        let result = dispatch_callback_result(serde_json::json!({
+            "content": [{"type": "text", "text": "Tool rejected the action"}],
+            "is_error": true,
+        }))
+        .await
+        .unwrap()
+        .result;
+        assert_eq!(result.tool_use_id, "tc-content");
+        assert_eq!(result.text_content(), "Tool rejected the action");
+        assert_eq!(result.content.len(), 1);
+        assert!(result.is_error);
+    }
+
+    #[tokio::test]
+    async fn callback_result_rejects_malformed_and_unknown_blocks() {
+        for payload in [
+            serde_json::json!({"content": [{"type": "image", "source": "inline", "data": "AQID"}]}),
+            serde_json::json!({"content": [
+                {"type": "text", "text": "Do not return a partial result"},
+                {"type": "unknown_future_block"},
+            ]}),
+        ] {
+            let error = dispatch_callback_result(payload).await.unwrap_err();
+            assert!(matches!(error, ToolError::ExecutionFailed { .. }));
+        }
+    }
+
+    #[tokio::test]
+    async fn callback_result_without_content_preserves_empty_text_and_error_flag() {
+        for is_error in [false, true] {
+            let result = dispatch_callback_result(serde_json::json!({"is_error": is_error}))
+                .await
+                .unwrap()
+                .result;
+            assert_eq!(result.tool_use_id, "tc-content");
+            assert_eq!(
+                result.content,
+                vec![ContentBlock::Text {
+                    text: String::new(),
+                }]
+            );
+            assert_eq!(result.is_error, is_error);
         }
     }
 
