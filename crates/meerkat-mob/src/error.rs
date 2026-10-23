@@ -758,6 +758,20 @@ pub enum MobError {
         cause: Arc<MobError>,
     },
 
+    /// Member `member_id`'s session `session_id` has a durable tail past its
+    /// committed runtime boundary that the store-owned recovery could not
+    /// prove: the recovery kept the tail intact, so the session still reads
+    /// as a revision conflict at that boundary. Nothing was written; the tail
+    /// stays for reconciliation. The structured data carries the
+    /// `tail_held_for_recovery` resume hold.
+    #[error(
+        "member {member_id} session {session_id} has a durable tail its recovery could not prove; the tail is kept for reconciliation"
+    )]
+    MemberDurableTailUnprovable {
+        member_id: AgentIdentity,
+        session_id: meerkat_core::types::SessionId,
+    },
+
     /// The member's runtime registration is durability-degraded: a durable
     /// commit could not be reconciled with the live shell, so the runtime
     /// refuses every ordinary input until a registration-authorized cold
@@ -1932,6 +1946,18 @@ impl MobError {
                 }
                 Some(data)
             }
+            Self::MemberDurableTailUnprovable {
+                member_id,
+                session_id,
+            } => Some(serde_json::json!({
+                "kind": "mob_member_durable_tail_unprovable",
+                "member_id": member_id.as_str(),
+                "session_id": session_id.to_string(),
+                meerkat_core::service::SessionError::DURABLE_RESUME_HOLD_KEY:
+                    meerkat_core::service::DurableResumeHold::TailHeldForRecovery.as_str(),
+                "content_retained": true,
+                "retryable": false,
+            })),
             Self::MemberRegistrationRefused {
                 member_id,
                 session_id,
@@ -2144,6 +2170,21 @@ impl MobError {
     /// structured `durable_resume_hold` wire token; never off display text.
     /// Hosts classify on this instead of parsing prose (Meta parks the
     /// member with the exact repair commands on `AuditedEndpointDivergence`).
+    /// Whether a member's custody restore at mob start failed for a cause
+    /// that can clear without this owner acting: another runtime owner hosts
+    /// the session, its hosting claim is unavailable, or its durable tail is
+    /// kept unprovable. Only these causes let the start defer that member
+    /// instead of failing; every other cause stays fatal.
+    pub(crate) fn is_deferrable_custody_cause(&self) -> bool {
+        matches!(
+            self,
+            Self::SessionError(
+                meerkat_core::SessionError::ServedElsewhere { .. }
+                    | meerkat_core::SessionError::HostingUnavailable { .. }
+            ) | Self::MemberDurableTailUnprovable { .. }
+        )
+    }
+
     pub fn durable_resume_hold(&self) -> Option<meerkat_core::service::DurableResumeHold> {
         match self {
             Self::SessionError(error) => error.durable_resume_hold(),
@@ -2315,6 +2356,10 @@ impl MobError {
             // (a live handle's `current` is final).
             | Self::IncarnationDestroyed { .. }
             | Self::IncarnationMismatch { .. } => MobFailureClass::TargetMissing,
+            // The same verdict as a resume refused at an unprovable committed
+            // boundary: the tail stays until its recovery or an operator
+            // resolves it, never a plain busy/backoff retry.
+            Self::MemberDurableTailUnprovable { .. } => MobFailureClass::RuntimeRejected,
             Self::SessionUnavailableForResume { reason, .. } => match reason {
                 SessionResumeUnavailableReason::Absent => MobFailureClass::TargetMissing,
                 SessionResumeUnavailableReason::ArchivedNotRevivable => {
@@ -2808,10 +2853,95 @@ mod tests {
         }
     }
 
+    /// A durable tail its recovery kept is a typed tail hold: it carries the
+    /// resume hold, lifts it through the startup failure that wraps it, and
+    /// is never a plain retry.
+    #[test]
+    fn an_unprovable_durable_tail_is_a_typed_tail_hold() {
+        let session_id = meerkat_core::SessionId::new();
+        let unprovable = MobError::MemberDurableTailUnprovable {
+            member_id: AgentIdentity::from("w-1"),
+            session_id: session_id.clone(),
+        };
+        assert_eq!(
+            unprovable.durable_resume_hold(),
+            Some(meerkat_core::service::DurableResumeHold::TailHeldForRecovery)
+        );
+        assert_eq!(unprovable.failure_class(), MobFailureClass::RuntimeRejected);
+        let data = unprovable
+            .structured_data()
+            .expect("the unprovable tail carries structured data");
+        assert_eq!(data["kind"], "mob_member_durable_tail_unprovable");
+        assert_eq!(data["member_id"], "w-1");
+        assert_eq!(data["session_id"], session_id.to_string());
+        assert_eq!(data["content_retained"], true);
+        let wrapped = MobError::MemberStartupRecoveryFailed {
+            member_id: AgentIdentity::from("w-1"),
+            session_id,
+            cause: Arc::new(unprovable),
+        };
+        assert_eq!(
+            wrapped.durable_resume_hold(),
+            Some(meerkat_core::service::DurableResumeHold::TailHeldForRecovery),
+            "the startup failure lifts its cause's hold"
+        );
+    }
+
+    /// Only a hosting refusal or an unprovable tail lets the start defer a
+    /// member's custody; every other cause, a bare revision conflict
+    /// included, stays fatal.
+    #[test]
+    fn only_hosting_refusals_and_an_unprovable_tail_defer_custody() {
+        let id = meerkat_core::SessionId::new();
+        for deferrable in [
+            MobError::SessionError(meerkat_core::service::SessionError::ServedElsewhere {
+                id: id.clone(),
+            }),
+            MobError::SessionError(meerkat_core::service::SessionError::HostingUnavailable {
+                id: id.clone(),
+            }),
+            MobError::MemberDurableTailUnprovable {
+                member_id: AgentIdentity::from("w-1"),
+                session_id: id.clone(),
+            },
+        ] {
+            assert!(
+                deferrable.is_deferrable_custody_cause(),
+                "{deferrable} defers the member"
+            );
+        }
+        for fatal in [
+            MobError::Internal("local cleanup delivery tuple diverges".to_string()),
+            MobError::SessionError(meerkat_core::service::SessionError::Store(Box::new(
+                meerkat_core::SessionStoreError::TranscriptRevisionConflict {
+                    id: id.clone(),
+                    expected: "a".to_string(),
+                    actual: "b".to_string(),
+                },
+            ))),
+            MobError::SessionError(meerkat_core::service::SessionError::NotFound {
+                id: id.clone(),
+            }),
+            MobError::MemberStartupRecoveryFailed {
+                member_id: AgentIdentity::from("w-1"),
+                session_id: id.clone(),
+                cause: Arc::new(MobError::SessionError(
+                    meerkat_core::service::SessionError::ServedElsewhere { id: id.clone() },
+                )),
+            },
+        ] {
+            assert!(!fatal.is_deferrable_custody_cause(), "{fatal} stays fatal");
+        }
+    }
+
     #[test]
     fn test_all_variants_exist() {
         // Ensures all variants are constructible.
         let _variants: Vec<MobError> = vec![
+            MobError::MemberDurableTailUnprovable {
+                member_id: AgentIdentity::from("m"),
+                session_id: meerkat_core::SessionId::new(),
+            },
             MobError::ProfileNotFound(ProfileName::from("p")),
             MobError::MemberNotFound(AgentIdentity::from("m")),
             MobError::MemberAlreadyExists(AgentIdentity::from("m")),

@@ -31176,7 +31176,8 @@ impl MobActor {
     /// every start. The tail is settled first, through the store-owned
     /// recovery the resume path runs (a proven continuation is adopted, an
     /// unprovable one is kept intact), and the session is read once more; a
-    /// tail the recovery keeps still refuses, typed, as before.
+    /// tail the recovery keeps still refuses, typed:
+    /// [`MobError::MemberDurableTailUnprovable`].
     ///
     /// The settle runs under this runtime owner's hosting claim for the
     /// session (#1813), taken for the settle alone; the second read takes
@@ -31221,7 +31222,19 @@ impl MobActor {
                     }
                     return Err(error.into());
                 }
-                Ok(io.session_service.load_persisted_session(session).await?)
+                // A tail the recovery kept still reads as a revision conflict
+                // at the boundary: that is the typed unprovable-tail outcome.
+                // Only this read after the settle yields it; a conflict from
+                // any other read keeps its own error.
+                match io.session_service.load_persisted_session(session).await {
+                    Err(error) if is_transcript_revision_conflict(&error) => {
+                        Err(MobError::MemberDurableTailUnprovable {
+                            member_id: member.clone(),
+                            session_id: session.clone(),
+                        })
+                    }
+                    loaded => Ok(loaded?),
+                }
             }
             loaded => Ok(loaded?),
         }

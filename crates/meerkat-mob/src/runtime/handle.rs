@@ -2532,7 +2532,11 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         }
         // A degraded or detached runtime registration is a session fault of
         // the existing member; the spawn row records it as its session cause.
-        MobError::MemberReloadRequired { .. } | MobError::MemberRuntimeDetached { .. } => {
+        // A durable tail kept unprovable is a fault of the member's session;
+        // never a spawn outcome today, it classifies as a session error.
+        MobError::MemberReloadRequired { .. }
+        | MobError::MemberRuntimeDetached { .. }
+        | MobError::MemberDurableTailUnprovable { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::SessionError
         }
         // Delivery-lane backpressure, bounded actor sends and reload verdicts
