@@ -275,6 +275,12 @@ them.
   the database and its WAL stat as they did before that read
   (`DeliveryGenerationReader::read_on_notification`).
 
+- `meerkat-mob-mcp`: `HostJobSource::new` refuses a namespace in the
+  Core-owned `meerkat.` prefix (for example the consent notices'
+  `meerkat.consent`) with the new `HostJobSourceError::ReservedNamespace`, a
+  new construction-time refusal for callers that declared one. No host
+  source may own a reserved namespace.
+
 ### Added
 
 - Hosted MCP OAuth through the host's own `https` callback (#1808), for a
@@ -492,6 +498,41 @@ them.
   `DeliveryStoreWatch::subscribe_sweeps`, which moves for each of the
   watch's sweeps before its tick does, so an owner reads at every sweep.
 
+- `meerkat`: governed admission of host continuations. On a runtime with a
+  native work authorization host a host continuation was always refused.
+  `ContinuationOwnerService::submit_host_original` now commits one from its
+  namespace owner's record (`HostOriginalRecord::from_owner`), and the
+  delivery owner admits it through that owner's `HostOriginalBinder`: the
+  binder binds Core's exact continuation input for the owed session (for
+  example with `bind_scoped_original`, Core's admission key as its event
+  key), native admission decides it as any governed input, and the host's
+  custody (`HostOriginalSettlement`) is promoted only on an accepted
+  admission. `RetainedJobSource` gains the defaulted `host_original` and
+  `host_original_binder`, `ContinuationDeliverySink` gains defaulted governed
+  admission methods (both in-tree sinks implement them), and
+  `ContinuationHostBindings::host_original_readiness` tells a host at setup
+  what the bound composition will do. It is refused
+  `NoAdmissibleWorkBinding` for a reserved (`meerkat.`) namespace, retained
+  work or a non-host producer on a host original row, steering handling or
+  a sink that admits none on a governed runtime, an original its bound
+  namespace owner does not hold exactly or whose key it does not bind to the
+  row, a binder that does not own it, or a bound input other than Core's
+  exact input with its authorization added; and `AuthorityDenied` for the
+  binder's or native admission's denial. An unreadable namespace owner, a
+  host that has not bound its continuation services yet (readiness
+  `Unbound`), a binder that cannot bind yet (a session with no live actor
+  waits for its host's own recovery: Core never makes a governed session
+  live) and a runtime that is not ready keep it pending, and an admitted row
+  is never refused later. An ungoverned runtime admits a host original as any
+  continuation. With it: `MeerkatMachine::accept_input_with_completion_and_custody`
+  in `meerkat-runtime`, the non-waiting controller pins
+  `try_pin_controller_client_for_actor` and
+  `try_acquire_live_session_actor_turn_boundary_lease_exact` in
+  `meerkat-session`, `ControllerReadinessFailure::TurnBoundaryHeld` in
+  `meerkat-core`, and `HostJobSource::new` in `meerkat-mob-mcp` refusing a
+  reserved namespace (`HostJobSourceError::ReservedNamespace`, see
+  Breaking).
+
 ### Changed
 
 - `meerkat-core`, `meerkat-session`, `meerkat-runtime`: a HeadCanonical run
@@ -531,6 +572,13 @@ them.
   variant is unchanged.
 
 ### Fixed
+
+- `meerkat`: a host that composes consent notices no longer refuses a
+  retained completion of another producer drained before it binds its
+  continuation services (for example by the arming reconcile after a
+  restart). Its consent-aware job source answered such jobs absent, which
+  refused the completion terminally; it now answers unavailable, so the
+  completion stays pending until the bound owner decides it.
 
 - `meerkat-core`, `meerkat-session`, `meerkat-runtime`, `meerkat-store`: a
   long run of a HeadCanonical session kept every compaction's transcript

@@ -11826,6 +11826,63 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         }))
     }
 
+    /// [`acquire_live_session_actor_turn_boundary_lease_exact`](Self::acquire_live_session_actor_turn_boundary_lease_exact)
+    /// for a caller that must not wait behind a turn: the turn boundary is
+    /// only tried, never waited for, exactly as
+    /// [`try_attach_live_mcp_server`](Self::try_attach_live_mcp_server) does.
+    /// A held boundary answers [`crate::TurnBoundaryHeld`] at once: it proves
+    /// a held boundary, not necessarily an active turn, and it grants nothing.
+    /// `Ok(None)` means `witness` no longer names the current actor.
+    pub async fn try_acquire_live_session_actor_turn_boundary_lease_exact(
+        &self,
+        witness: &LiveSessionActorWitness,
+    ) -> Result<Option<LiveSessionActorTurnBoundaryLease>, crate::TurnBoundaryHeld> {
+        let Ok(turn_finalization_guard) = self
+            .turn_finalization_gate_for_session(witness.session_id())
+            .await
+            .try_lock_owned()
+        else {
+            return Err(crate::TurnBoundaryHeld);
+        };
+        let Some(current) = self
+            .inner
+            .live_session_actor_witness(witness.session_id())
+            .await
+        else {
+            return Ok(None);
+        };
+        if &current != witness {
+            return Ok(None);
+        }
+        Ok(Some(LiveSessionActorTurnBoundaryLease {
+            witness: current,
+            _turn_finalization_guard: turn_finalization_guard,
+        }))
+    }
+
+    /// Pin the exact live actor's selected controller client without waiting
+    /// behind a turn: the turn boundary is only tried
+    /// ([`Self::try_acquire_live_session_actor_turn_boundary_lease_exact`]),
+    /// and under it the actor answers the pin command at once. The boundary is
+    /// released before this returns; the caller retains the returned pin.
+    pub async fn try_pin_controller_client_for_actor(
+        &self,
+        witness: &LiveSessionActorWitness,
+    ) -> Result<meerkat_core::ControllerModelClient, crate::TryPinControllerError> {
+        let lease = self
+            .try_acquire_live_session_actor_turn_boundary_lease_exact(witness)
+            .await
+            .map_err(|_| crate::TryPinControllerError::TurnBoundaryHeld)?
+            .ok_or_else(|| {
+                crate::TryPinControllerError::Session(SessionError::NotFound {
+                    id: witness.session_id().clone(),
+                })
+            })?;
+        self.pin_controller_client_for_actor(&lease)
+            .await
+            .map_err(crate::TryPinControllerError::Session)
+    }
+
     /// Reserve runtime-turn capacity for the actor protected by `lease`.
     ///
     /// There is deliberately no durable-session recovery or global capacity
@@ -43908,6 +43965,97 @@ mod tests {
                 )
             }),
             "stored-only predecessor publication must not append into a live successor actor"
+        );
+    }
+
+    /// The non-waiting turn boundary lease and controller pin: while the
+    /// boundary is held (as a running turn holds it) both answer at once that
+    /// it is held and ask nothing of the actor; once it is free the lease is
+    /// taken for the exact actor and the pin reaches it; an actor that is no
+    /// longer current gets no lease.
+    #[tokio::test]
+    async fn try_lease_answers_busy_while_the_turn_boundary_is_held_and_leases_when_free() {
+        let service = PersistentSessionService::new(
+            DummyBuilder,
+            4,
+            Arc::new(MemoryStore::new()),
+            Arc::new(InMemoryRuntimeStore::new()),
+            memory_blob_store(),
+        );
+        let actor_slot = LiveSessionActorWitnessSlot::default();
+        let admission = service
+            .reserve_create_session_admission()
+            .await
+            .expect("reserve admission");
+        let session_id = service
+            .create_session_with_reserved_admission_and_actor_witness(
+                create_request_with_metadata("member", InitialTurnPolicy::Defer),
+                admission,
+                &actor_slot,
+            )
+            .await
+            .expect("create member")
+            .session_id;
+        let actor = actor_slot.witness().expect("exact witness");
+
+        let held = service
+            .acquire_runtime_turn_finalization_guard(&session_id)
+            .await;
+        let busy = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            service.try_acquire_live_session_actor_turn_boundary_lease_exact(&actor),
+        )
+        .await
+        .expect("a held boundary is never waited for");
+        assert!(matches!(busy, Err(crate::TurnBoundaryHeld)));
+        let pin = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            service.try_pin_controller_client_for_actor(&actor),
+        )
+        .await
+        .expect("a held boundary is never waited for");
+        assert!(matches!(
+            pin,
+            Err(crate::TryPinControllerError::TurnBoundaryHeld)
+        ));
+        drop(held);
+
+        let lease = service
+            .try_acquire_live_session_actor_turn_boundary_lease_exact(&actor)
+            .await
+            .expect("a free boundary is taken")
+            .expect("the exact current actor");
+        assert!(lease.witness() == &actor);
+        drop(lease);
+        let pin = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            service.try_pin_controller_client_for_actor(&actor),
+        )
+        .await
+        .expect("a free boundary is never waited for");
+        assert!(
+            !matches!(pin, Err(crate::TryPinControllerError::TurnBoundaryHeld)),
+            "a free boundary reaches the actor"
+        );
+
+        let lease = service
+            .acquire_live_session_actor_turn_boundary_lease(&session_id)
+            .await
+            .expect("hold the boundary to discard");
+        assert!(
+            service
+                .discard_live_session_actor(&lease)
+                .await
+                .expect("discard the exact actor")
+        );
+        drop(lease);
+        assert!(
+            service
+                .try_acquire_live_session_actor_turn_boundary_lease_exact(&actor)
+                .await
+                .expect("a free boundary is taken")
+                .is_none(),
+            "an actor that is no longer current gets no lease"
         );
     }
 
