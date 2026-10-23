@@ -2526,8 +2526,10 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
             mob_dsl::MobSpawnManyFailureObservationKind::MemberRestoreFailed
         }
         // Never a spawn outcome today (a spawn on a stopped actor gets
-        // ActorCommandChannelClosed); were it one, it classifies as its cause.
-        MobError::MemberStartupRecoveryFailed { cause, .. } => {
+        // ActorCommandChannelClosed, and a spawn acts on no deferred member);
+        // were either one, it classifies as its cause.
+        MobError::MemberStartupRecoveryFailed { cause, .. }
+        | MobError::MemberCustodyDeferred { cause, .. } => {
             spawn_many_failure_observation(cause.as_ref())
         }
         // A degraded or detached runtime registration is a session fault of

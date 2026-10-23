@@ -267,6 +267,18 @@ them.
   request carries is host-asserted audit data, not authority. Additive:
   no wire, contract or persistence change.
 
+- `meerkat-mob`: `MobError::MemberCustodyDeferred { member_id, session_id,
+  restore, cause }`, the typed refusal of an operation on a member whose
+  custody restore the mob's start deferred, and `MemberCustodyRestore`
+  (`StartupBinding` or `CleanupDelivery`, `#[non_exhaustive]`), the restore
+  it names. The operation did nothing to the member's session. The mob
+  re-attempts the restore on its own backoff and before each operation on
+  that member, so a retry can pass once the cause clears. Its wire code,
+  failure class and durable resume hold are the cause's; its structured data
+  has kind `mob_member_custody_deferred` with the member, its session, the
+  restore, the cause's text and, when the cause has some, the cause's own
+  structured data as `cause_data`.
+
 ### Changed
 
 - `meerkat-core`: the `FORK_INSTRUCTION_REFUSED` message for a fork the
