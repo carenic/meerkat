@@ -4150,14 +4150,15 @@ impl<'a> MachineSessionArchiveProtocol<'a> {
 
     /// End, under the archive's runtime lease, the work the session's
     /// runtime kept for a later start (the inputs of the run it keeps
-    /// resumable, and every queued input), before the archive settles a
-    /// durable tail: the session ends with the archive, so no start comes.
+    /// resumable, and every queued input), once the archive's recovery held
+    /// the durable tail beside it: the session ends with the archive, so no
+    /// start comes. Returns whether any input ended.
     async fn end_unresumed_work_before_tail_settle(
         &self,
         id: &SessionId,
         lease: &meerkat_runtime::MachineSessionArchiveLease,
         deadline: meerkat_core::time_compat::Instant,
-    ) -> Result<(), SessionError> {
+    ) -> Result<bool, SessionError> {
         let ended = self
             .runtime_adapter
             .end_unresumed_work_with_archive_lease_before(lease, "session archived", deadline)
@@ -4167,10 +4168,10 @@ impl<'a> MachineSessionArchiveProtocol<'a> {
             tracing::info!(
                 session_id = %id,
                 inputs = ended.len(),
-                "ended the work an archived session's runtime kept for a later start before settling its durable tail"
+                "ended the work an archived session's runtime kept for a later start beside its held durable tail"
             );
         }
-        Ok(())
+        Ok(!ended.is_empty())
     }
 
     fn require_shared_runtime_store(
@@ -6273,17 +6274,20 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     ///
     /// The archive never continues a run: its recovery judges a quiescent
     /// runtime retired, so a continuable tail (an open run at a committed
-    /// round) is repaired and committed as interrupted. Before that recovery,
-    /// under its runtime lease, the archive ends the work the session's
-    /// runtime kept for a later start, as the runtime ends work nothing
-    /// resumes: the inputs of the run it keeps resumable, and every queued
-    /// input, are abandoned as cancelled through the lease's driver, so the
-    /// recovery commits the tail as interrupted instead of holding it beside
-    /// a queued input, and finds nothing left to terminalize that the driver
-    /// still holds. A nonterminal content input that is neither (bound to
-    /// another run) still holds the tail, typed. That work ends before the
-    /// recovery's verdict: a tail held or refused for another reason leaves
-    /// it cancelled, as a live retire's quiesce would.
+    /// round) is repaired and committed as interrupted. The recovery runs
+    /// first: a tail it commits keeps every input for that commit, so a run
+    /// whose answer landed before its boundary has its inputs consumed,
+    /// never cancelled, and a tail it refuses ends nothing. Only when it
+    /// holds the tail, the archive ends, under its runtime lease, the work
+    /// the session's runtime kept for a later start, as the runtime ends
+    /// work nothing resumes: the inputs of the run it keeps resumable, and
+    /// every queued input, are abandoned as cancelled through the lease's
+    /// driver. The recovery then runs once more, and commits the tail as
+    /// interrupted instead of holding it beside a queued input, with nothing
+    /// left to terminalize that the driver still holds. A nonterminal content
+    /// input that is neither (bound to another run) still holds the tail,
+    /// typed; a tail that holds for another reason leaves that work
+    /// cancelled, as a live retire's quiesce would.
     async fn settle_durable_tail_under_archive_gates(
         &self,
         id: &SessionId,
@@ -6313,15 +6317,23 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 return Err(conflict);
             }
         }
-        if let Some(lease) = archive_lease {
-            machine_archive
+        let mut outcome = self
+            .store_owned_durable_tail_recovery_outcome_for_archive(id)
+            .await?;
+        if let Some(lease) = archive_lease
+            && matches!(
+                outcome.0,
+                meerkat_runtime::recovery::DurableTailRecoveryOutcome::Held
+            )
+            && machine_archive
                 .end_unresumed_work_before_tail_settle(id, lease, deadline)
+                .await?
+        {
+            outcome = self
+                .store_owned_durable_tail_recovery_outcome_for_archive(id)
                 .await?;
         }
-        match self
-            .store_owned_durable_tail_recovery_outcome_for_archive(id)
-            .await?
-        {
+        match outcome {
             (meerkat_runtime::recovery::DurableTailRecoveryOutcome::Committed { .. }, _) => {
                 tracing::info!(
                     session_id = %id,

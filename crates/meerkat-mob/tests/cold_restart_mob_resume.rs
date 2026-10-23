@@ -7889,6 +7889,111 @@ async fn an_archive_before_a_kept_run_registers_again_ends_the_work_it_kept() {
     );
 }
 
+/// The archive of a member's session whose last run answered before its
+/// boundary commit consumes that run's input, and cancels nothing.
+///
+/// The member's second turn answers and its end-of-run save lands, but its
+/// runtime boundary commit is lost with the power, and the host dies. The
+/// next process archives the member's session before anything registers its
+/// runtime again. The archive's lease registration holds the answered run's
+/// input as pending again, still naming the run. The archive's recovery runs
+/// first and commits the completed tail, which consumes that input; nothing
+/// holds the tail, so the work the runtime kept for a later start is not
+/// ended. No input is cancelled, so no sender is told that work which ran
+/// was cancelled. RED before: the archive cancelled every queued input
+/// before its recovery, so the answered run's input ended
+/// `Abandoned { Cancelled }` beside the committed answer.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_archive_over_a_run_that_answered_before_its_boundary_consumes_its_input() {
+    use meerkat_runtime::input_state::{InputAbandonReason, InputTerminalOutcome};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let tail = crash_with_an_active_member_tail(temp.path(), &paths).await;
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&tail.session_id);
+    let answered_run = tail
+        .runtime_store
+        .load_head_canonical_provisional_tail(&runtime_id)
+        .await
+        .expect("load the provisional tail")
+        .expect("the answered turn's end-of-run save recorded a provisional tail")
+        .run_id()
+        .clone();
+    let (service, store) = persistent_head_canonical_service(&paths, tail.runtime_store.clone());
+
+    let archived = tokio::time::timeout(
+        Duration::from_secs(60),
+        service.archive_with_mob_lifecycle_authority(&tail.session_id),
+    )
+    .await
+    .expect("the archive ends within its bound");
+    assert!(
+        archived.is_ok(),
+        "the archive of a session whose last run answered must complete: {archived:?}"
+    );
+    assert!(
+        !tail.provisional_tail_recorded_now().await,
+        "the archive settled the answered run's tail"
+    );
+    assert_eq!(
+        tail.committed_token_now().await,
+        tail.physical_token_now(&store).await,
+        "the runtime authority names the physical head"
+    );
+
+    let rows = tail
+        .runtime_store
+        .load_input_states_strict(&runtime_id)
+        .await
+        .expect("read the member's input rows");
+    let run_inputs = rows
+        .iter()
+        .filter(|row| row.seed.last_run_id.as_ref() == Some(&answered_run))
+        .collect::<Vec<_>>();
+    assert!(
+        !run_inputs.is_empty(),
+        "the answered run's input is recorded with its run: {rows:?}"
+    );
+    assert!(
+        run_inputs.iter().all(|row| matches!(
+            row.seed.terminal_outcome,
+            Some(InputTerminalOutcome::Consumed)
+        )),
+        "the answered run's input ends consumed: {rows:?}"
+    );
+    assert!(
+        rows.iter().all(|row| !matches!(
+            &row.seed.terminal_outcome,
+            Some(InputTerminalOutcome::Abandoned {
+                reason: InputAbandonReason::Cancelled
+            })
+        )),
+        "the archive cancels nothing: {rows:?}"
+    );
+
+    let archived_session = service
+        .load_revivable_retired_session(&tail.session_id)
+        .await
+        .expect("read the member's archived session")
+        .expect("the member's session is archived");
+    let history =
+        to_string(archived_session.messages()).expect("serialize the archived transcript");
+    assert_eq!(
+        history.matches("POST_CUT_TAIL_TURN").count(),
+        1,
+        "the archived session keeps the answered turn's prompt exactly once: {history}"
+    );
+    assert!(
+        !matches!(
+            archived_session.messages().last(),
+            Some(meerkat_core::Message::SystemNotice(_))
+        ),
+        "the archive commits the run's answer, not an interrupted close: {:?}",
+        archived_session.messages().last()
+    );
+}
+
 /// One destructive reset as Meta's identity reset sends it: an atomic
 /// successor respawn onto a fresh session, with no parent auto-wiring.
 async fn destructive_reset(handle: &MobHandle, identity: &AgentIdentity) -> Result<(), String> {
