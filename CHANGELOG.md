@@ -83,6 +83,21 @@ them.
   and so does the `PartialOrd` order of `OccurrenceLifecycleEffectVariant::*`
   and `OccurrenceLifecycleInputVariant::*`; match them by variant name, not
   by numeric cast or position.
+- `meerkat-contracts`: the mob destroy report is typed on the wire.
+  `MobDestroyResult.destroy_report` changes from `serde_json::Value` to
+  `WireMobDestroyReport`, and `MobLifecycleResult.destroy_report` from
+  `Option<serde_json::Value>` to `Option<WireMobDestroyReport>` (see
+  Added). The JSON value each surface sends is unchanged. Code that read the
+  field as a `Value` reads the struct's fields instead; code that builds a
+  result converts a `meerkat_mob::MobDestroyReport` with
+  `WireMobDestroyReport::from(&report)`.
+- TypeScript and Web SDKs (not measured by the gate): `@rkat/sdk`'s
+  `MeerkatClient.mobDestroy()` returns `destroyReport` as
+  `WireMobDestroyReport` instead of `Record<string, unknown>`, and rejects a
+  malformed report with `INVALID_RESPONSE`. `@rkat/web`'s `Mob.lifecycle()`
+  rejects a refused action with a `MeerkatError` (`code`, `message`,
+  `data`), as the other `Mob` methods do, instead of the runtime's JSON
+  error string, and rejects a malformed destroy report.
 
 ### Added
 
@@ -100,6 +115,22 @@ them.
   "repair_blocked"`. Both new types are `#[non_exhaustive]`, and the field is
   left out of the serialized report when it is empty, so any other destroy
   report is unchanged.
+- `meerkat-contracts`: `WireMobDestroyReport`, the wire form of
+  `meerkat_mob::MobDestroyReport` field for field, with
+  `WireMobDestroyMemberRefusal` and `WireMemberReloadRefusal` (tagged on
+  `kind`; a kind this version does not know parses as `Unknown`, which the
+  server never sends), and `WireMobDestroyIncompleteData`, the typed `data`
+  of a `mob_destroy_incomplete` error. `meerkat-mob` converts a report with
+  `From`. The generated Python, TypeScript and Web SDK types carry them, so
+  `destroy_report` is typed in every SDK.
+- Python, TypeScript and Web SDKs: `mob_destroy_incomplete_report(error)`
+  (Python) and `mobDestroyIncompleteReport(error)` (TypeScript and Web)
+  return the typed `WireMobDestroyReport` of a destroy that did not finish
+  (code `mob_destroy_incomplete`), or `None`/`undefined` for any other error
+  or a report that does not parse. A refusal in its `member_reload_refusals`
+  tells the caller to retry the destroy later; a refusal kind the SDK does
+  not know reads as `{"kind": "unknown"}`. The SDKs export the report
+  types; the error's `details` (`data` on the Web) are unchanged.
 - `meerkat_mob::MobError::MemberReloadRepairBlocked` (`session_id`,
   `reason`, `evidence_digest`): a member retirement whose durability reload
   of the member session the runtime refused as repair-blocked
@@ -263,6 +294,14 @@ them.
   transcript revision conflict (`SessionError::Store`) instead of an
   internal "resume bridge session check failed" error. The spawn does not
   settle the tail; it stays as it was.
+- `@rkat/web`: a destroy that did not finish (`Mob.lifecycle("destroy")`,
+  `Session.destroy()` of a session that owns mobs, or
+  `MeerkatRuntime.destroy()`) no longer loses its report. The runtime's
+  error envelope carried the report only at its top level, and
+  `MeerkatError.fromWasm` keeps an envelope's `data`; `Mob.lifecycle()`
+  rejected with the raw envelope string. The envelope now also carries the
+  typed incomplete data under `data`, as JSON-RPC sends it in `error.data`,
+  and `mobDestroyIncompleteReport(error)` reads the report.
 
 ## [0.9.4] - 2026-10-20
 

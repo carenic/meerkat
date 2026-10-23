@@ -114,6 +114,25 @@ deduplication.
 `accept_schedule_runtime_input_with_reconciliation` on the task that calls
 them; a redelivery through such a host only replays the earlier input.
 
+#### Typed mob destroy report
+
+`meerkat-contracts` types the mob destroy report on the wire:
+`MobDestroyResult.destroy_report` is a `WireMobDestroyReport` instead of a
+`serde_json::Value`, and `MobLifecycleResult.destroy_report` an
+`Option<WireMobDestroyReport>` instead of an `Option<serde_json::Value>`. The
+JSON each surface sends is unchanged.
+
+**Do:** in Rust, read `destroy_report`'s fields (`errors`,
+`member_reload_refusals` and the rest) instead of matching a `Value`, and
+convert a `meerkat_mob::MobDestroyReport` with
+`WireMobDestroyReport::from(&report)` where you build a result. In
+TypeScript, `mobDestroy()` returns `destroyReport` as a
+`WireMobDestroyReport`. In `@rkat/web`, `Mob.lifecycle()` rejects with a
+`MeerkatError` instead of the runtime's JSON error string: read the report
+of a destroy that did not finish with `mobDestroyIncompleteReport(error)`
+(in Python, `mob_destroy_incomplete_report(error)`) rather than parsing the
+error text.
+
 ### Other behaviour changes
 
 - **Crash recovery of scheduled deliveries:** a delivery whose executor died
@@ -141,6 +160,8 @@ them; a redelivery through such a host only replays the earlier input.
 3. Custom `SurfaceScheduleSessionHost` implementations: return `true` from
    `decides_existing_admission` only if they admit through
    `accept_schedule_runtime_input_with_reconciliation` on the calling task.
+4. Read a mob destroy report as `WireMobDestroyReport` in Rust, and a failed
+   destroy's report through the SDK accessor, not the error text.
 
 ## Upgrading to 0.9.4
 

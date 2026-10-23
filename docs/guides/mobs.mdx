@@ -1233,10 +1233,13 @@ durable outcome, the destroy answers `Incomplete`. Since 0.9.5 its report also
 lists the member in `MobDestroyReport::member_reload_refusals`
 (`{"member": ..., "refusal": {"kind": "repair_blocked", "reason": ...}}`
 in the `destroy_report` of the `mob_destroy_incomplete` data): retry the
-destroy later. A refusal in the reload pass before the destroy starts leaves
-the mob unchanged. A refusal later in the destroy comes after its cleanup has
-begun: the mob's admission is closed, and some members may already be
-retired. Any other reload failure stays text in `errors` only.
+destroy later. The SDKs read that report typed, as a `WireMobDestroyReport`:
+`mob_destroy_incomplete_report(error)` in Python and
+`mobDestroyIncompleteReport(error)` in TypeScript and `@rkat/web`. A refusal
+in the reload pass before the destroy starts leaves the mob unchanged. A
+refusal later in the destroy comes after its cleanup has begun: the mob's
+admission is closed, and some members may already be retired. Any other
+reload failure stays text in `errors` only.
 
 A retire reloads such a member as well, at its quiesce stage. When the runtime
 refuses that reload as repair-blocked, the retirement sticks: `retire` answers

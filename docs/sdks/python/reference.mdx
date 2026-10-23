@@ -624,3 +624,25 @@ except MeerkatError as error:
         raise
     print(f"{failure['peer']} is unreachable: {failure['reason']}")
 ```
+
+A mob destroy that did not finish (`mob_destroy`, or `mob_lifecycle` with
+`"destroy"`) fails with code `mob_destroy_incomplete`; its `details` carry
+the `destroy_report` and `retryable: True`.
+`mob_destroy_incomplete_report(error)` returns that report as a
+`WireMobDestroyReport`, or `None` for any other error. Retry the destroy
+later: `member_reload_refusals` names each member whose reload the runtime
+refused, with its typed `refusal` (a kind this SDK does not know reads as
+`{"kind": "unknown"}`).
+
+```python
+from meerkat import MeerkatError, mob_destroy_incomplete_report
+
+try:
+    await client.mob_destroy(mob_id)
+except MeerkatError as error:
+    report = mob_destroy_incomplete_report(error)
+    if report is None:
+        raise
+    for refused in report.member_reload_refusals or []:
+        print(f"{refused.member}: {refused.refusal['kind']}")
+```
