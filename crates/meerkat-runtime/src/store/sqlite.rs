@@ -19600,6 +19600,7 @@ ORDER BY runtime_id";
                 foreign.try_lock().unwrap();
                 assert!(matches!(owner.try_acquire_shared(), Err(Busy)));
                 assert!(matches!(owner.try_acquire_governed(), Err(Busy)));
+                foreign.unlock().unwrap();
                 drop(foreign);
                 owner.try_acquire_shared().unwrap();
                 owner.try_acquire_governed().unwrap();
@@ -31615,6 +31616,7 @@ ORDER BY runtime_id";
             );
             assert!(!database.exists());
 
+            fence.unlock().unwrap();
             drop(fence);
             assert_eq!(store.load_delivery_generation().await.unwrap(), 0);
             assert!(

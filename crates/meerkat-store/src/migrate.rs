@@ -2191,6 +2191,7 @@ mod tests {
                 if path.ends_with(REALM_WRITE_ADMISSION_STEM)),
             "{error:?}"
         );
+        foreign.unlock().unwrap();
         drop(foreign);
         RealmMaintenanceFence::acquire(&realm, Duration::from_secs(1)).unwrap();
     }
@@ -2233,6 +2234,7 @@ mod tests {
                 .unwrap();
         assert!(admission.is_some(), "admission fence must be released");
         drop(admission);
+        foreign.unlock().unwrap();
         drop(foreign);
 
         // With the foreign lock gone, full acquisition succeeds.
