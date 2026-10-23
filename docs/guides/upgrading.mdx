@@ -166,16 +166,18 @@ add the arms (or a wildcard) where you match these enums exhaustively.
 
 #### The mob Shutdown default
 
-- `meerkat-mob`: `QueuedInputsOnShutdown` gains `RequeueDurable`, which is
-  now its `#[default]` in place of `Stop`, so `ShutdownOptions::default()`
-  and `MobHandle::shutdown()` take it. It resolves per member:
-  `Requeue(RequeueMaxAge::DEFAULT)` for a member whose session commits every
-  round (the mob's session service keeps persistent sessions and its runtime
-  has a persistence store), and `Stop` for any other member and for one
-  already retiring. A graceful Shutdown that does not choose therefore keeps
-  such a member's running turn and eligible queued prompts for the next
-  start (see Other behaviour changes below). `QueuedInputsOnShutdown` is
-  `#[non_exhaustive]`, so a match already has a wildcard arm.
+- `meerkat-mob`: a mob Shutdown that does not choose now keeps a durable
+  member's work. `ShutdownOptions` gains `queued_inputs`
+  (`with_queued_inputs`) of the new `#[non_exhaustive]` enum
+  `QueuedInputsOnShutdown`. Its default, `RequeueDurable`, which
+  `ShutdownOptions::default()` and `MobHandle::shutdown()` take, resolves per
+  member: `Requeue(RequeueMaxAge::DEFAULT)` for a member whose session
+  commits every round (the mob's session service keeps persistent sessions
+  and its runtime has a persistence store), and `Stop` for any other member
+  and for one already retiring. 0.9.4's Shutdown cancelled every member's
+  running turn; a Shutdown that does not choose now keeps such a member's
+  running turn and eligible queued prompts for the next start (see Other
+  behaviour changes below).
 - The generated mob machine (`meerkat-machine-kernels`, `generated::mob`)
   and its DSL (`meerkat-machine-schema`) decide an autonomous member's case:
   the input `ResolveAutonomousShutdownMemberAction` gains

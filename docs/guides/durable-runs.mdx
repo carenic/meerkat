@@ -210,8 +210,9 @@ the model response that commit saved is written into the transcript too,
 with an `outcome_uncertain` tool error for each of its calls, as for
 [calls answered as interrupted](#calls-answered-as-interrupted), because
 those calls may have run. A notice then tells the model that the run was
-interrupted, and the run's inputs do not run again. Only a failed run whose
-inputs are queued for another attempt drops its round commits.
+interrupted, and the run's inputs do not run again. Only a run whose inputs
+are queued for another attempt (a failed run's replay, or a run released to
+ordinary requeue) drops its round commits.
 
 The rules for every kind of durable tail are in
 [Session contracts: durable-tail recovery](/reference/session-contracts#durable-tail-recovery).
