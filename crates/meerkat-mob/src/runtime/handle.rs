@@ -4875,6 +4875,10 @@ async fn receive_exact_turn_completion<R: Clone>(
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "the typed bounded-turn failure, its MobError included, is the turn's answer to the caller"
+)]
 fn bounded_exact_turn_result(
     completion: ExactTurnCompletion,
     admitted_session_id: &SessionId,
@@ -4944,6 +4948,10 @@ fn bounded_exact_turn_result(
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "the typed bounded-turn failure, its MobError included, is the turn's answer to the caller"
+)]
 pub(super) fn bounded_runtime_turn_result(
     outcome: meerkat_runtime::completion::CompletionOutcome,
     admitted_session_id: &SessionId,
