@@ -559,6 +559,16 @@ them.
   `BUDGET_EXHAUSTED` until capacity is released. Terminal diagnostic details are
   limited to 1 KiB of UTF-8 text, preserving a 16 KiB terminal wire bound.
 
+- `meerkat-runtime`: `RuntimeSessionQuiescentClose` is now
+  `#[non_exhaustive]` and gains `ClosedOrphanedDrain`.
+  `MeerkatMachine::unregister_session_registration_until_terminal_if_quiescent`
+  returns that variant after completing an orphaned drain or pending
+  finalization, which may abandon held inputs with reason `Stopped`.
+  `Closed` now identifies only a genuinely quiescent close. Downstream
+  matches must handle the new variant and include a wildcard for future
+  variants; callers requiring non-interruption must not treat
+  `ClosedOrphanedDrain` as `Closed`.
+
 ### Added
 
 - `meerkat_core::host_store`: the host store SPI, a small storage interface
@@ -571,10 +581,14 @@ them.
   scopes (at most 8 MiB, each row at most 1 MiB). The module documentation
   states the nine obligations and the valid ways to meet each, at commit or
   at load. The host sizes the fence renew interval and lease through
-  `HostStore::fence_timing` (`FenceTiming`, by default 10 s and 30 s): an
-  exclusive acquire refuses typed (`HostStoreError::Held`) while another
-  holder's lease lasts, and a takeover's `FenceGrant` says how long the new
-  writer waits before it dispatches anything.
+  `HostStore::fence_timing` (`FenceTiming`, by default 10 s and 30 s), and
+  may declare the self-fence margin (`FenceTiming::try_with_margin`: at
+  least one renew interval plus twice the store's visibility lag);
+  `SelfFence` reports a writer's window. An exclusive acquire refuses typed
+  (`HostStoreError::Held`) while another holder's lease lasts, a takeover's
+  `FenceGrant` says how long the new writer waits before it dispatches
+  anything, and a holder whose renew failed or whose window closed acquires
+  again before it resumes.
 - `meerkat-store-conformance`: `chapters::host_store` checks a host store
   against those obligations through a `HostStoreFactory`, whose every open
   stands for a new process: reopen; a kill before, during and after a commit;

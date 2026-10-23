@@ -9451,6 +9451,196 @@ async fn quiescent_close_queued_behind_ingress_that_won_the_mutation_gate_answer
     assert_eq!(recorded_contributions(&contributions), vec![vec![won_id]]);
 }
 
+/// Commit the canonical drain prefix without installing a teardown owner,
+/// reproducing the recovery case separately from an ordinary quiescent close.
+async fn inject_orphaned_quiescent_close_drain(machine: &MeerkatMachine, session_id: &SessionId) {
+    let state = machine
+        .session_dsl_state(session_id)
+        .await
+        .expect("registered session retains DSL authority");
+    machine
+        .apply_session_dsl_input(
+            session_id,
+            mm_dsl::MeerkatMachineInput::BeginUnregisterSession {
+                session_id: mm_dsl::SessionId::from_domain(session_id),
+                agent_runtime_id: state.active_runtime_id,
+                fence_token: state.active_fence_token,
+                generation: state.active_runtime_generation,
+                runtime_epoch_id: state.active_runtime_epoch_id,
+                queued_inputs: mm_dsl::UnregisterQueuedInputsDisposition::Stop,
+                requeue_max_age_ms: 0,
+            },
+            "BeginUnregisterSession(orphaned quiescent-close regression)",
+        )
+        .await
+        .expect("the orphaned drain prefix commits");
+    assert_eq!(
+        machine
+            .session_dsl_state(session_id)
+            .await
+            .expect("draining session retains DSL authority")
+            .registration_phase,
+        mm_dsl::RegistrationPhase::Draining
+    );
+    let sessions = machine.sessions.read().await;
+    assert!(
+        sessions
+            .get(session_id)
+            .expect("the drain retains its registration")
+            .unregister_coordinator
+            .is_none(),
+        "the injected drain has no teardown owner"
+    );
+}
+
+#[tokio::test]
+async fn quiescent_close_distinguishes_orphaned_drain_from_idle() {
+    // An empty orphaned drain is still recovery, not a new idle admission.
+    for (orphaned, queued) in [(false, false), (true, false), (true, true)] {
+        let store = Arc::new(crate::store::InMemoryRuntimeStore::new());
+        let machine = MeerkatMachine::persistent(store.clone(), memory_blob_store())
+            .expect("persistent machine");
+        let session_id = SessionId::new();
+        machine
+            .register_session(session_id.clone())
+            .await
+            .expect("idle registration");
+        let registration = machine
+            .current_session_registration_witness(&session_id)
+            .await
+            .expect("exact registration witness");
+        let queued_id = if queued {
+            let input = make_prompt("retained by the orphaned drain");
+            let input_id = input.id().clone();
+            assert!(
+                machine
+                    .accept_input_without_wake(&session_id, input)
+                    .await
+                    .expect("queued input is admitted")
+                    .is_accepted()
+            );
+            Some(input_id)
+        } else {
+            None
+        };
+        if orphaned {
+            inject_orphaned_quiescent_close_drain(&machine, &session_id).await;
+        }
+
+        let answer = tokio::time::timeout(
+            Duration::from_secs(5),
+            machine.unregister_session_registration_until_terminal_if_quiescent(&registration),
+        )
+        .await
+        .expect("the exact close completes")
+        .expect("the close answers typed");
+        assert_eq!(
+            answer,
+            if orphaned {
+                RuntimeSessionQuiescentClose::ClosedOrphanedDrain
+            } else {
+                RuntimeSessionQuiescentClose::Closed
+            }
+        );
+        assert!(!machine.contains_session(&session_id).await);
+        if let Some(input_id) = queued_id {
+            let input = store
+                .load_input_state(&runtime_id_for_session(&session_id), &input_id)
+                .await
+                .expect("read durable input after recovery")
+                .expect("the abandoned input remains in history");
+            assert_eq!(
+                input.seed.terminal_outcome,
+                Some(crate::input_state::InputTerminalOutcome::Abandoned {
+                    reason: crate::input_state::InputAbandonReason::Stopped,
+                }),
+                "orphaned-drain recovery must not be reported as non-interrupting idle"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn quiescent_close_of_orphaned_drain_with_a_run_in_flight_is_busy() {
+    let machine = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    let apply_started = Arc::new(Notify::new());
+    let apply_release = Arc::new(Notify::new());
+    let contributions = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let hard_cancels = Arc::new(AtomicUsize::new(0));
+    machine
+        .register_session_with_executor(
+            session_id.clone(),
+            Box::new(QuiescentCloseExecutor {
+                apply_started: Arc::clone(&apply_started),
+                apply_release: Some(Arc::clone(&apply_release)),
+                contributions,
+                hard_cancels: Arc::clone(&hard_cancels),
+            }),
+        )
+        .await
+        .expect("runtime executor registration");
+    let registration = machine
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("exact registration witness");
+    assert!(
+        machine
+            .accept_input(
+                &session_id,
+                make_prompt("running when the orphaned drain begins")
+            )
+            .await
+            .expect("input is admitted")
+            .is_accepted()
+    );
+    tokio::time::timeout(Duration::from_secs(5), apply_started.notified())
+        .await
+        .expect("the admitted run starts");
+    inject_orphaned_quiescent_close_drain(&machine, &session_id).await;
+    let run_id = machine
+        .session_dsl_state(&session_id)
+        .await
+        .expect("running drain state")
+        .current_run_id
+        .expect("the drain still has a live run");
+
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            machine.unregister_session_registration_until_terminal_if_quiescent(&registration),
+        )
+        .await
+        .expect("busy answers without waiting for the run")
+        .expect("the close answers typed"),
+        RuntimeSessionQuiescentClose::Busy
+    );
+    assert_eq!(hard_cancels.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        machine
+            .session_dsl_state(&session_id)
+            .await
+            .expect("busy preserves the running drain")
+            .current_run_id,
+        Some(run_id)
+    );
+    {
+        let sessions = machine.sessions.read().await;
+        let entry = sessions
+            .get(&session_id)
+            .expect("busy retains the registration");
+        assert!(entry.unregister_coordinator.is_none());
+    }
+
+    // Explicit ordinary teardown owns cleanup after the Busy assertions.
+    apply_release.notify_one();
+    machine
+        .unregister_session_registration_until_terminal_if_current(&registration)
+        .await
+        .expect("cleanup joins the exact registration");
+    assert!(!machine.contains_session(&session_id).await);
+}
+
 /// The quiescent close's own prefix is owned by the canonical unregister
 /// coordinator before it mutates anything. A caller cancelled while that
 /// prefix's persistence is held leaves the close owned: it still converges,

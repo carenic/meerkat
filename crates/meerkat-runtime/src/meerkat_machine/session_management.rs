@@ -7753,8 +7753,8 @@ impl MeerkatMachine {
         .require_completed()
     }
 
-    /// Close one exact current registration only while it is quiescent, then
-    /// await its owned teardown saga to terminal completion.
+    /// Close one exact current registration while it is quiescent, or finish
+    /// its orphaned drain, then await its owned teardown to terminal completion.
     ///
     /// This is the close admission for a caller that must never interrupt
     /// the session's own work (an administrative close, for example). It
@@ -7782,7 +7782,11 @@ impl MeerkatMachine {
     /// canonical saga rather than reported as closing, unless a run is still
     /// in flight. Like any unregister, that saga abandons every input the
     /// drain still holds (reason `Stopped`) and resolves its completion as
-    /// runtime-terminated. A registration whose coordinator is installed
+    /// runtime-terminated. Successful completion of this recovery answers
+    /// [`RuntimeSessionQuiescentClose::ClosedOrphanedDrain`], even when the
+    /// drain held no inputs; only a quiescent admission answers
+    /// [`RuntimeSessionQuiescentClose::Closed`]. A registration whose
+    /// coordinator is installed
     /// answers [`RuntimeSessionQuiescentClose::AlreadyClosing`] from a
     /// read-only check, made before the registration transaction and again
     /// before the mutation gate, so this close never waits behind another
@@ -7877,7 +7881,7 @@ impl MeerkatMachine {
                 .await?
                 .require_completed()?;
             return Ok(if closed {
-                RuntimeSessionQuiescentClose::Closed
+                RuntimeSessionQuiescentClose::ClosedOrphanedDrain
             } else {
                 RuntimeSessionQuiescentClose::NotCurrent
             });
