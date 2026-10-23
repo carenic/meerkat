@@ -103,6 +103,9 @@ pub mod panic_payload;
 pub mod peer_correlation;
 pub mod peer_meta;
 pub mod persistence_contract;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(clippy::panic)] // test helper: a child that cannot start fails the test
+mod process_isolation_tests;
 pub mod secret_entropy;
 pub use generated::approval_lifecycle;
 pub use generated::session_document;

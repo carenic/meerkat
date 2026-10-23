@@ -14769,6 +14769,18 @@ mod tests {
         }
     }
 
+    /// Each test that resolves a sticky-fallback binding has a realm of its
+    /// own. A fallback rotation releases the primary binding's lease, which
+    /// refuses with `release_lease::Busy` while another test of the process
+    /// holds that binding's credential lifecycle, and plain `cargo test` runs
+    /// these tests at once in one process.
+    const FALLBACK_REALM_SESSION_OWNED: &str = "fallback_session_owned";
+    const FALLBACK_REALM_UNBOUND_SOURCE: &str = "fallback_unbound_source";
+    const FALLBACK_REALM_CHATGPT_BOUND: &str = "fallback_chatgpt_bound";
+    const FALLBACK_REALM_CHATGPT_UNBOUND: &str = "fallback_chatgpt_unbound";
+    const FALLBACK_REALM_RELOAD: &str = "fallback_reload";
+    const FALLBACK_REALM_HEAD_CANONICAL: &str = "fallback_head_canonical";
+
     fn inline_realm_section(entries: &[(&str, &str)]) -> RealmConfigSection {
         RealmConfigSection::from_inline_api_keys(entries)
     }
@@ -14964,13 +14976,17 @@ mod tests {
     }
 
     #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
-    fn sticky_fallback_test_config(backup_model: &str, backup_binding: AuthBindingRef) -> Config {
+    fn sticky_fallback_test_config(
+        realm: &str,
+        backup_model: &str,
+        backup_binding: AuthBindingRef,
+    ) -> Config {
         let mut config = Config {
             max_tokens: Some(1024),
             ..Default::default()
         };
         config.realm.insert(
-            "fallback_test".to_string(),
+            realm.to_string(),
             inline_realm_section(&[
                 ("anthropic", "test-primary-key"),
                 ("openai", "test-backup-key"),
@@ -15007,6 +15023,7 @@ mod tests {
 
     #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
     fn sticky_fallback_runtime_request(
+        realm: &str,
         primary_model: &str,
         external_tools: Arc<dyn AgentToolDispatcher>,
     ) -> CreateSessionRequest {
@@ -15023,7 +15040,7 @@ mod tests {
             deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
             build: Some(SessionBuildOptions {
                 provider: Some(Provider::Anthropic),
-                realm_id: Some(RealmId::parse("fallback_test").expect("test realm")),
+                realm_id: Some(RealmId::parse(realm).expect("test realm")),
                 external_tools: Some(external_tools),
                 override_builtins: ToolCategoryOverride::Disable,
                 ..Default::default()
@@ -15140,8 +15157,10 @@ mod tests {
 
         let primary_model = "claude-sonnet-4-5";
         let backup_model = "custom-text-only-backup";
-        let primary_binding = configured_auth_binding("fallback_test", "default_anthropic");
-        let backup_binding = configured_auth_binding("fallback_test", "default_openai");
+        let primary_binding =
+            configured_auth_binding(FALLBACK_REALM_SESSION_OWNED, "default_anthropic");
+        let backup_binding =
+            configured_auth_binding(FALLBACK_REALM_SESSION_OWNED, "default_openai");
         let primary_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let backup_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let primary_client: Arc<dyn LlmClient> = Arc::new(ScriptedStickyFallbackClient {
@@ -15173,7 +15192,7 @@ mod tests {
 
         let mut config = Config::default();
         config.realm.insert(
-            "fallback_test".to_string(),
+            FALLBACK_REALM_SESSION_OWNED.to_string(),
             inline_realm_section(&[
                 ("anthropic", "test-primary-key"),
                 ("openai", "test-backup-key"),
@@ -15216,7 +15235,7 @@ mod tests {
         let mut build = AgentBuildConfig::new(primary_model);
         build.max_tokens = Some(1024);
         build.provider = Some(Provider::Anthropic);
-        build.realm_id = Some(RealmId::parse("fallback_test").expect("test realm"));
+        build.realm_id = Some(RealmId::parse(FALLBACK_REALM_SESSION_OWNED).expect("test realm"));
         build.auth_binding = Some(primary_binding.clone());
         build.resume_session = Some(session);
         build.runtime_build_mode = RuntimeBuildMode::SessionOwned(bindings.clone());
@@ -15292,7 +15311,8 @@ mod tests {
     async fn fallback_from_an_unbound_source_names_the_resolved_default_binding() {
         let primary_model = "claude-sonnet-4-5";
         let backup_model = "custom-text-only-backup";
-        let backup_binding = configured_auth_binding("fallback_test", "default_openai");
+        let backup_binding =
+            configured_auth_binding(FALLBACK_REALM_UNBOUND_SOURCE, "default_openai");
         let primary_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let backup_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let temp = tempfile::tempdir().unwrap();
@@ -15322,7 +15342,7 @@ mod tests {
         // Only the fallback's provider has a configured binding.
         let mut config = Config::default();
         config.realm.insert(
-            "fallback_test".to_string(),
+            FALLBACK_REALM_UNBOUND_SOURCE.to_string(),
             inline_realm_section(&[("openai", "test-backup-key")]),
         );
         config.models.custom.insert(
@@ -15361,7 +15381,7 @@ mod tests {
         let mut build = AgentBuildConfig::new(primary_model);
         build.max_tokens = Some(1024);
         build.provider = Some(Provider::Anthropic);
-        build.realm_id = Some(RealmId::parse("fallback_test").expect("test realm"));
+        build.realm_id = Some(RealmId::parse(FALLBACK_REALM_UNBOUND_SOURCE).expect("test realm"));
         build.resume_session = Some(session);
         build.runtime_build_mode = RuntimeBuildMode::SessionOwned(bindings.clone());
         build.override_builtins = ToolCategoryOverride::Disable;
@@ -15412,20 +15432,21 @@ mod tests {
     }
 
     /// Run one sticky fallback from an Anthropic source onto `gpt-5.5`
-    /// through realm `fallback_test`, whose OpenAI binding is the private
+    /// through realm `realm_name` (the caller's own), whose OpenAI binding is the private
     /// ChatGPT backend, and return the session's resolved capability surface
     /// afterwards. `bound` names that binding on both the source and the
     /// fallback target; otherwise neither names one, and the target is served
     /// by the binding its client resolution selects (the ChatGPT one).
     #[cfg(not(target_arch = "wasm32"))]
     async fn chatgpt_backend_sticky_fallback_capabilities(
+        realm_name: &str,
         bound: bool,
     ) -> meerkat_runtime::SessionLlmCapabilitySurface {
         use meerkat_runtime::SessionServiceRuntimeExt as _;
 
         let primary_model = "claude-sonnet-4-5";
         let backup_model = "gpt-5.5";
-        let backup_binding = configured_auth_binding("fallback_test", "default_openai");
+        let backup_binding = configured_auth_binding(realm_name, "default_openai");
         let primary_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let backup_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let temp = tempfile::tempdir().unwrap();
@@ -15473,7 +15494,7 @@ mod tests {
             .get_mut("default_openai")
             .expect("OpenAI auth")
             .auth_method = "managed_chatgpt_oauth".to_string();
-        config.realm.insert("fallback_test".to_string(), realm);
+        config.realm.insert(realm_name.to_string(), realm);
         config.model_fallback.enabled = Some(true);
         config.model_fallback.policy.cross_provider = true;
         config.model_fallback.policy.trigger_after_attempts = 1;
@@ -15498,12 +15519,9 @@ mod tests {
         let mut build = AgentBuildConfig::new(primary_model);
         build.max_tokens = Some(1024);
         build.provider = Some(Provider::Anthropic);
-        build.realm_id = Some(RealmId::parse("fallback_test").expect("test realm"));
+        build.realm_id = Some(RealmId::parse(realm_name).expect("test realm"));
         if bound {
-            build.auth_binding = Some(configured_auth_binding(
-                "fallback_test",
-                "default_anthropic",
-            ));
+            build.auth_binding = Some(configured_auth_binding(realm_name, "default_anthropic"));
         }
         build.resume_session = Some(session);
         build.runtime_build_mode = RuntimeBuildMode::SessionOwned(bindings);
@@ -15551,7 +15569,8 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn sticky_fallback_onto_a_chatgpt_binding_records_its_backend_capability() {
-        let capabilities = chatgpt_backend_sticky_fallback_capabilities(true).await;
+        let capabilities =
+            chatgpt_backend_sticky_fallback_capabilities(FALLBACK_REALM_CHATGPT_BOUND, true).await;
         assert!(
             !capabilities.supports_mid_conversation_system_messages,
             "the ChatGPT backend refuses a later System row; the fallback must not \
@@ -15565,7 +15584,9 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn unbound_fallback_target_is_judged_by_the_binding_it_resolves() {
-        let capabilities = chatgpt_backend_sticky_fallback_capabilities(false).await;
+        let capabilities =
+            chatgpt_backend_sticky_fallback_capabilities(FALLBACK_REALM_CHATGPT_UNBOUND, false)
+                .await;
         assert!(
             !capabilities.supports_mid_conversation_system_messages,
             "the target resolves the ChatGPT-backend binding; the row's capability \
@@ -15585,9 +15606,13 @@ mod tests {
         const EXTERNAL_TOOL: &str = "known_external_tool";
         const ORIGINAL_PROMPT: &str = "persist this exact user prompt";
 
-        let primary_binding = configured_auth_binding("fallback_test", "default_anthropic");
-        let backup_binding = configured_auth_binding("fallback_test", "default_openai");
-        let config = sticky_fallback_test_config(BACKUP_MODEL, backup_binding.clone());
+        let primary_binding = configured_auth_binding(FALLBACK_REALM_RELOAD, "default_anthropic");
+        let backup_binding = configured_auth_binding(FALLBACK_REALM_RELOAD, "default_openai");
+        let config = sticky_fallback_test_config(
+            FALLBACK_REALM_RELOAD,
+            BACKUP_MODEL,
+            backup_binding.clone(),
+        );
         let temp = tempfile::tempdir().expect("persistent fallback tempdir");
         let sqlite_store = Arc::new(
             meerkat_store::SqliteSessionStore::open(temp.path().join("sessions.sqlite3"))
@@ -15626,6 +15651,7 @@ mod tests {
             session_id = session.id().clone();
             runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&session_id);
             let request = sticky_fallback_runtime_request(
+                FALLBACK_REALM_RELOAD,
                 PRIMARY_MODEL,
                 sticky_fallback_visibility_dispatcher(EXTERNAL_TOOL),
             );
@@ -15830,6 +15856,7 @@ mod tests {
             ORIGINAL_PROMPT,
         );
         let restart_request = sticky_fallback_runtime_request(
+            FALLBACK_REALM_RELOAD,
             PRIMARY_MODEL,
             sticky_fallback_visibility_dispatcher(EXTERNAL_TOOL),
         );
@@ -15942,8 +15969,13 @@ mod tests {
         const EXTERNAL_TOOL: &str = "known_external_tool";
         const ORIGINAL_PROMPT: &str = "persist this exact user prompt";
 
-        let backup_binding = configured_auth_binding("fallback_test", "default_openai");
-        let config = sticky_fallback_test_config(BACKUP_MODEL, backup_binding.clone());
+        let backup_binding =
+            configured_auth_binding(FALLBACK_REALM_HEAD_CANONICAL, "default_openai");
+        let config = sticky_fallback_test_config(
+            FALLBACK_REALM_HEAD_CANONICAL,
+            BACKUP_MODEL,
+            backup_binding.clone(),
+        );
         let temp = tempfile::tempdir().expect("head-canonical fallback tempdir");
         let sqlite_path = temp.path().join("sessions.sqlite3");
         let sqlite_store = Arc::new(
@@ -15981,6 +16013,7 @@ mod tests {
         let session_id = session.id().clone();
         let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&session_id);
         let request = sticky_fallback_runtime_request(
+            FALLBACK_REALM_HEAD_CANONICAL,
             PRIMARY_MODEL,
             sticky_fallback_visibility_dispatcher(EXTERNAL_TOOL),
         );
@@ -16006,6 +16039,17 @@ mod tests {
             .await
             .expect("stage known external visibility filter");
 
+        // A sibling test (the reload test, which plain `cargo test` runs at
+        // once in this process) holds its primary binding's credential
+        // lifecycle while this turn falls back. The rotation releases this
+        // test's own primary lease, never a sibling's binding.
+        let _sibling = meerkat_core::auth::acquire_auth_login_lifecycle_guard(
+            &meerkat_core::handles::LeaseKey::from_auth_binding(&configured_auth_binding(
+                FALLBACK_REALM_RELOAD,
+                "default_anthropic",
+            )),
+        )
+        .await;
         let (_accept, completion) = adapter
             .accept_input_with_completion(
                 &session_id,

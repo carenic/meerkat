@@ -5800,32 +5800,33 @@ async fn mixed_directed_max_attempt_failure_terminalizes_only_exhausted_contribu
         .await
         .expect("accept first max-attempt input");
 
-    tokio::time::timeout(STEP_BOUND, async {
-        loop {
-            let first = machine
-                .input_state(&session_id, &first_input_id)
-                .await
-                .expect("read first input after initial failure")
-                .expect("first input remains inspectable");
-            if first.seed.phase == crate::input_state::InputLifecycleState::Queued
-                && first.seed.attempt_count == 1
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("first directed input must park after its initial failed attempt");
-    assert!(
-        machine
-            .wake_runtime_if_active_inputs(&session_id)
-            .await
-            .expect("wake first input for its second attempt")
-    );
+    // The initial attempt fails while it is the only queued work, so the loop
+    // keeps draining: it rolls the input back to its queue and retries it at
+    // once. An observer on a loaded host may read only once that retry began.
     tokio::time::timeout(STEP_BOUND, second_apply_started.notified())
         .await
-        .expect("first input must reach its gated second attempt");
+        .expect("the runtime retries the rolled-back first input by itself");
+    // The input's Queued state at attempt 1 lasted only until that retry; its
+    // recorded rollback stays.
+    let first = machine
+        .input_state(&session_id, &first_input_id)
+        .await
+        .expect("read first input in its gated second attempt")
+        .expect("first input remains inspectable");
+    assert_eq!(
+        first
+            .state
+            .history
+            .iter()
+            .filter(|entry| {
+                entry.from == crate::input_state::InputLifecycleState::Staged
+                    && entry.to == crate::input_state::InputLifecycleState::Queued
+                    && entry.reason.as_deref() == Some("ResolveStagedRollback")
+            })
+            .count(),
+        1,
+        "the first input's initial attempt failed and rolled it back to its queue once"
+    );
 
     let second_uuid = meerkat_core::time_compat::new_uuid_v7();
     let second_input = crate::mob_adapter::create_tracked_flow_step_input(
