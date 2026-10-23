@@ -1289,6 +1289,23 @@ them.
   `SessionError::DurableTailHeldForRecovery` or
   `SessionError::DurableTailRecoveryRefused`.
 
+- `meerkat-runtime`, `meerkat-session`: the archive of an ending session
+  settles a durable tail when the session's runtime has stopped. When an
+  input waited behind the boundary-cancelled turn, the runtime loop read the
+  session's committed history before admitting it, met the tail, failed
+  closed and left the runtime persisted `Stopped`. Durable-tail recovery
+  counts a `Stopped` runtime as not quiescent, so the archive's recovery
+  refused the tail and the retirement stayed stuck with
+  `SessionError::DurableTailRecoveryRefused`. The new
+  `recovery::recover_durable_tail_for_session_archive` is the store-owned
+  recovery for an archive that holds the session's gates while the session
+  ends, and the archive now uses it. Unlike ordinary recovery, it counts a
+  persisted `Stopped` runtime as quiescent, as it counts a retired one, and
+  it re-asserts `Stopped`. A persisted current run still refuses, and the
+  commit stays fenced on the observed lifecycle row. Every other recovery
+  still refuses a `Stopped` runtime, because a later start may resume its
+  run.
+
 - `meerkat-gemini`: preserve provider-issued `functionCall.id` through
   streamed tool calls, saved transcripts, assistant replay and matching
   `functionResponse.id`, including parallel calls to the same function.
