@@ -1225,8 +1225,9 @@ pub struct MobMcpState {
     /// whose creation record disagrees with its log.
     #[cfg(test)]
     refused_resume_store: std::sync::Mutex<Option<PathBuf>>,
-    /// Test seam: when set, the next agent mob tool call parks once between
-    /// its admission and its action (see [`Self::pause_agent_call`]).
+    /// Test seam: when set, the next agent mob tool call (or keyed member
+    /// send) parks once between its admission and its action (see
+    /// [`Self::pause_agent_call`]).
     #[cfg(test)]
     agent_call_hold: std::sync::Mutex<Option<Arc<InsertHold>>>,
     /// Test seam: when set, a member lookup parks once between its first
@@ -6235,6 +6236,7 @@ impl MobMcpState {
             .map_or(0, |elapsed| {
                 u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
             });
+        self.pause_agent_call().await;
         let receipt = service
             .submit(&owner, delivery, committed_at_ms)
             .await
@@ -7405,9 +7407,9 @@ impl MobMcpState {
         Ok(handle)
     }
 
-    /// Test seam: an agent mob tool call parks here, once, between its
-    /// admission against a mob and its action, so a test can replace the
-    /// mob under the id in between. A no-op outside tests.
+    /// Test seam: an agent mob tool call, or a keyed member send, parks here,
+    /// once, between its admission against a mob and its action, so a test
+    /// can replace the mob under the id in between. A no-op outside tests.
     pub(crate) async fn pause_agent_call(&self) {
         #[cfg(test)]
         {
@@ -20332,6 +20334,115 @@ mod tests {
         assert_eq!(
             member_ids(&state, mob_id).await,
             vec!["b-member".to_string()]
+        );
+    }
+
+    /// A keyed member send admitted against a mob commits for that mob's
+    /// member or nowhere. When the mob is destroyed and created again under
+    /// the id, with a member of the same identity, between the send's
+    /// admission and its commit, the send answers that the member it was
+    /// admitted for is gone: the key stays uncommitted for the new mob's
+    /// member, and nothing reaches the inbox.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn an_admitted_keyed_member_send_never_commits_for_a_mob_recreated_under_its_id() {
+        let runtime = Arc::new(meerkat_runtime::MeerkatMachine::ephemeral());
+        let state = MobMcpState::from_acquired_runtime_adapter(
+            Arc::new(crate::LocalSessionService::new_over_runtime_for_tests(
+                Arc::clone(&runtime),
+            )),
+            Some(runtime),
+            meerkat_mob::MobControlPrincipal::Owner,
+        )
+        .into_shared();
+        let inbox = meerkat_runtime::RuntimeDeliveryInbox::new(Arc::new(
+            meerkat_runtime::InMemoryRuntimeStore::new(),
+        ));
+        state
+            .bind_continuations(inbox.clone(), &meerkat::ContinuationHostBindings::default())
+            .expect("bind the state's continuations");
+        let mob_id = MobId::from("raced-keyed-send-mob");
+        let member = AgentIdentity::from("w-1");
+        let create_with_member = || async {
+            crate::public_mcp::handle_public_tools_call(
+                &state,
+                "meerkat_mob_create",
+                &json!({
+                    "definition": {
+                        "id": mob_id.as_str(),
+                        "profiles": {
+                            "worker": { "model": "gpt-5.4", "tools": {"comms": true} }
+                        }
+                    }
+                }),
+            )
+            .await
+            .expect("create the mob");
+            crate::public_mcp::handle_public_tools_call(
+                &state,
+                "meerkat_mob_spawn",
+                &json!({
+                    "mob_id": mob_id.as_str(),
+                    "profile": "worker",
+                    "agent_identity": member.as_str(),
+                    "runtime_mode": "turn_driven"
+                }),
+            )
+            .await
+            .expect("spawn the member");
+        };
+        create_with_member().await;
+
+        let hold = hold_next_agent_call(&state);
+        let send = state.mob_member_send_keyed(
+            &mob_id,
+            member.clone(),
+            ContentInput::from("raced keyed send"),
+            HandlingMode::Queue,
+            "raced-item",
+        );
+        let race = async {
+            wait_parked(&hold).await;
+            state
+                .mob_destroy(&mob_id)
+                .await
+                .expect("the console destroys the admitted mob");
+            create_with_member().await;
+            hold.release.notify_one();
+        };
+        let (outcome, ()) = tokio::join!(send, race);
+
+        assert!(
+            matches!(&outcome, Err(MobError::MemberNotFound(identity)) if identity == &member),
+            "the member the send was admitted for is gone: {outcome:?}"
+        );
+        let status = state
+            .continuation_service()
+            .expect("bound")
+            .continuation_status(
+                &meerkat::ContinuationOwner::Member {
+                    mob_id: mob_id.to_string(),
+                    identity: member.to_string(),
+                },
+                &meerkat::ContinuationKey::new(format!(
+                    "{MEMBER_SEND_CONTINUATION_KEY_PREFIX}raced-item"
+                ))
+                .expect("key"),
+            )
+            .await
+            .expect("status");
+        assert_eq!(
+            status,
+            meerkat::ContinuationStatus::NotCommitted,
+            "nothing is committed for the new mob's member"
+        );
+        assert_eq!(
+            inbox
+                .pending_delivery_total()
+                .await
+                .expect("read the inbox"),
+            0,
+            "nothing reaches the inbox"
         );
     }
 
