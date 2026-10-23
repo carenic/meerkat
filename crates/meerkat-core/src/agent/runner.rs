@@ -4571,8 +4571,11 @@ mod skill_activation_effect_tests {
         }
     }
 
+    /// On a paused clock, so the 5 s guard on the final request comes due
+    /// only when the runtime idles with the run stuck, not because a loaded
+    /// host is slow.
     #[cfg(feature = "workspace-tests")]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn application_observation_is_visible_while_final_model_is_pending_and_clears_on_exit() {
         for cancel in [false, true] {
             let client = Arc::new(ObservationLlmClient {
@@ -4629,8 +4632,12 @@ mod skill_activation_effect_tests {
         }
     }
 
+    /// On a paused clock, so the 5 s guard on the bridge comes due only when
+    /// the runtime idles with the bridge stuck, not because a loaded host is
+    /// slow: the paused clock does not advance while the bridge's slow tool
+    /// dispatch runs on its blocking thread.
     #[cfg(feature = "workspace-tests")]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn app_executor_never_accepts_disposable_live_bridge_results() {
         let client = Arc::new(ObservationLlmClient {
             first: AtomicBool::new(true),
