@@ -788,29 +788,56 @@ impl ScheduleDriver {
         }
         let mut dispatching = dispatch_commit.successor().clone();
 
+        // The lease is renewed while the target admits the delivery, as it is
+        // while the delivery runs: an admission slower than the lease must not
+        // let another executor reclaim the occurrence mid-call. A renewal
+        // rewrites the durable occurrence, so the writes below start from the
+        // renewed one.
+        let lease_duration = self.config.lease_duration;
         let delivered = match existing {
             None => {
-                self.delivery
-                    .deliver_occurrence(&dispatching, &delivery_identity)
-                    .await
-            }
-            Some(existing) => match self
-                .delivery
-                .deliver_existing_occurrence(&dispatching, &delivery_identity, existing)
-                .await
-            {
-                Ok(ExistingDeliveryAnswer::Dispatch(dispatch)) => Ok(dispatch),
-                Ok(ExistingDeliveryAnswer::NotAdmittedPastDeadline) => {
-                    return self
-                        .resolve_existing_delivery_not_admitted(
-                            dispatching,
-                            existing,
-                            store_now_utc,
-                        )
-                        .await;
+                let (delivered, renewed) = run_with_lease_renewal(
+                    &self.store,
+                    &dispatching,
+                    lease_duration,
+                    self.delivery
+                        .deliver_occurrence(&dispatching, &delivery_identity),
+                )
+                .await;
+                if let Some(renewed) = renewed {
+                    dispatching = renewed;
                 }
-                Err(error) => Err(error),
-            },
+                delivered
+            }
+            Some(existing) => {
+                let (answer, renewed) = run_with_lease_renewal(
+                    &self.store,
+                    &dispatching,
+                    lease_duration,
+                    self.delivery.deliver_existing_occurrence(
+                        &dispatching,
+                        &delivery_identity,
+                        existing,
+                    ),
+                )
+                .await;
+                if let Some(renewed) = renewed {
+                    dispatching = renewed;
+                }
+                match answer {
+                    Ok(ExistingDeliveryAnswer::Dispatch(dispatch)) => Ok(dispatch),
+                    Ok(ExistingDeliveryAnswer::NotAdmittedPastDeadline) => {
+                        return self
+                            .resolve_existing_delivery_not_admitted(
+                                dispatching,
+                                existing,
+                                store_now_utc,
+                            )
+                            .await;
+                    }
+                    Err(error) => Err(error),
+                }
+            }
         };
         let dispatch = match delivered {
             Ok(dispatch) => dispatch,
@@ -1281,26 +1308,49 @@ fn validate_dispatch_receipt(
 /// lease at ~half the lease duration (2026-07 P0: the fixed 60s lease was
 /// never renewed, so every delivery longer than the lease — a routine
 /// session turn — was reclaimed mid-flight as a presumed-dead deliverer).
+/// The renewal itself is [`run_with_lease_renewal`].
+async fn run_completion_with_lease_renewal(
+    store: &Arc<dyn ScheduleStore>,
+    occurrence: &Occurrence,
+    lease_duration: Duration,
+    completion: DeliveryCompletion,
+) -> Result<DeliveryTerminal, ScheduleDomainError> {
+    run_with_lease_renewal(store, occurrence, lease_duration, completion)
+        .await
+        .0
+}
+
+/// Drive `work` while renewing the claimed occurrence's lease at ~half the
+/// lease duration. The driver runs both the target's admission call and the
+/// delivery's completion inside it, so neither lets the lease lapse while it
+/// runs: an admission can outlast the lease too (a cold executor rebuild, a
+/// mob Begin, an outcome read inside the call).
 ///
 /// Renewal goes through one store-atomic seam: the store samples its clock,
 /// screens the exact attempt/token witness, applies the machine's
 /// `RenewLease`, and commits in one critical section/transaction. Transient
 /// mechanism failures retry with bounded backoff inside the last proven lease
 /// budget; stale evidence or a terminal store failure stops renewal and lets
-/// eventual completion take the stale-screening path.
-async fn run_completion_with_lease_renewal(
+/// the caller's later commit take the stale-screening path.
+///
+/// Returns the work's output and, when a renewal committed, the last renewed
+/// occurrence. That is the durable row the renewal wrote, so a caller that
+/// later writes against the occurrence's exact prior state starts from it.
+async fn run_with_lease_renewal<T>(
     store: &Arc<dyn ScheduleStore>,
     occurrence: &Occurrence,
     lease_duration: Duration,
-    mut completion: DeliveryCompletion,
-) -> Result<DeliveryTerminal, ScheduleDomainError> {
+    work: impl Future<Output = T>,
+) -> (T, Option<Occurrence>) {
+    let mut work = std::pin::pin!(work);
+    let mut renewed = None;
     let Some(interval) = lease_renewal_interval(lease_duration) else {
-        return completion.await;
+        return (work.await, renewed);
     };
     let Some(claim_token) = occurrence.claim_token() else {
-        // No claim token on a dispatched occurrence is unreachable through
+        // No claim token on a dispatching occurrence is unreachable through
         // the claim path; without one the machine cannot authorize renewal.
-        return completion.await;
+        return (work.await, renewed);
     };
     let Some(expected_owner_id) = occurrence.claimed_by.as_deref() else {
         tracing::error!(
@@ -1308,7 +1358,7 @@ async fn run_completion_with_lease_renewal(
             attempt = occurrence.attempt_count,
             "dispatched occurrence omitted durable claim owner; lease cannot be renewed"
         );
-        return completion.await;
+        return (work.await, renewed);
     };
     let mut lease_deadline = monotonic_lease_deadline(Utc::now(), occurrence.lease_expires_at_utc)
         .unwrap_or_else(std::time::Instant::now);
@@ -1316,82 +1366,79 @@ async fn run_completion_with_lease_renewal(
     let mut transient_backoff = std::time::Duration::from_millis(50);
     loop {
         let tick = Box::pin(crate::tokio::time::sleep(renewal_delay));
-        match future::select(completion, tick).await {
-            Either::Left((result, _tick)) => return result,
-            Either::Right(((), waiting)) => {
-                completion = waiting;
-                match renew_lease_once(
-                    store,
-                    occurrence,
-                    claim_token,
-                    expected_owner_id,
-                    lease_duration,
-                )
-                .await
-                {
-                    LeaseRenewalAttempt::Renewed {
-                        store_now_utc,
-                        occurrence,
-                    } => {
-                        let Some(next_deadline) = monotonic_lease_deadline(
-                            store_now_utc,
-                            occurrence.lease_expires_at_utc,
-                        ) else {
-                            tracing::error!(
-                                occurrence_id = %occurrence.occurrence_id,
-                                attempt = occurrence.attempt_count,
-                                "lease renewal committed without a durable expiry"
-                            );
-                            return completion.await;
-                        };
-                        lease_deadline = next_deadline;
-                        renewal_delay = interval;
-                        transient_backoff = std::time::Duration::from_millis(50);
-                    }
-                    LeaseRenewalAttempt::StaleClaim => {
-                        tracing::debug!(
-                            occurrence_id = %occurrence.occurrence_id,
-                            attempt = occurrence.attempt_count,
-                            "lease renewal stopped: exact claim evidence is no longer current"
-                        );
-                        return completion.await;
-                    }
-                    LeaseRenewalAttempt::Transient(error) => {
-                        let now = std::time::Instant::now();
-                        let remaining = lease_deadline.saturating_duration_since(now);
-                        if remaining.is_zero() {
-                            tracing::warn!(
-                                occurrence_id = %occurrence.occurrence_id,
-                                attempt = occurrence.attempt_count,
-                                %error,
-                                "lease renewal exhausted the last proven lease budget"
-                            );
-                            return completion.await;
-                        }
-                        renewal_delay = transient_backoff.min(remaining);
-                        transient_backoff = transient_backoff
-                            .saturating_mul(2)
-                            .min(interval)
-                            .min(std::time::Duration::from_secs(2));
-                        tracing::warn!(
-                            occurrence_id = %occurrence.occurrence_id,
-                            attempt = occurrence.attempt_count,
-                            retry_in_ms = renewal_delay.as_millis(),
-                            remaining_lease_ms = remaining.as_millis(),
-                            %error,
-                            "transient lease renewal fault; retrying inside durable lease budget"
-                        );
-                    }
-                    LeaseRenewalAttempt::Fatal(error) => {
-                        tracing::error!(
-                            occurrence_id = %occurrence.occurrence_id,
-                            attempt = occurrence.attempt_count,
-                            %error,
-                            "lease renewal stopped on terminal store or authority fault"
-                        );
-                        return completion.await;
-                    }
+        if let Either::Left((output, _tick)) = future::select(work.as_mut(), tick).await {
+            return (output, renewed);
+        }
+        match renew_lease_once(
+            store,
+            occurrence,
+            claim_token,
+            expected_owner_id,
+            lease_duration,
+        )
+        .await
+        {
+            LeaseRenewalAttempt::Renewed {
+                store_now_utc,
+                occurrence: successor,
+            } => {
+                let Some(next_deadline) =
+                    monotonic_lease_deadline(store_now_utc, successor.lease_expires_at_utc)
+                else {
+                    tracing::error!(
+                        occurrence_id = %successor.occurrence_id,
+                        attempt = successor.attempt_count,
+                        "lease renewal committed without a durable expiry"
+                    );
+                    return (work.await, Some(successor));
+                };
+                renewed = Some(successor);
+                lease_deadline = next_deadline;
+                renewal_delay = interval;
+                transient_backoff = std::time::Duration::from_millis(50);
+            }
+            LeaseRenewalAttempt::StaleClaim => {
+                tracing::debug!(
+                    occurrence_id = %occurrence.occurrence_id,
+                    attempt = occurrence.attempt_count,
+                    "lease renewal stopped: exact claim evidence is no longer current"
+                );
+                return (work.await, renewed);
+            }
+            LeaseRenewalAttempt::Transient(error) => {
+                let now = std::time::Instant::now();
+                let remaining = lease_deadline.saturating_duration_since(now);
+                if remaining.is_zero() {
+                    tracing::warn!(
+                        occurrence_id = %occurrence.occurrence_id,
+                        attempt = occurrence.attempt_count,
+                        %error,
+                        "lease renewal exhausted the last proven lease budget"
+                    );
+                    return (work.await, renewed);
                 }
+                renewal_delay = transient_backoff.min(remaining);
+                transient_backoff = transient_backoff
+                    .saturating_mul(2)
+                    .min(interval)
+                    .min(std::time::Duration::from_secs(2));
+                tracing::warn!(
+                    occurrence_id = %occurrence.occurrence_id,
+                    attempt = occurrence.attempt_count,
+                    retry_in_ms = renewal_delay.as_millis(),
+                    remaining_lease_ms = remaining.as_millis(),
+                    %error,
+                    "transient lease renewal fault; retrying inside durable lease budget"
+                );
+            }
+            LeaseRenewalAttempt::Fatal(error) => {
+                tracing::error!(
+                    occurrence_id = %occurrence.occurrence_id,
+                    attempt = occurrence.attempt_count,
+                    %error,
+                    "lease renewal stopped on terminal store or authority fault"
+                );
+                return (work.await, renewed);
             }
         }
     }
@@ -4286,6 +4333,146 @@ mod tests {
             wait_for_occurrence_phase(&service, &schedule.schedule_id, OccurrencePhase::Completed)
                 .await?;
         assert_eq!(completed.attempt_count, 1);
+        Ok(())
+    }
+
+    /// Holds its first admission call open until the row releases it, then
+    /// admits like [`MaterializingDelivery`]: it materializes the session and
+    /// completes at once. A later call admits without waiting, so a reclaim
+    /// shows as a second call.
+    #[derive(Default)]
+    struct HeldAdmissionDelivery {
+        calls: AtomicUsize,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl ScheduleTargetDelivery for HeldAdmissionDelivery {
+        async fn deliver_occurrence(
+            &self,
+            occurrence: &Occurrence,
+            identity: &ScheduleDeliveryIdentity,
+        ) -> Result<DeliveryDispatch, ScheduleDomainError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.release.notified().await;
+            }
+            let session_id = occurrence.materialized_session_id();
+            let mut receipt = DeliveryReceipt::new(
+                occurrence.occurrence_id.clone(),
+                occurrence.attempt_count,
+                DeliveryReceiptStage::DispatchAccepted,
+            );
+            receipt.correlation_id = Some(identity.correlation_id.clone());
+            receipt.materialized_session_id = Some(session_id.clone());
+            receipt.runtime_outcome = Some(RuntimeDeliveryOutcome::AdmissionAccepted);
+            Ok(DeliveryDispatch {
+                receipt,
+                correlation_id: Some(identity.correlation_id.clone()),
+                materialized_session_id: Some(session_id),
+                completion: Box::pin(async { Ok(DeliveryTerminal::completed(None)) }),
+            })
+        }
+    }
+
+    /// The lease is renewed while the target admits the delivery, as it is
+    /// while the delivery runs: an admission call held open for several lease
+    /// periods keeps its claim (before, the lease stood still for the whole
+    /// call). The dispatch's writes after the call start from the renewed
+    /// occurrence, so recording the materialized session, a write against the
+    /// occurrence's exact prior state, still commits. The occurrence completes
+    /// at attempt 1 with one admission and no lease-expired receipt.
+    #[tokio::test]
+    async fn the_lease_is_renewed_while_the_target_admits_the_delivery()
+    -> Result<(), ScheduleDomainError> {
+        let store = Arc::new(MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>;
+        let service = ScheduleService::new(store.clone());
+        let schedule = service
+            .create(CreateScheduleRequest {
+                name: Some("renew-during-admission".into()),
+                description: None,
+                trigger: TriggerSpec::Once {
+                    due_at_utc: Utc::now() - Duration::seconds(1),
+                },
+                target: materialize_on_demand_target("scheduled prompt"),
+                misfire_policy: MisfirePolicy::Skip,
+                overlap_policy: OverlapPolicy::SkipIfRunning,
+                missing_target_policy: MissingTargetPolicy::MarkMisfired,
+                labels: BTreeMap::new(),
+                planning_horizon_days: Some(1),
+                planning_horizon_occurrences: Some(1),
+            })
+            .await?;
+        let delivery = Arc::new(HeldAdmissionDelivery::default());
+        let driver = ScheduleDriver::new(
+            service.clone(),
+            store.clone(),
+            Arc::new(ReadyProbe),
+            delivery.clone(),
+            "driver-owner",
+            ScheduleDriverConfig {
+                claim_limit: 8,
+                lease_duration: Duration::milliseconds(25),
+            },
+        );
+
+        let observe_open_admission = async {
+            for _ in 0..100 {
+                if delivery.calls.load(Ordering::SeqCst) >= 1 {
+                    break;
+                }
+                sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                delivery.calls.load(Ordering::SeqCst),
+                1,
+                "the admission call is open"
+            );
+            let admitting = wait_for_occurrence_attempt(&service, &schedule.schedule_id, 1).await?;
+            assert_eq!(admitting.phase, OccurrencePhase::Dispatching);
+            let initial_expiry = admitting
+                .lease_expires_at_utc
+                .expect("a dispatching occurrence holds a lease");
+            // Several lease periods pass while the call stays open.
+            sleep(std::time::Duration::from_millis(100)).await;
+            let current = wait_for_occurrence_attempt(&service, &schedule.schedule_id, 1).await?;
+            assert!(
+                current
+                    .lease_expires_at_utc
+                    .is_some_and(|at| at > initial_expiry),
+                "the lease must be renewed while the admission call is open"
+            );
+            delivery.release.notify_one();
+            Ok::<_, ScheduleDomainError>(current.occurrence_id)
+        };
+        let (tick, observed) = tokio::join!(driver.tick_once(), observe_open_admission);
+        tick?;
+        let occurrence_id = observed?;
+
+        let completed =
+            wait_for_occurrence_phase(&service, &schedule.schedule_id, OccurrencePhase::Completed)
+                .await?;
+        assert_eq!(completed.occurrence_id, occurrence_id);
+        assert_eq!(
+            completed.attempt_count, 1,
+            "no reclaim while the call was open"
+        );
+        assert_eq!(
+            delivery.calls.load(Ordering::SeqCst),
+            1,
+            "the delivery is admitted once"
+        );
+        assert_eq!(
+            crate::types::target_materialized_session_id(&completed.target_snapshot),
+            Some(completed.materialized_session_id()),
+            "the materialization recorded after the call commits on the renewed occurrence"
+        );
+        let receipts = store.list_receipts(&occurrence_id).await?;
+        assert!(
+            !receipts
+                .iter()
+                .any(|receipt| receipt.stage == DeliveryReceiptStage::LeaseExpired),
+            "no lease-expired receipt while the admission call was open"
+        );
         Ok(())
     }
 

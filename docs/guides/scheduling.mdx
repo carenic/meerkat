@@ -415,8 +415,9 @@ Use `schedule/occurrences` or `GET /schedules/{id}/occurrences` to inspect what 
 The store issues a fenced executor lease to one driver incarnation. Only that
 lease holder can plan or claim firing work. A standby driver reports a healthy
 non-authorized tick and can take over after release or expiry. The default
-occurrence claim lease is 60 seconds; a long delivery renews it around the
-half-lease point.
+occurrence claim lease is 60 seconds. A delivery renews it around the
+half-lease point while the target admits it and while it runs, so a slow
+admission keeps its claim too.
 
 Each dispatch also carries a stable occurrence-level delivery identity. If
 target admission succeeds but recording the receipt fails, a later reclaim

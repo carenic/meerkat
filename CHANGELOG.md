@@ -1268,6 +1268,12 @@ them.
   The scheduling guide also names the failure class that the 0.9.4
   `runtime_completion_authority_unavailable` end is recorded with:
   `internal_error`.
+- `meerkat-schedule`: a scheduled delivery's lease is renewed while the
+  target admits the delivery, not only while the delivery runs. An admission
+  slower than the lease (60 seconds by default), such as a cold executor
+  rebuild or a mob delivery's begin, let the lease lapse during the call; a
+  reclaim could then take the occurrence while the input ran, spending one of
+  its five attempts, and end it `delivery_failed` with `lease_lost`.
 
 - `SqliteSessionStore::list` and `load_meta` no longer fail now and then
   with `SessionStoreError::Corrupted` for an intact HeadCanonical session
