@@ -2046,7 +2046,8 @@ impl StoreCheckpointer {
     /// Re-base a WholeBlob run on its rewritten session, in one store call
     /// (`RuntimeStore::commit_prepared_whole_blob_run_rebase`): the session,
     /// without its run cursor, becomes the committed base, and the run's tail
-    /// restarts on it as the same document with the cursor, at candidate
+    /// restarts on it as the same document (with the cursor of a round
+    /// commit, or none for an end-of-run or closing save), at candidate
     /// sequence 1. Then the rewrites' audit receipt is published, as a
     /// rewrite boundary publishes it; a crash before it is repaired by the
     /// receipt-only replay of the rewrite proof.

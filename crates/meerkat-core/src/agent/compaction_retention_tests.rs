@@ -526,7 +526,9 @@ async fn a_long_run_without_a_durable_head_stops_round_commits_at_its_first_rewr
 /// With a checkpointer that re-bases runs, a WholeBlob run keeps committing
 /// its rounds after a rewrite: the first round commit after each rewrite is
 /// a re-base (here every round's first commit, since the run compacts at
-/// every boundary after the first), and the second commit chains on it.
+/// every boundary after the first), and the second commit chains on it. The
+/// end-of-run save after the final boundary's compaction is a re-base too,
+/// without a cursor, so no tail recovery would refuse is ever written.
 #[tokio::test]
 async fn a_long_run_without_a_durable_head_rebases_after_each_rewrite() {
     let checkpointer = Arc::new(HeadCanonicalCheckpointer::whole_blob(true));
@@ -543,7 +545,7 @@ async fn a_long_run_without_a_durable_head_rebases_after_each_rewrite() {
         expected_rebased.push(false);
     }
     expected_cursors.push(None);
-    expected_rebased.push(false);
+    expected_rebased.push(true);
     assert_eq!(cursors, expected_cursors);
     assert_eq!(rebased, expected_rebased);
 }

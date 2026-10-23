@@ -873,6 +873,16 @@ pub enum AgentError {
         "a staged create-time prompt is pending; a turn whose input carries directed interaction custody cannot deliver it"
     )]
     StagedPromptDirectedTurnRefused,
+
+    /// The run was suspended by a stop that keeps the session's queued work
+    /// (a host draining and requeueing, for a deploy): its turn stopped at an
+    /// await point and wrote nothing more, so its last round commit stays its
+    /// resume point. It is neither a cancellation nor a failure: no terminal
+    /// is published for it, and the run resumes at the session's next start.
+    #[error(
+        "run {run_id} was suspended by a requeueing stop; it resumes from its last round commit"
+    )]
+    RunSuspended { run_id: crate::lifecycle::RunId },
 }
 
 impl From<crate::OperationAuthorizationError> for AgentError {

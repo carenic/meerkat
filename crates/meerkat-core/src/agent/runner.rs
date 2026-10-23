@@ -3368,6 +3368,28 @@ where
         owed.stream.then_some(event)
     }
 
+    /// End a run whose execution future the host dropped to suspend it, for
+    /// a stop that keeps the session's queued work (a host draining and
+    /// requeueing, for a deploy), and return the suspended run's id; `None`
+    /// when no run had started.
+    ///
+    /// Unlike [`Self::cancel_dropped_run`] it realizes nothing: no terminal is
+    /// published on the stream or the tap, nothing is applied to the turn
+    /// authority (the runtime suspends the run in its own machine), and
+    /// nothing is written. The dropped future never reached its closing
+    /// write, so the run's last round commit, cursor included, stays its
+    /// resume point. The agent's run state is cleared, the live session keeps
+    /// no cursor and the dispatch context no round. The session layer answers
+    /// the turn with [`AgentError::RunSuspended`].
+    pub fn suspend_dropped_run(&mut self) -> Option<crate::lifecycle::RunId> {
+        let run_id = self.runtime_started_run_id.clone();
+        self.runtime_terminal_failure_witness = None;
+        self.session.clear_run_cursor();
+        self.tool_dispatch_context.clear_round();
+        self.clear_runtime_execution_kind();
+        run_id
+    }
+
     fn dropped_run_terminal_event(&self) -> Option<(AgentEvent, crate::agent::OwedRunTerminal)> {
         self.runtime_started_run_id.as_ref()?;
         let owed = self.run_lifecycle_publication.owed_terminal();

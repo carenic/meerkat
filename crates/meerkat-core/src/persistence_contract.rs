@@ -370,18 +370,19 @@ pub trait SessionCheckpointer: Send + Sync {
         false
     }
 
-    /// Write a run's round commit as a re-base, in one store call: the
+    /// Write a run's checkpoint as a re-base, in one store call: the
     /// session, without its run cursor, becomes the session's committed
     /// base, and the run's provisional tail restarts on it as the same
-    /// document with the cursor.
+    /// document, with the cursor when the session carries one (a round
+    /// commit) and without it otherwise (an end-of-run or closing save).
     ///
-    /// The agent asks for the first round commit after a rewrite of a
-    /// session recovered only from strict continuations, when
-    /// [`Self::rebases_runs`] answers `true`. `previous` is the run's latest
-    /// receipt, if any; the returned receipt names the new tail, with
+    /// The agent asks, when [`Self::rebases_runs`] answers `true`, for the
+    /// run's first round commit or save after a rewrite of a session
+    /// recovered only from strict continuations. `previous` is the run's
+    /// latest receipt, if any; the returned receipt names the new tail, with
     /// candidate sequence 1 on the new base, and the run's next checkpoints
-    /// chain from it. Any error is a failed round commit: a round whose first
-    /// commit fails dispatches nothing.
+    /// chain from it. Any error fails the write: a round whose first commit
+    /// fails dispatches nothing.
     async fn rebase_run(
         &self,
         session: &mut crate::Session,

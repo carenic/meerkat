@@ -138,9 +138,9 @@ struct RecordingTools {
     dispatched: Mutex<Vec<(String, Option<ToolCallDedupeKey>)>>,
     hang_on: Option<&'static str>,
     entered: Notify,
-    /// Ask the running run to stop at its next boundary from the first
-    /// dispatch: `true` suspends it, `false` cancels it.
-    boundary_stop: Mutex<Option<(meerkat_core::CancelAfterBoundarySender, bool)>>,
+    /// Ask the running run to cancel at its next boundary from the first
+    /// dispatch.
+    boundary_cancel: Mutex<Option<meerkat_core::CancelAfterBoundarySender>>,
 }
 
 impl RecordingTools {
@@ -150,16 +150,12 @@ impl RecordingTools {
             dispatched: Mutex::new(Vec::new()),
             hang_on,
             entered: Notify::new(),
-            boundary_stop: Mutex::new(None),
+            boundary_cancel: Mutex::new(None),
         })
     }
 
-    fn stop_at_next_boundary(
-        &self,
-        sender: meerkat_core::CancelAfterBoundarySender,
-        suspend: bool,
-    ) {
-        *self.boundary_stop.lock().unwrap() = Some((sender, suspend));
+    fn cancel_at_next_boundary(&self, sender: meerkat_core::CancelAfterBoundarySender) {
+        *self.boundary_cancel.lock().unwrap() = Some(sender);
     }
 
     fn probes() -> Vec<ToolDef> {
@@ -196,14 +192,13 @@ impl AgentToolDispatcher for RecordingTools {
             .lock()
             .unwrap()
             .push((call.id.to_string(), context.tool_call_dedupe_key(call)));
-        let boundary_stop = self.boundary_stop.lock().unwrap().take();
-        if let (Some((sender, suspend)), Some(run_id)) = (boundary_stop, context.run_id()) {
-            let command = if suspend {
-                meerkat_core::CancelAfterBoundaryCommand::suspend_for_run(run_id.clone())
-            } else {
-                meerkat_core::CancelAfterBoundaryCommand::for_run(run_id.clone())
-            };
-            sender.send(command).expect("the agent holds the receiver");
+        let boundary_cancel = self.boundary_cancel.lock().unwrap().take();
+        if let (Some(sender), Some(run_id)) = (boundary_cancel, context.run_id()) {
+            sender
+                .send(meerkat_core::CancelAfterBoundaryCommand::for_run(
+                    run_id.clone(),
+                ))
+                .expect("the agent holds the receiver");
         }
         if self.hang_on == Some(call.name) {
             self.entered.notify_one();
@@ -1058,59 +1053,93 @@ async fn an_interrupted_run_keeps_its_commit_and_leaves_no_live_cursor() {
     assert!(cursor_of(agent.session()).is_none(), "no cursor stays live");
 }
 
-/// A run a host suspends at a boundary (it drains and requeues its work)
-/// stops resumable: its exit writes no closing checkpoint, so its last round
-/// commit, cursor included, stays its resume point. A plain boundary cancel
-/// ends the run for good: its exit writes the closing checkpoint without the
-/// cursor.
+/// A run cancelled at a boundary ends for good: its exit writes the closing
+/// checkpoint without the cursor, so no committed boundary claims an open
+/// round.
 #[tokio::test]
-async fn a_suspended_run_keeps_its_last_round_commit_and_a_cancelled_one_closes() {
-    for suspend in [true, false] {
-        let client = ScriptedClient::new(vec![
-            Step::Tools(vec![("call-1", "probe", "{}")]),
-            Step::Answer("never asked"),
-        ]);
-        let tools = RecordingTools::new(RecordingTools::probes(), None);
-        let checkpointer = RecordingCheckpointer::new();
-        let mut agent = build_agent(
-            fresh_session(),
-            &client,
-            &tools,
-            Some(Arc::clone(&checkpointer)),
-            true,
-            None,
-        )
-        .await;
-        tools.stop_at_next_boundary(agent.cancel_after_boundary_handle(), suspend);
+async fn a_run_cancelled_at_a_boundary_closes_its_cursor() {
+    let client = ScriptedClient::new(vec![
+        Step::Tools(vec![("call-1", "probe", "{}")]),
+        Step::Answer("never asked"),
+    ]);
+    let tools = RecordingTools::new(RecordingTools::probes(), None);
+    let checkpointer = RecordingCheckpointer::new();
+    let mut agent = build_agent(
+        fresh_session(),
+        &client,
+        &tools,
+        Some(Arc::clone(&checkpointer)),
+        true,
+        None,
+    )
+    .await;
+    tools.cancel_at_next_boundary(agent.cancel_after_boundary_handle());
 
-        let error = agent
-            .run("start".into())
-            .await
-            .expect_err("the run stops at its next boundary");
-        assert!(
-            matches!(error.primary_error(), AgentError::Cancelled),
-            "{error}"
-        );
-        assert_eq!(client.calls(), 1, "no model call after the stop");
-        let commits = checkpointer.commits();
-        let (last, _) = commits.last().expect("the round committed");
-        if suspend {
-            assert_eq!(commits.len(), 2, "both round commits, no closing write");
-            let cursor = cursor_of(last).expect("the resume point keeps its cursor");
-            assert!(matches!(cursor.resume_point, RunResumePoint::AwaitingModel));
-            assert_eq!(cursor.round, 0);
-        } else {
-            assert_eq!(
-                commits.len(),
-                3,
-                "both round commits, then the closing write"
-            );
-            assert!(
-                cursor_of(last).is_none(),
-                "a cancelled run claims no open round"
-            );
-        }
-    }
+    let error = agent
+        .run("start".into())
+        .await
+        .expect_err("the run stops at its next boundary");
+    assert!(
+        matches!(error.primary_error(), AgentError::Cancelled),
+        "{error}"
+    );
+    assert_eq!(client.calls(), 1, "no model call after the cancel");
+    let commits = checkpointer.commits();
+    assert_eq!(
+        commits.len(),
+        3,
+        "both round commits, then the closing write"
+    );
+    let (last, _) = commits.last().unwrap();
+    assert!(
+        cursor_of(last).is_none(),
+        "a cancelled run claims no open round"
+    );
+    assert!(cursor_of(agent.session()).is_none());
+}
+
+/// A run the host suspends (it drains and requeues its work) is dropped at
+/// its next await point and realizes nothing: no terminal, no write. Its
+/// last round commit, cursor included, stays its resume point; the live
+/// session keeps no cursor; and the suspended run's id comes back for the
+/// session layer's typed outcome.
+#[tokio::test]
+async fn a_suspended_run_keeps_its_last_round_commit_and_realizes_nothing() {
+    let client = ScriptedClient::new(vec![Step::Tools(vec![("call-1", "probe", "{}")])]);
+    let tools = RecordingTools::new(RecordingTools::probes(), Some("probe"));
+    let checkpointer = RecordingCheckpointer::new();
+    let mut agent = build_agent(
+        fresh_session(),
+        &client,
+        &tools,
+        Some(Arc::clone(&checkpointer)),
+        true,
+        None,
+    )
+    .await;
+    run_until_stopped(agent.run("start".into()), &tools.entered).await;
+
+    let suspended = agent
+        .suspend_dropped_run()
+        .expect("the suspended run had started");
+
+    let commits = checkpointer.commits();
+    assert_eq!(
+        commits.len(),
+        1,
+        "nothing written after the round's first commit"
+    );
+    let cursor = cursor_of(&commits[0].0).expect("the resume point keeps its cursor");
+    assert_eq!(cursor.run_id, suspended);
+    assert!(matches!(
+        cursor.resume_point,
+        RunResumePoint::ToolsPending { .. }
+    ));
+    assert!(cursor_of(agent.session()).is_none(), "no cursor stays live");
+    assert!(
+        agent.suspend_dropped_run().is_none(),
+        "the agent holds no run after the suspension"
+    );
 }
 
 /// The cursor lists the inputs the session layer staged for the run; a run

@@ -650,14 +650,24 @@ them.
     cursor (`SessionCheckpointer::rebases_runs` and
     `SessionCheckpointer::rebase_run`; the session service's checkpointer
     does it for WholeBlob, and publishes the rewrites' audit receipt). The
-    run's later round commits continue the new base. A checkpointer that
-    does not re-base (the default) takes no round commit after the run's
-    first rewrite.
+    run's later round commits continue the new base. An end-of-run or
+    closing save after a rewrite with no round commit since is a re-base
+    too, without a cursor. A checkpointer that does not re-base (the
+    default) takes no round commit after the run's first rewrite.
   - `SessionCheckpointer::dispatch_fence_check` lets a checkpointer over a
     host store refuse dispatch once its writer's self-fence window has
-    closed. The agent asks right before each model request and right after a
-    tool round's first commit, before any tool runs; a refusal stops the run
-    as a refused commit does, and the run writes nothing more.
+    closed. The agent asks right before each model request (a compaction's
+    summarization request included) and right after a tool round's first
+    commit, before any tool runs, for every run with a checkpointer, a live
+    bridge run's included; a refusal stops the run as a refused commit does,
+    and the run writes nothing more.
+  - A stop that keeps a durable session's queued work (a host draining and
+    requeueing, for a deploy) suspends the session's run instead of
+    cancelling it. The session layer drops the run future at its next await
+    point, and `Agent::suspend_dropped_run` ends the run without a terminal,
+    without a turn-authority change and without a write, returning the run's
+    id. The run's last round commit, cursor included, stays its resume point,
+    and the turn answers `AgentError::RunSuspended { run_id }`.
 
 - `meerkat_core::host_store`: the host store SPI, a small storage interface
   a host implements so that Core can keep a realm's durable state in the

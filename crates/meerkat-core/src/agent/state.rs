@@ -916,10 +916,6 @@ pub(crate) struct RunRoundCommits {
     /// store-issued provisional run id), but a checkpoint without the cursor
     /// is attributable only by such a message.
     run_row_since_rewrite: bool,
-    /// The run was asked to stop at a boundary and stay resumable
-    /// ([`crate::agent::CancelAfterBoundaryCommand::suspend_for_run`]): a
-    /// cancelled exit then writes no closing checkpoint.
-    keep_resume_point: bool,
     /// The run rewrote its transcript since the committed base its round
     /// commits chain from. A session without a durable HeadCanonical head (a
     /// WholeBlob session) is recovered only from a strict continuation of
@@ -1483,7 +1479,23 @@ where
         // never carries a cursor, and recovery classifies a completed tail
         // that still carries one as ambiguous.
         self.session.clear_run_cursor();
-        self.write_session_checkpoint(run_id, durability).await?;
+        // A run that rewrote the transcript of a session recovered only from
+        // strict continuations since its last round commit re-bases this save
+        // too: the committed base and the tail are the same document, without
+        // a cursor, so no tail recovery would refuse is left.
+        if self.round_commits_enabled()
+            && self
+                .round_commits
+                .needs_rebase(self.session.has_durable_head_canonical_head())
+            && self
+                .checkpointer
+                .as_ref()
+                .is_some_and(|checkpointer| checkpointer.rebases_runs())
+        {
+            self.write_round_rebase(run_id).await?;
+        } else {
+            self.write_session_checkpoint(run_id, durability).await?;
+        }
         self.round_commits.cursor_written = false;
         Ok(())
     }
@@ -1700,13 +1712,13 @@ where
 
     /// Whether this writer may still dispatch: the session checkpointer's
     /// fence check (see [`crate::SessionCheckpointer::dispatch_fence_check`]),
-    /// asked only of an agent whose runs commit their rounds.
+    /// asked of every agent with a checkpointer, a live bridge run's included:
+    /// such a run commits nothing, but it still calls the model and runs
+    /// tools.
     fn check_dispatch_fence(&self) -> Result<(), AgentError> {
         match self.checkpointer.as_ref() {
-            Some(checkpointer) if self.round_commits_enabled() => {
-                checkpointer.dispatch_fence_check()
-            }
-            _ => Ok(()),
+            Some(checkpointer) => checkpointer.dispatch_fence_check(),
+            None => Ok(()),
         }
     }
 
@@ -2003,13 +2015,14 @@ where
         Ok(true)
     }
 
-    /// Write a round commit as a re-base (see
-    /// [`crate::SessionCheckpointer::rebase_run`]): the run's first round
-    /// commit after a rewrite of a session recovered only from strict
+    /// Write a round commit, or an end-of-run or closing save, as a re-base
+    /// (see [`crate::SessionCheckpointer::rebase_run`]): the run's first such
+    /// write after a rewrite of a session recovered only from strict
     /// continuations. The live session, without its cursor, becomes the
-    /// committed base and the run's tail restarts on it with the cursor, so
-    /// the run's later round commits continue the new base strictly. The
-    /// receipt chain restarts there.
+    /// committed base and the run's tail restarts on it as the same document
+    /// (with the cursor a round commit carries, or none for a save), so the
+    /// run's later writes continue the new base strictly. The receipt chain
+    /// restarts there.
     async fn write_round_rebase(&mut self, run_id: &RunId) -> Result<(), AgentError> {
         self.sync_control_state_to_session().map_err(|error| {
             AgentError::InternalError(format!(
@@ -2077,10 +2090,9 @@ where
     /// result, a failed write fails the run. After a failure the run's own
     /// error stands and the write's is logged, unless the write's error
     /// requires the session's teardown. A run whose own failure requires the
-    /// session's teardown writes nothing more, and neither does a run
-    /// cancelled at a boundary by a suspension (see
-    /// [`crate::agent::CancelAfterBoundaryCommand::suspend_for_run`]), whose
-    /// last round commit stays its resume point.
+    /// session's teardown writes nothing more. A run the host suspends never
+    /// reaches this: its future is dropped (see [`Agent::suspend_dropped_run`]),
+    /// so its last round commit stays its resume point.
     pub(super) async fn close_run_cursor_at_exit(
         &mut self,
         result: Result<RunResult, AgentError>,
@@ -2100,15 +2112,6 @@ where
         // unknown, a writer past its fence) writes nothing more: the live
         // actor reloads, and recovery reads the last round commit.
         if matches!(&result, Err(error) if error.requires_session_teardown()) {
-            self.session.clear_run_cursor();
-            return result;
-        }
-        // A run suspended at a boundary (a host draining and requeueing its
-        // work) stays resumable: its last round commit, cursor included,
-        // stays its resume point.
-        if self.round_commits.keep_resume_point
-            && matches!(&result, Err(error) if matches!(error.primary_error(), AgentError::Cancelled))
-        {
             self.session.clear_run_cursor();
             return result;
         }
@@ -4404,6 +4407,9 @@ where
                     ctx.last_rewrite_history_tokens =
                         self.compaction_cadence.last_rewrite_history_tokens;
                     if compactor.should_compact(&ctx) {
+                        // A writer past its self-fence window sends no
+                        // summarization request either.
+                        self.check_dispatch_fence()?;
                         self.tool_application_observations.invalidate();
                         let rollback_state = crate::agent::CompactionRollbackState {
                             rollback_session: self.session.clone(),
@@ -5775,31 +5781,21 @@ where
         // most once per boundary regardless of how many commands queued. A
         // disconnected producer simply means no request is pending.
         let mut requested = false;
-        let mut plain_cancel = false;
         while let Ok(command) = self.cancel_after_boundary_rx.try_recv() {
             // Commands are attachment/run capabilities, not SessionId-level
             // wishes. Discard stale commands instead of carrying them across a
             // turn transition and cancelling the successor run.
             if command.expected_run_id() == run_id {
                 requested = true;
-                plain_cancel |= !command.suspends_run();
             }
         }
         if !requested {
             return Ok(());
         }
 
-        if self.turn_active_run_id()?.as_ref() != Some(run_id) {
-            return Ok(());
-        }
-        // A suspension keeps the run's last round commit as its resume point;
-        // a plain cancel, observed before or after it, ends the run for good.
-        if plain_cancel {
-            self.round_commits.keep_resume_point = false;
-        } else if !self.turn_cancel_after_boundary()? {
-            self.round_commits.keep_resume_point = true;
-        }
-        if self.turn_cancel_after_boundary()? {
+        if self.turn_active_run_id()?.as_ref() != Some(run_id)
+            || self.turn_cancel_after_boundary()?
+        {
             return Ok(());
         }
 

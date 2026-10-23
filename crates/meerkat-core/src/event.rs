@@ -532,7 +532,9 @@ impl From<&AgentError> for AgentErrorClass {
             AgentError::MaxTokensReached { .. } => Self::MaxTokens,
             AgentError::ContentFiltered { .. } => Self::ContentFiltered,
             AgentError::MaxTurnsReached { .. } => Self::MaxTurns,
-            AgentError::Cancelled => Self::Cancelled,
+            // A suspended run publishes no terminal; a caller that reports
+            // the error anyway sees the class of a stopped run.
+            AgentError::Cancelled | AgentError::RunSuspended { .. } => Self::Cancelled,
             AgentError::InvalidStateTransition { .. } => Self::InvalidState,
             AgentError::OperationNotFound(_) => Self::OperationNotFound,
             AgentError::DepthLimitExceeded { .. } => Self::DepthLimit,
