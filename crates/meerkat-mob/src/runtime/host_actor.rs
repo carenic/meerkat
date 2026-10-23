@@ -824,7 +824,7 @@ pub struct MaterializedMemberRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forked_participant_attachment: Option<ForkedParticipantAttachmentAssociation>,
     /// Digest of the prompt-context fork this build carried (protocol V7,
-    /// [`prompt_context_fork_digest`]): per-launch material outside
+    /// `prompt_context_fork_digest`): per-launch material outside
     /// `spec_digest`, so a replay at this tuple that carries a different
     /// fork, or a fork against none, is refused rather than answered.
     /// Additive: a row written before it reads as `None`.
