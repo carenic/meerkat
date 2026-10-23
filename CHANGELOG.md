@@ -605,26 +605,38 @@ them.
     bound inputs, round and counters, and publishes `RunResumed` in place of
     `RunStarted`. At `ToolsPending` the staged message is the round's model
     response: the model is not asked again, and its tool calls are dispatched
-    again under their call ids through full admission (pre-tool hooks,
-    visibility, review; no earlier approval is reused), with nothing published
-    again for the message itself. At `AwaitingModel` the run makes its next
+    again under their call ids through full admission (pre- and post-tool
+    hooks, visibility, review; no earlier approval is reused), with nothing
+    published again for the message itself. A resumed call that admission now
+    refuses answers outcome-uncertain with the refusal, because it may have
+    taken effect before the restart. At `AwaitingModel` the run makes its next
     model call.
   - Delivery is at least once. Every dispatch of an agent-loop round carries
     the round in its `ToolDispatchContext`, and
     `ToolDispatchContext::tool_call_dedupe_key(call)` gives a call the same
     `ToolCallDedupeKey` (run, round, call id, call digest) fresh and after a
     resume, so a tool whose effects must not repeat deduplicates on it.
+    `call_digest` is the lowercase hex SHA-256 of the tool name and the call's
+    canonical arguments under a versioned domain tag:
+    `meerkat_core::tool_call_digest(name, arguments)` computes it, and
+    `ToolCallDedupeKey::new` builds the whole key. A call dispatched outside an
+    agent-loop round (an external call, a tool application) has no key.
   - Three kinds of call get an outcome-uncertain result instead of running
     again: a call whose process custody shows its process may have run before
     the restart, a call to one of Core's comms tools that sends to another
     agent, and a call whose plan is Detached under a runner that cannot resume
     or repeat it.
   - A first commit that fails or returns no receipt fails its round before any
-    tool runs. A run that ends without an end-of-run save (a failure, a
-    cancellation, a callback suspension, a turn or budget cap) writes one more
-    checkpoint without the cursor, so a committed boundary never carries one.
-    At a callback suspension that write is required, because the suspension's
-    boundary commits it as the suspended state.
+    tool runs. A run that ends without an end-of-run save writes one more
+    checkpoint without the cursor when the session layer commits the run's
+    boundary from it: a result (a turn or budget cap), a callback suspension
+    or a hard-failure terminal. So a committed boundary never carries a
+    cursor. At a callback suspension that write is required, because the
+    suspension's boundary commits it as the suspended state. After a
+    cancellation or another failure the run writes it only when the run's own
+    assistant message identifies the tail; otherwise the last round commit,
+    with its cursor, stays for recovery, which settles it by the run's
+    inputs. Every exit leaves the live session without a cursor.
   - `Agent::set_run_start_input_ids` stages the inputs a runtime batch binds
     to the next run; each steer or peer input written into a running turn at a
     boundary binds to the run too, and the cursor lists them all.
@@ -2027,6 +2039,10 @@ them.
   provider that mints fresh call ids for the repeated request (OpenAI,
   Anthropic) gives the repeated calls new dedupe keys; only a call with the
   same id, name and arguments meets the same key.
+- A structured-output run that resumes after a crash during its extraction
+  asks the model again from its last round commit, so it publishes
+  `RunCompleted` with `extraction_required` a second time under the same run
+  id.
 - The usage of a model call that a restart interrupted is not recorded,
   although the provider bills it. Asynchronous operations a resumed run was
   waiting for ended with the restart: the run does not wait for them, and the

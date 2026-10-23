@@ -858,6 +858,55 @@ async fn a_resumed_round_does_not_send_a_comms_message_again() {
     assert!(results[0].text_content().contains("outcome_uncertain"));
 }
 
+/// A resumed call that admission refuses now (here its tool is gone after
+/// the restart) may have taken effect before it: its result says the
+/// outcome is unknown and carries the refusal, instead of reading as a call
+/// that never ran.
+#[tokio::test]
+async fn a_resumed_call_refused_at_admission_answers_outcome_unknown() {
+    let stopped = stop_inside_first_round(
+        vec![("call-1", "probe", "{}")],
+        RecordingTools::probes(),
+        "probe",
+    )
+    .await;
+
+    let client = ScriptedClient::new(vec![Step::Answer("done")]);
+    let without_probe = vec![ToolDef::new(
+        "probe2",
+        "returns",
+        serde_json::json!({ "type": "object" }),
+    )];
+    let tools = RecordingTools::new(without_probe, None);
+    let mut agent = build_agent(
+        stopped.tail.clone(),
+        &client,
+        &tools,
+        Some(RecordingCheckpointer::new()),
+        false,
+        None,
+    )
+    .await;
+    agent
+        .resume_run(
+            stopped.cursor.clone(),
+            stopped.receipt.clone(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .expect("the resumed run completes");
+
+    assert!(tools.dispatched().is_empty());
+    let results = tool_results(agent.session());
+    assert_eq!(results.len(), 1);
+    assert!(results[0].is_error);
+    let text = results[0].text_content();
+    assert!(text.contains("outcome_uncertain"), "{text}");
+    assert!(text.contains("refused"), "{text}");
+}
+
 /// A first commit the checkpointer does not make durable (no receipt) fails
 /// the round before any of its tools runs.
 #[tokio::test]
@@ -971,6 +1020,42 @@ async fn a_run_capped_after_a_round_closes_its_cursor() {
         closing.messages().last(),
         Some(Message::ToolResults { .. })
     ));
+}
+
+/// A run interrupted between the first and second commits of its first
+/// round keeps the first commit as its latest checkpoint, cursor included,
+/// for recovery; its live session keeps no cursor, so no later save of it
+/// commits one, and the dispatch context no longer names the round.
+#[tokio::test]
+async fn an_interrupted_run_keeps_its_commit_and_leaves_no_live_cursor() {
+    let client = ScriptedClient::new(vec![Step::Tools(vec![("call-1", "probe", "{}")])]);
+    let tools = RecordingTools::new(RecordingTools::probes(), Some("probe"));
+    let checkpointer = RecordingCheckpointer::new();
+    let mut agent = build_agent(
+        fresh_session(),
+        &client,
+        &tools,
+        Some(Arc::clone(&checkpointer)),
+        true,
+        None,
+    )
+    .await;
+    run_until_stopped(agent.run("start".into()), &tools.entered).await;
+    assert!(
+        cursor_of(agent.session()).is_some(),
+        "the dropped run left its cursor live"
+    );
+
+    let _ = agent.cancel_dropped_run();
+
+    let commits = checkpointer.commits();
+    assert_eq!(commits.len(), 1, "only the round's first commit");
+    let cursor = cursor_of(&commits[0].0).expect("the durable commit keeps its cursor");
+    assert!(matches!(
+        cursor.resume_point,
+        RunResumePoint::ToolsPending { .. }
+    ));
+    assert!(cursor_of(agent.session()).is_none(), "no cursor stays live");
 }
 
 /// A run a host suspends at a boundary (it drains and requeues its work)

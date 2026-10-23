@@ -618,7 +618,10 @@ where
     pub(super) fn runtime_turn_ended_in_hard_failure(&self) -> bool {
         use crate::generated::terminal_surface_mapping::{SurfaceResultClass, classify_terminal};
 
-        if self.runtime_started_run_id.is_none() || self.runtime_execution_kind.is_none() {
+        let Some(started_run_id) = self.runtime_started_run_id.as_ref() else {
+            return false;
+        };
+        if self.runtime_execution_kind.is_none() {
             return false;
         }
         let Some(turn_state_handle) = self.turn_state_handle.as_deref() else {
@@ -630,6 +633,14 @@ where
                     classify_terminal(&snapshot.terminal_outcome, snapshot.terminal_cause_kind),
                     SurfaceResultClass::HardFailure
                 )
+                && validate_runtime_terminal_run_id(
+                    started_run_id,
+                    snapshot.terminal_run_id.as_ref(),
+                )
+                .is_ok()
+                && snapshot
+                    .terminal_cause_kind
+                    .is_some_and(|cause| cause.is_specific_failure_cause())
         })
     }
 
@@ -2670,13 +2681,16 @@ where
     /// - At `ToolsPending` the round's staged assistant message is the
     ///   round's model response: the model is not asked again, and the
     ///   message's tool calls are dispatched again under their call ids, with
-    ///   the same dedupe keys, each through the full admission path (pre-tool
-    ///   hooks, visibility, review; no earlier approval is reused). Delivery
-    ///   is at least once. Three kinds of call are answered as interrupted,
-    ///   with an outcome-uncertain result, instead of running again: a call
-    ///   whose process `interrupted_calls` shows may have run, a call to one
-    ///   of Core's comms tools that sends to another agent, and a call whose
-    ///   plan is Detached under a runner that cannot resume or repeat it.
+    ///   the same dedupe keys, each through the full admission path (pre- and
+    ///   post-tool hooks, visibility, review; no earlier approval is reused).
+    ///   A call that admission refuses now answers outcome-uncertain with the
+    ///   refusal, because it may have taken effect before the restart.
+    ///   Delivery is at least once. Three kinds of call are answered as
+    ///   interrupted, with an outcome-uncertain result, instead of running
+    ///   again: a call whose process `interrupted_calls` shows may have run, a
+    ///   call to one of Core's comms tools that sends to another agent, and a
+    ///   call whose plan is Detached under a runner that cannot resume or
+    ///   repeat it.
     /// - At `AwaitingModel` the run makes its next model call. Asynchronous
     ///   operations the run was to wait for ended with the restart; it does
     ///   not wait for them, and the model is told so.
@@ -3330,6 +3344,11 @@ where
     /// facts, so neither sink gets a second terminal.
     pub fn cancel_dropped_run(&mut self) -> Option<AgentEvent> {
         self.runtime_terminal_failure_witness = None;
+        // The dropped run's last round commit keeps its cursor in the store;
+        // the live session keeps none, so no later save of it commits one,
+        // and a call the host dispatches next carries no round's key.
+        self.session.clear_run_cursor();
+        self.tool_dispatch_context.clear_round();
         if let Err(error) = self.observe_dropped_run_cancellation() {
             tracing::warn!(%error, "generated authority rejected dropped-run cancellation");
         }

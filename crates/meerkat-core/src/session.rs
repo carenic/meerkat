@@ -3455,6 +3455,10 @@ pub struct RunLoopCarryOver {
     /// promoted only when the run reaches its clean end.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub staged_model_routing: Option<StagedModelRoutingCarryOver>,
+    /// The sequence number of the run's latest model request, as hooks see it
+    /// (`HookModelOperation`): a resumed run continues the numbering.
+    #[serde(default)]
+    pub model_operation_sequence: u64,
 }
 
 /// The usage account of an open run: the session total it started from and

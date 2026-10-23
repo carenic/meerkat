@@ -1861,6 +1861,7 @@ where
             }),
             pending_ops,
             staged_model_routing,
+            model_operation_sequence: *ctx.model_operation_sequence,
         })
     }
 
@@ -2090,10 +2091,16 @@ where
         let Some(run_id) = self.round_commits.run_id.clone() else {
             return result;
         };
+        // Every exit leaves the live session without a cursor, so no later
+        // save of the live session (a system notice, a reconfigure, an
+        // external tool call) commits one. Where the exit takes no closing
+        // write, the store's last round commit keeps its cursor for recovery.
+        //
         // A failure that requires the session's teardown (store authority
         // unknown, a writer past its fence) writes nothing more: the live
         // actor reloads, and recovery reads the last round commit.
         if matches!(&result, Err(error) if error.requires_session_teardown()) {
+            self.session.clear_run_cursor();
             return result;
         }
         // A run suspended at a boundary (a host draining and requeueing its
@@ -2102,6 +2109,7 @@ where
         if self.round_commits.keep_resume_point
             && matches!(&result, Err(error) if matches!(error.primary_error(), AgentError::Cancelled))
         {
+            self.session.clear_run_cursor();
             return result;
         }
         let promotes = self.run_exit_promotes_latest_checkpoint(&result);
@@ -2110,6 +2118,7 @@ where
                 .round_commits
                 .closing_tail_attributable(self.session.has_durable_head_canonical_head())
         {
+            self.session.clear_run_cursor();
             return result;
         }
         let Err(close_error) = self
@@ -6032,7 +6041,9 @@ where
         let mut model_operation: Option<crate::hooks::HookModelOperation> = None;
         let mut model_operation_id: Option<crate::OperationId> = None;
         let mut responding_operation_id: Option<crate::OperationId> = None;
-        let mut model_operation_sequence = 0_u64;
+        let mut model_operation_sequence = carried
+            .as_ref()
+            .map_or(0, |carried| carried.model_operation_sequence);
         let mut deferred_tool_failure = deferred_callback
             .as_ref()
             .map(|value| value.failure.clone());
@@ -8798,7 +8809,7 @@ where
             .map(|(tool_index, (tc, args))| (tool_index, tc, args))
             .collect::<Vec<_>>();
         let (indexed_calls, mut interrupted_calls) = match resumed.as_ref() {
-            Some(round) => self.partition_resumed_calls(round, tool_defs, indexed_calls),
+            Some(round) => self.partition_resumed_calls(round, indexed_calls),
             None => (indexed_calls, Vec::new()),
         };
         let CallingLlmToolAdmission {
@@ -8807,6 +8818,9 @@ where
         } = self
             .admit_calling_llm_tool_calls(ctx, tool_defs, indexed_calls)
             .await?;
+        if resumed.is_some() {
+            interrupt_resumed_refusals(&mut refused_tool_calls);
+        }
         refused_tool_calls.append(&mut interrupted_calls);
 
         // Execute all allowed tool calls in parallel, bounding
@@ -8855,7 +8869,6 @@ where
     fn partition_resumed_calls(
         &self,
         round: &ResumedToolRound,
-        tool_defs: &Arc<[Arc<ToolDef>]>,
         calls: Vec<(usize, ToolCallOwned, ToolCallArguments)>,
     ) -> (
         Vec<(usize, ToolCallOwned, ToolCallArguments)>,
@@ -8864,7 +8877,7 @@ where
         let mut rerun = Vec::with_capacity(calls.len());
         let mut interrupted = Vec::new();
         for (tool_index, tc, args) in calls {
-            match self.resumed_call_disposition(round, tool_defs, &tc) {
+            match self.resumed_call_disposition(round, &tc) {
                 ResumedCallDisposition::Rerun => rerun.push((tool_index, tc, args)),
                 ResumedCallDisposition::Interrupted { reason } => {
                     let error = ToolError::OutcomeUncertain {
@@ -8895,7 +8908,6 @@ where
     fn resumed_call_disposition(
         &self,
         round: &ResumedToolRound,
-        tool_defs: &Arc<[Arc<ToolDef>]>,
         tc: &ToolCallOwned,
     ) -> ResumedCallDisposition {
         if let Some(evidence) = round.interrupted_calls.get(&tc.id)
@@ -8910,7 +8922,9 @@ where
                 ),
             };
         }
-        let comms_tool = tool_defs.iter().any(|tool| {
+        // The dispatcher's own catalog, not the boundary's visible scope: a
+        // comms tool hidden at the resume is still one Core knows sends.
+        let comms_tool = self.tools.tools().iter().any(|tool| {
             tool.name == tc.name.as_str()
                 && tool
                     .provenance
@@ -10288,6 +10302,32 @@ impl ToolCallOwned {
             name: &self.name,
             args: &self.args,
         }
+    }
+}
+
+/// A resumed round's call that admission refuses now may have taken effect
+/// before the restart: its result says the outcome is unknown, carrying the
+/// refusal, instead of a refusal that reads as "never ran". Failures with a
+/// run-level meaning of their own keep their class.
+fn interrupt_resumed_refusals(refused: &mut [ToolDispatchResult]) {
+    for (_, tc, result, _) in refused.iter_mut() {
+        let reason = match &*result {
+            Err(
+                ToolError::OperationObservationUnavailable
+                | ToolError::OperationAuthorizationUnavailable
+                | ToolError::CallbackPending { .. },
+            )
+            | Ok(_) => continue,
+            Err(error) => format!(
+                "a host restart interrupted this call, and when the run resumed it was refused \
+                 ({error}). It was not run again; whether it took effect before the restart is \
+                 unknown"
+            ),
+        };
+        *result = Err(ToolError::OutcomeUncertain {
+            name: tc.name.clone(),
+            reason,
+        });
     }
 }
 
