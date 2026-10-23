@@ -242,10 +242,15 @@ impl Harness {
             }
             kill_switch.terminate();
         }
-        let reached =
-            tokio::time::timeout(STEP + SHUTDOWN_BUDGET, fired.wait_for(|fired| *fired)).await;
+        // Read as a bool at once: the watch borrow `wait_for` returns holds
+        // the channel's read lock and is not `Send`, so it must not live
+        // across the route release's await below.
+        let reached = matches!(
+            tokio::time::timeout(STEP + SHUTDOWN_BUDGET, fired.wait_for(|fired| *fired)).await,
+            Ok(Ok(_))
+        );
         incarnation_runtime.shutdown_background();
-        if !matches!(reached, Ok(Ok(_))) {
+        if !reached {
             return Err(harness_failure(
                 "kill_in_process",
                 "the incarnation never reached its kill point",
