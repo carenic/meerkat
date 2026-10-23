@@ -197,6 +197,35 @@ const COMPACTED_ROWS: [(&str, LongRunPlan); 7] = [
     ),
 ];
 
+/// The durable worker rows, by step name.
+const DURABLE_WORKER_ROWS: [(&str, LongRunPlan, ResumeGate); 5] = [
+    (
+        "worker_resumes",
+        plan(1, KillPoint::DuringTools, BeforeResume::Nothing),
+        ResumeGate::Absent,
+    ),
+    (
+        "worker_gate_continues",
+        plan(2, KillPoint::BeforeDispatch, BeforeResume::Nothing),
+        ResumeGate::Continue,
+    ),
+    (
+        "worker_gate_superseded",
+        plan(1, KillPoint::DuringTools, BeforeResume::Nothing),
+        ResumeGate::Superseded,
+    ),
+    (
+        "worker_gate_unavailable",
+        plan(1, KillPoint::DuringTools, BeforeResume::Nothing),
+        ResumeGate::Unavailable,
+    ),
+    (
+        "worker_gate_unavailable_once",
+        plan(2, KillPoint::DuringTools, BeforeResume::Nothing),
+        ResumeGate::UnavailableOnce,
+    ),
+];
+
 /// Long run chapter: every kill point of a round, unrepeatable and callback
 /// tools, image rounds, the first and last rounds, a queued input, and a
 /// stop or retire before the resume. No row compacts.
