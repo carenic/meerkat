@@ -2195,6 +2195,7 @@ macro_rules! mob_catalog_machine_dsl {
                     } else {
                         if lease == IdentityLeaseCondition::Missing
                             || lease == IdentityLeaseCondition::HeldByExpiredIncarnation
+                            || lease == IdentityLeaseCondition::HeldByEndedIncarnation
                         {
                             IdentityReconcileDecision::AcquireLease
                         } else {
@@ -25088,6 +25089,11 @@ pub enum IdentityLeaseCondition {
     HeldByCurrentIncarnation,
     HeldByOtherLiveIncarnation,
     HeldByExpiredIncarnation,
+    /// Unexpired, held by an earlier incarnation of the same holder whose
+    /// process the shell has proven ended (it holds the store's process
+    /// incarnation custody): nothing of that incarnation runs, so the lease
+    /// is taken over at once.
+    HeldByEndedIncarnation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
