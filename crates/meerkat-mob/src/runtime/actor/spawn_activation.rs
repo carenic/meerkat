@@ -2590,12 +2590,15 @@ impl MobActor {
                 self.dsl_authority.state(),
                 &pending.state.agent_identity,
             )
-            && !pending.state.suppress_autonomous_initial_prompt
         {
             // PLACED autonomous member: the loop runs on the MEMBER host
             // (ADJ-23 residency) and the kickoff prompt rides the placed
             // delivery lane, so activation only opens the durable obligation.
-            if let Err(error) = Box::pin(self.kickoff_placed_member(&mut pending.state)).await {
+            // A plain resume whose member host reported the adopted session's
+            // first turn as started waived the kickoff: nothing is opened.
+            if !pending.state.suppress_autonomous_initial_prompt
+                && let Err(error) = Box::pin(self.kickoff_placed_member(&mut pending.state)).await
+            {
                 return SpawnActivationStep::Done(Box::new(Err(error)));
             }
             pending.phase = SpawnActivationPhase::Commit;

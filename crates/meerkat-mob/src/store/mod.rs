@@ -3181,6 +3181,16 @@ impl MobPlacedSpawnCarrierRecord {
             .then(|| self.spec.profile.model.clone())
     }
 
+    /// Whether this committed carrier waived its kickoff: its member host
+    /// reported, on a plain resume's ack, that the adopted session's first
+    /// turn already started.
+    pub fn waives_first_turn(&self) -> bool {
+        matches!(
+            &self.phase,
+            PlacedSpawnCarrierPhase::Committed(commit) if commit.adopted_first_turn_started
+        )
+    }
+
     /// Project per-member operator facts only from an exact committed carrier.
     /// Mob-wide operator grants remain in their independent principal-keyed
     /// store and are never folded into this record.

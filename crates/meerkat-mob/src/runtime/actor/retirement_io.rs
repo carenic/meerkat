@@ -4808,6 +4808,7 @@ impl MobActor {
                                 None,
                                 origin,
                                 restore_wiring,
+                                false,
                                 spawn_reply,
                             )
                         })

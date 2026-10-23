@@ -1501,16 +1501,16 @@ pub enum MobError {
         required_bytes: usize,
     },
 
-    /// A prompt-context fork placed on member host `host_id` was not
-    /// spawned: the `HostFeatures` probe that decides how the child is
-    /// given its fork context failed with `cause` (a timeout, the
-    /// transport, admission). Nothing was recorded for the child. A host
-    /// that does not know the probe is not a failure: its child gets the
-    /// context as a prefix of its first prompt. It is classified as
-    /// `cause` everywhere: the failure class, the wire code and detail,
-    /// the rejection cause and the structured data are the cause's. A
-    /// spawn-time probe holds no durable resume and refuses no runtime
-    /// effect.
+    /// A placed spawn that asks its member host `host_id` what it serves (a
+    /// prompt-context fork child, or a plain resume) was not spawned: the
+    /// `HostFeatures` probe failed with `cause` (a timeout, the transport,
+    /// admission). Nothing was recorded for the member. A host that does
+    /// not know the probe is not a failure: a fork child gets the context
+    /// as a prefix of its first prompt, and a resume keeps its first turn.
+    /// It is classified as `cause` everywhere: the failure class, the wire
+    /// code and detail, the rejection cause and the structured data are the
+    /// cause's. A spawn-time probe holds no durable resume and refuses no
+    /// runtime effect.
     #[error("HostFeatures probe of member host '{host_id}' failed: {cause}")]
     HostFeaturesProbeFailed {
         host_id: String,

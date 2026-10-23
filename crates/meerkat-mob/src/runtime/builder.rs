@@ -6536,6 +6536,19 @@ async fn recover_placed_kickoff_outcome_custody(
                 expected.agent_identity
             )));
         }
+        // A plain resume whose member host reported the adopted session's
+        // first turn as started waived its kickoff: there is nothing to
+        // repair. A waived kickoff never records custody, so a chain for it
+        // fails closed.
+        if entry.record.waives_first_turn() {
+            if chains.contains_key(&key) {
+                return Err(MobError::Internal(format!(
+                    "waived placed kickoff '{}' has custody history",
+                    expected.input_id
+                )));
+            }
+            continue;
+        }
         if let Some(chain) = chains.get(&key) {
             if chain
                 .recorded_cursor

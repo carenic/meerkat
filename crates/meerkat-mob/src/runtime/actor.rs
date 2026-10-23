@@ -31592,6 +31592,7 @@ impl MobActor {
                     ops_registry,
                     None,
                     None,
+                    matches!(spawn_source, super::handle::SpawnSource::Resume),
                     reply_tx,
                 )
             })
@@ -33264,7 +33265,10 @@ impl MobActor {
                 member_session_id: ack.session_id.clone(),
                 member_peer_endpoint: mob_dsl::MemberPeerEndpoint::from(&ack.member_peer),
                 ack_engine_version: ack.engine_version.clone(),
-                adopted_first_turn_started: false,
+                adopted_first_turn_started: pending.spec.profile.runtime_mode
+                    == meerkat_contracts::wire::WireMobRuntimeMode::AutonomousHost
+                    && ack.adopted_first_turn
+                        == Some(super::bridge_protocol::BridgeAdoptedFirstTurn::Started),
             },
         );
         let authority = crate::store::MobPlacedSpawnCommitPersistenceAuthority::from_transition(
@@ -33715,6 +33719,7 @@ impl MobActor {
     /// authority → `RequestMemberMaterialization` realization as a bridge
     /// `MaterializeMember` dispatch in the pending-spawn task.
     #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+    #[allow(clippy::too_many_arguments)]
     async fn enqueue_spawn_remote(
         &mut self,
         spec: super::handle::SpawnMemberSpec,
@@ -33722,6 +33727,7 @@ impl MobActor {
         ops_registry: Option<Arc<dyn meerkat_core::ops_lifecycle::OpsLifecycleRegistry>>,
         respawn_origin: Option<RespawnOrigin>,
         restore_wiring: Option<RestoreWiringPlan>,
+        plain_resume: bool,
         reply_tx: oneshot::Sender<Result<super::handle::MemberSpawnReceipt, MobError>>,
     ) {
         let requested_identity = AgentIdentity::from(spec.identity.as_str());
@@ -33733,6 +33739,7 @@ impl MobActor {
                 ops_registry,
                 respawn_origin,
                 restore_wiring,
+                plain_resume,
                 reply_tx,
             )
         })
@@ -33773,7 +33780,11 @@ impl MobActor {
     }
 
     #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
-    #[allow(clippy::type_complexity, clippy::too_many_lines)]
+    #[allow(
+        clippy::type_complexity,
+        clippy::too_many_lines,
+        clippy::too_many_arguments
+    )]
     async fn enqueue_spawn_remote_inner(
         &mut self,
         spec: super::handle::SpawnMemberSpec,
@@ -33781,6 +33792,7 @@ impl MobActor {
         ops_registry: Option<Arc<dyn meerkat_core::ops_lifecycle::OpsLifecycleRegistry>>,
         respawn_origin: Option<RespawnOrigin>,
         restore_wiring: Option<RestoreWiringPlan>,
+        plain_resume: bool,
         reply_tx: oneshot::Sender<Result<super::handle::MemberSpawnReceipt, MobError>>,
     ) -> Result<
         (),
@@ -33978,7 +33990,13 @@ impl MobActor {
                 // the child's first run delivers as typed rows; toward an older
                 // host the context rides the child's first prompt. Asked once
                 // per fork, before anything is recorded.
-                let typed_rows = match self.host_serves_prompt_context_forks(&host).await {
+                let typed_rows = match self
+                    .host_serves_feature(
+                        &host,
+                        super::bridge_protocol::HOST_FEATURE_PROMPT_CONTEXT_FORK,
+                    )
+                    .await
+                {
                     Ok(typed_rows) => typed_rows,
                     Err(error) => fail!(error),
                 };
@@ -34007,6 +34025,27 @@ impl MobActor {
             } else {
                 (None, None)
             };
+        // A plain resume adopts an existing session, and only its member host
+        // can read whether that session's first turn already started. A host
+        // that reports it (V7) is asked to put it on the ack; an older host
+        // reports nothing and the resume keeps the kickoff it always ran. Fork
+        // seatings and respawns also launch as Resume, so the predicate is the
+        // spawn source, not the launch. Asked once, before anything is
+        // recorded.
+        let report_adopted_first_turn = if plain_resume && resume_session_id.is_some() {
+            match self
+                .host_serves_feature(
+                    &host,
+                    super::bridge_protocol::HOST_FEATURE_ADOPTED_FIRST_TURN,
+                )
+                .await
+            {
+                Ok(serves) => serves,
+                Err(error) => fail!(error),
+            }
+        } else {
+            false
+        };
 
         // Compose and persist the exact first-turn material BEFORE the
         // canonical Pending carrier. The carrier is the earliest durable
@@ -34511,8 +34550,9 @@ impl MobActor {
         // seating declares the version whose shape it actually uses, and the
         // receiving host's minimum-version gate is what proves it.
         // The same for the V7 prompt-context fork, which rides only a Fresh
-        // launch and so never meets the Resume-only V6 attachment.
-        let protocol_version = if prompt_context_fork.is_some() {
+        // launch and so never meets the Resume-only V6 attachment, and for
+        // the V7 request to report a plain resume's adopted first turn.
+        let protocol_version = if prompt_context_fork.is_some() || report_adopted_first_turn {
             super::bridge_protocol::BridgeProtocolVersion::V7
         } else if forked_participant_attachment.is_some() {
             super::forked_participant_routing::FORKED_PARTICIPANT_PROTOCOL_VERSION
@@ -34531,7 +34571,7 @@ impl MobActor {
             launch,
             forked_participant_attachment,
             prompt_context_fork,
-            report_adopted_first_turn: false,
+            report_adopted_first_turn,
         });
 
         // Callers that don't carry an owner ops context (the embedder
@@ -35136,6 +35176,18 @@ impl MobActor {
                         };
                         let generation = remote_exec.generation;
                         let fence = remote_exec.fence_token;
+                        // A plain resume's member host reported the adopted
+                        // session's first turn (only when asked): the same
+                        // rule as the local lane. An absent report keeps the
+                        // first turn.
+                        let (suppress_autonomous_initial_prompt, initial_turn_prompt) = self
+                            .adopted_session_first_turn_delivery(
+                                &agent_identity,
+                                ack.adopted_first_turn
+                                    .map(super::handle::AdoptedFirstTurn::from),
+                                suppress_autonomous_initial_prompt,
+                                initial_turn_prompt,
+                            );
                         let remote_finalize = Some(Box::new(RemoteSpawnFinalize {
                             placed_spawn_id: remote_exec.placed_spawn_id.clone(),
                             placement: remote_exec.placement.clone(),
@@ -51701,18 +51753,21 @@ impl MobActor {
         super::bridge_protocol::decode_bridge_payload(&command, value, "periodic host status")
     }
 
-    /// Whether member host `host` serves prompt-context fork children
-    /// (protocol V7), asked with the effect-free `HostFeatures` probe within
+    /// Whether member host `host` serves `feature` (protocol V7: a
+    /// prompt-context fork child, or a plain resume's adopted first turn),
+    /// asked with the effect-free `HostFeatures` probe within
     /// [`HOST_FEATURES_BRIDGE_TIMEOUT`]. Like the periodic `HostStatus`
     /// poll it rides the trust edge bind installed and changes no state. A
     /// host before V7 refuses the probe typed before reading it
-    /// (`UnsupportedProtocolVersion`, or `Unsupported`) and gets the prompt
-    /// prefix; any other failure fails the spawn
+    /// (`UnsupportedProtocolVersion`, or `Unsupported`) and serves no
+    /// feature: a fork child gets the prompt prefix, a resume keeps its
+    /// kickoff. Any other failure fails the spawn
     /// ([`MobError::HostFeaturesProbeFailed`]). A host without recorded
     /// binding facts is not asked: the spawn's own admission refuses it.
-    async fn host_serves_prompt_context_forks(
+    async fn host_serves_feature(
         &self,
         host: &mob_dsl::HostId,
+        feature: &str,
     ) -> Result<bool, MobError> {
         let (endpoint, pubkey) = {
             let state = self.dsl_authority.state();
@@ -51777,9 +51832,7 @@ impl MobActor {
             >(&command, value, "host features")
         };
         match probe.await {
-            Ok(features) => {
-                Ok(features.serves(super::bridge_protocol::HOST_FEATURE_PROMPT_CONTEXT_FORK))
-            }
+            Ok(features) => Ok(features.serves(feature)),
             Err(MobError::BridgeCommandRejected {
                 cause:
                     super::bridge_protocol::BridgeRejectionCause::UnsupportedProtocolVersion
