@@ -57272,7 +57272,8 @@ async fn test_spawn_rejects_reserved_flow_member_prefix() {
 /// A mob actor that fail-stops on an uncertain durable mutation (here a
 /// failed run's terminal event append) reports why, typed, to a status read
 /// and to an explicit resume, as a startup recovery failure does, instead of
-/// a closed reply channel.
+/// a closed reply channel: the durability fail-stop, with that mutation's
+/// own error as its cause.
 #[tokio::test]
 async fn an_in_loop_durability_fail_stop_reports_why_to_status_and_resume() {
     let events = Arc::new(FaultInjectedMobEventStore::new());
@@ -57306,15 +57307,13 @@ async fn an_in_loop_durability_fail_stop_reports_why_to_status_and_resume() {
         let MobError::SharedLifecycleFailure(failure) = &error else {
             panic!("{call} must report the fail-stop, typed: {error:?}");
         };
+        let MobError::DurabilityFailStop { cause, .. } = failure.as_ref() else {
+            panic!("{call} must name the durability fail-stop: {failure:?}");
+        };
         assert!(
-            matches!(
-                failure.as_ref(),
-                MobError::AdmissionClosed {
-                    reason: crate::runtime::MobAdmissionCloseReason::DurabilityFailStop,
-                    ..
-                }
-            ),
-            "{call} must name the durability fail-stop: {failure:?}"
+            cause.to_string().contains("FlowFailed append failed"),
+            "{call} must name the uncertain mutation, the failed run's terminal event \
+             append: {cause}"
         );
     }
 }
@@ -91830,6 +91829,9 @@ mod continuation_resolver;
 /// recovery over real persistent stores.
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod delivery_scope_gates;
+/// Each in-loop durability fail-stop records its own cause.
+#[cfg(not(target_arch = "wasm32"))]
+mod fail_stop_cause;
 /// #1497 fork job terminals are committed once and validated on every read.
 mod fork_job_terminal;
 /// Producer bridge Part B: held spawns.

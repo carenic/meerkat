@@ -91,12 +91,10 @@ async fn a_handle_observes_an_in_loop_fail_stop_with_its_recorded_cause() {
     assert!(
         matches!(
             reported.as_ref(),
-            MobError::AdmissionClosed {
-                reason: crate::runtime::MobAdmissionCloseReason::DurabilityFailStop,
-                ..
-            }
+            MobError::DurabilityFailStop { cause, .. }
+                if cause.to_string().contains("FlowFailed append failed")
         ),
-        "the in-loop fail-stop's cause: {reported:?}"
+        "the in-loop fail-stop's record carries its own cause: {reported:?}"
     );
     assert_observed_cause("MobHandle", &handle.lifecycle_observation(), &reported);
 }
