@@ -205,6 +205,14 @@ them.
   `MobError::OperatorAuthorityCeilingRefused` (`OperatorAuthorityCeilingRefusal`).
   This is Rust host API only; the JSON-RPC, REST and SDK spawn surfaces are
   unchanged.
+- `meerkat`: a restored mob member whose settled build holds mob operator
+  authority that the authority recorded with its session did not hold (a
+  spawn profile, manage scope, create or profile mutation) now logs one
+  warning per restore build. It names the mob, the member, the session and the
+  regained facts, and says that a host that narrows a member must narrow every
+  build of it, restores included. The recorded authority is unsealed and
+  advisory, so the warning is a hint: the build itself is unchanged. It also
+  shows once for a profile the mob gained since the member's previous build.
 
 ### Changed
 

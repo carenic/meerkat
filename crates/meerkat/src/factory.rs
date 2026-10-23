@@ -1537,6 +1537,63 @@ fn metadata_memory_override_for_realm(
 /// on every build; pinned by a drift test where the family is compiled.
 pub(crate) const MEMORY_TOOL_NAMES: &[&str] = &["memory_search"];
 
+/// The mob operator authority facts a restored member's settled build holds
+/// that its persisted authority record does not: spawn profiles per mob,
+/// manage scope, create and profile mutation.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RegainedMobOperatorAuthority {
+    spawn_profiles: BTreeMap<String, BTreeSet<String>>,
+    manage_scope: BTreeSet<String>,
+    create: bool,
+    mutate: bool,
+}
+
+impl RegainedMobOperatorAuthority {
+    /// What `settled` holds and `persisted` lacks, or `None` when it lacks
+    /// nothing. Both are read through their wire projection: a persisted
+    /// record is unsealed, so its accessors read as empty, and only its
+    /// recorded facts are compared, as a hint and never as authority.
+    fn between(
+        settled: &meerkat_core::service::MobToolAuthorityContext,
+        persisted: &meerkat_core::service::MobToolAuthorityContext,
+    ) -> Option<Self> {
+        let settled = Self::recorded_facts(settled)?;
+        let persisted = Self::recorded_facts(persisted)?;
+        let spawn_profiles = settled
+            .spawn_profile_scope
+            .iter()
+            .filter_map(|(mob_id, profiles)| {
+                let held = persisted.spawn_profile_scope.get(mob_id);
+                let regained = profiles
+                    .iter()
+                    .filter(|profile| held.is_none_or(|held| !held.contains(*profile)))
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                (!regained.is_empty()).then(|| (mob_id.clone(), regained))
+            })
+            .collect();
+        let regained = Self {
+            spawn_profiles,
+            manage_scope: settled
+                .managed_mob_scope
+                .difference(&persisted.managed_mob_scope)
+                .cloned()
+                .collect(),
+            create: settled.can_create_mobs && !persisted.can_create_mobs,
+            mutate: settled.can_mutate_profiles && !persisted.can_mutate_profiles,
+        };
+        (regained != Self::default()).then_some(regained)
+    }
+
+    fn recorded_facts(
+        context: &meerkat_core::service::MobToolAuthorityContext,
+    ) -> Option<meerkat_contracts::wire::WireMobToolAuthorityContext> {
+        serde_json::to_value(context)
+            .ok()
+            .and_then(|value| serde_json::from_value(value).ok())
+    }
+}
+
 /// The built-in tool families' vocabularies: every tool name a family can
 /// provide, whether or not a given build compiles or enables the family. Each
 /// list is owned by its family and pinned to the family's tool definitions by
@@ -6978,6 +7035,39 @@ impl AgentFactory {
         {
             build_config
                 .apply_generated_create_only_mob_operator_access(ToolCategoryOverride::Enable);
+        }
+
+        // A restored member whose settled authority holds operator facts its
+        // persisted authority record did not hold has most likely lost a
+        // host's narrowing: the host narrowed an earlier build of it, and not
+        // this one. The record is unsealed and advisory, so this is a hint to
+        // the host, never enforcement. A first build has no record (a fork
+        // does not inherit its source's), so it never warns.
+        if let Some(binding) = build_config.mob_member_binding.as_ref()
+            && !matches!(build_config.override_mob, ToolCategoryOverride::Disable)
+            && let Some(settled) = build_config
+                .mob_tool_authority_context
+                .as_ref()
+                .filter(|authority| authority.is_generated_authority_context())
+            && let Some(persisted) = build_config
+                .resume_session
+                .as_ref()
+                .and_then(Session::build_state)
+                .and_then(|state| state.mob_tool_authority_context)
+            && let Some(regained) = RegainedMobOperatorAuthority::between(settled, &persisted)
+        {
+            tracing::warn!(
+                mob_id = %binding.mob_id,
+                member = %binding.member,
+                session_id = %session.id(),
+                regained_spawn_profiles = ?regained.spawn_profiles,
+                regained_manage_scope = ?regained.manage_scope,
+                regained_create = regained.create,
+                regained_mutate = regained.mutate,
+                "restored mob member holds mob operator authority its persisted authority \
+                 record did not; a host that narrows a member must narrow every build of \
+                 it, restores included (the record is advisory, not enforced)"
+            );
         }
 
         // The session's final mob operator authority, settled above and only
