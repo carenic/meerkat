@@ -1,14 +1,17 @@
 //! A check a host runs against its own store: Core's host store adapter puts
 //! documents far larger than one batch through the realm (the adapter's
-//! chunk scopes), and they come back byte-exact after a restart.
+//! chunk scopes), and they come back byte-exact from the host after each
+//! restart.
 //!
 //! [`large_documents`] drives the real adapter ([`SpiRealm`] and
 //! [`SpiRuntimeStore`]) over handles the host opens with its
 //! [`HostStoreOpener`]: a 20 MiB WholeBlob document is committed as a
-//! session's base, written again as a run's round commit (a provisional
-//! tail), and re-based after a compaction. Then the process is dropped, a
-//! new one opens over the same realm and loads the run, and durable-tail
-//! recovery reads it back. Every document must come back byte-exact.
+//! session's base and written again as a run's round commit (a provisional
+//! tail). Then the process is dropped, and a new one opens over the same
+//! realm, reads both from the host and re-bases the run after a compaction.
+//! It is dropped in turn; a third process reads the re-based documents from
+//! the host, and durable-tail recovery reads the run back. Every document
+//! must come back byte-exact.
 //!
 //! The store sees what Core writes for such documents: values over the
 //! adapter's inline limit go to chunk scopes, written in pre-batches of at
@@ -17,10 +20,15 @@
 //! references them, and replaced chunks are deleted. A restart reads them
 //! back and verifies each chunk's length and digest.
 //!
-//! The check opens each process with a takeover, so a run killed earlier
-//! cannot block it; the restart therefore waits out the dropped process's
-//! recorded lease ([`meerkat_core::host_store::FenceTiming::lease`]).
-//! Start it on an empty realm.
+//! The first process acquires the fence exclusively, so on a realm whose
+//! writer is live the check fails at its `open` step and fences nobody out.
+//! Each restart takes over the fence of the process the check dropped, and
+//! so waits out what is left of that process's recorded lease
+//! ([`meerkat_core::host_store::FenceTiming::lease`]). Start it on an empty
+//! realm.
+//!
+//! The module is built with this crate's `test-support` feature: a host
+//! enables that feature in its own check harness to run it.
 
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -57,8 +65,8 @@ pub trait HostStoreOpener: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{step}: {detail}")]
 pub struct ChapterFailure {
-    /// The step: `open`, `base`, `round_commit`, `rebase`, `restart` or
-    /// `recovery`.
+    /// The step: `open`, `base`, `round_commit`, `reopen`, `rebase`,
+    /// `restart` or `recovery`.
     pub step: &'static str,
     /// What went wrong.
     pub detail: String,
@@ -87,14 +95,16 @@ fn ensure(
 }
 
 /// One process of the check: a realm over a new handle, and its runtime
-/// store.
+/// store. The first process acquires the fence exclusively; a restart takes
+/// over the fence of the process the check dropped.
 async fn start(
     opener: &dyn HostStoreOpener,
     step: &'static str,
+    acquire: AcquireMode,
 ) -> Result<(Arc<SpiRealm>, SpiRuntimeStore), ChapterFailure> {
     let host = opener.open().await.map_err(|error| failed(step, error))?;
     let config = SpiRealmConfig {
-        acquire: AcquireMode::Takeover,
+        acquire,
         ..SpiRealmConfig::default()
     };
     let realm = SpiRealm::open(host, config)
@@ -125,15 +135,15 @@ fn encoded(step: &'static str, session: &Session) -> Result<Vec<u8>, ChapterFail
         .map_err(|error| failed(step, error))
 }
 
-/// Put a 20 MiB WholeBlob document through a base commit, a run's round
-/// commit and a re-base after a compaction, restart over the same realm, and
-/// read every document back byte-exact, through the run's durable-tail
-/// recovery as well.
+/// Put a 20 MiB WholeBlob document through a base commit and a run's round
+/// commit, read both back from the host after a restart, re-base the run
+/// after a compaction, and read the re-based documents back from the host
+/// after a second restart, through the run's durable-tail recovery as well.
 ///
 /// # Errors
 /// The first step that failed, with what it found.
 pub async fn large_documents(opener: &dyn HostStoreOpener) -> Result<(), ChapterFailure> {
-    let (realm, store) = start(opener, "open").await?;
+    let (realm, store) = start(opener, "open", AcquireMode::Exclusive).await?;
 
     // The base: a small message and the large one.
     let mut base = Session::new();
@@ -157,15 +167,13 @@ pub async fn large_documents(opener: &dyn HostStoreOpener) -> Result<(), Chapter
         .map_err(|error| failed("base", error))?
         .ok_or_else(|| failed("base", "the committed base is missing"))?;
     let base_authority = committed.authority().clone();
-    ensure(
-        "base",
-        committed.session().messages() == base.messages(),
-        || "the committed base does not read back as written".to_string(),
-    )?;
+    ensure("base", committed.bytes() == base_bytes.as_slice(), || {
+        "the committed base does not read back byte-exact".to_string()
+    })?;
 
     // A run's round commit: the base plus its answer, with the run cursor.
     let run_id = RunId::new();
-    let mut live = base.clone();
+    let mut live = base;
     live.push(Message::User(UserMessage::text("the run's answer")));
     live.set_run_cursor(&SessionRunCursor::new(
         run_id.clone(),
@@ -174,11 +182,12 @@ pub async fn large_documents(opener: &dyn HostStoreOpener) -> Result<(), Chapter
         RunResumePoint::AwaitingModel,
     ))
     .map_err(|error| failed("round_commit", error))?;
+    let live_bytes = encoded("round_commit", &live)?;
     let first_tail = store
         .write_prepared_whole_blob_provisional_tail(
             &runtime_id,
             PreparedWholeBlobProvisionalTail::prepare_from_session(
-                base_authority,
+                base_authority.clone(),
                 run_id.clone(),
                 1,
                 &live,
@@ -194,12 +203,50 @@ pub async fn large_documents(opener: &dyn HostStoreOpener) -> Result<(), Chapter
         .ok_or_else(|| failed("round_commit", "the provisional tail is missing"))?;
     ensure(
         "round_commit",
-        written_tail.candidate_bytes() == encoded("round_commit", &live)?.as_slice(),
-        || "the round commit does not read back as written".to_string(),
+        written_tail.candidate_bytes() == live_bytes.as_slice(),
+        || "the round commit does not read back byte-exact".to_string(),
     )?;
 
-    // A compaction of the small message, then the re-base: the large one
-    // stays, so both re-based documents are large again.
+    // Until here the reads were served from this process's own memory. It
+    // ends after its round commit; a new one opens over the same realm and
+    // reads the base and the tail from the host.
+    drop(store);
+    drop(realm);
+    let (realm, store) = start(opener, "reopen", AcquireMode::Takeover).await?;
+    let committed = store
+        .load_committed_whole_blob_snapshot(&runtime_id)
+        .await
+        .map_err(|error| failed("reopen", error))?
+        .ok_or_else(|| failed("reopen", "the committed base is missing"))?;
+    ensure("reopen", committed.authority() == &base_authority, || {
+        format!(
+            "the base after the restart is {:?}, not the committed {base_authority:?}",
+            committed.authority()
+        )
+    })?;
+    ensure("reopen", committed.bytes() == base_bytes.as_slice(), || {
+        "the committed base does not read back from the host byte-exact".to_string()
+    })?;
+    let loaded_tail = store
+        .load_whole_blob_provisional_tail(&runtime_id)
+        .await
+        .map_err(|error| failed("reopen", error))?
+        .ok_or_else(|| failed("reopen", "the provisional tail is missing"))?;
+    ensure("reopen", loaded_tail.authority() == &first_tail, || {
+        format!(
+            "the tail after the restart is {:?}, not the written {first_tail:?}",
+            loaded_tail.authority()
+        )
+    })?;
+    ensure(
+        "reopen",
+        loaded_tail.candidate_bytes() == live_bytes.as_slice(),
+        || "the round commit does not read back from the host byte-exact".to_string(),
+    )?;
+
+    // A compaction of the small message, then the re-base on what this
+    // process loaded from the host: the large message stays, so both
+    // re-based documents are large again.
     let mut compacted = live;
     let parent = compacted
         .transcript_revision()
@@ -215,20 +262,14 @@ pub async fn large_documents(opener: &dyn HostStoreOpener) -> Result<(), Chapter
             Some(parent),
         )
         .map_err(|error| failed("rebase", error))?;
-    let payload = VerifiedCommittedWholeBlobPayload::from_committed(
-        &session_id,
-        store
-            .load_committed_whole_blob_snapshot(&runtime_id)
-            .await
-            .map_err(|error| failed("rebase", error))?
-            .ok_or_else(|| failed("rebase", "the committed base is missing"))?,
-    )
-    .map_err(|error| failed("rebase", error))?;
+    let candidate_bytes = encoded("rebase", &compacted)?;
+    let payload = VerifiedCommittedWholeBlobPayload::from_committed(&session_id, committed)
+        .map_err(|error| failed("rebase", error))?;
     let rebase = PreparedWholeBlobRunRebase::prepare(
         payload,
-        Some(first_tail),
-        run_id.clone(),
-        compacted.clone(),
+        Some(loaded_tail.authority().clone()),
+        run_id,
+        compacted,
         std::slice::from_ref(&commit),
     )
     .map_err(|error| failed("rebase", error))?;
@@ -245,15 +286,12 @@ pub async fn large_documents(opener: &dyn HostStoreOpener) -> Result<(), Chapter
             ));
         }
     };
-    let candidate_bytes = encoded("rebase", &compacted)?;
-    let mut successor = compacted.clone();
-    successor.clear_run_cursor();
 
     // The process ends without its boundary commit; a new one opens over
     // the same realm and loads the run.
     drop(store);
     drop(realm);
-    let (_realm, store) = start(opener, "restart").await?;
+    let (_realm, store) = start(opener, "restart", AcquireMode::Takeover).await?;
     let committed = store
         .load_committed_whole_blob_snapshot(&runtime_id)
         .await
@@ -267,8 +305,8 @@ pub async fn large_documents(opener: &dyn HostStoreOpener) -> Result<(), Chapter
     })?;
     ensure(
         "restart",
-        committed.session().messages() == successor.messages(),
-        || "the re-based base does not read back as written".to_string(),
+        committed.bytes() == rebase.rewrite().successor_bytes(),
+        || "the re-based base does not read back from the host byte-exact".to_string(),
     )?;
     let loaded_tail = store
         .load_whole_blob_provisional_tail(&runtime_id)
@@ -284,7 +322,7 @@ pub async fn large_documents(opener: &dyn HostStoreOpener) -> Result<(), Chapter
     ensure(
         "restart",
         loaded_tail.candidate_bytes() == candidate_bytes.as_slice(),
-        || "the re-based tail does not read back as written".to_string(),
+        || "the re-based tail does not read back from the host byte-exact".to_string(),
     )?;
 
     // Recovery reads the run back, continued or committed, with the large

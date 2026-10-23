@@ -1254,3 +1254,43 @@ async fn a_failed_batch_leaves_an_unchanged_locked_scope_serving() {
     );
     assert!(guards[1].poison().is_some());
 }
+
+// Unrun until the candidate's validation. The check a host runs against its
+// own store passes over Core's own test host. Each open after the first ends
+// the dropped process's lease, as a crash restart whose lease ran out, so
+// the restarts take over without waiting. Two worker threads keep the
+// realm's renew task running beside the check's 20 MiB encodings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_large_document_check_passes_over_the_test_host() {
+    use std::sync::atomic::AtomicU64;
+
+    use meerkat_core::host_store::{HostStore, HostStoreError};
+
+    use super::chapter::{HostStoreOpener, large_documents};
+
+    struct Opener {
+        host: Arc<TestHost>,
+        opens: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl HostStoreOpener for Opener {
+        async fn open(&self) -> Result<Arc<dyn HostStore>, HostStoreError> {
+            if self.opens.fetch_add(1, Ordering::SeqCst) > 0 {
+                self.host.expire_lease();
+            }
+            Ok(Arc::clone(&self.host) as Arc<dyn HostStore>)
+        }
+    }
+
+    let opener = Opener {
+        host: Arc::new(TestHost::new()),
+        opens: AtomicU64::new(0),
+    };
+    assert_eq!(large_documents(&opener).await, Ok(()));
+    assert_eq!(
+        opener.opens.load(Ordering::SeqCst),
+        3,
+        "the check opens a process, reopens after the round commit and restarts after the re-base"
+    );
+}
