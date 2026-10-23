@@ -1553,17 +1553,14 @@ pub(crate) async fn admit_continuation_row(
         } else {
             None
         };
-        admit_continuation(
+        let target = AdmissionTarget {
             inbox,
             address,
-            record,
             sink,
             session,
-            row.delivery,
-            retained,
             observer,
-        )
-        .await
+        };
+        admit_continuation(&target, record, row.delivery, retained).await
     }
     .await;
     match outcome {
@@ -1637,16 +1634,31 @@ async fn verify_committed_job(
     Ok(())
 }
 
+/// Where a drain admits one continuation row: the row's inbox and delivery
+/// address, the sink and session serving that address, and the observer
+/// that answers whether the address retired after the pass resolved it.
+#[derive(Clone, Copy)]
+struct AdmissionTarget<'a> {
+    inbox: &'a RuntimeDeliveryInbox,
+    address: &'a LogicalRuntimeId,
+    sink: &'a dyn ContinuationDeliverySink,
+    session: &'a SessionId,
+    observer: Option<&'a dyn crate::RuntimeDeliveryHost>,
+}
+
 async fn admit_continuation(
-    inbox: &RuntimeDeliveryInbox,
-    address: &LogicalRuntimeId,
+    target: &AdmissionTarget<'_>,
     record: &meerkat_runtime::RuntimeDeliveryRecord,
-    sink: &dyn ContinuationDeliverySink,
-    session: &SessionId,
     delivery: ContinuationDelivery,
     retained: Option<meerkat_core::retained_work::RetainedWorkIdentity>,
-    observer: Option<&dyn crate::RuntimeDeliveryHost>,
 ) -> Result<(), ContinuationAdmitError> {
+    let AdmissionTarget {
+        inbox,
+        address,
+        sink,
+        session,
+        observer,
+    } = *target;
     let delivery_id = record.submission.delivery_id();
     let admission_key = delivery.admission_key(delivery_id);
     let retained_work = retained.as_ref();
