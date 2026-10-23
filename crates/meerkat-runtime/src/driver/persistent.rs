@@ -3713,6 +3713,101 @@ mod tests {
             .expect("registration-authorized input recovery must commit by exact batch CAS")
     }
 
+    /// A process cut right after a requeue stop committed, before any waiter
+    /// was answered, loses nothing the next start needs: the store holds the
+    /// kept prompt queued, with its payload and the stop's mark and no
+    /// terminal completion or carrier, and every other input stopped.
+    #[tokio::test]
+    async fn a_requeue_stop_commit_alone_carries_the_kept_input_across_a_process_cut() {
+        use crate::input_state::{InputAbandonReason, InputLifecycleState, InputTerminalOutcome};
+        use crate::meerkat_machine::dsl as mm_dsl;
+
+        let store: Arc<dyn RuntimeStore> = Arc::new(crate::store::InMemoryRuntimeStore::new());
+        let blobs: Arc<dyn BlobStore> = Arc::new(meerkat_store::MemoryBlobStore::new());
+        let runtime_id = LogicalRuntimeId::new("requeue-stop-process-cut");
+        let mut driver = PersistentRuntimeDriver::new_with_control_and_durability_health(
+            runtime_id.clone(),
+            Arc::clone(&store),
+            Arc::clone(&blobs),
+            Arc::new(StdRwLock::new(
+                crate::driver::ephemeral::RuntimeControlProjection::default(),
+            )),
+            crate::driver::ephemeral::new_ingress_dsl_authority(),
+            crate::meerkat_machine::driver::ready_durability_health_for_test(),
+        );
+        driver
+            .inner_mut()
+            .ensure_contract_session_authority()
+            .expect("contract session authority");
+        let kept = make_prompt("queued when the stop committed");
+        let kept_id = kept.id().clone();
+        assert!(driver.accept_input(kept).await.unwrap().is_accepted());
+        let mut ephemeral = make_prompt("queued and ephemeral");
+        if let Input::Prompt(prompt) = &mut ephemeral {
+            prompt.header.durability = crate::input::InputDurability::Ephemeral;
+        }
+        let ephemeral_id = ephemeral.id().clone();
+        assert!(driver.accept_input(ephemeral).await.unwrap().is_accepted());
+        {
+            let authority = driver.inner_ref().shared_dsl_authority();
+            let mut authority = authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = authority.state().clone();
+            mm_dsl::MeerkatMachineMutator::apply(
+                &mut *authority,
+                mm_dsl::MeerkatMachineInput::BeginUnregisterSession {
+                    session_id: state
+                        .session_id
+                        .clone()
+                        .expect("the contract session is registered"),
+                    agent_runtime_id: state.active_runtime_id.clone(),
+                    fence_token: state.active_fence_token,
+                    generation: state.active_runtime_generation,
+                    runtime_epoch_id: state.active_runtime_epoch_id.clone(),
+                    queued_inputs: mm_dsl::UnregisterQueuedInputsDisposition::Requeue,
+                    requeue_max_age_ms: 900_000,
+                },
+            )
+            .expect("the unregister drain opens with the requeue disposition");
+        }
+        let active = driver.active_input_ids();
+        let before_exit = driver.inner_mut().stop_retained_input_ids(&active).unwrap();
+        driver
+            .finalize_runtime_executor_exit(&before_exit)
+            .await
+            .expect("the requeue stop commits");
+        // The process ends here: no waiter is answered and nothing else runs.
+        drop(driver);
+
+        let kept_row = store
+            .load_input_state(&runtime_id, &kept_id)
+            .await
+            .unwrap()
+            .expect("the kept row is durable");
+        assert_eq!(kept_row.seed.phase, InputLifecycleState::Queued);
+        assert!(kept_row.seed.terminal_outcome.is_none());
+        assert!(kept_row.state.persisted_input.is_some());
+        assert_eq!(
+            kept_row.state.stop_requeue.map(|mark| mark.max_age_ms),
+            Some(900_000)
+        );
+        assert!(kept_row.state.terminal_completion.is_none());
+        assert!(kept_row.state.interaction_terminal_outbox.is_none());
+        if let Some(stopped) = store
+            .load_input_state(&runtime_id, &ephemeral_id)
+            .await
+            .unwrap()
+        {
+            assert_eq!(
+                stopped.seed.terminal_outcome,
+                Some(InputTerminalOutcome::Abandoned {
+                    reason: InputAbandonReason::Stopped
+                })
+            );
+        }
+    }
+
     #[test]
     fn completed_unregister_commit_preserves_captured_live_bridge_recovery_image() {
         let store = Arc::new(crate::store::InMemoryRuntimeStore::new());

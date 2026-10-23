@@ -2732,8 +2732,10 @@ async fn observe_requeued_after_restart(
 /// behind a running turn stays durably queued: its waiter is told it was
 /// requeued, its row keeps its payload, its replay identity and a requeue
 /// mark, it has no terminal completion and no carrier, and nothing ran it.
-/// The running input is still cancelled and is not run again. After the restart the requeued input runs exactly once and a
-/// same-key replay re-attaches to its result.
+/// The running input is still cancelled and is not run again. After the
+/// restart the requeued input runs exactly once, its first model request
+/// does not carry the cancelled turn's user message, and a same-key replay
+/// re-attaches to its result.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn requeue_shutdown_keeps_a_queued_human_input_and_runs_it_once_after_restart() {
     use meerkat_runtime::input_state::InputLifecycleState;
@@ -2800,6 +2802,19 @@ async fn requeue_shutdown_keeps_a_queued_human_input_and_runs_it_once_after_rest
         interaction(&running_key),
     )
     .len();
+    // The kept input's first model request after the restart shows whether
+    // the cancelled turn's user message is still in the transcript.
+    let restart_requests = restarted_client.requests();
+    let first_kept_request_carries_cancelled_text = restart_requests
+        .iter()
+        .find(|request| requests_carrying(std::slice::from_ref(*request), QUEUED_HUMAN) == 1)
+        .map(|request| requests_carrying(std::slice::from_ref(request), HUMAN) == 1);
+    assert_eq!(
+        first_kept_request_carries_cancelled_text,
+        Some(false),
+        "the kept input's first request after the restart does not carry the \
+         cancelled turn's user message"
+    );
     assert_eq!(
         (running_answer, at_stop, after_restart, running_runs),
         (
@@ -2837,7 +2852,8 @@ async fn requeue_shutdown_keeps_a_queued_human_input_and_runs_it_once_after_rest
 
 /// A requeued input older than the requeue bound when the next start
 /// recovers it ends as expired instead of running: payload retired, no run,
-/// no model request, and a same-key replay answers the expiry.
+/// no model request, and a same-key replay answers the expiry. A later start
+/// serves nothing: the expiry's commit left the row terminal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn requeue_shutdown_expires_a_queued_human_input_older_than_the_bound_at_restart() {
     use meerkat_runtime::input_state::InputLifecycleState;
@@ -2915,7 +2931,41 @@ async fn requeue_shutdown_expires_a_queued_human_input_older_than_the_bound_at_r
         ),
         "a requeued input past its bound at restart ends as expired and never runs"
     );
+
+    // Once the expiry has committed, the row is terminal: the next start
+    // serves nothing, and the row stays expired. (The process stops
+    // gracefully here; the store then holds exactly what the expiry's own
+    // commit wrote, which is what a cut right after it leaves.)
     tokio::time::timeout(WAIT, restarted.handle.shutdown())
+        .await
+        .expect("mob shutdown finishes")
+        .expect("mob shutdown");
+    drop(restarted);
+    await_supervisor_route_release(&mob_id).await;
+    let third_client = ScriptedClient::new(true);
+    let third = open_stop_host(&root_path, &third_client, None).await;
+    let after_cut = stop_row(&third.runtime_store, &session_id, &key, &input_id).await;
+    let events = stop_events(&root_path, &session_id).await;
+    assert_eq!(
+        (
+            after_cut.stored.seed.phase,
+            serde_json::to_value(&after_cut.stored.seed.terminal_outcome)
+                .expect("terminal outcome wire image"),
+            runs_started_for(&events, interaction(&key)).len(),
+            requests_carrying(&third_client.requests(), QUEUED_HUMAN),
+        ),
+        (
+            InputLifecycleState::Abandoned,
+            serde_json::json!({
+                "outcome_type": "abandoned",
+                "reason": "requeue_expired",
+            }),
+            0,
+            0,
+        ),
+        "a start after the expiry committed serves nothing"
+    );
+    tokio::time::timeout(WAIT, third.handle.shutdown())
         .await
         .expect("mob shutdown finishes")
         .expect("mob shutdown");
@@ -3126,6 +3176,292 @@ async fn requeue_shutdown_does_not_keep_a_steer_input_queued_behind_the_running_
         .expect("mob shutdown");
 }
 
+/// Requeue keeps no input bound to an objective. A member's kickoff is one
+/// (its input carries the kickoff objective), and the mob records the
+/// kickoff's outcome in the stopping process, so a kept kickoff would run
+/// after a restart that record already calls failed. An objective-bound
+/// input queued behind the running turn therefore ends as a Stop Shutdown
+/// leaves it: terminal and unmarked, its waiter answered with the
+/// unregistered termination, and never run after the restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requeue_shutdown_does_not_keep_an_objective_bound_input_queued_behind_the_running_turn() {
+    use meerkat_runtime::input_state::InputLifecycleState;
+
+    const UNREGISTERED: &str = "runtime session unregistered";
+    let terminated = StopAnswer::RuntimeTerminated {
+        reason: UNREGISTERED.to_owned(),
+        kind: meerkat_core::TurnTerminalCauseKind::FatalFailure,
+        detail: Some(UNREGISTERED.to_owned()),
+    };
+    let (_root, root_path) = stop_root();
+    let client = ScriptedClient::new(true);
+    let host = open_stop_host(&root_path, &client, Some("host-human-requeue-objective")).await;
+    let mob_id = host.handle.mob_id().clone();
+    let (_identity, session_id, entry) = spawn_stop_member(&host).await;
+
+    client.block();
+    let requests_before = client.requests().len();
+    let running = start_stop_input(
+        &host,
+        &entry,
+        WorkSpec::new(HUMAN, WorkOrigin::External),
+        HandlingMode::Queue,
+        &delivery("requeue-objective-running"),
+    )
+    .await
+    .expect("running human admission");
+    client.wait_for_requests(requests_before + 1).await;
+    let key = delivery("requeue-objective-queued");
+    let interaction_id = interaction(&key);
+    let bound = start_stop_input(
+        &host,
+        &entry,
+        WorkSpec::new(QUEUED_HUMAN, WorkOrigin::External)
+            .with_objective_id(meerkat_core::interaction::ObjectiveId::new()),
+        HandlingMode::Queue,
+        &key,
+    )
+    .await
+    .expect("objective-bound human admission");
+    let input_id = admitted_input_id(&host.runtime_store, &session_id, &key).await;
+    let before_stop = stop_row(&host.runtime_store, &session_id, &key, &input_id).await;
+    assert_eq!(before_stop.stored.seed.phase, InputLifecycleState::Queued);
+
+    tokio::time::timeout(
+        WAIT,
+        host.handle
+            .shutdown_with_report(requeue_options(crate::RequeueMaxAge::DEFAULT)),
+    )
+    .await
+    .expect("the requeue stop finishes")
+    .expect("requeue stop");
+    let waiter = stop_answer(bound, &session_id).await;
+    let _ = stop_answer(running, &session_id).await;
+    let at_exit = stop_row(&host.runtime_store, &session_id, &key, &input_id).await;
+    drop(host);
+    await_supervisor_route_release(&mob_id).await;
+
+    let restarted_client = ScriptedClient::new(true);
+    let restarted = open_stop_host(&root_path, &restarted_client, None).await;
+    let after_restart = stop_row(&restarted.runtime_store, &session_id, &key, &input_id).await;
+    let events = stop_events(&root_path, &session_id).await;
+    assert_eq!(
+        (
+            waiter,
+            at_exit.stored.seed.phase,
+            !at_exit.image["stop_requeue"].is_null(),
+            after_restart.digest == at_exit.digest,
+            requests_carrying(&restarted_client.requests(), QUEUED_HUMAN),
+            runs_started_for(&events, interaction_id).len(),
+        ),
+        (
+            terminated,
+            InputLifecycleState::Abandoned,
+            false,
+            true,
+            0,
+            0
+        ),
+        "an objective-bound input is not requeued: terminal at the stop, never run after the restart"
+    );
+    tokio::time::timeout(WAIT, restarted.handle.shutdown())
+        .await
+        .expect("mob shutdown finishes")
+        .expect("mob shutdown");
+}
+
+const BOUND_HUMAN: &str = "A host question bound to the member's objective.";
+
+/// One objective-bound input as a Shutdown leaves it and as the restarted
+/// process finds it. Ids and times differ between runs, so the row's
+/// unchanged-by-restart fact is compared, not its bytes.
+#[derive(Debug, PartialEq)]
+struct ObjectiveBoundAfterShutdown {
+    waiter: StopAnswer,
+    phase: meerkat_runtime::input_state::InputLifecycleState,
+    outcome: serde_json::Value,
+    payload_kept: bool,
+    requeue_mark: bool,
+    row_unchanged_by_restart: bool,
+    requests_after_restart: usize,
+}
+
+/// What one Shutdown left of a plain queued host human input and of one
+/// bound to an objective.
+struct ObjectiveShutdownScenario {
+    plain_kept: bool,
+    bound: ObjectiveBoundAfterShutdown,
+}
+
+/// The stored row of `input_id` and its wire image.
+async fn row_image(
+    runtime_store: &Arc<dyn RuntimeStore>,
+    session_id: &SessionId,
+    input_id: &meerkat_core::lifecycle::InputId,
+) -> (
+    meerkat_runtime::input_state::StoredInputState,
+    serde_json::Value,
+) {
+    let stored = runtime_store
+        .load_input_state(&LogicalRuntimeId::for_session(session_id), input_id)
+        .await
+        .expect("runtime-owned input read")
+        .expect("the input keeps its durable row");
+    let image = serde_json::to_value(&stored).expect("the row's stored wire image");
+    (stored, image)
+}
+
+/// Run one Shutdown, `requeue` or the default Stop, over a plain host human
+/// input and an objective-bound one queued behind one running turn, then
+/// restart and let the restarted process run whatever was kept.
+async fn objective_bound_shutdown(mob_name: &str, requeue: bool) -> ObjectiveShutdownScenario {
+    let (_root, root_path) = stop_root();
+    let client = ScriptedClient::new(true);
+    let host = open_stop_host(&root_path, &client, Some(mob_name)).await;
+    let mob_id = host.handle.mob_id().clone();
+    let (identity, session_id, entry) = spawn_stop_member(&host).await;
+    let objective = meerkat_core::interaction::ObjectiveId::new();
+
+    client.block();
+    let requests_before = client.requests().len();
+    let running = start_stop_input(
+        &host,
+        &entry,
+        WorkSpec::new(HUMAN, WorkOrigin::External),
+        HandlingMode::Queue,
+        &delivery("objective-scenario-running"),
+    )
+    .await
+    .expect("running human admission");
+    client.wait_for_requests(requests_before + 1).await;
+    let plain_key = delivery("objective-scenario-plain");
+    let plain = start_stop_input(
+        &host,
+        &entry,
+        WorkSpec::new(QUEUED_HUMAN, WorkOrigin::External),
+        HandlingMode::Queue,
+        &plain_key,
+    )
+    .await
+    .expect("plain human admission");
+    let bound_key = delivery("objective-scenario-bound");
+    let bound_human = start_stop_input(
+        &host,
+        &entry,
+        WorkSpec::new(BOUND_HUMAN, WorkOrigin::External).with_objective_id(objective),
+        HandlingMode::Queue,
+        &bound_key,
+    )
+    .await
+    .expect("objective-bound human admission");
+    let plain_id = admitted_input_id(&host.runtime_store, &session_id, &plain_key).await;
+    let bound_id = admitted_input_id(&host.runtime_store, &session_id, &bound_key).await;
+
+    let options = if requeue {
+        requeue_options(crate::RequeueMaxAge::DEFAULT)
+    } else {
+        crate::ShutdownOptions::default()
+    };
+    tokio::time::timeout(WAIT, host.handle.shutdown_with_report(options))
+        .await
+        .expect("the stop finishes")
+        .expect("graceful stop");
+    let plain_waiter = stop_answer(plain, &session_id).await;
+    let bound_waiter = stop_answer(bound_human, &session_id).await;
+    let _ = stop_answer(running, &session_id).await;
+    let plain_marked = !row_image(&host.runtime_store, &session_id, &plain_id)
+        .await
+        .1["stop_requeue"]
+        .is_null();
+    let (stored, image) = row_image(&host.runtime_store, &session_id, &bound_id).await;
+    drop(host);
+    await_supervisor_route_release(&mob_id).await;
+
+    let restarted_client = ScriptedClient::new(true);
+    let restarted = open_stop_host(&root_path, &restarted_client, None).await;
+    // A same-key replay of the plain input waits for whatever the restart
+    // made of it: the kept input's run, or the stop's answer again.
+    let entry = restarted
+        .handle
+        .get_member(&identity)
+        .await
+        .expect("roster read")
+        .expect("the member survives the restart");
+    let plain_replay = match start_stop_input(
+        &restarted,
+        &entry,
+        WorkSpec::new(QUEUED_HUMAN, WorkOrigin::External),
+        HandlingMode::Queue,
+        &plain_key,
+    )
+    .await
+    {
+        Ok(replay) => stop_answer(replay, &session_id).await,
+        Err(error) => StopAnswer::Refused(error.to_string()),
+    };
+    let requests = restarted_client.requests();
+    let after = row_image(&restarted.runtime_store, &session_id, &bound_id)
+        .await
+        .1;
+    let bound = ObjectiveBoundAfterShutdown {
+        waiter: bound_waiter,
+        phase: stored.seed.phase,
+        outcome: serde_json::to_value(&stored.seed.terminal_outcome)
+            .expect("terminal outcome wire image"),
+        payload_kept: stored.state.persisted_input.is_some(),
+        requeue_mark: !image["stop_requeue"].is_null(),
+        row_unchanged_by_restart: after == image,
+        requests_after_restart: requests_carrying(&requests, BOUND_HUMAN),
+    };
+    let plain_kept = matches!(plain_waiter, StopAnswer::RequeuedAcrossStop(_))
+        && plain_marked
+        && plain_replay == StopAnswer::Succeeded
+        && requests_carrying(&requests, QUEUED_HUMAN) == 1;
+    tokio::time::timeout(WAIT, restarted.handle.shutdown())
+        .await
+        .expect("mob shutdown finishes")
+        .expect("mob shutdown");
+    ObjectiveShutdownScenario { plain_kept, bound }
+}
+
+/// Requeue keeps no input bound to an objective. A member's kickoff is one
+/// (its input carries the kickoff objective), and so is a turn-driven
+/// member's delegated or helper work while it works an objective; their
+/// owners record their outcome in the stopping process, and nothing runs
+/// them again after a restart. So an objective-bound input queued behind the
+/// running turn ends under a requeue Shutdown exactly as under a Stop
+/// Shutdown, compared field by field against that baseline: the same waiter
+/// answer, terminal, unmarked, untouched by the restart and never run after
+/// it. The plain input queued beside it is kept, and runs once after the
+/// restart, only under the requeue Shutdown, so the comparison tells kept
+/// from stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requeue_shutdown_ends_objective_bound_inputs_exactly_as_a_stop_shutdown() {
+    use meerkat_runtime::input_state::InputLifecycleState;
+
+    let stop = objective_bound_shutdown("host-human-objective-stop", false).await;
+    let requeue = objective_bound_shutdown("host-human-objective-requeue", true).await;
+    assert_eq!(
+        (stop.plain_kept, requeue.plain_kept),
+        (false, true),
+        "only the requeue Shutdown keeps the plain input"
+    );
+    assert_eq!(
+        requeue.bound, stop.bound,
+        "an objective-bound input ends under requeue exactly as under Stop"
+    );
+    assert_eq!(
+        (
+            requeue.bound.phase,
+            requeue.bound.requeue_mark,
+            requeue.bound.row_unchanged_by_restart,
+            requeue.bound.requests_after_restart,
+        ),
+        (InputLifecycleState::Abandoned, false, true, 0),
+        "terminal at the stop, never run after the restart"
+    );
+}
+
 #[test]
 fn requeue_max_age_refuses_zero_and_over_the_cap() {
     use crate::{RequeueMaxAge, ShutdownOptionsError};
@@ -3239,6 +3575,7 @@ async fn requeue_shutdown_whose_admission_misses_the_deadline_still_keeps_the_qu
             replay_identity_kept: true,
             requeue_mark: true,
             outbox: false,
+            terminal_completion: false,
             pending_terminal_owner: false,
             runs_started: 0,
         },

@@ -8002,6 +8002,129 @@ mod tests {
         assert!(driver.ledger.get(&steer_id).unwrap().stop_requeue.is_none());
     }
 
+    /// Under the requeue disposition only a prompt is kept: a durable
+    /// external event and a directed flow step, both queued behind the
+    /// running turn, end as stopped and unmarked, so the directed one keeps
+    /// its terminal carrier and the event never runs again.
+    #[tokio::test]
+    async fn a_requeue_stop_does_not_keep_a_queued_event_or_a_directed_input() {
+        let (mut driver, durable_id, _, _) =
+            stop_classification_fixture("stop-requeue-event-directed").await;
+        let event = Input::ExternalEvent(crate::input::ExternalEventInput {
+            header: InputHeader {
+                id: InputId::new(),
+                timestamp: chrono::Utc::now(),
+                source: InputOrigin::External {
+                    source_name: "webhook".into(),
+                },
+                durability: InputDurability::Durable,
+                visibility: InputVisibility::default(),
+                idempotency_key: None,
+                supersession_key: None,
+                correlation_id: None,
+                ingress_context: None,
+                retained_resume: None,
+                authority_association: None,
+            },
+            event_type: "build".into(),
+            payload: serde_json::json!({ "status": "queued" }),
+            blocks: None,
+            handling_mode: meerkat_core::types::HandlingMode::Queue,
+            render_metadata: None,
+            objective_id: None,
+        });
+        let event_id = event.id().clone();
+        assert!(driver.accept_input(event).await.unwrap().is_accepted());
+        let directed_uuid = meerkat_core::time_compat::new_uuid_v7();
+        let directed = crate::mob_adapter::create_tracked_flow_step_input(
+            "requeue-directed",
+            meerkat_core::types::ContentInput::Text("directed work".to_string()),
+            "requeue-flow",
+            None,
+            &directed_uuid.to_string(),
+        )
+        .expect("tracked flow step");
+        let directed_id = directed.id().clone();
+        assert!(driver.accept_input(directed).await.unwrap().is_accepted());
+        for queued in [&event_id, &directed_id] {
+            assert_eq!(
+                driver.input_phase(queued),
+                Some(InputLifecycleState::Queued),
+                "{queued}"
+            );
+        }
+        begin_unregister_with(
+            &mut driver,
+            mm_dsl::UnregisterQueuedInputsDisposition::Requeue,
+            900_000,
+        );
+
+        let active = driver.active_input_ids();
+        let before_exit = driver.stop_retained_input_ids(&active).unwrap();
+        let retained = driver.stop_non_terminal_inputs(&before_exit).unwrap();
+
+        assert_eq!(before_exit, vec![durable_id.clone()]);
+        assert_eq!(retained, vec![durable_id]);
+        for stopped in [&event_id, &directed_id] {
+            assert_eq!(
+                driver.input_terminal_outcome(stopped),
+                Some(InputTerminalOutcome::Abandoned {
+                    reason: InputAbandonReason::Stopped
+                }),
+                "{stopped}"
+            );
+            assert!(driver.ledger.get(stopped).unwrap().stop_requeue.is_none());
+        }
+    }
+
+    /// Under the requeue disposition a durable prompt bound to an objective
+    /// is not kept, even when queued in the queue lane: it ends as stopped
+    /// and unmarked, as under the stop disposition. A member's kickoff has
+    /// exactly this shape (an operator prompt whose turn metadata carries
+    /// only its objective), and the mob records the kickoff's outcome in the
+    /// stopping process, so a kept kickoff would run after a restart that
+    /// record already calls failed.
+    #[tokio::test]
+    async fn a_requeue_stop_does_not_keep_a_queued_objective_bound_prompt() {
+        let (mut driver, durable_id, _, _) =
+            stop_classification_fixture("stop-requeue-objective-bound").await;
+        let metadata = meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
+            transcript_identity: meerkat_core::types::TranscriptMessageIdentity {
+                objective_id: Some(meerkat_core::interaction::ObjectiveId::new()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let bound = Input::Prompt(PromptInput::new(
+            "kickoff queued behind the running turn",
+            Some(metadata),
+        ));
+        let bound_id = bound.id().clone();
+        assert!(driver.accept_input(bound).await.unwrap().is_accepted());
+        assert_eq!(
+            driver.input_phase(&bound_id),
+            Some(InputLifecycleState::Queued)
+        );
+        begin_unregister_with(
+            &mut driver,
+            mm_dsl::UnregisterQueuedInputsDisposition::Requeue,
+            900_000,
+        );
+
+        let active = driver.active_input_ids();
+        let before_exit = driver.stop_retained_input_ids(&active).unwrap();
+        let retained = driver.stop_non_terminal_inputs(&before_exit).unwrap();
+
+        assert_eq!(retained, vec![durable_id]);
+        assert_eq!(
+            driver.input_terminal_outcome(&bound_id),
+            Some(InputTerminalOutcome::Abandoned {
+                reason: InputAbandonReason::Stopped
+            })
+        );
+        assert!(driver.ledger.get(&bound_id).unwrap().stop_requeue.is_none());
+    }
+
     /// The stop refuses, before it changes any input, when its verdicts
     /// differ from the set the classifier retained before the executor's
     /// exit, whose complement got the runless carriers: a kept input with a

@@ -1139,6 +1139,75 @@ mod unregister_progress_recovery_tests {
         assert!(!state.unregister_comms_drain_forced_abort);
     }
 
+    /// A crash after an unregister began with the requeue disposition, and
+    /// before its stop committed, leaves the disposition in the unregister's
+    /// progress record. The recovered convergence replays it, so its stop
+    /// keeps the eligible queued prompt, marked with the same max age, as the
+    /// uninterrupted stop would. A progress record without it replays the
+    /// stop disposition, which keeps nothing.
+    #[tokio::test]
+    async fn a_recovered_unregister_keeps_what_the_interrupted_one_would() {
+        use crate::traits::RuntimeDriver as _;
+
+        for (recorded_max_age_ms, expect_kept) in [(Some(900_000), true), (None, false)] {
+            let mut driver = crate::driver::ephemeral::EphemeralRuntimeDriver::new(
+                crate::identifiers::LogicalRuntimeId::new("recovered-requeue-unregister"),
+            );
+            driver
+                .ensure_contract_session_authority()
+                .expect("contract session authority");
+            let prompt = crate::input::Input::Prompt(crate::input::PromptInput::new(
+                "queued when the process stopped",
+                None,
+            ));
+            let prompt_id = prompt.id().clone();
+            assert!(driver.accept_input(prompt).await.unwrap().is_accepted());
+            let progress = crate::store::MachineUnregisterProgressSnapshot::new(
+                true, true, true, false, false,
+            )
+            .with_requeue_max_age_ms(recorded_max_age_ms);
+            {
+                let authority = driver.shared_dsl_authority();
+                let mut authority = authority
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let session_id = authority
+                    .state()
+                    .session_id
+                    .clone()
+                    .expect("the contract session is registered");
+                replay_durable_unregister_progress_id(&mut authority, &session_id, Some(&progress))
+                    .expect("the recovered convergence replays the unregister");
+            }
+
+            let active = driver.active_input_ids();
+            let before_exit = driver.stop_retained_input_ids(&active).unwrap();
+            let retained = driver.stop_non_terminal_inputs(&before_exit).unwrap();
+
+            let state = driver.input_state(&prompt_id).expect("the prompt's row");
+            if expect_kept {
+                assert_eq!(retained, vec![prompt_id.clone()]);
+                assert_eq!(
+                    state.stop_requeue.map(|mark| mark.max_age_ms),
+                    Some(900_000)
+                );
+                assert_eq!(
+                    driver.input_phase(&prompt_id),
+                    Some(crate::input_state::InputLifecycleState::Queued)
+                );
+            } else {
+                assert!(retained.is_empty());
+                assert!(state.stop_requeue.is_none());
+                assert_eq!(
+                    driver.input_terminal_outcome(&prompt_id),
+                    Some(crate::input_state::InputTerminalOutcome::Abandoned {
+                        reason: crate::input_state::InputAbandonReason::Stopped
+                    })
+                );
+            }
+        }
+    }
+
     #[test]
     fn crash_recovered_pending_producers_close_as_forced_process_loss() {
         let session_id = SessionId::new();
