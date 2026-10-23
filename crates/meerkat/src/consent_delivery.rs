@@ -118,6 +118,10 @@ impl RetainedJobSource for ConsentNoticeJobSource {
     }
 }
 
+/// Why a consent-aware host answers no other owner yet.
+#[cfg(feature = "session-store")]
+const UNBOUND_SERVICES: &str = "the host has not bound its continuation services yet";
+
 /// Answers the consent namespace from the approval owner and every other
 /// job from the host's bound job source. Until the host binds its
 /// continuation services, every other job and every host original outside
@@ -126,10 +130,6 @@ impl RetainedJobSource for ConsentNoticeJobSource {
 /// a restart) stays pending and is decided by the bound owner once bound, as
 /// the setup signal (`Unbound`) says. Built only by the session-store runtime
 /// delivery host, so it is compiled with it.
-/// Why a consent-aware host answers no other owner yet.
-#[cfg(feature = "session-store")]
-const UNBOUND_SERVICES: &str = "the host has not bound its continuation services yet";
-
 #[cfg(feature = "session-store")]
 pub(crate) struct ConsentAwareJobSource {
     pub(crate) consent: ConsentNoticeJobSource,
