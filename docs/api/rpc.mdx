@@ -1274,6 +1274,16 @@ arrives while another turn on the same session is running is queued behind
 it: it runs once the running turn finishes, and the call returns its own
 result. It is not refused with `-32002` (`SESSION_BUSY`).
 
+Since 0.9.5, `"session_events": false` asks that the turn's events not be
+written as `session/event` notifications. A caller that reads them from a
+`session/stream_open` subscription, or reads only the run result, sends it so
+each event reaches it once. Absent or `true` keeps them. A turn that also
+carries the input of another request that wants them still writes them.
+`session/create` (for its first turn) and `mob/turn_start` take the same
+field. A server before 0.9.5 refuses it on `turn/start` and `mob/turn_start`,
+so the Python and TypeScript SDKs send it, from calls that do not stream
+their turn, only to a server whose contract version is 0.9.5 or later.
+
 A turn that fails returns the JSON-RPC code of its typed cause, as the
 [session error mapping](/reference/capability-matrix#error-codes) does for the
 same causes: `-32010` (provider error) for `llm_failure` and
@@ -3152,12 +3162,12 @@ live transport's realtime observations. See
 | `server_tool_content` | Provider-executed tool content surfaced during a model turn |
 | `assistant_image_appended` | Canonical assistant image block appended to transcript history; `assistant_message_id` names the message that carries it |
 | `tool_call_requested` | LLM wants to call a tool |
-| `tool_result_received` | Tool result processed |
+| `tool_result_received` | Tool result processed; the only event that carries the result body (`content`) |
 | `turn_completed` | LLM call finished (every agent-loop call, including tool-loop calls with `stop_reason: tool_use`); absent `usage` means no accounting row, not zero tokens; `assistant_message_id` names the message the turn closes. It is a live signal, not the commit: only a history row carrying the id is the commit. It can precede boundary work, run-completed hooks and persistence that still fail the run, and it is absent when a run fails after the row was pushed. It is also absent on realtime materializer turns, whose rows pair by `realtime_origin.provider_item_ids` |
 | `turn_usage_accounting_unmeasured` | Provider accounting was absent; no zero row may be fabricated, and this observation alone does not assert turn completion |
 | `turn_usage_accounting_identity_disputed` | Reported counters exist but provider/model attribution differs; preserve the reported identity and counters |
 | `tool_execution_started` | Tool dispatch began |
-| `tool_execution_completed` | Tool returned a result |
+| `tool_execution_completed` | Tool call finished: `is_error` and `duration_ms`, no result body (since 0.9.5; read `tool_result_received` with the same `id`) |
 | `tool_execution_timed_out` | Tool exceeded timeout |
 | `compaction_started` | Context compaction began |
 | `compaction_completed` | Compaction finished. Since 0.9.4 it carries `summary_source` (who wrote the summary: `{"kind": "provider_call", "source_bound": ...}` with bound `whole`, `trimmed` (`through`) or `requests_only` (`kept`, `of`), `{"kind": "host_curator"}` or `{"kind": "mechanical_fallback"}`) and optional `estimated_history_tokens_after`, in the unit of `compaction_started`'s `estimated_history_tokens` |

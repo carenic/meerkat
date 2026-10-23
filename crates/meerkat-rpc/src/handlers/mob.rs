@@ -2950,6 +2950,7 @@ pub async fn handle_mob_turn_start(
         auth_binding: lower_turn_metadata_override(mob_params.auth_binding),
         injected_context,
         transient_turn_context: mob_params.transient_turn_context,
+        session_events: mob_params.session_events,
     };
 
     super::turn::start_turn_with_params(
@@ -4423,6 +4424,7 @@ mod tests {
             auth_binding: lower_turn_metadata_override(mob_params.auth_binding),
             injected_context: None,
             transient_turn_context: mob_params.transient_turn_context,
+            session_events: mob_params.session_events,
         };
 
         assert_eq!(turn_params.session_id, "resolved-session-123");

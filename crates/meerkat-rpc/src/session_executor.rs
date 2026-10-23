@@ -860,13 +860,20 @@ impl CoreExecutor for SessionRuntimeExecutor {
 
         // Create an event channel and forward events to the notification sink.
         // Read the CURRENT sink from the runtime (not the one captured at
-        // executor creation) so reconnected TCP clients get events.
+        // executor creation) so reconnected TCP clients get events. A turn
+        // whose requests all opted out of its session/event copies drains
+        // the channel without writing them.
         let (event_tx, mut event_rx) = mpsc::channel::<EventEnvelope<AgentEvent>>(128);
         let sink = self.runtime.current_notification_sink();
         let sid = self.session_id.clone();
+        let write_session_events = self
+            .runtime
+            .turn_writes_session_events(&self.session_id, primitive.contributing_input_ids());
         let forwarder = tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
-                sink.emit_event(&sid, &event).await;
+                if write_session_events {
+                    sink.emit_event(&sid, &event).await;
+                }
             }
         });
 
@@ -1233,9 +1240,16 @@ impl CoreExecutor for MobRpcRuntimeExecutor {
         let (event_tx, mut event_rx) = mpsc::channel::<EventEnvelope<AgentEvent>>(128);
         let sink = self.notification_sink.clone();
         let sid = self.session_id.clone();
+        // A turn whose requests all opted out of its session/event copies
+        // drains the channel without writing them.
+        let write_session_events = self.runtime.as_ref().is_none_or(|runtime| {
+            runtime.turn_writes_session_events(&self.session_id, primitive.contributing_input_ids())
+        });
         let forwarder = tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
-                sink.emit_event(&sid, &event).await;
+                if write_session_events {
+                    sink.emit_event(&sid, &event).await;
+                }
             }
         });
 

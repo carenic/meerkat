@@ -1431,6 +1431,7 @@ export class MeerkatClient {
     options?: SessionOptions,
   ): Promise<Session> {
     const params = MeerkatClient.buildCreateParams(prompt, options);
+    this.optOutOfTurnSessionEvents(params);
     const raw = await this.request("session/create", params);
     const result = MeerkatClient.parseRunResult(raw);
     return new Session(this, result);
@@ -1550,13 +1551,8 @@ export class MeerkatClient {
     return MeerkatClient.parseSessionInfo(raw);
   }
 
-  /**
-   * Refuse a caller idempotency key before sending it to a server that would
-   * drop it: before contract 0.9.5 `session/external_event` ignores the field
-   * and admits the call unkeyed.
-   */
-  private requireCallerIdempotencyKeySupport(): void {
-    const minimum = [0, 9, 5];
+  /** Whether the server reports a contract version of at least `minimum`. */
+  private serverContractAtLeast(minimum: readonly number[]): boolean {
     const core = this._serverContractVersion.split("-", 1)[0].split("+", 1)[0];
     const parts = core.split(".").map((part) => Number(part));
     const valid = core.length > 0 && parts.every((part) => Number.isInteger(part));
@@ -1570,7 +1566,29 @@ export class MeerkatClient {
         }
       }
     }
-    if (!atLeast) {
+    return atLeast;
+  }
+
+  /**
+   * Ask the server not to write this turn's events as `session/event`: a call
+   * that does not stream its turn reads only the run result, so those copies
+   * would be parsed and dropped. Sent only to a server whose contract (0.9.5
+   * or later) takes the field; an older server refuses it on `turn/start`.
+   */
+  private optOutOfTurnSessionEvents(params: Record<string, unknown>): void {
+    if (this.serverContractAtLeast([0, 9, 5])) {
+      params.session_events = false;
+    }
+  }
+
+  /**
+   * Refuse a caller idempotency key before sending it to a server that would
+   * drop it: before contract 0.9.5 `session/external_event` ignores the field
+   * and admits the call unkeyed.
+   */
+  private requireCallerIdempotencyKeySupport(): void {
+    const minimum = [0, 9, 5];
+    if (!this.serverContractAtLeast(minimum)) {
       throw new CapabilityUnavailableError(
         "CAPABILITY_UNAVAILABLE",
         `idempotencyKey needs a server contract >= ${minimum.join(".")}; `
@@ -3300,12 +3318,13 @@ export class MeerkatClient {
     prompt: ContentInput,
     options?: MobTurnStartOptions,
   ): Promise<Record<string, unknown>> {
-    return await this.request("mob/turn_start", mobTurnStartPayload(
-      mobId,
-      agentIdentity,
-      prompt,
-      options,
-    ));
+    const payload = mobTurnStartPayload(mobId, agentIdentity, prompt, options);
+    // A non-streaming member turn: opt out of its session/event copies, as
+    // `optOutOfTurnSessionEvents` does for `turn/start`.
+    if (this.serverContractAtLeast([0, 9, 5])) {
+      payload.session_events = false;
+    }
+    return await this.request("mob/turn_start", payload);
   }
 
   async mobMemberStatus(
@@ -4323,6 +4342,7 @@ export class MeerkatClient {
     }
     if (options?.providerParams) params.provider_params = options.providerParams;
     if (options?.authBinding != null) params.auth_binding = options.authBinding;
+    this.optOutOfTurnSessionEvents(params);
     const raw = await this.request("turn/start", params);
     return MeerkatClient.parseRunResult(raw);
   }

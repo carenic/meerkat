@@ -379,7 +379,10 @@ impl TrajectoryBuilder {
                         extra: None,
                     });
             }
-            AgentEvent::ToolExecutionCompleted {
+            // The tool result is the observation: tool_result_received is the
+            // one event that carries the body (tool_execution_completed is the
+            // execution fact, with no body).
+            AgentEvent::ToolResultReceived {
                 id,
                 content,
                 is_error,
@@ -389,8 +392,8 @@ impl TrajectoryBuilder {
                 let content = Some(atif_blocks(content));
                 let error = (*is_error).then(|| (String::from("is_error"), Value::Bool(true)));
                 // The loop announces a timeout before the timed-out call's
-                // completion; the completion fills in that observation, so
-                // the call keeps exactly one.
+                // result; the result fills in that observation, so the call
+                // keeps exactly one.
                 let timed_out = if turn.timed_out_calls.remove(id) {
                     turn.observations
                         .iter_mut()
@@ -943,7 +946,6 @@ mod tests {
                 AgentEvent::ToolExecutionCompleted {
                     id: "call-1".into(),
                     name: "echo".into(),
-                    content: ContentBlock::text_vec("ok".into()),
                     is_error: false,
                     duration_ms: 1,
                 },
@@ -952,6 +954,17 @@ mod tests {
                 EventSourceIdentity::session(id.clone()),
                 5,
                 None,
+                AgentEvent::ToolResultReceived {
+                    id: "call-1".into(),
+                    name: "echo".into(),
+                    content: ContentBlock::text_vec("ok".into()),
+                    is_error: false,
+                },
+            ),
+            EventEnvelope::new_with_source(
+                EventSourceIdentity::session(id.clone()),
+                6,
+                None,
                 AgentEvent::TextComplete {
                     content: "done".into(),
                     assistant_message_id: None,
@@ -959,7 +972,7 @@ mod tests {
             ),
             EventEnvelope::new_with_source(
                 EventSourceIdentity::session(id),
-                6,
+                7,
                 None,
                 AgentEvent::TurnCompleted {
                     stop_reason: meerkat_core::StopReason::EndTurn,
@@ -991,6 +1004,11 @@ mod tests {
         .unwrap();
         assert_eq!(trajectory.steps.len(), 2);
         assert_eq!(trajectory.steps[1].tool_calls[0].function_name, "echo");
+        // The stream carries the call's execution fact and its result: the
+        // call has one observation, from the result.
+        let results = &trajectory.steps[1].observation.as_ref().unwrap().results;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source_call_id.as_deref(), Some("call-1"));
         assert_eq!(
             trajectory.steps[1].metrics.as_ref().unwrap().prompt_tokens,
             Some(4)
@@ -1182,12 +1200,11 @@ mod tests {
                 EventSourceIdentity::session(id.clone()),
                 4,
                 None,
-                AgentEvent::ToolExecutionCompleted {
+                AgentEvent::ToolResultReceived {
                     id: "call-1".into(),
                     name: "search".into(),
                     content: ContentBlock::text_vec("e".repeat(8192)),
                     is_error: false,
-                    duration_ms: 3,
                 },
             ),
             EventEnvelope::new_with_source(
@@ -1280,12 +1297,11 @@ mod tests {
                 )
                 .unwrap(),
             },
-            AgentEvent::ToolExecutionCompleted {
+            AgentEvent::ToolResultReceived {
                 id: "call-1".into(),
                 name: "read_file".into(),
                 content: ContentBlock::text_vec("fn main() {}".into()),
                 is_error: false,
-                duration_ms: 2,
             },
         ];
         if tool_turn_completes {
@@ -1695,9 +1711,14 @@ mod tests {
             AgentEvent::ToolExecutionCompleted {
                 id: "call-1".into(),
                 name: "slow_tool".into(),
-                content: ContentBlock::text_vec("tool slow_tool timed out after 20ms".into()),
                 is_error: true,
                 duration_ms: 20,
+            },
+            AgentEvent::ToolResultReceived {
+                id: "call-1".into(),
+                name: "slow_tool".into(),
+                content: ContentBlock::text_vec("tool slow_tool timed out after 20ms".into()),
+                is_error: true,
             },
             AgentEvent::TurnCompleted {
                 stop_reason: meerkat_core::StopReason::ToolUse,

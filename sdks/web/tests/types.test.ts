@@ -558,6 +558,34 @@ const backgroundJobStringOnly: AgentEvent = {
   detail: 'exit_code: 0',
 };
 
+// A tool call's result body is on tool_result_received only; the execution
+// fact carries no copy of it.
+const toolCompletionWithoutBody: AgentEvent = {
+  type: 'tool_execution_completed',
+  id: 'call_1',
+  name: 'view_image',
+  is_error: false,
+  duration_ms: 12,
+};
+
+const toolCompletionWithBody: AgentEvent = {
+  type: 'tool_execution_completed',
+  id: 'call_1',
+  name: 'view_image',
+  // @ts-expect-error the result body is on tool_result_received, not on the execution fact.
+  content: [{ type: 'text', text: 'one copy' }],
+  is_error: false,
+  duration_ms: 12,
+};
+
+const toolResultWithBody: AgentEvent = {
+  type: 'tool_result_received',
+  id: 'call_1',
+  name: 'view_image',
+  content: [{ type: 'text', text: 'one copy' }],
+  is_error: false,
+};
+
 handleEvent(backgroundJobWithoutLegacyStatus);
 void backgroundJobStringOnly;
 

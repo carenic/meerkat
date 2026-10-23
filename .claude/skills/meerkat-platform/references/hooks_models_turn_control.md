@@ -114,7 +114,9 @@ timestamp_ms, payload}`; `payload.type` is the event type.
 - Tools: `tool_call_requested`, `tool_execution_started`,
   `tool_execution_completed`, `tool_result_received`,
     `tool_execution_timed_out` (since 0.9.1; 0.9.0 never emitted it),
-  `tool_config_changed`.
+  `tool_config_changed`. Since 0.9.5 `tool_execution_completed` carries
+  `is_error` and `duration_ms` but no result body: `tool_result_received`
+  with the same `id` is the only event with `content`.
 - Hooks: `hook_started`, `hook_completed`, `hook_failed`, `hook_denied`,
   `hook_launch_refused`.
 - Model operations: `compaction_started`, `compaction_completed`,
