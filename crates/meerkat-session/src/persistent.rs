@@ -4089,9 +4089,16 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     }
 
     fn is_transcript_revision_conflict<T>(result: &Result<T, SessionError>) -> bool {
+        result
+            .as_ref()
+            .err()
+            .is_some_and(Self::is_transcript_revision_conflict_error)
+    }
+
+    fn is_transcript_revision_conflict_error(error: &SessionError) -> bool {
         matches!(
-            result,
-            Err(SessionError::Store(error))
+            error,
+            SessionError::Store(error)
                 if error
                     .downcast_ref::<SessionStoreError>()
                     .is_some_and(|error| {
@@ -5648,6 +5655,80 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                     "durable-tail recovery failed for a live session whose turn ended without its boundary commit"
                 );
                 false
+            }
+        }
+    }
+
+    /// Settle, inside an archive that holds the session's quiescent runtime
+    /// turn boundary and its recovery gate, the durable tail a turn left ahead
+    /// of the runtime boundary, so the archive can read the session again.
+    ///
+    /// A turn that ends after its end-of-run checkpoint applied the
+    /// HeadCanonical provisional tail, but without the boundary commit (a
+    /// retirement's boundary cancel lands between the two), leaves every
+    /// committed read of the session failing closed with the typed
+    /// `TranscriptRevisionConflict`, whether or not this service still hosts
+    /// the live actor. An observation settles it only while the actor is
+    /// hosted and the recovery gate is free; an archive holds that gate, so it
+    /// runs the same store-owned, machine-authorized recovery here instead
+    /// (the recovery machine refuses a runtime that is not quiescent). A
+    /// committed or already aligned tail returns `Ok`, and the archive reads
+    /// once more. A held tail ends the archive with
+    /// [`SessionError::DurableTailHeldForRecovery`] and a refused one with
+    /// [`SessionError::DurableTailRecoveryRefused`]; both keep the tail
+    /// intact. Without a recorded provisional tail, or outside HeadCanonical,
+    /// nothing here settles the conflict, which is returned unchanged.
+    async fn settle_durable_tail_under_archive_gates(
+        &self,
+        id: &SessionId,
+        conflict: SessionError,
+    ) -> Result<(), SessionError> {
+        if self.runtime_store.session_persistence_profile()
+            != RuntimeSessionPersistenceProfile::HeadCanonicalV1
+        {
+            return Err(conflict);
+        }
+        match self
+            .runtime_store
+            .load_head_canonical_provisional_tail(&Self::runtime_id_for_session(id))
+            .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => return Err(conflict),
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %id,
+                    %error,
+                    "could not observe the provisional tail of a session whose archive read conflicts"
+                );
+                return Err(conflict);
+            }
+        }
+        match self.store_owned_durable_tail_recovery_outcome(id).await? {
+            (meerkat_runtime::recovery::DurableTailRecoveryOutcome::Committed { .. }, _) => {
+                tracing::info!(
+                    session_id = %id,
+                    "settled the durable tail an ended turn left ahead of its runtime boundary before archiving the session"
+                );
+                self.note_live_authority_advanced(id);
+                Ok(())
+            }
+            (meerkat_runtime::recovery::DurableTailRecoveryOutcome::AlreadyAligned { .. }, _) => {
+                Ok(())
+            }
+            (meerkat_runtime::recovery::DurableTailRecoveryOutcome::Held, _) => {
+                tracing::warn!(
+                    session_id = %id,
+                    "durable-tail recovery held the tail of a session being archived"
+                );
+                Err(SessionError::DurableTailHeldForRecovery { id: id.clone() })
+            }
+            (meerkat_runtime::recovery::DurableTailRecoveryOutcome::Refused, _) => {
+                tracing::warn!(
+                    session_id = %id,
+                    "durable-tail recovery refused the tail of a session being archived"
+                );
+                Err(SessionError::DurableTailRecoveryRefused { id: id.clone() })
             }
         }
     }
@@ -14638,9 +14719,29 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 continue;
             }
 
-            let _ = self
+            // A turn stopped between its end-of-run checkpoint and its
+            // boundary commit left a durable tail every committed read
+            // refuses. This archive holds the quiescent boundary and the
+            // recovery gate, so it settles that tail and observes once more;
+            // a held or refused tail ends the archive typed.
+            match self
                 .discard_stale_live_session_if_needed(id, LiveStalenessPosition::TurnBoundaryHeld)
-                .await?;
+                .await
+            {
+                Err(conflict) if Self::is_transcript_revision_conflict_error(&conflict) => {
+                    self.settle_durable_tail_under_archive_gates(id, conflict)
+                        .await?;
+                    let _ = self
+                        .discard_stale_live_session_if_needed(
+                            id,
+                            LiveStalenessPosition::TurnBoundaryHeld,
+                        )
+                        .await?;
+                }
+                observed => {
+                    let _ = observed?;
+                }
+            }
             let stored_only_publication_handle: Option<Arc<dyn CoreExecutorPublicationHandle>> =
                 if self.inner.has_live_session(id).await? {
                     None
@@ -14711,7 +14812,16 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             let archived_snapshot = match self.export_session_with_labels(id).await {
                 Ok(session) => Some(session),
                 Err(SessionError::NotFound { .. }) => {
-                    self.load_persisted_session_for_archive(id).await?
+                    // The same durable tail, met with no live actor: settle
+                    // it under the held gates and read once more.
+                    match self.load_persisted_session_for_archive(id).await {
+                        Err(conflict) if Self::is_transcript_revision_conflict_error(&conflict) => {
+                            self.settle_durable_tail_under_archive_gates(id, conflict)
+                                .await?;
+                            self.load_persisted_session_for_archive(id).await?
+                        }
+                        loaded => loaded?,
+                    }
                 }
                 Err(err) => return Err(err),
             };

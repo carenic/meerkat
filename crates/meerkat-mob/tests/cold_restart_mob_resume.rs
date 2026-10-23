@@ -2058,6 +2058,10 @@ struct PowerCutRuntimeStore {
     /// a service opened over it takes the inner store's OS-locked hosting
     /// claims (#1813). Unset, it offers no claims, as before.
     forward_hosting: std::sync::atomic::AtomicBool,
+    /// While set, the store finds no durable-tail recovery source, so the
+    /// store-owned durable-tail recovery holds every tail intact
+    /// (`DurableTailRecoveryOutcome::Held`).
+    hold_tail_recovery: std::sync::atomic::AtomicBool,
 }
 
 /// Where a held boundary commit is.
@@ -2112,6 +2116,7 @@ impl PowerCutRuntimeStore {
             held_boundary: std::sync::Mutex::new(None),
             boundary_hold: tokio::sync::watch::channel(BoundaryHold::Idle).0,
             forward_hosting: std::sync::atomic::AtomicBool::new(false),
+            hold_tail_recovery: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2121,6 +2126,14 @@ impl PowerCutRuntimeStore {
     fn forward_hosting_capability(&self) {
         self.forward_hosting
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// While `hold` is set, every store-owned durable-tail recovery over this
+    /// store answers `Held` and leaves the tail intact.
+    #[cfg(feature = "test-support")]
+    fn hold_durable_tail_recovery(&self, hold: bool) {
+        self.hold_tail_recovery
+            .store(hold, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Hold `runtime_id`'s next prepared session boundary commits at the
@@ -2351,6 +2364,12 @@ impl meerkat_runtime::RuntimeStore for PowerCutRuntimeStore {
         Option<meerkat_runtime::store::PreparedDurableTailRecoverySource>,
         meerkat_runtime::RuntimeStoreError,
     > {
+        if self
+            .hold_tail_recovery
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(None);
+        }
         self.inner
             .load_durable_tail_recovery_source(runtime_id)
             .await
@@ -7063,6 +7082,383 @@ async fn a_member_retired_while_its_turn_reaches_the_boundary_retires() {
         "the retired member leaves the roster"
     );
     let _ = handle.shutdown().await;
+}
+
+/// Member `w-1` after its turn stopped between its end-of-run checkpoint and
+/// its runtime boundary commit, with its live actor gone (see
+/// [`a_member_whose_turn_stopped_before_its_boundary_commit`]).
+#[cfg(feature = "test-support")]
+struct StoppedTurnTail {
+    power_store: Arc<PowerCutRuntimeStore>,
+    service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    store: Arc<SqliteSessionStore>,
+    handle: MobHandle,
+    identity: AgentIdentity,
+    tail: ActiveMemberTail,
+}
+
+#[cfg(feature = "test-support")]
+impl StoppedTurnTail {
+    /// The archive settled the stopped turn's durable tail: the runtime
+    /// authority names the physical head again.
+    async fn assert_tail_settled(&self, context: &str) {
+        assert_eq!(
+            self.tail.committed_token_now().await,
+            self.tail.physical_token_now(&self.store).await,
+            "[{context}] the archive settles the durable tail: the runtime authority names \
+             the physical head"
+        );
+    }
+}
+
+/// Leave a [`StoppedTurnTail`] on member `w-1` of a mob led by `lead-1`.
+///
+/// The member's turn waits inside its provider call. The runtime is asked to
+/// stop that turn at its next boundary, and the provider call is released
+/// only once that cancel has reached the turn's boundary handle (a positive
+/// event, never a sleep). The turn then finishes its reply, its end-of-run
+/// checkpoint applies the provisional tail to the canonical head, and the
+/// turn stops at the boundary, so no boundary commit follows: the canonical
+/// head is ahead of the runtime boundary authority, and every committed read
+/// of the session refuses as a transcript revision conflict. The live actor
+/// is then discarded, as a runtime loop discards it when a run's boundary
+/// does not commit, so no observation in this process settles the tail. The
+/// store holds every durable-tail recovery from before the turn until the
+/// row decides otherwise, so nothing settles the tail before the row starts.
+#[cfg(feature = "test-support")]
+async fn a_member_whose_turn_stopped_before_its_boundary_commit(
+    paths: &Paths,
+    context: &str,
+) -> StoppedTurnTail {
+    let power_store = Arc::new(PowerCutRuntimeStore::new(&paths.realm_db_path));
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = power_store.clone();
+    let (service, store) = persistent_head_canonical_service(paths, runtime_store.clone());
+    let client = Arc::new(HeldTurnClient::default());
+    let handle = MobBuilder::new(
+        mob_definition(MobRuntimeMode::TurnDriven),
+        MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage"),
+    )
+    .with_session_service(service.clone())
+    .with_default_llm_client(client.clone())
+    .create()
+    .await
+    .expect("create persistent mob");
+    handle
+        .spawn_spec(SpawnMemberSpec::new("lead", AgentIdentity::from("lead-1")))
+        .await
+        .expect("spawn lead");
+    handle
+        .spawn_spec(SpawnMemberSpec::new("worker", AgentIdentity::from("w-1")))
+        .await
+        .expect("spawn worker");
+    let identity = AgentIdentity::from("w-1");
+    let w1_sid = handle
+        .resolve_bridge_session_id(&identity)
+        .await
+        .expect("w1 session id");
+    send_and_wait(
+        &handle,
+        service.as_ref(),
+        "w-1",
+        "PRE_HELD_TURN token-alpha",
+        &format!("{context}-first"),
+    )
+    .await;
+    wait_for_head_canonical_authority_convergence(
+        store.as_ref(),
+        runtime_store.as_ref(),
+        &w1_sid,
+        "PRE_HELD_TURN",
+        &format!("{context}-first-boundary"),
+    )
+    .await;
+
+    power_store.hold_durable_tail_recovery(true);
+    handle
+        .member(&identity)
+        .await
+        .expect("member handle")
+        .send(HELD_TURN_PROMPT.to_string(), HandlingMode::Queue)
+        .await
+        .expect("queue the held turn");
+    tokio::time::timeout(Duration::from_secs(30), client.entered.notified())
+        .await
+        .expect("the held turn's provider call is in flight");
+    let runtime = service
+        .canonical_runtime_adapter()
+        .expect("the session service's runtime owner");
+    let mut boundary_cancels = runtime.boundary_cancel_dispatches();
+    let dispatched_before = *boundary_cancels.borrow_and_update();
+    runtime
+        .cancel_after_boundary(&w1_sid)
+        .await
+        .expect("ask the running turn to stop at its next boundary");
+    let dispatched = tokio::time::timeout(
+        Duration::from_secs(10),
+        boundary_cancels.wait_for(|dispatched| *dispatched > dispatched_before),
+    )
+    .await
+    .expect("the boundary cancel reaches the running turn within its bound")
+    .map(|dispatched| *dispatched)
+    .expect("the boundary cancel dispatches stay observable");
+    assert!(
+        dispatched > dispatched_before,
+        "[{context}] the boundary cancel reached the turn"
+    );
+    client.release.notify_one();
+
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&w1_sid);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let run_ended = runtime
+            .meerkat_machine_archive_snapshot(&w1_sid)
+            .await
+            .is_some_and(|snapshot| snapshot.control.current_run_id.is_none());
+        let provisional_tail = runtime_store
+            .load_head_canonical_provisional_tail(&runtime_id)
+            .await
+            .expect("load the provisional tail")
+            .is_some();
+        let ahead = physical_head_token(&store, &w1_sid).await
+            != committed_head_token(runtime_store.as_ref(), &w1_sid).await;
+        if run_ended && provisional_tail && ahead {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "[{context}] the held turn must stop at its boundary after its end-of-run \
+             checkpoint: run_ended={run_ended}, provisional_tail={provisional_tail}, \
+             ahead={ahead}"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    let sessions: &dyn MobSessionService = service.as_ref();
+    sessions
+        .discard_live_session(&w1_sid)
+        .await
+        .expect("discard the member's live actor");
+    assert!(
+        !sessions
+            .has_live_session(&w1_sid)
+            .await
+            .expect("read whether the member's session is live"),
+        "[{context}] the member's live actor is gone"
+    );
+    match sessions.load_persisted_session(&w1_sid).await {
+        Err(meerkat_core::service::SessionError::Store(error))
+            if error
+                .downcast_ref::<meerkat_core::SessionStoreError>()
+                .is_some_and(|error| {
+                    matches!(
+                        error,
+                        meerkat_core::SessionStoreError::TranscriptRevisionConflict { id, .. }
+                            if *id == w1_sid
+                    )
+                }) => {}
+        other => panic!(
+            "[{context}] a committed read of the member's session must refuse its durable \
+             tail as a transcript revision conflict: {:?}",
+            other.map(|session| session.is_some())
+        ),
+    }
+    let committed_token = committed_head_token(runtime_store.as_ref(), &w1_sid).await;
+    let ahead_token = physical_head_token(&store, &w1_sid).await;
+    assert_ne!(
+        ahead_token, committed_token,
+        "[{context}] the canonical head stays ahead of the runtime boundary"
+    );
+    let tail = ActiveMemberTail {
+        mob_id: handle.mob_id().clone(),
+        runtime_store,
+        session_id: w1_sid,
+        committed_token,
+        ahead_token,
+    };
+    StoppedTurnTail {
+        power_store,
+        service,
+        store,
+        handle,
+        identity,
+        tail,
+    }
+}
+
+/// The session error a mob error carries, through the shared and stuck
+/// retirement wrappers a retire's reply arrives in.
+#[cfg(feature = "test-support")]
+fn session_error_cause(
+    error: &meerkat_mob::MobError,
+) -> Option<&meerkat_core::service::SessionError> {
+    match error {
+        meerkat_mob::MobError::SessionError(error) => Some(error.primary_error()),
+        meerkat_mob::MobError::SharedRetirementFailure(error)
+        | meerkat_mob::MobError::SharedLifecycleFailure(error)
+        | meerkat_mob::MobError::MemberRetirementStuck { cause: error, .. } => {
+            session_error_cause(error)
+        }
+        _ => None,
+    }
+}
+
+/// A member retired after its turn stopped between its end-of-run checkpoint
+/// and its runtime boundary commit retires, also once its live actor is gone.
+/// Every committed read of the member's session refuses the durable tail the
+/// turn left. The retirement's presence reads (its route observation, then
+/// its archive stage's check) take that refusal as proof that the session is
+/// still there, and the archive settles the tail under the turn boundary and
+/// recovery gate it holds, with the store-owned recovery a restart runs. The
+/// runtime authority then names the physical head again, and the retired
+/// session keeps the stopped turn exactly once.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_retired_after_its_turn_stopped_before_its_boundary_commit_retires() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "warn,meerkat_mob::runtime::actor::retirement_io=info,meerkat_runtime::recovery=info,\
+             meerkat_session::persistent=info",
+        ))
+        .with_writer(std::io::stderr)
+        .try_init();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let stopped =
+        a_member_whose_turn_stopped_before_its_boundary_commit(&paths, "stopped-turn-retire").await;
+    // The store-owned recovery may settle the tail from here on.
+    stopped.power_store.hold_durable_tail_recovery(false);
+    let retired = tokio::time::timeout(
+        Duration::from_secs(60),
+        stopped.handle.retire(stopped.identity.clone()),
+    )
+    .await
+    .expect("the retirement ends within its bound");
+    assert!(
+        retired.is_ok(),
+        "a member whose stopped turn left a durable tail and no live actor must retire: \
+         {retired:?}"
+    );
+    assert!(
+        stopped
+            .handle
+            .get_member(&stopped.identity)
+            .await
+            .expect("read the roster")
+            .is_none(),
+        "the retired member leaves the roster"
+    );
+    stopped.assert_tail_settled("stopped-turn-retire").await;
+    let retired_session = stopped
+        .service
+        .load_revivable_retired_session(&stopped.tail.session_id)
+        .await
+        .expect("read the member's retired session")
+        .expect("the retirement archived the member's session");
+    let history = to_string(retired_session.messages()).expect("serialize the retired transcript");
+    assert_eq!(
+        history.matches(HELD_TURN_PROMPT).count(),
+        1,
+        "the retired session keeps the stopped turn exactly once: {history}"
+    );
+    let _ = stopped.handle.shutdown().await;
+}
+
+/// A retire over a durable tail the store-owned recovery holds ends typed and
+/// keeps the tail. As in the row above, the member's turn stopped before its
+/// boundary commit and its live actor is gone, but the recovery holds the
+/// tail: the retirement reaches the archive, which ends it with
+/// `SessionError::DurableTailHeldForRecovery` for the member's session, never
+/// with the raw transcript revision conflict and never in a hang. The member
+/// stays Retiring, and the committed boundary, the physical head and the
+/// recorded provisional tail are as the turn left them.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retire_over_a_held_durable_tail_ends_typed_and_keeps_the_tail() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "warn,meerkat_mob::runtime::actor::retirement_io=info,meerkat_runtime::recovery=info,\
+             meerkat_session::persistent=info",
+        ))
+        .with_writer(std::io::stderr)
+        .try_init();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    // The store keeps holding every durable-tail recovery.
+    let stopped =
+        a_member_whose_turn_stopped_before_its_boundary_commit(&paths, "held-tail-retire").await;
+    let error = tokio::time::timeout(
+        Duration::from_secs(60),
+        stopped.handle.retire(stopped.identity.clone()),
+    )
+    .await
+    .expect("the retirement ends within its bound")
+    .expect_err("a retire over a held durable tail refuses");
+    assert!(
+        matches!(
+            session_error_cause(&error),
+            Some(meerkat_core::service::SessionError::DurableTailHeldForRecovery { id })
+                if *id == stopped.tail.session_id
+        ),
+        "the retire ends typed with the member session's held durable tail: {error:?}"
+    );
+    let members = stopped.handle.list_members_including_retiring().await;
+    assert!(
+        members
+            .iter()
+            .any(|entry| entry.agent_identity == stopped.identity
+                && entry.status == MobMemberStatus::Retiring),
+        "the member stays Retiring: {members:?}"
+    );
+    assert_tail_untouched(&stopped.tail, &stopped.store, "held-tail-retire").await;
+    let _ = stopped.handle.shutdown().await;
+}
+
+/// A destroy of a mob whose member's turn stopped between its end-of-run
+/// checkpoint and its runtime boundary commit completes, also once that
+/// member's live actor is gone. The destroy's retire route and its archive
+/// disposal step ask whether the member's session is still present; the
+/// durable tail's refusal proves it is, and the archive settles the tail
+/// under the turn boundary and recovery gate it holds. The destroy reports
+/// no cleanup error and no force-destroyed member, the mob is destroyed, and
+/// the runtime authority names the member's physical head again.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_destroy_with_a_member_whose_turn_stopped_before_its_boundary_commit_completes() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "warn,meerkat_mob::runtime::actor=info,meerkat_runtime::recovery=info,\
+             meerkat_session::persistent=info",
+        ))
+        .with_writer(std::io::stderr)
+        .try_init();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let stopped =
+        a_member_whose_turn_stopped_before_its_boundary_commit(&paths, "stopped-turn-destroy")
+            .await;
+    // The store-owned recovery may settle the tail from here on.
+    stopped.power_store.hold_durable_tail_recovery(false);
+    let report = match tokio::time::timeout(Duration::from_secs(60), stopped.handle.destroy())
+        .await
+        .expect("the destroy ends within its bound")
+    {
+        Ok(report) => report,
+        Err(error) => panic!(
+            "a destroy with a member whose stopped turn left a durable tail and no live actor \
+             must complete: {error:?}"
+        ),
+    };
+    assert!(
+        report.errors.is_empty() && report.force_destroyed_members.is_empty(),
+        "the destroy archives every member without a cleanup error or a force destroy: \
+         {report:?}"
+    );
+    let status = stopped.handle.status().await;
+    assert!(
+        matches!(status, Ok(meerkat_mob::MobState::Destroyed)),
+        "the destroy destroyed the mob: {status:?}"
+    );
+    stopped.assert_tail_settled("stopped-turn-destroy").await;
 }
 
 /// One destructive reset as Meta's identity reset sends it: an atomic
