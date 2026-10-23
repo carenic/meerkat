@@ -3557,6 +3557,7 @@ pub fn tool_call_digest(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tool_call_dedupe_key_tests {
     use super::*;
 
