@@ -11210,11 +11210,11 @@ impl MobHostActor {
                 }
                 if let Err(error) = self.binding_authority.commit_prepared_authority(prepared) {
                     self.durable_uncertainty_fail_stop
-.record_unreplied(MobHostActorError::DurableUncertainty {
-detail: format!(
-                        "revoke host durable receipt committed but prepared authority commit failed: {error:?}"
-                    ),
-});
+                        .record_unreplied(MobHostActorError::DurableUncertainty {
+                            detail: format!(
+                                "revoke host durable receipt committed but prepared authority commit failed: {error:?}"
+                            ),
+                        });
                     self.send_failure(
                         candidate,
                         BridgeRejectionCause::Internal,
@@ -11230,11 +11230,11 @@ detail: format!(
                         Ok(publication) => publication,
                         Err(error) => {
                             self.durable_uncertainty_fail_stop
-.record_unreplied(MobHostActorError::DurableUncertainty {
-detail: format!(
-                                "revoke durable commit succeeded but residency vacancy publication failed: {error}"
-                            ),
-});
+                                .record_unreplied(MobHostActorError::DurableUncertainty {
+                                    detail: format!(
+                                        "revoke durable commit succeeded but residency vacancy publication failed: {error}"
+                                    ),
+                                });
                             self.send_failure(
                                 candidate,
                                 BridgeRejectionCause::Internal,
