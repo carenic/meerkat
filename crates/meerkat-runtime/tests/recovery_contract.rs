@@ -648,7 +648,6 @@ fn applied_pending_state(input: &Input, run_id: &RunId, sequence: u64) -> Stored
 /// A durably accepted content row never bound to any run: the current
 /// never-started-input shape. Recovery must retain it for ordinary redelivery,
 /// not infer consumption from its presence beside a completed candidate.
-#[cfg(feature = "sqlite-store")]
 fn accepted_unbound_state(input: &Input) -> StoredInputState {
     let mut state = InputState::new_accepted(input.id().clone());
     state.persisted_input = Some(input.clone());
@@ -1960,6 +1959,212 @@ async fn an_archive_over_a_continuable_tail_commits_it_as_interrupted() {
     assert_eq!(
         load_runtime_state(&store, &runtime_id).await.unwrap(),
         Some(RuntimeState::Idle)
+    );
+}
+
+/// The archive of a session no start registered again ends the work the
+/// session's runtime kept for a later start, then commits the kept run's tail
+/// as interrupted.
+///
+/// The store holds what a graceful stop that kept a durable run leaves: the
+/// run's continuable tail (round zero's first commit, its staged call only in
+/// the run cursor), the run's input bound to it, and a content input queued
+/// behind it. On that store the archive's recovery holds the tail beside the
+/// queued input. The archive's lease registers the runtime from durable
+/// state, the run marked resumable again and the queued input queued. Ending
+/// the unresumed work abandons both inputs as cancelled through the lease's
+/// driver. The archive's recovery then commits the tail as interrupted with
+/// nothing left to terminalize, and the retire under the same lease leaves
+/// both inputs cancelled. RED before: nothing ended that work, so the archive
+/// ended with the held tail. Unrun: written while Cargo is not run.
+#[tokio::test]
+async fn an_archive_ends_the_unresumed_work_then_commits_the_kept_runs_tail_as_interrupted() {
+    use meerkat_core::lifecycle::core_executor::BoundSessionCommit;
+    use meerkat_core::types::{
+        AssistantBlock, BlockAssistantMessage, Message, StopReason, TranscriptMessageIdentity,
+        UserMessage,
+    };
+    use meerkat_runtime::input_state::InputAbandonReason;
+    use meerkat_runtime::recovery::{
+        DurableTailRecoveryDisposition, DurableTailRecoveryOutcome,
+        recover_durable_tail_for_session_archive,
+    };
+    use meerkat_runtime::store::{PreparedRuntimeSessionCommit, PreparedWholeBlobProvisionalTail};
+
+    let store = Arc::new(InMemoryRuntimeStore::new());
+    let run_id = RunId::new();
+    let input = make_prompt("the run's prompt");
+    let queued = make_prompt("an input queued behind the run");
+    let mut committed = meerkat_core::Session::new();
+    committed.push(Message::User(UserMessage::text("the run's prompt")));
+    let session_id = committed.id().clone();
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    let committed_authority = store
+        .commit_prepared_session_boundary(
+            &runtime_id,
+            PreparedRuntimeSessionCommit::snapshot_only(
+                BoundSessionCommit::sealed(Arc::new(committed.clone())).unwrap(),
+            ),
+        )
+        .await
+        .unwrap()
+        .authority()
+        .and_then(|authority| authority.whole_blob())
+        .cloned()
+        .expect("initial boundary returns WholeBlob store authority");
+
+    // The kept run: round zero's first commit, the staged call in the run
+    // cursor, which binds the run's input.
+    let staged = BlockAssistantMessage {
+        blocks: vec![AssistantBlock::ToolUse {
+            id: "kept-call".to_string(),
+            name: "durable_tool".to_string(),
+            args: serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
+            meta: None,
+        }],
+        stop_reason: Some(StopReason::ToolUse),
+        identity: TranscriptMessageIdentity::default().with_run_id(run_id.clone()),
+        created_at: meerkat_core::types::message_timestamp_now(),
+        assistant_message_id: Some(
+            serde_json::from_value(serde_json::Value::String(
+                "0190b5f0-0000-7000-8000-000000000004".to_string(),
+            ))
+            .unwrap(),
+        ),
+    };
+    let mut round = committed.clone();
+    round
+        .set_run_cursor(&meerkat_core::SessionRunCursor::new(
+            run_id.clone(),
+            vec![input.id().clone()],
+            0,
+            meerkat_core::RunResumePoint::ToolsPending {
+                assistant_message: staged,
+            },
+        ))
+        .unwrap();
+    store
+        .write_prepared_whole_blob_provisional_tail(
+            &runtime_id,
+            PreparedWholeBlobProvisionalTail::prepare(
+                committed_authority,
+                run_id.clone(),
+                1,
+                &BoundSessionCommit::sealed(Arc::new(round)).unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    store
+        .persist_input_state(
+            &runtime_id,
+            &persistable(applied_pending_state(&input, &run_id, 1)),
+        )
+        .await
+        .unwrap();
+    store
+        .persist_input_state(&runtime_id, &persistable(accepted_unbound_state(&queued)))
+        .await
+        .unwrap();
+
+    // The archive's recovery alone holds the tail beside the queued input.
+    let (held, _) = recover_durable_tail_for_session_archive(store.as_ref(), &session_id)
+        .await
+        .expect("the archive's recovery answers");
+    assert!(
+        matches!(held, DurableTailRecoveryOutcome::Held),
+        "a continuable tail beside a queued content input holds"
+    );
+
+    // The archive takes its lease on a runtime no start registered again.
+    let machine =
+        MeerkatMachine::persistent(store.clone() as Arc<dyn RuntimeStore>, memory_blob_store())
+            .expect("persistent machine");
+    let deadline = meerkat_core::time_compat::Instant::now() + std::time::Duration::from_secs(10);
+    let lease = machine
+        .prepare_session_archive_lease_before(&session_id, deadline)
+        .await
+        .expect("the archive's lease prepares")
+        .expect("a durable session leaves the archive a runtime to retire");
+    assert_eq!(
+        machine.resumable_run_id(&session_id).await,
+        Some(run_id.clone()),
+        "the lease's registration keeps the run resumable"
+    );
+
+    let ended = machine
+        .end_unresumed_work_with_archive_lease_before(&lease, "session archived", deadline)
+        .await
+        .expect("the unresumed work ends");
+    assert_eq!(
+        sorted_id_strings(ended),
+        sorted_id_strings([input.id().clone(), queued.id().clone()]),
+        "the kept run's input and the queued input end"
+    );
+    assert_eq!(
+        machine.resumable_run_id(&session_id).await,
+        None,
+        "the run is no longer kept"
+    );
+    let cancelled = Some((
+        InputLifecycleState::Abandoned,
+        Some(InputTerminalOutcome::Abandoned {
+            reason: InputAbandonReason::Cancelled,
+        }),
+    ));
+    let terminal_of = |rows: &[StoredInputState], input_id: &InputId| {
+        rows.iter()
+            .find(|row| &row.state.input_id == input_id)
+            .map(|row| (row.seed.phase, row.seed.terminal_outcome.clone()))
+    };
+    let rows = store.load_input_states_strict(&runtime_id).await.unwrap();
+    assert_eq!(terminal_of(&rows, input.id()), cancelled);
+    assert_eq!(terminal_of(&rows, queued.id()), cancelled);
+
+    // The archive's recovery now commits the tail as interrupted.
+    let (
+        DurableTailRecoveryOutcome::Committed {
+            disposition,
+            recovered,
+            ..
+        },
+        _,
+    ) = recover_durable_tail_for_session_archive(store.as_ref(), &session_id)
+        .await
+        .expect("the archive's recovery answers")
+    else {
+        panic!("the archive must commit the kept run's tail as interrupted");
+    };
+    assert_eq!(
+        disposition,
+        DurableTailRecoveryDisposition::RepairAndCommitInterrupted
+    );
+    let messages = recovered.messages();
+    assert_eq!(messages.len(), 4, "prompt, staged call, its result, notice");
+    assert!(matches!(messages.last(), Some(Message::SystemNotice(_))));
+    assert!(
+        store
+            .load_whole_blob_provisional_tail(&runtime_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "the archive's recovery consumes the tail"
+    );
+
+    // The retire under the same lease writes nothing over the inputs.
+    machine
+        .retire_session_with_archive_lease_before(lease, deadline)
+        .await
+        .expect("the archive's runtime retire commits");
+    let rows = store.load_input_states_strict(&runtime_id).await.unwrap();
+    assert_eq!(terminal_of(&rows, input.id()), cancelled);
+    assert_eq!(terminal_of(&rows, queued.id()), cancelled);
+    assert_eq!(
+        load_runtime_state(store.as_ref(), &runtime_id)
+            .await
+            .unwrap(),
+        Some(RuntimeState::Retired)
     );
 }
 
