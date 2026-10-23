@@ -124,6 +124,7 @@ MOB_RPC_CONTRACT_TYPES = [
     "MobSpawnReceiptWire",
     "MobMemberListEntryWire",
     "WireMemberProgressSnapshot",
+    "WireMemberCustodyDeferral",
     "WireMobToolConfig",
     "WireMobProfile",
     "WireMobRun",
@@ -593,6 +594,8 @@ MOB_RPC_CONTRACT_ALIAS_TYPES = [
     # branch on `state`. An alias, not a contract type: the object emitter
     # would turn the union into an empty `{}` interface.
     "WireContinuationStatus",
+    "WireMemberCustodyRestore",
+    "WireMemberCustodyDeferralCause",
     "WireMobRunStatus",
     # Closed usage-attribution vocabulary on the run-result accounting block.
     # An alias, not a contract type: the object emitter would turn a
@@ -7346,6 +7349,9 @@ def generate_web_mob_types(schemas: dict, output_dir: Path) -> None:
     append_interface("WireResolvedModelCapabilities")
     append_alias("WireMemberPreviewUnavailable")
     append_alias("WireMemberRegistrationHookCall")
+    append_alias("WireMemberCustodyRestore")
+    append_alias("WireMemberCustodyDeferralCause")
+    append_interface("WireMemberCustodyDeferral")
     append_interface("MobMemberStatusResult")
     append_interface("MobAppendSystemContextResult")
     append_alias("WireMemberReloadRefusal")

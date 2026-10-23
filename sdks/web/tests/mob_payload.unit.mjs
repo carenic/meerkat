@@ -1177,6 +1177,103 @@ test('memberStatus surfaces the registration_refusal hook call and omits it when
   }
 });
 
+test('memberStatus surfaces custody_deferred and omits it when unset', async () => {
+  const statusMob = (extra) =>
+    new Mob('mob-web-unit', {
+      async mob_member_status() {
+        return JSON.stringify({
+          status: 'broken',
+          member_ref: 'runtime-owned-ref-worker-1',
+          tokens_used: 0,
+          is_final: false,
+          ...extra,
+        });
+      },
+    });
+  for (const restore of ['startup_binding', 'cleanup_delivery']) {
+    for (const cause of ['served_elsewhere', 'hosting_unavailable', 'durable_tail_unprovable']) {
+      const snapshot = await statusMob({ custody_deferred: { restore, cause } }).memberStatus(
+        'worker-1',
+      );
+      assert.deepEqual(snapshot.custody_deferred, { restore, cause });
+      assert.equal(snapshot.status, 'broken');
+    }
+  }
+  for (const extra of [{}, { custody_deferred: null }]) {
+    const snapshot = await statusMob(extra).memberStatus('worker-1');
+    assert.equal(Object.prototype.hasOwnProperty.call(snapshot, 'custody_deferred'), false);
+  }
+  for (const deferral of [
+    'startup_binding',
+    ['startup_binding'],
+    { restore: 7, cause: 'served_elsewhere' },
+    { restore: 'startup_binding', cause: { kind: 'busy' } },
+    { cause: 'served_elsewhere' },
+  ]) {
+    await assert.rejects(
+      () => statusMob({ custody_deferred: deferral }).memberStatus('worker-1'),
+      /custody_deferred/,
+    );
+  }
+});
+
+test('memberStatus reads an unknown custody_deferred restore as unknown', async () => {
+  const mob = new Mob('mob-web-unit', {
+    async mob_member_status() {
+      return JSON.stringify({
+        status: 'broken',
+        member_ref: 'runtime-owned-ref-worker-1',
+        tokens_used: 0,
+        is_final: false,
+        custody_deferred: { restore: 'warm_handoff', cause: 'served_elsewhere' },
+      });
+    },
+  });
+  const snapshot = await mob.memberStatus('worker-1');
+  assert.deepEqual(snapshot.custody_deferred, {
+    restore: { unknown: 'warm_handoff' },
+    cause: 'served_elsewhere',
+  });
+});
+
+test('memberStatus reads an unknown custody_deferred cause as unknown', async () => {
+  const mob = new Mob('mob-web-unit', {
+    async mob_member_status() {
+      return JSON.stringify({
+        status: 'broken',
+        member_ref: 'runtime-owned-ref-worker-1',
+        tokens_used: 0,
+        is_final: false,
+        custody_deferred: { restore: 'startup_binding', cause: 'quota_paused' },
+      });
+    },
+  });
+  const snapshot = await mob.memberStatus('worker-1');
+  assert.deepEqual(snapshot.custody_deferred, {
+    restore: 'startup_binding',
+    cause: { unknown: 'quota_paused' },
+  });
+});
+
+test('memberStatus ignores a custody_deferred field it does not know', async () => {
+  const mob = new Mob('mob-web-unit', {
+    async mob_member_status() {
+      return JSON.stringify({
+        status: 'broken',
+        member_ref: 'runtime-owned-ref-worker-1',
+        tokens_used: 0,
+        is_final: false,
+        custody_deferred: { restore: 'startup_binding', cause: 'served_elsewhere', attempts: 2 },
+      });
+    },
+  });
+  const snapshot = await mob.memberStatus('worker-1');
+  assert.deepEqual(snapshot.custody_deferred, {
+    restore: 'startup_binding',
+    cause: 'served_elsewhere',
+  });
+});
+
 test('memberStatus rejects malformed resolved_capabilities booleans instead of coercing', async () => {
   // A non-boolean capability flag must fail closed; the SDK must NOT coerce it
   // (e.g. Boolean("false") === true would silently flip the meaning).

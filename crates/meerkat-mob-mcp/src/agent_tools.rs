@@ -4301,6 +4301,7 @@ mod tests {
                 non_portable_disabled: None,
                 preview_unavailable,
                 registration_refusal: None,
+                custody_deferred: None,
             }
         };
         let note = |marker: Option<Marker>, run_state: Option<WireMemberRunState>| {

@@ -6094,6 +6094,217 @@ async def test_wait_mob_members_carry_registration_refusal():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("restore", ["startup_binding", "cleanup_delivery"])
+@pytest.mark.parametrize(
+    "cause", ["served_elsewhere", "hosting_unavailable", "durable_tail_unprovable"]
+)
+async def test_mob_member_status_surfaces_custody_deferred(restore, cause):
+    client = MeerkatClient()
+
+    async def fake_request(_method, _params):
+        return {
+            "status": "broken",
+            "member_ref": _make_member_ref("mob-1", "agent-a"),
+            "tokens_used": 0,
+            "is_final": False,
+            "custody_deferred": {"restore": restore, "cause": cause},
+        }
+
+    client._request = fake_request  # type: ignore[method-assign]
+
+    status = await client.mob_member_status("mob-1", "agent-a")
+    assert status["custody_deferred"] == {"restore": restore, "cause": cause}
+    assert status["status"] == "broken"
+
+
+@pytest.mark.asyncio
+async def test_mob_member_status_omits_absent_or_null_custody_deferred():
+    client = MeerkatClient()
+    for extra in ({}, {"custody_deferred": None}):
+
+        async def fake_request(_method, _params, extra=extra):
+            return {
+                "status": "active",
+                "member_ref": _make_member_ref("mob-1", "agent-a"),
+                "tokens_used": 3,
+                "is_final": False,
+                **extra,
+            }
+
+        client._request = fake_request  # type: ignore[method-assign]
+        status = await client.mob_member_status("mob-1", "agent-a")
+        assert "custody_deferred" not in status
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("deferral", "message"),
+    [
+        ("startup_binding", "invalid custody_deferred"),
+        (["startup_binding"], "invalid custody_deferred"),
+        (
+            {"restore": 7, "cause": "served_elsewhere"},
+            "invalid custody_deferred.restore",
+        ),
+        (
+            {"restore": "startup_binding", "cause": {"kind": "busy"}},
+            "invalid custody_deferred.cause",
+        ),
+        ({"cause": "served_elsewhere"}, "invalid custody_deferred.restore"),
+    ],
+)
+async def test_mob_member_status_rejects_a_malformed_custody_deferred(deferral, message):
+    client = MeerkatClient()
+
+    async def fake_request(_method, _params):
+        return {
+            "status": "broken",
+            "member_ref": _make_member_ref("mob-1", "agent-a"),
+            "tokens_used": 0,
+            "is_final": False,
+            "custody_deferred": deferral,
+        }
+
+    client._request = fake_request  # type: ignore[method-assign]
+
+    with pytest.raises(MeerkatError, match=message):
+        await client.mob_member_status("mob-1", "agent-a")
+
+
+@pytest.mark.asyncio
+async def test_mob_member_status_reads_an_unknown_custody_restore_as_unknown():
+    client = MeerkatClient()
+
+    async def fake_request(_method, _params):
+        return {
+            "status": "broken",
+            "member_ref": _make_member_ref("mob-1", "agent-a"),
+            "tokens_used": 0,
+            "is_final": False,
+            "custody_deferred": {"restore": "warm_handoff", "cause": "served_elsewhere"},
+        }
+
+    client._request = fake_request  # type: ignore[method-assign]
+
+    status = await client.mob_member_status("mob-1", "agent-a")
+    assert status["custody_deferred"] == {
+        "restore": {"unknown": "warm_handoff"},
+        "cause": "served_elsewhere",
+    }
+
+
+@pytest.mark.asyncio
+async def test_mob_member_status_reads_an_unknown_custody_cause_as_unknown():
+    client = MeerkatClient()
+
+    async def fake_request(_method, _params):
+        return {
+            "status": "broken",
+            "member_ref": _make_member_ref("mob-1", "agent-a"),
+            "tokens_used": 0,
+            "is_final": False,
+            "custody_deferred": {"restore": "startup_binding", "cause": "quota_paused"},
+        }
+
+    client._request = fake_request  # type: ignore[method-assign]
+
+    status = await client.mob_member_status("mob-1", "agent-a")
+    assert status["custody_deferred"] == {
+        "restore": "startup_binding",
+        "cause": {"unknown": "quota_paused"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_mob_member_status_ignores_an_unknown_custody_deferred_field():
+    client = MeerkatClient()
+
+    async def fake_request(_method, _params):
+        return {
+            "status": "broken",
+            "member_ref": _make_member_ref("mob-1", "agent-a"),
+            "tokens_used": 0,
+            "is_final": False,
+            "custody_deferred": {
+                "restore": "startup_binding",
+                "cause": "served_elsewhere",
+                "attempts": 2,
+            },
+        }
+
+    client._request = fake_request  # type: ignore[method-assign]
+
+    status = await client.mob_member_status("mob-1", "agent-a")
+    assert status["custody_deferred"] == {
+        "restore": "startup_binding",
+        "cause": "served_elsewhere",
+    }
+
+
+@pytest.mark.asyncio
+async def test_wait_mob_members_read_an_unknown_custody_deferral_as_unknown():
+    client = MeerkatClient()
+
+    async def fake_request(_method, _params):
+        return {
+            "members": [
+                {
+                    "agent_identity": "lead",
+                    "status": "broken",
+                    "tokens_used": 0,
+                    "is_final": False,
+                    "custody_deferred": {"restore": "warm_handoff", "cause": "quota_paused"},
+                },
+            ]
+        }
+
+    client._request = fake_request  # type: ignore[method-assign]
+
+    for members in (
+        await client.wait_mob_kickoff("mob-1"),
+        await client.wait_mob_ready("mob-1"),
+    ):
+        assert members[0]["custody_deferred"] == {
+            "restore": {"unknown": "warm_handoff"},
+            "cause": {"unknown": "quota_paused"},
+        }
+
+
+@pytest.mark.asyncio
+async def test_wait_mob_members_carry_custody_deferred():
+    client = MeerkatClient()
+    deferral = {"restore": "startup_binding", "cause": "served_elsewhere"}
+
+    async def fake_request(_method, _params):
+        return {
+            "members": [
+                {
+                    "agent_identity": "lead",
+                    "status": "broken",
+                    "tokens_used": 0,
+                    "is_final": False,
+                    "custody_deferred": deferral,
+                },
+                {
+                    "agent_identity": "writer",
+                    "status": "active",
+                    "tokens_used": 7,
+                    "is_final": False,
+                },
+            ]
+        }
+
+    client._request = fake_request  # type: ignore[method-assign]
+
+    for members in (
+        await client.wait_mob_kickoff("mob-1"),
+        await client.wait_mob_ready("mob-1"),
+    ):
+        assert members[0]["custody_deferred"] == deferral
+        assert "custody_deferred" not in members[1]
+
+
+@pytest.mark.asyncio
 async def test_mob_member_status_rejects_unknown_peer_connectivity_tag():
     client = MeerkatClient()
 

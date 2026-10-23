@@ -1864,6 +1864,11 @@ export interface WireMemberProgressSnapshot {
   run_state: "idle" | "run_open" | "unknown";
 }
 
+export interface WireMemberCustodyDeferral {
+  cause: WireMemberCustodyDeferralCause;
+  restore: WireMemberCustodyRestore;
+}
+
 export interface WireMobToolConfig {
   builtins?: boolean;
   comms?: boolean;
@@ -2290,6 +2295,7 @@ export interface MobMemberStatusResult {
   comms_reachability?: WireReachability | null;
   control_reachability?: WireReachability | null;
   current_session_id?: string | null;
+  custody_deferred?: WireMemberCustodyDeferral | null;
   detached_jobs?: Record<string, unknown> | null;
   error?: string | null;
   external_member?: unknown;
@@ -3958,6 +3964,10 @@ export interface WireContinuationStatusRefused {
 }
 
 export type WireContinuationStatus = WireContinuationStatusPending | WireContinuationStatusAdmitted | WireContinuationStatusStranded | WireContinuationStatusRefused;
+
+export type WireMemberCustodyRestore = "startup_binding" | "cleanup_delivery";
+
+export type WireMemberCustodyDeferralCause = "served_elsewhere" | "hosting_unavailable" | "durable_tail_unprovable";
 
 export type WireMobRunStatus = "pending" | "running" | "completed" | "failed" | "canceled";
 

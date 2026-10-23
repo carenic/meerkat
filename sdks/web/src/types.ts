@@ -8,6 +8,8 @@ import type {
   WireMemberPreviewUnavailable,
   WireMemberProgressSnapshot,
   WireMemberRegistrationHookCall,
+  WireMemberCustodyDeferralCause,
+  WireMemberCustodyRestore,
   WireMobMemberStatus,
   WireNonPortableResourceKind,
   WireReachability,
@@ -22,6 +24,9 @@ export type {
   WireMemberProgressSnapshot,
   WireMemberRegistrationHookCall,
   WireMobLifecycleFailure,
+  WireMemberCustodyDeferral,
+  WireMemberCustodyDeferralCause,
+  WireMemberCustodyRestore,
 } from './generated/mob.js';
 
 // The destroy report of `Mob.lifecycle('destroy')` and of
@@ -473,6 +478,27 @@ export interface MobMemberSnapshot {
    * call that refused it. The member stays broken until an explicit repair.
    */
   registration_refusal?: WireMemberRegistrationHookCall;
+  /**
+   * Set when a mob start deferred the member's custody restore instead of
+   * failing the whole start: the restore and the cause its last attempt met.
+   * Every operation on the member re-attempts it first.
+   */
+  custody_deferred?: MobMemberCustodyDeferral;
+}
+
+/**
+ * A custody restore or cause this SDK does not know, as the server sent it:
+ * the deferral vocabularies may grow, and an unknown value is surfaced, not
+ * refused.
+ */
+export interface MobMemberCustodyUnknown {
+  unknown: string;
+}
+
+/** A member's custody restore a mob start deferred, and the cause its last attempt met. */
+export interface MobMemberCustodyDeferral {
+  restore: WireMemberCustodyRestore | MobMemberCustodyUnknown;
+  cause: WireMemberCustodyDeferralCause | MobMemberCustodyUnknown;
 }
 
 /** Result envelope for helper-style mob flows. */

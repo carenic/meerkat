@@ -942,6 +942,172 @@ impl IdentityReconcileCompletionAuthority {
     }
 }
 
+/// One member's startup custody restore that the start deferred instead of
+/// failing the whole mob: the restore, the member session it restores, the
+/// typed cause of its last failed attempt, and when it is re-attempted next
+/// (the identity reconcile's backoff).
+#[derive(Debug, Clone)]
+pub(super) struct DeferredMemberCustody {
+    pub(super) session: SessionId,
+    pub(super) restore: crate::MemberCustodyRestore,
+    pub(super) cause: Arc<MobError>,
+    pub(super) attempts: u32,
+    pub(super) next_attempt: Instant,
+}
+
+/// The member custody restores a start deferred, keyed by member. Volatile:
+/// the durable fact behind each entry (a retiring member's started
+/// retirement, a member's failed restore) re-derives it at every start.
+#[derive(Debug, Default)]
+pub(super) struct DeferredMemberCustodyRegistry {
+    entries: BTreeMap<AgentIdentity, DeferredMemberCustody>,
+    /// What member status reads see of each entry: its restore and the
+    /// cause its last attempt met. Shared with the mob's handles; kept in
+    /// step with `entries` by every change below.
+    view: super::handle::MemberCustodyDeferrals,
+}
+
+impl DeferredMemberCustodyRegistry {
+    /// An empty registry that publishes its entries to `view`.
+    pub(super) fn publishing(view: super::handle::MemberCustodyDeferrals) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            view,
+        }
+    }
+
+    /// The view member status reads see this registry's entries through.
+    pub(super) fn view(&self) -> super::handle::MemberCustodyDeferrals {
+        Arc::clone(&self.view)
+    }
+
+    /// Publish `identity`'s deferral (or its absence) to member status reads.
+    fn publish(&self, identity: &AgentIdentity, deferral: Option<crate::MemberCustodyDeferral>) {
+        let mut view = match self.view.write() {
+            Ok(view) => view,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match deferral {
+            Some(deferral) => {
+                view.insert(identity.clone(), deferral);
+            }
+            None => {
+                view.remove(identity);
+            }
+        }
+    }
+
+    /// Record `identity`'s deferred `restore` for `session` after its first
+    /// failed attempt; its next attempt is backed off from `now`.
+    pub(super) fn defer(
+        &mut self,
+        identity: AgentIdentity,
+        session: SessionId,
+        restore: crate::MemberCustodyRestore,
+        cause: MobError,
+        now: Instant,
+    ) {
+        self.publish(
+            &identity,
+            crate::MemberCustodyDeferral::new(restore, &cause),
+        );
+        self.entries.insert(
+            identity,
+            DeferredMemberCustody {
+                session,
+                restore,
+                cause: Arc::new(cause),
+                attempts: 1,
+                next_attempt: now
+                    .checked_add(identity_reconcile_backoff_delay(1))
+                    .unwrap_or(now),
+            },
+        );
+    }
+
+    /// The restore deferred for `identity`, if any.
+    pub(super) fn pending(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Option<(SessionId, crate::MemberCustodyRestore)> {
+        self.entries
+            .get(identity)
+            .map(|entry| (entry.session.clone(), entry.restore))
+    }
+
+    pub(super) fn contains(&self, identity: &AgentIdentity) -> bool {
+        self.entries.contains_key(identity)
+    }
+
+    pub(super) fn identities(&self) -> Vec<AgentIdentity> {
+        self.entries.keys().cloned().collect()
+    }
+
+    pub(super) fn get(&self, identity: &AgentIdentity) -> Option<&DeferredMemberCustody> {
+        self.entries.get(identity)
+    }
+
+    /// Settle one re-attempt of `identity`'s deferred restore, at `now`.
+    /// Success removes the entry. A failure with a cause the start may defer
+    /// ([`MobError::is_deferrable_custody_cause`]) keeps it, backs off its
+    /// next attempt, and answers [`MobError::MemberCustodyDeferred`]; any
+    /// other failure is answered as it is, its next attempt backed off as
+    /// well.
+    pub(super) fn settle(
+        &mut self,
+        identity: &AgentIdentity,
+        outcome: Result<(), MobError>,
+        now: Instant,
+    ) -> Result<(), MobError> {
+        let error = match outcome {
+            Ok(()) => {
+                self.entries.remove(identity);
+                self.publish(identity, None);
+                return Ok(());
+            }
+            Err(error) => error,
+        };
+        let Some(entry) = self.entries.get_mut(identity) else {
+            return Err(error);
+        };
+        entry.attempts = entry.attempts.saturating_add(1);
+        entry.next_attempt = now
+            .checked_add(identity_reconcile_backoff_delay(entry.attempts))
+            .unwrap_or(now);
+        if !error.is_deferrable_custody_cause() {
+            return Err(error);
+        }
+        let cause = Arc::new(error);
+        entry.cause = Arc::clone(&cause);
+        let deferred = MobError::MemberCustodyDeferred {
+            member_id: identity.clone(),
+            session_id: entry.session.clone(),
+            restore: entry.restore,
+            cause: Arc::clone(&cause),
+        };
+        let deferral = crate::MemberCustodyDeferral::new(entry.restore, cause.as_ref());
+        self.publish(identity, deferral);
+        Err(deferred)
+    }
+
+    /// The time from `now` until the earliest entry is due, `None` with none.
+    pub(super) fn next_wait(&self, now: Instant) -> Option<Duration> {
+        self.entries
+            .values()
+            .map(|entry| entry.next_attempt.saturating_duration_since(now))
+            .min()
+    }
+
+    /// The members whose next attempt is due at `now`.
+    pub(super) fn due(&self, now: Instant) -> Vec<AgentIdentity> {
+        self.entries
+            .iter()
+            .filter(|(_, entry)| entry.next_attempt <= now)
+            .map(|(identity, _)| identity.clone())
+            .collect()
+    }
+}
+
 /// Volatile per-identity actuation-backoff record. Scheduling custody only —
 /// never persisted machine state; a cold actor incarnation restarts with a
 /// clean slate and re-observes desired state.
@@ -1480,6 +1646,238 @@ fn identity_member_actuation_disposition(
     match result {
         Ok(_) => IdentityMemberActuationDisposition::Applied,
         Err(error) => identity_actuation_error_disposition(error),
+    }
+}
+
+#[cfg(test)]
+mod deferred_member_custody_tests {
+    use super::{DeferredMemberCustodyRegistry, identity_reconcile_backoff_delay};
+    use crate::ids::AgentIdentity;
+    use crate::{MemberCustodyRestore, MobError};
+    use meerkat_core::time_compat::{Duration, Instant};
+    use meerkat_core::types::SessionId;
+
+    fn served_elsewhere(session: &SessionId) -> MobError {
+        MobError::SessionError(meerkat_core::SessionError::ServedElsewhere {
+            id: session.clone(),
+        })
+    }
+
+    fn hosting_unavailable(session: &SessionId) -> MobError {
+        MobError::SessionError(meerkat_core::SessionError::HostingUnavailable {
+            id: session.clone(),
+        })
+    }
+
+    /// Without a deferred restore there is nothing to re-attempt and no wake.
+    #[test]
+    fn a_member_without_a_deferred_custody_restore_has_nothing_to_reattempt() {
+        let registry = DeferredMemberCustodyRegistry::default();
+        let member = AgentIdentity::from("member");
+        let now = Instant::now();
+        assert_eq!(registry.pending(&member), None);
+        assert!(!registry.contains(&member));
+        assert_eq!(registry.next_wait(now), None);
+        assert!(registry.due(now).is_empty());
+    }
+
+    /// A re-attempt that fails with a cause the start may defer keeps the
+    /// entry, backs its next attempt off by the identity reconcile's backoff,
+    /// keeps the newest cause, and answers the typed deferral naming the
+    /// member, its session, the restore and the cause.
+    #[test]
+    fn a_deferred_restore_that_still_fails_skippably_stays_deferred_and_backs_off() {
+        let mut registry = DeferredMemberCustodyRegistry::default();
+        let member = AgentIdentity::from("member");
+        let session = SessionId::new();
+        let start = Instant::now();
+        registry.defer(
+            member.clone(),
+            session.clone(),
+            MemberCustodyRestore::CleanupDelivery,
+            served_elsewhere(&session),
+            start,
+        );
+        assert_eq!(
+            registry.pending(&member),
+            Some((session.clone(), MemberCustodyRestore::CleanupDelivery))
+        );
+        assert_eq!(
+            registry.next_wait(start),
+            Some(identity_reconcile_backoff_delay(1))
+        );
+
+        let retry = start + Duration::from_secs(1);
+        let answer = registry.settle(&member, Err(hosting_unavailable(&session)), retry);
+        match answer {
+            Err(MobError::MemberCustodyDeferred {
+                member_id,
+                session_id,
+                restore,
+                cause,
+            }) => {
+                assert_eq!(member_id, member);
+                assert_eq!(session_id, session);
+                assert_eq!(restore, MemberCustodyRestore::CleanupDelivery);
+                assert!(matches!(
+                    cause.as_ref(),
+                    MobError::SessionError(meerkat_core::SessionError::HostingUnavailable { .. })
+                ));
+            }
+            other => panic!("a skippable failure answers the typed deferral: {other:?}"),
+        }
+        let entry = registry.get(&member).expect("the entry stays");
+        assert_eq!(entry.attempts, 2);
+        assert_eq!(
+            entry.next_attempt,
+            retry + identity_reconcile_backoff_delay(2),
+            "the next attempt is backed off from the re-attempt"
+        );
+        assert!(matches!(
+            entry.cause.as_ref(),
+            MobError::SessionError(meerkat_core::SessionError::HostingUnavailable { .. })
+        ));
+        assert!(registry.due(retry).is_empty(), "not due before its backoff");
+        let due = retry + identity_reconcile_backoff_delay(2);
+        assert_eq!(registry.due(due), vec![member.clone()]);
+
+        // A durable tail its recovery kept unprovable is a cause the start
+        // may defer as well.
+        let answer = registry.settle(
+            &member,
+            Err(MobError::MemberDurableTailUnprovable {
+                member_id: member.clone(),
+                session_id: session.clone(),
+            }),
+            due,
+        );
+        assert!(
+            matches!(
+                &answer,
+                Err(MobError::MemberCustodyDeferred { cause, .. })
+                    if matches!(cause.as_ref(), MobError::MemberDurableTailUnprovable { .. })
+            ),
+            "{answer:?}"
+        );
+        let entry = registry.get(&member).expect("the entry stays");
+        assert_eq!(entry.attempts, 3);
+        assert_eq!(
+            entry.next_attempt,
+            due + identity_reconcile_backoff_delay(3)
+        );
+    }
+
+    /// A re-attempt that restores the custody removes the entry.
+    #[test]
+    fn a_deferred_restore_that_succeeds_is_removed() {
+        let mut registry = DeferredMemberCustodyRegistry::default();
+        let member = AgentIdentity::from("member");
+        let session = SessionId::new();
+        let now = Instant::now();
+        registry.defer(
+            member.clone(),
+            session.clone(),
+            MemberCustodyRestore::StartupBinding,
+            served_elsewhere(&session),
+            now,
+        );
+        registry
+            .settle(&member, Ok(()), now)
+            .expect("a restored custody answers Ok");
+        assert_eq!(registry.pending(&member), None);
+        assert_eq!(registry.next_wait(now), None);
+    }
+
+    /// Any other failure is answered as it is, not as a deferral; the entry
+    /// stays with its next attempt backed off and its deferral cause kept.
+    #[test]
+    fn a_deferred_restore_that_fails_otherwise_answers_its_own_error() {
+        let mut registry = DeferredMemberCustodyRegistry::default();
+        let member = AgentIdentity::from("member");
+        let session = SessionId::new();
+        let now = Instant::now();
+        registry.defer(
+            member.clone(),
+            session.clone(),
+            MemberCustodyRestore::CleanupDelivery,
+            served_elsewhere(&session),
+            now,
+        );
+        let answer = registry.settle(
+            &member,
+            Err(MobError::Internal("store read failed".to_string())),
+            now,
+        );
+        assert!(
+            matches!(&answer, Err(MobError::Internal(message)) if message == "store read failed"),
+            "{answer:?}"
+        );
+        let entry = registry.get(&member).expect("the entry stays");
+        assert_eq!(entry.attempts, 2);
+        assert!(matches!(
+            entry.cause.as_ref(),
+            MobError::SessionError(meerkat_core::SessionError::ServedElsewhere { .. })
+        ));
+    }
+
+    /// Member status reads see each deferral as the registry holds it: its
+    /// restore and the cause its last attempt met, the newest deferrable
+    /// cause after a re-attempt, the same deferral after a failure that
+    /// defers nothing, and nothing once the restore succeeds.
+    #[test]
+    fn the_published_deferral_follows_the_registry() {
+        let view = super::super::handle::MemberCustodyDeferrals::default();
+        let mut registry = DeferredMemberCustodyRegistry::publishing(view.clone());
+        let member = AgentIdentity::from("member");
+        let session = SessionId::new();
+        let now = Instant::now();
+        let published = || {
+            view.read()
+                .expect("the published view")
+                .get(&member)
+                .copied()
+        };
+        assert_eq!(published(), None);
+        registry.defer(
+            member.clone(),
+            session.clone(),
+            MemberCustodyRestore::StartupBinding,
+            served_elsewhere(&session),
+            now,
+        );
+        assert_eq!(
+            published(),
+            Some(crate::MemberCustodyDeferral {
+                restore: MemberCustodyRestore::StartupBinding,
+                cause: crate::MemberCustodyDeferralCause::ServedElsewhere,
+            })
+        );
+        let _ = registry.settle(&member, Err(hosting_unavailable(&session)), now);
+        assert_eq!(
+            published(),
+            Some(crate::MemberCustodyDeferral {
+                restore: MemberCustodyRestore::StartupBinding,
+                cause: crate::MemberCustodyDeferralCause::HostingUnavailable,
+            }),
+            "the newest deferrable cause is shown"
+        );
+        let _ = registry.settle(
+            &member,
+            Err(MobError::Internal("store read failed".to_string())),
+            now,
+        );
+        assert_eq!(
+            published(),
+            Some(crate::MemberCustodyDeferral {
+                restore: MemberCustodyRestore::StartupBinding,
+                cause: crate::MemberCustodyDeferralCause::HostingUnavailable,
+            }),
+            "a failure that defers nothing leaves the deferral as it was"
+        );
+        registry
+            .settle(&member, Ok(()), now)
+            .expect("a restored custody answers Ok");
+        assert_eq!(published(), None, "a restored custody clears the deferral");
     }
 }
 
@@ -7590,12 +7988,15 @@ struct RestoredMemberOperationBinding {
 /// runs against a fresh ops adapter, so any surviving binding is an invariant
 /// violation and the strict bind applies. The explicit same-handle resume
 /// post-commit step runs against the live adapter, where a parent-owned
-/// member legitimately still holds its coordinator-owned binding.
+/// member legitimately still holds its coordinator-owned binding. A deferred
+/// startup restore re-attempted in the running actor restores a binding this
+/// incarnation never established, so the strict bind applies as at startup.
 #[cfg(feature = "runtime-adapter")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RestoredOperationBindingSeam {
     ActorStartup,
     ExplicitResumePostCommit,
+    DeferredReattempt,
 }
 
 /// Outcome of rehydrating a member's composition delivery custody.
@@ -7846,6 +8247,11 @@ pub(super) struct MobActor {
     /// Stuck retirements a resume handed back for re-drive, started one at a
     /// time from the actor loop.
     pub(super) pending_stuck_redrives: VecDeque<AgentIdentity>,
+    /// Startup restores of member custody deferred instead of failing the
+    /// whole start. An operation that acts on such a member's session passes
+    /// `reattempt_deferred_member_custody` first, and the identity reconcile's
+    /// backoff wake re-attempts each due entry.
+    pub(super) deferred_member_custody: DeferredMemberCustodyRegistry,
     pub(super) next_retirement_ticket: u64,
     pub(super) retirement_batch: Option<retirement_io::RetirementBatch>,
     pub(super) wiring_io_tasks: tokio::task::JoinSet<wiring_io::WiringIoCompletion>,
@@ -14568,6 +14974,7 @@ impl MobActor {
             #[cfg(feature = "runtime-adapter")]
             runtime_adapter: self.runtime_adapter.clone(),
             restore_diagnostics: self.restore_diagnostics.clone(),
+            custody_deferrals: self.deferred_member_custody.view(),
             supervisor_bridge: self.supervisor_bridge.clone(),
             machine_state_watch_rx: self.machine_state_watch_tx.subscribe(),
             reachability_observations: Arc::clone(&self.reachability_observations),
@@ -26013,6 +26420,10 @@ impl MobActor {
                     Ok(false)
                 }
                 IdentityReconcileDecision::CancelActiveMember => {
+                    // Cancelling acts on the member's runtime inputs: a
+                    // deferred custody restore is re-attempted first, and
+                    // backs the reconcile off while it stays deferred.
+                    self.reattempt_deferred_member_custody(identity).await?;
                     let entry = self
                         .roster
                         .read()
@@ -26094,6 +26505,10 @@ impl MobActor {
                     }
                 }
                 IdentityReconcileDecision::EnsureRuntimeRegistration => {
+                    // A member whose startup custody restore was deferred is
+                    // acted on only once that restore succeeds; still deferred,
+                    // the reconcile backs off.
+                    self.reattempt_deferred_member_custody(identity).await?;
                     let Some(write_lease) = self.renew_identity_actuation_lease(identity).await?
                     else {
                         return Ok(true);
@@ -26221,6 +26636,10 @@ impl MobActor {
                     }
                 }
                 IdentityReconcileDecision::EnsureMemberMaterialization => {
+                    // As for the runtime registration: a deferred custody
+                    // restore is re-attempted first, and backs off the
+                    // reconcile while it stays deferred.
+                    self.reattempt_deferred_member_custody(identity).await?;
                     let Some(write_lease) = self.renew_identity_actuation_lease(identity).await?
                     else {
                         return Ok(true);
@@ -29599,7 +30018,14 @@ impl MobActor {
         // leases from there: no reconcile pass claims one again meanwhile.
         let identity_reconcile_pending =
             identity_reconcile_pending && self.pending_shutdown_teardown.is_none();
-        let identity_reconcile_backoff_wait = self.identity_reconcile_next_backoff_wait();
+        // Deferred member custody re-attempts share this backoff deadline wake.
+        let identity_reconcile_backoff_wait = match (
+            self.identity_reconcile_next_backoff_wait(),
+            self.deferred_member_custody_next_wait(),
+        ) {
+            (Some(identity), Some(custody)) => Some(identity.min(custody)),
+            (identity, custody) => identity.or(custody),
+        };
         let ready_deferred = deferred_commands
             .iter()
             .position(|routed| !self.resume_member_control_is_pending(&routed.cmd));
@@ -29729,6 +30155,7 @@ impl MobActor {
                     }
                     RegularActorWake::IdentityBackoffDeadline => {
                         self.enqueue_due_identity_reconcile_backoffs();
+                        boxed_arm_future(|| self.reattempt_due_deferred_member_custody()).await;
                         return ActorLoopWakeSelection::Continue;
                     }
                     RegularActorWake::IdentitySafetyScan => {
@@ -30910,11 +31337,16 @@ impl MobActor {
                 .await
         })
         .await
-        .map_err(|error| {
-            MobError::Internal(format!(
+        .map_err(|error| match error {
+            // Another runtime owner hosts the session, or its claim cannot be
+            // taken: the typed hosting refusal, never an internal error.
+            meerkat_runtime::RuntimeBindingsError::Hosting(_, cause) => {
+                MobError::SessionError(cause)
+            }
+            error => MobError::Internal(format!(
                 "restore operation owner binding failed for member '{}': {error}",
                 entry.agent_identity
-            ))
+            )),
         })?;
         if bindings.session_id() != &generated_owner_session_id {
             return Err(MobError::Internal(format!(
@@ -30952,7 +31384,8 @@ impl MobActor {
                 .await?;
         } else {
             match seam {
-                RestoredOperationBindingSeam::ActorStartup => {
+                RestoredOperationBindingSeam::ActorStartup
+                | RestoredOperationBindingSeam::DeferredReattempt => {
                     io.provisioner
                         .bind_member_owner_context(
                             &entry.member_ref,
@@ -31047,6 +31480,16 @@ impl MobActor {
             .cloned()
             .collect::<Vec<_>>();
         for entry in entries {
+            #[cfg(any(test, feature = "test-support"))]
+            let entry = {
+                let mut entry = entry;
+                super::apply_restore_tuple_fault_for_test(
+                    &self.definition.id,
+                    crate::MemberCustodyRestore::CleanupDelivery,
+                    &mut entry,
+                );
+                entry
+            };
             let identity = mob_dsl::AgentIdentity::from_domain(&entry.agent_identity);
             let runtime = mob_dsl::AgentRuntimeId::from_domain(&entry.agent_runtime_id);
             let state = self.dsl_authority.state();
@@ -31130,8 +31573,13 @@ impl MobActor {
             .adapter
             .prepare_local_session_bindings(session.clone())
             .await
-            .map_err(|error| {
-                MobError::Internal(format!("prepare local cleanup delivery: {error}"))
+            .map_err(|error| match error {
+                // Another runtime owner hosts the session, or its claim cannot
+                // be taken: the typed hosting refusal, never an internal error.
+                meerkat_runtime::RuntimeBindingsError::Hosting(_, cause) => {
+                    MobError::SessionError(cause)
+                }
+                error => MobError::Internal(format!("prepare local cleanup delivery: {error}")),
             })?;
         // A cold start can re-register a session whose runtime already
         // stopped, which clears its member binding; the unbound endpoint
@@ -31168,6 +31616,184 @@ impl MobActor {
         Ok(())
     }
 
+    /// Defer `identity`'s startup `restore` of its custody for `session`
+    /// instead of failing the whole start: the member keeps its durable state
+    /// (Broken, or Retiring), the mob starts, and every operation that acts on
+    /// the member's session re-attempts the restore first
+    /// ([`Self::reattempt_deferred_member_custody`]), as does the identity
+    /// reconcile's backoff wake. `cause` is the typed failure the start met.
+    pub(super) fn defer_member_custody(
+        &mut self,
+        identity: AgentIdentity,
+        session: SessionId,
+        restore: crate::MemberCustodyRestore,
+        cause: MobError,
+    ) {
+        tracing::warn!(
+            mob_id = %self.definition.id,
+            member = %identity,
+            session_id = %session,
+            restore = restore.as_str(),
+            cause = %cause,
+            "member custody restore deferred: the mob starts, and an operation on the member \
+             re-attempts the restore first; it succeeds once the cause clears, for a session \
+             another runtime owner hosts once that owner stops or releases the session"
+        );
+        self.deferred_member_custody
+            .defer(identity, session, restore, cause, Instant::now());
+    }
+
+    /// Re-attempt the custody restore deferred for `identity` before an
+    /// operation acts on the member's session.
+    ///
+    /// Without an entry this answers Ok at once. When the restore succeeds,
+    /// the entry is removed and the caller proceeds. When it fails with a
+    /// cause the start may defer
+    /// ([`MobError::is_deferrable_custody_cause`]), the entry stays with its
+    /// next attempt backed off, and the caller gets
+    /// [`MobError::MemberCustodyDeferred`]: typed, scoped to this operation,
+    /// with nothing done to the member's session. Any other failure is
+    /// returned as it is, its next attempt backed off as well.
+    pub(super) async fn reattempt_deferred_member_custody(
+        &mut self,
+        identity: &AgentIdentity,
+    ) -> Result<(), MobError> {
+        let Some((session, restore)) = self.deferred_member_custody.pending(identity) else {
+            return Ok(());
+        };
+        let outcome = self
+            .attempt_deferred_member_custody_restore(identity, &session, restore)
+            .await;
+        let restored = outcome.is_ok();
+        let settled = self
+            .deferred_member_custody
+            .settle(identity, outcome, Instant::now());
+        if restored {
+            tracing::info!(
+                mob_id = %self.definition.id,
+                member = %identity,
+                session_id = %session,
+                restore = restore.as_str(),
+                "deferred member custody restore succeeded"
+            );
+        }
+        settled
+    }
+
+    /// One attempt at `identity`'s deferred `restore` for `session`: the
+    /// restore the start ran, the member's operation binding or a retiring
+    /// member's local cleanup delivery. A member no longer in the roster has
+    /// nothing left to restore.
+    async fn attempt_deferred_member_custody_restore(
+        &mut self,
+        identity: &AgentIdentity,
+        session: &SessionId,
+        restore: crate::MemberCustodyRestore,
+    ) -> Result<(), MobError> {
+        #[cfg(feature = "runtime-adapter")]
+        {
+            let Some(io) = self.resume_operation_binding_io() else {
+                return Ok(());
+            };
+            let Some(entry) = self.roster.read().await.get(identity).cloned() else {
+                return Ok(());
+            };
+            match restore {
+                crate::MemberCustodyRestore::StartupBinding => {
+                    match self.prepare_restored_member_operation_binding(entry)? {
+                        Some(plan) => {
+                            Self::realize_restored_member_operation_binding(
+                                io,
+                                plan,
+                                RestoredOperationBindingSeam::DeferredReattempt,
+                            )
+                            .await
+                        }
+                        None => Ok(()),
+                    }
+                }
+                crate::MemberCustodyRestore::CleanupDelivery => {
+                    self.restore_member_local_cleanup_delivery(&io, &entry, session)
+                        .await
+                }
+            }
+        }
+        #[cfg(not(feature = "runtime-adapter"))]
+        {
+            let _ = (session, restore);
+            Ok(())
+        }
+    }
+
+    /// Re-attempt every deferred custody restore before a destroy; the first
+    /// that stays deferred (or fails) refuses the destroy.
+    async fn reattempt_deferred_member_custody_for_destroy(
+        &mut self,
+    ) -> Result<(), super::handle::MobDestroyError> {
+        for identity in self.deferred_member_custody.identities() {
+            self.reattempt_deferred_member_custody(&identity)
+                .await
+                .map_err(super::handle::MobDestroyError::from)?;
+        }
+        Ok(())
+    }
+
+    /// The deferred custody re-attempts share the identity reconcile's backoff
+    /// deadline wake: the time until the earliest due entry, or `None` with no
+    /// entry, or while a Shutdown's runtime teardown or a resume's topology
+    /// mutation is in progress.
+    fn deferred_member_custody_next_wait(&self) -> Option<Duration> {
+        if self.pending_shutdown_teardown.is_some() {
+            return None;
+        }
+        #[cfg(feature = "runtime-adapter")]
+        if self.resume_topology_mutation_pending() {
+            return None;
+        }
+        self.deferred_member_custody.next_wait(Instant::now())
+    }
+
+    /// Re-attempt every deferred custody restore whose backoff elapsed. A
+    /// failure keeps its entry with the next attempt backed off; the
+    /// operation that next acts on the member re-attempts as well.
+    async fn reattempt_due_deferred_member_custody(&mut self) {
+        if self.deferred_member_custody_next_wait().is_none() {
+            return;
+        }
+        let due = self.deferred_member_custody.due(Instant::now());
+        for identity in due {
+            match self.reattempt_deferred_member_custody(&identity).await {
+                Ok(()) => {}
+                // Still deferred: reported at the identity reconcile's
+                // power-of-two checkpoints, so a long deferral stays visible
+                // without a line per attempt.
+                Err(MobError::MemberCustodyDeferred { .. }) => {
+                    if let Some(entry) = self.deferred_member_custody.get(&identity)
+                        && identity_reconcile_failure_should_log(entry.attempts)
+                    {
+                        tracing::warn!(
+                            mob_id = %self.definition.id,
+                            member = %identity,
+                            session_id = %entry.session,
+                            restore = entry.restore.as_str(),
+                            attempts = entry.attempts,
+                            cause = %entry.cause,
+                            "member custody restore still deferred"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        mob_id = %self.definition.id,
+                        member = %identity,
+                        error = %error,
+                        "deferred member custody re-attempt failed; it is retried after its backoff"
+                    );
+                }
+            }
+        }
+    }
+
     /// The persisted session of a member the start restores without a live
     /// actor, read once its durable tail is settled: the session a retiring
     /// member's local cleanup delivery restores, or the session whose
@@ -31182,7 +31808,8 @@ impl MobActor {
     /// every start. The tail is settled first, through the store-owned
     /// recovery the resume path runs (a proven continuation is adopted, an
     /// unprovable one is kept intact), and the session is read once more; a
-    /// tail the recovery keeps still refuses, typed, as before.
+    /// tail the recovery keeps still refuses, typed:
+    /// [`MobError::MemberDurableTailUnprovable`].
     ///
     /// The settle runs under this runtime owner's hosting claim for the
     /// session (#1813), taken for the settle alone; the second read takes
@@ -31227,7 +31854,19 @@ impl MobActor {
                     }
                     return Err(error.into());
                 }
-                Ok(io.session_service.load_persisted_session(session).await?)
+                // A tail the recovery kept still reads as a revision conflict
+                // at the boundary: that is the typed unprovable-tail outcome.
+                // Only this read after the settle yields it; a conflict from
+                // any other read keeps its own error.
+                match io.session_service.load_persisted_session(session).await {
+                    Err(error) if is_transcript_revision_conflict(&error) => {
+                        Err(MobError::MemberDurableTailUnprovable {
+                            member_id: member.clone(),
+                            session_id: session.clone(),
+                        })
+                    }
+                    loaded => Ok(loaded?),
+                }
             }
             loaded => Ok(loaded?),
         }
@@ -31240,6 +31879,16 @@ impl MobActor {
         };
         let entries = self.roster.read().await.list().cloned().collect::<Vec<_>>();
         for entry in entries {
+            #[cfg(any(test, feature = "test-support"))]
+            let entry = {
+                let mut entry = entry;
+                super::apply_restore_tuple_fault_for_test(
+                    &self.definition.id,
+                    crate::MemberCustodyRestore::StartupBinding,
+                    &mut entry,
+                );
+                entry
+            };
             // A member whose host refused its registration at this boot keeps
             // no registration and no owner context until a host-approved
             // materialization: the refusal removed the registration it was
@@ -31248,16 +31897,49 @@ impl MobActor {
             if self.member_registration_refused(&entry.agent_identity) {
                 continue;
             }
-            if let Some(plan) = self.prepare_restored_member_operation_binding(entry)? {
-                Self::realize_restored_member_operation_binding(
-                    io.clone(),
-                    plan,
-                    RestoredOperationBindingSeam::ActorStartup,
-                )
-                .await?;
+            let Some(plan) = self.prepare_restored_member_operation_binding(entry)? else {
+                continue;
+            };
+            let identity = plan.entry.agent_identity.clone();
+            let session = plan.owner_session_id.clone();
+            let deferrable = plan.placed_operation.is_none() && self.member_is_broken(&identity);
+            match Self::realize_restored_member_operation_binding(
+                io.clone(),
+                plan,
+                RestoredOperationBindingSeam::ActorStartup,
+            )
+            .await
+            {
+                Ok(()) => {}
+                // A local member whose restore already failed at this start
+                // (it is Broken) does not stop the whole mob when its session
+                // is hosted by another runtime owner, its hosting claim
+                // cannot be taken, or its durable tail could not be proven:
+                // its custody restore is deferred, and every operation on the
+                // member re-attempts it first. Any other failure still stops
+                // the start.
+                Err(cause) if deferrable && cause.is_deferrable_custody_cause() => {
+                    self.defer_member_custody(
+                        identity,
+                        session,
+                        crate::MemberCustodyRestore::StartupBinding,
+                        cause,
+                    );
+                }
+                Err(error) => return Err(error),
             }
         }
         Ok(())
+    }
+
+    /// Whether MobMachine records `agent_identity` Broken: its restore failed.
+    #[cfg(feature = "runtime-adapter")]
+    fn member_is_broken(&self, agent_identity: &AgentIdentity) -> bool {
+        self.dsl_authority
+            .state()
+            .member_lifecycle_for_identity(&mob_dsl::AgentIdentity::from_domain(agent_identity))
+            .status
+            == mob_dsl::MobMemberLifecycleStatus::Broken
     }
 
     #[cfg(not(feature = "runtime-adapter"))]
@@ -40591,6 +41273,12 @@ impl MobActor {
             let _ = reply_tx.send(Err(error));
             return;
         }
+        // A Broken member's session is restored only through its custody
+        // restore; a live open would recover it outside that restore.
+        if let Err(error) = self.ensure_member_not_broken(&agent_identity).await {
+            let _ = reply_tx.send(Err(error));
+            return;
+        }
         let lane = match self.member_live_lane(&agent_identity).await {
             Ok(lane) => lane,
             Err(error) => {
@@ -45894,6 +46582,13 @@ impl MobActor {
     ) -> Result<RespawnProgress, super::handle::MobRespawnError> {
         use super::handle::MobRespawnError;
 
+        // As in `handle_respawn`, which re-attempts first for every member
+        // (a placed member has no local session to defer): a member whose
+        // startup custody restore was deferred gets it re-attempted before
+        // the respawn acts on it.
+        self.reattempt_deferred_member_custody(&agent_identity)
+            .await
+            .map_err(MobRespawnError::from)?;
         if !snapshot.cleanup_retry {
             self.preview_dsl_input(
                 mob_dsl::MobMachineInput::Respawn {
@@ -46117,6 +46812,12 @@ impl MobActor {
     ) -> Result<RespawnProgress, super::handle::MobRespawnError> {
         use super::handle::MobRespawnError;
 
+        // A member whose startup custody restore was deferred gets it
+        // re-attempted before the respawn reads the member's session (its
+        // retained tool restrictions) or retires it.
+        self.reattempt_deferred_member_custody(&agent_identity)
+            .await
+            .map_err(MobRespawnError::from)?;
         let explicit_successor = successor_spec.is_some();
         let (placed_host, snapshot, replacement_spec, original_identity) =
             boxed_arm_future(|| async {
@@ -49876,6 +50577,13 @@ impl MobActor {
     async fn handle_destroy(
         &mut self,
     ) -> Result<super::handle::MobDestroyReport, super::handle::MobDestroyError> {
+        // A destroy acts on every member, so each member whose startup custody
+        // restore was deferred gets it re-attempted first. One that stays
+        // deferred refuses the whole destroy before it reloads, writes or
+        // retires anything; it names the member, its session and the cause
+        // (for a session another runtime owner hosts: stop that owner, or wait
+        // for it to release the session), and the destroy can be retried.
+        boxed_arm_future(|| self.reattempt_deferred_member_custody_for_destroy()).await?;
         // A member whose runtime requires a durability reload would hold the
         // destroy in its ingress detach forever. Reload each such member
         // before any destroy write, so a reload that fails leaves nothing to

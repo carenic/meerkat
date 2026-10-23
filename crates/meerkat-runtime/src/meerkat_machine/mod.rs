@@ -302,7 +302,11 @@ pub fn standalone_tool_visibility_owner(
 }
 
 /// Error type for [`MeerkatMachine::prepare_bindings`].
+///
+/// Non-exhaustive: a later release can add a refusal without breaking a
+/// downstream match, which needs a wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RuntimeBindingsError {
     /// Session was not found after registration (should not happen in practice).
     #[error("session {0} not found in runtime adapter after registration")]
@@ -314,15 +318,38 @@ pub enum RuntimeBindingsError {
     RegistrationNotCurrent(SessionId),
     #[error("materialization registration for session {0} has another owner")]
     RegistrationOwned(SessionId),
+    /// This runtime owner may not host the session: another runtime owner on
+    /// the realm hosts it ([`meerkat_core::SessionError::ServedElsewhere`]),
+    /// or its hosting claim cannot be taken
+    /// ([`meerkat_core::SessionError::HostingUnavailable`]). The typed
+    /// session refusal is carried as is, so a caller can tell it from a
+    /// preparation failure and keep its wire form.
+    #[error("runtime bindings for session {0} refused by session hosting: {1}")]
+    Hosting(SessionId, meerkat_core::SessionError),
 }
 
 impl RuntimeBindingsError {
+    /// The bindings error for a driver error a preparation stopped at: a
+    /// hosting refusal keeps its typed session error; any other error stays a
+    /// preparation failure with its message.
+    pub(crate) fn from_preparation_error(
+        session_id: SessionId,
+        error: &RuntimeDriverError,
+    ) -> Self {
+        match error.hosting_session_error() {
+            Some(cause) => Self::Hosting(session_id, cause),
+            None => Self::PrepareFailed(session_id, error.to_string()),
+        }
+    }
+
     /// Whether preparation was refused before this call reserved a
     /// materialization claim, inserted a registration, or installed handles.
     ///
     /// Both registration verdicts are returned only from checks that run
     /// before any mutation, so a caller may treat such a failed attempt as
-    /// proven no-effect rather than as an unproven cleanup obligation.
+    /// proven no-effect rather than as an unproven cleanup obligation. A
+    /// hosting refusal is not claimed as no-effect: a caller keeps its
+    /// cleanup open, as for any other preparation failure.
     #[must_use]
     pub fn rejected_before_effect(&self) -> bool {
         matches!(

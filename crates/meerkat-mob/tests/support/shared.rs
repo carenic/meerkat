@@ -678,6 +678,9 @@ pub struct FailingOnceSessionService {
     fail_projection_drain: bool,
     projection_drain_failed_once: AtomicBool,
     recorded_creates: std::sync::Mutex<Vec<RecordedMemberCreate>>,
+    keep_durable_tails: AtomicBool,
+    fail_durable_tail_settles: AtomicBool,
+    durable_tail_settle_failed: AtomicBool,
 }
 
 /// The build facts of one member create: one a fixture host's session
@@ -729,6 +732,9 @@ impl FailingOnceSessionService {
             fail_projection_drain,
             projection_drain_failed_once: AtomicBool::new(false),
             recorded_creates: std::sync::Mutex::new(Vec::new()),
+            keep_durable_tails: AtomicBool::new(false),
+            fail_durable_tail_settles: AtomicBool::new(false),
+            durable_tail_settle_failed: AtomicBool::new(false),
         })
     }
 
@@ -745,6 +751,24 @@ impl FailingOnceSessionService {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(RecordedMemberCreate::of(req));
+    }
+
+    /// Keep every durable tail at a cold start: the settle answers as the
+    /// store-owned recovery does for a tail it cannot prove (it keeps the
+    /// tail intact), without running it.
+    pub fn keep_durable_tails_unsettled(&self) {
+        self.keep_durable_tails.store(true, Ordering::SeqCst);
+    }
+
+    /// Fail every durable tail settle at a cold start as a session store
+    /// failure would, without running it.
+    pub fn fail_durable_tail_settles_in_the_store(&self) {
+        self.fail_durable_tail_settles.store(true, Ordering::SeqCst);
+    }
+
+    /// True once a durable tail settle failed as injected.
+    pub fn durable_tail_settle_failed(&self) -> bool {
+        self.durable_tail_settle_failed.load(Ordering::SeqCst)
     }
 
     /// True once the injected failure has fired.
@@ -997,6 +1021,16 @@ impl meerkat_mob::MobSessionService for FailingOnceSessionService {
         &self,
         session_id: &meerkat_core::SessionId,
     ) -> Result<(), meerkat_core::service::SessionError> {
+        if self.fail_durable_tail_settles.load(Ordering::SeqCst) {
+            self.durable_tail_settle_failed
+                .store(true, Ordering::SeqCst);
+            return Err(meerkat_core::service::SessionError::Store(
+                "injected session store failure while settling a durable tail".into(),
+            ));
+        }
+        if self.keep_durable_tails.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         self.inner
             .settle_durable_tail_before_cold_start(session_id)
             .await

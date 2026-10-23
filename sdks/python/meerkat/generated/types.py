@@ -2438,6 +2438,15 @@ class WireMemberProgressSnapshot:
 
 
 @dataclass
+class WireMemberCustodyDeferral:
+    """A member's custody restore a mob start deferred, as its status shows it.
+Advisory: its vocabularies may grow, and a reader surfaces a value it does
+not know instead of refusing it."""
+    cause: WireMemberCustodyDeferralCause
+    restore: WireMemberCustodyRestore
+
+
+@dataclass
 class WireMobToolConfig:
     """Tool configuration embedded in a wire mob profile override."""
     builtins: Optional[bool] = None
@@ -3031,6 +3040,7 @@ class MobMemberStatusResult:
     comms_reachability: Optional[WireReachability] = None
     control_reachability: Optional[WireReachability] = None
     current_session_id: Optional[str] = None
+    custody_deferred: Optional[WireMemberCustodyDeferral] = None
     detached_jobs: Optional[dict[str, Any]] = None
     error: Optional[str] = None
     external_member: Optional[Any] = None
@@ -7062,6 +7072,16 @@ class WireContinuationStatusRefused(TypedDict, total=False):
     state: Required[Literal['refused']]
 
 WireContinuationStatus = WireContinuationStatusPending | WireContinuationStatusAdmitted | WireContinuationStatusStranded | WireContinuationStatusRefused
+
+# Which startup restore of a member's custody a mob start deferred. The
+# vocabulary may grow: a reader surfaces a restore it does not know
+# instead of refusing it.
+WireMemberCustodyRestore = Literal['startup_binding', 'cleanup_delivery']
+
+# The cause a deferred member custody restore last met. The vocabulary
+# may grow: a reader surfaces a cause it does not know instead of
+# refusing it.
+WireMemberCustodyDeferralCause = Literal['served_elsewhere', 'hosting_unavailable', 'durable_tail_unprovable']
 
 # Lifecycle status of a flow run on the wire. Mirrors
 # `meerkat_mob::MobRunStatus` so consumers branch on a closed type rather than

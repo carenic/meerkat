@@ -123,7 +123,8 @@ pub use definition::{
 pub use error::{
     FlowStepDispatchRejectKind, ForkSourceUnavailableCause, ForkedParticipantLeaseOperation,
     ForkedParticipantOwnerHostRejection, ForkedParticipantSourceRejection,
-    IncarnationInconsistency, MemberProvisionFailureCause, MemberRegistrationHookCall,
+    IncarnationInconsistency, MemberCustodyDeferral, MemberCustodyDeferralCause,
+    MemberCustodyRestore, MemberProvisionFailureCause, MemberRegistrationHookCall,
     MemberRuntimeDetachment, MemberSendIdempotencyRefusal, MobDefinitionProjectionMismatchKind,
     MobError, MobFailureClass, OperatorAuthorityCeilingRefusal, RuntimeEffectKind,
 };
@@ -362,9 +363,9 @@ pub use runtime::{
 #[doc(hidden)]
 pub use runtime::{
     ForkSupervisorExitForTest, IdentityRecoveryFailStopPoint, MemberStatusDeadlineTestObservation,
-    MemberTurnAdmissionTestStage, arm_identity_recovery_fail_stop_for_test,
-    fail_stop_next_actor_start_for_test, member_operator_tool_defs_for_test,
-    member_status_deadline_after_snapshot_wait_for_test,
+    MemberTurnAdmissionTestStage, RestoreTupleFault, arm_identity_recovery_fail_stop_for_test,
+    fail_stop_next_actor_start_for_test, fault_next_restore_tuple_for_test,
+    member_operator_tool_defs_for_test, member_status_deadline_after_snapshot_wait_for_test,
 };
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 pub use runtime::{HeldSpawn, HeldSpawnSettlement, HeldSpawnStart, abort_all_held};

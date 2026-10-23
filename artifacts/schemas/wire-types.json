@@ -129596,6 +129596,59 @@
         "description": "Opaque host reference: the host's canonical comms `PeerId` string.",
         "type": "string"
       },
+      "WireMemberCustodyDeferral": {
+        "description": "A member's custody restore a mob start deferred, as its status shows it.\nAdvisory: its vocabularies may grow, and a reader surfaces a value it does\nnot know instead of refusing it.",
+        "properties": {
+          "cause": {
+            "$ref": "#/$defs/WireMemberCustodyDeferralCause",
+            "description": "The cause its last attempt met."
+          },
+          "restore": {
+            "$ref": "#/$defs/WireMemberCustodyRestore",
+            "description": "The deferred restore."
+          }
+        },
+        "required": [
+          "restore",
+          "cause"
+        ],
+        "type": "object"
+      },
+      "WireMemberCustodyDeferralCause": {
+        "description": "The cause a deferred member custody restore last met. The vocabulary\nmay grow: a reader surfaces a cause it does not know instead of\nrefusing it.",
+        "oneOf": [
+          {
+            "const": "served_elsewhere",
+            "description": "Another runtime owner on the realm hosts the member's session.",
+            "type": "string"
+          },
+          {
+            "const": "hosting_unavailable",
+            "description": "The member session's hosting claim cannot be taken on this realm.",
+            "type": "string"
+          },
+          {
+            "const": "durable_tail_unprovable",
+            "description": "The member's durable tail could not be proven, and its recovery kept\nit.",
+            "type": "string"
+          }
+        ]
+      },
+      "WireMemberCustodyRestore": {
+        "description": "Which startup restore of a member's custody a mob start deferred. The\nvocabulary may grow: a reader surfaces a restore it does not know\ninstead of refusing it.",
+        "oneOf": [
+          {
+            "const": "startup_binding",
+            "description": "The operation binding of a member whose restore failed at the start.",
+            "type": "string"
+          },
+          {
+            "const": "cleanup_delivery",
+            "description": "A retiring member's local cleanup delivery custody.",
+            "type": "string"
+          }
+        ]
+      },
       "WireMemberHealthClass": {
         "enum": [
           "healthy",
@@ -129940,6 +129993,17 @@
           "string",
           "null"
         ]
+      },
+      "custody_deferred": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/WireMemberCustodyDeferral"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "Present when a mob start deferred the member's custody restore instead\nof failing the whole start: which restore, and the cause its last\nattempt met. Every operation on the member re-attempts it first.\nAbsent-omitted for byte-compat with released SDKs."
       },
       "detached_jobs": {
         "anyOf": [
@@ -178962,6 +179026,102 @@
     ],
     "title": "WireMcpLoggedOut",
     "type": "object"
+  },
+  "WireMemberCustodyDeferral": {
+    "$defs": {
+      "WireMemberCustodyDeferralCause": {
+        "description": "The cause a deferred member custody restore last met. The vocabulary\nmay grow: a reader surfaces a cause it does not know instead of\nrefusing it.",
+        "oneOf": [
+          {
+            "const": "served_elsewhere",
+            "description": "Another runtime owner on the realm hosts the member's session.",
+            "type": "string"
+          },
+          {
+            "const": "hosting_unavailable",
+            "description": "The member session's hosting claim cannot be taken on this realm.",
+            "type": "string"
+          },
+          {
+            "const": "durable_tail_unprovable",
+            "description": "The member's durable tail could not be proven, and its recovery kept\nit.",
+            "type": "string"
+          }
+        ]
+      },
+      "WireMemberCustodyRestore": {
+        "description": "Which startup restore of a member's custody a mob start deferred. The\nvocabulary may grow: a reader surfaces a restore it does not know\ninstead of refusing it.",
+        "oneOf": [
+          {
+            "const": "startup_binding",
+            "description": "The operation binding of a member whose restore failed at the start.",
+            "type": "string"
+          },
+          {
+            "const": "cleanup_delivery",
+            "description": "A retiring member's local cleanup delivery custody.",
+            "type": "string"
+          }
+        ]
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "A member's custody restore a mob start deferred, as its status shows it.\nAdvisory: its vocabularies may grow, and a reader surfaces a value it does\nnot know instead of refusing it.",
+    "properties": {
+      "cause": {
+        "$ref": "#/$defs/WireMemberCustodyDeferralCause",
+        "description": "The cause its last attempt met."
+      },
+      "restore": {
+        "$ref": "#/$defs/WireMemberCustodyRestore",
+        "description": "The deferred restore."
+      }
+    },
+    "required": [
+      "restore",
+      "cause"
+    ],
+    "title": "WireMemberCustodyDeferral",
+    "type": "object"
+  },
+  "WireMemberCustodyDeferralCause": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "The cause a deferred member custody restore last met. The vocabulary\nmay grow: a reader surfaces a cause it does not know instead of\nrefusing it.",
+    "oneOf": [
+      {
+        "const": "served_elsewhere",
+        "description": "Another runtime owner on the realm hosts the member's session.",
+        "type": "string"
+      },
+      {
+        "const": "hosting_unavailable",
+        "description": "The member session's hosting claim cannot be taken on this realm.",
+        "type": "string"
+      },
+      {
+        "const": "durable_tail_unprovable",
+        "description": "The member's durable tail could not be proven, and its recovery kept\nit.",
+        "type": "string"
+      }
+    ],
+    "title": "WireMemberCustodyDeferralCause"
+  },
+  "WireMemberCustodyRestore": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Which startup restore of a member's custody a mob start deferred. The\nvocabulary may grow: a reader surfaces a restore it does not know\ninstead of refusing it.",
+    "oneOf": [
+      {
+        "const": "startup_binding",
+        "description": "The operation binding of a member whose restore failed at the start.",
+        "type": "string"
+      },
+      {
+        "const": "cleanup_delivery",
+        "description": "A retiring member's local cleanup delivery custody.",
+        "type": "string"
+      }
+    ],
+    "title": "WireMemberCustodyRestore"
   },
   "WireMemberHealthClass": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",

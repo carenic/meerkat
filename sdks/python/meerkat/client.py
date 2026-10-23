@@ -202,6 +202,8 @@ from .generated.types import (
     WireReachability,
     WireMemberPreviewUnavailable,
     WireMemberRegistrationHookCall,
+    WireMemberCustodyDeferralCause,
+    WireMemberCustodyRestore,
     WireExternalRouteInstallObligation,
     WireRouteInstallObligation,
     WireRuntimeBinding,
@@ -236,6 +238,7 @@ from .mob import (
     MobKickoffMemberSnapshot,
     MobLifecycleAction,
     MobMember,
+    MobMemberCustodyDeferral,
     MobMemberRef,
     MobMemberSnapshot,
     MobPeerConnectivity,
@@ -4002,6 +4005,9 @@ class MeerkatClient:
         registration_refusal = self._parse_member_registration_refusal(
             result, "Invalid mob/member_status response"
         )
+        custody_deferred = self._parse_member_custody_deferral(
+            result, "Invalid mob/member_status response"
+        )
         return {
             "status": self._require_string_field(
                 result,
@@ -4078,6 +4084,11 @@ class MeerkatClient:
                 if registration_refusal is not None
                 else {}
             ),
+            **(
+                {"custody_deferred": custody_deferred}
+                if custody_deferred is not None
+                else {}
+            ),
         }
 
     async def wait_mob_kickoff(
@@ -4116,6 +4127,9 @@ class MeerkatClient:
                 entry, "Invalid mob/wait_kickoff response"
             )
             registration_refusal = self._parse_member_registration_refusal(
+                entry, "Invalid mob/wait_kickoff response"
+            )
+            custody_deferred = self._parse_member_custody_deferral(
                 entry, "Invalid mob/wait_kickoff response"
             )
             normalized.append(
@@ -4164,6 +4178,11 @@ class MeerkatClient:
                     **(
                         {"registration_refusal": registration_refusal}
                         if registration_refusal is not None
+                        else {}
+                    ),
+                    **(
+                        {"custody_deferred": custody_deferred}
+                        if custody_deferred is not None
                         else {}
                     ),
                 }
@@ -4208,6 +4227,9 @@ class MeerkatClient:
             registration_refusal = self._parse_member_registration_refusal(
                 entry, "Invalid mob/wait_ready response"
             )
+            custody_deferred = self._parse_member_custody_deferral(
+                entry, "Invalid mob/wait_ready response"
+            )
             normalized.append(
                 {
                     "agent_identity": self._require_string_field(
@@ -4254,6 +4276,11 @@ class MeerkatClient:
                     **(
                         {"registration_refusal": registration_refusal}
                         if registration_refusal is not None
+                        else {}
+                    ),
+                    **(
+                        {"custody_deferred": custody_deferred}
+                        if custody_deferred is not None
                         else {}
                     ),
                 }
@@ -8236,6 +8263,50 @@ class MeerkatClient:
                 "INVALID_RESPONSE", f"{context}: invalid registration_refusal"
             )
         return cast(WireMemberRegistrationHookCall, value)
+
+    @staticmethod
+    def _parse_member_custody_deferral(
+        raw: dict[str, Any], context: str
+    ) -> MobMemberCustodyDeferral | None:
+        """Return the member's custody restore a mob start deferred.
+
+        Absent or ``null`` means no restore is deferred. The field is
+        advisory and its vocabularies may grow: a ``restore`` or ``cause``
+        this SDK does not know is read as ``{"unknown": <the value>}``, and a
+        field it does not know is ignored, so a newer server never fails the
+        read. A value that is not an object, or a restore or cause that is
+        not a string, is malformed and fails closed.
+        """
+        value = raw.get("custody_deferred")
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise MeerkatError(
+                "INVALID_RESPONSE", f"{context}: invalid custody_deferred"
+            )
+        restore = value.get("restore")
+        if not isinstance(restore, str):
+            raise MeerkatError(
+                "INVALID_RESPONSE", f"{context}: invalid custody_deferred.restore"
+            )
+        cause = value.get("cause")
+        if not isinstance(cause, str):
+            raise MeerkatError(
+                "INVALID_RESPONSE", f"{context}: invalid custody_deferred.cause"
+            )
+        return {
+            "restore": (
+                cast(WireMemberCustodyRestore, restore)
+                if restore in {"startup_binding", "cleanup_delivery"}
+                else {"unknown": restore}
+            ),
+            "cause": (
+                cast(WireMemberCustodyDeferralCause, cause)
+                if cause
+                in {"served_elsewhere", "hosting_unavailable", "durable_tail_unprovable"}
+                else {"unknown": cause}
+            ),
+        }
 
     @staticmethod
     def _optional_string_field(

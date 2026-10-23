@@ -164,8 +164,36 @@ classifier behind the new requeue option of a graceful stop:
 `UnregisterQueuedInputsDisposition::Stop` and `0`, the 0.9.4 behaviour, and
 add the arms (or a wildcard) where you match these enums exhaustively.
 
+#### Member custody at a mob start
+
+- `meerkat-runtime`: `RuntimeBindingsError` gains the variant
+  `Hosting(SessionId, SessionError)` and is now `#[non_exhaustive]`. Binding
+  preparation for a session another runtime owner hosts, or whose hosting
+  claim cannot be taken, returns it with the typed
+  `SessionError::ServedElsewhere` or `SessionError::HostingUnavailable`
+  instead of a `PrepareFailed` message.
+- `meerkat-contracts`: `MobMemberStatusResult` gains the field
+  `custody_deferred: Option<WireMemberCustodyDeferral>`. Its restore and
+  cause vocabularies may grow: `WireMemberCustodyRestore` and
+  `WireMemberCustodyDeferralCause` have an `Unknown(String)` variant for a
+  value this version does not know, and the SDKs report such a value as
+  `{"unknown": value}` instead of failing the read.
+
+**Do:** add a wildcard arm to any exhaustive match on `RuntimeBindingsError`,
+set `custody_deferred` (`None`) where you build `MobMemberStatusResult` with a
+struct literal, and handle the `Unknown` case where you read a custody
+restore or cause.
+
 ### Other behaviour changes
 
+- **A Broken member no longer stops a mob start:** when a member whose
+  restore already failed at a start cannot have its custody restored because
+  another runtime owner hosts its session, its hosting claim cannot be taken,
+  or its durable tail could not be proven, the start defers that restore and
+  the mob runs. The member stays Broken, its status shows `custody_deferred`,
+  and a respawn, retire or destroy of it answers
+  `MobError::MemberCustodyDeferred` until the restore succeeds. 0.9.4 stopped
+  the whole mob. See [Mobs](/guides/mobs).
 - **Crash recovery of scheduled deliveries:** a delivery whose executor died
   after an earlier attempt recorded its dispatch is reclaimed, also past its
   misfire deadline (up to five attempts), and redelivered without a fresh
@@ -224,6 +252,8 @@ add the arms (or a wildcard) where you match these enums exhaustively.
    or expired input's row after that. Treat `RequeuedAcrossStop` as "runs at
    the next start" (do not resubmit) and `RequeueExpired` as "resubmit if
    still wanted".
+7. Add a wildcard arm where you match `RuntimeBindingsError`, and set
+   `custody_deferred` in `MobMemberStatusResult` struct literals.
 
 ## Upgrading to 0.9.4
 

@@ -241,6 +241,8 @@ mod read_handle;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub use actor::fail_stop_next_actor_start_for_test;
+#[cfg(any(test, feature = "test-support"))]
+mod restore_fault_test_support;
 pub(crate) use handle::MemberTurnLlmIdentityAppliedSender;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
@@ -262,6 +264,11 @@ pub use provisioner::{
     arm_owned_actor_cleanup_released_boundary_pause_for_test,
     arm_owned_actor_cleanup_rollback_pause_for_test,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use restore_fault_test_support::apply_restore_tuple_fault_for_test;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use restore_fault_test_support::{RestoreTupleFault, fault_next_restore_tuple_for_test};
 
 /// Test-support seam: the operator tool definitions a mob member receives
 /// from `MobOperatorToolDispatcher` (local flavor), so the provider schema

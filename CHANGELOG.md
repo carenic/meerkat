@@ -501,6 +501,20 @@ them.
   details }` (`409` `SESSION_NOT_RUNNING`), appended last. The enum is
   exhaustive, so a `match` outside the crate needs the arm.
 
+- `meerkat-runtime`: `RuntimeBindingsError` gains the variant
+  `Hosting(SessionId, SessionError)` and is now `#[non_exhaustive]`. Binding
+  preparation for a session another runtime owner hosts, or whose hosting
+  claim cannot be taken, returns it with the typed
+  `SessionError::ServedElsewhere` or `SessionError::HostingUnavailable`
+  instead of a `PrepareFailed` message. The gate's findings: an added enum
+  variant and an enum marked non-exhaustive. A downstream match needs a
+  wildcard arm; `rejected_before_effect` stays false for the new variant.
+
+- `meerkat-contracts`: `MobMemberStatusResult` gains the field
+  `custody_deferred: Option<WireMemberCustodyDeferral>`, absent from the wire
+  unless the mob's start deferred the member's custody restore. Code that
+  builds the result with a struct literal sets it.
+
 ### Added
 
 - `MemberBinding::labels()`: the application labels the incarnation was
@@ -1034,6 +1048,31 @@ them.
   `retire_unpayloaded_browser_attempts` (by default retiring none), and
   `OAuthFlowRegistry` gains `holds_browser_payload`. The existing methods
   keep their signatures and errors; nothing changes on the wire.
+
+- `meerkat-mob`: `MobError::MemberCustodyDeferred { member_id, session_id,
+  restore, cause }`, the typed refusal of an operation on a member whose
+  custody restore the mob's start deferred, and `MemberCustodyRestore`
+  (`StartupBinding` or `CleanupDelivery`, `#[non_exhaustive]`), the restore
+  it names. The operation did nothing to the member's session. The mob
+  re-attempts the restore on its own backoff and before each operation on
+  that member, so a retry can pass once the cause clears. Its wire code,
+  failure class and durable resume hold are the cause's; its structured data
+  has kind `mob_member_custody_deferred` with the member, its session, the
+  restore, the cause's text and, when the cause has some, the cause's own
+  structured data as `cause_data`.
+
+- `meerkat-mob`: `MemberCustodyDeferral` (the deferred restore and the
+  `MemberCustodyDeferralCause` its last attempt met: `ServedElsewhere`,
+  `HostingUnavailable` or `DurableTailUnprovable`, both `#[non_exhaustive]`)
+  and `MobMemberSnapshot::custody_deferred`, which carries it for a member
+  whose custody restore the mob's start deferred. `meerkat-contracts` mirrors
+  them as `WireMemberCustodyDeferral`, `WireMemberCustodyRestore` and
+  `WireMemberCustodyDeferralCause`. The field is advisory and its vocabularies
+  may grow: the wire enums read a restore or cause they do not know as
+  `Unknown(value)` and write it back unchanged, and the Python, TypeScript
+  and Web SDKs surface it as `{"unknown": value}` and ignore a field they do
+  not know, instead of failing the read. A `custody_deferred` that is not an
+  object, or whose restore or cause is not a string, is still refused.
 
 ### Changed
 
@@ -1681,6 +1720,33 @@ them.
 - Python SDK: `compaction_failed` events decode `reason` as the tagged object the runtime sends
   (`{"kind": ...}`), keeping every field and future reason kinds. Before, valid events were reported as
   malformed.
+
+- `meerkat-mob`: a mob start no longer stops when it cannot restore the
+  operation binding of a member whose restore already failed at that start
+  because another runtime owner hosts the member's session, its hosting claim
+  cannot be taken, or its durable tail could not be proven. The mob runs, the
+  member stays Broken, and its custody restore is deferred, which the
+  member's status shows (`custody_deferred`). A respawn, a retire, a destroy,
+  an explicit resume and the identity reconcile each re-attempt the restore
+  first. While it still cannot restore, a respawn, a retire and a destroy
+  refuse with `MobError::MemberCustodyDeferred` and leave the member's
+  session as it was, an explicit resume still succeeds, and the reconcile
+  backs off. Once the cause clears, the next of them, or the mob's own
+  backoff, restores the member's custody and proceeds. Any other restore
+  failure, such as a restore tuple that diverges from the mob's authority or
+  a session store failure, still stops the start.
+
+- `meerkat-mob`: a mob start that cannot restore a member because another
+  runtime owner hosts its session reports the typed hosting refusal as the
+  startup failure's cause wherever the start prepares the member's runtime
+  bindings, not an internal preparation error. A member whose durable tail
+  its store-owned recovery kept (it could not prove the tail) is reported as
+  `MobError::MemberDurableTailUnprovable`, naming the member and its session
+  and carrying the `tail_held_for_recovery` resume hold, instead of a bare
+  transcript revision conflict. Where the start still fails on such a
+  member, that typed cause is what it reports; a member whose restore
+  already failed at that start is deferred instead (see the entry next to
+  this one).
 
 ## [0.9.4] - 2026-10-20
 

@@ -3971,37 +3971,69 @@ impl MobActor {
             }
             return;
         }
-        let mut redriven_refused = false;
-        if let Some(stuck) = self.stuck_retirements.get(&identity) {
-            if redrive || matches!(reply, RetirementReply::Owned) {
-                tracing::info!(
-                    mob_id = %self.definition.id,
-                    agent_identity = %identity,
-                    stage = %stuck.stage,
-                    cause = %stuck.cause,
-                    "re-driving stuck member retirement"
-                );
-                redriven_refused = stuck.registration_refused;
-                self.stuck_retirements.remove(&identity);
-            } else {
-                let error = MobError::MemberRetirementStuck {
-                    member_id: identity.clone(),
-                    stage: stuck.stage.as_str().to_string(),
-                    cause: Arc::clone(&stuck.cause),
-                };
-                match reply {
-                    RetirementReply::Retire(reply) | RetirementReply::BatchRetire(reply) => {
-                        let _ = reply.send(Err(error));
-                    }
-                    RetirementReply::Respawn { reply, .. } => {
-                        let _ = reply.send(Err(super::super::handle::MobRespawnError::from(error)));
-                    }
-                    RetirementReply::IdentityReconcile(_)
-                    | RetirementReply::SpawnRollback
-                    | RetirementReply::Owned => {}
+        let redriven = redrive || matches!(reply, RetirementReply::Owned);
+        if let Some(stuck) = self.stuck_retirements.get(&identity)
+            && !redriven
+        {
+            let error = MobError::MemberRetirementStuck {
+                member_id: identity.clone(),
+                stage: stuck.stage.as_str().to_string(),
+                cause: Arc::clone(&stuck.cause),
+            };
+            match reply {
+                RetirementReply::Retire(reply) | RetirementReply::BatchRetire(reply) => {
+                    let _ = reply.send(Err(error));
                 }
-                return;
+                RetirementReply::Respawn { reply, .. } => {
+                    let _ = reply.send(Err(super::super::handle::MobRespawnError::from(error)));
+                }
+                RetirementReply::IdentityReconcile(_)
+                | RetirementReply::SpawnRollback
+                | RetirementReply::Owned => {}
             }
+            return;
+        }
+        // Nothing below acts on the member's session before this point. A
+        // member whose startup custody restore was deferred gets that restore
+        // re-attempted first; while it stays deferred, the retirement answers
+        // typed and starts nothing, and a stuck retirement stays stuck.
+        if let Err(error) = self.reattempt_deferred_member_custody(&identity).await {
+            match reply {
+                RetirementReply::Retire(reply) | RetirementReply::BatchRetire(reply) => {
+                    let _ = reply.send(Err(error));
+                }
+                RetirementReply::Respawn { reply, .. } => {
+                    let _ = reply.send(Err(super::super::handle::MobRespawnError::from(error)));
+                }
+                RetirementReply::IdentityReconcile(authority) => {
+                    self.record_identity_reconcile_disposition(
+                        &identity,
+                        &authority,
+                        identity_actuation_error_disposition(&error),
+                    )
+                    .await;
+                    self.enqueue_identity_reconcile(identity);
+                }
+                // A spawn rollback's member was never restored at a start, so
+                // it has no deferred restore; an owned re-drive keeps its
+                // stuck entry for the next re-drive.
+                RetirementReply::SpawnRollback | RetirementReply::Owned => {}
+            }
+            return;
+        }
+        let mut redriven_refused = false;
+        if let Some(stuck) = self.stuck_retirements.get(&identity)
+            && redriven
+        {
+            tracing::info!(
+                mob_id = %self.definition.id,
+                agent_identity = %identity,
+                stage = %stuck.stage,
+                cause = %stuck.cause,
+                "re-driving stuck member retirement"
+            );
+            redriven_refused = stuck.registration_refused;
+            self.stuck_retirements.remove(&identity);
         }
         let entry = self.roster.read().await.get(&identity).cloned();
         let Some(entry) = entry else {
