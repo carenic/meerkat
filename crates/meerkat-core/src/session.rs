@@ -6713,20 +6713,52 @@ impl Session {
     /// ([`Self::retire_transcript_history`] never retires past that head).
     /// Only a checkpoint that moves the durable head over them lets
     /// retirement reach the bound.
+    ///
+    /// It reads only the graph this process already holds validated (one
+    /// installed by a materialization or a compaction): an unchanged graph is
+    /// never parsed or validated again for this check, and a graph that is
+    /// not held answers false.
     pub(crate) fn durable_head_holds_retirement(
         &self,
         retention: TranscriptHistoryRetention,
-    ) -> Result<bool, TranscriptEditError> {
-        if self.history_caches.durable_rewrite_count.is_none() {
-            return Ok(false);
+    ) -> bool {
+        self.durable_head_held_graph().is_some_and(|history| {
+            history.commit_count() - history.retired_count() > retention.retained_rewrites()
+        })
+    }
+
+    /// The graph this session holds validated in this process, when its
+    /// durable HeadCanonical head bounds retirement; `None` without a durable
+    /// head (a WholeBlob session retires after each compaction instead) or
+    /// when the graph is not held, so nothing parses or validates it here.
+    fn durable_head_held_graph(&self) -> Option<std::sync::Arc<TranscriptHistoryState>> {
+        if self.history_caches.durable_rewrite_count.is_none()
+            || self.transcript_history_metadata_validation
+                != TranscriptHistoryMetadataValidation::Validated
+        {
+            return None;
         }
-        let Some(history) = self.validated_transcript_history_state()? else {
-            return Ok(false);
-        };
-        Ok(
-            history.state().commit_count() - history.state().retired_count()
-                > retention.retained_rewrites(),
-        )
+        self.history_caches.shared_state.get()
+    }
+
+    /// Retire the live graph to `retention` after a checkpoint moved this
+    /// session's durable HeadCanonical head over its rewrites, and report the
+    /// graph's retired count for the run's boundary commit to apply to the
+    /// stored rows. Only a session with a durable head whose graph this
+    /// process holds validated does any work: an unchanged graph is never
+    /// parsed or validated again, and a session without a durable head
+    /// answers `None`.
+    pub(crate) fn retire_transcript_history_after_checkpoint(
+        &mut self,
+        retention: TranscriptHistoryRetention,
+    ) -> Result<Option<usize>, TranscriptEditError> {
+        if self.durable_head_held_graph().is_none() {
+            return Ok(None);
+        }
+        self.retire_transcript_history(retention)?;
+        Ok(self
+            .durable_head_held_graph()
+            .map(|history| history.retired_count()))
     }
 
     #[cfg(test)]
