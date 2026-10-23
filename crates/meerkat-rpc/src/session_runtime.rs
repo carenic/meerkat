@@ -5684,6 +5684,10 @@ impl SessionRuntime {
             // its per-call orchestrator.
             ingress_reconciler: None,
             actor_witness_capture,
+            // RPC's live methods address a session by its id: a mob member's
+            // session is opened through the mob's member live surface.
+            session_addressing:
+                meerkat::session_runtime::live_orchestration::LiveSessionAddressing::SessionScoped,
         }
     }
 

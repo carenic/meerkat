@@ -510,6 +510,11 @@ them.
   variant and an enum marked non-exhaustive. A downstream match needs a
   wildcard arm; `rejected_before_effect` stays false for the new variant.
 
+- `meerkat`: `LiveOrchestrator` gains the field `session_addressing`
+  (`LiveSessionAddressing`: `SessionScoped` or `MobMember`), so code that
+  builds it with a struct literal sets it. A surface that opens live channels
+  by session id passes `SessionScoped`; the member live host passes
+  `MobMember` (see Fixed).
 - `meerkat-contracts`: `MobMemberStatusResult` gains the field
   `custody_deferred: Option<WireMemberCustodyDeferral>`, absent from the wire
   unless the mob's start deferred the member's custody restore. Code that
@@ -1757,6 +1762,17 @@ them.
   restore already failed, is deferred instead (see the entries next to this
   one).
 
+- `meerkat`, `meerkat-rpc`: the session-scoped `live/open`, and the
+  projection, refresh-config, identity and precheck reads behind it, restored
+  a mob member's session from storage by its session id alone when it was
+  not live. That registered the member's session outside its mob, which
+  restores a member only after checking it (a member whose custody restore
+  was deferred stays down). It now refuses with `INVALID_PARAMS` (-32602) and
+  data kind `mob_member_session_addressed_by_id` (with the session, mob and
+  member) and restores nothing; `mob/member_live_open` opens the member
+  through its mob. A member session that is live opens as before.
+  `SessionError::mob_member_session_addressed_by_id` and
+  `SessionError::is_mob_member_session_addressed_by_id` name the refusal.
 - `meerkat-mob`: a mob restarted while another runtime owner on the realm
   hosts a retiring member's session now starts and runs. The start restores
   the retiring member's local cleanup delivery, which settles the session's

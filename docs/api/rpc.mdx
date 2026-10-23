@@ -2025,6 +2025,13 @@ the caller can address the owning session directly. In multi-host v1,
 controller `session/*` methods do not proxy a placed member's host-local
 session, so there is no controller-side WebRTC path to a placed member.
 
+The session-scoped `live/open` never restores a mob member's session from
+storage: the member's mob restores it, after checking the member. A member
+session that is not live answers `INVALID_PARAMS` (-32602) with data kind
+`mob_member_session_addressed_by_id` (and the session, mob and member), and
+nothing is restored. Open it through `mob/member_live_open`, which restores it
+through its mob; once it is live, the session-scoped flow can address it.
+
 Durable member role migration is not part of `mob/spawn`, profiles, or any
 public JSON-RPC/SDK params. The one-shot `resume_from_role` declaration exists
 only on trusted in-process `SpawnMemberSpec` and the private remote-host
