@@ -13954,7 +13954,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 admission,
             )
             .await;
-        let result = match result {
+        match result {
             Err((error, admission)) => {
                 let tail = self
                     .discard_replayed_run_provisional_tail(id, &discarded_run_id, &error)
@@ -13971,8 +13971,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 Err((error, admission))
             }
             ok => ok,
-        };
-        result
+        }
     }
 
     /// What `run_id`'s failure must respect about its re-base, read from the
@@ -14600,7 +14599,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 admission,
             )
             .await;
-        let result = match result {
+        match result {
             Err(error) => {
                 let tail = self
                     .discard_replayed_run_provisional_tail(id, &discarded_run_id, &error)
@@ -14616,8 +14615,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 }
             }
             ok => ok,
-        };
-        result
+        }
     }
 
     async fn apply_runtime_turn_outcome_with_admission_inner(
@@ -24135,7 +24133,7 @@ mod tests {
                 .resumed
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push((input.run_id.clone(), input.receipt.clone()));
+                .push((input.run_id, input.receipt));
             Ok(RunResult {
                 text: "resumed".to_string(),
                 session_id,
