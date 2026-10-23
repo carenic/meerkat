@@ -99,8 +99,14 @@
 //!   that answer [`HostStoreError::Held`] with what remains of its lease, so
 //!   two processes never fence each other back and forth. Only an explicit
 //!   takeover uses [`AcquireMode::Takeover`].
-//! - A holder renews once per renew interval and stops writing as soon as a
-//!   renew fails.
+//! - A holder renews at least once per renew interval and stops writing as
+//!   soon as a renew fails.
+//! - **A holder that stopped re-acquires; it never resumes on a later
+//!   renew.** Once a renew failed or its window closed, an acquire made
+//!   meanwhile may have missed its last renew (the store's visibility lag)
+//!   and seen its lease lapse; a renew that then succeeds proves nothing.
+//!   It resumes only after a fresh fenced acquire, which acquires are
+//!   ordered against: a token higher than any acquired before.
 //! - A holder fences itself on its own clock: it makes no model call and
 //!   dispatches nothing unless its last successful acquire or renew started
 //!   less than [`FenceTiming::self_fence_window`] ago, the lease minus the
@@ -109,18 +115,23 @@
 //!   store I/O per round, and there is no fence check on the per round
 //!   path. Core exposes the window through [`SelfFence`], so the run loop
 //!   checks it right before each model call and each tool dispatch.
-//! - **The host's obligation on the margin:** it exceeds the store's
-//!   visibility lag. A renew written just before a takeover can stay
-//!   invisible to the new holder for that long, so the new holder's wait
-//!   ([`FenceGrant::superseded_lease`]) may end that much before the old
-//!   holder's real lease; the old holder must have fenced itself by then.
+//! - **The host's obligation on the margin:** it is at least one renew
+//!   interval plus twice the store's visibility lag (the time from the
+//!   start of a write until every acquire and renew sees it). A takeover
+//!   can miss the renews started in the lag before it, so the lease it
+//!   waits out ([`FenceGrant::superseded_lease`]) can come from a renew an
+//!   interval or more older than the old holder's last one; and a renew
+//!   started in the lag after the takeover can still confirm the old
+//!   token. With no visibility lag, the default margin of one renew
+//!   interval is enough.
 //! - After an acquire that supersedes a live holder, the new writer waits
 //!   out what remained of that holder's recorded lease
 //!   ([`FenceGrant::superseded_lease`]) before it makes a model call or
 //!   dispatches anything. By then the old holder has fenced itself: the
 //!   store started that lease no earlier than the holder started the
-//!   acquire or renew it came from, and the holder stops a renew interval
-//!   before the lease ends.
+//!   acquire or renew it came from, and the holder stops the self-fence
+//!   margin before the lease ends, which covers the renews the takeover
+//!   could not see.
 //! - The bulk load of heads ([`HostStore::list_heads`]) runs after the
 //!   acquire and before the first commit, so it observes one cut.
 
@@ -189,9 +200,11 @@ impl FenceTiming {
 
     /// A timing as [`Self::try_new`] with a host-declared self-fence margin:
     /// a holder writes only while its last successful acquire or renew
-    /// started less than `lease - self_fence_margin` ago. The margin lies
-    /// strictly between zero and the lease, and it must exceed the store's
-    /// visibility lag (see the writer rules in the module documentation).
+    /// started less than `lease - self_fence_margin` ago. The margin is at
+    /// least one renew interval and leaves a window of at least two; the
+    /// host's obligation is a margin of at least one renew interval plus
+    /// twice the store's visibility lag (see the writer rules in the module
+    /// documentation).
     pub fn try_with_margin(
         renew_interval: Duration,
         lease: Duration,
@@ -210,9 +223,15 @@ impl FenceTiming {
                 Self::MAX_LEASE
             )));
         }
-        if self_fence_margin.is_zero() || self_fence_margin >= lease {
+        // At least one renew interval (a store with a visibility lag needs
+        // more, see the writer rules), and a window of at least two renew
+        // intervals, so a holder that renews on time never closes its own
+        // window between two renews.
+        let longest_margin = lease.saturating_sub(renew_interval.saturating_mul(2));
+        if self_fence_margin < renew_interval || self_fence_margin > longest_margin {
             return Err(HostStoreError::Invalid(format!(
-                "a self-fence margin of {self_fence_margin:?} lies outside zero to the lease {lease:?}"
+                "a self-fence margin of {self_fence_margin:?} lies outside {renew_interval:?} to \
+                 {longest_margin:?} (one renew interval to the lease minus two)"
             )));
         }
         Ok(Self {
@@ -868,18 +887,25 @@ pub trait HostStore: Send + Sync {
 mod tests {
     use super::*;
 
-    // UNRUN (Policy v1.1): written for the frozen candidate.
+    // Unrun until the candidate's validation.
     #[test]
     fn a_declared_self_fence_margin_sets_the_window() {
         let secs = Duration::from_secs;
         let default = FenceTiming::default();
         assert_eq!(default.self_fence_margin(), default.renew_interval());
         assert_eq!(default.self_fence_window(), secs(20));
-        let declared = FenceTiming::try_with_margin(secs(10), secs(30), secs(12));
-        assert_eq!(declared.map(FenceTiming::self_fence_window), Ok(secs(18)));
         let plain = FenceTiming::try_new(secs(2), secs(6));
         assert_eq!(plain.map(FenceTiming::self_fence_margin), Ok(secs(2)));
+        // The host's 10 s margin on a 30 s lease, at 10 s and at 5 s renews.
+        let host = FenceTiming::try_with_margin(secs(10), secs(30), secs(10));
+        assert_eq!(host.map(FenceTiming::self_fence_window), Ok(secs(20)));
+        let faster = FenceTiming::try_with_margin(secs(5), secs(30), secs(10));
+        assert_eq!(faster.map(FenceTiming::self_fence_window), Ok(secs(20)));
+        // Below one renew interval.
+        assert!(FenceTiming::try_with_margin(secs(10), secs(30), secs(4)).is_err());
         assert!(FenceTiming::try_with_margin(secs(10), secs(30), Duration::ZERO).is_err());
+        // A window under two renew intervals.
+        assert!(FenceTiming::try_with_margin(secs(10), secs(30), secs(12)).is_err());
         assert!(FenceTiming::try_with_margin(secs(10), secs(30), secs(30)).is_err());
     }
 }
