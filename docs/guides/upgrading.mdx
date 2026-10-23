@@ -164,6 +164,32 @@ classifier behind the new requeue option of a graceful stop:
 `UnregisterQueuedInputsDisposition::Stop` and `0`, the 0.9.4 behaviour, and
 add the arms (or a wildcard) where you match these enums exhaustively.
 
+#### The mob Shutdown default
+
+- `meerkat-mob`: `QueuedInputsOnShutdown` gains `RequeueDurable`, which is
+  now its `#[default]` in place of `Stop`, so `ShutdownOptions::default()`
+  and `MobHandle::shutdown()` take it. It resolves per member:
+  `Requeue(RequeueMaxAge::DEFAULT)` for a member whose session commits every
+  round (the mob's session service keeps persistent sessions and its runtime
+  has a persistence store), and `Stop` for any other member and for one
+  already retiring. A graceful Shutdown that does not choose therefore keeps
+  such a member's running turn and eligible queued prompts for the next
+  start (see Other behaviour changes below). `QueuedInputsOnShutdown` is
+  `#[non_exhaustive]`, so a match already has a wildcard arm.
+- The generated mob machine (`meerkat-machine-kernels`, `generated::mob`)
+  and its DSL (`meerkat-machine-schema`) decide an autonomous member's case:
+  the input `ResolveAutonomousShutdownMemberAction` gains
+  `keeps_durable_run`, the string enum `AutonomousShutdownMemberActionKind`
+  gains `KeepForResume`, appended last, and the transition ids gain the
+  per-phase transitions `ResolveAutonomousShutdownMemberActionKeepForResume*`.
+
+**Do:** where a mob Shutdown must end members' work as before, pass
+`ShutdownOptions::default().with_queued_inputs(QueuedInputsOnShutdown::Stop)`,
+the 0.9.4 behaviour; do so before a downgrade. Where you build
+`ResolveAutonomousShutdownMemberAction` literals, pass
+`keeps_durable_run: false`, the 0.9.4 behaviour, and add the arms (or a
+wildcard) where you match these enums exhaustively.
+
 #### Member custody at a mob start
 
 - `meerkat-runtime`: `RuntimeBindingsError` gains the variant
@@ -361,9 +387,11 @@ WebSocket, and keep WebRTC for sessions that are not mob members.
   kept input older than `max_age` when a start finds it still queued ends as
   `RequeueExpired` without running; every start that finds it queued checks
   again. A graceful shutdown that does not choose now uses this option, with
-  a 15 minute max age, for sessions with per-round commits: `rkat-rpc`'s and the REST
-  server's own shutdowns, and a mob Shutdown without `with_queued_inputs`.
-  Choose `Stop` explicitly to keep the 0.9.4 behaviour.
+  a 15 minute max age, for sessions with per-round commits: `rkat-rpc`'s and
+  the REST server's own shutdowns, and a mob Shutdown without
+  `with_queued_inputs` (the new default
+  `QueuedInputsOnShutdown::RequeueDurable`). Choose `Stop` explicitly to keep
+  the 0.9.4 behaviour.
   A kept input's row is written as stored input state version 8, and an
   unregister in progress with the requeue disposition as machine lifecycle
   record version 6; every other row and record keeps version 7 and version 5.
@@ -398,12 +426,15 @@ WebSocket, and keep WebRTC for sessions that are not mob members.
   [Durable Runs: the dedupe key](/guides/durable-runs#the-dedupe-key).
 - **A requeue stop keeps a durable run in flight:** an unregister with
   `UnregisterQueuedInputs::Requeue`, or a mob Shutdown with
-  `QueuedInputsOnShutdown::Requeue`, now suspends the run in flight of a session with per-round
-  commits instead of cancelling it: the run continues from its last committed
-  round at the next start, or, past the max age, its inputs end as
-  `RequeueExpired` and the run is closed as interrupted with its committed
-  rounds kept. Because a graceful shutdown that does not choose uses Requeue
-  for such sessions, a deploy no longer cancels their runs in flight. See
+  `QueuedInputsOnShutdown::Requeue`, now suspends the run in flight of a
+  session with per-round commits instead of cancelling it: the run continues
+  from its last committed round at the next start, or, past the max age, its
+  inputs end as `RequeueExpired` and the run is closed as interrupted with
+  its committed rounds kept. A mob Shutdown keeps an autonomous member's
+  running turn the same way, with its kickoff open, unless the member is
+  retiring or host-placed. Because a graceful shutdown that does not choose
+  uses Requeue for such sessions, a deploy no longer cancels their runs in
+  flight. See
   [Durable Runs: graceful stops and deploys](/guides/durable-runs#graceful-stops-and-deploys).
 - **Host stores:** a host can keep a realm's durable state in its own
   database through the host store SPI (`meerkat_core::host_store`), checked
@@ -424,10 +455,13 @@ WebSocket, and keep WebRTC for sessions that are not mob members.
 4. Read a mob destroy report as `WireMobDestroyReport` in Rust, and a failed
    destroy's report through the SDK accessor, not the error text.
 5. Pass `UnregisterQueuedInputsDisposition::Stop` and `0` where you build
-   `BeginUnregisterSession` or `State` of the generated runtime machine.
-6. A graceful shutdown of a session with per-round commits now keeps its queued prompts
-   and its run in flight unless you choose `Stop`. Before a downgrade,
-   follow [Downgrading to 0.9.4](#downgrading-to-0-9-4). Treat
+   `BeginUnregisterSession` or `State` of the generated runtime machine, and
+   `keeps_durable_run: false` where you build the mob machine's
+   `ResolveAutonomousShutdownMemberAction`.
+6. A graceful shutdown of a session with per-round commits now keeps its
+   queued prompts and its run in flight unless you choose `Stop` (for a mob,
+   the new default is `QueuedInputsOnShutdown::RequeueDurable`). Before a
+   downgrade, follow [Downgrading to 0.9.4](#downgrading-to-0-9-4). Treat
    `RequeuedAcrossStop` as "runs at the next start" (do not resubmit) and
    `RequeueExpired` as "resubmit if still wanted".
 7. Add a wildcard arm where you match `RuntimeBindingsError`, and set

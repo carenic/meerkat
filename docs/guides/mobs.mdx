@@ -1357,46 +1357,58 @@ Shutdown report such a member's run and run starts as `ReloadRequired` instead
 of failing on it, and a Shutdown holds every member's run starts, reporting the
 first failure in roster order.
 
-Since 0.9.5 a Shutdown keeps queued work for the next start. A Shutdown that
-does not choose (`MobHandle::shutdown()`, or `ShutdownOptions` without
-`with_queued_inputs`) keeps it for each member whose session commits every
-round,
-with a 15 minute max age, and stops the others' queued work as in 0.9.4. To
-choose, use
+Since 0.9.5 a graceful Shutdown keeps a durable member's work for the mob's
+next start. `MobHandle::shutdown()` and `ShutdownOptions::default()` take the
+default `QueuedInputsOnShutdown::RequeueDurable`, which resolves per member:
+`QueuedInputsOnShutdown::Requeue(RequeueMaxAge::DEFAULT)`, a 15 minute max
+age, for a member whose session commits every round (the mob's session
+service keeps persistent sessions and its runtime has a persistence store),
+and `QueuedInputsOnShutdown::Stop`, the 0.9.4 behaviour, for any other
+member. A member already retiring is stopped either way. To choose for every
+member alike, pass
 `ShutdownOptions::default().with_queued_inputs(QueuedInputsOnShutdown::Requeue(max_age))`,
 where `max_age` is a `RequeueMaxAge` (`RequeueMaxAge::new(duration)` refuses
 a bound under one millisecond, zero included, or over 24 hours with
-`ShutdownOptionsError`; the default is
-`RequeueMaxAge::DEFAULT`, 15 minutes). A member input still queued behind the
-running turn is kept when it is a durable prompt in the queue lane that is
-neither directed nor bound to an objective, as a host human input submitted
-with `HandlingMode::Queue` is. It
+`ShutdownOptionsError`), or `.with_queued_inputs(QueuedInputsOnShutdown::Stop)`,
+which ends every queued input as stopped and cancels running turns, as in
+0.9.4.
+
+Under `Requeue` the Shutdown holds a member's run starts and does not cancel
+its running turn. The member's runtime stop suspends a run that commits
+every round at its last committed round: the run's inputs stay bound to it,
+with the waiter answer and the max age below, and the run continues from
+that round at the next start, before the kept queued inputs run (see
+[Durable runs: graceful stops and deploys](/guides/durable-runs#graceful-stops-and-deploys)).
+An autonomous member keeps its running turn the same way, and its kickoff
+stays open: the next start resumes the run under the same objective, and
+when that run is the kickoff's, the kickoff resolves when it ends. A
+retiring or host-placed autonomous member is still interrupted, with its
+kickoff closed. The runtime stop still cancels a run that commits no rounds,
+such as a live bridge run: that turn's own input ends cancelled, and its
+user message is not in what a kept input's turn sees.
+
+A member input still queued behind the running turn is kept when it is a
+durable prompt in the queue lane that is neither directed nor bound to an
+objective, as a host human input submitted with `HandlingMode::Queue` is. It
 stays in the member's input store, its waiter ends with
 `BoundedTurnFailure::RequeuedAcrossStop`, and the mob's next start runs it
 once, in admission order, before new work; a same-key replay after the
 restart re-attaches to its result. Do not resubmit it. If it is older than
 `max_age`, measured from its admission, when a start finds it still queued
-(every such start checks again), it
-ends as abandoned (`requeue_expired`) without running, and a same-key replay
-answers `BoundedTurnFailure::RequeueExpired`: resubmit it if it is still
-wanted. On a member whose session commits every round, the running turn is kept
-too: it stops at once, its inputs stay bound to its run with the same waiter
-answer and the same max age, and the run continues from its last committed
-round at the next start, before the kept inputs run (see
-[Durable runs: graceful stops and deploys](/guides/durable-runs#graceful-stops-and-deploys)).
-This includes an autonomous member's running kickoff: the member keeps its
-kickoff, and its run resumes under the same objective at the next start.
-On any other member the running turn's own input still ends cancelled, and
-the cancelled turn's user message is not in what the kept input's turn sees.
+(every such start checks again), it ends as abandoned (`requeue_expired`)
+without running, and a same-key replay answers
+`BoundedTurnFailure::RequeueExpired`: resubmit it if it is still wanted.
 Steer, ephemeral, event, directed and objective-bound inputs that are not
-bound to the running turn's run still end as stopped. A
+bound to the running turn's run, and peer messages, end as stopped. A
 member's kickoff is bound to its objective, so a kickoff still queued at a
 requeue Shutdown ends as stopped and is recorded failed, as with `Stop`.
-An explicit `QueuedInputsOnShutdown::Stop` ends every queued input as
-stopped, and cancels running turns, as in 0.9.4. A member already retiring
-is stopped either way. 0.9.4 cannot open a store that holds a kept input still
-queued, and cannot read a kept or expired input's row after it ran or expired
-(see [Upgrading](/guides/upgrading)).
+Keeping queued inputs is guaranteed only for a member whose run starts the
+Shutdown holds (`MemberRunStarts::Held`): a member that cannot hold them may
+start a queued input once its running turn is cancelled, and that input then
+belongs to the cancelled run. 0.9.4 cannot open a store that holds a kept
+input still queued or a kept run, and cannot read a kept or expired input's
+row after it ran or expired (see [Upgrading](/guides/upgrading)): shut a mob
+down with `QueuedInputsOnShutdown::Stop` before you downgrade it.
 
 A mob restored with an unfinished destroy starts with admission closed before
 `MobBuilder::resume` returns its handle, so nothing is spawned into it while the
