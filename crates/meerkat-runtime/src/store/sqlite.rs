@@ -29842,6 +29842,94 @@ ORDER BY runtime_id";
         }
 
         #[tokio::test]
+        async fn sqlite_single_turn_closing_save_rebases_without_an_earlier_tail() {
+            let (_dir, store) = temp_store();
+            // A committed base and a single-turn run whose one boundary
+            // compacts: no round commit, so no tail before its closing save.
+            let original = session_with_one_turn();
+            let runtime_id = LogicalRuntimeId::for_session(original.id());
+            store
+                .commit_session_snapshot(
+                    &runtime_id,
+                    SerializedSessionSnapshot {
+                        session_snapshot: serde_json::to_vec(&original).unwrap().into(),
+                    },
+                )
+                .await
+                .unwrap();
+            let base = rebase_payload(&store, &runtime_id, original.id())
+                .await
+                .store_authority()
+                .clone();
+            let run_id = RunId::new();
+            let mut live = original;
+            live.push(Message::User(UserMessage::text(
+                "one long question".to_string(),
+            )));
+            live.push(Message::BlockAssistant(BlockAssistantMessage {
+                blocks: vec![AssistantBlock::Text {
+                    text: "the run's only answer".to_string(),
+                    meta: None,
+                }],
+                stop_reason: Some(StopReason::EndTurn),
+                identity: meerkat_core::types::TranscriptMessageIdentity::default(),
+                created_at: meerkat_core::types::message_timestamp_now(),
+                assistant_message_id: None,
+            }));
+            let (compacted, commit) = rebase_compact(&live);
+            let payload = rebase_payload(&store, &runtime_id, live.id()).await;
+            let rebase = crate::store::PreparedWholeBlobRunRebase::prepare(
+                payload,
+                None,
+                run_id.clone(),
+                compacted.clone(),
+                std::slice::from_ref(&commit),
+            )
+            .unwrap();
+            let outcome = store
+                .commit_prepared_whole_blob_run_rebase(&runtime_id, rebase.store_parts())
+                .await
+                .unwrap();
+            let crate::store::WholeBlobRunRebaseOutcome::Applied { committed, tail } = outcome
+            else {
+                unreachable!("the closing save re-bases on a fresh base");
+            };
+            assert_eq!(committed.store_revision(), base.store_revision() + 1);
+            assert_eq!(tail.run_id(), &run_id);
+            assert_eq!(tail.candidate_sequence(), 1);
+            assert_eq!(tail.base_blob_sha256(), committed.blob_sha256());
+            assert_eq!(tail.candidate_blob_sha256(), committed.blob_sha256());
+            let stored = store
+                .load_committed_whole_blob_snapshot(&runtime_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.authority(), &committed);
+            assert_eq!(stored.session().messages(), compacted.messages());
+            let loaded = store
+                .load_whole_blob_provisional_tail(&runtime_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(loaded.authority(), &tail);
+            assert!(
+                Session::from_persisted_bytes(loaded.candidate_bytes())
+                    .unwrap()
+                    .try_run_cursor()
+                    .unwrap()
+                    .is_none()
+            );
+            // An exact replay answers the same pair and writes nothing.
+            assert_eq!(
+                store
+                    .commit_prepared_whole_blob_run_rebase(&runtime_id, rebase.store_parts())
+                    .await
+                    .unwrap(),
+                crate::store::WholeBlobRunRebaseOutcome::Applied { committed, tail }
+            );
+        }
+
+        #[tokio::test]
         async fn sqlite_run_rebase_is_stale_once_another_writer_moved_the_tail() {
             let (_dir, store) = temp_store();
             let (runtime_id, live, run_id, base, first_tail) = rebase_run_with_tail(&store).await;
