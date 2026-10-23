@@ -198,6 +198,16 @@ mod tests {
         assert!(!incarnation_process_ended(&id, &foreign));
     }
 
+    /// The store's sweeps (doctor inventory, prune guard) name the lock file
+    /// by the same suffix the custody takes.
+    #[test]
+    fn the_store_sweeps_name_this_lock_file() {
+        assert_eq!(
+            LOCK_SUFFIX,
+            meerkat_store::migrate::MOB_INCARNATION_CUSTODY_LOCK_SUFFIX
+        );
+    }
+
     #[test]
     fn a_store_with_a_second_link_mints_unmarked_incarnations() {
         let dir = tempfile::tempdir().expect("temp dir");
