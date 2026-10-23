@@ -15,16 +15,17 @@
 # whole bounded space once (safety), then reruns it once per reachability
 # witness with that witness's negation as an extra invariant and requires
 # TLC to report exactly that violation, so the invariants are not vacuous.
-# With --mutants it then seeds twelve defects into a copy of the generated
+# With --mutants it then seeds fifteen defects into a copy of the generated
 # model (or, for the serve-before-settle control, into the audit's settlement
 # order) and requires TLC to refuse each with the invariant it breaks: a
 # verdict that ignores the phase and lane, one that reads a fact the
 # unregister changes, one that differs across the exit, a stop cleanup that
 # skips staged inputs, an expiry abandon that keeps the input queued,
 # serving before the settlement, a verdict without the disposition, four
-# verdicts each without one eligibility conjunct, and an Abandon arm that
-# overlaps Retain. An anchor this script expects but cannot find fails the
-# run.
+# verdicts each without one eligibility conjunct, an Abandon arm that
+# overlaps Retain, and a requeued wait-failure arm that writes state, is
+# guarded on the session or answers any failure. An anchor this script
+# expects but cannot find fails the run.
 set -euo pipefail
 
 usage="usage: requeue_across_stop_audit.sh <max-steps> [--mutants] [extra tlc args...]"
@@ -84,7 +85,9 @@ with open(os.environ["OUT"], "w") as out:
     out.write("EXTENDS model\n\n")
     out.write("AuditFreshMachine ==\n")
     out.write("\n".join(fresh))
-    out.write("\n====\n")
+    out.write("\n\n\\* Every generated variable but the step count.\n")
+    out.write("AuditStateButStep == << " + ", ".join(v for v in assigned if v != "model_step_count") + " >>\n")
+    out.write("====\n")
 print(f"derived AuditFreshMachine from Init ({len(assigned)} variables)")
 PY
 
@@ -113,7 +116,9 @@ write_cfg() {
   replace_exact_line "CONSTANTS" "CONSTANTS
   AuditMaxSteps = ${max_steps}
   AuditSettleBeforeServe = ${settle_first}" "${cfg}"
-  replace_exact_line "INVARIANTS" "INVARIANTS
+  replace_exact_line "INVARIANTS" "PROPERTIES
+  AuditRequeuedWaitAnswerChangesNothing
+INVARIANTS
   AuditRetainedNeverRunBeforeRestart
   AuditRetainedGetsNoCarrier
   AuditStoppedInputGetsItsCarrier
@@ -122,7 +127,8 @@ write_cfg() {
   AuditRetainOnlyUnderRequeue
   AuditRetainOnlyEligible
   AuditRetainNeverObjectiveBound
-  AuditStopVerdictIsAFunction${extra}" "${cfg}"
+  AuditStopVerdictIsAFunction
+  AuditRequeuedWaitResolvesInEveryPhase${extra}" "${cfg}"
   replace_exact_line "  CiStateConstraint" "  AuditStateConstraint" "${cfg}"
   printf 'CHECK_DEADLOCK FALSE\n' >> "${cfg}"
 }
@@ -165,7 +171,7 @@ if [[ "${tlc_status}" != "0" ]] \
 fi
 
 for witness in RetainedRunsAfterGracefulStop RetainedRunsAfterCrash ExpiredSettled \
-  StagedNotRetained StopAbandonsEligible PlainStopAbandons; do
+  StagedNotRetained StopAbandonsEligible PlainStopAbandons RequeuedWaitAnswered; do
   cfg="${work_dir}/witness-${witness}.cfg"
   write_cfg "${cfg}" TRUE "
   NotAuditWitness${witness}"
@@ -202,7 +208,7 @@ if [[ "${run_mutants}" == "true" ]]; then
     write_cfg "${cfg}" "${settle_first}" ""
     run_tlc "mutant-${name}" "${cfg}" "${dir}"
     local log="${work_dir}/mutant-${name}.log"
-    if ! grep -q "Error: Invariant ${property} is violated" "${log}"; then
+    if ! grep -qE "Error: (Invariant|Action property) ${property} is violated" "${log}"; then
       cat "${log}"
       echo "error: mutant ${name} was not refused by ${property} (tlc exit ${tlc_status})" >&2
       exit 1
@@ -386,6 +392,62 @@ for arm in os.environ["ARMS"].split():
     assert len(hits) == 1, f"expected one guard line in {arm}, found {len(hits)}"
     lines[hits[0]] = "    /\\ TRUE"
     text = text[:start] + "\n".join(lines) + text[end:]
+open(path, "w").write(text)
+PY
+
+  # The requeued wait-failure arm, which has no session guard and changes
+  # no state: one that writes state, one guarded on the session, one that
+  # answers any failure.
+  wait_arms=""
+  for arm_phase in Initializing Idle Attached Running Retired Stopped; do
+    wait_arms+=" ResolveRuntimeCompletionWaitFailureRequeuedAcrossStop${arm_phase}"
+  done
+  export WAIT_ARMS="${wait_arms}"
+  mutate wait_answer_writes_state AuditRequeuedWaitAnswerChangesNothing TRUE <<'PY'
+import os, re
+path = os.environ["MODEL"]
+text = open(path).read()
+for arm in os.environ["WAIT_ARMS"].split():
+    start = text.index("\n" + arm + "(") + 1
+    end = text.index("\n\n", start)
+    lines = text[start:end].split("\n")
+    frames = [i for i, line in enumerate(lines) if re.fullmatch(r"    /\\ UnchangedFrame_[0-9a-f]+", line)]
+    assert len(frames) == 1, f"expected one frame in {arm}"
+    name = lines[frames[0]].split()[-1]
+    definition = re.search(r"(?m)^" + name + r" == UNCHANGED << (.*) >>$", text)
+    assert definition, f"frame {name} not found"
+    kept = [v.strip() for v in definition.group(1).split(",") if v.strip() != "next_admission_seq"]
+    assert len(kept) + 1 == len(definition.group(1).split(",")), "next_admission_seq is not in the frame"
+    lines[frames[0]] = ("    /\\ next_admission_seq' = next_admission_seq + 1\n"
+                        "    /\\ UNCHANGED << " + ", ".join(kept) + " >>")
+    text = text[:start] + "\n".join(lines) + text[end:]
+open(path, "w").write(text)
+PY
+  mutate wait_answer_guarded_on_session AuditRequeuedWaitResolvesInEveryPhase TRUE <<'PY'
+import os
+path = os.environ["MODEL"]
+text = open(path).read()
+for arm in os.environ["WAIT_ARMS"].split():
+    start = text.index("\n" + arm + "(") + 1
+    end = text.index("\n\n", start)
+    block = text[start:end]
+    old = '    /\\ (failure = "RequeuedAcrossStop")'
+    assert block.count(old) == 1, f"guard not found in {arm}"
+    block = block.replace(old, old + "\n    /\\ (session_id = Some(arg_session_id))")
+    text = text[:start] + block + text[end:]
+open(path, "w").write(text)
+PY
+  mutate wait_answer_any_failure AuditRequeuedWaitResolvesInEveryPhase TRUE <<'PY'
+import os
+path = os.environ["MODEL"]
+text = open(path).read()
+for arm in os.environ["WAIT_ARMS"].split():
+    start = text.index("\n" + arm + "(") + 1
+    end = text.index("\n\n", start)
+    block = text[start:end]
+    old = '    /\\ (failure = "RequeuedAcrossStop")'
+    assert block.count(old) == 1, f"guard not found in {arm}"
+    text = text[:start] + block.replace(old, "    /\\ TRUE") + text[end:]
 open(path, "w").write(text)
 PY
 fi

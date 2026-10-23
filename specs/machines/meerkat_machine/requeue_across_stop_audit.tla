@@ -60,6 +60,12 @@
 \*     so a kickoff the stopping process records failed is never run later.
 \*   AuditStopVerdictIsAFunction: during a stop transaction exactly one of
 \*     the two verdict arms is enabled for each input still to classify.
+\*   AuditRequeuedWaitResolvesInEveryPhase: in every state of both
+\*     processes but Destroyed, ResolveRuntimeCompletionWaitFailure answers
+\*     exactly the RequeuedAcrossStop observation: it has no session guard.
+\*   AuditRequeuedWaitAnswerChangesNothing (action property): the stopping
+\*     process answering a kept input's waiter through that arm changes no
+\*     state but the step count.
 \*
 \* AuditWitness* operators are reachability goals the runner checks as
 \* expected violations, so the invariants are not vacuous. The runner's
@@ -101,6 +107,7 @@ VARIABLES
     audit_carriers,        \* inputs that got a stop's runless carrier
     audit_stopped,         \* inputs a stop's cleanup ended Stopped
     audit_unregistered,    \* process 1's unregister completed (a graceful end)
+    audit_wait_answered,   \* the stopping process answered a kept input's waiter
     audit_staged_p1,       \* inputs staged into a run of process 1
     audit_staged_p2,       \* inputs staged into a run of process 2
     audit_runs,            \* runs each input was staged into, both processes
@@ -115,7 +122,8 @@ historyVars == <<audit_retained, audit_replay_retained, audit_carriers, audit_st
                  audit_unregistered>>
 runVars == <<audit_staged_p1, audit_staged_p2, audit_runs>>
 restartVars == <<audit_rows, audit_recovery, audit_settled, audit_expired>>
-auditVars == <<audit_stage, setupVars, regionVars, historyVars, runVars, restartVars>>
+auditVars == <<audit_stage, setupVars, regionVars, historyVars, runVars, restartVars,
+              audit_wait_answered>>
 
 AuditSession == "sessionid_1"
 AuditA == "input_1"
@@ -172,6 +180,14 @@ BeginUnregisterAny(disp, age) ==
     \/ BeginUnregisterSessionRunning(AuditSession, None, None, None, None, disp, age)
     \/ BeginUnregisterSessionRetainsSnapshotStopped(AuditSession, None, None, None, None, disp, age)
 
+ResolveWaitAny(sid, failure) ==
+    \/ ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopInitializing(sid, failure)
+    \/ ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopIdle(sid, failure)
+    \/ ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopAttached(sid, failure)
+    \/ ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopRunning(sid, failure)
+    \/ ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopRetired(sid, failure)
+    \/ ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopStopped(sid, failure)
+
 AdmitPlan(i, kind) ==
     \/ ResolveAdmissionPlanDefaultQueueKindIdle(i, None, None, kind, None, "Ordinary", "InTurnEligible", FALSE, None, FALSE, FALSE, FALSE)
     \/ ResolveAdmissionPlanDefaultQueueKindRunning(i, None, None, kind, None, "Ordinary", "InTurnEligible", FALSE, None, TRUE, FALSE, FALSE)
@@ -200,7 +216,8 @@ AuditSetup ==
           /\ audit_staged_p1' = {AuditA}
           /\ audit_runs' = [audit_runs EXCEPT ![AuditA] = @ + 1]
           /\ UNCHANGED <<audit_stage, setupVars, regionVars, historyVars, audit_staged_p2,
-                         restartVars>>
+                         restartVars,
+                   audit_wait_answered>>
        \/ model_step_count = 7
           /\ \E kind \in AuditKinds, d \in InputDurabilityKindValues, dir \in BOOLEAN,
                 obj \in BOOLEAN :
@@ -209,11 +226,13 @@ AuditSetup ==
                                                              directed |-> dir,
                                                              objective_bound |-> obj])
           /\ UNCHANGED <<audit_stage, audit_disposition, audit_attempts, regionVars,
-                         historyVars, runVars, restartVars>>
+                         historyVars, runVars, restartVars,
+                   audit_wait_answered>>
        \/ model_step_count = 8
           /\ QueueAcceptedRunning(AuditB)
           /\ audit_stage' = "P1"
-          /\ UNCHANGED <<setupVars, regionVars, historyVars, runVars, restartVars>>
+          /\ UNCHANGED <<setupVars, regionVars, historyVars, runVars, restartVars,
+                   audit_wait_answered>>
 
 \* The host begins its unregister, before the stop or after a plain stop.
 AuditBeginUnregister ==
@@ -223,7 +242,8 @@ AuditBeginUnregister ==
           /\ BeginUnregisterAny(disp, IF disp = "Requeue" THEN AuditMaxAgeMs ELSE 0)
           /\ audit_disposition' = disp
     /\ UNCHANGED <<audit_stage, audit_facts, audit_attempts, regionVars, historyVars,
-                   runVars, restartVars>>
+                   runVars, restartVars,
+                   audit_wait_answered>>
 
 \* The run cancel: A's run ends cancelled and its staged input ends
 \* Abandoned(Cancelled).
@@ -249,7 +269,8 @@ AuditOpenStop ==
     /\ audit_post_verdict' = NoVerdict
     /\ audit_abandoned' = {}
     /\ UNCHANGED vars
-    /\ UNCHANGED <<setupVars, historyVars, runVars, restartVars>>
+    /\ UNCHANGED <<setupVars, historyVars, runVars, restartVars,
+                   audit_wait_answered>>
 
 \* Before the exit: the inputs answered Abandon get the runless carrier.
 AuditClassifyForCarriers ==
@@ -261,7 +282,8 @@ AuditClassifyForCarriers ==
                                   THEN audit_carriers \cup {i} ELSE audit_carriers
     /\ UNCHANGED <<audit_stage, setupVars, audit_post_verdict, audit_abandoned,
                    audit_retained, audit_replay_retained, audit_stopped,
-                   audit_unregistered, runVars, restartVars>>
+                   audit_unregistered, runVars, restartVars,
+                   audit_wait_answered>>
 
 AuditStopExit ==
     /\ audit_stage = "PreExit"
@@ -270,7 +292,8 @@ AuditStopExit ==
     /\ audit_stage' = "PostExit"
     /\ audit_pending' = NonTerminalInputs
     /\ UNCHANGED <<setupVars, audit_pre_verdict, audit_post_verdict, audit_abandoned,
-                   historyVars, runVars, restartVars>>
+                   historyVars, runVars, restartVars,
+                   audit_wait_answered>>
 
 \* After the exit: the cleanup classifies again and ends the Abandon set.
 AuditClassifyForCleanup ==
@@ -279,7 +302,8 @@ AuditClassifyForCleanup ==
           /\ Classify(i, audit_post_verdict)
           /\ audit_pending' = audit_pending \ {i}
     /\ UNCHANGED <<audit_stage, setupVars, audit_pre_verdict, audit_abandoned,
-                   historyVars, runVars, restartVars>>
+                   historyVars, runVars, restartVars,
+                   audit_wait_answered>>
 
 AuditStopAbandon ==
     /\ audit_stage = "PostExit"
@@ -289,7 +313,8 @@ AuditStopAbandon ==
           /\ audit_stopped' = audit_stopped \cup {i}
     /\ UNCHANGED <<audit_stage, setupVars, audit_pending, audit_pre_verdict,
                    audit_post_verdict, audit_retained, audit_replay_retained,
-                   audit_carriers, audit_unregistered, runVars, restartVars>>
+                   audit_carriers, audit_unregistered, runVars, restartVars,
+                   audit_wait_answered>>
 
 AuditCommitStop ==
     /\ audit_stage = "PostExit"
@@ -304,7 +329,8 @@ AuditCommitStop ==
     /\ audit_attempts' = audit_attempts + 1
     /\ UNCHANGED vars
     /\ UNCHANGED <<audit_facts, audit_disposition, regionVars, audit_carriers,
-                   audit_stopped, audit_unregistered, runVars, restartVars>>
+                   audit_stopped, audit_unregistered, runVars, restartVars,
+                   audit_wait_answered>>
 
 AuditUnregisterDrain ==
     /\ audit_stage = "P1Stopped"
@@ -316,7 +342,18 @@ AuditUnregisterDrain ==
           /\ audit_unregistered' = TRUE
           /\ UNCHANGED <<audit_stage, setupVars, regionVars, audit_retained,
                          audit_replay_retained, audit_carriers, audit_stopped, runVars,
-                         restartVars>>
+                         restartVars,
+                   audit_wait_answered>>
+
+\* The stopping process answers a kept input's waiter from the generated
+\* wait-failure class (once here; the arm repeats freely).
+AuditAnswerRequeuedWait ==
+    /\ audit_stage = "P1Stopped"
+    /\ audit_retained # {}
+    /\ ~audit_wait_answered
+    /\ ResolveWaitAny(AuditSession, "RequeuedAcrossStop")
+    /\ audit_wait_answered' = TRUE
+    /\ UNCHANGED <<audit_stage, setupVars, regionVars, historyVars, runVars, restartVars>>
 
 \* ---- the restart: a new process ----
 
@@ -338,14 +375,16 @@ AuditRestart ==
     /\ audit_recovery' = [i \in NonTerminalInputs |-> "Durability"]
     /\ audit_stage' = "P2Start"
     /\ UNCHANGED <<setupVars, regionVars, historyVars, runVars, audit_settled,
-                   audit_expired>>
+                   audit_expired,
+                   audit_wait_answered>>
 
 AuditStartProcess2 ==
     /\ audit_stage = "P2Start"
     /\ \/ Initialize /\ KeepAudit
        \/ /\ RegisterSessionIdle(AuditSession, None, {})
           /\ audit_stage' = "P2Recover"
-          /\ UNCHANGED <<setupVars, regionVars, historyVars, runVars, restartVars>>
+          /\ UNCHANGED <<setupVars, regionVars, historyVars, runVars, restartVars,
+                   audit_wait_answered>>
 
 NormalizeArm(i, p) ==
     \/ p = "Queued" /\ NormalizeRecoveredInputQueuedIdle(i, p, None)
@@ -354,7 +393,8 @@ NormalizeArm(i, p) ==
 RecoveryStep(i, next) ==
     /\ audit_recovery' = [audit_recovery EXCEPT ![i] = next]
     /\ UNCHANGED <<audit_stage, setupVars, regionVars, historyVars, runVars, audit_rows,
-                   audit_settled, audit_expired>>
+                   audit_settled, audit_expired,
+                   audit_wait_answered>>
 
 \* Cold recovery of each durable non-terminal row through the generated
 \* arms: the durability classifier (an Ephemeral row is discarded), the
@@ -391,7 +431,8 @@ AuditRecoveryDone ==
     /\ \A i \in DOMAIN audit_recovery : audit_recovery[i] \in {"Recovered", "Discarded"}
     /\ audit_stage' = "P2Settle"
     /\ UNCHANGED vars
-    /\ UNCHANGED <<setupVars, regionVars, historyVars, runVars, restartVars>>
+    /\ UNCHANGED <<setupVars, regionVars, historyVars, runVars, restartVars,
+                   audit_wait_answered>>
 
 \* The pre-serve settlement: the shell observes each marked row's age, and
 \* an expired row ends with the generated AbandonInput(RequeueExpired).
@@ -406,7 +447,8 @@ AuditSettle ==
                 /\ UNCHANGED audit_expired
           /\ audit_settled' = audit_settled \cup {i}
     /\ UNCHANGED <<audit_stage, setupVars, regionVars, historyVars, runVars, audit_rows,
-                   audit_recovery>>
+                   audit_recovery,
+                   audit_wait_answered>>
 
 \* The serving gate: the executor attaches once the settlement is done.
 AuditServeGate ==
@@ -414,7 +456,8 @@ AuditServeGate ==
     /\ AuditSettleBeforeServe => MarkedRows \subseteq audit_settled
     /\ EnsureSessionWithExecutorIdle(AuditSession)
     /\ audit_stage' = "P2Serve"
-    /\ UNCHANGED <<setupVars, regionVars, historyVars, runVars, restartVars>>
+    /\ UNCHANGED <<setupVars, regionVars, historyVars, runVars, restartVars,
+                   audit_wait_answered>>
 
 AuditServe ==
     /\ audit_stage = "P2Serve"
@@ -424,7 +467,8 @@ AuditServe ==
              /\ audit_staged_p2' = audit_staged_p2 \cup {i}
              /\ audit_runs' = [audit_runs EXCEPT ![i] = @ + 1]
              /\ UNCHANGED <<audit_stage, setupVars, regionVars, historyVars,
-                            audit_staged_p1, restartVars>>
+                            audit_staged_p1, restartVars,
+                   audit_wait_answered>>
 
 AuditNext ==
     \/ AuditSetup
@@ -437,6 +481,7 @@ AuditNext ==
     \/ AuditStopAbandon
     \/ AuditCommitStop
     \/ AuditUnregisterDrain
+    \/ AuditAnswerRequeuedWait
     \/ AuditRestart
     \/ AuditStartProcess2
     \/ AuditRecoverRow
@@ -461,6 +506,7 @@ AuditInit ==
     /\ audit_carriers = {}
     /\ audit_stopped = {}
     /\ audit_unregistered = FALSE
+    /\ audit_wait_answered = FALSE
     /\ audit_staged_p1 = {}
     /\ audit_staged_p2 = {}
     /\ audit_runs = [i \in AuditInputs |-> 0]
@@ -514,6 +560,14 @@ AuditStopVerdictIsAFunction ==
             (ENABLED RetainArm(i, f.durability, f.directed, f.objective_bound))
                 # (ENABLED AbandonArm(i, f.durability, f.directed, f.objective_bound))
 
+AuditRequeuedWaitResolvesInEveryPhase ==
+    phase # "Destroyed" =>
+        \A sid \in SessionIdValues, failure \in RuntimeCompletionWaitFailureObservationValues :
+            (ENABLED ResolveWaitAny(sid, failure)) = (failure = "RequeuedAcrossStop")
+
+AuditRequeuedWaitAnswerChangesNothing ==
+    [][(~audit_wait_answered /\ audit_wait_answered') => UNCHANGED AuditStateButStep]_<<vars, auditVars>>
+
 \* ---- reachability goals, each checked as an expected violation ----
 
 \* The graceful end: Requeue keeps B through the stop and a replay, the
@@ -552,7 +606,11 @@ AuditWitnessPlainStopAbandons ==
     /\ AuditB \in audit_stopped
     /\ audit_stage = "P2Settle"
 
+\* The stopping process answers a kept input's waiter as requeued.
+AuditWitnessRequeuedWaitAnswered == audit_wait_answered
+
 NotAuditWitnessRetainedRunsAfterGracefulStop == ~AuditWitnessRetainedRunsAfterGracefulStop
+NotAuditWitnessRequeuedWaitAnswered == ~AuditWitnessRequeuedWaitAnswered
 NotAuditWitnessRetainedRunsAfterCrash == ~AuditWitnessRetainedRunsAfterCrash
 NotAuditWitnessExpiredSettled == ~AuditWitnessExpiredSettled
 NotAuditWitnessStagedNotRetained == ~AuditWitnessStagedNotRetained

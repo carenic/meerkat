@@ -235,10 +235,11 @@ fi
 # never runs before the restart, never gets a stop's runless carrier while
 # every input a stop ends gets one, runs at most once across the restart,
 # never runs once expired or before its settlement, and is kept only under
-# Requeue and only when eligible (never objective-bound), and that exactly one
-# verdict arm answers each input. It requires six witnesses reached, a
-# graceful end and a crash among them; its --mutants mode (by hand) refuses
-# twelve seeded defects. 32 steps reach the deepest witness, and 36 the whole
+# Requeue and only when eligible (never objective-bound), that exactly one
+# verdict arm answers each input, and that the requeued wait-failure arm has
+# no session guard and changes no state. It requires seven witnesses reached,
+# a graceful end and a crash among them; its --mutants mode (by hand) refuses
+# fifteen seeded defects. 32 steps reach the deepest witness, and 36 the whole
 # reachable space.
 requeue_across_stop_audit="${workspace_root}/specs/machines/meerkat_machine/requeue_across_stop_audit.sh"
 if [[ ! -x "${requeue_across_stop_audit}" ]]; then

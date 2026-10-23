@@ -334,7 +334,7 @@ trap 'rm -rf "$tlc_env_tmp"' EXIT
 # and with --mutants each seeded defect's property violated.
 # run_start_hold_audit.sh requires each of its seven reachability witnesses
 # to be reported violated.
-# requeue_across_stop_audit.sh requires each of its six reachability
+# requeue_across_stop_audit.sh requires each of its seven reachability
 # witnesses to be reported violated.
 # live_delegation_worker_start_after_close_audit.sh requires its two goals to
 # be reported violated.
@@ -391,6 +391,7 @@ printf '%s\n' \
   'echo "Error: Invariant NotAuditWitnessStagedNotRetained is violated."' \
   'echo "Error: Invariant NotAuditWitnessStopAbandonsEligible is violated."' \
   'echo "Error: Invariant NotAuditWitnessPlainStopAbandons is violated."' \
+  'echo "Error: Invariant NotAuditWitnessRequeuedWaitAnswered is violated."' \
   'echo "Error: Action property AuditNeverUnregisters is violated."' \
   'echo "Error: Action property AuditNeverUnregistersWithPreparation is violated."' \
   'echo "Error: Invariant AuditNeverCancelsRecovery is violated."' \
