@@ -3047,6 +3047,325 @@ mod hosting {
             drop(handle);
         }
 
+        /// Longer than any tick of a reader's own open or close would take:
+        /// the store watch coalesces for 10 ms.
+        const SELF_TICK_WINDOW: Duration = Duration::from_millis(500);
+
+        /// Let the owner answer whatever the store watch delivers within
+        /// `window` of real time, while the paused clock stands still.
+        async fn answer_the_watch_for(window: Duration) {
+            let started = std::time::Instant::now();
+            while started.elapsed() < window {
+                tokio::task::yield_now().await;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        /// A sweep no test here waits for.
+        const NO_SWEEP: Duration = Duration::from_secs(3600);
+
+        /// Arm the owner of a watched store with `sweep`, its store watch
+        /// registered before the owner's first read: the owner task runs only
+        /// once the test awaits (current-thread runtime).
+        /// `wal_lifecycle_as_modified` makes the watch report the WAL created
+        /// or removed also as modified, as ReadDirectoryChangesW can.
+        fn arm_registered(
+            fixture: &Fixture,
+            path: &std::path::Path,
+            capability: &HostingCapability,
+            sweep: Duration,
+            wal_lifecycle_as_modified: bool,
+        ) -> meerkat::RuntimeDeliveryOwnerHandle {
+            let registrations = meerkat_sqlite::watch::test_support::observe_registrations_in(
+                path.parent().expect("the database's directory"),
+            )
+            .expect("observe the store watch's registration");
+            if wal_lifecycle_as_modified {
+                registrations.report_wal_lifecycle_as_modified();
+            }
+            let handle = fixture
+                .owner()
+                .with_store_sweep(sweep)
+                .arm(ClaimHost::new(capability))
+                .expect("arm");
+            assert!(
+                registrations.wait_registered(1, EVENT_GUARD),
+                "the store watch registers"
+            );
+            handle
+        }
+
+        /// Let the owner run until `done` holds, for at most `bound` of real
+        /// time: the store watch is a thread of its own, and the paused clock
+        /// stands still.
+        async fn wait_real(what: &str, bound: Duration, mut done: impl FnMut() -> bool) {
+            let started = std::time::Instant::now();
+            while !done() {
+                assert!(started.elapsed() < bound, "never happened: {what}");
+                tokio::task::yield_now().await;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        /// The database's WAL file.
+        fn wal_of(path: &std::path::Path) -> std::path::PathBuf {
+            let mut wal = path.as_os_str().to_owned();
+            wal.push("-wal");
+            wal.into()
+        }
+
+        /// Move the store's delivery generation on through a connection of
+        /// the test's own, as another process's delivery would (the delivery
+        /// domain is provisioned already).
+        fn move_the_delivery_generation(conn: &meerkat_sqlite::Connection) {
+            conn.execute(
+                "UPDATE runtime_delivery_generation SET generation = generation + 1 \
+                 WHERE singleton = 1",
+                [],
+            )
+            .expect("move the delivery generation");
+        }
+
+        /// Provision the store's delivery domain, as a store's first delivery
+        /// write does, through a store of the test's own on the same file: a
+        /// compare-and-swap that expects a revision no row has conflicts and
+        /// commits nothing, so no runtime is left for the owner to route.
+        async fn provision_the_delivery_domain(path: &std::path::Path) {
+            let store = SqliteRuntimeStore::new(path.to_path_buf()).expect("another store");
+            let outcome = store
+                .compare_and_swap_runtime_delivery_authority(
+                    &LogicalRuntimeId::new("provisioning"),
+                    Some(1),
+                    meerkat_runtime::RuntimeDeliveryAuthorityRecord::from_parts(2, b"{}".to_vec()),
+                    None,
+                )
+                .await
+                .expect("the delivery write connection");
+            assert!(
+                matches!(
+                    outcome,
+                    meerkat_runtime::RuntimeDeliveryAuthorityCasOutcome::Conflict(_)
+                ),
+                "{outcome:?}"
+            );
+        }
+
+        /// The owner's own reads are no store change. Its arming read opens
+        /// the database as the store's first connection, creating the WAL and
+        /// its index, and its idle release closes it as the last, removing
+        /// them; neither wakes the owner, so a quiet store's reader reads
+        /// once, closes at its idle bound and stays closed (paused time).
+        #[tokio::test(start_paused = true)]
+        async fn a_quiet_kept_reader_wakes_on_nothing_it_does_itself() {
+            let (fixture, path, capability) = watched_store();
+            let kept_reads = count_kept_reads(&path);
+            let handle = arm_registered(&fixture, &path, &capability, NO_SWEEP, false);
+            let mut passes = handle.subscribe_passes();
+            first_pass(&mut passes).await;
+            answer_the_watch_for(SELF_TICK_WINDOW).await;
+            assert_eq!(
+                kept_reads.load(Ordering::SeqCst),
+                0,
+                "the arming read's own open woke the owner"
+            );
+            assert_eq!(hooks::verified_opens(&path), 1);
+            assert!(
+                !maintenance_gets_the_database(&path),
+                "the arming read keeps its connection"
+            );
+
+            tokio::time::advance(
+                meerkat_runtime::KEPT_DELIVERY_READER_IDLE + Duration::from_millis(1),
+            )
+            .await;
+            let mut released = false;
+            for _ in 0..1000 {
+                tokio::task::yield_now().await;
+                released = maintenance_gets_the_database(&path);
+                if released {
+                    break;
+                }
+            }
+            assert!(released, "the quiet reader closed at its idle bound");
+            answer_the_watch_for(SELF_TICK_WINDOW).await;
+            assert!(
+                maintenance_gets_the_database(&path),
+                "the closed reader stays closed: its own close woke nothing"
+            );
+            assert_eq!(
+                hooks::verified_opens(&path),
+                1,
+                "nothing opened the database again"
+            );
+            assert_eq!(kept_reads.load(Ordering::SeqCst), 0);
+            drop(handle);
+        }
+
+        /// Through the fresh-open path (forced here, as a platform without the
+        /// kept reader takes it) a quiet store's owner opens the database for
+        /// its arming read and never again: each fresh read opens and closes
+        /// it as the store's first and last connection, which wakes nothing.
+        #[tokio::test(start_paused = true)]
+        async fn a_quiet_fresh_read_owner_opens_the_store_once() {
+            let (fixture, path, capability) = watched_store();
+            hooks::force_fresh_reads(&path);
+            let handle = arm_registered(&fixture, &path, &capability, NO_SWEEP, false);
+            let mut passes = handle.subscribe_passes();
+            first_pass(&mut passes).await;
+            answer_the_watch_for(SELF_TICK_WINDOW).await;
+            assert_eq!(
+                hooks::verified_opens(&path),
+                1,
+                "the arming read opened the database once; its own open and close woke nothing"
+            );
+            drop(handle);
+        }
+
+        /// A platform that reports the WAL created or removed as a change of
+        /// it (ReadDirectoryChangesW, emulated here) notifies every fresh
+        /// read's own open and close. The fresh-open path answers such a
+        /// notification from its last read when the database and its WAL stat
+        /// as they did before that read, so a quiet store's owner opens the
+        /// database once, not once per notification (paused time).
+        #[tokio::test(start_paused = true)]
+        async fn a_fresh_read_owner_opens_once_where_its_own_open_notifies_a_wal_change() {
+            let (fixture, path, capability) = watched_store();
+            hooks::force_fresh_reads(&path);
+            let handle = arm_registered(&fixture, &path, &capability, NO_SWEEP, true);
+            let mut passes = handle.subscribe_passes();
+            first_pass(&mut passes).await;
+            answer_the_watch_for(SELF_TICK_WINDOW).await;
+            assert_eq!(
+                hooks::verified_opens(&path),
+                1,
+                "the arming read opened the database once; the notifications of its own open \
+                 and close were answered from it"
+            );
+            drop(handle);
+        }
+
+        /// The control on the same platform shape: another connection's
+        /// commit changes the WAL, so its notification opens the database and
+        /// the owner reconciles the moved generation.
+        #[tokio::test(start_paused = true)]
+        async fn a_fresh_read_owner_reads_a_commit_where_its_own_open_notifies_a_wal_change() {
+            let (fixture, path, capability) = watched_store();
+            hooks::force_fresh_reads(&path);
+            provision_the_delivery_domain(&path).await;
+            let handle = arm_registered(&fixture, &path, &capability, NO_SWEEP, true);
+            let mut passes = handle.subscribe_passes();
+            first_pass(&mut passes).await;
+            answer_the_watch_for(SELF_TICK_WINDOW).await;
+            let opens = hooks::verified_opens(&path);
+            let reconciled = passes.borrow().generation;
+
+            let conn = meerkat_sqlite::open(&path, meerkat_sqlite::ConnectionProfile::PRIMARY)
+                .expect("another connection");
+            move_the_delivery_generation(&conn);
+            drop(conn);
+            wait_real("the commit's reconcile", EVENT_GUARD, || {
+                passes.borrow().generation > reconciled
+            })
+            .await;
+            assert!(
+                hooks::verified_opens(&path) > opens,
+                "the commit's notification opened the database"
+            );
+            drop(handle);
+        }
+
+        /// A commit the stat cannot see (the WAL rewritten from its start at
+        /// the same length within the file system's time resolution; the test
+        /// restores the WAL's mtime to make it so) is answered from the last
+        /// read at its notification, and read at the watch's next sweep,
+        /// which always opens: the sweep bounds how long such a commit waits.
+        #[tokio::test(start_paused = true)]
+        async fn a_commit_the_stat_cannot_see_is_read_at_the_next_sweep() {
+            const SWEEP: Duration = Duration::from_secs(3);
+            let (fixture, path, capability) = watched_store();
+            hooks::force_fresh_reads(&path);
+            let wal = wal_of(&path);
+            provision_the_delivery_domain(&path).await;
+            // Held through the test: no read is the store's first or last
+            // connection, so the WAL stays and no read changes it.
+            let held = meerkat_sqlite::open(&path, meerkat_sqlite::ConnectionProfile::PRIMARY)
+                .expect("a held connection");
+            // Commits before the owner arms grow the WAL (an update that
+            // rewrites a row unchanged writes nothing).
+            for _ in 0..8 {
+                move_the_delivery_generation(&held);
+            }
+            let busy: i64 = held
+                .query_row("PRAGMA wal_checkpoint(RESTART)", [], |row| row.get(0))
+                .expect("checkpoint");
+            assert_eq!(
+                busy, 0,
+                "the WAL is checkpointed: the next commit rewrites it from its start"
+            );
+            let handle = arm_registered(&fixture, &path, &capability, SWEEP, false);
+            let mut passes = handle.subscribe_passes();
+            first_pass(&mut passes).await;
+            answer_the_watch_for(SELF_TICK_WINDOW).await;
+            let opens = hooks::verified_opens(&path);
+            let reconciled = passes.borrow().generation;
+
+            // The commit and the restored mtime, before the owner runs again.
+            let before = std::fs::metadata(&wal).expect("the WAL");
+            move_the_delivery_generation(&held);
+            assert_eq!(
+                std::fs::metadata(&wal).expect("the WAL").len(),
+                before.len(),
+                "the commit rewrote the WAL from its start at the same length"
+            );
+            std::fs::File::options()
+                .write(true)
+                .open(&wal)
+                .expect("the WAL")
+                .set_modified(before.modified().expect("the WAL's mtime"))
+                .expect("restore the WAL's mtime");
+
+            answer_the_watch_for(SELF_TICK_WINDOW).await;
+            assert_eq!(
+                hooks::verified_opens(&path),
+                opens,
+                "the commit's notification was answered from the last read"
+            );
+            assert_eq!(
+                passes.borrow().generation,
+                reconciled,
+                "so the owner has not reconciled it yet"
+            );
+            wait_real("the next sweep's reconcile", EVENT_GUARD, || {
+                passes.borrow().generation > reconciled
+            })
+            .await;
+            assert!(
+                hooks::verified_opens(&path) > opens,
+                "the sweep opened the database"
+            );
+            drop(held);
+            drop(handle);
+        }
+
+        /// A stat that fails never answers a notification from the last read:
+        /// on the platform shape whose own open and close notify a WAL change,
+        /// a notification after the arming read opens the database again
+        /// (paused time).
+        #[tokio::test(start_paused = true)]
+        async fn a_fresh_read_owner_whose_stat_fails_reads_its_notifications() {
+            let (fixture, path, capability) = watched_store();
+            hooks::force_fresh_reads(&path);
+            hooks::fail_file_stamps(&path);
+            let handle = arm_registered(&fixture, &path, &capability, NO_SWEEP, true);
+            let mut passes = handle.subscribe_passes();
+            first_pass(&mut passes).await;
+            wait_real("a notification's read", EVENT_GUARD, || {
+                hooks::verified_opens(&path) >= 2
+            })
+            .await;
+            drop(handle);
+        }
+
         /// Holds the host calls made through it, once armed, until the test
         /// opens it, and says when it holds one.
         struct HostGate {

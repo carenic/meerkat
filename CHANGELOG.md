@@ -259,6 +259,22 @@ them.
   dataclass lists its optional fields alphabetically, so `cwd` now comes
   before `env` and `secret_env`: pass those by keyword.
 
+- Behaviour-only (not measured by the gate): `meerkat-sqlite`:
+  `watch::sqlite_watch_event_relevant`, and so the `Changed` ticks of
+  `watch::start_sqlite_change_watch`, no longer count a connection's own
+  open and close as a change: no event on the database's `-shm` file (the
+  WAL index), and no creation, removal or metadata change of its `-wal`
+  file. A write to the `-wal` (a commit), every event on the database file
+  or on the directory itself, and an event that names no path still count.
+  0.9.4 counted every event but an access on all three files.
+
+- Behaviour-only (not measured by the gate): `meerkat-runtime`:
+  `SqliteRuntimeStore::delivery_generation_reader` returns a reader on the
+  fresh-open read path too, where 0.9.4 returned `None`. It keeps no
+  connection, and answers a store notification from its last read while
+  the database and its WAL stat as they did before that read
+  (`DeliveryGenerationReader::read_on_notification`).
+
 ### Added
 
 - Hosted MCP OAuth through the host's own `https` callback (#1808), for a
@@ -469,6 +485,12 @@ them.
   launch meaning and attachment identity unchanged. Mob portable profiles
   refuse a stdio `cwd`, and the adaptive layer decision schema leaves it
   out, so packs built by earlier hosts stay valid.
+
+- `meerkat-runtime`: `DeliveryGenerationReader::read_on_notification`, a
+  provided method (it reads by default) that a reader overrides to answer a
+  store notification without opening the database, and
+  `DeliveryStoreWatch::subscribe_sweeps`, which moves for each of the
+  watch's sweeps before its tick does, so an owner reads at every sweep.
 
 ### Changed
 
@@ -819,6 +841,22 @@ them.
   not report in time ends as `commit_unsettled`, never as a success or a
   clean failure; `rkat-rpc` notes it for shutdown, so its attempt is never
   reported as cleanly resolved.
+
+- A quiet store no longer wakes its own readers. The SQLite change watch
+  counted a connection's own open and close (the first connection creates
+  the WAL and the WAL index, the last removes them) as a store change, so a
+  read that opened the database woke the next one. On a quiet store the
+  delivery owner's kept generation reader reopened itself 10 to 30 ms after
+  each idle release, and so held its connection, with the presence lock the
+  maintenance fence waits for, nearly all the time; the fresh-open read
+  path, which Windows takes, could open the database tens of times a
+  second; and a mob event observer's catch-up reads woke it about 90 times
+  a second. Commits still wake them at once, and the watch's sweep still
+  bounds a missed notification. On the fresh-open path, a notification
+  after which the database and its WAL stat as they did before the last
+  read (a platform that reports a read's own open or close as a change of
+  the WAL) is answered from that read without opening the database; a
+  sweep always reads.
 
 ## [0.9.4] - 2026-10-20
 
