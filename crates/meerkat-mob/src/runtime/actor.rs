@@ -31363,6 +31363,12 @@ impl MobActor {
             .cloned()
             .collect::<Vec<_>>();
         for entry in entries {
+            #[cfg(any(test, feature = "test-support"))]
+            let entry = {
+                let mut entry = entry;
+                super::apply_restore_tuple_fault_for_test(&self.definition.id, &mut entry);
+                entry
+            };
             let identity = mob_dsl::AgentIdentity::from_domain(&entry.agent_identity);
             let runtime = mob_dsl::AgentRuntimeId::from_domain(&entry.agent_runtime_id);
             let state = self.dsl_authority.state();
