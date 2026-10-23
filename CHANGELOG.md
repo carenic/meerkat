@@ -709,8 +709,15 @@ them.
   a session that is ending
   (`recovery::recover_durable_tail_for_session_archive`), which judges a
   quiescent persisted runtime (no row, `Idle`, `Stopped` or `Retired`) as
-  retired: an archive never continues a run, and an unbound content input
-  beside a continuable tail holds it there, as beside an interrupted one. A
+  retired: an archive never continues a run. Before that recovery the archive
+  ends, under its runtime lease, the work the runtime kept for a later start
+  (`MeerkatMachine::end_unresumed_work_with_archive_lease_before`): the inputs
+  of the run it keeps resumable, and every queued input, are abandoned as
+  cancelled, as a live retire cancels its queue. A retire or destroy that
+  archives a member before a restarted host registers its runtime again
+  (after a graceful stop kept its run and requeued its queue) therefore
+  commits the tail as interrupted instead of ending with
+  `SessionError::DurableTailHeldForRecovery`. A
   tail with no assistant
   message and no tool result is attributed to its run by the store-issued
   provisional binding on a strict continuation (round zero's first commit, or
