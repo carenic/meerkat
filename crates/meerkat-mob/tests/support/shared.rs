@@ -59,19 +59,19 @@ use meerkat_comms::{
 // the integration-tests consumer of this file has no meerkat-contracts
 // dependency (A1 lane owns the re-export block additions).
 use self::meerkat_mob::runtime::bridge_protocol::{
-    BridgeAck, BridgeCapabilities, BridgeCommand, BridgeCreateForkedParticipantPayload,
-    BridgeForkedParticipantCreatedResponse, BridgeForkedParticipantOwnerRoute,
-    BridgeForkedParticipantRef, BridgeForkedParticipantRevocationOutcome,
-    BridgeForkedParticipantRevokedResponse, BridgeHostBindResponse, BridgeHostMemberRecord,
-    BridgeHostRevokedResponse, BridgeHostRuntimeIncarnation, BridgeHostStatusResponse,
-    BridgeMaterializePayload, BridgeMaterializedResponse, BridgeMemberIncarnation,
-    BridgeMemberReleasedResponse, BridgePeerTrustPayload, BridgeProtocolVersion,
-    BridgeRejectionCause, BridgeReleasePayload, BridgeReply, BridgeRevokeForkedParticipantPayload,
-    MaterializeLaunchMode, MaterializeLaunchOutcome,
-    MemberSessionDisposal as WireMemberSessionDisposal, PortableDefinitionExtract,
-    PortableMemberSpec, PortableProfile, PortableSpawnOverlay, PortableSystemPrompt,
-    PortableToolConfig, WireHostBindingDescriptor, WireMobRuntimeMode, WireSpawnContinuityIntent,
-    portable_member_spec_digest,
+    BridgeAck, BridgeAdoptedFirstTurn, BridgeCapabilities, BridgeCommand,
+    BridgeCreateForkedParticipantPayload, BridgeForkedParticipantCreatedResponse,
+    BridgeForkedParticipantOwnerRoute, BridgeForkedParticipantRef,
+    BridgeForkedParticipantRevocationOutcome, BridgeForkedParticipantRevokedResponse,
+    BridgeHostBindResponse, BridgeHostMemberRecord, BridgeHostRevokedResponse,
+    BridgeHostRuntimeIncarnation, BridgeHostStatusResponse, BridgeMaterializePayload,
+    BridgeMaterializedResponse, BridgeMemberIncarnation, BridgeMemberReleasedResponse,
+    BridgePeerTrustPayload, BridgeProtocolVersion, BridgeRejectionCause, BridgeReleasePayload,
+    BridgeReply, BridgeRevokeForkedParticipantPayload, MaterializeLaunchMode,
+    MaterializeLaunchOutcome, MemberSessionDisposal as WireMemberSessionDisposal,
+    PortableDefinitionExtract, PortableMemberSpec, PortableProfile, PortableSpawnOverlay,
+    PortableSystemPrompt, PortableToolConfig, WireHostBindingDescriptor, WireMobRuntimeMode,
+    WireSpawnContinuityIntent, portable_member_spec_digest,
 };
 use self::meerkat_mob::runtime::host_actor::{
     HostBindingDeletionAuthority, HostBindingPersistenceAuthority, HostCapabilityFacts,
@@ -2587,6 +2587,17 @@ pub struct ScriptedMaterializeState {
     /// Scripted per-identity member identity material, so a test-held
     /// endpoint can BE the member (upcall-lane rows).
     member_identities: std::collections::BTreeMap<String, ScriptedMemberIdentity>,
+    /// The first turn the session a `Resume` of an identity adopts, as its
+    /// member host reads it (owed unless scripted).
+    adopted_first_turns: std::collections::BTreeMap<String, BridgeAdoptedFirstTurn>,
+    /// The first turn each recorded `Resume` build read, reported again on a
+    /// replay that asks (the host row's shape).
+    recorded_first_turns: std::collections::BTreeMap<(String, u64, u64), BridgeAdoptedFirstTurn>,
+    /// Replace the adopted first turn of the next ack, whatever its request
+    /// asked: a host that contradicts its request.
+    tamper_next_first_turn: Option<Option<BridgeAdoptedFirstTurn>>,
+    /// Ack the next materialize as a `Fresh` launch, whatever launch it sent.
+    fresh_outcome_next: bool,
 }
 
 /// Ack identity material for one scripted member.
@@ -2693,6 +2704,27 @@ impl ScriptedHostPeer {
             .keys()
             .filter(|(identity, _, _)| identity == agent_identity)
             .count()
+    }
+
+    /// The first turn the session a `Resume` of `identity` adopts, as its
+    /// member host reads it (owed unless scripted). An ack reports it only
+    /// when its request asks.
+    pub fn script_adopted_first_turn(&self, identity: &str, first_turn: BridgeAdoptedFirstTurn) {
+        self.materialize_state()
+            .adopted_first_turns
+            .insert(identity.to_string(), first_turn);
+    }
+
+    /// The next materialize ack carries `field` as its adopted first turn,
+    /// whatever its request asked: a host that contradicts its request.
+    pub fn tamper_next_adopted_first_turn(&self, field: Option<BridgeAdoptedFirstTurn>) {
+        self.materialize_state().tamper_next_first_turn = Some(field);
+    }
+
+    /// The next materialize ack reports a `Fresh` launch outcome, whatever
+    /// launch its request sent.
+    pub fn ack_next_launch_as_fresh(&self) {
+        self.materialize_state().fresh_outcome_next = true;
     }
 
     pub fn materialize_count(&self) -> u64 {
@@ -2983,7 +3015,7 @@ fn scripted_materialize_reply(
             resolved_auth_binding: None,
             adopted_first_turn: None,
         };
-        state.recorded.insert(tuple, fresh.clone());
+        state.recorded.insert(tuple.clone(), fresh.clone());
         fresh
     };
     if state.wrong_digest_next {
@@ -2992,6 +3024,29 @@ fn scripted_materialize_reply(
     }
     if let Some(version) = state.engine_version_next.take() {
         response.engine_version = version;
+    }
+    // A member host reads the adopted first turn on every Resume build and
+    // reports it only to a request that asks, on a replay too.
+    response.adopted_first_turn = match &payload.launch {
+        MaterializeLaunchMode::Resume { .. } => {
+            let scripted = state
+                .adopted_first_turns
+                .get(agent_identity)
+                .copied()
+                .unwrap_or(BridgeAdoptedFirstTurn::Owed);
+            let read = *state
+                .recorded_first_turns
+                .entry(tuple.clone())
+                .or_insert(scripted);
+            payload.report_adopted_first_turn.then_some(read)
+        }
+        MaterializeLaunchMode::Fresh {} => None,
+    };
+    if let Some(field) = state.tamper_next_first_turn.take() {
+        response.adopted_first_turn = field;
+    }
+    if std::mem::take(&mut state.fresh_outcome_next) {
+        response.launch_outcome = MaterializeLaunchOutcome::Fresh;
     }
     if state.drop_next_reply > 0 {
         state.drop_next_reply -= 1;
@@ -5392,6 +5447,55 @@ impl meerkat_client::LlmClient for ScriptedCompletingClient {
 
     fn provider(&self) -> meerkat_core::Provider {
         self.provider
+    }
+
+    async fn health_check(&self) -> Result<(), meerkat_client::LlmError> {
+        Ok(())
+    }
+}
+
+/// A member client whose every turn completes with `text` and records each
+/// request's messages in `requests`, in order.
+pub fn scripted_member_client_completing_recorded(
+    text: &str,
+    requests: Arc<std::sync::Mutex<Vec<Vec<meerkat_core::Message>>>>,
+) -> Arc<dyn meerkat_client::LlmClient> {
+    Arc::new(RecordingCompletingClient {
+        inner: ScriptedCompletingClient {
+            text: text.to_string(),
+            provider: meerkat_core::Provider::Anthropic,
+        },
+        requests,
+    })
+}
+
+struct RecordingCompletingClient {
+    inner: ScriptedCompletingClient,
+    requests: Arc<std::sync::Mutex<Vec<Vec<meerkat_core::Message>>>>,
+}
+
+#[async_trait::async_trait]
+impl meerkat_client::LlmClient for RecordingCompletingClient {
+    fn project_replay_messages(
+        &self,
+        messages: &[meerkat_core::Message],
+    ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+        self.inner.project_replay_messages(messages)
+    }
+
+    fn stream<'a>(
+        &'a self,
+        request: &'a meerkat_client::LlmRequest,
+    ) -> meerkat_client::types::LlmStream<'a> {
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(request.messages.clone());
+        self.inner.stream(request)
+    }
+
+    fn provider(&self) -> meerkat_core::Provider {
+        self.inner.provider()
     }
 
     async fn health_check(&self) -> Result<(), meerkat_client::LlmError> {

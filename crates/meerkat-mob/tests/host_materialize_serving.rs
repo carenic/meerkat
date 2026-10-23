@@ -26,9 +26,10 @@ use std::time::Duration;
 use meerkat_core::agent::CommsRuntime as _;
 use meerkat_core::{CommsCommand, HandlingMode, PeerRoute, SendReceipt};
 use meerkat_mob::runtime::bridge_protocol::{
-    BridgeCommand, BridgeEventCursor, BridgeRejectionCause, BridgeReply, BridgeTurnOutcomeAck,
-    MaterializeLaunchMode, MaterializeLaunchOutcome, PortableMcpDecl, WireFlowTurnOutcome,
-    WireSpawnContinuityIntent, portable_member_spec_digest,
+    BridgeAdoptedFirstTurn, BridgeCommand, BridgeEventCursor, BridgeHostFeaturesPayload,
+    BridgeProtocolVersion, BridgeRejectionCause, BridgeReply, BridgeTurnOutcomeAck,
+    HOST_FEATURE_ADOPTED_FIRST_TURN, MaterializeLaunchMode, MaterializeLaunchOutcome,
+    PortableMcpDecl, WireFlowTurnOutcome, WireSpawnContinuityIntent, portable_member_spec_digest,
 };
 use meerkat_mob::runtime::host_actor::{
     MaterializedMemberRow, MobHostActorError, MobHostBindingRecord,
@@ -3422,5 +3423,225 @@ async fn a_fork_childs_resume_replay_is_answered_and_a_forkless_fresh_one_is_ref
         1,
         "the child was seeded once: {rendered}"
     );
+    fixture.shutdown().await;
+}
+
+// ===========================================================================
+// A Resume build reads whether the session it adopts already started its
+// first turn, records that on its row, and reports it on the ack only when
+// the request asks (protocol 7), on a replay too.
+// ===========================================================================
+
+/// A `Resume` materialize of `identity` at `(generation, fence)`. When
+/// `report` is set it is stamped protocol 7 and asks for the adopted first
+/// turn.
+fn resume_materialize(
+    sender: &support::PeerCommsEndpoint,
+    mob_id: &str,
+    identity: &str,
+    tuple: (u64, u64),
+    session_id: &str,
+    report: bool,
+) -> BridgeCommand {
+    let mut payload = sample_materialize_payload(
+        sender,
+        1,
+        sample_portable_member_spec(mob_id, identity, "worker"),
+        tuple.0,
+        tuple.1,
+        MaterializeLaunchMode::Resume {
+            session_id: session_id.to_string(),
+            resume_from_role: None,
+        },
+    );
+    if report {
+        payload.protocol_version = BridgeProtocolVersion::V7;
+        payload.report_adopted_first_turn = true;
+    }
+    BridgeCommand::MaterializeMember(payload)
+}
+
+async fn materialized(
+    sender: &support::PeerCommsEndpoint,
+    fixture: &support::HostDaemonFixture,
+    command: &BridgeCommand,
+) -> meerkat_mob::runtime::bridge_protocol::BridgeMaterializedResponse {
+    let reply = sender
+        .send_bridge_command_raw(&fixture.host_peer_descriptor(), command, REPLY_TIMEOUT)
+        .await
+        .expect("materialize reply");
+    let BridgeReply::MemberMaterialized(ack) = reply else {
+        panic!("expected MemberMaterialized, got {reply:?}");
+    };
+    ack
+}
+
+/// Deliver one input to the member the ack names and wait until its turn
+/// has answered in the persisted session.
+async fn run_one_member_turn(
+    sender: &support::PeerCommsEndpoint,
+    fixture: &support::HostDaemonFixture,
+    mob_id: &str,
+    identity: &str,
+    ack: &meerkat_mob::runtime::bridge_protocol::BridgeMaterializedResponse,
+    tuple: (u64, u64),
+) {
+    let member = member_descriptor_from_ack(identity, ack);
+    let incarnation =
+        member_incarnation_from_ack(fixture, mob_id, identity, ack, 1, tuple.0, tuple.1);
+    sender.trust(member.clone()).await;
+    let delivery = raw_deliver_member_input_command(
+        sender,
+        mob_id,
+        &uuid::Uuid::new_v4().to_string(),
+        "first-turn input",
+        incarnation,
+        None,
+    );
+    let reply = sender
+        .send_bridge_command_raw(&member, &delivery, REPLY_TIMEOUT)
+        .await
+        .expect("delivery reply");
+    assert!(matches!(reply, BridgeReply::Delivery(_)), "{reply:?}");
+    let session_id = meerkat_core::SessionId::parse(&ack.session_id).expect("member session id");
+    let service = fixture.member_session_service();
+    wait_until("the member answers its first input", || {
+        let service = std::sync::Arc::clone(&service);
+        let session_id = session_id.clone();
+        async move {
+            service
+                .load_persisted_session(&session_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|session| {
+                    session
+                        .messages()
+                        .iter()
+                        .any(|row| matches!(row, meerkat_core::types::Message::BlockAssistant(_)))
+                })
+        }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resume_that_asks_reports_whether_its_session_started_its_first_turn() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let fixture = member_build_fixture("mat-first-turn-host").await;
+    let probe = spawn_peer_comms_endpoint("mat-first-turn-supervisor", true, None).await;
+    probe.trust(fixture.host_peer_descriptor()).await;
+    let mob_id = format!("mob-first-turn-{}", uuid::Uuid::new_v4().simple());
+    let fresh = bind_then_materialize(&probe, &fixture, &mob_id, "b2").await;
+    assert_eq!(
+        fresh.adopted_first_turn, None,
+        "a Fresh launch reports nothing"
+    );
+
+    // The member's first turn never ran: the resume owes it.
+    let owed = materialized(
+        &probe,
+        &fixture,
+        &resume_materialize(&probe, &mob_id, "b2", (2, 2), &fresh.session_id, true),
+    )
+    .await;
+    assert_eq!(
+        owed.launch_outcome,
+        MaterializeLaunchOutcome::ResumedFromSnapshot
+    );
+    assert_eq!(owed.adopted_first_turn, Some(BridgeAdoptedFirstTurn::Owed));
+
+    run_one_member_turn(&probe, &fixture, &mob_id, "b2", &owed, (2, 2)).await;
+    let started = materialized(
+        &probe,
+        &fixture,
+        &resume_materialize(&probe, &mob_id, "b2", (3, 3), &fresh.session_id, true),
+    )
+    .await;
+    assert_eq!(
+        started.adopted_first_turn,
+        Some(BridgeAdoptedFirstTurn::Started)
+    );
+
+    // A request that does not ask gets no report, and the row still records
+    // what the build read.
+    let unasked = materialized(
+        &probe,
+        &fixture,
+        &resume_materialize(&probe, &mob_id, "b2", (4, 4), &fresh.session_id, false),
+    )
+    .await;
+    assert_eq!(unasked.adopted_first_turn, None);
+    let row = fixture
+        .host_binding_record(&mob_id)
+        .await
+        .materialized
+        .get("b2")
+        .cloned()
+        .expect("b2 materialized row");
+    assert_eq!(
+        row.adopted_first_turn,
+        Some(BridgeAdoptedFirstTurn::Started)
+    );
+
+    // The host lists the report among the features it serves.
+    let probe_features = BridgeCommand::HostFeatures(BridgeHostFeaturesPayload {
+        supervisor: support::supervisor_spec_for_endpoint(&probe, &mob_id),
+        epoch: 1,
+        binding_generation: 1,
+        protocol_version: BridgeProtocolVersion::V7,
+        mob_id: mob_id.clone(),
+    });
+    let reply = probe
+        .send_bridge_command_raw(
+            &fixture.host_peer_descriptor(),
+            &probe_features,
+            REPLY_TIMEOUT,
+        )
+        .await
+        .expect("host features reply");
+    assert!(
+        matches!(&reply, BridgeReply::HostFeatures(features) if features.serves(HOST_FEATURE_ADOPTED_FIRST_TURN)),
+        "{reply:?}"
+    );
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replayed_resume_reports_the_first_turn_its_build_read() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let fixture = member_build_fixture("mat-first-turn-replay-host").await;
+    let probe = spawn_peer_comms_endpoint("mat-first-turn-replay-supervisor", true, None).await;
+    probe.trust(fixture.host_peer_descriptor()).await;
+    let mob_id = format!("mob-first-turn-replay-{}", uuid::Uuid::new_v4().simple());
+    let fresh = bind_then_materialize(&probe, &fixture, &mob_id, "b2").await;
+
+    let resume = resume_materialize(&probe, &mob_id, "b2", (2, 2), &fresh.session_id, true);
+    let first = materialized(&probe, &fixture, &resume).await;
+    assert_eq!(first.adopted_first_turn, Some(BridgeAdoptedFirstTurn::Owed));
+
+    // The first turn runs after the build. A retry of the same command is
+    // answered from the recorded row: what the build read, not what the
+    // session holds now.
+    run_one_member_turn(&probe, &fixture, &mob_id, "b2", &first, (2, 2)).await;
+    let replayed = materialized(&probe, &fixture, &resume).await;
+    assert_eq!(replayed.session_id, first.session_id);
+    assert_eq!(
+        replayed.adopted_first_turn,
+        Some(BridgeAdoptedFirstTurn::Owed),
+        "the replay reports the recorded first turn"
+    );
+
+    // The same tuple asked without the report gets none.
+    let unasked = materialized(
+        &probe,
+        &fixture,
+        &resume_materialize(&probe, &mob_id, "b2", (2, 2), &fresh.session_id, false),
+    )
+    .await;
+    assert_eq!(unasked.session_id, first.session_id);
+    assert_eq!(unasked.adopted_first_turn, None);
+
     fixture.shutdown().await;
 }
