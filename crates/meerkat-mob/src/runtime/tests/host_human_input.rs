@@ -3486,13 +3486,19 @@ fn requeue_max_age_refuses_zero_and_over_the_cap() {
     assert_eq!(
         (
             RequeueMaxAge::new(Duration::ZERO),
+            RequeueMaxAge::new(Duration::from_micros(999)),
             RequeueMaxAge::new(over),
             RequeueMaxAge::new(RequeueMaxAge::CAP).map(RequeueMaxAge::get),
             RequeueMaxAge::new(Duration::from_millis(1)).map(RequeueMaxAge::get),
             RequeueMaxAge::default().get(),
         ),
         (
-            Err(ShutdownOptionsError::RequeueMaxAgeZero),
+            Err(ShutdownOptionsError::RequeueMaxAgeUnderOneMillisecond {
+                max_age: Duration::ZERO,
+            }),
+            Err(ShutdownOptionsError::RequeueMaxAgeUnderOneMillisecond {
+                max_age: Duration::from_micros(999),
+            }),
             Err(ShutdownOptionsError::RequeueMaxAgeOverCap {
                 max_age: over,
                 cap: RequeueMaxAge::CAP,

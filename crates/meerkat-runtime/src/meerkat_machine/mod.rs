@@ -1304,10 +1304,10 @@ struct UnregisterTeardownCoordinator {
     epoch_id: meerkat_core::RuntimeEpochId,
     coordinator_id: uuid::Uuid,
     result_rx: crate::tokio::sync::watch::Receiver<Option<UnregisterTeardownResult>>,
-    /// The disposition the caller that installed this coordinator asked for.
-    /// `BeginUnregisterSession` records it once; from then on the generated
-    /// state and the durable progress own it.
-    queued_inputs: UnregisterQueuedInputs,
+    /// The checked disposition the caller that installed this coordinator
+    /// asked for. `BeginUnregisterSession` records it once; from then on the
+    /// generated state and the durable progress own it.
+    queued_inputs: UnregisterDisposition,
 }
 
 /// Read-only terminal-result observer for one exact runtime unregister
@@ -1425,18 +1425,81 @@ pub enum UnregisterQueuedInputs {
 }
 
 impl UnregisterQueuedInputs {
-    /// The generated disposition and the max age, in whole milliseconds and
-    /// at least one, that `BeginUnregisterSession` records.
-    pub(crate) fn dsl_disposition(self) -> (dsl::UnregisterQueuedInputsDisposition, u64) {
+    /// The longest max age a requeue may carry.
+    pub const MAX_AGE_CAP: std::time::Duration = std::time::Duration::from_hours(24);
+
+    /// Check the disposition every unregister entry point checks before it
+    /// starts anything. A requeue's max age is recorded in whole
+    /// milliseconds, so a max age under one millisecond (zero included) is
+    /// refused, as is one over [`Self::MAX_AGE_CAP`]; neither is clamped.
+    ///
+    /// # Errors
+    /// [`UnregisterQueuedInputsError`] names the refused max age.
+    pub fn check(self) -> Result<(), UnregisterQueuedInputsError> {
+        self.recorded().map(|_| ())
+    }
+
+    /// The generated disposition and the max age in whole milliseconds that
+    /// `BeginUnregisterSession` records, for a disposition that passes
+    /// [`Self::check`].
+    pub(crate) fn recorded(self) -> Result<UnregisterDisposition, UnregisterQueuedInputsError> {
         match self {
-            Self::Stop => (dsl::UnregisterQueuedInputsDisposition::Stop, 0),
-            Self::Requeue { max_age } => (
-                dsl::UnregisterQueuedInputsDisposition::Requeue,
-                u64::try_from(max_age.as_millis())
-                    .unwrap_or(u64::MAX)
-                    .max(1),
-            ),
+            Self::Stop => Ok(UnregisterDisposition::STOP),
+            Self::Requeue { max_age } => {
+                if max_age > Self::MAX_AGE_CAP {
+                    return Err(UnregisterQueuedInputsError::MaxAgeOverCap {
+                        max_age,
+                        cap: Self::MAX_AGE_CAP,
+                    });
+                }
+                match u64::try_from(max_age.as_millis()) {
+                    Ok(0) | Err(_) => {
+                        Err(UnregisterQueuedInputsError::MaxAgeUnderOneMillisecond { max_age })
+                    }
+                    Ok(requeue_max_age_ms) => Ok(UnregisterDisposition {
+                        queued_inputs: dsl::UnregisterQueuedInputsDisposition::Requeue,
+                        requeue_max_age_ms,
+                    }),
+                }
+            }
         }
+    }
+}
+
+/// A refused [`UnregisterQueuedInputs`]: nothing was started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum UnregisterQueuedInputsError {
+    /// The requeue max age is under one millisecond, the resolution the stop
+    /// mark records; zero is refused here too.
+    #[error("requeue max age {max_age:?} is under one millisecond")]
+    MaxAgeUnderOneMillisecond { max_age: std::time::Duration },
+    /// The requeue max age is over [`UnregisterQueuedInputs::MAX_AGE_CAP`].
+    #[error("requeue max age {max_age:?} is over the {cap:?} cap")]
+    MaxAgeOverCap {
+        max_age: std::time::Duration,
+        cap: std::time::Duration,
+    },
+}
+
+/// A checked [`UnregisterQueuedInputs`], as an unregister coordinator holds
+/// it: the generated disposition and the whole milliseconds
+/// `BeginUnregisterSession` records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UnregisterDisposition {
+    queued_inputs: dsl::UnregisterQueuedInputsDisposition,
+    requeue_max_age_ms: u64,
+}
+
+impl UnregisterDisposition {
+    /// Stop every non-terminal input; nothing to record.
+    pub(crate) const STOP: Self = Self {
+        queued_inputs: dsl::UnregisterQueuedInputsDisposition::Stop,
+        requeue_max_age_ms: 0,
+    };
+
+    pub(crate) fn dsl_disposition(self) -> (dsl::UnregisterQueuedInputsDisposition, u64) {
+        (self.queued_inputs, self.requeue_max_age_ms)
     }
 }
 

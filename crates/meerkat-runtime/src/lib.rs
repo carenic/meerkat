@@ -633,9 +633,9 @@ pub use meerkat_machine::{
     RuntimeSessionRegistrationWitness, RuntimeSessionUnregisterAdmission,
     RuntimeSessionUnregisterObserver, RuntimeSessionUnregisterUseAdmission,
     SessionDurabilityReloadRequired, StagedCustodyRelease, StagedMeerkatMachine,
-    StandaloneSessionRuntimeAuthorities, UnregisterQueuedInputs, classify_runtime_lifecycle_state,
-    classify_runtime_loop_queue_admission, standalone_session_runtime_authorities,
-    standalone_tool_visibility_owner,
+    StandaloneSessionRuntimeAuthorities, UnregisterQueuedInputs, UnregisterQueuedInputsError,
+    classify_runtime_lifecycle_state, classify_runtime_loop_queue_admission,
+    standalone_session_runtime_authorities, standalone_tool_visibility_owner,
 };
 pub use meerkat_machine_types::{
     CommittedModelRoutingHandoff, HydratedSessionLlmState, ImageOperationRoutingRequest,

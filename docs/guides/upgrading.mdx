@@ -161,9 +161,11 @@ add the arms (or a wildcard) where you match these enums exhaustively.
   A kept input's row is written as stored input state version 8, and an
   unregister in progress with the requeue disposition as machine lifecycle
   record version 6; every other row and record keeps version 7 and version 5.
-  0.9.4 refuses version 8 rows and version 6 records with its typed
-  unsupported-version error, so a store written by a requeue Shutdown does not
-  open in 0.9.4. See [Mobs](/guides/mobs).
+  0.9.4 refuses a version 8 row with a stop mark, and a version 6 record, with
+  its typed unsupported-version error, and fails to read a version 8 row that
+  ended `RequeueExpired`, whose abandon reason it does not know. Either way a
+  store written by a requeue Shutdown does not open in 0.9.4. See
+  [Mobs](/guides/mobs).
 
 ### Upgrade checklist
 

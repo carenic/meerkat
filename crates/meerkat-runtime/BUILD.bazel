@@ -66,6 +66,7 @@ rust_library(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
@@ -122,6 +123,7 @@ rust_library(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = [
@@ -199,6 +201,7 @@ rust_library(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = [
@@ -257,6 +260,7 @@ rust_library(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = [
@@ -321,6 +325,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
@@ -406,6 +411,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/auth_reauth_notice.rs",
@@ -487,6 +493,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/bounded_submit_contract.rs",
@@ -565,6 +572,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/composition_dispatch_is_the_path.rs",
@@ -645,6 +653,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/composition_driver_contract.rs",
@@ -725,6 +734,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/control_plane_contract.rs",
@@ -805,6 +815,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/core_apply_terminal_truth.rs",
@@ -891,6 +902,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/delivery_generation.rs",
@@ -969,6 +981,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/detached_wake_contract.rs",
@@ -1047,6 +1060,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/driver_ephemeral.rs",
@@ -1125,6 +1139,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/driver_persistent.rs",
@@ -1203,6 +1218,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/durable_delivery_inbox.rs",
@@ -1281,6 +1297,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/durable_tail_recovery_authorization.rs",
@@ -1359,6 +1376,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/gpt_live_generated_authority.rs",
@@ -1437,6 +1455,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/handles_dispatch_through_dispatcher.rs",
@@ -1517,6 +1536,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/kept_delivery_reader.rs",
@@ -1597,6 +1617,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/meerkat_machine.rs",
@@ -1677,6 +1698,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/ops_lifecycle_contract.rs",
@@ -1755,6 +1777,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/ops_lifecycle_persistence.rs",
@@ -1833,6 +1856,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/peer_handling_mode_contract.rs",
@@ -1911,6 +1935,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/peer_ingress_fact_ratchet.rs",
@@ -1991,6 +2016,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/peer_interaction_dsl.rs",
@@ -2069,6 +2095,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/peer_projection_dsl.rs",
@@ -2147,6 +2174,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/peer_projection_producer_wiring.rs",
@@ -2227,6 +2255,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/pre_ledger_realm_bridge.rs",
@@ -2311,6 +2340,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/recovery_contract.rs",
@@ -2395,6 +2425,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/recovery_replay.rs",
@@ -2473,6 +2504,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/regression_comms_runtime.rs",
@@ -2553,6 +2585,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/runtime_bindings_contract.rs",
@@ -2631,6 +2664,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/runtime_ingress_control.rs",
@@ -2709,6 +2743,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/runtime_terminal_publication_contract.rs",
@@ -2789,6 +2824,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/session_hosting_claims.rs",
@@ -2867,6 +2903,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/stop_run_public_api.rs",
@@ -2945,6 +2982,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/supervisor_bridge_command_manifest.rs",
@@ -3025,6 +3063,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/trust_reconcile_add_failure.rs",
@@ -3106,6 +3145,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/trust_reconcile_concurrency.rs",
@@ -3187,6 +3227,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/turn_content_shape_contract.rs",
@@ -3267,6 +3308,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/turn_metadata_single_construction_site.rs",
@@ -3347,6 +3389,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/turn_projection_cost.rs",
@@ -3427,6 +3470,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/unregister_drain_contract.rs",
@@ -3505,6 +3549,7 @@ rust_test(
         "src/store/mod.rs",
         "src/store/sqlite.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt",
     ],
     srcs = [
         "tests/whole_blob_repair.rs",

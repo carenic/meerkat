@@ -159,7 +159,7 @@ Since 0.9.4 every input row a binary writes is version 7, including a row it
 read at an older version. 0.9.3 and older refuse a version 7 row before
 installing state (the stored bytes stay in place), so once a 0.9.4 binary has
 written any input row there is no downgrade to 0.9.3. Upgrade every process
-that shares a runtime store together. 0.9.4 refuses a version 8 row or a version 6 lifecycle record with its typed unsupported-version error, so a store that a requeue Shutdown wrote does not open in 0.9.4. Likewise a HeadCanonical session that
+that shares a runtime store together. 0.9.4 refuses a version 8 row with a stop mark, or a version 6 lifecycle record, with its typed unsupported-version error, and fails to read a version 8 row that ended `RequeueExpired` (an abandon reason it does not know), so a store that a requeue Shutdown wrote does not open in 0.9.4. Likewise a HeadCanonical session that
 records a failed realtime response writes realtime sidecar event schema 4,
 which 0.9.3 and earlier refuse ("unsupported realtime event schema 4").
 A session whose last turn 0.9.2 or 0.9.3 committed but never finalized (for

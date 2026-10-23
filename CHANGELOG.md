@@ -203,11 +203,16 @@ them.
   is the same for a mob member's attachment.
 - Queued prompts kept across a graceful stop. `meerkat-mob`:
   `ShutdownOptions::with_queued_inputs(QueuedInputsOnShutdown::Requeue(max_age))`
-  with a `RequeueMaxAge` (default 15 minutes; zero and more than 24 hours are
-  refused with `ShutdownOptionsError`). `meerkat-runtime`:
-  `UnregisterQueuedInputs::Requeue { max_age }` through
+  with a `RequeueMaxAge` (default 15 minutes; a bound under one millisecond,
+  zero included, or over 24 hours is refused with `ShutdownOptionsError`).
+  `meerkat-runtime`: `UnregisterQueuedInputs::Requeue { max_age }` through
   `MeerkatMachine::observe_unregister_session_registration_with_queued_inputs_if_current`
-  and `observe_unregister_session_registration_with_queued_inputs_if_use_unchanged`.
+  and `observe_unregister_session_registration_with_queued_inputs_if_use_unchanged`,
+  which refuse the same bounds before they start anything
+  (`RuntimeDriverError::QueuedInputsRefused` with an
+  `UnregisterQueuedInputsError`; `UnregisterQueuedInputs::check` is the one
+  rule, and `UnregisterQueuedInputs::MAX_AGE_CAP` the cap). The bound is
+  recorded in whole milliseconds and never clamped.
   An input is kept when it is still queued behind the running turn, in the
   queue lane, a prompt, not directed, not bound to an objective, and durable.
   A member's kickoff is bound to its objective, so a requeue Shutdown ends a
@@ -259,10 +264,13 @@ them.
   the `RequeueExpired` reason is written as stored input state version 8, and
   the machine lifecycle record of an unregister in progress with the requeue
   disposition as version 6. Every other row and record keeps version 7 and
-  version 5, which 0.9.4 reads. 0.9.4 refuses a version 8 row or a version 6
-  record with its typed unsupported-version error, so a store that holds one
-  does not open after a downgrade (a kept input's row keeps its mark after it
-  runs). In `meerkat-core`'s generated version authority,
+  version 5, which 0.9.4 reads. 0.9.4 refuses a version 8 row that carries a
+  stop mark, and a version 6 record, with its typed unsupported-version error.
+  A version 8 row that ended `RequeueExpired` fails earlier in 0.9.4, when it
+  decodes the row's abandon reason, which 0.9.4 does not know: a read failure,
+  not the typed error, and the fact is not misread either. Either way a store
+  that holds one does not open after a downgrade (a kept input's row keeps its
+  mark after it runs). In `meerkat-core`'s generated version authority,
   `STORED_INPUT_STATE_VERSION` is 8, and `STORED_INPUT_STATE_BASELINE_VERSION`
   (7) and `stored_input_state_version_for_row` are new.
 

@@ -19086,13 +19086,16 @@ mod deferred_tool_failure_tests {
         include!("../tests/fixtures/v0_9_4_session_persistence_version_authority.rs.txt");
     }
 
-    /// The released 0.9.4 authority admits stored input state v3 to v7. A
-    /// row this binary writes without a requeue-across-stop fact is stamped
-    /// at the v7 baseline, so 0.9.4 still reads it; a row carrying such a
-    /// fact is v8, which 0.9.4 refuses with its typed version error instead
-    /// of misreading the fact.
+    /// The released 0.9.4 version authority admits stored input state v3 to
+    /// v7. A row this binary writes without a requeue-across-stop fact is
+    /// stamped at the v7 baseline, so 0.9.4 still reads it; a row carrying a
+    /// stop mark is v8, which this gate refuses with its typed version error
+    /// instead of misreading the mark. A v8 row that ended `RequeueExpired`
+    /// never reaches this gate in 0.9.4: its decode fails first, on the abandon
+    /// reason 0.9.4 does not know (meerkat-runtime's
+    /// `a_released_v0_9_4_reader_fails_closed_on_both_requeue_facts`).
     #[test]
-    fn released_v0_9_4_reader_reads_baseline_rows_and_refuses_requeue_rows_typed() {
+    fn released_v0_9_4_version_gate_reads_baseline_rows_and_refuses_v8_typed() {
         use crate::generated::session_persistence_version_authority as current;
         assert_eq!(
             released_v0_9_4_version_authority::restore_stored_input_state_version(

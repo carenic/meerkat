@@ -744,27 +744,27 @@ impl QueuedInputsOnShutdown {
 pub struct RequeueMaxAge(Duration);
 
 impl RequeueMaxAge {
-    /// The longest accepted bound.
-    pub const CAP: Duration = Duration::from_hours(24);
+    /// The longest accepted bound, the runtime's
+    /// [`UnregisterQueuedInputs::MAX_AGE_CAP`](meerkat_runtime::UnregisterQueuedInputs::MAX_AGE_CAP).
+    pub const CAP: Duration = meerkat_runtime::UnregisterQueuedInputs::MAX_AGE_CAP;
     /// The bound a requeue uses when the caller names none.
     pub const DEFAULT: Duration = Duration::from_mins(15);
 
-    /// A bound of `max_age`.
+    /// A bound of `max_age`, checked by the runtime's own rule
+    /// ([`UnregisterQueuedInputs::check`](meerkat_runtime::UnregisterQueuedInputs::check)).
     ///
     /// # Errors
-    /// Refuses a bound of zero and a bound over [`Self::CAP`]. A bound is
+    /// Refuses a bound under one millisecond (zero included), the resolution
+    /// the stop mark records, and a bound over [`Self::CAP`]. A bound is
     /// never clamped.
     pub fn new(max_age: Duration) -> Result<Self, ShutdownOptionsError> {
-        if max_age.is_zero() {
-            return Err(ShutdownOptionsError::RequeueMaxAgeZero);
+        match (meerkat_runtime::UnregisterQueuedInputs::Requeue { max_age }).check() {
+            Ok(()) => Ok(Self(max_age)),
+            Err(meerkat_runtime::UnregisterQueuedInputsError::MaxAgeOverCap { max_age, cap }) => {
+                Err(ShutdownOptionsError::RequeueMaxAgeOverCap { max_age, cap })
+            }
+            Err(_) => Err(ShutdownOptionsError::RequeueMaxAgeUnderOneMillisecond { max_age }),
         }
-        if max_age > Self::CAP {
-            return Err(ShutdownOptionsError::RequeueMaxAgeOverCap {
-                max_age,
-                cap: Self::CAP,
-            });
-        }
-        Ok(Self(max_age))
     }
 
     /// The bound.
@@ -784,9 +784,9 @@ impl Default for RequeueMaxAge {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ShutdownOptionsError {
-    /// A requeue bound of zero.
-    #[error("the requeue max age must be greater than zero")]
-    RequeueMaxAgeZero,
+    /// A requeue bound under one millisecond, zero included.
+    #[error("the requeue max age {max_age:?} is under one millisecond")]
+    RequeueMaxAgeUnderOneMillisecond { max_age: Duration },
     /// A requeue bound over [`RequeueMaxAge::CAP`].
     #[error("the requeue max age {max_age:?} is over the cap of {cap:?}")]
     RequeueMaxAgeOverCap { max_age: Duration, cap: Duration },

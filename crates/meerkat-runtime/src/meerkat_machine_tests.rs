@@ -977,6 +977,97 @@ fn realtime_policy(target_realtime_capable: bool) -> ModelRoutingRealtimePolicy 
     }
 }
 
+/// A requeue disposition the stop mark cannot record as given is refused at
+/// the runtime boundary, typed, before any unregister starts, by both entry
+/// points: a max age under one millisecond (zero included) and one over the
+/// cap. The session stays registered. The accepted bounds record exactly
+/// their whole milliseconds, so nothing is clamped.
+#[tokio::test]
+async fn an_unregister_refuses_a_requeue_max_age_it_cannot_record() {
+    use crate::meerkat_machine::{UnregisterQueuedInputs, UnregisterQueuedInputsError};
+
+    let machine = MeerkatMachine::ephemeral();
+    let session_id = SessionId::new();
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("register the session");
+    let registration = machine
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("the registered session exposes its exact registration");
+    let registration_use = machine
+        .session_registration_use(&registration)
+        .await
+        .expect("the current registration has a use");
+    let over = UnregisterQueuedInputs::MAX_AGE_CAP + Duration::from_millis(1);
+    for (max_age, refusal) in [
+        (
+            Duration::ZERO,
+            UnregisterQueuedInputsError::MaxAgeUnderOneMillisecond {
+                max_age: Duration::ZERO,
+            },
+        ),
+        (
+            Duration::from_micros(999),
+            UnregisterQueuedInputsError::MaxAgeUnderOneMillisecond {
+                max_age: Duration::from_micros(999),
+            },
+        ),
+        (
+            over,
+            UnregisterQueuedInputsError::MaxAgeOverCap {
+                max_age: over,
+                cap: UnregisterQueuedInputs::MAX_AGE_CAP,
+            },
+        ),
+    ] {
+        let queued_inputs = UnregisterQueuedInputs::Requeue { max_age };
+        assert_eq!(queued_inputs.check(), Err(refusal));
+        let current = machine
+            .observe_unregister_session_registration_with_queued_inputs_if_current(
+                &registration,
+                queued_inputs,
+            )
+            .await
+            .expect_err("the current-registration entry refuses it");
+        assert!(
+            matches!(current, RuntimeDriverError::QueuedInputsRefused(found) if found == refusal),
+            "{current}"
+        );
+        let unchanged = machine
+            .observe_unregister_session_registration_with_queued_inputs_if_use_unchanged(
+                &registration,
+                registration_use,
+                queued_inputs,
+            )
+            .await
+            .expect_err("the use-gated entry refuses it");
+        assert!(
+            matches!(unchanged, RuntimeDriverError::QueuedInputsRefused(found) if found == refusal),
+            "{unchanged}"
+        );
+        assert!(
+            machine.contains_session(&session_id).await,
+            "a refused disposition starts no unregister"
+        );
+    }
+    for (max_age, recorded_ms) in [
+        (Duration::from_millis(1), 1),
+        (UnregisterQueuedInputs::MAX_AGE_CAP, 86_400_000),
+    ] {
+        assert_eq!(
+            UnregisterQueuedInputs::Requeue { max_age }
+                .recorded()
+                .map(|disposition| disposition.dsl_disposition()),
+            Ok((
+                crate::meerkat_machine::dsl::UnregisterQueuedInputsDisposition::Requeue,
+                recorded_ms
+            ))
+        );
+    }
+}
+
 fn memory_blob_store() -> Arc<dyn meerkat_core::BlobStore> {
     Arc::new(meerkat_store::MemoryBlobStore::new())
 }
@@ -21380,7 +21471,7 @@ mod stop_teardown_coordinator_class {
                 epoch_id: entry.epoch_id.clone(),
                 coordinator_id: uuid::Uuid::new_v4(),
                 result_rx,
-                queued_inputs: UnregisterQueuedInputs::Stop,
+                queued_inputs: UnregisterDisposition::STOP,
             });
         }
         drop(held_transaction);
@@ -50460,6 +50551,9 @@ fn summarize_runtime_parity_driver_error(error: &RuntimeDriverError) -> String {
         RuntimeDriverError::Internal(reason) => format!("internal:{reason}"),
         RuntimeDriverError::ScopedContextGenerationNotAdvanced { bound, requested } => {
             format!("scoped_context_generation_not_advanced:{bound}:{requested}")
+        }
+        RuntimeDriverError::QueuedInputsRefused(refusal) => {
+            format!("queued_inputs_refused:{refusal:?}")
         }
     }
 }

@@ -7934,7 +7934,7 @@ impl MeerkatMachine {
                 epoch_id: epoch_id.clone(),
                 coordinator_id,
                 result_rx: result_rx.clone(),
-                queued_inputs: UnregisterQueuedInputs::Stop,
+                queued_inputs: UnregisterDisposition::STOP,
             });
             (
                 epoch_id,
@@ -8053,6 +8053,9 @@ impl MeerkatMachine {
         registration: &RuntimeSessionRegistrationWitness,
         queued_inputs: UnregisterQueuedInputs,
     ) -> Result<RuntimeSessionUnregisterAdmission, RuntimeDriverError> {
+        let queued_inputs = queued_inputs
+            .recorded()
+            .map_err(RuntimeDriverError::QueuedInputsRefused)?;
         if !registration.belongs_to(self) {
             return Ok(RuntimeSessionUnregisterAdmission::NotCurrent);
         }
@@ -8096,6 +8099,9 @@ impl MeerkatMachine {
         expected_use: RuntimeSessionRegistrationUse,
         queued_inputs: UnregisterQueuedInputs,
     ) -> Result<RuntimeSessionUnregisterUseAdmission, RuntimeDriverError> {
+        let queued_inputs = queued_inputs
+            .recorded()
+            .map_err(RuntimeDriverError::QueuedInputsRefused)?;
         if !registration.belongs_to(self) {
             return Ok(RuntimeSessionUnregisterUseAdmission::Admitted(
                 RuntimeSessionUnregisterAdmission::NotCurrent,
@@ -9286,7 +9292,7 @@ impl MeerkatMachine {
             admission,
             expected_registration,
             wait,
-            UnregisterQueuedInputs::Stop,
+            UnregisterDisposition::STOP,
         )
         .await
     }
@@ -9307,7 +9313,7 @@ impl MeerkatMachine {
         admission: UnregisterTeardownAdmission,
         expected_registration: Option<&RuntimeSessionRegistrationWitness>,
         wait: UnregisterTeardownWait,
-        queued_inputs: UnregisterQueuedInputs,
+        queued_inputs: UnregisterDisposition,
     ) -> Result<UnregisterTeardownWaitOutcome, RuntimeDriverError> {
         enum CoordinatorDecision {
             Join {
@@ -10127,7 +10133,7 @@ impl MeerkatMachine {
         let (queued_inputs, requeue_max_age_ms) = entry
             .unregister_coordinator
             .as_ref()
-            .map_or(UnregisterQueuedInputs::Stop, |coordinator| {
+            .map_or(UnregisterDisposition::STOP, |coordinator| {
                 coordinator.queued_inputs
             })
             .dsl_disposition();

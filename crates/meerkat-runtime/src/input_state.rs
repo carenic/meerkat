@@ -3200,6 +3200,77 @@ mod tests {
         );
     }
 
+    // Byte-exact released v0.9.4 terminal-outcome enums, commit
+    // e91835c5fea0170d0dfc1d297d70269234fd4a16, src/input_state.rs blob
+    // 0240352c88556191e86567813bdce53249f8bf14, lines 47-92: what the 0.9.4
+    // reader decodes a row's terminal outcome with, before its version gate.
+    #[allow(dead_code)]
+    mod released_v0_9_4_terminal_outcome {
+        use meerkat_core::lifecycle::InputId;
+        use serde::{Deserialize, Serialize};
+
+        include!("../tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt");
+    }
+
+    /// What the released 0.9.4 reader does with each requeue-across-stop fact.
+    /// It decodes a row's whole helper, the terminal outcome included, before
+    /// its version gate. A row that ended `RequeueExpired` therefore fails on
+    /// the abandon reason 0.9.4 does not know: a decode failure, not the typed
+    /// version error, and still fail-closed. A row with a stop mark carries no
+    /// such terminal, and 0.9.4's helper ignores the mark field, so the row
+    /// reaches the version gate, which refuses v8 typed (meerkat-core's
+    /// `released_v0_9_4_version_gate_reads_baseline_rows_and_refuses_v8_typed`).
+    /// The same 0.9.4 enums still decode an ordinary stopped row's terminal.
+    #[test]
+    fn a_released_v0_9_4_reader_fails_closed_on_both_requeue_facts() {
+        use released_v0_9_4_terminal_outcome as released;
+
+        let mut expired = StoredInputState::new_accepted(InputId::new());
+        expired.seed.phase = InputLifecycleState::Abandoned;
+        expired.seed.terminal_outcome = Some(InputTerminalOutcome::Abandoned {
+            reason: InputAbandonReason::RequeueExpired,
+        });
+        let expired = serde_json::to_value(&expired).unwrap();
+        assert_eq!(expired["stored_input_state_version"], 8);
+        let error = serde_json::from_value::<released::InputTerminalOutcome>(
+            expired["terminal_outcome"].clone(),
+        )
+        .expect_err("0.9.4 does not know the requeue-expired reason");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown variant `requeue_expired`"),
+            "{error}"
+        );
+
+        let mut marked = StoredInputState::new_accepted(InputId::new());
+        marked.state.stop_requeue = Some(StopRequeueMark {
+            stopped_at: Utc::now(),
+            max_age_ms: 900_000,
+        });
+        let marked = serde_json::to_value(&marked).unwrap();
+        assert_eq!(marked["stored_input_state_version"], 8);
+        assert!(marked.get("terminal_outcome").is_none());
+        assert!(marked.get("stop_requeue").is_some());
+
+        let mut stopped = StoredInputState::new_accepted(InputId::new());
+        stopped.seed.phase = InputLifecycleState::Abandoned;
+        stopped.seed.terminal_outcome = Some(InputTerminalOutcome::Abandoned {
+            reason: InputAbandonReason::Stopped,
+        });
+        let stopped = serde_json::to_value(&stopped).unwrap();
+        assert_eq!(stopped["stored_input_state_version"], 7);
+        assert_eq!(
+            serde_json::from_value::<released::InputTerminalOutcome>(
+                stopped["terminal_outcome"].clone()
+            )
+            .unwrap(),
+            released::InputTerminalOutcome::Abandoned {
+                reason: released::InputAbandonReason::Stopped
+            }
+        );
+    }
+
     /// A row whose authority association bounds its resource domains by owner
     /// is written as stored input state v7. Stamped with an older version it
     /// is refused, wherever the bound sits: either ceiling, of the persisted

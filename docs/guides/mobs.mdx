@@ -1229,7 +1229,8 @@ first failure in roster order.
 Since 0.9.5 a Shutdown can keep queued work for the next start:
 `ShutdownOptions::default().with_queued_inputs(QueuedInputsOnShutdown::Requeue(max_age))`,
 where `max_age` is a `RequeueMaxAge` (`RequeueMaxAge::new(duration)` refuses
-zero and more than 24 hours with `ShutdownOptionsError`; the default is
+a bound under one millisecond, zero included, or over 24 hours with
+`ShutdownOptionsError`; the default is
 `RequeueMaxAge::DEFAULT`, 15 minutes). A member input still queued behind the
 running turn is kept when it is a durable prompt in the queue lane that is
 neither directed nor bound to an objective, as a host human input submitted
