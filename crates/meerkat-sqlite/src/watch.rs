@@ -738,6 +738,10 @@ struct NotifySource(notify::RecommendedWatcher);
 
 impl WatchSource for NotifySource {
     fn watch(&mut self, directory: &Path) -> Result<(), String> {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(delay) = test_support::platform_registration_delay() {
+            thread::sleep(delay);
+        }
         self.0
             .watch(directory, RecursiveMode::NonRecursive)
             .map_err(|error| format!("cannot watch {}: {error}", directory.display()))
@@ -967,6 +971,24 @@ pub mod test_support {
     use std::time::{Duration, Instant};
 
     use super::{WatchBackend, WatchSource, WatchTargets, lock};
+
+    /// The variable that slows every platform registration in a test process.
+    pub const PLATFORM_REGISTRATION_DELAY_MS: &str =
+        "MEERKAT_TEST_SQLITE_WATCH_REGISTRATION_DELAY_MS";
+
+    /// How long every platform registration in this process waits before it
+    /// registers: [`PLATFORM_REGISTRATION_DELAY_MS`] milliseconds, read once
+    /// (unset: none). It makes the notify source register as slowly as a
+    /// macOS FSEvents registration can (tens of seconds), on any platform.
+    pub(super) fn platform_registration_delay() -> Option<Duration> {
+        static DELAY: OnceLock<Option<Duration>> = OnceLock::new();
+        *DELAY.get_or_init(|| {
+            std::env::var(PLATFORM_REGISTRATION_DELAY_MS)
+                .ok()
+                .and_then(|millis| millis.parse().ok())
+                .map(Duration::from_millis)
+        })
+    }
 
     /// Held directories, by canonical path.
     static HOLDS: OnceLock<Mutex<HashMap<PathBuf, Arc<Hold>>>> = OnceLock::new();
