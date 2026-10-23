@@ -252,7 +252,14 @@ const RECORD_BUILDER: &str = "fn record_durability_fail_stop";
 /// files, by path relative to `src/`, with comments and literals blanked and
 /// test-only items removed.
 fn shipped_sources() -> Vec<(String, String)> {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    // Read when the test runs: cargo, nextest (also from an archive) and the
+    // Bazel test rule set CARGO_MANIFEST_DIR for the test process, so an
+    // archived test binary never carries the builder's path.
+    let root = std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR is set for test processes"),
+    )
+    .join("src");
     let mut pending = vec![root.clone()];
     let mut files = Vec::new();
     while let Some(directory) = pending.pop() {
