@@ -272,6 +272,9 @@ changes below):
   `dedupe_key: Option<ToolCallDedupeKey>`;
 - `meerkat-runtime`: `CompletionOutcome::CallbackPending` gains
   `dedupe_key: Option<ToolCallDedupeKey>`;
+- `meerkat-mob`: the struct variants `MobError::CallbackPending` and
+  `BoundedTurnFailure::CallbackPending` gain
+  `dedupe_key: Option<Box<ToolCallDedupeKey>>`;
 - `meerkat-contracts`: `WirePendingToolCall` gains
   `dedupe_key: Option<ToolCallDedupeKey>`, and `WireCallbackPending::single`
   takes the key as its eighth argument.
@@ -444,28 +447,35 @@ WebSocket, and keep WebRTC for sessions that are not mob members.
 Some state that 0.9.5 writes does not carry back to 0.9.4:
 
 - **Runs in flight.** 0.9.4 never continues a run. It closes a run that was
-  in flight when 0.9.5 last stopped (a crash, a kill, or a graceful stop
-  that kept the run) as interrupted, and ends the run's inputs without
-  running them again. Some of these sessions, such as one whose run stopped
-  in its first round or right after a compaction, do not open in 0.9.4 at
-  all until 0.9.5 has settled the run.
+  in flight when 0.9.5 last stopped (a crash or a kill) as interrupted, and
+  ends the run's inputs without running them again. Some of these sessions,
+  such as one whose run stopped in its first round or right after a
+  compaction, do not open in 0.9.4 at all until 0.9.5 has settled the run.
 - **Kept inputs.** 0.9.4 cannot open a store while an input that a
   requeue stop kept is still queued, and cannot read a kept or expired
-  input's row after that (see Other behaviour changes above).
+  input's row after that (see Other behaviour changes above). This includes
+  the inputs of a run that a requeue stop kept: 0.9.4 cannot read them, so
+  it neither continues nor closes that run.
+- **Unfinished requeue stops.** A requeue stop that was killed while it
+  drained, such as a default graceful shutdown of a session with per-round
+  commits, leaves the session's lifecycle record at version 6, which 0.9.4
+  refuses when it opens that session. Opening the session on 0.9.5 finishes
+  that stop and rewrites the record in a version 0.9.4 reads.
 - **Pending callback calls.** 0.9.4 cannot finalize a pending callback
   call stored with a dedupe key: its stored digest no longer verifies there.
 
 Before you start 0.9.4 on a state root that 0.9.5 used:
 
 1. On 0.9.5, open each session that had a run in flight at the last stop,
-   and let the run end. Deliver the results of its pending callback calls,
-   or cancel the run.
+   and each session whose shutdown did not finish, and let any run end.
+   Deliver the results of its pending callback calls, or cancel the run.
 2. Shut down with an explicit `Stop` (an unregister with
    `UnregisterQueuedInputs::Stop`, or a mob Shutdown with
    `with_queued_inputs(QueuedInputsOnShutdown::Stop)`), so that no run and
    no queued input is kept. For `rkat-rpc` and the REST server, whose own
-   shutdown keeps the work of sessions with per-round commits, stop sending work and let every
-   run and queued input finish before you stop them.
+   shutdown keeps the work of sessions with per-round commits, stop sending
+   work, let every run and queued input finish before you stop them, and
+   let their shutdown finish.
 3. Then start 0.9.4.
 
 ## Upgrading to 0.9.4

@@ -149,8 +149,8 @@ per-round commits, and Stop for any other session:
   exits), on SIGTERM and on an interrupt;
 - the REST server's shutdown on SIGTERM or an interrupt;
 - a mob Shutdown (`MobHandle::shutdown()`, or `ShutdownOptions` without
-  `with_queued_inputs`), member by member: it suspends a durable member's
-  running turn instead of cancelling it.
+  `with_queued_inputs`), member by member: it suspends the running turn of a
+  member whose session commits every round instead of cancelling it.
 
 A host that chooses explicitly keeps its choice: an unregister with
 `UnregisterQueuedInputs::Stop`, or a Shutdown with
