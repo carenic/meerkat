@@ -104,8 +104,10 @@
 //!
 //! - A writer acquires with [`AcquireMode::Exclusive`]; a live holder makes
 //!   that answer [`HostStoreError::Held`] with what remains of its lease, so
-//!   two processes never fence each other back and forth. Only an explicit
-//!   takeover uses [`AcquireMode::Takeover`].
+//!   two processes never fence each other back and forth. Apart from Core
+//!   taking over its own recorded lease (a stopped holder re-acquires, and
+//!   its exclusive acquire answers Held with its own token), only an
+//!   explicit takeover uses [`AcquireMode::Takeover`].
 //! - A holder renews at least once per renew interval and stops writing as
 //!   soon as a renew fails.
 //! - **A holder that stopped re-acquires; it never resumes on a later
