@@ -3754,7 +3754,23 @@ impl EphemeralRuntimeDriver {
         input_ids: &[InputId],
     ) -> Result<(), RuntimeDriverError> {
         for input_id in input_ids {
-            self.apply_input(input_id, run_id)?;
+            // A resumed run's contributor can already be applied by one of
+            // the run's committed rounds: an `Applied` one only becomes
+            // pending consumption at this terminal, and one already pending
+            // consumption has nothing left to apply.
+            match self.input_phase(input_id) {
+                Some(InputLifecycleState::AppliedPendingConsumption)
+                    if self.input_bound_to_open_run(input_id, run_id) =>
+                {
+                    continue;
+                }
+                Some(InputLifecycleState::Applied)
+                    if self.input_bound_to_open_run(input_id, run_id) =>
+                {
+                    self.mark_applied_contributor_pending_consumption(input_id, run_id)?;
+                }
+                _ => self.apply_input(input_id, run_id)?,
+            }
             self.dsl_apply(
                 mm_dsl::MeerkatMachineInput::RecordBoundarySeq {
                     input_id: Self::dsl_key(input_id),
@@ -6361,8 +6377,11 @@ impl EphemeralRuntimeDriver {
                 self.abandon_staged_inputs(
                     contributing_input_ids,
                     InputAbandonReason::NeverExecuted,
-                )
-                .map(|_| ())
+                )?;
+                // A contributor one of the run's committed rounds already
+                // applied did execute: its effect is the run's committed
+                // history, so it ends consumed, never as never executed.
+                self.consume_applied_contributors_of_run(run_id, contributing_input_ids)
             }
             FailedRunContributorDisposition::Replayed => {
                 tracing::debug!(
@@ -6397,17 +6416,8 @@ impl EphemeralRuntimeDriver {
         run_id: &RunId,
         input_ids: &[InputId],
     ) -> Result<(), RuntimeDriverError> {
-        for input_id in input_ids {
-            let Some(from) = self.input_phase(input_id) else {
-                continue;
-            };
-            if !matches!(
-                from,
-                InputLifecycleState::Applied | InputLifecycleState::AppliedPendingConsumption
-            ) || self.input_last_run_id(input_id).as_ref() != Some(run_id)
-            {
-                continue;
-            }
+        for (input_id, from) in self.applied_contributors_of_run(run_id, input_ids) {
+            let input_id = &input_id;
             let lane = self.input_recovery_lane(input_id).ok_or_else(|| {
                 RuntimeDriverError::Internal(format!(
                     "generated recovery lane missing for replay of applied input '{input_id}'"
@@ -6433,6 +6443,77 @@ impl EphemeralRuntimeDriver {
             }
         }
         Ok(())
+    }
+
+    /// The contributors among `input_ids` that a committed round of `run_id`
+    /// already applied (`Applied` or `AppliedPendingConsumption`, still
+    /// associated with the run), with their phase. Only a resumed run has
+    /// such contributors: an ordinary run applies its inputs at the boundary
+    /// that also consumes them.
+    fn applied_contributors_of_run(
+        &self,
+        run_id: &RunId,
+        input_ids: &[InputId],
+    ) -> Vec<(InputId, InputLifecycleState)> {
+        input_ids
+            .iter()
+            .filter_map(|input_id| {
+                let phase = self.input_phase(input_id)?;
+                (matches!(
+                    phase,
+                    InputLifecycleState::Applied | InputLifecycleState::AppliedPendingConsumption
+                ) && self.input_last_run_id(input_id).as_ref() == Some(run_id))
+                .then(|| (input_id.clone(), phase))
+            })
+            .collect()
+    }
+
+    /// `Applied` to `AppliedPendingConsumption` for a contributor a
+    /// committed round of `run_id` already applied, as its run's terminal
+    /// takes it.
+    fn mark_applied_contributor_pending_consumption(
+        &mut self,
+        input_id: &InputId,
+        run_id: &RunId,
+    ) -> Result<(), RuntimeDriverError> {
+        self.dsl_apply(
+            mm_dsl::MeerkatMachineInput::MarkAppliedPendingConsumption {
+                input_id: Self::dsl_key(input_id),
+            },
+            "MarkAppliedPendingConsumption(ended run)",
+        )?;
+        let now = Utc::now();
+        if let Some(state) = self.ledger.get_mut(input_id) {
+            state.history.push(InputStateHistoryEntry {
+                timestamp: now,
+                from: InputLifecycleState::Applied,
+                to: InputLifecycleState::AppliedPendingConsumption,
+                reason: Some(format!("MarkAppliedPendingConsumption(ended run {run_id})")),
+            });
+            state.updated_at = now;
+        }
+        Ok(())
+    }
+
+    /// Consume each contributor a committed round of the ended `run_id`
+    /// already applied: its effect is the run's committed history. An
+    /// `Applied` one becomes pending consumption first.
+    fn consume_applied_contributors_of_run(
+        &mut self,
+        run_id: &RunId,
+        input_ids: &[InputId],
+    ) -> Result<(), RuntimeDriverError> {
+        let applied = self.applied_contributors_of_run(run_id, input_ids);
+        for (input_id, phase) in &applied {
+            if *phase == InputLifecycleState::Applied {
+                self.mark_applied_contributor_pending_consumption(input_id, run_id)?;
+            }
+        }
+        let applied = applied
+            .into_iter()
+            .map(|(input_id, _)| input_id)
+            .collect::<Vec<_>>();
+        self.consume_inputs(&applied, run_id)
     }
 
     /// Machine-owned realization for a validated cancelled run.

@@ -38104,6 +38104,313 @@ async fn persistent_machine_terminal_commit_recovers_consumed_input_and_failed_t
     );
 }
 
+/// A durable session's resumed run, as the runtime holds it while the run
+/// executes: `applied` of its inputs one of its committed rounds already
+/// applied (pending consumption), and `staged` more still staged, all bound
+/// to the run. The store holds the run's provisional tail over a committed
+/// base, its cursor binding every input, as the session's durable state
+/// leaves it for a restart.
+struct ResumedRunWithAppliedInputs {
+    store: Arc<crate::store::InMemoryRuntimeStore>,
+    driver: SharedDriver,
+    session_id: SessionId,
+    runtime_id: LogicalRuntimeId,
+    run_id: RunId,
+    applied: Vec<InputId>,
+    staged: Vec<InputId>,
+    /// The run's tail, and the store-issued receipt naming it.
+    tail: meerkat_core::Session,
+    tail_receipt: meerkat_core::RunCheckpointReceipt,
+}
+
+impl ResumedRunWithAppliedInputs {
+    /// Every input of the run, in admission order.
+    fn inputs(&self) -> Vec<InputId> {
+        self.applied.iter().chain(&self.staged).cloned().collect()
+    }
+}
+
+/// `round_complete` names the tail's resume point: a completed round awaits
+/// the model (a tail a run's failure may promote); otherwise the round's
+/// first commit holds its staged call only in the run cursor.
+async fn resumed_run_with_applied_inputs(
+    applied: usize,
+    staged: usize,
+    round_complete: bool,
+) -> ResumedRunWithAppliedInputs {
+    use meerkat_core::types::{
+        AssistantBlock, BlockAssistantMessage, Message, StopReason, TranscriptMessageIdentity,
+        UserMessage,
+    };
+
+    let store = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let session_id = SessionId::new();
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    let mut committed = meerkat_core::Session::with_id(session_id.clone());
+    committed.push(Message::User(UserMessage::text("committed before the run")));
+    let base = store
+        .commit_prepared_session_boundary(
+            &runtime_id,
+            crate::store::PreparedRuntimeSessionCommit::snapshot_only(
+                BoundSessionCommit::sealed(Arc::new(committed.clone()))
+                    .expect("seal the committed base"),
+            ),
+        )
+        .await
+        .expect("the committed base commits")
+        .authority()
+        .and_then(|authority| authority.whole_blob())
+        .cloned()
+        .expect("the committed base has a WholeBlob authority");
+
+    let mut driver = PersistentRuntimeDriver::new(
+        runtime_id.clone(),
+        Arc::clone(&store) as Arc<dyn RuntimeStore>,
+        memory_blob_store(),
+    );
+    let mut inputs = Vec::new();
+    for ordinal in 0..applied + staged {
+        let input = make_prompt(&format!("the resumed run's input {ordinal}"));
+        inputs.push(input.id().clone());
+        driver
+            .accept_input(input)
+            .await
+            .expect("the input is accepted");
+    }
+    let run_id = RunId::new();
+    driver
+        .contract_begin_run_authority(run_id.clone())
+        .expect("the run begins through generated authority");
+    driver
+        .machine_realize_authorized_stage_batch(
+            crate::meerkat_machine::driver::test_authorized_stage_for_run(
+                inputs.clone(),
+                run_id.clone(),
+            ),
+        )
+        .expect("the inputs stage for the run");
+    let (applied_inputs, staged_inputs) = inputs.split_at(applied);
+    if !applied_inputs.is_empty() {
+        let receipt = RunBoundaryReceiptDraft {
+            run_id: run_id.clone(),
+            boundary: RunApplyBoundary::Immediate,
+            contributing_input_ids: applied_inputs.to_vec(),
+            conversation_digest: None,
+            message_count: 0,
+        }
+        .into_sequenced(1);
+        driver
+            .machine_realize_boundary_applied_in_memory(&run_id, &receipt)
+            .expect("a committed round applies its contributors");
+    }
+
+    // The run's tail, its cursor binding every input of the run.
+    let staged_call = BlockAssistantMessage {
+        blocks: vec![AssistantBlock::ToolUse {
+            id: "resumed-call".to_string(),
+            name: "durable_tool".to_string(),
+            args: serde_json::value::RawValue::from_string("{}".to_string())
+                .expect("raw tool arguments"),
+            meta: None,
+        }],
+        stop_reason: Some(StopReason::ToolUse),
+        identity: TranscriptMessageIdentity::default().with_run_id(run_id.clone()),
+        created_at: meerkat_core::types::message_timestamp_now(),
+        assistant_message_id: Some(
+            serde_json::from_value(serde_json::Value::String(uuid::Uuid::now_v7().to_string()))
+                .expect("an assistant message id"),
+        ),
+    };
+    let resume_point = if round_complete {
+        meerkat_core::RunResumePoint::AwaitingModel
+    } else {
+        meerkat_core::RunResumePoint::ToolsPending {
+            assistant_message: staged_call,
+        }
+    };
+    let mut tail = committed;
+    tail.push(Message::User(UserMessage::text(
+        "the run's committed round",
+    )));
+    tail.set_run_cursor(&meerkat_core::SessionRunCursor::new(
+        run_id.clone(),
+        inputs.clone(),
+        0,
+        resume_point,
+    ))
+    .expect("the run cursor is recorded");
+    let tail_authority = store
+        .write_prepared_whole_blob_provisional_tail(
+            &runtime_id,
+            crate::store::PreparedWholeBlobProvisionalTail::prepare(
+                base,
+                run_id.clone(),
+                1,
+                &BoundSessionCommit::sealed(Arc::new(tail.clone())).expect("seal the run's tail"),
+            )
+            .expect("the run's tail prepares"),
+        )
+        .await
+        .expect("the run's tail is written");
+    let tail_receipt = meerkat_core::RunCheckpointReceipt::issued(
+        meerkat_core::RunCheckpointAuthority::WholeBlob(tail_authority),
+        tail.transcript_content_digest()
+            .expect("the tail's transcript digests"),
+        u64::try_from(tail.messages().len()).expect("message count fits"),
+    )
+    .expect("a well-formed checkpoint receipt");
+
+    ResumedRunWithAppliedInputs {
+        store,
+        driver: Arc::new(Mutex::new(DriverEntry::Persistent(driver))),
+        session_id,
+        runtime_id,
+        run_id,
+        applied: applied_inputs.to_vec(),
+        staged: staged_inputs.to_vec(),
+        tail,
+        tail_receipt,
+    }
+}
+
+/// The durable phase and terminal outcome each input of `run` ended with, in
+/// admission order. The live driver keeps none of them bound to the run and
+/// none of them queued.
+async fn ended_run_input_outcomes(
+    run: &ResumedRunWithAppliedInputs,
+) -> Vec<(
+    crate::input_state::InputLifecycleState,
+    Option<crate::input_state::InputTerminalOutcome>,
+)> {
+    {
+        let entry = run.driver.lock().await;
+        for input_id in run.inputs() {
+            assert!(
+                !entry.input_bound_to_open_run(&input_id, &run.run_id),
+                "no input stays bound to the ended run: {input_id}"
+            );
+        }
+        assert!(
+            !entry.has_queued_input_in_any_lane(),
+            "the ended run returned none of its inputs to a lane"
+        );
+    }
+    let mut outcomes = Vec::new();
+    for input_id in run.inputs() {
+        let stored = run
+            .store
+            .load_input_state(&run.runtime_id, &input_id)
+            .await
+            .expect("the input's durable row loads")
+            .expect("the ended run's input stays inspectable");
+        outcomes.push((stored.seed.phase, stored.seed.terminal_outcome));
+    }
+    outcomes
+}
+
+/// A cold registration over the ended run's store, as a restart takes it:
+/// the run is not kept resumable, and none of its inputs is requeued, so no
+/// committed round's content runs again.
+async fn assert_cold_registration_neither_resumes_nor_requeues(run: ResumedRunWithAppliedInputs) {
+    let ResumedRunWithAppliedInputs {
+        store,
+        driver,
+        session_id,
+        run_id,
+        ..
+    } = run;
+    drop(driver);
+    let machine = MeerkatMachine::persistent_without_blobs(store as Arc<dyn RuntimeStore>)
+        .expect("persistent machine");
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("a cold registration recovers the ended run's durable state");
+    assert_eq!(
+        machine.resumable_run_id(&session_id).await,
+        None,
+        "a cold registration does not resume the ended run {run_id}"
+    );
+    let recovered = machine
+        .session_dsl_state(&session_id)
+        .await
+        .expect("the recovered authority reads");
+    assert!(
+        recovered.input_lane.is_empty(),
+        "a cold registration requeues none of the ended run's inputs: {:?}",
+        recovered.input_lane
+    );
+}
+
+/// RED before: a machine-terminal failure of a resumed run collected only its
+/// staged inputs, so the receipt, which names every input of the run, did
+/// not match them and the failure was refused. The run's failed boundary
+/// promotes the tail its completed round left, as a hard failure over a held
+/// checkpoint does, and the input a committed round already applied is
+/// consumed with the staged one: its effect is the run's committed history.
+#[tokio::test]
+async fn a_hard_failure_of_a_resumed_run_consumes_its_staged_and_applied_inputs() {
+    let run = resumed_run_with_applied_inputs(1, 1, true).await;
+    mark_staged_runtime_turn_machine_failed(&run.driver, &run.run_id).await;
+
+    commit_machine_terminal_run(
+        &run.driver,
+        run.run_id.clone(),
+        machine_terminal_tool_failure(),
+        crate::meerkat_machine::driver::MachineTerminalAppliedDraft {
+            receipt: machine_terminal_receipt(run.run_id.clone(), run.inputs(), &run.tail),
+            session: BoundSessionCommit::provisional_promotion(run.tail_receipt.clone()),
+        },
+    )
+    .await
+    .expect("the machine-terminal failure commits");
+
+    let consumed = (
+        crate::input_state::InputLifecycleState::Consumed,
+        Some(crate::input_state::InputTerminalOutcome::Consumed),
+    );
+    assert_eq!(
+        ended_run_input_outcomes(&run).await,
+        vec![consumed.clone(), consumed]
+    );
+    assert_cold_registration_neither_resumes_nor_requeues(run).await;
+}
+
+/// RED before: a resumed run that never began executing abandoned only its
+/// staged inputs, as never executed, and left the applied one bound. The
+/// staged input keeps that reason; the applied one did execute, so it is
+/// consumed, never reported as never executed.
+#[tokio::test]
+async fn a_never_started_resumed_run_consumes_the_inputs_its_rounds_applied() {
+    let run = resumed_run_with_applied_inputs(1, 1, false).await;
+
+    fail_runtime_loop_run(
+        &run.driver,
+        run.run_id.clone(),
+        CoreApplyFailureCause::executor_stopped(),
+        crate::meerkat_machine::FailedRunContributorDisposition::Terminalized,
+    )
+    .await
+    .expect("the never-started run terminalizes");
+
+    assert_eq!(
+        ended_run_input_outcomes(&run).await,
+        vec![
+            (
+                crate::input_state::InputLifecycleState::Consumed,
+                Some(crate::input_state::InputTerminalOutcome::Consumed),
+            ),
+            (
+                crate::input_state::InputLifecycleState::Abandoned,
+                Some(crate::input_state::InputTerminalOutcome::Abandoned {
+                    reason: crate::input_state::InputAbandonReason::NeverExecuted,
+                }),
+            ),
+        ]
+    );
+    assert_cold_registration_neither_resumes_nor_requeues(run).await;
+}
+
 #[tokio::test]
 async fn persistent_failed_run_lifecycle_commit_failure_preserves_pre_terminal_state() {
     let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
