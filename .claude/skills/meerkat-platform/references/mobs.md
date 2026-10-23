@@ -136,12 +136,13 @@ actor's life, with Stop, Shutdown and Destroy available. `MobError` is
 Shutdown report: `shutdown_with_report(ShutdownOptions)`
 (`ShutdownOptions::default().with_deadline(deadline)` bounds its waits;
 since 0.9.5 `.with_queued_inputs(QueuedInputsOnShutdown::Requeue(max_age))`,
-the default for members with persistent sessions (15 min; explicit `Stop`
+the default for members whose sessions commit every round (15 min; explicit `Stop`
 keeps 0.9.4 behaviour), keeps durable queued prompts that are neither
 directed nor bound to an objective (never a member's kickoff) for the next
 start, whose waiters get
 `BoundedTurnFailure::RequeuedAcrossStop`, or `RequeueExpired` when older than
-`max_age` at that start; a persistent member's running turn is kept too and
+`max_age` at that start; the running turn of a member whose session commits
+every round is kept too and
 continues from its last committed round at that start)
 returns a `MobShutdownReport` with per-member `members`
 (`MemberShutdownOutcome`), `runs` and `run_starts`; `is_clean()` is true when

@@ -1359,7 +1359,8 @@ first failure in roster order.
 
 Since 0.9.5 a Shutdown keeps queued work for the next start. A Shutdown that
 does not choose (`MobHandle::shutdown()`, or `ShutdownOptions` without
-`with_queued_inputs`) keeps it for each member whose session is persistent,
+`with_queued_inputs`) keeps it for each member whose session commits every
+round,
 with a 15 minute max age, and stops the others' queued work as in 0.9.4. To
 choose, use
 `ShutdownOptions::default().with_queued_inputs(QueuedInputsOnShutdown::Requeue(max_age))`,
@@ -1378,7 +1379,7 @@ restart re-attaches to its result. Do not resubmit it. If it is older than
 (every such start checks again), it
 ends as abandoned (`requeue_expired`) without running, and a same-key replay
 answers `BoundedTurnFailure::RequeueExpired`: resubmit it if it is still
-wanted. On a member whose session is persistent, the running turn is kept
+wanted. On a member whose session commits every round, the running turn is kept
 too: it stops at once, its inputs stay bound to its run with the same waiter
 answer and the same max age, and the run continues from its last committed
 round at the next start, before the kept inputs run (see

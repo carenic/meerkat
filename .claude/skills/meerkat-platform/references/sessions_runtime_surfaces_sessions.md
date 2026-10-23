@@ -390,7 +390,7 @@ Contract and limits: `docs/guides/durable-runs.mdx`.
   would run detached under a runner that declares itself non-resumable.
 - Graceful stop for a deploy: an unregister with
   `UnregisterQueuedInputs::Requeue { max_age }` (or a mob Shutdown with
-  `QueuedInputsOnShutdown::Requeue(max_age)`) keeps a durable session's run
+  `QueuedInputsOnShutdown::Requeue(max_age)`) keeps the run of a session with per-round commits
   in flight like a crash: the turn stops at once (work since the last round
   commit is redone), its inputs stay bound with waiters answered
   `requeued_across_stop`, and the run continues at the next open, before
@@ -400,7 +400,7 @@ Contract and limits: `docs/guides/durable-runs.mdx`.
   explicit stop/cancel, retire, destroy, reset, a requeue stop that meets a
   steer being written into the turn, or a session without per-round
   commits still ends the run. Requeue (15 min) is the default of every
-  graceful shutdown that does not choose, for durable sessions: `rkat-rpc`
+  graceful shutdown that does not choose, for sessions with per-round commits: `rkat-rpc`
   (input end, SIGTERM, interrupt), REST (SIGTERM, interrupt) and a mob
   Shutdown without `with_queued_inputs`; an explicit `Stop` keeps 0.9.4
   behaviour, and a host's own unregister without a disposition stops

@@ -876,12 +876,14 @@ idempotency key re-attaches to it. Only a durable prompt in the queue lane
 that is neither directed nor bound to an objective is kept: a member's kickoff,
 and any other objective-bound input, ends as stopped, as without the option.
 The same stop, like an unregister with `UnregisterQueuedInputs::Requeue`, also
-keeps a persistent session's run in flight: the turn stops at once, the
+keeps the run in flight of a session that commits every round: the turn
+stops at once, the
 run's inputs stay bound to it with the same waiter answer and max age, and
 the run continues from its last committed round at the session's next start
 (see [Durable runs](/guides/durable-runs#graceful-stops-and-deploys)). A
 graceful shutdown that does not choose a disposition, a mob Shutdown
-included, uses this stop with a 15 minute max age for persistent sessions.
+included, uses this stop with a 15 minute max age for sessions that commit
+every round.
 
 - The generated wait-failure resolver classes such a wait: session not
   running, reason `requeued_across_stop`, resumable, and the surface's

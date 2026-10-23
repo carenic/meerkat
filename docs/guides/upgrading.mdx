@@ -349,7 +349,7 @@ WebSocket, and keep WebRTC for sessions that are not mob members.
   kept input older than `max_age` when a start finds it still queued ends as
   `RequeueExpired` without running; every start that finds it queued checks
   again. A graceful shutdown that does not choose now uses this option, with
-  a 15 minute max age, for durable sessions: `rkat-rpc`'s and the REST
+  a 15 minute max age, for sessions with per-round commits: `rkat-rpc`'s and the REST
   server's own shutdowns, and a mob Shutdown without `with_queued_inputs`.
   Choose `Stop` explicitly to keep the 0.9.4 behaviour.
   A kept input's row is written as stored input state version 8, and an
@@ -386,11 +386,11 @@ WebSocket, and keep WebRTC for sessions that are not mob members.
   [Durable Runs: the dedupe key](/guides/durable-runs#the-dedupe-key).
 - **A requeue stop keeps a durable run in flight:** an unregister with
   `UnregisterQueuedInputs::Requeue`, or a mob Shutdown with
-  `QueuedInputsOnShutdown::Requeue`, now suspends a durable session's run in
-  flight instead of cancelling it: the run continues from its last committed
+  `QueuedInputsOnShutdown::Requeue`, now suspends the run in flight of a session with per-round
+  commits instead of cancelling it: the run continues from its last committed
   round at the next start, or its inputs end as `RequeueExpired` past the
   max age. Because a graceful shutdown that does not choose uses Requeue for
-  durable sessions, a deploy no longer cancels their runs in flight. See
+  such sessions, a deploy no longer cancels their runs in flight. See
   [Durable Runs: graceful stops and deploys](/guides/durable-runs#graceful-stops-and-deploys).
 - **Host stores:** a host can keep a realm's durable state in its own
   database through the host store SPI (`meerkat_core::host_store`), checked
@@ -412,7 +412,7 @@ WebSocket, and keep WebRTC for sessions that are not mob members.
    destroy's report through the SDK accessor, not the error text.
 5. Pass `UnregisterQueuedInputsDisposition::Stop` and `0` where you build
    `BeginUnregisterSession` or `State` of the generated runtime machine.
-6. A graceful shutdown of a durable session now keeps its queued prompts
+6. A graceful shutdown of a session with per-round commits now keeps its queued prompts
    and its run in flight unless you choose `Stop`. Before a downgrade,
    follow [Downgrading to 0.9.4](#downgrading-to-0-9-4). Treat
    `RequeuedAcrossStop` as "runs at the next start" (do not resubmit) and
@@ -463,7 +463,7 @@ Before you start 0.9.4 on a state root that 0.9.5 used:
    `UnregisterQueuedInputs::Stop`, or a mob Shutdown with
    `with_queued_inputs(QueuedInputsOnShutdown::Stop)`), so that no run and
    no queued input is kept. For `rkat-rpc` and the REST server, whose own
-   shutdown keeps durable sessions' work, stop sending work and let every
+   shutdown keeps the work of sessions with per-round commits, stop sending work and let every
    run and queued input finish before you stop them.
 3. Then start 0.9.4.
 
