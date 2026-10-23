@@ -18602,7 +18602,7 @@ mod tests {
             })
             .collect();
 
-        let results = dispatch_tool_calls_boxed(
+        let dispatch = dispatch_tool_calls_boxed(
             dispatcher,
             crate::ToolDispatchContext::default(),
             std::time::Duration::from_secs(1),
@@ -18612,8 +18612,15 @@ mod tests {
             )]),
             1,
             calls,
-        )
-        .await;
+        );
+        // Once both calls are underway, this runtime's only thread is busy
+        // elsewhere for longer than the slot is held, as on a starved host:
+        // the queued call's deadline and the slot's release come due together.
+        let starve = async {
+            tokio::task::yield_now().await;
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        let (results, ()) = tokio::join!(dispatch, starve);
 
         assert!(matches!(
             &results[1].2,
