@@ -8777,9 +8777,12 @@ pub async fn shutdown_all_mcp_sessions(state: &AppState) {
 /// runtime with a persistence store requeues, so a session's eligible queued
 /// prompts stay queued for its next start and the runtime's stop keeps the
 /// run in flight of a session that commits each round; a runtime without one
-/// stops them. The server calls it before it cancels the requests still
-/// tracked, which would cancel such a run first. A teardown that fails is
-/// logged, and the rest still run.
+/// stops them. The server calls it when the shutdown signal arrives, before
+/// its HTTP drain, so an open request waiting on such a run is answered
+/// instead of holding the drain open, and once more after the drain for a
+/// session registered meanwhile. It cancels the requests still tracked only
+/// after that, as cancelling them first would cancel such a run. A teardown
+/// that fails is logged, and the rest still run.
 pub async fn unregister_runtime_sessions_for_shutdown(state: &AppState) {
     let queued_inputs = state.runtime_adapter.graceful_shutdown_queued_inputs();
     for registration in state
@@ -11322,13 +11325,15 @@ mod tests {
     }
 
     /// The REST server's graceful shutdown keeps a durable session's work for
-    /// its next start. It unregisters every registration with the runtime's
-    /// graceful disposition (Requeue on this persistent realm) before it
-    /// cancels the requests still tracked, so neither tracked continue is
-    /// cancelled: the one running and the one queued behind it are both
-    /// answered `409` `SESSION_NOT_RUNNING` with `requeued_across_stop`. A
-    /// server started again on the realm runs each of them once when the
-    /// session is opened again, ahead of the new continue.
+    /// its next start. At the signal, before its HTTP drain, it unregisters
+    /// every registration with the runtime's graceful disposition (Requeue on
+    /// this persistent realm), and it cancels the requests still tracked only
+    /// after the drain. The unregister alone answers both open tracked
+    /// continues, the one running and the one queued behind it, with `409`
+    /// `SESSION_NOT_RUNNING` and `requeued_across_stop`: neither is cancelled,
+    /// and neither holds the drain open. A server started again on the realm
+    /// runs each of them once when the session is opened again, ahead of the
+    /// new continue.
     ///
     /// Unrun. The queued continue's answer needs only the requeue; the running
     /// continue's answer and its run at the next start also need the runtime
@@ -11369,19 +11374,24 @@ mod tests {
                 "the second continue waits queued behind the running turn"
             );
 
-            // The server's shutdown order after its HTTP drain.
+            // The server's shutdown at the signal, before its HTTP drain:
+            // schedule delivery stops and the sessions unregister. That alone
+            // answers both open requests, so the drain that follows does not
+            // wait for their runs; nothing has been cancelled yet.
             state.shutdown_schedule_host().await;
             unregister_runtime_sessions_for_shutdown(&state).await;
-            state.request_executor.shutdown_and_abort_stragglers().await;
-
             let running = tokio::time::timeout(FAILURE_BOUND, running)
                 .await
-                .expect("the running continue is answered by the shutdown")
+                .expect("the running continue is answered by the unregister")
                 .expect("running continue task");
             let queued = tokio::time::timeout(FAILURE_BOUND, queued)
                 .await
-                .expect("the queued continue is answered by the shutdown")
+                .expect("the queued continue is answered by the unregister")
                 .expect("queued continue task");
+            // After the drain: the second unregister pass, then the requests
+            // still tracked are cancelled.
+            unregister_runtime_sessions_for_shutdown(&state).await;
+            state.request_executor.shutdown_and_abort_stragglers().await;
             let kept = |(status, body): &(StatusCode, Value)| {
                 *status == StatusCode::CONFLICT
                     && body["code"] == "SESSION_NOT_RUNNING"
