@@ -811,7 +811,6 @@ async fn an_executor_without_an_actor_over_a_round_commit_reports_the_session_un
     an_executor_without_an_actor_over_a_round_commit_reports_the_session_unavailable(false).await;
 }
 
-
 // ---------------------------------------------------------------------------
 // An earlier incarnation's open run, met under the session's hosting claim.
 // ---------------------------------------------------------------------------
