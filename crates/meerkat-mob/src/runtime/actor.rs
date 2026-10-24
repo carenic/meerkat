@@ -33536,6 +33536,32 @@ impl MobActor {
                 }
                 let member_ref = MemberRef::from_bridge_session_id(resume_id.clone());
 
+                // A session whose durable tail runs past its committed runtime
+                // boundary refuses this spawn, typed, as the transcript
+                // revision conflict, before anything settles the tail: a
+                // session no start of this mob restores (another mob's member
+                // session, say) is not this spawn's to complete. The tail is
+                // decided on the strict committed read, ahead of every other
+                // read of the session and whether or not a live actor of this
+                // service hosts it. The activity check below reads through
+                // `read`, which serves the committed snapshot under such a
+                // tail; a presence or activity read of a session a live actor
+                // hosts settles the tail its ended turn left; and the resume's
+                // verdict settles the tail of a session no live actor hosts.
+                // Only a service that keeps durable sessions holds such a
+                // tail, and its committed read never waits on a running turn
+                // (an in-memory service's read exports the live session, which
+                // does).
+                if preparation_context.session_service.supports_persistent_sessions()
+                    && let Err(error) = preparation_context
+                        .session_service
+                        .load_persisted_session(&resume_id)
+                        .await
+                    && is_transcript_revision_conflict(&error)
+                {
+                    return Err(MobError::SessionError(error));
+                }
+
                 // A role migration is a cold, one-shot restamp of durable
                 // identity. Never let it reuse or race an exact live actor,
                 // even when that actor is idle and `SessionInfo::is_active`
@@ -33551,30 +33577,6 @@ impl MobActor {
                         reason: "the exact session is still live; stop or retire its current runtime before restamping durable comms identity"
                             .to_string(),
                     });
-                }
-
-                // A session whose durable tail runs past its committed runtime
-                // boundary refuses this spawn, typed, as the transcript
-                // revision conflict, before anything settles the tail: a
-                // session no start of this mob restores (another mob's member
-                // session, say) is not this spawn's to complete. The tail is
-                // decided on the strict committed read. The activity check
-                // below reads through `read`, which serves a session's
-                // committed snapshot under such a tail, and the resume's
-                // verdict that follows settles it. A live actor of this
-                // service owns its own run's tail, so only a session no live
-                // actor hosts is decided here.
-                if !preparation_context
-                    .session_service
-                    .has_live_session(&resume_id)
-                    .await?
-                    && let Err(error) = preparation_context
-                        .session_service
-                        .load_persisted_session(&resume_id)
-                        .await
-                    && is_transcript_revision_conflict(&error)
-                {
-                    return Err(MobError::SessionError(error));
                 }
 
                 // Validate the session exists and is active. A service whose
