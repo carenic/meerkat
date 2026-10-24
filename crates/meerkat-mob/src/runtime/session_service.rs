@@ -1789,6 +1789,24 @@ pub trait MobSessionService:
         Ok(None)
     }
 
+    /// [`Self::load_persisted_session`] for a reader that serves the
+    /// session's committed snapshot while the session's own durable run
+    /// holds a provisional tail ahead of it, where the strict read refuses
+    /// the boundary (a running member, a fork source mid-turn).
+    ///
+    /// For readers only: the snapshot proves nothing about the tail, so a
+    /// caller that decides about a tail (presence, a settle, a resume) keeps
+    /// [`Self::load_persisted_session`], which stays strict.
+    ///
+    /// Default: the strict read. Durable services override it with their
+    /// tolerant committed read and the same archived-as-absent rule.
+    async fn load_persisted_session_tolerating_tail(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<Session>, SessionError> {
+        self.load_persisted_session(session_id).await
+    }
+
     /// Persist a transcript fork for a concrete new mob identity.
     ///
     /// Durable services override this with their store-owned fork authority.
@@ -3054,6 +3072,36 @@ where
     }
 }
 
+/// The persistent loaders' archived-as-absent rule: an archived session reads
+/// as `None` (the typed resume seam, `load_session_for_resume`, is where
+/// archived stops reading as absent).
+#[cfg(not(target_arch = "wasm32"))]
+async fn hide_archived_persisted_session<B>(
+    service: &meerkat_session::PersistentSessionService<B>,
+    session_id: &SessionId,
+    session: Option<Session>,
+) -> Result<Option<Session>, SessionError>
+where
+    B: meerkat_session::SessionAgentBuilder + 'static,
+{
+    let Some(session) = session else {
+        return Ok(None);
+    };
+    if service
+        .session_archived_by_authority(session_id, &session)
+        .await?
+    {
+        // Logged at debug because callers that treat this None as "missing"
+        // are the misdiagnosis this line exists to catch.
+        tracing::debug!(
+            session_id = %session_id,
+            "load_persisted_session hid an archived session (use the resume seam for revival)"
+        );
+        return Ok(None);
+    }
+    Ok(Some(session))
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 #[async_trait::async_trait]
 impl<B> MobSessionService for meerkat_session::PersistentSessionService<B>
@@ -3570,25 +3618,18 @@ where
         &self,
         session_id: &SessionId,
     ) -> Result<Option<Session>, SessionError> {
-        let Some(session) = self.load_authoritative_session(session_id).await? else {
-            return Ok(None);
-        };
-        if self
-            .session_archived_by_authority(session_id, &session)
-            .await?
-        {
-            // The ordinary loader deliberately hides archived sessions; the
-            // typed resume seam (`load_session_for_resume`) is where archived
-            // stops reading as absent. Logged at debug because callers that
-            // treat this None as "missing" are the misdiagnosis this line
-            // exists to catch.
-            tracing::debug!(
-                session_id = %session_id,
-                "load_persisted_session hid an archived session (use the resume seam for revival)"
-            );
-            return Ok(None);
-        }
-        Ok(Some(session))
+        let session = self.load_authoritative_session(session_id).await?;
+        hide_archived_persisted_session(self, session_id, session).await
+    }
+
+    async fn load_persisted_session_tolerating_tail(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<Session>, SessionError> {
+        let session = self
+            .load_committed_session_tolerating_tail(session_id)
+            .await?;
+        hide_archived_persisted_session(self, session_id, session).await
     }
 
     async fn observe_live_durable_source(
