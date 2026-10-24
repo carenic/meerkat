@@ -348,8 +348,8 @@ pub async fn durable_worker(harness: &dyn DurableWorkerHarness) -> Result<(), Co
 
 /// The compaction race over a store with fence leases: the second Core took
 /// the fence over, its write settled the run's committed rounds as an
-/// interrupted run and then committed, the run's compaction commit was
-/// refused, and the restart ran nothing.
+/// interrupted run, its input consumed with it, and then committed, the
+/// run's compaction commit was refused, and the restart ran nothing.
 fn check_race_settled_by_takeover(
     steps: &Steps,
     step: &'static str,
@@ -427,8 +427,8 @@ fn check_race_settled_by_takeover(
     )?;
     steps.ensure(
         step,
-        report.inputs_settled,
-        "the settled run's inputs are not terminal",
+        report.inputs_consumed,
+        "the settled run's input did not end consumed with its interrupted run",
     )
 }
 

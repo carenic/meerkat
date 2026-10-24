@@ -522,11 +522,14 @@ fn fence_timing_bounds() {
 /// Over a store with fence leases (`fence_leases`) or one whose sessions
 /// are hosted under cross-process claims; `race_requeues` plays a
 /// compaction race the way the chapter's first draft expected (the input
-/// runs again as a new run), which no store meets now.
+/// runs again as a new run), which no store meets now; `race_abandons`
+/// settles a fence takeover race's run with its input abandoned instead of
+/// consumed.
 struct ScriptedCore {
     recalls_model: bool,
     fence_leases: bool,
     race_requeues: bool,
+    race_abandons: bool,
     run_id: Mutex<Option<RunId>>,
 }
 
@@ -536,6 +539,7 @@ impl ScriptedCore {
             recalls_model,
             fence_leases: true,
             race_requeues: false,
+            race_abandons: false,
             run_id: Mutex::new(None),
         }
     }
@@ -554,6 +558,15 @@ impl ScriptedCore {
         Self {
             fence_leases,
             race_requeues: true,
+            ..Self::new(false)
+        }
+    }
+
+    /// A Core whose fence takeover settles the raced run with its input
+    /// abandoned.
+    fn abandoning_the_raced_input() -> Self {
+        Self {
+            race_abandons: true,
             ..Self::new(false)
         }
     }
@@ -630,6 +643,7 @@ impl ScriptedCore {
             interrupted_notices: 0,
             other_writer_follows_interrupted_notice: false,
             inputs_settled: true,
+            inputs_consumed: true,
         }
     }
 
@@ -649,6 +663,7 @@ impl ScriptedCore {
                 other_writer: Some(OtherWriterOutcome::Committed),
                 interrupted_notices: 1,
                 other_writer_follows_interrupted_notice: true,
+                inputs_consumed: !self.race_abandons,
                 ..self.settled_report()
             }
         } else {
@@ -756,6 +771,7 @@ impl ScriptedCore {
             interrupted_notices: 0,
             other_writer_follows_interrupted_notice: false,
             inputs_settled: true,
+            inputs_consumed: true,
         }
     }
 }
@@ -852,6 +868,20 @@ async fn compacted_long_run_chapter_refuses_a_core_that_requeues_the_raced_input
         assert_eq!(failure.chapter(), "compacted_long_run");
         assert_eq!(failure.step(), step);
     }
+}
+
+/// A fence takeover that settles the raced run with its input abandoned
+/// leaves the input settled but not consumed: the fence race row refuses it.
+#[tokio::test]
+async fn compacted_long_run_chapter_refuses_a_core_that_abandons_the_raced_input() {
+    let failure = chapters::compacted_long_run(&ScriptedCore::abandoning_the_raced_input())
+        .await
+        .expect_err("abandoning the raced input must fail the fence race row");
+    assert_eq!(failure.chapter(), "compacted_long_run");
+    assert_eq!(
+        failure.step(),
+        "compaction_racing_a_fence_takeover_settles_the_run_as_interrupted"
+    );
 }
 
 #[tokio::test]

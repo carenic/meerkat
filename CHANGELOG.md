@@ -1469,8 +1469,9 @@ them.
     run commits its compaction and finishes every round once in its first
     incarnation.
   `RestartReport` reports what the other writer got (`OtherWriterOutcome`),
-  the transcript's interrupted-run notices and whether the writer's message
-  follows one.
+  the transcript's interrupted-run notices, whether the writer's message
+  follows one, and whether the raced run's input ended consumed
+  (`inputs_consumed`), which the fence takeover row requires.
 - `MemberBinding::labels()`: the application labels the incarnation was
   spawned with, as its spawn recorded them (a member reset keeps them). Every
   read of the member binding history carries them, the store-level

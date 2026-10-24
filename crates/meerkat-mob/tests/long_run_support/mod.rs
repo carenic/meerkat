@@ -1732,6 +1732,30 @@ impl Incarnation {
             })
     }
 
+    /// Whether `input` ended consumed: its terminal receipt, or for a
+    /// session the restart never registers, its durable row.
+    pub async fn input_consumed(&self, session: &SessionId, input: &InputId) -> bool {
+        use meerkat_runtime::InputTerminalOutcome;
+        if let Some(terminal) = self.input_terminal(session, input).await {
+            return terminal == InputTerminalOutcome::Consumed;
+        }
+        let runtime_id = LogicalRuntimeId::for_session(session);
+        self.runtime_store
+            .load_input_states(&runtime_id)
+            .await
+            .is_ok_and(|rows| {
+                rows.into_iter().any(|row| {
+                    matches!(
+                        row,
+                        meerkat_runtime::store::InputStateRow::Decoded(state)
+                            if &state.state.input_id == input
+                                && state.seed.terminal_outcome
+                                    == Some(InputTerminalOutcome::Consumed)
+                    )
+                })
+            })
+    }
+
     /// `input`'s terminal outcome, once it has one.
     pub async fn input_terminal(
         &self,
@@ -2697,6 +2721,7 @@ async fn report_from(
             .count();
     }
     let inputs_settled = incarnation.input_settled(session, &killed.input).await;
+    let inputs_consumed = incarnation.input_consumed(session, &killed.input).await;
     Ok(RestartReport {
         resumed,
         waited_out_lease: fence_leases && !incarnation.waited_out_lease.is_zero(),
@@ -2712,6 +2737,7 @@ async fn report_from(
         interrupted_notices,
         other_writer_follows_interrupted_notice,
         inputs_settled,
+        inputs_consumed,
     })
 }
 

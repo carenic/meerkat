@@ -276,6 +276,10 @@ pub struct RestartReport {
     pub other_writer_follows_interrupted_notice: bool,
     /// Whether every input bound to the killed run is terminal in the store.
     pub inputs_settled: bool,
+    /// Whether every input bound to the killed run ended consumed in the
+    /// store: its run finished, or was committed as interrupted with it. An
+    /// abandoned, superseded or coalesced input is settled, not consumed.
+    pub inputs_consumed: bool,
 }
 
 /// What the other writer of a compaction race got for its write.
