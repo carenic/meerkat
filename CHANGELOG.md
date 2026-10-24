@@ -2085,9 +2085,14 @@ them.
   on serving the session. Such a request is now refused `-32032`
   (`SESSION_RUNTIME_UNAVAILABLE`) with `data.kind` `runtime_shutting_down`.
   Nothing of it runs or is kept for the next start, so resubmit it after the
-  restart. The same refusal covers external events, runtime inputs and the
-  other paths that register a session. A registration already under way when
-  the shutdown begins finishes first, so the shutdown tears it down with the
+  restart. The same refusal covers external events, runtime inputs, a
+  session create or resume (`create_or_resume_session_without_turn`, and
+  governed cold recovery through it) and the other paths that register a
+  session. The shutdown also closes the mob state's admission, so its mobs
+  refuse new members (`MobError::AdmissionClosed`, reason `StandDown`), and
+  the mob session service registers no member session (`runtime_shutting_down`
+  in the session error's data). A registration already under way when the
+  shutdown begins finishes first, so the shutdown tears it down with the
   rest. The schedule firing host is not armed again after the shutdown.
 
 - RPC callback tools accept typed content blocks from SDK handlers, which

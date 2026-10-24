@@ -504,7 +504,10 @@ Before you run a host store in production, run the host store chapter of the
   `runtime_shutting_down`. Nothing of it runs or is kept for the next start,
   so resubmit it after the restart. A second turn on a session whose turn is
   running is such a request until the running turn's boundary frees, so the
-  stop keeps the running turn and refuses that one.
+  stop keeps the running turn and refuses that one. The runtime registers
+  no session once its shutdown began: a session create or resume is refused
+  the same way, and the mobs of its mob state refuse new members
+  (`AdmissionClosed`, reason `StandDown`).
 - The REST server keeps accepting requests until its shutdown has suspended
   the runs in flight at the signal. A run that a request accepted in that
   window starts is not suspended: the server's drain waits for it, so it

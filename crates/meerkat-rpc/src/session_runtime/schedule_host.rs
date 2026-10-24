@@ -195,10 +195,7 @@ impl SessionRuntime {
         // good: a firing would admit work into a runtime that is stopping.
         // Read under the slot, so an arming that waited on the shutdown's
         // stop of the host does not start another one after it.
-        if self
-            .runtime_registration_closing
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if self.runtime_registration_fence.is_closing() {
             return Ok(());
         }
         if slot.as_ref().is_some_and(|handle| handle.is_running()) {
