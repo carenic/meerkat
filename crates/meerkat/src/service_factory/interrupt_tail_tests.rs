@@ -2688,7 +2688,10 @@ async fn retire_and_discard_the_actor_under_the_boundary(start: &Start, id: &Ses
     .await
     .expect("the read answers at once")
     .expect("the read");
-    assert!(!live, "the read of the retired runtime discards the live actor");
+    assert!(
+        !live,
+        "the read of the retired runtime discards the live actor"
+    );
     assert!(
         start.service.live_session_actor_witness(id).await.is_none(),
         "no live actor is hosted any more"

@@ -148,6 +148,25 @@ fn whole_blob_read_error_to_session_error(
 /// counted attempts, never wall clock (issue #1104).
 const OBSERVATION_LOAD_ATTEMPTS: usize = 8;
 
+/// Bound on a strict authoritative read's wait for the session's
+/// turn-finalization boundary before it runs a settle an observation
+/// deferred (see `settle_deferred_ended_tail_for_strict_read`). A settle
+/// commits only between runtime loop laps; this covers the short holders
+/// while such a tail stands: the post-commit work of a finished lap, a lap
+/// whose run the standing tail refuses before its model call, and a lap whose
+/// resumed-run admission answers once a stop or retire settled that run. A
+/// boundary still held after it keeps the read's conflict.
+const DEFERRED_ENDED_TAIL_SETTLE_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How the settle of an ended turn's tail takes the per-session recovery
+/// gate: an observation takes only a free gate (a holder owns the tail), and
+/// a strict read waits for it, bounded.
+#[derive(Debug, Clone, Copy)]
+enum EndedTailRecoveryGate {
+    Try,
+    Await(std::time::Duration),
+}
+
 /// Consecutive transcript-authority invalidations an optimistic live read
 /// absorbs with a plain yield before it warns and starts backing off (#1226).
 const OPTIMISTIC_READ_RETRY_WARN_AFTER: u32 = 64;
@@ -3247,6 +3266,14 @@ pub struct PersistentSessionService<B: SessionAgentBuilder> {
     /// same-SessionId teardown/re-registration overlap) without retaining one
     /// allocation forever for every rejected/random SessionId ever observed.
     turn_finalization_gates: Mutex<HashMap<SessionId, std::sync::Weak<Mutex<()>>>>,
+    /// Settles an observation deferred under a held turn-finalization
+    /// boundary, each by the ended run whose tail it owes (see
+    /// `settle_ended_live_turn_durable_tail`). A discard of the live actor
+    /// leaves the entry in place, so the settle is not dropped with the
+    /// actor: the session's next strict read runs it on the cold path
+    /// (`settle_deferred_ended_tail_for_strict_read`). The settle attempt that
+    /// reaches the tail's recovery, or finds the tail gone, removes it.
+    deferred_ended_tail_settles: std::sync::Mutex<HashMap<SessionId, RunId>>,
     /// Live channels whose projections no longer wait behind a held turn
     /// boundary. An explicit channel close records the channel here once the
     /// owner has revoked its custody: a projection for that channel that
@@ -6317,6 +6344,13 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// quiescent, and a held or refused tail is left intact. Returns whether
     /// the store now names a settled boundary, so the caller observes once
     /// more.
+    ///
+    /// A settle the held boundary defers is recorded as owed by the tail's
+    /// run (`deferred_ended_tail_settles`). The live actor it needs can be
+    /// discarded before the lap ends (a read of a retired runtime discards
+    /// it), and then no observation runs it. The record outlives that discard:
+    /// the session's next strict read runs the settle on the cold path
+    /// (`settle_deferred_ended_tail_for_strict_read`).
     async fn settle_ended_live_turn_durable_tail(&self, id: &SessionId) -> bool {
         if self.runtime_store.session_persistence_profile()
             != RuntimeSessionPersistenceProfile::HeadCanonicalV1
@@ -6325,8 +6359,62 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         }
         let turn_finalization_gate = self.turn_finalization_gate_for_session(id).await;
         let Ok(_turn_finalization_guard) = turn_finalization_gate.try_lock_owned() else {
+            self.record_deferred_ended_tail_settle(id).await;
             return false;
         };
+        self.settle_ended_live_turn_tail_under_boundary(id, EndedTailRecoveryGate::Try)
+            .await
+    }
+
+    /// Record the settle a held turn boundary deferred, when everything else
+    /// the settle needs holds: this service hosts the live actor, and the
+    /// store holds a provisional tail of a run the runtime holds open neither
+    /// as its current run nor as its resumable run.
+    async fn record_deferred_ended_tail_settle(&self, id: &SessionId) {
+        if !matches!(self.inner.has_live_session(id).await, Ok(true)) {
+            return;
+        }
+        let Ok(Some(tail)) = self
+            .runtime_store
+            .load_head_canonical_provisional_tail(&Self::runtime_id_for_session(id))
+            .await
+        else {
+            return;
+        };
+        if self.runtime_holds_run_open(id, tail.run_id()).await {
+            return;
+        }
+        self.deferred_ended_tail_settles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.clone(), tail.run_id().clone());
+    }
+
+    /// The run whose tail a deferred settle of `id` owes, if one is recorded.
+    fn deferred_ended_tail_settle(&self, id: &SessionId) -> Option<RunId> {
+        self.deferred_ended_tail_settles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .cloned()
+    }
+
+    fn forget_deferred_ended_tail_settle(&self, id: &SessionId) {
+        self.deferred_ended_tail_settles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
+    }
+
+    /// [`Self::settle_ended_live_turn_durable_tail`] for a caller that holds
+    /// the session's turn-finalization boundary: every condition but the
+    /// boundary's, the recovery gate taken as `recovery_gate` says. A tail
+    /// that is gone, or whose recovery runs, owes no deferred settle any more.
+    async fn settle_ended_live_turn_tail_under_boundary(
+        &self,
+        id: &SessionId,
+        recovery_gate: EndedTailRecoveryGate,
+    ) -> bool {
         if !matches!(self.inner.has_live_session(id).await, Ok(true)) {
             return false;
         }
@@ -6340,7 +6428,10 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                     return false;
                 }
             }
-            Ok(None) => return false,
+            Ok(None) => {
+                self.forget_deferred_ended_tail_settle(id);
+                return false;
+            }
             Err(error) => {
                 tracing::warn!(
                     session_id = %id,
@@ -6350,11 +6441,21 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 return false;
             }
         }
-        let recovery_gate = self.recovery_gate_for_session(id).await;
-        let Ok(_recovery_guard) = recovery_gate.try_lock_owned() else {
+        let gate = self.recovery_gate_for_session(id).await;
+        let recovery_guard = match recovery_gate {
+            EndedTailRecoveryGate::Try => gate.try_lock_owned().ok(),
+            EndedTailRecoveryGate::Await(bound) => {
+                tokio::time::timeout(bound, gate.lock_owned()).await.ok()
+            }
+        };
+        let Some(_recovery_guard) = recovery_guard else {
             return false;
         };
-        match self.store_owned_durable_tail_recovery_outcome(id).await {
+        let outcome = self.store_owned_durable_tail_recovery_outcome(id).await;
+        // Under the boundary, so a strict read that still meets the tail
+        // waits for this settle instead of missing the record.
+        self.forget_deferred_ended_tail_settle(id);
+        match outcome {
             Ok((meerkat_runtime::recovery::DurableTailRecoveryOutcome::Committed { .. }, _)) => {
                 tracing::info!(
                     session_id = %id,
@@ -10923,6 +11024,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             whole_blob_body_budget_bytes: DEFAULT_WHOLE_BLOB_BODY_CACHE_BYTES,
             rejected_run_compaction_aborted: std::sync::Mutex::new(HashSet::new()),
             turn_finalization_gates: Mutex::new(HashMap::new()),
+            deferred_ended_tail_settles: std::sync::Mutex::new(HashMap::new()),
             live_projection_released_channels: std::sync::Mutex::new(HashMap::new()),
             live_projection_release_changed: tokio::sync::Notify::new(),
             live_channel_projection_holds: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -19200,6 +19302,13 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// issued for that attempt. The budget counts attempts, not wall-clock
     /// time. A conflict on every attempt surfaces unchanged: stale or
     /// contradictory authority still fails closed.
+    ///
+    /// One conflict is not left standing: the tail of an ended run whose
+    /// settle an observation deferred under a held turn boundary. The read
+    /// runs that settle between laps and reads once more (see
+    /// `settle_deferred_ended_tail_for_strict_read`). Only that settle waits
+    /// on the boundary, bounded; a caller that holds the boundary itself
+    /// waits out the bound there and gets the conflict.
     pub async fn load_authoritative_session(
         &self,
         id: &SessionId,
@@ -19211,7 +19320,103 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             }
             result = self.load_authoritative_session_base(id).await;
         }
+        if Self::is_transcript_revision_conflict(&result)
+            && self.settle_deferred_ended_tail_for_strict_read(id).await
+        {
+            result = self.load_authoritative_session_base(id).await;
+        }
         result
+    }
+
+    /// Run the settle an observation deferred under a held turn boundary,
+    /// for a strict read that meets the tail it owes. Returns whether to
+    /// read again.
+    ///
+    /// The settle commits only between runtime loop laps, so the read first
+    /// waits, bounded by [`DEFERRED_ENDED_TAIL_SETTLE_BOUND`], for the
+    /// session's turn-finalization boundary. Under it, a tail a settle ended
+    /// while the read waited leaves nothing to do but read again. Otherwise
+    /// the read settles the ended run's tail: with the observation's live
+    /// settle while this service hosts the actor, else with a cold attach's
+    /// recovery under this runtime owner's hosting claim, as the session's
+    /// next start would. A session another runtime owner hosts keeps the
+    /// conflict, and so does a boundary held past the bound. With no deferred
+    /// settle recorded, the read keeps the conflict: such a tail is settled by
+    /// a start, an attach or the session's archive.
+    async fn settle_deferred_ended_tail_for_strict_read(&self, id: &SessionId) -> bool {
+        let Some(owed_run) = self.deferred_ended_tail_settle(id) else {
+            return false;
+        };
+        let started = std::time::Instant::now();
+        let turn_finalization_gate = self.turn_finalization_gate_for_session(id).await;
+        let Ok(_turn_finalization_guard) = tokio::time::timeout(
+            DEFERRED_ENDED_TAIL_SETTLE_BOUND,
+            turn_finalization_gate.lock_owned(),
+        )
+        .await
+        else {
+            return false;
+        };
+        match self
+            .runtime_store
+            .load_head_canonical_provisional_tail(&Self::runtime_id_for_session(id))
+            .await
+        {
+            Ok(Some(tail)) if tail.run_id() == &owed_run => {}
+            // Settled while the read waited, or a later run's tail stands.
+            Ok(_) => {
+                self.forget_deferred_ended_tail_settle(id);
+                return true;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %id,
+                    %error,
+                    "could not observe the provisional tail a deferred settle owes"
+                );
+                return false;
+            }
+        }
+        if self.runtime_holds_run_open(id, &owed_run).await {
+            return false;
+        }
+        if matches!(self.inner.has_live_session(id).await, Ok(true)) {
+            // The recovery gate gets whatever is left of the same bound. A
+            // zero remainder still polls the gate once, so a free gate is
+            // taken.
+            let recovery_gate_bound =
+                DEFERRED_ENDED_TAIL_SETTLE_BOUND.saturating_sub(started.elapsed());
+            let settled = self
+                .settle_ended_live_turn_tail_under_boundary(
+                    id,
+                    EndedTailRecoveryGate::Await(recovery_gate_bound),
+                )
+                .await;
+            return settled || self.deferred_ended_tail_settle(id).is_none();
+        }
+        let claim = match self.grant_session_hosting(id) {
+            Ok(claim) => claim,
+            Err(SessionError::ServedElsewhere { .. }) => {
+                // Another runtime owner hosts the session: its start settles
+                // the tail.
+                self.forget_deferred_ended_tail_settle(id);
+                return false;
+            }
+            Err(_) => return false,
+        };
+        let settled = self.prepare_cold_attach(id, claim).await;
+        self.forget_deferred_ended_tail_settle(id);
+        match settled {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %id,
+                    %error,
+                    "a strict read could not run the settle an observation deferred"
+                );
+                false
+            }
+        }
     }
 
     /// The committed session as a public reader serves it:
@@ -19281,10 +19486,13 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// this owner never resolves another owner's in-flight tail. The claim is
     /// held for this preparation (inside its blocking writes too); a caller
     /// that attaches next keeps a lineage clone across the attach. This runs
-    /// only on start and attach paths, never on plain reads
-    /// (`load_authoritative_session`, history, status), which keep returning
-    /// the typed conflict for a session another process may still be
-    /// committing.
+    /// on start and attach paths, never on plain reads (history, status),
+    /// which keep returning the typed conflict for a session another process
+    /// may still be committing. The one read that runs it is
+    /// `load_authoritative_session`, for a tail whose settle an observation of
+    /// this service deferred and the discard of the live actor left behind,
+    /// under the session's turn-finalization boundary and this owner's claim
+    /// (see `settle_deferred_ended_tail_for_strict_read`).
     ///
     /// Apart from that refusal it never fails the caller's attach on its own
     /// account: a tail it cannot observe or resolve (held, refused, or an
