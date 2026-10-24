@@ -11865,6 +11865,38 @@ impl MobActor {
         Ok(())
     }
 
+    /// Mount the tool bundles the mob's definition profile names on a member
+    /// lowered from sealed identity material. The sealed profile is portable
+    /// and carries no runtime-owned bundles (they cannot cross hosts), so a
+    /// local materialization takes them from the definition profile of the
+    /// same name, as any member of that profile does; the mob's registered
+    /// bundles stay the ceiling at the build. A role the definition does not
+    /// define has no bundles to mount.
+    async fn mount_definition_tool_bundles(
+        &self,
+        spec: &mut super::handle::SpawnMemberSpec,
+    ) -> Result<(), MobError> {
+        if !self.definition.profiles.contains_key(&spec.role_name) {
+            return Ok(());
+        }
+        let Some(profile) = spec.override_profile.as_mut() else {
+            return Ok(());
+        };
+        let definition_profile = self
+            .definition
+            .resolve_profile(&spec.role_name, self.realm_profile_store.as_ref())
+            .await?;
+        profile
+            .tools
+            .rust_bundles
+            .clone_from(&definition_profile.tools.rust_bundles);
+        profile
+            .tools
+            .bundles
+            .clone_from(&definition_profile.tools.bundles);
+        Ok(())
+    }
+
     /// The signal that records a failed revival of `agent_identity`'s
     /// session `session_id`, with the reason it records. A host refusal of
     /// the member's registration keeps its typed code and the host's own
@@ -27218,6 +27250,7 @@ impl MobActor {
                         session,
                         member,
                     )?;
+                    self.mount_definition_tool_bundles(&mut spec).await?;
                     let key = super::IdentityLocalMaterializationKey::new(
                         self.definition.id.clone(),
                         identity.clone(),
