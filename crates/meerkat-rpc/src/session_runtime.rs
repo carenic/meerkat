@@ -3684,14 +3684,25 @@ impl SessionRuntime {
             .await;
         let archived = self
             .archived_persisted_session_without_live_by_authority(session_id)
-            .await?;
-        let stale = if archived {
-            false
-        } else {
-            self.live_session_is_stale(session_id, LiveStalenessPosition::TurnBoundaryHeld)
-                .await?
+            .await;
+        let stale = match archived {
+            Ok(false) => Some(
+                self.live_session_is_stale(session_id, LiveStalenessPosition::TurnBoundaryHeld)
+                    .await,
+            ),
+            Ok(true) | Err(_) => None,
         };
         drop(turn_boundary);
+        // The turn boundary above waits for a running turn, so a shutdown may
+        // have begun meanwhile: the input is refused before its admission,
+        // and before the checks' own errors, which the run the shutdown
+        // stopped can cause.
+        self.refuse_admission_after_shutdown(session_id)?;
+        let archived = archived?;
+        let stale = match stale {
+            Some(stale) => stale?,
+            None => false,
+        };
 
         if archived {
             self.reject_archived_persisted_session_without_live(session_id)
@@ -3703,10 +3714,9 @@ impl SessionRuntime {
         } else {
             None
         };
-        self.refuse_cold_help_session(session_id).await?;
-        // The turn boundary above waits for a running turn, so a shutdown may
-        // have begun meanwhile: the input is refused before its admission.
+        let help_session = self.refuse_cold_help_session(session_id).await;
         self.refuse_admission_after_shutdown(session_id)?;
+        help_session?;
         Ok(rematerialization_hosting)
     }
 
@@ -8781,22 +8791,25 @@ impl SessionRuntime {
             .await?;
         let workgraph_service = self.workgraph_service().ok();
 
-        // Held until this turn re-materializes the session (#1813).
-        let _rematerialization_hosting = if self
+        // The staleness check waits on a running turn's boundary, so a
+        // shutdown may have begun meanwhile: such a turn is refused before it
+        // registers or reserves anything, and before the check's own error,
+        // which the run the shutdown stopped can cause.
+        let stale = self
             .live_session_is_stale(session_id, LiveStalenessPosition::OutsideTurnBoundary)
-            .await?
-        {
+            .await;
+        self.refuse_admission_after_shutdown(session_id)?;
+        // Held until this turn re-materializes the session (#1813).
+        let _rematerialization_hosting = if stale? {
             self.discard_stale_live_session(session_id).await?
         } else {
             None
         };
         // A help session continues only on its live session: refuse to
         // rebuild it from storage before the turn is admitted.
-        self.refuse_cold_help_session(session_id).await?;
-        // The staleness check above waits on a running turn's boundary, so a
-        // shutdown may have begun meanwhile: such a turn is refused here,
-        // before it registers or reserves anything.
+        let help_session = self.refuse_cold_help_session(session_id).await;
         self.refuse_admission_after_shutdown(session_id)?;
+        help_session?;
 
         let runtime_registration_lock = self.runtime_registration_lock(session_id);
         let runtime_registration_guard = runtime_registration_lock.mutex().lock().await;
@@ -9266,20 +9279,23 @@ impl SessionRuntime {
         let runtime_was_registered = self.runtime_adapter.contains_session(session_id).await;
         let staged_session_existed = self.staged_sessions.contains(session_id).await;
 
-        // Held until the executor below re-registers the session (#1813).
-        let _rematerialization_hosting = if self
+        // The staleness check waits on a running turn's boundary, so a
+        // shutdown may have begun meanwhile: the event is refused before its
+        // admission, and before the check's own error, which the run the
+        // shutdown stopped can cause.
+        let stale = self
             .live_session_is_stale(session_id, LiveStalenessPosition::OutsideTurnBoundary)
-            .await?
-        {
+            .await;
+        self.refuse_admission_after_shutdown(session_id)?;
+        // Held until the executor below re-registers the session (#1813).
+        let _rematerialization_hosting = if stale? {
             self.discard_stale_live_session(session_id).await?
         } else {
             None
         };
-        self.refuse_cold_help_session(session_id).await?;
-        // The staleness check above waits on a running turn's boundary, so a
-        // shutdown may have begun meanwhile: the event is refused here,
-        // before its admission.
+        let help_session = self.refuse_cold_help_session(session_id).await;
         self.refuse_admission_after_shutdown(session_id)?;
+        help_session?;
         if let Err(primary) = self.ensure_runtime_executor(session_id).await {
             return Err(self
                 .unregister_new_runtime_registration_after_rpc_error(
