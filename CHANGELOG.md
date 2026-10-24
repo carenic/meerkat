@@ -2131,7 +2131,13 @@ them.
   revival fails is recorded Broken with the reason; any other registration a
   restore cannot use is refused as before. Two revivals of one member asked
   for at the same time (a member turn, `MobHandle::ensure_member_live`, the
-  start's own) now share one materialization instead of racing.
+  start's own) now share one materialization instead of racing. A member
+  whose runtime registration needs a durability reload when the mob starts
+  no longer stops the mob either: it is left out of the start, its
+  registration is reloaded right after the start (the same reload
+  `MobHandle::reload_member_registration` runs, so a delivery to it waits
+  behind the reload or is refused `MemberReloadRequired`), and it is
+  recorded Broken with the reason if the reload fails.
 - `meerkat`, `meerkat-rpc`: a graceful stop that keeps queued work keeps a
   session's first turn as well. When the stop suspended the run of a first
   turn that was materializing its session (a session created without a
