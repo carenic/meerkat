@@ -9699,4 +9699,115 @@ mod tests {
             );
         }
     }
+
+    /// A member's retirement archive, ordinary or in the mob's destroy, leaves
+    /// the mob's active runs: another member's run stays counted, so the Stop
+    /// quiesce is refused until the run finishes. Every per-member archive arm
+    /// used to reset the mob-wide count.
+    #[test]
+    fn a_member_retirement_archive_keeps_the_mobs_active_runs() {
+        for destroy in [false, true] {
+            let mut authority = MobMachineAuthority::new();
+            let identity = AgentIdentity::from("retired-member");
+            let runtime_id = AgentRuntimeId::from("retired-member:0");
+            let session_id = seed_live_member(&mut authority, &identity, &runtime_id);
+            seed_live_member(
+                &mut authority,
+                &AgentIdentity::from("running-member"),
+                &AgentRuntimeId::from("running-member:0"),
+            );
+            authority
+                .apply_signal(MobMachineSignal::StartRun)
+                .expect("the mob starts a run");
+            let fence_token = live_fence(&authority, &runtime_id);
+            let archived = if destroy {
+                begin_completion_lifecycle_quiesce(
+                    &mut authority,
+                    PlacedCompletionLifecycleIntentKind::Destroy,
+                );
+                authority
+                    .apply_signal(MobMachineSignal::AdmitDestroyCleanup)
+                    .expect("the mob admits its destroy");
+                authority
+                    .apply_signal(MobMachineSignal::AdmitDestroyMemberRetire {
+                        mob_id: MobId::from("test-mob"),
+                        agent_identity: identity.clone(),
+                        agent_runtime_id: runtime_id.clone(),
+                        fence_token,
+                        generation: Generation(0),
+                        session_id: Some(session_id.clone()),
+                    })
+                    .expect("the destroy admits the member's retirement");
+                MobMachineMutator::apply(
+                    &mut authority,
+                    MobMachineInput::SessionIngressDetachedForMobDestroy {
+                        mob_id: MobId::from("test-mob"),
+                        agent_runtime_id: runtime_id.clone(),
+                    },
+                )
+                .expect("the destroy closes the member's session ingress detach");
+                MobMachineSignal::ObserveDestroyMemberRetirementArchived {
+                    agent_identity: identity.clone(),
+                    agent_runtime_id: runtime_id.clone(),
+                    fence_token,
+                    generation: Generation(0),
+                    session_id: Some(session_id.clone()),
+                    disposal: MemberSessionDisposal::Archived,
+                }
+            } else {
+                authority
+                    .apply_signal(MobMachineSignal::RetireMember {
+                        agent_identity: identity.clone(),
+                        agent_runtime_id: runtime_id.clone(),
+                        fence_token,
+                        session_id: Some(session_id.clone()),
+                    })
+                    .expect("the member's retirement is admitted");
+                MobMachineSignal::ObserveMemberRetirementArchived {
+                    agent_identity: identity.clone(),
+                    agent_runtime_id: runtime_id.clone(),
+                    fence_token,
+                    generation: Generation(0),
+                    session_id: Some(session_id.clone()),
+                    disposal: MemberSessionDisposal::Archived,
+                    preserve_machine_topology: false,
+                }
+            };
+
+            authority.apply_signal(archived).unwrap_or_else(|error| {
+                panic!("the retirement archives (destroy: {destroy}): {error}")
+            });
+
+            assert!(
+                !authority
+                    .state()
+                    .identity_to_runtime
+                    .contains_key(&identity)
+            );
+            assert_eq!(
+                authority.state().active_run_count,
+                1,
+                "the other member's run stays active (destroy: {destroy})"
+            );
+            if !destroy {
+                assert!(
+                    MobMachineMutator::apply(
+                        &mut authority,
+                        MobMachineInput::BeginPlacedCompletionLifecycleQuiesce {
+                            intent: PlacedCompletionLifecycleIntentKind::Stop,
+                        },
+                    )
+                    .is_err(),
+                    "the Stop waits for the run"
+                );
+                authority
+                    .apply_signal(MobMachineSignal::FinishRun)
+                    .expect("the run finishes");
+                begin_completion_lifecycle_quiesce(
+                    &mut authority,
+                    PlacedCompletionLifecycleIntentKind::Stop,
+                );
+            }
+        }
+    }
 }

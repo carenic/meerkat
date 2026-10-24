@@ -11286,7 +11286,6 @@ macro_rules! mob_catalog_machine_dsl {
                     self.external_peer_edges_by_key = mob_machine_external_peer_edges_by_key_without_identity(self.external_peer_edges_by_key, agent_identity);
                     self.topology_epoch += 1;
                 }
-                self.active_run_count = 0;
             }
             to Running
             emit AppendLifecycleJournal {
@@ -11359,7 +11358,6 @@ macro_rules! mob_catalog_machine_dsl {
                 self.external_peer_edges = mob_machine_external_peer_edges_without_identity(self.external_peer_edges, agent_identity);
                 self.external_peer_edges_by_key = mob_machine_external_peer_edges_by_key_without_identity(self.external_peer_edges_by_key, agent_identity);
                 self.topology_epoch += 1;
-                self.active_run_count = 0;
             }
             to Running
             emit AppendLifecycleJournal { kind: MobLifecycleJournalKind::MemberRetired, agent_identity: Some(agent_identity), agent_runtime_id: Some(agent_runtime_id), fence_token: None, generation: Some(generation), session_id: session_id }
@@ -11421,7 +11419,6 @@ macro_rules! mob_catalog_machine_dsl {
                     self.pending_respawn_topology.insert(agent_identity);
                     self.topology_epoch += 1;
                 }
-                self.active_run_count = 0;
             }
             to Running
             emit AppendLifecycleJournal { kind: MobLifecycleJournalKind::MemberRetired, agent_identity: Some(agent_identity), agent_runtime_id: Some(agent_runtime_id), fence_token: None, generation: Some(generation), session_id: session_id }
@@ -11483,7 +11480,6 @@ macro_rules! mob_catalog_machine_dsl {
                 self.external_peer_edges = mob_machine_external_peer_edges_without_identity(self.external_peer_edges, agent_identity);
                 self.external_peer_edges_by_key = mob_machine_external_peer_edges_by_key_without_identity(self.external_peer_edges_by_key, agent_identity);
                 self.topology_epoch += 1;
-                self.active_run_count = 0;
             }
             to Stopped
             emit AppendLifecycleJournal { kind: MobLifecycleJournalKind::MemberRetired, agent_identity: Some(agent_identity), agent_runtime_id: Some(agent_runtime_id), fence_token: None, generation: Some(generation), session_id: session_id }
@@ -11724,7 +11720,6 @@ macro_rules! mob_catalog_machine_dsl {
                     self.external_peer_edges_by_key = mob_machine_external_peer_edges_by_key_without_identity(self.external_peer_edges_by_key, agent_identity);
                     self.topology_epoch += 1;
                 }
-                self.active_run_count = 0;
             }
             to Running
             emit PlacedCarrierCleanupRequested {
@@ -11991,7 +11986,6 @@ macro_rules! mob_catalog_machine_dsl {
                 // placement and materialization-failure facts too.
                 self.member_placement.remove(agent_identity);
                 self.member_materialization_failures.remove(agent_identity);
-                self.active_run_count = 0;
                 self.topology_epoch += 1;
             }
             to Running
@@ -12056,7 +12050,6 @@ macro_rules! mob_catalog_machine_dsl {
                 // placement and materialization-failure facts too.
                 self.member_placement.remove(agent_identity);
                 self.member_materialization_failures.remove(agent_identity);
-                self.active_run_count = 0;
                 self.topology_epoch += 1;
             }
             to Stopped
@@ -12243,7 +12236,6 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_revival_pending.remove(agent_identity);
                 self.member_placement.remove(agent_identity);
                 self.member_materialization_failures.remove(agent_identity);
-                self.active_run_count = 0;
                 self.topology_epoch += 1;
             }
             to Running

@@ -56293,6 +56293,73 @@ async fn test_stop_rejects_active_flow_and_schema_requires_no_active_runs() {
     );
 }
 
+/// Another member's retirement does not end the mob's runs: with a flow run
+/// active on the worker, the lead is retired (its retirement archived), the
+/// run stays counted, and a stop is still refused until the run ends. Before,
+/// the member's retirement archive reset the mob-wide run count, and the stop
+/// was admitted while the flow kept running.
+#[tokio::test]
+async fn test_stop_still_rejects_an_active_flow_after_another_member_retires() {
+    let (handle, service) =
+        create_test_mob(sample_definition_with_single_step_flow(60_000, 8)).await;
+    handle
+        .spawn(
+            ProfileName::from("worker"),
+            AgentIdentity::from("w-1"),
+            None,
+        )
+        .await
+        .expect("spawn worker");
+    handle
+        .spawn(ProfileName::from("lead"), AgentIdentity::from("l-1"), None)
+        .await
+        .expect("spawn lead");
+    service.set_flow_turn_never_terminal(true);
+
+    let run_id = handle
+        .run_flow(FlowId::from("demo"), serde_json::json!({}))
+        .await
+        .expect("run flow");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    handle
+        .retire(AgentIdentity::from("l-1"))
+        .await
+        .expect("retire the lead while the flow runs");
+    assert!(
+        handle
+            .get_member(&AgentIdentity::from("l-1"))
+            .await
+            .unwrap()
+            .is_none(),
+        "the lead's retirement is archived"
+    );
+
+    let error = handle
+        .stop()
+        .await
+        .expect_err("the stop still rejects the active flow");
+    assert!(matches!(
+        error,
+        MobError::InvalidTransition {
+            from: MobState::Running,
+            to: MobState::Stopped,
+        }
+    ));
+    assert_eq!(handle.status().await.unwrap(), MobState::Running);
+
+    handle
+        .cancel_flow(run_id.clone())
+        .await
+        .expect("cancel flow after the rejected stop");
+    let terminal = wait_for_run_terminal(&handle, &run_id, Duration::from_secs(8)).await;
+    assert_eq!(terminal.status, MobRunStatus::Canceled);
+    handle
+        .stop()
+        .await
+        .expect("the stop is admitted once the run ended");
+}
+
 #[tokio::test]
 async fn test_failed_spawn_clears_pending_spawn_count_and_failed_roster_entry() {
     let (handle, service) = create_test_mob(sample_definition_with_auto_wire()).await;
