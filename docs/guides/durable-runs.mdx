@@ -513,6 +513,18 @@ Before you run a host store in production, run the host store chapter of the
   continues it at the session's next start. Read the run's status, for
   example with `session/input_status`, before you retry: resubmitting the
   input runs it again.
+- A request that `rkat-rpc`'s runtime (`SessionRuntime`, also when a host
+  embeds it) has not admitted yet when the runtime's shutdown begins is
+  refused `-32032` (`SESSION_RUNTIME_UNAVAILABLE`) with `data.kind`
+  `runtime_shutting_down`. Nothing of it runs or is kept for the next start,
+  so resubmit it after the restart. A second turn on a session whose turn is
+  running is such a request until the running turn's boundary frees, so the
+  stop keeps the running turn and refuses that one. The runtime registers
+  no session once its shutdown began: a session create or resume is refused
+  the same way. A mob of its mob state answers a new member with the mob's
+  own `AdmissionClosed` (reason `StandDown`) instead, and the mob session
+  service with a session error whose data carries `kind`
+  `runtime_shutting_down`.
 - The REST server keeps accepting requests until its shutdown has suspended
   the runs in flight at the signal. A run that a request accepted in that
   window starts is not suspended: the server's drain waits for it, so it

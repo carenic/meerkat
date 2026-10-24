@@ -2105,6 +2105,47 @@ them.
 
 ### Fixed
 
+- `meerkat`, `meerkat-rpc`: a graceful stop that keeps queued work keeps a
+  session's first turn as well. When the stop suspended the run of a first
+  turn that was materializing its session (a session created without a
+  turn), the staged promotion took the suspension for a failed first turn
+  and rolled the session back with an archive. The stopping runtime refused
+  that archive (`Invalid state for operation: running`), and the turn was
+  answered `-32603` `runtime_apply_failure` with its session torn down,
+  instead of `requeued_across_stop`. A suspended run is not a failure: the
+  promotion now finishes and the suspension reaches the runtime. The turn is
+  answered `requeued_across_stop` and its run continues once at the
+  session's next start, like every other run the stop keeps.
+  `should_restore_pending_after_apply_runtime_turn` and its runtime-loop
+  variant now answer `false` for a suspended run.
+
+- `meerkat-rpc`: once a `SessionRuntime` begins its shutdown, it admits no
+  new work and registers no session. A second turn request on a session
+  whose turn is in flight waits before its admission until that turn's
+  boundary frees. After a graceful stop suspended the running turn, the
+  waiting request registered the session again on the stopped runtime and
+  ran its turn there, so its caller got no answer and a stopped process went
+  on serving the session. Such a request is now refused `-32032`
+  (`SESSION_RUNTIME_UNAVAILABLE`) with `data.kind` `runtime_shutting_down`.
+  Nothing of it runs or is kept for the next start, so resubmit it after the
+  restart. The same refusal covers external events, runtime inputs, a
+  session create or resume (`create_or_resume_session_without_turn`, and
+  governed cold recovery through it) and the other paths that register a
+  session. The shutdown also closes the mob state's admission. The refusal a
+  host gets depends on the surface it calls:
+  - the runtime's own ingress and registration paths answer `-32032` with
+    `data.kind` `runtime_shutting_down`;
+  - a mob of its mob state refuses a new member, work, a flow or a resume
+    with the mob's own typed `MobError::AdmissionClosed`, reason `StandDown`,
+    as for any mob stand-down (no new close reason was added);
+  - the mob session service, which registers member sessions, refuses with a
+    `SessionError::FailedWithData` whose data carries `kind`
+    `runtime_shutting_down`.
+
+  A registration already under way when the shutdown begins finishes first,
+  so the shutdown tears it down with the rest. The schedule firing host is
+  not armed again after the shutdown.
+
 - RPC callback tools accept typed content blocks from SDK handlers, which
   released 0.9.3 and 0.9.4 rejected as non-string results. Mixed text and image
   results are preserved alongside legacy text and tool error flags.
