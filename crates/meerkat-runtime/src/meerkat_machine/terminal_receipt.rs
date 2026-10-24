@@ -46,11 +46,17 @@ impl MeerkatMachine {
     /// A known empty session returns an empty observation. An unregistered
     /// session on a store-less machine fails `NotReady`; a persistent session
     /// with neither lifecycle nor input records fails `NotFound`.
+    ///
+    /// Each row is released as the public row read releases it: a result
+    /// payload (a run result or callback arguments) only to a reader the
+    /// input's scoped destination permits, so once a scoped session is
+    /// unregistered none comes out; every body-free lifecycle fact stays.
     pub async fn session_input_states(
         &self,
         session_id: &SessionId,
     ) -> Result<Sourced<Vec<StoredInputState>>, RuntimeDriverError> {
-        let (source, report) = self.session_input_witnesses(session_id).await?;
+        let (source, rows) = self.session_input_witnesses(session_id).await?;
+        let report = self.release_public_rows(session_id, rows).await;
         Ok(Sourced { source, report })
     }
 

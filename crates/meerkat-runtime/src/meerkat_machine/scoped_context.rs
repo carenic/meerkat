@@ -265,6 +265,50 @@ impl MeerkatMachine {
         }
     }
 
+    /// [`Self::release_public_row`] for every row of one session read: each
+    /// row is decided against the session's current registration, under one
+    /// driver lock taken after the read's last await, immediately before
+    /// release. A session that is not registered (or was unregistered
+    /// meanwhile) has no current destination.
+    pub(crate) async fn release_public_rows(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+        mut rows: Vec<crate::input_state::StoredInputState>,
+    ) -> Vec<crate::input_state::StoredInputState> {
+        if !rows
+            .iter()
+            .any(crate::input_state::StoredInputState::carries_result_payload)
+        {
+            return rows;
+        }
+        let posture = scoped_host_posture(&self.native_work_authorization_host);
+        let driver = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .get(session_id)
+                .map(|entry| std::sync::Arc::clone(&entry.driver))
+        };
+        let withhold =
+            |rows: &mut Vec<crate::input_state::StoredInputState>,
+             authority: Option<&crate::driver::ephemeral::SharedIngressDslAuthority>| {
+                for row in rows.iter_mut() {
+                    if row.carries_result_payload()
+                        && !disclosure_permitted_with(authority, &row.state, posture)
+                    {
+                        row.withhold_result_payload();
+                    }
+                }
+            };
+        match driver {
+            Some(driver) => {
+                let driver = driver.lock().await;
+                withhold(&mut rows, Some(&driver.shared_dsl_authority()));
+            }
+            None => withhold(&mut rows, None),
+        }
+        rows
+    }
+
     /// Withhold the result payload of a public row read this reader may not
     /// receive. The stored row is unchanged; the returned copy keeps every
     /// body-free lifecycle fact (phase, terminal, receipt identity, witness).

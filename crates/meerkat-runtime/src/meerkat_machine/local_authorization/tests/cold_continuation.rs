@@ -80,6 +80,9 @@ struct CountingExecutor {
     /// The session boundary this executor's runtime loop holds across each
     /// turn, when it takes one.
     loop_boundary: Option<Boundary>,
+    /// When set, every run ends at an external callback boundary whose call
+    /// carries these arguments, instead of a result.
+    callback_arguments: Option<&'static str>,
 }
 
 #[async_trait::async_trait]
@@ -108,6 +111,21 @@ impl CoreExecutor for CountingExecutor {
             .expect("test owns the apply receiver");
         if let Some(hold) = &self.hold {
             hold.notified().await;
+        }
+        if let Some(arguments) = self.callback_arguments {
+            return Ok(CoreApplyOutput::with_callback_pending(
+                RunBoundaryReceiptDraft {
+                    run_id: run,
+                    boundary: RunApplyBoundary::RunStart,
+                    contributing_input_ids: ids,
+                    conversation_digest: None,
+                    message_count: 0,
+                },
+                None,
+                "census-call",
+                "census-tool",
+                serde_json::json!({ "argument": arguments }),
+            ));
         }
         let result = serde_json::from_value(serde_json::json!({
             "text": self.reply,
@@ -508,6 +526,22 @@ async fn attach_serving(
     Arc<AtomicUsize>,
     tokio::sync::mpsc::UnboundedReceiver<Applied>,
 ) {
+    attach_executor(machine, session, reply, actor, loop_boundary, None).await
+}
+
+/// [`attach_serving`] with an executor whose every run ends at an external
+/// callback boundary carrying `callback_arguments`, when set.
+async fn attach_executor(
+    machine: &Arc<MeerkatMachine>,
+    session: &SessionId,
+    reply: &'static str,
+    actor: Option<Actor>,
+    loop_boundary: Option<Boundary>,
+    callback_arguments: Option<&'static str>,
+) -> (
+    Arc<AtomicUsize>,
+    tokio::sync::mpsc::UnboundedReceiver<Applied>,
+) {
     machine
         .register_session(session.clone())
         .await
@@ -529,6 +563,7 @@ async fn attach_serving(
                 hold: None,
                 actor,
                 loop_boundary,
+                callback_arguments,
             }),
         )
         .await
@@ -1611,6 +1646,7 @@ async fn a_stale_witness_or_inexact_evidence_runs_no_publication_step() {
                 hold: None,
                 actor: Some(newest_actor.clone()),
                 loop_boundary: Some(newest_actor.boundary.clone()),
+                callback_arguments: None,
             }),
         )
         .await
@@ -1887,6 +1923,7 @@ async fn a_reattach_while_the_call_waits_for_the_boundary_runs_no_step() {
                     hold: None,
                     actor: Some(replacement.clone()),
                     loop_boundary: None,
+                    callback_arguments: None,
                 }),
             )
             .await
@@ -2007,6 +2044,7 @@ async fn a_live_admission_waits_for_its_open_run_to_release_the_boundary() {
                 hold: Some(Arc::clone(&hold)),
                 actor: Some(actor.clone()),
                 loop_boundary: Some(boundary.clone()),
+                callback_arguments: None,
             }),
         )
         .await
@@ -2358,5 +2396,146 @@ async fn the_durable_read_refuses_inexact_evidence_and_unreadable_stores() {
         reopened.durable(expected).await,
         Err(Unavailable),
         "an index entry the store cannot prove is not absence"
+    );
+}
+
+/// One governed scoped input of a persistent machine whose session
+/// destination is bound, run to its terminal with `reply` (or, with
+/// `callback_arguments`, to an external callback boundary), and its
+/// session's input-state census serialized at three points: registered with
+/// the destination current, after the unregister joined its teardown, and on
+/// a machine reopened over the same store.
+async fn scoped_census(
+    reply: &'static str,
+    callback_arguments: Option<&'static str>,
+) -> [Vec<serde_json::Value>; 3] {
+    let (configuration, template, _account, _publication) = mutable_controller_configuration(true);
+    let claims = template
+        .header()
+        .authority_association
+        .as_ref()
+        .expect("claims")
+        .candidate()
+        .clone();
+    let selection = claims.controller_model.clone().expect("controller");
+    let owners = HostOwners {
+        grants: Arc::clone(&configuration.grants),
+        ingress_domain: claims.ingress_namespace.ingress.clone(),
+        custody: Arc::default(),
+        policy: Arc::new(Policy {
+            requester: claims.requester.clone(),
+            executor: claims.logical_executor.clone(),
+        }),
+        controllers: Arc::default(),
+        operation_owner: Arc::clone(&configuration.operation_owner),
+    };
+    drop(configuration);
+    let store = InMemoryRuntimeStore::new();
+    let blobs = Arc::new(MemoryBlobStore::new());
+    let session = SessionId::new();
+    let runtime = LogicalRuntimeId::for_session(&session);
+    let census = async |machine: &MeerkatMachine| {
+        machine
+            .session_input_states(&session)
+            .await
+            .expect("the session's input census")
+            .report
+            .iter()
+            .map(|row| serde_json::to_value(row).expect("row serialization"))
+            .collect::<Vec<_>>()
+    };
+
+    let machine = open(&store, &blobs, &owners).await;
+    let (_effects, mut applied) =
+        attach_executor(&machine, &session, reply, None, None, callback_arguments).await;
+    install_credential(&machine, &EphemeralTokenStore::new(), &selection).await;
+    let original = original_prompt(&template, &runtime);
+    owners.custody.hold(&original);
+    bind_destination(&machine, &session, &original).await;
+    let original_id = original.id().clone();
+    machine
+        .ingest(&runtime, original)
+        .await
+        .expect("governed original admitted");
+    next_apply(&mut applied, "original").await;
+    let terminal = tokio::time::timeout(
+        BOUND,
+        machine.wait_input_terminal_receipt(&session, &original_id),
+    )
+    .await
+    .expect("terminal within bound")
+    .expect("receipt read")
+    .expect("attached input");
+    assert!(
+        matches!(terminal, InputTerminalReceiptWait::Resolved(_)),
+        "{terminal:?}"
+    );
+    let bound = census(&machine).await;
+    let registration = machine
+        .current_session_registration_witness(&session)
+        .await
+        .expect("current registration");
+    assert!(
+        machine
+            .unregister_session_registration_until_terminal_if_current(&registration)
+            .await
+            .expect("the unregister joins its teardown"),
+        "the current registration unregistered"
+    );
+    let unregistered = census(&machine).await;
+    drop(applied);
+    drop(machine);
+    let reopened = open(&store, &blobs, &owners).await;
+    let after_reopen = census(&reopened).await;
+    [bound, unregistered, after_reopen]
+}
+
+/// The census releases each row as the public row read does: the marker
+/// comes out while the destination is current, and never once the session
+/// is unregistered or the store reopened, while the row's lifecycle facts
+/// and its receipt identity stay.
+fn assert_census_withholds(census: [Vec<serde_json::Value>; 3], marker: &str) {
+    let [bound, unregistered, reopened] = census;
+    assert!(
+        serde_json::to_string(&bound)
+            .expect("census text")
+            .contains(marker),
+        "released to the current destination: {bound:?}"
+    );
+    for (when, rows) in [
+        ("after the unregister", unregistered),
+        ("after a reopen", reopened),
+    ] {
+        assert_eq!(rows.len(), 1, "{when}: the one input");
+        let text = serde_json::to_string(&rows).expect("census text");
+        assert!(!text.contains(marker), "{when}: {marker} came out: {text}");
+        assert!(
+            !rows[0]["terminal_outcome"].is_null(),
+            "{when}: the input is terminal"
+        );
+        assert!(
+            !rows[0]["terminal_completion"].is_null(),
+            "{when}: its receipt identity stays"
+        );
+    }
+}
+
+/// After the unregister, a scoped result never comes out of the session's
+/// input-state census.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scoped_result_never_comes_out_of_the_census_after_the_unregister() {
+    assert_census_withholds(
+        scoped_census("census-result-marker", None).await,
+        "census-result-marker",
+    );
+}
+
+/// After the unregister, a scoped run's callback arguments never come out of
+/// the session's input-state census.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scoped_callback_arguments_never_come_out_of_the_census_after_the_unregister() {
+    assert_census_withholds(
+        scoped_census("no result", Some("census-argument-marker")).await,
+        "census-argument-marker",
     );
 }
