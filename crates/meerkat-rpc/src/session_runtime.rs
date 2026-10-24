@@ -313,7 +313,9 @@ impl RpcRuntimePreAdmission {
 }
 
 /// Whether the current caller must acquire the stable service turn boundary
-/// before applying an LLM identity reconfiguration.
+/// before applying an LLM identity reconfiguration, and whether a cold
+/// attach's tail settle waits for that boundary or runs under the one the
+/// caller holds.
 #[derive(Clone, Copy)]
 pub(crate) enum LlmReconfigureBoundaryOwnership {
     /// Direct control-plane call: acquire the boundary in the adapter.
@@ -3812,16 +3814,39 @@ impl SessionRuntime {
     /// start/attach entry point before its archive and existence prechecks,
     /// never on plain reads.
     pub(crate) async fn prepare_cold_attach(&self, session_id: &SessionId) -> Result<(), RpcError> {
+        self.prepare_cold_attach_with_turn_boundary(
+            session_id,
+            LlmReconfigureBoundaryOwnership::Acquire,
+        )
+        .await
+    }
+
+    /// [`Self::prepare_cold_attach`] for an apply that may already hold the
+    /// session's turn-finalization boundary: a runtime loop lap's apply
+    /// (`AlreadyHeld`) settles under the boundary its lap holds, where any
+    /// other caller's settle waits for it.
+    async fn prepare_cold_attach_with_turn_boundary(
+        &self,
+        session_id: &SessionId,
+        boundary: LlmReconfigureBoundaryOwnership,
+    ) -> Result<(), RpcError> {
         // #1813: the hosting claim is taken first and handed over by move; a
         // session another process hosts is refused typed here.
         let claim = self
             .service
             .grant_session_hosting(session_id)
             .map_err(session_error_to_rpc)?;
-        self.service
-            .prepare_cold_attach(session_id, claim)
-            .await
-            .map_err(session_error_to_rpc)
+        match boundary {
+            LlmReconfigureBoundaryOwnership::Acquire => {
+                self.service.prepare_cold_attach(session_id, claim).await
+            }
+            LlmReconfigureBoundaryOwnership::AlreadyHeld => {
+                self.service
+                    .prepare_cold_attach_under_runtime_turn_boundary(session_id, claim)
+                    .await
+            }
+        }
+        .map_err(session_error_to_rpc)
     }
 
     pub async fn reject_archived_persisted_session_without_live(
@@ -8140,6 +8165,22 @@ impl SessionRuntime {
             .await
     }
 
+    /// [`Self::ensure_runtime_executor`] for an apply that may already hold
+    /// the session's turn-finalization boundary (see
+    /// [`Self::prepare_cold_attach_with_turn_boundary`]).
+    async fn ensure_runtime_executor_with_turn_boundary(
+        self: &Arc<Self>,
+        session_id: &SessionId,
+        boundary: LlmReconfigureBoundaryOwnership,
+    ) -> Result<(), RpcError> {
+        self.ensure_runtime_executor_on_adapter_with_turn_boundary(
+            &self.runtime_adapter,
+            session_id,
+            boundary,
+        )
+        .await
+    }
+
     /// The typed refusal of work that reaches admission or registration
     /// after this runtime's shutdown began: `-32032` (session runtime
     /// unavailable) with `data.kind` `runtime_shutting_down`. Nothing of the
@@ -8640,6 +8681,20 @@ impl SessionRuntime {
         adapter: &Arc<MeerkatMachine>,
         session_id: &SessionId,
     ) -> Result<(), RpcError> {
+        self.ensure_runtime_executor_on_adapter_with_turn_boundary(
+            adapter,
+            session_id,
+            LlmReconfigureBoundaryOwnership::Acquire,
+        )
+        .await
+    }
+
+    async fn ensure_runtime_executor_on_adapter_with_turn_boundary(
+        self: &Arc<Self>,
+        adapter: &Arc<MeerkatMachine>,
+        session_id: &SessionId,
+        boundary: LlmReconfigureBoundaryOwnership,
+    ) -> Result<(), RpcError> {
         // A runtime whose shutdown began registers no session: refuse before
         // any attach work (see `refuse_admission_after_shutdown`). A session
         // it still serves keeps its executor, so the work that executor is
@@ -8656,7 +8711,8 @@ impl SessionRuntime {
         // schedules against this runtime's store — the firing host must be
         // live in the same process (see arm_schedule_host_for_agent_tools).
         self.arm_schedule_host_for_agent_tools().await;
-        self.prepare_cold_attach(session_id).await?;
+        self.prepare_cold_attach_with_turn_boundary(session_id, boundary)
+            .await?;
         if self
             .archived_persisted_session_without_live(session_id)
             .await?
@@ -10246,7 +10302,10 @@ impl SessionRuntime {
                     });
                 }
             }
-            if let Err(error) = self.ensure_runtime_executor(session_id).await {
+            if let Err(error) = self
+                .ensure_runtime_executor_with_turn_boundary(session_id, llm_reconfigure_boundary)
+                .await
+            {
                 promotion_cleanup.restore_now().await;
                 return Err(error);
             }
@@ -10349,7 +10408,10 @@ impl SessionRuntime {
                 options.external_tools = build.external_tools;
             }
         }
-        if let Err(primary) = self.ensure_runtime_executor(session_id).await {
+        if let Err(primary) = self
+            .ensure_runtime_executor_with_turn_boundary(session_id, llm_reconfigure_boundary)
+            .await
+        {
             drop(active_turn);
             return Err(self
                 .combine_with_recovered_runtime_cleanup(

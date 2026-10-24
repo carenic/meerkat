@@ -2418,6 +2418,24 @@ them.
   `SessionError::DurableTailRecoveryRefused` instead of an internal error, so
   a caller can tell a session withheld for reconciliation from a fault. The
   tail and every durable row are kept, as before.
+- `meerkat-session`: `PersistentSessionService::load_authoritative_session`
+  may settle a provisional tail an observation deferred while a runtime loop
+  lap held the session's turn-finalization boundary, also after the live
+  actor is gone, waiting up to one second for that boundary. Its counted
+  retries still add no wait on the boundary, and every other conflict
+  surfaces unchanged; a caller that holds the boundary itself waits out the
+  second and gets the conflict.
+- `meerkat-session`: `PersistentSessionService::prepare_cold_attach` (and
+  `prepare_cold_attach_reporting`) settle a provisional tail only between
+  runtime loop laps. Once a tail stands they wait up to one second for the
+  session's turn-finalization boundary, which a lap holds from its top
+  through its run, and a lap that holds it longer leaves the tail for a later
+  settle; the caller's committed read then refuses, as for any unresolved
+  tail. A lap can outlive the live actor, and a settle inside the lap's
+  staging window would be written over by its staging commit, which ends the
+  input the settle consumed as stopped. A caller that holds the boundary
+  itself (a runtime loop lap's apply) uses the new
+  `prepare_cold_attach_under_runtime_turn_boundary`.
 - `meerkat-core`, `meerkat-session`, `meerkat-runtime`: a HeadCanonical run's
   round commits (see Added, per-round commits) move its durable head over the
   run's compaction rewrites, and the run retires its compaction history to
