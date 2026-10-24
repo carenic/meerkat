@@ -3609,11 +3609,15 @@ them.
   revision conflict while the round's tail stands; without the second,
   every resume spawn over a persistent inner service is refused. It should
   forward `settle_durable_tail_before_cold_start`,
-  `settle_durable_tail_before_cold_start_reporting` and
-  `keeps_durable_member_sessions` as well: their defaults settle through a
-  whole resume, report no continued run (so a mob start after a graceful
-  stop with a member's run in flight fails), and answer
-  `supports_persistent_sessions` instead of the inner service's own answer.
+  `settle_durable_tail_before_cold_start_reporting`,
+  `keeps_durable_member_sessions` and
+  `materialize_session_resume_verdict_under_runtime_turn_boundary` as well:
+  their defaults settle through a whole resume, report no continued run (so
+  a mob start after a graceful stop with a member's run in flight fails),
+  answer `supports_persistent_sessions` instead of the inner service's own
+  answer, and make a member host's resume verdict wait for the turn
+  boundary the host holds and refuse with `SessionError::Busy` once a
+  durable tail stands.
 
 - A `RuntimeStore` decorator outside this repository should forward
   `append_service_call_audit` and `read_service_call_audit`. Their defaults
