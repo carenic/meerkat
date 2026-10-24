@@ -2388,6 +2388,13 @@ them.
   next stop or retire failed after its checkpoint and left the registration
   reload-required.
 
+- `meerkat-runtime`: when a retire or an archive fails at a step after its
+  durable commit (the session's machine commit, the archive's model-routing
+  handoffs, its post-commit hook, or the removal of a recovered
+  registration), the waiters of the inputs it ended are still answered and
+  their completions recorded before the error is returned. They used to wait
+  for a recovery that a retired session never runs.
+
 - `meerkat-runtime`: a Reset the machine refuses, on a running or a stopped
   runtime, answers `RuntimeControlPlaneError::InvalidState { state }`
   (`RuntimeDriverError::NotReady { state }` through
