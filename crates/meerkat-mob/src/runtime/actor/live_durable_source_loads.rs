@@ -1,18 +1,20 @@
-//! Single flight for the live open's durable-source body load.
+//! Single flight for the live open's durable-source check.
 //!
 //! The actor validates a member's roster and session binding inline for
-//! `ValidateLiveDurableSourceAvailability`, then loads the durable source body
-//! off the actor loop. That load reads, decodes, and hashes the whole session
-//! body, so it can take seconds on a large member. Without sharing, every
-//! concurrent open started its own load, and a caller that timed out left its
-//! load running while the next caller started another.
+//! `ValidateLiveDurableSourceAvailability`, then checks the durable source off
+//! the actor loop: the store's own observation that the exact session is
+//! committed and not archived. The check reads no session body, so a run's
+//! provisional tail standing ahead of the committed snapshot does not refuse
+//! it. It still goes to the store, which can stall. Without sharing, every
+//! concurrent open started its own check, and a caller that timed out left its
+//! check running while the next caller started another.
 //!
-//! This registry keeps at most one body load per session in flight. A caller
-//! that arrives while a load runs waits on that load's result instead of
-//! starting a second one; a caller that goes away leaves the one load running
-//! for the others. A load still running at [`LIVE_DURABLE_SOURCE_LOAD_CEILING`]
-//! is abandoned as temporarily unavailable, and its slot is released so a
-//! stalled store cannot pin every later open to one hung read.
+//! This registry keeps at most one check per session in flight. A caller that
+//! arrives while a check runs waits on that check's result instead of starting
+//! a second one; a caller that goes away leaves the one check running for the
+//! others. A check still running at [`LIVE_DURABLE_SOURCE_LOAD_CEILING`] is
+//! abandoned as temporarily unavailable, and its slot is released so a stalled
+//! store cannot pin every later open to one hung read.
 //!
 //! This is actor-owned shell state for read sharing. It holds no MobMachine
 //! fact: the roster and binding checks stay inline in the actor.
@@ -27,8 +29,8 @@ use tokio::sync::{oneshot, watch};
 use super::super::LiveBridgeOperationStartError;
 use super::super::session_service::{LiveDurableSourceObservation, MobSessionService};
 
-/// Longest one shared durable-source body load is driven before it is
-/// abandoned as temporarily unavailable.
+/// Longest one shared durable-source check is driven before it is abandoned
+/// as temporarily unavailable.
 pub(in crate::runtime) const LIVE_DURABLE_SOURCE_LOAD_CEILING: Duration = Duration::from_secs(30);
 
 type LoadResult = Result<(), LiveBridgeOperationStartError>;
@@ -87,7 +89,7 @@ impl LiveDurableSourceLoads {
                     tracing::warn!(
                         session_id = %slot.session_id,
                         ceiling_ms = LIVE_DURABLE_SOURCE_LOAD_CEILING.as_millis() as u64,
-                        "live durable-source body load abandoned at its ceiling"
+                        "live durable-source check abandoned at its ceiling"
                     );
                     Err(LiveBridgeOperationStartError::TemporarilyUnavailable)
                 });

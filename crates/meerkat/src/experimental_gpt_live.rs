@@ -352,7 +352,8 @@ pub trait ExperimentalLiveSessionBindingAuthority: Send + Sync {
     /// [`Self::validate_live_durable_source_availability`].
     ///
     /// The default delegates to that full validation, which is correct but
-    /// slow; hosts override it.
+    /// goes through the actor's queue, so it waits while the member is busy;
+    /// hosts override it.
     async fn observe_live_durable_source_readiness(
         &self,
         canonical_session_id: &meerkat_core::SessionId,

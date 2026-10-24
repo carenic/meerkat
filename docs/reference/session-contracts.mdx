@@ -872,6 +872,13 @@ waited for it.
   The input stays durably admitted: read it after the reload instead of
   resubmitting it. The public error class is still authority unavailable and
   only the message names the case, so resubmit only with an idempotency key.
+- A session that must reload for another reason answers the same way: for
+  one, a resumed run whose actor the runtime cannot build. Once the runtime
+  loop exits, every completion waiter still on the registration fails with
+  `CompletionWaitError::AuthorityUnavailable`, which a JSON-RPC `turn/start`
+  answers with `-32603` and `data.reason` `completion_authority_unavailable`,
+  and a message that the input stays durably admitted and runs once the
+  runtime reloads. Do not resubmit it: read it after the reload.
 - Until the store answers, a reload refuses with the retryable
   `RuntimeDriverError::RecoveryRepairBlocked`; afterwards it replaces the
   registration from durable truth.

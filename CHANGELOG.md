@@ -972,7 +972,13 @@ them.
     (`SessionAgentResumeInput`). A resumed dispatch whose live image does not
     begin with the tail the receipt names is refused before any call runs
     again. An agent without durable round commits refuses a resume (the
-    method's default).
+    method's default). A resumed run never replays its inputs. A dispatch
+    the session refuses before the run continues, or any other failure the
+    runtime would replay for an ordinary run, keeps the run's WholeBlob tail
+    and stops the executor, and the next start resumes or repairs the run
+    (an applied HeadCanonical tail reloads the runtime instead). A failure
+    the agent loop records once the run is under way is a hard failure that
+    commits the rounds it ran and ends its inputs.
   - `SessionAgent::set_run_start_input_ids` names the inputs the runtime bound
     to every runtime-dispatched run, so a durable session's run cursor names
     them.
@@ -992,17 +998,26 @@ them.
     replayed.
   - The resumed actor is seeded from the run's provisional tail with the
     tail's checkpoint receipt (`MeerkatMachine::resumable_run_id` reads the
-    mark). A recovery that holds or refuses the tail keeps the tail and the
-    mark for reconciliation, and the session is not materialized. An open
-    run that no runtime registration marks (a session served without a
-    runtime, for one) is refused as `SessionError::DurableTailHeldForRecovery`
-    instead of failing on its first write. The resumed agent waits for its
-    MCP servers before it re-dispatches the round's staged calls, and
-    receives the interrupted tool calls of its run from the session's
-    process-custody evidence
+    mark). Once the runtime loop has begun the resumed run, the mark is
+    cleared and the run is the runtime's current run, which counts the same:
+    an executor that builds its actor on the run's own dispatch (an RPC
+    `turn/start` on a session with no live actor) resumes the run, and the
+    turn is served after it. A recovery that holds or refuses the tail keeps
+    the tail and the mark for reconciliation, and the session is not
+    materialized. An open run that no runtime registration marks or runs (a
+    session served without a runtime, for one) is refused as
+    `SessionError::DurableTailHeldForRecovery` instead of failing on its
+    first write. The resumed agent waits for its MCP servers before it
+    re-dispatches the round's staged calls, and receives the interrupted
+    tool calls of its run from the session's process-custody evidence
     (`MeerkatMachine::resumed_run_interrupted_tool_calls`), which is
     acknowledged once the resumed run has ended
     (`MeerkatMachine::acknowledge_resumed_run_interrupted_tool_calls`).
+    When the host that resumed the run stops before that acknowledgement,
+    the next start acknowledges the evidence of a foreground shell call the
+    ended run already answered without a recovery notice, so the call is not
+    reported twice. Background jobs, monitors and command hooks keep their
+    notice.
   - A marked run that is settled without resuming (a refused resume, an
     expired requeue stop, or a stop) has its provisional tail repaired as
     interrupted once its inputs' abandonment commits: rows kept, open calls
@@ -2026,6 +2041,54 @@ them.
   before 0.9.5 refuses the field on `turn/start` and `mob/turn_start` and
   ignores it on `session/create`.
 
+- `meerkat-session`: reads of a session whose durable run holds a round
+  commit. From a run's first tool round until its boundary commit, or until a
+  restart resumes it, the store keeps the round as the run's provisional tail
+  ahead of the committed snapshot. Readers of the committed session serve that
+  snapshot at once, and never decide anything about the tail from it:
+  - `PersistentSessionService::load_committed_session_tolerating_tail` keeps
+    the committed read's contract (the same transcript rewrite replay, audit
+    verification and counted retry budget). Under the session's own applied
+    tail it serves the boundary's snapshot instead of refusing with a
+    transcript revision conflict; with no provisional tail applied the
+    conflict stands. `PersistentSessionService::observe_authoritative_session_body_tolerating_tail`
+    is its read-only sibling: it never writes and never replays the rewrite
+    audit.
+  - Through them, while a round commit stands: session history, transcript
+    revisions, instruction activation records, `read` with no live actor, the
+    durable body behind planned-fork verification and mob execution evidence,
+    tool application observations, a mob member's status view, a member's
+    auth binding read, a fork's inheritance read, the fork-off re-link's
+    reads, the schedule hosts' metadata reads, and the surfaces' session reads
+    and controls (RPC `turn/start`, `turn/interrupt` and `turn/stop_run`; REST
+    run stop, `POST /sessions/{id}/messages`, the external-events and
+    peer-response-terminal webhooks, `GET /sessions/{id}/events` and live MCP
+    add, remove and reload; the MCP server's `meerkat_resume` and MCP
+    operations; `rkat session show`). A turn sent to a running session is
+    queued behind the run.
+  - Live checks read no committed body: the live-session staleness judgement,
+    the live presence checks, a live bridge's durable-source check and the
+    runtime-backed executor's session check after its actor is gone. The live
+    actor of an open run is not stale, and a host restarted over a tail takes
+    its cold path, where recovery decides the tail. Live mutations (tool
+    filter, MCP intents, mob authority context, tool application) check the
+    archive without reading the session, and land after the run. A read of a
+    hosted session whose turn stopped before its boundary commit settles the
+    tail that turn left, as a restart would.
+
+- `meerkat-mob`: `MobSessionService::load_persisted_session_tolerating_tail`,
+  the same read for mob code. Its default is the strict
+  `load_persisted_session`; the persistent session service overrides it. A
+  wrapper over another `MobSessionService` must forward it (see Upgrade
+  notes).
+
+- `meerkat-session`: `PersistentSessionService::live_actor_continues_open_run_tail`
+  answers whether the live actor continues the store's standing provisional
+  tail of a run the runtime holds open: the actor's latest run checkpoint
+  receipt is exactly the store's tail authority, and the run is the
+  runtime's current run or the run its registration keeps resumable. Such an
+  actor is not stale.
+
 ### Changed
 
 - `meerkat-core`, `meerkat-session`, `meerkat-runtime`: stopping a durable
@@ -2106,6 +2169,25 @@ them.
   `MobError::FlowRunIdempotencyConflict` instead of an internal error, for
   every keyed admission. A schedule delivery that meets such a key conflict
   records it as `MobRejected` instead of an internal error.
+
+- A `turn/start` or an external event that arrives while a durable run is
+  under way, after the run's first round commit, is admitted and queued at
+  once instead of waiting outside admission until the run ends. Its input is
+  durable earlier and still runs after the run. At a graceful stop the input
+  is kept and requeued with the session's work, and the request ends as
+  `requeued_across_stop` instead of being refused as `runtime_shutting_down`.
+  Before the run's first round commit such a request still waits, as in
+  0.9.4.
+
+- REST: a runtime apply whose session cannot be read fails, where it skipped
+  the video input validation. `rkat`: a scheduled peer-ingress update fails
+  on a session read error, where it turned keep-alive off.
+
+- `meerkat-mob-mcp`: a fork-off re-link that cannot read the child's durable
+  reply where it must decide (the job's limit, the commit ceiling, an idle
+  child) delivers `restart_interrupted` carrying the read error and keeps the
+  child seated, where it took the failure for "no reply" and settled the job
+  on that absence. A completion record it cannot read retires no child.
 
 ### Fixed
 
@@ -2993,6 +3075,20 @@ them.
   receipt, or the interrupted run without the cursor binding it, keeps the
   hold.
 
+- A caller waiting on an input whose session's runtime must reload, for a
+  reason other than a boundary commit with no durable answer (for one, a
+  resumed run whose actor the runtime cannot build), is answered once the
+  runtime loop exits, instead of waiting with no answer:
+  `CompletionWaitError::AuthorityUnavailable`, which JSON-RPC `turn/start`
+  answers with `-32603` and `data.reason` `completion_authority_unavailable`.
+  The input stays durably admitted and runs once the runtime reloads, so do
+  not resubmit it: read it after the reload (see Session contracts).
+
+- `meerkat-mob`: a member an adopted identity rebuilds (one that converged
+  by retiring and respawning) keeps the tool bundles the mob registered for
+  its profile, as a spawn of that profile does. The rebuild offered none of
+  the bundles' tools.
+
 ### Security
 
 - tokio is updated to 1.53.3 in Meerkat's lockfile for RUSTSEC-2026-0386.
@@ -3021,6 +3117,18 @@ them.
 - A session whose run a pre-release build of 0.9.5 interrupted, with no
   input submitted after it, heals at its next start: the run's tail is
   closed as an interrupted run.
+
+- A `MobSessionService` wrapper outside this repository must forward
+  `load_persisted_session_tolerating_tail` to its inner service. Without it,
+  mob reads of a member whose run holds a round commit keep the strict read
+  and fail with a transcript revision conflict while the round's tail
+  stands.
+
+- A mob that a pre-release build of 0.9.5 kept in a host store must be
+  recreated. Those builds stored the mob's events without the fields a
+  restart needs (a spawned member's bridge among them), so a restarted mob
+  skipped its members. This release keeps those fields and refuses an entry a
+  pre-release build wrote, with a read error that names the entry.
 
 ### Known limitations
 

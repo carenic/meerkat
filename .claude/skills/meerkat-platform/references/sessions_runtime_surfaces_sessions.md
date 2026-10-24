@@ -46,8 +46,10 @@ API changes, error codes, SDKs, prebuilt binaries and Rust embedding:
   tearing down.
 - A `turn/start` whose run's durable outcome is unknown (since 0.9.4 a
   boundary commit with no answer within the store's deadline, 120 seconds for
-  SQLite) or whose boundary commit was rolled back fails with `-32603` and
-  `data.reason` `completion_authority_unavailable`. The input stays durably
+  SQLite), whose boundary commit was rolled back, or whose session's runtime
+  must reload for another reason (since 0.9.5, for one a resumed run whose
+  actor cannot be built) fails with `-32603` and `data.reason`
+  `completion_authority_unavailable`. The input stays durably
   admitted: read it with `session/input_status` after the session reloads
   instead of resubmitting it (see `references/sessions_runtime_surfaces_storage_config.md`).
 - `INPUT_NOT_READY` (-32031) means the runtime did not admit the input now;
