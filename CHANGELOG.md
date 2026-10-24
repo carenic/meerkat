@@ -1004,8 +1004,12 @@ them.
     `turn/start` on a session with no live actor) resumes the run, and the
     turn is served after it. A recovery that holds or refuses the tail keeps
     the tail and the mark for reconciliation, and the session is not
-    materialized. An open run that no runtime registration marks or runs (a
-    session served without a runtime, for one) is refused as
+    materialized. One that finds the marked run's tail already committed, or
+    fails in a way that may follow its commit, finds the mark stale: the
+    actor is not built, the session's runtime must reload, and a caller
+    waiting on one of its inputs is answered as a runtime that must reload
+    answers (see Fixed). An open run that no runtime registration marks or
+    runs (a session served without a runtime, for one) is refused as
     `SessionError::DurableTailHeldForRecovery` instead of failing on its
     first write. The resumed agent waits for its MCP servers before it
     re-dispatches the round's staged calls, and receives the interrupted
@@ -2235,16 +2239,6 @@ them.
   Before the run's first round commit such a request still waits, as in
   0.9.4.
 
-- REST: a runtime apply whose session cannot be read fails, where it skipped
-  the video input validation. `rkat`: a scheduled peer-ingress update fails
-  on a session read error, where it turned keep-alive off.
-
-- `meerkat-mob-mcp`: a fork-off re-link that cannot read the child's durable
-  reply where it must decide (the job's limit, the commit ceiling, an idle
-  child) delivers `restart_interrupted` carrying the read error and keeps the
-  child seated, where it took the failure for "no reply" and settled the job
-  on that absence. A completion record it cannot read retires no child.
-
 ### Fixed
 
 - `meerkat-mob`, `meerkat-rpc`, `meerkat-rest`: identity adoption refuses a
@@ -3132,14 +3126,28 @@ them.
   receipt, or the interrupted run without the cursor binding it, keeps the
   hold.
 
-- A caller waiting on an input whose session's runtime must reload, for a
-  reason other than a boundary commit with no durable answer (for one, a
-  resumed run whose actor the runtime cannot build), is answered once the
-  runtime loop exits, instead of waiting with no answer:
+- `meerkat-runtime`: a caller waiting on an input whose session's runtime
+  must reload is answered once the runtime loop exits:
   `CompletionWaitError::AuthorityUnavailable`, which JSON-RPC `turn/start`
   answers with `-32603` and `data.reason` `completion_authority_unavailable`.
-  The input stays durably admitted and runs once the runtime reloads, so do
-  not resubmit it: read it after the reload (see Session contracts).
+  When a run's boundary commit or terminalization got no durable outcome
+  within the store's deadline, only that run's own inputs were answered
+  (`DurableOutcomeUnknown`), and a caller waiting on an input queued behind
+  the run got no answer. The input stays durably admitted and runs once the
+  runtime reloads, so do not resubmit it: read it after the reload (see
+  Session contracts).
+
+- REST: a runtime apply whose session cannot be read fails, where it skipped
+  the video input validation. `rkat`: a scheduled peer-ingress update fails
+  on a session read error, where it turned keep-alive off.
+
+- `meerkat-mob-mcp`: a fork-off re-link that cannot read the child's durable
+  reply where it must decide (the job's limit, the commit ceiling, an idle
+  child) delivers `restart_interrupted` carrying the read error and keeps the
+  child seated. It took the failure for "no reply" and settled the job on
+  that absence: past the job's limit it delivered `max_run_elapsed` and
+  retired a child that may have replied, and at the commit ceiling it
+  reported a commit that never landed.
 
 - `meerkat-mob`: a member an adopted identity rebuilds (one that converged
   by retiring and respawning) keeps the tool bundles the mob registered for
