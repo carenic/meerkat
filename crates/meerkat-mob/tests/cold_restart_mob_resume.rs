@@ -7690,6 +7690,7 @@ async fn a_member_retired_after_its_runtime_stopped_over_a_cancelled_turns_tail_
 /// What a host that died inside member `w-1`'s kept run left in the store.
 #[cfg(feature = "test-support")]
 struct KeptRunCrash {
+    /// The next process's own handle on the runtime database.
     runtime_store: Arc<dyn meerkat_runtime::RuntimeStore>,
     session_id: meerkat_core::types::SessionId,
     runtime_id: meerkat_runtime::LogicalRuntimeId,
@@ -7702,7 +7703,15 @@ struct KeptRunCrash {
 /// second input queues behind the held run first. Nothing the run would
 /// still write reaches the store, which keeps what a stop that keeps a
 /// durable run leaves: the run's continuable tail with its input bound to
-/// the run (and the queued input). The power is back on when this returns.
+/// the run (and the queued input).
+///
+/// The dead host's store handle stays cut for good. A task of that host can
+/// outlive the release of its session runtimes (the cancelled run's runtime
+/// loop, which persists the run's cancellation and settles its tail once its
+/// writes land), and a real crash leaves no such task: with the power back
+/// on, it would close the tail and cancel the run's input concurrently with
+/// the next process. The next process opens the database afresh, through
+/// the returned handle.
 #[cfg(feature = "test-support")]
 async fn crash_inside_a_kept_run(paths: &Paths, queue_behind: bool) -> KeptRunCrash {
     let power_store = Arc::new(PowerCutRuntimeStore::new(&paths.realm_db_path));
@@ -7804,7 +7813,8 @@ async fn crash_inside_a_kept_run(paths: &Paths, queue_behind: bool) -> KeptRunCr
     .await
     .expect("process-loss fixture waits for every old session runtime to be released");
 
-    power_store.set_cut(false);
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(PowerCutRuntimeStore::new(&paths.realm_db_path));
     KeptRunCrash {
         runtime_store,
         session_id: w1_sid,
@@ -7823,12 +7833,14 @@ async fn crash_inside_a_kept_run(paths: &Paths, queue_behind: bool) -> KeptRunCr
 /// process archives the member's session before anything registers its
 /// runtime again, through the machine-protocol archive a mob retire and a
 /// surface's archive both reach (a mob retire of a member whose startup
-/// restore was deferred is refused before it gets there). The archive ends
-/// the work the runtime kept for a later start through its lease's driver
-/// (the kept run's input and the queued input, both cancelled) and commits
-/// the tail as interrupted. RED before: nothing ended that work, so the
-/// archive's recovery held the continuable tail beside the queued input and
-/// the archive ended with `DurableTailHeldForRecovery`.
+/// restore was deferred is refused before it gets there). The tail's run
+/// cursor binds the run's input and not the queued one, which names no run,
+/// so the queued input is not in the tail and does not hold it: the
+/// archive's recovery commits the tail as interrupted at once and consumes
+/// the run's input with it, and the archive's retire then ends the queued
+/// input with the queue (abandoned, retired). The queued input never runs.
+/// RED before the cursor attribution: the recovery held the tail beside the
+/// queued input, and the archive ended both inputs as cancelled first.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread")]
 async fn an_archive_before_a_kept_run_registers_again_ends_the_work_it_kept() {
@@ -7840,7 +7852,7 @@ async fn an_archive_before_a_kept_run_registers_again_ends_the_work_it_kept() {
         runtime_store,
         session_id: w1_sid,
         runtime_id,
-        ..
+        kept_run,
     } = crash_inside_a_kept_run(&paths, true).await;
 
     // Nothing registers the member's runtime again before its session is
@@ -7889,14 +7901,31 @@ async fn an_archive_before_a_kept_run_registers_again_ends_the_work_it_kept() {
             })
             .count()
     };
+    let (run_inputs, queued): (Vec<_>, Vec<_>) = rows
+        .iter()
+        .partition(|row| row.seed.last_run_id.as_ref() == Some(&kept_run));
     assert!(
-        ended_with(&InputAbandonReason::Cancelled) >= 2,
-        "the kept run's input and the queued input end cancelled: {rows:?}"
+        !run_inputs.is_empty()
+            && run_inputs.iter().all(|row| matches!(
+                row.seed.terminal_outcome,
+                Some(InputTerminalOutcome::Consumed)
+            )),
+        "the kept run's input is consumed with its tail: {rows:?}"
+    );
+    assert!(
+        queued.len() == 1
+            && matches!(
+                &queued[0].seed.terminal_outcome,
+                Some(InputTerminalOutcome::Abandoned {
+                    reason: InputAbandonReason::Retired
+                })
+            ),
+        "the queued input ends with the archive's retire: {rows:?}"
     );
     assert_eq!(
-        ended_with(&InputAbandonReason::Retired),
+        ended_with(&InputAbandonReason::Cancelled),
         0,
-        "the archive's retire sweep finds nothing left to abandon: {rows:?}"
+        "the archive cancels nothing: {rows:?}"
     );
 
     let archived_session = service_2
@@ -7919,6 +7948,11 @@ async fn an_archive_before_a_kept_run_registers_again_ends_the_work_it_kept() {
         1,
         "the archived session keeps the kept run's prompt exactly once: {history}"
     );
+    assert_eq!(
+        history.matches("QUEUED_BEHIND_THE_KEPT_RUN").count(),
+        0,
+        "the queued input never runs: {history}"
+    );
 }
 
 /// The archive of a member's session whose kept run never registered again,
@@ -7932,7 +7966,13 @@ async fn an_archive_before_a_kept_run_registers_again_ends_the_work_it_kept() {
 /// bound to the kept run, so it repairs the continuable tail, commits it as
 /// interrupted and consumes the run's input; nothing holds the tail, so no
 /// work is ended. RED before: the archive cancelled the kept run's input
-/// before its recovery, so the input ended `Abandoned { Cancelled }`.
+/// before its recovery, so the input ended `Abandoned { Cancelled }`. The
+/// row stayed red after that fix while the crash fixture turned the power
+/// back on for the dead host: its runtime loop, still alive, then persisted
+/// the run's cancellation and closed the tail itself, so the input again
+/// ended cancelled, or the archive's registration lost its input-set race and
+/// backed off ("durable input state changed while cold recovery was
+/// preparing").
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread")]
 async fn an_archive_of_a_kept_run_with_nothing_queued_consumes_its_input() {

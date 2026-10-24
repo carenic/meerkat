@@ -784,9 +784,9 @@ the committed authority is preserved.
   no run, or the tail's run (a steer that joined after the last round
   commit), stays queued and runs once after the tail is closed; one that
   names another run holds the tail for reconciliation. A tail without an
-  agreeing run cursor (none, or a stale one the transcript went past)
-  settles the inputs that name its run and holds beside any other content
-  input. A cancelled run (an
+  agreeing run cursor (none, or one the classifier finds stale or cannot
+  check) settles the inputs that name its run and holds beside any other
+  content input. A cancelled run (an
   interrupt or a run stop) is closed as interrupted when its cancellation
   commits, under these rules.
 - Anything else, including any tail carrying a dangling `tool_use`, is held

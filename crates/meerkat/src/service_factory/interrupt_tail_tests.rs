@@ -1940,8 +1940,9 @@ async fn a_steer_joins_run_a_at_its_next_model_boundary(
 
 /// A steer that joins run A at A's model boundary, with A interrupted during
 /// that model call before a round commit lists it, is not in A's tail: it is
-/// requeued and runs once after A. RED before: the tail recovery attributed
-/// it to A by its run association and consumed it, so the steer was lost.
+/// requeued and runs once after A. GREEN before on this live path; the
+/// durable loss (a cold recovery consumed the join by its run association)
+/// is pinned by the recovery_contract requeued-join rows.
 async fn a_steer_joined_but_never_committed_runs_once_after_an_interrupt(head_canonical: bool) {
     let root = TempDir::new().expect("temp");
     let stores = Stores::new(head_canonical, &root);

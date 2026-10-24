@@ -360,8 +360,8 @@ session whose every send reports `reload_required`; see
 `session resolve-held-tail` reports why durable-tail recovery holds a
 session's tail as ambiguous (`tail_held_for_recovery`), or holds an
 interrupted tail beside inputs another run left staged or queued (a shape
-only pre-release builds of 0.9.5 leave), and what the repair keeps,
-answers, ends and requeues. With `--apply` it commits a repair the runtime
+only pre-release builds of 0.9.5, or a store fault, leave), and what the
+repair keeps, answers, ends and requeues. With `--apply` it commits a repair the runtime
 machine authorizes as an interrupted run. Stop every host of the session
 first: the repair is refused while the persisted lifecycle row is not
 quiescent, and an idle live host is not detected. A row a host left `Stopped`

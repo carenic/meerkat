@@ -286,12 +286,13 @@ session UUID.
 
 `resolve-held-tail` reports why durable-tail recovery holds a session's tail
 as ambiguous, or holds an interrupted tail beside inputs another run left
-staged or queued (a shape only pre-release builds of 0.9.5 leave), and what
-the repair keeps, answers, ends and requeues; with `--apply` it commits a
-repair the runtime machine authorizes as an interrupted run (every row kept,
-the open calls answered as outcome unknown, the stranded inputs requeued). Stop every host of the
-session first: the repair is refused while the persisted lifecycle row is not
-quiescent, and an idle live host is not detected. A row a host left `Stopped`
+staged or queued (a shape only pre-release builds of 0.9.5, or a store fault,
+leave), and what the repair keeps, answers, ends and requeues; with `--apply`
+it commits a repair the runtime machine authorizes as an interrupted run
+(every row kept, the open calls answered as outcome unknown, the stranded
+inputs requeued). Stop every host of the session first: the repair is refused
+while the persisted lifecycle row is not quiescent, and an idle live host is
+not detected. A row a host left `Stopped`
 when it ended before unregistering (no current run, no unregister in progress)
 counts as the `Idle` row a start would normalize it to: the report says so, and
 `--apply` writes it with the repair. It exits non-zero when the

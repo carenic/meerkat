@@ -916,9 +916,9 @@ them.
   input the cursor does not bind is not in the tail: one that names no run,
   or the tail's run, stays queued for ordinary delivery, and one that names
   another run holds the tail. That takes a cursor that agrees with the
-  tail: a tail without one (no cursor, or a stale one the transcript went
-  past) settles the inputs that name its run and holds beside any other
-  content input.
+  tail: a tail without one (no cursor, or one the classifier finds stale or
+  cannot check) settles the inputs that name its run and holds beside any
+  other content input.
   `recovery::observe_resumable_run` observes a continuable tail for
   registration, which marks the run resumable on the live authority and keeps
   its inputs bound instead of requeueing them. Every recovery commit clears the
@@ -1083,8 +1083,8 @@ them.
     commit, with its cursor, stays for recovery, which settles it by the
     inputs the cursor binds. A cancellation (an interrupt or a run stop) has
     the runtime run that recovery as soon as the cancellation commits, so the
-    tail is closed as interrupted before the session's next turn. Every exit
-    leaves the live session without a cursor.
+    tail is closed as interrupted before the session's next turn, unless
+    recovery holds it. Every exit leaves the live session without a cursor.
   - `Agent::set_run_start_input_ids` stages the inputs a runtime batch binds
     to the next run; each steer or peer input written into a running turn at a
     boundary binds to the run too, and every later round commit lists it in
@@ -2828,9 +2828,9 @@ them.
 - `rkat`, `meerkat-runtime`: `rkat session resolve-held-tail`
   (`recovery::resolve_held_durable_tail`) also resolves an interrupted run's
   tail that recovery holds beside an input staged for another run, a shape
-  only pre-release builds of 0.9.5 leave: their interrupt kept the run's
-  last round commit as the tail, and the next turn's input was staged for a
-  run that never committed. The store must prove the input is not the
+  only pre-release builds of 0.9.5, or a store fault, leave: those builds'
+  interrupt kept the run's last round commit as the tail, and the next
+  turn's input was staged for a run that never committed. The store must prove the input is not the
   tail's own: the tail's run cursor does not bind it, and it names that
   other run, which has no boundary receipt and no tail. The answer is
   `stranded_inputs` (`HeldTailResolution::StrandedInputs`). Applied, the
