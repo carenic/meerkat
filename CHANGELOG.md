@@ -2832,6 +2832,21 @@ them.
   not map, so the policy saw an unknown provider-native tool and a governed
   Gemini web search was refused as malformed.
 
+- `rkat`, `meerkat-runtime`: `rkat session resolve-held-tail`
+  (`recovery::resolve_held_durable_tail`) also resolves an interrupted run's
+  tail that recovery holds beside an input staged for another run, a shape
+  only pre-release builds of 0.9.5 leave: their interrupt kept the run's
+  last round commit as the tail, and the next turn's input was staged for a
+  run that never committed. The store must prove the input is not the
+  tail's own: it names that other run, which has no boundary receipt and no
+  tail, and the tail's run cursor binds only the interrupted run's own
+  inputs, all ended. The answer is `stranded_inputs`
+  (`HeldTailResolution::StrandedInputs`). Applied, the repair commits the
+  tail as interrupted, as recovery commits any interrupted run, and in the
+  same commit requeues those inputs with their content
+  (`HeldTailRepair::requeued_inputs`), so each runs once after it. Any other
+  input beside the tail keeps the hold.
+
 ### Security
 
 - tokio is updated to 1.53.3 in Meerkat's lockfile for RUSTSEC-2026-0386.
@@ -2847,6 +2862,10 @@ them.
 
 - Upgrade the Meta gateway and Forge together. The Meta CHANGELOG carries the
   details.
+
+- A session whose run a pre-release build of 0.9.5 interrupted, with no
+  input submitted after it, heals at its next start: the run's tail is
+  closed as an interrupted run.
 
 ### Known limitations
 
