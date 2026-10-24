@@ -2921,7 +2921,10 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         | MobError::ResumeProviderParamsRequireResume { .. }
         // A durable profile is a spawn this mob's session service cannot
         // honour, the same family as an unsupported runtime mode.
-        | MobError::NonDurableService { .. } => {
+        | MobError::NonDurableService { .. }
+        // An identity adoption is not a spawn, but the refusal is the same
+        // family: the mob's runtime cannot honour the request.
+        | MobError::IdentityAdoptionRequiresPersistentRuntime { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::UnsupportedForMode
         }
         MobError::MissingMemberCapability { .. } => {

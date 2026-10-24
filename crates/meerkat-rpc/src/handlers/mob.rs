@@ -3866,6 +3866,137 @@ mod tests {
         );
     }
 
+    /// `mob/adopt_member_identity_declaration` on a mob whose runtime has no
+    /// persistent store (the in-memory state runs every mob on an ephemeral
+    /// runtime) answers the typed refusal, `CAPABILITY_UNAVAILABLE` with
+    /// `data.kind` `mob_identity_adoption_requires_persistent_runtime`, and
+    /// the member stays as it was.
+    #[tokio::test]
+    async fn adopt_member_identity_declaration_on_an_ephemeral_runtime_answers_the_typed_refusal() {
+        let mob_id = MobId::from("rpc-ephemeral-adoption");
+        let member = AgentIdentity::from("worker-1");
+        let state = MobMcpState::new_in_memory();
+        // Mob members need comms; the shared fixture profile leaves it off.
+        let mut definition = rpc_destroy_test_definition(&mob_id);
+        if let Some(meerkat_mob::ProfileBinding::Inline(profile)) = definition
+            .profiles
+            .get_mut(&meerkat_mob::ProfileName::from("worker"))
+        {
+            profile.tools.comms = true;
+        }
+        let handle = MobBuilder::new(definition, MobStorage::in_memory())
+            .with_session_service(state.session_service())
+            .allow_ephemeral_sessions(true)
+            .create()
+            .await
+            .expect("create the mob");
+        state
+            .mob_insert_handle(mob_id.clone(), handle.clone())
+            .await;
+        let mut spawn = meerkat_mob::SpawnMemberSpec::new("worker", member.clone());
+        spawn.runtime_mode = Some(MobRuntimeMode::TurnDriven);
+        handle
+            .spawn_spec(spawn)
+            .await
+            .expect("spawn the member to adopt");
+        let attached = handle
+            .get_member(&member)
+            .await
+            .expect("read the member")
+            .expect("the member is attached");
+        let session_id = attached
+            .bridge_session_id()
+            .cloned()
+            .expect("session-backed member");
+        let adoption = meerkat_mob::AdoptMemberIdentityDeclaration {
+            mob_id: mob_id.clone(),
+            agent_identity: member.clone(),
+            request_id: meerkat_mob::IdentityAdoptionId::new("adopt-on-ephemeral-runtime")
+                .expect("valid adoption id"),
+            precondition: meerkat_mob::IdentityAdoptionPrecondition::ExpectedAbsent,
+            declaration_scope: meerkat_mob::IdentityDeclarationScopeId::new("example")
+                .expect("valid declaration scope"),
+            declaration_revision: 1,
+            session: meerkat_mob::DesiredSessionTarget {
+                session_id: session_id.clone(),
+                lineage_id: meerkat_core::SessionLineageId::for_session(&session_id),
+                lineage_generation: meerkat_core::SessionGeneration::INITIAL,
+                authority_policy: meerkat_mob::DesiredSessionAuthorityPolicy::RequireExisting,
+            },
+            member: meerkat_mob::IdentityProfileMemberDeclaration {
+                profile_name: meerkat_mob::ProfileName::from("worker"),
+                profile_override: None,
+                model_override: None,
+                external_addressable_override: None,
+                context: None,
+                labels: None,
+                additional_instructions: None,
+                system_prompt_override: None,
+                tool_access_policy: None,
+                auth_binding: None,
+                budget_limits: None,
+                runtime_mode: Some(meerkat_contracts::wire::WireMobRuntimeMode::TurnDriven),
+                required_env_keys: Vec::new(),
+                required_local_callback_tools: Vec::new(),
+                execution: meerkat_mob::DesiredExecution::ControllingSession,
+            },
+            wiring_custody: meerkat_mob::identity::IdentityWiringCustody::ExternalManaged,
+            owned_wiring: std::collections::BTreeSet::new(),
+            convergence: meerkat_mob::IdentityConvergenceMode::Drain { max_wait_ms: 5_000 },
+        };
+        let params = serde_json::to_value(&adoption).expect("encode the adoption request");
+        let raw = serde_json::value::RawValue::from_string(params.to_string())
+            .expect("serialize adoption params");
+
+        let response =
+            handle_adopt_member_identity_declaration(Some(RpcId::Num(21)), Some(&raw), &state)
+                .await;
+
+        let error = response.error.unwrap_or_else(|| {
+            panic!(
+                "adoption on an ephemeral runtime was accepted: {:?}",
+                response.result
+            )
+        });
+        assert_eq!(
+            error.code,
+            meerkat_contracts::ErrorCode::CapabilityUnavailable.jsonrpc_code(),
+            "{}",
+            error.message
+        );
+        let data = error.data.expect("typed refusal data");
+        assert_eq!(
+            data.get("kind").and_then(serde_json::Value::as_str),
+            Some("mob_identity_adoption_requires_persistent_runtime")
+        );
+        assert_eq!(
+            data.get("member_id").and_then(serde_json::Value::as_str),
+            Some(member.as_str())
+        );
+        assert_eq!(
+            handle
+                .get_member(&member)
+                .await
+                .expect("read the member after the refusal"),
+            Some(attached),
+            "the member stays attached as it was"
+        );
+        let retired = handle
+            .events()
+            .replay_all()
+            .await
+            .expect("replay the mob events")
+            .into_iter()
+            .any(|event| {
+                matches!(
+                    &event.kind,
+                    meerkat_mob::event::MobEventKind::MemberRetired { agent_identity, .. }
+                        if agent_identity == &member
+                )
+            });
+        assert!(!retired, "a refused adoption retires nothing");
+    }
+
     fn assert_destroy_incomplete_rpc_error_with_message(
         response: RpcResponse,
         expected_error: &str,

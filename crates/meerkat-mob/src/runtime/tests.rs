@@ -17510,6 +17510,16 @@ async fn a_lost_identity_lease_claim_is_retried_once_the_holders_lease_expires()
 
 #[tokio::test]
 async fn test_existing_member_adoption_preserves_prompt_sequence_without_spawn_prompt_source() {
+    fn system_rows(messages: &[meerkat_core::Message]) -> Vec<&str> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                meerkat_core::Message::System(system) => Some(system.content.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     let definition = with_unique_mob_id(sample_definition(), "persisted-prompt-adoption");
     let mob_id = definition.id.clone();
     let member = AgentIdentity::from("worker-persisted-prompt");
@@ -17517,7 +17527,14 @@ async fn test_existing_member_adoption_preserves_prompt_sequence_without_spawn_p
     let intermediate_prompt = "intermediate unkeyed prompt";
     let persisted_prompt = "Current agent-specific persisted prompt";
     let service = Arc::new(MockSessionService::new());
-    let _ = service.enable_runtime_adapter();
+    // Identity adoption needs a mob runtime with a persistent store; the
+    // mock's default runtime authority is ephemeral.
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    service.set_runtime_adapter(Arc::new(
+        meerkat_runtime::MeerkatMachine::persistent_without_blobs(runtime_store)
+            .expect("construct runtime authority"),
+    ));
     let initial = service
         .create_session(CreateSessionRequest {
             injected_context: Vec::new(),
@@ -17556,8 +17573,9 @@ async fn test_existing_member_adoption_preserves_prompt_sequence_without_spawn_p
         &event_store,
         Arc::new(crate::store::SystemMobIdentityStoreClock),
     ));
+    let events: Arc<dyn MobEventStore> = Arc::new(event_store);
     let storage = MobStorage {
-        events: Arc::new(event_store),
+        events: events.clone(),
         runs,
         specs,
         definition_projection_composition:
@@ -17583,6 +17601,23 @@ async fn test_existing_member_adoption_preserves_prompt_sequence_without_spawn_p
         )
         .await
         .expect("attach existing persisted session");
+    // No identity intent exists yet, so nothing reconciles the attached
+    // member and its live history is stable here.
+    let attached = service
+        .read_history(
+            &session_id,
+            meerkat_core::service::SessionHistoryQuery {
+                offset: 0,
+                limit: None,
+            },
+        )
+        .await
+        .expect("read attached history");
+    assert_eq!(
+        system_rows(&attached.messages),
+        vec![stale_prompt, intermediate_prompt, persisted_prompt],
+        "the attached member must materialize every legacy unkeyed System row in order"
+    );
 
     let adoption = crate::identity::AdoptMemberIdentityDeclaration {
         mob_id: mob_id.clone(),
@@ -17670,30 +17705,258 @@ async fn test_existing_member_adoption_preserves_prompt_sequence_without_spawn_p
         rematerialization.system_prompt_override.is_none(),
         "exact-session resume must not replace or collapse the persisted System sequence"
     );
-    let history = service
-        .read_history(
-            &session_id,
-            meerkat_core::service::SessionHistoryQuery {
-                offset: 0,
-                limit: None,
-            },
-        )
+    // Adoption hands the attached legacy realization to identity
+    // reconciliation, which replaces it in the background: the retirement
+    // archives the session and tears down its live actor, the only copy this
+    // mock's `read_history` serves, so a history read issued right after
+    // adoption raced it. The exact-session resume that would follow cannot
+    // complete in this fixture (this mock session service cannot revive the
+    // archived session), so the live copy does not come back. Wait until the
+    // retirement is journaled, then read the durable transcript the
+    // replacement keeps for that resume.
+    let retired = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let journaled = events
+                .replay_all()
+                .await
+                .expect("replay the adoption mob journal")
+                .iter()
+                .any(|event| {
+                    matches!(
+                        &event.kind,
+                        MobEventKind::MemberRetired { agent_identity, .. }
+                            if agent_identity == &member
+                    )
+                });
+            if journaled {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        retired.is_ok(),
+        "identity reconciliation must retire the adopted legacy realization; latest status: {:?}",
+        handle
+            .identity_convergence_status(&member)
+            .await
+            .expect("read adoption convergence")
+    );
+    let durable = service
+        .persisted_session_clone(&session_id)
         .await
-        .expect("read preserved adopted history");
-    let system_prompts = history
-        .messages
-        .iter()
-        .filter_map(|message| match message {
-            meerkat_core::Message::System(system) => Some(system.content.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+        .expect("adoption must keep the durable transcript");
     assert_eq!(
-        system_prompts,
+        system_rows(durable.messages()),
         vec![stale_prompt, intermediate_prompt, persisted_prompt],
         "adoption must leave every legacy unkeyed System row intact and ordered"
     );
     handle.shutdown().await.expect("shutdown adoption mob");
+}
+
+/// Identity adoption needs a mob runtime with a persistent store:
+/// reconciliation realizes an adoption by retiring the attached member and
+/// resuming its exact session from the runtime's durable lifecycle record.
+/// On the mock's ephemeral runtime authority, which keeps no such record, an
+/// accepted adoption retired the member and parked the identity
+/// RepairBlocked, so the member was lost. The adoption is now refused, typed,
+/// before anything is recorded, and the member stays attached, live and
+/// readable.
+#[tokio::test]
+async fn identity_adoption_on_a_runtime_without_a_persistent_store_is_refused_and_keeps_the_member()
+{
+    const REFUSAL_KIND: &str = "mob_identity_adoption_requires_persistent_runtime";
+    let definition = with_unique_mob_id(sample_definition(), "ephemeral-runtime-adoption");
+    let mob_id = definition.id.clone();
+    let member = AgentIdentity::from("worker-ephemeral-runtime");
+    let service = Arc::new(MockSessionService::new());
+    let runtime = service.enable_runtime_adapter();
+    assert!(
+        !runtime.has_runtime_persistence(),
+        "the mock's default runtime authority keeps no persistent store"
+    );
+    let event_store = InMemoryMobEventStore::new();
+    let identity_store = Arc::new(InMemoryMobIdentityStore::paired_with_event_store(
+        &event_store,
+        Arc::new(crate::store::SystemMobIdentityStoreClock),
+    ));
+    let events: Arc<dyn MobEventStore> = Arc::new(event_store);
+    let storage = MobStorage {
+        events: events.clone(),
+        runs: Arc::new(InMemoryMobRunStore::new()),
+        specs: Arc::new(InMemoryMobSpecStore::new()),
+        definition_projection_composition:
+            crate::storage::DefinitionProjectionComposition::Independent,
+        runtime_metadata: Arc::new(InMemoryMobRuntimeMetadataStore::new()),
+        identity: identity_store.clone(),
+        identity_member: Some(identity_store.clone()),
+        identity_status: Arc::new(InMemoryMobIdentityStatusStore::new()),
+        identity_status_projection_order: Default::default(),
+        realm_profiles: None,
+        forked_participants: None,
+    };
+    let handle = MobBuilder::new(definition, storage)
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create the mob on an ephemeral runtime");
+    let mut spawn = SpawnMemberSpec::new(ProfileName::from("worker"), member.clone());
+    spawn.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    handle
+        .spawn_spec(spawn)
+        .await
+        .expect("spawn the member to adopt");
+    let attached = handle
+        .get_member(&member)
+        .await
+        .expect("read the attached member")
+        .expect("the member is attached");
+    let session_id = attached
+        .bridge_session_id()
+        .cloned()
+        .expect("session-backed member");
+    let history_query = meerkat_core::service::SessionHistoryQuery {
+        offset: 0,
+        limit: None,
+    };
+    let history_before = service
+        .read_history(&session_id, history_query.clone())
+        .await
+        .expect("read the member's history before the adoption");
+    let member_retired = |events: &[MobEvent]| {
+        events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                MobEventKind::MemberRetired { agent_identity, .. } if agent_identity == &member
+            )
+        })
+    };
+
+    let adoption = crate::identity::AdoptMemberIdentityDeclaration {
+        mob_id: mob_id.clone(),
+        agent_identity: member.clone(),
+        request_id: crate::identity::IdentityAdoptionId::new("adopt-on-ephemeral-runtime")
+            .expect("valid adoption id"),
+        precondition: crate::identity::IdentityAdoptionPrecondition::ExpectedAbsent,
+        declaration_scope: crate::identity::IdentityDeclarationScopeId::new("example")
+            .expect("valid declaration scope"),
+        declaration_revision: 1,
+        session: crate::identity::DesiredSessionTarget {
+            session_id: session_id.clone(),
+            lineage_id: meerkat_core::SessionLineageId::for_session(&session_id),
+            lineage_generation: meerkat_core::SessionGeneration::INITIAL,
+            authority_policy: crate::identity::DesiredSessionAuthorityPolicy::RequireExisting,
+        },
+        member: crate::identity::IdentityProfileMemberDeclaration {
+            profile_name: ProfileName::from("worker"),
+            profile_override: None,
+            model_override: None,
+            external_addressable_override: None,
+            context: None,
+            labels: None,
+            additional_instructions: None,
+            system_prompt_override: None,
+            tool_access_policy: None,
+            auth_binding: None,
+            budget_limits: None,
+            runtime_mode: Some(meerkat_contracts::wire::WireMobRuntimeMode::TurnDriven),
+            required_env_keys: Vec::new(),
+            required_local_callback_tools: Vec::new(),
+            execution: crate::identity::DesiredExecution::ControllingSession,
+        },
+        wiring_custody: crate::identity::IdentityWiringCustody::ExternalManaged,
+        owned_wiring: BTreeSet::new(),
+        convergence: crate::identity::IdentityConvergenceMode::Drain { max_wait_ms: 5_000 },
+    };
+    let error = match handle.adopt_member_identity_declaration(adoption).await {
+        Err(error) => error,
+        Ok(accepted) => {
+            // Name what the accepted adoption costs: reconciliation retires
+            // the member, then cannot resume it.
+            let retired = tokio::time::timeout(Duration::from_secs(20), async {
+                while !member_retired(&events.replay_all().await.expect("replay the journal")) {
+                    tokio::task::yield_now().await;
+                }
+                loop {
+                    if let crate::identity::IdentityStoredObservation::Valid(status) = handle
+                        .identity_convergence_status(&member)
+                        .await
+                        .expect("read the convergence status")
+                        && status.decision
+                            == Some(crate::identity::IdentityReconcileDecision::RepairBlocked)
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+            panic!(
+                "adoption on a runtime without a persistent store was accepted ({accepted:?}); retired and parked RepairBlocked: {retired}; convergence: {:?}; roster entry: {:?}",
+                handle.identity_convergence_status(&member).await,
+                handle.get_member(&member).await
+            );
+        }
+    };
+    assert_eq!(
+        error.wire_error_code(),
+        Some(meerkat_contracts::ErrorCode::CapabilityUnavailable),
+        "{error}"
+    );
+    let data = error.structured_data().expect("typed refusal data");
+    assert_eq!(data["kind"], REFUSAL_KIND, "{error}");
+    assert_eq!(data["member_id"], member.as_str());
+    assert_eq!(data["retryable"], false);
+
+    // Nothing was recorded, so nothing reconciles the member.
+    assert!(
+        matches!(
+            identity_store
+                .observe_identity_intent(&mob_id, &member)
+                .await
+                .expect("read the identity intent"),
+            crate::identity::IdentityStoredObservation::Missing
+        ),
+        "a refused adoption records no intent"
+    );
+    assert!(
+        matches!(
+            handle
+                .identity_convergence_status(&member)
+                .await
+                .expect("read the convergence status"),
+            crate::identity::IdentityStoredObservation::Missing
+        ),
+        "a refused adoption schedules no reconciliation"
+    );
+
+    // The member stays exactly as it was: attached, live and readable.
+    assert_eq!(
+        handle
+            .get_member(&member)
+            .await
+            .expect("read the member after the refusal"),
+        Some(attached),
+        "the member stays attached as it was"
+    );
+    assert!(
+        service.live_session_clone(&session_id).await.is_some(),
+        "the member's session stays live"
+    );
+    assert!(!service.test_is_session_archived(&session_id).await);
+    assert_eq!(service.archive_call_count(&session_id).await, 0);
+    let history_after = service
+        .read_history(&session_id, history_query)
+        .await
+        .expect("the member's history stays readable");
+    assert_eq!(history_after.messages, history_before.messages);
+    assert!(
+        !member_retired(&events.replay_all().await.expect("replay the journal")),
+        "a refused adoption retires nothing"
+    );
+    handle.shutdown().await.expect("shutdown the mob");
 }
 
 #[tokio::test]
@@ -86214,6 +86477,9 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
             "resume_provider_params_require_resume".to_string()
         }
         MobError::NonDurableService { .. } => "non_durable_service".to_string(),
+        MobError::IdentityAdoptionRequiresPersistentRuntime { .. } => {
+            "identity_adoption_requires_persistent_runtime".to_string()
+        }
         MobError::MemberRoleMigrationRequired { .. } => {
             "member_role_migration_required".to_string()
         }

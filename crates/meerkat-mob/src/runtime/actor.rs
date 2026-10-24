@@ -24726,6 +24726,23 @@ impl MobActor {
         format!("sha256:{:x}", Sha256::digest(bytes))
     }
 
+    /// Whether identity reconciliation can finish replacing a member on this
+    /// mob. It resumes the member's exact session from the runtime's durable
+    /// lifecycle record, which only a runtime with a persistent store keeps
+    /// (`MeerkatMachine::observe_cold_runtime_lifecycle`).
+    fn identity_replacement_runtime_is_persistent(&self) -> bool {
+        #[cfg(feature = "runtime-adapter")]
+        {
+            self.runtime_adapter
+                .as_ref()
+                .is_some_and(|runtime| runtime.has_runtime_persistence())
+        }
+        #[cfg(not(feature = "runtime-adapter"))]
+        {
+            false
+        }
+    }
+
     async fn adopt_member_identity_declaration(
         &mut self,
         request: crate::identity::AdoptMemberIdentityDeclaration,
@@ -24750,6 +24767,15 @@ impl MobActor {
             return Err(MobError::WiringError(
                 "identity adoption currently requires controlling-session execution".to_string(),
             ));
+        }
+        // Reconciliation realizes an adoption by retiring the attached member
+        // and resuming its exact session. On a runtime without a persistent
+        // store it could retire the member but never resume it, so refuse
+        // before anything is recorded: no intent, no receipt, no reconcile.
+        if !self.identity_replacement_runtime_is_persistent() {
+            return Err(MobError::IdentityAdoptionRequiresPersistentRuntime {
+                member_id: request.agent_identity.clone(),
+            });
         }
         let entry = self
             .roster
