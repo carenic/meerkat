@@ -6303,6 +6303,27 @@ impl EphemeralRuntimeDriver {
         Ok(abandoned)
     }
 
+    /// The inputs the ended resumable run `run_id` still holds (staged for
+    /// it, or applied by one of its committed rounds), in admission order.
+    /// Nothing finishes them: the run does not resume past the retire that
+    /// ended it, and a retired drain runs only queued inputs.
+    pub(crate) fn ended_resumable_run_kept_inputs(&self, run_id: &RunId) -> Vec<InputId> {
+        self.resumable_run_kept_inputs(run_id)
+            .into_iter()
+            .map(|(input_id, _)| input_id)
+            .collect()
+    }
+
+    /// Abandon exactly `input_ids` with `reason` through the generated
+    /// `AbandonInput`. The caller stages any receipt the reason needs.
+    pub(crate) fn abandon_inputs(
+        &mut self,
+        input_ids: &[InputId],
+        reason: InputAbandonReason,
+    ) -> Result<usize, RuntimeDriverError> {
+        self.abandon_non_terminal_inputs(input_ids, &reason)
+    }
+
     /// Machine-owned realization for a validated run-completion transition.
     ///
     /// Delegates to `consume_inputs`, which drives the DSL `ConsumeInput`
