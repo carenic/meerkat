@@ -735,7 +735,7 @@ impl SessionStreamForwarding {
                 _ = &mut stop_rx => {
                     break;
                 }
-                _ = notification_sink.tx.closed() => {
+                () = notification_sink.tx.closed() => {
                     emit_authorized_session_stream_terminal(
                         &notification_sink, &active_session_streams, &stream_authority,
                         stream_id_for_task,
@@ -1021,7 +1021,7 @@ fn record_session_stream_terminal_authority_locked(
         meerkat_runtime::meerkat_machine::dsl::MeerkatMachineInput::RecordSessionEventStreamTerminated {
             stream_id: stream_id.clone(),
             observation,
-            detail: detail.clone(),
+            detail,
         },
     )
     .map_err(|error| error.to_string())?;
@@ -1206,10 +1206,10 @@ async fn close_session_stream(
             })
         })
     });
-    if close.is_err() {
-        if let Some(mut stream) = streams.remove(stream_id) {
-            stop_stream_forwarder(&mut stream);
-        }
+    if close.is_err()
+        && let Some(mut stream) = streams.remove(stream_id)
+    {
+        stop_stream_forwarder(&mut stream);
     }
     drop(streams);
     drop(authority);
@@ -5124,7 +5124,7 @@ impl MethodRouter {
                         _ = &mut stop_rx => {
                             break;
                         }
-                        _ = notification_sink.tx.closed() => {
+                        () = notification_sink.tx.closed() => {
                             emit_authorized_mob_stream_terminal(
                                 &notification_sink, &active_mob_streams, &stream_authority,
                                 stream_id_for_task,
@@ -5238,7 +5238,7 @@ impl MethodRouter {
                         _ = &mut stop_rx => {
                             break;
                         }
-                        _ = notification_sink.tx.closed() => {
+                        () = notification_sink.tx.closed() => {
                             emit_authorized_mob_stream_terminal(
                                 &notification_sink, &active_mob_streams, &stream_authority,
                                 stream_id_for_task,

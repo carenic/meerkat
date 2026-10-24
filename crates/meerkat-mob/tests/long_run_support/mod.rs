@@ -63,7 +63,8 @@ use meerkat_mob::{
 };
 use meerkat_runtime::terminal_status::InteractionSelector;
 use meerkat_runtime::{
-    AcceptOutcome, Input, LogicalRuntimeId, MeerkatMachine, PromptInput, RuntimeStore,
+    AcceptOutcome, Input, LogicalRuntimeId, MeerkatMachine, PromptInput,
+    RuntimeSessionPersistenceProfile, RuntimeStore,
 };
 use meerkat_store_conformance::{
     BeforeResume, KillPoint, KilledRun, LongRunPlan, RestartReport, ResumeGate, ResumePointKind,
@@ -2206,24 +2207,26 @@ pub struct Restarted {
 }
 
 /// The run of the provisional tail `runtime_store` holds for `session`'s
-/// runtime, in either session profile, if any.
+/// runtime, if any, read in the store's own session profile: a
+/// head-canonical store refuses the whole-blob read.
 pub async fn provisional_tail_run(
     runtime_store: &dyn RuntimeStore,
     session: &SessionId,
 ) -> Result<Option<RunId>, String> {
     let runtime = LogicalRuntimeId::for_session(session);
-    if let Some(tail) = runtime_store
-        .load_head_canonical_provisional_tail(&runtime)
-        .await
-        .map_err(|error| format!("read the head-canonical tail: {error}"))?
-    {
-        return Ok(Some(tail.run_id().clone()));
+    match runtime_store.session_persistence_profile() {
+        RuntimeSessionPersistenceProfile::HeadCanonicalV1 => Ok(runtime_store
+            .load_head_canonical_provisional_tail(&runtime)
+            .await
+            .map_err(|error| format!("read the head-canonical tail: {error}"))?
+            .map(|tail| tail.run_id().clone())),
+        RuntimeSessionPersistenceProfile::WholeBlobV1 => Ok(runtime_store
+            .load_whole_blob_provisional_tail(&runtime)
+            .await
+            .map_err(|error| format!("read the whole-blob tail: {error}"))?
+            .map(|tail| tail.authority().run_id().clone())),
+        other => Err(format!("no provisional tail read for the {other} profile")),
     }
-    Ok(runtime_store
-        .load_whole_blob_provisional_tail(&runtime)
-        .await
-        .map_err(|error| format!("read the whole-blob tail: {error}"))?
-        .map(|tail| tail.authority().run_id().clone()))
 }
 
 /// With no runtime running, discard the provisional tail the store holds
@@ -2234,26 +2237,36 @@ pub async fn discard_provisional_tail(store: &Store, session: &SessionId) -> Res
     let opened = open_persistence(store, true).await;
     let runtime_store = opened.persistence.runtime_store();
     let runtime = LogicalRuntimeId::for_session(session);
-    if let Some(tail) = runtime_store
-        .load_head_canonical_provisional_tail(&runtime)
-        .await
-        .map_err(|error| format!("read the head-canonical tail: {error}"))?
-    {
-        return runtime_store
-            .discard_head_canonical_provisional_tail(&runtime, &tail)
-            .await
-            .map_err(|error| format!("discard the head-canonical tail: {error}"));
-    }
-    match runtime_store
-        .load_whole_blob_provisional_tail(&runtime)
-        .await
-        .map_err(|error| format!("read the whole-blob tail: {error}"))?
-    {
-        Some(tail) => runtime_store
-            .discard_whole_blob_provisional_tail(&runtime, tail.authority())
-            .await
-            .map_err(|error| format!("discard the whole-blob tail: {error}")),
-        None => Ok(false),
+    match runtime_store.session_persistence_profile() {
+        RuntimeSessionPersistenceProfile::HeadCanonicalV1 => {
+            match runtime_store
+                .load_head_canonical_provisional_tail(&runtime)
+                .await
+                .map_err(|error| format!("read the head-canonical tail: {error}"))?
+            {
+                Some(tail) => runtime_store
+                    .discard_head_canonical_provisional_tail(&runtime, &tail)
+                    .await
+                    .map_err(|error| format!("discard the head-canonical tail: {error}")),
+                None => Ok(false),
+            }
+        }
+        RuntimeSessionPersistenceProfile::WholeBlobV1 => {
+            match runtime_store
+                .load_whole_blob_provisional_tail(&runtime)
+                .await
+                .map_err(|error| format!("read the whole-blob tail: {error}"))?
+            {
+                Some(tail) => runtime_store
+                    .discard_whole_blob_provisional_tail(&runtime, tail.authority())
+                    .await
+                    .map_err(|error| format!("discard the whole-blob tail: {error}")),
+                None => Ok(false),
+            }
+        }
+        other => Err(format!(
+            "no provisional tail discard for the {other} profile"
+        )),
     }
 }
 
@@ -2304,16 +2317,35 @@ pub async fn restart(
                             .map(|_| ())
                             .map_err(|error| error.to_string())
                     } else {
-                        machine
-                            .stop_runtime_executor(&target, "the long run harness stops it")
-                            .await
-                            .map_err(|error| error.to_string())
+                        // A stop whose cleanup outlives the call's own
+                        // bounded wait answers that it is still in progress;
+                        // asking again joins the same cleanup.
+                        let deadline = Instant::now() + STEP;
+                        loop {
+                            match machine
+                                .stop_runtime_executor(&target, "the long run harness stops it")
+                                .await
+                            {
+                                Err(
+                                    meerkat_runtime::RuntimeDriverError::RuntimeStopInProgress {
+                                        ..
+                                    },
+                                ) if Instant::now() < deadline => {
+                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                }
+                                other => break other.map_err(|error| error.to_string()),
+                            }
+                        }
                     }
                 });
                 // The stop or retire settles the resumable run while the
                 // gate holds the resume; then the gate answers.
                 let _ = incarnation
-                    .wait_terminal(&session, &killed.input, PARK - Duration::from_secs(1))
+                    .wait_terminal(
+                        &session,
+                        &killed.input,
+                        PARK.saturating_sub(Duration::from_secs(1)),
+                    )
                     .await;
                 gate.release();
                 match tokio::time::timeout(STEP, action).await {
@@ -2620,7 +2652,7 @@ pub async fn restart_workers(
     for (member, killed) in workers {
         let tag = worker_tag(member);
         restarted.push(DeployRestart {
-            member: *member,
+            member,
             report: report_for(&incarnation, tag, &killed.session, killed, fence_leases).await?,
             terminal: incarnation
                 .input_terminal(&killed.session, &killed.input)
