@@ -36,9 +36,9 @@ use long_run_support::{
     ChildRace, DeployConfig, DeployRestart, FollowUp, HarnessGate, HostRace, Incarnation,
     KillSwitch, KilledState, OpenOptions, ROOT_ENV, RaceHook, Restarted, SHUTDOWN_BUDGET, STEP,
     Store, WHOLE_BLOB, WORKER, await_supervisor_route_release, discard_provisional_tail,
-    fail_model_call, fresh_root, other_writer, read_killed, read_killed_member, read_plan, restart,
-    restart_deploy, restart_workers, run_resumed_until_killed, run_until_killed, wait_converged,
-    write_plan,
+    fail_model_call, fresh_root, kill_orphaned_process, other_writer, read_killed,
+    read_killed_member, read_plan, restart, restart_deploy, restart_workers,
+    run_resumed_until_killed, run_until_killed, wait_converged, write_plan,
 };
 use meerkat_core::types::SessionId;
 use meerkat_store_conformance::{
@@ -217,7 +217,19 @@ impl Harness {
     }
 
     /// The host store backend: the first incarnation runs on a runtime of
-    /// its own, shut down at the kill point so every Core object drops.
+    /// its own, shut down at the kill point.
+    ///
+    /// This approximates a process death only in part. Core runs its session
+    /// tasks (and so the turn in flight, with its tool calls) and its runtime
+    /// loops on runtimes the process owns, which this shutdown leaves
+    /// running: the killed incarnation's session lives on in this process,
+    /// blocked at its kill point and fenced out by the restart's takeover,
+    /// and commits nothing. A death would also have ended the tool process a
+    /// started call left running, by the next start's recovery; here the
+    /// call's owner is still alive, so the harness stops that process itself
+    /// at the kill (see [`kill_orphaned_process`]), which ends the call and
+    /// leaves its custody record to the restart. The SQLite backend, a child
+    /// process killed with SIGKILL, is the proof of the death itself.
     async fn kill_in_process(store: &Store, plan: &LongRunPlan) -> Result<(), ConformanceFailure> {
         let root = store.root().to_path_buf();
         let kill = KillSwitch::new(&root);
@@ -264,6 +276,11 @@ impl Harness {
             Ok(Ok(_))
         );
         incarnation_runtime.shutdown_background();
+        // The started tool process the killed incarnation's call left
+        // running: ended here, as the next start's recovery ends it after a
+        // death, so the still-live call returns and lets go of its custody
+        // record. The killed session itself stays blocked at its kill point.
+        kill_orphaned_process(&root);
         if !reached {
             return Err(harness_failure(
                 "kill_in_process",
