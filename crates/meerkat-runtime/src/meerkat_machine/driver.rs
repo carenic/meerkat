@@ -5904,6 +5904,30 @@ impl DriverEntry {
         }
     }
 
+    /// The inputs the ended resumable run `run_id` still holds; see
+    /// [`crate::driver::EphemeralRuntimeDriver::ended_resumable_run_kept_inputs`].
+    pub(crate) fn ended_resumable_run_kept_inputs(&self, run_id: &RunId) -> Vec<InputId> {
+        match self {
+            DriverEntry::Ephemeral(driver) => driver.ended_resumable_run_kept_inputs(run_id),
+            DriverEntry::Persistent(driver) => {
+                driver.inner_ref().ended_resumable_run_kept_inputs(run_id)
+            }
+        }
+    }
+
+    /// Abandon exactly `input_ids` with `reason`, committed durably on the
+    /// persistent driver; the caller stages the receipt the reason needs.
+    pub(crate) async fn abandon_inputs(
+        &mut self,
+        input_ids: &[InputId],
+        reason: crate::input_state::InputAbandonReason,
+    ) -> Result<usize, RuntimeDriverError> {
+        match self {
+            DriverEntry::Ephemeral(driver) => driver.abandon_inputs(input_ids, reason),
+            DriverEntry::Persistent(driver) => driver.abandon_inputs(input_ids, reason).await,
+        }
+    }
+
     pub(crate) async fn abandon_queued_input(
         &mut self,
         input_id: &InputId,

@@ -2626,6 +2626,54 @@ impl PersistentRuntimeDriver {
         Ok(abandoned)
     }
 
+    /// Abandon exactly `input_ids` with `reason` and commit them; see
+    /// [`EphemeralRuntimeDriver::abandon_inputs`].
+    pub(crate) async fn abandon_inputs(
+        &mut self,
+        input_ids: &[meerkat_core::lifecycle::InputId],
+        reason: InputAbandonReason,
+    ) -> Result<usize, RuntimeDriverError> {
+        self.require_durability_ready()?;
+        let checkpoint = self.persistence_rollback_checkpoint();
+        let abandoned = match self.inner.abandon_inputs(input_ids, reason) {
+            Ok(abandoned) => abandoned,
+            Err(err) => {
+                return Err(self.post_transition_failure(
+                    checkpoint,
+                    "abandon_inputs",
+                    err.to_string(),
+                ));
+            }
+        };
+        let (checkpoint, input_states, commit) = self.lifecycle_persistence_payload_with_rollback(
+            checkpoint,
+            input_ids,
+            "input abandon",
+        )?;
+        if let Err(err) = self
+            .store
+            .commit_machine_lifecycle(&self.runtime_id, commit, &input_states)
+            .await
+        {
+            return Err(self.post_transition_failure(
+                checkpoint,
+                "abandon_inputs_commit",
+                format!("input abandon persist failed: {err}"),
+            ));
+        }
+        if let Err(error) = self
+            .inner
+            .archive_archivable_terminal_inputs_after_durable_commit(input_ids)
+        {
+            return Err(self.post_transition_failure(
+                None,
+                "abandon_inputs_archive",
+                error.to_string(),
+            ));
+        }
+        Ok(abandoned)
+    }
+
     /// Reload from the store the `Consumed` terminals a store-owned
     /// durable-tail recovery committed for inputs this driver still holds as
     /// non-terminal. The recovery consumes the rows bound to the run whose

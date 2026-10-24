@@ -2559,10 +2559,11 @@ impl MeerkatMachine {
         // ends with the retire, and the retire's sweep settles its bound
         // inputs with the rest. A failed retire restores the staged state,
         // the mark with it.
-        let retire_result = match drv.resumable_run_id() {
+        let ended_run = drv.resumable_run_id();
+        let retire_result = match ended_run.as_ref() {
             Some(run_id) => {
                 match drv
-                    .end_resumable_run(&run_id, &crate::input_state::InputAbandonReason::Retired)
+                    .end_resumable_run(run_id, &crate::input_state::InputAbandonReason::Retired)
                 {
                     Ok(()) => Box::pin(machine_retire(&mut drv)).await,
                     Err(error) => Err(error),
@@ -2611,6 +2612,53 @@ impl MeerkatMachine {
                 .await
                 .sync_control_projection_from_dsl_authority();
             commit_error = Some(reason);
+        }
+
+        // The inputs the run this retire ended still holds (staged for it, or
+        // applied by one of its committed rounds) never finish: the run does
+        // not resume past the retire, and the retired drain runs only queued
+        // inputs. They end here, as one runless runtime termination, the way
+        // a retire without a runtime loop ends its pending inputs; queued
+        // inputs keep the drain.
+        //
+        // They are the inputs the run's agreeing cursor binds. A run is kept
+        // resumable only from a tail the classifier reads as continuable,
+        // which needs the run cursor to agree with the tail, and its
+        // registration kept bound only the inputs that cursor binds; any other
+        // input that names the run recovered as for a run nothing resumes
+        // (requeued, or consumed by its committed receipt). A tail whose
+        // cursor disagrees or is unreadable keeps no run resumable, so the
+        // retire ends nothing here and takes its path as before.
+        let mut ended_run_batch = None;
+        if let Some(run_id) = ended_run.as_ref() {
+            let reason = "retired with the resumable run it ended";
+            let mut drv = driver.lock().await;
+            let held = drv.ended_resumable_run_kept_inputs(run_id);
+            if !held.is_empty() {
+                let prepared = drv
+                    .prepare_runless_runtime_terminated_interaction_outboxes(
+                        &held,
+                        reason.to_string(),
+                    )
+                    .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
+                let abandoned = match drv
+                    .abandon_inputs(&held, crate::input_state::InputAbandonReason::Retired)
+                    .await
+                {
+                    Ok(abandoned) => abandoned,
+                    Err(error) => {
+                        drv.rollback_prepared_runless_interaction_terminal_outboxes(prepared);
+                        return Err(RuntimeControlPlaneError::Internal(error.to_string()));
+                    }
+                };
+                if abandoned > 0 {
+                    runless_terminal.owe();
+                }
+                let candidate_owner_input_id = crate::meerkat_machine::driver::DriverEntry::commit_prepared_runless_interaction_terminal_outboxes(prepared);
+                report.inputs_abandoned += abandoned;
+                report.inputs_pending_drain = report.inputs_pending_drain.saturating_sub(abandoned);
+                ended_run_batch = Some((held, candidate_owner_input_id, reason));
+            }
         }
 
         let mut abandoned_batch = None;
@@ -2734,9 +2782,12 @@ impl MeerkatMachine {
             })?;
         }
 
-        if let Some((completion_input_ids, candidate_owner_input_id, reason)) = abandoned_batch
-            && candidate_owner_input_id.is_none()
+        for (completion_input_ids, candidate_owner_input_id, reason) in
+            [ended_run_batch, abandoned_batch].into_iter().flatten()
         {
+            if candidate_owner_input_id.is_some() {
+                continue;
+            }
             crate::control_plane::publish_and_resolve_runless_runtime_termination_before(
                 &driver,
                 Some(&completions),

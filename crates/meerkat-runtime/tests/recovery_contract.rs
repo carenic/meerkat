@@ -2198,12 +2198,11 @@ async fn an_archive_over_a_continuable_tail_commits_it_as_interrupted() {
 
 /// What a graceful stop that kept a durable run leaves in `store`: the run's
 /// continuable tail (round zero's first commit, its staged call only in the
-/// run cursor, which binds the run's input), the run's input bound to it, and
-/// `queued_row`, the row of a content input queued behind it. Returns the
-/// session, the run and the run's input.
-async fn a_kept_run_beside_a_queued_input(
+/// run cursor, which binds the run's input) and the run's input bound to it in
+/// `kept_phase`. Returns the session, the run and the run's input.
+async fn a_kept_run(
     store: &InMemoryRuntimeStore,
-    queued_row: StoredInputState,
+    kept_phase: InputLifecycleState,
 ) -> (SessionId, RunId, Input) {
     use meerkat_core::lifecycle::core_executor::BoundSessionCommit;
     use meerkat_core::types::{
@@ -2276,14 +2275,51 @@ async fn a_kept_run_beside_a_queued_input(
         .await
         .unwrap();
     store
-        .persist_input_state(
-            &runtime_id,
-            &persistable(applied_pending_state(&input, &run_id, 1)),
-        )
+        .persist_input_state(&runtime_id, &kept_row(&input, &run_id, kept_phase))
         .await
         .unwrap();
+    (session_id, run_id, input)
+}
+
+/// The row of a kept run's input: bound to `run_id` in `phase`, Staged,
+/// Applied or AppliedPendingConsumption. A staged row is packaged as stored:
+/// the persistence record of a staged row normalizes it back to the queue,
+/// as for a run nothing resumes.
+fn kept_row(
+    input: &Input,
+    run_id: &RunId,
+    phase: InputLifecycleState,
+) -> InputStatePersistenceRecord {
+    let mut row = applied_pending_state(input, run_id, 1);
+    match phase {
+        InputLifecycleState::AppliedPendingConsumption => persistable(row),
+        InputLifecycleState::Applied => {
+            row.seed.phase = InputLifecycleState::Applied;
+            persistable(row)
+        }
+        InputLifecycleState::Staged => {
+            row.seed.phase = InputLifecycleState::Staged;
+            row.seed.last_boundary_sequence = None;
+            InputStatePersistenceRecord::stored_row_for_test(row)
+                .expect("a staged row passes the stored-seed authority")
+        }
+        other => panic!("a kept run holds its input staged or applied, not {other:?}"),
+    }
+}
+
+/// [`a_kept_run`] with the run's input applied and pending consumption, and
+/// `queued_row`, the row of a content input queued behind the run.
+async fn a_kept_run_beside_a_queued_input(
+    store: &InMemoryRuntimeStore,
+    queued_row: StoredInputState,
+) -> (SessionId, RunId, Input) {
+    let (session_id, run_id, input) =
+        a_kept_run(store, InputLifecycleState::AppliedPendingConsumption).await;
     store
-        .persist_input_state(&runtime_id, &persistable(queued_row))
+        .persist_input_state(
+            &LogicalRuntimeId::for_session(&session_id),
+            &persistable(queued_row),
+        )
         .await
         .unwrap();
     (session_id, run_id, input)
@@ -2538,6 +2574,387 @@ async fn an_archive_commits_the_kept_runs_tail_at_once_beside_a_queued_input_nam
             .await
             .unwrap(),
         Some(RuntimeState::Retired)
+    );
+}
+
+const RETIRED_ROW: Option<(InputLifecycleState, Option<InputTerminalOutcome>)> = Some((
+    InputLifecycleState::Abandoned,
+    Some(InputTerminalOutcome::Abandoned {
+        reason: meerkat_runtime::input_state::InputAbandonReason::Retired,
+    }),
+));
+
+/// Holds every resume of a kept run at its admission until released, then
+/// lets it continue.
+struct HeldResume {
+    asked: tokio::sync::Notify,
+    released: tokio::sync::watch::Sender<bool>,
+}
+
+impl HeldResume {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            asked: tokio::sync::Notify::new(),
+            released: tokio::sync::watch::channel(false).0,
+        })
+    }
+
+    fn release(&self) {
+        self.released.send_replace(true);
+    }
+}
+
+#[async_trait::async_trait]
+impl meerkat_runtime::resumed_run_admission::ResumedRunAdmission for HeldResume {
+    async fn admit_resumed_run(
+        &self,
+        _request: &meerkat_runtime::resumed_run_admission::ResumedRunAdmissionRequest,
+    ) -> meerkat_runtime::resumed_run_admission::ResumedRunAdmissionDecision {
+        self.asked.notify_one();
+        let mut released = self.released.subscribe();
+        let _ = released.wait_for(|released| *released).await;
+        meerkat_runtime::resumed_run_admission::ResumedRunAdmissionDecision::Continue
+    }
+}
+
+/// Completes every run it is asked to apply and records the inputs each
+/// contributed.
+#[derive(Clone, Default)]
+struct RecordedRuns(Arc<std::sync::Mutex<Vec<InputId>>>);
+
+impl RecordedRuns {
+    fn applied(&self) -> Vec<InputId> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl meerkat_core::lifecycle::core_executor::CoreExecutor for RecordedRuns {
+    async fn apply(
+        &mut self,
+        run_id: RunId,
+        primitive: meerkat_core::lifecycle::run_primitive::RunPrimitive,
+    ) -> Result<
+        meerkat_core::lifecycle::core_executor::CoreApplyOutput,
+        meerkat_core::lifecycle::core_executor::CoreExecutorError,
+    > {
+        let contributing = primitive.contributing_input_ids().to_vec();
+        self.0.lock().unwrap().extend(contributing.iter().cloned());
+        Ok(
+            meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_untyped_snapshot(
+                meerkat_core::lifecycle::run_receipt::RunBoundaryReceiptDraft {
+                    run_id,
+                    boundary: RunApplyBoundary::RunStart,
+                    contributing_input_ids: contributing,
+                    conversation_digest: None,
+                    message_count: 0,
+                },
+                None,
+                None,
+            ),
+        )
+    }
+
+    async fn cancel_after_boundary(
+        &mut self,
+        _reason: String,
+    ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+        Ok(())
+    }
+
+    async fn stop_runtime_executor(
+        &mut self,
+        _reason: String,
+    ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+        Ok(())
+    }
+}
+
+/// A runtime registered from `store` with `run_id` kept resumable, an
+/// executor attached, and the run's resume held at its admission: the
+/// runtime loop has asked and waits.
+async fn a_runtime_held_at_the_kept_runs_resume(
+    store: &Arc<InMemoryRuntimeStore>,
+    session_id: &SessionId,
+    run_id: &RunId,
+) -> (Arc<MeerkatMachine>, Arc<HeldResume>, RecordedRuns) {
+    let machine = Arc::new(
+        MeerkatMachine::persistent(store.clone() as Arc<dyn RuntimeStore>, memory_blob_store())
+            .expect("persistent machine"),
+    );
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("the session's runtime registers");
+    assert_eq!(
+        machine.resumable_run_id(session_id).await,
+        Some(run_id.clone()),
+        "the registration keeps the run resumable"
+    );
+    let admission = HeldResume::new();
+    let registration = machine
+        .current_session_registration_witness(session_id)
+        .await
+        .expect("the registration");
+    machine
+        .bind_resumed_run_admission(&registration, Arc::clone(&admission) as _)
+        .await
+        .expect("bind the admission");
+    let runs = RecordedRuns::default();
+    {
+        let asked = admission.asked.notified();
+        tokio::pin!(asked);
+        asked.as_mut().enable();
+        machine
+            .ensure_session_with_executor(session_id.clone(), Box::new(runs.clone()))
+            .await
+            .expect("attach the executor");
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut asked)
+            .await
+            .expect("the runtime loop asks the admission before it resumes the run");
+    }
+    (machine, admission, runs)
+}
+
+/// A retire before the resume of a kept run whose input is `kept_phase` ends
+/// that input itself: once, as retired, with a finalized receipt, and the
+/// run never resumes.
+async fn a_retire_before_the_resume_ends_the_kept_runs_input(kept_phase: InputLifecycleState) {
+    use meerkat_runtime::terminal_status::{InputTerminalReceiptRead, InteractionSelector};
+
+    let store = Arc::new(InMemoryRuntimeStore::new());
+    let (session_id, run_id, input) = a_kept_run(&store, kept_phase).await;
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    let (machine, admission, runs) =
+        a_runtime_held_at_the_kept_runs_resume(&store, &session_id, &run_id).await;
+
+    let report = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        machine.retire_runtime_control_plane(&runtime_id),
+    )
+    .await
+    .expect("the retire answers")
+    .expect("the retire commits");
+    admission.release();
+    assert_eq!(
+        (report.inputs_abandoned, report.inputs_pending_drain),
+        (1, 0),
+        "{kept_phase:?}: the retire ends the run's input itself, leaving nothing to its drain: \
+         {report:?}"
+    );
+    assert_eq!(
+        stored_terminal(&store, &runtime_id, input.id()).await,
+        RETIRED_ROW,
+        "{kept_phase:?}: the run's input ends as retired"
+    );
+    let read = machine
+        .input_terminal_receipt(
+            &session_id,
+            InteractionSelector::InputId(input.id().clone()),
+        )
+        .await
+        .expect("the input's receipt reads")
+        .expect("the input has a receipt");
+    let InputTerminalReceiptRead::Finalized(receipt) = read.report else {
+        panic!(
+            "{kept_phase:?}: a waiter reads the input's finalized terminal, not {:?}",
+            read.report
+        );
+    };
+    assert_eq!(
+        receipt.terminal(),
+        &InputTerminalOutcome::Abandoned {
+            reason: meerkat_runtime::input_state::InputAbandonReason::Retired,
+        }
+    );
+    assert_eq!(receipt.run_id(), None, "a runtime termination ends it");
+
+    // The released resume finds the run ended: nothing runs the input or ends
+    // it a second time.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(
+        stored_terminal(&store, &runtime_id, input.id()).await,
+        RETIRED_ROW,
+        "{kept_phase:?}: nothing ends the input a second time"
+    );
+    assert!(
+        runs.applied().is_empty(),
+        "{kept_phase:?}: the ended run never resumes: {:?}",
+        runs.applied()
+    );
+    assert_eq!(machine.resumable_run_id(&session_id).await, None);
+}
+
+/// A retire before the resume of a kept run ends the run's staged input as
+/// retired. The registration kept the run resumable, so its staged input
+/// stayed bound to it instead of going back to the queue; the run does not
+/// resume past the retire, and the retired drain runs only queued inputs.
+/// RED before: the retire left the input to that drain (pending drain 1),
+/// and it stayed staged with no terminal.
+#[tokio::test]
+async fn a_retire_before_the_resume_ends_the_kept_runs_staged_input_as_retired() {
+    a_retire_before_the_resume_ends_the_kept_runs_input(InputLifecycleState::Staged).await;
+}
+
+/// [`a_retire_before_the_resume_ends_the_kept_runs_staged_input_as_retired`]
+/// for an input a committed round of the run applied. RED before: it stayed
+/// applied with no terminal.
+#[tokio::test]
+async fn a_retire_before_the_resume_ends_the_kept_runs_applied_input_as_retired() {
+    a_retire_before_the_resume_ends_the_kept_runs_input(InputLifecycleState::Applied).await;
+}
+
+/// [`a_retire_before_the_resume_ends_the_kept_runs_staged_input_as_retired`]
+/// for an input applied and pending its consumption at the run's end. RED
+/// before: it stayed applied pending consumption with no terminal.
+#[tokio::test]
+async fn a_retire_before_the_resume_ends_the_kept_runs_applied_pending_input_as_retired() {
+    a_retire_before_the_resume_ends_the_kept_runs_input(
+        InputLifecycleState::AppliedPendingConsumption,
+    )
+    .await;
+}
+
+/// A retire before the resume of a kept run leaves an input queued behind
+/// the run, which names no run, to the retired drain, as before. The run's
+/// input is terminal, so its tail no longer reads as continuable, and the
+/// store-owned recovery the session runs for a turn that ended without its
+/// boundary commit closes it as interrupted. The drain then runs the queued
+/// input, and nothing of the ended run. RED before: the retire left the
+/// run's own input to the drain too (pending drain 2), where it stayed
+/// applied pending consumption with no terminal.
+#[tokio::test]
+async fn a_retire_before_the_resume_drains_an_input_queued_behind_the_kept_run() {
+    use meerkat_runtime::recovery::{
+        DurableTailRecoveryDisposition, DurableTailRecoveryOutcome, recover_durable_tail,
+    };
+
+    let store = Arc::new(InMemoryRuntimeStore::new());
+    let (session_id, run_id, input) =
+        a_kept_run(&store, InputLifecycleState::AppliedPendingConsumption).await;
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    let (machine, admission, runs) =
+        a_runtime_held_at_the_kept_runs_resume(&store, &session_id, &run_id).await;
+    let queued = make_prompt("an input queued behind the kept run");
+    let (outcome, waiter) = machine
+        .accept_input_with_completion(&session_id, queued.clone())
+        .await
+        .expect("the queued input is accepted");
+    assert!(outcome.is_accepted());
+    let waiter = waiter.expect("an accepted input has a waiter");
+
+    let report = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        machine.retire_runtime_control_plane(&runtime_id),
+    )
+    .await
+    .expect("the retire answers")
+    .expect("the retire commits");
+    assert_eq!(
+        (report.inputs_abandoned, report.inputs_pending_drain),
+        (1, 1),
+        "the retire ends the run's input and leaves the queued one to its drain: {report:?}"
+    );
+    let DurableTailRecoveryOutcome::Committed { disposition, .. } =
+        recover_durable_tail(store.as_ref(), &session_id)
+            .await
+            .expect("the recovery answers")
+    else {
+        panic!("the recovery closes the ended run's tail");
+    };
+    assert_eq!(
+        disposition,
+        DurableTailRecoveryDisposition::RepairAndCommitInterrupted
+    );
+    admission.release();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), waiter.wait())
+        .await
+        .expect("the drain answers the queued input")
+        .expect("its waiter resolves");
+    assert!(
+        !matches!(
+            outcome,
+            meerkat_runtime::completion::CompletionOutcome::RuntimeTerminated { .. }
+        ),
+        "the drain runs the queued input: {outcome:?}"
+    );
+    assert_eq!(
+        runs.applied(),
+        vec![queued.id().clone()],
+        "the drain runs the queued input and nothing of the ended run"
+    );
+    assert_eq!(
+        stored_terminal(&store, &runtime_id, queued.id()).await,
+        CONSUMED_ROW
+    );
+    assert_eq!(
+        stored_terminal(&store, &runtime_id, input.id()).await,
+        RETIRED_ROW
+    );
+}
+
+/// A respawn on the session after a retire before a kept run's resume never
+/// runs the input the retire ended. The retired runtime unregisters, and the
+/// session registers again from the store: the input is terminal, so the
+/// run's tail no longer reads as continuable, no run is kept resumable, and
+/// the attached executor runs nothing. RED before: the retire left the input
+/// bound to the ended run with no terminal, and only the unregister ended it,
+/// as stopped.
+#[tokio::test]
+async fn a_respawn_after_a_retire_before_the_resume_never_runs_the_input_it_ended() {
+    let store = Arc::new(InMemoryRuntimeStore::new());
+    let (session_id, run_id, input) =
+        a_kept_run(&store, InputLifecycleState::AppliedPendingConsumption).await;
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    let (machine, admission, runs) =
+        a_runtime_held_at_the_kept_runs_resume(&store, &session_id, &run_id).await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        machine.retire_runtime_control_plane(&runtime_id),
+    )
+    .await
+    .expect("the retire answers")
+    .expect("the retire commits");
+    admission.release();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    machine
+        .unregister_session(&session_id)
+        .await
+        .expect("the retired runtime unregisters");
+
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("the respawn registers the session again");
+    assert_eq!(
+        machine.resumable_run_id(&session_id).await,
+        None,
+        "the respawn keeps no run of the retired runtime resumable"
+    );
+    assert!(
+        !machine
+            .list_active_inputs(&session_id)
+            .await
+            .unwrap()
+            .contains(input.id()),
+        "the input the retire ended is not pending after the respawn"
+    );
+    let respawned = RecordedRuns::default();
+    machine
+        .ensure_session_with_executor(session_id.clone(), Box::new(respawned.clone()))
+        .await
+        .expect("attach the respawned executor");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        runs.applied().is_empty() && respawned.applied().is_empty(),
+        "nothing runs the retired run's input: {:?} then {:?}",
+        runs.applied(),
+        respawned.applied()
+    );
+    assert_eq!(
+        stored_terminal(&store, &runtime_id, input.id()).await,
+        RETIRED_ROW,
+        "the input stays as the retire ended it"
     );
 }
 
