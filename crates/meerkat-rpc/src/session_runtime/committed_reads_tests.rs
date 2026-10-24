@@ -733,9 +733,11 @@ async fn a_graceful_shutdown_keeps_a_turn_sent_after_a_round_commit(completed_tu
     let runtime = sqlite_runtime(root.path()).await;
     let mut steps = Vec::new();
     let mut users_before = Vec::new();
+    let mut answers_before = Vec::new();
     if completed_turn_first {
         steps.push(Step::Text("completed answer"));
         users_before.push("a completed turn".to_string());
+        answers_before.push("completed answer".to_string());
     }
     steps.extend([Step::Tool, Step::Held]);
     let model = ScriptedModel::new(steps);
@@ -843,6 +845,90 @@ async fn a_graceful_shutdown_keeps_a_turn_sent_after_a_round_commit(completed_tu
         expected,
         "the kept run and the kept second turn each run once at the next start, the run \
          first, ahead of the new turn"
+    );
+    // The user turns alone read the same whether the kept run resumed, was
+    // closed as interrupted, or was replayed. A resumed run keeps its first
+    // incarnation's tool round exactly once, gets no interruption notice, and
+    // its next model call is the restarted model's first.
+    let session = restarted
+        .service
+        .load_authoritative_session(&session_id)
+        .await
+        .expect("read the committed session")
+        .expect("the session is committed");
+    let probe_calls = session
+        .messages()
+        .iter()
+        .filter_map(|message| match message {
+            Message::BlockAssistant(assistant) => Some(
+                assistant
+                    .tool_calls()
+                    .filter(|call| call.name == PROBE_TOOL)
+                    .map(|call| call.id.to_string())
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        probe_calls.len(),
+        1,
+        "the first incarnation's tool call is kept once, not replayed: {probe_calls:?}"
+    );
+    let probe_answers = session
+        .messages()
+        .iter()
+        .filter_map(|message| match message {
+            Message::ToolResults { results, .. } => Some(
+                results
+                    .iter()
+                    .filter(|result| result.tool_use_id == probe_calls[0])
+                    .map(|result| result.is_error)
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        probe_answers,
+        [true],
+        "the tool call's typed refusal is kept once, not replayed"
+    );
+    let notices = session
+        .messages()
+        .iter()
+        .filter(|message| matches!(message, Message::SystemNotice(_)))
+        .count();
+    assert_eq!(
+        notices, 0,
+        "the kept run resumed: it was not closed with an interruption notice"
+    );
+    let answers = session
+        .messages()
+        .iter()
+        .filter_map(|message| match message {
+            Message::BlockAssistant(assistant) => {
+                let text = assistant.text_blocks().collect::<String>();
+                (!text.is_empty()).then_some(text)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut expected_answers = answers_before;
+    expected_answers.extend(
+        [
+            "kept run answer",
+            "second turn answer",
+            "after the restart answer",
+        ]
+        .map(str::to_string),
+    );
+    assert_eq!(
+        answers, expected_answers,
+        "the kept run's next model call is the restarted model's first, then the kept second \
+         turn's, then the new turn's; the held call never answered"
     );
     restarted
         .try_shutdown()
