@@ -597,9 +597,10 @@ async fn run_runtime_backed_initial_turn_with_machine_boundary_mode<
 /// every input it recovered from the store exactly as the store holds it, so
 /// a materialization refused before it served (a durable tail held for
 /// recovery, a failed agent build) ends nothing a later start would run. If
-/// the registration served live work (its initial turn, another admission,
-/// a deduplicated resubmission, a recycle), the machine stops every input
-/// instead, so a turn its caller saw refused never runs later.
+/// the registration admitted live work (an admission, a deduplicated
+/// resubmission, a recycle), the machine stops every input instead, so a
+/// turn its caller saw refused never runs later. A direct initial turn
+/// leaves no input to keep or stop.
 async fn rollback_prepared_runtime_registration(
     prepared: &mut meerkat_runtime::PreparedSessionMaterialization,
 ) {

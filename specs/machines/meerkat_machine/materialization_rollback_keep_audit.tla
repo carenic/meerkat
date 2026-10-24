@@ -90,10 +90,13 @@
 \* (the inputs answered Abandon) and a kept row is the recovered row
 \* unchanged. A recycle's recovery is modelled by its witness step
 \* (RecoverAdmittedInput for every active input); its lifecycle replay
-\* changes no verdict input. The meerkat facade rows pin the shell: a refused
-\* restart keeps the stranded input, the dry run still names it, and the next
-\* start runs it once; after an admission, a recycle or a deduplicated
-\* resubmission the rollback keeps nothing.
+\* changes no verdict input. The unserved-attachment route is driven from
+\* Attached only, and a recycle from Idle only: the unserved arm's Idle and
+\* Running variants and RecycleFromAttached rest on the machine's ci TLC
+\* run. The meerkat facade rows pin the shell: a refused restart keeps the
+\* stranded input, the dry run still names it, and the next start runs it
+\* once; after an admission, a recycle or a deduplicated resubmission the
+\* rollback keeps nothing.
 EXTENDS materialization_rollback_keep_fresh
 
 CONSTANTS AuditMaxSteps

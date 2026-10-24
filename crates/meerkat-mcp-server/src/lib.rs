@@ -281,8 +281,10 @@ async fn prepare_mcp_actor_materialization_claim(
 /// durable session document remains discoverable, and the explicit resume
 /// seam can reconstruct a fresh actor/executor incarnation. The rollback
 /// keeps every input the registration recovered from the store; once the
-/// registration served live work (its initial turn ran), the machine stops
-/// every input instead, so a turn its caller saw refused never runs later.
+/// registration admitted live work (an admission, a deduplicated
+/// resubmission, a recycle), the machine stops every input instead, so a
+/// turn its caller saw refused never runs later. A direct initial turn
+/// leaves no input to keep or stop.
 async fn release_mcp_actor_materialization(
     prepared: &mut Option<McpPreparedActorMaterialization>,
     session_id: &meerkat::SessionId,
