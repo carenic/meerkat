@@ -111,6 +111,10 @@ pub const ROOT_ENV: &str = "MEERKAT_LONG_RUN_ROOT";
 /// The row root's record of the main input's round whose model call fails
 /// ([`fail_model_call`]).
 const MODEL_FAILS: &str = "model-fails";
+/// The row root's marker for a whole-blob realm: every incarnation opens the
+/// realm with the JSONL session store, whose runtime store keeps the
+/// whole-blob session profile, instead of the SQLite one.
+pub const WHOLE_BLOB: &str = "whole-blob";
 /// A one-pixel PNG, the image an image round's message carries. The blob
 /// store addresses it by content, so every incarnation stores the same blob.
 const PIXEL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
@@ -1283,7 +1287,8 @@ impl DurableResumeGate for HarnessGate {
 /// The store a row runs over.
 #[derive(Clone)]
 pub enum Store {
-    /// The built-in SQLite realm under `root`.
+    /// The built-in SQLite realm under `root`, or the JSONL one when the
+    /// root holds the [`WHOLE_BLOB`] marker.
     Sqlite { root: PathBuf },
     /// The reference host store; `root` holds only the factory's files.
     /// The stores the host store does not hold (schedule, work graph, jobs,
@@ -1348,14 +1353,19 @@ async fn open_persistence(store: &Store, takeover: bool) -> OpenedPersistence {
         .to_string();
     match store {
         Store::Sqlite { root } => {
+            let backend = if root.join(WHOLE_BLOB).exists() {
+                meerkat_store::RealmBackend::Jsonl
+            } else {
+                meerkat_store::RealmBackend::Sqlite
+            };
             let (_manifest, persistence) = meerkat::open_realm_persistence_in(
                 root,
                 REALM,
-                Some(meerkat_store::RealmBackend::Sqlite),
+                Some(backend),
                 Some(meerkat_store::RealmOrigin::Explicit),
             )
             .await
-            .expect("open the SQLite realm");
+            .expect("open the realm");
             OpenedPersistence {
                 persistence,
                 mob_storage: None,
@@ -2317,24 +2327,24 @@ pub async fn restart(
                             .map(|_| ())
                             .map_err(|error| error.to_string())
                     } else {
-                        // A stop whose cleanup outlives the call's own
-                        // bounded wait answers that it is still in progress;
-                        // asking again joins the same cleanup.
-                        let deadline = Instant::now() + STEP;
-                        loop {
-                            match machine
-                                .stop_runtime_executor(&target, "the long run harness stops it")
-                                .await
-                            {
-                                Err(
-                                    meerkat_runtime::RuntimeDriverError::RuntimeStopInProgress {
-                                        ..
-                                    },
-                                ) if Instant::now() < deadline => {
-                                    tokio::time::sleep(Duration::from_millis(50)).await;
-                                }
-                                other => break other.map_err(|error| error.to_string()),
-                            }
+                        // The stop of the registration the resume runs on,
+                        // awaited to its terminal completion: its cleanup
+                        // may outlive a plain stop call's bounded wait.
+                        let Some(registration) =
+                            machine.current_session_registration_witness(&target).await
+                        else {
+                            return Err("the session has no registration to stop".to_string());
+                        };
+                        match machine
+                            .stop_runtime_executor_until_terminal_if_current(
+                                &registration,
+                                "the long run harness stops it",
+                            )
+                            .await
+                        {
+                            Ok(true) => Ok(()),
+                            Ok(false) => Err("the stopped registration was replaced".to_string()),
+                            Err(error) => Err(error.to_string()),
                         }
                     }
                 });
