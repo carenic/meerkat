@@ -33995,64 +33995,127 @@ mod tests {
         );
     }
 
-    /// rkat-rpc's graceful shutdown keeps a durable session's work for its
-    /// next start. The runtime's shutdown unregisters every registration with
-    /// the runtime's graceful disposition (Requeue on this persistent
-    /// runtime), so neither the running turn nor the turn queued behind it is
-    /// cancelled: both are answered `requeued_across_stop`. A runtime started
-    /// again on the same stores runs each of them once when the session is
-    /// opened again, ahead of the new turn.
-    ///
-    /// Unrun. The queued turn's answer needs only the requeue; the running
-    /// turn's answer and its run at the next start also need the runtime stop
-    /// to suspend a run that commits each round, and the start to resume it.
-    #[tokio::test]
-    async fn a_graceful_shutdown_keeps_a_durable_sessions_turns_for_the_next_start() {
-        let temp = tempfile::tempdir().unwrap();
-        let store: Arc<dyn meerkat::SessionStore> = Arc::new(meerkat::MemoryStore::new());
-        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
-            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
-        let blob_store: Arc<dyn meerkat_core::BlobStore> =
-            Arc::new(meerkat_store::MemoryBlobStore::new());
-        // One process start over the shared stores.
-        let start = || {
-            Arc::new(
-                SessionRuntime::new(
-                    temp_factory(&temp),
-                    Config::default(),
-                    4,
+    /// The stores a graceful-shutdown row runs on, by session persistence
+    /// profile: the in-memory stores (WholeBlob), or an ordinary sqlite realm
+    /// (head-canonical).
+    #[derive(Clone, Copy, Debug)]
+    enum GracefulShutdownStores {
+        InMemoryWholeBlob,
+        SqliteHeadCanonical,
+    }
+
+    /// Stores that outlive one start of a runtime: every start shares the
+    /// in-memory stores, and opens the sqlite realm again.
+    struct GracefulShutdownRealm {
+        temp: tempfile::TempDir,
+        stores: GracefulShutdownStores,
+        session_store: Arc<dyn meerkat::SessionStore>,
+        runtime_store: Arc<dyn meerkat_runtime::RuntimeStore>,
+        blob_store: Arc<dyn meerkat_core::BlobStore>,
+    }
+
+    impl GracefulShutdownRealm {
+        fn new(stores: GracefulShutdownStores) -> Self {
+            Self {
+                temp: tempfile::tempdir().unwrap(),
+                stores,
+                session_store: Arc::new(meerkat::MemoryStore::new()),
+                runtime_store: Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
+                blob_store: Arc::new(meerkat_store::MemoryBlobStore::new()),
+            }
+        }
+
+        /// One process start over the realm's stores.
+        async fn start(&self) -> Arc<SessionRuntime> {
+            let (persistence, profile) = match self.stores {
+                GracefulShutdownStores::InMemoryWholeBlob => (
                     meerkat::PersistenceBundle::new(
-                        Arc::clone(&store),
-                        Arc::clone(&runtime_store),
-                        Arc::clone(&blob_store),
+                        Arc::clone(&self.session_store),
+                        Arc::clone(&self.runtime_store),
+                        Arc::clone(&self.blob_store),
                     )
                     .expect("construct runtime authority"),
+                    meerkat_runtime::RuntimeSessionPersistenceProfile::WholeBlobV1,
+                ),
+                GracefulShutdownStores::SqliteHeadCanonical => (
+                    meerkat::open_realm_persistence_in(
+                        self.temp.path(),
+                        "graceful-shutdown",
+                        Some(meerkat_store::RealmBackend::Sqlite),
+                        None,
+                    )
+                    .await
+                    .expect("open the sqlite realm")
+                    .1,
+                    meerkat_runtime::RuntimeSessionPersistenceProfile::HeadCanonicalV1,
+                ),
+            };
+            assert_eq!(
+                persistence.runtime_store().session_persistence_profile(),
+                profile,
+                "{:?}",
+                self.stores
+            );
+            Arc::new(
+                SessionRuntime::new(
+                    temp_factory(&self.temp),
+                    Config::default(),
+                    4,
+                    persistence,
                     crate::router::NotificationSink::noop(),
                 )
                 .expect("compose the RPC session runtime"),
             )
-        };
-        let calls = Arc::new(BlockingLlmCallWitness::default());
-        let blocking: Arc<dyn LlmClient> = Arc::new(BlockingMockLlmClient {
-            calls: Arc::clone(&calls),
-            release: Arc::new(Notify::new()),
-        });
-        let runtime = start();
-        runtime.set_default_llm_client(Some(Arc::clone(&blocking)));
-        let session_id = runtime
-            .create_session(
-                AgentBuildConfig {
-                    llm_client_override: Some(Arc::clone(&blocking)),
-                    ..AgentBuildConfig::new("claude-sonnet-4-5")
-                },
-                None,
-                None,
-                Vec::new(),
-            )
-            .await
-            .expect("create the session");
-        let turn = |prompt: &'static str| {
-            let runtime = Arc::clone(&runtime);
+        }
+    }
+
+    /// A started runtime with one session whose first turn is in flight on a
+    /// model call that only returns when released, and that turn's request.
+    struct GracefulShutdownTurnInFlight {
+        runtime: Arc<SessionRuntime>,
+        session_id: SessionId,
+        calls: Arc<BlockingLlmCallWitness>,
+        running: tokio::task::JoinHandle<Result<RunResult, RpcError>>,
+    }
+
+    impl GracefulShutdownTurnInFlight {
+        async fn start(realm: &GracefulShutdownRealm) -> Self {
+            let calls = Arc::new(BlockingLlmCallWitness::default());
+            let blocking: Arc<dyn LlmClient> = Arc::new(BlockingMockLlmClient {
+                calls: Arc::clone(&calls),
+                release: Arc::new(Notify::new()),
+            });
+            let runtime = realm.start().await;
+            runtime.set_default_llm_client(Some(Arc::clone(&blocking)));
+            let session_id = runtime
+                .create_session(
+                    AgentBuildConfig {
+                        llm_client_override: Some(Arc::clone(&blocking)),
+                        ..AgentBuildConfig::new("claude-sonnet-4-5")
+                    },
+                    None,
+                    None,
+                    Vec::new(),
+                )
+                .await
+                .expect("create the session");
+            let running = Self::turn(&runtime, &session_id, "the running turn");
+            wait_for_llm_calls(&calls, 1, "the running turn").await;
+            Self {
+                runtime,
+                session_id,
+                calls,
+                running,
+            }
+        }
+
+        /// A runtime-routed turn request on its own task.
+        fn turn(
+            runtime: &Arc<SessionRuntime>,
+            session_id: &SessionId,
+            prompt: &'static str,
+        ) -> tokio::task::JoinHandle<Result<RunResult, RpcError>> {
+            let runtime = Arc::clone(runtime);
             let session_id = session_id.clone();
             tokio::spawn(async move {
                 let (event_tx, _event_rx) = mpsc::channel(100);
@@ -34069,51 +34132,130 @@ mod tests {
                     )
                     .await
             })
-        };
-        let running = turn("the running turn");
-        wait_for_llm_calls(&calls, 1, "the running turn").await;
-        let mut queued = turn("the queued turn");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(300), &mut queued)
+        }
+
+        /// The running turn's answer once the shutdown returned: it must be
+        /// kept across the stop, answered `requeued_across_stop`, never ended.
+        async fn assert_running_turn_kept(self) -> Arc<SessionRuntime> {
+            let running = tokio::time::timeout(TEST_ASYNC_WITNESS_TIMEOUT, self.running)
                 .await
-                .is_err(),
-            "the second turn waits queued behind the running one"
+                .expect("the running turn is answered by the shutdown")
+                .expect("running turn task");
+            let refusal = running.expect_err("the running turn does not complete in this process");
+            assert_eq!(refusal.code, error::SESSION_NOT_RUNNING, "{refusal:?}");
+            assert_eq!(
+                refusal.data.as_ref().map(|data| &data["kind"]),
+                Some(&serde_json::json!("requeued_across_stop")),
+                "the running turn is kept across the stop, not ended: {refusal:?}"
+            );
+            self.runtime
+        }
+    }
+
+    /// rkat-rpc's graceful shutdown keeps a durable session's work for its
+    /// next start, on the in-memory stores (WholeBlob): see
+    /// [`assert_a_graceful_shutdown_keeps_the_turns_for_the_next_start`].
+    #[tokio::test]
+    async fn a_graceful_shutdown_keeps_a_durable_sessions_turns_for_the_next_start() {
+        assert_a_graceful_shutdown_keeps_the_turns_for_the_next_start(
+            GracefulShutdownStores::InMemoryWholeBlob,
+        )
+        .await;
+    }
+
+    /// The same on an ordinary sqlite realm (head-canonical).
+    #[tokio::test]
+    async fn a_graceful_shutdown_keeps_a_durable_sessions_turns_for_the_next_start_head_canonical()
+    {
+        assert_a_graceful_shutdown_keeps_the_turns_for_the_next_start(
+            GracefulShutdownStores::SqliteHeadCanonical,
+        )
+        .await;
+    }
+
+    /// The runtime's shutdown unregisters every registration with the
+    /// runtime's graceful disposition (Requeue on this persistent runtime).
+    /// The session's first turn is in flight and a second prompt sits in the
+    /// runtime's queue behind it (listed among the session's active inputs
+    /// before the shutdown). Neither is cancelled: the stop suspends the
+    /// running turn's run and keeps the queued prompt, and both are answered
+    /// `requeued_across_stop` (`-32003`). A runtime started again on the same
+    /// stores runs each of them once when the session is opened again, the
+    /// kept run first, ahead of the new turn.
+    async fn assert_a_graceful_shutdown_keeps_the_turns_for_the_next_start(
+        stores: GracefulShutdownStores,
+    ) {
+        use meerkat_runtime::input::{Input, PromptInput};
+
+        let realm = GracefulShutdownRealm::new(stores);
+        let in_flight = GracefulShutdownTurnInFlight::start(&realm).await;
+        let session_id = in_flight.session_id.clone();
+        let calls = Arc::clone(&in_flight.calls);
+
+        let queued = Input::Prompt(PromptInput::from_content_input(
+            "the queued turn".into(),
+            SessionRuntime::typed_text_turn(None),
+        ));
+        let queued_id = queued.id().clone();
+        let (_, queued_waiter) = in_flight
+            .runtime
+            .runtime_adapter
+            .accept_input_with_completion(&session_id, queued)
+            .await
+            .expect("the runtime admits the queued prompt");
+        let queued_waiter = queued_waiter.expect("an admitted prompt has a completion waiter");
+        let active = in_flight
+            .runtime
+            .runtime_adapter
+            .list_active_inputs(&session_id)
+            .await
+            .expect("list the session's active inputs");
+        assert!(
+            active.contains(&queued_id),
+            "{stores:?}: the second prompt sits in the runtime's queue before the shutdown: \
+             {active:?}"
         );
 
-        runtime
+        in_flight
+            .runtime
             .try_shutdown()
             .await
             .expect("the runtime shuts down");
-        let running = tokio::time::timeout(TEST_ASYNC_WITNESS_TIMEOUT, running)
-            .await
-            .expect("the running turn is answered by the shutdown")
-            .expect("running turn task");
-        let queued = tokio::time::timeout(TEST_ASYNC_WITNESS_TIMEOUT, queued)
-            .await
-            .expect("the queued turn is answered by the shutdown")
-            .expect("queued turn task");
-        let kept = |result: &Result<RunResult, RpcError>| {
-            matches!(
-                result,
-                Err(error) if error
-                    .data
-                    .as_ref()
-                    .is_some_and(|data| data["kind"] == "requeued_across_stop")
-            )
+        // The first start's only remaining handle: dropped before the restart
+        // opens the same stores again.
+        let runtime = in_flight.assert_running_turn_kept().await;
+        let queued_wait =
+            tokio::time::timeout(TEST_ASYNC_WITNESS_TIMEOUT, queued_waiter.try_wait())
+                .await
+                .expect("the queued prompt is answered by the shutdown");
+        let kept = match queued_wait {
+            Err(error) => error,
+            Ok(outcome) => {
+                panic!("{stores:?}: the queued prompt ended in this process: {outcome:?}")
+            }
         };
-        assert!(
-            kept(&running) && kept(&queued),
-            "both turns are kept across the stop, not cancelled: running={running:?} \
-             queued={queued:?}"
+        assert!(kept.is_requeued_across_stop(), "{stores:?}: {kept:?}");
+        let answer = runtime
+            .runtime_completion_wait_error_to_rpc_error(kept, &session_id, Some(&queued_id))
+            .await;
+        assert_eq!(
+            answer.code,
+            error::SESSION_NOT_RUNNING,
+            "{stores:?}: {answer:?}"
+        );
+        assert_eq!(
+            answer.data.as_ref().map(|data| &data["kind"]),
+            Some(&serde_json::json!("requeued_across_stop")),
+            "{stores:?}: the queued prompt is kept across the stop: {answer:?}"
         );
         assert_eq!(
             calls.load(AtomicOrdering::SeqCst),
             1,
-            "nothing ran after the stop"
+            "{stores:?}: nothing ran after the stop"
         );
         drop(runtime);
 
-        let restarted = start();
+        let restarted = realm.start().await;
         restarted.set_default_llm_client(Some(Arc::new(MockLlmClient)));
         runtime_turn(&restarted, &session_id, "after the restart").await;
         let session = restarted
@@ -34129,9 +34271,102 @@ mod tests {
         assert_eq!(
             users,
             ["the running turn", "the queued turn", "after the restart"],
-            "the kept run and the kept turn each run once at the next start, ahead of the \
-             new turn"
+            "{stores:?}: the kept run and the kept prompt each run once at the next start, the \
+             run first, ahead of the new turn"
         );
+        restarted
+            .try_shutdown()
+            .await
+            .expect("the restarted runtime shuts down");
+    }
+
+    /// A turn request still waiting before its admission when rkat-rpc's
+    /// graceful shutdown begins is refused, on the in-memory stores
+    /// (WholeBlob): see
+    /// [`assert_a_turn_waiting_for_admission_at_a_shutdown_is_refused`].
+    #[tokio::test]
+    async fn a_turn_waiting_for_admission_at_a_graceful_shutdown_is_refused() {
+        assert_a_turn_waiting_for_admission_at_a_shutdown_is_refused(
+            GracefulShutdownStores::InMemoryWholeBlob,
+        )
+        .await;
+    }
+
+    /// The same on an ordinary sqlite realm (head-canonical).
+    #[tokio::test]
+    async fn a_turn_waiting_for_admission_at_a_graceful_shutdown_is_refused_head_canonical() {
+        assert_a_turn_waiting_for_admission_at_a_shutdown_is_refused(
+            GracefulShutdownStores::SqliteHeadCanonical,
+        )
+        .await;
+    }
+
+    /// A second turn request on a session whose turn is in flight waits
+    /// before its admission, at its staleness check, on the turn boundary
+    /// the running turn holds: it is not among the session's active inputs.
+    /// The shutdown's registration teardown can neither keep nor answer it.
+    /// Once the shutdown began, the request is refused when it reaches
+    /// admission (`-32032`, `data.kind` `runtime_shutting_down`): it never
+    /// registers the session again on the stopped runtime, and nothing of it
+    /// runs. The running turn is still kept (`requeued_across_stop`).
+    async fn assert_a_turn_waiting_for_admission_at_a_shutdown_is_refused(
+        stores: GracefulShutdownStores,
+    ) {
+        let realm = GracefulShutdownRealm::new(stores);
+        let in_flight = GracefulShutdownTurnInFlight::start(&realm).await;
+        let runtime = Arc::clone(&in_flight.runtime);
+        let session_id = in_flight.session_id.clone();
+        let calls = Arc::clone(&in_flight.calls);
+
+        let mut waiting =
+            GracefulShutdownTurnInFlight::turn(&runtime, &session_id, "the waiting turn");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut waiting)
+                .await
+                .is_err(),
+            "{stores:?}: the second turn waits behind the running one"
+        );
+        let active = runtime
+            .runtime_adapter
+            .list_active_inputs(&session_id)
+            .await
+            .expect("list the session's active inputs");
+        assert_eq!(
+            active.len(),
+            1,
+            "{stores:?}: only the running turn's input is admitted; the waiting turn is not: \
+             {active:?}"
+        );
+
+        runtime
+            .try_shutdown()
+            .await
+            .expect("the runtime shuts down");
+        let waiting = tokio::time::timeout(TEST_ASYNC_WITNESS_TIMEOUT, waiting)
+            .await
+            .expect("the waiting turn is answered once the shutdown began")
+            .expect("waiting turn task");
+        let refusal = waiting.expect_err("the waiting turn is refused");
+        assert_eq!(
+            refusal.code,
+            meerkat_contracts::ErrorCode::SessionRuntimeUnavailable.jsonrpc_code(),
+            "{stores:?}: {refusal:?}"
+        );
+        assert_eq!(
+            refusal.data.as_ref().map(|data| &data["kind"]),
+            Some(&serde_json::json!("runtime_shutting_down")),
+            "{stores:?}: {refusal:?}"
+        );
+        assert!(
+            !runtime.runtime_adapter.contains_session(&session_id).await,
+            "{stores:?}: the refused turn registered nothing on the stopped runtime"
+        );
+        assert_eq!(
+            calls.load(AtomicOrdering::SeqCst),
+            1,
+            "{stores:?}: nothing ran after the stop"
+        );
+        in_flight.assert_running_turn_kept().await;
     }
 
     /// A login lifts a sign-out's suppression only for the exact attachment
