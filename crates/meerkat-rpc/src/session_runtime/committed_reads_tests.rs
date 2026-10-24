@@ -688,3 +688,176 @@ async fn mcp_durable_intents_mid_run_read_the_committed_snapshot_head_canonical(
 async fn mcp_durable_intents_mid_run_read_the_committed_snapshot_whole_blob() {
     mcp_durable_intents_mid_run_read_the_committed_snapshot(false).await;
 }
+
+// ---------------------------------------------------------------------------
+// A graceful shutdown across a run held after a round commit
+// ---------------------------------------------------------------------------
+
+/// The user-channel texts of the committed transcript of `id`, in order.
+async fn committed_user_texts(runtime: &SessionRuntime, id: &SessionId) -> Vec<String> {
+    runtime
+        .service
+        .load_authoritative_session(id)
+        .await
+        .expect("read the committed session")
+        .expect("the session is committed")
+        .messages()
+        .iter()
+        .filter_map(|message| match message {
+            Message::User(user) if !user.transcript_role.is_injected_context() => {
+                Some(user.text_content())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// rkat-rpc's graceful shutdown across a run held after its first round
+/// commit, on the HeadCanonical SQLite realm. The running turn's first tool
+/// round committed (its provisional tail stands) and its second model call
+/// holds. A second turn sent to the session then is admitted into the
+/// runtime's queue behind the run: the live actor that continues its own
+/// run's provisional tail is not stale, so the turn waits for nothing before
+/// its admission. The shutdown suspends the run and keeps the queued input,
+/// and both are answered `requeued_across_stop` (`-32003`); the second turn
+/// is never refused `runtime_shutting_down` (`-32032`), which only a turn
+/// still waiting before its admission gets. A runtime started again on the
+/// same realm runs each of them exactly once, the kept run first, ahead of a
+/// new turn.
+///
+/// `completed_turn_first`: whether the session completed a turn before the
+/// running one, so the running turn is a later turn rather than the
+/// session's first.
+async fn a_graceful_shutdown_keeps_a_turn_sent_after_a_round_commit(completed_turn_first: bool) {
+    let root = tempfile::tempdir().expect("tempdir");
+    let runtime = sqlite_runtime(root.path()).await;
+    let mut steps = Vec::new();
+    let mut users_before = Vec::new();
+    if completed_turn_first {
+        steps.push(Step::Text("completed answer"));
+        users_before.push("a completed turn".to_string());
+    }
+    steps.extend([Step::Tool, Step::Held]);
+    let model = ScriptedModel::new(steps);
+    let build_config = AgentBuildConfig {
+        llm_client_override: Some(model.clone()),
+        ..AgentBuildConfig::new(MODEL)
+    };
+    let session_id = runtime
+        .create_session(build_config, None, None, Vec::new())
+        .await
+        .expect("create the session");
+    if completed_turn_first {
+        run_turn(&runtime, &session_id, "a completed turn")
+            .await
+            .expect("the completed turn");
+    }
+    let requests_before = model.requests.load(std::sync::atomic::Ordering::SeqCst);
+
+    let running = tokio::spawn({
+        let runtime = Arc::clone(&runtime);
+        let session_id = session_id.clone();
+        async move { run_turn(&runtime, &session_id, "the running turn").await }
+    });
+    model.wait_entered().await;
+    assert!(
+        tail_run(&runtime, &session_id).await.is_some(),
+        "the running turn's first round commit stands as the provisional tail"
+    );
+
+    let second = tokio::spawn({
+        let runtime = Arc::clone(&runtime);
+        let session_id = session_id.clone();
+        async move { run_turn(&runtime, &session_id, "the second turn").await }
+    });
+    let deadline = tokio::time::Instant::now() + MID_RUN_BOUND;
+    let admitted = loop {
+        let active = runtime
+            .runtime_adapter
+            .list_active_inputs(&session_id)
+            .await
+            .expect("list the session's active inputs");
+        if active.len() >= 2 {
+            break true;
+        }
+        if tokio::time::Instant::now() >= deadline || second.is_finished() {
+            break false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    runtime
+        .try_shutdown()
+        .await
+        .expect("the runtime shuts down");
+    let running = tokio::time::timeout(DEADLINE, running)
+        .await
+        .expect("the running turn is answered by the shutdown")
+        .expect("running turn task");
+    let running = running.expect_err("the running turn does not complete in this process");
+    assert_eq!(running.code, error::SESSION_NOT_RUNNING, "{running:?}");
+    assert_eq!(
+        running.data.as_ref().map(|data| &data["kind"]),
+        Some(&serde_json::json!("requeued_across_stop")),
+        "the running turn is kept across the stop: {running:?}"
+    );
+    let second = tokio::time::timeout(DEADLINE, second)
+        .await
+        .expect("the second turn is answered by the shutdown")
+        .expect("second turn task");
+    let second = second.expect_err("the second turn does not run in this process");
+    assert_eq!(
+        second.data.as_ref().map(|data| &data["kind"]),
+        Some(&serde_json::json!("requeued_across_stop")),
+        "the second turn is kept across the stop, not refused as work still waiting for \
+         admission (admitted into the runtime's queue before the shutdown: {admitted}): \
+         {second:?}"
+    );
+    assert_eq!(second.code, error::SESSION_NOT_RUNNING, "{second:?}");
+    assert!(
+        admitted,
+        "the second turn was admitted into the runtime's queue before the shutdown"
+    );
+    assert_eq!(
+        model.requests.load(std::sync::atomic::Ordering::SeqCst) - requests_before,
+        2,
+        "the running turn's tool round and its held call ran; nothing ran after the stop"
+    );
+    drop(runtime);
+
+    let restarted = sqlite_runtime(root.path()).await;
+    let after = ScriptedModel::new([
+        Step::Text("kept run answer"),
+        Step::Text("second turn answer"),
+        Step::Text("after the restart answer"),
+    ]);
+    restarted.set_default_llm_client(Some(after.clone()));
+    run_turn(&restarted, &session_id, "after the restart")
+        .await
+        .expect("a new turn after the restart");
+    let mut expected = users_before;
+    expected
+        .extend(["the running turn", "the second turn", "after the restart"].map(str::to_string));
+    assert_eq!(
+        committed_user_texts(&restarted, &session_id).await,
+        expected,
+        "the kept run and the kept second turn each run once at the next start, the run \
+         first, ahead of the new turn"
+    );
+    restarted
+        .try_shutdown()
+        .await
+        .expect("the restarted runtime shuts down");
+}
+
+/// The running turn is the session's first.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_graceful_shutdown_keeps_a_turn_sent_after_the_first_turns_round_commit_head_canonical() {
+    a_graceful_shutdown_keeps_a_turn_sent_after_a_round_commit(false).await;
+}
+
+/// The running turn follows a completed one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_graceful_shutdown_keeps_a_turn_sent_after_a_later_turns_round_commit_head_canonical() {
+    a_graceful_shutdown_keeps_a_turn_sent_after_a_round_commit(true).await;
+}
