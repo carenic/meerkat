@@ -285,9 +285,11 @@ instead of `<state-root>/<realm>/runtime.sqlite3`; the id must then be a full
 session UUID.
 
 `resolve-held-tail` reports why durable-tail recovery holds a session's tail
-as ambiguous and what the repair keeps, answers and ends; with `--apply` it
-commits a repair the runtime machine authorizes as an interrupted run (every
-row kept, the open calls answered as outcome unknown). Stop every host of the
+as ambiguous, or holds an interrupted tail beside inputs another run left
+staged or queued (a shape only pre-release builds of 0.9.5 leave), and what
+the repair keeps, answers, ends and requeues; with `--apply` it commits a
+repair the runtime machine authorizes as an interrupted run (every row kept,
+the open calls answered as outcome unknown, the stranded inputs requeued). Stop every host of the
 session first: the repair is refused while the persisted lifecycle row is not
 quiescent, and an idle live host is not detected. A row a host left `Stopped`
 when it ended before unregistering (no current run, no unregister in progress)

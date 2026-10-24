@@ -5938,12 +5938,71 @@ impl DriverEntry {
         {
             completions.lock().await.fail_inputs(
                 adopted.iter().cloned(),
-                crate::completion::CompletionWaitError::AuthorityUnavailable(
-                    "a durable-tail recovery outside this runtime consumed the input with the \
-                     run it committed; read the session's committed history for its result"
-                        .to_string(),
-                ),
+                Self::consumed_by_outside_recovery(),
             );
+        }
+        Ok(adopted)
+    }
+
+    /// The wait failure of an input a store-owned durable-tail recovery
+    /// consumed outside this runtime.
+    fn consumed_by_outside_recovery() -> crate::completion::CompletionWaitError {
+        crate::completion::CompletionWaitError::AuthorityUnavailable(
+            "a durable-tail recovery outside this runtime consumed the input with the run it \
+             committed; read the session's committed history for its result"
+                .to_string(),
+        )
+    }
+
+    /// After the settle of cancelled run `run_id` committed its provisional
+    /// tail as an interrupted run, adopt the `Consumed` terminals that
+    /// recovery wrote for inputs this driver still holds as non-terminal
+    /// (`PersistentRuntimeDriver::adopt_durable_consumed_inputs`).
+    ///
+    /// Those are the inputs the tail's run cursor lists that the cancel
+    /// requeued: a join the run's round commit took into the tail, whose
+    /// live image the cancel dropped, and which keeps the run as its run.
+    /// Adopted, the loop never runs their content again. Their waiters fail
+    /// with [`CompletionWaitError::ConsumedWithInterruptedRun`]: the input was
+    /// consumed with the run, not lost to a vanished authority. Any other
+    /// input adopted here was consumed by a recovery outside this runtime,
+    /// and its waiter fails as [`Self::adopt_durable_consumed_inputs`] fails
+    /// it. A settle that did not commit consumed nothing of the run.
+    ///
+    /// [`CompletionWaitError::ConsumedWithInterruptedRun`]: crate::completion::CompletionWaitError::ConsumedWithInterruptedRun
+    pub(crate) async fn adopt_settled_cancelled_run_inputs(
+        &mut self,
+        run_id: &RunId,
+        completions: Option<&SharedCompletionRegistry>,
+    ) -> Result<Vec<InputId>, RuntimeDriverError> {
+        // The run association is read before the adoption consumes them.
+        let of_the_run = self
+            .as_driver()
+            .active_input_ids()
+            .into_iter()
+            .filter(|input_id| {
+                self.as_driver().input_last_run_id(input_id).as_ref() == Some(run_id)
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let adopted = match self {
+            DriverEntry::Ephemeral(_) => return Ok(Vec::new()),
+            DriverEntry::Persistent(driver) => driver.adopt_durable_consumed_inputs().await?,
+        };
+        if !adopted.is_empty()
+            && let Some(completions) = completions
+        {
+            let (with_the_run, other): (Vec<_>, Vec<_>) = adopted
+                .iter()
+                .cloned()
+                .partition(|input_id| of_the_run.contains(input_id));
+            let mut completions = completions.lock().await;
+            completions.fail_inputs(
+                with_the_run,
+                crate::completion::CompletionWaitError::ConsumedWithInterruptedRun {
+                    run_id: run_id.clone(),
+                },
+            );
+            completions.fail_inputs(other, Self::consumed_by_outside_recovery());
         }
         Ok(adopted)
     }

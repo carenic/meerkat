@@ -939,7 +939,13 @@ them.
   tail with no assistant
   message and no tool result is attributed to its run by the store-issued
   provisional binding on a strict continuation (round zero's first commit, or
-  a run's closing save), and by an agreeing cursor after a rewrite.
+  a run's closing save), and by an agreeing cursor after a rewrite. Recovery
+  settles the inputs a tail's run cursor binds, the inputs whose content its
+  rounds wrote, and those a committed receipt of the run names. A content
+  input the cursor does not bind is not in the tail: one that names no run,
+  or the tail's run, stays queued for ordinary delivery, and one that names
+  another run holds the tail. A tail without a cursor settles the inputs
+  that name its run and holds beside any other content input.
   `recovery::observe_resumable_run` observes a continuable tail for
   registration, which marks the run resumable on the live authority and keeps
   its inputs bound instead of requeueing them. Every recovery commit clears the
@@ -1101,11 +1107,16 @@ them.
     because the suspension's boundary commits it as the suspended state. After
     a cancellation or another failure the run writes it only when the run's
     own assistant message identifies the tail; otherwise the last round
-    commit, with its cursor, stays for recovery, which settles it by the run's
-    inputs. Every exit leaves the live session without a cursor.
+    commit, with its cursor, stays for recovery, which settles it by the
+    inputs the cursor binds. A cancellation (an interrupt or a run stop) has
+    the runtime run that recovery as soon as the cancellation commits, so the
+    tail is closed as interrupted before the session's next turn. Every exit
+    leaves the live session without a cursor.
   - `Agent::set_run_start_input_ids` stages the inputs a runtime batch binds
     to the next run; each steer or peer input written into a running turn at a
-    boundary binds to the run too, and the cursor lists them all.
+    boundary binds to the run too, and every later round commit lists it in
+    the cursor. A steer that joined after the last round commit is not in the
+    tail: a cancel puts it back in its queue, and it runs once after the run.
     `Budget::resume_turn` and `Budget::turn_elapsed` carry the turn horizon
     across a resume.
   - A WholeBlob session is recovered only from a strict continuation of its
@@ -1152,6 +1163,15 @@ them.
     `AgentError::RunSuspended { run_id }`, which a core executor reports as
     `CoreExecutorError::Suspended { run_id }`: neither a cancellation nor an
     apply failure.
+
+- `meerkat-runtime`: `CompletionWaitError::ConsumedWithInterruptedRun { run_id }`
+  (`is_consumed_with_interrupted_run()`). A steer that joined a durable run
+  at a model boundary, and that a round commit of the run listed, ends with
+  the run when the run is interrupted or stopped: the cancel puts it back in
+  its queue, and closing the run's tail as interrupted consumes it, because
+  its content is in the transcript. Its waiter fails with this variant
+  instead of running it again (wait-failure observation
+  `AuthorityUnavailable`, as for `BoundaryRolledBack`).
 
 - `meerkat-runtime`: a WholeBlob run re-bases at a compaction.
   `PreparedWholeBlobRunRebase::prepare` proves the compacted document's
@@ -2838,14 +2858,17 @@ them.
   only pre-release builds of 0.9.5 leave: their interrupt kept the run's
   last round commit as the tail, and the next turn's input was staged for a
   run that never committed. The store must prove the input is not the
-  tail's own: it names that other run, which has no boundary receipt and no
-  tail, and the tail's run cursor binds only the interrupted run's own
-  inputs, all ended. The answer is `stranded_inputs`
-  (`HeldTailResolution::StrandedInputs`). Applied, the repair commits the
-  tail as interrupted, as recovery commits any interrupted run, and in the
-  same commit requeues those inputs with their content
-  (`HeldTailRepair::requeued_inputs`), so each runs once after it. Any other
-  input beside the tail keeps the hold.
+  tail's own: the tail's run cursor does not bind it, and it names that
+  other run, which has no boundary receipt and no tail. The answer is
+  `stranded_inputs` (`HeldTailResolution::StrandedInputs`). Applied, the
+  repair commits the tail as interrupted, as recovery commits any
+  interrupted run, and in the same commit requeues those inputs with their
+  content (`HeldTailRepair::requeued_inputs`), so each runs once after it.
+  An input the cursor binds is the tail's own, whatever run it names now:
+  the repair consumes it with the tail (`HeldTailRepair::terminalized_inputs`).
+  An input that names no run stays queued. An input that names a run with a
+  receipt, or the interrupted run without the cursor binding it, keeps the
+  hold.
 
 ### Security
 

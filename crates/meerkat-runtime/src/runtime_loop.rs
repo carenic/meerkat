@@ -9222,14 +9222,28 @@ async fn process_queue(
                                 // not meet it. A suspension never reaches this
                                 // arm.
                                 if cancelled {
+                                    let mut driver = driver.lock().await;
                                     driver
-                                        .lock()
-                                        .await
                                         .settle_cancelled_run_tail(
                                             &authority_binding.session_id,
                                             &run_id,
                                         )
                                         .await;
+                                    // A committed settle consumed the inputs
+                                    // the tail's cursor lists. The cancel may
+                                    // have requeued one of them (a join whose
+                                    // live image it dropped); adopt it, so the
+                                    // loop never runs that content again.
+                                    if let Err(error) = driver
+                                        .adopt_settled_cancelled_run_inputs(&run_id, completions)
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            %run_id,
+                                            %error,
+                                            "the cancelled run's settled inputs were not adopted"
+                                        );
+                                    }
                                 }
                             }
                             OwnedRuntimeLoopTerminalizationOutcome::Rejected(error) => {

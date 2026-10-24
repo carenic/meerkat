@@ -91,6 +91,16 @@ pub enum CompletionWaitError {
         /// When the stop kept the input queued.
         stopped_at: chrono::DateTime<chrono::Utc>,
     },
+    /// The input joined run `run_id` at a model boundary, and a round commit
+    /// of the run wrote its content into the run's provisional tail. The run
+    /// was cancelled, and its tail was closed as an interrupted run with
+    /// every committed row kept: the input was consumed with the run, its
+    /// content is in the session's committed history, and it does not run
+    /// again. Do not resubmit it.
+    #[error(
+        "the input joined run {run_id}, whose committed rounds took its content; the run was closed as interrupted, so it does not run again"
+    )]
+    ConsumedWithInterruptedRun { run_id: RunId },
 }
 
 impl CompletionWaitError {
@@ -106,7 +116,8 @@ impl CompletionWaitError {
             Self::AttachmentReplaced
             | Self::AuthorityUnavailable(_)
             | Self::BoundaryRolledBack { .. }
-            | Self::DurableOutcomeUnknown { .. } => Some(
+            | Self::DurableOutcomeUnknown { .. }
+            | Self::ConsumedWithInterruptedRun { .. } => Some(
                 crate::meerkat_machine::dsl::RuntimeCompletionWaitFailureObservation::AuthorityUnavailable,
             ),
             Self::RequeuedAcrossStop { .. } => Some(
@@ -148,6 +159,14 @@ impl CompletionWaitError {
     #[must_use]
     pub const fn is_requeued_across_stop(&self) -> bool {
         matches!(self, Self::RequeuedAcrossStop { .. })
+    }
+
+    /// Stable typed predicate: the input was consumed with a cancelled run
+    /// whose committed round holds its content, and the run was closed as
+    /// interrupted. The input does not run again.
+    #[must_use]
+    pub const fn is_consumed_with_interrupted_run(&self) -> bool {
+        matches!(self, Self::ConsumedWithInterruptedRun { .. })
     }
 
     /// When the stop kept the input queued, for a
