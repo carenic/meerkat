@@ -199,7 +199,7 @@ that is killed leaves its runs as any crash does.
 | Situation | What recovery does |
 |-----------|--------------------|
 | A bound input was already settled, for example by a stop | Closes the run as interrupted, with its content kept |
-| The run failed and its inputs were queued for another attempt | Its round commits were discarded first, so its inputs run again as a new run; a tail left behind with requeued inputs is held for reconciliation, never committed |
+| The run failed and its inputs were queued for another attempt | Its round commits were discarded first, so its inputs run again as a new run; a tail left behind with requeued inputs is closed as interrupted, and the inputs its run cursor binds are consumed with it, so they do not run twice |
 | The runtime was retired | Closes the run as interrupted, with its content kept |
 | The run has no bound inputs (a direct or machine-service turn) | Closes the run as interrupted, with its content kept |
 | The saved transcript and the run cursor disagree | Holds the session for reconciliation; an operator can resolve the hold, unless the cursor cannot be read or its saved response has calls without a message id (see [Storage Operations](/guides/storage-operations#resolve-a-durable-tail-held-for-recovery)) |
@@ -216,6 +216,21 @@ those calls may have run. A notice then tells the model that the run was
 interrupted, and the run's inputs do not run again. Only a run whose inputs
 are queued for another attempt (a failed run's replay, or a run released to
 ordinary requeue) drops its round commits.
+
+The run's inputs are the inputs its run cursor binds: every input the run
+wrote into its turn, its first batch and each steer or peer input that joined
+it at a model boundary, from the round commit after the join on. Closing
+the run ends them with it, and none of them runs again. A steer that joined
+after the run's last round commit is not in what the run committed: it is
+put back in its queue and runs once after the run, and so does every input
+queued behind the run. A run that is interrupted or stopped is closed as
+interrupted as soon as its cancellation commits, so the session's next turn
+runs over it. A steer that a round commit of the cancelled run listed ends
+with the run although the cancel had put it back in its queue: its content
+is already in the transcript, and its waiter fails with
+`CompletionWaitError::ConsumedWithInterruptedRun`. An input beside the
+run that names another run keeps the run's tail held for reconciliation
+(see [Storage Operations](/guides/storage-operations#an-interrupted-tail-held-beside-a-stranded-input)).
 
 The rules for every kind of durable tail are in
 [Session contracts: durable-tail recovery](/reference/session-contracts#durable-tail-recovery).

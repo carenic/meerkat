@@ -470,12 +470,16 @@ that never committed, and recovery holds the interrupted tail beside that
 input, because the input could be the tail's own. The command resolves
 this hold when the store proves that the input is not the tail's own:
 
-- the tail's run cursor binds only the interrupted run's own inputs, and
-  every one of them has ended;
-- every other input beside the tail that carries content is staged or
-  queued and names another run as its run, and that run has neither a
-  boundary receipt nor a durable tail (the store keeps one tail per
-  session, the interrupted run's).
+- the tail carries a run cursor, which binds exactly the inputs whose
+  content the tail holds, and the cursor does not bind the input;
+- the input carries content, is staged or queued, and names another run as
+  its run, and that run has neither a boundary receipt nor a durable tail
+  (the store keeps one tail per session, the interrupted run's).
+
+An input the cursor binds is the tail's own, whatever run it names now (a
+steer the interrupt put back in its queue and a later run took again, for
+one): the repair consumes it with the tail, once. An input that carries
+content and names no run is not in the tail either, and stays queued.
 
 Nothing is inferred from timing or order. The answer is `stranded_inputs`,
 with the report an `ambiguous` hold gets plus the inputs the repair
@@ -484,10 +488,11 @@ commits any interrupted run: every row is kept, the interrupted notice is
 appended, and the run's own inputs do not run again. In the same commit it
 puts each stranded input back in its queue with its content, bound to no
 run, so it runs once, after the interrupted run, when the session next
-starts. The command requeues no input this proof does not cover (one bound
-to no run, one the tail's cursor binds, one that names a run with a
-receipt): while such an input holds the tail, the answer stays
-`held_otherwise` and nothing is written.
+starts. The command requeues no input this proof does not cover (one that
+names a run with a receipt, one that names the interrupted run without its
+cursor binding it, or one in another phase): while such an input stands
+beside the tail, the answer stays `held_otherwise` and nothing is
+written.
 
 On a WholeBlob session, run the command before 0.9.5 opens the session.
 The first open ends the stranded input as abandoned, and the next start

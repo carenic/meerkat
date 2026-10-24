@@ -238,17 +238,22 @@ pub enum HeldTailResolution {
     /// planned or applied. Each such input is staged for, or queued after, a
     /// run that never committed (no provisional tail and no boundary
     /// receipt in the store), and the tail's run cursor does not bind it: that
-    /// run binding is the proof that the input is not the tail's own. The
-    /// tail's run binds only its own inputs, all ended. The repair commits
-    /// the tail as interrupted, as ordinary recovery commits an interrupted
-    /// tail, and requeues those inputs with their content
+    /// run binding is the proof that the input is not the tail's own. An
+    /// input the cursor binds is the tail's own, whatever run it names now:
+    /// the repair consumes it with the tail
+    /// ([`HeldTailRepair::terminalized_inputs`]). An input that names no run
+    /// is not in the tail and stays queued. The repair commits the tail as
+    /// interrupted, as ordinary recovery commits an interrupted tail, and
+    /// requeues the stranded inputs with their content
     /// ([`HeldTailRepair::requeued_inputs`]), so each runs once after it.
     /// Only a pre-release build of 0.9.5, whose cancelled run kept its tail,
-    /// leaves this shape.
+    /// or a store fault, leaves this shape.
     StrandedInputs(Box<HeldTailRepair>),
 }
 
-/// The operator repair of an ambiguous held tail.
+/// The operator repair of a held tail: an ambiguous one
+/// ([`HeldTailResolution::Ambiguous`]), or an interrupted one held beside
+/// another run's stranded inputs ([`HeldTailResolution::StrandedInputs`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct HeldTailRepair {
@@ -265,8 +270,9 @@ pub struct HeldTailRepair {
     pub messages_after: usize,
     /// The calls the repair answers as outcome unknown.
     pub closed_calls: Vec<String>,
-    /// The inputs the repair terminalizes: those proved bound to the run.
-    /// Other inputs stay for ordinary redelivery.
+    /// The inputs the repair terminalizes: those proved bound to the run
+    /// (beside a run cursor, the inputs it binds). Other inputs stay for
+    /// ordinary redelivery.
     pub terminalized_inputs: Vec<InputId>,
     /// The inputs the repair requeues, with their content, to run once after
     /// the repaired run: another run's stranded inputs
@@ -2586,14 +2592,18 @@ pub async fn recover_durable_tail_for_run(
 /// writes that row with its commit, fenced on the observed row version.
 ///
 /// With `apply` false (the dry run) nothing is written: the answer reports
-/// what the repair keeps, answers and terminalizes, and the verdict. With
-/// `apply` true an authorized repair commits the tail as interrupted through
-/// the ordinary recovery commit: every durable row kept, the open calls
-/// answered as outcome unknown, a notice naming the verb and the candidate,
-/// the inputs proved bound to the run terminalized, and a recovery row
-/// recording the `operator_repair_and_commit_interrupted` disposition and the
-/// candidate id. Evidence that cannot be verified is an error, and the tail
-/// stays held.
+/// what the repair keeps, answers, terminalizes and requeues, and the
+/// verdict. With `apply` true an authorized repair commits the tail as
+/// interrupted through the ordinary recovery commit: every durable row kept,
+/// the open calls answered as outcome unknown, the interrupted notice (for an
+/// ambiguous tail it names the verb and the candidate), the inputs proved
+/// bound to the run terminalized (beside a run cursor, every input it binds
+/// that has not ended: their content is in the tail), a stranded-input
+/// repair's inputs requeued, and a recovery row recording the candidate id
+/// and its disposition (`operator_repair_and_commit_interrupted` for an
+/// ambiguous tail, ordinary recovery's `repair_and_commit_interrupted` for
+/// stranded inputs). Evidence that cannot be verified is an error, and the
+/// tail stays held.
 pub async fn resolve_held_durable_tail(
     store: &dyn RuntimeStore,
     session_id: &SessionId,
@@ -2683,8 +2693,8 @@ impl DriveAnswer {
     }
 }
 
-/// The operator repair an ambiguous candidate plans, with the machine's
-/// verdict.
+/// The operator repair a held candidate plans (an ambiguous one, or an
+/// interrupted one beside `stranded` inputs), with the machine's verdict.
 fn operator_plan(
     candidate: &PreparedRecoveryCandidate,
     inputs: &CandidateInputObservation,
@@ -2985,6 +2995,7 @@ async fn recover_durable_tail_capturing(
         &runtime_id,
         &candidate.candidate_run_id,
         &prior.receipt_bound_inputs,
+        candidate.cursor_bound_inputs.as_deref(),
     )
     .await?;
     // An operator's drive also resolves one held shape that is not
@@ -3134,9 +3145,10 @@ async fn recover_durable_tail_capturing(
                 )));
             }
             match non_commit {
-                // Only a stranded-input drive reaches a hold in operator
-                // mode: ordinary recovery's own verdict holds the tail for a
-                // reason the attributed inputs do not settle.
+                // Defensive: no operator verdict holds. The operator
+                // transitions answer a commit or a refusal, and the ordinary
+                // verdict a stranded-input drive takes holds an interrupted
+                // tail only on the input evidence that drive replaces.
                 DurableTailRecoveryDisposition::HoldIntact
                     if matches!(mode, DriveMode::Operator { .. }) =>
                 {
@@ -3480,23 +3492,36 @@ fn carries_redeliverable_content(input: Option<&crate::input::Input>) -> bool {
 /// Observation pass: classify the input-lifecycle evidence the machine judges,
 /// on durable identity only.
 ///
-/// Attribution classes:
+/// A tail with a readable run cursor (a round commit's) names its own inputs:
+/// every round commit lists in the cursor each input the run wrote into its
+/// turn, its batch at run start and each join at the boundary that appended
+/// it. So the cursor's inputs, and those a committed receipt for the
+/// candidate run names, are attributed to the candidate; nothing else is,
+/// even a row naming the candidate (a join the cancel requeued before any
+/// round commit listed it is not in the tail, so it is redelivered, not
+/// consumed with the tail). A content row the cursor does not list is inert
+/// when it names no run or the candidate: it cannot be in the tail. One
+/// naming another run is reported as `UnboundContentInput`.
+///
+/// A tail without a readable cursor (a closing save, an older shape) keeps
+/// the durable run association:
 /// 1. Records the persisted machine facts already bound to the candidate run
 ///    (`seed.last_run_id`).
 /// 2. Records a durably committed receipt for the candidate run names in its
 ///    `contributing_input_ids`.
 ///
-/// Anything else that is non-terminal and carries redeliverable content might
-/// be the tail's own input whose binding never became durable — text equality
-/// is content evidence, never identity — and is reported as
-/// `UnboundContentInput`. A store that cannot version input rows while
-/// blocking rows exist is reported as `Unfenceable`. The DISPOSITION for both
-/// belongs to the machine.
+/// Without a cursor, anything else that is non-terminal and carries
+/// redeliverable content might be the tail's own input whose binding never
+/// became durable (text equality is content evidence, never identity), and
+/// is reported as `UnboundContentInput`. A store that cannot version input
+/// rows while blocking rows exist is reported as `Unfenceable`. The
+/// DISPOSITION for both belongs to the machine.
 async fn observe_candidate_run_inputs(
     store: &dyn RuntimeStore,
     runtime_id: &LogicalRuntimeId,
     candidate_run_id: &meerkat_core::RunId,
     receipt_bound_inputs: &BTreeSet<String>,
+    cursor_bound_inputs: Option<&[InputId]>,
 ) -> Result<CandidateInputObservation, DurableTailRecoveryError> {
     let snapshot = match store.load_input_states_with_versions(runtime_id).await {
         Ok(snapshot) => snapshot,
@@ -3535,21 +3560,46 @@ async fn observe_candidate_run_inputs(
     // side effects. Proven-bound rows are terminalized; only genuinely
     // unbound rows are retained for redelivery.
     //
+    let cursor_bound_inputs = cursor_bound_inputs.map(|inputs| {
+        inputs
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>()
+    });
     let mut attributed = Vec::new();
     let mut unbound_content_input = false;
     for (bundle, row_digest) in rows {
         if is_terminal(bundle.seed.phase) {
             continue;
         }
-        let bound_to_candidate = bundle.seed.last_run_id.as_ref() == Some(candidate_run_id)
-            || receipt_bound_inputs.contains(&bundle.state.input_id.to_string());
-        if !bound_to_candidate {
-            if carries_redeliverable_content(bundle.state.persisted_input.as_ref()) {
-                unbound_content_input = true;
-            }
+        let input_id = bundle.state.input_id.to_string();
+        let receipt_bound = receipt_bound_inputs.contains(&input_id);
+        let bound_to_candidate = match cursor_bound_inputs.as_ref() {
+            Some(cursor_bound) => cursor_bound.contains(&input_id) || receipt_bound,
+            None => bundle.seed.last_run_id.as_ref() == Some(candidate_run_id) || receipt_bound,
+        };
+        if bound_to_candidate {
+            attributed.push((bundle, row_digest));
             continue;
         }
-        attributed.push((bundle, row_digest));
+        if !carries_redeliverable_content(bundle.state.persisted_input.as_ref()) {
+            continue;
+        }
+        // Beside a cursor, a row the cursor does not list that names no run,
+        // or the candidate, is not in the tail and stays for redelivery. One
+        // naming another run is not proven either way, so it holds.
+        // Without a cursor every such row holds.
+        let holds = match cursor_bound_inputs {
+            Some(_) => bundle
+                .seed
+                .last_run_id
+                .as_ref()
+                .is_some_and(|run_id| run_id != candidate_run_id),
+            None => true,
+        };
+        if holds {
+            unbound_content_input = true;
+        }
     }
     Ok(CandidateInputObservation {
         evidence: if unbound_content_input {
@@ -3602,22 +3652,27 @@ fn terminalize_attributed_inputs(
 /// tail, when they are the only reason ordinary recovery holds it.
 ///
 /// Every row is read again from a snapshot at the same input-set revision the
-/// observation read (a moved set answers `None`), and the shape holds only
-/// when:
-/// - the tail carries a readable run cursor, and every input it binds that
-///   has a row has ended (the run's own inputs);
-/// - no non-terminal row is bound to the candidate run;
-/// - every non-terminal content row names another run (its staging run as
-///   `last_run_id`) and is Staged or Queued (so the cursor binds none of
-///   them);
-/// - each run they name has no boundary receipt in the store. The store
+/// observation read (a moved set answers `None`). The tail must carry a
+/// readable run cursor, whose bound inputs are exactly the inputs whose
+/// content the tail holds. Each non-terminal row is then judged as the
+/// observation attributes it ([`observe_candidate_run_inputs`]):
+/// - a row the cursor binds is the tail's own, whatever run it names now (a
+///   join the cancel requeued and a later run staged again, for one): the
+///   observation attributed it, so the repair commit consumes it with the
+///   tail, once, and it is never requeued;
+/// - a content row that names no run is not in the tail: it stays queued for
+///   ordinary delivery;
+/// - a content row that names another run, and is Staged or Queued, is
+///   stranded, when that run has no boundary receipt in the store. The store
 ///   keeps one provisional tail per session, the candidate's, so such a run
 ///   has no tail either: it never committed.
 ///
-/// That binding is the proof that an input is not the tail's own: nothing is
-/// inferred from order or timing. Rows without content (operations,
-/// continuations, external events) are left as they are, as ordinary recovery
-/// leaves them. `None` leaves the tail to today's verdict.
+/// Any other non-terminal row answers `None`: one naming the candidate run
+/// that the cursor does not bind, one a receipt binds, and a content row in
+/// another phase. That binding is the proof that an input is not the tail's
+/// own: nothing is inferred from order or timing. Rows without content
+/// (operations, continuations, external events) are left as they are, as
+/// ordinary recovery leaves them. `None` leaves the tail to today's verdict.
 async fn observe_stranded_run_inputs(
     store: &dyn RuntimeStore,
     runtime_id: &LogicalRuntimeId,
@@ -3649,8 +3704,11 @@ async fn observe_stranded_run_inputs(
         if is_terminal(bundle.seed.phase) {
             continue;
         }
-        if cursor_bound_inputs.contains(&bundle.state.input_id)
-            || bundle.seed.last_run_id.as_ref() == Some(&candidate.candidate_run_id)
+        // The tail's own content: attributed, so the repair consumes it.
+        if cursor_bound_inputs.contains(&bundle.state.input_id) {
+            continue;
+        }
+        if bundle.seed.last_run_id.as_ref() == Some(&candidate.candidate_run_id)
             || receipt_bound_inputs.contains(&bundle.state.input_id.to_string())
         {
             return Ok(None);
@@ -3658,8 +3716,9 @@ async fn observe_stranded_run_inputs(
         if !carries_redeliverable_content(bundle.state.persisted_input.as_ref()) {
             continue;
         }
+        // Not in the tail, and no run's: it stays queued.
         let Some(run_id) = bundle.seed.last_run_id.clone() else {
-            return Ok(None);
+            continue;
         };
         if !matches!(
             bundle.seed.phase,

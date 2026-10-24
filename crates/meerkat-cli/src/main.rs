@@ -2971,13 +2971,16 @@ enum SessionCommands {
     ///
     /// Reports why durable-tail recovery holds the session's tail as
     /// ambiguous (the run's rows, its last stop, the calls without a result,
-    /// the run cursor) and what the repair keeps, answers and ends. With
+    /// the run cursor), or holds an interrupted tail beside inputs another
+    /// run left staged or queued (a shape only pre-release builds of 0.9.5
+    /// leave), and what the repair keeps, answers, ends and requeues. With
     /// --apply, a repair the runtime machine authorizes commits the tail as
     /// an interrupted run: every row is kept, the open calls are answered as
-    /// outcome unknown, and the inputs bound to the run end. Stop every host
-    /// of the session first: the repair is refused while the persisted
-    /// lifecycle row is not quiescent, and an idle live host is not
-    /// detected. A refusal is never retried.
+    /// outcome unknown, the inputs bound to the run end (beside a run
+    /// cursor, the inputs it binds), and another run's stranded inputs go
+    /// back to their queue. Stop every host of the session first: the repair
+    /// is refused while the persisted lifecycle row is not quiescent, and an
+    /// idle live host is not detected. A refusal is never retried.
     ResolveHeldTail {
         /// Session ID
         id: String,
