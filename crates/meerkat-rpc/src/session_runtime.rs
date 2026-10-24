@@ -34510,6 +34510,179 @@ mod tests {
         in_flight.assert_running_turn_kept().await;
     }
 
+    /// A session create or resume that reaches registration after this
+    /// runtime's shutdown began is refused (`-32032`, `data.kind`
+    /// `runtime_shutting_down`) and registers nothing. A host's
+    /// `create_or_resume_session_without_turn`, which governed cold recovery
+    /// also goes through, never materializes a session on a stopping runtime.
+    #[tokio::test]
+    async fn a_session_create_or_resume_after_a_shutdown_began_is_refused() {
+        let realm = GracefulShutdownRealm::new(GracefulShutdownStores::InMemoryWholeBlob);
+        let first = realm.start().await;
+        first.set_default_llm_client(Some(Arc::new(MockLlmClient)));
+        let session_id = first
+            .create_session(mock_build_config(), None, None, Vec::new())
+            .await
+            .expect("create the session");
+        runtime_turn(&first, &session_id, "a committed turn").await;
+        first
+            .try_shutdown()
+            .await
+            .expect("the first start shuts down");
+        drop(first);
+
+        let runtime = realm.start().await;
+        runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
+        runtime.close_runtime_registration().await;
+        for (what, resume_id) in [
+            (
+                "the resume of a persisted session",
+                Some(session_id.clone()),
+            ),
+            ("a new session", None),
+        ] {
+            let refusal = runtime
+                .create_or_resume_session_without_turn(
+                    mock_build_config(),
+                    resume_id,
+                    None,
+                    Default::default(),
+                )
+                .await
+                .expect_err(what);
+            assert_eq!(
+                refusal.code,
+                meerkat_contracts::ErrorCode::SessionRuntimeUnavailable.jsonrpc_code(),
+                "{what}: {refusal:?}"
+            );
+            assert_eq!(
+                refusal.data.as_ref().map(|data| &data["kind"]),
+                Some(&serde_json::json!("runtime_shutting_down")),
+                "{what}: {refusal:?}"
+            );
+        }
+        assert!(
+            !runtime.runtime_adapter.contains_session(&session_id).await,
+            "the refused resume registered nothing"
+        );
+        assert!(
+            runtime
+                .runtime_adapter
+                .current_session_registration_witnesses()
+                .await
+                .is_empty(),
+            "nothing registered after the shutdown began"
+        );
+    }
+
+    /// A mob member spawn after this runtime's shutdown began is refused,
+    /// typed, and registers nothing. The shutdown closes the mob state's
+    /// admission, so every managed mob refuses new members (`AdmissionClosed`,
+    /// reason `StandDown`). The mob session service registers no member
+    /// session either: a member session a spawn admitted earlier would create
+    /// now is refused `runtime_shutting_down`.
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn a_mob_member_spawn_after_a_shutdown_began_is_refused() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = make_runtime_with_runtime_store(temp_factory(&temp), 10);
+        let mob_state = rpc_mob_state_with_realm(&runtime);
+        runtime.set_mob_state(Arc::clone(&mob_state));
+        // Unique per test: the mob id names the process-global in-process
+        // supervisor participant.
+        let mut definition = meerkat_mob::MobDefinition::explicit(meerkat_mob::MobId::from(
+            format!("rpc-mob-shutdown-spawn-{}", uuid::Uuid::new_v4().simple()),
+        ));
+        definition.profiles.insert(
+            meerkat_mob::ProfileName::from("worker"),
+            meerkat_mob::ProfileBinding::Inline(Box::new(meerkat_mob::Profile {
+                model_fallback: None,
+                model: "claude-sonnet-4-5".to_string(),
+                provider: None,
+                self_hosted_server_id: None,
+                image_generation_provider: None,
+                auto_compact_threshold: None,
+                resume_overrides: Vec::new(),
+                skills: Vec::new(),
+                tools: meerkat_mob::ToolConfig {
+                    comms: true,
+                    ..meerkat_mob::ToolConfig::default()
+                },
+                peer_description: "worker".to_string(),
+                external_addressable: false,
+                backend: None,
+                runtime_mode: meerkat_mob::MobRuntimeMode::TurnDriven,
+                max_inline_peer_notifications: None,
+                output_schema: None,
+                provider_params: None,
+                durable: false,
+            })),
+        );
+        let mob_id = mob_state
+            .mob_create_definition(definition)
+            .await
+            .expect("create the mob");
+        mob_state
+            .mob_spawn_spec(
+                &mob_id,
+                meerkat_mob::SpawnMemberSpec::new("worker", "worker-1"),
+            )
+            .await
+            .expect("a spawn before the shutdown");
+        let registered = runtime
+            .runtime_adapter
+            .current_session_registration_witnesses()
+            .await
+            .len();
+
+        runtime.close_runtime_registration().await;
+        let refused = mob_state
+            .mob_spawn_spec(
+                &mob_id,
+                meerkat_mob::SpawnMemberSpec::new("worker", "worker-2"),
+            )
+            .await
+            .expect_err("a spawn after the shutdown began is refused");
+        assert!(
+            matches!(
+                refused,
+                meerkat_mob::MobError::AdmissionClosed {
+                    reason: meerkat_mob::MobAdmissionCloseReason::StandDown,
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+        let direct = runtime
+            .session_service()
+            .create_session(service_create_request(
+                mock_build_config(),
+                InitialTurnPolicy::Defer,
+            ))
+            .await
+            .expect_err("the mob session service registers no session after the shutdown began");
+        assert_eq!(
+            direct
+                .structured_data()
+                .and_then(|data| data.get("kind").cloned()),
+            Some(serde_json::json!("runtime_shutting_down")),
+            "{direct:?}"
+        );
+        assert_eq!(
+            runtime
+                .runtime_adapter
+                .current_session_registration_witnesses()
+                .await
+                .len(),
+            registered,
+            "nothing registered after the shutdown began"
+        );
+        runtime
+            .try_shutdown()
+            .await
+            .expect("the runtime shuts down");
+    }
+
     /// A login lifts a sign-out's suppression only for the exact attachment
     /// it suppressed: equal unbound identities (withheld parts, no key) prove
     /// nothing, another account is not the same attachment, and an exact,
