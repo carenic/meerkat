@@ -151,6 +151,33 @@ impl std::fmt::Debug for OperationObservation {
 #[error("operation observation unavailable")]
 pub struct OperationObservationError;
 
+/// A protected observation owner's step before a governed tool call enters
+/// its dispatcher.
+///
+/// A fenced dispatch whose context carries one
+/// ([`crate::ToolDispatchContext::with_observation_barrier`]) awaits it after
+/// the call's decision is prepared, any review admitted and the root entry
+/// staged, and before any dispatcher code runs, so the owner can make what
+/// its sink staged so far durable. The dispatch then checks the decision
+/// again: a decision prepared again meanwhile (an owner change during the
+/// wait) is staged with a new entry and the barrier is awaited once more, so
+/// what the barrier made durable always carries the decision the call
+/// enters with. An error refuses the call before any dispatcher code runs
+/// ([`crate::ToolError::OperationObservationUnavailable`]); nothing is sent.
+///
+/// Only the native runtime installs one, for a governed service call: its
+/// audit log appends the call's decision and entry here (see
+/// `meerkat_runtime::meerkat_machine::ServiceCall`). Host code never
+/// installs one. A barrier grants nothing, and it is no audit owner of its
+/// own: the observations are the work's sink's. The fenced dispatch holds no
+/// lock of its own while it waits, and the owner bounds its own wait.
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+pub trait OperationObservationBarrier: Send + Sync {
+    /// Make every observation staged so far durable, or refuse the entry.
+    async fn before_entry(&self) -> Result<(), OperationObservationError>;
+}
+
 /// Bound on the already-run provider-native tools a withholding record lists.
 pub const MANDATORY_HOOK_PROVIDER_NATIVE_TOOLS: usize = 16;
 /// A provider-owned dynamic tool name longer than this is omitted, never

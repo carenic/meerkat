@@ -36,8 +36,8 @@ pub use audit::{
     MANDATORY_HOOK_ID_BYTES, MANDATORY_HOOK_PROVIDER_NATIVE_NAME_BYTES,
     MANDATORY_HOOK_PROVIDER_NATIVE_TOOLS, MandatoryHookCause, MandatoryHookProviderTool,
     MandatoryHookWithheldEffect, MandatoryHookWithholding, MandatoryHookWithholdingRecord,
-    OperationEntryBoundary, OperationObservation, OperationObservationError,
-    OperationObservationPhase, OperationObservedOutcome,
+    OperationEntryBoundary, OperationObservation, OperationObservationBarrier,
+    OperationObservationError, OperationObservationPhase, OperationObservedOutcome,
 };
 mod owner_change_wait;
 pub use owner_change_wait::{
