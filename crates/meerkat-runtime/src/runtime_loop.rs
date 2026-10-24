@@ -7218,10 +7218,10 @@ async fn settle_refused_resumed_run(
     authority_binding.release_ended_run_tool_markers(run_id);
     // The settled run never resumes, so its provisional tail is repaired as
     // an interrupted run, after the abandonment committed: its rows stay in
-    // the transcript. The repair commits a boundary this live runtime did
-    // not, so the seeded actor is stale, and a tail the repair leaves would
-    // refuse the next run's first round commit: either way the session
-    // reloads at once, before any run, and the lap exits.
+    // the transcript, and the session layer resynchronizes the seeded actor
+    // from the repaired boundary at its next step. A tail the repair leaves
+    // standing would refuse the next run's first round commit, so then the
+    // session reloads at once, before any run, and the lap exits.
     let reload = driver
         .lock()
         .await
@@ -7232,7 +7232,7 @@ async fn settle_refused_resumed_run(
         authority_binding
             .require_session_durability_reload(
                 "settled_resumable_run_tail_repair",
-                format!("settled run {run_id}'s provisional tail was repaired or still stands"),
+                format!("settled run {run_id}'s provisional tail still stands"),
             )
             .await;
         return ResumedRunAdmissionLap::Exit(true);

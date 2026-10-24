@@ -973,10 +973,11 @@ them.
   - A marked run that is settled without resuming (a refused resume, an
     expired requeue stop, or a stop) has its provisional tail repaired as
     interrupted once its inputs' abandonment commits: rows kept, open calls
-    answered outcome-unknown, notice appended. The repair commits a boundary
-    the live session did not, so the session reloads before it serves again; a
-    tail the repair cannot resolve is left to the next registration's
-    recovery, with the same reload. `MeerkatMachine::release_resumable_run`
+    answered outcome-unknown, notice appended. The live session
+    resynchronizes from the repaired boundary at its next step, as after an
+    interrupt, and keeps serving; a tail the repair cannot resolve is left to
+    the next registration's recovery, and the session reloads before it
+    serves again. `MeerkatMachine::release_resumable_run`
     discards the tail by its exact authority before it requeues the run's
     inputs to run again. It refuses a run whose cursor records a re-base and
     releases nothing: that run's inputs are already in the committed body, and
@@ -2830,15 +2831,17 @@ them.
   tail that recovery holds beside an input staged for another run, a shape
   only pre-release builds of 0.9.5, or a store fault, leave: those builds'
   interrupt kept the run's last round commit as the tail, and the next
-  turn's input was staged for a run that never committed. The store must prove the input is not the
-  tail's own: the tail's run cursor does not bind it, and it names that
-  other run, which has no boundary receipt and no tail. The answer is
+  turn's input was staged for a run that never committed. The store must
+  prove the input is not the tail's own: the tail's run cursor does not
+  bind it, and it names that other run, which has no boundary receipt and
+  no tail. The answer is
   `stranded_inputs` (`HeldTailResolution::StrandedInputs`). Applied, the
   repair commits the tail as interrupted, as recovery commits any
   interrupted run, and in the same commit requeues those inputs with their
   content (`HeldTailRepair::requeued_inputs`), so each runs once after it.
   An input the cursor binds is the tail's own, whatever run it names now:
-  the repair consumes it with the tail (`HeldTailRepair::terminalized_inputs`).
+  the repair consumes it with the tail
+  (`HeldTailRepair::terminalized_inputs`).
   An input that names no run stays queued. An input that names a run with a
   receipt, or the interrupted run without the cursor binding it, keeps the
   hold.
