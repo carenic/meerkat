@@ -74,6 +74,9 @@ pub(super) struct ScriptedModel {
     /// Builds the builder refuses, from the next one on: a session whose
     /// agent build fails is refused by its materialization.
     refused_builds: AtomicUsize,
+    /// The turn-boundary state of the agent the builder built last: the
+    /// session's live agent.
+    boundary: StdMutex<Option<meerkat_core::TransientTurnContextStateHandle>>,
 }
 
 impl ScriptedModel {
@@ -87,6 +90,7 @@ impl ScriptedModel {
             tool_entered: Semaphore::new(0),
             tool_release: Semaphore::new(0),
             refused_builds: AtomicUsize::new(0),
+            boundary: StdMutex::new(None),
         }
     }
 
@@ -297,6 +301,8 @@ impl SessionAgentBuilder for ScriptedBuilder {
         })
         .await
         .map_err(|error| SessionError::Agent(AgentError::InternalError(error.to_string())))?;
+        *self.client.boundary.lock().expect("boundary") =
+            Some(agent.transient_turn_context_state());
         Ok(FactoryAgent {
             agent,
             session_context,
@@ -2386,6 +2392,11 @@ async fn a_steer_that_never_joined_runs_once_after_an_interrupt_head_canonical()
 /// A's next model boundary. Releasing the tool takes A to that boundary,
 /// where the steer joins A, and A holds at its next model call. Returns A's
 /// completion waiter, its run id, the steer's own completion waiter and id.
+///
+/// The steer's live-boundary delivery registers at A's next boundary from
+/// the runtime's ingress task, after the admission returns. The tool is
+/// released only once that delivery waits there: released earlier, A can
+/// pass the boundary first, and the steer joins a later one or none.
 async fn a_steer_joins_run_a_at_its_next_model_boundary(
     start: &Start,
     client: &ScriptedModel,
@@ -2407,9 +2418,27 @@ async fn a_steer_joins_run_a_at_its_next_model_boundary(
         .tail_run(id)
         .await
         .expect("run A's round commit stands as the provisional tail");
+    let boundary = client
+        .boundary
+        .lock()
+        .expect("boundary")
+        .clone()
+        .expect("the live agent's turn boundary");
+    assert!(
+        !boundary.has_waiting_delivery_for_test(),
+        "no delivery waits at A's next boundary before the steer"
+    );
     let steer_input = steer("steered");
     let steer_id = steer_input.id().clone();
     let steered = start.admit_input_waiter(id, steer_input).await;
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    while !boundary.has_waiting_delivery_for_test() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the steer's delivery never waited at A's next model boundary"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     client.tool_release.add_permits(1);
     tokio::time::timeout(DEADLINE, client.entered.acquire())
         .await
