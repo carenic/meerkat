@@ -2283,7 +2283,9 @@ them.
   persistent session service implements with its cold-attach preparation. The
   method's default settles through the resume verdict, which takes the claim
   as well (see the next entry) but materializes the whole resume, so a
-  session-service wrapper around a persistent service should forward it. When
+  session-service wrapper around a persistent service should forward it, and
+  `MobSessionService::settle_durable_tail_before_cold_start_reporting` too
+  (see the entry on a mob start after a graceful stop below). When
   that claim is refused (`SessionError::ServedElsewhere` or
   `HostingUnavailable`), or the tail's recovery cannot prove it
   (`MobError::MemberDurableTailUnprovable`), the start defers that one member:
@@ -2342,6 +2344,32 @@ them.
   transcript revision conflict. Where the start still fails on such a member,
   that typed cause is what it reports; a retiring member, or one whose restore
   already failed, is deferred instead (see the entries above).
+
+- `meerkat-session`, `meerkat-mob`: a mob start after a graceful stop with a
+  member's run in flight no longer fails. A host's graceful shutdown leaves
+  the mob Stopped and suspends a member's run that has committed a round at
+  its last round commit (a requeueing stop), so the run's provisional tail
+  outlives the process. The next start restores every member of the stopped
+  mob before it admits a command. The store-owned durable-tail recovery
+  continues such a run (it keeps the tail and writes nothing), but the
+  cold-attach settle reported that as settled, the start's next committed
+  read of the member's session met the kept tail as a transcript revision
+  conflict, and the start failed with `MobError::MemberDurableTailUnprovable`.
+  The mob never started. The settle now reports the recovery's own
+  disposition: when the run continues, the start restores the member from
+  the committed snapshot under the tail, and the tail stays for the run,
+  which resumes from its last round commit when the member's actor is next
+  materialized. The snapshot only serves that read; whether the run
+  continues is the recovery's decision, never derived from the snapshot. A
+  held, refused or unprovable tail still fails the start as before. New
+  public items: `meerkat_session::ColdAttachSettlement` and
+  `PersistentSessionService::prepare_cold_attach_reporting`, which returns
+  it (`prepare_cold_attach` is unchanged), and
+  `MobSessionService::settle_durable_tail_before_cold_start_reporting`, which
+  returns `meerkat_mob::ColdStartTailSettlement`. The method's default runs
+  the plain settle and reports no continued run, so a session-service
+  wrapper around a persistent service should forward it as well: a wrapper
+  that does not keeps the old refusal.
 
 - `meerkat-mob`: a resume spawn onto a session whose durable tail runs past
   its committed runtime boundary, and which no start of the mob restores
