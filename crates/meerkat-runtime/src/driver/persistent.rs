@@ -3158,12 +3158,23 @@ impl PersistentRuntimeDriver {
                 ));
             }
         };
-        let request = match self.prepare_success_boundary(
-            session,
-            receipt.clone(),
-            input_updates,
-            owner_session_id.clone(),
-        ) {
+        // A context receipt that carries no session image is a mid-run
+        // checkpoint of the run: it commits beside the provisional tail the
+        // run's round commits keep standing.
+        let request = match session {
+            Some(session) => self.prepare_success_boundary(
+                Some(session),
+                receipt.clone(),
+                input_updates,
+                owner_session_id.clone(),
+            ),
+            None => PreparedRuntimeSessionCommit::run_checkpoint(
+                receipt.clone(),
+                input_updates,
+                owner_session_id.clone(),
+            ),
+        };
+        let request = match request {
             Ok(request) => request,
             Err(error) => {
                 return Err(self.post_transition_failure(
@@ -3192,7 +3203,9 @@ impl PersistentRuntimeDriver {
 
     /// Stamp one owner request-only contribution onto the run's next
     /// checkpoint receipt and make that receipt durable, before the caller
-    /// publishes the parked context to the runner.
+    /// publishes the parked context to the runner. The receipt is a mid-run
+    /// checkpoint of the run, committed beside the provisional tail the run's
+    /// round commits keep standing.
     pub(crate) async fn machine_realize_live_boundary_owner_context(
         &mut self,
         run_id: &RunId,
@@ -3214,8 +3227,7 @@ impl PersistentRuntimeDriver {
                 ));
             }
         };
-        let request = match self.prepare_success_boundary(
-            None,
+        let request = match PreparedRuntimeSessionCommit::run_checkpoint(
             receipt.clone(),
             Vec::new(),
             owner_session_id.clone(),
@@ -3396,7 +3408,9 @@ impl PersistentRuntimeDriver {
     }
 
     /// Consume one Retained durable join with a live-boundary checkpoint
-    /// receipt committed together with its input row.
+    /// receipt committed together with its input row. The receipt is a
+    /// checkpoint of the still-current run, committed beside the provisional
+    /// tail its round commits left standing.
     pub(crate) async fn machine_consume_retained_live_boundary_join(
         &mut self,
         run_id: &RunId,
@@ -3431,8 +3445,7 @@ impl PersistentRuntimeDriver {
                 ));
             }
         };
-        let request = match self.prepare_success_boundary(
-            None,
+        let request = match PreparedRuntimeSessionCommit::run_checkpoint(
             receipt,
             input_updates,
             owner_session_id.clone(),

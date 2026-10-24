@@ -1325,3 +1325,137 @@ async fn the_large_document_check_passes_over_the_test_host() {
         "the check opens a process, reopens after the round commit and restarts after the re-base"
     );
 }
+
+/// The host store adapter commits a session boundary through the in-memory
+/// store's own implementation, so a run's mid-run checkpoint receipt commits
+/// beside the run's WholeBlob provisional tail over a host store as well, and
+/// a reopen reads both from the host; a receipt-only success and another
+/// run's checkpoint stay refused beside the tail.
+#[tokio::test]
+async fn a_mid_run_checkpoint_commits_beside_its_runs_tail_over_the_host_store() {
+    use meerkat_core::lifecycle::run_primitive::RunApplyBoundary;
+    use meerkat_core::lifecycle::{RunBoundaryReceipt, RunId};
+    use meerkat_core::types::{Message, UserMessage};
+
+    use crate::store::{
+        PreparedRuntimeSessionCommit, PreparedWholeBlobProvisionalTail, SerializedSessionSnapshot,
+    };
+
+    let checkpoint = |run_id: &RunId, sequence: u64| RunBoundaryReceipt {
+        run_id: run_id.clone(),
+        boundary: RunApplyBoundary::RunCheckpoint,
+        contributing_input_ids: Vec::new(),
+        conversation_digest: None,
+        message_count: 0,
+        sequence,
+        owner_contributions: vec!["live-delegation-steer:continuation-1".to_string()],
+    };
+    let host = Arc::new(TestHost::new());
+    let opened = open(&host).await;
+    let mut session = meerkat_core::Session::new();
+    session.push(Message::User(UserMessage::text("the committed base")));
+    let session_id = session.id().clone();
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    opened
+        .1
+        .commit_session_snapshot(
+            &runtime_id,
+            SerializedSessionSnapshot {
+                session_snapshot: Arc::new(serde_json::to_vec(&session).unwrap()),
+            },
+        )
+        .await
+        .expect("the committed base");
+    let base = opened
+        .1
+        .load_whole_blob_store_authority(&runtime_id)
+        .await
+        .unwrap()
+        .expect("a committed base");
+    session.push(Message::User(UserMessage::text("the run's first round")));
+    let run_id = RunId::new();
+    let tail = opened
+        .1
+        .write_prepared_whole_blob_provisional_tail(
+            &runtime_id,
+            PreparedWholeBlobProvisionalTail::prepare_from_session(
+                base,
+                run_id.clone(),
+                1,
+                &session,
+            )
+            .unwrap(),
+        )
+        .await
+        .expect("the round commit's tail");
+    let receipt = checkpoint(&run_id, 1);
+    opened
+        .1
+        .commit_prepared_session_boundary(
+            &runtime_id,
+            PreparedRuntimeSessionCommit::run_checkpoint(
+                receipt.clone(),
+                Vec::new(),
+                session_id.clone(),
+            )
+            .unwrap(),
+        )
+        .await
+        .expect("a mid-run checkpoint commits beside its run's tail");
+    for refused in [
+        PreparedRuntimeSessionCommit::success(
+            None,
+            checkpoint(&run_id, 2),
+            Vec::new(),
+            Some(session_id.clone()),
+        ),
+        PreparedRuntimeSessionCommit::run_checkpoint(
+            checkpoint(&RunId::new(), 1),
+            Vec::new(),
+            session_id.clone(),
+        )
+        .unwrap(),
+    ] {
+        let error = opened
+            .1
+            .commit_prepared_session_boundary(&runtime_id, refused)
+            .await
+            .expect_err("this receipt-only boundary would bypass the candidate");
+        assert!(
+            matches!(
+                error,
+                RuntimeStoreError::SessionPersistenceAuthorityConflict { .. }
+            ),
+            "{error:?}"
+        );
+    }
+
+    let reopened = reopen(&host, opened).await;
+    assert_eq!(
+        reopened
+            .1
+            .load_boundary_receipt(&runtime_id, &run_id, 1)
+            .await
+            .unwrap(),
+        Some(receipt),
+        "the checkpoint reached the host"
+    );
+    assert_eq!(
+        reopened
+            .1
+            .load_boundary_receipt(&runtime_id, &run_id, 2)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        reopened
+            .1
+            .load_whole_blob_provisional_tail(&runtime_id)
+            .await
+            .unwrap()
+            .map(|loaded| loaded.authority().clone()),
+        Some(tail),
+        "the tail stands on the host"
+    );
+}

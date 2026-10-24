@@ -978,6 +978,7 @@ impl InMemoryRuntimeStore {
         receipt: RunBoundaryReceipt,
         input_updates: Vec<InputStatePersistenceRecord>,
         session_store_key: Option<meerkat_core::types::SessionId>,
+        tail_admission: super::ReceiptOnlyTailAdmission,
     ) -> Result<Option<WholeBlobStoreAuthority>, RuntimeStoreError> {
         let rid = runtime_id.0.clone();
         let compaction_intents = prepared_session
@@ -1005,7 +1006,13 @@ impl InMemoryRuntimeStore {
             sequence: receipt.sequence,
         };
         let mut inner = self.inner.lock().await;
-        if prepared_session.is_none() && inner.whole_blob_provisional_tails.contains_key(&rid) {
+        // Only a mid-run checkpoint receipt of the tail's own run commits
+        // beside it; any other receipt-only boundary would bypass the
+        // store-owned candidate.
+        if prepared_session.is_none()
+            && let Some(tail) = inner.whole_blob_provisional_tails.get(&rid)
+            && !tail_admission.admits(&receipt.run_id, tail.authority.run_id())
+        {
             return Err(RuntimeStoreError::SessionPersistenceAuthorityConflict {
                 runtime_id: rid,
                 detail: "receipt-only boundary cannot bypass a store-owned WholeBlob candidate"
@@ -1781,6 +1788,26 @@ fn promote_whole_blob_provisional_locked(
     Ok(next)
 }
 
+/// A receipt-only boundary carries no session document that binds the
+/// runtime, so the session key it names must own the runtime, as the SQLite
+/// store requires of the same request. Refused before anything is written.
+fn require_receipt_only_session_key_owns_runtime(
+    runtime_id: &LogicalRuntimeId,
+    session_store_key: Option<&meerkat_core::types::SessionId>,
+) -> Result<(), RuntimeStoreError> {
+    if let Some(session_store_key) = session_store_key
+        && &LogicalRuntimeId::for_session(session_store_key) != runtime_id
+    {
+        return Err(RuntimeStoreError::SessionPersistenceAuthorityConflict {
+            runtime_id: runtime_id.to_string(),
+            detail: format!(
+                "receipt-only WholeBlob session key {session_store_key} does not own this runtime"
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn commit_prepared_whole_blob_snapshot_locked(
     inner: &mut Inner,
     runtime_id: &LogicalRuntimeId,
@@ -2102,12 +2129,38 @@ impl super::RuntimeSessionAuthorityOps for InMemoryRuntimeStore {
                     .as_ref()
                     .map(super::prepared_whole_blob_snapshot)
                     .transpose()?;
+                if prepared.is_none() {
+                    require_receipt_only_session_key_owns_runtime(
+                        runtime_id,
+                        session_store_key.as_ref(),
+                    )?;
+                }
                 self.atomic_apply_prepared_whole_blob(
                     runtime_id,
                     prepared,
                     receipt,
                     input_updates,
                     session_store_key,
+                    super::ReceiptOnlyTailAdmission::NoTail,
+                )
+                .await?
+            }
+            PreparedRuntimeSessionCommitPayload::RunCheckpoint {
+                receipt,
+                input_updates,
+                session_store_key,
+            } => {
+                require_receipt_only_session_key_owns_runtime(
+                    runtime_id,
+                    Some(&session_store_key),
+                )?;
+                self.atomic_apply_prepared_whole_blob(
+                    runtime_id,
+                    None,
+                    receipt,
+                    input_updates,
+                    Some(session_store_key),
+                    super::ReceiptOnlyTailAdmission::OwnRunTail,
                 )
                 .await?
             }
@@ -3201,6 +3254,7 @@ impl RuntimeStore for InMemoryRuntimeStore {
             receipt,
             input_updates,
             session_store_key,
+            super::ReceiptOnlyTailAdmission::NoTail,
         )
         .await
         .map(|_| ())
@@ -7754,6 +7808,267 @@ mod tests {
             .await
             .unwrap();
         (runtime_id, live, run_id, base, tail)
+    }
+
+    /// A mid-run checkpoint receipt of `run_id`: the owner-contribution
+    /// receipt of a steer delivered into the running turn.
+    fn mid_run_checkpoint_receipt(run_id: &RunId, sequence: u64) -> RunBoundaryReceipt {
+        RunBoundaryReceipt {
+            run_id: run_id.clone(),
+            boundary: RunApplyBoundary::RunCheckpoint,
+            contributing_input_ids: Vec::new(),
+            conversation_digest: None,
+            message_count: 0,
+            sequence,
+            owner_contributions: vec!["live-delegation-steer:continuation-1".to_string()],
+        }
+    }
+
+    /// A mid-run checkpoint request of `receipt` for `session_id`.
+    fn run_checkpoint_request(
+        receipt: RunBoundaryReceipt,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> super::super::PreparedRuntimeSessionCommit {
+        super::super::PreparedRuntimeSessionCommit::run_checkpoint(
+            receipt,
+            Vec::new(),
+            session_id.clone(),
+        )
+        .expect("a mid-run checkpoint receipt")
+    }
+
+    /// An ordinary receipt-only success request of `receipt` for `session_id`.
+    fn receipt_only_request(
+        receipt: RunBoundaryReceipt,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> super::super::PreparedRuntimeSessionCommit {
+        super::super::PreparedRuntimeSessionCommit::success(
+            None,
+            receipt,
+            Vec::new(),
+            Some(session_id.clone()),
+        )
+    }
+
+    /// Commit `request` beside the standing tail and expect the store to
+    /// refuse it with nothing written: no receipt, the same tail.
+    async fn assert_refused_beside_tail(
+        store: &InMemoryRuntimeStore,
+        runtime_id: &LogicalRuntimeId,
+        tail: &WholeBlobProvisionalTailAuthority,
+        request: super::super::PreparedRuntimeSessionCommit,
+    ) {
+        let receipt = request.receipt().cloned().expect("a receipt");
+        let error = store
+            .commit_prepared_session_boundary(runtime_id, request)
+            .await
+            .expect_err("this receipt-only boundary would bypass the candidate");
+        assert!(
+            matches!(
+                error,
+                RuntimeStoreError::SessionPersistenceAuthorityConflict { .. }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            store
+                .load_boundary_receipt(runtime_id, &receipt.run_id, receipt.sequence)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .load_whole_blob_provisional_tail(runtime_id)
+                .await
+                .unwrap()
+                .map(|loaded| loaded.authority().clone())
+                .as_ref(),
+            Some(tail)
+        );
+    }
+
+    /// A run's round commits leave its provisional tail standing until its
+    /// terminal boundary, so every checkpoint receipt the run commits before
+    /// that boundary commits beside the tail
+    /// (`PreparedRuntimeSessionCommit::run_checkpoint`): the owner-contribution
+    /// receipt of a steer delivered into the running turn, and the context
+    /// receipt of a steer input the turn took. They commit receipt-only and
+    /// leave the tail for the terminal promotion.
+    #[tokio::test]
+    async fn a_mid_run_receipt_commits_beside_its_runs_provisional_tail() {
+        let store = InMemoryRuntimeStore::new();
+        let (runtime_id, live, run_id, _base, tail) = rebase_run_with_tail(&store).await;
+        let owner = mid_run_checkpoint_receipt(&run_id, 1);
+        let mut input = mid_run_checkpoint_receipt(&run_id, 2);
+        input.owner_contributions.clear();
+        input.contributing_input_ids.push(InputId::new());
+        for receipt in [owner, input] {
+            assert_eq!(
+                store
+                    .commit_prepared_session_boundary(
+                        &runtime_id,
+                        run_checkpoint_request(receipt.clone(), live.id())
+                    )
+                    .await
+                    .expect("a mid-run receipt commits beside its run's tail"),
+                PreparedRuntimeSessionCommitResult::receipt_only(
+                    RuntimeSessionPersistenceProfile::WholeBlobV1
+                )
+            );
+            assert_eq!(
+                store
+                    .load_boundary_receipt(&runtime_id, &run_id, receipt.sequence)
+                    .await
+                    .unwrap(),
+                Some(receipt)
+            );
+        }
+        assert_eq!(
+            store
+                .load_whole_blob_provisional_tail(&runtime_id)
+                .await
+                .unwrap()
+                .map(|loaded| loaded.authority().clone()),
+            Some(tail),
+            "the tail stands for the run's terminal promotion"
+        );
+    }
+
+    /// The store admits a checkpoint beside a tail only for the tail's own
+    /// run: a checkpoint receipt of any other run is refused with nothing
+    /// written, whether or not that run ever committed here.
+    #[tokio::test]
+    async fn a_foreign_runs_checkpoint_never_commits_beside_a_tail() {
+        let store = InMemoryRuntimeStore::new();
+        let (runtime_id, live, _run_id, _base, tail) = rebase_run_with_tail(&store).await;
+        let foreign = mid_run_checkpoint_receipt(&RunId::new(), 1);
+        assert_refused_beside_tail(
+            &store,
+            &runtime_id,
+            &tail,
+            run_checkpoint_request(foreign, live.id()),
+        )
+        .await;
+    }
+
+    /// A receipt-only success (a run's end) never commits beside a standing
+    /// tail, even with the run's own checkpoint-shaped receipt: it would end
+    /// the run without promoting the candidate. A receipt that counts the
+    /// transcript is no mid-run checkpoint.
+    #[tokio::test]
+    async fn a_receipt_only_success_never_commits_beside_a_tail() {
+        let store = InMemoryRuntimeStore::new();
+        let (runtime_id, live, run_id, _base, tail) = rebase_run_with_tail(&store).await;
+        let mut terminal = mid_run_checkpoint_receipt(&run_id, 1);
+        terminal.owner_contributions.clear();
+        terminal.boundary = RunApplyBoundary::RunStart;
+        terminal.conversation_digest = Some(live.transcript_content_digest().unwrap());
+        terminal.message_count = live.messages().len();
+        assert!(
+            super::super::PreparedRuntimeSessionCommit::run_checkpoint(
+                terminal.clone(),
+                Vec::new(),
+                live.id().clone(),
+            )
+            .is_err(),
+            "a receipt that counts the transcript is no mid-run checkpoint"
+        );
+        for receipt in [terminal, mid_run_checkpoint_receipt(&run_id, 1)] {
+            assert_refused_beside_tail(
+                &store,
+                &runtime_id,
+                &tail,
+                receipt_only_request(receipt, live.id()),
+            )
+            .await;
+        }
+    }
+
+    /// A receipt-only request carries no session document that binds the
+    /// runtime, so the session key it names must own the runtime (the SQLite
+    /// store's rule): a receipt-only success or a run checkpoint naming
+    /// another session's key is refused, and neither its receipt nor its
+    /// input row is written. The owner's own key commits the same request.
+    #[tokio::test]
+    async fn a_receipt_only_request_for_a_runtime_its_session_key_does_not_own_writes_nothing() {
+        let store = InMemoryRuntimeStore::new();
+        let mut owner = meerkat_core::Session::new();
+        owner.push(meerkat_core::types::Message::User(
+            meerkat_core::types::UserMessage::text("the owner's session".to_string()),
+        ));
+        let runtime_id = LogicalRuntimeId::for_session(owner.id());
+        store
+            .commit_session_snapshot(
+                &runtime_id,
+                SerializedSessionSnapshot {
+                    session_snapshot: serde_json::to_vec(&owner).unwrap().into(),
+                },
+            )
+            .await
+            .unwrap();
+        let stranger = meerkat_core::types::SessionId::new();
+        let run_id = RunId::new();
+        let input = InputStatePersistenceRecord::from_machine_snapshot(
+            StoredInputState::new_accepted(InputId::new()),
+        )
+        .expect("machine snapshot");
+        let receipt_only = |key: &meerkat_core::types::SessionId| {
+            super::super::PreparedRuntimeSessionCommit::success(
+                None,
+                mid_run_checkpoint_receipt(&run_id, 1),
+                vec![input.clone()],
+                Some(key.clone()),
+            )
+        };
+        let run_checkpoint = |key: &meerkat_core::types::SessionId| {
+            super::super::PreparedRuntimeSessionCommit::run_checkpoint(
+                mid_run_checkpoint_receipt(&run_id, 1),
+                vec![input.clone()],
+                key.clone(),
+            )
+            .expect("a mid-run checkpoint receipt")
+        };
+        for request in [receipt_only(&stranger), run_checkpoint(&stranger)] {
+            let error = store
+                .commit_prepared_session_boundary(&runtime_id, request)
+                .await
+                .expect_err("a session key that does not own the runtime is refused");
+            assert!(
+                matches!(
+                    error,
+                    RuntimeStoreError::SessionPersistenceAuthorityConflict { .. }
+                ),
+                "{error:?}"
+            );
+            assert_eq!(
+                store
+                    .load_boundary_receipt(&runtime_id, &run_id, 1)
+                    .await
+                    .unwrap(),
+                None
+            );
+            assert!(
+                store
+                    .load_input_states(&runtime_id)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "no input row is written"
+            );
+        }
+        store
+            .commit_prepared_session_boundary(&runtime_id, receipt_only(owner.id()))
+            .await
+            .expect("the owner's key commits the same request");
+        assert!(
+            store
+                .load_boundary_receipt(&runtime_id, &run_id, 1)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(store.load_input_states(&runtime_id).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

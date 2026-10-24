@@ -1130,6 +1130,30 @@ impl PreparedWholeBlobProvisionalPromotion {
     }
 }
 
+/// Which standing WholeBlob provisional tail a receipt-only boundary may
+/// commit beside.
+///
+/// A run's round commits keep its provisional tail standing from its first
+/// tool round until its terminal boundary promotes it. A mid-run checkpoint
+/// receipt of that run ([`PreparedRuntimeSessionCommit::run_checkpoint`])
+/// commits beside it; any other receipt-only boundary beside a store-owned
+/// candidate would end a run without promoting the candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReceiptOnlyTailAdmission {
+    /// Beside no tail: an ordinary receipt-only boundary.
+    NoTail,
+    /// Beside a tail of the receipt's own run: a mid-run checkpoint receipt.
+    OwnRunTail,
+}
+
+impl ReceiptOnlyTailAdmission {
+    /// Whether a receipt-only boundary of `receipt_run` commits beside a
+    /// standing tail of `tail_run`.
+    pub(crate) fn admits(self, receipt_run: &RunId, tail_run: &RunId) -> bool {
+        self == Self::OwnRunTail && receipt_run == tail_run
+    }
+}
+
 /// Exact WholeBlob recovery action bound to one store-owned provisional row.
 ///
 /// A completed candidate carries no body: the store promotes its existing
@@ -4770,6 +4794,11 @@ pub(crate) enum PreparedRuntimeSessionCommitPayload {
         input_updates: Vec<InputStatePersistenceRecord>,
         session_store_key: Option<meerkat_core::types::SessionId>,
     },
+    RunCheckpoint {
+        receipt: RunBoundaryReceipt,
+        input_updates: Vec<InputStatePersistenceRecord>,
+        session_store_key: meerkat_core::types::SessionId,
+    },
     PromoteWholeBlobSuccess {
         promotion: PreparedWholeBlobProvisionalPromotion,
         receipt: RunBoundaryReceipt,
@@ -4943,6 +4972,52 @@ impl PreparedRuntimeSessionCommit {
                 session_store_key,
             },
         }
+    }
+
+    /// Prepare a mid-run checkpoint receipt of the running run, committed
+    /// receipt-only: the context receipt of a request-only steer the running
+    /// turn took at a model boundary, the owner-contribution receipt of a
+    /// context delivered into the turn (a live delegation's continuation of
+    /// the user's sentence), or the consumption receipt of a durable join the
+    /// run retained.
+    ///
+    /// The run's round commits keep its provisional tail standing from its
+    /// first tool round until its terminal boundary promotes it, so a
+    /// WholeBlob store commits this receipt beside a tail of the receipt's own
+    /// run, never beside another run's tail. A receipt-only [`Self::success`]
+    /// commits beside no WholeBlob tail: it would end a run without promoting
+    /// the candidate. The receipt must have the machine's checkpoint shape
+    /// (`RunApplyBoundary::RunCheckpoint`, no transcript count, no digest), so
+    /// it claims nothing of the session the tail holds.
+    ///
+    /// Crate-private: only the runtime driver, which commits the receipts the
+    /// generated machine mints for the running run, states that a receipt is
+    /// a mid-run checkpoint. A store holder outside the crate cannot mint one
+    /// for a run and commit it beside that run's tail.
+    pub(crate) fn run_checkpoint(
+        receipt: RunBoundaryReceipt,
+        input_updates: Vec<InputStatePersistenceRecord>,
+        session_store_key: meerkat_core::types::SessionId,
+    ) -> Result<Self, RuntimeStoreError> {
+        if receipt.boundary
+            != meerkat_core::lifecycle::run_primitive::RunApplyBoundary::RunCheckpoint
+            || receipt.conversation_digest.is_some()
+            || receipt.message_count != 0
+        {
+            return Err(RuntimeStoreError::SessionPersistenceAuthorityConflict {
+                runtime_id: session_store_key.to_string(),
+                detail: "a mid-run checkpoint receipt must be a run checkpoint that counts no \
+                         transcript rows"
+                    .to_string(),
+            });
+        }
+        Ok(Self {
+            payload: PreparedRuntimeSessionCommitPayload::RunCheckpoint {
+                receipt,
+                input_updates,
+                session_store_key,
+            },
+        })
     }
 
     /// Prepare a successful final boundary that promotes an already-written
@@ -5190,6 +5265,7 @@ impl PreparedRuntimeSessionCommit {
                 PreparedRuntimeSessionCommitKind::SnapshotOnly
             }
             PreparedRuntimeSessionCommitPayload::Success { .. }
+            | PreparedRuntimeSessionCommitPayload::RunCheckpoint { .. }
             | PreparedRuntimeSessionCommitPayload::PromoteWholeBlobSuccess { .. }
             | PreparedRuntimeSessionCommitPayload::PromoteHeadCanonicalSuccess { .. } => {
                 PreparedRuntimeSessionCommitKind::Success
@@ -5220,6 +5296,7 @@ impl PreparedRuntimeSessionCommit {
             | PreparedRuntimeSessionCommitPayload::MachineTerminal { session, .. }
             | PreparedRuntimeSessionCommitPayload::Recovery { session, .. } => Some(session),
             PreparedRuntimeSessionCommitPayload::Success { session, .. } => session.as_ref(),
+            PreparedRuntimeSessionCommitPayload::RunCheckpoint { .. } => None,
             PreparedRuntimeSessionCommitPayload::PromoteWholeBlobSuccess { .. }
             | PreparedRuntimeSessionCommitPayload::PromoteWholeBlobServiceTurnTerminal { .. }
             | PreparedRuntimeSessionCommitPayload::PromoteWholeBlobMachineTerminal { .. }
@@ -5257,6 +5334,7 @@ impl PreparedRuntimeSessionCommit {
         match &self.payload {
             PreparedRuntimeSessionCommitPayload::SnapshotOnly { .. } => None,
             PreparedRuntimeSessionCommitPayload::Success { receipt, .. }
+            | PreparedRuntimeSessionCommitPayload::RunCheckpoint { receipt, .. }
             | PreparedRuntimeSessionCommitPayload::PromoteWholeBlobSuccess { receipt, .. }
             | PreparedRuntimeSessionCommitPayload::PromoteHeadCanonicalSuccess {
                 receipt, ..
@@ -5297,6 +5375,7 @@ impl PreparedRuntimeSessionCommit {
                 ..
             } => Some(&[]),
             PreparedRuntimeSessionCommitPayload::Success { input_updates, .. }
+            | PreparedRuntimeSessionCommitPayload::RunCheckpoint { input_updates, .. }
             | PreparedRuntimeSessionCommitPayload::PromoteWholeBlobSuccess {
                 input_updates, ..
             }
@@ -5328,7 +5407,10 @@ impl PreparedRuntimeSessionCommit {
             PreparedRuntimeSessionCommitPayload::Success {
                 session_store_key, ..
             } => session_store_key.as_ref(),
-            PreparedRuntimeSessionCommitPayload::PromoteWholeBlobSuccess {
+            PreparedRuntimeSessionCommitPayload::RunCheckpoint {
+                session_store_key, ..
+            }
+            | PreparedRuntimeSessionCommitPayload::PromoteWholeBlobSuccess {
                 session_store_key,
                 ..
             }
@@ -5403,6 +5485,7 @@ impl PreparedRuntimeSessionCommit {
             } => Some(machine_lifecycle),
             PreparedRuntimeSessionCommitPayload::SnapshotOnly { .. }
             | PreparedRuntimeSessionCommitPayload::Success { .. }
+            | PreparedRuntimeSessionCommitPayload::RunCheckpoint { .. }
             | PreparedRuntimeSessionCommitPayload::PromoteWholeBlobSuccess { .. }
             | PreparedRuntimeSessionCommitPayload::PromoteHeadCanonicalSuccess { .. } => None,
         }

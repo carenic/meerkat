@@ -1141,6 +1141,16 @@ them.
     tail: a cancel puts it back in its queue, and it runs once after the run.
     `Budget::resume_turn` and `Budget::turn_elapsed` carry the turn horizon
     across a resume.
+  - The round commits keep a run's provisional tail standing until its
+    terminal boundary promotes it, so a run's mid-run checkpoint receipts
+    commit beside that tail: the receipt of a context delivered into the
+    running turn after its first tool round (a request-only steer, or a live
+    delegation's continuation of the user's sentence), and the consumption
+    receipt of a durable join a failed or cancelled run's image keeps. Only
+    the runtime commits a receipt as such a checkpoint, and only one that
+    counts no transcript rows. A WholeBlob store still refuses every other
+    receipt-only boundary, and another run's checkpoint, while a tail
+    stands.
   - A WholeBlob session is recovered only from a strict continuation of its
     committed transcript, which a compaction breaks. So a WholeBlob run's
     first round commit after a compaction is a re-base: one store call commits

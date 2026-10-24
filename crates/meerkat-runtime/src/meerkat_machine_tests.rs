@@ -36971,7 +36971,26 @@ async fn persistent_staged_run_driver(
     // registration path, so use the UUID session alias as the contract-owned
     // session identity. Failed-but-applied validation intentionally rejects
     // opaque/non-session owner strings.
-    let runtime_id = LogicalRuntimeId::legacy_session_uuid_alias(&SessionId::new());
+    persistent_staged_run_driver_on(
+        LogicalRuntimeId::legacy_session_uuid_alias(&SessionId::new()),
+        store,
+    )
+    .await
+}
+
+/// [`persistent_staged_run_driver`] on the session's canonical runtime id. A
+/// store commits a receipt-only boundary only under a session key that owns
+/// its runtime, so the rows that commit one stage their run here.
+async fn persistent_staged_run_driver_for_session(
+    store: Arc<dyn RuntimeStore>,
+) -> (SharedDriver, LogicalRuntimeId, RunId, InputId) {
+    persistent_staged_run_driver_on(LogicalRuntimeId::for_session(&SessionId::new()), store).await
+}
+
+async fn persistent_staged_run_driver_on(
+    runtime_id: LogicalRuntimeId,
+    store: Arc<dyn RuntimeStore>,
+) -> (SharedDriver, LogicalRuntimeId, RunId, InputId) {
     let mut driver = PersistentRuntimeDriver::new(runtime_id.clone(), store, memory_blob_store());
     let input = make_prompt("persistent terminalization");
     let input_id = input.id().clone();
@@ -37573,8 +37592,9 @@ async fn persistent_commit_success_persists_receipt_and_terminalizes_once() {
 async fn terminal_receipt_follows_live_boundary_checkpoint_without_sequence_collision() {
     let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
     let store: Arc<dyn RuntimeStore> = inner.clone();
-    let (driver, runtime_id, run_id, input_id) = persistent_staged_run_driver(store).await;
-    let owner_session_id = SessionId::parse(&runtime_id.to_string()).unwrap();
+    let (driver, runtime_id, run_id, input_id) =
+        persistent_staged_run_driver_for_session(store).await;
+    let owner_session_id = runtime_id.session_id().unwrap();
 
     let live_input = Input::Prompt(crate::input::PromptInput::new(
         "context admitted at the active boundary",
@@ -37665,8 +37685,9 @@ async fn terminal_receipt_follows_live_boundary_checkpoint_without_sequence_coll
 async fn mid_run_receipts_carry_no_transcript_count_or_digest() {
     let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
     let store: Arc<dyn RuntimeStore> = inner.clone();
-    let (driver, runtime_id, run_id, input_id) = persistent_staged_run_driver(store).await;
-    let owner_session_id = SessionId::parse(&runtime_id.to_string()).unwrap();
+    let (driver, runtime_id, run_id, input_id) =
+        persistent_staged_run_driver_for_session(store).await;
+    let owner_session_id = runtime_id.session_id().unwrap();
 
     let live_input = Input::Prompt(crate::input::PromptInput::new(
         "context admitted at the active boundary",
