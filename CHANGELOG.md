@@ -2221,11 +2221,7 @@ them.
     filter, MCP intents, mob authority context, tool application) check the
     archive without reading the session, and land after the run. A read of a
     hosted session whose turn stopped before its boundary commit settles the
-    tail that turn left, as a restart would. A strict read
-    (`PersistentSessionService::load_authoritative_session`) settles a tail
-    such a read deferred while a runtime loop lap held the session's turn
-    boundary, waiting up to one second for that boundary, also after the live
-    actor is gone.
+    tail that turn left, as a restart would.
 
 - `meerkat-mob`: `MobSessionService::load_persisted_session_tolerating_tail`,
   the same read for mob code. Its default is the strict
@@ -2256,6 +2252,13 @@ them.
   `SessionError::DurableTailRecoveryRefused` instead of an internal error, so
   a caller can tell a session withheld for reconciliation from a fault. The
   tail and every durable row are kept, as before.
+- `meerkat-session`: `PersistentSessionService::load_authoritative_session`
+  may settle a provisional tail an observation deferred while a runtime loop
+  lap held the session's turn-finalization boundary, also after the live
+  actor is gone, waiting up to one second for that boundary. Its counted
+  retries still add no wait on the boundary, and every other conflict
+  surfaces unchanged; a caller that holds the boundary itself waits out the
+  second and gets the conflict.
 - `meerkat-session`: `PersistentSessionService::prepare_cold_attach` (and
   `prepare_cold_attach_reporting`) settle a provisional tail only between
   runtime loop laps. Once a tail stands they wait up to one second for the

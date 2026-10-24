@@ -19497,6 +19497,12 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// under the session's turn-finalization boundary and this owner's claim
     /// (see `settle_deferred_ended_tail_for_strict_read`).
     ///
+    /// The settle commits only between runtime loop laps: once a tail stands
+    /// it waits, at most one second, for the session's turn-finalization
+    /// boundary, and a lap that holds it longer leaves the tail, which the
+    /// caller's committed read then refuses. A caller that holds that boundary
+    /// itself uses [`Self::prepare_cold_attach_under_runtime_turn_boundary`].
+    ///
     /// Apart from that refusal it never fails the caller's attach on its own
     /// account: a tail it cannot observe or resolve (held, refused, or an
     /// error) is logged, and the caller's committed read then surfaces the
