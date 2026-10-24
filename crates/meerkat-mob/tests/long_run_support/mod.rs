@@ -975,15 +975,20 @@ impl DispatchLog {
     }
 
     fn record(&self, key: &ToolCallDedupeKey) {
-        self.keys.lock().unwrap().push(key.clone());
+        let mut keys = self.keys.lock().unwrap();
+        keys.push(key.clone());
         if let Some(file) = &self.file {
             use std::io::Write as _;
-            let mut file = std::fs::OpenOptions::new()
+            // The calls of a round record concurrently: each line goes out
+            // whole in one write, so two keys never share a line.
+            let mut line = serde_json::to_string(key).expect("encode key");
+            line.push('\n');
+            std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(file)
-                .expect("open the dispatch log");
-            writeln!(file, "{}", serde_json::to_string(key).expect("encode key"))
+                .expect("open the dispatch log")
+                .write_all(line.as_bytes())
                 .expect("append the dispatch log");
         }
     }
