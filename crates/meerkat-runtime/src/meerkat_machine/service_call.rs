@@ -136,7 +136,16 @@ impl ServiceCall {
     /// failure there cannot undo the call, so it is reported beside the
     /// call's result ([`ServiceCallOutcome::audit`]). After any failed
     /// append this `ServiceCall` refuses every later call the same way: its
-    /// log would have a gap. The occurrence can prepare a new request.
+    /// log would have a gap. So does a call dropped while one of its appends
+    /// is in the store, since whether that append landed is unknown. The
+    /// occurrence can prepare a new request.
+    ///
+    /// A call whose rows end at its entry, with no outcome row, entered its
+    /// dispatcher and was then dropped, or its `ServiceCall` was dropped or
+    /// its process stopped, before its outcome was appended (or that append
+    /// failed): its outcome is unknown and it may have taken effect, the
+    /// meaning `ToolError::OutcomeUncertain` gives an interrupted run's
+    /// call. Nothing is appended for it later.
     ///
     /// Calls on one `ServiceCall` append one at a time: a call waits for an
     /// append in progress, so that its own decision is durable before it
@@ -283,8 +292,9 @@ impl NativeServiceCallAudit {
 /// Whether a service call may still append to its audit log.
 enum FlushState {
     Open,
-    /// An append failed: the log would have a gap, so nothing more is
-    /// appended and every later call is refused before it is sent.
+    /// An append failed, or a call was dropped while its append was in the
+    /// store: the log would have a gap (or may), so nothing more is appended
+    /// and every later call is refused before it is sent.
     Spent,
 }
 
@@ -320,16 +330,21 @@ impl ServiceCallAuditLog {
         if observations.is_empty() {
             return Ok(());
         }
+        // Spent until the store answers. A call dropped while the store
+        // appends (the SQLite append goes on in its blocking task) leaves the
+        // log spent: whether that append landed is unknown, so nothing more
+        // is appended and every later call is refused before it is sent.
+        *state = FlushState::Spent;
         match self
             .store
             .append_service_call_audit(ServiceCallAuditBatch::new(self.key.clone(), observations))
             .await
         {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                *state = FlushState::Spent;
-                Err(error.into())
+            Ok(()) => {
+                *state = FlushState::Open;
+                Ok(())
             }
+            Err(error) => Err(error.into()),
         }
     }
 }

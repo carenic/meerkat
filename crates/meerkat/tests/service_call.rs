@@ -2055,6 +2055,53 @@ async fn a_failed_append_after_the_call_is_reported_beside_its_result() {
     assert_eq!(host.calls().len(), 1, "nothing more was sent");
 }
 
+/// A call dropped while its decision's append is in the store spends its
+/// `ServiceCall`: whether that append lands is unknown, so every later call
+/// is refused before it is sent, and nothing reaches the server.
+#[tokio::test]
+async fn a_call_dropped_during_its_append_spends_its_service_call() {
+    let host = Host::new().await;
+    let mail = host.mail_router().await;
+    let call = host.admitted();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    host.store.block_next_service_call_audit_append_for_test(
+        call.audit_key().clone(),
+        Arc::clone(&entered),
+        Arc::clone(&release),
+    );
+    {
+        let dropped = dispatch_outcome(&call, &mail, "list_messages");
+        tokio::pin!(dropped);
+        tokio::select! {
+            () = entered.notified() => {}
+            outcome = &mut dropped => {
+                panic!("the call settled while its append was blocked: {:?}", outcome.result)
+            }
+        }
+        // Dropped here, while its append waits in the store.
+    }
+    // Nothing waits on the block any more.
+    release.notify_one();
+
+    let next = dispatch_outcome(&call, &mail, "list_messages").await;
+    assert!(
+        matches!(next.result, Err(ToolError::OperationObservationUnavailable)),
+        "{:?}",
+        next.result
+    );
+    assert!(
+        matches!(next.audit, Err(ServiceCallAuditError::Spent)),
+        "{:?}",
+        next.audit
+    );
+    assert!(host.calls().is_empty(), "nothing was sent");
+    assert!(
+        host.audit(call.audit_key()).await.is_empty(),
+        "the dropped append wrote nothing"
+    );
+}
+
 /// The protected read gives back every observation of an occurrence in the
 /// order it was appended, each with its store-assigned sequence: a sent
 /// call's decision, entry and outcome, then a refused call's refusal. Each
