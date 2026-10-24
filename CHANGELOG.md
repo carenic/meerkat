@@ -2169,9 +2169,26 @@ them.
 - `MeerkatMachine::session_input_states` exposes the existing strict input
   witness observation through the selected machine. It includes pending and
   terminal rows, fails on corrupt durable rows, and reads unregistered sessions
-  without restoring them. It does not fence ingress or establish settlement;
-  hosts must separately establish the close boundary and inspect each input's
-  canonical terminal receipt.
+  without restoring them. Each row is released as the public row read
+  releases it: a scoped run result or callback arguments come out only to the
+  reader the input's destination permits. It does not fence ingress or
+  establish settlement; hosts must separately establish the close boundary
+  and inspect each input's canonical terminal receipt.
+
+- `MeerkatMachine::input_terminal_receipt_observation` proves an input's
+  terminal without its outcome. It resolves, loads and natively validates the
+  input's terminal-completion batch exactly as `input_terminal_receipt` does,
+  and answers an `InputTerminalReceiptObservation`: `Pending`,
+  `TerminalWithoutReceipt`, or `Finalized` with an
+  `InputTerminalReceiptSummary` (the input, its terminal and attempts, the
+  batch's scope, owner and recipients, and the outcome's `CompletionClass`).
+  `CompletionOutcome::class` gives the class; one `CallbackPending` class
+  covers one pending call or several. The observation carries no run result,
+  callback call or failure text, so it answers whatever the reader's
+  destination: a host proves a scoped cohort's completion after its
+  unregister, where `input_terminal_receipt` keeps refusing the result
+  (`ScopedResultWithheld`). Batch corruption, a store that cannot load the
+  batch and selector resolution answer as for the receipt. Additive.
 
 - `meerkat-mob`: role-targeted flow runs, so several runs can share one mob
   and one role while each dispatches only to its own members.

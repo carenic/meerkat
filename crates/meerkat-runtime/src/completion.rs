@@ -181,6 +181,43 @@ impl CompletionWaitError {
     }
 }
 
+/// The body-free class of a [`CompletionOutcome`]: which closed outcome a
+/// terminal batch finalized, without its result, callback calls or failure
+/// text ([`CompletionOutcome::class`]).
+///
+/// A class is a lifecycle fact. It carries nothing that scoped disclosure
+/// withholds: no run result, no tool name, call id or arguments, and not how
+/// many callbacks are pending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum CompletionClass {
+    /// The input was consumed and produced a result
+    /// ([`CompletionOutcome::Completed`]).
+    Completed,
+    /// The input was consumed and produced no result
+    /// ([`CompletionOutcome::CompletedWithoutResult`]).
+    CompletedWithoutResult,
+    /// The run waits on external callback fulfillment: one call or several
+    /// ([`CompletionOutcome::CallbackPending`],
+    /// [`CompletionOutcome::CallbackBatchPending`]).
+    CallbackPending,
+    /// The input reached the cancellation terminal
+    /// ([`CompletionOutcome::Cancelled`]).
+    Cancelled,
+    /// The input was abandoned before completing
+    /// ([`CompletionOutcome::Abandoned`]).
+    Abandoned,
+    /// The execution attempt ended with a typed failure
+    /// ([`CompletionOutcome::AbandonedWithError`]).
+    AbandonedWithError,
+    /// The turn produced output but its durable finalization failed
+    /// ([`CompletionOutcome::CompletedWithFinalizationFailure`]).
+    CompletedWithFinalizationFailure,
+    /// The runtime was stopped or destroyed while the input was pending
+    /// ([`CompletionOutcome::RuntimeTerminated`]).
+    RuntimeTerminated,
+}
+
 /// Outcome delivered to a completion waiter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "completion_type", rename_all = "snake_case")]
@@ -914,6 +951,26 @@ impl CompletionOutcome {
             self,
             Self::Completed(_) | Self::CallbackPending { .. } | Self::CallbackBatchPending { .. }
         )
+    }
+
+    /// This outcome's body-free class: what it finalized, without its
+    /// result, callback calls or failure text.
+    #[must_use]
+    pub const fn class(&self) -> CompletionClass {
+        match self {
+            Self::Completed(_) => CompletionClass::Completed,
+            Self::CompletedWithoutResult => CompletionClass::CompletedWithoutResult,
+            Self::CallbackPending { .. } | Self::CallbackBatchPending { .. } => {
+                CompletionClass::CallbackPending
+            }
+            Self::Cancelled => CompletionClass::Cancelled,
+            Self::Abandoned { .. } => CompletionClass::Abandoned,
+            Self::AbandonedWithError { .. } => CompletionClass::AbandonedWithError,
+            Self::CompletedWithFinalizationFailure { .. } => {
+                CompletionClass::CompletedWithFinalizationFailure
+            }
+            Self::RuntimeTerminated { .. } => CompletionClass::RuntimeTerminated,
+        }
     }
 
     /// Mint a [`RuntimeTerminated`](Self::RuntimeTerminated) outcome from a

@@ -565,7 +565,8 @@ pub use coalescing::{
     create_aggregate_input, is_coalescing_eligible,
 };
 pub use completion::{
-    CompletionCleanupObservation, CompletionHandle, CompletionOutcome, CompletionWaitError,
+    CompletionClass, CompletionCleanupObservation, CompletionHandle, CompletionOutcome,
+    CompletionWaitError,
 };
 pub use delivery_inbox::{
     ContinuationKeyClaim, KeyedSubmitOutcome, RuntimeDeliveryAcknowledgement, RuntimeDeliveryError,

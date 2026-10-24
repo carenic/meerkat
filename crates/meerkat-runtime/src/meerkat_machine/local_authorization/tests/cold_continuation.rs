@@ -34,7 +34,10 @@ use crate::meerkat_machine::{
 };
 use crate::service_ext::SessionServiceRuntimeExt;
 use crate::store::{InMemoryRuntimeStore, RuntimeStore};
-use crate::terminal_status::{InputTerminalReceiptRead, InputTerminalReceiptWait};
+use crate::terminal_status::{
+    InputTerminalReceiptObservation, InputTerminalReceiptRead, InputTerminalReceiptSummary,
+    InputTerminalReceiptWait, InteractionSelector, TerminalWitnessSource,
+};
 use crate::traits::{ControllerReadinessFailure, RuntimeControlPlane};
 use meerkat_auth_core::auth_store::EphemeralTokenStore;
 use meerkat_authorization_contracts::work_association::{
@@ -2538,4 +2541,153 @@ async fn scoped_callback_arguments_never_come_out_of_the_census_after_the_unregi
         scoped_census("no result", Some("census-argument-marker")).await,
         "census-argument-marker",
     );
+}
+
+/// A scoped input's completion is proven without its result after the
+/// unregister: the payload readers keep refusing the result
+/// (`ScopedResultWithheld`), while the body-free receipt observation reports
+/// the exact validated identities and class, on the unregistered machine and
+/// on a machine reopened over the same store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scoped_completion_is_observed_without_its_result_after_the_unregister() {
+    let (configuration, template, _account, _publication) = mutable_controller_configuration(true);
+    let claims = template
+        .header()
+        .authority_association
+        .as_ref()
+        .expect("claims")
+        .candidate()
+        .clone();
+    let selection = claims.controller_model.clone().expect("controller");
+    let owners = HostOwners {
+        grants: Arc::clone(&configuration.grants),
+        ingress_domain: claims.ingress_namespace.ingress.clone(),
+        custody: Arc::default(),
+        policy: Arc::new(Policy {
+            requester: claims.requester.clone(),
+            executor: claims.logical_executor.clone(),
+        }),
+        controllers: Arc::default(),
+        operation_owner: Arc::clone(&configuration.operation_owner),
+    };
+    drop(configuration);
+    let store = InMemoryRuntimeStore::new();
+    let blobs = Arc::new(MemoryBlobStore::new());
+    let session = SessionId::new();
+    let runtime = LogicalRuntimeId::for_session(&session);
+
+    let machine = open(&store, &blobs, &owners).await;
+    let (_effects, mut applied) = attach(&machine, &session, "observed-result-marker").await;
+    install_credential(&machine, &EphemeralTokenStore::new(), &selection).await;
+    let original = original_prompt(&template, &runtime);
+    owners.custody.hold(&original);
+    bind_destination(&machine, &session, &original).await;
+    let original_id = original.id().clone();
+    machine
+        .ingest(&runtime, original)
+        .await
+        .expect("governed original admitted");
+    let entered = next_apply(&mut applied, "original").await;
+    assert_eq!(
+        completed_text(&machine, &session, &original_id).await,
+        "observed-result-marker",
+        "the result is released while its destination is current"
+    );
+    let selector = || InteractionSelector::InputId(original_id.clone());
+    let summary = |observation: &InputTerminalReceiptObservation| -> InputTerminalReceiptSummary {
+        match observation {
+            InputTerminalReceiptObservation::Finalized(summary) => (**summary).clone(),
+            other => panic!("expected a finalized observation, got {other:?}"),
+        }
+    };
+    let live = machine
+        .input_terminal_receipt_observation(&session, selector())
+        .await
+        .expect("observation")
+        .expect("known input");
+    let live_summary = summary(&live.report);
+    assert_eq!(live_summary.input_id(), &original_id);
+    assert_eq!(live_summary.owner_input_id(), &original_id);
+    assert_eq!(
+        live_summary.recipient_input_ids(),
+        std::slice::from_ref(&original_id)
+    );
+    assert_eq!(live_summary.run_id(), Some(&entered.run));
+    assert_eq!(
+        live_summary.terminal(),
+        &crate::input_state::InputTerminalOutcome::Consumed
+    );
+    assert_eq!(
+        live_summary.class(),
+        crate::completion::CompletionClass::Completed
+    );
+
+    let registration = machine
+        .current_session_registration_witness(&session)
+        .await
+        .expect("current registration");
+    assert!(
+        machine
+            .unregister_session_registration_until_terminal_if_current(&registration)
+            .await
+            .expect("the unregister joins its teardown"),
+        "the current registration unregistered"
+    );
+    let withheld_and_observed = async |machine: &MeerkatMachine, when: &str| {
+        let withheld = |read: Result<(), RuntimeDriverError>| {
+            matches!(
+                read,
+                Err(RuntimeDriverError::ScopedResultWithheld { ref input_id })
+                    if input_id == &original_id
+            )
+        };
+        assert!(
+            withheld(
+                machine
+                    .input_terminal_receipt(&session, selector())
+                    .await
+                    .map(drop)
+            ),
+            "{when}: the receipt read keeps withholding"
+        );
+        assert!(
+            withheld(
+                machine
+                    .input_terminal_completion(&session, &original_id)
+                    .await
+                    .map(drop)
+            ),
+            "{when}: the completion read keeps withholding"
+        );
+        assert!(
+            withheld(
+                machine
+                    .wait_input_terminal_receipt(&session, &original_id)
+                    .await
+                    .map(drop)
+            ),
+            "{when}: the receipt wait keeps withholding"
+        );
+        let observed = machine
+            .input_terminal_receipt_observation(&session, selector())
+            .await
+            .expect("the observation answers without a destination")
+            .expect("known input");
+        assert_eq!(
+            observed.source,
+            TerminalWitnessSource::DurableStore,
+            "{when}"
+        );
+        assert_eq!(summary(&observed.report), live_summary, "{when}");
+        let text = format!("{observed:?}");
+        assert!(
+            !text.contains("observed-result-marker"),
+            "{when}: no result in {text}"
+        );
+    };
+    withheld_and_observed(&machine, "after the unregister").await;
+    drop(applied);
+    drop(machine);
+    let reopened = open(&store, &blobs, &owners).await;
+    withheld_and_observed(&reopened, "after a reopen").await;
 }
