@@ -19119,10 +19119,15 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// the typed conflict for a session another process may still be
     /// committing.
     ///
-    /// Apart from that refusal it never fails the caller's attach on its own
-    /// account: a tail it cannot observe or resolve (held, refused, or an
-    /// error) is logged, and the caller's committed read then surfaces the
-    /// original conflict.
+    /// A tail the recovery withholds from resume (held for recovery or
+    /// refused by recovery) refuses the attach with its typed hold
+    /// ([`SessionError::DurableTailHeldForRecovery`] or
+    /// [`SessionError::DurableTailRecoveryRefused`]). Nothing is written: the
+    /// tail, the run's mark and every input stay as the store holds them, for
+    /// reconciliation. Apart from these refusals it never fails the caller's
+    /// attach on its own account: a tail it cannot observe or prove (or a
+    /// recovery that errs) is logged, and the caller's committed read then
+    /// surfaces the original conflict.
     ///
     /// The caller proves the hosting claim by handing it over: take it with
     /// [`Self::grant_session_hosting`] (which refuses a session another
@@ -19208,13 +19213,24 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             Ok(ResumeBoundaryRecovery::Continue(seed)) => {
                 return Ok(self.continued_run_cold_attach(id, seed.run_id).await);
             }
-            Ok(
-                ResumeBoundaryRecovery::Settled(
-                    CommittedBoundaryRecovery::Unprovable { reason },
-                    _,
-                )
-                | ResumeBoundaryRecovery::Withheld { reason, .. },
-            ) => {
+            // The recovery withholds the tail from resume: it wrote nothing,
+            // so the tail, the run's mark and every input stay for
+            // reconciliation, and the attach refuses with the typed hold
+            // instead of letting the caller's committed read meet the tail as
+            // an untyped revision conflict.
+            Ok(ResumeBoundaryRecovery::Withheld { hold, reason }) => {
+                tracing::warn!(
+                    session_id = %id,
+                    %hold,
+                    reason,
+                    "the session's durable tail is withheld from resume; the cold attach refuses typed"
+                );
+                return Err(hold.session_error(id.clone()));
+            }
+            Ok(ResumeBoundaryRecovery::Settled(
+                CommittedBoundaryRecovery::Unprovable { reason },
+                _,
+            )) => {
                 tracing::warn!(
                     session_id = %id,
                     reason,

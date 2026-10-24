@@ -720,6 +720,12 @@ them.
   details }` (`409` `SESSION_NOT_RUNNING`), appended last. The enum is
   exhaustive, so a `match` outside the crate needs the arm.
 
+- `meerkat-rest`: `ApiError` gains `SessionDurableHold { message, code,
+  details }` (`409` with the durable hold's session error code, such as
+  `SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY`, and its `durable_resume_hold`
+  payload), appended last. The enum is exhaustive, so a `match` outside the
+  crate needs the arm.
+
 - Behaviour-only (not measured by the gate): `meerkat-runtime`: a graceful
   stop that requeues (`UnregisterQueuedInputs::Requeue`, for example a
   deploy) now suspends a durable session's in-flight run instead
@@ -2206,6 +2212,27 @@ them.
   member stays attached and serving. Build the mob over the persistent
   session service to adopt its members: a mob in any realm, `memory`
   included, can.
+
+- `meerkat-session`, `meerkat-runtime`, `meerkat-rest`, `meerkat-mcp-server`:
+  a start or attach of a HeadCanonical session whose durable tail its
+  recovery withholds from resume (held for recovery or refused by recovery)
+  now refuses with that typed hold (`SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY`
+  or `SESSION_DURABLE_TAIL_RECOVERY_REFUSED`, with the `durable_resume_hold`
+  payload) before it reads the session.
+  `PersistentSessionService::prepare_cold_attach` logged the hold and let the
+  caller's committed read meet the tail, so a JSON-RPC `turn/start` answered
+  `SESSION_STORE_ERROR` ("rewrite rejected: previous transcript revision ...
+  did not match commit parent"), REST `500`, and the MCP server's
+  `meerkat_resume` an internal error (shipped in 0.9.4:
+  `crates/meerkat-session/src/persistent.rs:16504-16510` at v0.9.4). Nothing
+  is written: the tail and the session's inputs stay for reconciliation. REST
+  carries the hold through its attach path as the new
+  `RuntimeDriverError::DurableResumeHeld` (an additive variant of the
+  `#[non_exhaustive]` enum, with `durable_hold_session_error()`) and answers
+  `409` with the hold's code and payload (`ApiError::SessionDurableHold`,
+  under Breaking); `DurableResumeHold::session_error`
+  builds the typed error from a hold. A mob member restore answers
+  `MemberDurableTailUnprovable`, as for a tail its recovery could not prove.
 
 - `meerkat`, `meerkat-rpc`: a graceful stop that keeps queued work keeps a
   session's first turn as well. When the stop suspended the run of a first

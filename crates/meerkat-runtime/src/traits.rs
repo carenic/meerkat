@@ -84,6 +84,18 @@ pub enum RuntimeDriverError {
         session_id: meerkat_core::types::SessionId,
     },
 
+    /// The session is withheld from resume by the durable hold `hold` (its
+    /// tail held for recovery or refused by recovery, its evidence
+    /// quarantined, or its document awaiting the audited-endpoint repair), so
+    /// a start or attach of it is refused. Its content is intact and
+    /// retained; nothing was written. The refusal clears once the hold is
+    /// reconciled.
+    #[error("session {session_id} is withheld from resume: {hold}")]
+    DurableResumeHeld {
+        session_id: meerkat_core::types::SessionId,
+        hold: meerkat_core::service::DurableResumeHold,
+    },
+
     /// This registration's claim lineage excluded every earlier holder of
     /// the session's hosting claim, and the issuing consent owner could not
     /// settle yet what a lost owner left in the session's scope (consent
@@ -262,6 +274,19 @@ impl RuntimeDriverError {
                 Some(meerkat_core::SessionError::HostingUnavailable {
                     id: session_id.clone(),
                 })
+            }
+            _ => None,
+        }
+    }
+
+    /// The typed session error for a session whose durable tail is withheld
+    /// from resume ([`Self::DurableResumeHeld`]), or `None` for any other
+    /// error. Surfaces use it so the hold keeps its typed wire form instead
+    /// of becoming an internal error.
+    pub fn durable_hold_session_error(&self) -> Option<meerkat_core::SessionError> {
+        match self {
+            Self::DurableResumeHeld { session_id, hold } => {
+                Some(hold.session_error(session_id.clone()))
             }
             _ => None,
         }

@@ -975,12 +975,18 @@ impl ToolCallError {
 /// owner hosts keeps its typed wire form (session busy, with
 /// `kind = "session_served_elsewhere"`; #1813), as does one whose hosting
 /// claim is unavailable (runtime unavailable, with
-/// `kind = "session_hosting_unavailable"`); anything else is internal.
+/// `kind = "session_hosting_unavailable"`), and one whose durable tail is
+/// withheld from resume (`SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY` and the
+/// other durable holds, with the typed `durable_resume_hold` payload; the
+/// content is retained); anything else is internal.
 fn prepare_session_tool_error(error: SessionError) -> ToolCallError {
+    // A hosting refusal, and a session whose durable tail is withheld from
+    // resume (its content retained), keep their typed wire form.
     if matches!(
         error,
         SessionError::ServedElsewhere { .. } | SessionError::HostingUnavailable { .. }
-    ) {
+    ) || error.durable_resume_hold().is_some()
+    {
         let wire = meerkat_contracts::WireError::from(error);
         return ToolCallError::new(wire.code.jsonrpc_code(), wire.message, wire.details);
     }
@@ -5690,6 +5696,36 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::time::{Duration, timeout};
+
+    /// `meerkat_resume` of a session whose durable tail is withheld from
+    /// resume refuses with the hold's own wire code and its typed
+    /// `durable_resume_hold` payload (the content is retained), not with an
+    /// internal tool error.
+    #[test]
+    fn a_withheld_durable_tail_refuses_the_mcp_resume_typed() {
+        use meerkat_core::service::DurableResumeHold;
+        let id = meerkat_core::SessionId::new();
+        for (held, hold) in [
+            (
+                DurableResumeHold::TailHeldForRecovery,
+                "tail_held_for_recovery",
+            ),
+            (DurableResumeHold::RecoveryRefused, "recovery_refused"),
+            (
+                DurableResumeHold::EvidenceQuarantined,
+                "evidence_quarantined",
+            ),
+        ] {
+            let wire = meerkat_contracts::WireError::from(held.session_error(id.clone()));
+            let tool_error = prepare_session_tool_error(held.session_error(id.clone()));
+            assert_eq!(tool_error.code, wire.code.jsonrpc_code(), "{hold}");
+            assert_ne!(tool_error.code, -32603, "{hold}: not an internal error");
+            let data = tool_error.data.expect("the typed hold payload");
+            assert_eq!(data["durable_resume_hold"], hold);
+            assert_eq!(data["content_retained"], true);
+            assert_eq!(data["session_id"], id.to_string());
+        }
+    }
 
     /// The head config store for the reserved `global` realm routes to the
     /// injected user-global document: an explicit state root must not shadow

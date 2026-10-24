@@ -5935,6 +5935,106 @@ async fn a_mob_start_defers_a_retiring_members_unprovable_durable_tail() {
     let _ = handle.shutdown().await;
 }
 
+/// A retiring member whose durable tail its recovery withholds from resume
+/// (held for recovery, or refused by recovery) meets the settle's typed
+/// refusal at start, before any read of its session. That is the member's
+/// unprovable-tail outcome, as when the tail still conflicts after a settle:
+/// the start defers the member instead of failing, a retire refuses with the
+/// deferral carrying the typed unprovable tail, and the tail stays as the
+/// crash left it.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mob_start_defers_a_retiring_members_withheld_durable_tail() {
+    for hold in [
+        meerkat_core::service::DurableResumeHold::TailHeldForRecovery,
+        meerkat_core::service::DurableResumeHold::RecoveryRefused,
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let paths = Paths::new(temp.path());
+        let power_store = Arc::new(PowerCutRuntimeStore::new(&paths.realm_db_path));
+        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = power_store.clone();
+        let label = format!("withheld-tail-{hold}");
+        let w1_sid = retiring_member_after_a_crash(&paths, &power_store, true, &label).await;
+
+        let (service_2, store_2) = persistent_head_canonical_service(&paths, runtime_store.clone());
+        let head_before = store_2
+            .load_head(&w1_sid)
+            .await
+            .expect("load the physical head")
+            .expect("the physical head exists");
+        let persistent_owner: Arc<dyn MobSessionService> = service_2.clone();
+        let withholding = FailingOnceSessionService::new(persistent_owner, None, None, 0, false);
+        withholding.withhold_durable_tails(hold);
+        let handle = MobBuilder::for_resume(
+            MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage"),
+        )
+        .with_session_service(withholding)
+        .with_default_llm_client(openai_test_client())
+        .notify_orchestrator_on_resume(false)
+        .resume()
+        .await
+        .unwrap_or_else(|error| {
+            panic!("[{hold}] the start defers the retiring member and runs: {error}")
+        });
+        let status = handle.status().await;
+        assert!(
+            matches!(status, Ok(meerkat_mob::MobState::Running)),
+            "[{hold}] {status:?}"
+        );
+        let identity = AgentIdentity::from("w-1");
+        let error = handle
+            .retire(identity.clone())
+            .await
+            .expect_err("a retire while the member's tail stays withheld refuses");
+        let deferral = match &error {
+            meerkat_mob::MobError::SharedRetirementFailure(shared) => shared.as_ref(),
+            other => other,
+        };
+        assert!(
+            matches!(
+                deferral,
+                meerkat_mob::MobError::MemberCustodyDeferred {
+                    member_id,
+                    session_id,
+                    restore: meerkat_mob::MemberCustodyRestore::CleanupDelivery,
+                    cause,
+                } if member_id == &identity
+                    && session_id == &w1_sid
+                    && matches!(
+                        cause.as_ref(),
+                        meerkat_mob::MobError::MemberDurableTailUnprovable { member_id, session_id }
+                            if member_id == &identity && session_id == &w1_sid
+                    )
+            ),
+            "[{hold}] the retire refuses with the deferral carrying the typed unprovable tail: \
+             {error:?}"
+        );
+        let members = handle.list_members_including_retiring().await;
+        assert!(
+            members.iter().any(|entry| entry.agent_identity == identity
+                && entry.status == MobMemberStatus::Retiring),
+            "[{hold}] the deferred member stays Retiring: {members:?}"
+        );
+        assert_retiring_custody_deferred_for(
+            &handle,
+            &identity,
+            meerkat_mob::MemberCustodyDeferralCause::DurableTailUnprovable,
+        )
+        .await;
+        let head_after = store_2
+            .load_head(&w1_sid)
+            .await
+            .expect("load the physical head after the deferred retire")
+            .expect("the physical head still exists");
+        assert_eq!(
+            meerkat_core::session_store::session_head_cas_token(&head_after).unwrap(),
+            meerkat_core::session_store::session_head_cas_token(&head_before).unwrap(),
+            "[{hold}] the deferred start and retire leave the tail as the crash left it"
+        );
+        let _ = handle.shutdown().await;
+    }
+}
+
 /// The operation binding restore an operation on a Broken member refused
 /// with, typed: it names the member, its session and the deferred restore,
 /// and its cause is the one `cause_matches` accepts.

@@ -51349,6 +51349,9 @@ fn summarize_runtime_parity_driver_error(error: &RuntimeDriverError) -> String {
         RuntimeDriverError::HostingUnavailable { session_id } => {
             format!("hosting_unavailable:{session_id}")
         }
+        RuntimeDriverError::DurableResumeHeld { session_id, hold } => {
+            format!("durable_resume_held:{session_id}:{hold}")
+        }
         RuntimeDriverError::ConsentOwnerLossUnsettled { session_id } => {
             format!("consent_owner_loss_unsettled:{session_id}")
         }

@@ -1229,6 +1229,13 @@ async fn prepare_rest_session_runtime_executor_locked(
 fn runtime_driver_error_from_session_error(
     error: SessionError,
 ) -> meerkat_runtime::RuntimeDriverError {
+    // A session whose durable tail is withheld from resume keeps its typed
+    // hold through the attach path, as a hosting refusal does.
+    if let (Some(hold), Some(session_id)) =
+        (error.durable_resume_hold(), durable_hold_session_id(&error))
+    {
+        return meerkat_runtime::RuntimeDriverError::DurableResumeHeld { session_id, hold };
+    }
     match error {
         // Keeps the typed refusal through the attach path (#1813).
         SessionError::ServedElsewhere { id } => {
@@ -1241,7 +1248,22 @@ fn runtime_driver_error_from_session_error(
     }
 }
 
+/// The session a durable resume hold names, for the session errors that
+/// carry one.
+fn durable_hold_session_id(error: &SessionError) -> Option<SessionId> {
+    match error.primary_error() {
+        SessionError::DurableTailHeldForRecovery { id }
+        | SessionError::DurableTailRecoveryRefused { id }
+        | SessionError::DurableEvidenceQuarantined { id }
+        | SessionError::WholeBlobAuditedEndpointDivergence { id } => Some(id.clone()),
+        _ => None,
+    }
+}
+
 fn runtime_executor_attach_error_to_api(error: meerkat_runtime::RuntimeDriverError) -> ApiError {
+    if let Some(held) = error.durable_hold_session_error() {
+        return session_durable_hold_api_error(&held);
+    }
     if let Some(typed) = error
         .teardown_in_progress_session_error()
         .or_else(|| error.hosting_session_error())
@@ -1264,6 +1286,9 @@ fn runtime_driver_error_to_session_error(
     }
     if let Some(hosting) = error.hosting_session_error() {
         return hosting;
+    }
+    if let Some(held) = error.durable_hold_session_error() {
+        return held;
     }
     SessionError::Agent(meerkat_core::AgentError::InternalError(error.to_string()))
 }
@@ -8907,6 +8932,15 @@ pub enum ApiError {
         message: String,
         details: Value,
     },
+    /// A session whose durable tail is withheld from resume (409): `code` is
+    /// the hold's session error code (`SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY`,
+    /// `SESSION_DURABLE_TAIL_RECOVERY_REFUSED`, ...) and `details` its typed
+    /// `durable_resume_hold` payload. The content is retained.
+    SessionDurableHold {
+        message: String,
+        code: String,
+        details: Value,
+    },
 }
 
 /// `ApiError::SessionBusyWithData` for a typed retryable runtime teardown
@@ -8922,6 +8956,18 @@ fn session_runtime_unavailable_api_error(error: &SessionError) -> Option<ApiErro
             })
         }
         _ => None,
+    }
+}
+
+/// `ApiError::SessionDurableHold` for a session whose durable tail is
+/// withheld from resume: `409` with the hold's session error code and its
+/// typed `durable_resume_hold` payload. The content is retained; the hold
+/// clears once it is reconciled.
+fn session_durable_hold_api_error(error: &SessionError) -> ApiError {
+    ApiError::SessionDurableHold {
+        message: error.to_string(),
+        code: error.code().to_string(),
+        details: error.structured_data().unwrap_or(Value::Null),
     }
 }
 
@@ -8963,6 +9009,7 @@ fn api_error_message(error: &ApiError) -> String {
         | ApiError::InternalWithData { message, .. }
         | ApiError::SessionBusyWithData { message, .. }
         | ApiError::SessionNotRunningWithData { message, .. }
+        | ApiError::SessionDurableHold { message, .. }
         | ApiError::SessionRuntimeUnavailable { message, .. } => message.clone(),
         ApiError::DuplicateInput { existing_id } => {
             format!("duplicate input: {existing_id}")
@@ -9108,6 +9155,11 @@ impl IntoResponse for ApiError {
                 message,
                 Some(details),
             ),
+            ApiError::SessionDurableHold {
+                message,
+                code,
+                details,
+            } => (StatusCode::CONFLICT, code, message, Some(details)),
         };
 
         let body = Json(ErrorResponse {
@@ -9141,6 +9193,56 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use tempfile::TempDir;
+
+    /// A start or attach of a session whose durable tail is withheld from
+    /// resume refuses through the attach path's runtime error with `409`, the
+    /// hold's own session error code and its typed `durable_resume_hold`
+    /// payload (the content is retained), not with a `500`.
+    #[tokio::test]
+    async fn a_withheld_durable_tail_refuses_the_rest_attach_typed() {
+        let id = SessionId::new();
+        for (error, code, hold) in [
+            (
+                SessionError::DurableTailHeldForRecovery { id: id.clone() },
+                "SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY",
+                "tail_held_for_recovery",
+            ),
+            (
+                SessionError::DurableTailRecoveryRefused { id: id.clone() },
+                "SESSION_DURABLE_TAIL_RECOVERY_REFUSED",
+                "recovery_refused",
+            ),
+            (
+                SessionError::DurableEvidenceQuarantined { id: id.clone() },
+                "SESSION_DURABLE_EVIDENCE_QUARANTINED",
+                "evidence_quarantined",
+            ),
+        ] {
+            let driver = runtime_driver_error_from_session_error(error);
+            assert!(
+                matches!(
+                    &driver,
+                    meerkat_runtime::RuntimeDriverError::DurableResumeHeld { session_id, .. }
+                        if session_id == &id
+                ),
+                "{code}: the hold survives the attach path: {driver:?}"
+            );
+            assert_eq!(
+                runtime_driver_error_to_session_error(driver.clone()).code(),
+                code
+            );
+            let response = runtime_executor_attach_error_to_api(driver).into_response();
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{code}");
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read the error body");
+            let body: Value = serde_json::from_slice(&bytes).expect("a JSON error body");
+            assert_eq!(body["code"], code);
+            assert_eq!(body["details"]["durable_resume_hold"], hold);
+            assert_eq!(body["details"]["content_retained"], true);
+            assert_eq!(body["details"]["session_id"], id.to_string());
+        }
+    }
 
     /// A wait a graceful stop ended by keeping the input queued for the next
     /// start answers what the generated wait-failure authority resolves, the
