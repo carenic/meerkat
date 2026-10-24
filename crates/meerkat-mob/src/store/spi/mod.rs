@@ -31,7 +31,10 @@
 //!
 //! Every entry value is versioned JSON (`{"v":1,...}`) and a load refuses
 //! another version. Keyed entries carry their full map key, and a load
-//! refuses an entry whose name does not hash from that key.
+//! refuses an entry whose name does not hash from that key. An event entry
+//! holds the stored event codec's form, the one the SQLite mob store writes,
+//! so the replay-only fields the public event form leaves out survive a
+//! reload.
 //!
 //! # Concurrency
 //!
@@ -332,6 +335,22 @@ fn decode_single<V: DeserializeOwned>(bytes: &[u8]) -> Result<V, MobStoreError> 
     check_version(bytes)?;
     let entry: SingleOwned<V> = serde_json::from_slice(bytes).map_err(serialization)?;
     Ok(entry.d)
+}
+
+/// An event entry holds the stored event codec's form, as the SQLite mob
+/// store does: it keeps the replay-only fields the public event form leaves
+/// out (a spawned member's bridge ref, placed spawn and endpoint, among
+/// others), from which a restarted mob rebuilds its roster and topology.
+fn encode_event(event: &MobEvent) -> Result<EntryBytes, MobStoreError> {
+    let stored = crate::event::encode_stored_mob_event(event).map_err(serialization)?;
+    let stored: Box<serde_json::value::RawValue> =
+        serde_json::from_slice(&stored).map_err(serialization)?;
+    encode_single(&stored)
+}
+
+fn decode_event(bytes: &[u8]) -> Result<MobEvent, MobStoreError> {
+    let stored: Box<serde_json::value::RawValue> = decode_single(bytes)?;
+    crate::event::decode_stored_mob_event(stored.get().as_bytes()).map_err(serialization)
 }
 
 /// Every `(name, bytes)` of a keyed map, named by [`hashed_name`].
@@ -981,7 +1000,7 @@ impl Bundle {
             .events
             .iter()
             .filter(|event| after.is_none_or(|after| event.cursor > after))
-            .map(|event| Ok((event_name(event.cursor), encode_single(event)?)))
+            .map(|event| Ok((event_name(event.cursor), encode_event(event)?)))
             .collect()
     }
 
@@ -1474,7 +1493,7 @@ impl Bundle {
         let mut events = Vec::new();
         let prefix = format!("{G_EVENT}/");
         for (name, bytes) in entries_with_prefix(body, &prefix) {
-            let event: MobEvent = decode_single(bytes)?;
+            let event = decode_event(bytes)?;
             if event_name(event.cursor) != *name {
                 return Err(corrupt(format!(
                     "event entry {name} holds cursor {}",
