@@ -74,7 +74,10 @@ impl MobActor {
                                     plan,
                                     RestoredOperationBindingSeam::ExplicitResumePostCommit,
                                 )
-                                .await
+                                .await?
+                                .without_takeover(
+                                    RestoredOperationBindingSeam::ExplicitResumePostCommit,
+                                )
                             }),
                         );
                     }

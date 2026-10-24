@@ -11221,6 +11221,9 @@ impl MobBuilder {
                 deferred_member_custody: super::actor::DeferredMemberCustodyRegistry::publishing(
                     custody_deferrals,
                 ),
+                #[cfg(feature = "runtime-adapter")]
+                startup_member_recoveries: BTreeMap::new(),
+                member_live_revivals_in_flight: BTreeMap::new(),
                 identity_reconcile_parked: BTreeMap::new(),
                 spawn_panic_log_ledger: Arc::new(
                     super::panic_capture::SpawnPanicLogLedger::default(),

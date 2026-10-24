@@ -2270,6 +2270,11 @@ struct MockSessionService {
     /// Models a retryable service cleanup outage after machine unregister has
     /// already retained attachment-local cleanup authority.
     discard_actor_failures_remaining: AtomicU64,
+    /// While set, every exact actor discard parks before it acts (a post-stop
+    /// cleanup still in flight), until released.
+    park_exact_actor_discards: AtomicBool,
+    parked_exact_actor_discard_entries: tokio::sync::watch::Sender<u64>,
+    parked_exact_actor_discard_release: tokio::sync::Notify,
     /// Session IDs for which `subscribe_session_events` must return an error.
     subscribe_fail_sessions: RwLock<HashSet<SessionId>>,
     /// Holds the next event subscription of a session until released.
@@ -2459,6 +2464,9 @@ impl MockSessionService {
             return_exact_run_result: AtomicBool::new(false),
             flow_turn_overlays: RwLock::new(Vec::new()),
             discard_actor_failures_remaining: AtomicU64::new(0),
+            park_exact_actor_discards: AtomicBool::new(false),
+            parked_exact_actor_discard_entries: tokio::sync::watch::channel(0).0,
+            parked_exact_actor_discard_release: tokio::sync::Notify::new(),
             subscribe_fail_sessions: RwLock::new(HashSet::new()),
             session_event_subscribe_barriers: RwLock::new(HashMap::new()),
             session_event_subscribe_started: tokio::sync::Notify::new(),
@@ -3428,6 +3436,25 @@ impl MockSessionService {
     fn fail_next_exact_actor_discard(&self) {
         self.discard_actor_failures_remaining
             .store(1, Ordering::Relaxed);
+    }
+
+    /// Park every later exact actor discard until
+    /// [`Self::release_parked_exact_actor_discards`].
+    fn park_exact_actor_discards(&self) {
+        self.park_exact_actor_discards
+            .store(true, Ordering::Release);
+    }
+
+    /// Stop parking and release every parked exact actor discard.
+    fn release_parked_exact_actor_discards(&self) {
+        self.park_exact_actor_discards
+            .store(false, Ordering::Release);
+        self.parked_exact_actor_discard_release.notify_waiters();
+    }
+
+    /// Typed count of exact actor discards that entered the park.
+    fn parked_exact_actor_discard_entries(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.parked_exact_actor_discard_entries.subscribe()
     }
 
     /// Park every later non-host `start_turn` until released or interrupted.
@@ -6146,6 +6173,16 @@ impl MobSessionService for MockSessionService {
         &self,
         witness: &meerkat_session::LiveSessionActorWitness,
     ) -> Result<bool, SessionError> {
+        if self.park_exact_actor_discards.load(Ordering::Acquire) {
+            let released = self.parked_exact_actor_discard_release.notified();
+            let mut released = std::pin::pin!(released);
+            released.as_mut().enable();
+            self.parked_exact_actor_discard_entries
+                .send_modify(|entries| *entries += 1);
+            if self.park_exact_actor_discards.load(Ordering::Acquire) {
+                released.await;
+            }
+        }
         if self
             .discard_actor_failures_remaining
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
@@ -37672,6 +37709,969 @@ async fn cold_actor_startup_serves_while_a_stopped_members_registration_is_owned
             .is_some(),
         "the member is still projected after resume"
     );
+}
+
+/// A Running mob restarted with its startup paused right before the binding
+/// restore. The builder has already rebuilt `identity`'s session and
+/// attachment, which a host can stop in this window (the long run harness
+/// does, through a durable resume gate). Returns what the rows act on.
+#[cfg(feature = "runtime-adapter")]
+struct PausedRunningStart {
+    resumed: MobHandle,
+    release: tokio::sync::oneshot::Sender<()>,
+    mob_id: MobId,
+    session_id: SessionId,
+    registration: meerkat_runtime::RuntimeSessionRegistrationWitness,
+}
+
+#[cfg(feature = "runtime-adapter")]
+async fn paused_running_start(
+    service: &Arc<MockSessionService>,
+    adapter: &Arc<meerkat_runtime::MeerkatMachine>,
+    identity: &AgentIdentity,
+    runtime_mode: crate::MobRuntimeMode,
+    peers: &[AgentIdentity],
+) -> PausedRunningStart {
+    let storage = MobStorage::in_memory();
+    let events = storage.events.clone();
+    let runtime_metadata = storage.runtime_metadata.clone();
+    let handle = MobBuilder::new(sample_definition(), storage)
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let session_id = handle
+        .spawn_with_options(
+            ProfileName::from("worker"),
+            identity.clone(),
+            None,
+            Some(runtime_mode),
+            None,
+        )
+        .await
+        .expect("spawn the member")
+        .bridge_session_id()
+        .cloned()
+        .expect("session-backed member");
+    for peer in peers {
+        handle
+            .spawn_with_options(
+                ProfileName::from("worker"),
+                peer.clone(),
+                None,
+                Some(crate::MobRuntimeMode::TurnDriven),
+                None,
+            )
+            .await
+            .expect("spawn a healthy member");
+    }
+    let mob_id = handle.mob_id().clone();
+    crash_stop_and_release_routes(handle).await;
+
+    let (entered, release) = super::actor::pause_before_startup_binding_restore_for_test(&mob_id);
+    let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
+        events,
+        runtime_metadata,
+    ))
+    .with_session_service(service.clone())
+    .notify_orchestrator_on_resume(false)
+    .resume()
+    .await
+    .expect("restart the Running mob");
+    tokio::time::timeout(Duration::from_secs(10), entered)
+        .await
+        .expect("the start reaches its binding restore")
+        .expect("the startup pause is armed");
+    let registration = adapter
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("the builder registered the member again");
+    assert!(
+        adapter
+            .current_executor_attachment_witness(&session_id)
+            .await
+            .is_some(),
+        "the builder rebuilt the member's attachment before the actor restores it"
+    );
+    PausedRunningStart {
+        resumed,
+        release,
+        mob_id,
+        session_id,
+        registration,
+    }
+}
+
+/// Wait until the member taken over at startup is served again: its stopped
+/// registration replaced by a fresh one with a committed attachment and a
+/// live actor.
+#[cfg(feature = "runtime-adapter")]
+async fn wait_for_member_served_again(
+    service: &MockSessionService,
+    adapter: &Arc<meerkat_runtime::MeerkatMachine>,
+    session_id: &SessionId,
+    stopped: &meerkat_runtime::RuntimeSessionRegistrationWitness,
+) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let replaced = adapter
+                .current_session_registration_witness(session_id)
+                .await
+                .is_some_and(|current| &current != stopped);
+            let attached = adapter
+                .current_executor_attachment_witness(session_id)
+                .await
+                .is_some();
+            let live = service
+                .live_session_actor_registered(session_id)
+                .await
+                .unwrap_or(false);
+            if replaced && attached && live {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the member taken over at startup is served again");
+}
+
+/// A host stops a member's runtime in the window between the builder's
+/// rebuild of the member and the actor's startup binding restore. The
+/// stopped attachment leaves its retained handles on the registration, which
+/// the restore refused, and the whole Running mob entered Stopped. The start
+/// now takes that completed residue over exactly once, revives the member
+/// through MobMachine authority right after the start, and serves it.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_running_start_takes_a_stopped_members_registration_over_once_and_serves_it() {
+    let service = Arc::new(MockSessionService::new());
+    let adapter = service.enable_runtime_adapter();
+    let identity = AgentIdentity::from("stopped-before-its-restore");
+    let paused = paused_running_start(
+        &service,
+        &adapter,
+        &identity,
+        crate::MobRuntimeMode::TurnDriven,
+        &[],
+    )
+    .await;
+    assert!(
+        adapter
+            .stop_runtime_executor_until_terminal_if_current(
+                &paused.registration,
+                "a host stops the member before the start restores it",
+            )
+            .await
+            .expect("stop the member's runtime to terminal"),
+        "the rebuilt registration is current when the host stops it"
+    );
+    let builds_before = member_build_count(&service, &identity).await;
+    paused.release.send(()).expect("release the start");
+    // A host that asks for the member right after the start shares the one
+    // revival the start dispatches, whichever request reaches the actor
+    // first, instead of racing a second materialization of the session.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        paused.resumed.ensure_member_live(&identity),
+    )
+    .await
+    .expect("the host's request answers")
+    .expect("the member is live again");
+
+    wait_for_member_served_again(&service, &adapter, &paused.session_id, &paused.registration)
+        .await;
+    assert_eq!(
+        paused.resumed.status().await.expect("mob status"),
+        MobState::Running,
+        "the start stays Running"
+    );
+    assert_eq!(
+        super::actor::startup_registration_takeovers_for_test(&paused.mob_id, &identity),
+        1,
+        "the start takes the stopped registration over exactly once"
+    );
+    assert_eq!(
+        member_build_count(&service, &identity).await,
+        builds_before + 1,
+        "the member is revived once"
+    );
+    let snapshot = paused
+        .resumed
+        .member_status(&identity)
+        .await
+        .expect("member status");
+    assert_ne!(
+        snapshot.status,
+        crate::runtime::handle::MobMemberStatus::Broken,
+        "the revived member is not broken: {:?}",
+        snapshot.error
+    );
+    paused
+        .resumed
+        .member(&identity)
+        .await
+        .expect("member handle")
+        .internal_turn("served after the takeover")
+        .await
+        .expect("the revived member serves a turn");
+    assert_eq!(
+        super::actor::startup_registration_takeovers_for_test(&paused.mob_id, &identity),
+        1,
+        "serving the member takes nothing over again"
+    );
+}
+
+/// A Running start whose binding restore meets the member's stop cleanup
+/// still in flight joins that exact cleanup and decides on its result. It
+/// never decides on a sample of it, and it no longer fails the whole start
+/// by registering the member while the cleanup runs (`RuntimeStopInProgress`).
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_running_start_joins_a_members_stop_cleanup_in_flight_and_then_takes_it_over() {
+    let service = Arc::new(MockSessionService::new());
+    let adapter = service.enable_runtime_adapter();
+    let identity = AgentIdentity::from("stopping-during-its-restore");
+    let paused = paused_running_start(
+        &service,
+        &adapter,
+        &identity,
+        crate::MobRuntimeMode::TurnDriven,
+        &[],
+    )
+    .await;
+    service.park_exact_actor_discards();
+    let mut parked = service.parked_exact_actor_discard_entries();
+    let stop = {
+        let adapter = Arc::clone(&adapter);
+        let registration = paused.registration.clone();
+        tokio::spawn(async move {
+            adapter
+                .stop_runtime_executor_until_terminal_if_current(
+                    &registration,
+                    "a host stops the member while the start restores it",
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        parked.wait_for(|entries| *entries > 0),
+    )
+    .await
+    .expect("the stop's post-stop cleanup parks")
+    .expect("the park counter stays open");
+    let builds_before = member_build_count(&service, &identity).await;
+    paused.release.send(()).expect("release the start");
+
+    // While the stop cleanup is in flight nothing is taken over and the
+    // registration stays exactly the one the stop is cleaning.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        super::actor::startup_registration_takeovers_for_test(&paused.mob_id, &identity),
+        0,
+        "no takeover while the stop cleanup runs"
+    );
+    assert_eq!(
+        adapter
+            .current_session_registration_witness(&paused.session_id)
+            .await,
+        Some(paused.registration.clone()),
+        "the registration under cleanup is untouched"
+    );
+
+    service.release_parked_exact_actor_discards();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), stop)
+            .await
+            .expect("the stop answers")
+            .expect("the stop task")
+            .expect("the stop completes"),
+        "the stop's registration was current"
+    );
+    wait_for_member_served_again(&service, &adapter, &paused.session_id, &paused.registration)
+        .await;
+    assert_eq!(
+        paused.resumed.status().await.expect("mob status"),
+        MobState::Running,
+        "the start joins the cleanup instead of failing"
+    );
+    assert_eq!(
+        super::actor::startup_registration_takeovers_for_test(&paused.mob_id, &identity),
+        1,
+        "the start takes the cleaned registration over once"
+    );
+    assert_eq!(
+        member_build_count(&service, &identity).await,
+        builds_before + 1,
+        "the member is revived once"
+    );
+    paused
+        .resumed
+        .member(&identity)
+        .await
+        .expect("member handle")
+        .internal_turn("served after the joined cleanup")
+        .await
+        .expect("the revived member serves a turn");
+}
+
+/// A stop cleanup that fails leaves no completed residue: the start joins
+/// it, takes nothing over, and ends in the restore's refusal as before. The
+/// mob enters Stopped, the failed stop's registration stays current, and the
+/// member is not revived.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_running_start_keeps_the_refusal_when_the_members_stop_cleanup_fails() {
+    let service = Arc::new(MockSessionService::new());
+    let adapter = service.enable_runtime_adapter();
+    let identity = AgentIdentity::from("cleanup-fails-during-its-restore");
+    let paused = paused_running_start(
+        &service,
+        &adapter,
+        &identity,
+        crate::MobRuntimeMode::TurnDriven,
+        &[],
+    )
+    .await;
+    service.park_exact_actor_discards();
+    let mut parked = service.parked_exact_actor_discard_entries();
+    let stop = {
+        let adapter = Arc::clone(&adapter);
+        let registration = paused.registration.clone();
+        tokio::spawn(async move {
+            adapter
+                .stop_runtime_executor_until_terminal_if_current(
+                    &registration,
+                    "a host stops the member while the start restores it",
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        parked.wait_for(|entries| *entries > 0),
+    )
+    .await
+    .expect("the stop's post-stop cleanup parks")
+    .expect("the park counter stays open");
+    let builds_before = member_build_count(&service, &identity).await;
+    paused.release.send(()).expect("release the start");
+
+    service.fail_next_exact_actor_discard();
+    service.release_parked_exact_actor_discards();
+    let stopped = tokio::time::timeout(Duration::from_secs(10), stop)
+        .await
+        .expect("the stop answers")
+        .expect("the stop task");
+    assert!(
+        stopped.is_err(),
+        "the failed post-stop cleanup fails the stop: {stopped:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while paused.resumed.status().await.expect("mob status") != MobState::Stopped {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the start ends in the restore's refusal");
+    assert_eq!(
+        super::actor::startup_registration_takeovers_for_test(&paused.mob_id, &identity),
+        0,
+        "a failed stop cleanup is not taken over"
+    );
+    assert_eq!(
+        adapter
+            .current_session_registration_witness(&paused.session_id)
+            .await,
+        Some(paused.registration.clone()),
+        "the failed stop's registration stays current"
+    );
+    assert_eq!(
+        member_build_count(&service, &identity).await,
+        builds_before,
+        "nothing is revived"
+    );
+}
+
+/// A missing-live revival does not belong to the caller that asked first.
+/// Its first requester leaves while the revival is in flight (the session's
+/// creation is parked), a second request arrives meanwhile, and a third one
+/// leaves too: the one revival still finishes, the request that stayed is
+/// answered once it did, and the session is materialized once.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_revival_finishes_for_a_waiter_when_its_first_requester_leaves() {
+    let service = Arc::new(MockSessionService::new());
+    let machine = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(sample_definition(), MobStorage::in_memory())
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let worker = AgentIdentity::from("revived-once");
+    let session = handle
+        .spawn_with_options(
+            ProfileName::from("worker"),
+            worker.clone(),
+            None,
+            Some(crate::MobRuntimeMode::TurnDriven),
+            None,
+        )
+        .await
+        .expect("spawn the member")
+        .bridge_session_id()
+        .cloned()
+        .expect("session-backed member");
+    MobSessionService::discard_live_session(service.as_ref(), &session)
+        .await
+        .expect("discard the idle live session");
+    machine
+        .unregister_session(&session)
+        .await
+        .expect("the runtime unregisters the idle executor");
+    let builds_before = member_build_count(&service, &worker).await;
+    let creation = service.park_session_creation(session.clone()).await;
+    let ask = |handle: MobHandle, worker: AgentIdentity| {
+        tokio::spawn(async move { handle.ensure_member_live(&worker).await })
+    };
+
+    let leader = ask(handle.clone(), worker.clone());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while creation.boundary_calls.load(Ordering::Acquire) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the revival reaches the session's creation");
+    let waiter = ask(handle.clone(), worker.clone());
+    let leaving_waiter = ask(handle.clone(), worker.clone());
+    // Both requests reach the actor while the revival is still in flight.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    leader.abort();
+    leaving_waiter.abort();
+    let _ = leader.await;
+    let _ = leaving_waiter.await;
+    creation.release_all();
+
+    tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .expect("the request that stayed is answered")
+        .expect("waiter task")
+        .expect("the member is live");
+    assert!(
+        service
+            .live_session_actor_registered(&session)
+            .await
+            .expect("live lookup"),
+        "the revival finished although its first requester left"
+    );
+    assert_eq!(
+        member_build_count(&service, &worker).await,
+        builds_before + 1,
+        "the session is materialized once"
+    );
+}
+
+/// A stop cleanup that never finishes does not hold the start: the start
+/// joins it for a bounded wait only, then decides on what it sees (not
+/// completed residue), takes nothing over, and ends in the restore's
+/// refusal as before.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_running_start_does_not_wait_forever_on_a_stop_cleanup_that_never_finishes() {
+    let service = Arc::new(MockSessionService::new());
+    let adapter = service.enable_runtime_adapter();
+    let identity = AgentIdentity::from("cleanup-never-finishes");
+    let paused = paused_running_start(
+        &service,
+        &adapter,
+        &identity,
+        crate::MobRuntimeMode::TurnDriven,
+        &[],
+    )
+    .await;
+    service.park_exact_actor_discards();
+    let mut parked = service.parked_exact_actor_discard_entries();
+    let stop = {
+        let adapter = Arc::clone(&adapter);
+        let registration = paused.registration.clone();
+        tokio::spawn(async move {
+            adapter
+                .stop_runtime_executor_until_terminal_if_current(
+                    &registration,
+                    "a host stops the member while the start restores it",
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        parked.wait_for(|entries| *entries > 0),
+    )
+    .await
+    .expect("the stop's post-stop cleanup parks")
+    .expect("the park counter stays open");
+    paused.release.send(()).expect("release the start");
+
+    // The cleanup stays parked; the start still settles, refused as before.
+    let status = tokio::time::timeout(Duration::from_secs(10), paused.resumed.status())
+        .await
+        .expect("the start settles while the stop cleanup never finishes")
+        .expect("mob status");
+    assert_eq!(
+        status,
+        MobState::Stopped,
+        "the start ends in the restore's refusal"
+    );
+    assert_eq!(
+        super::actor::startup_registration_takeovers_for_test(&paused.mob_id, &identity),
+        0,
+        "nothing is taken over while its stop cleanup has not finished"
+    );
+    service.release_parked_exact_actor_discards();
+    let _ = tokio::time::timeout(Duration::from_secs(10), stop).await;
+}
+
+/// A stopped registration admits no input before the start takes it over:
+/// an input offered to it then is refused typed, so the takeover's
+/// unregister ends nothing a caller handed in, and the member serves work
+/// after its revival.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_registration_admits_no_input_before_the_start_takes_it_over() {
+    use meerkat_runtime::service_ext::SessionServiceRuntimeExt as _;
+
+    let service = Arc::new(MockSessionService::new());
+    let adapter = service.enable_runtime_adapter();
+    let identity = AgentIdentity::from("offered-input-while-stopped");
+    let paused = paused_running_start(
+        &service,
+        &adapter,
+        &identity,
+        crate::MobRuntimeMode::TurnDriven,
+        &[],
+    )
+    .await;
+    assert!(
+        adapter
+            .stop_runtime_executor_until_terminal_if_current(
+                &paused.registration,
+                "a host stops the member before the start restores it",
+            )
+            .await
+            .expect("stop the member's runtime to terminal"),
+        "the rebuilt registration is current when the host stops it"
+    );
+    let offered = adapter
+        .accept_input_with_completion(
+            &paused.session_id,
+            meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::new(
+                "offered to the stopped registration",
+                None,
+            )),
+        )
+        .await;
+    assert!(
+        offered.is_err(),
+        "a stopped registration refuses the input typed: {:?}",
+        offered.as_ref().map(|(outcome, _)| outcome)
+    );
+    assert!(
+        adapter
+            .list_active_inputs(&paused.session_id)
+            .await
+            .expect("list the stopped registration's inputs")
+            .is_empty(),
+        "nothing is queued on the stopped registration"
+    );
+    paused.release.send(()).expect("release the start");
+
+    wait_for_member_served_again(&service, &adapter, &paused.session_id, &paused.registration)
+        .await;
+    assert_eq!(
+        super::actor::startup_registration_takeovers_for_test(&paused.mob_id, &identity),
+        1,
+        "the start takes the stopped registration over"
+    );
+    paused
+        .resumed
+        .member(&identity)
+        .await
+        .expect("member handle")
+        .internal_turn("served after the takeover")
+        .await
+        .expect("the revived member serves a turn");
+}
+
+/// A member runtime retired outside the mob in the same window is not
+/// stopped residue: a retired runtime is not served again, so the start
+/// neither takes its registration over nor revives the member.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_running_start_does_not_take_over_a_member_runtime_retired_outside_the_mob() {
+    let service = Arc::new(MockSessionService::new());
+    let adapter = service.enable_runtime_adapter();
+    let identity = AgentIdentity::from("retired-before-its-restore");
+    let paused = paused_running_start(
+        &service,
+        &adapter,
+        &identity,
+        crate::MobRuntimeMode::TurnDriven,
+        &[],
+    )
+    .await;
+    adapter
+        .retire_runtime_control_plane(&meerkat_runtime::LogicalRuntimeId::for_session(
+            &paused.session_id,
+        ))
+        .await
+        .expect("retire the member's runtime outside the mob");
+    let builds_before = member_build_count(&service, &identity).await;
+    paused.release.send(()).expect("release the start");
+
+    // The start settles either way; then nothing it dispatches is pending.
+    let status = tokio::time::timeout(Duration::from_secs(10), paused.resumed.status())
+        .await
+        .expect("the start settles")
+        .expect("mob status");
+    assert_eq!(
+        super::actor::startup_registration_takeovers_for_test(&paused.mob_id, &identity),
+        0,
+        "a retired runtime is not taken over (mob {status:?})"
+    );
+    assert_eq!(
+        member_build_count(&service, &identity).await,
+        builds_before,
+        "the start revives nothing for a retired runtime"
+    );
+}
+
+/// A persistent runtime adapter for the mock service: its registrations
+/// track durability, so one can need a durability reload.
+#[cfg(feature = "runtime-adapter")]
+fn persistent_runtime_adapter(
+    service: &MockSessionService,
+) -> Arc<meerkat_runtime::MeerkatMachine> {
+    let runtime_store: Arc<dyn meerkat_runtime::store::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let blob_store: Arc<dyn meerkat_core::BlobStore> =
+        Arc::new(meerkat_store::MemoryBlobStore::new());
+    let adapter = Arc::new(
+        meerkat_runtime::MeerkatMachine::persistent(runtime_store, blob_store)
+            .expect("construct runtime authority"),
+    );
+    service.set_runtime_adapter(Arc::clone(&adapter));
+    adapter
+}
+
+/// Mark the member's current registration reload-required through the
+/// runtime's own seam, in the window the paused start leaves.
+#[cfg(feature = "runtime-adapter")]
+async fn mark_reload_required(
+    adapter: &Arc<meerkat_runtime::MeerkatMachine>,
+    session_id: &SessionId,
+) {
+    assert!(
+        adapter
+            .require_session_durability_reload(
+                session_id,
+                "test_marked_reload_required",
+                "the row marks the member's registration reload-required",
+            )
+            .await,
+        "the member's registration is current and persistent"
+    );
+}
+
+/// A member whose runtime registration needs a durability reload when a
+/// Running mob starts no longer stops the whole mob. The start leaves the
+/// member out, reloads its registration right after the start through the
+/// mob's reload flow, and serves it, and the other members are served
+/// throughout.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_running_start_reloads_a_member_whose_registration_needs_a_reload() {
+    let service = Arc::new(MockSessionService::new());
+    let adapter = persistent_runtime_adapter(&service);
+    let degraded = AgentIdentity::from("reload-required-at-start");
+    let healthy = AgentIdentity::from("healthy-beside-a-reload");
+    let paused = paused_running_start(
+        &service,
+        &adapter,
+        &degraded,
+        crate::MobRuntimeMode::TurnDriven,
+        std::slice::from_ref(&healthy),
+    )
+    .await;
+    mark_reload_required(&adapter, &paused.session_id).await;
+    paused.release.send(()).expect("release the start");
+
+    paused
+        .resumed
+        .member(&healthy)
+        .await
+        .expect("healthy member handle")
+        .internal_turn("served while the other member reloads")
+        .await
+        .expect("the healthy member is served");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let reloaded = adapter
+                .durability_reload_required(&paused.session_id)
+                .await
+                .is_none();
+            let attached = adapter
+                .current_executor_attachment_witness(&paused.session_id)
+                .await
+                .is_some();
+            if reloaded && attached {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the member's registration is reloaded and attached");
+    assert_eq!(
+        paused.resumed.status().await.expect("mob status"),
+        MobState::Running,
+        "a reload-required member does not stop the mob"
+    );
+    paused
+        .resumed
+        .member(&degraded)
+        .await
+        .expect("member handle")
+        .internal_turn("served after its reload")
+        .await
+        .expect("the reloaded member is served");
+    let snapshot = paused
+        .resumed
+        .member_status(&degraded)
+        .await
+        .expect("member status");
+    assert_ne!(
+        snapshot.status,
+        crate::runtime::handle::MobMemberStatus::Broken,
+        "the reloaded member is not broken: {:?}",
+        snapshot.error
+    );
+}
+
+/// A reload-required member whose reload fails ends Broken with the typed
+/// reason. The mob stays Running and serves the other members.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_running_start_records_a_member_broken_when_its_reload_fails() {
+    let service = Arc::new(MockSessionService::new());
+    let adapter = persistent_runtime_adapter(&service);
+    let degraded = AgentIdentity::from("reload-fails-at-start");
+    let healthy = AgentIdentity::from("healthy-beside-a-failed-reload");
+    let paused = paused_running_start(
+        &service,
+        &adapter,
+        &degraded,
+        crate::MobRuntimeMode::TurnDriven,
+        std::slice::from_ref(&healthy),
+    )
+    .await;
+    mark_reload_required(&adapter, &paused.session_id).await;
+    // Without its durable session nothing can be reloaded or revived.
+    service.delete_persisted_session(&paused.session_id).await;
+    paused.release.send(()).expect("release the start");
+
+    let dsl_identity = crate::machines::mob_machine::AgentIdentity::from_domain(&degraded);
+    let reason = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let state = paused
+                .resumed
+                .query_machine_state()
+                .await
+                .expect("MobMachine state");
+            if let Some(reason) = state.member_restore_failures.get(&dsl_identity) {
+                return reason.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the member whose reload failed is recorded Broken");
+    assert!(!reason.is_empty(), "the Broken member carries its reason");
+    let snapshot = paused
+        .resumed
+        .member_status(&degraded)
+        .await
+        .expect("member status");
+    assert_eq!(
+        snapshot.status,
+        crate::runtime::handle::MobMemberStatus::Broken,
+        "the member whose reload failed is Broken: {:?}",
+        snapshot.error
+    );
+    assert_eq!(
+        paused.resumed.status().await.expect("mob status"),
+        MobState::Running,
+        "a failed member reload does not stop the mob"
+    );
+    paused
+        .resumed
+        .member(&healthy)
+        .await
+        .expect("healthy member handle")
+        .internal_turn("served beside a broken member")
+        .await
+        .expect("the healthy member is served");
+}
+
+/// A delivery to a member whose registration the start reloads either
+/// waits behind the reload on the member's admission lane and is served, or
+/// is refused typed `MemberReloadRequired`, as a delivery to a degraded
+/// member is today; never anything else. After the reload it is served.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delivery_during_a_start_reload_waits_for_it_or_is_refused_typed() {
+    let service = Arc::new(MockSessionService::new());
+    let adapter = persistent_runtime_adapter(&service);
+    let degraded = AgentIdentity::from("delivered-to-during-its-reload");
+    let paused = paused_running_start(
+        &service,
+        &adapter,
+        &degraded,
+        crate::MobRuntimeMode::TurnDriven,
+        &[],
+    )
+    .await;
+    mark_reload_required(&adapter, &paused.session_id).await;
+    let member = paused.resumed.clone();
+    let delivery_identity = degraded.clone();
+    let delivery = tokio::spawn(async move {
+        member
+            .member(&delivery_identity)
+            .await?
+            .internal_turn("delivered while the member reloads")
+            .await
+    });
+    paused.release.send(()).expect("release the start");
+
+    let delivered = tokio::time::timeout(Duration::from_secs(10), delivery)
+        .await
+        .expect("the delivery answers")
+        .expect("delivery task");
+    assert!(
+        matches!(
+            &delivered,
+            Ok(_) | Err(MobError::MemberReloadRequired { .. })
+        ),
+        "a delivery during the reload waits for it or is refused typed: {delivered:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while adapter
+            .durability_reload_required(&paused.session_id)
+            .await
+            .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the member's registration is reloaded");
+    paused
+        .resumed
+        .member(&degraded)
+        .await
+        .expect("member handle")
+        .internal_turn("served after its reload")
+        .await
+        .expect("the reloaded member is served");
+}
+
+/// An autonomous member taken over at a Running start gets its host loop
+/// back with its revival: the readiness step the startup pass left out for
+/// it runs after the revival (comms drain and dispatch injector), and
+/// MobMachine marks its runtime startup-ready again.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_autonomous_member_taken_over_at_a_running_start_gets_its_host_loop_back() {
+    let service = Arc::new(MockSessionService::new());
+    let adapter = service.enable_runtime_adapter();
+    let identity = AgentIdentity::from("autonomous-stopped-before-its-restore");
+    let paused = paused_running_start(
+        &service,
+        &adapter,
+        &identity,
+        crate::MobRuntimeMode::AutonomousHost,
+        &[],
+    )
+    .await;
+    // A host-loop run in flight defers a stop to its boundary; end it first.
+    let _ = adapter
+        .hard_cancel_current_run(
+            &paused.session_id,
+            "end the host loop's run before the stop",
+        )
+        .await;
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            adapter.stop_runtime_executor_until_terminal_if_current(
+                &paused.registration,
+                "a host stops the autonomous member before the start restores it",
+            ),
+        )
+        .await
+        .expect("the stop answers")
+        .expect("stop the member's runtime to terminal"),
+        "the rebuilt registration is current when the host stops it"
+    );
+    paused.release.send(()).expect("release the start");
+
+    wait_for_member_served_again(&service, &adapter, &paused.session_id, &paused.registration)
+        .await;
+    paused
+        .resumed
+        .wait_for_members_ready(
+            std::slice::from_ref(&identity),
+            Some(Duration::from_secs(10)),
+        )
+        .await
+        .expect("the revived autonomous member is ready again");
+    assert_eq!(
+        paused.resumed.status().await.expect("mob status"),
+        MobState::Running,
+        "the start stays Running"
+    );
+    assert_eq!(
+        super::actor::startup_registration_takeovers_for_test(&paused.mob_id, &identity),
+        1,
+        "the start takes the stopped registration over exactly once"
+    );
+    // Its readiness step ran on the revived runtime: a failed one records
+    // the member Broken with the reason.
+    let snapshot = paused
+        .resumed
+        .member_status(&identity)
+        .await
+        .expect("member status");
+    assert_ne!(
+        snapshot.status,
+        crate::runtime::handle::MobMemberStatus::Broken,
+        "the revived autonomous member is not broken: {:?}",
+        snapshot.error
+    );
+    // The host loop serves work again: a delivery is admitted to it.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        paused
+            .resumed
+            .member(&identity)
+            .await
+            .expect("member handle")
+            .internal_turn("served by the revived host loop"),
+    )
+    .await
+    .expect("the revived host loop answers")
+    .expect("the revived host loop admits work");
 }
 
 #[test]

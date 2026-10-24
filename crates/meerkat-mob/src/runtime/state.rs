@@ -869,6 +869,14 @@ pub(super) enum MobCommand {
         scope: super::actor::MemberLiveRevivalScope,
         reply_tx: oneshot::Sender<Result<super::actor::MemberLiveRevivalOutcome, MobError>>,
     },
+    /// Internal re-entry carrying the settled recovery, and the readiness
+    /// step, of one member a Running start left out (a stopped registration
+    /// it took over, or one that needed a durability reload). Boxed so the
+    /// roster entry does not widen every command on the channel.
+    StartupMemberRecovered {
+        cause: super::actor::StartupMemberRecoveryCause,
+        outcome: Box<super::actor::MemberReadinessOutcome>,
+    },
     /// Non-destructive cold reload of one member's durability-degraded
     /// runtime registration (same session id, same continuity generation).
     /// The actor performs only the authority reads inline; the quiesce,
@@ -1929,6 +1937,7 @@ impl MobCommand {
             Self::SpawnActivationStageSettled { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::MemberTurnAdmissionSettled { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumeLifecycleReadinessResolved { .. } => ShutdownAnswerClass::ActorCompletion,
+            Self::StartupMemberRecovered { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumeLifecyclePreparationResolved { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::AutonomousStopInterruptSettled => ShutdownAnswerClass::ActorCompletion,
             Self::AutonomousMemberStopsResolved { .. } => ShutdownAnswerClass::ActorCompletion,
@@ -2155,6 +2164,7 @@ impl MobCommand {
             Self::PolicySpawnSettled { .. } => "PolicySpawnSettled",
             Self::MemberTurnAdmissionSettled { .. } => "MemberTurnAdmissionSettled",
             Self::ReviveMemberLiveMaterialization { .. } => "ReviveMemberLiveMaterialization",
+            Self::StartupMemberRecovered { .. } => "StartupMemberRecovered",
             Self::ReloadMemberRegistration { .. } => "ReloadMemberRegistration",
             Self::ResumeLifecycleReadinessResolved { .. } => "ResumeLifecycleReadinessResolved",
             Self::ResumeLifecyclePreparationResolved { .. } => "ResumeLifecyclePreparationResolved",

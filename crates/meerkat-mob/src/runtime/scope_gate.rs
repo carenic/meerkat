@@ -199,6 +199,7 @@ impl MobCommand {
             | Self::PendingSpawnAnchorSettled { .. }
             | Self::PolicySpawnSettled { .. }
             | Self::ReviveMemberLiveMaterialization { .. }
+            | Self::StartupMemberRecovered { .. }
             | Self::ResumeLifecycleReadinessResolved { .. }
             | Self::ResumeLifecyclePreparationResolved { .. }
             | Self::AutonomousMemberStopsResolved { .. }
@@ -680,6 +681,7 @@ impl MobCommand {
             | Self::SpawnCleanupSettled { .. }
             | Self::PendingSpawnAnchorSettled { .. }
             | Self::PolicySpawnSettled { .. }
+            | Self::StartupMemberRecovered { .. }
             | Self::ResumeLifecycleReadinessResolved { .. }
             | Self::ResumeLifecyclePreparationResolved { .. }
             | Self::AutonomousMemberStopsResolved { .. }
