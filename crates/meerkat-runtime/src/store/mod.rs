@@ -9188,6 +9188,95 @@ pub enum WholeBlobRunRebaseOutcome {
     Stale,
 }
 
+/// The key of one governed service call occurrence's rows in the
+/// service-call audit log ([`RuntimeStore::append_service_call_audit`]): the
+/// identity digest of the enrolled service original the occurrence's calls
+/// were admitted under, and the schedule occurrence the trusted host
+/// asserted for them. Data only: a key reads rows, it authorizes nothing.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ServiceCallAuditKey {
+    original_digest: String,
+    occurrence: String,
+}
+
+impl ServiceCallAuditKey {
+    /// The key of `occurrence`'s rows under the service original whose
+    /// identity digest is `original_digest`
+    /// ([`crate::input_authority::ServiceCallRequest::audit_key`] derives
+    /// it from a request).
+    #[must_use]
+    pub fn new(original_digest: impl Into<String>, occurrence: impl Into<String>) -> Self {
+        Self {
+            original_digest: original_digest.into(),
+            occurrence: occurrence.into(),
+        }
+    }
+
+    /// The enrolled service original's identity digest.
+    #[must_use]
+    pub fn original_digest(&self) -> &str {
+        &self.original_digest
+    }
+
+    /// The schedule occurrence the trusted host asserted.
+    #[must_use]
+    pub fn occurrence(&self) -> &str {
+        &self.occurrence
+    }
+}
+
+/// One append to the service-call audit log: the observations Core staged
+/// for one occurrence's calls since its last append, in the order they were
+/// made.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ServiceCallAuditBatch {
+    /// The occurrence's rows the observations follow.
+    pub key: ServiceCallAuditKey,
+    /// The observations, oldest first.
+    pub observations:
+        Vec<meerkat_authorization_contracts::audit::StoredAuthorizationAuditObservation>,
+}
+
+impl ServiceCallAuditBatch {
+    /// `observations` for `key`'s rows, oldest first.
+    #[must_use]
+    pub fn new(
+        key: ServiceCallAuditKey,
+        observations: Vec<
+            meerkat_authorization_contracts::audit::StoredAuthorizationAuditObservation,
+        >,
+    ) -> Self {
+        Self { key, observations }
+    }
+}
+
+/// One row of the service-call audit log, as its protected native read
+/// ([`RuntimeStore::read_service_call_audit`]) returns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ServiceCallAuditRecord {
+    /// The row's place among its key's rows: 0 for the first, then one more
+    /// for each row after it.
+    pub sequence: u64,
+    /// The observation, exactly as it was appended.
+    pub observation: meerkat_authorization_contracts::audit::StoredAuthorizationAuditObservation,
+}
+
+impl ServiceCallAuditRecord {
+    /// The row `sequence` of `observation`.
+    #[must_use]
+    pub fn new(
+        sequence: u64,
+        observation: meerkat_authorization_contracts::audit::StoredAuthorizationAuditObservation,
+    ) -> Self {
+        Self {
+            sequence,
+            observation,
+        }
+    }
+}
+
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 pub trait RuntimeStore: Send + Sync {
@@ -9875,6 +9964,57 @@ pub trait RuntimeStore: Send + Sync {
     /// answers `true`, and a decorator forwards both together.
     fn supports_whole_blob_run_rebase(&self) -> bool {
         false
+    }
+
+    /// Append `batch` to the service-call audit log, the native owner of the
+    /// audit of governed service calls: provider calls that no runtime input
+    /// carries, so no input row's commit can hold their observations
+    /// ([`crate::MeerkatMachine::prepare_service_call`]). The batch's rows
+    /// follow every row its key already holds, in the batch's order, each
+    /// under its key's next sequence, and the whole batch commits in one
+    /// transaction or not at all. The log is append-only: no row is ever
+    /// changed or removed. An empty batch writes nothing.
+    ///
+    /// A governed call waits for this append before it is sent, so an
+    /// implementation must not wait without bound: it fails instead (on a
+    /// held maintenance fence, or past its busy timeout behind another
+    /// writer). The SQLite store fails at once under another holder's
+    /// maintenance fence and waits at most its connection's busy timeout for
+    /// each lock it takes.
+    ///
+    /// The default answers `Unsupported`, so a store without the log still
+    /// compiles and Core refuses every service call over it before the call
+    /// is sent. A decorator forwards this method and
+    /// [`Self::read_service_call_audit`] to the store it wraps.
+    async fn append_service_call_audit(
+        &self,
+        batch: ServiceCallAuditBatch,
+    ) -> Result<(), RuntimeStoreError> {
+        let _ = batch;
+        Err(RuntimeStoreError::Unsupported(
+            "append_service_call_audit".into(),
+        ))
+    }
+
+    /// The protected native read of the service-call audit log: every row
+    /// of `key`, in sequence order, with the full observations, for the
+    /// trusted host. No surface projects these rows. A key with no rows
+    /// reads as empty. The default answers `Unsupported`.
+    ///
+    /// An operation's rows end with its outcome, or its refusal. An operation
+    /// whose rows end at its entry, with no outcome row, may have entered its
+    /// dispatcher; it was cancelled or lost before its outcome (or refusal)
+    /// was appended, or that append failed. Its outcome is unknown and it may
+    /// have taken effect, the meaning `ToolError::OutcomeUncertain` gives an
+    /// interrupted run's call.
+    async fn read_service_call_audit(
+        &self,
+        key: &ServiceCallAuditKey,
+    ) -> Result<Vec<ServiceCallAuditRecord>, RuntimeStoreError> {
+        let _ = key;
+        Err(RuntimeStoreError::Unsupported(
+            "read_service_call_audit".into(),
+        ))
     }
 
     /// Atomically persist session delta + receipt + input state updates.
@@ -10980,6 +11120,243 @@ mod runtime_store_write_fence_tests {
             .await
             .expect_err("default decorator must not forward fenced commit implicitly");
         assert!(matches!(error, RuntimeStoreError::Unsupported(_)));
+    }
+
+    /// A store that does not implement the service-call audit log answers
+    /// `Unsupported` for its append and its read: the provided defaults,
+    /// which a decorator that forwards nothing keeps.
+    #[tokio::test]
+    async fn a_store_without_the_service_call_audit_log_answers_unsupported() {
+        let store = DefaultFenceDecorator {
+            inner: InMemoryRuntimeStore::new(),
+        };
+        let key = ServiceCallAuditKey::new("original", "occurrence");
+        let appended = store
+            .append_service_call_audit(ServiceCallAuditBatch::new(
+                key.clone(),
+                vec![service_call_audit_tests::observation("attempt-1")],
+            ))
+            .await;
+        assert!(
+            matches!(appended, Err(RuntimeStoreError::Unsupported(_))),
+            "{appended:?}"
+        );
+        let read = store.read_service_call_audit(&key).await;
+        assert!(
+            matches!(read, Err(RuntimeStoreError::Unsupported(_))),
+            "{read:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod service_call_audit_tests {
+    use super::*;
+    use meerkat_authorization_contracts::audit::{
+        AuditObservation, AuthorizationAuditObservation, StoredAuthorizationAuditObservation,
+    };
+
+    /// A distinguishable observation of a service call: its attempt names it.
+    pub(super) fn observation(attempt: &str) -> StoredAuthorizationAuditObservation {
+        StoredAuthorizationAuditObservation {
+            contributors: Arc::from([]),
+            observation: AuthorizationAuditObservation {
+                operation_id: meerkat_core::OperationId::new(),
+                execution_scope: meerkat_core::exact_operation::OperationExecutionScope::Domain,
+                run_id: None,
+                context_revision: None,
+                review_attribution: None,
+                delegate_attribution: None,
+                observation: AuditObservation::ReviewAttemptStarted {
+                    attempt_ref: attempt.to_owned(),
+                },
+            },
+        }
+    }
+
+    /// Each row's sequence and the attempt its observation names.
+    fn rows(records: &[ServiceCallAuditRecord]) -> Vec<(u64, String)> {
+        records
+            .iter()
+            .map(|record| match &record.observation.observation.observation {
+                AuditObservation::ReviewAttemptStarted { attempt_ref } => {
+                    (record.sequence, attempt_ref.clone())
+                }
+                _ => (record.sequence, String::new()),
+            })
+            .collect()
+    }
+
+    fn expected(rows: &[(u64, &str)]) -> Vec<(u64, String)> {
+        rows.iter()
+            .map(|(sequence, attempt)| (*sequence, (*attempt).to_owned()))
+            .collect()
+    }
+
+    /// The log reads empty before any append, writes nothing for an empty
+    /// batch, keeps each key's rows in append order under sequences that
+    /// continue across batches, keeps keys apart, and reads back each
+    /// observation exactly.
+    async fn appends_in_order_and_reads_back(store: &dyn RuntimeStore) {
+        let key = ServiceCallAuditKey::new("original-a", "occurrence-1");
+        let other = ServiceCallAuditKey::new("original-a", "occurrence-2");
+        assert!(
+            store
+                .read_service_call_audit(&key)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .append_service_call_audit(ServiceCallAuditBatch::new(key.clone(), Vec::new()))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .read_service_call_audit(&key)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let first = observation("a");
+        store
+            .append_service_call_audit(ServiceCallAuditBatch::new(
+                key.clone(),
+                vec![first.clone(), observation("b")],
+            ))
+            .await
+            .unwrap();
+        store
+            .append_service_call_audit(ServiceCallAuditBatch::new(
+                other.clone(),
+                vec![observation("x")],
+            ))
+            .await
+            .unwrap();
+        store
+            .append_service_call_audit(ServiceCallAuditBatch::new(
+                key.clone(),
+                vec![observation("c")],
+            ))
+            .await
+            .unwrap();
+
+        let records = store.read_service_call_audit(&key).await.unwrap();
+        assert_eq!(rows(&records), expected(&[(0, "a"), (1, "b"), (2, "c")]));
+        assert!(records[0].observation == first, "read back exactly");
+        assert_eq!(
+            rows(&store.read_service_call_audit(&other).await.unwrap()),
+            expected(&[(0, "x")])
+        );
+    }
+
+    #[tokio::test]
+    async fn the_in_memory_service_call_audit_log_appends_in_order_and_reads_back() {
+        appends_in_order_and_reads_back(&InMemoryRuntimeStore::new()).await;
+    }
+
+    /// The SQLite log, in the runtime store's file: its schema domain is
+    /// provisioned by the first append (opening and reading the store
+    /// provision nothing), and its rows outlive the store's reopen, the
+    /// next append's sequence continuing after them.
+    #[cfg(feature = "sqlite-store")]
+    #[tokio::test]
+    async fn the_sqlite_service_call_audit_log_appends_in_order_reads_back_and_outlives_a_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("runtime.sqlite3");
+        let ledger_version = || {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            meerkat_sqlite::domain_version(&conn, "runtime-service-call-audit").unwrap()
+        };
+        let store = SqliteRuntimeStore::new(path.clone()).unwrap();
+        let key = ServiceCallAuditKey::new("original-a", "occurrence-1");
+        assert!(
+            store
+                .read_service_call_audit(&key)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            ledger_version(),
+            None,
+            "opening and reading provision nothing"
+        );
+
+        appends_in_order_and_reads_back(&store).await;
+        assert_eq!(
+            ledger_version(),
+            Some(1),
+            "the first append provisioned the log"
+        );
+        drop(store);
+
+        let reopened = SqliteRuntimeStore::new(path.clone()).unwrap();
+        reopened
+            .append_service_call_audit(ServiceCallAuditBatch::new(
+                key.clone(),
+                vec![observation("d")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            rows(&reopened.read_service_call_audit(&key).await.unwrap()),
+            expected(&[(0, "a"), (1, "b"), (2, "c"), (3, "d")])
+        );
+    }
+
+    /// An append under another holder's maintenance fence fails typed at
+    /// once (the fence guard never waits for the holder) and writes nothing;
+    /// once the fence is released, the same append is written.
+    #[cfg(feature = "sqlite-store")]
+    #[tokio::test]
+    async fn a_sqlite_append_under_another_holders_maintenance_fence_fails_typed_at_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("runtime.sqlite3");
+        let store = SqliteRuntimeStore::new(path.clone()).unwrap();
+        let key = ServiceCallAuditKey::new("original-a", "occurrence-1");
+        // Another holder's exclusive fence: a raw lock on the fence file,
+        // without this process's holder registry entry.
+        let fence = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(meerkat_sqlite::fence_lock_path(&path))
+            .unwrap();
+        fence.try_lock().unwrap();
+
+        let started = std::time::Instant::now();
+        let fenced = store
+            .append_service_call_audit(ServiceCallAuditBatch::new(
+                key.clone(),
+                vec![observation("a")],
+            ))
+            .await;
+        assert!(
+            matches!(fenced, Err(RuntimeStoreError::MaintenanceFenceHeld { .. })),
+            "{fenced:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the fence guard does not wait for its holder"
+        );
+
+        fence.unlock().unwrap();
+        drop(fence);
+        store
+            .append_service_call_audit(ServiceCallAuditBatch::new(
+                key.clone(),
+                vec![observation("a")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            rows(&store.read_service_call_audit(&key).await.unwrap()),
+            expected(&[(0, "a")]),
+            "only the append after the release was written"
+        );
     }
 }
 

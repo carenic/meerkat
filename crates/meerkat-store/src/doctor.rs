@@ -256,6 +256,10 @@ pub const KNOWN_LEDGER_DOMAINS: &[&str] = &[
     // realms that never used durable delivery, so it is deliberately NOT in
     // any `REALM_DATABASE_FILES` expected-domain list.
     "runtime-delivery",
+    // Lazily provisioned by the first governed service call's audit append,
+    // in the runtime store's file; absent on realms that never made one, so
+    // it is not in any expected-domain list either.
+    "runtime-service-call-audit",
     "workgraph",
     "jobs",
     "memory",

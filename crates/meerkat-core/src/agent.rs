@@ -19,6 +19,8 @@ mod extraction;
 mod hook_impl;
 #[cfg(all(test, feature = "workspace-tests"))]
 mod hooks_behavior_tests;
+#[cfg(test)]
+mod observation_barrier_tests;
 pub(crate) mod reasoning_preference;
 #[cfg(all(test, feature = "workspace-tests"))]
 mod round_commit_tests;
@@ -908,6 +910,10 @@ pub struct ToolDispatchContext {
     /// The host's operation refusal observer with the agent's session,
     /// attached by the agent. Host-only: nothing here reaches the model.
     refusal_observer: Option<crate::authorization::RefusalObserverBinding>,
+    /// The work's observation barrier, awaited by every fenced entry made
+    /// with this context before any dispatcher code runs. Only the native
+    /// runtime installs one, for a governed service call.
+    observation_barrier: Option<Arc<dyn crate::authorization::OperationObservationBarrier>>,
     // Monotonic restriction set by the core execution policy owner.
     read_only_execution_required: bool,
 }
@@ -1448,6 +1454,11 @@ impl PartialEq for ToolDispatchContext {
                 (None, None) => true,
                 _ => false,
             }
+            && match (&self.observation_barrier, &other.observation_barrier) {
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                (None, None) => true,
+                _ => false,
+            }
             && self.read_only_execution_required == other.read_only_execution_required
     }
 }
@@ -1513,6 +1524,7 @@ impl ToolDispatchContext {
             review_entry: None,
             staging_wait: None,
             refusal_observer: None,
+            observation_barrier: None,
             read_only_execution_required: false,
         }
     }
@@ -1569,6 +1581,23 @@ impl ToolDispatchContext {
     #[must_use]
     fn with_staging_wait(mut self, wait: Arc<EntryStagingWait>) -> Self {
         self.staging_wait = Some(wait);
+        self
+    }
+
+    /// Attach the work's observation barrier: every fenced entry made with
+    /// this context awaits it before any dispatcher code runs, and its error
+    /// refuses the call unsent (see
+    /// [`crate::authorization::OperationObservationBarrier`]).
+    ///
+    /// Only the native runtime installs one, on the context of a governed
+    /// service call it built itself; host code never does. It grants
+    /// nothing, and every other context carries none.
+    #[must_use]
+    pub fn with_observation_barrier(
+        mut self,
+        barrier: Arc<dyn crate::authorization::OperationObservationBarrier>,
+    ) -> Self {
+        self.observation_barrier = Some(barrier);
         self
     }
 
@@ -3026,6 +3055,14 @@ fn staging_wait_site(boundary: crate::authorization::OperationEntryBoundary) -> 
 /// forwarded unchanged: its tool code may have produced an effect before a
 /// later governed step refused.
 ///
+/// A context carrying an observation barrier
+/// ([`ToolDispatchContext::with_observation_barrier`]) awaits it after the
+/// root entry staging and before any dispatcher code runs, then checks the
+/// decision again (see
+/// [`crate::authorization::OperationObservationBarrier`]); its error refuses
+/// the call with [`crate::ToolError::OperationObservationUnavailable`]. A
+/// context without one is dispatched exactly as before.
+///
 /// A refused or unavailable result is reported, from that same value, to
 /// the operation refusal observer of the host that composed the agent, when
 /// the context carries one (the agent loop's and its external tool calls').
@@ -3351,6 +3388,23 @@ async fn dispatch_admitted_plan<T: AgentToolDispatcher + ?Sized + 'static>(
                 return Ok(Admitted::Superseded(superseded));
             }
         };
+        // Only a context carrying an observation barrier waits here, so its
+        // owner can make the staged decision and entry durable before any
+        // dispatcher code runs. Every other context goes straight on.
+        let entry_context = match context.observation_barrier.as_ref() {
+            None => entry_context,
+            Some(barrier) => {
+                match await_observation_barrier(barrier, context, entry_context, call, plan).await {
+                    Ok(entry_context) => entry_context,
+                    Err(crate::approval::review::ReviewAdmissionRefusal::Settled(error)) => {
+                        return Err(error);
+                    }
+                    Err(crate::approval::review::ReviewAdmissionRefusal::Superseded(
+                        superseded,
+                    )) => return Ok(Admitted::Superseded(superseded)),
+                }
+            }
+        };
         let context = entry_context.as_ref().unwrap_or(context);
         let result = match plan.kind() {
             crate::ResolvedExecutionKind::Streaming(policy) => {
@@ -3393,6 +3447,55 @@ async fn dispatch_admitted_plan<T: AgentToolDispatcher + ?Sized + 'static>(
         guard.complete();
     }
     outcome.unwrap_or_else(Admitted::Refused)
+}
+
+/// Rounds of a fenced entry's observation barrier before the entry is
+/// refused: each decision prepared again during a wait goes round once more.
+const OBSERVATION_BARRIER_ROUNDS: usize = 3;
+
+/// The observation barrier of one fenced entry, after its root staging and
+/// before any dispatcher code runs (see
+/// [`crate::authorization::OperationObservationBarrier`]).
+///
+/// After each wait the entering decision is checked again, as the root
+/// staging checks it (app custody, then the decision's currentness), with
+/// nothing held across the wait. A decision that is still current is the one
+/// the barrier just made durable, and the call enters with it. A decision
+/// prepared again meanwhile (an owner change during the wait) is staged with
+/// a new root entry and goes round once more, at most
+/// [`OBSERVATION_BARRIER_ROUNDS`] times, so what the barrier made durable
+/// always carries the decision the call enters with. A failed barrier, a
+/// refusal or too many changes settle the entry; nothing is sent.
+async fn await_observation_barrier(
+    barrier: &Arc<dyn crate::authorization::OperationObservationBarrier>,
+    root: &ToolDispatchContext,
+    mut entering: Option<ToolDispatchContext>,
+    call: ToolCallView<'_>,
+    plan: &crate::ResolvedToolExecutionPlan,
+) -> Result<Option<ToolDispatchContext>, crate::approval::review::ReviewAdmissionRefusal> {
+    for _ in 0..OBSERVATION_BARRIER_ROUNDS {
+        barrier
+            .before_entry()
+            .await
+            .map_err(|_| crate::ToolError::OperationObservationUnavailable)?;
+        let current = entering.as_ref().unwrap_or(root);
+        let Some(prepared_again) = current.check_tool_authorization(call, Some(plan))? else {
+            return Ok(entering);
+        };
+        let staged = prepared_again.stage_root_tool_entry(call, plan).await?;
+        entering = Some(staged.unwrap_or(prepared_again));
+    }
+    // The owner kept changing: the entering decision is refused, and the
+    // refusal is staged like every other refusal of the decision.
+    let refusal = crate::authorization::OperationRefused::new(
+        crate::authorization::OperationRefusalKind::ReprepareRequired,
+    );
+    if let Some(prepared) = entering.as_ref().unwrap_or(root).prepared_authorization() {
+        prepared
+            .observe_refusal(refusal)
+            .map_err(|_| crate::ToolError::OperationObservationUnavailable)?;
+    }
+    Err(crate::ToolError::AuthorizationRefused { refusal }.into())
 }
 
 /// Compute whether the current exact catalog should stay inline or switch to deferred mode.

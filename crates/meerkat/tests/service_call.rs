@@ -7,6 +7,10 @@
 //! nothing), so every refusal these rows observe is Core's own: the
 //! enrollment comparison, the grant lineage, the connector approval the
 //! grant records, the review tier and the connector credential.
+//!
+//! The machine is persistent over an in-memory runtime store, whose
+//! service-call audit log is the calls' audit owner: the rows read each
+//! occurrence's observations back from it, and script its appends.
 #![cfg(all(unix, feature = "local-authorization", feature = "mcp"))]
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -26,9 +30,7 @@ use meerkat_authorization::policy::{
     LocalOperationValues, LocalPolicyAllowance, LocalPolicyPurpose,
 };
 use meerkat_authorization::publication::LocalAuthorizationPublication;
-use meerkat_authorization_contracts::audit::{
-    AuditObservation, AuthorizationAuditObservation, AuthorizationAuditSink,
-};
+use meerkat_authorization_contracts::audit::{AuditObservation, AuthorizationAuditObservation};
 use meerkat_authorization_contracts::constraints::{
     ActionRef, AudienceRef, DomainRestriction, ExactRestriction, ExecutionRestrictions,
     LifetimeRestriction, ProcessorRef, ResourceDomain,
@@ -47,9 +49,8 @@ use meerkat_authorization_contracts::work_association::{
     WorkAuthorityBasis,
 };
 use meerkat_core::authorization::{
-    AuthorizationOperation, ControllerReadinessFailure, OperationObservationError,
-    OperationRefusalKind, OperationRefused, OperationReviewTier, PreparedAuthorizationBinding,
-    ToolAuthorizationTarget,
+    AuthorizationOperation, ControllerReadinessFailure, OperationRefusalKind, OperationRefused,
+    OperationReviewTier, PreparedAuthorizationBinding, ToolAuthorizationTarget,
 };
 use meerkat_core::connection::{
     AuthCredentialIdentity, CredentialAccountId, CredentialAccountRef, RealmId,
@@ -72,14 +73,18 @@ use meerkat_providers::connector_login::{
 use meerkat_providers::connector_oauth::{
     AccountSelection, ConnectorAccountObservation, ConnectorOAuthDescriptor, ConnectorOAuthRefusal,
 };
-use meerkat_runtime::MeerkatMachine;
 use meerkat_runtime::input_authority::{
     NativeAdmissionError, NativeIngressContext, ServiceCallRequest, ServiceOccurrence,
 };
 use meerkat_runtime::meerkat_machine::{
     AuthenticatedOriginal, AuthenticatedOriginalSource, EnrolledServiceOriginal,
     OriginalDisposition, RetainedCustody, ScopedGrantComposition, ScopedInvocation,
-    ScopedMandateOwner, ServiceCall, original_operation_grant, require_source_original_live,
+    ScopedMandateOwner, ServiceCall, ServiceCallAuditError, ServiceCallOutcome,
+    original_operation_grant, require_source_original_live,
+};
+use meerkat_runtime::{
+    InMemoryRuntimeStore, MeerkatMachine, RuntimeStore, RuntimeStoreError, ServiceCallAuditBatch,
+    ServiceCallAuditKey,
 };
 
 const STRATEGY: &str = "service-call-fixture-v1";
@@ -497,46 +502,40 @@ impl AuthenticatedOriginalSource for Originals {
     }
 }
 
-/// The occurrence's audit row: every observation of the request's calls.
-#[derive(Default)]
-struct Audit {
-    observations: Mutex<Vec<AuthorizationAuditObservation>>,
-    failing: AtomicBool,
+/// The decisions that allowed a call, among an occurrence's observations.
+fn prepared(observations: &[AuthorizationAuditObservation]) -> usize {
+    observations
+        .iter()
+        .filter(|seen| matches!(seen.observation, AuditObservation::Prepared { .. }))
+        .count()
 }
 
-impl AuthorizationAuditSink for Audit {
-    fn append(
-        &self,
-        observation: AuthorizationAuditObservation,
-    ) -> Result<(), OperationObservationError> {
-        if self.failing.load(Ordering::SeqCst) {
-            return Err(OperationObservationError);
-        }
-        self.observations.lock().unwrap().push(observation);
-        Ok(())
+/// The refusals of `kind`, among an occurrence's observations.
+fn refused(observations: &[AuthorizationAuditObservation], kind: OperationRefusalKind) -> usize {
+    observations
+        .iter()
+        .filter(|seen| {
+            matches!(&seen.observation, AuditObservation::Refused { reason, .. } if *reason == kind)
+        })
+        .count()
+}
+
+/// The kind of one observation, for rows that read the log's order.
+fn kind(observation: &AuthorizationAuditObservation) -> &'static str {
+    match observation.observation {
+        AuditObservation::ReviewAttemptStarted { .. } => "review_attempt_started",
+        AuditObservation::Prepared { .. } => "prepared",
+        AuditObservation::Refused { .. } => "refused",
+        AuditObservation::AuthorizationUnavailable { .. } => "authorization_unavailable",
+        AuditObservation::Entry { .. } => "entry",
+        AuditObservation::Outcome { .. } => "outcome",
+        AuditObservation::MandatoryHookWithheld { .. } => "mandatory_hook_withheld",
+        _ => "other",
     }
 }
 
-impl Audit {
-    fn observations(&self) -> Vec<AuthorizationAuditObservation> {
-        self.observations.lock().unwrap().clone()
-    }
-
-    fn prepared(&self) -> usize {
-        self.observations()
-            .iter()
-            .filter(|seen| matches!(seen.observation, AuditObservation::Prepared { .. }))
-            .count()
-    }
-
-    fn refused(&self, kind: OperationRefusalKind) -> usize {
-        self.observations()
-            .iter()
-            .filter(|seen| {
-                matches!(&seen.observation, AuditObservation::Refused { reason, .. } if *reason == kind)
-            })
-            .count()
-    }
+fn kinds(observations: &[AuthorizationAuditObservation]) -> Vec<&'static str> {
+    observations.iter().map(kind).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -744,6 +743,9 @@ struct Host {
     issuer: String,
     grants: Arc<LocalGrantAuthority>,
     originals: Arc<Originals>,
+    /// The machine's runtime store, whose service-call audit log holds the
+    /// occurrences' observations.
+    store: Arc<InMemoryRuntimeStore>,
     machine: MeerkatMachine,
     host_auth: meerkat::HostAuthService,
     /// The collector's grant for the mail installation.
@@ -805,21 +807,13 @@ impl Host {
         let originals = Arc::new(Originals::default());
         let original = association(candidate("setup-1", SERVER, &grant));
         originals.enroll(&original);
-        let machine = MeerkatMachine::ephemeral()
-            .with_local_grant_authorization(
-                ScopedGrantComposition {
-                    grants: Arc::clone(&grants),
-                    ingress_domain: ingress_domain(),
-                    originals: Arc::clone(&originals) as Arc<dyn AuthenticatedOriginalSource>,
-                    invocation: ScopedInvocation::from_policy(Arc::new(Permissive)),
-                    operation_owner: Arc::new(Operations {
-                        reviewed: options.reviewed,
-                    }),
-                    retained_resume: None,
-                }
-                .into_configuration(),
-            )
-            .expect("a governed machine");
+        let store = Arc::new(InMemoryRuntimeStore::new());
+        let machine = MeerkatMachine::persistent_with_local_grant_authorization(
+            Arc::clone(&store) as Arc<dyn RuntimeStore>,
+            None,
+            composition(&grants, &originals, options.reviewed),
+        )
+        .expect("a governed machine");
         let host_auth = meerkat::HostAuthService::new(
             ProviderAuthPersistence::new(
                 Arc::new(EphemeralTokenStore::new()),
@@ -835,6 +829,7 @@ impl Host {
             issuer,
             grants,
             originals,
+            store,
             machine,
             host_auth,
             grant,
@@ -869,31 +864,41 @@ impl Host {
         server(SERVER, &MAIL_OPERATIONS, &self.calls, &self.issuer, SUBJECT)
     }
 
-    fn request(
+    fn request(&self, association: InputAuthorityAssociation) -> Arc<ServiceCallRequest> {
+        self.request_for(association, "occurrence-1")
+    }
+
+    fn request_for(
         &self,
         association: InputAuthorityAssociation,
-        audit: &Arc<Audit>,
+        occurrence_name: &str,
     ) -> Arc<ServiceCallRequest> {
-        ServiceCallRequest::from_trusted_host(
-            association,
-            occurrence("occurrence-1"),
-            Arc::clone(audit) as Arc<dyn AuthorizationAuditSink>,
-        )
-        .expect("a service original's request")
+        ServiceCallRequest::from_trusted_host(association, occurrence(occurrence_name))
+            .expect("a service original's request")
     }
 
     fn prepare(
         &self,
         association: InputAuthorityAssociation,
-        audit: &Arc<Audit>,
     ) -> Result<ServiceCall, OperationAuthorizationError> {
-        self.machine
-            .prepare_service_call(self.request(association, audit))
+        self.machine.prepare_service_call(self.request(association))
     }
 
-    fn admitted(&self, audit: &Arc<Audit>) -> ServiceCall {
-        self.prepare(self.original.clone(), audit)
+    fn admitted(&self) -> ServiceCall {
+        self.prepare(self.original.clone())
             .expect("the enrolled original's occurrence is admitted")
+    }
+
+    /// The observations the store's service-call audit log holds for `key`,
+    /// in order, read through its protected native read.
+    async fn audit(&self, key: &ServiceCallAuditKey) -> Vec<AuthorizationAuditObservation> {
+        self.store
+            .read_service_call_audit(key)
+            .await
+            .expect("the protected read of the audit log")
+            .into_iter()
+            .map(|record| record.observation.observation)
+            .collect()
     }
 
     fn calls(&self) -> Vec<serde_json::Value> {
@@ -917,11 +922,27 @@ fn resolution() -> ToolExecutionResolutionContext {
     )
 }
 
+/// One call whose observations all reach the audit log: its result.
 async fn dispatch<T: AgentToolDispatcher + ?Sized + 'static>(
     call: &ServiceCall,
     dispatcher: &Arc<T>,
     name: &str,
 ) -> Result<ToolDispatchOutcome, ToolError> {
+    let outcome = dispatch_outcome(call, dispatcher, name).await;
+    assert!(
+        outcome.audit.is_ok(),
+        "every observation of the call is in the log: {:?}",
+        outcome.audit
+    );
+    outcome.result
+}
+
+/// One call: its result and whether its observations reached the log.
+async fn dispatch_outcome<T: AgentToolDispatcher + ?Sized + 'static>(
+    call: &ServiceCall,
+    dispatcher: &Arc<T>,
+    name: &str,
+) -> ServiceCallOutcome {
     let args = serde_json::value::to_raw_value(&serde_json::json!({})).unwrap();
     tokio::time::timeout(
         LIMIT,
@@ -937,6 +958,24 @@ async fn dispatch<T: AgentToolDispatcher + ?Sized + 'static>(
     )
     .await
     .expect("the call settles")
+}
+
+/// The scoped grant composition of the fixture's grant owner and original
+/// source, with `reviewed` operations needing review.
+fn composition(
+    grants: &Arc<LocalGrantAuthority>,
+    originals: &Arc<Originals>,
+    reviewed: BTreeSet<String>,
+) -> meerkat_runtime::meerkat_machine::NativeGrantWorkConfiguration {
+    ScopedGrantComposition {
+        grants: Arc::clone(grants),
+        ingress_domain: ingress_domain(),
+        originals: Arc::clone(originals) as Arc<dyn AuthenticatedOriginalSource>,
+        invocation: ScopedInvocation::from_policy(Arc::new(Permissive)),
+        operation_owner: Arc::new(Operations { reviewed }),
+        retained_resume: None,
+    }
+    .into_configuration()
 }
 
 fn refusal_kind(result: &Result<ToolDispatchOutcome, ToolError>) -> Option<OperationRefusalKind> {
@@ -970,8 +1009,7 @@ fn is_refused(error: &OperationAuthorizationError, kind: OperationRefusalKind) -
 async fn an_enrolled_service_original_reaches_the_connector_with_the_slots_credential() {
     let host = Host::new().await;
     let mail = host.mail_router().await;
-    let audit = Arc::new(Audit::default());
-    let call = host.admitted(&audit);
+    let call = host.admitted();
 
     dispatch(&call, &mail, "list_messages")
         .await
@@ -984,7 +1022,11 @@ async fn an_enrolled_service_original_reaches_the_connector_with_the_slots_crede
     assert_eq!(credential["account"]["subject"], SUBJECT);
     assert_eq!(credential["account"]["strategy_id"], STRATEGY);
     assert_eq!(credential["destination_origin"], DESTINATION);
-    assert_eq!(audit.prepared(), 1, "the decision was audited");
+    assert_eq!(
+        prepared(&host.audit(call.audit_key()).await),
+        1,
+        "the decision was audited"
+    );
 }
 
 /// An ungoverned machine has no native host: the request is refused as
@@ -994,10 +1036,9 @@ async fn an_enrolled_service_original_reaches_the_connector_with_the_slots_crede
 async fn an_ungoverned_machine_refuses_a_service_call_before_anything_is_sent() {
     let host = Host::new().await;
     let ungoverned = MeerkatMachine::ephemeral();
-    let audit = Arc::new(Audit::default());
-    let refused = prepare_refusal(
-        ungoverned.prepare_service_call(host.request(host.original.clone(), &audit)),
-    );
+    let request = host.request(host.original.clone());
+    let key = request.audit_key().clone();
+    let refused = prepare_refusal(ungoverned.prepare_service_call(request));
     assert!(matches!(refused, OperationAuthorizationError::Unavailable));
 
     let mail = host.mail_router().await;
@@ -1011,7 +1052,7 @@ async fn an_ungoverned_machine_refuses_a_service_call_before_anything_is_sent() 
         .await;
     assert!(direct.is_err(), "an ungoverned connector call is refused");
     assert!(host.calls().is_empty(), "nothing reached the server");
-    assert!(audit.observations().is_empty());
+    assert!(host.audit(&key).await.is_empty());
 }
 
 /// A native host that serves no service call (the trait's default).
@@ -1042,37 +1083,38 @@ impl meerkat_runtime::input_authority::NativeWorkAuthorizationHost for WithoutSe
 }
 
 /// A host or an admitted-work owner without service call support
-/// refuses as unavailable: neither default borrows any authority.
+/// refuses as unavailable: neither default borrows any authority. (A
+/// custom host installs only on a storeless machine, which already refuses
+/// a service call for having no audit log.)
 #[tokio::test]
 async fn a_host_or_owner_without_service_call_support_refuses_unavailable() {
     let host = Host::new().await;
-    let audit = Arc::new(Audit::default());
 
     let custom = MeerkatMachine::ephemeral()
         .with_native_work_authorization_host(Arc::new(WithoutServiceCalls))
         .expect("an installed host");
-    let refused =
-        prepare_refusal(custom.prepare_service_call(host.request(host.original.clone(), &audit)));
+    let refused = prepare_refusal(custom.prepare_service_call(host.request(host.original.clone())));
     assert!(matches!(refused, OperationAuthorizationError::Unavailable));
 
     // An owner that is not a scoped composition's keeps the default.
-    let unscoped = MeerkatMachine::ephemeral()
-        .with_local_grant_authorization(
-            meerkat_runtime::meerkat_machine::NativeGrantWorkConfiguration {
-                grants: Arc::clone(&host.grants),
-                ingress: Arc::new(|_, _, _, _| Ok(())),
-                invocation_owner: Arc::new(Permissive),
-                operation_owner: Arc::new(Operations {
-                    reviewed: BTreeSet::new(),
-                }),
-                retained_resume: None,
-                require_scoped_destination: false,
-                configured_mcp_attachment: None,
-            },
-        )
-        .expect("a governed machine");
+    let unscoped = MeerkatMachine::persistent_with_local_grant_authorization(
+        Arc::new(InMemoryRuntimeStore::new()),
+        None,
+        meerkat_runtime::meerkat_machine::NativeGrantWorkConfiguration {
+            grants: Arc::clone(&host.grants),
+            ingress: Arc::new(|_, _, _, _| Ok(())),
+            invocation_owner: Arc::new(Permissive),
+            operation_owner: Arc::new(Operations {
+                reviewed: BTreeSet::new(),
+            }),
+            retained_resume: None,
+            require_scoped_destination: false,
+            configured_mcp_attachment: None,
+        },
+    )
+    .expect("a governed machine");
     let refused =
-        prepare_refusal(unscoped.prepare_service_call(host.request(host.original.clone(), &audit)));
+        prepare_refusal(unscoped.prepare_service_call(host.request(host.original.clone())));
     assert!(matches!(refused, OperationAuthorizationError::Unavailable));
     assert!(host.calls().is_empty());
 }
@@ -1084,10 +1126,9 @@ async fn a_host_or_owner_without_service_call_support_refuses_unavailable() {
 #[tokio::test]
 async fn an_unenrolled_cancelled_or_unreadable_original_refuses() {
     let host = Host::new().await;
-    let audit = Arc::new(Audit::default());
 
     let unenrolled = association(candidate("setup-unknown", SERVER, &host.grant));
-    let refused = prepare_refusal(host.prepare(unenrolled, &audit));
+    let refused = prepare_refusal(host.prepare(unenrolled));
     assert!(
         is_refused(&refused, OperationRefusalKind::Denied),
         "{refused:?}"
@@ -1095,7 +1136,7 @@ async fn an_unenrolled_cancelled_or_unreadable_original_refuses() {
 
     host.originals
         .cancel(&host.original.candidate().original_work);
-    let refused = prepare_refusal(host.prepare(host.original.clone(), &audit));
+    let refused = prepare_refusal(host.prepare(host.original.clone()));
     assert!(
         is_refused(&refused, OperationRefusalKind::Denied),
         "{refused:?}"
@@ -1103,7 +1144,7 @@ async fn an_unenrolled_cancelled_or_unreadable_original_refuses() {
     host.originals.cancelled.lock().unwrap().clear();
 
     host.originals.unreadable.store(true, Ordering::SeqCst);
-    let refused = prepare_refusal(host.prepare(host.original.clone(), &audit));
+    let refused = prepare_refusal(host.prepare(host.original.clone()));
     assert!(
         matches!(refused, OperationAuthorizationError::Unavailable),
         "{refused:?}"
@@ -1111,7 +1152,7 @@ async fn an_unenrolled_cancelled_or_unreadable_original_refuses() {
     host.originals.unreadable.store(false, Ordering::SeqCst);
 
     let mail = host.mail_router().await;
-    let call = host.admitted(&audit);
+    let call = host.admitted();
     dispatch(&call, &mail, "list_messages")
         .await
         .expect("the first call is permitted");
@@ -1126,7 +1167,7 @@ async fn an_unenrolled_cancelled_or_unreadable_original_refuses() {
     assert_eq!(host.calls().len(), 1, "the revoked call was not sent");
 
     host.originals.enroll(&host.original);
-    let call = host.admitted(&audit);
+    let call = host.admitted();
     host.originals
         .cancel(&host.original.candidate().original_work);
     let refused = dispatch(&call, &mail, "get_message").await;
@@ -1144,8 +1185,7 @@ async fn an_unenrolled_cancelled_or_unreadable_original_refuses() {
 async fn a_grant_revoked_between_calls_refuses_the_next_call_locally() {
     let host = Host::new().await;
     let mail = host.mail_router().await;
-    let audit = Arc::new(Audit::default());
-    let call = host.admitted(&audit);
+    let call = host.admitted();
     dispatch(&call, &mail, "list_messages")
         .await
         .expect("permitted before the revocation");
@@ -1201,8 +1241,7 @@ async fn a_second_connector_server_has_no_lineage_and_is_denied() {
     let original = association(candidate("setup-both", SERVER, &both_installations));
     host.originals.enroll(&original);
     let both = host.router(vec![host.mail(), calendar]).await;
-    let audit = Arc::new(Audit::default());
-    let call = host.prepare(original, &audit).expect("admitted");
+    let call = host.prepare(original).expect("admitted");
     let refused = dispatch(&call, &both, "list_events").await;
     assert_eq!(
         refusal_kind(&refused),
@@ -1222,7 +1261,6 @@ async fn a_second_connector_server_has_no_lineage_and_is_denied() {
 #[tokio::test]
 async fn a_reinstalled_binding_with_another_account_is_denied_and_an_unrecorded_one_unavailable() {
     let host = Host::new().await;
-    let audit = Arc::new(Audit::default());
     let other_account = server(
         SERVER,
         &MAIL_OPERATIONS,
@@ -1236,7 +1274,7 @@ async fn a_reinstalled_binding_with_another_account_is_denied_and_an_unrecorded_
         "the binding for another account has another approval"
     );
     let reinstalled = host.router(vec![other_account]).await;
-    let call = host.admitted(&audit);
+    let call = host.admitted();
     let refused = dispatch(&call, &reinstalled, "list_messages").await;
     assert_eq!(
         refusal_kind(&refused),
@@ -1262,7 +1300,7 @@ async fn a_reinstalled_binding_with_another_account_is_denied_and_an_unrecorded_
     let original = association(candidate("setup-unrecorded", SERVER, &unrecorded));
     host.originals.enroll(&original);
     let mail = host.mail_router().await;
-    let call = host.prepare(original, &audit).expect("admitted");
+    let call = host.prepare(original).expect("admitted");
     let unavailable = dispatch(&call, &mail, "list_messages").await;
     assert!(
         matches!(
@@ -1333,8 +1371,7 @@ impl AgentToolDispatcher for Targeted {
 #[tokio::test]
 async fn a_builtin_comms_or_untargeted_operation_is_malformed_for_a_service_call() {
     let host = Host::new().await;
-    let audit = Arc::new(Audit::default());
-    let call = host.admitted(&audit);
+    let call = host.admitted();
     for target in [
         Some(ToolOperationTarget::BuiltinOperation {
             operation: meerkat_core::BuiltinToolOperation::WebSearch,
@@ -1366,8 +1403,7 @@ async fn an_operation_whose_tier_needs_review_is_refused_not_skipped() {
     })
     .await;
     let mail = host.mail_router().await;
-    let audit = Arc::new(Audit::default());
-    let call = host.admitted(&audit);
+    let call = host.admitted();
     let refused = dispatch(&call, &mail, "archive_message").await;
     assert!(refused.is_err(), "an R2 operation is refused: {refused:?}");
     assert!(host.calls().is_empty(), "nothing reached the server");
@@ -1418,8 +1454,7 @@ async fn the_context_is_domain_scoped_runless_and_fresh_per_request() {
     })
     .await;
     let mail = host.mail_router().await;
-    let audit = Arc::new(Audit::default());
-    let request = host.request(host.original.clone(), &audit);
+    let request = host.request(host.original.clone());
     let call = host
         .machine
         .prepare_service_call(Arc::clone(&request))
@@ -1433,7 +1468,7 @@ async fn the_context_is_domain_scoped_runless_and_fresh_per_request() {
     dispatch(&call, &mail, "list_messages")
         .await
         .expect("permitted within the grant's window");
-    let observations = audit.observations();
+    let observations = host.audit(call.audit_key()).await;
     assert!(!observations.is_empty());
     for seen in &observations {
         assert_eq!(seen.execution_scope, OperationExecutionScope::Domain);
@@ -1450,7 +1485,8 @@ async fn the_context_is_domain_scoped_runless_and_fresh_per_request() {
 }
 
 /// Every decision and refusal of an occurrence's calls goes to that
-/// occurrence's own audit row, and a failing row refuses the call.
+/// occurrence's own rows of the audit log, and none to another
+/// occurrence's rows.
 #[tokio::test]
 async fn every_decision_and_refusal_is_audited_with_its_occurrence() {
     let host = Host::new().await;
@@ -1466,36 +1502,39 @@ async fn every_decision_and_refusal_is_audited_with_its_occurrence() {
             ),
         ])
         .await;
-    let first = Arc::new(Audit::default());
-    let second = Arc::new(Audit::default());
-    let request = host.request(host.original.clone(), &first);
+    let request = host.request(host.original.clone());
     assert_eq!(request.occurrence(), &occurrence("occurrence-1"));
     let call = host
         .machine
         .prepare_service_call(request)
         .expect("admitted");
-    let other = host.admitted(&second);
+    let other = host
+        .machine
+        .prepare_service_call(host.request_for(host.original.clone(), "occurrence-2"))
+        .expect("admitted");
+    assert_eq!(
+        call.audit_key().original_digest(),
+        other.audit_key().original_digest(),
+        "one service original"
+    );
+    assert_ne!(call.audit_key(), other.audit_key(), "two occurrences");
 
     dispatch(&call, &both, "list_messages")
         .await
         .expect("permitted");
-    let refused = dispatch(&call, &both, "list_events").await;
-    assert!(refused.is_err());
-    assert_eq!(first.prepared(), 1, "the permitted call's decision");
+    let refused_call = dispatch(&call, &both, "list_events").await;
+    assert!(refused_call.is_err());
+    let first = host.audit(call.audit_key()).await;
+    assert_eq!(prepared(&first), 1, "the permitted call's decision");
     assert_eq!(
-        first.refused(OperationRefusalKind::Denied),
+        refused(&first, OperationRefusalKind::Denied),
         1,
         "the refused call's decision"
     );
     assert!(
-        second.observations().is_empty(),
-        "nothing went to another occurrence's row"
+        host.audit(other.audit_key()).await.is_empty(),
+        "nothing went to another occurrence's rows"
     );
-
-    second.failing.store(true, Ordering::SeqCst);
-    let failed = dispatch(&other, &both, "list_messages").await;
-    assert!(failed.is_err(), "an unrecordable decision refuses the call");
-    assert_eq!(host.calls().len(), 1, "the unaudited call was not sent");
 }
 
 /// The connector owner still checks the exact credential: a slot
@@ -1509,15 +1548,14 @@ async fn a_slot_credential_for_another_account_is_refused_despite_a_current_gran
     })
     .await;
     let mail = host.mail_router().await;
-    let audit = Arc::new(Audit::default());
-    let call = host.admitted(&audit);
+    let call = host.admitted();
     let refused = dispatch(&call, &mail, "list_messages").await;
     assert!(
         refused.is_err(),
         "another account's credential is refused: {refused:?}"
     );
     assert_eq!(
-        audit.prepared(),
+        prepared(&host.audit(call.audit_key()).await),
         1,
         "the governed decision itself allowed the call"
     );
@@ -1530,14 +1568,11 @@ async fn a_slot_credential_for_another_account_is_refused_despite_a_current_gran
 async fn an_association_whose_executor_differs_from_the_grantee_is_denied() {
     let host = Host::new().await;
     let mail = host.mail_router().await;
-    let audit = Arc::new(Audit::default());
     let mut intruder = candidate("setup-intruder", SERVER, &host.grant);
     intruder.logical_executor = principal(PrincipalKind::ServiceAccount, "intruder");
     let intruder = association(intruder);
     host.originals.enroll(&intruder);
-    let call = host
-        .prepare(intruder, &audit)
-        .expect("admitted as enrolled");
+    let call = host.prepare(intruder).expect("admitted as enrolled");
     let refused = dispatch(&call, &mail, "list_messages").await;
     assert_eq!(
         refusal_kind(&refused),
@@ -1553,11 +1588,10 @@ async fn an_association_whose_executor_differs_from_the_grantee_is_denied() {
 #[tokio::test]
 async fn the_enrolled_original_with_one_claim_changed_is_refused() {
     let host = Host::new().await;
-    let audit = Arc::new(Audit::default());
 
     let mut requester = candidate("setup-1", SERVER, &host.grant);
     requester.requester = principal(PrincipalKind::Human, "someone-else");
-    let refused = prepare_refusal(host.prepare(association(requester), &audit));
+    let refused = prepare_refusal(host.prepare(association(requester)));
     assert!(
         is_refused(&refused, OperationRefusalKind::MalformedFacts),
         "{refused:?}"
@@ -1565,7 +1599,7 @@ async fn the_enrolled_original_with_one_claim_changed_is_refused() {
 
     let mut target = candidate("setup-1", SERVER, &host.grant);
     target.target.context = id("another-source");
-    let refused = prepare_refusal(host.prepare(association(target), &audit));
+    let refused = prepare_refusal(host.prepare(association(target)));
     assert!(
         is_refused(&refused, OperationRefusalKind::MalformedFacts),
         "{refused:?}"
@@ -1578,10 +1612,9 @@ async fn the_enrolled_original_with_one_claim_changed_is_refused() {
 #[tokio::test]
 async fn an_admitted_retained_original_of_the_right_shape_cannot_prepare_a_service_call() {
     let host = Host::new().await;
-    let audit = Arc::new(Audit::default());
     let admitted = association(candidate("admitted-1", SERVER, &host.grant));
     host.originals.retain_admitted(&admitted);
-    let refused = prepare_refusal(host.prepare(admitted, &audit));
+    let refused = prepare_refusal(host.prepare(admitted));
     assert!(
         is_refused(&refused, OperationRefusalKind::Denied),
         "{refused:?}"
@@ -1652,7 +1685,6 @@ async fn an_enrolled_service_original_reads_not_retained_and_its_retained_resume
 #[tokio::test]
 async fn a_request_that_cannot_be_a_service_original_is_malformed() {
     let fixture = Host::new().await;
-    let audit = Arc::new(Audit::default());
     let base = || candidate("setup-1", SERVER, &fixture.grant);
     let mut cases: Vec<(&str, InputAuthorityAssociationCandidate)> = Vec::new();
 
@@ -1713,11 +1745,502 @@ async fn a_request_that_cannot_be_a_service_original_is_malformed() {
         let refused = ServiceCallRequest::from_trusted_host(
             association(candidate),
             occurrence("occurrence-1"),
-            Arc::clone(&audit) as Arc<dyn AuthorizationAuditSink>,
         );
         assert!(
             matches!(&refused, Err(refusal) if refusal.kind() == OperationRefusalKind::MalformedFacts),
             "{case}: {refused:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The service-call audit log
+// ---------------------------------------------------------------------------
+
+/// The mail router, recording what the audit log held for one occurrence,
+/// and how many calls the server had received, when the router's own
+/// dispatch began: the first dispatcher code a call runs.
+struct LogAtEntry {
+    inner: Arc<meerkat_mcp::McpRouterAdapter>,
+    store: Arc<InMemoryRuntimeStore>,
+    key: ServiceCallAuditKey,
+    calls: PathBuf,
+    seen: Mutex<Vec<(Vec<&'static str>, usize)>>,
+}
+
+#[async_trait::async_trait]
+impl AgentToolDispatcher for LogAtEntry {
+    fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+        self.inner.tools()
+    }
+
+    fn tool_catalog(&self) -> Arc<[meerkat_core::ToolCatalogEntry]> {
+        self.inner.tool_catalog()
+    }
+
+    fn tool_catalog_capabilities(&self) -> meerkat_core::ToolCatalogCapabilities {
+        self.inner.tool_catalog_capabilities()
+    }
+
+    fn tool_mutation_class(&self, tool_name: &str) -> meerkat_core::ToolMutationClass {
+        self.inner.tool_mutation_class(tool_name)
+    }
+
+    fn live_bridge_effect_kind(&self, tool_name: &str) -> meerkat_core::LiveBridgeEffectKind {
+        self.inner.live_bridge_effect_kind(tool_name)
+    }
+
+    fn review_entry_support(
+        &self,
+        tool_name: &str,
+    ) -> meerkat_core::approval::review::ReviewEntrySupport {
+        self.inner.review_entry_support(tool_name)
+    }
+
+    fn execution_binding_epoch(&self, tool_name: &str) -> u64 {
+        self.inner.execution_binding_epoch(tool_name)
+    }
+
+    fn execution_binding_fingerprint(
+        &self,
+        tool_name: &str,
+    ) -> Result<
+        meerkat_core::EphemeralToolBindingFingerprint,
+        meerkat_core::ToolExecutionResolutionError,
+    > {
+        self.inner.execution_binding_fingerprint(tool_name)
+    }
+
+    fn resolve_execution_plan(
+        &self,
+        call: ToolCallView<'_>,
+        dispatch_context: &meerkat_core::ToolDispatchContext,
+        resolution_context: &ToolExecutionResolutionContext,
+    ) -> Result<meerkat_core::ResolvedToolExecutionPlan, meerkat_core::ToolExecutionResolutionError>
+    {
+        self.inner
+            .resolve_execution_plan(call, dispatch_context, resolution_context)
+    }
+
+    async fn dispatch(&self, call: ToolCallView<'_>) -> Result<ToolDispatchOutcome, ToolError> {
+        self.inner.dispatch(call).await
+    }
+
+    async fn dispatch_with_context(
+        &self,
+        call: ToolCallView<'_>,
+        context: &meerkat_core::ToolDispatchContext,
+    ) -> Result<ToolDispatchOutcome, ToolError> {
+        self.inner.dispatch_with_context(call, context).await
+    }
+
+    async fn dispatch_resolved_with_context(
+        &self,
+        call: ToolCallView<'_>,
+        context: &meerkat_core::ToolDispatchContext,
+        plan: &meerkat_core::ResolvedToolExecutionPlan,
+    ) -> Result<ToolDispatchOutcome, ToolError> {
+        let held: Vec<AuthorizationAuditObservation> = self
+            .store
+            .read_service_call_audit(&self.key)
+            .await
+            .expect("the protected read of the audit log")
+            .into_iter()
+            .map(|record| record.observation.observation)
+            .collect();
+        self.seen
+            .lock()
+            .unwrap()
+            .push((kinds(&held), calls(&self.calls).len()));
+        self.inner
+            .dispatch_resolved_with_context(call, context, plan)
+            .await
+    }
+}
+
+/// The call's decision and root entry are in the log before any dispatcher
+/// code runs: the router's own dispatch reads them there when it begins,
+/// before anything reached the server. The rest of the call (its outcome)
+/// is appended once it returns.
+#[tokio::test]
+async fn the_decision_is_durable_before_any_dispatcher_code_runs() {
+    let host = Host::new().await;
+    let call = host.admitted();
+    let router = Arc::new(LogAtEntry {
+        inner: host.mail_router().await,
+        store: Arc::clone(&host.store),
+        key: call.audit_key().clone(),
+        calls: host.calls.clone(),
+        seen: Mutex::default(),
+    });
+
+    dispatch(&call, &router, "list_messages")
+        .await
+        .expect("the governed call reaches the server");
+    assert_eq!(
+        *router.seen.lock().unwrap(),
+        vec![(vec!["prepared", "entry"], 0)],
+        "the decision and entry were durable when the dispatcher began, and nothing was sent"
+    );
+    let log = kinds(&host.audit(call.audit_key()).await);
+    assert_eq!(log[..2], ["prepared", "entry"], "{log:?}");
+    assert_eq!(log.last(), Some(&"outcome"), "{log:?}");
+    assert_eq!(host.calls().len(), 1);
+}
+
+/// A call whose decision cannot be appended to the log is refused before
+/// any dispatcher code runs: nothing is sent and nothing is written. Its
+/// `ServiceCall` then refuses every later call the same way (its log would
+/// have a gap), while a new request for the occurrence is admitted and
+/// audited.
+#[tokio::test]
+async fn a_failed_append_before_the_call_refuses_it_unsent() {
+    let host = Host::new().await;
+    let mail = host.mail_router().await;
+    let call = host.admitted();
+    host.store.refuse_service_call_audit_appends_for_test(
+        1,
+        RuntimeStoreError::WriteFailed("the audit log is full".into()),
+    );
+
+    let refused = dispatch_outcome(&call, &mail, "list_messages").await;
+    assert!(
+        matches!(
+            refused.result,
+            Err(ToolError::OperationObservationUnavailable)
+        ),
+        "{:?}",
+        refused.result
+    );
+    assert!(
+        matches!(
+            refused.audit,
+            Err(ServiceCallAuditError::Store(
+                RuntimeStoreError::WriteFailed(_)
+            ))
+        ),
+        "{:?}",
+        refused.audit
+    );
+    assert!(host.calls().is_empty(), "nothing was sent");
+    assert!(
+        host.audit(call.audit_key()).await.is_empty(),
+        "nothing was written"
+    );
+
+    let spent = dispatch_outcome(&call, &mail, "list_messages").await;
+    assert!(
+        matches!(
+            spent.result,
+            Err(ToolError::OperationObservationUnavailable)
+        ),
+        "{:?}",
+        spent.result
+    );
+    assert!(
+        matches!(spent.audit, Err(ServiceCallAuditError::Spent)),
+        "{:?}",
+        spent.audit
+    );
+    assert!(host.calls().is_empty(), "nothing was sent");
+
+    let fresh = host.admitted();
+    dispatch(&fresh, &mail, "list_messages")
+        .await
+        .expect("a new request's call is sent");
+    assert_eq!(host.calls().len(), 1);
+    assert_eq!(
+        prepared(&host.audit(fresh.audit_key()).await),
+        1,
+        "only the sent call's decision is in the log"
+    );
+}
+
+/// A store without the service-call audit log answers `Unsupported` (the
+/// trait's default answer), and the call is refused before it is sent.
+#[tokio::test]
+async fn a_store_without_the_audit_log_refuses_the_call_unsent() {
+    let host = Host::new().await;
+    host.store.refuse_service_call_audit_appends_for_test(
+        usize::MAX,
+        RuntimeStoreError::Unsupported("append_service_call_audit".into()),
+    );
+    let mail = host.mail_router().await;
+    let call = host.admitted();
+
+    let refused = dispatch_outcome(&call, &mail, "list_messages").await;
+    assert!(
+        matches!(
+            refused.result,
+            Err(ToolError::OperationObservationUnavailable)
+        ),
+        "{:?}",
+        refused.result
+    );
+    assert!(
+        matches!(
+            refused.audit,
+            Err(ServiceCallAuditError::Store(
+                RuntimeStoreError::Unsupported(_)
+            ))
+        ),
+        "{:?}",
+        refused.audit
+    );
+    assert!(host.calls().is_empty(), "nothing was sent");
+}
+
+/// A call whose outcome cannot be appended once it returned keeps its own
+/// result and reports the failure beside it. The log keeps what was
+/// appended before the call was sent, and the `ServiceCall` refuses every
+/// later call before it is sent.
+#[tokio::test]
+async fn a_failed_append_after_the_call_is_reported_beside_its_result() {
+    let host = Host::new().await;
+    let mail = host.mail_router().await;
+    let call = host.admitted();
+    let armed = AtomicBool::new(false);
+    let store = Arc::downgrade(&host.store);
+    host.store
+        .observe_service_call_audit_appends_for_test(Arc::new(move |_: &ServiceCallAuditBatch| {
+            // The first append (the decision) goes through and arms a
+            // refusal of the next one (the outcome).
+            if !armed.swap(true, Ordering::SeqCst)
+                && let Some(store) = store.upgrade()
+            {
+                store.refuse_service_call_audit_appends_for_test(
+                    1,
+                    RuntimeStoreError::WriteFailed("the audit log is full".into()),
+                );
+            }
+        }));
+
+    let outcome = dispatch_outcome(&call, &mail, "list_messages").await;
+    assert!(
+        outcome.result.is_ok(),
+        "the call's own result: {:?}",
+        outcome.result
+    );
+    assert!(
+        matches!(
+            outcome.audit,
+            Err(ServiceCallAuditError::Store(
+                RuntimeStoreError::WriteFailed(_)
+            ))
+        ),
+        "{:?}",
+        outcome.audit
+    );
+    assert_eq!(host.calls().len(), 1, "the call was sent once");
+    assert_eq!(
+        kinds(&host.audit(call.audit_key()).await),
+        ["prepared", "entry"],
+        "what was appended before the call was sent"
+    );
+
+    let spent = dispatch_outcome(&call, &mail, "list_messages").await;
+    assert!(
+        matches!(
+            spent.result,
+            Err(ToolError::OperationObservationUnavailable)
+        ),
+        "{:?}",
+        spent.result
+    );
+    assert!(
+        matches!(spent.audit, Err(ServiceCallAuditError::Spent)),
+        "{:?}",
+        spent.audit
+    );
+    assert_eq!(host.calls().len(), 1, "nothing more was sent");
+}
+
+/// A call dropped while its decision's append is in the store spends its
+/// `ServiceCall`: whether that append lands is unknown, so every later call
+/// is refused before it is sent, and nothing reaches the server.
+#[tokio::test]
+async fn a_call_dropped_during_its_append_spends_its_service_call() {
+    let host = Host::new().await;
+    let mail = host.mail_router().await;
+    let call = host.admitted();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    host.store.block_next_service_call_audit_append_for_test(
+        call.audit_key().clone(),
+        Arc::clone(&entered),
+        Arc::clone(&release),
+    );
+    {
+        let dropped = dispatch_outcome(&call, &mail, "list_messages");
+        tokio::pin!(dropped);
+        tokio::select! {
+            () = entered.notified() => {}
+            outcome = &mut dropped => {
+                panic!("the call settled while its append was blocked: {:?}", outcome.result)
+            }
+        }
+        // Dropped here, while its append waits in the store.
+    }
+    // Nothing waits on the block any more.
+    release.notify_one();
+
+    let next = dispatch_outcome(&call, &mail, "list_messages").await;
+    assert!(
+        matches!(next.result, Err(ToolError::OperationObservationUnavailable)),
+        "{:?}",
+        next.result
+    );
+    assert!(
+        matches!(next.audit, Err(ServiceCallAuditError::Spent)),
+        "{:?}",
+        next.audit
+    );
+    assert!(host.calls().is_empty(), "nothing was sent");
+    assert!(
+        host.audit(call.audit_key()).await.is_empty(),
+        "the dropped append wrote nothing"
+    );
+}
+
+/// The protected read gives back every observation of an occurrence in the
+/// order it was appended, each with its store-assigned sequence: a sent
+/// call's decision, entry and outcome, then a refused call's refusal. Each
+/// is Domain-scoped and runless and names no contributing input. The key
+/// names the service original's identity digest and the occurrence.
+#[tokio::test]
+async fn the_log_reads_back_every_observation_in_order_under_its_key() {
+    let host = Host::new().await;
+    let mail = host.mail_router().await;
+    let call = host.admitted();
+    dispatch(&call, &mail, "list_messages")
+        .await
+        .expect("permitted");
+    host.revoke_grant(&host.grant);
+    let refused = dispatch(&call, &mail, "get_message").await;
+    assert_eq!(
+        refusal_kind(&refused),
+        Some(OperationRefusalKind::Denied),
+        "{refused:?}"
+    );
+
+    let records = host
+        .store
+        .read_service_call_audit(call.audit_key())
+        .await
+        .expect("the protected read of the audit log");
+    let sequences: Vec<u64> = records.iter().map(|record| record.sequence).collect();
+    assert_eq!(sequences, (0..records.len() as u64).collect::<Vec<_>>());
+    let log: Vec<AuthorizationAuditObservation> = records
+        .iter()
+        .map(|record| record.observation.observation.clone())
+        .collect();
+    let order = kinds(&log);
+    assert_eq!(order[..2], ["prepared", "entry"], "{order:?}");
+    assert_eq!(
+        order[order.len() - 2..],
+        ["outcome", "refused"],
+        "{order:?}"
+    );
+    let sent = &log[0].operation_id;
+    assert!(
+        log[..log.len() - 1]
+            .iter()
+            .all(|seen| &seen.operation_id == sent),
+        "the sent call's observations are one operation's"
+    );
+    assert_ne!(
+        &log[log.len() - 1].operation_id,
+        sent,
+        "the refused call is another operation"
+    );
+    for record in &records {
+        assert!(record.observation.contributors.is_empty());
+        assert_eq!(
+            record.observation.observation.execution_scope,
+            OperationExecutionScope::Domain
+        );
+        assert!(record.observation.observation.run_id.is_none());
+    }
+
+    let key = call.audit_key();
+    assert_eq!(key.occurrence(), "occurrence-1");
+    assert_eq!(key.original_digest().len(), 64);
+    assert!(
+        key.original_digest()
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    );
+    assert_eq!(
+        host.request(host.original.clone()).audit_key(),
+        key,
+        "the key is the original's and the occurrence's, whatever the request"
+    );
+    let another = association(candidate("setup-other", SERVER, &host.grant));
+    assert_ne!(
+        host.request(another).audit_key().original_digest(),
+        key.original_digest(),
+        "another original has another digest"
+    );
+}
+
+/// An append that waits in the store holds nothing another occurrence's
+/// call needs: while one occurrence's call waits for its decision to be
+/// appended, another occurrence's call of the same original is admitted,
+/// appended and sent through the same router, and the waiting call is sent
+/// once its append completes.
+#[tokio::test]
+async fn a_slow_append_of_one_occurrence_blocks_no_other_occurrence() {
+    let host = Host::new().await;
+    let mail = host.mail_router().await;
+    let slow = host.admitted();
+    let other = host
+        .machine
+        .prepare_service_call(host.request_for(host.original.clone(), "occurrence-2"))
+        .expect("admitted");
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    host.store.block_next_service_call_audit_append_for_test(
+        slow.audit_key().clone(),
+        Arc::clone(&entered),
+        Arc::clone(&release),
+    );
+
+    let waiting = dispatch_outcome(&slow, &mail, "list_messages");
+    let others = async {
+        entered.notified().await;
+        assert!(host.calls().is_empty(), "the waiting call was not sent");
+        let outcome = dispatch_outcome(&other, &mail, "get_message").await;
+        let sent = host.calls().len();
+        release.notify_one();
+        (outcome, sent)
+    };
+    let (waiting, (other_outcome, sent_while_waiting)) = tokio::join!(waiting, others);
+    assert!(other_outcome.result.is_ok(), "{:?}", other_outcome.result);
+    assert!(other_outcome.audit.is_ok(), "{:?}", other_outcome.audit);
+    assert_eq!(
+        sent_while_waiting, 1,
+        "the other occurrence's call was sent while the first waited"
+    );
+    assert!(waiting.result.is_ok(), "{:?}", waiting.result);
+    assert!(waiting.audit.is_ok(), "{:?}", waiting.audit);
+    assert_eq!(host.calls().len(), 2);
+    assert_eq!(prepared(&host.audit(slow.audit_key()).await), 1);
+    assert_eq!(prepared(&host.audit(other.audit_key()).await), 1);
+}
+
+/// A governed machine without a store has nowhere to keep a call's record,
+/// so it admits no service call.
+#[tokio::test]
+async fn a_storeless_governed_machine_admits_no_service_call() {
+    let host = Host::new().await;
+    let storeless = MeerkatMachine::ephemeral()
+        .with_local_grant_authorization(composition(&host.grants, &host.originals, BTreeSet::new()))
+        .expect("a governed machine");
+    let refused =
+        prepare_refusal(storeless.prepare_service_call(host.request(host.original.clone())));
+    assert!(
+        matches!(refused, OperationAuthorizationError::Unavailable),
+        "{refused:?}"
+    );
+    assert!(host.calls().is_empty());
 }

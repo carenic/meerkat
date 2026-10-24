@@ -1094,11 +1094,12 @@ impl NativeWorkAuthorizationHost for WithConfiguredMcpAttachment {
     fn service_call_authorization(
         &self,
         request: Arc<crate::input_authority::ServiceCallRequest>,
+        audit: Arc<dyn meerkat_authorization_contracts::audit::AuthorizationAuditSink>,
     ) -> Result<
         meerkat_core::authorization::WorkAuthorizationContext,
         meerkat_core::OperationAuthorizationError,
     > {
-        self.host.service_call_authorization(request)
+        self.host.service_call_authorization(request, audit)
     }
 
     fn authenticate_association(

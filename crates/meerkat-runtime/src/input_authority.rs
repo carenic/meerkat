@@ -236,38 +236,53 @@ impl ServiceOccurrence {
 /// association is the record the host's original source holds enrolled, and
 /// the operator's grant, selected for exactly the operation's MCP server,
 /// decides every call it then makes. The occurrence is audit data
-/// ([`ServiceOccurrence`]); the audit sink receives every decision and
-/// refusal of the request's calls and must be durable: a failing sink
-/// refuses the call.
+/// ([`ServiceOccurrence`]). The audit of the request's calls is Core's: the
+/// machine stages every decision and refusal in the audit sink it builds
+/// for the request, and makes them durable in its store's service-call
+/// audit log under [`Self::audit_key`]
+/// ([`crate::store::RuntimeStore::append_service_call_audit`]); an append
+/// that fails refuses the call before it is sent.
 #[non_exhaustive]
 pub struct ServiceCallRequest {
     association: InputAuthorityAssociation,
     occurrence: ServiceOccurrence,
-    audit: Arc<dyn meerkat_authorization_contracts::audit::AuthorizationAuditSink>,
+    audit_key: crate::store::ServiceCallAuditKey,
     claimed: std::sync::atomic::AtomicBool,
 }
 
+/// The domain tag of a service original's identity digest
+/// ([`ServiceCallRequest::audit_key`]).
+const SERVICE_ORIGINAL_DIGEST_DOMAIN: &[u8] = b"meerkat.service-call-audit.original.v1";
+
 impl ServiceCallRequest {
     /// The request of a trusted host for `association`, the service
-    /// original it enrolled, in `occurrence`, with `audit` for its calls.
+    /// original it enrolled, in `occurrence`.
     ///
     /// # Errors
     /// Refuses as `MalformedFacts` an association that cannot be a service
-    /// original.
+    /// original, or that has no canonical encoding.
     pub fn from_trusted_host(
         association: InputAuthorityAssociation,
         occurrence: ServiceOccurrence,
-        audit: Arc<dyn meerkat_authorization_contracts::audit::AuthorizationAuditSink>,
     ) -> Result<Arc<Self>, meerkat_core::OperationRefused> {
+        let malformed = || {
+            meerkat_core::OperationRefused::new(meerkat_core::OperationRefusalKind::MalformedFacts)
+        };
         if !service_original_shape(&association) {
-            return Err(meerkat_core::OperationRefused::new(
-                meerkat_core::OperationRefusalKind::MalformedFacts,
-            ));
+            return Err(malformed());
         }
+        let canonical = association.canonical_bytes().map_err(|_| malformed())?;
+        let audit_key = crate::store::ServiceCallAuditKey::new(
+            crate::delivery_inbox::delivery_digest_hex(&[
+                SERVICE_ORIGINAL_DIGEST_DOMAIN,
+                &canonical,
+            ]),
+            occurrence.occurrence.as_str(),
+        );
         Ok(Arc::new(Self {
             association,
             occurrence,
-            audit,
+            audit_key,
             claimed: std::sync::atomic::AtomicBool::new(false),
         }))
     }
@@ -284,12 +299,15 @@ impl ServiceCallRequest {
         &self.occurrence
     }
 
-    /// The sink every decision and refusal of the request's calls goes to.
+    /// The key of the request's rows in the service-call audit log: the
+    /// identity digest of the service original it presents (a SHA-256 of
+    /// the association's canonical bytes, so a re-enrollment with other
+    /// claims is another original in the log) and its occurrence. A host
+    /// reads its occurrence's audit back with it
+    /// ([`crate::store::RuntimeStore::read_service_call_audit`]).
     #[must_use]
-    pub fn audit_sink(
-        &self,
-    ) -> &Arc<dyn meerkat_authorization_contracts::audit::AuthorizationAuditSink> {
-        &self.audit
+    pub fn audit_key(&self) -> &crate::store::ServiceCallAuditKey {
+        &self.audit_key
     }
 
     /// Claim the request's one admission. The installed host claims it
@@ -444,12 +462,16 @@ pub trait NativeWorkAuthorizationHost: Send + Sync {
     /// admits the request only when the request's whole association is the
     /// record its original source holds enrolled, and every operation is
     /// then decided again by the work owner, the operator's grant selected
-    /// for the operation's MCP server and the operation owner. The default
-    /// refuses: a host that cannot read enrolled service originals serves no
-    /// service call, and no run's authority is ever borrowed for one.
+    /// for the operation's MCP server and the operation owner. Every
+    /// decision and refusal goes to `audit`, the sink the machine built for
+    /// this request (its observations reach the store's service-call audit
+    /// log before a call is sent). The default refuses: a host that cannot
+    /// read enrolled service originals serves no service call, and no run's
+    /// authority is ever borrowed for one.
     fn service_call_authorization(
         &self,
         _request: Arc<ServiceCallRequest>,
+        _audit: Arc<dyn meerkat_authorization_contracts::audit::AuthorizationAuditSink>,
     ) -> Result<WorkAuthorizationContext, meerkat_core::OperationAuthorizationError> {
         Err(meerkat_core::OperationAuthorizationError::Unavailable)
     }

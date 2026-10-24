@@ -1246,7 +1246,7 @@ pub use agent_mandate::{
 };
 pub(crate) mod scoped_context;
 mod service_call;
-pub use service_call::ServiceCall;
+pub use service_call::{ServiceCall, ServiceCallAuditError, ServiceCallOutcome};
 mod session_management;
 mod session_mutation_gate;
 mod terminal_receipt;

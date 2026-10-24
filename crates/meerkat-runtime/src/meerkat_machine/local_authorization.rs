@@ -354,10 +354,12 @@ impl NativeWorkAuthorizationHost for NativeGrantWorkAuthorizationHost {
     /// returned context is Domain-scoped and runless: every operation is
     /// prepared through the grant-backed policy (this request's owner, then
     /// the operator's grant selected for the operation's target, then the
-    /// operation owner) and audited to the request's own sink.
+    /// operation owner) and audited to `audit`, the sink the machine built
+    /// for the request.
     fn service_call_authorization(
         &self,
         request: Arc<crate::input_authority::ServiceCallRequest>,
+        audit: Arc<dyn meerkat_authorization_contracts::audit::AuthorizationAuditSink>,
     ) -> Result<WorkAuthorizationContext, meerkat_core::OperationAuthorizationError> {
         let owner = self
             .machine
@@ -381,7 +383,7 @@ impl NativeWorkAuthorizationHost for NativeGrantWorkAuthorizationHost {
         let context = policy.audited_work_context(
             Arc::from([request.association().clone()]),
             OperationExecutionScope::Domain,
-            Arc::clone(request.audit_sink()),
+            audit,
         )?;
         Ok(WorkAuthorizationContext::new(
             Arc::new(NativeControlAuthorization {
