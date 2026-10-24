@@ -1540,7 +1540,9 @@ impl UnregisterDisposition {
     /// store exactly as the store holds it, with no requeue mark: the
     /// rollback of a materialization that never served and admitted no
     /// input. An input admitted while the registration stood still ends
-    /// as stopped.
+    /// as stopped. The machine grants the keep only to a registration that
+    /// served no live work: after an admission, a deduplicated resubmission
+    /// or a recycle it records the unregister as Stop.
     pub(crate) const KEEP: Self = Self {
         queued_inputs: dsl::UnregisterQueuedInputsDisposition::Keep,
         requeue_max_age_ms: 0,
@@ -5929,6 +5931,13 @@ impl PreparedSessionMaterialization {
     /// again. A refused materialization (a durable tail held for recovery,
     /// a failed agent build) so ends nothing a later start would run. An
     /// input admitted while the registration stood still ends as stopped.
+    ///
+    /// The machine decides whether the keep stands: a registration that
+    /// served live work (an input admitted to it, a resubmission
+    /// deduplicated onto an input it holds, or a host's recycle, whose
+    /// recovery mixes live inputs into the recovered ones) unregisters with
+    /// Stop instead, as [`Self::rollback_now`] does, so a turn whose caller
+    /// saw the materialization refused never runs on a later start.
     pub async fn rollback_now_keeping_recovered_inputs(
         &mut self,
     ) -> Result<bool, RuntimeDriverError> {

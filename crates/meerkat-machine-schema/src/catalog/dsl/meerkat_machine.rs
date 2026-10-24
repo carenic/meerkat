@@ -2850,7 +2850,9 @@ pub enum UnregisterQueuedInputsDisposition {
     /// store exactly as the store holds it, with no requeue mark: the
     /// rollback of a materialization that never served and admitted no
     /// input. An input admitted while the registration stood still ends
-    /// as stopped.
+    /// as stopped. A registration that served live work (an admission, a
+    /// deduplicated resubmission or a recycle) records a requested Keep as
+    /// Stop.
     Keep,
 }
 
@@ -4063,6 +4065,18 @@ macro_rules! meerkat_catalog_machine_dsl {
             // start, steer joins, cancels and terminals are unaffected.
             run_start_holds: Set<Enum<RunStartHoldReason>>,
             recovered_admitted_lanes: Map<String, Enum<InputLane>>,
+            // Whether the registration served live work: an input admitted
+            // live (QueueAccepted, SteerAccepted), a resubmission
+            // deduplicated onto an input it holds
+            // (ResolveAdmissionIdempotencyDuplicate), or a host Recycle, whose
+            // re-recovery folds every active input into
+            // `recovered_admitted_inputs`. Once set, that witness is no longer
+            // only what the registration recovered from the store, so an
+            // unregister keeps nothing: BeginUnregisterSession records a
+            // requested Keep as Stop, and each setter turns a Keep already
+            // recorded into Stop. Never cleared, like the witness it
+            // qualifies; a driver starts with both empty.
+            registration_live_input_seen: bool,
 
             // --- Ops lifecycle substate ---
             op_statuses: Map<String, Enum<OperationStatus>>,
@@ -4790,6 +4804,7 @@ macro_rules! meerkat_catalog_machine_dsl {
             input_idempotency_keys = EmptyMap,
             recovered_admitted_inputs = EmptySet,
             recovered_admitted_lanes = EmptyMap,
+            registration_live_input_seen = false,
             admission_authorized_live_boundary_delivery = EmptyMap,
             input_live_boundary_delivery = EmptyMap,
             input_live_boundary_join_run = EmptyMap,
@@ -10191,6 +10206,13 @@ macro_rules! meerkat_catalog_machine_dsl {
                 && self.unregister_requeue_max_age_ms == 0)
         }
 
+        // A Keep unregister keeps only what the registration recovered from
+        // the store: no Keep stands once the registration served live work.
+        invariant keep_unregister_only_without_live_input {
+            !(self.unregister_queued_inputs == UnregisterQueuedInputsDisposition::Keep
+                && self.registration_live_input_seen)
+        }
+
         invariant current_run_only_while_running_or_retired {
             self.current_run_id == None
             || self.lifecycle_phase == Phase::Running
@@ -11984,7 +12006,13 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.unregister_teardown_retains_snapshot = false;
                 self.unregister_runtime_loop_forced_abort = false;
                 self.unregister_comms_drain_forced_abort = false;
-                self.unregister_queued_inputs = queued_inputs;
+                // A registration that served live work keeps nothing: a
+                // requested Keep is recorded as Stop.
+                if queued_inputs == UnregisterQueuedInputsDisposition::Keep && self.registration_live_input_seen {
+                    self.unregister_queued_inputs = UnregisterQueuedInputsDisposition::Stop;
+                } else {
+                    self.unregister_queued_inputs = queued_inputs;
+                }
                 self.unregister_requeue_max_age_ms = requeue_max_age_ms;
             }
             to Idle
@@ -12017,7 +12045,13 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.unregister_teardown_retains_snapshot = true;
                 self.unregister_runtime_loop_forced_abort = false;
                 self.unregister_comms_drain_forced_abort = false;
-                self.unregister_queued_inputs = queued_inputs;
+                // A registration that served live work keeps nothing: a
+                // requested Keep is recorded as Stop.
+                if queued_inputs == UnregisterQueuedInputsDisposition::Keep && self.registration_live_input_seen {
+                    self.unregister_queued_inputs = UnregisterQueuedInputsDisposition::Stop;
+                } else {
+                    self.unregister_queued_inputs = queued_inputs;
+                }
                 self.unregister_requeue_max_age_ms = requeue_max_age_ms;
             }
             to Idle
@@ -18569,7 +18603,14 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "idempotency_key_claimed" {
                 self.admission_idempotency_inputs.contains_key(idempotency_key.get("value"))
             }
-            update {}
+            // The resubmission waits on the input the key names: live work,
+            // as for QueueAccepted.
+            update {
+                self.registration_live_input_seen = true;
+                if self.unregister_queued_inputs == UnregisterQueuedInputsDisposition::Keep {
+                    self.unregister_queued_inputs = UnregisterQueuedInputsDisposition::Stop;
+                }
+            }
             to Idle
             emit AdmissionIdempotencyResolved {
                 input_id: input_id,
@@ -24632,6 +24673,12 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.active_fence_token = None;
                 self.active_runtime_generation = None;
                 self.current_run_id = None;
+                // The recycle's recovery re-admits every active input to the
+                // recovered witness, live ones included: as for QueueAccepted.
+                self.registration_live_input_seen = true;
+                if self.unregister_queued_inputs == UnregisterQueuedInputsDisposition::Keep {
+                    self.unregister_queued_inputs = UnregisterQueuedInputsDisposition::Stop;
+                }
             }
             to Idle
             emit InitiateRecycle
@@ -24646,6 +24693,11 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.active_fence_token = None;
                 self.active_runtime_generation = None;
                 self.current_run_id = None;
+                // As for RecycleFromIdleOrRetired.
+                self.registration_live_input_seen = true;
+                if self.unregister_queued_inputs == UnregisterQueuedInputsDisposition::Keep {
+                    self.unregister_queued_inputs = UnregisterQueuedInputsDisposition::Stop;
+                }
             }
             to Attached
             emit InitiateRecycle
@@ -24945,6 +24997,12 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.next_admission_seq += 1;
                 self.input_live_boundary_delivery.remove(input_id);
                 self.admission_authorized_live_boundary_delivery.remove(input_id);
+                // Live work: the registration keeps nothing at its
+                // unregister (registration_live_input_seen).
+                self.registration_live_input_seen = true;
+                if self.unregister_queued_inputs == UnregisterQueuedInputsDisposition::Keep {
+                    self.unregister_queued_inputs = UnregisterQueuedInputsDisposition::Stop;
+                }
             }
             to Idle
             emit IngressAccepted
@@ -24978,6 +25036,11 @@ macro_rules! meerkat_catalog_machine_dsl {
                     self.input_live_boundary_delivery.remove(input_id);
                 }
                 self.admission_authorized_live_boundary_delivery.remove(input_id);
+                // Live work, as for QueueAccepted.
+                self.registration_live_input_seen = true;
+                if self.unregister_queued_inputs == UnregisterQueuedInputsDisposition::Keep {
+                    self.unregister_queued_inputs = UnregisterQueuedInputsDisposition::Stop;
+                }
             }
             to Idle
             emit IngressAccepted
@@ -39297,7 +39360,10 @@ macro_rules! meerkat_catalog_machine_dsl {
         // stranded inputs open for the operator's repair. An input admitted
         // while the registration stood was not recovered: the Abandon arm
         // ends it as stopped, so a turn its caller saw refused never runs
-        // on a later start.
+        // on a later start. A registration that served live work keeps
+        // nothing (registration_live_input_seen): its unregister records a
+        // requested Keep as Stop, since a recycle's recovery or a
+        // deduplicated wait mixes live inputs into the recovered witness.
         transition ClassifyStopInputDispositionKeep {
             per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
             on input ClassifyStopInputDisposition { input_id, durability, directed, objective_bound }

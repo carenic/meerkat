@@ -4912,6 +4912,26 @@ impl EphemeralRuntimeDriver {
         self.admissions.subscribe()
     }
 
+    /// The machine's idempotency verdict for a resubmission the persistent
+    /// store deduplicated, taken under the same driver lock as the
+    /// in-memory admission's ([`Self::resolve_idempotency`]). A key the
+    /// machine still holds names an input this registration tracks, so the
+    /// resubmission waits on it: the duplicate verdict records live work,
+    /// after which the registration's unregister keeps nothing
+    /// (`registration_live_input_seen`). A key the machine no longer holds
+    /// (its input ended and was archived) changes nothing.
+    pub(crate) fn resolve_durable_idempotency_duplicate(
+        &mut self,
+        input: &Input,
+    ) -> Result<(), RuntimeDriverError> {
+        let key = crate::input_authority::qualified_idempotency_key(input)?;
+        self.resolve_idempotency(
+            input.id(),
+            key.as_ref().map(std::string::ToString::to_string),
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn record_durable_idempotency_deduplication(
         &mut self,
         input_id: InputId,

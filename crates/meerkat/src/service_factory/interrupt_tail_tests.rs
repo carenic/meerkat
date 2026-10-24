@@ -1728,46 +1728,114 @@ async fn a_rollback_after_admission_still_stops_the_admitted_input_head_canonica
     a_rollback_after_admission_still_stops_the_admitted_input(true).await;
 }
 
-/// The keep is exact: a rollback that keeps the inputs its registration
-/// recovered still stops an input admitted while the registration stood. A
-/// prompt an earlier process left queued stays queued, with no requeue mark,
-/// and runs once on the next start; the prompt admitted to the rolled-back
-/// registration ends as stopped and never runs.
-async fn a_keeping_rollback_still_stops_what_its_registration_admitted(head_canonical: bool) {
-    use meerkat_runtime::input_state::{
-        InputAbandonReason, InputLifecycleState as Phase, InputTerminalOutcome,
-    };
+/// The first lifetime of a keeping-rollback row: the session's first turn
+/// commits, and the process stops.
+async fn keeping_rollback_first_turn(
+    stores: &Stores,
+    root: &TempDir,
+    client: &Arc<ScriptedModel>,
+) -> SessionId {
+    let start = Start::open(stores, root, client);
+    let id = start.materialize(None).await;
+    client.push(Step::Text("first answer"));
+    let outcome = start.turn(&id, "first").await;
+    assert!(
+        matches!(outcome, Some(CompletionOutcome::Completed(_))),
+        "the first turn commits: {outcome:?}"
+    );
+    start.service.try_shutdown().await.expect("shutdown");
+    id
+}
 
+/// Leave `input` queued in the store behind the first turn, as a process that
+/// stopped before running it would.
+async fn keeping_rollback_queued_row(
+    stores: &Stores,
+    id: &SessionId,
+    input: &Input,
+) -> meerkat_core::InputId {
+    let store = stores.operator_store();
+    let first_row = input_rows(store.as_ref(), id)
+        .await
+        .into_iter()
+        .next()
+        .expect("the first turn's row");
+    let row = stranded_row(&first_row, input, None);
+    write_input_row(store.as_ref(), id, row.clone()).await;
+    row.state.input_id
+}
+
+/// Each of `inputs` ended as stopped, with no requeue mark.
+async fn assert_stopped_by_the_rollback(
+    stores: &Stores,
+    id: &SessionId,
+    inputs: &[(&meerkat_core::InputId, &str)],
+) {
+    use meerkat_runtime::input_state::{InputAbandonReason, InputTerminalOutcome};
+
+    let store = stores.operator_store();
+    let rows = input_rows(store.as_ref(), id).await;
+    for (input_id, what) in inputs {
+        let row = rows
+            .iter()
+            .find(|row| &row.state.input_id == *input_id)
+            .unwrap_or_else(|| panic!("the {what} prompt's row"));
+        assert_eq!(
+            row.seed.terminal_outcome,
+            Some(InputTerminalOutcome::Abandoned {
+                reason: InputAbandonReason::Stopped
+            }),
+            "the rollback stops the {what} prompt: {:?}",
+            row.state.history
+        );
+        assert!(
+            row.state.stop_requeue.is_none(),
+            "the {what} prompt has no requeue mark"
+        );
+    }
+}
+
+/// The next start runs nothing: no model call, and the transcript stays the
+/// first turn's.
+async fn assert_next_start_runs_nothing(
+    stores: &Stores,
+    root: &TempDir,
+    client: &Arc<ScriptedModel>,
+    id: &SessionId,
+) {
+    let start = Start::open(stores, root, client);
+    let requests_before = client.requests.load(Ordering::SeqCst);
+    start.cold_attach(id).await;
+    start.materialize(Some(id)).await;
+    start.wait_runtime_settled(id).await;
+    assert_eq!(
+        client.requests.load(Ordering::SeqCst),
+        requests_before,
+        "no stopped prompt runs"
+    );
+    assert_eq!(
+        start.committed_rows(id).await,
+        ["user first", "assistant first answer"]
+    );
+}
+
+/// A keeping rollback keeps only what its registration recovered, and only
+/// while the registration served no live work. Once it admitted an input,
+/// the machine records the unregister as Stop: the prompt an earlier process
+/// left queued and the prompt admitted to the rolled-back registration both
+/// end as stopped, and neither runs on the next start. RED before: the keep
+/// left the recovered prompt queued, and the next start ran it.
+async fn a_keeping_rollback_after_an_admission_keeps_nothing(head_canonical: bool) {
     let root = TempDir::new().expect("temp");
     let stores = Stores::new(head_canonical, &root);
     let client = Arc::new(ScriptedModel::new());
-    let id = {
-        let start = Start::open(&stores, &root, &client);
-        let id = start.materialize(None).await;
-        client.push(Step::Text("first answer"));
-        let outcome = start.turn(&id, "first").await;
-        assert!(
-            matches!(outcome, Some(CompletionOutcome::Completed(_))),
-            "the first turn commits: {outcome:?}"
-        );
-        start.service.try_shutdown().await.expect("shutdown");
-        id
-    };
-    let recovered = {
-        let store = stores.operator_store();
-        let first_row = input_rows(store.as_ref(), &id)
-            .await
-            .into_iter()
-            .next()
-            .expect("the first turn's row");
-        let row = stranded_row(
-            &first_row,
-            &Input::Prompt(PromptInput::new("second", None)),
-            None,
-        );
-        write_input_row(store.as_ref(), &id, row.clone()).await;
-        row.state.input_id
-    };
+    let id = keeping_rollback_first_turn(&stores, &root, &client).await;
+    let recovered = keeping_rollback_queued_row(
+        &stores,
+        &id,
+        &Input::Prompt(PromptInput::new("second", None)),
+    )
+    .await;
 
     let admitted = {
         let start = Start::open(&stores, &root, &client);
@@ -1791,71 +1859,141 @@ async fn a_keeping_rollback_still_stops_what_its_registration_admitted(head_cano
         start.service.try_shutdown().await.expect("shutdown");
         admitted
     };
+    assert_stopped_by_the_rollback(
+        &stores,
+        &id,
+        &[(&recovered, "recovered"), (&admitted, "admitted")],
+    )
+    .await;
+    assert_next_start_runs_nothing(&stores, &root, &client, &id).await;
+}
+
+#[tokio::test]
+async fn a_keeping_rollback_after_an_admission_keeps_nothing_whole_blob() {
+    a_keeping_rollback_after_an_admission_keeps_nothing(false).await;
+}
+
+#[tokio::test]
+async fn a_keeping_rollback_after_an_admission_keeps_nothing_head_canonical() {
+    a_keeping_rollback_after_an_admission_keeps_nothing(true).await;
+}
+
+/// A host's recycle in the prepared window recovers every active input again,
+/// the prompt admitted to the registration included, so the registration's
+/// recovered set no longer holds only what it recovered from the store. The
+/// keeping rollback after it keeps nothing: the admitted prompt ends as
+/// stopped and never runs on a later start, so its caller, who saw the
+/// materialization refused, never sees its turn run. RED before: the recycle
+/// put the admitted prompt among the recovered ones, the keep left it queued,
+/// and the next start ran it.
+async fn a_keeping_rollback_after_a_recycle_stops_the_admitted_input(head_canonical: bool) {
+    let root = TempDir::new().expect("temp");
+    let stores = Stores::new(head_canonical, &root);
+    let client = Arc::new(ScriptedModel::new());
+    let id = keeping_rollback_first_turn(&stores, &root, &client).await;
+
+    let admitted = {
+        let start = Start::open(&stores, &root, &client);
+        start.cold_attach(&id).await;
+        let mut prepared = start
+            .machine
+            .prepare_session_materialization(id.clone())
+            .await
+            .expect("prepare the registration");
+        let input = Input::Prompt(PromptInput::new("admitted", None));
+        let admitted = input.id().clone();
+        start
+            .machine
+            .accept_input_with_completion(&id, input)
+            .await
+            .expect("the registration admits the prompt");
+        meerkat_runtime::RuntimeControlPlane::recycle(
+            start.machine.as_ref(),
+            &LogicalRuntimeId::for_session(&id),
+        )
+        .await
+        .expect("a host recycles the runtime in the prepared window");
+        prepared
+            .rollback_now_keeping_recovered_inputs()
+            .await
+            .expect("roll the registration back");
+        start.service.try_shutdown().await.expect("shutdown");
+        admitted
+    };
+    assert_stopped_by_the_rollback(&stores, &id, &[(&admitted, "admitted")]).await;
+    assert_next_start_runs_nothing(&stores, &root, &client, &id).await;
+}
+
+#[tokio::test]
+async fn a_keeping_rollback_after_a_recycle_stops_the_admitted_input_whole_blob() {
+    a_keeping_rollback_after_a_recycle_stops_the_admitted_input(false).await;
+}
+
+#[tokio::test]
+async fn a_keeping_rollback_after_a_recycle_stops_the_admitted_input_head_canonical() {
+    a_keeping_rollback_after_a_recycle_stops_the_admitted_input(true).await;
+}
+
+/// A resubmission deduplicated onto a prompt the registration recovered
+/// waits on that prompt. The keeping rollback after it keeps nothing: the
+/// recovered prompt ends as stopped and never runs on a later start, so the
+/// resubmitting caller, who saw the materialization refused, never sees the
+/// turn run. The persistent store answers the duplicate before the machine's
+/// own admission would; its verdict still goes through the machine. RED
+/// before: the keep left the recovered prompt queued, and the next start ran
+/// it.
+async fn a_keeping_rollback_after_a_deduplicated_resubmission_keeps_nothing(head_canonical: bool) {
+    let root = TempDir::new().expect("temp");
+    let stores = Stores::new(head_canonical, &root);
+    let client = Arc::new(ScriptedModel::new());
+    let id = keeping_rollback_first_turn(&stores, &root, &client).await;
+    let keyed_prompt = || {
+        let mut prompt = PromptInput::new("second", None);
+        prompt.header.idempotency_key =
+            Some(meerkat_runtime::IdempotencyKey::new("resubmitted-second"));
+        Input::Prompt(prompt)
+    };
+    let recovered = keeping_rollback_queued_row(&stores, &id, &keyed_prompt()).await;
+
     {
-        let store = stores.operator_store();
-        let rows = input_rows(store.as_ref(), &id).await;
-        let kept = rows
-            .iter()
-            .find(|row| row.state.input_id == recovered)
-            .expect("the recovered prompt's row");
-        assert_eq!(
-            (kept.seed.phase, kept.seed.terminal_outcome.clone()),
-            (Phase::Queued, None),
-            "the rollback keeps the prompt its registration recovered: {:?}",
-            kept.state.history
-        );
+        let start = Start::open(&stores, &root, &client);
+        start.cold_attach(&id).await;
+        let mut prepared = start
+            .machine
+            .prepare_session_materialization(id.clone())
+            .await
+            .expect("prepare the registration");
+        let (outcome, _completion) = start
+            .machine
+            .accept_input_with_completion(&id, keyed_prompt())
+            .await
+            .expect("the resubmission is answered");
         assert!(
-            kept.state.stop_requeue.is_none(),
-            "kept as the store holds it, with no requeue mark"
+            matches!(
+                &outcome,
+                meerkat_runtime::AcceptOutcome::Deduplicated { existing_id, .. }
+                    if existing_id == &recovered
+            ),
+            "the resubmission waits on the recovered prompt: {outcome:?}"
         );
-        let stopped = rows
-            .iter()
-            .find(|row| row.state.input_id == admitted)
-            .expect("the admitted prompt's row");
-        assert_eq!(
-            stopped.seed.terminal_outcome,
-            Some(InputTerminalOutcome::Abandoned {
-                reason: InputAbandonReason::Stopped
-            }),
-            "the rollback stops the prompt its registration admitted: {:?}",
-            stopped.state.history
-        );
+        prepared
+            .rollback_now_keeping_recovered_inputs()
+            .await
+            .expect("roll the registration back");
+        start.service.try_shutdown().await.expect("shutdown");
     }
-
-    let start = Start::open(&stores, &root, &client);
-    let requests_before = client.requests.load(Ordering::SeqCst);
-    client.push(Step::Text("second answer"));
-    start.cold_attach(&id).await;
-    start.materialize(Some(&id)).await;
-    let rows = start
-        .committed_rows_ending_with(&id, "assistant second answer")
-        .await;
-    start.wait_runtime_settled(&id).await;
-    assert_eq!(
-        client.requests.load(Ordering::SeqCst),
-        requests_before + 1,
-        "only the kept prompt calls the model"
-    );
-    assert_eq!(
-        rows,
-        [
-            "user first",
-            "assistant first answer",
-            "user second",
-            "assistant second answer",
-        ],
-        "the kept prompt runs once and the stopped one never"
-    );
+    assert_stopped_by_the_rollback(&stores, &id, &[(&recovered, "recovered")]).await;
+    assert_next_start_runs_nothing(&stores, &root, &client, &id).await;
 }
 
 #[tokio::test]
-async fn a_keeping_rollback_still_stops_what_its_registration_admitted_whole_blob() {
-    a_keeping_rollback_still_stops_what_its_registration_admitted(false).await;
+async fn a_keeping_rollback_after_a_deduplicated_resubmission_keeps_nothing_whole_blob() {
+    a_keeping_rollback_after_a_deduplicated_resubmission_keeps_nothing(false).await;
 }
 
 #[tokio::test]
-async fn a_keeping_rollback_still_stops_what_its_registration_admitted_head_canonical() {
-    a_keeping_rollback_still_stops_what_its_registration_admitted(true).await;
+async fn a_keeping_rollback_after_a_deduplicated_resubmission_keeps_nothing_head_canonical() {
+    a_keeping_rollback_after_a_deduplicated_resubmission_keeps_nothing(true).await;
 }
 
 /// A prompt staged for a run that committed is not proven stranded: that

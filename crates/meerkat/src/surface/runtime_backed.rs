@@ -617,7 +617,9 @@ async fn rollback_prepared_runtime_registration(
 /// (it was refused before it served: a durable tail held for recovery, a
 /// failed agent build). The registration it inserted keeps every input it
 /// recovered from the store exactly as the store holds it, so the refusal
-/// ends nothing a later start would run.
+/// ends nothing a later start would run. If the registration served live
+/// work meanwhile (an admission, a deduplicated resubmission, a recycle),
+/// the machine stops every input instead.
 async fn rollback_prepared_runtime_registration_keeping_recovered_inputs(
     prepared: &mut meerkat_runtime::PreparedSessionMaterialization,
 ) {

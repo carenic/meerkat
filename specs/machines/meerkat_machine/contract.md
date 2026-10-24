@@ -179,6 +179,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `run_stop_requested`: `Option<RunId>`
 - `run_start_holds`: `Set<RunStartHoldReason>`
 - `recovered_admitted_lanes`: `Map<String, InputLane>`
+- `registration_live_input_seen`: `Bool`
 - `op_statuses`: `Map<String, OperationStatus>`
 - `op_completion_seq`: `Map<String, u64>`
 - `completion_sequence_claims`: `Set<u64>`
@@ -1487,6 +1488,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `deferred_stop_requires_active_runtime_phase`
 - `unregister_drain_obligations_require_draining`
 - `unregister_requeue_max_age_matches_disposition`
+- `keep_unregister_only_without_live_input`
 - `current_run_only_while_running_or_retired`
 - `current_run_has_pre_run_phase`
 - `input_context_targets_are_governed`

@@ -144,8 +144,11 @@ The generated runtime machine (`meerkat-machine-kernels`,
 classifier behind the new requeue option of a graceful stop:
 
 - the input struct `BeginUnregisterSession` gains `queued_inputs` and
-  `requeue_max_age_ms`, and `State` gains `unregister_queued_inputs` and
-  `unregister_requeue_max_age_ms`;
+  `requeue_max_age_ms`, and `State` gains `unregister_queued_inputs`,
+  `unregister_requeue_max_age_ms` and `registration_live_input_seen` (whether
+  the registration served live work: an admission, a deduplicated
+  resubmission or a recycle, after which a materialization's rollback keeps
+  nothing; a struct literal sets `false`);
 - the input, effect and transition enums gain `ClassifyStopInputDisposition`,
   `StopInputDispositionClassified` and its per-phase transitions, and
   `InputAbandonReason` gains `RequeueExpired`, each appended last;

@@ -9012,6 +9012,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `unregister_requeue_max_age_matches_disposition`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `keep_unregister_only_without_live_input`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `current_run_only_while_running_or_retired`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)

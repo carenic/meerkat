@@ -1234,13 +1234,15 @@ mod unregister_progress_recovery_tests {
         }
     }
 
-    /// A crash during a materialization rollback that began with the keep
-    /// disposition leaves the keep in the unregister's progress record. The
-    /// recovered convergence replays Keep, not Stop: its stop keeps what the
-    /// registration recovered, and still ends an input admitted while the
-    /// registration stood, as the uninterrupted rollback would.
+    /// The machine grants a keep only to a registration that served no live
+    /// work. A keep unregister begun after an input was admitted live to the
+    /// registration (here, replayed from a progress record that carries the
+    /// keep) records Stop: its stop ends the admitted input as stopped and
+    /// keeps nothing. A crash recovery replays the keep before anything is
+    /// admitted, so its keep stands
+    /// (`a_replayed_keep_unregister_keeps_what_the_new_process_recovered`).
     #[tokio::test]
-    async fn a_recovered_keep_unregister_replays_keep_and_still_stops_an_admitted_input() {
+    async fn a_keep_unregister_after_a_live_admission_begins_as_stop() {
         use crate::traits::RuntimeDriver as _;
 
         let mut driver = crate::driver::ephemeral::EphemeralRuntimeDriver::new(
@@ -1269,10 +1271,11 @@ mod unregister_progress_recovery_tests {
                 .clone()
                 .expect("the contract session is registered");
             replay_durable_unregister_progress_id(&mut authority, &session_id, Some(&progress))
-                .expect("the recovered convergence replays the unregister");
+                .expect("the unregister begins");
             assert_eq!(
                 authority.state().unregister_queued_inputs,
-                crate::meerkat_machine::dsl::UnregisterQueuedInputsDisposition::Keep
+                crate::meerkat_machine::dsl::UnregisterQueuedInputsDisposition::Stop,
+                "a registration that served live work keeps nothing"
             );
             assert_eq!(authority.state().unregister_requeue_max_age_ms, 0);
         }
@@ -4272,7 +4275,8 @@ impl MeerkatMachine {
     /// claim inserted is unregistered with `queued_inputs`: Stop ends every
     /// non-terminal input, Keep (a materialization that served nothing and
     /// admitted no input) keeps every input the registration recovered
-    /// from the store exactly as the store holds it.
+    /// from the store exactly as the store holds it. The machine records a
+    /// requested Keep as Stop once the registration served live work.
     pub(super) async fn abort_prepared_session_materialization_claim(
         &self,
         session_id: &SessionId,

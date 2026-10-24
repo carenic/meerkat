@@ -3,7 +3,11 @@
 \* materialization that was refused before it served (a durable tail held for
 \* recovery, a failed agent build) keeps every input its registration
 \* recovered from the store exactly as the store holds it, and still stops an
-\* input admitted while the registration stood.
+\* input admitted while the registration stood. The machine grants the keep
+\* only to a registration that served no live work: once it admitted an
+\* input, waited on a deduplicated resubmission or was recycled, its
+\* unregister records a requested Keep as Stop
+\* (registration_live_input_seen).
 \*
 \* This audit keeps the generated MeerkatMachine model unchanged and explores
 \* three processes. Each restart is a new process: every generated variable
@@ -11,13 +15,18 @@
 \* generated Init on every run by materialization_rollback_keep_audit.sh).
 \*
 \* Process 1 registers one session, admits A, attaches, stages A into a run,
-\* admits B behind that run (every kind and durability) and crashes, so A
-\* (Staged) and B (Queued) are its durable non-terminal rows. Process 2
-\* registers and recovers each durable row through the generated recovery
-\* arms (the durability classifier discards an Ephemeral row, and the staged
-\* A is queued again), may admit a new input C, and its materialization is
-\* refused before it serves: the host rolls the registration back with an
-\* unregister that begins with Keep, or, as the control, with Stop. The
+\* admits B behind that run (every kind and durability) under an idempotency
+\* key, and crashes, so A (Staged) and B (Queued) are its durable
+\* non-terminal rows. Process 2 registers and recovers each durable row
+\* through the generated recovery arms (the durability classifier discards an
+\* Ephemeral row, the staged A is queued again, and B's key is registered
+\* again). It may then serve live work, each at most once: admit a new input
+\* C, resolve a resubmission D under B's key as a duplicate of B (D waits on
+\* B), or take a host recycle, whose recovery admits every active input to
+\* the recovered witness again, C included. Its materialization is refused
+\* before it serves: the host rolls the registration back with an unregister
+\* that begins with Keep, or, as the control, with Stop; C's admission and
+\* D's resolution may also land between that begin and the stop. The
 \* rollback's stop is one driver-lock transaction, as in the shell: it
 \* classifies each non-terminal input before the executor's exit (an input
 \* answered Abandon gets the runless carrier) and again after it, ends the
@@ -30,36 +39,48 @@
 \*   AuditRollbackVerdictIsAFunction: during the rollback's stop exactly one
 \*     verdict arm (Retain, Keep or Abandon) answers each input still to
 \*     classify.
-\*   AuditKeepEndsNoRecoveredInput: under Keep, no input process 2 recovered
-\*     is answered Abandon, gets a runless carrier or ends stopped.
+\*   AuditKeepEndsNoRecoveredInput: under Keep, when process 2 served no
+\*     live work, no input it recovered is answered Abandon, gets a runless
+\*     carrier or ends stopped.
 \*   AuditKeepStopsWhatItAdmitted: an input admitted in process 2 is never
 \*     answered Keep and never runs in process 3.
 \*   AuditKeepOnlyUnderKeep: every Keep answer came from an unregister the
 \*     host began with Keep.
 \*   AuditKeptInputSurvivesTheRollback: an input the rollback kept is still
 \*     non-terminal once the stop committed, so process 3 recovers it.
+\*   AuditLiveWorkForfeitsKeep: once process 2 served live work (an
+\*     admission, a deduplicated wait or a recycle) before its stop, nothing
+\*     is answered Keep.
 \*
 \* AuditWitness* operators are reachability goals the runner checks as
 \* expected violations, so the invariants are not vacuous. The runner's
-\* --mutants mode seeds four defects into a copy of the generated model and
+\* --mutants mode seeds nine defects into a copy of the generated model and
 \* requires TLC to refuse each with the invariant it breaks: the machine
 \* without the Keep arm (Keep stops like Stop), a Keep arm that ignores the
-\* recovery witness, an Abandon arm that overlaps Keep, and a Keep arm that
-\* ignores the disposition.
+\* recovery witness (with admissions that leave no live-work mark, which on
+\* its own already stops a Keep from reaching an admitted input), an Abandon
+\* arm that overlaps Keep, a Keep arm that ignores the disposition, an
+\* unregister begin that records a requested Keep after live work, an
+\* admission that leaves a recorded Keep standing, and an admission, a
+\* deduplicated wait or a recycle that does not mark the registration as
+\* having served live work.
 \*
 \* The TLC config is DERIVED from the generated ci.cfg on every run by
 \* materialization_rollback_keep_audit.sh. No audit step repeats, so the
 \* reachable space is finite: the lane's bound of 50 steps explores all of it
-\* (a deeper bound finds no new state), and 40 steps reach the deepest
-\* witness. Check that by hand with:
-\*   specs/machines/meerkat_machine/materialization_rollback_keep_audit.sh 60
+\* (16,468 distinct states; a deeper bound finds no new state), and 43 steps
+\* reach the deepest witness. Check that by hand with:
+\*   specs/machines/meerkat_machine/materialization_rollback_keep_audit.sh 80
 \*
 \* Scope limits: the requeue mark, the waiter answers, the runless carriers
 \* and the durable rows are shell, so the carrier set here is the shell's rule
 \* (the inputs answered Abandon) and a kept row is the recovered row
-\* unchanged. The meerkat facade rows pin the shell: a refused restart keeps
-\* the stranded input, the dry run still names it, and the next start runs
-\* it once.
+\* unchanged. A recycle's recovery is modelled by its witness step
+\* (RecoverAdmittedInput for every active input); its lifecycle replay
+\* changes no verdict input. The meerkat facade rows pin the shell: a refused
+\* restart keeps the stranded input, the dry run still names it, and the next
+\* start runs it once; after an admission, a recycle or a deduplicated
+\* resubmission the rollback keeps nothing.
 EXTENDS materialization_rollback_keep_fresh
 
 CONSTANTS AuditMaxSteps
@@ -70,6 +91,10 @@ VARIABLES
     audit_disposition,    \* the disposition process 2's rollback began with
     audit_c_planned,      \* process 2's admission of C was planned
     audit_admitted_p2,    \* inputs admitted while process 2's registration stood
+    audit_live_p2,        \* live work process 2 served before its stop opened
+    audit_draining_live,  \* some of it landed after the unregister began
+    audit_recycle_pending, \* active inputs process 2's recycle has yet to recover
+    audit_rerecovered,    \* inputs process 2's recycle recovered again
     audit_pending,        \* inputs the open stop pass still classifies
     audit_pre_verdict,    \* the stop's verdicts before the exit (carriers)
     audit_post_verdict,   \* the stop's verdicts after the exit (cleanup)
@@ -83,17 +108,25 @@ VARIABLES
     audit_staged_p3       \* inputs staged into a run of process 3
 
 setupVars == <<audit_facts, audit_disposition, audit_c_planned, audit_admitted_p2>>
+liveVars == <<audit_live_p2, audit_draining_live, audit_recycle_pending, audit_rerecovered>>
 regionVars == <<audit_pending, audit_pre_verdict, audit_post_verdict, audit_abandoned>>
 historyVars == <<audit_kept, audit_carriers, audit_stopped>>
 restartVars == <<audit_rows, audit_recovery, audit_recovered_p2, audit_staged_p3>>
-auditVars == <<audit_stage, setupVars, regionVars, historyVars, restartVars>>
+auditVars == <<audit_stage, setupVars, liveVars, regionVars, historyVars, restartVars>>
 
 AuditSession == "sessionid_1"
+AuditEpoch == "runtimeepochid_1"
 AuditA == "input_1"
 AuditB == "input_2"
 AuditC == "input_3"
-\* The fixed order rows recover and inputs are classified and ended in.
-AuditOrder == <<AuditA, AuditB, AuditC>>
+\* The resubmission of B: never admitted, it waits on B.
+AuditD == "input_4"
+\* B's idempotency key.
+AuditKey == "key_b"
+\* The fixed order rows recover and inputs are classified and ended in. C,
+\* the input admitted live, comes first, so a defect that keeps it breaks the
+\* property about admitted inputs before any other.
+AuditOrder == <<AuditC, AuditA, AuditB>>
 AuditInputs == {AuditA, AuditB, AuditC}
 AuditRun == "runid_1"
 AuditKinds == {"Prompt", "ExternalEvent"}
@@ -168,7 +201,7 @@ AuditUnchanged == UNCHANGED auditVars
 \* ---- process 1 ----
 
 \* Scripted start: register, admit A, attach, stage A into a run, admit B
-\* behind the run.
+\* behind the run and register B's idempotency key.
 AuditSetup ==
     /\ audit_stage = "Setup"
     /\ \/ model_step_count = 0 /\ Initialize /\ AuditUnchanged
@@ -183,11 +216,12 @@ AuditSetup ==
                 /\ AdmitPlan(AuditB, kind)
                 /\ audit_facts' = audit_facts @@ (AuditB :> [kind |-> kind, durability |-> d])
           /\ UNCHANGED <<audit_stage, audit_disposition, audit_c_planned, audit_admitted_p2,
-                         regionVars, historyVars, restartVars>>
-       \/ model_step_count = 8
-          /\ QueueAcceptedRunning(AuditB)
+                         liveVars, regionVars, historyVars, restartVars>>
+       \/ model_step_count = 8 /\ QueueAcceptedRunning(AuditB) /\ AuditUnchanged
+       \/ model_step_count = 9
+          /\ RegisterAcceptedIdempotencyRunning(AuditB, AuditKey)
           /\ audit_stage' = "P1"
-          /\ UNCHANGED <<setupVars, regionVars, historyVars, restartVars>>
+          /\ UNCHANGED <<setupVars, liveVars, regionVars, historyVars, restartVars>>
 
 RowOf(i) ==
     [phase |-> input_phases[i],
@@ -196,7 +230,8 @@ RowOf(i) ==
      lane |-> Lookup(input_recovery_lanes, i, "Queue"),
      boundary |-> Lookup(input_runtime_boundary, i, "RunStart"),
      exec |-> Lookup(input_runtime_execution_kind, i, "ContentTurn"),
-     is_prompt |-> Lookup(input_is_prompt, i, FALSE)]
+     is_prompt |-> Lookup(input_is_prompt, i, FALSE),
+     key |-> Lookup(input_idempotency_keys, i, "")]
 
 \* A new process: the durable non-terminal rows, every generated variable at
 \* its initial value.
@@ -210,21 +245,24 @@ Restart(next_stage) ==
 AuditCrashProcess1 ==
     /\ audit_stage = "P1"
     /\ Restart("P2Start")
-    /\ UNCHANGED <<setupVars, regionVars, historyVars, audit_recovered_p2, audit_staged_p3>>
+    /\ UNCHANGED <<setupVars, liveVars, regionVars, historyVars, audit_recovered_p2,
+                   audit_staged_p3>>
 
+\* Processes 2 and 3 register under an entry epoch, so a host may recycle
+\* the runtime.
 StartProcess(start_stage, recover_stage) ==
     /\ audit_stage = start_stage
     /\ \/ Initialize /\ AuditUnchanged
-       \/ /\ RegisterSessionIdle(AuditSession, None, {})
+       \/ /\ RegisterSessionIdle(AuditSession, Some(AuditEpoch), {})
           /\ audit_stage' = recover_stage
-          /\ UNCHANGED <<setupVars, regionVars, historyVars, restartVars>>
+          /\ UNCHANGED <<setupVars, liveVars, regionVars, historyVars, restartVars>>
 
 AuditStartProcess2 == StartProcess("P2Start", "P2Recover")
 AuditStartProcess3 == StartProcess("P3Start", "P3Recover")
 
 RecoveryStep(i, next) ==
     /\ audit_recovery' = [audit_recovery EXCEPT ![i] = next]
-    /\ UNCHANGED <<audit_stage, setupVars, regionVars, historyVars, audit_rows,
+    /\ UNCHANGED <<audit_stage, setupVars, liveVars, regionVars, historyVars, audit_rows,
                    audit_recovered_p2, audit_staged_p3>>
 
 Unrecovered == {i \in DOMAIN audit_recovery : audit_recovery[i] \notin {"Recovered", "Discarded"}}
@@ -232,8 +270,8 @@ Unrecovered == {i \in DOMAIN audit_recovery : audit_recovery[i] \notin {"Recover
 \* Cold recovery of each durable non-terminal row through the generated arms,
 \* one row at a time in the fixed order: the durability classifier (an
 \* Ephemeral row is discarded), the normalization classifier for the row's
-\* phase (a Staged row is queued again), then the admitted input and its
-\* Queued lifecycle.
+\* phase (a Staged row is queued again), then the admitted input, its
+\* Queued lifecycle and, for a row with one, its idempotency key.
 AuditRecoverRow ==
     /\ audit_stage \in {"P2Recover", "P3Recover"}
     /\ Unrecovered # {}
@@ -257,6 +295,9 @@ AuditRecoverRow ==
           /\ RecoverInputLifecycleIdle(i, "Queued", None, None, None, None, 0,
                 r.attempts, None, None, Some(r.seq), None, Some(r.lane),
                 Some(r.lane), Some(r.boundary), Some(r.exec), None, r.is_prompt)
+          /\ RecoveryStep(i, IF r.key = "" THEN "Recovered" ELSE "Key")
+       \/ /\ audit_recovery[i] = "Key"
+          /\ RegisterAcceptedIdempotencyIdle(i, r.key)
           /\ RecoveryStep(i, "Recovered")
 
 RecoveredRows == {i \in DOMAIN audit_recovery : audit_recovery[i] = "Recovered"}
@@ -268,38 +309,88 @@ AuditRecoveryDone ==
     /\ audit_recovered_p2' = IF audit_stage = "P2Recover" THEN RecoveredRows
                                                           ELSE audit_recovered_p2
     /\ UNCHANGED vars
-    /\ UNCHANGED <<setupVars, regionVars, historyVars, audit_rows, audit_recovery,
+    /\ UNCHANGED <<setupVars, liveVars, regionVars, historyVars, audit_rows, audit_recovery,
                    audit_staged_p3>>
 
 \* ---- process 2: refused before it serves ----
 
-\* A caller admits C while the registration stands (once).
+\* Live work landing at stage s: before the unregister began, or between its
+\* begin and its stop.
+LiveWork(kind) ==
+    /\ audit_live_p2' = audit_live_p2 \cup {kind}
+    /\ audit_draining_live' = (audit_draining_live \/ audit_stage = "P2Draining")
+
+\* A caller plans C while the registration stands, and admits it then or
+\* once the unregister began (once).
 AuditAdmitInProcess2 ==
+    \/ /\ audit_stage = "P2Ready"
+       /\ ~audit_c_planned
+       /\ AdmitPlan(AuditC, "Prompt")
+       /\ audit_c_planned' = TRUE
+       /\ UNCHANGED <<audit_stage, audit_facts, audit_disposition, audit_admitted_p2,
+                      liveVars, regionVars, historyVars, restartVars>>
+    \/ /\ audit_stage \in {"P2Ready", "P2Draining"}
+       /\ audit_c_planned
+       /\ audit_admitted_p2 = {}
+       /\ QueueAcceptedIdle(AuditC)
+       /\ audit_admitted_p2' = {AuditC}
+       /\ LiveWork("Admit")
+       /\ UNCHANGED <<audit_stage, audit_facts, audit_disposition, audit_c_planned,
+                      audit_recycle_pending, audit_rerecovered, regionVars, historyVars,
+                      restartVars>>
+
+\* A caller resubmits B under its key: the machine resolves it as a
+\* duplicate of B, which it then waits on (once).
+AuditDedupeInProcess2 ==
+    /\ audit_stage \in {"P2Ready", "P2Draining"}
+    /\ "Dedupe" \notin audit_live_p2
+    /\ ResolveAdmissionIdempotencyDuplicateIdle(AuditD, Some(AuditKey))
+    /\ LiveWork("Dedupe")
+    /\ UNCHANGED <<audit_stage, setupVars, audit_recycle_pending, audit_rerecovered,
+                   regionVars, historyVars, restartVars>>
+
+\* A host recycles the runtime while the registration stands (once). Its
+\* recovery admits every active input to the recovered witness again, one
+\* at a time in the fixed order.
+AuditRecycleInProcess2 ==
     /\ audit_stage = "P2Ready"
-    /\ \/ /\ ~audit_c_planned
-          /\ AdmitPlan(AuditC, "Prompt")
-          /\ audit_c_planned' = TRUE
-          /\ UNCHANGED <<audit_stage, audit_facts, audit_disposition, audit_admitted_p2,
-                         regionVars, historyVars, restartVars>>
-       \/ /\ audit_c_planned
-          /\ audit_admitted_p2 = {}
-          /\ QueueAcceptedIdle(AuditC)
-          /\ audit_admitted_p2' = {AuditC}
-          /\ UNCHANGED <<audit_stage, audit_facts, audit_disposition, audit_c_planned,
-                         regionVars, historyVars, restartVars>>
+    /\ "Recycle" \notin audit_live_p2
+    /\ RecycleFromIdleOrRetired
+    /\ audit_stage' = "P2Recycle"
+    /\ audit_recycle_pending' = NonTerminalInputs
+    /\ LiveWork("Recycle")
+    /\ UNCHANGED <<setupVars, audit_rerecovered, regionVars, historyVars, restartVars>>
+
+AuditRecycleRecover ==
+    /\ audit_stage = "P2Recycle"
+    /\ audit_recycle_pending # {}
+    /\ LET i == FirstOf(audit_recycle_pending)
+           r == RowOf(i)
+       IN
+       /\ RecoverAdmittedInputIdle(i, audit_facts[i].kind, r.boundary, r.exec, None, r.lane)
+       /\ audit_recycle_pending' = audit_recycle_pending \ {i}
+       /\ audit_rerecovered' = audit_rerecovered \cup {i}
+    /\ UNCHANGED <<audit_stage, setupVars, audit_live_p2, audit_draining_live, regionVars,
+                   historyVars, restartVars>>
+
+AuditRecycleDone ==
+    /\ audit_stage = "P2Recycle"
+    /\ audit_recycle_pending = {}
+    /\ audit_stage' = "P2Ready"
+    /\ UNCHANGED vars
+    /\ UNCHANGED <<setupVars, liveVars, regionVars, historyVars, restartVars>>
 
 \* The materialization is refused: the host rolls its registration back with
 \* an unregister that begins with Keep, or, as the control, with Stop. The
 \* registration never attached an executor, so its runtime is Idle.
 AuditBeginRollback ==
     /\ audit_stage = "P2Ready"
-    /\ audit_c_planned => audit_admitted_p2 # {}
     /\ \E disp \in {"Keep", "Stop"} :
-          /\ BeginUnregisterSessionIdle(AuditSession, None, None, None, None, disp, 0)
+          /\ BeginUnregisterSessionIdle(AuditSession, None, None, None, Some(AuditEpoch), disp, 0)
           /\ audit_disposition' = disp
     /\ audit_stage' = "P2Draining"
-    /\ UNCHANGED <<audit_facts, audit_c_planned, audit_admitted_p2, regionVars, historyVars,
-                   restartVars>>
+    /\ UNCHANGED <<audit_facts, audit_c_planned, audit_admitted_p2, liveVars, regionVars,
+                   historyVars, restartVars>>
 
 \* The rollback's stop transaction. The open step is the shell taking the
 \* driver lock.
@@ -311,7 +402,7 @@ AuditOpenStop ==
     /\ audit_post_verdict' = NoVerdict
     /\ audit_abandoned' = {}
     /\ UNCHANGED vars
-    /\ UNCHANGED <<setupVars, historyVars, restartVars>>
+    /\ UNCHANGED <<setupVars, liveVars, historyVars, restartVars>>
 
 \* Before the exit: the inputs answered Abandon get the runless carrier.
 AuditClassifyForCarriers ==
@@ -322,7 +413,7 @@ AuditClassifyForCarriers ==
           /\ audit_pending' = audit_pending \ {i}
           /\ audit_carriers' = IF audit_pre_verdict'[i] = "Abandon"
                                   THEN audit_carriers \cup {i} ELSE audit_carriers
-    /\ UNCHANGED <<audit_stage, setupVars, audit_post_verdict, audit_abandoned,
+    /\ UNCHANGED <<audit_stage, setupVars, liveVars, audit_post_verdict, audit_abandoned,
                    audit_kept, audit_stopped, restartVars>>
 
 AuditStopExit ==
@@ -331,7 +422,7 @@ AuditStopExit ==
     /\ RuntimeExecutorExitedFromIdle
     /\ audit_stage' = "PostExit"
     /\ audit_pending' = NonTerminalInputs
-    /\ UNCHANGED <<setupVars, audit_pre_verdict, audit_post_verdict, audit_abandoned,
+    /\ UNCHANGED <<setupVars, liveVars, audit_pre_verdict, audit_post_verdict, audit_abandoned,
                    historyVars, restartVars>>
 
 \* After the exit: the cleanup classifies again and ends the Abandon set.
@@ -341,7 +432,7 @@ AuditClassifyForCleanup ==
     /\ LET i == FirstOf(audit_pending) IN
           /\ Classify(i, audit_post_verdict)
           /\ audit_pending' = audit_pending \ {i}
-    /\ UNCHANGED <<audit_stage, setupVars, audit_pre_verdict, audit_abandoned,
+    /\ UNCHANGED <<audit_stage, setupVars, liveVars, audit_pre_verdict, audit_abandoned,
                    historyVars, restartVars>>
 
 ToEnd == Answered(audit_post_verdict, "Abandon") \ audit_abandoned
@@ -354,7 +445,7 @@ AuditStopAbandon ==
           /\ AbandonAny(i, "Stopped", Attempts(i))
           /\ audit_abandoned' = audit_abandoned \cup {i}
           /\ audit_stopped' = audit_stopped \cup {i}
-    /\ UNCHANGED <<audit_stage, setupVars, audit_pending, audit_pre_verdict,
+    /\ UNCHANGED <<audit_stage, setupVars, liveVars, audit_pending, audit_pre_verdict,
                    audit_post_verdict, audit_kept, audit_carriers, restartVars>>
 
 AuditCommitStop ==
@@ -364,7 +455,7 @@ AuditCommitStop ==
     /\ audit_stage' = "P2Stopped"
     /\ audit_kept' = Answered(audit_post_verdict, "Keep")
     /\ UNCHANGED vars
-    /\ UNCHANGED <<setupVars, regionVars, audit_carriers, audit_stopped, restartVars>>
+    /\ UNCHANGED <<setupVars, liveVars, regionVars, audit_carriers, audit_stopped, restartVars>>
 
 \* The unregister drain may complete before the next process starts.
 AuditUnregisterDrain ==
@@ -372,7 +463,7 @@ AuditUnregisterDrain ==
     /\ \/ RuntimeLoopStoppedForUnregisterStopped(AuditSession, FALSE)
        \/ CommsDrainExitedForUnregisterStopped(AuditSession, FALSE)
        \/ CompletionWaitersResolvedForUnregisterStopped(AuditSession)
-       \/ UnregisterSessionStopped(AuditSession, None, None, None, None)
+       \/ UnregisterSessionStopped(AuditSession, None, None, None, Some(AuditEpoch))
     /\ AuditUnchanged
 
 \* ---- process 3: a later start ----
@@ -380,7 +471,8 @@ AuditUnregisterDrain ==
 AuditRestartProcess3 ==
     /\ audit_stage = "P2Stopped"
     /\ Restart("P3Start")
-    /\ UNCHANGED <<setupVars, regionVars, historyVars, audit_recovered_p2, audit_staged_p3>>
+    /\ UNCHANGED <<setupVars, liveVars, regionVars, historyVars, audit_recovered_p2,
+                   audit_staged_p3>>
 
 AuditServe ==
     /\ audit_stage = "P3Serve"
@@ -389,8 +481,8 @@ AuditServe ==
        \/ \E i \in AuditInputs :
              /\ StageForRunRunning(i, AuditRun)
              /\ audit_staged_p3' = audit_staged_p3 \cup {i}
-             /\ UNCHANGED <<audit_stage, setupVars, regionVars, historyVars, audit_rows,
-                            audit_recovery, audit_recovered_p2>>
+             /\ UNCHANGED <<audit_stage, setupVars, liveVars, regionVars, historyVars,
+                            audit_rows, audit_recovery, audit_recovered_p2>>
 
 AuditNext ==
     \/ AuditSetup
@@ -399,6 +491,10 @@ AuditNext ==
     \/ AuditRecoverRow
     \/ AuditRecoveryDone
     \/ AuditAdmitInProcess2
+    \/ AuditDedupeInProcess2
+    \/ AuditRecycleInProcess2
+    \/ AuditRecycleRecover
+    \/ AuditRecycleDone
     \/ AuditBeginRollback
     \/ AuditOpenStop
     \/ AuditClassifyForCarriers
@@ -419,6 +515,10 @@ AuditInit ==
     /\ audit_disposition = "None"
     /\ audit_c_planned = FALSE
     /\ audit_admitted_p2 = {}
+    /\ audit_live_p2 = {}
+    /\ audit_draining_live = FALSE
+    /\ audit_recycle_pending = {}
+    /\ audit_rerecovered = {}
     /\ audit_pending = {}
     /\ audit_pre_verdict = NoVerdict
     /\ audit_post_verdict = NoVerdict
@@ -450,7 +550,7 @@ AuditRollbackVerdictIsAFunction ==
             IN r + k + a = 1
 
 AuditKeepEndsNoRecoveredInput ==
-    audit_disposition = "Keep" =>
+    (audit_disposition = "Keep" /\ audit_live_p2 = {}) =>
         /\ audit_recovered_p2 \cap OpenAnswers("Abandon") = {}
         /\ audit_recovered_p2 \cap audit_carriers = {}
         /\ audit_recovered_p2 \cap audit_stopped = {}
@@ -464,6 +564,9 @@ AuditKeepOnlyUnderKeep ==
 
 AuditKeptInputSurvivesTheRollback ==
     audit_stage = "P2Stopped" => audit_kept \subseteq NonTerminalInputs
+
+AuditLiveWorkForfeitsKeep ==
+    audit_live_p2 # {} => OpenAnswers("Keep") \cup audit_kept = {}
 
 \* ---- reachability goals, each checked as an expected violation ----
 
@@ -489,9 +592,32 @@ AuditWitnessAdmittedInputStoppedUnderKeep ==
 AuditWitnessStopRollbackEndsRecoveredInput ==
     /\ audit_disposition = "Stop"
     /\ AuditB \in audit_stopped
+\* C, admitted and then recovered again by a host recycle, so it sits in the
+\* recovered witness, still ends Stopped under a requested Keep.
+AuditWitnessRecycledAdmittedInputStoppedUnderKeep ==
+    /\ audit_disposition = "Keep"
+    /\ AuditC \in audit_rerecovered
+    /\ AuditC \in audit_stopped
+\* A resubmission waiting on B is the only live work, and the Keep rollback
+\* still ends B Stopped.
+AuditWitnessDedupedInputStoppedUnderKeep ==
+    /\ audit_disposition = "Keep"
+    /\ audit_live_p2 = {"Dedupe"}
+    /\ AuditB \in audit_stopped
+\* Live work that lands after a Keep unregister began turns the recorded
+\* Keep into Stop: the recovered B ends Stopped.
+AuditWitnessDrainingLiveWorkStopsRecoveredInput ==
+    /\ audit_disposition = "Keep"
+    /\ audit_draining_live
+    /\ AuditB \in audit_stopped
 
 NotAuditWitnessKeptQueuedInputRuns == ~AuditWitnessKeptQueuedInputRuns
 NotAuditWitnessKeptRequeuedInputRuns == ~AuditWitnessKeptRequeuedInputRuns
 NotAuditWitnessAdmittedInputStoppedUnderKeep == ~AuditWitnessAdmittedInputStoppedUnderKeep
 NotAuditWitnessStopRollbackEndsRecoveredInput == ~AuditWitnessStopRollbackEndsRecoveredInput
+NotAuditWitnessRecycledAdmittedInputStoppedUnderKeep ==
+    ~AuditWitnessRecycledAdmittedInputStoppedUnderKeep
+NotAuditWitnessDedupedInputStoppedUnderKeep == ~AuditWitnessDedupedInputStoppedUnderKeep
+NotAuditWitnessDrainingLiveWorkStopsRecoveredInput ==
+    ~AuditWitnessDrainingLiveWorkStopsRecoveredInput
 ====

@@ -730,6 +730,14 @@ them.
   `RunSuspendedForStop`. Both enums are exhaustive, so a `match` outside the
   crates needs the arms.
 
+- `meerkat-machine-schema` (`catalog::dsl::meerkat_machine`),
+  `meerkat-runtime` and `meerkat-machine-kernels` (`generated::meerkat`):
+  `MeerkatMachineState` and the kernel `State` gain
+  `registration_live_input_seen`, whether the registration served live work
+  (see Fixed, a refused restart keeps the inputs it recovered). Code that
+  builds either with a struct literal must set it (`false` for a
+  registration that served none).
+
 - `meerkat-rest`: `ApiError` gains `SessionNotRunningWithData { message,
   details }` (`409` `SESSION_NOT_RUNNING`), appended last. The enum is
   exhaustive, so a `match` outside the crate needs the arm.
@@ -2302,7 +2310,12 @@ them.
   the rollback for a materialization that admitted no input; `rollback_now`
   still stops every input. The keep is recorded with the unregister's
   progress (machine lifecycle record version 6), so a crash during the
-  rollback keeps the same inputs.
+  rollback keeps the same inputs. The machine grants the keep only to a
+  registration that served no live work: after an admission, a resubmission
+  deduplicated onto an input it holds, or a host's recycle (whose recovery
+  mixes live inputs into the recovered ones), the unregister records Stop
+  and stops every input, so a turn whose caller saw the materialization
+  refused never runs on a later start.
 
 - `meerkat-gemini`: preserve provider-issued `functionCall.id` through
   streamed tool calls, saved transcripts, assistant replay and matching

@@ -14085,6 +14085,7 @@ pub struct State {
     pub run_stop_requested: Option<RunId>,
     pub run_start_holds: std::collections::BTreeSet<RunStartHoldReason>,
     pub recovered_admitted_lanes: std::collections::BTreeMap<String, InputLane>,
+    pub registration_live_input_seen: bool,
     pub op_statuses: std::collections::BTreeMap<String, OperationStatus>,
     pub op_completion_seq: std::collections::BTreeMap<String, u64>,
     pub completion_sequence_claims: std::collections::BTreeSet<u64>,
@@ -14940,6 +14941,10 @@ impl std::fmt::Debug for State {
             .field("run_stop_requested", &self.run_stop_requested)
             .field("run_start_holds", &self.run_start_holds)
             .field("recovered_admitted_lanes", &self.recovered_admitted_lanes)
+            .field(
+                "registration_live_input_seen",
+                &self.registration_live_input_seen,
+            )
             .field("op_statuses", &self.op_statuses)
             .field("op_completion_seq", &self.op_completion_seq)
             .field(
@@ -25944,6 +25949,7 @@ pub fn initial_state() -> State {
         run_stop_requested: None,
         run_start_holds: Default::default(),
         recovered_admitted_lanes: Default::default(),
+        registration_live_input_seen: false,
         op_statuses: Default::default(),
         op_completion_seq: Default::default(),
         completion_sequence_claims: Default::default(),

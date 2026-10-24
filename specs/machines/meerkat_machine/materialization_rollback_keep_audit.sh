@@ -2,7 +2,8 @@
 # Bounded TLC audit of the Keep disposition: the rollback of a materialization
 # that was refused before it served keeps every input its registration
 # recovered from the store, and still stops an input admitted while the
-# registration stood.
+# registration stood. Once the registration served live work (an admission,
+# a deduplicated wait or a recycle) its unregister keeps nothing.
 #
 # usage: materialization_rollback_keep_audit.sh <max-steps> [--mutants] [extra tlc args...]
 #
@@ -16,15 +17,21 @@
 # specs. It checks the whole bounded space once (safety), then reruns it once
 # per reachability witness with that witness's negation as an extra invariant
 # and requires TLC to report exactly that violation, so the invariants are
-# not vacuous. With --mutants it then seeds four defects into a copy of the
+# not vacuous. With --mutants it then seeds nine defects into a copy of the
 # generated model and requires TLC to refuse each with the invariant it
 # breaks: the machine without the Keep arm (Keep stops like Stop), a Keep arm
-# that ignores the recovery witness, an Abandon arm that overlaps Keep, and a
-# Keep arm that ignores the disposition. An anchor this script expects but
-# cannot find fails the run.
+# that ignores the recovery witness (with admissions that leave no live-work
+# mark), an Abandon arm that overlaps Keep, a
+# Keep arm that ignores the disposition, an unregister begin that records a
+# requested Keep after live work, an admission that leaves a recorded Keep
+# standing, and an admission, a deduplicated wait or a recycle that does not
+# mark the registration as having served live work. An anchor this script
+# expects but cannot find fails the run.
 set -euo pipefail
 
 usage="usage: materialization_rollback_keep_audit.sh <max-steps> [--mutants] [extra tlc args...]"
+# The deepest witness's model_step_count; a smaller bound cannot reach it.
+deepest_witness_steps=43
 max_steps="${1:?${usage}}"
 shift
 run_mutants=false
@@ -32,8 +39,8 @@ if [[ "${1:-}" == "--mutants" ]]; then
   run_mutants=true
   shift
 fi
-if ! [[ "${max_steps}" =~ ^[0-9]+$ ]] || (( max_steps < 40 )); then
-  echo "error: max-steps must be an integer >= 45 (the deepest witness is 40 steps)" >&2
+if ! [[ "${max_steps}" =~ ^[0-9]+$ ]] || (( max_steps < deepest_witness_steps )); then
+  echo "error: max-steps must be an integer >= ${deepest_witness_steps} (the deepest witness's model_step_count)" >&2
   exit 2
 fi
 
@@ -103,10 +110,11 @@ write_cfg() {
   local cfg="$1" extra="$2"
   cp "${ci_cfg}" "${cfg}"
   replace_exact_line "SPECIFICATION Spec" "SPECIFICATION AuditSpec" "${cfg}"
-  replace_exact_line "  InputIdValues = {}" '  InputIdValues = {"input_1", "input_2", "input_3"}' "${cfg}"
+  replace_exact_line "  InputIdValues = {}" '  InputIdValues = {"input_1", "input_2", "input_3", "input_4"}' "${cfg}"
   replace_exact_line "  RunIdValues = {}" '  RunIdValues = {"runid_1"}' "${cfg}"
+  replace_exact_line "  RuntimeEpochIdValues = {}" '  RuntimeEpochIdValues = {"runtimeepochid_1"}' "${cfg}"
   replace_exact_line "  SessionIdValues = {}" '  SessionIdValues = {"sessionid_1"}' "${cfg}"
-  replace_exact_line "  StringValues = {}" '  StringValues = {"input_1", "input_2", "input_3"}' "${cfg}"
+  replace_exact_line "  StringValues = {}" '  StringValues = {"input_1", "input_2", "input_3", "input_4", "key_b"}' "${cfg}"
   replace_exact_line "CONSTANTS" "CONSTANTS
   AuditMaxSteps = ${max_steps}" "${cfg}"
   # The verdict function comes first: an overlapping arm breaks it a state
@@ -116,7 +124,8 @@ write_cfg() {
   AuditKeepEndsNoRecoveredInput
   AuditKeepStopsWhatItAdmitted
   AuditKeepOnlyUnderKeep
-  AuditKeptInputSurvivesTheRollback${extra}" "${cfg}"
+  AuditKeptInputSurvivesTheRollback
+  AuditLiveWorkForfeitsKeep${extra}" "${cfg}"
   replace_exact_line "  CiStateConstraint" "  AuditStateConstraint" "${cfg}"
   printf 'CHECK_DEADLOCK FALSE\n' >> "${cfg}"
 }
@@ -159,7 +168,8 @@ if [[ "${tlc_status}" != "0" ]] \
 fi
 
 for witness in KeptQueuedInputRuns KeptRequeuedInputRuns AdmittedInputStoppedUnderKeep \
-  StopRollbackEndsRecoveredInput; do
+  StopRollbackEndsRecoveredInput RecycledAdmittedInputStoppedUnderKeep \
+  DedupedInputStoppedUnderKeep DrainingLiveWorkStopsRecoveredInput; do
   cfg="${work_dir}/witness-${witness}.cfg"
   write_cfg "${cfg}" "
   NotAuditWitness${witness}"
@@ -182,17 +192,29 @@ if [[ "${run_mutants}" == "true" ]]; then
     keep_arms+=" ClassifyStopInputDispositionKeep${arm_phase}"
     abandon_arms+=" ClassifyStopInputDispositionAbandon${arm_phase}"
   done
+  begin_arms="BeginUnregisterSessionIdle BeginUnregisterSessionAttached BeginUnregisterSessionRunning"
+  begin_arms+=" BeginUnregisterSessionRetainsSnapshotRetired BeginUnregisterSessionRetainsSnapshotStopped"
+  queue_arms=""
+  for arm_phase in Idle Attached Running Retired Stopped; do
+    queue_arms+=" QueueAccepted${arm_phase}"
+  done
+  dedupe_arms="ResolveAdmissionIdempotencyDuplicateIdle ResolveAdmissionIdempotencyDuplicateAttached"
+  dedupe_arms+=" ResolveAdmissionIdempotencyDuplicateRunning"
+  recycle_arms="RecycleFromIdleOrRetired RecycleFromAttached"
 
   # usage: mutate <name> <expected invariant>; reads a python edit on stdin
   # that rewrites model.tla in place (MODEL) and must find each anchor it
-  # names. KEEP_ARMS and ABANDON_ARMS name the classifier arms.
+  # names. KEEP_ARMS and ABANDON_ARMS name the classifier arms, BEGIN_ARMS
+  # the unregister begin arms, and QUEUE_ARMS, DEDUPE_ARMS and RECYCLE_ARMS
+  # the arms that mark live work; MARK_ARMS names one of those three.
   mutate() {
     local name="$1" property="$2"
     local dir="${work_dir}/mutant-${name}"
     mkdir -p "${dir}"
     cp "${model_dir}"/*.tla "${dir}/"
     MODEL="${dir}/model.tla" KEEP_ARMS="${keep_arms}" ABANDON_ARMS="${abandon_arms}" \
-      PYTHONPATH="${work_dir}" python3 -
+      BEGIN_ARMS="${begin_arms}" QUEUE_ARMS="${queue_arms}" DEDUPE_ARMS="${dedupe_arms}" \
+      RECYCLE_ARMS="${recycle_arms}" MARK_ARMS="${mark_arms:-}" PYTHONPATH="${work_dir}" python3 -
     local cfg="${work_dir}/mutant-${name}.cfg"
     write_cfg "${cfg}" ""
     run_tlc "mutant-${name}" "${cfg}" "${dir}"
@@ -215,9 +237,32 @@ KEEP_GUARD = (
     '(input_id \\in DOMAIN input_phases) /\\ (input_id \\in recovered_admitted_inputs))'
 )
 
+# A requested Keep is recorded as Stop once the registration served live work.
+BEGIN_DOWNGRADE = (
+    "unregister_queued_inputs' = IF ((queued_inputs = \"Keep\") /\\ "
+    "registration_live_input_seen) THEN \"Stop\" ELSE queued_inputs"
+)
+# Live work turns a Keep already recorded into Stop.
+SETTER_DOWNGRADE = (
+    "unregister_queued_inputs' = IF (unregister_queued_inputs = \"Keep\") THEN \"Stop\" "
+    "ELSE unregister_queued_inputs"
+)
+# Live work marks the registration.
+SEEN_SET = "registration_live_input_seen' = TRUE"
+
+
+def arm_start(text, arm):
+    # An arm with parameters opens with "Name(", one without with "Name ==".
+    for opener in ("\n" + arm + "(", "\n" + arm + " =="):
+        at = text.find(opener)
+        if at >= 0:
+            return at + 1
+    raise AssertionError(f"arm {arm} not found")
+
+
 def edit_arm_lines(text, arms_env, needle, replacement):
     for arm in os.environ[arms_env].split():
-        start = text.index("\n" + arm + "(") + 1
+        start = arm_start(text, arm)
         end = text.index("\n\n", start)
         lines = text[start:end].split("\n")
         hits = [i for i, line in enumerate(lines) if needle in line]
@@ -241,15 +286,21 @@ open(path, "w").write(text)
 PY
 
   # A Keep arm (and its Abandon exclusion) without the recovery witness keeps
-  # the input the registration admitted.
+  # the input the registration admitted. The admission's live-work mark
+  # alone already records the unregister as Stop, so this mutant also drops
+  # that mark: the recovery witness is then all that keeps the Keep arm off
+  # the admitted input.
   mutate keep_ignores_recovery AuditKeepStopsWhatItAdmitted <<'PY'
 import os
-from keep_mutation import KEEP_GUARD, edit_arm_lines
+from keep_mutation import KEEP_GUARD, SEEN_SET, edit_arm_lines
 path = os.environ["MODEL"]
 text = open(path).read()
 drop = lambda line: line.replace(" /\\ (input_id \\in recovered_admitted_inputs)", "", 1)
 text = edit_arm_lines(text, "KEEP_ARMS", KEEP_GUARD, drop)
 text = edit_arm_lines(text, "ABANDON_ARMS", KEEP_GUARD, drop)
+text = edit_arm_lines(
+    text, "QUEUE_ARMS", SEEN_SET,
+    lambda line: line.replace(SEEN_SET, "registration_live_input_seen' = registration_live_input_seen"))
 open(path, "w").write(text)
 PY
 
@@ -275,5 +326,47 @@ text = edit_arm_lines(text, "KEEP_ARMS", KEEP_GUARD, drop)
 text = edit_arm_lines(text, "ABANDON_ARMS", KEEP_GUARD, drop)
 open(path, "w").write(text)
 PY
+
+  # An unregister begin that records a requested Keep after live work.
+  mutate begin_keeps_after_live_work keep_unregister_only_without_live_input <<'PY'
+import os
+from keep_mutation import BEGIN_DOWNGRADE, edit_arm_lines
+path = os.environ["MODEL"]
+text = open(path).read()
+text = edit_arm_lines(
+    text, "BEGIN_ARMS", BEGIN_DOWNGRADE,
+    lambda line: line.replace(BEGIN_DOWNGRADE, "unregister_queued_inputs' = queued_inputs"))
+open(path, "w").write(text)
+PY
+
+  # An admission that leaves a Keep the unregister already recorded standing.
+  mutate admission_leaves_a_recorded_keep keep_unregister_only_without_live_input <<'PY'
+import os
+from keep_mutation import SETTER_DOWNGRADE, edit_arm_lines
+path = os.environ["MODEL"]
+text = open(path).read()
+text = edit_arm_lines(
+    text, "QUEUE_ARMS", SETTER_DOWNGRADE,
+    lambda line: line.replace(SETTER_DOWNGRADE, "unregister_queued_inputs' = unregister_queued_inputs"))
+open(path, "w").write(text)
+PY
+
+  # An admission, a deduplicated wait or a recycle that does not mark the
+  # registration as having served live work.
+  for marker in admission:queue_arms dedupe:dedupe_arms recycle:recycle_arms; do
+    mark_arms="${marker#*:}"
+    mark_arms="${!mark_arms}"
+    mutate "${marker%%:*}_does_not_mark_live_work" AuditLiveWorkForfeitsKeep <<'PY'
+import os
+from keep_mutation import SEEN_SET, edit_arm_lines
+path = os.environ["MODEL"]
+text = open(path).read()
+text = edit_arm_lines(
+    text, "MARK_ARMS", SEEN_SET,
+    lambda line: line.replace(SEEN_SET, "registration_live_input_seen' = registration_live_input_seen"))
+open(path, "w").write(text)
+PY
+  done
+  mark_arms=""
 fi
 echo "materialization-rollback keep audit passed at model_step_count <= ${max_steps}"
