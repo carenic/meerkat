@@ -2221,7 +2221,11 @@ them.
     filter, MCP intents, mob authority context, tool application) check the
     archive without reading the session, and land after the run. A read of a
     hosted session whose turn stopped before its boundary commit settles the
-    tail that turn left, as a restart would.
+    tail that turn left, as a restart would. A strict read
+    (`PersistentSessionService::load_authoritative_session`) settles a tail
+    such a read deferred while a runtime loop lap held the session's turn
+    boundary, waiting up to one second for that boundary, also after the live
+    actor is gone.
 
 - `meerkat-mob`: `MobSessionService::load_persisted_session_tolerating_tail`,
   the same read for mob code. Its default is the strict
@@ -2252,6 +2256,17 @@ them.
   `SessionError::DurableTailRecoveryRefused` instead of an internal error, so
   a caller can tell a session withheld for reconciliation from a fault. The
   tail and every durable row are kept, as before.
+- `meerkat-session`: `PersistentSessionService::prepare_cold_attach` (and
+  `prepare_cold_attach_reporting`) settle a provisional tail only between
+  runtime loop laps. Once a tail stands they wait up to one second for the
+  session's turn-finalization boundary, which a lap holds from its top
+  through its run, and a lap that holds it longer leaves the tail for a later
+  settle; the caller's committed read then refuses, as for any unresolved
+  tail. A lap can outlive the live actor, and a settle inside the lap's
+  staging window would be written over by its staging commit, which ends the
+  input the settle consumed as stopped. A caller that holds the boundary
+  itself (a runtime loop lap's apply) uses the new
+  `prepare_cold_attach_under_runtime_turn_boundary`.
 - `meerkat-core`, `meerkat-session`, `meerkat-runtime`: a HeadCanonical run's
   round commits (see Added, per-round commits) move its durable head over the
   run's compaction rewrites, and the run retires its compaction history to
@@ -2407,22 +2422,6 @@ them.
   bytes and ends the archive, and the retirement or destroy, with the typed
   `SessionError::DurableTailHeldForRecovery` or
   `SessionError::DurableTailRecoveryRefused`.
-- `meerkat-session`: a strict authoritative read
-  (`PersistentSessionService::load_authoritative_session`) runs the settle an
-  observation deferred instead of refusing the session with a transcript
-  revision conflict. An observation of a hosted session whose turn ended
-  without its boundary commit defers that settle while a runtime loop lap
-  holds the session's turn-finalization boundary, and the first observation
-  after the lap runs it. When the live actor was discarded first (a read of a
-  runtime retired meanwhile discards it), no observation could run the settle
-  any more, and every strict read refused the session until a later start or
-  attach settled the tail. The deferred settle now outlives the actor: the
-  next strict read waits at most one second for the boundary and settles the
-  tail between laps, with the live settle while the actor is hosted, or as
-  the session's next start would, under this runtime owner's hosting claim.
-  A session another runtime owner hosts, and a boundary held past the wait,
-  keep the conflict, and a tail no observation deferred is still settled by
-  a start, an attach or the session's archive.
 
 - `meerkat-gemini`: preserve provider-issued `functionCall.id` through
   streamed tool calls, saved transcripts, assistant replay and matching

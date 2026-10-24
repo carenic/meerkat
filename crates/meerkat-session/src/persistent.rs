@@ -148,15 +148,17 @@ fn whole_blob_read_error_to_session_error(
 /// counted attempts, never wall clock (issue #1104).
 const OBSERVATION_LOAD_ATTEMPTS: usize = 8;
 
-/// Bound on a strict authoritative read's wait for the session's
-/// turn-finalization boundary before it runs a settle an observation
-/// deferred (see `settle_deferred_ended_tail_for_strict_read`). A settle
-/// commits only between runtime loop laps; this covers the short holders
-/// while such a tail stands: the post-commit work of a finished lap, a lap
-/// whose run the standing tail refuses before its model call, and a lap whose
-/// resumed-run admission answers once a stop or retire settled that run. A
-/// boundary still held after it keeps the read's conflict.
-const DEFERRED_ENDED_TAIL_SETTLE_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
+/// Bound on the wait for a session's turn-finalization boundary before a
+/// tail settle that does not hold it: a strict read running a settle an
+/// observation deferred (`settle_deferred_ended_tail_for_strict_read`), and a
+/// cold attach's settle (`prepare_cold_attach_hosted`). A settle commits only
+/// between runtime loop laps; this covers the short holders while a tail
+/// stands: the post-commit work of a finished lap, a lap whose run the
+/// standing tail refuses before its model call, and a lap whose resumed-run
+/// admission answers once a stop or retire settled that run. A boundary
+/// still held after it leaves the tail standing, and the caller's committed
+/// read refuses as before.
+const TAIL_SETTLE_BOUNDARY_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How the settle of an ended turn's tail takes the per-session recovery
 /// gate: an observation takes only a free gate (a holder owns the tail), and
@@ -19333,7 +19335,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// read again.
     ///
     /// The settle commits only between runtime loop laps, so the read first
-    /// waits, bounded by [`DEFERRED_ENDED_TAIL_SETTLE_BOUND`], for the
+    /// waits, bounded by [`TAIL_SETTLE_BOUNDARY_BOUND`], for the
     /// session's turn-finalization boundary. Under it, a tail a settle ended
     /// while the read waited leaves nothing to do but read again. Otherwise
     /// the read settles the ended run's tail: with the observation's live
@@ -19350,7 +19352,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         let started = std::time::Instant::now();
         let turn_finalization_gate = self.turn_finalization_gate_for_session(id).await;
         let Ok(_turn_finalization_guard) = tokio::time::timeout(
-            DEFERRED_ENDED_TAIL_SETTLE_BOUND,
+            TAIL_SETTLE_BOUNDARY_BOUND,
             turn_finalization_gate.lock_owned(),
         )
         .await
@@ -19384,8 +19386,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             // The recovery gate gets whatever is left of the same bound. A
             // zero remainder still polls the gate once, so a free gate is
             // taken.
-            let recovery_gate_bound =
-                DEFERRED_ENDED_TAIL_SETTLE_BOUND.saturating_sub(started.elapsed());
+            let recovery_gate_bound = TAIL_SETTLE_BOUNDARY_BOUND.saturating_sub(started.elapsed());
             let settled = self
                 .settle_ended_live_turn_tail_under_boundary(
                     id,
@@ -19404,7 +19405,9 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             }
             Err(_) => return false,
         };
-        let settled = self.prepare_cold_attach(id, claim).await;
+        let settled = self
+            .prepare_cold_attach_under_runtime_turn_boundary(id, claim)
+            .await;
         self.forget_deferred_ended_tail_settle(id);
         match settled {
             Ok(()) => true,
@@ -19525,6 +19528,39 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         id: &SessionId,
         claim: meerkat_core::session_hosting::HostingClaim,
     ) -> Result<ColdAttachSettlement, SessionError> {
+        self.require_cold_attach_claim(id, &claim)?;
+        meerkat_core::session_hosting::with_write_hosting(
+            claim,
+            self.prepare_cold_attach_hosted(id, false),
+        )
+        .await
+    }
+
+    /// [`Self::prepare_cold_attach`] for a caller that holds the session's
+    /// turn-finalization boundary (a runtime loop lap's apply that attaches
+    /// the session): the settle does not wait for the boundary again. A
+    /// caller that does not hold it uses [`Self::prepare_cold_attach`], whose
+    /// settle waits for it, bounded.
+    pub async fn prepare_cold_attach_under_runtime_turn_boundary(
+        &self,
+        id: &SessionId,
+        claim: meerkat_core::session_hosting::HostingClaim,
+    ) -> Result<(), SessionError> {
+        self.require_cold_attach_claim(id, &claim)?;
+        meerkat_core::session_hosting::with_write_hosting(
+            claim,
+            self.prepare_cold_attach_hosted(id, true),
+        )
+        .await
+        .map(|_settlement| ())
+    }
+
+    /// A cold attach's hosting claim must be this owner's claim of `id`.
+    fn require_cold_attach_claim(
+        &self,
+        id: &SessionId,
+        claim: &meerkat_core::session_hosting::HostingClaim,
+    ) -> Result<(), SessionError> {
         if claim.session_id() != id {
             return Err(SessionError::Agent(AgentError::InternalError(format!(
                 "cold attach of session {id} was offered the hosting claim of session {}",
@@ -19536,16 +19572,23 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 "cold attach of session {id} was offered another runtime owner's hosting claim"
             ))));
         }
-        meerkat_core::session_hosting::with_write_hosting(
-            claim,
-            self.prepare_cold_attach_hosted(id),
-        )
-        .await
+        Ok(())
     }
 
+    /// The cold attach's settle of a provisional tail. It commits only
+    /// between runtime loop laps, as the observation's settle does: a lap
+    /// can outlive the live actor (a read of a retired runtime discards the
+    /// actor while a lap holds the boundary), and a commit inside the lap's
+    /// staging window is written over by its staging commit. So unless the
+    /// caller holds the session's turn-finalization boundary
+    /// (`turn_boundary_held`), the settle waits for it, bounded by
+    /// [`TAIL_SETTLE_BOUNDARY_BOUND`], once a tail stands. A boundary still
+    /// held after the bound leaves the tail, as an unresolved tail is left:
+    /// the caller's committed read refuses.
     async fn prepare_cold_attach_hosted(
         &self,
         id: &SessionId,
+        turn_boundary_held: bool,
     ) -> Result<ColdAttachSettlement, SessionError> {
         if self.inner.has_live_session(id).await? {
             return Ok(ColdAttachSettlement::Settled);
@@ -19571,6 +19614,24 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 return Ok(ColdAttachSettlement::Settled);
             }
         }
+        let _turn_finalization_guard = if turn_boundary_held {
+            None
+        } else {
+            let turn_finalization_gate = self.turn_finalization_gate_for_session(id).await;
+            let Ok(guard) = tokio::time::timeout(
+                TAIL_SETTLE_BOUNDARY_BOUND,
+                turn_finalization_gate.lock_owned(),
+            )
+            .await
+            else {
+                tracing::warn!(
+                    session_id = %id,
+                    "a runtime loop lap held the turn boundary past the cold attach's bound; the provisional tail is left for a settle between laps"
+                );
+                return Ok(ColdAttachSettlement::Settled);
+            };
+            Some(guard)
+        };
         match self.recover_committed_boundary_for_resume(id).await {
             Ok(ResumeBoundaryRecovery::Settled(
                 CommittedBoundaryRecovery::Recovered { .. }
