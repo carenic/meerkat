@@ -2484,18 +2484,24 @@ them.
   `AdmitDestroyMemberRetireRuntimeEnded` arms (Running, Stopped) mark the
   member Retiring with its retirement session and request its session
   ingress detach, with no runtime retire, and the destroy archives it as a
-  retired member.
+  retired member. A mob with a member retired outside it could not be
+  destroyed in 0.9.4 either.
 
-- `meerkat-mob`, `meerkat-machine-schema`: one member's retirement no longer
-  resets the mob's active run count. A member runtime retired outside the mob
+- `meerkat-mob`, `meerkat-machine-schema`: the mob's active run count is
+  now right. As in 0.9.4, a member runtime retired outside the mob
   (`ObserveRuntimeRetired`, in Running and Stopped) and every member
   retirement archive (the ordinary, destroy, placed and remote archive arms
   taken while the runtime was still live) set the mob-wide count to zero
-  while another member's flow run was still active. `MobHandle::stop` was
-  then admitted under that run, and cancelled it at a boundary, where it is
+  while another member's flow run was still active: `MobHandle::stop` was
+  then admitted under that run, and cancelled it at a boundary; it is now
   refused with `MobError::InvalidTransition` until the run ends. Only the
   arms that end every run of the mob (stop, complete, reset, force cancel,
-  shutdown, destroy, cancel all work) reset the count now.
+  shutdown, destroy, cancel all work) reset the count now. An external
+  delivery whose Flow admission fails after the run started (its
+  realization claim fails, or the delivery turns terminal before the Flow
+  realizes it) now ends that run (`FinishRun`) as well as its Flow: the
+  compensation left the count at one, which those resets hid, so the stop
+  was refused until a cancel-all, force cancel, shutdown or destroy.
 
 - `meerkat-session`, `meerkat-mob`: a mob start after a graceful stop with a
   member's run in flight no longer fails on a HeadCanonical store. A host's

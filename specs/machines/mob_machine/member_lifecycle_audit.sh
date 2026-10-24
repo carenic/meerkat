@@ -24,7 +24,7 @@
 # space once per reachability witness, with that witness's negation as an
 # extra invariant (a state goal) or action property (a step goal), and
 # requires TLC to report exactly that violation, so the properties are not
-# vacuous. With --mutants it then seeds nine defects into a copy of the
+# vacuous. With --mutants it then seeds ten defects into a copy of the
 # generated model and requires TLC to refuse each: a progress arm without its
 # observation_monotonic guard (AuditObservationMonotonic); the same guard
 # rendered as a plain `<=` between option records, which TLC cannot evaluate
@@ -41,8 +41,9 @@
 # mapped guard, which then overlaps NoCurrentIncarnation
 # (AuditRetireAtScopeExactlyOne); the roster recovery keeping the
 # predecessor's execution-health entries (AuditMintClearsExecutionHealth);
-# a runtime destroy observation that ends the mob, and one that leaves its
-# runtime live (AuditRuntimeDestroyedRemovesOnlyItsRuntime).
+# a runtime destroy observation that ends the mob, one that leaves its
+# runtime live, and one that resets the mob's run count
+# (AuditRuntimeDestroyedRemovesOnlyItsRuntime).
 # An anchor this script
 # expects but cannot find fails the run. Each TLC run is held to the
 # canonical lane's per-run cap (tlc_run_cap.sh) and fails closed as TLC
@@ -56,12 +57,15 @@ if [[ "${1:-}" == "--mutants" ]]; then
 fi
 # Each run's distinct-state floor is 90% of the whole space its first green
 # run found, so a guard that silently disables arms fails the lane.
-lifecycle_states=59607
+lifecycle_states=79476
 min_distinct_states=$(( lifecycle_states * 9 / 10 ))
-scope_states=3760
+scope_states=5908
 min_scope_distinct_states=$(( scope_states * 9 / 10 ))
 
 # Every lifecycle-run arm the audit's domains can enable; each must fire.
+# AuditStartRun is StartRunRunning held to one run at a time: TLC names a
+# guarded arm after the audit's wrapper, so its coverage line is of this
+# audit's module.
 covered_actions=(
   RecoverRosterMemberRunning
   RecoverRosterMemberResetRunning
@@ -115,6 +119,8 @@ covered_actions=(
   BeginPlacedCompletionLifecycleQuiesceFreshStop
   StopRunning
   ResumeStopped
+  AuditStartRun
+  FinishRunRunning
 )
 
 # Every RetireAtScope verdict arm, the completion and destruction arms that
@@ -316,16 +322,17 @@ check_space() {
 
   # TLC prints a coverage block every minute and one at the end; read the
   # last. An action's line is
-  # `<Action line L, col C to line L, col C of module model>: D:T`, with D the
-  # new distinct states it found and T the successor states it generated; an
-  # action that fires only into known states has D = 0, so T counts.
+  # `<Action line L, col C to line L, col C of module model>: D:T` (of module
+  # member_lifecycle_audit for an audit wrapper), with D the new distinct
+  # states it found and T the successor states it generated; an action that
+  # fires only into known states has D = 0, so T counts.
   local coverage="${work_dir}/${run}-coverage.txt"
   awk '/^The coverage statistics at / { block = ""; next } { block = block $0 "\n" } END { printf "%s", block }' \
     "${log}" > "${coverage}"
   local action generated
   for action in "$@"; do
     generated="$(awk -v head="<${action} line " '
-      index($0, head) == 1 && $0 ~ / of module model>: [0-9]+:[0-9]+$/ {
+      index($0, head) == 1 && $0 ~ / of module (model|member_lifecycle_audit)>: [0-9]+:[0-9]+$/ {
         split($NF, counts, ":"); total += counts[2]; found = 1
       }
       END { if (found) print total }' "${coverage}")"
@@ -550,6 +557,29 @@ for field, removal in (
     old = "    /\\ " + field + "' = " + removal
     assert body.count(old) == 1, f"expected one {field} removal in ObserveRuntimeDestroyed"
     body = body.replace(old, "    /\\ " + field + "' = " + field)
+text = text[: block.start()] + body + text[block.end():]
+open(path, "w").write(text)
+PY
+
+  mutate lifecycle destroyed_runtime_resets_the_runs "Error: Action property AuditRuntimeDestroyedRemovesOnlyItsRuntime is violated" "$@" <<'PY'
+import os, re
+path = os.environ["MODEL"]
+text = open(path).read()
+block = re.search(r"^ObserveRuntimeDestroyed\(.*?\n\n", text, re.S | re.M)
+assert block, "ObserveRuntimeDestroyed not found"
+body = block.group(0)
+frames = re.findall(r"^    /\\ (UnchangedFrame_[0-9a-f]+)$", body, re.M)
+assert len(frames) == 1, "expected one UNCHANGED frame in ObserveRuntimeDestroyed"
+frame = frames[0]
+definition = re.findall(r"^" + frame + r" == UNCHANGED << (.*) >>$", text, re.M)
+assert len(definition) == 1, "expected one definition of " + frame
+names = [name.strip() for name in definition[0].split(",")]
+assert "active_run_count" in names, "the arm no longer leaves active_run_count unchanged"
+kept = ", ".join(name for name in names if name != "active_run_count")
+body = body.replace(
+    "    /\\ " + frame,
+    "    /\\ active_run_count' = 0\n    /\\ UNCHANGED << " + kept + " >>",
+)
 text = text[: block.start()] + body + text[block.end():]
 open(path, "w").write(text)
 PY

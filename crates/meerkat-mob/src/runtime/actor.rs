@@ -59273,6 +59273,7 @@ impl MobActor {
                             &detail,
                             "external_delivery_terminal_pending_run",
                             "external_delivery_terminal_complete_flow",
+                            "external_delivery_terminal_finish_run",
                         )
                         .await
                     {
@@ -59514,6 +59515,7 @@ impl MobActor {
                 detail,
                 "external_delivery_pre_realization_failure",
                 "external_delivery_recovery_complete_flow",
+                "external_delivery_recovery_finish_run",
             )
             .await
         {
@@ -59591,6 +59593,7 @@ impl MobActor {
         detail: &str,
         terminalization_context: &'static str,
         completion_context: &'static str,
+        finish_context: &'static str,
     ) -> Result<(), MobError> {
         self.terminalize_failed_in_actor(
             run_id.clone(),
@@ -59601,7 +59604,11 @@ impl MobActor {
             terminalization_context,
         )
         .await?;
+        // The compensation started the run (RunFlow, StartRun), so it ends
+        // it as every other run end does: CompleteFlow and FinishRun. No task,
+        // token or stream exists for this run to finish it later.
         self.apply_dsl_signal(mob_dsl::MobMachineSignal::CompleteFlow, completion_context)?;
+        self.apply_dsl_signal(mob_dsl::MobMachineSignal::FinishRun, finish_context)?;
         Ok(())
     }
 

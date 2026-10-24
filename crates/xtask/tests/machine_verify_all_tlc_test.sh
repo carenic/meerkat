@@ -435,15 +435,16 @@ fi
 # TLC coverage and requires every listed arm to fire and a floor of distinct
 # states, requires its six witnesses reached (one recovers an archived
 # identity's next incarnation, one replays a delayed final of an older
-# generation), and refuses six seeded defects (--mutants): a progress arm
+# generation), and refuses eight seeded defects (--mutants): a progress arm
 # without its observation guard, that guard rendered as a plain `<=` between
 # option records, which TLC cannot evaluate, a peer-only retirement-start
 # replay that drops a releasing retirement's session while its ingress
 # detach is pending, the stale-incarnation Retired replay with its old
 # guard, which prunes the Retiring runtime of an identity held for a
 # respawn, a roster recovery that keeps its predecessor's execution health,
-# and a runtime destroy observation that ends the mob, and one that leaves its
-# runtime live.
+# and a runtime destroy observation that ends the mob, one that leaves its
+# runtime live, and one that resets the mob's run count (the audit also starts
+# and finishes one mob-level run, so the count is not always zero).
 # A second run of the same audit drops the progress observations, adds the
 # mob's completion and destruction (DestroyMob, and the destroy admission,
 # after which a member runtime destroyed still removes only that runtime),

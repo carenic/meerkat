@@ -56697,6 +56697,78 @@ async fn external_delivery_claim_failure_compensates_pending_run_and_delivery() 
         .expect("proven Begun compensation must not fail-stop the actor");
 }
 
+/// An external delivery whose Flow admission fails after the run started
+/// (here the realization claim fails, and the delivery is compensated as
+/// failed) leaves the mob stoppable: the compensation ends the run the way
+/// every other run end does, so the mob's active run count drops back to
+/// zero. Before, the compensation finished the Flow (CompleteFlow) but not the
+/// run (FinishRun), so the count stayed at one and the stop was refused with
+/// InvalidTransition until a cancel-all, force cancel, shutdown or destroy.
+/// The delivery that turns terminal between its check and its claim takes the
+/// same compensation.
+#[tokio::test]
+async fn external_delivery_compensation_leaves_the_mob_stoppable() {
+    let definition = with_unique_mob_id(
+        sample_definition_with_single_step_flow(2_000, 8),
+        "external-delivery-compensation-stop",
+    );
+    let mob_id = definition.id.clone();
+    let events = Arc::new(FaultInjectedMobEventStore::new());
+    let (handle, _service, runs, _specs, _runtime_metadata, _identity, _identity_status) =
+        create_test_mob_with_recoverable_fault_events(definition, events.clone()).await;
+    let identity = crate::store::MobExternalDeliveryIdentity::new(
+        "binding-compensation-stop",
+        Uuid::new_v4().to_string(),
+    )
+    .expect("external delivery identity");
+    let intent = crate::store::MobExternalDeliveryIntent::new(
+        mob_id.clone(),
+        identity.clone(),
+        crate::store::MobExternalDeliveryTargetKind::Flow,
+        b"flow:demo",
+    )
+    .expect("external delivery intent");
+    handle
+        .begin_external_delivery(&intent)
+        .await
+        .expect("begin external delivery");
+    events.fail_next_external_delivery_claim();
+
+    let outcome = handle
+        .run_flow_with_external_delivery(
+            FlowId::from("demo"),
+            serde_json::json!({ "case": "compensation-stop" }),
+            &intent,
+        )
+        .await
+        .expect("claim failure must converge to an observable terminal delivery");
+    assert!(
+        matches!(
+            &outcome,
+            crate::store::MobExternalFlowLaunchOutcome::ExistingTerminal(
+                crate::store::MobExternalDeliveryTerminal::Failed { .. }
+            )
+        ),
+        "claim compensation returned {outcome:?}"
+    );
+    let run_id =
+        RunId::for_external_delivery(&mob_id, &FlowId::from("demo"), &identity.idempotency_key);
+    assert_eq!(
+        runs.get_run(&run_id)
+            .await
+            .expect("read compensated run")
+            .expect("compensated run must remain durable")
+            .status,
+        MobRunStatus::Failed
+    );
+
+    handle
+        .stop()
+        .await
+        .unwrap_or_else(|error| panic!("the mob stops after the compensated delivery: {error:?}"));
+    assert_eq!(handle.status().await.unwrap(), MobState::Stopped);
+}
+
 #[tokio::test]
 async fn external_delivery_claim_and_reread_failure_fail_stops_with_pending_run() {
     let definition = with_unique_mob_id(
