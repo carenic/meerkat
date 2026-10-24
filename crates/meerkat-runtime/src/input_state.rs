@@ -548,6 +548,15 @@ impl InputTerminalCompletion {
         if self.candidate_digest.is_empty() || self.completion_input_ids_digest.is_empty() {
             return Err("terminal completion row carried an empty immutable digest".into());
         }
+        if self.candidate_digest == WITHHELD_PAYLOAD_DIGEST
+            || matches!(
+                &self.phase,
+                InputTerminalCompletionPhase::Finalized { receipt_digest, .. }
+                    if receipt_digest == WITHHELD_PAYLOAD_DIGEST
+            )
+        {
+            return Err("terminal completion row carried a withheld payload digest".into());
+        }
         let owns_payload = self.input_id == self.owner_input_id;
         if owns_payload != (self.batch_ordinal == 0) {
             return Err("terminal completion owner/ordinal mismatch".into());
@@ -802,6 +811,12 @@ pub(crate) struct InteractionTerminalOutbox {
     pub(crate) phase: InteractionTerminalOutboxPhase,
 }
 
+/// The value a released copy carries in place of every digest derived from
+/// a withheld result payload ([`StoredInputState::withhold_result_payload`]).
+/// It is no SHA-256 hex digest, so it never equals a real one, and every
+/// validation of a stored or decoded row refuses it.
+pub(crate) const WITHHELD_PAYLOAD_DIGEST: &str = "withheld";
+
 pub(crate) fn interaction_terminal_payload_digest<T: Serialize>(
     payload: &T,
 ) -> Result<String, String> {
@@ -853,6 +868,22 @@ pub(crate) fn interaction_terminal_event_for_id(
 }
 
 impl InteractionTerminalOutbox {
+    /// Whether a digest of this row is the [`WITHHELD_PAYLOAD_DIGEST`] a
+    /// released copy carries.
+    fn carries_withheld_payload_digest(&self) -> bool {
+        self.candidate_digest == WITHHELD_PAYLOAD_DIGEST
+            || match &self.phase {
+                InteractionTerminalOutboxPhase::Candidate => false,
+                InteractionTerminalOutboxPhase::Finalized {
+                    finalized_payload_digest,
+                    ..
+                } => finalized_payload_digest == WITHHELD_PAYLOAD_DIGEST,
+                InteractionTerminalOutboxPhase::Published { publication, .. } => {
+                    publication.payload_digest == WITHHELD_PAYLOAD_DIGEST
+                }
+            }
+    }
+
     /// Whether this row still carries the duplicated released-0.8.31 payloads
     /// that must be normalized into the single completion owner.
     pub(crate) fn has_released_0831_carriers(&self) -> bool {
@@ -865,6 +896,9 @@ impl InteractionTerminalOutbox {
         }
         if self.candidate_digest.is_empty() {
             return Err("interaction terminal outbox candidate digest is empty".into());
+        }
+        if self.carries_withheld_payload_digest() {
+            return Err("interaction terminal outbox carried a withheld payload digest".into());
         }
         if self.completion_input_ids_digest.is_empty() {
             return Err("interaction terminal outbox completion recipient digest is empty".into());
@@ -1345,10 +1379,27 @@ impl StoredInputState {
                 .is_some_and(InteractionTerminalCandidate::carries_result_payload)
     }
 
-    /// Drop the result payload from a copy released to a public reader that
-    /// may not receive it. Every body-free lifecycle fact stays: phase,
-    /// terminal, receipt identity and digests, history and the destination
-    /// witness. Never applied to a row that is stored or compared.
+    /// Whether this row holds anything a reader its destination does not
+    /// permit must not receive: a result payload, or a terminal completion or
+    /// directed outbox whose digests derive from its batch's payload (a peer
+    /// recipient holds the batch's digests but not its payload).
+    pub(crate) fn carries_withholdable_facts(&self) -> bool {
+        self.carries_result_payload()
+            || self.state.terminal_completion.is_some()
+            || self.state.interaction_terminal_outbox.is_some()
+    }
+
+    /// Withhold everything of the result payload from a copy released to a
+    /// public reader that may not receive it: the result or callback
+    /// arguments on the completion and the 0.8.31 outbox carrier, the
+    /// directed terminal event a finalized outbox keeps until publication,
+    /// and every digest derived from the batch's payload, which reads
+    /// [`WITHHELD_PAYLOAD_DIGEST`]. The copy is marked
+    /// (`result_payload_withheld`), in process only. Every body-free
+    /// lifecycle fact stays: phase, terminal, receipt identity (input, owner,
+    /// batch, ordinal and recipients, with their digest), history and the
+    /// destination witness. Never applied to a row that is stored or
+    /// compared.
     pub(crate) fn withhold_result_payload(&mut self) {
         if let Some(completion) = self.state.terminal_completion.as_mut() {
             if completion
@@ -1365,15 +1416,38 @@ impl StoredInputState {
             {
                 completion.candidate = None;
             }
+            completion.candidate_digest = WITHHELD_PAYLOAD_DIGEST.to_string();
+            if let InputTerminalCompletionPhase::Finalized { receipt_digest, .. } =
+                &mut completion.phase
+            {
+                *receipt_digest = WITHHELD_PAYLOAD_DIGEST.to_string();
+            }
         }
-        if let Some(outbox) = self.state.interaction_terminal_outbox.as_mut()
-            && outbox
+        if let Some(outbox) = self.state.interaction_terminal_outbox.as_mut() {
+            if outbox
                 .released_0831_candidate
                 .as_ref()
                 .is_some_and(InteractionTerminalCandidate::carries_result_payload)
-        {
-            outbox.released_0831_candidate = None;
+            {
+                outbox.released_0831_candidate = None;
+            }
+            outbox.candidate_digest = WITHHELD_PAYLOAD_DIGEST.to_string();
+            match &mut outbox.phase {
+                InteractionTerminalOutboxPhase::Candidate => {}
+                InteractionTerminalOutboxPhase::Finalized {
+                    finalized_event,
+                    finalized_payload_digest,
+                    ..
+                } => {
+                    *finalized_event = None;
+                    *finalized_payload_digest = WITHHELD_PAYLOAD_DIGEST.to_string();
+                }
+                InteractionTerminalOutboxPhase::Published { publication, .. } => {
+                    publication.payload_digest = WITHHELD_PAYLOAD_DIGEST.to_string();
+                }
+            }
         }
+        self.state.result_payload_withheld = true;
     }
 
     /// A freshly accepted row for `input` carrying the replay witnesses its
@@ -1404,13 +1478,27 @@ impl StoredInputState {
 
     /// Return a sealed compact binding only after the runtime-private terminal
     /// outbox validates and carries its durable publication receipt.
+    ///
+    /// On a copy a public read released without its result payload (marked in
+    /// process only), whose digests and event are withheld, the binding is
+    /// decided from the outbox's identity and phase alone; the stored row it
+    /// was copied from was validated when read. A row that is not so marked
+    /// is validated in full, and a withheld digest on it is refused.
     pub fn published_directed_terminal_binding(
         &self,
     ) -> Result<Option<PublishedDirectedTerminalBinding>, String> {
         let Some(outbox) = self.state.interaction_terminal_outbox.as_ref() else {
             return Ok(None);
         };
-        outbox.validate()?;
+        if self.state.result_payload_withheld {
+            if outbox.input_id.0 != outbox.interaction_id.0 {
+                return Err(
+                    "interaction terminal outbox input/interaction identity mismatch".into(),
+                );
+            }
+        } else {
+            outbox.validate()?;
+        }
         if !matches!(
             outbox.phase,
             InteractionTerminalOutboxPhase::Published { .. }
@@ -2102,6 +2190,12 @@ pub struct InputState {
     /// Set when a graceful stop kept this queued input for the next start.
     pub stop_requeue: Option<StopRequeueMark>,
     pub created_at: DateTime<Utc>,
+    /// Set only on an in-process copy released to a reader that may not
+    /// receive this input's result ([`StoredInputState::withhold_result_payload`]).
+    /// Never serialized (the on-disk row has no such field), so a stored or
+    /// decoded row is never marked, and its validation refuses the
+    /// [`WITHHELD_PAYLOAD_DIGEST`] a released copy carries.
+    pub(crate) result_payload_withheld: bool,
 }
 
 impl InputState {
@@ -2134,6 +2228,7 @@ impl InputState {
             persisted_input: None,
             stop_requeue: None,
             created_at: now,
+            result_payload_withheld: false,
         }
     }
 
@@ -2523,6 +2618,7 @@ impl<'de> Deserialize<'de> for StoredInputState {
             persisted_input: helper.persisted_input,
             stop_requeue: helper.stop_requeue,
             created_at: helper.created_at,
+            result_payload_withheld: false,
         };
         let seed = InputStateSeed {
             phase: helper.current_state,
@@ -2743,6 +2839,315 @@ mod tests {
                 stored
             })
             .collect()
+    }
+
+    /// One finalized directed batch of two recipients (its canonical owner and
+    /// a peer) whose run returned a result carrying `marker`: each row holds
+    /// its terminal completion and its directed outbox, finalized and not yet
+    /// published, the owner's outbox keeping its terminal event for the
+    /// publication's retry.
+    fn finalized_directed_batch_fixture(marker: &str) -> Vec<StoredInputState> {
+        let mut input_ids = vec![InputId::new(), InputId::new()];
+        input_ids.sort_by_key(|input_id| input_id.0);
+        let owner_input_id = input_ids[0].clone();
+        let session_id = SessionId::new();
+        let run_id = RunId::new();
+        let result: meerkat_core::types::RunResult = serde_json::from_value(serde_json::json!({
+            "text": marker,
+            "session_id": session_id,
+            "usage": meerkat_core::Usage::default(),
+            "turns": 1,
+            "tool_calls": 0,
+        }))
+        .unwrap();
+        let candidate = InteractionTerminalCandidate::RunResult {
+            result: Box::new(result.clone()),
+        };
+        let outcome = crate::completion::CompletionOutcome::Completed(Box::new(result));
+        let finalization = InputTerminalCompletionFinalizationVerdict::Succeeded;
+        let candidate_digest = interaction_terminal_payload_digest(&candidate).unwrap();
+        let receipt_digest =
+            interaction_terminal_payload_digest(&(&outcome, &finalization)).unwrap();
+        let completion_input_ids_digest = interaction_terminal_payload_digest(&input_ids).unwrap();
+        input_ids
+            .iter()
+            .enumerate()
+            .map(|(ordinal, input_id)| {
+                let owns = input_id == &owner_input_id;
+                let event = AgentEvent::InteractionComplete {
+                    interaction_id: InteractionId(input_id.0),
+                    result: marker.to_string(),
+                    structured_output: None,
+                };
+                let event_digest = interaction_terminal_payload_digest(&event).unwrap();
+                let mut stored = StoredInputState::new_accepted(input_id.clone());
+                stored.seed.phase = InputLifecycleState::Consumed;
+                stored.seed.terminal_outcome = Some(InputTerminalOutcome::Consumed);
+                stored.state.terminal_completion = Some(InputTerminalCompletion {
+                    input_id: input_id.clone(),
+                    batch_ordinal: ordinal as u16,
+                    batch_key: InputTerminalCompletionBatchKey::Run {
+                        run_id: run_id.clone(),
+                    },
+                    owner_input_id: owner_input_id.clone(),
+                    candidate_digest: candidate_digest.clone(),
+                    completion_input_ids_digest: completion_input_ids_digest.clone(),
+                    requires_session_checkpoint: true,
+                    candidate: owns.then(|| candidate.clone()),
+                    completion_input_ids: owns.then(|| input_ids.clone()),
+                    outcome: owns.then(|| outcome.clone()),
+                    phase: InputTerminalCompletionPhase::Finalized {
+                        receipt_digest: receipt_digest.clone(),
+                        finalization,
+                    },
+                });
+                stored.state.interaction_terminal_outbox = Some(InteractionTerminalOutbox {
+                    interaction_id: InteractionId(input_id.0),
+                    input_id: input_id.clone(),
+                    batch_ordinal: ordinal as u16,
+                    batch_key: InteractionTerminalBatchKey::Run {
+                        run_id: run_id.clone(),
+                    },
+                    owner_session_id: session_id.clone(),
+                    owner_agent_runtime_id: Some("fixture-runtime".to_string()),
+                    owner_fence_token: Some(7),
+                    owner_runtime_generation: Some(3),
+                    owner_runtime_epoch_id: Some("fixture-epoch".to_string()),
+                    candidate_owner_input_id: owner_input_id.clone(),
+                    released_0831_candidate: None,
+                    candidate_digest: candidate_digest.clone(),
+                    released_0831_completion_input_ids: None,
+                    completion_input_ids_digest: completion_input_ids_digest.clone(),
+                    phase: InteractionTerminalOutboxPhase::Finalized {
+                        finalization_failed: false,
+                        finalized_event: owns.then_some(event),
+                        finalized_payload_digest: event_digest,
+                    },
+                });
+                stored
+            })
+            .collect()
+    }
+
+    /// Every digest a row derives from its batch's payload.
+    fn row_payload_digests(row: &StoredInputState) -> Vec<String> {
+        let mut digests = Vec::new();
+        if let Some(completion) = row.state.terminal_completion.as_ref() {
+            digests.push(completion.candidate_digest.clone());
+            if let InputTerminalCompletionPhase::Finalized { receipt_digest, .. } =
+                &completion.phase
+            {
+                digests.push(receipt_digest.clone());
+            }
+        }
+        if let Some(outbox) = row.state.interaction_terminal_outbox.as_ref() {
+            digests.push(outbox.candidate_digest.clone());
+            match &outbox.phase {
+                InteractionTerminalOutboxPhase::Finalized {
+                    finalized_payload_digest,
+                    ..
+                } => digests.push(finalized_payload_digest.clone()),
+                InteractionTerminalOutboxPhase::Published { publication, .. } => {
+                    digests.push(publication.payload_digest.clone());
+                }
+                InteractionTerminalOutboxPhase::Candidate => {}
+            }
+        }
+        digests
+    }
+
+    /// A copy released to a reader its destination does not permit carries
+    /// no payload and nothing derived from one, on the batch's canonical owner
+    /// and on a peer, which holds the shared digests but no payload: not the
+    /// result, not the owner's finalized terminal event, and none of the
+    /// payload digests. Every identity, the phases and the recipient digest
+    /// stay, and the stored row is untouched.
+    #[test]
+    fn a_withheld_copy_carries_no_payload_and_no_payload_digest() {
+        let marker = "withheld-copy-result-marker";
+        for row in finalized_directed_batch_fixture(marker) {
+            let stored_bytes = serde_json::to_vec(&row).unwrap();
+            let round_trip: StoredInputState = serde_json::from_slice(&stored_bytes)
+                .expect("the stored fixture row is a valid stored row");
+            assert_eq!(serde_json::to_vec(&round_trip).unwrap(), stored_bytes);
+            let mut copy = row.clone();
+            copy.withhold_result_payload();
+            assert_eq!(
+                serde_json::to_vec(&row).unwrap(),
+                stored_bytes,
+                "the stored row is untouched"
+            );
+            let released = serde_json::to_string(&copy).unwrap();
+            assert!(!released.contains(marker), "{released}");
+            for digest in row_payload_digests(&row) {
+                assert!(
+                    !released.contains(&digest),
+                    "the payload digest {digest} came out: {released}"
+                );
+            }
+            let stored_completion = row.state.terminal_completion.as_ref().unwrap();
+            let completion = copy.state.terminal_completion.as_ref().unwrap();
+            assert_eq!(completion.input_id, stored_completion.input_id);
+            assert_eq!(completion.owner_input_id, stored_completion.owner_input_id);
+            assert_eq!(completion.batch_key, stored_completion.batch_key);
+            assert_eq!(completion.batch_ordinal, stored_completion.batch_ordinal);
+            assert_eq!(
+                completion.completion_input_ids_digest,
+                stored_completion.completion_input_ids_digest
+            );
+            assert_eq!(
+                completion.completion_input_ids,
+                stored_completion.completion_input_ids
+            );
+            assert!(matches!(
+                completion.phase,
+                InputTerminalCompletionPhase::Finalized { .. }
+            ));
+            let outbox = copy.state.interaction_terminal_outbox.as_ref().unwrap();
+            assert!(
+                matches!(
+                    outbox.phase,
+                    InteractionTerminalOutboxPhase::Finalized {
+                        finalized_event: None,
+                        ..
+                    }
+                ),
+                "the finalized terminal event is withheld"
+            );
+            assert_eq!(outbox.input_id, completion.input_id);
+            assert_eq!(outbox.interaction_id, InteractionId(completion.input_id.0));
+        }
+    }
+
+    /// The withheld digest never passes for a real one. A released copy
+    /// written out and read back is refused (it carries the sentinel and no
+    /// mark), and on an otherwise valid stored row each digest set to the
+    /// sentinel is refused by the row's own validation.
+    #[test]
+    fn a_withheld_digest_never_passes_as_a_real_digest() {
+        let rows = finalized_directed_batch_fixture("sentinel-result-marker");
+        for row in &rows {
+            let mut copy = row.clone();
+            copy.withhold_result_payload();
+            assert!(
+                copy.state.result_payload_withheld,
+                "the copy is marked in process"
+            );
+            let written = serde_json::to_vec(&copy).unwrap();
+            assert!(
+                !String::from_utf8_lossy(&written).contains("result_payload_withheld"),
+                "the mark is never written"
+            );
+            assert!(
+                serde_json::from_slice::<StoredInputState>(&written).is_err(),
+                "a released copy read back is refused"
+            );
+        }
+
+        let peer = &rows[1];
+        let mut completion = peer.state.terminal_completion.clone().unwrap();
+        completion
+            .validate_row()
+            .expect("the stored peer completion is valid");
+        completion.candidate_digest = WITHHELD_PAYLOAD_DIGEST.to_string();
+        assert!(
+            completion
+                .validate_row()
+                .is_err_and(|error| error.contains("withheld")),
+            "a withheld candidate digest is refused"
+        );
+        let mut completion = peer.state.terminal_completion.clone().unwrap();
+        if let InputTerminalCompletionPhase::Finalized { receipt_digest, .. } =
+            &mut completion.phase
+        {
+            *receipt_digest = WITHHELD_PAYLOAD_DIGEST.to_string();
+        }
+        assert!(
+            completion
+                .validate_row()
+                .is_err_and(|error| error.contains("withheld")),
+            "a withheld receipt digest is refused"
+        );
+        let mut outbox = peer.state.interaction_terminal_outbox.clone().unwrap();
+        outbox.validate().expect("the stored peer outbox is valid");
+        outbox.candidate_digest = WITHHELD_PAYLOAD_DIGEST.to_string();
+        assert!(
+            outbox
+                .validate()
+                .is_err_and(|error| error.contains("withheld")),
+            "a withheld outbox candidate digest is refused"
+        );
+        let mut outbox = peer.state.interaction_terminal_outbox.clone().unwrap();
+        if let InteractionTerminalOutboxPhase::Finalized {
+            finalized_payload_digest,
+            ..
+        } = &mut outbox.phase
+        {
+            *finalized_payload_digest = WITHHELD_PAYLOAD_DIGEST.to_string();
+        }
+        assert!(
+            outbox
+                .validate()
+                .is_err_and(|error| error.contains("withheld")),
+            "a withheld event digest is refused"
+        );
+    }
+
+    /// The published binding is decided on a released copy from the outbox's
+    /// identity and phase alone: it answers for a published row and is
+    /// absent for a finalized one, whose event and digests are withheld. A
+    /// row that is not a released copy keeps its full validation and refuses
+    /// a withheld digest.
+    #[test]
+    fn the_published_binding_answers_on_a_withheld_copy_from_identity_and_phase() {
+        let mut owner = finalized_directed_batch_fixture("binding-result-marker").remove(0);
+        let finalized_copy = {
+            let mut copy = owner.clone();
+            copy.withhold_result_payload();
+            copy
+        };
+        assert!(matches!(
+            finalized_copy.published_directed_terminal_binding(),
+            Ok(None)
+        ));
+
+        let outbox = owner.state.interaction_terminal_outbox.as_mut().unwrap();
+        let InteractionTerminalOutboxPhase::Finalized {
+            finalization_failed,
+            finalized_payload_digest,
+            ..
+        } = outbox.phase.clone()
+        else {
+            panic!("finalized fixture")
+        };
+        outbox.phase = InteractionTerminalOutboxPhase::Published {
+            finalization_failed,
+            publication: InteractionTerminalPublication {
+                terminal_seq: 1,
+                payload_digest: finalized_payload_digest,
+            },
+        };
+        let input_id = owner.state.input_id.clone();
+        let stored_binding = owner
+            .published_directed_terminal_binding()
+            .expect("the stored published row validates")
+            .expect("published");
+        assert!(stored_binding.binds(&input_id, InteractionId(input_id.0)));
+
+        let mut released = owner.clone();
+        released.withhold_result_payload();
+        let binding = released
+            .published_directed_terminal_binding()
+            .expect("the released copy answers")
+            .expect("published");
+        assert!(binding.binds(&input_id, InteractionId(input_id.0)));
+
+        let mut unmarked = released.clone();
+        unmarked.state.result_payload_withheld = false;
+        assert!(
+            unmarked.published_directed_terminal_binding().is_err(),
+            "an unmarked row with a withheld digest is refused"
+        );
     }
 
     fn restart_terminal_completion_rows(rows: Vec<StoredInputState>) -> Vec<StoredInputState> {

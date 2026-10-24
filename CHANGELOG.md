@@ -2404,6 +2404,32 @@ them.
 
 ### Fixed
 
+- `meerkat-runtime`: a public input row released to a reader its scoped
+  destination does not permit (`SessionServiceRuntimeExt::input_state` and
+  the idempotency-key reads) no longer carries a directed batch's finalized
+  terminal event. A directed (peer-request) batch's owner row keeps that
+  `InteractionComplete` or `InteractionCallbackPending` event, with the run's
+  result or callback arguments, from finalization until its publication
+  succeeds, and for as long as a failing publication is retried. The
+  withholding cleared the result on the terminal completion but left the
+  event (`crates/meerkat-runtime/src/input_state.rs:666` and `:1278` at
+  v0.9.4).
+
+- `meerkat-runtime`: such a released row no longer carries the digests
+  derived from the withheld payload: an unsalted SHA-256 let a reader confirm
+  a low-entropy result by guessing it. On every row the destination does not
+  permit, a peer recipient's included (it binds the batch's payload by
+  digest without holding it), the terminal completion's candidate and receipt
+  digests and a directed outbox's candidate, event and publication digests
+  read `withheld`, and the copy is marked in process only: a released copy
+  written out and read back fails validation, and a stored row never carries
+  the value. Before, only a row holding the payload was withheld at all
+  (`crates/meerkat-runtime/src/meerkat_machine/scoped_context.rs:277`, and
+  the digests at `crates/meerkat-runtime/src/input_state.rs:424`, `:446`,
+  `:650`, `:667` and `:732`, at v0.9.4). On a released copy,
+  `StoredInputState::published_directed_terminal_binding` decides from the
+  outbox's identity and phase alone, so it still answers.
+
 - `meerkat-mob`, `meerkat-rpc`, `meerkat-rest`: identity adoption refuses a
   mob whose runtime has no store. Reconciliation realizes an adoption by
   retiring the attached member and resuming its exact session from the

@@ -277,7 +277,7 @@ impl MeerkatMachine {
     ) -> Vec<crate::input_state::StoredInputState> {
         if !rows
             .iter()
-            .any(crate::input_state::StoredInputState::carries_result_payload)
+            .any(crate::input_state::StoredInputState::carries_withholdable_facts)
         {
             return rows;
         }
@@ -292,7 +292,7 @@ impl MeerkatMachine {
             |rows: &mut Vec<crate::input_state::StoredInputState>,
              authority: Option<&crate::driver::ephemeral::SharedIngressDslAuthority>| {
                 for row in rows.iter_mut() {
-                    if row.carries_result_payload()
+                    if row.carries_withholdable_facts()
                         && !disclosure_permitted_with(authority, &row.state, posture)
                     {
                         row.withhold_result_payload();
@@ -310,15 +310,18 @@ impl MeerkatMachine {
     }
 
     /// Withhold the result payload of a public row read this reader may not
-    /// receive. The stored row is unchanged; the returned copy keeps every
-    /// body-free lifecycle fact (phase, terminal, receipt identity, witness).
+    /// receive, with the directed terminal event and every digest derived
+    /// from the payload ([`crate::input_state::StoredInputState::withhold_result_payload`]),
+    /// on any row of a batch, a peer recipient's included. The stored row is
+    /// unchanged; the returned copy keeps every body-free lifecycle fact
+    /// (phase, terminal, receipt identity, witness).
     pub(crate) async fn release_public_row(
         &self,
         session_id: &meerkat_core::types::SessionId,
         row: Option<crate::input_state::StoredInputState>,
     ) -> Option<crate::input_state::StoredInputState> {
         let mut row = row?;
-        if row.carries_result_payload()
+        if row.carries_withholdable_facts()
             && !self
                 .stored_result_disclosure_permitted(session_id, &row.state)
                 .await
