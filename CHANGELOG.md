@@ -1989,6 +1989,14 @@ them.
 
 ### Changed
 
+- `meerkat-core`, `meerkat-session`, `meerkat-runtime`: stopping a durable
+  run (for example with `MeerkatMachine::stop_run`) keeps the rounds it has
+  already committed in the transcript, closed as an interrupted run with a
+  notice, and the stopped input is not run again; a steer that joined a round
+  the stop cut short is not kept. The next turn's model request carries that
+  committed history. In 0.9.4 the next turn's request carried nothing of a
+  stopped turn.
+
 - `meerkat-session`: materializing a durable session whose durable-tail
   recovery held or refused its tail now answers the typed
   `SessionError::DurableTailHeldForRecovery` or
