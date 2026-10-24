@@ -888,3 +888,109 @@ async fn the_identity_write_fence_declares_the_hosts_longest_commit() {
         Ok(RuntimeStoreWriteFenceOutcome::Applied)
     ));
 }
+
+/// Every field the stored event codec keeps beyond the public event
+/// contract survives a reopen of the host store's mob storage: a member's
+/// bridge ref, placed spawn, identity intent digest, peer endpoint and direct
+/// fence; a recovered binding's session and endpoint; a retirement's endpoint
+/// and topology mark; an abandoned respawn's runtime and fence. A restarted
+/// mob rebuilds its roster and topology from them.
+#[tokio::test]
+async fn a_reopen_keeps_every_replay_only_event_field() {
+    use crate::event::{MemberSessionBindingRecoveredEvent, MemberSpawnedEvent};
+    use crate::ids::{AgentIdentity, AgentRuntimeId, Generation, PlacedSpawnId, ProfileName};
+    use meerkat_contracts::wire::supervisor_bridge::{
+        BridgeDirectMemberFence, BridgeDirectRuntimeSessionToken,
+    };
+    use meerkat_core::comms::{PeerId, TrustedPeerDescriptor};
+    use meerkat_core::types::SessionId;
+
+    let host = Arc::new(MemoryHost::default());
+    let process = start(&host, "mob").await;
+    let identity = AgentIdentity::from("worker");
+    let generation = Generation::INITIAL;
+    let runtime = AgentRuntimeId::initial(identity.clone());
+    let fence = crate::ids::FenceToken::new(1);
+    let session = SessionId::new();
+    let pubkey = [7; 32];
+    let endpoint = TrustedPeerDescriptor::unsigned_with_pubkey(
+        "mob/worker/worker",
+        PeerId::from_ed25519_pubkey(&pubkey).to_string(),
+        pubkey,
+        "inproc://mob/worker/worker",
+    )
+    .expect("member peer endpoint");
+    let kinds = vec![
+        MobEventKind::MemberSpawned(
+            MemberSpawnedEvent::new(
+                identity.clone(),
+                generation,
+                fence,
+                runtime.clone(),
+                ProfileName::from("worker"),
+            )
+            .with_bridge_member_ref(Some(MemberRef::from_bridge_session_id(session.clone())))
+            .with_identity_intent_authority_digest(Some("sha256:intent".to_string()))
+            .with_placed_spawn_id(Some(PlacedSpawnId::new()))
+            .with_member_peer_endpoint(Some(endpoint.clone()))
+            .with_direct_member_fence(Some(BridgeDirectMemberFence {
+                mob_id: "mob".to_string(),
+                agent_identity: identity.to_string(),
+                generation: generation.get(),
+                fence_token: 1,
+                member_session_id: session.to_string(),
+                runtime_session_token: BridgeDirectRuntimeSessionToken::new(),
+            })),
+        ),
+        MobEventKind::MemberSessionBindingRecovered(
+            MemberSessionBindingRecoveredEvent::new(
+                identity.clone(),
+                runtime.clone(),
+                session.clone(),
+            )
+            .with_member_peer_endpoint(Some(endpoint.clone())),
+        ),
+        MobEventKind::MemberRetirementStarted {
+            agent_identity: identity.clone(),
+            agent_runtime_id: runtime.clone(),
+            generation,
+            role: ProfileName::from("worker"),
+            releasing: Some(session.clone()),
+            session_id: Some(session),
+            retiring_peer_endpoint: Some(endpoint),
+            preserve_machine_topology: true,
+        },
+        MobEventKind::RespawnTopologyAbandoned {
+            agent_identity: identity,
+            generation,
+            agent_runtime_id: Some(runtime),
+            fence_token: Some(fence),
+        },
+    ];
+    let storage = process.stores.storage();
+    for kind in &kinds {
+        storage
+            .events
+            .append(event(kind.clone(), None))
+            .await
+            .expect("append the event");
+    }
+    drop(storage);
+    drop(process);
+
+    let reopened = start(&host, "mob").await;
+    let replayed: Vec<MobEventKind> = reopened
+        .stores
+        .storage()
+        .events
+        .replay_all()
+        .await
+        .expect("replay the events")
+        .into_iter()
+        .map(|event| event.kind)
+        .collect();
+    assert_eq!(
+        replayed, kinds,
+        "a reopen replays every replay-only field of the stored events"
+    );
+}
