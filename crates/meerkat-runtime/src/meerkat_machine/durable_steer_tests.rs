@@ -2797,6 +2797,278 @@ async fn owner_context_bound_to_an_ended_run_never_reaches_the_next_run() {
     );
 }
 
+/// Leave a WholeBlob provisional tail of `run_id` standing in `store`, as a
+/// durable run's round commits do from its first tool round on: a committed
+/// base of the session, then the run's first candidate on it. The scripted
+/// runner writes no session document, so the row stands the tail itself.
+async fn stand_whole_blob_run_tail(
+    store: &Arc<dyn crate::store::RuntimeStore>,
+    session_id: &SessionId,
+    run_id: &RunId,
+) -> crate::store::WholeBlobProvisionalTailAuthority {
+    let runtime_id = MeerkatMachine::logical_runtime_id(session_id);
+    let mut session = meerkat_core::Session::with_id(session_id.clone());
+    session.push(meerkat_core::types::Message::User(
+        meerkat_core::types::UserMessage::text("batch prompt keeps the runtime busy".to_string()),
+    ));
+    store
+        .commit_session_snapshot(
+            &runtime_id,
+            crate::store::SerializedSessionSnapshot {
+                session_snapshot: serde_json::to_vec(&session).unwrap().into(),
+            },
+        )
+        .await
+        .expect("the session's committed base");
+    let base = store
+        .load_whole_blob_store_authority(&runtime_id)
+        .await
+        .expect("read the committed base")
+        .expect("a committed base");
+    session.push(meerkat_core::types::Message::User(
+        meerkat_core::types::UserMessage::text("the run's first round".to_string()),
+    ));
+    let candidate = crate::store::PreparedWholeBlobProvisionalTail::prepare_from_session(
+        base,
+        run_id.clone(),
+        1,
+        &session,
+    )
+    .expect("the round's candidate");
+    store
+        .write_prepared_whole_blob_provisional_tail(&runtime_id, candidate)
+        .await
+        .expect("the round commit's tail")
+}
+
+/// The run's WholeBlob tail as the store holds it.
+async fn standing_whole_blob_tail(
+    store: &Arc<dyn crate::store::RuntimeStore>,
+    session_id: &SessionId,
+) -> Option<crate::store::WholeBlobProvisionalTailAuthority> {
+    store
+        .load_whole_blob_provisional_tail(&MeerkatMachine::logical_runtime_id(session_id))
+        .await
+        .expect("read the provisional tail")
+        .map(|tail| tail.authority().clone())
+}
+
+/// A durable run's round commits keep its WholeBlob provisional tail standing
+/// from its first tool round on, so an owner context (a live delegation's
+/// continuation of the user's sentence) delivered at a later boundary
+/// records its receipt beside that tail and reaches the runner. Live gate run
+/// 40073579938: the store refused that receipt, the runtime went
+/// repair-blocked, and the delegated worker's run failed.
+#[tokio::test]
+async fn owner_context_lands_beside_the_runs_whole_blob_provisional_tail() {
+    let store: Arc<dyn crate::store::RuntimeStore> =
+        Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let rig = DurableSteerRig::persistent(Arc::clone(&store)).await;
+    let runtime_id = MeerkatMachine::logical_runtime_id(&rig.session_id);
+    let busy = rig.start_busy_turn().await;
+    rig.script
+        .step_and_wait(RunnerStep::BoundaryThenStream)
+        .await;
+    let run_id = rig
+        .script
+        .active_run
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("active run");
+    let tail = stand_whole_blob_run_tail(&store, &rig.session_id, &run_id).await;
+    let adapter = Arc::clone(&rig.adapter);
+    let session_id = rig.session_id.clone();
+    let delivery = tokio::spawn(async move {
+        adapter
+            .deliver_live_owner_request_context(
+                &session_id,
+                "live-delegation-steer:continuation-1",
+                owner_context("and answer in one sentence"),
+            )
+            .await
+    });
+    rig.wait_for_waiting_delivery().await;
+    rig.script.step(RunnerStep::OpenNextBoundary);
+    rig.script.step(RunnerStep::BoundaryThenToolCalls);
+    let delivered = delivery
+        .await
+        .expect("delivery task")
+        .expect("the owner receipt commits beside the run's tail");
+    let crate::live_execution::LiveOwnerContextDelivery::Delivered {
+        boundary_sequence, ..
+    } = delivered
+    else {
+        panic!("delivered at the next boundary, got {delivered:?}");
+    };
+    let receipt = store
+        .load_boundary_receipt(&runtime_id, &run_id, boundary_sequence)
+        .await
+        .expect("load receipt")
+        .expect("the owner contribution is on a durable runtime receipt");
+    assert_eq!(
+        receipt.owner_contributions,
+        vec!["live-delegation-steer:continuation-1".to_string()]
+    );
+    assert_eq!(
+        standing_whole_blob_tail(&store, &rig.session_id).await,
+        Some(tail.clone()),
+        "the tail stands for the run's terminal promotion"
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while rig.script.request_only_taken.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the runner took the owner context");
+    // The run's terminal boundary promotes its tail; the scripted runner
+    // commits no session document, so the tail leaves the store first.
+    assert!(
+        store
+            .discard_whole_blob_provisional_tail(&runtime_id, &tail)
+            .await
+            .expect("discard the tail")
+    );
+    rig.script.step(RunnerStep::Finish);
+    rig.wait_for_phase(&busy, InputLifecycleState::Consumed)
+        .await;
+}
+
+/// A request-only steer input the running turn takes after its first tool
+/// round commits its context receipt beside the run's WholeBlob provisional
+/// tail and is consumed with that boundary; no follow-up turn runs.
+#[tokio::test]
+async fn request_only_steer_lands_beside_the_runs_whole_blob_provisional_tail() {
+    let store: Arc<dyn crate::store::RuntimeStore> =
+        Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let rig = DurableSteerRig::persistent(Arc::clone(&store)).await;
+    let runtime_id = MeerkatMachine::logical_runtime_id(&rig.session_id);
+    let busy = rig.start_busy_turn().await;
+    rig.script
+        .step_and_wait(RunnerStep::BoundaryThenStream)
+        .await;
+    let run_id = rig
+        .script
+        .active_run
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("active run");
+    let tail = stand_whole_blob_run_tail(&store, &rig.session_id, &run_id).await;
+    rig.script.step_and_wait(RunnerStep::OpenNextBoundary).await;
+
+    let mut continuation = crate::input::ContinuationInput::detached_background_op_completed();
+    continuation.turn_append = Some(notice_append(
+        "review context",
+        ConversationAppendRole::SystemNotice,
+    ));
+    let continuation = Input::Continuation(continuation);
+    let continuation_id = continuation.id().clone();
+    rig.admit(continuation).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !rig.state.has_registered_request_only_delivery_for_test() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the request-only steer prepares at the open boundary");
+    rig.script.step(RunnerStep::BoundaryThenToolCalls);
+    rig.wait_for_phase(&continuation_id, InputLifecycleState::Consumed)
+        .await;
+    assert_eq!(*rig.script.request_only_taken.lock().unwrap(), vec![1]);
+    let receipts = store
+        .load_committed_boundary_receipts(&runtime_id, &run_id)
+        .await
+        .expect("load receipts");
+    assert!(
+        receipts
+            .iter()
+            .any(|receipt| receipt.contributing_input_ids == vec![continuation_id.clone()]),
+        "the steer's context receipt commits beside the tail: {receipts:?}"
+    );
+    assert_eq!(
+        standing_whole_blob_tail(&store, &rig.session_id).await,
+        Some(tail.clone()),
+        "the tail stands for the run's terminal promotion"
+    );
+    assert!(
+        store
+            .discard_whole_blob_provisional_tail(&runtime_id, &tail)
+            .await
+            .expect("discard the tail")
+    );
+    rig.script.step(RunnerStep::Finish);
+    rig.wait_for_phase(&busy, InputLifecycleState::Consumed)
+        .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        rig.script.apply_calls.load(Ordering::SeqCst),
+        1,
+        "the steer landed in the running turn; no follow-up turn ran"
+    );
+}
+
+/// A run that fails after its round commits leaves its WholeBlob provisional
+/// tail standing, and the durable join its kept image holds is consumed with
+/// a checkpoint receipt beside that tail instead of failing the runtime
+/// closed; it is never delivered again.
+#[tokio::test]
+async fn retained_join_of_a_failed_run_is_consumed_beside_its_whole_blob_provisional_tail() {
+    let store: Arc<dyn crate::store::RuntimeStore> =
+        Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let rig = DurableSteerRig::persistent(Arc::clone(&store)).await;
+    let runtime_id = MeerkatMachine::logical_runtime_id(&rig.session_id);
+    let batch = rig.start_busy_turn().await;
+    let run_id = rig
+        .script
+        .active_run
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("active run");
+    let tail = stand_whole_blob_run_tail(&store, &rig.session_id, &run_id).await;
+    let steer = typed_steer("kept beside the tail", ConversationAppendRole::SystemNotice);
+    let steer_id = steer.id().clone();
+    rig.admit(steer).await;
+    rig.wait_for_waiting_delivery().await;
+    rig.script.step(RunnerStep::BoundaryThenToolCalls);
+    rig.wait_for_phase(&steer_id, InputLifecycleState::Staged)
+        .await;
+
+    rig.script.step(RunnerStep::FailKeepingImage);
+    rig.wait_for_phase(&steer_id, InputLifecycleState::Consumed)
+        .await;
+    let receipts = store
+        .load_committed_boundary_receipts(&runtime_id, &run_id)
+        .await
+        .expect("load receipts");
+    assert!(
+        receipts
+            .iter()
+            .any(|receipt| receipt.contributing_input_ids == vec![steer_id.clone()]),
+        "the join's consumption receipt commits beside the tail: {receipts:?}"
+    );
+    assert_eq!(
+        standing_whole_blob_tail(&store, &rig.session_id).await,
+        Some(tail.clone()),
+        "the failed run's tail stands for recovery"
+    );
+    // Recovery settles the failed run's tail before the replayed batch's
+    // run commits; the scripted runner has no recovery, so the row does.
+    rig.wait_for_apply_calls(2).await;
+    assert!(
+        store
+            .discard_whole_blob_provisional_tail(&runtime_id, &tail)
+            .await
+            .expect("discard the tail")
+    );
+    rig.script.step(RunnerStep::Finish);
+    rig.wait_for_phase(&batch, InputLifecycleState::Consumed)
+        .await;
+    assert_eq!(contributions(&rig.script.primitives(), &steer_id), 0);
+}
+
 /// One content steer joins the running run at the next boundary and is
 /// consumed with the run's commit: written once, never by a follow-up turn.
 async fn content_steer_joins_the_running_run_and_is_consumed_with_it(steer: Input) {

@@ -11531,10 +11531,13 @@ async fn run_s101_busy_backend(evidence: Journal) -> Result<(), Box<dyn std::err
         println!(
             "GPT_LIVE_S101_JOBS job1_delegation_ms={job1_delegation_ms} delegation_created_ms={delegation_times:?} max_concurrent={max_concurrent} terminal={terminal_at:?} jobs_done_at_ms={jobs_done_ms}"
         );
+        // Every job must complete. A supersede of a running job would end it
+        // Cancelled; a steer into a running worker whose delivery fails the
+        // worker ends it Failed (Live gate run 40073579938).
         for (operation, (at_ms, terminal)) in &terminal_at {
             if !terminal.contains("Completed") {
                 deterministic_failures.push(format!(
-                    "delegation {operation} ended {terminal} at {at_ms} ms (a running job must not be cancelled by supersede)"
+                    "delegation {operation} ended {terminal} at {at_ms} ms (every job must complete: a running job is neither cancelled by supersede nor failed by a steer into it)"
                 ));
             }
         }
