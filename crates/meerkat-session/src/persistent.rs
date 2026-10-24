@@ -6251,6 +6251,14 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// machine-authorized durable-tail recovery a restart runs, and only when
     /// all of these hold:
     /// - the profile is HeadCanonical;
+    /// - the session's turn-finalization boundary is free. A runtime loop
+    ///   lap holds it from its top through its run: between its read of a
+    ///   batch's input rows, which adopts an end the store already wrote,
+    ///   and the batch's staging commit, a recovery that consumed one of
+    ///   those inputs would be written over by the staging, and the input
+    ///   would run again. So this settle commits only between laps, and a
+    ///   lap after it reads what it consumed. A held boundary defers the
+    ///   settle to a later observation; it is never dropped;
     /// - this service hosts the session's live actor, so no other process
     ///   commits it;
     /// - the store records a provisional tail for the session, of a run the
@@ -6258,15 +6266,21 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     ///   registration keeps resumable (an open run commits its own tail);
     /// - the per-session recovery gate is free (a holder owns the tail).
     ///
-    /// The recovery machine refuses a runtime that is not quiescent, and a
-    /// held or refused tail is left intact. Returns whether the store now
-    /// names a settled boundary, so the caller observes once more.
+    /// Both the boundary and the gate are held across the recovery, the
+    /// boundary first. The recovery machine refuses a runtime that is not
+    /// quiescent, and a held or refused tail is left intact. Returns whether
+    /// the store now names a settled boundary, so the caller observes once
+    /// more.
     async fn settle_ended_live_turn_durable_tail(&self, id: &SessionId) -> bool {
         if self.runtime_store.session_persistence_profile()
             != RuntimeSessionPersistenceProfile::HeadCanonicalV1
         {
             return false;
         }
+        let turn_finalization_gate = self.turn_finalization_gate_for_session(id).await;
+        let Ok(_turn_finalization_guard) = turn_finalization_gate.try_lock_owned() else {
+            return false;
+        };
         if !matches!(self.inner.has_live_session(id).await, Ok(true)) {
             return false;
         }
