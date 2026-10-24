@@ -1003,6 +1003,22 @@ them.
     (`MeerkatMachine::resumed_run_interrupted_tool_calls`), which is
     acknowledged once the resumed run has ended
     (`MeerkatMachine::acknowledge_resumed_run_interrupted_tool_calls`).
+  - A run also resumes in the host process that ran it: a graceful requeue
+    stop, or a teardown, that ends the session's registration while a tool
+    call runs keeps the run open at its round commit, and a later start of
+    the session in the same process resumes it. The resumption then settles
+    the custody records that process left for the run, as recovery settles
+    an earlier host process's: a call whose process may have run is answered
+    as interrupted, outcome uncertain, and never run again, and a process
+    still running is killed first. A call whose process an owner in this
+    process still runs means the run still executes here: the resumption is
+    refused with nothing settled, and the resumed round is held as for
+    unreadable evidence. A background job the run started stays with its
+    live owner, and the resumed round dispatches the call that started it
+    again: the job's submission key (the session and the call id) dedupes
+    that dispatch to the running job. Only the session's current run is
+    settled: `MeerkatMachine::resumed_run_interrupted_tool_calls` refuses any
+    other run id.
   - A marked run that is settled without resuming (a refused resume, an
     expired requeue stop, or a stop) has its provisional tail repaired as
     interrupted once its inputs' abandonment commits: rows kept, open calls
@@ -1052,6 +1068,14 @@ them.
     next start resumes it unless one of them is older than the stop's max
     age, which settles the whole run with
     `InputAbandonReason::RequeueExpired` instead.
+
+- `meerkat-core`, `meerkat-tools`: `InterruptedToolEvidence::run_resumes`,
+  which a session's evidence store answers when a run resumes: it settles
+  the evidence its own host process left for the run and returns the run's
+  interrupted calls (a provided method; the default returns the run's
+  `interrupted_calls`). `ProcessCustodyError::ResumedRunStillOwned` is
+  process custody's refusal of a resumption whose call an owner in the same
+  process still runs.
 
 - `meerkat-core`: per-round commits and resumable runs. A run whose agent has
   a session checkpointer commits every tool round twice:
@@ -2108,28 +2132,6 @@ them.
   records it as `MobRejected` instead of an internal error.
 
 ### Fixed
-
-- `meerkat-tools`, `meerkat-runtime`, `meerkat-core`: a run resumed in the
-  process that ran it no longer runs a started shell call again. A graceful
-  requeue stop, or a teardown, that ends a session's registration while a tool
-  call runs keeps the run open at its round commit, and a later start of the
-  session in the same process resumes it. The call's process-custody record
-  then belongs to the running process, which recovery of the scope never
-  settles, so the resumed round found no interrupted-call evidence and
-  dispatched the call again: its command ran a second time. The resumed round
-  now tells the session's evidence that the run resumes
-  (`InterruptedToolEvidence::run_resumes`, a new provided method whose default
-  returns the run's `interrupted_calls`), and process custody settles the
-  run's own records there as recovery settles an earlier incarnation's: a call
-  whose process may have run is answered as interrupted, outcome uncertain,
-  and never run again, and a process still running is killed first. A call
-  whose process an owner in this process still runs means the run still
-  executes here: the resumption is refused
-  (`ProcessCustodyError::ResumedRunStillOwned`) with nothing settled, and the
-  resumed round is held as for unreadable evidence. A background job the run
-  started stays with its live owner. Only the session's current run is
-  settled: `MeerkatMachine::resumed_run_interrupted_tool_calls` refuses any
-  other run id.
 
 - `meerkat`, `meerkat-rpc`: a graceful stop that keeps queued work keeps a
   session's first turn as well. When the stop suspended the run of a first

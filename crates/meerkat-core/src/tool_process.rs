@@ -355,7 +355,11 @@ pub trait InterruptedToolEvidence: Send + Sync {
     /// live owner in this process still runs means the run still executes
     /// here: the call fails, settles nothing, and the resumed round is held
     /// instead of run. A background job the run started runs on under its
-    /// own owner and stays with it.
+    /// own owner and stays with it, and the call that started it is
+    /// deliberately left out of the evidence: the job outlives its call, so
+    /// the resumed round dispatches the call again, and the job's
+    /// `JobSubmissionKey` (the session and the call id) dedupes that dispatch
+    /// to the running job.
     ///
     /// The default is the run's [`Self::interrupted_calls`], for a store whose
     /// only evidence is what earlier incarnations left.

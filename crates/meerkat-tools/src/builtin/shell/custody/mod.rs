@@ -2144,7 +2144,10 @@ fn settle_resumed_run_blocking(
             match record.spawner {
                 // A background job or monitor runs under its job's owner
                 // past the call that started it, by design: it is not the
-                // run's execution, and its live owner keeps it.
+                // run's execution, and its live owner keeps it. Its starting
+                // call stays out of the evidence: the resumed round dispatches
+                // it again, and the job's submission key dedupes that dispatch
+                // to this job.
                 ToolProcessSpawner::BackgroundJob { .. } | ToolProcessSpawner::Monitor { .. } => {
                     continue;
                 }
