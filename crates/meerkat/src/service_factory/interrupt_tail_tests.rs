@@ -2557,6 +2557,103 @@ async fn an_observation_never_settles_inside_a_laps_staging_window_head_canonica
     );
 }
 
+/// A cold attach never settles a tail inside a runtime loop lap's staging
+/// window either. A lap can outlive the live actor (a read of a retired
+/// runtime discards the actor while a lap holds the boundary), and a start
+/// or attach then settles the tail on the cold path. As in the observation
+/// row above, run A is interrupted after a round commit that listed a steer,
+/// A's own settle holds the tail beside a row of another run, and the next
+/// lap reads the steer's row and is held right before its staging commit.
+/// There the other run's row ends, the live actor is discarded, and a cold
+/// attach of the session runs: the lap holds the turn-finalization boundary,
+/// so the attach leaves A's tail to a settle between laps instead of
+/// consuming the steer under the lap. RED before: the cold attach's settle
+/// took only the recovery gate, consumed the steer between the lap's read and
+/// its staging commit, and the steer ran a second time.
+#[tokio::test]
+async fn a_cold_attach_never_settles_inside_a_laps_staging_window_head_canonical() {
+    use meerkat_runtime::input_state::InputTerminalOutcome;
+
+    let root = TempDir::new().expect("temp");
+    let stores = Stores::new(true, &root);
+    let client = Arc::new(ScriptedModel::new());
+    let (id, steer_id) = {
+        let start = Start::open(&stores, &root, &client);
+        let id = start.materialize(None).await;
+        client.push(Step::Tool);
+        client.push(Step::Tool);
+        client.push(Step::Held);
+        let (turn_a, run_a, steered, steer_id) =
+            a_steer_joins_run_a_at_its_next_model_boundary(&start, &client, &id).await;
+        let other_runs_row = strand_another_runs_row(&start, &id, &run_a, Some(&steer_id)).await;
+        // Run B answers the steer if it calls the model.
+        client.push(Step::Text("steer answer"));
+        let (staging, release) = start
+            .machine
+            .arm_runtime_loop_before_batch_staging_test_hook(id.clone());
+
+        interrupt_run_a(&start, &id, turn_a).await;
+        tokio::time::timeout(DEADLINE, staging)
+            .await
+            .expect("the next lap reaches the steer's staging commit")
+            .expect("the staging hook");
+        assert_eq!(
+            start.tail_run(&id).await,
+            Some(run_a.clone()),
+            "the cancelled run's settle holds A's tail"
+        );
+        end_another_runs_row(&start, &id, other_runs_row).await;
+        start
+            .service
+            .discard_live_session(&id)
+            .await
+            .expect("discard the live actor while the lap runs");
+        tokio::time::timeout(DEADLINE, start.cold_attach(&id))
+            .await
+            .expect("the cold attach answers while the lap is held");
+        let _ = release.send(());
+        let _ = steered.await.expect("steer waiter task");
+        start.service.try_shutdown().await.expect("shutdown");
+        // Run B's step stays unused where B never called the model.
+        client.steps.lock().expect("steps").clear();
+        (id, steer_id)
+    };
+
+    let requests_before = client.requests.load(Ordering::SeqCst);
+    let start = Start::open(&stores, &root, &client);
+    start.cold_attach(&id).await;
+    start.materialize(Some(&id)).await;
+    start.wait_runtime_settled(&id).await;
+    let rows = start.committed_rows(&id).await;
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.as_str() == "user steered")
+            .count(),
+        1,
+        "the steer's content appears once: {rows:?}"
+    );
+    assert_eq!(
+        requests_before, 3,
+        "only run A's three model calls: the model never sees the steer again"
+    );
+    assert_eq!(
+        client.requests.load(Ordering::SeqCst),
+        requests_before,
+        "nothing runs the steer after the restart"
+    );
+    let steer_row = input_rows(start.runtime_store.as_ref(), &id)
+        .await
+        .into_iter()
+        .find(|row| row.state.input_id == steer_id)
+        .expect("the steer's row");
+    assert_eq!(
+        steer_row.seed.terminal_outcome,
+        Some(InputTerminalOutcome::Consumed),
+        "the steer is consumed with A: {:?}",
+        steer_row.state.history
+    );
+}
+
 /// A held turn-finalization boundary defers an observation's settle of the
 /// tail a cancelled run left, and never drops it: the first read after the
 /// boundary is released settles the tail.
