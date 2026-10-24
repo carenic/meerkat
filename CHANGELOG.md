@@ -2855,6 +2855,11 @@ them.
   for example with `cargo update -p tokio`.
 - ctutils is updated to 0.4.5 in Meerkat's lockfile for RUSTSEC-2026-0385
   (reached only under the aws-sigv4 feature).
+- RUSTSEC-2026-0387 (crypto-bigint) reaches only the optional live WebRTC
+  path (meerkat-live's webrtc feature, used by openai-live), through webrtc
+  0.14's dtls; it can expose timing of the per-handshake ECDHE secret.
+  Builds without that feature are unaffected. The fix is porting meerkat-live
+  to webrtc 0.20 or later, which is planned as a follow-up.
 
 ### Upgrade notes
 
