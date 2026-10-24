@@ -1563,6 +1563,10 @@ impl PersistentRuntimeDriver {
                         == crate::meerkat_machine::dsl::UnregisterQueuedInputsDisposition::Requeue)
                         .then_some(state.unregister_requeue_max_age_ms),
                 )
+                .with_keeps_recovered_inputs(
+                    state.unregister_queued_inputs
+                        == crate::meerkat_machine::dsl::UnregisterQueuedInputsDisposition::Keep,
+                )
             },
         )
     }
@@ -2100,6 +2104,10 @@ impl PersistentRuntimeDriver {
             .await?
         {
             let input_id = input.id().clone();
+            // The machine judges the resubmission as the in-memory admission
+            // does: waiting on an input this registration holds is live work,
+            // so the registration's unregister keeps nothing.
+            self.inner.resolve_durable_idempotency_duplicate(&input)?;
             self.inner
                 .record_durable_idempotency_deduplication(input_id.clone(), existing_id.clone());
             return Ok(AcceptOutcome::Deduplicated {

@@ -262,11 +262,13 @@ AuditSetup ==
           /\ UNCHANGED <<setupVars, regionVars, historyVars, runVars, restartVars,
                    audit_wait_answered, resumeVars>>
 
-\* The host begins its unregister, before the stop or after a plain stop.
+\* The host begins its unregister, before the stop or after a plain stop. A
+\* host unregister stops or requeues; the Keep disposition is a refused
+\* materialization's rollback (materialization_rollback_keep_audit).
 AuditBeginUnregister ==
     /\ audit_stage \in {"P1", "P1Stopped"}
     /\ audit_disposition = "None"
-    /\ \E disp \in UnregisterQueuedInputsDispositionValues :
+    /\ \E disp \in {"Stop", "Requeue"} :
           /\ BeginUnregisterAny(disp, IF disp = "Requeue" THEN AuditMaxAgeMs ELSE 0)
           /\ audit_disposition' = disp
     /\ UNCHANGED <<audit_stage, audit_facts, audit_attempts, regionVars, historyVars,

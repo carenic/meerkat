@@ -389,9 +389,11 @@ impl super::driver::DriverEntry {
     }
 
     /// Whether this runtime's stop keeps its queued work for the next start:
-    /// a graceful unregister that requeues. Such a stop leaves a run the
-    /// session left open to the next registration, which finds it open again;
-    /// every other stop ends that run with the stop.
+    /// a graceful unregister that requeues, or the rollback of a
+    /// materialization that never served, which keeps every input its
+    /// registration recovered. Such a stop leaves a run the session left
+    /// open to the next registration, which finds it open again; every
+    /// other stop ends that run with the stop.
     pub(crate) fn stop_keeps_queued_work(&self) -> bool {
         let authority = self.shared_dsl_authority();
         let authority = authority
@@ -399,8 +401,11 @@ impl super::driver::DriverEntry {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let state = authority.state();
         state.registration_phase == crate::meerkat_machine::dsl::RegistrationPhase::Draining
-            && state.unregister_queued_inputs
-                == crate::meerkat_machine::dsl::UnregisterQueuedInputsDisposition::Requeue
+            && matches!(
+                state.unregister_queued_inputs,
+                crate::meerkat_machine::dsl::UnregisterQueuedInputsDisposition::Requeue
+                    | crate::meerkat_machine::dsl::UnregisterQueuedInputsDisposition::Keep
+            )
     }
 
     /// The inputs still bound to the open `run_id`, in admission order.

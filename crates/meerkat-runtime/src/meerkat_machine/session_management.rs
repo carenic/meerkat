@@ -1070,6 +1070,10 @@ pub(super) fn replay_durable_unregister_progress_id(
             crate::meerkat_machine::dsl::UnregisterQueuedInputsDisposition::Requeue,
             max_age_ms,
         ),
+        None if progress.keeps_recovered_inputs() => (
+            crate::meerkat_machine::dsl::UnregisterQueuedInputsDisposition::Keep,
+            0,
+        ),
         None => (
             crate::meerkat_machine::dsl::UnregisterQueuedInputsDisposition::Stop,
             0,
@@ -1228,6 +1232,66 @@ mod unregister_progress_recovery_tests {
                 );
             }
         }
+    }
+
+    /// The machine grants a keep only to a registration that served no live
+    /// work. A keep unregister begun after an input was admitted live to the
+    /// registration (here, replayed from a progress record that carries the
+    /// keep) records Stop: its stop ends the admitted input as stopped and
+    /// keeps nothing. A crash recovery replays the keep before anything is
+    /// admitted, so its keep stands
+    /// (`a_replayed_keep_unregister_keeps_what_the_new_process_recovered`).
+    #[tokio::test]
+    async fn a_keep_unregister_after_a_live_admission_begins_as_stop() {
+        use crate::traits::RuntimeDriver as _;
+
+        let mut driver = crate::driver::ephemeral::EphemeralRuntimeDriver::new(
+            crate::identifiers::LogicalRuntimeId::new("recovered-keep-unregister"),
+        );
+        driver
+            .ensure_contract_session_authority()
+            .expect("contract session authority");
+        let prompt = crate::input::Input::Prompt(crate::input::PromptInput::new(
+            "admitted while the registration stood",
+            None,
+        ));
+        let prompt_id = prompt.id().clone();
+        assert!(driver.accept_input(prompt).await.unwrap().is_accepted());
+        let progress =
+            crate::store::MachineUnregisterProgressSnapshot::new(true, true, true, false, false)
+                .with_keeps_recovered_inputs(true);
+        {
+            let authority = driver.shared_dsl_authority();
+            let mut authority = authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let session_id = authority
+                .state()
+                .session_id
+                .clone()
+                .expect("the contract session is registered");
+            replay_durable_unregister_progress_id(&mut authority, &session_id, Some(&progress))
+                .expect("the unregister begins");
+            assert_eq!(
+                authority.state().unregister_queued_inputs,
+                crate::meerkat_machine::dsl::UnregisterQueuedInputsDisposition::Stop,
+                "a registration that served live work keeps nothing"
+            );
+            assert_eq!(authority.state().unregister_requeue_max_age_ms, 0);
+        }
+
+        let active = driver.active_input_ids();
+        let before_exit = driver.stop_retained_input_ids(&active).unwrap();
+        let retained = driver.stop_non_terminal_inputs(&before_exit).unwrap();
+        assert!(retained.is_empty(), "an admitted input is not kept");
+        let state = driver.input_state(&prompt_id).expect("the prompt's row");
+        assert!(state.stop_requeue.is_none());
+        assert_eq!(
+            driver.input_terminal_outcome(&prompt_id),
+            Some(crate::input_state::InputTerminalOutcome::Abandoned {
+                reason: crate::input_state::InputAbandonReason::Stopped
+            })
+        );
     }
 
     #[test]
@@ -4202,10 +4266,17 @@ impl MeerkatMachine {
             Some(bindings.epoch_id()),
             Some(&authority.materialization_claim_state),
             turn_finalization_boundary_already_held,
+            UnregisterDisposition::STOP,
         )
         .await
     }
 
+    /// Abort the exact materialization claim `claim_id`. A registration this
+    /// claim inserted is unregistered with `queued_inputs`: Stop ends every
+    /// non-terminal input, Keep (a materialization that served nothing and
+    /// admitted no input) keeps every input the registration recovered
+    /// from the store exactly as the store holds it. The machine records a
+    /// requested Keep as Stop once the registration served live work.
     pub(super) async fn abort_prepared_session_materialization_claim(
         &self,
         session_id: &SessionId,
@@ -4215,6 +4286,7 @@ impl MeerkatMachine {
             &Arc<std::sync::Mutex<crate::RuntimeActorMaterializationClaimState>>,
         >,
         turn_finalization_boundary_already_held: bool,
+        queued_inputs: UnregisterDisposition,
     ) -> Result<bool, RuntimeDriverError> {
         let Some(gate_guard) = self
             .lock_current_settled_session_mutation_gate(session_id, SettledGateWait::PreInstall)
@@ -4343,13 +4415,14 @@ impl MeerkatMachine {
             // default, and committed Mob retirement drops B before joining. A
             // handle that gains a real exit wait must not be paired with a
             // boundary-held rollback on this path.
-            self.join_or_start_unregister_teardown_with_admission(
+            self.join_or_start_unregister_teardown_with_queued_inputs(
                 session_id,
                 expected_epoch,
                 UnregisterTeardownCaller::Explicit,
                 UnregisterTeardownAdmission::AnyCurrentRegistration,
                 None,
                 UnregisterTeardownWait::UntilTerminal,
+                queued_inputs,
             )
             .await?
             .require_completed()?;

@@ -46,10 +46,11 @@ const SUPERVISOR_MACHINE_LIFECYCLE_STORE_RECORD_VERSION: u16 = 2;
 const UNREGISTER_MACHINE_LIFECYCLE_STORE_RECORD_VERSION: u16 = 3;
 const RUN_MACHINE_LIFECYCLE_STORE_RECORD_VERSION: u16 = 4;
 pub(crate) const MACHINE_LIFECYCLE_STORE_RECORD_VERSION: u16 = 5;
-/// A record whose unregister progress keeps queued inputs for the next start.
-/// Only such records carry it, so a host that never requeues writes version
-/// 5 byte for byte, and an older reader refuses a requeue record as an
-/// unsupported version instead of stopping its kept inputs.
+/// A record whose unregister progress keeps inputs for the next start: a
+/// requeue, or the keep of a materialization rollback. Only such records
+/// carry it, so a host that never keeps inputs writes version 5 byte for
+/// byte, and an older reader refuses such a record as an unsupported
+/// version instead of stopping its kept inputs.
 pub(crate) const REQUEUE_MACHINE_LIFECYCLE_STORE_RECORD_VERSION: u16 = 6;
 
 /// Maximum number of exact input-state rows admitted by one compare-and-swap
@@ -6759,6 +6760,10 @@ pub struct MachineUnregisterProgressSnapshot {
     /// The max age, in milliseconds, of the queued inputs this unregister
     /// keeps for the next start; `None` when it stops them.
     requeue_max_age_ms: Option<u64>,
+    /// Whether this unregister keeps every input its registration recovered
+    /// exactly as the store holds it (the rollback of a materialization that
+    /// never served). Never set with a requeue max age.
+    keeps_recovered_inputs: bool,
 }
 
 impl MachineUnregisterProgressSnapshot {
@@ -6776,6 +6781,7 @@ impl MachineUnregisterProgressSnapshot {
             runtime_loop_forced_abort,
             comms_drain_forced_abort,
             requeue_max_age_ms: None,
+            keeps_recovered_inputs: false,
         }
     }
 
@@ -6790,6 +6796,26 @@ impl MachineUnregisterProgressSnapshot {
     /// The requeue max age the unregister began with, `None` for a stop.
     pub(crate) fn requeue_max_age_ms(&self) -> Option<u64> {
         self.requeue_max_age_ms
+    }
+
+    /// This progress keeping, or not, every input its registration
+    /// recovered: `true` when the unregister began with the keep
+    /// disposition.
+    #[must_use]
+    pub(crate) fn with_keeps_recovered_inputs(mut self, keeps_recovered_inputs: bool) -> Self {
+        self.keeps_recovered_inputs = keeps_recovered_inputs;
+        self
+    }
+
+    /// Whether the unregister began with the keep disposition.
+    pub(crate) fn keeps_recovered_inputs(&self) -> bool {
+        self.keeps_recovered_inputs
+    }
+
+    /// Whether the unregister keeps inputs for the next start: a requeue or
+    /// a keep.
+    fn keeps_inputs(&self) -> bool {
+        self.requeue_max_age_ms.is_some() || self.keeps_recovered_inputs
     }
 
     pub(crate) fn runtime_loop_drain_pending(&self) -> bool {
@@ -7110,8 +7136,9 @@ struct MachineUnregisterProgressSnapshotStoreWire {
     completion_waiter_drain_pending: bool,
     runtime_loop_forced_abort: bool,
     comms_drain_forced_abort: bool,
-    /// Present only when the unregister keeps queued inputs, so a stopping
-    /// unregister's progress is the version 5 shape byte for byte.
+    /// Present only when the unregister keeps inputs (a requeue or a keep),
+    /// so a stopping unregister's progress is the version 5 shape byte for
+    /// byte.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     queued_inputs: Option<UnregisterQueuedInputsStoreWire>,
 }
@@ -7127,6 +7154,9 @@ struct UnregisterQueuedInputsStoreWire {
 #[serde(rename_all = "snake_case")]
 enum UnregisterQueuedInputsDispositionStoreWire {
     Requeue,
+    /// Every input the registration recovered is kept as the store holds
+    /// it; `max_age_ms` is zero.
+    Keep,
 }
 
 impl From<&MachineUnregisterProgressSnapshot> for MachineUnregisterProgressSnapshotStoreWire {
@@ -7137,12 +7167,20 @@ impl From<&MachineUnregisterProgressSnapshot> for MachineUnregisterProgressSnaps
             completion_waiter_drain_pending: snapshot.completion_waiter_drain_pending(),
             runtime_loop_forced_abort: snapshot.runtime_loop_forced_abort(),
             comms_drain_forced_abort: snapshot.comms_drain_forced_abort(),
-            queued_inputs: snapshot.requeue_max_age_ms().map(|max_age_ms| {
-                UnregisterQueuedInputsStoreWire {
+            queued_inputs: match (
+                snapshot.requeue_max_age_ms(),
+                snapshot.keeps_recovered_inputs(),
+            ) {
+                (Some(max_age_ms), _) => Some(UnregisterQueuedInputsStoreWire {
                     disposition: UnregisterQueuedInputsDispositionStoreWire::Requeue,
                     max_age_ms,
-                }
-            }),
+                }),
+                (None, true) => Some(UnregisterQueuedInputsStoreWire {
+                    disposition: UnregisterQueuedInputsDispositionStoreWire::Keep,
+                    max_age_ms: 0,
+                }),
+                (None, false) => None,
+            },
         }
     }
 }
@@ -7156,11 +7194,25 @@ impl From<MachineUnregisterProgressSnapshotStoreWire> for MachineUnregisterProgr
             snapshot.runtime_loop_forced_abort,
             snapshot.comms_drain_forced_abort,
         )
-        .with_requeue_max_age_ms(snapshot.queued_inputs.map(|queued_inputs| {
+        .with_requeue_max_age_ms(snapshot.queued_inputs.as_ref().and_then(|queued_inputs| {
             match queued_inputs.disposition {
-                UnregisterQueuedInputsDispositionStoreWire::Requeue => queued_inputs.max_age_ms,
+                UnregisterQueuedInputsDispositionStoreWire::Requeue => {
+                    Some(queued_inputs.max_age_ms)
+                }
+                UnregisterQueuedInputsDispositionStoreWire::Keep => None,
             }
         }))
+        .with_keeps_recovered_inputs(
+            snapshot
+                .queued_inputs
+                .as_ref()
+                .is_some_and(|queued_inputs| {
+                    matches!(
+                        queued_inputs.disposition,
+                        UnregisterQueuedInputsDispositionStoreWire::Keep
+                    ) && queued_inputs.max_age_ms == 0
+                }),
+        )
     }
 }
 
@@ -7843,11 +7895,11 @@ impl TryFrom<SupervisorAuthoritySnapshotStoreWire> for SupervisorAuthoritySnapsh
 
 impl From<&MachineLifecycleSnapshot> for MachineLifecycleSnapshotStoreWire {
     fn from(snapshot: &MachineLifecycleSnapshot) -> Self {
-        let requeues = snapshot
+        let keeps_inputs = snapshot
             .unregister_progress()
-            .is_some_and(|progress| progress.requeue_max_age_ms().is_some());
+            .is_some_and(MachineUnregisterProgressSnapshot::keeps_inputs);
         Self {
-            record_version: if requeues {
+            record_version: if keeps_inputs {
                 REQUEUE_MACHINE_LIFECYCLE_STORE_RECORD_VERSION
             } else {
                 MACHINE_LIFECYCLE_STORE_RECORD_VERSION
@@ -7888,13 +7940,14 @@ fn validate_unregister_progress_snapshot(
     Ok(())
 }
 
-/// The requeue disposition is a version 6 fact: an older record version
-/// cannot carry it, and a version 6 record must.
+/// A disposition that keeps inputs (a requeue or a keep) is a version 6
+/// fact: an older record version cannot carry it, and a version 6 record
+/// must.
 fn validate_unregister_progress_requeue_version(
     record_version: u16,
     progress: Option<&MachineUnregisterProgressSnapshot>,
 ) -> Result<(), RuntimeStoreError> {
-    let requeues = progress.is_some_and(|progress| progress.requeue_max_age_ms().is_some());
+    let requeues = progress.is_some_and(MachineUnregisterProgressSnapshot::keeps_inputs);
     match (
         record_version == REQUEUE_MACHINE_LIFECYCLE_STORE_RECORD_VERSION,
         requeues,
@@ -11950,6 +12003,51 @@ mod lifecycle_record_compatibility_tests {
             MachineLifecycleObservation::Unsupported { record_version, .. }
                 if record_version == u64::from(REQUEUE_MACHINE_LIFECYCLE_STORE_RECORD_VERSION + 1)
         ));
+    }
+
+    /// The keep of a materialization rollback is a version 6 fact too: its
+    /// progress carries the keep disposition with a zero max age and
+    /// round-trips. Version 5 cannot carry it, and a keep with a max age is
+    /// refused (it would decode as keeping nothing under version 6).
+    #[test]
+    fn keep_unregister_progress_is_a_version_6_record() {
+        let keep = MachineLifecycleSnapshot::new_with_unregister_progress(
+            RuntimeState::Idle,
+            MachineLifecycleBindingFacts::new(None, None, None, None),
+            SupervisorAuthoritySnapshot::UnboundNoReceipt,
+            Some(
+                MachineUnregisterProgressSnapshot::new(true, true, true, false, false)
+                    .with_keeps_recovered_inputs(true),
+            ),
+        );
+        let keep_bytes = encode_snapshot(&keep);
+        let keep_value: serde_json::Value =
+            serde_json::from_slice(&keep_bytes).expect("keep record is JSON");
+        assert_eq!(
+            keep_value["record_version"],
+            serde_json::json!(REQUEUE_MACHINE_LIFECYCLE_STORE_RECORD_VERSION)
+        );
+        assert_eq!(
+            keep_value["unregister_progress"]["queued_inputs"],
+            serde_json::json!({ "disposition": "keep", "max_age_ms": 0 })
+        );
+        let decoded =
+            decode_machine_lifecycle_store_record(&keep_bytes).expect("a version 6 keep decodes");
+        assert_eq!(decoded, keep);
+        let progress = decoded
+            .unregister_progress()
+            .expect("the keep record carries its progress");
+        assert!(progress.keeps_recovered_inputs());
+        assert_eq!(progress.requeue_max_age_ms(), None);
+
+        let mut version_5_with_keep = keep_value.clone();
+        version_5_with_keep["record_version"] =
+            serde_json::json!(MACHINE_LIFECYCLE_STORE_RECORD_VERSION);
+        assert_decode_fails(version_5_with_keep);
+        let mut keep_with_max_age = keep_value;
+        keep_with_max_age["unregister_progress"]["queued_inputs"]["max_age_ms"] =
+            serde_json::json!(900_000);
+        assert_decode_fails(keep_with_max_age);
     }
 
     #[test]

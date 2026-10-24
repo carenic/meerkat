@@ -697,6 +697,20 @@ them.
   input fields (`MeerkatMachineInput::BeginUnregisterSession` gains
   `queued_inputs` and `requeue_max_age_ms`).
 
+- `meerkat-machine-kernels` (`generated::meerkat`) and
+  `meerkat-machine-schema` (`catalog::dsl::meerkat_machine`): the runtime
+  machine gains the keep of a refused materialization's rollback (see Fixed,
+  a refused restart keeps the inputs it recovered).
+  `UnregisterQueuedInputsDisposition` and `StopInputDisposition` gain `Keep`,
+  appended last, and `TransitionId` gains
+  `ClassifyStopInputDispositionKeepInitializing`,
+  `ClassifyStopInputDispositionKeepIdle`,
+  `ClassifyStopInputDispositionKeepAttached`,
+  `ClassifyStopInputDispositionKeepRunning`,
+  `ClassifyStopInputDispositionKeepRetired` and
+  `ClassifyStopInputDispositionKeepStopped`. The enums are exhaustive, so a
+  `match` outside the crate needs the arms.
+
 - `meerkat-runtime`: `MeerkatMachineRuntimeInternalInput` gains
   `ClassifyStopInputDisposition`, `MarkRunResumable`, `ResumeRun`,
   `ReleaseResumableRun`, `SettleResumableRun`, `SuspendRunForStop`,
@@ -715,6 +729,14 @@ them.
   `ResumedRunAuthorized`, `ResumableRunReleased`, `ResumableRunSettled` and
   `RunSuspendedForStop`. Both enums are exhaustive, so a `match` outside the
   crates needs the arms.
+
+- `meerkat-machine-schema` (`catalog::dsl::meerkat_machine`),
+  `meerkat-runtime` and `meerkat-machine-kernels` (`generated::meerkat`):
+  `MeerkatMachineState` and the kernel `State` gain
+  `registration_live_input_seen`, whether the registration served live work
+  (see Fixed, a refused restart keeps the inputs it recovered). Code that
+  builds either with a struct literal must set it (`false` for a
+  registration that served none).
 
 - `meerkat-rest`: `ApiError` gains `SessionNotRunningWithData { message,
   details }` (`409` `SESSION_NOT_RUNNING`), appended last. The enum is
@@ -2503,6 +2525,30 @@ them.
   bytes and ends the archive, and the retirement or destroy, with the typed
   `SessionError::DurableTailHeldForRecovery` or
   `SessionError::DurableTailRecoveryRefused`.
+
+- `meerkat`, `meerkat-runtime`: a restart refused before the session serves
+  keeps the inputs it recovered. A materialization refused after its runtime
+  registration recovered the session's inputs from the store (a durable tail
+  held for recovery, a refused recovery, a failed agent build) rolled the
+  registration back with an unregister that stopped every non-terminal
+  input. A held tail's stranded input was ended as stopped, the hold went
+  with it, and the next start ran without the input, so the operator's
+  `resolve-held-tail` had nothing left to requeue. The rollback now
+  unregisters with the generated Keep disposition: every input the
+  registration recovered stays exactly as the store holds it, so the hold
+  stands and a later start or the operator's repair runs the input once. An
+  input admitted while the registration stood still ends as stopped. A
+  refused preparation, and a cancelled one, keep the same way.
+  `PreparedSessionMaterialization::rollback_now_keeping_recovered_inputs` is
+  the rollback for a materialization that admitted no input; `rollback_now`
+  still stops every input. The keep is recorded with the unregister's
+  progress (machine lifecycle record version 6), so a crash during the
+  rollback keeps the same inputs. The machine grants the keep only to a
+  registration that served no live work: after an admission, a resubmission
+  deduplicated onto an input it holds, or a host's recycle (whose recovery
+  mixes live inputs into the recovered ones), the unregister records Stop
+  and stops every input, so a turn whose caller saw the materialization
+  refused never runs on a later start.
 
 - `meerkat-gemini`: preserve provider-issued `functionCall.id` through
   streamed tool calls, saved transcripts, assistant replay and matching

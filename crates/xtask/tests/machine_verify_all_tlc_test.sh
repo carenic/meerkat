@@ -252,6 +252,34 @@ if run_part audits-c; then
   TLC_WORKERS="${tlc_workers}" "${requeue_across_stop_audit}" "${REQUEUE_ACROSS_STOP_AUDIT_MAX_STEPS:-36}"
 fi
 
+# The Keep disposition: a materialization refused before it served (a durable
+# tail held for recovery, a failed agent build) rolls its registration back
+# with an unregister that keeps every input the registration recovered from
+# the store, exactly as the store holds it, and still stops an input admitted
+# while the registration stood; once the registration served live work (an
+# admission, a deduplicated wait or a recycle) its unregister keeps nothing.
+# A hand-written audit over the same generated model runs three processes:
+# the first crashes with one input staged and one queued under a key, the
+# second recovers both through the generated recovery arms, may admit a
+# third, resolve a resubmission as a duplicate or take a recycle, and rolls
+# back with Keep (or, as the control, Stop), and the third recovers and
+# serves. It checks that exactly one verdict arm answers each input, that
+# Keep stops no recovered input and keeps no admitted one, that only Keep
+# keeps, that a kept input survives the rollback, and that live work
+# forfeits the keep, and requires seven witnesses reached; its --mutants
+# mode refuses nine seeded defects, the machine without the Keep arm and an
+# unregister begin that keeps after live work among them. 43 steps reach the
+# deepest witness, and 50 the whole reachable space.
+materialization_rollback_keep_audit="${workspace_root}/specs/machines/meerkat_machine/materialization_rollback_keep_audit.sh"
+if [[ ! -x "${materialization_rollback_keep_audit}" ]]; then
+  echo "error: materialization-rollback keep audit runner is missing from workspace runfiles: ${materialization_rollback_keep_audit}" >&2
+  exit 1
+fi
+if run_part audits-b; then
+  echo "running bounded materialization-rollback keep TLC audit"
+  TLC_WORKERS="${tlc_workers}" "${materialization_rollback_keep_audit}" "${MATERIALIZATION_ROLLBACK_KEEP_AUDIT_MAX_STEPS:-50}" --mutants
+fi
+
 # The live-context result barrier: a delegation result on a channel with a
 # late bootstrap summary is released after the summary's provider
 # acknowledgement and only after it, never held by queued context rows (S99).
@@ -569,10 +597,13 @@ run_machine_verify() {
 # hosted, expect 90-180 s), plus the durable-tail classification audit
 # with --mutants (20 s on a local 4-worker run, sixteen runs of one state;
 # not yet hosted, expect 30-60 s; the lightest shard by a local run of all
-# three on 10-22: a 394 s, b 314 s, c 352 s), plus the durable-tail
-# recovery ownership audit with --mutants (127 s on a local 4-worker run,
-# thirteen runs of nine states over the whole MeerkatMachine model, whose
-# parse is most of each run; not yet hosted, expect 190-380 s);
+# three on 10-22: a 394 s, b 314 s, c 352 s), plus the durable-tail recovery
+# ownership audit with --mutants (127 s on a local 4-worker run, thirteen runs
+# of nine states over the whole MeerkatMachine model, whose parse is most of
+# each run; not yet hosted, expect 190-380 s), plus the
+# materialization-rollback keep audit with --mutants (about 100 s on a local
+# 8-worker run, seventeen runs of at most 16,468 distinct states; not yet
+# hosted, expect 150-300 s);
 # audits-c = run-start hold (239 s), live media health (155 s),
 # live-context causal-tail batch with --mutants (112 s): 506 s; plus the
 # generation high-water audit with --mutants (30 s on a local 4-worker run,

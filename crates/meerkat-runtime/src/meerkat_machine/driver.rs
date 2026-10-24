@@ -14426,6 +14426,71 @@ mod recovery_tests {
         assert_eq!(driver.queue_lane(), vec![input_id]);
     }
 
+    /// A crash during a materialization rollback that began with the keep
+    /// disposition leaves the keep in the unregister's progress record. The
+    /// new process recovers the session's inputs from the store before it
+    /// serves anything, then replays the unregister: the keep still stands
+    /// (the new registration served no live work), and its stop keeps the
+    /// recovered prompt exactly as the store holds it, as the interrupted
+    /// rollback would.
+    #[tokio::test]
+    async fn a_replayed_keep_unregister_keeps_what_the_new_process_recovered() {
+        use crate::store::RuntimeStore;
+        use crate::traits::RuntimeDriver as _;
+
+        let runtime_id = LogicalRuntimeId::new("replayed-keep-unregister");
+        let input = Input::Prompt(crate::input::PromptInput::new(
+            "queued when the process stopped",
+            None,
+        ));
+        let input_id = input.id().clone();
+        let mut state = crate::input_state::InputState::new_accepted(input_id.clone());
+        state.runtime_semantics = Some(generated_runtime_semantics(&input));
+        state.persisted_input = Some(input);
+        let bundle = crate::input_state::StoredInputState {
+            state,
+            seed: queued_seed_with_admission_sequence(1),
+        };
+        let store = crate::store::memory::InMemoryRuntimeStore::new();
+        store
+            .persist_input_state(&runtime_id, &persistable(bundle))
+            .await
+            .expect("persist the queued prompt's row");
+
+        let mut driver = crate::driver::ephemeral::EphemeralRuntimeDriver::new(runtime_id.clone());
+        driver
+            .ensure_contract_session_authority()
+            .expect("contract session authority");
+        let progress =
+            crate::store::MachineUnregisterProgressSnapshot::new(true, true, true, false, false)
+                .with_keeps_recovered_inputs(true);
+        machine_recover_persistent_inputs(&store, &runtime_id, &mut driver, Some(&progress))
+            .await
+            .expect("the new process recovers the prompt and replays the keep");
+        {
+            let authority = driver.shared_dsl_authority();
+            let authority = authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                authority.state().unregister_queued_inputs,
+                crate::meerkat_machine::dsl::UnregisterQueuedInputsDisposition::Keep,
+                "a registration that served no live work keeps"
+            );
+        }
+
+        let active = driver.active_input_ids();
+        let before_exit = driver.stop_retained_input_ids(&active).unwrap();
+        let kept = driver.stop_non_terminal_inputs(&before_exit).unwrap();
+        assert_eq!(kept, vec![input_id.clone()], "the recovered prompt is kept");
+        let state = driver.input_state(&input_id).expect("the prompt's row");
+        assert!(state.stop_requeue.is_none(), "kept with no requeue mark");
+        assert_eq!(
+            driver.input_phase(&input_id),
+            Some(InputLifecycleState::Queued)
+        );
+    }
+
     #[tokio::test]
     async fn persistent_recovery_normalizes_cold_running_lifecycle_to_idle() {
         use crate::store::RuntimeStore;

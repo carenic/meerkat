@@ -1647,6 +1647,7 @@ impl MeerkatMachine {
                     Some(epoch_id),
                     Some(claim_state),
                     false,
+                    super::UnregisterDisposition::KEEP,
                 )
                 .await
             {

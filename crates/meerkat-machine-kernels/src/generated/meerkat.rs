@@ -11862,12 +11862,15 @@ pub enum StopInputDisposition {
     Abandon,
     #[serde(rename = "Retain")]
     Retain,
+    #[serde(rename = "Keep")]
+    Keep,
 }
 impl StopInputDisposition {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Abandon => "Abandon",
             Self::Retain => "Retain",
+            Self::Keep => "Keep",
         }
     }
 }
@@ -11877,6 +11880,7 @@ impl std::convert::TryFrom<&str> for StopInputDisposition {
         match value {
             "Abandon" => Ok(Self::Abandon),
             "Retain" => Ok(Self::Retain),
+            "Keep" => Ok(Self::Keep),
             other => Err(format!("invalid StopInputDisposition value `{other}`")),
         }
     }
@@ -13542,12 +13546,15 @@ pub enum UnregisterQueuedInputsDisposition {
     Stop,
     #[serde(rename = "Requeue")]
     Requeue,
+    #[serde(rename = "Keep")]
+    Keep,
 }
 impl UnregisterQueuedInputsDisposition {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Stop => "Stop",
             Self::Requeue => "Requeue",
+            Self::Keep => "Keep",
         }
     }
 }
@@ -13557,6 +13564,7 @@ impl std::convert::TryFrom<&str> for UnregisterQueuedInputsDisposition {
         match value {
             "Stop" => Ok(Self::Stop),
             "Requeue" => Ok(Self::Requeue),
+            "Keep" => Ok(Self::Keep),
             other => Err(format!(
                 "invalid UnregisterQueuedInputsDisposition value `{other}`"
             )),
@@ -14131,6 +14139,7 @@ pub struct State {
     pub run_stop_requested: Option<RunId>,
     pub run_start_holds: std::collections::BTreeSet<RunStartHoldReason>,
     pub recovered_admitted_lanes: std::collections::BTreeMap<String, InputLane>,
+    pub registration_live_input_seen: bool,
     pub op_statuses: std::collections::BTreeMap<String, OperationStatus>,
     pub op_completion_seq: std::collections::BTreeMap<String, u64>,
     pub completion_sequence_claims: std::collections::BTreeSet<u64>,
@@ -14986,6 +14995,10 @@ impl std::fmt::Debug for State {
             .field("run_stop_requested", &self.run_stop_requested)
             .field("run_start_holds", &self.run_start_holds)
             .field("recovered_admitted_lanes", &self.recovered_admitted_lanes)
+            .field(
+                "registration_live_input_seen",
+                &self.registration_live_input_seen,
+            )
             .field("op_statuses", &self.op_statuses)
             .field("op_completion_seq", &self.op_completion_seq)
             .field(
@@ -25689,6 +25702,12 @@ pub enum TransitionId {
     ClassifyStopInputDispositionAbandonRunning,
     ClassifyStopInputDispositionAbandonRetired,
     ClassifyStopInputDispositionAbandonStopped,
+    ClassifyStopInputDispositionKeepInitializing,
+    ClassifyStopInputDispositionKeepIdle,
+    ClassifyStopInputDispositionKeepAttached,
+    ClassifyStopInputDispositionKeepRunning,
+    ClassifyStopInputDispositionKeepRetired,
+    ClassifyStopInputDispositionKeepStopped,
     ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopInitializing,
     ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopIdle,
     ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopAttached,
@@ -25993,6 +26012,7 @@ pub fn initial_state() -> State {
         run_stop_requested: None,
         run_start_holds: Default::default(),
         recovered_admitted_lanes: Default::default(),
+        registration_live_input_seen: false,
         op_statuses: Default::default(),
         op_completion_seq: Default::default(),
         completion_sequence_claims: Default::default(),
