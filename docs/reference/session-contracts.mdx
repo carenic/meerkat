@@ -878,10 +878,11 @@ waited for it.
   `CompletionWaitError::AuthorityUnavailable`, which a JSON-RPC `turn/start`
   answers with `-32603` and `data.reason` `completion_authority_unavailable`,
   and a message that the input stays durably admitted and runs once the
-  runtime reloads. In 0.9.4 such a waiter got no answer. A session that must
-  reload for another reason (a resumed run whose actor the runtime cannot
-  build, for one) answers its waiters the same way. Do not resubmit the
-  input: read it after the reload.
+  runtime reloads. In 0.9.4 such a waiter got no answer until a reload or
+  resume replaced the registration, and then only an untyped closed channel.
+  A session that must reload for another reason (a resumed run whose actor
+  the runtime cannot build, for one) answers its waiters the same way. Do not
+  resubmit the input: read it after the reload.
 - Until the store answers, a reload refuses with the retryable
   `RuntimeDriverError::RecoveryRepairBlocked`; afterwards it replaces the
   registration from durable truth.

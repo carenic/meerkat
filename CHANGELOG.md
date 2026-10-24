@@ -3133,9 +3133,11 @@ them.
   When a run's boundary commit or terminalization got no durable outcome
   within the store's deadline, only that run's own inputs were answered
   (`DurableOutcomeUnknown`), and a caller waiting on an input queued behind
-  the run got no answer. The input stays durably admitted and runs once the
-  runtime reloads, so do not resubmit it: read it after the reload (see
-  Session contracts).
+  the run got no answer until a reload or resume replaced the registration,
+  and then only an untyped closed channel
+  (`CompletionWaitError::ChannelClosed`). The input stays durably admitted
+  and runs once the runtime reloads, so do not resubmit it: read it after
+  the reload (see Session contracts).
 
 - REST: a runtime apply whose session cannot be read fails, where it skipped
   the video input validation. `rkat`: a scheduled peer-ingress update fails
