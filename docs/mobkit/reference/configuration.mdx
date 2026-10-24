@@ -4,7 +4,7 @@ description: "Configuration reference for Meta: module definitions, runtime opti
 icon: "gear"
 ---
 
-*Mirrored from MobKit main at [39d8833a14a3](https://github.com/lukacf/meerkat-meta/commit/39d8833a14a30c9d7cb196543d793a05af02a156) on 2026-10-23; MobKit workspace version 0.9.4 at that commit.*
+*Mirrored from MobKit main at [ba44bcb8cb03](https://github.com/lukacf/meerkat-meta/commit/ba44bcb8cb03d0f9f04b4d17c46e3de04b1c46df) on 2026-10-23; MobKit workspace version 0.9.4 at that commit.*
 
 Meta is configured through Rust types passed at startup. This page documents every configuration surface.
 
@@ -152,6 +152,15 @@ member label accepts a numeric seconds string or `"disabled"`; otherwise the
 runtime default applies. Setting the runtime default to `null` therefore does
 not disable a member's explicit numeric timeout. See
 [roster and member lifecycle](/mobkit/concepts/roster) for the identity/worker boundary.
+
+A member is idle while its session runs no turn. Its window starts when the
+sweep first finds it idle under its current session, so a member re-seated or
+woken under a new session starts a fresh window, and the sweep reads the
+member's session again right before it retires the member. After a restart, a
+member whose session no live runtime serves yet is idle only when it owes no
+work: no kickoff in flight and no input of its session short of a terminal
+state. The sweep never retires a member whose session this process does not
+hold, such as one placed on another host.
 
 Agents set a per-member override with the `idle_retire_secs` argument of the
 `delegate`, `fork_off` and `mob_spawn_member` tools. A non-negative integer is
