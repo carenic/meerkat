@@ -217,7 +217,24 @@ Ownership splits three ways:
   (`DurableRecoveryInputEvidence`). Recovery is admissible only when both
   the in-process and the persisted facts are quiescent (`Idle`, `Retired`,
   or a missing row) with no current run and no recorded terminal for the
-  candidate's run; every other shape refuses. Commit verdicts arrive as
+  candidate's run; every other shape refuses. The one exception is the
+  drive's store-proven ownership (`DurableRecoveryOwnership`): when typed
+  store facts prove that the drive holds the session's exclusive write
+  authority (on the built-in SQLite realm the session's cross-process
+  hosting claim; on a host store the realm fence this process holds after
+  its open waited out any superseded lease), an earlier incarnation's
+  non-quiescent row, or its current-run fact naming the candidate's run, no
+  longer gates. A row naming another run, or one that does not decode,
+  still refuses; the proof is never inferred from timing, and it covers
+  earlier holders only (a drive offered another runtime owner's claim, or
+  whose own runtime owner has the session registered, proves nothing). A
+  drive that
+  hosts the session (`ExclusiveHost`) then decides as a restart does; a
+  store-only writer (`ExclusiveWriter`) cannot run the run, so it takes the
+  retired cuts and never continues it. The bounded TLC audit
+  `specs/machines/meerkat_machine/durable_tail_recovery_ownership_audit.sh`
+  checks the partition of the arms and these rules over the whole
+  observation product. Commit verdicts arrive as
   `DurableTailRecoveryCommitAuthorized` (`CommitCompleted`,
   `RepairAndCommitInterrupted`, or `CommitCompletedRetainInputs`), carry the
   machine-minted boundary sequence — one past the last committed receipt for

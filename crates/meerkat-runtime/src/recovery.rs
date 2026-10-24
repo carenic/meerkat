@@ -2599,9 +2599,16 @@ pub async fn recover_durable_tail(
     store: &dyn RuntimeStore,
     session_id: &SessionId,
 ) -> Result<DurableTailRecoveryOutcome, DurableTailRecoveryError> {
-    recover_durable_tail_capturing(store, session_id, &mut None, None, DriveMode::Recovery)
-        .await?
-        .into_outcome()
+    recover_durable_tail_capturing(
+        store,
+        session_id,
+        &mut None,
+        None,
+        DriveMode::Recovery,
+        mm_dsl::DurableRecoveryOwnership::NotProven,
+    )
+    .await?
+    .into_outcome()
 }
 
 /// [`recover_durable_tail`] for the tail of one run: the run that the caller
@@ -2630,6 +2637,7 @@ pub async fn recover_durable_tail_for_run(
         &mut None,
         Some(run_id),
         DriveMode::Recovery,
+        mm_dsl::DurableRecoveryOwnership::NotProven,
     )
     .await?
     {
@@ -2686,6 +2694,7 @@ pub async fn resolve_held_durable_tail(
         &mut None,
         None,
         DriveMode::Operator { apply },
+        mm_dsl::DurableRecoveryOwnership::NotProven,
     )
     .await?;
     Ok(match answer {
@@ -2826,6 +2835,7 @@ pub async fn recover_durable_tail_retaining_committed_whole_blob(
         &mut committed_whole_blob,
         None,
         DriveMode::Recovery,
+        mm_dsl::DurableRecoveryOwnership::NotProven,
     )
     .await?
     .into_outcome()?;
@@ -2866,10 +2876,122 @@ pub async fn recover_durable_tail_for_session_archive(
         &mut committed_whole_blob,
         None,
         DriveMode::SessionArchive,
+        mm_dsl::DurableRecoveryOwnership::NotProven,
     )
     .await?
     .into_outcome()?;
     Ok((outcome, committed_whole_blob))
+}
+
+/// What a recovery drive under the session's hosting claim is for
+/// ([`recover_durable_tail_under_hosting_claim`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DurableTailDriveRole {
+    /// A start, a resume or a cold attach: the caller's runtime owner hosts
+    /// the session next, so the tail is recovered as a restart recovers it,
+    /// and a continuable run resumes.
+    Host,
+    /// A store-only write (a System message appended to a session this
+    /// runtime owner does not host): the caller cannot run the session's
+    /// run, so an open run is committed as interrupted before the write.
+    Writer,
+}
+
+/// [`recover_durable_tail_retaining_committed_whole_blob`] under the
+/// session's hosting claim, which the caller holds for the whole call.
+///
+/// When typed store state proves that the caller holds the session's
+/// exclusive write authority, the persisted lifecycle row of an earlier
+/// incarnation no longer gates the recovery: that incarnation can no longer
+/// commit. The proof is never inferred from timing or from the absence of
+/// activity. It is one of:
+/// - the claim is a cross-process OS lock held by the caller's lineage: the
+///   kernel releases it only when its holder dies, and a live holder never
+///   loses it, so no earlier holder can still write the session;
+/// - the store is a host store realm whose fence this process holds (its
+///   self-fence window is open): the open waited out any superseded holder's
+///   lease before it served anything, and a fenced-out holder commits
+///   nothing.
+///
+/// Without either proof the persisted lifecycle gates exactly as for
+/// [`recover_durable_tail`]. With it, `role` decides what happens to an open
+/// run: a host continues a continuable run, as at a restart; a writer
+/// commits it as interrupted. A persisted current run that names another
+/// run, or a lifecycle row that does not decode, still refuses.
+///
+/// `owner` is the runtime owner the caller drives for, and the proof holds
+/// only for a claim of its own lineage, taken while it does not have the
+/// session registered. The drive is NotProven otherwise:
+/// - `claim` is another runtime owner's: it proves nothing about `owner`;
+/// - `owner` has the session registered: its lineage shares the claim, so
+///   the claim proves nothing against that registration, which may still
+///   write the lifecycle row while its run is live.
+///
+/// The registration check is a point-in-time read; a registration that
+/// lands before the recovery's commit changes the lifecycle row the commit
+/// is fenced on, so the commit fails typed instead of overwriting it.
+///
+/// After a host store takeover, a superseded holder may still be finishing
+/// a tool call it dispatched before its window closed. A writer's
+/// interrupted commit answers every open call as outcome unknown, and a
+/// resumed run follows the documented at-least-once tool contract.
+pub async fn recover_durable_tail_under_hosting_claim(
+    store: &dyn RuntimeStore,
+    session_id: &SessionId,
+    owner: &crate::meerkat_machine::MeerkatMachine,
+    claim: &meerkat_core::session_hosting::HostingClaim,
+    role: DurableTailDriveRole,
+) -> Result<
+    (
+        DurableTailRecoveryOutcome,
+        Option<crate::store::CommittedWholeBlobSnapshot>,
+    ),
+    DurableTailRecoveryError,
+> {
+    if claim.session_id() != session_id {
+        return Err(DurableTailRecoveryError::InvalidEvidence(format!(
+            "durable-tail recovery of session {session_id} was offered the hosting claim of session {}",
+            claim.session_id()
+        )));
+    }
+    let ownership = if claim.owner() != owner.hosting_authority().owner()
+        || owner.contains_session(session_id).await
+    {
+        mm_dsl::DurableRecoveryOwnership::NotProven
+    } else {
+        proven_ownership(store, claim, role)
+    };
+    let mut committed_whole_blob = None;
+    let outcome = recover_durable_tail_capturing(
+        store,
+        session_id,
+        &mut committed_whole_blob,
+        None,
+        DriveMode::Recovery,
+        ownership,
+    )
+    .await?
+    .into_outcome()?;
+    Ok((outcome, committed_whole_blob))
+}
+
+/// The ownership a drive under `claim` proves (see
+/// [`recover_durable_tail_under_hosting_claim`]).
+fn proven_ownership(
+    store: &dyn RuntimeStore,
+    claim: &meerkat_core::session_hosting::HostingClaim,
+    role: DurableTailDriveRole,
+) -> mm_dsl::DurableRecoveryOwnership {
+    let exclusive = claim.is_cross_process()
+        || store
+            .self_fence()
+            .is_some_and(|fence| fence.window().is_open());
+    match (exclusive, role) {
+        (false, _) => mm_dsl::DurableRecoveryOwnership::NotProven,
+        (true, DurableTailDriveRole::Host) => mm_dsl::DurableRecoveryOwnership::ExclusiveHost,
+        (true, DurableTailDriveRole::Writer) => mm_dsl::DurableRecoveryOwnership::ExclusiveWriter,
+    }
 }
 
 /// The recovery drive: ordinary, an archive's, or an operator's. It answers
@@ -2883,6 +3005,7 @@ async fn recover_durable_tail_capturing(
     aligned_committed_whole_blob: &mut Option<crate::store::CommittedWholeBlobSnapshot>,
     expected_run: Option<&RunId>,
     mode: DriveMode,
+    ownership: mm_dsl::DurableRecoveryOwnership,
 ) -> Result<DriveAnswer, DurableTailRecoveryError> {
     let runtime_id = LogicalRuntimeId::for_session(session_id);
     let mut preparation =
@@ -3126,6 +3249,7 @@ async fn recover_durable_tail_capturing(
             last_committed_sequence: prior.last_committed_sequence,
             prior_commit: prior.classification,
             input_evidence,
+            ownership,
         }
     };
     let transition = mm_dsl::MeerkatMachineMutator::apply(&mut authority, authorization)

@@ -22,8 +22,8 @@ use serde_json::value::RawValue;
 
 use crate::long_run::{
     BeforeResume, DurableWorkerHarness, KillPoint, KilledRun, KilledWorker, LongRunHarness,
-    LongRunPlan, RestartReport, RestartedWorker, ResumeGate, ResumePointKind, ResumedRun, RoundSet,
-    call_id, resumes, takes_first_commit,
+    LongRunPlan, OtherWriterOutcome, RestartReport, RestartedWorker, ResumeGate, ResumePointKind,
+    ResumedRun, RoundSet, call_id, resumes, takes_first_commit,
 };
 use crate::{ConformanceFailure, HostStoreFactory, InMemoryHostStore, chapters};
 
@@ -519,8 +519,17 @@ fn fence_timing_bounds() {
 
 /// A Core that resumes exactly as the contract says, or (`recalls_model`)
 /// one that calls the model again for a round whose calls were committed.
+/// Over a store with fence leases (`fence_leases`) or one whose sessions
+/// are hosted under cross-process claims; `race_requeues` plays a
+/// compaction race the way the chapter's first draft expected (the input
+/// runs again as a new run), which no store meets now; `race_abandons`
+/// settles a fence takeover race's run with its input abandoned instead of
+/// consumed.
 struct ScriptedCore {
     recalls_model: bool,
+    fence_leases: bool,
+    race_requeues: bool,
+    race_abandons: bool,
     run_id: Mutex<Option<RunId>>,
 }
 
@@ -528,7 +537,37 @@ impl ScriptedCore {
     fn new(recalls_model: bool) -> Self {
         Self {
             recalls_model,
+            fence_leases: true,
+            race_requeues: false,
+            race_abandons: false,
             run_id: Mutex::new(None),
+        }
+    }
+
+    /// The contract Core over a store whose sessions are hosted under
+    /// cross-process claims.
+    fn over_hosted_sessions() -> Self {
+        Self {
+            fence_leases: false,
+            ..Self::new(false)
+        }
+    }
+
+    /// A Core that requeues a raced run's input.
+    fn requeuing_the_raced_input(fence_leases: bool) -> Self {
+        Self {
+            fence_leases,
+            race_requeues: true,
+            ..Self::new(false)
+        }
+    }
+
+    /// A Core whose fence takeover settles the raced run with its input
+    /// abandoned.
+    fn abandoning_the_raced_input() -> Self {
+        Self {
+            race_abandons: true,
+            ..Self::new(false)
         }
     }
 
@@ -556,7 +595,16 @@ impl ScriptedCore {
     fn kill(&self, plan: &LongRunPlan) -> KilledRun {
         let run_id = RunId::new();
         *self.run_id.lock().unwrap_or_else(PoisonError::into_inner) = Some(run_id.clone());
-        let mut dispatched: Vec<ToolCallDedupeKey> = (0..plan.kill_round)
+        // Over hosted sessions the race's writer is refused and the run
+        // finishes in its first incarnation.
+        let finished_first =
+            plan.kill_point == KillPoint::RebaseRace && !self.fence_leases && !self.race_requeues;
+        let last_round = if finished_first {
+            plan.rounds
+        } else {
+            plan.kill_round
+        };
+        let mut dispatched: Vec<ToolCallDedupeKey> = (0..last_round)
             .flat_map(|round| {
                 Self::calls(plan, round)
                     .into_iter()
@@ -579,10 +627,10 @@ impl ScriptedCore {
         KilledRun { run_id, dispatched }
     }
 
-    fn settled_report() -> RestartReport {
+    fn settled_report(&self) -> RestartReport {
         RestartReport {
             resumed: None,
-            waited_out_lease: true,
+            waited_out_lease: self.fence_leases,
             runs: Vec::new(),
             model_call_rounds: Vec::new(),
             dispatched: Vec::new(),
@@ -591,7 +639,47 @@ impl ScriptedCore {
             transcript_results: Vec::new(),
             receipts: 0,
             other_writer_messages: 0,
+            other_writer: None,
+            interrupted_notices: 0,
+            other_writer_follows_interrupted_notice: false,
             inputs_settled: true,
+            inputs_consumed: true,
+        }
+    }
+
+    /// The restart after a compaction race the contract Core played.
+    fn race_report(&self, plan: &LongRunPlan) -> RestartReport {
+        if self.fence_leases {
+            // The takeover settled the committed rounds as interrupted.
+            let committed: Vec<u64> = (0..plan.kill_round).collect();
+            RestartReport {
+                transcript_results: committed
+                    .iter()
+                    .flat_map(|round| Self::calls(plan, *round))
+                    .collect(),
+                transcript_rounds: committed,
+                receipts: 1,
+                other_writer_messages: 1,
+                other_writer: Some(OtherWriterOutcome::Committed),
+                interrupted_notices: 1,
+                other_writer_follows_interrupted_notice: true,
+                inputs_consumed: !self.race_abandons,
+                ..self.settled_report()
+            }
+        } else {
+            // The refused writer left the run to finish.
+            let first_transcript_round = plan.compactions.last().unwrap_or(0);
+            let rounds: Vec<u64> = (first_transcript_round..plan.rounds).collect();
+            RestartReport {
+                transcript_results: rounds
+                    .iter()
+                    .flat_map(|round| Self::calls(plan, *round))
+                    .collect(),
+                transcript_rounds: rounds,
+                receipts: 1,
+                other_writer: Some(OtherWriterOutcome::ServedElsewhere),
+                ..self.settled_report()
+            }
         }
     }
 
@@ -600,7 +688,11 @@ impl ScriptedCore {
             plan.before_resume,
             BeforeResume::Stop | BeforeResume::Retire
         ) {
-            return Self::settled_report();
+            return self.settled_report();
+        }
+        let race = plan.kill_point == KillPoint::RebaseRace;
+        if race && !self.race_requeues {
+            return self.race_report(plan);
         }
         let killed_run = self
             .run_id
@@ -610,7 +702,6 @@ impl ScriptedCore {
             .unwrap_or_default();
         let kill_round = plan.kill_round;
         let resumed_run = resumes(plan);
-        let race = plan.kill_point == KillPoint::RebaseRace;
         let tools_pending = resumed_run
             && !matches!(
                 plan.kill_point,
@@ -667,7 +758,7 @@ impl ScriptedCore {
         });
         RestartReport {
             resumed,
-            waited_out_lease: true,
+            waited_out_lease: self.fence_leases,
             runs,
             model_call_rounds: (first_model_round..plan.rounds).collect(),
             dispatched,
@@ -676,7 +767,11 @@ impl ScriptedCore {
             transcript_results,
             receipts: 1,
             other_writer_messages: usize::from(race),
+            other_writer: race.then_some(OtherWriterOutcome::Committed),
+            interrupted_notices: 0,
+            other_writer_follows_interrupted_notice: false,
             inputs_settled: true,
+            inputs_consumed: true,
         }
     }
 }
@@ -684,7 +779,7 @@ impl ScriptedCore {
 #[async_trait]
 impl LongRunHarness for ScriptedCore {
     fn fence_leases(&self) -> bool {
-        true
+        self.fence_leases
     }
 
     async fn run_and_kill(&self, plan: &LongRunPlan) -> Result<KilledRun, ConformanceFailure> {
@@ -699,7 +794,7 @@ impl LongRunHarness for ScriptedCore {
 #[async_trait]
 impl DurableWorkerHarness for ScriptedCore {
     fn fence_leases(&self) -> bool {
-        true
+        self.fence_leases
     }
 
     async fn spawn_and_kill(&self, plan: &LongRunPlan) -> Result<KilledWorker, ConformanceFailure> {
@@ -717,7 +812,7 @@ impl DurableWorkerHarness for ScriptedCore {
     ) -> Result<RestartedWorker, ConformanceFailure> {
         let refused = matches!(gate, ResumeGate::Superseded | ResumeGate::Unavailable);
         let report = if refused {
-            Self::settled_report()
+            self.settled_report()
         } else {
             self.restart_report(plan)
         };
@@ -741,6 +836,52 @@ async fn long_run_chapter_accepts_a_core_that_resumes_as_the_contract_says() {
     chapters::durable_worker(&ScriptedCore::new(false))
         .await
         .expect("a contract Core passes the durable worker chapter");
+}
+
+/// The compaction race over a store whose sessions are hosted under
+/// cross-process claims: the writer is refused and the run finishes.
+#[tokio::test]
+async fn compacted_long_run_chapter_accepts_a_core_over_hosted_sessions() {
+    chapters::compacted_long_run(&ScriptedCore::over_hosted_sessions())
+        .await
+        .expect("a contract Core over hosted sessions passes the compacted long run chapter");
+}
+
+/// Requeuing a raced run's input runs its committed rounds' tool calls
+/// again: the race rows of both store kinds refuse it.
+#[tokio::test]
+async fn compacted_long_run_chapter_refuses_a_core_that_requeues_the_raced_input() {
+    for (fence_leases, step) in [
+        (
+            true,
+            "compaction_racing_a_fence_takeover_settles_the_run_as_interrupted",
+        ),
+        (
+            false,
+            "compaction_racing_the_sessions_host_refuses_the_writer",
+        ),
+    ] {
+        let failure =
+            chapters::compacted_long_run(&ScriptedCore::requeuing_the_raced_input(fence_leases))
+                .await
+                .expect_err("requeuing the raced input must fail the race row");
+        assert_eq!(failure.chapter(), "compacted_long_run");
+        assert_eq!(failure.step(), step);
+    }
+}
+
+/// A fence takeover that settles the raced run with its input abandoned
+/// leaves the input settled but not consumed: the fence race row refuses it.
+#[tokio::test]
+async fn compacted_long_run_chapter_refuses_a_core_that_abandons_the_raced_input() {
+    let failure = chapters::compacted_long_run(&ScriptedCore::abandoning_the_raced_input())
+        .await
+        .expect_err("abandoning the raced input must fail the fence race row");
+    assert_eq!(failure.chapter(), "compacted_long_run");
+    assert_eq!(
+        failure.step(),
+        "compaction_racing_a_fence_takeover_settles_the_run_as_interrupted"
+    );
 }
 
 #[tokio::test]

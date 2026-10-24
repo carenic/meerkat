@@ -19,7 +19,10 @@ use super::interrupt_tail_tests::{
     run_a_held_after_a_round_commit,
 };
 use super::*;
-use meerkat_core::service::{DeferredPromptPolicy, InitialTurnPolicy, SessionService};
+use meerkat_core::service::{
+    AppendSystemContextRequest, DeferredPromptPolicy, InitialTurnPolicy, SessionControlError,
+    SessionError, SessionService, SessionServiceControlExt,
+};
 use meerkat_core::{AssistantBlock, Message, RunId, SessionId};
 use meerkat_runtime::completion::CompletionOutcome;
 use meerkat_runtime::identifiers::LogicalRuntimeId;
@@ -64,29 +67,56 @@ impl DiskStores {
         }
     }
 
-    fn runtime_store(&self) -> Arc<dyn RuntimeStore> {
-        match self {
-            Self::HeadCanonical { path } => Arc::new(
+    /// The runtime store, hosting its sessions across processes with
+    /// OS-locked claims at `hosting` when given, as a realm opens it.
+    fn runtime_store(
+        &self,
+        hosting: Option<meerkat_runtime::HostingPaths>,
+    ) -> Arc<dyn RuntimeStore> {
+        let store = match self {
+            Self::HeadCanonical { path } => {
                 meerkat_runtime::store::SqliteRuntimeStore::new_head_canonical(path.clone())
-                    .expect("open the head-canonical runtime store"),
-            ),
+                    .expect("open the head-canonical runtime store")
+            }
             Self::WholeBlob { dir } => {
                 std::fs::create_dir_all(dir).expect("create the realm directory");
-                Arc::new(
-                    meerkat_runtime::store::SqliteRuntimeStore::new_whole_blob(
-                        dir.join("runtime.sqlite3"),
-                    )
-                    .expect("open the whole-blob runtime store"),
+                meerkat_runtime::store::SqliteRuntimeStore::new_whole_blob(
+                    dir.join("runtime.sqlite3"),
                 )
+                .expect("open the whole-blob runtime store")
             }
-        }
+        };
+        let Some(hosting) = hosting else {
+            return Arc::new(store);
+        };
+        let store: Arc<dyn RuntimeStore> = Arc::new(store.with_hosting_paths(hosting));
+        assert!(
+            store.hosting_capability().is_cross_process(),
+            "the store hosts its sessions with OS-locked claims"
+        );
+        store
     }
 
     /// One process start over the stores.
     fn open(&self, root: &TempDir, client: &Arc<ScriptedModel>) -> Start {
+        self.open_with(root, client, None)
+    }
+
+    /// One process start over the stores that hosts their sessions with
+    /// cross-process claims, its own under `root`.
+    fn open_hosted(&self, root: &TempDir, client: &Arc<ScriptedModel>) -> Start {
+        self.open_with(root, client, Some(hosting_paths(root)))
+    }
+
+    fn open_with(
+        &self,
+        root: &TempDir,
+        client: &Arc<ScriptedModel>,
+        hosting: Option<meerkat_runtime::HostingPaths>,
+    ) -> Start {
         let persistence = crate::PersistenceBundle::new(
             self.session_store(),
-            self.runtime_store(),
+            self.runtime_store(hosting),
             Arc::new(MemoryBlobStore::new()),
         )
         .expect("construct runtime authority");
@@ -779,4 +809,387 @@ async fn an_executor_without_an_actor_over_a_round_commit_reports_the_session_un
 async fn an_executor_without_an_actor_over_a_round_commit_reports_the_session_unavailable_whole_blob()
  {
     an_executor_without_an_actor_over_a_round_commit_reports_the_session_unavailable(false).await;
+}
+
+
+// ---------------------------------------------------------------------------
+// An earlier incarnation's open run, met under the session's hosting claim.
+// ---------------------------------------------------------------------------
+
+/// The OS-locked hosting paths of a host whose stores live under `root`, as
+/// a realm's path authority lays them out.
+fn hosting_paths(root: &TempDir) -> meerkat_runtime::HostingPaths {
+    let hosting = root.path().join("hosting");
+    let delivery = root.path().join("delivery");
+    std::fs::create_dir_all(&hosting).expect("create the hosting lock directory");
+    std::fs::create_dir_all(&delivery).expect("create the delivery directory");
+    meerkat_runtime::HostingPaths {
+        hosting_lock_dir: hosting,
+        cold_delivery_lock: delivery.join("cold-delivery.lock"),
+        database: None,
+    }
+}
+
+/// The System message the store-only writer appends.
+const WRITER_CONTEXT: &str = "context from a store-only writer";
+
+/// A session's transcript after the system prompt, one label per row,
+/// appended System messages included.
+fn transcript_rows(session: &meerkat_core::Session) -> Vec<String> {
+    session
+        .messages()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| match message {
+            Message::System(_) if index == 0 => None,
+            Message::System(system) => Some(format!("system {}", system.content)),
+            Message::User(user) => Some(format!("user {}", user.text_content())),
+            Message::BlockAssistant(assistant) => Some(
+                if assistant
+                    .blocks
+                    .iter()
+                    .any(|block| matches!(block, AssistantBlock::ToolUse { .. }))
+                {
+                    "assistant tool use".to_string()
+                } else {
+                    format!("assistant {}", assistant.text_blocks().collect::<String>())
+                },
+            ),
+            Message::ToolResults { .. } => Some("tool results".to_string()),
+            Message::SystemNotice(notice) => Some(format!("notice {:?}", notice.kind)),
+        })
+        .collect()
+}
+
+async fn committed_transcript(start: &Start, id: &SessionId) -> Vec<String> {
+    let session = start
+        .service
+        .load_authoritative_session(id)
+        .await
+        .expect("read the committed session")
+        .expect("the session is committed");
+    transcript_rows(&session)
+}
+
+/// Run A's input rows, each with its phase.
+async fn run_a_inputs(start: &Start, id: &SessionId, run_a: &RunId) -> Vec<InputLifecycleState> {
+    let rows = start
+        .runtime_store
+        .load_input_states(&LogicalRuntimeId::for_session(id))
+        .await
+        .expect("read the input rows");
+    assert!(!rows.is_empty(), "run A's input has a row");
+    rows.iter()
+        .map(|row| {
+            let InputStateRow::Decoded(stored) = row else {
+                panic!("an input row decodes: {row:?}");
+            };
+            assert_eq!(
+                stored.seed.last_run_id.as_ref(),
+                Some(run_a),
+                "the only input is run A's: {:?}",
+                stored.seed
+            );
+            stored.seed.phase
+        })
+        .collect()
+}
+
+/// A store-only write over the run an earlier incarnation left open. The
+/// power goes out while run A waits on the model: its round commit stands as
+/// the provisional tail, a run its next host continues. The next host never
+/// resumes the session; it appends one System message to it.
+///
+/// Without proof that no earlier holder can still write (a host whose store
+/// takes no cross-process claims), the write recovers the tail as a restart
+/// does, which leaves run A to the host that resumes it: the write fails as
+/// held, and settles nothing. A host holding the session's cross-process
+/// hosting claim has that proof, and a store-only write cannot run run A,
+/// so the write first commits run A as interrupted (its round kept, its
+/// input consumed), then lands after it. The model is not asked, nothing of
+/// run A runs again, and the next turn completes over both.
+async fn a_store_only_write_over_an_earlier_incarnations_open_run_commits_it_as_interrupted_first(
+    head_canonical: bool,
+) {
+    let root = TempDir::new().expect("temp");
+    let stores = DiskStores::new(head_canonical, &root);
+    let client = Arc::new(ScriptedModel::new());
+    let first = stores.open(&root, &client);
+    let id = materialize_session(&first, meerkat_core::Session::new()).await;
+    let (_turn_a, run_a) = run_a_held_after_a_round_commit(&first, &client, &id).await;
+    // The power goes out while run A waits on the model; each host below
+    // opens its own copy of what it left.
+    let unproven_root = TempDir::new().expect("temp");
+    let unproven_copy = stores.power_cut_copy(&unproven_root);
+    let after_the_cut = TempDir::new().expect("temp");
+    let restarted = stores.power_cut_copy(&after_the_cut);
+
+    let unproven_client = Arc::new(ScriptedModel::new());
+    let unproven = unproven_copy.open(&unproven_root, &unproven_client);
+    let refused = unproven
+        .service
+        .append_system_context(&id, AppendSystemContextRequest::from_text(WRITER_CONTEXT))
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(SessionControlError::Session(
+                SessionError::DurableTailHeldForRecovery { .. }
+            ))
+        ),
+        "without proof that no earlier holder can still write, run A is left to its next host: {refused:?}"
+    );
+    assert_eq!(
+        tail_run(&unproven, &id).await,
+        Some(run_a.clone()),
+        "the held write settles nothing"
+    );
+
+    let writer_client = Arc::new(ScriptedModel::new());
+    writer_client.push(Step::Text("after the write"));
+    let writer = restarted.open_hosted(&after_the_cut, &writer_client);
+    writer
+        .service
+        .append_system_context(&id, AppendSystemContextRequest::from_text(WRITER_CONTEXT))
+        .await
+        .expect("the write commits run A as interrupted, then lands");
+    assert_eq!(
+        tail_run(&writer, &id).await,
+        None,
+        "run A's tail is settled"
+    );
+    assert_eq!(
+        committed_transcript(&writer, &id).await,
+        vec![
+            "user first".to_string(),
+            "assistant tool use".to_string(),
+            "tool results".to_string(),
+            "notice Generic".to_string(),
+            format!("system {WRITER_CONTEXT}"),
+        ],
+        "run A is committed once as interrupted, and the write lands after it"
+    );
+    assert_eq!(
+        run_a_inputs(&writer, &id, &run_a).await,
+        vec![InputLifecycleState::Consumed],
+        "run A's input is consumed with its interrupted run, never requeued"
+    );
+    assert_eq!(
+        writer_client.requests.load(Ordering::SeqCst),
+        0,
+        "the write runs nothing of run A: the model is not asked"
+    );
+
+    materialize_session(&writer, restarted.stored_session(&writer, &id).await).await;
+    let outcome = turn(&writer, &id, "again").await;
+    assert!(
+        matches!(outcome, Some(CompletionOutcome::Completed(ref run)) if run.text == "after the write"),
+        "the next turn completes: {outcome:?}"
+    );
+    assert_eq!(
+        writer_client.requests.load(Ordering::SeqCst),
+        1,
+        "only the new turn calls the model"
+    );
+    assert_eq!(
+        committed_transcript(&writer, &id).await[4..],
+        [
+            format!("system {WRITER_CONTEXT}"),
+            "user again".to_string(),
+            "assistant after the write".to_string(),
+        ],
+        "the next turn follows the write"
+    );
+}
+
+#[tokio::test]
+async fn a_store_only_write_over_an_earlier_incarnations_open_run_commits_it_as_interrupted_first_head_canonical()
+ {
+    a_store_only_write_over_an_earlier_incarnations_open_run_commits_it_as_interrupted_first(true)
+        .await;
+}
+
+#[tokio::test]
+async fn a_store_only_write_over_an_earlier_incarnations_open_run_commits_it_as_interrupted_first_whole_blob()
+ {
+    a_store_only_write_over_an_earlier_incarnations_open_run_commits_it_as_interrupted_first(false)
+        .await;
+}
+
+/// A store-only write to a session a live host serves. Run A waits on the
+/// model in the first host, which holds the session's cross-process hosting
+/// claim. A second runtime owner over the same stores asks to append a
+/// System message: it takes the claim before it reads anything, and is
+/// refused at once, typed. Run A's tail stands, and run A then completes
+/// once, with no foreign message in its transcript.
+async fn a_store_only_write_to_a_session_a_live_host_serves_is_refused_and_settles_nothing(
+    head_canonical: bool,
+) {
+    let root = TempDir::new().expect("temp");
+    let stores = DiskStores::new(head_canonical, &root);
+    let client = Arc::new(ScriptedModel::new());
+    let host = stores.open_hosted(&root, &client);
+    let id = materialize_session(&host, meerkat_core::Session::new()).await;
+    let (turn_a, run_a) = run_a_held_after_a_round_commit(&host, &client, &id).await;
+
+    let other_client = Arc::new(ScriptedModel::new());
+    let other = stores.open_hosted(&root, &other_client);
+    let refused = other
+        .service
+        .append_system_context(&id, AppendSystemContextRequest::from_text(WRITER_CONTEXT))
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(SessionControlError::Session(
+                SessionError::ServedElsewhere { .. }
+            ))
+        ),
+        "the live host keeps the session: {refused:?}"
+    );
+    assert_eq!(
+        tail_run(&host, &id).await,
+        Some(run_a),
+        "the refused write settles nothing"
+    );
+
+    client.release.add_permits(1);
+    let outcome_a = tokio::time::timeout(DEADLINE, turn_a)
+        .await
+        .expect("run A ends")
+        .expect("turn A task");
+    assert!(
+        matches!(outcome_a, Some(CompletionOutcome::Completed(ref run)) if run.text == "held answer"),
+        "run A completes: {outcome_a:?}"
+    );
+    assert_eq!(
+        committed_transcript(&host, &id).await,
+        vec![
+            "user first".to_string(),
+            "assistant tool use".to_string(),
+            "tool results".to_string(),
+            "assistant held answer".to_string(),
+        ],
+        "run A committed once, with no foreign message"
+    );
+    assert_eq!(
+        other_client.requests.load(Ordering::SeqCst),
+        0,
+        "the refused owner asked no model"
+    );
+}
+
+#[tokio::test]
+async fn a_store_only_write_to_a_session_a_live_host_serves_is_refused_and_settles_nothing_head_canonical()
+ {
+    a_store_only_write_to_a_session_a_live_host_serves_is_refused_and_settles_nothing(true).await;
+}
+
+#[tokio::test]
+async fn a_store_only_write_to_a_session_a_live_host_serves_is_refused_and_settles_nothing_whole_blob()
+ {
+    a_store_only_write_to_a_session_a_live_host_serves_is_refused_and_settles_nothing(false).await;
+}
+
+/// The claim drive proves nothing for a runtime owner the claim does not
+/// cover. Run A waits on the model in a host whose own runtime registers the
+/// session and holds its cross-process hosting claim. An embedder runs a
+/// writer's claim drive over the session, which would commit run A as
+/// interrupted if the claim proved exclusive write authority:
+/// - for a second runtime owner over the same stores, which registers
+///   nothing, offered the host's claim;
+/// - for the host's own runtime owner, which registers the session, with
+///   its own claim.
+///
+/// Each drive decides as without the proof, as a restart would: run A is a
+/// run its host continues, so the drive answers Continue and writes
+/// nothing. Run A's tail stands, and run A then completes once, with no
+/// interrupted-run notice.
+async fn a_claim_drive_proves_nothing_against_its_own_runtimes_registration(head_canonical: bool) {
+    use meerkat_runtime::recovery::{
+        DurableTailDriveRole, DurableTailRecoveryOutcome, recover_durable_tail_under_hosting_claim,
+    };
+    let root = TempDir::new().expect("temp");
+    let stores = DiskStores::new(head_canonical, &root);
+    let client = Arc::new(ScriptedModel::new());
+    let host = stores.open_hosted(&root, &client);
+    let id = materialize_session(&host, meerkat_core::Session::new()).await;
+    let (turn_a, run_a) = run_a_held_after_a_round_commit(&host, &client, &id).await;
+
+    let claim = host
+        .service
+        .grant_session_hosting(&id)
+        .expect("the host's own hosting claim");
+    assert!(claim.is_cross_process(), "the claim is an OS lock");
+
+    let other_client = Arc::new(ScriptedModel::new());
+    let other = stores.open_hosted(&root, &other_client);
+    let (outcome, _) = recover_durable_tail_under_hosting_claim(
+        other.runtime_store.as_ref(),
+        &id,
+        &other.machine,
+        &claim,
+        DurableTailDriveRole::Writer,
+    )
+    .await
+    .expect("the drive answers");
+    assert!(
+        matches!(outcome, DurableTailRecoveryOutcome::Continue { ref run_id, .. } if *run_id == run_a),
+        "another runtime owner's claim proves nothing for this one: {outcome:?}"
+    );
+
+    let (outcome, _) = recover_durable_tail_under_hosting_claim(
+        host.runtime_store.as_ref(),
+        &id,
+        &host.machine,
+        &claim,
+        DurableTailDriveRole::Writer,
+    )
+    .await
+    .expect("the drive answers");
+    drop(claim);
+    assert!(
+        matches!(outcome, DurableTailRecoveryOutcome::Continue { ref run_id, .. } if *run_id == run_a),
+        "the claim proves nothing against its own runtime's registration: {outcome:?}"
+    );
+    assert_eq!(
+        tail_run(&host, &id).await,
+        Some(run_a),
+        "run A's tail stands"
+    );
+
+    client.release.add_permits(1);
+    let outcome_a = tokio::time::timeout(DEADLINE, turn_a)
+        .await
+        .expect("run A ends")
+        .expect("turn A task");
+    assert!(
+        matches!(outcome_a, Some(CompletionOutcome::Completed(ref run)) if run.text == "held answer"),
+        "run A completes: {outcome_a:?}"
+    );
+    assert_eq!(
+        committed_transcript(&host, &id).await,
+        vec![
+            "user first".to_string(),
+            "assistant tool use".to_string(),
+            "tool results".to_string(),
+            "assistant held answer".to_string(),
+        ],
+        "run A committed once, with no interrupted-run notice"
+    );
+    assert_eq!(
+        other_client.requests.load(Ordering::SeqCst),
+        0,
+        "the second runtime owner asked no model"
+    );
+}
+
+#[tokio::test]
+async fn a_claim_drive_proves_nothing_against_its_own_runtimes_registration_head_canonical() {
+    a_claim_drive_proves_nothing_against_its_own_runtimes_registration(true).await;
+}
+
+#[tokio::test]
+async fn a_claim_drive_proves_nothing_against_its_own_runtimes_registration_whole_blob() {
+    a_claim_drive_proves_nothing_against_its_own_runtimes_registration(false).await;
 }

@@ -67,10 +67,26 @@ pub enum KillPoint {
     /// While the round's calls, all external callback tools, run.
     DuringCallbackTools,
     /// Not a kill: before the round's compaction commits, a second Core over
-    /// the same store takes the fence over and commits the session with one
-    /// message of its own. The run's compaction commit is refused (stale or
-    /// fenced out), and the run dispatches nothing more. The restart runs
-    /// over the same store after that.
+    /// the same store writes one System message of its own to the session,
+    /// without hosting it. What it gets depends on how the store excludes
+    /// writers ([`LongRunHarness::fence_leases`]):
+    /// - a store with fence leases: the second Core takes the fence over and
+    ///   waits out the superseded lease, so it holds the session's exclusive
+    ///   write authority. Its write cannot run the session's run: it commits
+    ///   the run's committed rounds as an interrupted run (open calls
+    ///   answered as outcome unknown, the run's inputs settled by its run
+    ///   cursor), then its message. The run's compaction commit is refused
+    ///   (fenced out), and the run dispatches nothing more. A superseded
+    ///   holder may still be finishing a tool call it dispatched before its
+    ///   fence window closed.
+    /// - a store whose sessions are hosted under cross-process claims (the
+    ///   built-in store): the first Core still hosts the session, so the
+    ///   second Core's write is refused (served elsewhere) and settles
+    ///   nothing. The run commits its compaction and finishes in its first
+    ///   incarnation.
+    ///
+    /// The restart runs over the same store after that, and nothing of the
+    /// run resumes or runs again.
     RebaseRace,
 }
 
@@ -168,11 +184,13 @@ pub fn takes_first_commit(plan: &LongRunPlan, round: u64) -> bool {
 /// Whether the killed run resumes: some commit of it is durable. A kill in
 /// round 0 resumes only after that round's first commit; otherwise the
 /// input is requeued, exactly as when no round was committed. After a
-/// compaction race the input is requeued too.
+/// compaction race nothing resumes and nothing is requeued (see
+/// [`KillPoint::RebaseRace`]).
 #[must_use]
 pub fn resumes(plan: &LongRunPlan) -> bool {
-    // Every commit of the other writer drops the run's provisional rounds,
-    // so after a compaction race nothing of the run is continuable.
+    // A fence takeover settles the raced run as interrupted, and a refused
+    // writer leaves it to finish in its first incarnation: either way no
+    // restart continues it.
     if plan.kill_point == KillPoint::RebaseRace {
         return false;
     }
@@ -247,8 +265,32 @@ pub struct RestartReport {
     /// How many messages of the other writer of a compaction race the
     /// session's final transcript holds; zero in every other row.
     pub other_writer_messages: usize,
+    /// What the other writer of a compaction race got for its write; `None`
+    /// in every other row.
+    pub other_writer: Option<OtherWriterOutcome>,
+    /// How many interrupted-run notices the session's final transcript
+    /// holds.
+    pub interrupted_notices: usize,
+    /// Whether the other writer's message directly follows an
+    /// interrupted-run notice in the session's final transcript.
+    pub other_writer_follows_interrupted_notice: bool,
     /// Whether every input bound to the killed run is terminal in the store.
     pub inputs_settled: bool,
+    /// Whether every input bound to the killed run ended consumed in the
+    /// store: its run finished, or was committed as interrupted with it. An
+    /// abandoned, superseded or coalesced input is settled, not consumed.
+    pub inputs_consumed: bool,
+}
+
+/// What the other writer of a compaction race got for its write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OtherWriterOutcome {
+    /// The write committed.
+    Committed,
+    /// The store refused it: another runtime hosts the session.
+    ServedElsewhere,
+    /// Any other refusal, as its error renders.
+    Refused(String),
 }
 
 /// A Core build over one store, for the long run chapter.

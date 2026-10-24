@@ -797,6 +797,30 @@ where
     })
 }
 
+/// The hosting claim of `session_id` that the store-only write running on
+/// this task holds (see [`with_write_hosting`]), as a clone of the same
+/// lineage, or `None` outside such a write. A durable-tail recovery reads it
+/// to learn whether the write holds the session's exclusive hosting.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn write_hosting_claim(session_id: &SessionId) -> Option<HostingClaim> {
+    WRITE_HOSTING
+        .try_with(|claims| {
+            claims
+                .iter()
+                .rev()
+                .find(|claim| claim.session_id() == session_id)
+                .cloned()
+        })
+        .ok()
+        .flatten()
+}
+
+/// A browser build holds no write-hosting scope.
+#[cfg(target_arch = "wasm32")]
+pub fn write_hosting_claim(_session_id: &SessionId) -> Option<HostingClaim> {
+    None
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::{ExclusiveProcessLock, session_hosting_lock_path};
 

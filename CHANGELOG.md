@@ -914,6 +914,17 @@ them.
   takes a tenth parameter, `session_events: bool`, the request's opt-out of its
   turn's `session/event` copies (`true` keeps the earlier behaviour).
 
+- `meerkat-runtime`, `meerkat-machine-schema`, `meerkat-machine-kernels`:
+  `MeerkatMachineInput::AuthorizeDurableTailRecovery` gains `ownership`, of
+  the new enum `DurableRecoveryOwnership` (`NotProven`, `ExclusiveHost`,
+  `ExclusiveWriter`), in the `meerkat_machine::dsl` bridge copies and the
+  catalog types; the kernel's `generated::meerkat::inputs::AuthorizeDurableTailRecovery`
+  gains the field `ownership` and `generated::meerkat` the enum
+  `DurableRecoveryOwnership`. Code that builds the input sets it; `NotProven`
+  keeps the earlier verdicts (see Added, durable-tail recovery under the
+  session's hosting claim). The transitions keep their names and their
+  `TransitionId` positions.
+
 ### Added
 
 - `meerkat-runtime`: a durable session whose process stopped inside a run
@@ -960,6 +971,61 @@ them.
   run. `recovery::recover_durable_tail_for_run` runs the same recovery for
   one run's tail and leaves another run's tail untouched; the runtime uses
   it to commit as interrupted the tail of a run that ends without resuming.
+
+- `meerkat-runtime`, `meerkat-session`: durable-tail recovery under the
+  session's hosting claim
+  (`recovery::recover_durable_tail_under_hosting_claim`, with the drive's
+  `recovery::DurableTailDriveRole`). An earlier incarnation's persisted
+  lifecycle row (a non-quiescent row, or one that names the candidate's run
+  as current) no longer gates the recovery once typed store facts prove
+  that the caller holds the session's exclusive write authority, so that
+  incarnation can no longer commit. Takeover, by store type:
+  - the built-in SQLite realm (sessions hosted under cross-process claims):
+    the session's hosting claim is held. It is an OS lock the kernel
+    releases only when its holder dies, and a live host keeps it, so a new
+    owner gets the claim only once the earlier holder is gone or has
+    released it; a write to a session another runtime owner hosts is
+    refused at once with `SessionError::ServedElsewhere`;
+  - a host store (realm fence leases): this process holds the realm's
+    fence, and its open waited out any superseded holder's lease before it
+    served anything, so a fenced-out holder commits nothing more.
+  The proof is never inferred from timing or from the absence of activity,
+  and it covers earlier holders only: the drive takes the runtime owner it
+  drives for, and with another owner's claim, or while that owner has the
+  session registered (its own registration may still write the row), it
+  decides without the proof. Without it the earlier rules hold unchanged.
+  It reaches the machine as
+  `DurableRecoveryOwnership` on `AuthorizeDurableTailRecovery` (see
+  Breaking), with the drive's role:
+  - a host (a resume preparation, an actor's materialization, a cold attach
+    or `PersistentSessionService::recover_committed_boundary`, each under the
+    session's hosting claim) recovers the tail as a restart does: a
+    continuable run resumes. A host deploy killed in the middle of its
+    suspend therefore still resumes every run;
+  - a store-only write (`append_system_context` on a session this runtime
+    owner does not host) cannot run the run, so it treats the earlier
+    runtime as retired: an open run is committed as interrupted (its
+    committed rounds kept, its open calls answered as outcome unknown, its
+    inputs settled by its run cursor) and the write lands after it, a
+    completed run commits, and an ambiguous tail holds and fails the write
+    with `SessionError::DurableTailHeldForRecovery`. Without the proof the
+    write recovers the tail as a restart would: an earlier incarnation's
+    row still refuses (`SessionError::DurableTailRecoveryRefused`), and a
+    run the restart would continue is left to its next host
+    (`SessionError::DurableTailHeldForRecovery`); neither settles anything.
+    The write takes the session's hosting claim before any read.
+  In either role a row whose current run is another run, or a lifecycle row
+  that does not decode, still refuses. Caveat for host stores: the store
+  cannot tell a dead holder from a live one it fenced out, so after a
+  takeover a superseded holder may still be finishing a tool call it
+  dispatched before its fence window closed. A writer's interrupted commit
+  answers that call as outcome unknown, and a resumed run follows the
+  at-least-once tool contract (dedupe keys). The bounded TLC audit
+  `specs/machines/meerkat_machine/durable_tail_recovery_ownership_audit.sh`
+  checks, over the whole observation product, that the authorization arms
+  partition the observations in the Idle and Retired phases and that
+  ownership changes only what these rules say; it runs in the canonical TLC
+  lane with eleven seeded defects.
 
 - Resumed runs, runtime and session plumbing. A durable session that stops
   inside a run continues that run on its next open, under the run's original
@@ -1411,9 +1477,30 @@ them.
   every restart waits out the killed process's lease.
   `chapters::compacted_long_run` kills runs after one to five compactions:
   each resumes at its last committed round, never at a round before a
-  compaction, and a run whose compaction races another writer stops
-  dispatching and its input runs again as a new run, with nothing lost or
-  duplicated.
+  compaction. It ends with a compaction race: right before a compaction's
+  commit, a second Core writes one System message to the session it does
+  not host. The row branches on how the store excludes writers
+  (`LongRunHarness::fence_leases`), and nothing of the raced run resumes or
+  runs again either way:
+  - over a store with fence leases
+    (`compaction_racing_a_fence_takeover_settles_the_run_as_interrupted`),
+    the second Core takes the fence over and holds the session's exclusive
+    write authority, so its write commits the run as interrupted (the run's
+    committed rounds once, one interrupted-run notice, its input consumed
+    with it) and its message right after the notice, and the run's own
+    compaction commit is refused. A superseded holder may still be
+    finishing a tool call it dispatched before its fence window closed: the
+    interrupted commit answers it as outcome unknown;
+  - over a store whose sessions are hosted under cross-process claims
+    (`compaction_racing_the_sessions_host_refuses_the_writer`, the built-in
+    SQLite realm), the first Core still hosts the session, so the second
+    Core's write is refused as served elsewhere and settles nothing; the
+    run commits its compaction and finishes every round once in its first
+    incarnation.
+  `RestartReport` reports what the other writer got (`OtherWriterOutcome`),
+  the transcript's interrupted-run notices, whether the writer's message
+  follows one, and whether the raced run's input ended consumed
+  (`inputs_consumed`), which the fence takeover row requires.
 - `MemberBinding::labels()`: the application labels the incarnation was
   spawned with, as its spawn recorded them (a member reset keeps them). Every
   read of the member binding history carries them, the store-level

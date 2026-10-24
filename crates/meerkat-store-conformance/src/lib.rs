@@ -98,8 +98,8 @@ pub use failure::ConformanceFailure;
 pub use host_store_memory::InMemoryHostStore;
 pub use long_run::{
     BeforeResume, DurableWorkerHarness, KillPoint, KilledRun, KilledWorker, LongRunHarness,
-    LongRunPlan, RestartReport, RestartedWorker, ResumeGate, ResumePointKind, ResumedRun, RoundSet,
-    UnrepeatableTool, call_id, resumes, takes_first_commit,
+    LongRunPlan, OtherWriterOutcome, RestartReport, RestartedWorker, ResumeGate, ResumePointKind,
+    ResumedRun, RoundSet, UnrepeatableTool, call_id, resumes, takes_first_commit,
 };
 pub use wrappers::{
     DefaultRangeVerbIncrementalStore, ForwardingSessionStore, SwallowingSessionStore,

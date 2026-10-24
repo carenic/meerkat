@@ -481,6 +481,31 @@ if run_part audits-b; then
   TLC_WORKERS="${tlc_workers}" "${durable_tail_classification_audit}" --mutants
 fi
 
+# The MeerkatMachine durable-tail recovery authorization
+# (AuthorizeDurableTailRecovery*, Idle and Retired) over the drive's
+# store-proven ownership (NotProven, ExclusiveHost, ExclusiveWriter): a
+# hand-written audit over the same generated model checks, with ENABLED in
+# each state of a short walk (Idle and Retired, with no terminal run, the
+# candidate's run terminal, or another run terminal) over all 2160
+# observation tuples, that exactly one arm answers each tuple, that an
+# unproven drive gates on the persisted facts as before, that ownership never
+# admits another run or an undecodable row, that a host decides as a restart
+# does over the row read as quiescent, and that a writer decides as for a
+# retired runtime and never continues a run. It first checks on the
+# generated model that the arms read no state but phase, the current run and
+# the terminal run, so the walk stands for every state without a current
+# run, and requires its four witnesses reached. --mutants refuses eleven
+# seeded defects, each by the invariant it targets.
+durable_tail_recovery_ownership_audit="${workspace_root}/specs/machines/meerkat_machine/durable_tail_recovery_ownership_audit.sh"
+if [[ ! -x "${durable_tail_recovery_ownership_audit}" ]]; then
+  echo "error: durable-tail recovery ownership audit runner is missing from workspace runfiles: ${durable_tail_recovery_ownership_audit}" >&2
+  exit 1
+fi
+if run_part audits-b; then
+  echo "running bounded durable-tail recovery ownership TLC audit"
+  TLC_WORKERS="${tlc_workers}" "${durable_tail_recovery_ownership_audit}" --mutants
+fi
+
 # Broad composition full-TLC skips are CI-time/memory-budget exceptions, NOT
 # codegen defects. `machine-verify` still validates drift and the generated
 # ci.cfg structural-invariant contract before honoring these skips. The earlier
@@ -543,7 +568,10 @@ run_machine_verify() {
 # hosted, expect 90-180 s), plus the durable-tail classification audit
 # with --mutants (20 s on a local 4-worker run, sixteen runs of one state;
 # not yet hosted, expect 30-60 s; the lightest shard by a local run of all
-# three on 10-22: a 394 s, b 314 s, c 352 s);
+# three on 10-22: a 394 s, b 314 s, c 352 s), plus the durable-tail
+# recovery ownership audit with --mutants (127 s on a local 4-worker run,
+# thirteen runs of nine states over the whole MeerkatMachine model, whose
+# parse is most of each run; not yet hosted, expect 190-380 s);
 # audits-c = run-start hold (239 s), live media health (155 s),
 # live-context causal-tail batch with --mutants (112 s): 506 s; plus the
 # generation high-water audit with --mutants (30 s on a local 4-worker run,

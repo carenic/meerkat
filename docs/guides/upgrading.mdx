@@ -262,6 +262,10 @@ a crash (see [Durable Runs](/guides/durable-runs)). Integrations see:
     `MeerkatMachineEffect` gains `ResumableRunMarked`,
     `ResumedRunAuthorized`, `ResumableRunReleased`, `ResumableRunSettled`
     and `RunSuspendedForStop`;
+  - `MeerkatMachineInput::AuthorizeDurableTailRecovery` gains `ownership`,
+    of the new enum `DurableRecoveryOwnership` (`NotProven`,
+    `ExclusiveHost`, `ExclusiveWriter`), with the bridge copies and the
+    catalog and kernel types;
   - `meerkat-runtime`'s `MeerkatMachineRuntimeInternalInput` gains
     `MarkRunResumable`, `ResumeRun`, `ReleaseResumableRun`,
     `SettleResumableRun`, `SuspendRunForStop`,
@@ -284,8 +288,9 @@ and a `RuntimeStore` decorator forwards
 `supports_whole_blob_run_rebase`. Handle `run_resumed` where you consume
 events. Where you build these machine inputs or state literals, pass
 `DurableTailRunCursor::Absent` and `false` to
-`ClassifyDurableTail`, `None` for `resumable_run_id` and `false` for
-`bound_run_resumable` (a tail without a run cursor, the 0.9.4 behaviour),
+`ClassifyDurableTail`, `None` for `resumable_run_id`, `false` for
+`bound_run_resumable` (a tail without a run cursor, the 0.9.4 behaviour) and
+`DurableRecoveryOwnership::NotProven` for `ownership` (the 0.9.4 verdicts),
 and add the arms (or a wildcard) where you match the enums exhaustively.
 
 #### Durable workers
@@ -398,6 +403,28 @@ struct literal, and treat an advisory you do not know as informational.
 
 ### Other behaviour changes
 
+- **An earlier incarnation's open run no longer blocks its session's next
+  owner:** when the session's exclusive write authority is proven by the
+  store (the session's cross-process hosting claim on the built-in SQLite
+  realm, or the realm fence a host store's open took after waiting out the
+  superseded lease), the run a dead or fenced-out incarnation left open no
+  longer refuses the recovery. A resume, an actor's materialization or a
+  cold attach continues the run as a restart does, so a host deploy killed
+  in the middle of its suspend resumes every run. A store-only
+  `append_system_context` on a session no runtime of yours hosts first
+  commits that run as interrupted (an ambiguous tail fails the write with
+  `SessionError::DurableTailHeldForRecovery`), then lands; it takes the session's
+  hosting claim before it reads anything, so a session another runtime
+  owner hosts refuses it at once with `ServedElsewhere` and keeps its run.
+  Without that proof (or while your own runtime has the session
+  registered) the earlier rules hold: an earlier incarnation's row still
+  refuses the recovery, and the write fails with
+  `SessionError::DurableTailRecoveryRefused`, or with
+  `SessionError::DurableTailHeldForRecovery` when the run is one its next
+  host resumes. A host store cannot tell a dead holder from a live one it fenced
+  out: a superseded holder may still be finishing a tool call it dispatched
+  before its fence window closed, which the interrupted commit answers as
+  outcome unknown.
 - **A Broken member no longer stops a mob start:** when a member whose
   restore already failed at a start cannot have its custody restored because
   another runtime owner hosts its session, its hosting claim cannot be taken,
