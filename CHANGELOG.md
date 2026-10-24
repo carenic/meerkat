@@ -1745,6 +1745,42 @@ them.
   reserved namespace (`HostJobSourceError::ReservedNamespace`, see
   Breaking).
 
+- `meerkat-runtime`: governed admission of peer deliveries. On a runtime
+  with a native work authorization host every peer message, request,
+  response and supervisor-bridge member delivery was refused. A trusted host
+  composition can now install a `PeerIngressBinder` (`input_authority`) on
+  the machine with `MeerkatMachine::install_peer_ingress_binder`: once,
+  after the native host and before any session registers, refused typed
+  otherwise (`PeerIngressBinderInstallRefused`: `Ungoverned`,
+  `SessionsRegistered`, `AlreadyInstalled`). Core offers it each delivery
+  whose sender the transport established (a signature a listener verified,
+  or an in-process sender: `PeerIngressSenderAuthentication` in
+  `meerkat-core`, which the comms queue records on each claim) as a
+  facts-only `PeerIngressBindRequest`: the receiving session, the origin
+  (`PeerIngressOrigin::Comms` or `SupervisorDelivery`), Core's admission key,
+  Core's exact input and Core's work id for the delivery. Core admits a
+  delivery only as the binder binds it, after the bound-original check that
+  host continuations already pass (now `input_authority::check_bound_original`):
+  Core's exact input with only the association and the trusted ingress
+  observation added, this runtime as the target, a controller lineage and
+  model, and an original whose work is Core's work id for this delivery. A
+  comms delivery takes one derived input id per delivery; a supervisor
+  delivery keeps its payload input id. A denied or malformed binding ends
+  the delivery rejected. A binder that is not ready keeps a comms delivery
+  queued, and rejects a supervisor delivery with cause `NotReady`, which the
+  mob layer or the sender can retry with the same input id (Core adds no
+  retry). A plain event, an open-auth listener's claimed sender and an
+  exempt route are never offered and keep today's refusal, as does a runtime
+  without a binder; an ungoverned runtime is unchanged. A governed input
+  whose id names a stored row admitted under another association is refused
+  as a replay conflict. The by-key input reads (`input_state_by_idempotency_key`,
+  the durable-only read, and interaction terminal status and receipts by
+  key) also find a governed row named by its own input id, when the row's
+  own retained association qualifies the key to its admission key, so a
+  member host's tracked deliveries, completions and cancels reach governed
+  rows. New `StoredInputState::admitted_under_idempotency_key` says whether a
+  row was admitted under a key, a governed row's qualification included.
+
 - `meerkat-mob`: a controlling host can narrow the operator authority it
   records for a placed member. `SpawnMemberSpec::with_operator_authority_ceiling`
   (and `set_operator_authority_ceiling`, for a `SpawnMemberCustomizer`) sets a
