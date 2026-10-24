@@ -3012,7 +3012,10 @@ async fn request_only_steer_lands_beside_the_runs_whole_blob_provisional_tail() 
 /// A run that fails after its round commits leaves its WholeBlob provisional
 /// tail standing, and the durable join its kept image holds is consumed with
 /// a checkpoint receipt beside that tail instead of failing the runtime
-/// closed; it is never delivered again.
+/// closed; it is never delivered again. The row pins the driver and store
+/// mechanics for an executor that keeps its failed run's image, as the
+/// scripted runner does: the in-tree persistent service reports a failed
+/// run's image as uncommitted, so there the join is requeued, not retained.
 #[tokio::test]
 async fn retained_join_of_a_failed_run_is_consumed_beside_its_whole_blob_provisional_tail() {
     let store: Arc<dyn crate::store::RuntimeStore> =

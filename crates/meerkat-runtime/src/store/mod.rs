@@ -4989,7 +4989,12 @@ impl PreparedRuntimeSessionCommit {
     /// the candidate. The receipt must have the machine's checkpoint shape
     /// (`RunApplyBoundary::RunCheckpoint`, no transcript count, no digest), so
     /// it claims nothing of the session the tail holds.
-    pub fn run_checkpoint(
+    ///
+    /// Crate-private: only the runtime driver, which commits the receipts the
+    /// generated machine mints for the running run, states that a receipt is
+    /// a mid-run checkpoint. A store holder outside the crate cannot mint one
+    /// for a run and commit it beside that run's tail.
+    pub(crate) fn run_checkpoint(
         receipt: RunBoundaryReceipt,
         input_updates: Vec<InputStatePersistenceRecord>,
         session_store_key: meerkat_core::types::SessionId,
