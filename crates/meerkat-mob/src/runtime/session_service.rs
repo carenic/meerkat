@@ -3728,7 +3728,9 @@ where
     /// the session task (which serves no command while a turn runs); other
     /// members answer from the committed durable head through the read-only
     /// body observation, which never writes and never replays the rewrite
-    /// audit. An archived session has no readable view.
+    /// audit, and which serves the committed snapshot while a run's
+    /// provisional tail stands ahead of it. An archived session has no
+    /// readable view.
     async fn observe_member_status_view(
         &self,
         session_id: &SessionId,
@@ -3744,7 +3746,10 @@ where
                 view.billing.total_tokens,
             ));
         }
-        let Some(session) = self.observe_authoritative_session_body(session_id).await? else {
+        let Some(session) = self
+            .observe_authoritative_session_body_tolerating_tail(session_id)
+            .await?
+        else {
             return Ok(MemberStatusSessionView::absent());
         };
         if self
