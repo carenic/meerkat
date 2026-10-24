@@ -34585,6 +34585,337 @@ mod tests {
             .expect("the restarted runtime shuts down");
     }
 
+    /// rkat-rpc's graceful shutdown and a start again in the same process,
+    /// while a round's shell call runs under the realm's tool-process
+    /// custody (Linux and macOS, where custody runs).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    mod same_process_shell_custody {
+        use super::*;
+
+        /// The model of the same-process restart rows: a request without tool
+        /// results calls the shell tool with the row's command, and any other
+        /// request is answered.
+        struct ShellCallingLlmClient {
+            command: String,
+            tool_calls: AtomicUsize,
+            requests: AtomicUsize,
+        }
+
+        /// The call id of the same-process restart rows' shell call.
+        const SAME_PROCESS_SHELL_CALL: &str = "call-same-process";
+
+        #[async_trait]
+        impl LlmClient for ShellCallingLlmClient {
+            fn project_replay_messages(
+                &self,
+                messages: &[meerkat_core::Message],
+            ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+                Ok(messages.to_vec())
+            }
+
+            fn stream<'a>(
+                &'a self,
+                request: &'a meerkat_client::LlmRequest,
+            ) -> Pin<
+                Box<
+                    dyn futures::Stream<Item = Result<meerkat_client::LlmEvent, LlmError>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                self.requests.fetch_add(1, AtomicOrdering::SeqCst);
+                let answered = request
+                    .messages
+                    .iter()
+                    .any(|message| matches!(message, Message::ToolResults { .. }));
+                let mut events = Vec::new();
+                let stop_reason = if answered {
+                    events.push(Ok(meerkat_client::LlmEvent::TextDelta {
+                        delta: "noted".to_string(),
+                        meta: None,
+                    }));
+                    StopReason::EndTurn
+                } else {
+                    self.tool_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                    events.push(Ok(meerkat_client::LlmEvent::ToolCallComplete {
+                        id: SAME_PROCESS_SHELL_CALL.to_string(),
+                        name: "shell".to_string(),
+                        args: serde_json::json!({
+                            "command": self.command,
+                            "timeout_secs": 600,
+                        }),
+                        meta: None,
+                    }));
+                    StopReason::ToolUse
+                };
+                events.push(Ok(meerkat_client::LlmEvent::UsageUpdate {
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        provider_for_successful_rpc_test_model(&request.model),
+                        &request.model,
+                        meerkat_core::Usage::default(),
+                    ),
+                }));
+                events.push(Ok(meerkat_client::LlmEvent::Done {
+                    outcome: meerkat_client::LlmDoneOutcome::success(stop_reason),
+                }));
+                Box::pin(stream::iter(events))
+            }
+
+            fn provider(&self) -> meerkat_core::Provider {
+                meerkat_core::Provider::Other
+            }
+
+            async fn health_check(&self) -> Result<(), LlmError> {
+                Ok(())
+            }
+        }
+
+        /// The pids of the same-process rows' shell command starts, one per
+        /// start.
+        fn same_process_shell_starts(root: &std::path::Path) -> Vec<i32> {
+            std::fs::read_to_string(root.join("starts"))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| line.trim().parse().ok())
+                .collect()
+        }
+
+        /// Kills, however the row ends, every recorded start still running its
+        /// `sleep`, so a failed row leaves no process behind.
+        struct KillSameProcessShellStarts(std::path::PathBuf);
+
+        impl Drop for KillSameProcessShellStarts {
+            #[allow(clippy::disallowed_methods)] // test-only reaper of the row's own processes
+            fn drop(&mut self) {
+                for pid in same_process_shell_starts(&self.0) {
+                    let sleeping = std::process::Command::new("ps")
+                        .args(["-o", "comm=", "-p", &pid.to_string()])
+                        .output()
+                        .is_ok_and(|output| {
+                            String::from_utf8_lossy(&output.stdout)
+                                .trim()
+                                .ends_with("sleep")
+                        });
+                    if sleeping {
+                        let _ = std::process::Command::new("kill")
+                            .args(["-9", &pid.to_string()])
+                            .status();
+                    }
+                }
+            }
+        }
+
+        /// One start of a runtime over `realm`'s stores whose agents run the
+        /// shell tool under the realm's tool-process custody.
+        async fn start_with_shell_custody(
+            realm: &GracefulShutdownRealm,
+            client: &Arc<ShellCallingLlmClient>,
+        ) -> Arc<SessionRuntime> {
+            let persistence = match realm.stores {
+                GracefulShutdownStores::InMemoryWholeBlob => meerkat::PersistenceBundle::new(
+                    Arc::clone(&realm.session_store),
+                    Arc::clone(&realm.runtime_store),
+                    Arc::clone(&realm.blob_store),
+                )
+                .expect("construct runtime authority"),
+                GracefulShutdownStores::SqliteHeadCanonical => {
+                    meerkat::open_realm_persistence_in(
+                        realm.temp.path(),
+                        "graceful-shutdown",
+                        Some(meerkat_store::RealmBackend::Sqlite),
+                        None,
+                    )
+                    .await
+                    .expect("open the sqlite realm")
+                    .1
+                }
+            };
+            let project = realm.temp.path().join("project");
+            std::fs::create_dir_all(&project).expect("project dir");
+            let factory = AgentFactory::new(realm.temp.path().join("sessions"))
+                .runtime_root(realm.temp.path().join("runtime"))
+                .project_root(&project)
+                .shell(true);
+            let mut config = Config::default();
+            config.shell.program = "sh".to_string();
+            config.shell.security_mode = meerkat_core::types::SecurityMode::Unrestricted;
+            let runtime = Arc::new(
+                SessionRuntime::new(
+                    factory,
+                    config,
+                    4,
+                    persistence,
+                    crate::router::NotificationSink::noop(),
+                )
+                .expect("compose the RPC session runtime"),
+            );
+            runtime.set_default_llm_client(Some(Arc::clone(client) as Arc<dyn LlmClient>));
+            runtime
+        }
+
+        /// rkat-rpc's graceful shutdown suspends a durable session's run while
+        /// its round's shell call runs, on the in-memory stores (WholeBlob), and
+        /// a runtime started again in this same process resumes it: see
+        /// [`assert_a_same_process_restart_never_runs_a_started_shell_call_again`].
+        #[tokio::test]
+        async fn a_same_process_restart_never_runs_a_started_shell_call_again() {
+            assert_a_same_process_restart_never_runs_a_started_shell_call_again(
+                GracefulShutdownStores::InMemoryWholeBlob,
+            )
+            .await;
+        }
+
+        /// The same on an ordinary sqlite realm (head-canonical).
+        #[tokio::test]
+        async fn a_same_process_restart_never_runs_a_started_shell_call_again_head_canonical() {
+            assert_a_same_process_restart_never_runs_a_started_shell_call_again(
+                GracefulShutdownStores::SqliteHeadCanonical,
+            )
+            .await;
+        }
+
+        /// A durable session's turn starts a shell call in its first round, and
+        /// the runtime's graceful shutdown suspends the run while the call runs:
+        /// the stop drops the call (its process ends) and keeps the run open at
+        /// the round's commit. A runtime started again on the same stores, in
+        /// this same process, resumes the run when the session is opened again.
+        /// The call's process-custody record then belongs to this process, which
+        /// recovery never settles; the resumed round must still answer the call
+        /// as interrupted, with an outcome-uncertain result, and never start it
+        /// again. The run then asks the model once more and ends, and the call's
+        /// custody evidence is acknowledged.
+        async fn assert_a_same_process_restart_never_runs_a_started_shell_call_again(
+            stores: GracefulShutdownStores,
+        ) {
+            let realm = GracefulShutdownRealm::new(stores);
+            let root = realm.temp.path().to_path_buf();
+            let _reaper = KillSameProcessShellStarts(root.clone());
+            // Every start records its pid; only the first one then runs on, so
+            // a start after the restart ends at once instead of hanging.
+            let client = Arc::new(ShellCallingLlmClient {
+                command: format!(
+                    "echo $$ >> '{starts}'; if [ -e '{ran}' ]; then exit 0; fi; : > '{ran}'; exec sleep 600",
+                    starts = root.join("starts").display(),
+                    ran = root.join("ran").display(),
+                ),
+                tool_calls: AtomicUsize::new(0),
+                requests: AtomicUsize::new(0),
+            });
+
+            let runtime = start_with_shell_custody(&realm, &client).await;
+            let session_id = runtime
+                .create_session(
+                    AgentBuildConfig {
+                        llm_client_override: Some(Arc::clone(&client) as Arc<dyn LlmClient>),
+                        ..AgentBuildConfig::new("claude-sonnet-4-5")
+                    },
+                    None,
+                    None,
+                    Vec::new(),
+                )
+                .await
+                .expect("create the session");
+            let running = GracefulShutdownTurnInFlight::turn(&runtime, &session_id, "run the tool");
+            let started = tokio::time::timeout(TEST_ASYNC_WITNESS_TIMEOUT, async {
+                while same_process_shell_starts(&root).is_empty() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            assert!(
+                started.is_ok(),
+                "{stores:?}: the run never started its shell call"
+            );
+
+            runtime
+                .try_shutdown()
+                .await
+                .expect("the runtime shuts down");
+            let running = tokio::time::timeout(TEST_ASYNC_WITNESS_TIMEOUT, running)
+                .await
+                .expect("the running turn is answered by the shutdown")
+                .expect("running turn task");
+            let refusal = running.expect_err("the running turn does not complete in this process");
+            assert_eq!(
+                refusal.data.as_ref().map(|data| &data["kind"]),
+                Some(&serde_json::json!("requeued_across_stop")),
+                "{stores:?}: the stop keeps the run for the next start: {refusal:?}"
+            );
+            drop(runtime);
+
+            let restarted = start_with_shell_custody(&realm, &client).await;
+            runtime_turn(&restarted, &session_id, "after the restart").await;
+
+            assert_eq!(
+                same_process_shell_starts(&root).len(),
+                1,
+                "{stores:?}: the started shell call ran again after the same-process restart"
+            );
+            let session = restarted
+                .load_persisted_session(&session_id)
+                .await
+                .expect("load the persisted session")
+                .expect("the session is persisted");
+            let results: Vec<_> = session
+                .messages()
+                .iter()
+                .filter_map(|message| match message {
+                    Message::ToolResults { results, .. } => Some(results.iter()),
+                    _ => None,
+                })
+                .flatten()
+                .filter(|result| result.tool_use_id == SAME_PROCESS_SHELL_CALL)
+                .collect();
+            assert_eq!(
+                results.len(),
+                1,
+                "{stores:?}: the call has one result: {results:?}"
+            );
+            assert!(
+                results[0].is_error && results[0].text_content().contains("not run again"),
+                "{stores:?}: the resumed round answers the started call as interrupted: {:?}",
+                results[0]
+            );
+            assert_eq!(
+                client.tool_calls.load(AtomicOrdering::SeqCst),
+                1,
+                "{stores:?}: the model asked for the call once"
+            );
+            let scope = root
+                .join("runtime")
+                .join("tool_process_custody")
+                .join(session_id.to_string());
+            let acknowledged = tokio::time::timeout(TEST_ASYNC_WITNESS_TIMEOUT, async {
+                loop {
+                    let records = std::fs::read_dir(&scope)
+                        .map(|entries| {
+                            entries
+                                .filter_map(Result::ok)
+                                .filter(|entry| {
+                                    entry.path().extension().and_then(|e| e.to_str())
+                                        == Some("json")
+                                })
+                                .count()
+                        })
+                        .unwrap_or(0);
+                    if records == 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            assert!(
+                acknowledged.is_ok(),
+                "{stores:?}: the resumed run's custody evidence is acknowledged once it ends"
+            );
+            restarted
+                .try_shutdown()
+                .await
+                .expect("the restarted runtime shuts down");
+        }
+    }
+
     /// A turn request still waiting before its admission when rkat-rpc's
     /// graceful shutdown begins is refused, on the in-memory stores
     /// (WholeBlob): see
