@@ -33553,12 +33553,32 @@ impl MobActor {
                     });
                 }
 
-                // Validate the session exists and is active. A session whose
-                // durable tail runs past its committed runtime boundary
-                // refuses this read as a transcript revision conflict, and the
-                // refusal stays typed. The spawn does not settle the tail: a
+                // A session whose durable tail runs past its committed runtime
+                // boundary refuses this spawn, typed, as the transcript
+                // revision conflict, before anything settles the tail: a
                 // session no start of this mob restores (another mob's member
-                // session, say) is not this spawn's to complete.
+                // session, say) is not this spawn's to complete. The tail is
+                // decided on the strict committed read. The activity check
+                // below reads through `read`, which serves a session's
+                // committed snapshot under such a tail, and the resume's
+                // verdict that follows settles it. A live actor of this
+                // service owns its own run's tail, so only a session no live
+                // actor hosts is decided here.
+                if !preparation_context
+                    .session_service
+                    .has_live_session(&resume_id)
+                    .await?
+                    && let Err(error) = preparation_context
+                        .session_service
+                        .load_persisted_session(&resume_id)
+                        .await
+                    && is_transcript_revision_conflict(&error)
+                {
+                    return Err(MobError::SessionError(error));
+                }
+
+                // Validate the session exists and is active. A service whose
+                // read still refuses the tail is answered the same way.
                 let is_active = match preparation_context
                     .provisioner
                     .is_member_active(&member_ref)
