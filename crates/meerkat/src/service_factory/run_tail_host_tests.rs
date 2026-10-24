@@ -690,3 +690,93 @@ async fn a_presence_probe_answers_while_a_resumed_run_waits_on_the_model_head_ca
 async fn a_presence_probe_answers_while_a_resumed_run_waits_on_the_model_whole_blob() {
     a_presence_probe_answers_while_a_resumed_run_waits_on_the_model(false).await;
 }
+
+// ---------------------------------------------------------------------------
+// The runtime-backed executor's session check with no actor over a tail.
+// ---------------------------------------------------------------------------
+
+/// A content turn's primitive, as the runtime hands one to an executor.
+fn content_turn_primitive(note: &str) -> meerkat_core::lifecycle::run_primitive::RunPrimitive {
+    use meerkat_core::lifecycle::run_primitive::{
+        ConversationAppend, ConversationAppendRole, CoreRenderable, RunApplyBoundary, RunPrimitive,
+        RuntimeTurnMetadata, StagedRunInput,
+    };
+    RunPrimitive::StagedInput(StagedRunInput {
+        boundary: RunApplyBoundary::RunStart,
+        appends: vec![ConversationAppend {
+            runtime_source: None,
+            role: ConversationAppendRole::SystemNotice,
+            content: CoreRenderable::SystemNotice {
+                kind: meerkat_core::types::SystemNoticeKind::Comms,
+                body: Some(note.to_string()),
+                blocks: Vec::new(),
+            },
+            identity: None,
+        }],
+        contributing_input_ids: vec![meerkat_core::lifecycle::InputId::new()],
+        turn_metadata: Some(RuntimeTurnMetadata {
+            execution_kind: Some(meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn),
+            ..Default::default()
+        }),
+    })
+}
+
+/// A runtime-backed executor that applies a turn while no actor serves the
+/// session, and while a run's round commit stands over the committed
+/// snapshot (a host restarted over it, before anything materializes the
+/// session), answers with the session-unavailable teardown it gives with no
+/// tail. Its check that the session is still committed and not archived is
+/// body-free. RED before, on HeadCanonical: the check read the committed body
+/// strictly, met the revision conflict, and reported an apply failure.
+async fn an_executor_without_an_actor_over_a_round_commit_reports_the_session_unavailable(
+    head_canonical: bool,
+) {
+    let root = TempDir::new().expect("temp");
+    let stores = DiskStores::new(head_canonical, &root);
+    let client = Arc::new(ScriptedModel::new());
+    let first = stores.open(&root, &client);
+    let id = materialize_session(&first, meerkat_core::Session::new()).await;
+    let (_turn_a, run_a) = run_a_held_after_a_round_commit(&first, &client, &id).await;
+    // The power goes out while run A waits on the model.
+    let after_the_cut = TempDir::new().expect("temp");
+    let restarted = stores.power_cut_copy(&after_the_cut);
+    let start = restarted.open(&after_the_cut, &Arc::new(ScriptedModel::new()));
+    assert_eq!(
+        tail_run(&start, &id).await,
+        Some(run_a),
+        "run A's round commit stands over the committed snapshot"
+    );
+
+    let mut executor = crate::surface::default_persistent_executor(
+        start.service.clone(),
+        start.machine.clone(),
+        id.clone(),
+    );
+    let refused = executor
+        .apply(RunId::new(), content_turn_primitive("a turn with no actor"))
+        .await
+        .expect_err("no actor serves the session");
+    assert!(
+        matches!(
+            refused,
+            meerkat_core::lifecycle::core_executor::CoreExecutorError::TeardownRequired {
+                reason:
+                    meerkat_core::lifecycle::core_executor::CoreExecutorTeardownReason::SessionUnavailable,
+                ..
+            }
+        ),
+        "the committed session with no actor tears the executor down as unavailable: {refused:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_executor_without_an_actor_over_a_round_commit_reports_the_session_unavailable_head_canonical()
+ {
+    an_executor_without_an_actor_over_a_round_commit_reports_the_session_unavailable(true).await;
+}
+
+#[tokio::test]
+async fn an_executor_without_an_actor_over_a_round_commit_reports_the_session_unavailable_whole_blob()
+ {
+    an_executor_without_an_actor_over_a_round_commit_reports_the_session_unavailable(false).await;
+}
