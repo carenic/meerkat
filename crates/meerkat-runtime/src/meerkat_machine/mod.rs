@@ -1625,6 +1625,25 @@ pub enum RuntimeSessionAttachmentState {
     },
 }
 
+/// What [`MeerkatMachine::take_over_stopped_attachment_registration_if_current`]
+/// did with one exact registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StoppedRegistrationTakeover {
+    /// The registration was the completed residue of a stopped attachment,
+    /// and its canonical unregister completed.
+    Unregistered,
+    /// The witness no longer names the session's current registration.
+    /// Nothing changed.
+    NotCurrent,
+    /// The exact registration is not a stopped attachment's completed
+    /// residue: it is attached, its stop or post-stop cleanup did not
+    /// complete, it was never attached, it is not Stopped (a Retired
+    /// runtime included), it is claimed, or it needs a durability reload.
+    /// Nothing changed.
+    NotStoppedResidue,
+}
+
 /// Where a detached registration's machine-owned unregister stands.
 #[derive(Debug, Clone)]
 pub enum RuntimeDetachedUnregister {

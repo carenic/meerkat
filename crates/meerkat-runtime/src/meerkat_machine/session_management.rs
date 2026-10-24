@@ -18,6 +18,12 @@ enum UnregisterTeardownAdmission {
     /// the expected epoch and `RuntimeSessionRegistrationWitness` arguments.
     AnyCurrentRegistration,
     ExactTerminalUnattachedRegistration,
+    /// [`Self::ExactTerminalUnattachedRegistration`] narrowed to the completed
+    /// residue of a stopped machine-managed attachment, durability-ready.
+    /// Any other registration is answered with the typed
+    /// [`UnregisterTeardownWaitOutcome::NotStoppedResidue`], never an error,
+    /// so the caller decides from that exact fact.
+    StoppedAttachmentResidue,
     /// [`Self::AnyCurrentRegistration`] for an exact registration whose use
     /// must still be this one: the decision to start or join a coordinator
     /// answers `UseChanged` instead when anyone has adopted the registration
@@ -53,6 +59,9 @@ enum UnregisterTeardownWaitOutcome {
     /// `UnchangedRegistrationUse`: the registration was adopted since its
     /// use was read. Nothing was started or joined.
     UseChanged,
+    /// `StoppedAttachmentResidue`: the exact registration is not a stopped
+    /// attachment's completed residue. Nothing was started or joined.
+    NotStoppedResidue,
     /// `ReturnCallerGrace`: the joined result, still to be awaited until the
     /// caller's deadline.
     Joined(
@@ -70,6 +79,10 @@ impl UnregisterTeardownWaitOutcome {
             )),
             Self::UseChanged => Err(RuntimeDriverError::Internal(
                 "a use-gated unregister refusal reached a caller that gave no expected use"
+                    .to_string(),
+            )),
+            Self::NotStoppedResidue => Err(RuntimeDriverError::Internal(
+                "a stopped-residue unregister refusal reached a caller that did not ask for one"
                     .to_string(),
             )),
         }
@@ -7125,6 +7138,96 @@ impl MeerkatMachine {
         .require_completed()
     }
 
+    /// Take over `witness`'s exact registration when, and only when, it is
+    /// the completed residue of a stopped machine-managed attachment: the
+    /// attachment stopped, its stop cleanup and post-stop callback completed,
+    /// no executor, claim or provisional owner remains, and the registration
+    /// is `Stopped` (not `Retired`) and durability-ready. Such a
+    /// registration still holds that attachment's retained publication and
+    /// cleanup handles, so no new materialization may claim it; this
+    /// unregisters it through the canonical unregister saga, awaited to
+    /// terminal completion, which consumes those handles as its inputs.
+    ///
+    /// A stop cleanup still in flight on this exact registration is joined
+    /// first, and the decision is made on its result: the decision reads
+    /// facts, never a deadline. The decision and the coordinator installation
+    /// are one atomic admission under the stable registration transaction and
+    /// the witness's exact mutation gate. Anything else is answered typed and
+    /// changes nothing: [`StoppedRegistrationTakeover::NotCurrent`] for a
+    /// stale witness (a same-`SessionId` replacement is never touched), and
+    /// [`StoppedRegistrationTakeover::NotStoppedResidue`] for a registration
+    /// that is attached, still or unsuccessfully cleaning up, claimed, never
+    /// attached, not Stopped (a Retired runtime included), or
+    /// reload-required.
+    pub async fn take_over_stopped_attachment_registration_if_current(
+        &self,
+        witness: &RuntimeSessionRegistrationWitness,
+    ) -> Result<StoppedRegistrationTakeover, RuntimeDriverError> {
+        if !witness.belongs_to(self) {
+            return Ok(StoppedRegistrationTakeover::NotCurrent);
+        }
+        let in_flight_stop_cleanup = {
+            let sessions = self.sessions.read().await;
+            let Some(entry) = sessions.get(witness.session_id()) else {
+                return Ok(StoppedRegistrationTakeover::NotCurrent);
+            };
+            if entry.epoch_id != witness.epoch_id || !witness.matches_entry(entry) {
+                return Ok(StoppedRegistrationTakeover::NotCurrent);
+            }
+            entry
+                .runtime_stop_cleanup_coordinator
+                .as_ref()
+                .filter(|coordinator| {
+                    coordinator.epoch_id == entry.epoch_id
+                        && coordinator.result_rx.borrow().is_none()
+                })
+                .map(|coordinator| coordinator.result_rx.clone())
+        };
+        if let Some(mut result_rx) = in_flight_stop_cleanup {
+            // The admission below reads the coordinator's own result: a
+            // failed cleanup is not completed residue and is refused there.
+            if let Err(error) =
+                wait_for_runtime_stop_cleanup_result(&mut result_rx, witness.session_id()).await
+            {
+                tracing::debug!(
+                    session_id = %witness.session_id(),
+                    %error,
+                    "the joined stop cleanup failed; the takeover admission refuses its residue"
+                );
+            }
+        }
+        match self
+            .join_or_start_unregister_teardown_with_admission(
+                witness.session_id(),
+                Some(witness.epoch_id()),
+                UnregisterTeardownCaller::Explicit,
+                UnregisterTeardownAdmission::StoppedAttachmentResidue,
+                Some(witness),
+                UnregisterTeardownWait::UntilTerminal,
+            )
+            .await?
+        {
+            UnregisterTeardownWaitOutcome::Completed(true) => {
+                Ok(StoppedRegistrationTakeover::Unregistered)
+            }
+            UnregisterTeardownWaitOutcome::Completed(false) => {
+                Ok(StoppedRegistrationTakeover::NotCurrent)
+            }
+            UnregisterTeardownWaitOutcome::NotStoppedResidue => {
+                Ok(StoppedRegistrationTakeover::NotStoppedResidue)
+            }
+            outcome @ (UnregisterTeardownWaitOutcome::Pending(_)
+            | UnregisterTeardownWaitOutcome::UseChanged
+            | UnregisterTeardownWaitOutcome::Joined(..)) => {
+                outcome.require_completed()?;
+                Err(RuntimeDriverError::Internal(format!(
+                    "stopped-registration takeover for session {} escaped its terminal wait",
+                    witness.session_id()
+                )))
+            }
+        }
+    }
+
     /// Check the issuer of an attachment witness. This says nothing about
     /// whether the attachment is still current or its retirement has finished.
     pub fn owns_executor_attachment_witness(
@@ -8161,6 +8264,9 @@ impl MeerkatMachine {
             UnregisterTeardownWaitOutcome::UseChanged => Err(RuntimeDriverError::Internal(
                 "an ungated unregister observer admission answered a use change".to_string(),
             )),
+            UnregisterTeardownWaitOutcome::NotStoppedResidue => Err(RuntimeDriverError::Internal(
+                "an unregister observer admission answered a stopped-residue refusal".to_string(),
+            )),
         }
     }
 
@@ -8209,6 +8315,12 @@ impl MeerkatMachine {
             UnregisterTeardownWaitOutcome::Joined(..) => {
                 return Err(RuntimeDriverError::Internal(
                     "use-gated unregister observer admission returned a caller-grace wait"
+                        .to_string(),
+                ));
+            }
+            UnregisterTeardownWaitOutcome::NotStoppedResidue => {
+                return Err(RuntimeDriverError::Internal(
+                    "use-gated unregister observer admission answered a stopped-residue refusal"
                         .to_string(),
                 ));
             }
@@ -8659,6 +8771,10 @@ impl MeerkatMachine {
             )),
             UnregisterTeardownWaitOutcome::UseChanged => Err(RuntimeDriverError::Internal(
                 "the runtime-loop watcher's ungated unregister answered a use change".to_string(),
+            )),
+            UnregisterTeardownWaitOutcome::NotStoppedResidue => Err(RuntimeDriverError::Internal(
+                "the runtime-loop watcher's unregister answered a stopped-residue refusal"
+                    .to_string(),
             )),
         }
     }
@@ -9261,6 +9377,38 @@ impl MeerkatMachine {
         .map(|_| ())
     }
 
+    /// Whether `entry` is the completed residue of a stopped machine-managed
+    /// attachment: Stopped and unattached (see
+    /// [`Self::require_terminal_unattached_registration`]), with that
+    /// attachment's post-stop callback recorded and completed, and
+    /// durability-ready. A registration that was never attached, a Retired
+    /// one, or one that needs a durability reload, is not.
+    fn is_stopped_attachment_residue(session_id: &SessionId, entry: &RuntimeSessionEntry) -> bool {
+        // An ordinary stop keeps the registration Queuing; Draining belongs
+        // to an unregister that owns it. A retired runtime is not served
+        // again, so only a Stopped one is residue to take over.
+        let (registration_queuing, stopped) = {
+            let authority = entry
+                .dsl_authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                authority.state().registration_phase
+                    == crate::meerkat_machine::dsl::RegistrationPhase::Queuing,
+                super::dsl_authority::runtime_phase_from_authority(&authority)
+                    == RuntimeState::Stopped,
+            )
+        };
+        registration_queuing
+            && stopped
+            && entry.post_stop_cleanup_attachment_id.is_some()
+            && entry.post_stop_cleanup_complete
+            && entry.pending_unregister_finalization.is_none()
+            && entry.pending_user_interrupt_dispatch.is_none()
+            && entry.require_durability_ready().is_ok()
+            && Self::require_terminal_unattached_registration(session_id, entry).is_ok()
+    }
+
     fn require_terminal_unattached_registration(
         session_id: &SessionId,
         entry: &RuntimeSessionEntry,
@@ -9406,6 +9554,7 @@ impl MeerkatMachine {
             EpochChanged,
             RegistrationChanged,
             UseChanged,
+            NotStoppedResidue,
             Completed(Result<(), RuntimeDriverError>),
             Retry,
         }
@@ -9478,6 +9627,18 @@ impl MeerkatMachine {
                         ) =>
                     {
                         CoordinatorDecision::UseChanged
+                    }
+                    // Decided under T, the witness's exact M and the session
+                    // map lock, before any coordinator is joined or started:
+                    // only the completed residue of a stopped attachment is
+                    // taken over, and an unregister another owner already
+                    // runs is that owner's, never joined here.
+                    Some(entry)
+                        if admission == UnregisterTeardownAdmission::StoppedAttachmentResidue
+                            && (entry.unregister_coordinator.is_some()
+                                || !Self::is_stopped_attachment_residue(session_id, entry)) =>
+                    {
+                        CoordinatorDecision::NotStoppedResidue
                     }
                     Some(entry) => {
                         if entry.reload_required_discard_coordinator.is_some() {
@@ -9609,6 +9770,10 @@ impl MeerkatMachine {
             CoordinatorDecision::UseChanged => {
                 drop(registration_transaction_guard.take());
                 return Ok(UnregisterTeardownWaitOutcome::UseChanged);
+            }
+            CoordinatorDecision::NotStoppedResidue => {
+                drop(registration_transaction_guard.take());
+                return Ok(UnregisterTeardownWaitOutcome::NotStoppedResidue);
             }
             CoordinatorDecision::Completed(result) => {
                 drop(registration_transaction_guard.take());

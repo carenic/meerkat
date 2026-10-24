@@ -3398,6 +3398,21 @@ pub(super) struct MemberLiveRevivalScope {
     publication: Option<super::provisioner::ResumedMemberRollbackAuthority>,
 }
 
+impl MemberLiveRevivalScope {
+    /// A plain missing-live revival: no reload registration or publication
+    /// is carried, so the revival materializes the member from scratch.
+    pub(super) fn is_missing_live(&self) -> bool {
+        #[cfg(feature = "runtime-adapter")]
+        {
+            self.registration.is_none() && self.publication.is_none()
+        }
+        #[cfg(not(feature = "runtime-adapter"))]
+        {
+            true
+        }
+    }
+}
+
 /// Reply and continuation custody for an explicit Resume. Canonical attempt
 /// and settlement facts belong to MobMachine; this holds the process-local
 /// channels and progress observers between owner-tracked I/O stages.
@@ -3487,6 +3502,68 @@ fn member_readiness_expectations(
         .iter()
         .map(|target| (target.entry.agent_identity.clone(), target.clone()))
         .collect()
+}
+
+/// The readiness step a local member needs: turn-driven resumed members
+/// still need their mob-owned comms drain rebound even though they do not
+/// need autonomous dispatch; autonomous members need both, through one step.
+fn member_readiness_stage(entry: &RosterEntry) -> super::state::LifecycleProgressStage {
+    if entry.runtime_mode == crate::MobRuntimeMode::AutonomousHost {
+        super::state::LifecycleProgressStage::AutonomousRuntimeReadiness
+    } else {
+        super::state::LifecycleProgressStage::MemberCommsReadiness
+    }
+}
+
+/// Run one member's readiness `stage` off the actor, bounded by
+/// [`RESUME_MEMBER_READINESS_BOUND`], with a panic answered as a typed
+/// failure.
+async fn run_member_readiness_step(
+    context: &DetachedMemberReadinessContext,
+    agent_identity: &AgentIdentity,
+    member_ref: &MemberRef,
+    stage: super::state::LifecycleProgressStage,
+) -> Result<(), MobError> {
+    let work = async {
+        match stage {
+            super::state::LifecycleProgressStage::AutonomousRuntimeReadiness => {
+                context
+                    .ensure_autonomous_runtime_ready(agent_identity, member_ref)
+                    .await
+            }
+            _ => {
+                context
+                    .provisioner
+                    .ensure_runtime_session_state(member_ref)
+                    .await?;
+                context
+                    .ensure_mob_comms_drain(agent_identity, member_ref)
+                    .await
+            }
+        }
+    };
+    match tokio::time::timeout(
+        RESUME_MEMBER_READINESS_BOUND,
+        std::panic::AssertUnwindSafe(work).catch_unwind(),
+    )
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(_panic)) => Err(MobError::Internal(format!(
+            "member readiness step panicked for '{agent_identity}'"
+        ))),
+        Err(_elapsed) => {
+            tracing::warn!(
+                agent_identity = %agent_identity,
+                stage = stage.as_str(),
+                bound_ms = RESUME_MEMBER_READINESS_BOUND.as_millis() as u64,
+                "timed out ensuring member runtime readiness"
+            );
+            Err(MobError::ReadyWaitTimedOut {
+                pending_member_ids: vec![AgentIdentity::from(agent_identity.as_str())],
+            })
+        }
+    }
 }
 
 impl DetachedMemberReadinessContext {
@@ -5105,6 +5182,13 @@ async fn pause_before_startup_binding_restore_if_armed(mob_id: &MobId) {
 static STARTUP_REGISTRATION_TAKEOVERS_FOR_TEST: std::sync::Mutex<
     BTreeMap<(MobId, AgentIdentity), u64>,
 > = std::sync::Mutex::new(BTreeMap::new());
+
+#[cfg(all(test, feature = "runtime-adapter"))]
+fn record_startup_registration_takeover_for_test(mob_id: &MobId, member: &AgentIdentity) {
+    if let Ok(mut counts) = STARTUP_REGISTRATION_TAKEOVERS_FOR_TEST.lock() {
+        *counts.entry((mob_id.clone(), member.clone())).or_default() += 1;
+    }
+}
 
 /// Test read: how many times a startup restore of `mob_id` took `member`'s
 /// stopped registration over.
@@ -8308,6 +8392,46 @@ enum CompositionDeliveryRestore {
     HeldByRegistrationOwner,
 }
 
+/// A member whose stopped runtime registration a Running mob's startup
+/// restore took over: the registration was the completed residue of a
+/// stopped attachment, and it was unregistered. This typed fact alone keeps
+/// the member out of the startup readiness pass, and the member's warm
+/// revival, dispatched right after startup, consumes it.
+#[cfg(feature = "runtime-adapter")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct StartupRegistrationTakeover {
+    /// The member's bridge session, whose registration was unregistered.
+    session_id: SessionId,
+}
+
+/// What restoring one member's generated operation binding did.
+#[cfg(feature = "runtime-adapter")]
+#[derive(Debug, PartialEq, Eq)]
+enum RestoredOperationBinding {
+    /// The binding is restored, or there was nothing to restore.
+    Restored,
+    /// A Running mob's startup restore took the member's stopped
+    /// registration over ([`StartupRegistrationTakeover`]); no binding is
+    /// restored here. The member's warm revival after startup registers and
+    /// binds it again.
+    TakenOver(StartupRegistrationTakeover),
+}
+
+#[cfg(feature = "runtime-adapter")]
+impl RestoredOperationBinding {
+    /// The outcome of a restore at a seam that never takes a registration
+    /// over: only the actor startup restore does.
+    fn without_takeover(self, seam: RestoredOperationBindingSeam) -> Result<(), MobError> {
+        match self {
+            Self::Restored => Ok(()),
+            Self::TakenOver(takeover) => Err(MobError::Internal(format!(
+                "the {seam:?} operation binding restore took over the registration of session {}; only the actor startup restore may",
+                takeover.session_id
+            ))),
+        }
+    }
+}
+
 #[cfg(feature = "runtime-adapter")]
 #[derive(Clone)]
 struct ResumeOperationBindingIo {
@@ -8548,6 +8672,19 @@ pub(super) struct MobActor {
     /// `reattempt_deferred_member_custody` first, and the identity reconcile's
     /// backoff wake re-attempts each due entry.
     pub(super) deferred_member_custody: DeferredMemberCustodyRegistry,
+    /// Members whose stopped runtime registration this incarnation's Running
+    /// startup restore took over. Only that restore adds to it, and it is
+    /// drained right after startup, when each member's warm revival is
+    /// dispatched. While it holds a member, and only for that reason, the
+    /// startup readiness pass leaves the member out: it has no attachment
+    /// until its revival, which runs its readiness step itself.
+    #[cfg(feature = "runtime-adapter")]
+    pub(super) startup_registration_takeovers: BTreeMap<AgentIdentity, StartupRegistrationTakeover>,
+    /// The missing-live revival in flight per member: set to true once it
+    /// answered. A second request meanwhile waits on it and asks again,
+    /// instead of racing a second materialization of the same session.
+    pub(super) member_live_revivals_in_flight:
+        BTreeMap<AgentIdentity, tokio::sync::watch::Receiver<bool>>,
     pub(super) next_retirement_ticket: u64,
     pub(super) retirement_batch: Option<retirement_io::RetirementBatch>,
     pub(super) wiring_io_tasks: tokio::task::JoinSet<wiring_io::WiringIoCompletion>,
@@ -21455,17 +21592,11 @@ impl MobActor {
                     && !lifecycle.runtime_retire_pending_sessions.contains_key(
                         &mob_dsl::AgentRuntimeId::from_domain(&entry.agent_runtime_id),
                     )
+                    && !self.registration_taken_over_at_startup(&entry.agent_identity)
             })
             .map(|entry| MemberReadinessTarget {
                 entry: entry.clone(),
-                // Turn-driven resumed members still need their mob-owned comms
-                // drain rebound even though they do not need autonomous
-                // dispatch; autonomous members need both, through one step.
-                stage: if entry.runtime_mode == crate::MobRuntimeMode::AutonomousHost {
-                    super::state::LifecycleProgressStage::AutonomousRuntimeReadiness
-                } else {
-                    super::state::LifecycleProgressStage::MemberCommsReadiness
-                },
+                stage: member_readiness_stage(entry),
             })
             .collect::<Vec<_>>();
         Ok(Some(targets))
@@ -21494,46 +21625,8 @@ impl MobActor {
                 }
                 let agent_identity = entry.agent_identity.clone();
                 let member_ref = entry.member_ref.clone();
-                let work = async {
-                    match stage {
-                        super::state::LifecycleProgressStage::AutonomousRuntimeReadiness => {
-                            context
-                                .ensure_autonomous_runtime_ready(&agent_identity, &member_ref)
-                                .await
-                        }
-                        _ => {
-                            context
-                                .provisioner
-                                .ensure_runtime_session_state(&member_ref)
-                                .await?;
-                            context
-                                .ensure_mob_comms_drain(&agent_identity, &member_ref)
-                                .await
-                        }
-                    }
-                };
-                let result = match tokio::time::timeout(
-                    RESUME_MEMBER_READINESS_BOUND,
-                    std::panic::AssertUnwindSafe(work).catch_unwind(),
-                )
-                .await
-                {
-                    Ok(Ok(result)) => result,
-                    Ok(Err(_panic)) => Err(MobError::Internal(format!(
-                        "member readiness step panicked for '{agent_identity}'"
-                    ))),
-                    Err(_elapsed) => {
-                        tracing::warn!(
-                            agent_identity = %agent_identity,
-                            stage = stage.as_str(),
-                            bound_ms = RESUME_MEMBER_READINESS_BOUND.as_millis() as u64,
-                            "timed out ensuring member runtime readiness"
-                        );
-                        Err(MobError::ReadyWaitTimedOut {
-                            pending_member_ids: vec![AgentIdentity::from(agent_identity.as_str())],
-                        })
-                    }
-                };
+                let result =
+                    run_member_readiness_step(&context, &agent_identity, &member_ref, stage).await;
                 if let Some(progress) = &progress {
                     progress.member_progress(&agent_identity, stage);
                 }
@@ -27660,6 +27753,11 @@ impl MobActor {
                         ).await;
                     }
                 }
+                MobCommand::StartupTakeoverRevived { outcome } => {
+                    self.inline_step_watchdog
+                        .set_step("startup_takeover_revived");
+                    Box::pin(self.startup_takeover_revived(*outcome)).await;
+                }
                 MobCommand::ReloadMemberRegistration {
                     agent_identity,
                     deadline,
@@ -30977,6 +31075,8 @@ impl MobActor {
             Self::close_and_drain_commands(command_rx).await;
             return;
         }
+        #[cfg(feature = "runtime-adapter")]
+        boxed_arm_future(|| self.revive_startup_registration_takeovers()).await;
         // Desired-state recovery is independent from the legacy roster
         // projection. Every cold actor incarnation starts by reading the sole
         // durable intent authority and scheduling one level-triggered pass per
@@ -31908,7 +32008,7 @@ impl MobActor {
         io: ResumeOperationBindingIo,
         plan: RestoredMemberOperationBinding,
         seam: RestoredOperationBindingSeam,
-    ) -> Result<(), MobError> {
+    ) -> Result<RestoredOperationBinding, MobError> {
         let RestoredMemberOperationBinding {
             entry,
             owner_session_id: generated_owner_session_id,
@@ -31940,7 +32040,7 @@ impl MobActor {
                 .await
                 .map_err(|error| MobError::Internal(error.to_string()))?
         {
-            return Ok(());
+            return Ok(RestoredOperationBinding::Restored);
         }
         if let Some((operation_id, _, _)) = placed_operation.as_ref() {
             let carrier = io
@@ -31975,6 +32075,25 @@ impl MobActor {
         // idempotent, so a late completion after a cancelled restore is
         // harmless (see `relieve_caller_stack`). Do not move this back inline:
         // that re-stacks the registration chain beneath the actor frames.
+        //
+        // A Running mob's startup decides on a local member's stopped
+        // registration before it registers the member here: registering
+        // re-admits a Stopped registration (`RegisterSessionResumesStopped`)
+        // and retires its completed stop record, after which the stopped
+        // facts can no longer be read. Only the completed residue of a
+        // stopped attachment is taken over; anything else, a live owner or a
+        // held one included, goes on to the restore below unchanged.
+        if seam == RestoredOperationBindingSeam::ActorStartup
+            && local_member_owner
+            && let Some(takeover) = Self::take_over_stopped_member_registration(
+                &io,
+                &entry.agent_identity,
+                &generated_owner_session_id,
+            )
+            .await?
+        {
+            return Ok(RestoredOperationBinding::TakenOver(takeover));
+        }
         let adapter = Arc::clone(&io.adapter);
         let owner_session_id = generated_owner_session_id.clone();
         let bindings = meerkat_runtime::stack_relief::relieve_caller_stack(move || async move {
@@ -32051,7 +32170,61 @@ impl MobActor {
                 }
             }
         }
-        Ok(())
+        Ok(RestoredOperationBinding::Restored)
+    }
+
+    /// Take over `agent_identity`'s registration of `session_id` at a Running
+    /// mob's startup when, and only when, it is the completed residue of a
+    /// stopped attachment: the runtime joins a stop cleanup still in flight
+    /// on that exact registration, then decides and unregisters it in one
+    /// atomic admission, through the canonical unregister saga, which
+    /// delivers any terminal publication the stopped attachment still owes.
+    /// `None` when there is nothing to take over; nothing changed then.
+    #[cfg(feature = "runtime-adapter")]
+    async fn take_over_stopped_member_registration(
+        io: &ResumeOperationBindingIo,
+        agent_identity: &AgentIdentity,
+        session_id: &SessionId,
+    ) -> Result<Option<StartupRegistrationTakeover>, MobError> {
+        let Some(registration) = io
+            .adapter
+            .current_session_registration_witness(session_id)
+            .await
+        else {
+            return Ok(None);
+        };
+        let adapter = Arc::clone(&io.adapter);
+        // The unregister saga is owned by the runtime once admitted, so a
+        // late completion after a cancelled start is harmless.
+        let takeover = meerkat_runtime::stack_relief::relieve_caller_stack(move || async move {
+            adapter
+                .take_over_stopped_attachment_registration_if_current(&registration)
+                .await
+        })
+        .await
+        .map_err(|error| {
+            MobError::Internal(format!(
+                "take over the stopped runtime registration of member '{agent_identity}' (session {session_id}): {error}"
+            ))
+        })?;
+        match takeover {
+            meerkat_runtime::StoppedRegistrationTakeover::Unregistered => {
+                tracing::info!(
+                    mob_id = %io.mob_id,
+                    member = %agent_identity,
+                    session_id = %session_id,
+                    "the mob start took over a member's stopped runtime registration; the member is revived after the start"
+                );
+                #[cfg(test)]
+                record_startup_registration_takeover_for_test(&io.mob_id, agent_identity);
+                Ok(Some(StartupRegistrationTakeover {
+                    session_id: session_id.clone(),
+                }))
+            }
+            // Not the completed residue of a stopped attachment, or no longer
+            // current: nothing changed, and the ordinary restore decides.
+            _ => Ok(None),
+        }
     }
 
     #[cfg(feature = "runtime-adapter")]
@@ -32371,14 +32544,13 @@ impl MobActor {
             match restore {
                 crate::MemberCustodyRestore::StartupBinding => {
                     match self.prepare_restored_member_operation_binding(entry)? {
-                        Some(plan) => {
-                            Self::realize_restored_member_operation_binding(
-                                io,
-                                plan,
-                                RestoredOperationBindingSeam::DeferredReattempt,
-                            )
-                            .await
-                        }
+                        Some(plan) => Self::realize_restored_member_operation_binding(
+                            io,
+                            plan,
+                            RestoredOperationBindingSeam::DeferredReattempt,
+                        )
+                        .await?
+                        .without_takeover(RestoredOperationBindingSeam::DeferredReattempt),
                         None => Ok(()),
                     }
                 }
@@ -32635,7 +32807,11 @@ impl MobActor {
             )
             .await
             {
-                Ok(()) => {}
+                Ok(RestoredOperationBinding::Restored) => {}
+                Ok(RestoredOperationBinding::TakenOver(takeover)) => {
+                    self.startup_registration_takeovers
+                        .insert(identity, takeover);
+                }
                 // A local member whose restore already failed at this start
                 // (it is Broken) does not stop the whole mob when its session
                 // is hosted by another runtime owner, its hosting claim
@@ -32655,6 +32831,196 @@ impl MobActor {
             }
         }
         Ok(())
+    }
+
+    /// Whether this incarnation's startup restore took `agent_identity`'s
+    /// stopped registration over, so its readiness runs after its revival.
+    fn registration_taken_over_at_startup(&self, agent_identity: &AgentIdentity) -> bool {
+        #[cfg(feature = "runtime-adapter")]
+        {
+            self.startup_registration_takeovers
+                .contains_key(agent_identity)
+        }
+        #[cfg(not(feature = "runtime-adapter"))]
+        {
+            let _ = agent_identity;
+            false
+        }
+    }
+
+    /// Dispatch, right after startup, the warm revival of every member this
+    /// incarnation's Running startup restore took over, through the same
+    /// MobMachine-authorized path a member turn or `MobHandle::ensure_member_live`
+    /// takes, then that member's own readiness step: the one the startup pass
+    /// left out, an autonomous member's host loop included. The outcome comes
+    /// back as [`MobCommand::StartupTakeoverRevived`].
+    #[cfg(feature = "runtime-adapter")]
+    async fn revive_startup_registration_takeovers(&mut self) {
+        let takeovers = std::mem::take(&mut self.startup_registration_takeovers);
+        if takeovers.is_empty() {
+            return;
+        }
+        if self.state() != MobState::Running {
+            // A later startup step stopped the mob; its explicit resume
+            // rebuilds every member without a serving attachment.
+            tracing::warn!(
+                mob_id = %self.definition.id,
+                members = ?takeovers.keys().collect::<Vec<_>>(),
+                "the mob start took over stopped member registrations but did not reach Running; the explicit resume rebuilds those members"
+            );
+            return;
+        }
+        let entries = {
+            let roster = self.roster.read().await;
+            takeovers
+                .into_iter()
+                .filter_map(|(identity, takeover)| {
+                    roster
+                        .get(&identity)
+                        .cloned()
+                        .map(|entry| (entry, takeover))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (entry, takeover) in entries {
+            let command_tx = self.command_tx.clone();
+            let context = self.detached_member_readiness_context();
+            self.actor_io_tasks.spawn(async move {
+                let stage = member_readiness_stage(&entry);
+                let Some(result) = Self::revive_member_taken_over_at_startup(
+                    &command_tx,
+                    &context,
+                    &entry,
+                    &takeover,
+                    stage,
+                )
+                .await
+                else {
+                    return;
+                };
+                let _ = command_tx
+                    .send(RoutedMobCommand::internal(
+                        MobCommand::StartupTakeoverRevived {
+                            outcome: Box::new(MemberReadinessOutcome {
+                                entry,
+                                stage,
+                                result,
+                            }),
+                        },
+                    ))
+                    .await;
+            });
+        }
+    }
+
+    /// Revive one member taken over at startup and run its readiness step.
+    /// `None` when the member's incarnation changed meanwhile: its successor
+    /// is not this takeover's to serve.
+    #[cfg(feature = "runtime-adapter")]
+    async fn revive_member_taken_over_at_startup(
+        command_tx: &mpsc::Sender<RoutedMobCommand>,
+        context: &DetachedMemberReadinessContext,
+        entry: &RosterEntry,
+        takeover: &StartupRegistrationTakeover,
+        stage: super::state::LifecycleProgressStage,
+    ) -> Option<Result<(), MobError>> {
+        match Self::request_member_live_revival(
+            command_tx,
+            &entry.agent_identity,
+            &takeover.session_id,
+            MemberLiveRevivalScope::default(),
+        )
+        .await
+        {
+            Ok(
+                MemberLiveRevivalOutcome::Materialized(_) | MemberLiveRevivalOutcome::AlreadyLive,
+            ) => {}
+            Ok(MemberLiveRevivalOutcome::NotCurrent) => {
+                tracing::info!(
+                    member = %entry.agent_identity,
+                    session_id = %takeover.session_id,
+                    "a member taken over at startup changed before its revival; its successor is served on its own"
+                );
+                return None;
+            }
+            Ok(MemberLiveRevivalOutcome::CurrentButOwned) => {
+                return Some(Err(MobError::Internal(format!(
+                    "the revival of member '{}' after the startup takeover met a competing materialization owner of session {}",
+                    entry.agent_identity, takeover.session_id
+                ))));
+            }
+            Err(error) => return Some(Err(error)),
+        }
+        Some(
+            run_member_readiness_step(context, &entry.agent_identity, &entry.member_ref, stage)
+                .await,
+        )
+    }
+
+    /// Settle the revival of a member this incarnation's startup restore took
+    /// over: apply its readiness exactly as the startup pass would have (an
+    /// autonomous member's `StartupMarkReady` included), and record the
+    /// member Broken, with the typed reason, on any failure. An outcome for
+    /// an incarnation the roster no longer holds is dropped.
+    async fn startup_takeover_revived(&mut self, outcome: MemberReadinessOutcome) {
+        let entry = outcome.entry.clone();
+        if let Err(error) = self.apply_member_readiness_outcomes(vec![outcome]).await {
+            self.record_startup_takeover_failure(&entry, &error).await;
+        }
+    }
+
+    /// Record a member the startup restore took over Broken because its
+    /// revival or readiness failed, so it is never left unserved silently. A
+    /// revival that failed after MobMachine authorized it already recorded
+    /// the member Broken; its reason is kept.
+    async fn record_startup_takeover_failure(&mut self, entry: &RosterEntry, error: &MobError) {
+        let identity = mob_dsl::AgentIdentity::from_domain(&entry.agent_identity);
+        let recorded = self
+            .dsl_authority
+            .state()
+            .member_restore_failures
+            .get(&identity)
+            .cloned();
+        let reason = match recorded {
+            Some(reason) => reason,
+            None => {
+                let reason = format!(
+                    "the mob start took over the stopped runtime registration of member '{}', and the member's revival failed: {error}",
+                    entry.agent_identity
+                );
+                if let Err(apply_error) = self.apply_dsl_signal(
+                    mob_dsl::MobMachineSignal::RecoverMemberRestoreFailure {
+                        agent_identity: identity,
+                        reason: reason.clone(),
+                    },
+                    "startup_takeover_revival_failure",
+                ) {
+                    tracing::error!(
+                        mob_id = %self.definition.id,
+                        member = %entry.agent_identity,
+                        error = %apply_error,
+                        "MobMachine rejected the startup takeover's revival failure"
+                    );
+                }
+                reason
+            }
+        };
+        tracing::error!(
+            mob_id = %self.definition.id,
+            member = %entry.agent_identity,
+            reason = %reason,
+            "a member the mob start took over could not be revived; marked member broken"
+        );
+        self.record_member_restore_failure(
+            &entry.agent_identity,
+            super::handle::RestoreFailureDiagnostic {
+                bridge_session_id: entry.member_ref.bridge_session_id().cloned(),
+                reason,
+                hold: error.durable_resume_hold(),
+                registration_refusal: None,
+            },
+        )
+        .await;
     }
 
     /// Whether MobMachine records `agent_identity` Broken: its restore failed.
