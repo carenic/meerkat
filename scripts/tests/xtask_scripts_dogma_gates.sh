@@ -356,6 +356,8 @@ trap 'rm -rf "$tlc_env_tmp"' EXIT
 # and its mint mutant's action property violated.
 # durable_tail_classification_audit.sh requires its Ready witness violated,
 # and with --mutants each seeded defect's target invariant violated.
+# durable_tail_recovery_ownership_audit.sh requires its four witnesses
+# violated, and with --mutants each seeded defect's target invariant violated.
 printf '%s\n' \
   '#!/bin/sh' \
   'printf "%s\n" "$JAVA_TOOL_OPTIONS" > "$TLC_JAVA_OPTIONS_CAPTURE"' \
@@ -469,6 +471,16 @@ printf '%s\n' \
   'echo "Error: Invariant AuditDisagreeingCursorHolds is violated by the initial state:"' \
   'echo "Error: Invariant AuditCursorOnEndTurnHolds is violated by the initial state:"' \
   'echo "Error: Invariant AuditContinuableNeedsAgreeingBoundCursor is violated by the initial state:"' \
+  'echo "Error: Invariant NotAuditWitnessIdle is violated."' \
+  'echo "Error: Invariant NotAuditWitnessRetired is violated."' \
+  'echo "Error: Invariant NotAuditWitnessTerminalized is violated."' \
+  'echo "Error: Invariant NotAuditWitnessOtherTerminal is violated."' \
+  'echo "Error: Invariant AuditRecoveryIsTotalAndDisjoint is violated."' \
+  'echo "Error: Invariant AuditUnprovenOwnershipGatesAsBefore is violated."' \
+  'echo "Error: Invariant AuditOwnershipNeverAdmitsAnotherRunOrAnUndecodableRow is violated."' \
+  'echo "Error: Invariant AuditHostRecoversAsARestartDoes is violated."' \
+  'echo "Error: Invariant AuditWriterRecoversAsRetired is violated."' \
+  'echo "Error: Invariant AuditWriterNeverContinues is violated."' \
   'echo "Error: The first argument of <= should be an integer, but instead it is:"' \
   'echo "100000 states generated, 100000 distinct states found, 0 states left on queue."' \
   'echo "The coverage statistics at 2026-01-01 00:00:00"' \

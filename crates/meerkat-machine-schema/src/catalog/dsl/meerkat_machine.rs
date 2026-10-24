@@ -157,6 +157,31 @@ pub enum DurableRecoveryPriorCommit {
     MatchesCandidate,
 }
 
+/// Whether the recovery drive holds the session's exclusive write authority,
+/// as typed store facts prove it, and what the drive is for. The shell never
+/// infers it from timing or from the absence of activity: only a held
+/// cross-process hosting claim (an OS lock the kernel releases when its
+/// holder dies), or a host store's realm fence held after the superseded
+/// lease ran out, proves it, and only against earlier holders: a shell whose
+/// own runtime has the session registered proves nothing. With that proof
+/// the persisted lifecycle row of an earlier incarnation no longer gates
+/// recovery: that incarnation can no longer commit. The role decides what
+/// happens to its open run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum DurableRecoveryOwnership {
+    /// No such proof: the persisted lifecycle must be quiescent, as before.
+    #[default]
+    NotProven,
+    /// Proven, for a drive that will host the session (a start, a resume or
+    /// a cold attach): the tail is recovered as at a restart, so a
+    /// continuable run resumes.
+    ExclusiveHost,
+    /// Proven, for a store-only write that cannot run the session's run: the
+    /// earlier runtime is treated as retired, so an open run is committed as
+    /// interrupted before the write.
+    ExclusiveWriter,
+}
+
 /// The machine's recovery verdict. Nothing here ever authorizes discarding
 /// the durable tail; refusal and hold both retain it intact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -5163,6 +5188,10 @@ macro_rules! meerkat_catalog_machine_dsl {
                 // terminalization only on a commit verdict; it never
                 // downgrades a commit to a hold on its own.
                 input_evidence: Enum<DurableRecoveryInputEvidence>,
+                // The drive's store-proven exclusive write authority over the
+                // session, and its role. Without the proof the persisted
+                // lifecycle gates as before.
+                ownership: Enum<DurableRecoveryOwnership>,
             },
             PrepareTerminalSupervisorCleanupBindings { session_id: SessionId },
             // Two-phase unregister (D1): BeginUnregisterSession opens the
@@ -10516,15 +10545,25 @@ macro_rules! meerkat_catalog_machine_dsl {
         // when it names the candidate). Every other shape refuses. Refusal
         // and hold both retain the durable tail intact.
         //
+        // The one exception is store-proven ownership (`ownership` other than
+        // NotProven): the drive holds the session's exclusive write authority,
+        // so an earlier incarnation's non-quiescent row, or its current-run
+        // fact naming the candidate, can no longer commit and no longer gates.
+        // A row naming another run, or one that does not decode, still
+        // refuses. A store-only writer (ExclusiveWriter) treats that runtime
+        // as retired, so it never continues a run; a host (ExclusiveHost)
+        // recovers as a restart does.
+        //
         // GUARD PARTITION (total and disjoint over the quiescent phases). Let
         //   A := no_current_run && !terminalized(candidate)
-        //        && persisted_quiescent && persisted_no_current_run
+        //        && persisted_lifecycle_admitted
+        //        && persisted_current_run_admitted
         // be the admissible core. Its complement is still covered exactly
         // twice-over-nothing: `RefuseRunFacts` takes !(no_current_run &&
         // !terminalized), and `RefusePersistedFacts` takes the rest of the
-        // complement — its guard pair is the exact negation of
-        // (persisted_quiescent && persisted_no_current_run) under
-        // in-process quiescence.
+        // complement: its guard is the exact negation of
+        // (persisted_lifecycle_admitted && persisted_current_run_admitted)
+        // under in-process quiescence.
         // A itself is cut by the durable observation dimensions:
         //   1. class == Ambiguous -> `...Hold` (evidence-blind: an ambiguous
         //      tail holds whatever the receipts and input rows say, so it
@@ -10549,14 +10588,15 @@ macro_rules! meerkat_catalog_machine_dsl {
         //      classes. With prior_commit admitting recovery and
         //      input_evidence in {AllBoundOrInert, UnboundContentInput}:
         //      a runtime that is not retired (in-process Idle and a
-        //      persisted lifecycle other than Retired) -> `...Continue`
-        //      (write nothing, keep the run open; an unbound row stays
-        //      queued as in the retain-inputs commit); a retired runtime
-        //      (in-process Retired, or a persisted Retired lifecycle under
-        //      the fresh Idle authority the drive uses) takes the
-        //      interrupted cuts -> AllBoundOrInert
-        //      `...RepairContinuableRetired`, UnboundContentInput
-        //      `...HoldContinuableRetired`.
+        //      persisted lifecycle other than Retired) and a drive that can
+        //      host the run (ownership other than ExclusiveWriter)
+        //      -> `...Continue` (write nothing, keep the run open; an
+        //      unbound row stays queued as in the retain-inputs commit); a
+        //      retired runtime (in-process Retired, a persisted Retired
+        //      lifecycle under the fresh Idle authority the drive uses, or
+        //      a store-only writer's drive) takes the interrupted cuts
+        //      -> AllBoundOrInert `...RepairContinuableRetired`,
+        //      UnboundContentInput `...HoldContinuableRetired`.
         // Each dimension is split into complementary variant sets of a closed
         // enum, so cuts 2/3/4 cover A minus the Ambiguous slice exactly once.
         // Both hold-producing dispositions are minted HERE: no shell may
@@ -10573,19 +10613,24 @@ macro_rules! meerkat_catalog_machine_dsl {
                 observed_current_run,
                 last_committed_sequence,
                 prior_commit,
-                input_evidence
+                input_evidence,
+                ownership
             }
             guard "no_current_run" { self.current_run_id == None }
             guard "candidate_run_not_terminalized" {
                 self.turn_terminal_run_id != Some(candidate_run_id)
             }
-            guard "persisted_quiescent" {
+            guard "persisted_lifecycle_admitted" {
                 observed_lifecycle == DurableRecoveryObservedLifecycle::MissingRow
                 || observed_lifecycle == DurableRecoveryObservedLifecycle::Idle
                 || observed_lifecycle == DurableRecoveryObservedLifecycle::Retired
+                || (observed_lifecycle == DurableRecoveryObservedLifecycle::NonQuiescent
+                    && ownership != DurableRecoveryOwnership::NotProven)
             }
-            guard "persisted_no_current_run" {
+            guard "persisted_current_run_admitted" {
                 observed_current_run == DurableRecoveryObservedRun::NoRun
+                || (observed_current_run == DurableRecoveryObservedRun::CandidateRun
+                    && ownership != DurableRecoveryOwnership::NotProven)
             }
             // The durable receipts must not already cover this candidate: a
             // recovery that landed in another process is re-committable as a
@@ -10624,19 +10669,24 @@ macro_rules! meerkat_catalog_machine_dsl {
                 observed_current_run,
                 last_committed_sequence,
                 prior_commit,
-                input_evidence
+                input_evidence,
+                ownership
             }
             guard "no_current_run" { self.current_run_id == None }
             guard "candidate_run_not_terminalized" {
                 self.turn_terminal_run_id != Some(candidate_run_id)
             }
-            guard "persisted_quiescent" {
+            guard "persisted_lifecycle_admitted" {
                 observed_lifecycle == DurableRecoveryObservedLifecycle::MissingRow
                 || observed_lifecycle == DurableRecoveryObservedLifecycle::Idle
                 || observed_lifecycle == DurableRecoveryObservedLifecycle::Retired
+                || (observed_lifecycle == DurableRecoveryObservedLifecycle::NonQuiescent
+                    && ownership != DurableRecoveryOwnership::NotProven)
             }
-            guard "persisted_no_current_run" {
+            guard "persisted_current_run_admitted" {
                 observed_current_run == DurableRecoveryObservedRun::NoRun
+                || (observed_current_run == DurableRecoveryObservedRun::CandidateRun
+                    && ownership != DurableRecoveryOwnership::NotProven)
             }
             guard "prior_commit_admits_recovery" {
                 prior_commit == DurableRecoveryPriorCommit::NoPriorCommit
@@ -10686,19 +10736,24 @@ macro_rules! meerkat_catalog_machine_dsl {
                 observed_current_run,
                 last_committed_sequence,
                 prior_commit,
-                input_evidence
+                input_evidence,
+                ownership
             }
             guard "no_current_run" { self.current_run_id == None }
             guard "candidate_run_not_terminalized" {
                 self.turn_terminal_run_id != Some(candidate_run_id)
             }
-            guard "persisted_quiescent" {
+            guard "persisted_lifecycle_admitted" {
                 observed_lifecycle == DurableRecoveryObservedLifecycle::MissingRow
                 || observed_lifecycle == DurableRecoveryObservedLifecycle::Idle
                 || observed_lifecycle == DurableRecoveryObservedLifecycle::Retired
+                || (observed_lifecycle == DurableRecoveryObservedLifecycle::NonQuiescent
+                    && ownership != DurableRecoveryOwnership::NotProven)
             }
-            guard "persisted_no_current_run" {
+            guard "persisted_current_run_admitted" {
                 observed_current_run == DurableRecoveryObservedRun::NoRun
+                || (observed_current_run == DurableRecoveryObservedRun::CandidateRun
+                    && ownership != DurableRecoveryOwnership::NotProven)
             }
             guard "prior_commit_admits_recovery" {
                 prior_commit == DurableRecoveryPriorCommit::NoPriorCommit
@@ -10733,19 +10788,24 @@ macro_rules! meerkat_catalog_machine_dsl {
                 observed_current_run,
                 last_committed_sequence,
                 prior_commit,
-                input_evidence
+                input_evidence,
+                ownership
             }
             guard "no_current_run" { self.current_run_id == None }
             guard "candidate_run_not_terminalized" {
                 self.turn_terminal_run_id != Some(candidate_run_id)
             }
-            guard "persisted_quiescent" {
+            guard "persisted_lifecycle_admitted" {
                 observed_lifecycle == DurableRecoveryObservedLifecycle::MissingRow
                 || observed_lifecycle == DurableRecoveryObservedLifecycle::Idle
                 || observed_lifecycle == DurableRecoveryObservedLifecycle::Retired
+                || (observed_lifecycle == DurableRecoveryObservedLifecycle::NonQuiescent
+                    && ownership != DurableRecoveryOwnership::NotProven)
             }
-            guard "persisted_no_current_run" {
+            guard "persisted_current_run_admitted" {
                 observed_current_run == DurableRecoveryObservedRun::NoRun
+                || (observed_current_run == DurableRecoveryObservedRun::CandidateRun
+                    && ownership != DurableRecoveryOwnership::NotProven)
             }
             // Evidence-blind by construction: an ambiguous classification
             // holds whatever the receipts and input rows say, so this arm
@@ -10785,19 +10845,24 @@ macro_rules! meerkat_catalog_machine_dsl {
                 observed_current_run,
                 last_committed_sequence,
                 prior_commit,
-                input_evidence
+                input_evidence,
+                ownership
             }
             guard "no_current_run" { self.current_run_id == None }
             guard "candidate_run_not_terminalized" {
                 self.turn_terminal_run_id != Some(candidate_run_id)
             }
-            guard "persisted_quiescent" {
+            guard "persisted_lifecycle_admitted" {
                 observed_lifecycle == DurableRecoveryObservedLifecycle::MissingRow
                 || observed_lifecycle == DurableRecoveryObservedLifecycle::Idle
                 || observed_lifecycle == DurableRecoveryObservedLifecycle::Retired
+                || (observed_lifecycle == DurableRecoveryObservedLifecycle::NonQuiescent
+                    && ownership != DurableRecoveryOwnership::NotProven)
             }
-            guard "persisted_no_current_run" {
+            guard "persisted_current_run_admitted" {
                 observed_current_run == DurableRecoveryObservedRun::NoRun
+                || (observed_current_run == DurableRecoveryObservedRun::CandidateRun
+                    && ownership != DurableRecoveryOwnership::NotProven)
             }
             guard "commit_seeking_class" {
                 class == DurableTailRecoveryClass::CompletedCandidate
@@ -10833,19 +10898,24 @@ macro_rules! meerkat_catalog_machine_dsl {
                 observed_current_run,
                 last_committed_sequence,
                 prior_commit,
-                input_evidence
+                input_evidence,
+                ownership
             }
             guard "no_current_run" { self.current_run_id == None }
             guard "candidate_run_not_terminalized" {
                 self.turn_terminal_run_id != Some(candidate_run_id)
             }
-            guard "persisted_quiescent" {
+            guard "persisted_lifecycle_admitted" {
                 observed_lifecycle == DurableRecoveryObservedLifecycle::MissingRow
                 || observed_lifecycle == DurableRecoveryObservedLifecycle::Idle
                 || observed_lifecycle == DurableRecoveryObservedLifecycle::Retired
+                || (observed_lifecycle == DurableRecoveryObservedLifecycle::NonQuiescent
+                    && ownership != DurableRecoveryOwnership::NotProven)
             }
-            guard "persisted_no_current_run" {
+            guard "persisted_current_run_admitted" {
                 observed_current_run == DurableRecoveryObservedRun::NoRun
+                || (observed_current_run == DurableRecoveryObservedRun::CandidateRun
+                    && ownership != DurableRecoveryOwnership::NotProven)
             }
             guard "commit_seeking_class" {
                 class == DurableTailRecoveryClass::CompletedCandidate
@@ -10898,19 +10968,24 @@ macro_rules! meerkat_catalog_machine_dsl {
                 observed_current_run,
                 last_committed_sequence,
                 prior_commit,
-                input_evidence
+                input_evidence,
+                ownership
             }
             guard "no_current_run" { self.current_run_id == None }
             guard "candidate_run_not_terminalized" {
                 self.turn_terminal_run_id != Some(candidate_run_id)
             }
-            guard "persisted_quiescent" {
+            guard "persisted_lifecycle_admitted" {
                 observed_lifecycle == DurableRecoveryObservedLifecycle::MissingRow
                 || observed_lifecycle == DurableRecoveryObservedLifecycle::Idle
                 || observed_lifecycle == DurableRecoveryObservedLifecycle::Retired
+                || (observed_lifecycle == DurableRecoveryObservedLifecycle::NonQuiescent
+                    && ownership != DurableRecoveryOwnership::NotProven)
             }
-            guard "persisted_no_current_run" {
+            guard "persisted_current_run_admitted" {
                 observed_current_run == DurableRecoveryObservedRun::NoRun
+                || (observed_current_run == DurableRecoveryObservedRun::CandidateRun
+                    && ownership != DurableRecoveryOwnership::NotProven)
             }
             guard "prior_commit_admits_recovery" {
                 prior_commit == DurableRecoveryPriorCommit::NoPriorCommit
@@ -10929,6 +11004,11 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "runtime_not_retired" {
                 observed_lifecycle != DurableRecoveryObservedLifecycle::Retired
             }
+            // A store-only writer cannot run the run it would continue: its
+            // drive takes the retired cuts below.
+            guard "drive_hosts_the_run" {
+                ownership != DurableRecoveryOwnership::ExclusiveWriter
+            }
             update {}
             to Idle
             emit DurableTailRecoveryAuthorized {
@@ -10942,7 +11022,7 @@ macro_rules! meerkat_catalog_machine_dsl {
         // repaired and committed as interrupted, exactly as the Repair arm
         // does for an interrupted shape.
         transition AuthorizeDurableTailRecoveryRepairContinuableRetired {
-            per_phase [Idle, Retired]
+            per_phase [Idle]
             on input AuthorizeDurableTailRecovery {
                 session_id,
                 candidate_id,
@@ -10952,19 +11032,24 @@ macro_rules! meerkat_catalog_machine_dsl {
                 observed_current_run,
                 last_committed_sequence,
                 prior_commit,
-                input_evidence
+                input_evidence,
+                ownership
             }
             guard "no_current_run" { self.current_run_id == None }
             guard "candidate_run_not_terminalized" {
                 self.turn_terminal_run_id != Some(candidate_run_id)
             }
-            guard "persisted_quiescent" {
+            guard "persisted_lifecycle_admitted" {
                 observed_lifecycle == DurableRecoveryObservedLifecycle::MissingRow
                 || observed_lifecycle == DurableRecoveryObservedLifecycle::Idle
                 || observed_lifecycle == DurableRecoveryObservedLifecycle::Retired
+                || (observed_lifecycle == DurableRecoveryObservedLifecycle::NonQuiescent
+                    && ownership != DurableRecoveryOwnership::NotProven)
             }
-            guard "persisted_no_current_run" {
+            guard "persisted_current_run_admitted" {
                 observed_current_run == DurableRecoveryObservedRun::NoRun
+                || (observed_current_run == DurableRecoveryObservedRun::CandidateRun
+                    && ownership != DurableRecoveryOwnership::NotProven)
             }
             guard "prior_commit_admits_recovery" {
                 prior_commit == DurableRecoveryPriorCommit::NoPriorCommit
@@ -10976,9 +11061,68 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "continuable_class" {
                 class == DurableTailRecoveryClass::ContinuableCandidate
             }
+            // On the fresh Idle authority a recovery drive uses, a retired
+            // runtime shows in the persisted lifecycle; a store-only writer
+            // treats the earlier runtime as retired too.
             guard "retired_runtime" {
-                self.lifecycle_phase == Phase::Retired
+                observed_lifecycle == DurableRecoveryObservedLifecycle::Retired
+                || ownership == DurableRecoveryOwnership::ExclusiveWriter
+            }
+            update {
+                self.recovered_boundary_sequence = last_committed_sequence + 1;
+                self.turn_terminal_run_id = Some(candidate_run_id);
+            }
+            to Retired
+            emit DurableTailRecoveryCommitAuthorized {
+                candidate_id: candidate_id,
+                disposition: DurableTailRecoveryDisposition::RepairAndCommitInterrupted,
+                boundary_sequence: self.recovered_boundary_sequence
+            }
+        }
+
+        // The same cut in a Retired runtime, which never resumes a run.
+        // It carries no phase disjunct: the schema lowering strips phase
+        // predicates out of a guard, so a `self.lifecycle_phase` disjunct
+        // would make the generated model's arm stronger than this one.
+        transition AuthorizeDurableTailRecoveryRepairContinuableRetired {
+            per_phase [Retired]
+            on input AuthorizeDurableTailRecovery {
+                session_id,
+                candidate_id,
+                candidate_run_id,
+                class,
+                observed_lifecycle,
+                observed_current_run,
+                last_committed_sequence,
+                prior_commit,
+                input_evidence,
+                ownership
+            }
+            guard "no_current_run" { self.current_run_id == None }
+            guard "candidate_run_not_terminalized" {
+                self.turn_terminal_run_id != Some(candidate_run_id)
+            }
+            guard "persisted_lifecycle_admitted" {
+                observed_lifecycle == DurableRecoveryObservedLifecycle::MissingRow
+                || observed_lifecycle == DurableRecoveryObservedLifecycle::Idle
                 || observed_lifecycle == DurableRecoveryObservedLifecycle::Retired
+                || (observed_lifecycle == DurableRecoveryObservedLifecycle::NonQuiescent
+                    && ownership != DurableRecoveryOwnership::NotProven)
+            }
+            guard "persisted_current_run_admitted" {
+                observed_current_run == DurableRecoveryObservedRun::NoRun
+                || (observed_current_run == DurableRecoveryObservedRun::CandidateRun
+                    && ownership != DurableRecoveryOwnership::NotProven)
+            }
+            guard "prior_commit_admits_recovery" {
+                prior_commit == DurableRecoveryPriorCommit::NoPriorCommit
+                || prior_commit == DurableRecoveryPriorCommit::PrecedesCandidate
+            }
+            guard "inputs_attributable" {
+                input_evidence == DurableRecoveryInputEvidence::AllBoundOrInert
+            }
+            guard "continuable_class" {
+                class == DurableTailRecoveryClass::ContinuableCandidate
             }
             update {
                 self.recovered_boundary_sequence = last_committed_sequence + 1;
@@ -10996,7 +11140,7 @@ macro_rules! meerkat_catalog_machine_dsl {
         // as it does next to an interrupted shape: the repaired boundary does
         // not requeue the run's input, and the unbound row may be that input.
         transition AuthorizeDurableTailRecoveryHoldContinuableRetired {
-            per_phase [Idle, Retired]
+            per_phase [Idle]
             on input AuthorizeDurableTailRecovery {
                 session_id,
                 candidate_id,
@@ -11006,19 +11150,24 @@ macro_rules! meerkat_catalog_machine_dsl {
                 observed_current_run,
                 last_committed_sequence,
                 prior_commit,
-                input_evidence
+                input_evidence,
+                ownership
             }
             guard "no_current_run" { self.current_run_id == None }
             guard "candidate_run_not_terminalized" {
                 self.turn_terminal_run_id != Some(candidate_run_id)
             }
-            guard "persisted_quiescent" {
+            guard "persisted_lifecycle_admitted" {
                 observed_lifecycle == DurableRecoveryObservedLifecycle::MissingRow
                 || observed_lifecycle == DurableRecoveryObservedLifecycle::Idle
                 || observed_lifecycle == DurableRecoveryObservedLifecycle::Retired
+                || (observed_lifecycle == DurableRecoveryObservedLifecycle::NonQuiescent
+                    && ownership != DurableRecoveryOwnership::NotProven)
             }
-            guard "persisted_no_current_run" {
+            guard "persisted_current_run_admitted" {
                 observed_current_run == DurableRecoveryObservedRun::NoRun
+                || (observed_current_run == DurableRecoveryObservedRun::CandidateRun
+                    && ownership != DurableRecoveryOwnership::NotProven)
             }
             guard "prior_commit_admits_recovery" {
                 prior_commit == DurableRecoveryPriorCommit::NoPriorCommit
@@ -11030,9 +11179,61 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "continuable_class" {
                 class == DurableTailRecoveryClass::ContinuableCandidate
             }
+            // On the fresh Idle authority a recovery drive uses, a retired
+            // runtime shows in the persisted lifecycle; a store-only writer
+            // treats the earlier runtime as retired too.
             guard "retired_runtime" {
-                self.lifecycle_phase == Phase::Retired
+                observed_lifecycle == DurableRecoveryObservedLifecycle::Retired
+                || ownership == DurableRecoveryOwnership::ExclusiveWriter
+            }
+            update {}
+            to Retired
+            emit DurableTailRecoveryAuthorized {
+                candidate_id: candidate_id,
+                disposition: DurableTailRecoveryDisposition::HoldIntact
+            }
+        }
+
+        // The same hold in a Retired runtime (no phase disjunct, as above).
+        transition AuthorizeDurableTailRecoveryHoldContinuableRetired {
+            per_phase [Retired]
+            on input AuthorizeDurableTailRecovery {
+                session_id,
+                candidate_id,
+                candidate_run_id,
+                class,
+                observed_lifecycle,
+                observed_current_run,
+                last_committed_sequence,
+                prior_commit,
+                input_evidence,
+                ownership
+            }
+            guard "no_current_run" { self.current_run_id == None }
+            guard "candidate_run_not_terminalized" {
+                self.turn_terminal_run_id != Some(candidate_run_id)
+            }
+            guard "persisted_lifecycle_admitted" {
+                observed_lifecycle == DurableRecoveryObservedLifecycle::MissingRow
+                || observed_lifecycle == DurableRecoveryObservedLifecycle::Idle
                 || observed_lifecycle == DurableRecoveryObservedLifecycle::Retired
+                || (observed_lifecycle == DurableRecoveryObservedLifecycle::NonQuiescent
+                    && ownership != DurableRecoveryOwnership::NotProven)
+            }
+            guard "persisted_current_run_admitted" {
+                observed_current_run == DurableRecoveryObservedRun::NoRun
+                || (observed_current_run == DurableRecoveryObservedRun::CandidateRun
+                    && ownership != DurableRecoveryOwnership::NotProven)
+            }
+            guard "prior_commit_admits_recovery" {
+                prior_commit == DurableRecoveryPriorCommit::NoPriorCommit
+                || prior_commit == DurableRecoveryPriorCommit::PrecedesCandidate
+            }
+            guard "unbound_content_input" {
+                input_evidence == DurableRecoveryInputEvidence::UnboundContentInput
+            }
+            guard "continuable_class" {
+                class == DurableTailRecoveryClass::ContinuableCandidate
             }
             update {}
             to Retired
@@ -11053,7 +11254,8 @@ macro_rules! meerkat_catalog_machine_dsl {
                 observed_current_run,
                 last_committed_sequence,
                 prior_commit,
-                input_evidence
+                input_evidence,
+                ownership
             }
             guard "conflicting_run_facts" {
                 self.current_run_id != None
@@ -11083,16 +11285,23 @@ macro_rules! meerkat_catalog_machine_dsl {
                 observed_current_run,
                 last_committed_sequence,
                 prior_commit,
-                input_evidence
+                input_evidence,
+                ownership
             }
             guard "in_process_quiescent" {
                 self.current_run_id == None
                     && self.turn_terminal_run_id != Some(candidate_run_id)
             }
+            // One flat case per refusal, each the exact complement of a case
+            // of the admitted guards, so every pair with an admitting arm is
+            // structurally exclusive.
             guard "persisted_facts_conflict" {
-                observed_lifecycle == DurableRecoveryObservedLifecycle::NonQuiescent
-                    || observed_lifecycle == DurableRecoveryObservedLifecycle::Undecodable
-                    || observed_current_run != DurableRecoveryObservedRun::NoRun
+                observed_lifecycle == DurableRecoveryObservedLifecycle::Undecodable
+                    || observed_current_run == DurableRecoveryObservedRun::OtherRun
+                    || (ownership == DurableRecoveryOwnership::NotProven
+                        && observed_lifecycle == DurableRecoveryObservedLifecycle::NonQuiescent)
+                    || (ownership == DurableRecoveryOwnership::NotProven
+                        && observed_current_run == DurableRecoveryObservedRun::CandidateRun)
             }
             update {}
             to Idle
@@ -11113,7 +11322,8 @@ macro_rules! meerkat_catalog_machine_dsl {
                 observed_current_run,
                 last_committed_sequence,
                 prior_commit,
-                input_evidence
+                input_evidence,
+                ownership
             }
             update {}
             to Idle

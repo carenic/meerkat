@@ -25,17 +25,36 @@
 //! [`compacted_long_run`] holds the rows with compactions: a compaction
 //! commits the rewritten transcript as the run's new base, so a run killed
 //! after any number of compactions resumes at its last committed round,
-//! never at a round before a compaction. When another writer moves the
-//! session right before a compaction's commit, the run stops dispatching,
-//! and its input runs again as a new run, with nothing lost or duplicated.
+//! never at a round before a compaction.
+//!
+//! It ends with a compaction race ([`KillPoint::RebaseRace`]): a second Core
+//! writes one System message to the session right before a compaction's
+//! commit, without hosting the session. How it ends depends on how the
+//! store excludes writers:
+//! - over a store with fence leases the second Core takes the fence over,
+//!   so its write holds the session's exclusive write authority; it cannot
+//!   run the session's run, so it settles the run's committed rounds as an
+//!   interrupted run and then commits its message, and the run's own
+//!   compaction commit is refused (fenced out). A superseded holder may
+//!   still be finishing a tool call it dispatched before its fence window
+//!   closed: the interrupted commit answers every open call as outcome
+//!   unknown, and a resumed run follows the at-least-once tool contract
+//!   (dedupe keys);
+//! - over a store whose sessions are hosted under cross-process claims (the
+//!   built-in store) the first Core still hosts the session, so the second
+//!   Core's write is refused (served elsewhere) and settles nothing; the
+//!   run commits its compaction and finishes in its first incarnation.
+//!
+//! Either way nothing of the run resumes, runs again or is lost, and its
+//! input ends with one receipt.
 
 use meerkat_core::{RunId, ToolCallDedupeKey};
 
 use crate::failure::{ConformanceFailure, Steps};
 use crate::long_run::{
     BeforeResume, DurableWorkerHarness, KillPoint, KilledRun, LongRunHarness, LongRunPlan,
-    RestartReport, ResumeGate, ResumePointKind, RoundSet, UnrepeatableTool, call_id, resumes,
-    takes_first_commit,
+    OtherWriterOutcome, RestartReport, ResumeGate, ResumePointKind, RoundSet, UnrepeatableTool,
+    call_id, resumes, takes_first_commit,
 };
 
 /// Rounds of every row's run in the long run chapter.
@@ -151,7 +170,7 @@ const LONG_RUN_ROWS: [(&str, LongRunPlan); 16] = [
 ];
 
 /// The compacted long run rows, by step name.
-const COMPACTED_ROWS: [(&str, LongRunPlan); 7] = [
+const COMPACTED_ROWS: [(&str, LongRunPlan); 6] = [
     (
         "five_compactions_then_tools",
         compacted(
@@ -191,11 +210,20 @@ const COMPACTED_ROWS: [(&str, LongRunPlan); 7] = [
             KillPoint::ModelCall,
         ),
     ),
-    (
-        "compaction_racing_another_writer_requeues",
-        compacted(6, RoundSet::EMPTY.with(3), 3, KillPoint::RebaseRace),
-    ),
 ];
+
+/// The compaction race: a run of six rounds that compacts at round 3,
+/// raced at that compaction ([`KillPoint::RebaseRace`]).
+const COMPACTION_RACE: LongRunPlan =
+    compacted(6, RoundSet::EMPTY.with(3), 3, KillPoint::RebaseRace);
+
+/// The race's step over a store with fence leases.
+const FENCE_TAKEOVER_RACE: &str =
+    "compaction_racing_a_fence_takeover_settles_the_run_as_interrupted";
+
+/// The race's step over a store whose sessions are hosted under
+/// cross-process claims.
+const HOSTED_SESSION_RACE: &str = "compaction_racing_the_sessions_host_refuses_the_writer";
 
 /// The durable worker rows, by step name.
 const DURABLE_WORKER_ROWS: [(&str, LongRunPlan, ResumeGate); 5] = [
@@ -237,15 +265,21 @@ pub async fn long_run(harness: &dyn LongRunHarness) -> Result<(), ConformanceFai
 /// killed right after a compaction, during the tools of the round after
 /// it, rounds later, and after the last of five compactions. Each resumes
 /// at its last committed round, never at a round before a compaction, and
-/// finishes. This is the acceptance row for durable rounds on a host store
-/// whose sessions are whole documents.
+/// finishes. Then the compaction race, whose step names what it proves for
+/// the store under test. This is the acceptance row for durable rounds on
+/// a host store whose sessions are whole documents.
 pub async fn compacted_long_run(harness: &dyn LongRunHarness) -> Result<(), ConformanceFailure> {
-    run_rows(
-        harness,
-        Steps::chapter("compacted_long_run"),
-        &COMPACTED_ROWS,
-    )
-    .await
+    let steps = Steps::chapter("compacted_long_run");
+    run_rows(harness, steps, &COMPACTED_ROWS).await?;
+    let plan = COMPACTION_RACE;
+    let killed = harness.run_and_kill(&plan).await?;
+    let report = harness.restart(&plan).await?;
+    if harness.fence_leases() {
+        check_killed(&steps, FENCE_TAKEOVER_RACE, &plan, &killed)?;
+        check_race_settled_by_takeover(&steps, FENCE_TAKEOVER_RACE, &plan, &report)
+    } else {
+        check_race_refused_by_host(&steps, HOSTED_SESSION_RACE, &plan, &killed, &report)
+    }
 }
 
 async fn run_rows(
@@ -310,6 +344,199 @@ pub async fn durable_worker(harness: &dyn DurableWorkerHarness) -> Result<(), Co
         }
     }
     Ok(())
+}
+
+/// The compaction race over a store with fence leases: the second Core took
+/// the fence over, its write settled the run's committed rounds as an
+/// interrupted run and then committed, the run's compaction commit was
+/// refused, and the restart ran nothing.
+fn check_race_settled_by_takeover(
+    steps: &Steps,
+    step: &'static str,
+    plan: &LongRunPlan,
+    report: &RestartReport,
+) -> Result<(), ConformanceFailure> {
+    check_lease_wait(steps, step, report, true)?;
+    steps.ensure(
+        step,
+        report.other_writer == Some(OtherWriterOutcome::Committed),
+        format!(
+            "the other writer got {:?}; after the fence takeover its write must commit",
+            report.other_writer
+        ),
+    )?;
+    steps.ensure(
+        step,
+        report.resumed.is_none()
+            && report.runs.is_empty()
+            && report.model_call_rounds.is_empty()
+            && report.dispatched.is_empty(),
+        format!(
+            "the restart resumed {:?}, ran {:?}, called the model for rounds {:?} and dispatched {:?}; \
+             the settled run must not run again",
+            report.resumed, report.runs, report.model_call_rounds, report.dispatched
+        ),
+    )?;
+    // The committed rounds once, from round 0: the refused compaction folded
+    // nothing into a summary.
+    let committed: Vec<u64> = (0..plan.kill_round).collect();
+    steps.ensure(
+        step,
+        report.transcript_rounds == committed,
+        format!(
+            "the transcript holds rounds {:?}, expected the committed rounds {committed:?} once",
+            report.transcript_rounds
+        ),
+    )?;
+    let mut results = report.transcript_results.clone();
+    let mut expected_results: Vec<String> = committed
+        .iter()
+        .flat_map(|round| calls_of(plan, *round))
+        .collect();
+    results.sort();
+    expected_results.sort();
+    steps.ensure(
+        step,
+        results == expected_results && report.interrupted.is_empty(),
+        format!(
+            "the transcript holds the results {results:?} (outcome unknown: {:?}), expected each of \
+             {expected_results:?} once and no open call (the race comes after a round's second commit)",
+            report.interrupted
+        ),
+    )?;
+    steps.ensure(
+        step,
+        report.interrupted_notices == 1
+            && report.other_writer_messages == 1
+            && report.other_writer_follows_interrupted_notice,
+        format!(
+            "the transcript holds {} interrupted-run notices and {} messages of the other writer \
+             (right after the notice: {}); expected the interrupted notice, then the message",
+            report.interrupted_notices,
+            report.other_writer_messages,
+            report.other_writer_follows_interrupted_notice
+        ),
+    )?;
+    steps.ensure(
+        step,
+        report.receipts == 1,
+        format!(
+            "the input has {} run receipts, expected the settle's one",
+            report.receipts
+        ),
+    )?;
+    steps.ensure(
+        step,
+        report.inputs_settled,
+        "the settled run's inputs are not terminal",
+    )
+}
+
+/// The compaction race over a store whose sessions are hosted under
+/// cross-process claims: the first Core still hosted the session, so the
+/// second Core's write was refused and settled nothing; the run committed
+/// its compaction and finished in its first incarnation, every round once,
+/// and the restart ran nothing.
+fn check_race_refused_by_host(
+    steps: &Steps,
+    step: &'static str,
+    plan: &LongRunPlan,
+    killed: &KilledRun,
+    report: &RestartReport,
+) -> Result<(), ConformanceFailure> {
+    check_lease_wait(steps, step, report, false)?;
+    steps.ensure(
+        step,
+        report.other_writer == Some(OtherWriterOutcome::ServedElsewhere),
+        format!(
+            "the other writer got {:?}; a session its first Core still hosts must refuse it \
+             (served elsewhere)",
+            report.other_writer
+        ),
+    )?;
+    let mut expected_calls: Vec<(RunId, u64, String)> = (0..plan.rounds)
+        .flat_map(|round| {
+            calls_of(plan, round)
+                .into_iter()
+                .map(move |call| (round, call))
+        })
+        .map(|(round, call)| (killed.run_id.clone(), round, call))
+        .collect();
+    let mut dispatched: Vec<(RunId, u64, String)> = killed.dispatched.iter().map(call_of).collect();
+    let order = |call: &(RunId, u64, String)| (call.1, call.2.clone());
+    expected_calls.sort_by_key(order);
+    dispatched.sort_by_key(order);
+    steps.ensure(
+        step,
+        dispatched == expected_calls,
+        format!(
+            "the first incarnation dispatched {dispatched:?}; the run it finished must dispatch each of \
+             {expected_calls:?} once"
+        ),
+    )?;
+    steps.ensure(
+        step,
+        report.resumed.is_none()
+            && report.runs.is_empty()
+            && report.model_call_rounds.is_empty()
+            && report.dispatched.is_empty(),
+        format!(
+            "the restart resumed {:?}, ran {:?}, called the model for rounds {:?} and dispatched {:?}; \
+             the finished run must not run again",
+            report.resumed, report.runs, report.model_call_rounds, report.dispatched
+        ),
+    )?;
+    let rounds = &report.transcript_rounds;
+    let consecutive = rounds.windows(2).all(|pair| pair[1] == pair[0] + 1);
+    let starts_right = match (rounds.first(), plan.compactions.last()) {
+        (Some(first), Some(last_compaction)) => *first <= last_compaction,
+        (Some(first), None) => *first == 0,
+        (None, _) => false,
+    };
+    steps.ensure(
+        step,
+        consecutive && starts_right && rounds.last() == Some(&(plan.rounds - 1)),
+        format!(
+            "the transcript holds rounds {rounds:?}, expected each round once, in order, ending at {}",
+            plan.rounds - 1
+        ),
+    )?;
+    let mut results = report.transcript_results.clone();
+    let mut expected_results: Vec<String> = rounds
+        .iter()
+        .flat_map(|round| calls_of(plan, *round))
+        .collect();
+    results.sort();
+    expected_results.sort();
+    steps.ensure(
+        step,
+        results == expected_results,
+        format!(
+            "the transcript holds the results {results:?}, expected each of {expected_results:?} once"
+        ),
+    )?;
+    steps.ensure(
+        step,
+        report.other_writer_messages == 0 && report.interrupted_notices == 0,
+        format!(
+            "the transcript holds {} messages of the refused writer and {} interrupted-run notices, \
+             expected none",
+            report.other_writer_messages, report.interrupted_notices
+        ),
+    )?;
+    steps.ensure(
+        step,
+        report.receipts == 1,
+        format!(
+            "the input has {} run receipts, expected exactly one",
+            report.receipts
+        ),
+    )?;
+    steps.ensure(
+        step,
+        report.inputs_settled,
+        "the finished run's inputs are not terminal",
+    )
 }
 
 /// The calls of `round`, in emission order; none for the last round.
@@ -630,13 +857,12 @@ fn check_restart(
             report.receipts
         ),
     )?;
-    let other_writer_messages = usize::from(plan.kill_point == KillPoint::RebaseRace);
     steps.ensure(
         step,
-        report.other_writer_messages == other_writer_messages,
+        report.other_writer_messages == 0 && report.other_writer.is_none(),
         format!(
-            "the final transcript holds {} messages of the other writer, expected {other_writer_messages}",
-            report.other_writer_messages
+            "the final transcript holds {} messages of an other writer ({:?}), expected none",
+            report.other_writer_messages, report.other_writer
         ),
     )?;
     steps.ensure(

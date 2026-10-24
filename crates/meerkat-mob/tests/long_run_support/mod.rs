@@ -67,8 +67,8 @@ use meerkat_runtime::{
     RuntimeSessionPersistenceProfile, RuntimeStore,
 };
 use meerkat_store_conformance::{
-    BeforeResume, KillPoint, KilledRun, LongRunPlan, RestartReport, ResumeGate, ResumePointKind,
-    ResumedRun, RoundSet, UnrepeatableTool, call_id,
+    BeforeResume, KillPoint, KilledRun, LongRunPlan, OtherWriterOutcome, RestartReport, ResumeGate,
+    ResumePointKind, ResumedRun, RoundSet, UnrepeatableTool, call_id,
 };
 
 /// The realm every row opens.
@@ -93,6 +93,10 @@ pub const FOLLOW: &str = "follow";
 pub const SHUTDOWN_BUDGET: Duration = Duration::from_secs(75);
 /// The System message the other writer of a compaction race appends.
 pub const OTHER_WRITER: &str = "[lr other writer]";
+/// How the notice of a run that recovery closed as interrupted begins.
+const INTERRUPTED_RUN_NOTICE: &str = "A previous run was interrupted";
+/// The file the other writer of a compaction race records its outcome in.
+const RACE_OUTCOME: &str = "race-outcome";
 /// The worker's auto-compaction threshold, and the input tokens the model
 /// reports on the round before a compaction.
 const COMPACTION_THRESHOLD: u64 = 50_000;
@@ -584,19 +588,44 @@ impl RaceHook for HostRace {
 }
 
 /// A second Core over `store` takes it over and appends one System message
-/// of its own to `session`.
+/// of its own to `session`, and records what its write got
+/// ([`read_other_writer_outcome`]).
 pub async fn other_writer(store: &Store, session: &SessionId) {
     let opened = open_persistence(store, true).await;
     let (service, _machine) = runtime_backed_service(store.root(), opened.persistence, None, false);
-    service
+    let outcome = match service
         .append_system_context(
             session,
             meerkat_core::service::AppendSystemContextRequest::from_text(OTHER_WRITER),
         )
         .await
-        .expect("the other writer appends its message");
+    {
+        Ok(_) => OtherWriterOutcome::Committed,
+        Err(meerkat_core::service::SessionControlError::Session(
+            meerkat_core::service::SessionError::ServedElsewhere { .. },
+        )) => OtherWriterOutcome::ServedElsewhere,
+        Err(error) => OtherWriterOutcome::Refused(error.to_string()),
+    };
+    let encoded = match &outcome {
+        OtherWriterOutcome::Committed => "committed".to_string(),
+        OtherWriterOutcome::ServedElsewhere => "served_elsewhere".to_string(),
+        OtherWriterOutcome::Refused(error) => format!("refused\n{error}"),
+    };
+    std::fs::write(store.root().join(RACE_OUTCOME), encoded)
+        .expect("record the other writer's outcome");
     drop(service);
     drop(opened.owners);
+}
+
+/// What the other writer of a compaction race over `root` got, if it ran.
+fn read_other_writer_outcome(root: &Path) -> Option<OtherWriterOutcome> {
+    let encoded = std::fs::read_to_string(root.join(RACE_OUTCOME)).ok()?;
+    Some(match encoded.split_once('\n') {
+        Some(("refused", error)) => OtherWriterOutcome::Refused(error.to_string()),
+        _ if encoded == "committed" => OtherWriterOutcome::Committed,
+        _ if encoded == "served_elsewhere" => OtherWriterOutcome::ServedElsewhere,
+        _ => OtherWriterOutcome::Refused(format!("unreadable outcome record {encoded:?}")),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1674,12 +1703,33 @@ impl Incarnation {
     }
 
     pub async fn input_settled(&self, session: &SessionId, input: &InputId) -> bool {
-        self.machine
+        if self
+            .machine
             .input_terminal_receipt(session, InteractionSelector::InputId(input.clone()))
             .await
             .ok()
             .flatten()
             .is_some_and(|read| read.report.is_resolved())
+        {
+            return true;
+        }
+        // A session whose run ended in the first incarnation (a compaction
+        // race's) is never registered by the restart: its input's durable
+        // row answers.
+        let runtime_id = LogicalRuntimeId::for_session(session);
+        self.runtime_store
+            .load_input_states(&runtime_id)
+            .await
+            .is_ok_and(|rows| {
+                rows.into_iter().any(|row| {
+                    matches!(
+                        row,
+                        meerkat_runtime::store::InputStateRow::Decoded(state)
+                            if &state.state.input_id == input
+                                && state.seed.terminal_outcome.is_some()
+                    )
+                })
+            })
     }
 
     /// `input`'s terminal outcome, once it has one.
@@ -2168,6 +2218,8 @@ pub struct KilledState {
     pub session: SessionId,
     pub input: InputId,
     pub run: KilledRun,
+    /// What the other writer of a compaction race got, if one ran.
+    pub other_writer: Option<OtherWriterOutcome>,
 }
 
 /// What a deploy row's first incarnation left on disk for `member`; its
@@ -2191,6 +2243,7 @@ pub fn read_killed_member(root: &Path, member: &str) -> Result<KilledState, Stri
         session,
         input,
         run: KilledRun { run_id, dispatched },
+        other_writer: None,
     })
 }
 
@@ -2211,6 +2264,7 @@ pub fn read_killed(root: &Path) -> Result<KilledState, String> {
             run_id,
             dispatched: DispatchLog::read(&root.join("dispatched.jsonl")),
         },
+        other_writer: read_other_writer_outcome(root),
     })
 }
 
@@ -2497,20 +2551,27 @@ async fn report_from(
     fence_leases: bool,
     held_events: Option<meerkat_core::comms::SessionEventSubscription>,
 ) -> Result<RestartReport, String> {
-    // The runs, from the events the session retains.
-    let subscription = match held_events {
-        Some(subscription) => subscription,
-        None => incarnation
+    // The runs, from the events the session retains. A session the restart
+    // never loaded (a compaction race's run ended in the first incarnation)
+    // has no event stream here: the restart ran nothing for it, and the
+    // chapter judges that.
+    let mut stream = match held_events {
+        Some(subscription) => Some(subscription.stream),
+        None => match incarnation
             .service
             .subscribe_session_events_from(session, meerkat_core::SessionEventCursor::Earliest)
             .await
-            .map_err(|error| format!("replay the session's events: {error}"))?,
+        {
+            Ok(subscription) => Some(subscription.stream),
+            Err(meerkat_core::comms::StreamError::NotFound(_)) => None,
+            Err(error) => return Err(format!("replay the session's events: {error}")),
+        },
     };
-    let mut stream = subscription.stream;
     let mut resumed = None;
     let mut runs: Vec<RunId> = Vec::new();
-    while let Ok(Some(envelope)) =
-        tokio::time::timeout(Duration::from_millis(500), stream.next()).await
+    while let Some(stream) = stream.as_mut()
+        && let Ok(Some(envelope)) =
+            tokio::time::timeout(Duration::from_millis(500), stream.next()).await
     {
         match envelope.payload {
             AgentEvent::RunResumed {
@@ -2574,8 +2635,21 @@ async fn report_from(
     let mut transcript_results = Vec::new();
     let mut interrupted = Vec::new();
     let mut other_writer_messages = 0;
+    let mut interrupted_notices = 0;
+    let mut other_writer_follows_interrupted_notice = false;
+    let mut after_interrupted_notice = false;
     for message in transcript.messages() {
+        let follows_notice = std::mem::take(&mut after_interrupted_notice);
         match message {
+            Message::SystemNotice(notice)
+                if notice
+                    .body
+                    .as_deref()
+                    .is_some_and(|body| body.starts_with(INTERRUPTED_RUN_NOTICE)) =>
+            {
+                interrupted_notices += 1;
+                after_interrupted_notice = true;
+            }
             Message::BlockAssistant(assistant) => {
                 let text = assistant.text_blocks().collect::<Vec<_>>().join("\n");
                 if let Some(round) = markers(&text)
@@ -2599,6 +2673,7 @@ async fn report_from(
             }
             Message::System(system) if system.content.contains(OTHER_WRITER) => {
                 other_writer_messages += 1;
+                other_writer_follows_interrupted_notice |= follows_notice;
             }
             _ => {}
         }
@@ -2633,6 +2708,9 @@ async fn report_from(
         transcript_results,
         receipts,
         other_writer_messages,
+        other_writer: killed.other_writer.clone(),
+        interrupted_notices,
+        other_writer_follows_interrupted_notice,
         inputs_settled,
     })
 }

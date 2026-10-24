@@ -1705,6 +1705,60 @@ impl std::fmt::Display for DurableRecoveryObservedRun {
     serde::Serialize,
     serde::Deserialize,
 )]
+pub enum DurableRecoveryOwnership {
+    #[default]
+    #[serde(rename = "NotProven")]
+    NotProven,
+    #[serde(rename = "ExclusiveHost")]
+    ExclusiveHost,
+    #[serde(rename = "ExclusiveWriter")]
+    ExclusiveWriter,
+}
+impl DurableRecoveryOwnership {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NotProven => "NotProven",
+            Self::ExclusiveHost => "ExclusiveHost",
+            Self::ExclusiveWriter => "ExclusiveWriter",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for DurableRecoveryOwnership {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "NotProven" => Ok(Self::NotProven),
+            "ExclusiveHost" => Ok(Self::ExclusiveHost),
+            "ExclusiveWriter" => Ok(Self::ExclusiveWriter),
+            other => Err(format!("invalid DurableRecoveryOwnership value `{other}`")),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for DurableRecoveryOwnership {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for DurableRecoveryOwnership {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum DurableRecoveryPriorCommit {
     #[default]
     #[serde(rename = "DivergesFromCandidate")]
@@ -16022,6 +16076,7 @@ pub mod inputs {
         pub last_committed_sequence: u64,
         pub prior_commit: DurableRecoveryPriorCommit,
         pub input_evidence: DurableRecoveryInputEvidence,
+        pub ownership: DurableRecoveryOwnership,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct PrepareTerminalSupervisorCleanupBindings {

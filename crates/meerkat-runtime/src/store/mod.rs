@@ -12509,6 +12509,7 @@ mod recovery_disposition_pairing_tests {
                                     last_committed_sequence: 0,
                                     prior_commit: prior,
                                     input_evidence: evidence,
+                                    ownership: mm_dsl::DurableRecoveryOwnership::NotProven,
                                 }
                             };
                             let transition =

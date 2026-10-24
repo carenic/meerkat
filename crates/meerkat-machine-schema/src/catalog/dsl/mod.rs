@@ -1619,6 +1619,13 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
                 "DurableRecoveryInputEvidence",
                 &["Unfenceable", "UnboundContentInput", "AllBoundOrInert"],
             ),
+            // The recovery drive's store-proven exclusive write authority over
+            // the session, and its role. The fail-closed NotProven is FIRST,
+            // as above.
+            NamedTypeBinding::string_enum(
+                "DurableRecoveryOwnership",
+                &["NotProven", "ExclusiveHost", "ExclusiveWriter"],
+            ),
             NamedTypeBinding::string_enum("RealtimeTranscriptLaneKind", &["Display", "Spoken"]),
             NamedTypeBinding::string("AuthBindingRef"),
             NamedTypeBinding::string_enum(
