@@ -509,7 +509,7 @@
           "REPO_MAPPING:rules_rust+,bazel_tools bazel_tools",
           "REPO_MAPPING:rules_rust+,rules_cc rules_cc+",
           "REPO_MAPPING:rules_rust+,rules_rust rules_rust+",
-          "FILE:@@//Cargo.lock 49a9e8af9ceec616324ba5406c9bad5bc543ca280c5afae9dccd610475780b6e",
+          "FILE:@@//Cargo.lock b071a48cd8effa8adc917b6cbfeab91222011648e35116d5c540ddd9d0145b0c",
           "FILE:@@//Cargo.toml 3f8118f74ff273177a1e9bea478407a1d5e9b59606d1121f347e90a55b000f7a",
           "FILE:@@//crates/meerkat/Cargo.toml b7e5f252461318ef30de9bb039184ca9e1f5b24fba076246ccfd881ce4b3dec9",
           "FILE:@@//crates/meerkat-anthropic/Cargo.toml 4987b0d77b008da6a1e65425a75b73f7046ab9c368882d672b2503dbad0d8616",

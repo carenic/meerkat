@@ -2853,6 +2853,8 @@ them.
   Meerkat's crates still accept tokio 1.43 and later, so a project that
   depends on them should update tokio to 1.53.3 or later in its own lockfile,
   for example with `cargo update -p tokio`.
+- ctutils is updated to 0.4.5 in Meerkat's lockfile for RUSTSEC-2026-0385
+  (reached only under the aws-sigv4 feature).
 
 ### Upgrade notes
 
