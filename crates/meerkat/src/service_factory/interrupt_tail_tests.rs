@@ -892,16 +892,16 @@ async fn a_restart_after_an_interrupt_resumes_and_requeues_nothing_head_canonica
 enum Strand {
     /// Staged for a run that never started: the row a pre-release build of
     /// 0.9.5 left for the turn after its interrupt.
-    ForANewRun,
+    NewRunPrompt,
     /// Staged for the session's earlier run, which committed: a boundary
     /// receipt names that run.
-    ForACommittedRun,
+    CommittedRunPrompt,
     /// A steer queued again in its lane, still naming a run that never
     /// committed: it joined that run at a model boundary and the join was
     /// discarded when the run failed.
-    DiscardedSteerOfANewRun,
+    NewRunDiscardedSteer,
     /// A peer message staged for a run that never started.
-    PeerForANewRun,
+    NewRunPeerMessage,
 }
 
 /// The durable state a pre-release interrupt left, every host stopped.
@@ -1073,7 +1073,7 @@ async fn pre_release_wedge(
     let start = Start::open(stores, root, client);
     let id = start.materialize(None).await;
     let committed_run = match strand {
-        Strand::ForACommittedRun => {
+        Strand::CommittedRunPrompt => {
             client.push(Step::Text("zeroth answer"));
             let outcome = start.turn(&id, "zeroth").await;
             assert!(
@@ -1085,7 +1085,7 @@ async fn pre_release_wedge(
                 .into_iter()
                 .find_map(|row| row.seed.last_run_id)
         }
-        Strand::ForANewRun | Strand::DiscardedSteerOfANewRun | Strand::PeerForANewRun => None,
+        Strand::NewRunPrompt | Strand::NewRunDiscardedSteer | Strand::NewRunPeerMessage => None,
     };
     let (turn_a, run_a) = run_a_held_after_a_round_commit(&start, client, &id).await;
     let run_a_row = input_rows(start.runtime_store.as_ref(), &id)
@@ -1094,25 +1094,25 @@ async fn pre_release_wedge(
         .find(|row| row.seed.last_run_id.as_ref() == Some(&run_a))
         .expect("run A's own input row");
     let bound_run = match strand {
-        Strand::ForANewRun | Strand::DiscardedSteerOfANewRun | Strand::PeerForANewRun => {
+        Strand::NewRunPrompt | Strand::NewRunDiscardedSteer | Strand::NewRunPeerMessage => {
             Some(RunId::new())
         }
-        Strand::ForACommittedRun => {
+        Strand::CommittedRunPrompt => {
             Some(committed_run.expect("the earlier run's input names its run"))
         }
     };
     let second = match strand {
-        Strand::DiscardedSteerOfANewRun => steer("second"),
-        Strand::PeerForANewRun => peer_message("second"),
-        Strand::ForANewRun | Strand::ForACommittedRun => {
+        Strand::NewRunDiscardedSteer => steer("second"),
+        Strand::NewRunPeerMessage => peer_message("second"),
+        Strand::NewRunPrompt | Strand::CommittedRunPrompt => {
             Input::Prompt(PromptInput::new("second", None))
         }
     };
     let mut row = stranded_row(&run_a_row, &second, bound_run);
     match strand {
-        Strand::DiscardedSteerOfANewRun => as_discarded_join(&mut row, &second),
-        Strand::PeerForANewRun => stamp_own_admission(&mut row, &second, true),
-        Strand::ForANewRun | Strand::ForACommittedRun => {}
+        Strand::NewRunDiscardedSteer => as_discarded_join(&mut row, &second),
+        Strand::NewRunPeerMessage => stamp_own_admission(&mut row, &second, true),
+        Strand::NewRunPrompt | Strand::CommittedRunPrompt => {}
     }
     write_input_row(start.runtime_store.as_ref(), &id, row).await;
     start
@@ -1314,7 +1314,7 @@ async fn an_operator_requeues_the_input_stranded_beside_a_pre_release_interrupt(
 async fn an_operator_requeues_the_prompt_stranded_beside_a_pre_release_interrupt_whole_blob() {
     an_operator_requeues_the_input_stranded_beside_a_pre_release_interrupt(
         false,
-        Strand::ForANewRun,
+        Strand::NewRunPrompt,
         "user second",
     )
     .await;
@@ -1324,7 +1324,7 @@ async fn an_operator_requeues_the_prompt_stranded_beside_a_pre_release_interrupt
 async fn an_operator_requeues_the_prompt_stranded_beside_a_pre_release_interrupt_head_canonical() {
     an_operator_requeues_the_input_stranded_beside_a_pre_release_interrupt(
         true,
-        Strand::ForANewRun,
+        Strand::NewRunPrompt,
         "user second",
     )
     .await;
@@ -1334,7 +1334,7 @@ async fn an_operator_requeues_the_prompt_stranded_beside_a_pre_release_interrupt
 async fn an_operator_requeues_a_discarded_steer_beside_a_pre_release_interrupt_whole_blob() {
     an_operator_requeues_the_input_stranded_beside_a_pre_release_interrupt(
         false,
-        Strand::DiscardedSteerOfANewRun,
+        Strand::NewRunDiscardedSteer,
         "user second",
     )
     .await;
@@ -1344,7 +1344,7 @@ async fn an_operator_requeues_a_discarded_steer_beside_a_pre_release_interrupt_w
 async fn an_operator_requeues_a_discarded_steer_beside_a_pre_release_interrupt_head_canonical() {
     an_operator_requeues_the_input_stranded_beside_a_pre_release_interrupt(
         true,
-        Strand::DiscardedSteerOfANewRun,
+        Strand::NewRunDiscardedSteer,
         "user second",
     )
     .await;
@@ -1354,7 +1354,7 @@ async fn an_operator_requeues_a_discarded_steer_beside_a_pre_release_interrupt_h
 async fn an_operator_requeues_a_peer_message_stranded_beside_an_interrupt_whole_blob() {
     an_operator_requeues_the_input_stranded_beside_a_pre_release_interrupt(
         false,
-        Strand::PeerForANewRun,
+        Strand::NewRunPeerMessage,
         "notice Comms",
     )
     .await;
@@ -1364,7 +1364,7 @@ async fn an_operator_requeues_a_peer_message_stranded_beside_an_interrupt_whole_
 async fn an_operator_requeues_a_peer_message_stranded_beside_an_interrupt_head_canonical() {
     an_operator_requeues_the_input_stranded_beside_a_pre_release_interrupt(
         true,
-        Strand::PeerForANewRun,
+        Strand::NewRunPeerMessage,
         "notice Comms",
     )
     .await;
@@ -1382,7 +1382,7 @@ async fn the_operator_refuses_a_prompt_staged_for_a_run_that_committed(head_cano
     let root = TempDir::new().expect("temp");
     let stores = Stores::new(head_canonical, &root);
     let client = Arc::new(ScriptedModel::new());
-    let wedge = pre_release_wedge(&stores, &root, &client, Strand::ForACommittedRun).await;
+    let wedge = pre_release_wedge(&stores, &root, &client, Strand::CommittedRunPrompt).await;
     let id = &wedge.id;
     let store = stores.operator_store();
 
@@ -1432,7 +1432,7 @@ async fn an_operator_repair_consumes_a_cursor_bound_row_staged_for_another_run_o
     let root = TempDir::new().expect("temp");
     let stores = Stores::new(head_canonical, &root);
     let client = Arc::new(ScriptedModel::new());
-    let wedge = pre_release_wedge(&stores, &root, &client, Strand::ForANewRun).await;
+    let wedge = pre_release_wedge(&stores, &root, &client, Strand::NewRunPrompt).await;
     let id = &wedge.id;
     let run_a_input = wedge.run_a_row.state.input_id.clone();
     let store = stores.operator_store();
