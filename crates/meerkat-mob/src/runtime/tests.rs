@@ -16710,6 +16710,188 @@ async fn test_existing_member_adoption_tool_update_and_resume_keep_identity_and_
     resumed.shutdown().await.expect("shutdown resumed mob");
 }
 
+/// [`PersistentMockBuilder`], recording the external tool names each member
+/// build is offered.
+struct ToolRecordingBuilder {
+    builds: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+}
+
+#[async_trait]
+impl SessionAgentBuilder for ToolRecordingBuilder {
+    type Agent = PersistentMockAgent;
+
+    async fn build_agent(
+        &self,
+        req: &CreateSessionRequest,
+        event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+    ) -> Result<Self::Agent, SessionError> {
+        let names = req
+            .build
+            .as_ref()
+            .and_then(|build| build.external_tools.as_ref())
+            .map(|tools| {
+                tools
+                    .tools()
+                    .iter()
+                    .map(|tool| tool.name.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.builds.lock().expect("recorded builds").push(names);
+        PersistentMockBuilder.build_agent(req, event_tx).await
+    }
+}
+
+/// An adopted identity converges by rebuilding its member from the sealed
+/// identity material. The sealed profile is portable and carries no
+/// runtime-owned tool bundles, so the rebuild mounts the bundles the mob's
+/// definition profile names: the member keeps its registered bundle's tools.
+#[tokio::test]
+async fn an_adopted_identity_keeps_its_profiles_registered_tool_bundle() {
+    let definition = with_unique_mob_id(
+        sample_definition_with_tool_bundle("bundle-a"),
+        "identity-bundle",
+    );
+    let mob_id = definition.id.clone();
+    let event_store = InMemoryMobEventStore::new();
+    let identity_store = Arc::new(InMemoryMobIdentityStore::paired_with_event_store(
+        &event_store,
+        Arc::new(crate::store::SystemMobIdentityStoreClock),
+    ));
+    let events: Arc<dyn MobEventStore> = Arc::new(event_store);
+    let session_store_dyn: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let blob_store: Arc<dyn meerkat_core::BlobStore> =
+        Arc::new(meerkat_store::MemoryBlobStore::new());
+    let builds = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let service = Arc::new(meerkat_session::PersistentSessionService::new(
+        ToolRecordingBuilder {
+            builds: Arc::clone(&builds),
+        },
+        16,
+        session_store_dyn,
+        runtime_store,
+        blob_store,
+    ));
+    let storage = MobStorage {
+        events,
+        runs: Arc::new(InMemoryMobRunStore::new()),
+        specs: Arc::new(InMemoryMobSpecStore::new()),
+        definition_projection_composition:
+            crate::storage::DefinitionProjectionComposition::Independent,
+        runtime_metadata: Arc::new(InMemoryMobRuntimeMetadataStore::new()),
+        identity: identity_store.clone(),
+        identity_member: Some(identity_store),
+        identity_status: Arc::new(InMemoryMobIdentityStatusStore::new()),
+        identity_status_projection_order: Default::default(),
+        realm_profiles: None,
+        forked_participants: None,
+    };
+    let handle = MobBuilder::new(definition, storage)
+        .with_session_service(service.clone())
+        .with_spawn_base_prompt_source(Arc::new(crate::StaticSpawnBasePromptSource(
+            "adoption test base prompt".to_string(),
+        )))
+        .register_tool_bundle("bundle-a", Arc::new(EchoBundleDispatcher))
+        .create()
+        .await
+        .expect("create the bundle adoption test mob");
+    let member = AgentIdentity::from("worker-1");
+    let mut spawn = SpawnMemberSpec::new(ProfileName::from("worker"), member.clone());
+    spawn.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    handle.spawn_spec(spawn).await.expect("spawn the member");
+    let session_id = handle
+        .resolve_bridge_session_id(&member)
+        .await
+        .expect("session-backed member");
+    let offers_the_bundle = |names: &Vec<String>| names.iter().any(|name| name == "bundle_echo");
+    assert!(
+        builds
+            .lock()
+            .expect("recorded builds")
+            .first()
+            .is_some_and(offers_the_bundle),
+        "the spawn mounts the registered bundle: {:?}",
+        builds.lock().expect("recorded builds")
+    );
+
+    handle
+        .adopt_member_identity_declaration(crate::identity::AdoptMemberIdentityDeclaration {
+            mob_id: mob_id.clone(),
+            agent_identity: member.clone(),
+            request_id: crate::identity::IdentityAdoptionId::new("adopt-worker-1")
+                .expect("valid adoption id"),
+            precondition: crate::identity::IdentityAdoptionPrecondition::ExpectedAbsent,
+            declaration_scope: crate::identity::IdentityDeclarationScopeId::new("bundle-policy")
+                .expect("valid declaration scope"),
+            declaration_revision: 1,
+            session: crate::identity::DesiredSessionTarget {
+                session_id: session_id.clone(),
+                lineage_id: meerkat_core::SessionLineageId::for_session(&session_id),
+                lineage_generation: meerkat_core::SessionGeneration::INITIAL,
+                authority_policy: crate::identity::DesiredSessionAuthorityPolicy::RequireExisting,
+            },
+            member: crate::identity::IdentityProfileMemberDeclaration {
+                profile_name: ProfileName::from("worker"),
+                profile_override: None,
+                model_override: None,
+                external_addressable_override: None,
+                context: None,
+                labels: None,
+                additional_instructions: None,
+                system_prompt_override: None,
+                tool_access_policy: None,
+                auth_binding: None,
+                budget_limits: None,
+                runtime_mode: Some(meerkat_contracts::wire::WireMobRuntimeMode::TurnDriven),
+                required_env_keys: Vec::new(),
+                required_local_callback_tools: Vec::new(),
+                execution: crate::identity::DesiredExecution::ControllingSession,
+            },
+            wiring_custody: crate::identity::IdentityWiringCustody::ExternalManaged,
+            owned_wiring: BTreeSet::new(),
+            convergence: crate::identity::IdentityConvergenceMode::Drain { max_wait_ms: 5_000 },
+        })
+        .await
+        .expect("adopt the member");
+    let rebuilt = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let converged = matches!(
+                handle
+                    .identity_convergence_status(&member)
+                    .await
+                    .expect("read adoption convergence"),
+                crate::identity::IdentityStoredObservation::Valid(
+                    crate::identity::IdentityConvergenceStatus {
+                        active_intent_revision: Some(1),
+                        decision: Some(crate::identity::IdentityReconcileDecision::Converged),
+                        ..
+                    }
+                )
+            );
+            if converged && builds.lock().expect("recorded builds").len() >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let recorded = builds.lock().expect("recorded builds").clone();
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown the bundle adoption test mob");
+    assert!(
+        rebuilt.is_ok(),
+        "the adoption converges by rebuilding the member: {recorded:?}"
+    );
+    assert!(
+        recorded.last().is_some_and(offers_the_bundle),
+        "the rebuilt member keeps its profile's registered bundle: {recorded:?}"
+    );
+}
+
 #[tokio::test]
 async fn an_adopted_identity_converges_once_the_previous_incarnations_lease_expires() {
     // The previous incarnation's last lease renewal; long enough that the
