@@ -6628,20 +6628,12 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         .map_err(|error| Self::store_owned_durable_tail_recovery_error(id, error))
     }
 
-    /// Whether this service's runtime owner has `id` registered. Its own
-    /// registration may still write the session's lifecycle row, so the
-    /// session's hosting claim, which this owner's lineage shares, proves
-    /// nothing against that row: it is no earlier incarnation's.
-    async fn runtime_registers_session(&self, id: &SessionId) -> bool {
-        let adapter = self
-            .runtime_adapter
+    /// This service's runtime owner, if a machine hosts its sessions.
+    fn runtime_owner(&self) -> Option<Arc<MeerkatMachine>> {
+        self.runtime_adapter
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        match adapter {
-            Some(adapter) => adapter.contains_session(id).await,
-            None => false,
-        }
+            .clone()
     }
 
     /// [`Self::store_owned_durable_tail_recovery_outcome`] for a host: a
@@ -6652,9 +6644,9 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// an earlier incarnation's lifecycle row no longer gates the recovery,
     /// and a continuable run resumes as at a restart
     /// ([`meerkat_runtime::recovery::recover_durable_tail_under_hosting_claim`]).
-    /// Outside a claim's scope, or while this runtime owner has the session
-    /// registered (the row may be its own), it is the store-owned recovery
-    /// itself.
+    /// Outside a claim's scope, or without a runtime owner, it is the
+    /// store-owned recovery itself; while the owner has the session
+    /// registered the drive proves nothing (the row may be its own).
     async fn hosted_durable_tail_recovery_outcome(
         &self,
         id: &SessionId,
@@ -6668,12 +6660,13 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         let Some(claim) = meerkat_core::session_hosting::write_hosting_claim(id) else {
             return self.store_owned_durable_tail_recovery_outcome(id).await;
         };
-        if self.runtime_registers_session(id).await {
+        let Some(owner) = self.runtime_owner() else {
             return self.store_owned_durable_tail_recovery_outcome(id).await;
-        }
+        };
         meerkat_runtime::recovery::recover_durable_tail_under_hosting_claim(
             self.runtime_store.as_ref(),
             id,
+            &owner,
             &claim,
             meerkat_runtime::recovery::DurableTailDriveRole::Host,
         )
@@ -6690,10 +6683,9 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// outcome unknown, its inputs settled by its run cursor), a completed
     /// one commits, and the write then lands after it. A tail the recovery
     /// holds or refuses fails the write typed, and nothing is settled.
-    /// Without that proof, or while this runtime owner has the session
-    /// registered, the store-owned recovery decides as at a restart, and a
-    /// run it would continue is left to its next host: the write fails as
-    /// held.
+    /// Without that proof (while this runtime owner has the session
+    /// registered too), the recovery decides as at a restart, and a run it
+    /// would continue is left to its next host: the write fails as held.
     async fn settle_earlier_run_before_store_only_write(
         &self,
         id: &SessionId,
@@ -6734,24 +6726,26 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 return Ok(());
             }
         }
-        let (outcome, _) = if self.runtime_registers_session(id).await {
-            meerkat_core::session_hosting::with_write_hosting(
-                hosting.clone(),
-                self.store_owned_durable_tail_recovery_outcome(id),
-            )
-            .await?
-        } else {
-            meerkat_core::session_hosting::with_write_hosting(
+        let (outcome, _) = match self.runtime_owner() {
+            Some(owner) => meerkat_core::session_hosting::with_write_hosting(
                 hosting.clone(),
                 meerkat_runtime::recovery::recover_durable_tail_under_hosting_claim(
                     self.runtime_store.as_ref(),
                     id,
+                    &owner,
                     hosting,
                     meerkat_runtime::recovery::DurableTailDriveRole::Writer,
                 ),
             )
             .await
-            .map_err(|error| Self::store_owned_durable_tail_recovery_error(id, error))?
+            .map_err(|error| Self::store_owned_durable_tail_recovery_error(id, error))?,
+            None => {
+                meerkat_core::session_hosting::with_write_hosting(
+                    hosting.clone(),
+                    self.store_owned_durable_tail_recovery_outcome(id),
+                )
+                .await?
+            }
         };
         match outcome {
             meerkat_runtime::recovery::DurableTailRecoveryOutcome::Committed { .. } => {

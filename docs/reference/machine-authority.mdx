@@ -226,8 +226,9 @@ Ownership splits three ways:
   non-quiescent row, or its current-run fact naming the candidate's run, no
   longer gates. A row naming another run, or one that does not decode,
   still refuses; the proof is never inferred from timing, and it covers
-  earlier holders only (a drive whose own runtime owner has the session
-  registered proves nothing). A drive that
+  earlier holders only (a drive offered another runtime owner's claim, or
+  whose own runtime owner has the session registered, proves nothing). A
+  drive that
   hosts the session (`ExclusiveHost`) then decides as a restart does; a
   store-only writer (`ExclusiveWriter`) cannot run the run, so it takes the
   retired cuts and never continues it. The bounded TLC audit

@@ -999,3 +999,106 @@ async fn a_store_only_write_to_a_session_a_live_host_serves_is_refused_and_settl
  {
     a_store_only_write_to_a_session_a_live_host_serves_is_refused_and_settles_nothing(false).await;
 }
+
+/// The claim drive proves nothing for a runtime owner the claim does not
+/// cover. Run A waits on the model in a host whose own runtime registers the
+/// session and holds its cross-process hosting claim. An embedder runs a
+/// writer's claim drive over the session, which would commit run A as
+/// interrupted if the claim proved exclusive write authority:
+/// - for a second runtime owner over the same stores, which registers
+///   nothing, offered the host's claim;
+/// - for the host's own runtime owner, which registers the session, with
+///   its own claim.
+///
+/// Each drive decides as without the proof, as a restart would: run A is a
+/// run its host continues, so the drive answers Continue and writes
+/// nothing. Run A's tail stands, and run A then completes once, with no
+/// interrupted-run notice.
+async fn a_claim_drive_proves_nothing_against_its_own_runtimes_registration(head_canonical: bool) {
+    use meerkat_runtime::recovery::{
+        DurableTailDriveRole, DurableTailRecoveryOutcome, recover_durable_tail_under_hosting_claim,
+    };
+    let root = TempDir::new().expect("temp");
+    let stores = DiskStores::new(head_canonical, &root);
+    let client = Arc::new(ScriptedModel::new());
+    let host = stores.open_hosted(&root, &client);
+    let id = materialize_session(&host, meerkat_core::Session::new()).await;
+    let (turn_a, run_a) = run_a_held_after_a_round_commit(&host, &client, &id).await;
+
+    let claim = host
+        .service
+        .grant_session_hosting(&id)
+        .expect("the host's own hosting claim");
+    assert!(claim.is_cross_process(), "the claim is an OS lock");
+
+    let other_client = Arc::new(ScriptedModel::new());
+    let other = stores.open_hosted(&root, &other_client);
+    let (outcome, _) = recover_durable_tail_under_hosting_claim(
+        other.runtime_store.as_ref(),
+        &id,
+        &other.machine,
+        &claim,
+        DurableTailDriveRole::Writer,
+    )
+    .await
+    .expect("the drive answers");
+    assert!(
+        matches!(outcome, DurableTailRecoveryOutcome::Continue { ref run_id, .. } if *run_id == run_a),
+        "another runtime owner's claim proves nothing for this one: {outcome:?}"
+    );
+
+    let (outcome, _) = recover_durable_tail_under_hosting_claim(
+        host.runtime_store.as_ref(),
+        &id,
+        &host.machine,
+        &claim,
+        DurableTailDriveRole::Writer,
+    )
+    .await
+    .expect("the drive answers");
+    drop(claim);
+    assert!(
+        matches!(outcome, DurableTailRecoveryOutcome::Continue { ref run_id, .. } if *run_id == run_a),
+        "the claim proves nothing against its own runtime's registration: {outcome:?}"
+    );
+    assert_eq!(
+        tail_run(&host, &id).await,
+        Some(run_a),
+        "run A's tail stands"
+    );
+
+    client.release.add_permits(1);
+    let outcome_a = tokio::time::timeout(DEADLINE, turn_a)
+        .await
+        .expect("run A ends")
+        .expect("turn A task");
+    assert!(
+        matches!(outcome_a, Some(CompletionOutcome::Completed(ref run)) if run.text == "held answer"),
+        "run A completes: {outcome_a:?}"
+    );
+    assert_eq!(
+        committed_transcript(&host, &id).await,
+        vec![
+            "user first".to_string(),
+            "assistant tool use".to_string(),
+            "tool results".to_string(),
+            "assistant held answer".to_string(),
+        ],
+        "run A committed once, with no interrupted-run notice"
+    );
+    assert_eq!(
+        other_client.requests.load(Ordering::SeqCst),
+        0,
+        "the second runtime owner asked no model"
+    );
+}
+
+#[tokio::test]
+async fn a_claim_drive_proves_nothing_against_its_own_runtimes_registration_head_canonical() {
+    a_claim_drive_proves_nothing_against_its_own_runtimes_registration(true).await;
+}
+
+#[tokio::test]
+async fn a_claim_drive_proves_nothing_against_its_own_runtimes_registration_whole_blob() {
+    a_claim_drive_proves_nothing_against_its_own_runtimes_registration(false).await;
+}

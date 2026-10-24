@@ -2920,10 +2920,17 @@ pub enum DurableTailDriveRole {
 /// commits it as interrupted. A persisted current run that names another
 /// run, or a lifecycle row that does not decode, still refuses.
 ///
-/// The claim proves nothing against the caller's own runtime owner, whose
-/// lineage shares it: a caller whose runtime owner has the session
-/// registered calls [`recover_durable_tail_retaining_committed_whole_blob`]
-/// instead, since that registration may still write the lifecycle row.
+/// `owner` is the runtime owner the caller drives for, and the proof holds
+/// only for a claim of its own lineage, taken while it does not have the
+/// session registered. The drive is NotProven otherwise:
+/// - `claim` is another runtime owner's: it proves nothing about `owner`;
+/// - `owner` has the session registered: its lineage shares the claim, so
+///   the claim proves nothing against that registration, which may still
+///   write the lifecycle row while its run is live.
+///
+/// The registration check is a point-in-time read; a registration that
+/// lands before the recovery's commit changes the lifecycle row the commit
+/// is fenced on, so the commit fails typed instead of overwriting it.
 ///
 /// After a host store takeover, a superseded holder may still be finishing
 /// a tool call it dispatched before its window closed. A writer's
@@ -2932,6 +2939,7 @@ pub enum DurableTailDriveRole {
 pub async fn recover_durable_tail_under_hosting_claim(
     store: &dyn RuntimeStore,
     session_id: &SessionId,
+    owner: &crate::meerkat_machine::MeerkatMachine,
     claim: &meerkat_core::session_hosting::HostingClaim,
     role: DurableTailDriveRole,
 ) -> Result<
@@ -2947,7 +2955,13 @@ pub async fn recover_durable_tail_under_hosting_claim(
             claim.session_id()
         )));
     }
-    let ownership = proven_ownership(store, claim, role);
+    let ownership = if claim.owner() != owner.hosting_authority().owner()
+        || owner.contains_session(session_id).await
+    {
+        mm_dsl::DurableRecoveryOwnership::NotProven
+    } else {
+        proven_ownership(store, claim, role)
+    };
     let mut committed_whole_blob = None;
     let outcome = recover_durable_tail_capturing(
         store,

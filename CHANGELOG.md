@@ -990,9 +990,11 @@ them.
     fence, and its open waited out any superseded holder's lease before it
     served anything, so a fenced-out holder commits nothing more.
   The proof is never inferred from timing or from the absence of activity,
-  and it covers earlier holders only: while this runtime owner has the
-  session registered, its own registration may still write the row. Without
-  it the earlier rules hold unchanged. It reaches the machine as
+  and it covers earlier holders only: the drive takes the runtime owner it
+  drives for, and with another owner's claim, or while that owner has the
+  session registered (its own registration may still write the row), it
+  decides without the proof. Without it the earlier rules hold unchanged.
+  It reaches the machine as
   `DurableRecoveryOwnership` on `AuthorizeDurableTailRecovery` (see
   Breaking), with the drive's role:
   - a host (a resume preparation, an actor's materialization, a cold attach
