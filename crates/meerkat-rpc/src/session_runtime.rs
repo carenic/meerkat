@@ -8447,7 +8447,7 @@ impl SessionRuntime {
     /// `session_events: false` is the request's opt-out of its turn's
     /// `session/event` copies: the turn applying this request's input writes
     /// none, unless another input of the same turn wants them (see
-    /// [`Self::turn_writes_session_events`]).
+    /// `Self::turn_writes_session_events`).
     #[allow(clippy::too_many_arguments, unused_variables)]
     pub async fn start_turn_via_runtime_with_request_context(
         self: &Arc<Self>,

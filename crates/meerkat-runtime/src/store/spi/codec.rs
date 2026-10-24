@@ -2,13 +2,13 @@
 //! chunks. Every format carries a version and a load refuses an unknown one.
 //!
 //! - A **journaled scope** (a runtime, a mob, an identity, a realm record)
-//!   has a JSON head ([`ScopeHeadV1`]): its family, its full logical key,
+//!   has a JSON head (`ScopeHeadV1`): its family, its full logical key,
 //!   its pinned entries (small values every boot needs, inline or by chunk),
-//!   its row window and its byte counters. Its rows ([`ROW_MAGIC`]) carry the
+//!   its row window and its byte counters. Its rows (`ROW_MAGIC`) carry the
 //!   other entries as keyed changes, folded in order.
-//! - A **chunk scope** (record kind, family [`CHUNK_TAG`]) carries one value
+//! - A **chunk scope** (record kind, family `CHUNK_TAG`) carries one value
 //!   too large for a row or a batch, as rows of at most [`MAX_ROW_BYTES`],
-//!   under a JSON head ([`ChunkHeadV1`]) naming its owner scope, its length
+//!   under a JSON head (`ChunkHeadV1`) naming its owner scope, its length
 //!   and its SHA-256. It is written, over as many batches as it needs, before
 //!   the batch that references it; it is complete only once its head says so.
 //!
