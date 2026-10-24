@@ -145,10 +145,12 @@ struct PreparedRecoveryCandidate {
     physical_message_count: usize,
     /// The calls the recovered document answers as outcome unknown.
     closed_call_ids: Vec<String>,
-    /// The inputs the tail's run cursor binds to its run; `None` for a tail
-    /// without a readable run cursor. An operator's requeue of another run's
-    /// stranded inputs needs a readable cursor and never touches one of these
-    /// (see [`observe_stranded_run_inputs`]).
+    /// The inputs the tail's run cursor binds to its run, when the cursor
+    /// agrees with the tail; `None` for a tail without a run cursor or with
+    /// one that disagrees (a stale or unreadable one, which does not show
+    /// what the tail holds). An operator's requeue of another run's stranded
+    /// inputs needs an agreeing cursor and never touches one of these (see
+    /// [`observe_stranded_run_inputs`]).
     cursor_bound_inputs: Option<Vec<InputId>>,
 }
 
@@ -494,9 +496,17 @@ fn observe_run_cursor(
     Ok((DurableTailRunCursor::Agrees, inputs_bound))
 }
 
-/// The inputs a tail's run cursor binds to its run; `None` for a tail
-/// without a readable run cursor.
-fn cursor_bound_inputs(head: &Session) -> Option<Vec<InputId>> {
+/// The inputs a tail's run cursor binds to its run, when the classifier's
+/// cursor verdict `run_cursor` is that the cursor agrees with the tail:
+/// only an agreeing cursor binds exactly the inputs whose content the tail
+/// holds. `None` for a tail without a cursor, and for one whose cursor
+/// disagrees (unreadable, or a round's staged message that is already in
+/// the tail or cannot be told apart): that tail keeps attribution by run
+/// association.
+fn cursor_bound_inputs(head: &Session, run_cursor: DurableTailRunCursor) -> Option<Vec<InputId>> {
+    if run_cursor != DurableTailRunCursor::Agrees {
+        return None;
+    }
     match head.try_run_cursor() {
         Ok(Some(cursor)) => Some(cursor.bound_input_ids),
         Ok(None) | Err(_) => None,
@@ -1419,7 +1429,7 @@ fn prepare_head_canonical_recovery_candidate_in(
             tail_facts: HeldTailFacts::observed(&observation),
             physical_message_count: physical_head.messages().len(),
             closed_call_ids,
-            cursor_bound_inputs: cursor_bound_inputs(physical_head),
+            cursor_bound_inputs: cursor_bound_inputs(physical_head, observation.run_cursor),
         },
     ))
 }
@@ -1564,7 +1574,8 @@ fn prepare_whole_blob_recovery_candidate_in(
     }
     let physical_envelope = candidate_session.clone();
     let physical_message_count = candidate_session.messages().len();
-    let candidate_cursor_bound_inputs = cursor_bound_inputs(&candidate_session);
+    let candidate_cursor_bound_inputs =
+        cursor_bound_inputs(&candidate_session, observation.run_cursor);
     let mut recovered = candidate_session;
     let closer = match class {
         DurableTailRecoveryClass::CompletedCandidate => None,
@@ -3492,10 +3503,10 @@ fn carries_redeliverable_content(input: Option<&crate::input::Input>) -> bool {
 /// Observation pass: classify the input-lifecycle evidence the machine judges,
 /// on durable identity only.
 ///
-/// A tail with a readable run cursor (a round commit's) names its own inputs:
-/// every round commit lists in the cursor each input the run wrote into its
-/// turn, its batch at run start and each join at the boundary that appended
-/// it. So the cursor's inputs, and those a committed receipt for the
+/// A tail whose run cursor agrees with it (a round commit's) names its own
+/// inputs: every round commit lists in the cursor each input the run wrote
+/// into its turn, its batch at run start and each join at the boundary that
+/// appended it. So the cursor's inputs, and those a committed receipt for the
 /// candidate run names, are attributed to the candidate; nothing else is,
 /// even a row naming the candidate (a join the cancel requeued before any
 /// round commit listed it is not in the tail, so it is redelivered, not
@@ -3503,14 +3514,15 @@ fn carries_redeliverable_content(input: Option<&crate::input::Input>) -> bool {
 /// when it names no run or the candidate: it cannot be in the tail. One
 /// naming another run is reported as `UnboundContentInput`.
 ///
-/// A tail without a readable cursor (a closing save, an older shape) keeps
-/// the durable run association:
+/// A tail without an agreeing cursor (a closing save, an older shape, or a
+/// cursor the classifier judged to disagree with the tail) keeps the durable
+/// run association:
 /// 1. Records the persisted machine facts already bound to the candidate run
 ///    (`seed.last_run_id`).
 /// 2. Records a durably committed receipt for the candidate run names in its
 ///    `contributing_input_ids`.
 ///
-/// Without a cursor, anything else that is non-terminal and carries
+/// Without an agreeing cursor, anything else that is non-terminal and carries
 /// redeliverable content might be the tail's own input whose binding never
 /// became durable (text equality is content evidence, never identity), and
 /// is reported as `UnboundContentInput`. A store that cannot version input
@@ -3585,10 +3597,10 @@ async fn observe_candidate_run_inputs(
         if !carries_redeliverable_content(bundle.state.persisted_input.as_ref()) {
             continue;
         }
-        // Beside a cursor, a row the cursor does not list that names no run,
-        // or the candidate, is not in the tail and stays for redelivery. One
-        // naming another run is not proven either way, so it holds.
-        // Without a cursor every such row holds.
+        // Beside an agreeing cursor, a row the cursor does not list that
+        // names no run, or the candidate, is not in the tail and stays for
+        // redelivery. One naming another run is not proven either way, so it
+        // holds. Without an agreeing cursor every such row holds.
         let holds = match cursor_bound_inputs {
             Some(_) => bundle
                 .seed
@@ -3652,9 +3664,9 @@ fn terminalize_attributed_inputs(
 /// tail, when they are the only reason ordinary recovery holds it.
 ///
 /// Every row is read again from a snapshot at the same input-set revision the
-/// observation read (a moved set answers `None`). The tail must carry a
-/// readable run cursor, whose bound inputs are exactly the inputs whose
-/// content the tail holds. Each non-terminal row is then judged as the
+/// observation read (a moved set answers `None`). The tail must carry a run
+/// cursor that agrees with it, whose bound inputs are exactly the inputs
+/// whose content the tail holds. Each non-terminal row is then judged as the
 /// observation attributes it ([`observe_candidate_run_inputs`]):
 /// - a row the cursor binds is the tail's own, whatever run it names now (a
 ///   join the cancel requeued and a later run staged again, for one): the

@@ -776,15 +776,17 @@ the committed authority is preserved.
   with an `outcome_uncertain` tool error result for each of its tool calls,
   which says only that the call's outcome is unknown: the calls may have
   run.
-- Since 0.9.5 a tail with a run cursor settles the inputs its cursor binds:
-  the cursor binds exactly the inputs whose content the run wrote into its
-  turn, and a committed receipt of the run names more. Those not ended yet
-  are consumed with the tail, whatever run they name now. A content input the cursor does
-  not bind is not in the tail: one that names no run, or the tail's run (a
-  steer that joined after the last round commit), stays queued and runs once
-  after the tail is closed; one that names another run holds the tail for
-  reconciliation. A tail without a run cursor settles the inputs that name
-  its run and holds beside any other content input. A cancelled run (an
+- Since 0.9.5 a tail whose run cursor agrees with it settles the inputs its
+  cursor binds: the cursor binds exactly the inputs whose content the run
+  wrote into its turn, and a committed receipt of the run names more. Those
+  not ended yet are consumed with the tail, whatever run they name now. A
+  content input the cursor does not bind is not in the tail: one that names
+  no run, or the tail's run (a steer that joined after the last round
+  commit), stays queued and runs once after the tail is closed; one that
+  names another run holds the tail for reconciliation. A tail without an
+  agreeing run cursor (none, or a stale one the transcript went past)
+  settles the inputs that name its run and holds beside any other content
+  input. A cancelled run (an
   interrupt or a run stop) is closed as interrupted when its cancellation
   commits, under these rules.
 - Anything else, including any tail carrying a dangling `tool_use`, is held

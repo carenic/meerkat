@@ -915,8 +915,10 @@ them.
   rounds wrote, and those a committed receipt of the run names. A content
   input the cursor does not bind is not in the tail: one that names no run,
   or the tail's run, stays queued for ordinary delivery, and one that names
-  another run holds the tail. A tail without a cursor settles the inputs
-  that name its run and holds beside any other content input.
+  another run holds the tail. That takes a cursor that agrees with the
+  tail: a tail without one (no cursor, or a stale one the transcript went
+  past) settles the inputs that name its run and holds beside any other
+  content input.
   `recovery::observe_resumable_run` observes a continuable tail for
   registration, which marks the run resumable on the live authority and keeps
   its inputs bound instead of requeueing them. Every recovery commit clears the
