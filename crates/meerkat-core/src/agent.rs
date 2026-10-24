@@ -1846,8 +1846,9 @@ impl ToolDispatchContext {
     /// An owned, single-use entry for a leaf whose effect runs on a worker
     /// (for example a queued blocking task). It re-derives the exact
     /// binding-owned call when entered, so it is `'static` and `Send`, and it
-    /// is consumed by value, so it can enter at most once. A ticket entered
-    /// after the admitting dispatch ended refuses.
+    /// is consumed by value, so it can enter at most once. A reviewed ticket
+    /// entered after the admitting dispatch ended refuses; any ticket refuses
+    /// once its run is no longer current.
     pub fn reviewed_entry_ticket(
         &self,
         call: ToolCallView<'_>,
