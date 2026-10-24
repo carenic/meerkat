@@ -7707,7 +7707,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// persists, or revives anything. While the session's own durable run
     /// holds a provisional tail ahead of the committed snapshot it reads that
     /// snapshot through the tail
-    /// ([`Self::load_authoritative_session_base_with_replay_info_tolerating_tail`]).
+    /// (`Self::load_authoritative_session_base_with_replay_info_tolerating_tail`).
     pub async fn load_durable_session_body(
         &self,
         id: &SessionId,
