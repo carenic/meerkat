@@ -1891,10 +1891,14 @@ impl StoreCheckpointer {
     /// model fallback the next run commits before its first checkpoint. A
     /// resumed run keeps its own receipt: it continues that tail.
     ///
-    /// Takes the checkpoint gate, then the receipt, the order every user that
-    /// takes both keeps; the run cursor's lock is taken last.
+    /// Takes the receipt's lock, then the run cursor's, and never the
+    /// checkpoint gate. Every caller holds the session's recovery gate, which
+    /// a turn holds for its whole execution, so no checkpoint of this actor is
+    /// in flight while it runs. An archive holds the checkpoint gate while it
+    /// takes the recovery gate back after its retire, so a clear that waited
+    /// on that gate under the recovery gate would hold the archive until its
+    /// deadline.
     async fn forget_run_checkpoint_receipt_unless(&self, keep: Option<&RunId>) {
-        let _gate = self.gate.cancelled.lock().await;
         let mut receipt_slot = self.latest_run_checkpoint_receipt.lock().await;
         if receipt_slot
             .as_ref()
@@ -21022,6 +21026,57 @@ mod tests {
             rewrite_audit: None,
         };
         (runtime_store, session, checkpointer)
+    }
+
+    /// Forgetting a settled run's receipt does not wait on the checkpoint gate.
+    /// An archive holds that gate while it retires the session and then takes
+    /// the recovery gate back. A turn admission or a staleness sync clears a
+    /// receipt while it holds the recovery gate, so a clear that waited on the
+    /// checkpoint gate there would hold the archive until its deadline
+    /// (`RetirementInProgress`). The receipt and the held cursor are still
+    /// forgotten.
+    #[tokio::test]
+    async fn forgetting_a_settled_runs_receipt_does_not_wait_on_the_checkpoint_gate() {
+        let (_runtime_store, mut session, checkpointer) = whole_blob_checkpointer_fixture().await;
+        let run_id = RunId::new();
+        session.push(Message::User(UserMessage::text("a settled run's prompt")));
+        let receipt = checkpointer
+            .checkpoint_whole_blob(&mut session, &run_id, None)
+            .await
+            .expect("checkpoint the settled run")
+            .expect("the checkpoint issues a receipt");
+        *checkpointer.latest_run_checkpoint_receipt.lock().await = Some(receipt);
+        checkpointer.record_held_checkpoint_cursor(Some((
+            run_id.clone(),
+            HeldCheckpointCursor::of(&session),
+        )));
+
+        // An archive holds the checkpoint gate.
+        let archive_holds_the_gate = checkpointer.gate.cancelled.lock().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            checkpointer.forget_run_checkpoint_receipt_unless(None),
+        )
+        .await
+        .expect("the clear does not wait on the checkpoint gate");
+        drop(archive_holds_the_gate);
+
+        assert!(
+            checkpointer
+                .latest_run_checkpoint_receipt
+                .lock()
+                .await
+                .is_none(),
+            "the settled run's receipt is forgotten"
+        );
+        assert!(
+            checkpointer
+                .latest_run_checkpoint_cursor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "the settled run's held cursor is forgotten"
+        );
     }
 
     fn assert_teardown_required_projection_authority(error: AgentError, expected_message: &str) {
