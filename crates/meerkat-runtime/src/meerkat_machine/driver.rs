@@ -5922,8 +5922,9 @@ impl DriverEntry {
     /// cancel point, a replaced attachment's predecessor work) runs it before
     /// it names the inputs it ends. An adopted input leaves the active set, so
     /// no sweep answers its process-local waiters any more: they fail here
-    /// with `AuthorityUnavailable`, because the run that consumed the input
-    /// was committed outside this runtime and its result does not reach them.
+    /// with `AuthorityUnavailable`, which names the terminal the input was
+    /// adopted with ([`Self::fail_outside_terminal_waiters`]), because the
+    /// input ended outside this runtime and no result of it reaches them.
     /// An ephemeral runtime keeps no durable rows, so nothing is reloaded.
     pub(crate) async fn adopt_durable_consumed_inputs(
         &mut self,
@@ -5936,10 +5937,8 @@ impl DriverEntry {
         if !adopted.is_empty()
             && let Some(completions) = completions
         {
-            completions.lock().await.fail_inputs(
-                adopted.iter().cloned(),
-                Self::consumed_by_outside_recovery(),
-            );
+            let mut completions = completions.lock().await;
+            self.fail_outside_terminal_waiters(&adopted, &mut completions);
         }
         Ok(adopted)
     }
@@ -5962,10 +5961,8 @@ impl DriverEntry {
         if !adopted.is_empty()
             && let Some(completions) = completions
         {
-            completions.lock().await.fail_inputs(
-                adopted.iter().cloned(),
-                Self::consumed_by_outside_recovery(),
-            );
+            let mut completions = completions.lock().await;
+            self.fail_outside_terminal_waiters(&adopted, &mut completions);
         }
         Ok(adopted)
     }
@@ -5980,6 +5977,41 @@ impl DriverEntry {
         )
     }
 
+    /// The wait failure of an input a store-owned durable-tail recovery
+    /// abandoned outside this runtime, with the reason its row holds.
+    fn abandoned_by_outside_recovery(
+        reason: &crate::input_state::InputAbandonReason,
+    ) -> crate::completion::CompletionWaitError {
+        crate::completion::CompletionWaitError::AuthorityUnavailable(format!(
+            "a durable-tail recovery outside this runtime abandoned the input ({reason:?}), so \
+             it does not run; read the session's committed history for what it left"
+        ))
+    }
+
+    /// Fail the waiters of `adopted`, inputs this driver adopted with a
+    /// terminal a store-owned durable-tail recovery wrote outside this
+    /// runtime, each with the terminal it was adopted with: a consumed input's
+    /// waiter is told that a recovery consumed it, an abandoned input's that
+    /// one abandoned it and why, never that it was consumed.
+    fn fail_outside_terminal_waiters(
+        &self,
+        adopted: &[InputId],
+        completions: &mut crate::completion::CompletionRegistry,
+    ) {
+        for input_id in adopted {
+            let error = match self.input_terminal_outcome(input_id) {
+                Some(InputTerminalOutcome::Abandoned { reason }) => {
+                    Self::abandoned_by_outside_recovery(&reason)
+                }
+                // Consumed, the store-owned recovery's own terminal. The
+                // adoption refuses a Superseded or Coalesced row before any
+                // waiter fails, and an adopted input holds its terminal.
+                _ => Self::consumed_by_outside_recovery(),
+            };
+            completions.fail_inputs([input_id.clone()], error);
+        }
+    }
+
     /// After the settle of cancelled run `run_id` committed its provisional
     /// tail as an interrupted run, adopt the `Consumed` terminals that
     /// recovery wrote for inputs this driver still holds as non-terminal
@@ -5988,12 +6020,15 @@ impl DriverEntry {
     /// Those are the inputs the tail's run cursor lists that the cancel
     /// requeued: a join the run's round commit took into the tail, whose
     /// live image the cancel dropped, and which keeps the run as its run.
-    /// Adopted, the loop never runs their content again. Their waiters fail
-    /// with [`CompletionWaitError::ConsumedWithInterruptedRun`]: the input was
+    /// Adopted, the loop never runs their content again. The waiter of each
+    /// one adopted as consumed fails with
+    /// [`CompletionWaitError::ConsumedWithInterruptedRun`]: the input was
     /// consumed with the run, not lost to a vanished authority. Any other
-    /// input adopted here was consumed by a recovery outside this runtime,
-    /// and its waiter fails as [`Self::adopt_durable_consumed_inputs`] fails
-    /// it. A settle that did not commit consumed nothing of the run.
+    /// input adopted here (another run's, or one adopted with another
+    /// terminal) ended through a recovery outside this runtime, and its waiter
+    /// fails as [`Self::adopt_durable_consumed_inputs`] fails it, with the
+    /// terminal it was adopted with. A settle that did not commit consumed
+    /// nothing of the run.
     ///
     /// [`CompletionWaitError::ConsumedWithInterruptedRun`]: crate::completion::CompletionWaitError::ConsumedWithInterruptedRun
     pub(crate) async fn adopt_settled_cancelled_run_inputs(
@@ -6017,10 +6052,12 @@ impl DriverEntry {
         if !adopted.is_empty()
             && let Some(completions) = completions
         {
-            let (with_the_run, other): (Vec<_>, Vec<_>) = adopted
-                .iter()
-                .cloned()
-                .partition(|input_id| of_the_run.contains(input_id));
+            let (with_the_run, other): (Vec<_>, Vec<_>) =
+                adopted.iter().cloned().partition(|input_id| {
+                    of_the_run.contains(input_id)
+                        && self.input_terminal_outcome(input_id)
+                            == Some(InputTerminalOutcome::Consumed)
+                });
             let mut completions = completions.lock().await;
             completions.fail_inputs(
                 with_the_run,
@@ -6028,7 +6065,7 @@ impl DriverEntry {
                     run_id: run_id.clone(),
                 },
             );
-            completions.fail_inputs(other, Self::consumed_by_outside_recovery());
+            self.fail_outside_terminal_waiters(&other, &mut completions);
         }
         Ok(adopted)
     }
@@ -14569,6 +14606,121 @@ mod recovery_tests {
             err.to_string()
                 .contains("cannot derive admitted-input content shape"),
             "unexpected recovery error: {err}"
+        );
+    }
+
+    /// An input a store-owned recovery ended outside this runtime is adopted
+    /// with the terminal its row holds, and its waiter is told that terminal:
+    /// a consumed input's waiter that a recovery consumed it, an abandoned
+    /// input's that one abandoned it and why, never that it was consumed.
+    #[tokio::test]
+    async fn an_input_adopted_from_an_outside_terminal_tells_its_waiter_that_terminal() {
+        use crate::store::RuntimeStore;
+
+        let (runtime_id, _session_id, store, mut persistent) =
+            registered_persistent_driver_for_test("outside-terminal-waiters").await;
+        let consumed = Input::Prompt(crate::input::PromptInput::new("consumed outside", None));
+        let consumed_id = consumed.id().clone();
+        let abandoned = Input::Prompt(crate::input::PromptInput::new("abandoned outside", None));
+        let abandoned_id = abandoned.id().clone();
+        for input in [consumed, abandoned] {
+            assert!(
+                persistent
+                    .accept_input(input)
+                    .await
+                    .expect("accept the input")
+                    .is_accepted(),
+                "the input is admitted"
+            );
+        }
+        // The rows a store-owned recovery leaves: consumed with the run whose
+        // tail it committed, and abandoned with its reason.
+        let reason = crate::input_state::InputAbandonReason::Cancelled;
+        for (input_id, phase, outcome) in [
+            (
+                &consumed_id,
+                InputLifecycleState::Consumed,
+                InputTerminalOutcome::Consumed,
+            ),
+            (
+                &abandoned_id,
+                InputLifecycleState::Abandoned,
+                InputTerminalOutcome::Abandoned {
+                    reason: reason.clone(),
+                },
+            ),
+        ] {
+            let mut ended = store
+                .load_input_state(&runtime_id, input_id)
+                .await
+                .expect("read the input's row")
+                .expect("the admitted input's row");
+            ended.seed.phase = phase;
+            ended.seed.terminal_outcome = Some(outcome);
+            ended.seed.recovery_lane = None;
+            if phase == InputLifecycleState::Consumed {
+                ended.seed.last_run_id = Some(RunId::new());
+                ended.seed.last_boundary_sequence = Some(1);
+            }
+            store
+                .persist_input_state(&runtime_id, &persistable(ended))
+                .await
+                .expect("a writer outside the driver ends the row");
+        }
+
+        let mut driver = DriverEntry::Persistent(persistent);
+        let completions: SharedCompletionRegistry =
+            Arc::new(Mutex::new(crate::completion::CompletionRegistry::new()));
+        let (consumed_waiter, abandoned_waiter) = {
+            let mut registry = completions.lock().await;
+            (
+                registry.register(consumed_id.clone()),
+                registry.register(abandoned_id.clone()),
+            )
+        };
+        let adopted = driver
+            .adopt_durable_terminals_of(
+                &[consumed_id.clone(), abandoned_id.clone()],
+                Some(&completions),
+            )
+            .await
+            .expect("adopt the terminals the store holds");
+        assert_eq!(adopted, vec![consumed_id.clone(), abandoned_id.clone()]);
+        assert_eq!(
+            driver.input_terminal_outcome(&consumed_id),
+            Some(InputTerminalOutcome::Consumed)
+        );
+        assert_eq!(
+            driver.input_terminal_outcome(&abandoned_id),
+            Some(InputTerminalOutcome::Abandoned { reason })
+        );
+
+        let consumed_error = consumed_waiter
+            .wait()
+            .await
+            .expect_err("the consumed input's waiter fails");
+        let crate::completion::CompletionWaitError::AuthorityUnavailable(consumed_detail) =
+            &consumed_error
+        else {
+            panic!("the consumed input's waiter: {consumed_error:?}");
+        };
+        assert!(
+            consumed_detail.contains("consumed the input"),
+            "{consumed_detail}"
+        );
+        let abandoned_error = abandoned_waiter
+            .wait()
+            .await
+            .expect_err("the abandoned input's waiter fails");
+        let crate::completion::CompletionWaitError::AuthorityUnavailable(abandoned_detail) =
+            &abandoned_error
+        else {
+            panic!("the abandoned input's waiter: {abandoned_error:?}");
+        };
+        assert!(
+            abandoned_detail.contains("abandoned the input (Cancelled)")
+                && !abandoned_detail.contains("consumed"),
+            "{abandoned_detail}"
         );
     }
 }
