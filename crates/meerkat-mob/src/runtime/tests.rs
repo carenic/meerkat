@@ -37334,6 +37334,7 @@ async fn paused_running_start(
     adapter: &Arc<meerkat_runtime::MeerkatMachine>,
     identity: &AgentIdentity,
     runtime_mode: crate::MobRuntimeMode,
+    peers: &[AgentIdentity],
 ) -> PausedRunningStart {
     let storage = MobStorage::in_memory();
     let events = storage.events.clone();
@@ -37356,6 +37357,18 @@ async fn paused_running_start(
         .bridge_session_id()
         .cloned()
         .expect("session-backed member");
+    for peer in peers {
+        handle
+            .spawn_with_options(
+                ProfileName::from("worker"),
+                peer.clone(),
+                None,
+                Some(crate::MobRuntimeMode::TurnDriven),
+                None,
+            )
+            .await
+            .expect("spawn a healthy member");
+    }
     let mob_id = handle.mob_id().clone();
     crash_stop_and_release_routes(handle).await;
 
@@ -37444,6 +37457,7 @@ async fn a_running_start_takes_a_stopped_members_registration_over_once_and_serv
         &adapter,
         &identity,
         crate::MobRuntimeMode::TurnDriven,
+        &[],
     )
     .await;
     assert!(
@@ -37527,6 +37541,7 @@ async fn a_running_start_joins_a_members_stop_cleanup_in_flight_and_then_takes_i
         &adapter,
         &identity,
         crate::MobRuntimeMode::TurnDriven,
+        &[],
     )
     .await;
     service.park_exact_actor_discards();
@@ -37620,6 +37635,7 @@ async fn a_running_start_keeps_the_refusal_when_the_members_stop_cleanup_fails()
         &adapter,
         &identity,
         crate::MobRuntimeMode::TurnDriven,
+        &[],
     )
     .await;
     service.park_exact_actor_discards();
@@ -37775,6 +37791,7 @@ async fn a_running_start_does_not_take_over_a_member_runtime_retired_outside_the
         &adapter,
         &identity,
         crate::MobRuntimeMode::TurnDriven,
+        &[],
     )
     .await;
     adapter
@@ -37803,6 +37820,227 @@ async fn a_running_start_does_not_take_over_a_member_runtime_retired_outside_the
     );
 }
 
+/// Mark the member's current registration reload-required through the
+/// runtime's own seam, in the window the paused start leaves.
+#[cfg(feature = "runtime-adapter")]
+async fn mark_reload_required(
+    adapter: &Arc<meerkat_runtime::MeerkatMachine>,
+    session_id: &SessionId,
+) {
+    assert!(
+        adapter
+            .require_session_durability_reload(
+                session_id,
+                "test_marked_reload_required",
+                "the row marks the member's registration reload-required",
+            )
+            .await,
+        "the member's registration is current and persistent"
+    );
+}
+
+/// A member whose runtime registration needs a durability reload when a
+/// Running mob starts no longer stops the whole mob. The start leaves the
+/// member out, reloads its registration right after the start through the
+/// mob's reload flow, and serves it, and the other members are served
+/// throughout.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_running_start_reloads_a_member_whose_registration_needs_a_reload() {
+    let service = Arc::new(MockSessionService::new());
+    let adapter = service.enable_runtime_adapter();
+    let degraded = AgentIdentity::from("reload-required-at-start");
+    let healthy = AgentIdentity::from("healthy-beside-a-reload");
+    let paused = paused_running_start(
+        &service,
+        &adapter,
+        &degraded,
+        crate::MobRuntimeMode::TurnDriven,
+        std::slice::from_ref(&healthy),
+    )
+    .await;
+    mark_reload_required(&adapter, &paused.session_id).await;
+    paused.release.send(()).expect("release the start");
+
+    paused
+        .resumed
+        .member(&healthy)
+        .await
+        .expect("healthy member handle")
+        .internal_turn("served while the other member reloads")
+        .await
+        .expect("the healthy member is served");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let reloaded = adapter
+                .durability_reload_required(&paused.session_id)
+                .await
+                .is_none();
+            let attached = adapter
+                .current_executor_attachment_witness(&paused.session_id)
+                .await
+                .is_some();
+            if reloaded && attached {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the member's registration is reloaded and attached");
+    assert_eq!(
+        paused.resumed.status().await.expect("mob status"),
+        MobState::Running,
+        "a reload-required member does not stop the mob"
+    );
+    paused
+        .resumed
+        .member(&degraded)
+        .await
+        .expect("member handle")
+        .internal_turn("served after its reload")
+        .await
+        .expect("the reloaded member is served");
+    let snapshot = paused
+        .resumed
+        .member_status(&degraded)
+        .await
+        .expect("member status");
+    assert_ne!(
+        snapshot.status,
+        crate::runtime::handle::MobMemberStatus::Broken,
+        "the reloaded member is not broken: {:?}",
+        snapshot.error
+    );
+}
+
+/// A reload-required member whose reload fails ends Broken with the typed
+/// reason. The mob stays Running and serves the other members.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_running_start_records_a_member_broken_when_its_reload_fails() {
+    let service = Arc::new(MockSessionService::new());
+    let adapter = service.enable_runtime_adapter();
+    let degraded = AgentIdentity::from("reload-fails-at-start");
+    let healthy = AgentIdentity::from("healthy-beside-a-failed-reload");
+    let paused = paused_running_start(
+        &service,
+        &adapter,
+        &degraded,
+        crate::MobRuntimeMode::TurnDriven,
+        std::slice::from_ref(&healthy),
+    )
+    .await;
+    mark_reload_required(&adapter, &paused.session_id).await;
+    // Without its durable session nothing can be reloaded or revived.
+    service.delete_persisted_session(&paused.session_id).await;
+    paused.release.send(()).expect("release the start");
+
+    let dsl_identity = crate::machines::mob_machine::AgentIdentity::from_domain(&degraded);
+    let reason = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let state = paused
+                .resumed
+                .query_machine_state()
+                .await
+                .expect("MobMachine state");
+            if let Some(reason) = state.member_restore_failures.get(&dsl_identity) {
+                return reason.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the member whose reload failed is recorded Broken");
+    assert!(!reason.is_empty(), "the Broken member carries its reason");
+    let snapshot = paused
+        .resumed
+        .member_status(&degraded)
+        .await
+        .expect("member status");
+    assert_eq!(
+        snapshot.status,
+        crate::runtime::handle::MobMemberStatus::Broken,
+        "the member whose reload failed is Broken: {:?}",
+        snapshot.error
+    );
+    assert_eq!(
+        paused.resumed.status().await.expect("mob status"),
+        MobState::Running,
+        "a failed member reload does not stop the mob"
+    );
+    paused
+        .resumed
+        .member(&healthy)
+        .await
+        .expect("healthy member handle")
+        .internal_turn("served beside a broken member")
+        .await
+        .expect("the healthy member is served");
+}
+
+/// A delivery to a member whose registration the start reloads either
+/// waits behind the reload on the member's admission lane and is served, or
+/// is refused typed `MemberReloadRequired`, as a delivery to a degraded
+/// member is today; never anything else. After the reload it is served.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delivery_during_a_start_reload_waits_for_it_or_is_refused_typed() {
+    let service = Arc::new(MockSessionService::new());
+    let adapter = service.enable_runtime_adapter();
+    let degraded = AgentIdentity::from("delivered-to-during-its-reload");
+    let paused = paused_running_start(
+        &service,
+        &adapter,
+        &degraded,
+        crate::MobRuntimeMode::TurnDriven,
+        &[],
+    )
+    .await;
+    mark_reload_required(&adapter, &paused.session_id).await;
+    let member = paused.resumed.clone();
+    let delivery_identity = degraded.clone();
+    let delivery = tokio::spawn(async move {
+        member
+            .member(&delivery_identity)
+            .await?
+            .internal_turn("delivered while the member reloads")
+            .await
+    });
+    paused.release.send(()).expect("release the start");
+
+    let delivered = tokio::time::timeout(Duration::from_secs(10), delivery)
+        .await
+        .expect("the delivery answers")
+        .expect("delivery task");
+    assert!(
+        matches!(
+            &delivered,
+            Ok(_) | Err(MobError::MemberReloadRequired { .. })
+        ),
+        "a delivery during the reload waits for it or is refused typed: {delivered:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while adapter
+            .durability_reload_required(&paused.session_id)
+            .await
+            .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the member's registration is reloaded");
+    paused
+        .resumed
+        .member(&degraded)
+        .await
+        .expect("member handle")
+        .internal_turn("served after its reload")
+        .await
+        .expect("the reloaded member is served");
+}
+
 /// An autonomous member taken over at a Running start gets its host loop
 /// back with its revival: the readiness step the startup pass left out for
 /// it runs after the revival (comms drain and dispatch injector), and
@@ -37818,6 +38056,7 @@ async fn an_autonomous_member_taken_over_at_a_running_start_gets_its_host_loop_b
         &adapter,
         &identity,
         crate::MobRuntimeMode::AutonomousHost,
+        &[],
     )
     .await;
     // A host-loop run in flight defers a stop to its boundary; end it first.
