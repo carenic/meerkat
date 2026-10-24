@@ -109,6 +109,176 @@ fn the_recorded_prompt_witness_must_equal_the_expected_prompt() {
     );
 }
 
+fn peer() -> Input {
+    use crate::input::{InputOrigin, PeerConvention, PeerInput};
+    let mut header = input("caller").header().clone();
+    header.ingress_context = None;
+    header.source = InputOrigin::Peer {
+        peer_id: meerkat_core::comms::PeerId::from_uuid(uuid::Uuid::from_u128(7)).to_string(),
+        display_identity: None,
+        runtime_id: None,
+    };
+    Input::Peer(PeerInput {
+        header,
+        directed_interaction_id: None,
+        convention: Some(PeerConvention::Message),
+        content: "one peer delivery".into(),
+        payload: None,
+        handling_mode: None,
+        sender_taint: None,
+        objective_id: None,
+        system_prompts: vec![],
+        injected_context: vec![],
+        in_reply_to: None,
+    })
+}
+
+/// Low-level comparison controls use the same row constructor as the existing
+/// prompt controls, with the qualified key a governed admission records.
+/// The live/reopen controls exercise actual native admission separately.
+fn peer_row(expected: &Input) -> InputState {
+    let mut state = row(expected);
+    state.idempotency_key =
+        crate::input_authority::qualified_idempotency_key(expected).expect("qualified event key");
+    state
+}
+
+#[test]
+fn a_governed_peer_requires_exact_native_identity_after_payload_retirement() {
+    let expected = peer();
+    let state = peer_row(&expected);
+    assert!(state.persisted_input.is_none());
+    assert!(state.prompt_replay_identity.is_none());
+    assert!(state.directed_run_started_attribution.is_none());
+    assert!(observed(&state, association(&expected), &expected).is_ok());
+    assert!(crate::input_state::verify_exact_replay(&state, &expected).is_ok());
+
+    let mut later_observation = expected.clone();
+    later_observation.header_mut().timestamp = chrono::DateTime::UNIX_EPOCH;
+    assert!(
+        crate::input_state::verify_exact_replay(&state, &later_observation).is_ok(),
+        "native canonical replay retains its timestamp normalization"
+    );
+
+    for change in 0..9 {
+        let mut changed = expected.clone();
+        let Input::Peer(body) = &mut changed else {
+            panic!("peer fixture")
+        };
+        match change {
+            0 => body.header.id = InputId::new(),
+            1 => body.header.idempotency_key = Some(IdempotencyKey::new("other-event")),
+            2 => body.content = "other content".into(),
+            3 => body.payload = Some(serde_json::json!({"different": true})),
+            4 => {
+                body.header.source = crate::input::InputOrigin::Peer {
+                    peer_id: meerkat_core::comms::PeerId::from_uuid(uuid::Uuid::from_u128(8))
+                        .to_string(),
+                    display_identity: None,
+                    runtime_id: None,
+                }
+            }
+            5 => body.injected_context.push("other context".into()),
+            6 => {
+                let mut claims = body
+                    .header
+                    .authority_association
+                    .as_ref()
+                    .expect("claims")
+                    .candidate()
+                    .clone();
+                claims.original_work.work =
+                    meerkat_authorization_contracts::evidence::EvidenceId::new(
+                        "other-delivery-work",
+                    )
+                    .expect("work");
+                body.header.authority_association =
+                    Some(InputAuthorityAssociation::new(claims).expect("well-formed changed work"));
+            }
+            7 => body.header.authority_association = None,
+            _ => body.header.idempotency_key = None,
+        }
+        assert!(
+            matches!(crate::input_state::verify_exact_replay(&state, &changed),
+            Err(crate::RuntimeDriverError::InputIdempotencyConflict { existing_id })
+                if existing_id == *expected.id()),
+            "changed peer field {change}"
+        );
+    }
+
+    for change in 0..5 {
+        let mut changed = state.clone();
+        match change {
+            0 => changed.authority_contributors.clear(),
+            1 => changed
+                .authority_contributors
+                .push(changed.authority_contributors[0].clone()),
+            2 => changed.authority_contributors = peer_row(&peer()).authority_contributors,
+            3 => changed.idempotency_key = expected.header().idempotency_key.clone(),
+            _ => {
+                let mut foreign = input("other-requester");
+                foreign.header_mut().id = expected.id().clone();
+                changed.authority_contributors[0] = row(&foreign).authority_contributors.remove(0);
+            }
+        }
+        assert!(
+            crate::input_state::verify_exact_replay(&changed, &expected).is_err(),
+            "missing, duplicate, foreign or unqualified native witness {change}"
+        );
+    }
+
+    let mut ungoverned = expected.clone();
+    ungoverned.header_mut().authority_association = None;
+    assert!(
+        crate::input_state::verify_exact_replay(&row(&ungoverned), &ungoverned).is_err(),
+        "an ungoverned row is not a governed original proof"
+    );
+}
+
+#[test]
+fn peer_proof_refuses_a_retained_resume_and_preserves_prompt_retry_semantics() {
+    let expected = peer();
+    let mut state = peer_row(&expected);
+    let runtime = crate::identifiers::LogicalRuntimeId::for_session(&SessionId::new());
+    state.retained_resume = Some(crate::retained_work::RetainedResumeRecord {
+        identity: crate::retained_work::identity_from(
+            &runtime,
+            RunId::new(),
+            &state.authority_contributors,
+            &Default::default(),
+            association(&expected).candidate().controller_model.clone(),
+        )
+        .expect("retained identity"),
+        delivery: crate::retained_work::RetainedResumeDelivery {
+            address: runtime,
+            delivery_id: crate::delivery_inbox::RuntimeDeliveryId::new("continuation:other")
+                .expect("delivery"),
+            delivery_sequence: 1,
+            submission_digest: "other-resume".into(),
+        },
+    });
+    assert!(
+        crate::input_state::verify_exact_replay(&state, &expected).is_err(),
+        "a resume row cannot stand in for its contributor's own admission"
+    );
+
+    let prompt = input("caller");
+    let state = row(&prompt);
+    let mut retry = prompt.clone();
+    retry.header_mut().id = InputId::new();
+    retry.header_mut().timestamp = chrono::DateTime::UNIX_EPOCH;
+    assert!(
+        crate::input_state::verify_exact_replay(&state, &retry).is_ok(),
+        "the existing prompt retry ID/time contract is unchanged"
+    );
+    let mut legacy = state;
+    legacy.prompt_replay_identity = None;
+    assert!(
+        crate::input_state::verify_exact_replay(&legacy, &retry).is_err(),
+        "old prompt rows do not acquire a new proof"
+    );
+}
+
 /// The durable read on a real SQLite runtime store: a session the store
 /// never held is unknown, a held runtime without the original's key is
 /// absence, and once the runtime holds a row its key index cannot read, the

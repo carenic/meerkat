@@ -78,11 +78,11 @@ pub enum AdmittedOriginalRefusal {
     /// original's qualified key.
     NotAdmitted,
     /// An admission exists under that key but is not the expected original's
-    /// exact one: the expected input is not a keyed governed prompt, the
-    /// row's own contributor is missing, duplicated or names another
-    /// association, its prompt witness is absent or differs from the expected
-    /// input, or the controller the actor pinned does not have the
-    /// association's selection.
+    /// exact one: the expected input is not a keyed governed prompt or peer,
+    /// the row's own contributor is missing, duplicated or names another
+    /// association, its canonical replay witness is absent or differs from
+    /// the expected input, or the controller the actor pinned does not have
+    /// the association's selection.
     Conflict,
 }
 
@@ -146,10 +146,10 @@ impl AdmittedOriginal<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DurableAdmittedOriginalRefusal {
-    /// The expected input is not a keyed governed prompt, or the durable row
-    /// under its qualified key is not its exact admission: the row's own
-    /// contributor is missing, duplicated or names another association, or
-    /// its prompt witness is absent or differs from the expected input.
+    /// The expected input is not a keyed governed prompt or peer, or the
+    /// durable row under its qualified key is not its exact admission: the
+    /// row's own contributor is missing, duplicated or names another
+    /// association, or its canonical replay witness is absent or differs.
     Conflict,
     /// The session's durable runtime exists and its store-owned key index
     /// holds no row under the expected original's qualified key: absence in
@@ -232,12 +232,14 @@ impl DurableAdmittedOriginal {
 }
 
 /// The association and runtime-qualified idempotency key of `expected` when
-/// it is a keyed governed prompt: the exact original its source owner
-/// retains. `None` for any other input.
+/// it is a keyed governed prompt or peer: the exact original its source
+/// owner retains. `None` for any other input or a peer retained resume.
 fn expected_original(expected: &Input) -> Option<(&InputAuthorityAssociation, IdempotencyKey)> {
-    let Input::Prompt(_) = expected else {
+    if !matches!(expected, Input::Prompt(_) | Input::Peer(_))
+        || (matches!(expected, Input::Peer(_)) && expected.header().retained_resume.is_some())
+    {
         return None;
-    };
+    }
     let association = expected.header().authority_association.as_ref()?;
     let key = crate::input_authority::qualified_idempotency_key(expected)
         .ok()
@@ -252,12 +254,13 @@ impl MeerkatMachine {
     /// are proven current and stay so, under that actor's turn boundary.
     ///
     /// `expected` is the source owner's retained evidence of the original:
-    /// the keyed governed prompt it submitted. Its association and raw key
+    /// the keyed governed prompt or peer it submitted. Its association and raw key
     /// derive the qualified idempotency key here, and the admitted row must
     /// be its exact replay by the canonical replay identity (content and
-    /// semantic slots, and the retained authority); presence of a prompt
-    /// witness alone is never equality. The row must carry exactly one own
-    /// contributor, with exactly that association.
+    /// semantic slots, and the retained authority). Peer inputs additionally
+    /// retain their exact input id and qualified key; prompt retry id/time
+    /// semantics are unchanged. The row must carry exactly one own contributor,
+    /// with exactly that association.
     ///
     /// `actor` is the caller's observation of the live actor `attachment`
     /// serves (for a session service's actor, its witness's executor
@@ -392,13 +395,13 @@ impl MeerkatMachine {
     /// owner whose session has no current registration, live attachment or
     /// actor on this machine, for example after the session was retired.
     /// `expected` is the owner's retained evidence of the original: the keyed
-    /// governed prompt it submitted. Its association and raw key derive the
+    /// governed prompt or peer it submitted. Its association and raw key derive the
     /// qualified idempotency key here, exactly as for the live call. The
     /// store-owned key index names the row, and that row must be the
     /// original's exact admission: exactly one own contributor, with exactly
     /// that association, and the exact replay of `expected` by the canonical
     /// replay identity (content and semantic slots, and the retained
-    /// authority).
+    /// authority), including the exact input id and qualified key for a peer.
     ///
     /// Durable only: no registration, attachment, actor, turn boundary or
     /// gate is required or taken, live state is never consulted, and nothing

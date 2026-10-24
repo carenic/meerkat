@@ -2001,14 +2001,20 @@ pub fn verify_exact_resume_replay(
     Ok(())
 }
 
-/// Verify that the accepted row `stored` is an exact replay of the prompt
-/// `expected`: the same content and semantic header slots (the exact prompt
-/// identity, which includes the authority association) and the same retained
-/// authority. Input id and timestamp are not part of either.
+/// Verify that the accepted row `stored` is an exact replay of `expected`.
+/// Prompts retain their exact prompt identity and retained-authority checks;
+/// their fresh input id and timestamp are not part of that identity.
 ///
-/// A row recorded without an exact prompt identity (an older admission, or a
-/// non-prompt) never matches, so a key alone never stands in for an
-/// admission.
+/// A keyed governed peer input must instead name the row's exact input id and
+/// qualified event key, with exactly one own contributor, the same association
+/// (including the original work), and its native canonical replay digest.
+/// The digest retains all semantic input fields but normalizes the observation
+/// timestamp. This proof survives payload retirement; it admits no ungoverned
+/// peer, retained resume, or row without its own native authority witness.
+///
+/// Other input families and prompt rows without an exact prompt identity
+/// never match. A key alone never stands in for an admission. The comparison
+/// grants no current operation authority and does not prove completion.
 ///
 /// # Errors
 /// [`crate::RuntimeDriverError::InputIdempotencyConflict`] naming the row
@@ -2017,6 +2023,39 @@ pub fn verify_exact_replay(
     stored: &InputState,
     expected: &Input,
 ) -> Result<(), crate::RuntimeDriverError> {
+    if matches!(expected, Input::Peer(_)) {
+        let conflict = || crate::RuntimeDriverError::InputIdempotencyConflict {
+            existing_id: stored.input_id.clone(),
+        };
+        if stored.input_id != *expected.id()
+            || stored.retained_resume.is_some()
+            || expected.header().retained_resume.is_some()
+        {
+            return Err(conflict());
+        }
+        let association = expected
+            .header()
+            .authority_association
+            .as_ref()
+            .ok_or_else(conflict)?;
+        let key = crate::input_authority::qualified_idempotency_key(expected)
+            .map_err(|_| conflict())?
+            .ok_or_else(conflict)?;
+        if stored.idempotency_key.as_ref() != Some(&key) {
+            return Err(conflict());
+        }
+        let mut own = stored
+            .authority_contributors
+            .iter()
+            .filter(|contributor| contributor.input_id() == &stored.input_id);
+        let (Some(own), None) = (own.next(), own.next()) else {
+            return Err(conflict());
+        };
+        if own.association() != association {
+            return Err(conflict());
+        }
+        return own.verify_replay(expected);
+    }
     PromptReplayIdentity::verify_replay(
         stored,
         expected,

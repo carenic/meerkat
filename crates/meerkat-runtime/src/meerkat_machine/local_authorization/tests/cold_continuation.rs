@@ -675,6 +675,34 @@ fn original_prompt(template: &Input, runtime: &LogicalRuntimeId) -> Input {
         .expect("exact final input")
 }
 
+/// An ordinary governed peer message, using this fixture's actual original,
+/// controller and ingress owners. No directed terminal or peer transport is
+/// fabricated by this admission-proof test.
+fn original_peer(template: &Input, runtime: &LogicalRuntimeId) -> Input {
+    use crate::input::{InputOrigin, PeerConvention, PeerInput};
+    let mut header = template.header().clone();
+    header.source = InputOrigin::Peer {
+        peer_id: meerkat_core::comms::PeerId::from_uuid(uuid::Uuid::from_u128(7)).to_string(),
+        display_identity: None,
+        runtime_id: None,
+    };
+    let peer = Input::Peer(PeerInput {
+        header,
+        directed_interaction_id: None,
+        convention: Some(PeerConvention::Message),
+        content: "one governed peer message".into(),
+        payload: None,
+        handling_mode: None,
+        sender_taint: None,
+        objective_id: None,
+        system_prompts: vec![],
+        injected_context: vec![],
+        in_reply_to: None,
+    });
+    // The existing owner attaches a fresh observation of these peer bytes.
+    original_prompt(&peer, runtime)
+}
+
 /// The composition requires a bound destination: the registration owner
 /// binds the original's destination on each machine that serves the session.
 async fn bind_destination(machine: &MeerkatMachine, session: &SessionId, original: &Input) {
@@ -1244,6 +1272,13 @@ impl Reopened {
     /// [`Self::new`] whose reopened executor's runtime loop takes the
     /// session boundary, or, with `false`, takes none.
     async fn with_loop_boundary(loop_boundary: bool) -> Self {
+        Self::with_original(loop_boundary, original_prompt).await
+    }
+
+    async fn with_original(
+        loop_boundary: bool,
+        prepare: fn(&Input, &LogicalRuntimeId) -> Input,
+    ) -> Self {
         let (configuration, template, _account, _publication) =
             mutable_controller_configuration(true);
         let claims = template
@@ -1270,7 +1305,7 @@ impl Reopened {
         let blobs = Arc::new(MemoryBlobStore::new());
         let session = SessionId::new();
         let runtime = LogicalRuntimeId::for_session(&session);
-        let original = original_prompt(&template, &runtime);
+        let original = prepare(&template, &runtime);
         let original_id = original.id().clone();
         // The dropped machine's session service owns its own boundary.
         let before_actor = Actor::new(&Boundary::default(), &selection);
@@ -1470,6 +1505,271 @@ async fn a_lost_admission_is_published_once_per_step_after_a_same_process_reopen
         0,
         "nothing ran after the reopen"
     );
+}
+
+/// The existing real admission/reopen fixture, now with an ordinary peer
+/// original. Native retires its payload before the source recovers custody;
+/// neither the public row comparison nor live/durable proof needs that body.
+/// This is same-process owner reconstruction, not a comms delivery test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_admission_is_recovered_after_payload_retirement_and_reopen() {
+    let reopened = Reopened::with_original(true, original_peer).await;
+    let before = reopened.inputs().await;
+    let rows = reopened
+        .store
+        .load_input_states_strict(&reopened.runtime)
+        .await
+        .expect("actual native rows");
+    let stored = rows
+        .iter()
+        .find(|row| row.state.input_id == reopened.original_id)
+        .expect("actual peer admission");
+    assert!(
+        stored.state.persisted_input.is_none(),
+        "native retired the terminal payload"
+    );
+    assert!(stored.state.prompt_replay_identity.is_none());
+    assert!(
+        stored.state.directed_run_started_attribution.is_none(),
+        "ordinary peer message"
+    );
+    crate::input_state::verify_exact_replay(&stored.state, &reopened.original)
+        .expect("native exact peer row proof after retirement");
+
+    let (registration, attachment) = reopened.current().await;
+    let actor = reopened.actor.identity();
+    let custody = SourceCustody::default();
+    assert_eq!(
+        custody.admitted(),
+        None,
+        "source settlement was lost before reopen"
+    );
+    assert_eq!(
+        reopened
+            .promote(
+                &registration,
+                &attachment,
+                &actor,
+                &reopened.original,
+                &custody
+            )
+            .await,
+        Ok(Ok(Promotion::Promoted))
+    );
+    assert_eq!(
+        reopened
+            .promote(
+                &registration,
+                &attachment,
+                &actor,
+                &reopened.original,
+                &custody
+            )
+            .await,
+        Ok(Ok(Promotion::AlreadyAdmitted))
+    );
+    assert_eq!(custody.admitted(), Some(reopened.original_id.clone()));
+    assert_eq!(custody.publications.load(Ordering::SeqCst), 2);
+
+    let admitted = reopened
+        .durable(&reopened.original)
+        .await
+        .expect("durable peer proof");
+    assert_eq!(admitted.input_id(), &reopened.original_id);
+    assert_eq!(admitted.phase(), InputLifecycleState::Consumed);
+    assert_eq!(
+        admitted.terminal_outcome(),
+        Some(&crate::input_state::InputTerminalOutcome::Consumed)
+    );
+    reopened.retire().await;
+    assert_eq!(
+        reopened
+            .promote(
+                &registration,
+                &attachment,
+                &actor,
+                &reopened.original,
+                &custody
+            )
+            .await,
+        Err(crate::meerkat_machine::AdmittedOriginalRefusal::Unavailable)
+    );
+    assert_eq!(
+        reopened.durable(&reopened.original).await,
+        Ok(admitted.clone())
+    );
+    assert_eq!(
+        SessionServiceRuntimeExt::durable_admitted_original(
+            &*reopened.machine,
+            &reopened.session,
+            &reopened.original
+        )
+        .await,
+        Ok(admitted)
+    );
+    assert_eq!(reopened.inputs().await, before, "no new input or replay");
+    assert_eq!(
+        reopened.effects.load(Ordering::SeqCst),
+        0,
+        "no execution after reopen"
+    );
+    assert_eq!(
+        custody.publications.load(Ordering::SeqCst),
+        2,
+        "retirement publishes nothing"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_recovery_refuses_changed_delivery_and_stale_current_owners() {
+    use crate::meerkat_machine::AdmittedOriginalRefusal::{Conflict, NotAdmitted, Unavailable};
+    let reopened = Reopened::with_original(true, original_peer).await;
+    let (registration, attachment) = reopened.current().await;
+    let actor = reopened.actor.identity();
+    let before = reopened.inputs().await;
+    let custody = SourceCustody::default();
+    let mut changed_inputs = Vec::new();
+    for change in 0..5 {
+        let mut changed = reopened.original.clone();
+        let Input::Peer(body) = &mut changed else {
+            panic!("peer fixture")
+        };
+        match change {
+            0 => body.header.id = InputId::new(),
+            1 => body.content = "changed delivery content".into(),
+            2 => {
+                body.header.source = crate::input::InputOrigin::Peer {
+                    peer_id: meerkat_core::comms::PeerId::from_uuid(uuid::Uuid::from_u128(8))
+                        .to_string(),
+                    display_identity: None,
+                    runtime_id: None,
+                }
+            }
+            3 => {
+                let mut claims = body
+                    .header
+                    .authority_association
+                    .as_ref()
+                    .expect("claims")
+                    .candidate()
+                    .clone();
+                claims.original_work.work = EvidenceId::new("another-delivery-work").expect("work");
+                body.header.authority_association =
+                    Some(InputAuthorityAssociation::new(claims).expect("well-formed changed work"));
+            }
+            _ => body.header.authority_association = None,
+        }
+        assert_eq!(
+            reopened
+                .promote(&registration, &attachment, &actor, &changed, &custody)
+                .await,
+            Err(Conflict),
+            "changed peer field {change}"
+        );
+        changed_inputs.push(changed);
+    }
+    let mut rekeyed = reopened.original.clone();
+    rekeyed.header_mut().idempotency_key =
+        Some(crate::identifiers::IdempotencyKey::new("other-peer-event"));
+    assert_eq!(
+        reopened
+            .promote(&registration, &attachment, &actor, &rekeyed, &custody)
+            .await,
+        Err(NotAdmitted)
+    );
+    let (old_registration, old_attachment) = &reopened.before_reopen;
+    let old_actor = reopened.before_actor.identity();
+    for (registration, attachment, actor) in [
+        (old_registration, &attachment, &actor),
+        (&registration, old_attachment, &actor),
+        (&registration, &attachment, &old_actor),
+    ] {
+        assert_eq!(
+            reopened
+                .promote(
+                    registration,
+                    attachment,
+                    actor,
+                    &reopened.original,
+                    &custody
+                )
+                .await,
+            Err(Unavailable)
+        );
+    }
+    let other = crate::input_authority::tests::input_for_account("caller", "another-account")
+        .header()
+        .authority_association
+        .as_ref()
+        .expect("claims")
+        .candidate()
+        .controller_model
+        .clone()
+        .expect("another controller");
+    reopened.actor.select(&other);
+    assert_eq!(
+        reopened
+            .promote(
+                &registration,
+                &attachment,
+                &actor,
+                &reopened.original,
+                &custody
+            )
+            .await,
+        Err(Conflict)
+    );
+    reopened.actor.select(&reopened.selection);
+    assert_eq!(
+        custody.publications.load(Ordering::SeqCst),
+        0,
+        "all native refusals precede publication"
+    );
+    custody.cancel(Cancellation::Pending);
+    assert_eq!(
+        reopened
+            .promote(
+                &registration,
+                &attachment,
+                &actor,
+                &reopened.original,
+                &custody
+            )
+            .await,
+        Ok(Err(OwnerRefusal::Unavailable))
+    );
+    custody.cancel(Cancellation::Committed);
+    assert_eq!(
+        reopened
+            .promote(
+                &registration,
+                &attachment,
+                &actor,
+                &reopened.original,
+                &custody
+            )
+            .await,
+        Ok(Err(OwnerRefusal::Denied))
+    );
+    assert_eq!(custody.admitted(), None);
+
+    reopened.retire().await;
+    for changed in changed_inputs {
+        assert_eq!(
+            reopened.durable(&changed).await,
+            Err(crate::meerkat_machine::DurableAdmittedOriginalRefusal::Conflict)
+        );
+    }
+    assert_eq!(
+        reopened.durable(&rekeyed).await,
+        Err(crate::meerkat_machine::DurableAdmittedOriginalRefusal::NotAdmitted)
+    );
+    assert!(
+        reopened.durable(&reopened.original).await.is_ok(),
+        "historical proof grants no live custody"
+    );
+    assert_eq!(reopened.inputs().await, before);
+    assert_eq!(reopened.effects.load(Ordering::SeqCst), 0);
 }
 
 /// Same-process reopen only, as above.
