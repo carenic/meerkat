@@ -71,6 +71,9 @@ pub(super) struct ScriptedModel {
     tool_gate_armed: std::sync::atomic::AtomicBool,
     tool_entered: Semaphore,
     tool_release: Semaphore,
+    /// Builds the builder refuses, from the next one on: a session whose
+    /// agent build fails is refused by its materialization.
+    refused_builds: AtomicUsize,
 }
 
 impl ScriptedModel {
@@ -83,6 +86,7 @@ impl ScriptedModel {
             tool_gate_armed: std::sync::atomic::AtomicBool::new(false),
             tool_entered: Semaphore::new(0),
             tool_release: Semaphore::new(0),
+            refused_builds: AtomicUsize::new(0),
         }
     }
 
@@ -93,6 +97,11 @@ impl ScriptedModel {
     /// Hold the next `probe` call until the test releases it.
     fn hold_next_tool_call(&self) {
         self.tool_gate_armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Refuse the next agent build.
+    fn refuse_next_build(&self) {
+        self.refused_builds.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -255,6 +264,18 @@ impl SessionAgentBuilder for ScriptedBuilder {
         request: &CreateSessionRequest,
         event_tx: mpsc::Sender<AgentEvent>,
     ) -> Result<FactoryAgent, SessionError> {
+        if self
+            .client
+            .refused_builds
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |refused| {
+                refused.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(SessionError::Agent(AgentError::InternalError(
+                "the scripted build is refused".to_string(),
+            )));
+        }
         let mut config = AgentBuildConfig::from_create_session_request(request, event_tx);
         config.llm_client_override = Some(self.client.clone());
         config.tool_dispatcher_override = Some(Arc::new(ProbeTools {
@@ -390,23 +411,11 @@ impl Start {
                 .expect("the session is committed"),
             None => meerkat_core::Session::new(),
         };
-        let request = CreateSessionRequest {
-            model: "claude-sonnet-4-5".into(),
-            prompt: "unused".into(),
-            injected_context: Vec::new(),
-            system_prompt: meerkat_core::SystemPromptOverride::Inherit,
-            max_tokens: None,
-            event_tx: None,
-            initial_turn: InitialTurnPolicy::Defer,
-            deferred_prompt_policy: DeferredPromptPolicy::Discard,
-            build: None,
-            labels: None,
-        };
         let created = Box::pin(crate::surface::materialize_session(
             &self.service,
             &self.machine,
             session,
-            request,
+            deferred_create_request(),
             {
                 let service = self.service.clone();
                 let machine = self.machine.clone();
@@ -430,6 +439,36 @@ impl Start {
             .prepare_cold_attach(id, claim)
             .await
             .expect("the cold attach");
+    }
+
+    /// Restart the committed session `id` as a host does: the cold attach,
+    /// the committed read and the materialization. Answers the first
+    /// refusal, typed.
+    async fn restart(&self, id: &SessionId) -> Result<(), SessionError> {
+        let claim = self.service.grant_session_hosting(id)?;
+        self.service.prepare_cold_attach(id, claim).await?;
+        let session = self
+            .service
+            .load_authoritative_session(id)
+            .await?
+            .expect("the session is committed");
+        match Box::pin(crate::surface::materialize_session(
+            &self.service,
+            &self.machine,
+            session,
+            deferred_create_request(),
+            {
+                let service = self.service.clone();
+                let machine = self.machine.clone();
+                move |id| crate::surface::default_persistent_executor(service, machine, id)
+            },
+        ))
+        .await
+        {
+            Ok(_) => Ok(()),
+            Err(crate::surface::SurfaceRuntimeMaterializeError::Session(error)) => Err(error),
+            Err(error) => panic!("a restart is refused only as a session error: {error:?}"),
+        }
     }
 
     /// Admit one prompt; the completion waiter of its turn.
@@ -566,6 +605,22 @@ impl Start {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+}
+
+/// A create request with no first turn, as every start here materializes.
+fn deferred_create_request() -> CreateSessionRequest {
+    CreateSessionRequest {
+        model: "claude-sonnet-4-5".into(),
+        prompt: "unused".into(),
+        injected_context: Vec::new(),
+        system_prompt: meerkat_core::SystemPromptOverride::Inherit,
+        max_tokens: None,
+        event_tx: None,
+        initial_turn: InitialTurnPolicy::Defer,
+        deferred_prompt_policy: DeferredPromptPolicy::Discard,
+        build: None,
+        labels: None,
     }
 }
 
@@ -1233,10 +1288,19 @@ async fn durable_witness(store: &dyn RuntimeStore, id: &SessionId, head_canonica
 /// closes run A as interrupted and requeues the input; a second repair finds
 /// no tail. The next start runs the input exactly once (it lands as
 /// `input_row`).
+///
+/// With `restart_first`, a host restarts the session before the operator
+/// acts. The restart is refused, typed, as held for recovery, and its
+/// rollback leaves the stranded input as the store held it, not ended, so
+/// the hold stands and the repair finds and requeues the input. RED
+/// before: the refused restart's rollback stopped the runtime with the
+/// Stop disposition, which ended the input as stopped; the hold went with
+/// it, and the next start never ran the input.
 async fn an_operator_requeues_the_input_stranded_beside_a_pre_release_interrupt(
     head_canonical: bool,
     strand: Strand,
     input_row: &str,
+    restart_first: bool,
 ) {
     use meerkat_runtime::input_state::InputLifecycleState as Phase;
     use meerkat_runtime::recovery::{
@@ -1248,6 +1312,31 @@ async fn an_operator_requeues_the_input_stranded_beside_a_pre_release_interrupt(
     let client = Arc::new(ScriptedModel::new());
     let wedge = pre_release_wedge(&stores, &root, &client, strand).await;
     let id = &wedge.id;
+
+    if restart_first {
+        let start = Start::open(&stores, &root, &client);
+        let refused = start.restart(id).await;
+        assert!(
+            matches!(
+                refused,
+                Err(SessionError::DurableTailHeldForRecovery { .. })
+            ),
+            "a restart before the repair is refused as held for recovery: {refused:?}"
+        );
+        start.service.try_shutdown().await.expect("shutdown");
+        drop(start);
+        let store = stores.operator_store();
+        let second = input_rows(store.as_ref(), id)
+            .await
+            .into_iter()
+            .find(|row| row.state.input_id == wedge.second)
+            .expect("the stranded input's row");
+        assert_eq!(
+            second.seed.terminal_outcome, None,
+            "the refused restart leaves the stranded input open: {:?}",
+            second.state.history
+        );
+    }
 
     let store = stores.operator_store();
     let before = durable_witness(store.as_ref(), id, head_canonical).await;
@@ -1359,6 +1448,7 @@ async fn an_operator_requeues_the_prompt_stranded_beside_a_pre_release_interrupt
         false,
         Strand::NewRunPrompt,
         "user second",
+        false,
     )
     .await;
 }
@@ -1369,6 +1459,7 @@ async fn an_operator_requeues_the_prompt_stranded_beside_a_pre_release_interrupt
         true,
         Strand::NewRunPrompt,
         "user second",
+        false,
     )
     .await;
 }
@@ -1379,6 +1470,7 @@ async fn an_operator_requeues_a_discarded_steer_beside_a_pre_release_interrupt_w
         false,
         Strand::NewRunDiscardedSteer,
         "user second",
+        false,
     )
     .await;
 }
@@ -1389,6 +1481,7 @@ async fn an_operator_requeues_a_discarded_steer_beside_a_pre_release_interrupt_h
         true,
         Strand::NewRunDiscardedSteer,
         "user second",
+        false,
     )
     .await;
 }
@@ -1399,6 +1492,7 @@ async fn an_operator_requeues_a_peer_message_stranded_beside_an_interrupt_whole_
         false,
         Strand::NewRunPeerMessage,
         "notice Comms",
+        false,
     )
     .await;
 }
@@ -1409,8 +1503,223 @@ async fn an_operator_requeues_a_peer_message_stranded_beside_an_interrupt_head_c
         true,
         Strand::NewRunPeerMessage,
         "notice Comms",
+        false,
     )
     .await;
+}
+
+#[tokio::test]
+async fn a_restart_before_the_operator_keeps_the_stranded_prompt_whole_blob() {
+    an_operator_requeues_the_input_stranded_beside_a_pre_release_interrupt(
+        false,
+        Strand::NewRunPrompt,
+        "user second",
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_restart_before_the_operator_keeps_the_discarded_steer_whole_blob() {
+    an_operator_requeues_the_input_stranded_beside_a_pre_release_interrupt(
+        false,
+        Strand::NewRunDiscardedSteer,
+        "user second",
+        true,
+    )
+    .await;
+}
+
+/// A prompt an earlier process left queued, with no tail standing. A
+/// restart whose agent build fails is refused before the session serves,
+/// and its rollback keeps the prompt as the store holds it: not ended, still
+/// queued and with no requeue mark. The next start runs it exactly once.
+/// RED before: the refused restart's rollback stopped the runtime with the
+/// Stop disposition, which ended the recovered prompt as stopped.
+async fn a_refused_restart_keeps_a_recovered_prompt(head_canonical: bool) {
+    use meerkat_runtime::input_state::InputLifecycleState as Phase;
+
+    let root = TempDir::new().expect("temp");
+    let stores = Stores::new(head_canonical, &root);
+    let client = Arc::new(ScriptedModel::new());
+    let id = {
+        let start = Start::open(&stores, &root, &client);
+        let id = start.materialize(None).await;
+        client.push(Step::Text("first answer"));
+        let outcome = start.turn(&id, "first").await;
+        assert!(
+            matches!(outcome, Some(CompletionOutcome::Completed(_))),
+            "the first turn commits: {outcome:?}"
+        );
+        start.service.try_shutdown().await.expect("shutdown");
+        id
+    };
+    let second = {
+        let store = stores.operator_store();
+        let first_row = input_rows(store.as_ref(), &id)
+            .await
+            .into_iter()
+            .next()
+            .expect("the first turn's row");
+        let row = stranded_row(
+            &first_row,
+            &Input::Prompt(PromptInput::new("second", None)),
+            None,
+        );
+        write_input_row(store.as_ref(), &id, row.clone()).await;
+        row.state.input_id
+    };
+
+    client.refuse_next_build();
+    {
+        let start = Start::open(&stores, &root, &client);
+        let refused = start.restart(&id).await;
+        assert!(
+            matches!(refused, Err(SessionError::Agent(_))),
+            "the restart is refused by its agent build: {refused:?}"
+        );
+        start.service.try_shutdown().await.expect("shutdown");
+    }
+    {
+        let store = stores.operator_store();
+        let row = input_rows(store.as_ref(), &id)
+            .await
+            .into_iter()
+            .find(|row| row.state.input_id == second)
+            .expect("the queued prompt's row");
+        assert_eq!(
+            row.seed.terminal_outcome, None,
+            "the refused restart leaves the recovered prompt open: {:?}",
+            row.state.history
+        );
+        assert_eq!(row.seed.phase, Phase::Queued, "the prompt stays queued");
+        assert!(
+            row.state.stop_requeue.is_none(),
+            "the prompt is kept as the store holds it, with no requeue mark"
+        );
+    }
+
+    let start = Start::open(&stores, &root, &client);
+    let requests_before = client.requests.load(Ordering::SeqCst);
+    client.push(Step::Text("second answer"));
+    start.cold_attach(&id).await;
+    start.materialize(Some(&id)).await;
+    let rows = start
+        .committed_rows_ending_with(&id, "assistant second answer")
+        .await;
+    start.wait_runtime_settled(&id).await;
+    assert_eq!(
+        client.requests.load(Ordering::SeqCst),
+        requests_before + 1,
+        "the kept prompt calls the model once"
+    );
+    assert_eq!(
+        rows,
+        [
+            "user first",
+            "assistant first answer",
+            "user second",
+            "assistant second answer",
+        ],
+        "the kept prompt runs once after the refused restart"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_restart_keeps_a_recovered_prompt_whole_blob() {
+    a_refused_restart_keeps_a_recovered_prompt(false).await;
+}
+
+#[tokio::test]
+async fn a_refused_restart_keeps_a_recovered_prompt_head_canonical() {
+    a_refused_restart_keeps_a_recovered_prompt(true).await;
+}
+
+/// The control: a materialization's rollback after an input was admitted to
+/// its registration still stops. The admitted prompt ends as stopped, so a
+/// turn its caller saw refused never runs on a later start.
+async fn a_rollback_after_admission_still_stops_the_admitted_input(head_canonical: bool) {
+    use meerkat_runtime::input_state::{InputAbandonReason, InputTerminalOutcome};
+
+    let root = TempDir::new().expect("temp");
+    let stores = Stores::new(head_canonical, &root);
+    let client = Arc::new(ScriptedModel::new());
+    let id = {
+        let start = Start::open(&stores, &root, &client);
+        let id = start.materialize(None).await;
+        client.push(Step::Text("first answer"));
+        let outcome = start.turn(&id, "first").await;
+        assert!(
+            matches!(outcome, Some(CompletionOutcome::Completed(_))),
+            "the first turn commits: {outcome:?}"
+        );
+        start.service.try_shutdown().await.expect("shutdown");
+        id
+    };
+
+    let admitted = {
+        let start = Start::open(&stores, &root, &client);
+        start.cold_attach(&id).await;
+        let mut prepared = start
+            .machine
+            .prepare_session_materialization(id.clone())
+            .await
+            .expect("prepare the registration");
+        let input = Input::Prompt(PromptInput::new("admitted", None));
+        let admitted = input.id().clone();
+        start
+            .machine
+            .accept_input_with_completion(&id, input)
+            .await
+            .expect("the registration admits the prompt");
+        prepared
+            .rollback_now()
+            .await
+            .expect("roll the registration back");
+        start.service.try_shutdown().await.expect("shutdown");
+        admitted
+    };
+    {
+        let store = stores.operator_store();
+        let row = input_rows(store.as_ref(), &id)
+            .await
+            .into_iter()
+            .find(|row| row.state.input_id == admitted)
+            .expect("the admitted prompt's row");
+        assert_eq!(
+            row.seed.terminal_outcome,
+            Some(InputTerminalOutcome::Abandoned {
+                reason: InputAbandonReason::Stopped
+            }),
+            "the rollback stops the prompt it admitted: {:?}",
+            row.state.history
+        );
+    }
+
+    let start = Start::open(&stores, &root, &client);
+    let requests_before = client.requests.load(Ordering::SeqCst);
+    start.cold_attach(&id).await;
+    start.materialize(Some(&id)).await;
+    start.wait_runtime_settled(&id).await;
+    assert_eq!(
+        client.requests.load(Ordering::SeqCst),
+        requests_before,
+        "the stopped prompt never runs"
+    );
+    assert_eq!(
+        start.committed_rows(&id).await,
+        ["user first", "assistant first answer"]
+    );
+}
+
+#[tokio::test]
+async fn a_rollback_after_admission_still_stops_the_admitted_input_whole_blob() {
+    a_rollback_after_admission_still_stops_the_admitted_input(false).await;
+}
+
+#[tokio::test]
+async fn a_rollback_after_admission_still_stops_the_admitted_input_head_canonical() {
+    a_rollback_after_admission_still_stops_the_admitted_input(true).await;
 }
 
 /// A prompt staged for a run that committed is not proven stranded: that
