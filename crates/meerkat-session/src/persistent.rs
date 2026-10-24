@@ -4697,6 +4697,74 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         self.apply_transcript_rewrite_replay(id, session).await
     }
 
+    /// [`Self::load_authoritative_session_base_with_replay_info`] for a
+    /// reader that tolerates the session's own HeadCanonical provisional
+    /// tail.
+    ///
+    /// A durable run's round commits apply its provisional tail to the
+    /// physical head, so from the run's first tool round until its boundary
+    /// commit the committed read refuses the boundary with
+    /// `TranscriptRevisionConflict`. On that conflict alone this reads the
+    /// committed snapshot the tail sits on through the store-owned
+    /// durable-tail source
+    /// (`meerkat_runtime::recovery::load_committed_snapshot_under_provisional_tail`)
+    /// and replays its transcript rewrites as the strict read does. Without
+    /// a provisional tail applied on the boundary (another profile, no tail,
+    /// or an intent written but not yet applied) the conflict stands.
+    ///
+    /// The snapshot serves the reader only: it proves nothing about the tail
+    /// (an unproven rewrite still reads one), so no decision about a tail
+    /// (a settle, a discard, an archive, a resume or a persist) reads through
+    /// this layer. Those keep the strict read.
+    async fn load_authoritative_session_base_with_replay_info_tolerating_tail(
+        &self,
+        id: &SessionId,
+    ) -> Result<TranscriptRewriteReplay, SessionError> {
+        match self
+            .load_authoritative_session_base_with_replay_info(id)
+            .await
+        {
+            Ok(replay) => Ok(replay),
+            Err(conflict) if Self::is_transcript_revision_conflict_error(&conflict) => {
+                let committed =
+                    meerkat_runtime::recovery::load_committed_snapshot_under_provisional_tail(
+                        self.runtime_store.as_ref(),
+                        id,
+                    )
+                    .await
+                    .map_err(|error| {
+                        SessionError::Agent(AgentError::InternalError(format!(
+                            "failed to read the committed snapshot of session {id} under its \
+                             provisional tail: {error}"
+                        )))
+                    })?;
+                let Some(committed) = committed else {
+                    return Err(conflict);
+                };
+                self.apply_transcript_rewrite_replay(id, Some(committed))
+                    .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// [`Self::load_authoritative_session_base`] over the tolerant layer: the
+    /// same rewrite replay and audit verification, on the committed snapshot
+    /// while the session's own provisional tail stands on it.
+    async fn load_authoritative_session_base_tolerating_tail(
+        &self,
+        id: &SessionId,
+    ) -> Result<Option<Session>, SessionError> {
+        let replay = self
+            .load_authoritative_session_base_with_replay_info_tolerating_tail(id)
+            .await?;
+        if let Some(session) = replay.session.as_ref() {
+            self.verify_transcript_rewrite_audit_events(session, &replay)
+                .await?;
+        }
+        Ok(replay.session)
+    }
+
     /// Materialize the safe full-read fallback for EventStore implementations
     /// that do not implement the combined rewrite-audit capability.
     async fn transcript_rewrite_full_fallback(
@@ -6876,7 +6944,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// provisional tail sits ahead of the committed snapshot and the
     /// committed read refuses the boundary with `TranscriptRevisionConflict`.
     /// The branch is cut at that snapshot, so it is then read whole through
-    /// the tail (`meerkat_runtime::recovery::load_committed_snapshot_under_provisional_tail`):
+    /// the tail ([`Self::load_authoritative_session_base_with_replay_info_tolerating_tail`]):
     /// the boundary's exact rows and metadata, never the running turn's.
     /// Without an applied provisional tail on the boundary the conflict
     /// stands.
@@ -6884,32 +6952,9 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         &self,
         id: &SessionId,
     ) -> Result<Session, SessionError> {
-        let mut replay = match self
-            .load_authoritative_session_base_with_replay_info(id)
-            .await
-        {
-            Ok(replay) => replay,
-            Err(conflict) if Self::is_transcript_revision_conflict_error(&conflict) => {
-                let committed =
-                    meerkat_runtime::recovery::load_committed_snapshot_under_provisional_tail(
-                        self.runtime_store.as_ref(),
-                        id,
-                    )
-                    .await
-                    .map_err(|error| {
-                        SessionError::Agent(AgentError::InternalError(format!(
-                            "failed to read the committed snapshot of session {id} under its \
-                             running turn's durable tail: {error}"
-                        )))
-                    })?;
-                let Some(committed) = committed else {
-                    return Err(conflict);
-                };
-                self.apply_transcript_rewrite_replay(id, Some(committed))
-                    .await?
-            }
-            Err(error) => return Err(error),
-        };
+        let mut replay = self
+            .load_authoritative_session_base_with_replay_info_tolerating_tail(id)
+            .await?;
         let session = match replay.session.take() {
             Some(session) => {
                 // The caller's turn is appending to this session's event log
@@ -18576,6 +18621,44 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 break;
             }
             result = self.load_authoritative_session_base(id).await;
+        }
+        result
+    }
+
+    /// The committed session as a public reader serves it:
+    /// [`Self::load_authoritative_session`], except while the session's own
+    /// durable run holds a HeadCanonical provisional tail ahead of the
+    /// committed snapshot. The strict read refuses the boundary then (with
+    /// `TranscriptRevisionConflict`); this read serves the committed
+    /// snapshot, read through the tail, which is what every reader saw
+    /// before runs committed their rounds.
+    ///
+    /// It keeps the strict read's contract: the same transcript rewrite
+    /// replay, the same audit verification and the same counted attempt
+    /// budget. On a conflict an attempt reads the snapshot through the tail;
+    /// an attempt that finds no provisional tail applied on the boundary (a
+    /// writer committed between the reads, or a round's intent is written but
+    /// not yet applied) observes again, and a conflict on every attempt
+    /// surfaces unchanged. A WholeBlob store never conflicts here: its
+    /// committed read is the committed document.
+    ///
+    /// For readers only. The snapshot proves nothing about the tail, so every
+    /// decision about one (a settle, a discard, an archive, a resume or a
+    /// persist) keeps [`Self::load_authoritative_session`].
+    pub async fn load_committed_session_tolerating_tail(
+        &self,
+        id: &SessionId,
+    ) -> Result<Option<Session>, SessionError> {
+        let mut result = self
+            .load_authoritative_session_base_tolerating_tail(id)
+            .await;
+        for _ in 1..OBSERVATION_LOAD_ATTEMPTS {
+            if !Self::is_transcript_revision_conflict(&result) {
+                break;
+            }
+            result = self
+                .load_authoritative_session_base_tolerating_tail(id)
+                .await;
         }
         result
     }
@@ -34563,6 +34646,142 @@ mod tests {
             .await
             .expect("a caller-turn fork branches at the committed snapshot under the audit");
         assert_fork_child_is_the_committed_snapshot(&service, &forked, &committed).await;
+    }
+
+    /// The committed snapshot the tolerant read serves: the snapshot's rows
+    /// and build state, and nothing of the running turn.
+    fn assert_served_the_committed_snapshot(served: &Session, committed: &Session) {
+        assert_eq!(
+            meerkat_core::transcript_messages_digest(served.messages()).unwrap(),
+            meerkat_core::transcript_messages_digest(committed.messages()).unwrap(),
+            "the read serves the committed snapshot's rows, nothing of the running turn"
+        );
+        assert!(
+            served.try_run_cursor().unwrap().is_none(),
+            "no run cursor of the running turn reaches the reader"
+        );
+        assert_eq!(
+            served
+                .try_build_state()
+                .unwrap()
+                .and_then(|state| state.app_context),
+            Some(serde_json::json!({"domain": "fork-source"})),
+            "the read carries the snapshot's build state"
+        );
+    }
+
+    /// While the session's own run holds a round commit's provisional tail
+    /// ahead of the committed snapshot, the strict read refuses the boundary
+    /// and the tolerant read serves the snapshot, read through the tail. The
+    /// read writes nothing: the strict read still refuses afterwards.
+    #[tokio::test]
+    async fn the_tolerant_read_serves_the_committed_snapshot_under_a_round_commit() {
+        let (_directory, service, checkpointer, committed) =
+            caller_turn_fork_source_fixture(false).await;
+        let id = committed.id().clone();
+        let run_id = RunId::new();
+        let mut running = committed.clone();
+        commit_running_turn_round(&checkpointer, &mut running, &run_id).await;
+        assert!(
+            PersistentSessionService::<DummyBuilder>::is_transcript_revision_conflict(
+                &service.load_authoritative_session(&id).await
+            ),
+            "the strict read refuses the boundary while the round's tail is ahead of it"
+        );
+
+        let served = service
+            .load_committed_session_tolerating_tail(&id)
+            .await
+            .expect("the tolerant read serves the committed snapshot under the round's tail")
+            .expect("the session is committed");
+        assert_served_the_committed_snapshot(&served, &committed);
+        assert!(
+            PersistentSessionService::<DummyBuilder>::is_transcript_revision_conflict(
+                &service.load_authoritative_session(&id).await
+            ),
+            "the read wrote nothing: the round's tail still stands"
+        );
+    }
+
+    /// A physical head moved past the boundary with no provisional tail the
+    /// store issued is not the session's own run: the tolerant read serves
+    /// nothing. It fails closed with the store's own refusal, which names the
+    /// inconsistency, where the strict read answers the revision conflict.
+    #[tokio::test]
+    async fn the_tolerant_read_keeps_the_refusal_without_a_bound_tail() {
+        let (_directory, service, _checkpointer, committed) =
+            caller_turn_fork_source_fixture(false).await;
+        let id = committed.id().clone();
+        let incremental = service.incremental.as_ref().expect("an incremental store");
+        let physical = incremental
+            .load_head(&id)
+            .await
+            .expect("load the physical head")
+            .expect("the physical head exists");
+        let mut advanced = committed.clone();
+        advanced.push(user_message("written past the boundary"));
+        let mutation = meerkat_core::session_store::PreparedHeadCanonicalMutation::prepare(
+            &advanced,
+            Some(physical),
+        )
+        .expect("prepare a physical-only successor");
+        incremental
+            .apply_prepared_head_canonical_mutation(&mutation)
+            .await
+            .expect("advance the physical head past the boundary");
+        assert!(
+            PersistentSessionService::<DummyBuilder>::is_transcript_revision_conflict(
+                &service.load_authoritative_session(&id).await
+            ),
+            "the strict read refuses the boundary"
+        );
+
+        let tolerant = service.load_committed_session_tolerating_tail(&id).await;
+        assert!(
+            matches!(
+                &tolerant,
+                Err(SessionError::Agent(AgentError::InternalError(message)))
+                    if message.contains("no store-issued provisional authority")
+            ),
+            "the tolerant read fails closed with the store's refusal: {tolerant:?}"
+        );
+    }
+
+    /// A round that compacts rewrites rows the committed snapshot holds. The
+    /// tolerant read still serves the snapshot's own rows, read whole from the
+    /// store, and verifies its rewrite audit as the strict read does.
+    #[tokio::test]
+    async fn the_tolerant_read_replays_the_rewrite_audit_after_a_compacting_round() {
+        let (_directory, service, checkpointer, committed) =
+            caller_turn_fork_source_fixture(false).await;
+        let id = committed.id().clone();
+        let run_id = RunId::new();
+        let mut running = committed.clone();
+        compact_and_retire(
+            &mut running,
+            0,
+            meerkat_core::TranscriptHistoryRetention::from_count(4).unwrap(),
+        );
+        commit_running_turn_round(&checkpointer, &mut running, &run_id).await;
+        assert_eq!(
+            physical_rewrite_count(&service, &id).await,
+            1,
+            "the round's tail carries the compaction"
+        );
+
+        let served = service
+            .load_committed_session_tolerating_tail(&id)
+            .await
+            .expect("the tolerant read serves the committed snapshot under a compacting round")
+            .expect("the session is committed");
+        assert_served_the_committed_snapshot(&served, &committed);
+        assert!(
+            served
+                .validated_transcript_history_state()
+                .unwrap()
+                .is_none_or(|history| history.commits().next().is_none()),
+            "the snapshot carries none of the round's rewrites"
+        );
     }
 
     /// A session whose committed boundary already carries a compaction, and
