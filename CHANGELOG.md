@@ -213,9 +213,9 @@ them.
 - `meerkat-core::ProviderMeta` and `meerkat-contracts::WireProviderMeta` gain
   the `GeminiFunctionCall { provider_id, thought_signature }` variant,
   serialized with `provider: "gemini_function_call"` and required
-  `provider_id`. This replaces the unreleased variant's `id` field;
-  downstream exhaustive Rust matches and wire decoders must handle this
-  metadata for provider-issued Gemini call IDs. Persisted transcripts using
+  `provider_id`. Downstream exhaustive Rust matches and wire decoders must
+  handle this metadata for provider-issued Gemini call IDs. Persisted
+  transcripts using
   this metadata cannot be read after downgrading to a runtime or SDK that
   lacks the variant or its required `provider_id` field. The existing
   signature-only `Gemini` variant and Gemini's HTTP `functionCall.id` and
@@ -365,10 +365,9 @@ them.
 - `meerkat-contracts` (bounded MCP OAuth network stages):
   `WireAuthErrorReason` gains `CommitUnsettled`, appended last; the semver
   gate reports it as an enum variant added to an exhaustive enum.
-  `WireAuthErrorDetail`, new in this release (hosted MCP OAuth above), gains
-  `UpstreamTimeout` and `UpstreamTimeoutAfterCode`, appended last: not a
-  finding against 0.9.4, but a match written against an earlier build of
-  this release needs the arms. On the wire they are new values
+  `WireAuthErrorDetail`, new in this release (hosted MCP OAuth above),
+  includes `UpstreamTimeout` and `UpstreamTimeoutAfterCode`. On the wire
+  they are new values
   (`upstream_timeout`, `upstream_timeout_after_code`, `commit_unsettled`);
   SDK helpers built before them read them as absent.
 
@@ -685,8 +684,8 @@ them.
   `ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopStopped` (one per
   phase from `Initializing` to `Stopped`). Each is appended last, so no
   existing implicit discriminant changes. The new enums are
-  `UnregisterQueuedInputsDisposition` (`Stop`, `Requeue`) and
-  `StopInputDisposition` (`Abandon`, `Retain`). `State` gains the public
+  `UnregisterQueuedInputsDisposition` (`Stop`, `Requeue`, `Keep`) and
+  `StopInputDisposition` (`Abandon`, `Retain`, `Keep`). `State` gains the public
   fields `unregister_queued_inputs` and `unregister_requeue_max_age_ms`, and
   the input struct `BeginUnregisterSession` gains `queued_inputs` and
   `requeue_max_age_ms` (struct literals need them; `Stop` and `0` keep the
@@ -701,15 +700,15 @@ them.
   `meerkat-machine-schema` (`catalog::dsl::meerkat_machine`): the runtime
   machine gains the keep of a refused materialization's rollback (see Fixed,
   a refused restart keeps the inputs it recovered).
-  `UnregisterQueuedInputsDisposition` and `StopInputDisposition` gain `Keep`,
-  appended last, and `TransitionId` gains
+  The new `UnregisterQueuedInputsDisposition` and `StopInputDisposition`
+  carry it as `Keep` (see above), and `TransitionId` gains
   `ClassifyStopInputDispositionKeepInitializing`,
   `ClassifyStopInputDispositionKeepIdle`,
   `ClassifyStopInputDispositionKeepAttached`,
   `ClassifyStopInputDispositionKeepRunning`,
   `ClassifyStopInputDispositionKeepRetired` and
-  `ClassifyStopInputDispositionKeepStopped`. The enums are exhaustive, so a
-  `match` outside the crate needs the arms.
+  `ClassifyStopInputDispositionKeepStopped`. `TransitionId` is exhaustive,
+  so a `match` outside the crate needs the arms.
 
 - `meerkat-runtime`: `MeerkatMachineRuntimeInternalInput` gains
   `ClassifyStopInputDisposition`, `MarkRunResumable`, `ResumeRun`,
@@ -793,7 +792,13 @@ them.
   they cancel the requests still in flight (with `--tcp`, each connection
   keeps its tracked requests until the shared runtime has shut down), so a
   tracked request's cancellation no longer ends its run first, and the REST
-  server now unregisters its sessions at shutdown, which it did not. An
+  server now unregisters its sessions at shutdown, which it did not. Once
+  `rkat-rpc`'s shutdown begins, its runtime admits no new work and registers
+  no session: a request that arrives then, or that waited behind the
+  suspended turn, is refused `-32032` (`SESSION_RUNTIME_UNAVAILABLE`) with
+  `data.kind` `runtime_shutting_down` (a mob of its mob state refuses with
+  `MobError::AdmissionClosed`, reason `StandDown`), and nothing of it is kept
+  for the next start, so resubmit it after the restart. An
   unregister that names no disposition still stops. `meerkat-runtime` adds
   `MeerkatMachine::unregister_session_registration_until_terminal_with_queued_inputs_if_current`
   and `meerkat-rest` adds `unregister_runtime_sessions_for_shutdown`, the
@@ -802,8 +807,8 @@ them.
 - Not measured by the gate (a persistence change): `meerkat-runtime`
   persistence: an input row that carries a stop mark or the `RequeueExpired`
   reason is written as stored input state version 8, and the machine lifecycle
-  record of an unregister in progress with the requeue disposition as version
-  6. Every other row and record keeps version 7 and version 5, which 0.9.4
+  record of an unregister in progress with the requeue or keep disposition as
+  version 6. Every other row and record keeps version 7 and version 5, which 0.9.4
   reads. 0.9.4 refuses a version 8 row that carries a stop mark, and a version
   6 record, with its typed unsupported-version error. A version 8 row that
   ended `RequeueExpired` fails earlier in 0.9.4, when it decodes the row's
@@ -949,6 +954,17 @@ them.
 
 ### Added
 
+- `meerkat-runtime`: `MeerkatMachine::take_over_stopped_attachment_registration_if_current`
+  unregisters one exact session registration when, and only when, it is the
+  completed residue of a stopped attachment: Stopped (not Retired),
+  unattached, durability-ready, with the attachment's stop cleanup and
+  post-stop callback completed. A stop cleanup still in flight on that
+  registration is joined first, for at most the caller's bound, and the
+  decision and the canonical unregister start are one atomic admission. The
+  answer is the new `#[non_exhaustive]` `StoppedRegistrationTakeover`
+  (`Unregistered`, `NotCurrent`, `NotStoppedResidue`, `StopCleanupPending`);
+  anything that is not such residue changes nothing.
+
 - `meerkat-runtime`: a durable session whose process stopped inside a run
   resumes the same run from its last committed round. Durable-tail recovery
   classifies a provisional tail whose run cursor agrees with it, and whose
@@ -1046,8 +1062,7 @@ them.
   `specs/machines/meerkat_machine/durable_tail_recovery_ownership_audit.sh`
   checks, over the whole observation product, that the authorization arms
   partition the observations in the Idle and Retired phases and that
-  ownership changes only what these rules say; it runs in the canonical TLC
-  lane with eleven seeded defects.
+  ownership changes only what these rules say.
 
 - Resumed runs, runtime and session plumbing. A durable session that stops
   inside a run continues that run on its next open, under the run's original
@@ -1110,6 +1125,22 @@ them.
     ended run already answered without a recovery notice, so the call is not
     reported twice. Background jobs, monitors and command hooks keep their
     notice.
+  - A run also resumes in the host process that ran it: a graceful requeue
+    stop, or a teardown, that ends the session's registration while a tool
+    call runs keeps the run open at its round commit, and a later start of
+    the session in the same process resumes it. The resumption then settles
+    the custody records that process left for the run, as recovery settles
+    an earlier host process's: a call whose process may have run is answered
+    as interrupted, outcome uncertain, and never run again, and a process
+    still running is killed first. A call whose process an owner in this
+    process still runs means the run still executes here: the resumption is
+    refused with nothing settled, and the resumed round is held as for
+    unreadable evidence. A background job the run started stays with its
+    live owner, and the resumed round dispatches the call that started it
+    again: the job's submission key (the session and the call id) dedupes
+    that dispatch to the running job. Only the session's current run is
+    settled: `MeerkatMachine::resumed_run_interrupted_tool_calls` refuses any
+    other run id.
   - A marked run that is settled without resuming (a refused resume, an
     expired requeue stop, or a stop) has its provisional tail repaired as
     interrupted once its inputs' abandonment commits: rows kept, open calls
@@ -1159,6 +1190,14 @@ them.
     next start resumes it unless one of them is older than the stop's max
     age, which settles the whole run with
     `InputAbandonReason::RequeueExpired` instead.
+
+- `meerkat-core`, `meerkat-tools`: `InterruptedToolEvidence::run_resumes`,
+  which a session's evidence store answers when a run resumes: it settles
+  the evidence its own host process left for the run and returns the run's
+  interrupted calls (a provided method; the default returns the run's
+  `interrupted_calls`). `ProcessCustodyError::ResumedRunStillOwned` is
+  process custody's refusal of a resumption whose call an owner in the same
+  process still runs.
 
 - `meerkat-core`: per-round commits and resumable runs. A run whose agent has
   a session checkpointer commits every tool round twice:
@@ -1387,6 +1426,24 @@ them.
   binary's (runtime store, and for head-canonical the co-tenant session
   store), an unpinned head-canonical profile and a pending activation, and
   it never migrates, activates or rewrites a boundary.
+
+- `rkat`, `meerkat-runtime`: `rkat session resolve-held-tail`
+  (`recovery::resolve_held_durable_tail`) also resolves an interrupted run's
+  tail that recovery holds beside an input staged for another run, a shape
+  a store fault can leave. The store must
+  prove the input is not the tail's own: the tail's run cursor does not
+  bind it, and it names that other run, which has no boundary receipt and
+  no tail. The answer is
+  `stranded_inputs` (`HeldTailResolution::StrandedInputs`). Applied, the
+  repair commits the tail as interrupted, as recovery commits any
+  interrupted run, and in the same commit requeues those inputs with their
+  content (`HeldTailRepair::requeued_inputs`), so each runs once after it.
+  An input the cursor binds is the tail's own, whatever run it names now:
+  the repair consumes it with the tail
+  (`HeldTailRepair::terminalized_inputs`).
+  An input that names no run stays queued. An input that names a run with a
+  receipt, or the interrupted run without the cursor binding it, keeps the
+  hold.
 
 - Durable workers: a mob profile with `durable = true` spawns its members as
   durable workers. The spawn records a durable identity
@@ -2113,6 +2170,39 @@ them.
   failure, and the mob host's tracked-turn watcher keeps the turn pending
   for the next start.
 
+- `meerkat`, `meerkat-rpc`: a graceful stop that keeps queued work keeps a
+  session's first turn as well. When the stop suspends the run of a first
+  turn that is materializing its session (a session created without a
+  turn), the staged promotion finishes and the suspension reaches the
+  runtime: a suspended run is not a failed first turn. The turn is answered
+  `requeued_across_stop` and its run continues once at the session's next
+  start, like every other run the stop keeps.
+  `should_restore_pending_after_apply_runtime_turn` and its runtime-loop
+  variant answer `false` for a suspended run.
+
+- `meerkat-session`, `meerkat-mob`: a mob start after a graceful stop with a
+  member's run in flight keeps the run. A host's graceful shutdown leaves the
+  mob Stopped and suspends a member's run that has committed a round at its
+  last round commit (a requeueing stop), so the run's provisional tail
+  outlives the process. The next start restores every member of the stopped
+  mob before it admits a command. The store-owned durable-tail recovery
+  continues such a run (it keeps the tail and writes nothing), and the
+  cold-attach settle reports the recovery's own disposition: when the run
+  continues, the start restores the member from the committed snapshot
+  under the tail, and the tail stays for the run, which resumes from its last
+  round commit when the member's actor is next materialized. The snapshot
+  only serves that read; whether the run continues is the recovery's
+  decision, never derived from the snapshot. A held, refused or unprovable
+  tail still fails the start. New public items:
+  `meerkat_session::ColdAttachSettlement` and
+  `PersistentSessionService::prepare_cold_attach_reporting`, which returns it
+  (`prepare_cold_attach` is unchanged), and
+  `MobSessionService::settle_durable_tail_before_cold_start_reporting`, which
+  returns `meerkat_mob::ColdStartTailSettlement`. The method's default runs
+  the plain settle and reports no continued run, so a session-service wrapper
+  around a persistent service should forward it as well: without it, such a
+  start fails with `MobError::MemberDurableTailUnprovable`.
+
 - A failed MCP login start says what it left of the attempt it tried to
   admit, so a host can report a clean cleanup exactly.
   `McpOAuthAuthority::login_start_with_admission` and
@@ -2404,6 +2494,26 @@ them.
 
 ### Fixed
 
+- `meerkat-mob`: a Running mob whose member's runtime was stopped after the
+  restart rebuilt the member, and before the mob restored it, starts and
+  serves the member instead of stopping. The stopped runtime keeps its
+  registration until it is unregistered, and the restore refused it, so the
+  whole mob entered Stopped. The restore now takes such a registration over
+  once (after a stop cleanup still running finishes; it waits for one within
+  a bound, past which the restore goes on as before),
+  revives the member right after the start, and runs the member's readiness
+  then, its host loop included for an autonomous member. A member whose
+  revival fails is recorded Broken with the reason; any other registration a
+  restore cannot use is refused as before. Two revivals of one member asked
+  for at the same time (a member turn, `MobHandle::ensure_member_live`, the
+  start's own) now share one materialization instead of racing. A member
+  whose runtime registration needs a durability reload when the mob starts
+  no longer stops the mob either: it is left out of the start, its
+  registration is reloaded right after the start (the same reload
+  `MobHandle::reload_member_registration` runs, so a delivery to it waits
+  behind the reload or is refused `MemberReloadRequired`), and it is
+  recorded Broken with the reason if the reload fails.
+
 - `meerkat-runtime`: a public input row released to a reader its scoped
   destination does not permit (`SessionServiceRuntimeExt::input_state` and
   the idempotency-key reads) no longer carries a directed batch's finalized
@@ -2445,6 +2555,39 @@ them.
   member stays attached and serving. Build the mob over the persistent
   session service to adopt its members: a mob in any realm, `memory`
   included, can.
+
+- `meerkat-session`, `meerkat-runtime`, `meerkat-rest`, `meerkat-mcp-server`:
+  a start or attach of a HeadCanonical session whose durable tail its
+  recovery withholds from resume (held for recovery or refused by recovery)
+  now refuses with that typed hold (`SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY`
+  or `SESSION_DURABLE_TAIL_RECOVERY_REFUSED`, with the `durable_resume_hold`
+  payload) before it reads the session.
+  `PersistentSessionService::prepare_cold_attach` logged the hold and let the
+  caller's committed read meet the tail, so a JSON-RPC `turn/start` answered
+  `SESSION_STORE_ERROR` ("rewrite rejected: previous transcript revision ...
+  did not match commit parent"), REST `500`, and the MCP server's
+  `meerkat_resume` an internal error (shipped in 0.9.4:
+  `crates/meerkat-session/src/persistent.rs:16504-16510` at v0.9.4). Nothing
+  is written: the tail and the session's inputs stay for reconciliation.
+  JSON-RPC and the MCP server answer the canonical `SESSION_NOT_RUNNING`
+  form (JSON-RPC `-32003`) with the hold's `durable_resume_hold` payload,
+  whose `session_error_code` names the hold; REST carries the hold through
+  its attach path as the new `RuntimeDriverError::DurableResumeHeld` (an
+  additive variant of the `#[non_exhaustive]` enum, with
+  `durable_hold_session_error()`) and answers `409` `SESSION_NOT_RUNNING`
+  with the same payload. `DurableResumeHold::session_error` builds the typed
+  error from a hold. A mob member restore answers
+  `MemberDurableTailUnprovable`, as for a tail its recovery could not prove.
+
+- `meerkat-rest`: an archive refused with a durable resume hold answers `409`
+  `SESSION_NOT_RUNNING` with the hold's `durable_resume_hold` payload (its
+  `session_error_code` names the hold) instead of an internal `500`. In
+  0.9.4 an archive of a WholeBlob session whose document needs the
+  audited-endpoint repair met this: the archive's committed read refused
+  with `WholeBlobAuditedEndpointDivergence`
+  (`crates/meerkat-session/src/persistent.rs:14377` and `128-139` at
+  v0.9.4), and `archive_session_error_to_api_error` answered it `Internal`
+  (`crates/meerkat-rest/src/lib.rs:6560-6578` at v0.9.4).
 
 - `meerkat-runtime`, `meerkat-machine-schema`, `meerkat-machine-kernels`: a
   session that completes more than 256 inputs at once no longer becomes
@@ -2504,47 +2647,6 @@ them.
   prepares anything. It used to prepare its inputs' terminals first and roll
   them back once the machine refused, which marked the registration
   reload-required and answered an internal error.
-
-- `meerkat`, `meerkat-rpc`: a graceful stop that keeps queued work keeps a
-  session's first turn as well. When the stop suspended the run of a first
-  turn that was materializing its session (a session created without a
-  turn), the staged promotion took the suspension for a failed first turn
-  and rolled the session back with an archive. The stopping runtime refused
-  that archive (`Invalid state for operation: running`), and the turn was
-  answered `-32603` `runtime_apply_failure` with its session torn down,
-  instead of `requeued_across_stop`. A suspended run is not a failure: the
-  promotion now finishes and the suspension reaches the runtime. The turn is
-  answered `requeued_across_stop` and its run continues once at the
-  session's next start, like every other run the stop keeps.
-  `should_restore_pending_after_apply_runtime_turn` and its runtime-loop
-  variant now answer `false` for a suspended run.
-
-- `meerkat-rpc`: once a `SessionRuntime` begins its shutdown, it admits no
-  new work and registers no session. A second turn request on a session
-  whose turn is in flight waits before its admission until that turn's
-  boundary frees. After a graceful stop suspended the running turn, the
-  waiting request registered the session again on the stopped runtime and
-  ran its turn there, so its caller got no answer and a stopped process went
-  on serving the session. Such a request is now refused `-32032`
-  (`SESSION_RUNTIME_UNAVAILABLE`) with `data.kind` `runtime_shutting_down`.
-  Nothing of it runs or is kept for the next start, so resubmit it after the
-  restart. The same refusal covers external events, runtime inputs, a
-  session create or resume (`create_or_resume_session_without_turn`, and
-  governed cold recovery through it) and the other paths that register a
-  session. The shutdown also closes the mob state's admission. The refusal a
-  host gets depends on the surface it calls:
-  - the runtime's own ingress and registration paths answer `-32032` with
-    `data.kind` `runtime_shutting_down`;
-  - a mob of its mob state refuses a new member, work, a flow or a resume
-    with the mob's own typed `MobError::AdmissionClosed`, reason `StandDown`,
-    as for any mob stand-down (no new close reason was added);
-  - the mob session service, which registers member sessions, refuses with a
-    `SessionError::FailedWithData` whose data carries `kind`
-    `runtime_shutting_down`.
-
-  A registration already under way when the shutdown begins finishes first,
-  so the shutdown tears it down with the rest. The schedule firing host is
-  not armed again after the shutdown.
 
 - `meerkat-rpc`, `rkat`: a mob member whose runtime is repair-blocked retires
   on the JSON-RPC host and under `rkat mob`. A member is repair-blocked when
@@ -2619,8 +2721,7 @@ them.
   held for recovery, a refused recovery, a failed agent build) rolled the
   registration back with an unregister that stopped every non-terminal
   input. A held tail's stranded input was ended as stopped, the hold went
-  with it, and the next start ran without the input, so the operator's
-  `resolve-held-tail` had nothing left to requeue. The rollback now
+  with it, and the next start ran without the input. The rollback now
   unregisters with the generated Keep disposition: every input the
   registration recovered stays exactly as the store holds it, so the hold
   stands and a later start or the operator's repair runs the input once. An
@@ -2837,7 +2938,8 @@ them.
   as well (see the next entry) but materializes the whole resume, so a
   session-service wrapper around a persistent service should forward it, and
   `MobSessionService::settle_durable_tail_before_cold_start_reporting` too
-  (see the entry on a mob start after a graceful stop below). When
+  (see Added, a mob start after a graceful stop with a member's run in
+  flight). When
   that claim is refused (`SessionError::ServedElsewhere` or
   `HostingUnavailable`), or the tail's recovery cannot prove it
   (`MobError::MemberDurableTailUnprovable`), the start defers that one member:
@@ -2906,32 +3008,6 @@ them.
   and records it Broken with a typed restore failure that says its runtime
   was retired outside the mob and to respawn the member; the mob serves its
   other members. Only the runtime's own `Retired` state leaves a member out.
-
-- `meerkat-session`, `meerkat-mob`: a mob start after a graceful stop with a
-  member's run in flight no longer fails on a HeadCanonical store. A host's
-  graceful shutdown leaves the mob Stopped and suspends a member's run that
-  has committed a round at its last round commit (a requeueing stop), so the
-  run's provisional tail outlives the process. The next start restores every
-  member of the stopped mob before it admits a command. The store-owned
-  durable-tail recovery continues such a run (it keeps the tail and writes
-  nothing), but the cold-attach settle reported that as settled, the start's
-  next committed read of the member's session met the kept tail as a
-  transcript revision conflict, and the start failed with
-  `MobError::MemberDurableTailUnprovable`. The mob never started. The settle
-  now reports the recovery's own disposition: when the run continues, the
-  start restores the member from the committed snapshot under the tail, and
-  the tail stays for the run, which resumes from its last round commit when
-  the member's actor is next materialized. The snapshot only serves that read;
-  whether the run continues is the recovery's decision, never derived from the
-  snapshot. A held, refused or unprovable tail still fails the start as
-  before. New public items: `meerkat_session::ColdAttachSettlement` and
-  `PersistentSessionService::prepare_cold_attach_reporting`, which returns it
-  (`prepare_cold_attach` is unchanged), and
-  `MobSessionService::settle_durable_tail_before_cold_start_reporting`, which
-  returns `meerkat_mob::ColdStartTailSettlement`. The method's default runs
-  the plain settle and reports no continued run, so a session-service wrapper
-  around a persistent service should forward it as well: a wrapper that does
-  not keeps the old refusal.
 
 - `meerkat-mob`: a resume spawn onto a session whose durable tail runs past
   its committed runtime boundary, and which no start of the mob restores
@@ -3428,26 +3504,6 @@ them.
   not map, so the policy saw an unknown provider-native tool and a governed
   Gemini web search was refused as malformed.
 
-- `rkat`, `meerkat-runtime`: `rkat session resolve-held-tail`
-  (`recovery::resolve_held_durable_tail`) also resolves an interrupted run's
-  tail that recovery holds beside an input staged for another run, a shape
-  only pre-release builds of 0.9.5, or a store fault, leave: those builds'
-  interrupt kept the run's last round commit as the tail, and the next
-  turn's input was staged for a run that never committed. The store must
-  prove the input is not the tail's own: the tail's run cursor does not
-  bind it, and it names that other run, which has no boundary receipt and
-  no tail. The answer is
-  `stranded_inputs` (`HeldTailResolution::StrandedInputs`). Applied, the
-  repair commits the tail as interrupted, as recovery commits any
-  interrupted run, and in the same commit requeues those inputs with their
-  content (`HeldTailRepair::requeued_inputs`), so each runs once after it.
-  An input the cursor binds is the tail's own, whatever run it names now:
-  the repair consumes it with the tail
-  (`HeldTailRepair::terminalized_inputs`).
-  An input that names no run stays queued. An input that names a run with a
-  receipt, or the interrupted run without the cursor binding it, keeps the
-  hold.
-
 - `meerkat-runtime`: a caller waiting on an input whose session's runtime
   must reload is answered once the runtime loop exits:
   `CompletionWaitError::AuthorityUnavailable`, which JSON-RPC `turn/start`
@@ -3514,21 +3570,23 @@ them.
 - Upgrade the Meta gateway and Forge together. The Meta CHANGELOG carries the
   details.
 
-- A session whose run a pre-release build of 0.9.5 interrupted, with no
-  input submitted after it, heals at its next start: the run's tail is
-  closed as an interrupted run.
-
 - A `MobSessionService` wrapper outside this repository must forward
-  `load_persisted_session_tolerating_tail` to its inner service. Without it,
-  mob reads of a member whose run holds a round commit keep the strict read
-  and fail with a transcript revision conflict while the round's tail
-  stands.
+  `load_persisted_session_tolerating_tail` and `provisional_tail_stands` to
+  its inner service. Without the first, mob reads of a member whose run
+  holds a round commit keep the strict read and fail with a transcript
+  revision conflict while the round's tail stands; without the second,
+  every resume spawn over a persistent inner service is refused. It should
+  forward `settle_durable_tail_before_cold_start`,
+  `settle_durable_tail_before_cold_start_reporting` and
+  `keeps_durable_member_sessions` as well: their defaults settle through a
+  whole resume, report no continued run (so a mob start after a graceful
+  stop with a member's run in flight fails), and answer
+  `supports_persistent_sessions` instead of the inner service's own answer.
 
-- A mob that a pre-release build of 0.9.5 kept in a host store must be
-  recreated. Those builds stored the mob's events without the fields a
-  restart needs (a spawned member's bridge among them), so a restarted mob
-  skipped its members. This release keeps those fields and refuses an entry a
-  pre-release build wrote, with a read error that names the entry.
+- A `RuntimeStore` decorator outside this repository should forward
+  `append_service_call_audit` and `read_service_call_audit`. Their defaults
+  answer `Unsupported`, so every governed service call over the decorator is
+  refused before it is sent.
 
 ### Known limitations
 
