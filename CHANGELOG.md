@@ -2546,6 +2546,34 @@ them.
   so the shutdown tears it down with the rest. The schedule firing host is
   not armed again after the shutdown.
 
+- `meerkat-rpc`, `rkat`: a mob member whose runtime is repair-blocked retires
+  on the JSON-RPC host and under `rkat mob`. A member is repair-blocked when
+  the store refused one of its runtime's commits, so its runtime waits for a
+  reload. Retiring such a member reloads its runtime from durable state, moves
+  the member's operation onto the reloaded runtime, and archives through a
+  hook that marks that operation retired once the runtime is durably Retired.
+  Neither host's mob session service passed the hook on to the persistent
+  session service it wraps. The trait default refused it, so the retirement
+  failed with `MobError::MemberRetirementStuck` at `retire-session-archive`
+  ("session service cannot run a pre-retire archive hook"). Every redrive
+  failed the same way, and the member stayed Retiring. This has been so since
+  0.8.22 and shipped in 0.9.4: `RpcMobSessionService` in `meerkat-rpc` and
+  `MobCliSessionService` in `rkat` forwarded only the archives without a
+  hook. Both now forward the hook-bearing archive. They also forward the
+  other mob session methods whose defaults refuse, report nothing or fall
+  back to a heavier read, so mobs on these hosts get the persistent
+  service's answers:
+  - instruction activation;
+  - the live bridge member preflight and operation start;
+  - persisted session authority reads;
+  - live actor presence;
+  - run suspension for a graceful stop, which used to hard-cancel the
+    member's run;
+  - the visible tool definitions;
+  - controller route and pin;
+  - metadata reads, on `meerkat-rpc`;
+  - the tool catalog view, on `rkat`.
+
 - RPC callback tools accept typed content blocks from SDK handlers, which
   released 0.9.3 and 0.9.4 rejected as non-string results. Mixed text and image
   results are preserved alongside legacy text and tool error flags.

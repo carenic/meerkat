@@ -17194,6 +17194,27 @@ impl meerkat_mob::MobSessionService for MobCliSessionService {
         .await
     }
 
+    /// Retirement archives a member whose runtime a durability reload
+    /// replaced through this hook-bearing archive: the hook marks the
+    /// member's recovered operation retired once the runtime is durably
+    /// Retired. The trait default refuses every hook, which left such a
+    /// member Retiring for good; the inner persistent service runs it, as
+    /// it does the plain archives above.
+    async fn archive_with_mob_lifecycle_authority_under_runtime_turn_boundary_and_hook_before(
+        &self,
+        session_id: &SessionId,
+        deadline: meerkat_core::time_compat::Instant,
+        post_commit_hook: Option<Arc<dyn meerkat_runtime::MachineSessionArchivePostCommitHook>>,
+    ) -> Result<(), meerkat_core::service::SessionError> {
+        <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::archive_with_mob_lifecycle_authority_under_runtime_turn_boundary_and_hook_before(
+            &self.inner,
+            session_id,
+            deadline,
+            post_commit_hook,
+        )
+        .await
+    }
+
     async fn discard_live_session_under_runtime_turn_boundary(
         &self,
         session_id: &SessionId,
@@ -17747,6 +17768,149 @@ impl meerkat_mob::MobSessionService for MobCliSessionService {
 
     async fn rearm_all_checkpointers(&self) {
         meerkat_mob::MobSessionService::rearm_all_checkpointers(self.inner.as_ref()).await;
+    }
+
+    // Forwarded explicitly as well: each of these trait defaults refuses,
+    // reports nothing or falls back to a heavier read, so a mob under `rkat
+    // mob` would lose what the inner persistent service answers.
+
+    async fn activate_instruction_under_runtime_turn_boundary(
+        &self,
+        session_id: &SessionId,
+        request: meerkat_core::InstructionActivationRequest,
+        write_fence: Option<Arc<dyn meerkat_runtime::RuntimeStoreWriteFence>>,
+    ) -> Result<meerkat_core::InstructionActivationMutation, meerkat_core::service::SessionError>
+    {
+        <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::activate_instruction_under_runtime_turn_boundary(
+            &self.inner,
+            session_id,
+            request,
+            write_fence,
+        )
+        .await
+    }
+
+    #[cfg(feature = "openai-live")]
+    async fn validate_live_bridge_member_eligibility(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), meerkat_core::service::SessionError> {
+        <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::validate_live_bridge_member_eligibility(
+            &self.inner,
+            session_id,
+        )
+        .await
+    }
+
+    #[cfg(feature = "openai-live")]
+    async fn start_live_bridge_member_operation(
+        &self,
+        request: meerkat_mob::LiveBridgeOperationRequest,
+        cancellation: meerkat_mob::LiveBridgeOperationCancellationSignal,
+    ) -> Result<
+        meerkat_mob::LiveBridgeOperationTerminalFuture,
+        meerkat_mob::LiveBridgeOperationStartError,
+    > {
+        <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::start_live_bridge_member_operation(
+            &self.inner,
+            request,
+            cancellation,
+        )
+        .await
+    }
+
+    fn persisted_session_authority_read_cost(
+        &self,
+    ) -> meerkat_mob::runtime::PersistedSessionAuthorityReadCost {
+        <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::persisted_session_authority_read_cost(
+            &self.inner,
+        )
+    }
+
+    async fn observe_persisted_session_authority(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<
+        Option<meerkat_mob::IdentitySessionStoreAuthority>,
+        meerkat_core::service::SessionError,
+    > {
+        <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::observe_persisted_session_authority(
+            &self.inner,
+            session_id,
+        )
+        .await
+    }
+
+    async fn live_session_actor_registered(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<bool, meerkat_core::service::SessionError> {
+        <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::live_session_actor_registered(
+            &self.inner,
+            session_id,
+        )
+        .await
+    }
+
+    async fn suspend_run_with_machine_authority(
+        &self,
+        session_id: &SessionId,
+        expected_run_id: &meerkat_core::RunId,
+        authority: meerkat_runtime::MachineSessionControlAuthority,
+    ) -> Result<bool, meerkat_core::service::SessionError> {
+        <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::suspend_run_with_machine_authority(
+            &self.inner,
+            session_id,
+            expected_run_id,
+            authority,
+        )
+        .await
+    }
+
+    async fn tool_catalog_view(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<meerkat_core::ToolCatalogView>, meerkat_core::service::SessionError> {
+        <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::tool_catalog_view(
+            &self.inner,
+            session_id,
+        )
+        .await
+    }
+
+    async fn live_visible_tool_defs(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<Vec<meerkat_core::ToolDef>>, meerkat_core::service::SessionError> {
+        <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::live_visible_tool_defs(
+            &self.inner,
+            session_id,
+        )
+        .await
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn controller_route_under_runtime_turn_boundary(
+        &self,
+        actor: &meerkat::LiveSessionActorWitness,
+    ) -> Result<meerkat_mob::ControllerRouteObservation, meerkat_core::service::SessionError> {
+        <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::controller_route_under_runtime_turn_boundary(
+            &self.inner,
+            actor,
+        )
+        .await
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn pin_controller_client_under_runtime_turn_boundary(
+        &self,
+        actor: &meerkat::LiveSessionActorWitness,
+    ) -> Result<meerkat_core::ControllerModelClient, meerkat_core::service::SessionError> {
+        <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::pin_controller_client_under_runtime_turn_boundary(
+            &self.inner,
+            actor,
+        )
+        .await
     }
 }
 
@@ -34836,6 +35000,150 @@ default_model = "gpt-5.4"
             )) => assert_eq!(run_result.text, "ok"),
             other => panic!("expected terminal run result, got {other:?}"),
         }
+    }
+
+    /// A mob member whose runtime went repair-blocked retires on the `rkat
+    /// mob` host. Retirement reloads the degraded runtime cold, moves the
+    /// member operation onto the cold registration, and archives through
+    /// `MobCliSessionService`. The member leaves the roster, and its runtime
+    /// is unregistered and durably Retired.
+    #[cfg(all(feature = "mob", feature = "session-store"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_repair_blocked_mob_member_retires_on_the_cli_mob_host() {
+        let temp = tempfile::tempdir().expect("tempdir must be created");
+        let session_store = sqlite_session_store(&temp);
+        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+        let persistence = PersistenceBundle::new(
+            Arc::clone(&session_store),
+            Arc::clone(&runtime_store),
+            Arc::new(meerkat_store::MemoryBlobStore::default()),
+        )
+        .expect("construct runtime authority");
+        let factory = AgentFactory::new(temp.path().join("sessions"))
+            .session_store(session_store)
+            .builtins(false)
+            .shell(false);
+        let (service, runtime_adapter) = build_cli_runtime_backed_service_with_defaults(
+            factory,
+            Config::default(),
+            persistence,
+            temp.path().join("config_state.json"),
+            None,
+            None,
+            None,
+        )
+        .expect("compose the CLI runtime-backed service");
+        let mob_service: Arc<dyn meerkat_mob::MobSessionService> =
+            Arc::new(MobCliSessionService::new(service));
+        // Unique per test: the mob id names the process-global in-process
+        // supervisor participant.
+        let definition: meerkat_mob::MobDefinition = serde_json::from_value(serde_json::json!({
+            "id": format!("cli-mob-repair-blocked-retire-{}", uuid::Uuid::new_v4().simple()),
+            "profiles": {
+                "worker": {
+                    "model": "claude-sonnet-4-5",
+                    "tools": { "comms": true }
+                }
+            }
+        }))
+        .expect("the test mob definition decodes");
+        let llm: Arc<dyn LlmClient> = Arc::new(CapturingLlmClient::new(
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(None)),
+        ));
+        let handle = meerkat_mob::MobBuilder::new(definition, meerkat_mob::MobStorage::in_memory())
+            .with_session_service(mob_service)
+            .with_default_llm_client(llm)
+            .create()
+            .await
+            .expect("create the mob");
+        let identity = meerkat_mob::AgentIdentity::from("worker-1");
+        handle
+            .spawn_spec(meerkat_mob::SpawnMemberSpec::new(
+                "worker",
+                identity.clone(),
+            ))
+            .await
+            .expect("spawn the worker");
+        let session_id = handle
+            .resolve_bridge_session_id(&identity)
+            .await
+            .expect("the spawned worker has a session");
+        let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&session_id);
+
+        // The worker's runtime goes repair-blocked, and a refused admission
+        // starts its degraded loop's teardown, as a failed boundary commit
+        // leaves it.
+        assert!(
+            runtime_adapter
+                .force_session_durability_reload_required_for_test(&session_id)
+                .await,
+            "the worker's runtime degrades"
+        );
+        meerkat_runtime::SessionServiceRuntimeExt::accept_input(
+            runtime_adapter.as_ref(),
+            &session_id,
+            Input::Prompt(PromptInput::new("start the degraded teardown", None)),
+        )
+        .await
+        .expect_err("a degraded admission is refused and starts the teardown");
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while runtime_adapter
+                .session_has_live_executor_attachment(&session_id)
+                .await
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the degraded runtime loop exits");
+
+        let retired = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match handle.retire(identity.clone()).await {
+                    Err(meerkat_mob::MobError::MemberRetirementInProgress { .. }) => {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    settled => return settled,
+                }
+            }
+        })
+        .await
+        .expect("retiring the repair-blocked worker settles");
+        if let Err(error) = retired {
+            let mut redrives = Vec::new();
+            for _ in 0..2 {
+                redrives.push(
+                    handle
+                        .retire(identity.clone())
+                        .await
+                        .err()
+                        .map(|error| error.to_string()),
+                );
+            }
+            panic!("the repair-blocked worker retires: {error}; redrives: {redrives:?}");
+        }
+
+        assert!(
+            handle
+                .list_members_including_retiring()
+                .await
+                .iter()
+                .all(|entry| entry.agent_identity != identity),
+            "the retired worker leaves the roster"
+        );
+        assert!(
+            !runtime_adapter.contains_session(&session_id).await,
+            "retirement unregisters the worker's runtime"
+        );
+        assert_eq!(
+            meerkat_runtime::store::load_runtime_state(runtime_store.as_ref(), &runtime_id)
+                .await
+                .expect("read the worker's durable runtime state"),
+            Some(meerkat_runtime::RuntimeState::Retired),
+            "the worker's runtime is durably Retired"
+        );
     }
 
     /// Council participants are forked from durable bodies, which the
