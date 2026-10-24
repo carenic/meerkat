@@ -16863,6 +16863,141 @@ impl SessionAgentBuilder for ToolRecordingBuilder {
     }
 }
 
+/// A member identity that converged keeps reconciling from its cached
+/// session witness, on a mob served by the persistent session service
+/// directly. A pass of the unchanged intent after convergence revalidates
+/// the witness against the store's persisted authority and converges again
+/// without reading the session document.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_converged_member_identity_reconciles_from_its_cached_witness_on_a_persistent_host() {
+    use super::actor::identity_reconcile_session_authority_observations as document_reads;
+
+    let definition = with_unique_mob_id(sample_definition(), "identity-witness");
+    let mob_id = definition.id.clone();
+    let session_store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let blob_store: Arc<dyn meerkat_core::BlobStore> =
+        Arc::new(meerkat_store::MemoryBlobStore::new());
+    let service = Arc::new(meerkat_session::PersistentSessionService::new(
+        PersistentMockBuilder,
+        16,
+        session_store,
+        runtime_store,
+        blob_store,
+    ));
+    let handle = MobBuilder::new(definition, MobStorage::in_memory())
+        .with_session_service(service.clone())
+        .with_spawn_base_prompt_source(Arc::new(crate::StaticSpawnBasePromptSource(
+            "identity witness test base prompt".to_string(),
+        )))
+        .create()
+        .await
+        .expect("create the mob");
+    let member = AgentIdentity::from("worker-1");
+    let mut spawn = SpawnMemberSpec::new(ProfileName::from("worker"), member.clone());
+    spawn.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    handle.spawn_spec(spawn).await.expect("spawn the worker");
+    let session_id = handle
+        .resolve_bridge_session_id(&member)
+        .await
+        .expect("session-backed member");
+    let adoption = crate::identity::AdoptMemberIdentityDeclaration {
+        mob_id: mob_id.clone(),
+        agent_identity: member.clone(),
+        request_id: crate::identity::IdentityAdoptionId::new("adopt-worker-1")
+            .expect("valid adoption id"),
+        precondition: crate::identity::IdentityAdoptionPrecondition::ExpectedAbsent,
+        declaration_scope: crate::identity::IdentityDeclarationScopeId::new("identity-witness")
+            .expect("valid declaration scope"),
+        declaration_revision: 1,
+        session: crate::identity::DesiredSessionTarget {
+            session_id: session_id.clone(),
+            lineage_id: meerkat_core::SessionLineageId::for_session(&session_id),
+            lineage_generation: meerkat_core::SessionGeneration::INITIAL,
+            authority_policy: crate::identity::DesiredSessionAuthorityPolicy::RequireExisting,
+        },
+        member: crate::identity::IdentityProfileMemberDeclaration {
+            profile_name: ProfileName::from("worker"),
+            profile_override: None,
+            model_override: None,
+            external_addressable_override: None,
+            context: None,
+            labels: None,
+            additional_instructions: None,
+            system_prompt_override: None,
+            tool_access_policy: None,
+            auth_binding: None,
+            budget_limits: None,
+            runtime_mode: Some(meerkat_contracts::wire::WireMobRuntimeMode::TurnDriven),
+            required_env_keys: Vec::new(),
+            required_local_callback_tools: Vec::new(),
+            execution: crate::identity::DesiredExecution::ControllingSession,
+        },
+        wiring_custody: crate::identity::IdentityWiringCustody::ExternalManaged,
+        owned_wiring: BTreeSet::new(),
+        convergence: crate::identity::IdentityConvergenceMode::Drain { max_wait_ms: 5_000 },
+    };
+    assert!(matches!(
+        handle
+            .adopt_member_identity_declaration(adoption.clone())
+            .await
+            .expect("adopt the worker's identity")
+            .adoption,
+        crate::identity::IdentityAdoptionOutcome::Adopted {
+            desired_revision: 1
+        }
+    ));
+    // The time of the latest converged status, once there is one after
+    // `after`.
+    let converged_after = |after: u64| {
+        let handle = handle.clone();
+        let member = member.clone();
+        async move {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    if let crate::identity::IdentityStoredObservation::Valid(
+                        crate::identity::IdentityConvergenceStatus {
+                            decision: Some(crate::identity::IdentityReconcileDecision::Converged),
+                            observed_at_ms,
+                            ..
+                        },
+                    ) = handle
+                        .identity_convergence_status(&member)
+                        .await
+                        .expect("read the identity's convergence")
+                        && observed_at_ms > after
+                    {
+                        break observed_at_ms;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+        }
+    };
+    let converged_at = converged_after(0)
+        .await
+        .expect("the adopted identity converges");
+
+    // A pass of the unchanged intent, nothing broken: it converges from the
+    // cached witness and reads no session document.
+    let reads = document_reads(&session_id);
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    handle
+        .adopt_member_identity_declaration(adoption.clone())
+        .await
+        .expect("replay the adoption");
+    converged_after(converged_at)
+        .await
+        .expect("the replay's pass converges");
+    assert_eq!(
+        document_reads(&session_id),
+        reads,
+        "a converged pass takes the cached session witness"
+    );
+}
+
 /// An adopted identity converges by rebuilding its member from the sealed
 /// identity material. The sealed profile is portable and carries no
 /// runtime-owned tool bundles, so the rebuild mounts the bundles the mob's

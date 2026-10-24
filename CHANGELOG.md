@@ -2559,20 +2559,36 @@ them.
   failed the same way, and the member stayed Retiring. This has been so since
   0.8.22 and shipped in 0.9.4: `RpcMobSessionService` in `meerkat-rpc` and
   `MobCliSessionService` in `rkat` forwarded only the archives without a
-  hook. Both now forward the hook-bearing archive. They also forward the
-  other mob session methods whose defaults refuse, report nothing or fall
-  back to a heavier read, so mobs on these hosts get the persistent
-  service's answers:
-  - instruction activation;
-  - the live bridge member preflight and operation start;
-  - persisted session authority reads;
-  - live actor presence;
-  - run suspension for a graceful stop, which used to hard-cancel the
-    member's run;
-  - the visible tool definitions;
-  - controller route and pin;
-  - metadata reads, on `meerkat-rpc`;
-  - the tool catalog view, on `rkat`.
+  hook. Both now forward the hook-bearing archive.
+
+- `meerkat-rpc`, `rkat`: a member identity that converged keeps reconciling
+  on the JSON-RPC host and under `rkat mob`. After a member identity
+  converges, each later reconciliation pass checks its cached session
+  against the store's persisted session authority. Neither host's mob
+  session service passed that read on to the persistent session service it
+  wraps, and the trait default answers that the read is unsupported. Every
+  later reconciliation pass after convergence therefore failed ("session
+  service cannot cheaply revalidate exact persisted authority") and went
+  into backoff, so identity reconciliation stopped acting on that member. The
+  JSON-RPC identity verbs (`mob/adopt_member_identity_declaration`) reach it.
+  As shipped in 0.9.4, `meerkat-mob`'s `actor.rs:25253-25275` refuses the
+  unsupported read, and `RpcMobSessionService` (`session_runtime.rs:1308`)
+  and `MobCliSessionService` (`main.rs:16724`) keep the trait default
+  (`session_service.rs:1471`). Both now forward the read cost and the read.
+
+- `meerkat-rpc`: Rust embedders composing the RPC runtime's mob state
+  (`meerkat_rpc::router::compose_rpc_mob_state`) get the persistent session
+  service's answers on its mobs where 0.9.4 refused or reported nothing:
+  - `MobHandle::activate_member_instruction` failed with "instruction
+    activation is not supported by this session service";
+  - with `openai-live`, `MemberHandle::start_live_bridge_operation` was
+    rejected, because the member eligibility preflight refused;
+  - a held spawn's `controller_route_report` was
+    `ControllerRouteObservation::Unsupported`.
+
+  As shipped in 0.9.4, `RpcMobSessionService` (`session_runtime.rs:1308`)
+  kept those trait defaults (`meerkat-mob`'s `session_service.rs:1240`,
+  `1307`, `1337` and `2202`). It now forwards them.
 
 - RPC callback tools accept typed content blocks from SDK handlers, which
   released 0.9.3 and 0.9.4 rejected as non-string results. Mixed text and image

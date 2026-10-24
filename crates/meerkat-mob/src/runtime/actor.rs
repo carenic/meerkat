@@ -4972,9 +4972,25 @@ pub(super) static IDENTITY_RECONCILE_COMPLETION_REQUEUES: std::sync::atomic::Ato
 #[cfg(test)]
 pub(super) static IDENTITY_RECONCILE_REPLY_DELIVERY_FAILURES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Session documents identity reconciliation read afresh, by desired
+/// session: a pass that takes the cached converged witness reads none. Keyed,
+/// so tests sharing the process do not count each other's reads.
 #[cfg(test)]
-pub(super) static IDENTITY_RECONCILE_SESSION_AUTHORITY_OBSERVATIONS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static IDENTITY_RECONCILE_SESSION_AUTHORITY_OBSERVATIONS: std::sync::Mutex<
+    std::collections::BTreeMap<SessionId, u64>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// How many session documents identity reconciliation read afresh for
+/// `session_id`.
+#[cfg(test)]
+pub(super) fn identity_reconcile_session_authority_observations(session_id: &SessionId) -> u64 {
+    IDENTITY_RECONCILE_SESSION_AUTHORITY_OBSERVATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(session_id)
+        .copied()
+        .unwrap_or(0)
+}
 #[cfg(test)]
 static FAIL_SESSION_INGRESS_DETACH_FOR_SESSION: std::sync::Mutex<Option<SessionId>> =
     std::sync::Mutex::new(None);
@@ -25946,8 +25962,13 @@ impl MobActor {
         desired: &crate::identity::DesiredSessionTarget,
     ) -> Result<crate::identity::IdentitySessionObservation, MobError> {
         #[cfg(test)]
-        IDENTITY_RECONCILE_SESSION_AUTHORITY_OBSERVATIONS
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            *IDENTITY_RECONCILE_SESSION_AUTHORITY_OBSERVATIONS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(desired.session_id.clone())
+                .or_default() += 1;
+        }
         // Typed resume-seam read: `load_persisted_session` deliberately
         // hides archived documents, and mapping that hidden state to
         // authoritative Missing let identity reconciliation mark an intact

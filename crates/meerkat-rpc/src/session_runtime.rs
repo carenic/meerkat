@@ -35437,27 +35437,17 @@ mod tests {
             .expect("the runtime shuts down");
     }
 
-    /// A mob member whose runtime a refused run-boundary commit left
-    /// repair-blocked retires on the RPC host. Retirement disposes the
-    /// degraded shell, cold-registers the member's durable authority, moves
-    /// its member operation onto that registration, and archives through the
-    /// RPC mob session service. The member leaves the roster, and its runtime
-    /// is unregistered and durably Retired.
+    /// A mob on `mob_state` with one turn-driven, externally addressable
+    /// `worker` profile. The id is unique per call: it names the
+    /// process-global in-process supervisor participant.
     #[cfg(feature = "mob")]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_repair_blocked_mob_member_retires_on_the_rpc_host() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let (runtime, runtime_store) =
-            make_runtime_with_failing_runtime_store(temp_factory(&temp), 10);
-        let mob_state = rpc_mob_state_with_realm(&runtime);
-        runtime.set_mob_state(Arc::clone(&mob_state));
-        // Unique per test: the mob id names the process-global in-process
-        // supervisor participant.
-        let mut definition =
-            meerkat_mob::MobDefinition::explicit(meerkat_mob::MobId::from(format!(
-                "rpc-mob-repair-blocked-retire-{}",
-                uuid::Uuid::new_v4().simple()
-            )));
+    async fn rpc_worker_mob(
+        mob_state: &meerkat_mob_mcp::MobMcpState,
+        prefix: &str,
+    ) -> meerkat_mob::MobId {
+        let mut definition = meerkat_mob::MobDefinition::explicit(meerkat_mob::MobId::from(
+            format!("{prefix}-{}", uuid::Uuid::new_v4().simple()),
+        ));
         definition.profiles.insert(
             meerkat_mob::ProfileName::from("worker"),
             meerkat_mob::ProfileBinding::Inline(Box::new(meerkat_mob::Profile {
@@ -35483,23 +35473,51 @@ mod tests {
                 durable: false,
             })),
         );
-        let mob_id = mob_state
+        mob_state
             .mob_create_definition(definition)
             .await
-            .expect("create the mob");
+            .expect("create the mob")
+    }
+
+    /// Spawn the turn-driven `worker-1` member on `mob_id`, answering its
+    /// identity and session.
+    #[cfg(feature = "mob")]
+    async fn spawn_rpc_worker(
+        mob_state: &meerkat_mob_mcp::MobMcpState,
+        mob_id: &meerkat_mob::MobId,
+    ) -> (meerkat_mob::AgentIdentity, SessionId) {
         let identity = meerkat_mob::AgentIdentity::from("worker-1");
         mob_state
             .mob_spawn_spec(
-                &mob_id,
+                mob_id,
                 meerkat_mob::SpawnMemberSpec::new("worker", identity.clone()),
             )
             .await
             .expect("spawn the worker");
         let session_id = mob_state
-            .mob_resolve_bridge_session_id(&mob_id, &identity)
+            .mob_resolve_bridge_session_id(mob_id, &identity)
             .await
             .expect("resolve the worker's session")
             .expect("the spawned worker has a session");
+        (identity, session_id)
+    }
+
+    /// A mob member whose runtime a refused run-boundary commit left
+    /// repair-blocked retires on the RPC host. Retirement disposes the
+    /// degraded shell, cold-registers the member's durable authority, moves
+    /// its member operation onto that registration, and archives through the
+    /// RPC mob session service. The member leaves the roster, and its runtime
+    /// is unregistered and durably Retired.
+    #[cfg(feature = "mob")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_repair_blocked_mob_member_retires_on_the_rpc_host() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (runtime, runtime_store) =
+            make_runtime_with_failing_runtime_store(temp_factory(&temp), 10);
+        let mob_state = rpc_mob_state_with_realm(&runtime);
+        runtime.set_mob_state(Arc::clone(&mob_state));
+        let mob_id = rpc_worker_mob(&mob_state, "rpc-mob-repair-blocked-retire").await;
+        let (identity, session_id) = spawn_rpc_worker(&mob_state, &mob_id).await;
         let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&session_id);
 
         // The store refuses the worker's next run boundary, as a failed
@@ -35605,6 +35623,423 @@ mod tests {
                 .expect("read the worker's durable runtime state"),
             Some(meerkat_runtime::RuntimeState::Retired),
             "the worker's runtime is durably Retired"
+        );
+    }
+
+    /// The RPC mob session service answers what the persistent service it
+    /// wraps answers wherever the trait default refuses or reports nothing:
+    /// the persisted authority read cost and observation, live actor
+    /// presence, the live visible tool definitions, metadata, the controller
+    /// route and pin of an exact live actor, instruction activation and, with
+    /// `openai-live`, the live bridge member preflight. The hook-bearing
+    /// archive and run suspension have scenario rows of their own.
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn rpc_mob_session_service_answers_what_its_persistent_service_answers() {
+        use meerkat_mob::MobSessionService as _;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = make_runtime_with_runtime_store(temp_factory(&temp), 2);
+        runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
+        let wrapper = runtime.session_service();
+        let inner = runtime.service.as_ref();
+        let session_id = wrapper
+            .create_session(service_create_request(
+                mock_build_config(),
+                InitialTurnPolicy::Defer,
+            ))
+            .await
+            .expect("create a mob actor")
+            .session_id;
+        let actor = runtime
+            .mob_actor_witness(&session_id)
+            .expect("capture the mob actor");
+
+        let cost =
+            meerkat_mob::MobSessionService::persisted_session_authority_read_cost(wrapper.as_ref());
+        assert_eq!(
+            cost,
+            meerkat_mob::runtime::PersistedSessionAuthorityReadCost::Bounded,
+            "every runtime store reads its persisted authority at a bounded cost"
+        );
+        assert_eq!(
+            cost,
+            meerkat_mob::MobSessionService::persisted_session_authority_read_cost(inner)
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                meerkat_mob::MobSessionService::observe_persisted_session_authority(
+                    wrapper.as_ref(),
+                    &session_id
+                )
+                .await
+            ),
+            format!(
+                "{:?}",
+                meerkat_mob::MobSessionService::observe_persisted_session_authority(
+                    inner,
+                    &session_id
+                )
+                .await
+            ),
+            "persisted authority"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                meerkat_mob::MobSessionService::live_session_actor_registered(
+                    wrapper.as_ref(),
+                    &session_id
+                )
+                .await
+            ),
+            format!(
+                "{:?}",
+                meerkat_mob::MobSessionService::live_session_actor_registered(inner, &session_id)
+                    .await
+            ),
+            "live actor presence"
+        );
+        let tool_names = |defs: Option<Vec<meerkat_core::ToolDef>>| {
+            defs.map(|defs| {
+                defs.into_iter()
+                    .map(|def| def.name.to_string())
+                    .collect::<Vec<_>>()
+            })
+        };
+        let visible = tool_names(
+            meerkat_mob::MobSessionService::live_visible_tool_defs(wrapper.as_ref(), &session_id)
+                .await
+                .expect("read the visible tools through the wrapper"),
+        );
+        assert!(visible.is_some(), "the wrapper reports the visible tools");
+        assert_eq!(
+            visible,
+            tool_names(
+                meerkat_mob::MobSessionService::live_visible_tool_defs(inner, &session_id)
+                    .await
+                    .expect("read the visible tools")
+            )
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                meerkat_mob::MobSessionService::load_persisted_session_metadata(
+                    wrapper.as_ref(),
+                    &session_id
+                )
+                .await
+                .map(|view| view.map(|view| view.session_id))
+            ),
+            format!(
+                "{:?}",
+                meerkat_mob::MobSessionService::load_persisted_session_metadata(inner, &session_id)
+                    .await
+                    .map(|view| view.map(|view| view.session_id))
+            ),
+            "metadata"
+        );
+        let route = meerkat_mob::MobSessionService::controller_route_under_runtime_turn_boundary(
+            wrapper.as_ref(),
+            &actor,
+        )
+        .await;
+        assert!(
+            !matches!(
+                route,
+                Ok(meerkat_mob::ControllerRouteObservation::Unsupported)
+            ),
+            "the wrapper reports the controller route: {route:?}"
+        );
+        assert_eq!(
+            format!("{route:?}"),
+            format!(
+                "{:?}",
+                meerkat_mob::MobSessionService::controller_route_under_runtime_turn_boundary(
+                    inner, &actor,
+                )
+                .await
+            ),
+            "controller route"
+        );
+        match (
+            meerkat_mob::MobSessionService::pin_controller_client_under_runtime_turn_boundary(
+                wrapper.as_ref(),
+                &actor,
+            )
+            .await,
+            meerkat_mob::MobSessionService::pin_controller_client_under_runtime_turn_boundary(
+                inner, &actor,
+            )
+            .await,
+        ) {
+            (Ok(pinned), Ok(expected)) => assert_eq!(pinned.selection(), expected.selection()),
+            (Err(refused), Err(expected)) => {
+                assert_eq!(refused.to_string(), expected.to_string());
+            }
+            (Ok(_), Err(expected)) => panic!("only the persistent service refused: {expected}"),
+            (Err(refused), Ok(_)) => panic!("only the wrapper refused the pin: {refused}"),
+        }
+        let body = "a standing instruction";
+        let request = meerkat_core::InstructionActivationRequest {
+            revision: meerkat_core::InstructionRevisionRef {
+                namespace: meerkat_core::InstructionNamespace::new("host.standing")
+                    .expect("namespace"),
+                key: meerkat_core::InstructionKey::new("member").expect("key"),
+                revision_id: meerkat_core::InstructionRevisionId::new("rev-1").expect("revision"),
+                content_sha256: meerkat_core::InstructionContentDigest::for_body(body),
+            },
+            activation_id: meerkat_core::InstructionActivationId::new("activation-1")
+                .expect("activation id"),
+            expectation: meerkat_core::InstructionActivationExpectation::Absent,
+            supersedes: None,
+            body: body.to_string(),
+        };
+        let activated =
+            meerkat_mob::MobSessionService::activate_instruction_under_runtime_turn_boundary(
+                wrapper.as_ref(),
+                &session_id,
+                request,
+                None,
+            )
+            .await;
+        assert!(
+            activated.is_ok(),
+            "the wrapper activates the instruction: {activated:?}"
+        );
+        #[cfg(feature = "openai-live")]
+        assert_eq!(
+            format!(
+                "{:?}",
+                meerkat_mob::MobSessionService::validate_live_bridge_member_eligibility(
+                    wrapper.as_ref(),
+                    &session_id
+                )
+                .await
+            ),
+            format!(
+                "{:?}",
+                meerkat_mob::MobSessionService::validate_live_bridge_member_eligibility(
+                    inner,
+                    &session_id
+                )
+                .await
+            ),
+            "live bridge member preflight"
+        );
+    }
+
+    /// rkat-rpc's graceful shutdown keeps a running mob member's run for the
+    /// next start, as it keeps a plain session's: the stop suspends the
+    /// member's run instead of cancelling it, so the run's input stays live
+    /// in the store, and a runtime started again on the same stores runs the
+    /// kept run once when the member's session is opened again, ahead of the
+    /// new turn.
+    #[cfg(feature = "mob")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_graceful_shutdown_keeps_a_running_mob_members_run_for_the_next_start() {
+        let realm = GracefulShutdownRealm::new(GracefulShutdownStores::InMemoryWholeBlob);
+        let runtime = realm.start().await;
+        let mob_state = rpc_mob_state_with_realm(&runtime);
+        runtime.set_mob_state(Arc::clone(&mob_state));
+        let calls = Arc::new(BlockingLlmCallWitness::default());
+        runtime.set_default_llm_client(Some(Arc::new(BlockingMockLlmClient {
+            calls: Arc::clone(&calls),
+            release: Arc::new(Notify::new()),
+        })));
+        let mob_id = rpc_worker_mob(&mob_state, "rpc-mob-graceful-requeue").await;
+        let (identity, session_id) = spawn_rpc_worker(&mob_state, &mob_id).await;
+        let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&session_id);
+        mob_state
+            .mob_member_send(
+                &mob_id,
+                identity,
+                "the member's running turn".into(),
+                meerkat_core::types::HandlingMode::Queue,
+                None,
+            )
+            .await
+            .expect("the worker admits the turn");
+        wait_for_llm_calls(&calls, 1, "the member's running turn").await;
+        let running = runtime
+            .runtime_adapter
+            .list_active_inputs(&session_id)
+            .await
+            .expect("list the member's active inputs");
+        assert_eq!(running.len(), 1, "one input runs: {running:?}");
+
+        runtime
+            .try_shutdown()
+            .await
+            .expect("the runtime shuts down");
+        let kept = realm
+            .runtime_store
+            .load_input_state(&runtime_id, &running[0])
+            .await
+            .expect("read the member's input")
+            .expect("the member's input is stored");
+        assert!(
+            !matches!(
+                kept.seed.phase,
+                meerkat_runtime::input_state::InputLifecycleState::Abandoned
+                    | meerkat_runtime::input_state::InputLifecycleState::Consumed
+            ),
+            "the stop suspends the member's run and keeps its input, never ends it: {:?}",
+            kept.seed.phase
+        );
+        drop(mob_state);
+        drop(runtime);
+
+        let restarted = realm.start().await;
+        restarted.set_default_llm_client(Some(Arc::new(MockLlmClient)));
+        runtime_turn(&restarted, &session_id, "after the restart").await;
+        let session = restarted
+            .load_persisted_session(&session_id)
+            .await
+            .expect("load the member's session")
+            .expect("the member's session is persisted");
+        let users: Vec<String> = user_channel_messages(&session)
+            .into_iter()
+            .filter(|(injected, _)| !injected)
+            .map(|(_, text)| text)
+            .collect();
+        assert_eq!(
+            users
+                .iter()
+                .filter(|text| text.contains("the member's running turn"))
+                .count(),
+            1,
+            "the kept run runs once at the next start: {users:?}"
+        );
+        assert_eq!(
+            users.last().map(String::as_str),
+            Some("after the restart"),
+            "the kept run runs ahead of the new turn: {users:?}"
+        );
+        restarted
+            .try_shutdown()
+            .await
+            .expect("the restarted runtime shuts down");
+    }
+
+    /// A member identity that converged on the RPC host keeps reconciling.
+    /// Once converged, a pass of the unchanged intent checks the cached
+    /// session witness against the store's persisted authority. The RPC mob
+    /// session service answers that read as the persistent service does, so
+    /// the pass converges again and records it. A pass that cannot read it
+    /// fails before it observes anything, records nothing and backs off, so
+    /// the identity reconciliation would no longer act on the member.
+    #[cfg(feature = "mob")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_converged_member_identity_keeps_reconciling_on_the_rpc_host() {
+        use meerkat_mob::identity::{
+            AdoptMemberIdentityDeclaration, DesiredExecution, DesiredSessionAuthorityPolicy,
+            DesiredSessionTarget, IdentityAdoptionId, IdentityAdoptionOutcome,
+            IdentityAdoptionPrecondition, IdentityConvergenceMode, IdentityConvergenceStatus,
+            IdentityDeclarationScopeId, IdentityProfileMemberDeclaration,
+            IdentityReconcileDecision, IdentityStoredObservation, IdentityWiringCustody,
+        };
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = make_runtime_with_runtime_store(temp_factory(&temp), 10);
+        let mob_state = rpc_mob_state_with_realm(&runtime);
+        runtime.set_mob_state(Arc::clone(&mob_state));
+        let mob_id = rpc_worker_mob(&mob_state, "rpc-mob-identity-reconcile").await;
+        let (identity, session_id) = spawn_rpc_worker(&mob_state, &mob_id).await;
+        let adoption = AdoptMemberIdentityDeclaration {
+            mob_id: mob_id.clone(),
+            agent_identity: identity.clone(),
+            request_id: IdentityAdoptionId::new("adopt-worker-1").expect("adoption id"),
+            precondition: IdentityAdoptionPrecondition::ExpectedAbsent,
+            declaration_scope: IdentityDeclarationScopeId::new("rpc-identity-reconcile")
+                .expect("declaration scope"),
+            declaration_revision: 1,
+            session: DesiredSessionTarget {
+                session_id: session_id.clone(),
+                lineage_id: meerkat_core::SessionLineageId::for_session(&session_id),
+                lineage_generation: meerkat_core::SessionGeneration::INITIAL,
+                authority_policy: DesiredSessionAuthorityPolicy::RequireExisting,
+            },
+            member: IdentityProfileMemberDeclaration {
+                profile_name: meerkat_mob::ProfileName::from("worker"),
+                profile_override: None,
+                model_override: None,
+                external_addressable_override: None,
+                context: None,
+                labels: None,
+                additional_instructions: None,
+                system_prompt_override: None,
+                tool_access_policy: None,
+                auth_binding: None,
+                budget_limits: None,
+                runtime_mode: Some(meerkat_contracts::wire::WireMobRuntimeMode::TurnDriven),
+                required_env_keys: Vec::new(),
+                required_local_callback_tools: Vec::new(),
+                execution: DesiredExecution::ControllingSession,
+            },
+            wiring_custody: IdentityWiringCustody::ExternalManaged,
+            owned_wiring: std::collections::BTreeSet::new(),
+            convergence: IdentityConvergenceMode::Drain { max_wait_ms: 5_000 },
+        };
+        let adopted = mob_state
+            .mob_adopt_member_identity_declaration(&mob_id, adoption.clone())
+            .await
+            .expect("adopt the worker's identity");
+        assert!(
+            matches!(
+                adopted.adoption,
+                IdentityAdoptionOutcome::Adopted {
+                    desired_revision: 1
+                }
+            ),
+            "{:?}",
+            adopted.adoption
+        );
+        // The time of the latest converged status, once one is newer than
+        // `after`.
+        let converged_after = |after: u64| {
+            let mob_state = Arc::clone(&mob_state);
+            let mob_id = mob_id.clone();
+            let identity = identity.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    loop {
+                        if let IdentityStoredObservation::Valid(IdentityConvergenceStatus {
+                            decision: Some(IdentityReconcileDecision::Converged),
+                            observed_at_ms,
+                            ..
+                        }) = mob_state
+                            .mob_identity_convergence_status(&mob_id, &identity)
+                            .await
+                            .expect("read the identity's convergence")
+                            && observed_at_ms > after
+                        {
+                            break observed_at_ms;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+            }
+        };
+        let converged_at = converged_after(0)
+            .await
+            .expect("the adopted identity converges");
+
+        // The adoption's replay wakes a pass of the unchanged intent.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        mob_state
+            .mob_adopt_member_identity_declaration(&mob_id, adoption)
+            .await
+            .expect("replay the adoption");
+        let again = converged_after(converged_at).await;
+        assert!(
+            again.is_ok(),
+            "a pass after convergence converges again; status: {:?}",
+            mob_state
+                .mob_identity_convergence_status(&mob_id, &identity)
+                .await
         );
     }
 
