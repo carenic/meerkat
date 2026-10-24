@@ -348,8 +348,26 @@ fn encode_event(event: &MobEvent) -> Result<EntryBytes, MobStoreError> {
     encode_single(&stored)
 }
 
-fn decode_event(bytes: &[u8]) -> Result<MobEvent, MobStoreError> {
+/// The stored event codec's form carries a schema version; the public event
+/// form, which builds before this release's storage wrote, does not.
+#[derive(Deserialize)]
+struct StoredEventSchema {
+    #[serde(default)]
+    schema_version: Option<serde_json::Value>,
+}
+
+/// Decode the event entry `name`. An entry in the public event form was
+/// written by a pre-release build of this storage and lacks the fields a
+/// restart needs: it is refused as such, never read without them.
+fn decode_event(name: &str, bytes: &[u8]) -> Result<MobEvent, MobStoreError> {
     let stored: Box<serde_json::value::RawValue> = decode_single(bytes)?;
+    let schema: StoredEventSchema = serde_json::from_str(stored.get()).map_err(serialization)?;
+    if schema.schema_version.is_none() {
+        return Err(MobStoreError::ReadFailed(format!(
+            "host store mob event {name} was written by a pre-release 0.9.5 build in a form \
+             this release does not read: recreate the mob"
+        )));
+    }
     crate::event::decode_stored_mob_event(stored.get().as_bytes()).map_err(serialization)
 }
 
@@ -1493,7 +1511,7 @@ impl Bundle {
         let mut events = Vec::new();
         let prefix = format!("{G_EVENT}/");
         for (name, bytes) in entries_with_prefix(body, &prefix) {
-            let event = decode_event(bytes)?;
+            let event = decode_event(name, bytes)?;
             if event_name(event.cursor) != *name {
                 return Err(corrupt(format!(
                     "event entry {name} holds cursor {}",
