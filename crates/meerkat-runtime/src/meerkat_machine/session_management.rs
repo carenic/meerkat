@@ -7153,9 +7153,10 @@ impl MeerkatMachine {
     /// on its result: the decision reads facts, never a deadline. A cleanup
     /// still running at the bound is answered
     /// [`StoppedRegistrationTakeover::StopCleanupPending`], with nothing
-    /// decided or changed; the runtime keeps owning that cleanup. The decision and the coordinator installation
-    /// are one atomic admission under the stable registration transaction and
-    /// the witness's exact mutation gate. Anything else is answered typed and
+    /// decided or changed; the runtime keeps owning that cleanup. The
+    /// decision and the coordinator installation are one atomic admission
+    /// under the stable registration transaction and the witness's exact
+    /// mutation gate. Anything else is answered typed and
     /// changes nothing: [`StoppedRegistrationTakeover::NotCurrent`] for a
     /// stale witness (a same-`SessionId` replacement is never touched), and
     /// [`StoppedRegistrationTakeover::NotStoppedResidue`] for a registration

@@ -18723,10 +18723,22 @@ impl MobActor {
         })
     }
 
-    /// Admit one member registration reload onto the member's admission lane:
-    /// the [`MobCommand::ReloadMemberRegistration`] handler, and a Running
-    /// start's own recovery of a member it left out because its registration
-    /// needed a durability reload.
+    /// Admit one member registration reload onto the member's admission lane.
+    ///
+    /// It has exactly two callers, and any new one must be one of these two
+    /// kinds:
+    /// - the [`MobCommand::ReloadMemberRegistration`] handler, which the scope
+    ///   gate admits only for a principal holding the operator `Retire` scope
+    ///   (or on the agent lane);
+    /// - a Running start's recovery of a member its startup restore left out
+    ///   because the member's registration needed a durability reload
+    ///   (`recover_startup_members`). No principal asked for that reload: the
+    ///   runtime's own reload-required fact, read exactly by the actor's
+    ///   startup restore, is its only trigger, and the reload restores the
+    ///   member's existing registration (same session, same continuity
+    ///   generation) without widening anything. So it needs no operator
+    ///   scope, and it is admitted here on the actor: an operator-class
+    ///   command sent from internal authority is refused by the scope gate.
     async fn admit_member_registration_reload(
         &mut self,
         agent_identity: &AgentIdentity,
@@ -32939,13 +32951,36 @@ impl MobActor {
             return;
         }
         if self.state() != MobState::Running {
-            // A later startup step stopped the mob; its explicit resume
-            // rebuilds every member without a serving attachment.
-            tracing::warn!(
-                mob_id = %self.definition.id,
-                members = ?recoveries.keys().collect::<Vec<_>>(),
-                "the mob start left members to recover but did not reach Running; the explicit resume rebuilds those members"
-            );
+            // A later startup step stopped the mob. A member whose stopped
+            // registration the start took over has no registration left, and
+            // the explicit resume rebuilds it. A member left out for a
+            // durability reload keeps its degraded registration: a resume
+            // refuses typed `MemberReloadRequired`, naming the member, until
+            // `MobHandle::reload_member_registration` reloads it (admitted
+            // while the mob is Stopped).
+            let members_with = |cause| {
+                recoveries
+                    .iter()
+                    .filter(|(_, recovery)| recovery.cause == cause)
+                    .map(|(identity, _)| identity)
+                    .collect::<Vec<_>>()
+            };
+            let taken_over = members_with(StartupMemberRecoveryCause::StoppedResidue);
+            if !taken_over.is_empty() {
+                tracing::warn!(
+                    mob_id = %self.definition.id,
+                    members = ?taken_over,
+                    "the mob start took over stopped member registrations but did not reach Running; the explicit resume rebuilds those members"
+                );
+            }
+            let reload_required = members_with(StartupMemberRecoveryCause::ReloadRequired);
+            if !reload_required.is_empty() {
+                tracing::warn!(
+                    mob_id = %self.definition.id,
+                    members = ?reload_required,
+                    "the mob start left members whose registrations need a durability reload but did not reach Running; a resume refuses MemberReloadRequired until each is reloaded with MobHandle::reload_member_registration"
+                );
+            }
             return;
         }
         let entries = {
