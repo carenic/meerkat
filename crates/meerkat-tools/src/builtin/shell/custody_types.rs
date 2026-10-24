@@ -217,6 +217,21 @@ pub enum ProcessCustodyError {
         context: &'static str,
         view: ForeignProcfsView,
     },
+    /// A run resumes in this host process, but a tool process this process
+    /// spawned for the run is still held by its owner here: an earlier
+    /// execution of the run still runs (or still settles) the call in this
+    /// process. Nothing was signalled or settled, and the resumed round is
+    /// held instead of run. Operator action: let the session's earlier
+    /// execution in this process end (its stop or teardown must finish
+    /// before the session is started again), then start the session again;
+    /// the start repairs the run as interrupted.
+    #[error(
+        "run {run_id} resumes, but the tool process of its custody entry {entry_id} is still held by its owner in this host process"
+    )]
+    ResumedRunStillOwned {
+        entry_id: Uuid,
+        run_id: meerkat_core::RunId,
+    },
 }
 
 impl ProcessCustodyError {

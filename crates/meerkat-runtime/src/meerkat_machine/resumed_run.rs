@@ -64,11 +64,22 @@ impl MeerkatMachine {
     /// before that hand-off still finds them.
     ///
     /// The evidence is the one the attachment installed on the session's
-    /// bindings when it settled the session's earlier-incarnation processes;
-    /// this read never settles them a second time. Empty when the host keeps
-    /// no process custody. An evidence store that cannot be read, or a host
-    /// that keeps custody but whose evidence the attachment did not install,
-    /// fails the call, so the round is not dispatched without it.
+    /// bindings when it settled the session's earlier-incarnation processes.
+    /// The read tells it the run resumes
+    /// ([`InterruptedToolEvidence::run_resumes`](meerkat_core::tool_process::InterruptedToolEvidence::run_resumes)),
+    /// so it also settles what the run's execution left in this host process
+    /// when that execution ended here (a stop, or a teardown of an earlier
+    /// registration of the session): a process that ran is interrupted
+    /// evidence too, and a started call is never run again. Only the run this
+    /// registration resumes is settled: the session's current run, which
+    /// `ResumeRun` made current from the resumable mark. Another run id
+    /// settles nothing and fails the call.
+    ///
+    /// Empty when the host keeps no process custody. An evidence store that
+    /// cannot be read or settled, a host that keeps custody but whose
+    /// evidence the attachment did not install, or a run that is not the
+    /// session's current run fails the call, so the round is not dispatched
+    /// without it.
     pub async fn resumed_run_interrupted_tool_calls(
         &self,
         session_id: &meerkat_core::types::SessionId,
@@ -82,7 +93,12 @@ impl MeerkatMachine {
             }
             return Ok(Vec::new());
         };
-        let calls = evidence.interrupted_calls().await.map_err(|error| {
+        if self.current_run(session_id).await.as_ref() != Some(run_id) {
+            return Err(RuntimeDriverError::Internal(format!(
+                "run {run_id} is not the current run of session {session_id}, so it does not resume here: its tool-process custody evidence is not settled"
+            )));
+        }
+        let calls = evidence.run_resumes(run_id).await.map_err(|error| {
             RuntimeDriverError::Internal(format!(
                 "failed to read the interrupted tool calls of run {run_id} of session {session_id}, which resumes: {error}"
             ))

@@ -280,9 +280,11 @@ pub enum InterruptedToolRunDisposition {
     Unknown,
 }
 
-/// Durable evidence that an earlier host incarnation's tool process of this
-/// session ceased while the run that started it may still have been in
-/// flight.
+/// Durable evidence that a tool process of this session ceased while the run
+/// that started it may still have been in flight: an earlier host
+/// incarnation's process, or, for a run that resumes, one this host process
+/// ran before the run's execution here ended
+/// ([`InterruptedToolEvidence::run_resumes`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterruptedToolCall {
     /// Identity of the evidence (the custody entry).
@@ -335,6 +337,39 @@ pub trait InterruptedToolEvidence: Send + Sync {
     /// for the run. Best effort; a marker left behind is moot at the next
     /// recovery.
     async fn run_ended(&self, run_id: &RunId) -> Result<(), InterruptedToolEvidenceError>;
+
+    /// The run resumes: a new registration of the session continues `run_id`
+    /// from its last round commit, so the execution that ran it before has
+    /// ended without the run ending, in an earlier host process or in this
+    /// one (a stop or a teardown of the session's earlier registration).
+    /// Settle the evidence that execution left and return the run's
+    /// interrupted calls: every call of the run whose process may have run,
+    /// which the resumed round answers as interrupted instead of running it
+    /// again.
+    ///
+    /// An earlier host process's tool processes are settled when the session
+    /// is attached. A host whose custody records belong to its own process
+    /// settles here what this process left for the run, as recovery settles
+    /// an earlier incarnation's records: a process that ran is evidence, and
+    /// one still running is stopped first. A call of the run whose process a
+    /// live owner in this process still runs means the run still executes
+    /// here: the call fails, settles nothing, and the resumed round is held
+    /// instead of run. A background job the run started runs on under its
+    /// own owner and stays with it.
+    ///
+    /// The default is the run's [`Self::interrupted_calls`], for a store whose
+    /// only evidence is what earlier incarnations left.
+    async fn run_resumes(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Vec<InterruptedToolCall>, InterruptedToolEvidenceError> {
+        Ok(self
+            .interrupted_calls()
+            .await?
+            .into_iter()
+            .filter(|call| &call.run_id == run_id)
+            .collect())
+    }
 }
 
 /// Host-side provider of interrupted-run evidence, installed on a runtime

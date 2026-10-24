@@ -2109,6 +2109,28 @@ them.
 
 ### Fixed
 
+- `meerkat-tools`, `meerkat-runtime`, `meerkat-core`: a run resumed in the
+  process that ran it no longer runs a started shell call again. A graceful
+  requeue stop, or a teardown, that ends a session's registration while a tool
+  call runs keeps the run open at its round commit, and a later start of the
+  session in the same process resumes it. The call's process-custody record
+  then belongs to the running process, which recovery of the scope never
+  settles, so the resumed round found no interrupted-call evidence and
+  dispatched the call again: its command ran a second time. The resumed round
+  now tells the session's evidence that the run resumes
+  (`InterruptedToolEvidence::run_resumes`, a new provided method whose default
+  returns the run's `interrupted_calls`), and process custody settles the
+  run's own records there as recovery settles an earlier incarnation's: a call
+  whose process may have run is answered as interrupted, outcome uncertain,
+  and never run again, and a process still running is killed first. A call
+  whose process an owner in this process still runs means the run still
+  executes here: the resumption is refused
+  (`ProcessCustodyError::ResumedRunStillOwned`) with nothing settled, and the
+  resumed round is held as for unreadable evidence. A background job the run
+  started stays with its live owner. Only the session's current run is
+  settled: `MeerkatMachine::resumed_run_interrupted_tool_calls` refuses any
+  other run id.
+
 - `meerkat`, `meerkat-rpc`: a graceful stop that keeps queued work keeps a
   session's first turn as well. When the stop suspended the run of a first
   turn that was materializing its session (a session created without a
