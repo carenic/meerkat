@@ -1563,22 +1563,44 @@ impl MeerkatMachine {
         if !directed {
             return Ok(());
         }
-        let publication_available = self
-            .sessions
-            .read()
-            .await
-            .get(session_id)
-            .and_then(RuntimeSessionEntry::publication_handle)
-            .is_some();
-        if publication_available {
-            Ok(())
-        } else {
-            Err(RuntimeDriverError::ValidationFailed {
+        let (publication_available, placement_bound) = {
+            let sessions = self.sessions.read().await;
+            match sessions.get(session_id) {
+                Some(entry) => {
+                    // A directed terminal's outbox names the runtime placement
+                    // that owns it; its runless termination cannot stage one
+                    // without it, and that failure lands after the
+                    // termination's checkpoint.
+                    let placement_bound = {
+                        let authority = entry
+                            .dsl_authority
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let state = authority.state();
+                        state.active_runtime_id.is_some()
+                            && state.active_fence_token.is_some()
+                            && state.active_runtime_generation.is_some()
+                    };
+                    (entry.publication_handle().is_some(), placement_bound)
+                }
+                None => (false, false),
+            }
+        };
+        if !publication_available {
+            return Err(RuntimeDriverError::ValidationFailed {
                 reason: format!(
                     "session {session_id} cannot accept directed input without a terminal publication capability"
                 ),
-            })
+            });
         }
+        if !placement_bound {
+            return Err(RuntimeDriverError::ValidationFailed {
+                reason: format!(
+                    "session {session_id} cannot accept directed input without a runtime placement binding; prepare its bindings first"
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Wake terminal-receipt waiters parked on the queued input this committed

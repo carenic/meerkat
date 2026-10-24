@@ -2380,6 +2380,14 @@ them.
   or a retired session with pending inputs that never ended; once it holds
   the session's mutation gate, it now runs in its own task.
 
+- `meerkat-runtime`: an embedder that gives a session an executor without
+  binding it to a runtime placement (`prepare_bindings`) now gets a typed
+  refusal (`RuntimeDriverError::ValidationFailed`) when it admits a directed
+  input, before anything is queued. Such an input could never be published,
+  since a directed terminal names the runtime placement, and the session's
+  next stop or retire failed after its checkpoint and left the registration
+  reload-required.
+
 - `meerkat-runtime`: a Reset the machine refuses, on a running or a stopped
   runtime, answers `RuntimeControlPlaneError::InvalidState { state }`
   (`RuntimeDriverError::NotReady { state }` through
