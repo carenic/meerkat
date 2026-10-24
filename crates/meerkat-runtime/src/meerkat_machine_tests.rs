@@ -60252,6 +60252,54 @@ mod terminal_completion_batch_bound {
         fixture.assert_ready("after the directed stop").await;
     }
 
+    /// A session registered with a publishing executor but never bound to a
+    /// runtime placement (`prepare_bindings`) refuses a directed input at
+    /// admission, typed, before anything is queued: a directed terminal names
+    /// its runtime placement, so the input's runless termination could never
+    /// stage its outbox, and a stop would fail after its checkpoint and leave
+    /// the registration reload-required. The session stays usable: a stop
+    /// ends it cleanly. RED while admission checked only for a publisher.
+    async fn directed_input_without_a_runtime_placement_is_refused_at_admission(store: BoundStore) {
+        let fixture = Fixture::new(store).await;
+        fixture
+            .machine
+            .register_session_with_executor(
+                fixture.session_id.clone(),
+                Box::new(PublishingCompletingExecutor {
+                    publisher: Arc::new(CountingTerminalPublisher::default()),
+                }),
+            )
+            .await
+            .expect("register the session with a publishing loop and no bindings");
+        fixture
+            .machine
+            .hold_run_starts(&fixture.session_id, crate::RunStartHoldReason::MobStop)
+            .await
+            .expect("hold run starts");
+        let admitted = fixture
+            .machine
+            .accept_input_with_completion(&fixture.session_id, directed_flow_step(0))
+            .await;
+        assert!(
+            matches!(admitted, Err(RuntimeDriverError::ValidationFailed { .. })),
+            "a directed input with no runtime placement is refused at admission: {:?}",
+            admitted.as_ref().map(|(outcome, _)| outcome)
+        );
+        assert!(
+            fixture
+                .machine
+                .list_active_inputs(&fixture.session_id)
+                .await
+                .expect("list the active inputs")
+                .is_empty(),
+            "nothing was queued"
+        );
+        fixture.stop_until_terminal("runtime stopped").await;
+        fixture
+            .assert_ready("after the stop of the session that refused it")
+            .await;
+    }
+
     macro_rules! on_every_store {
         ($($row:ident),* $(,)?) => {
             $(
@@ -60292,6 +60340,7 @@ mod terminal_completion_batch_bound {
         retirement_cleanup_answers_the_batch_a_failed_publication_leaves,
         retirement_cleanup_publishes_every_directed_batch,
         held_loop_stop_publishes_every_directed_batch,
+        directed_input_without_a_runtime_placement_is_refused_at_admission,
     );
 
     /// Inputs a dropped-caller row queues.
