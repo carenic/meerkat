@@ -720,12 +720,6 @@ them.
   details }` (`409` `SESSION_NOT_RUNNING`), appended last. The enum is
   exhaustive, so a `match` outside the crate needs the arm.
 
-- `meerkat-rest`: `ApiError` gains `SessionDurableHold { message, code,
-  details }` (`409` with the durable hold's session error code, such as
-  `SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY`, and its `durable_resume_hold`
-  payload), appended last. The enum is exhaustive, so a `match` outside the
-  crate needs the arm.
-
 - Behaviour-only (not measured by the gate): `meerkat-runtime`: a graceful
   stop that requeues (`UnregisterQueuedInputs::Requeue`, for example a
   deploy) now suspends a durable session's in-flight run instead
@@ -2225,14 +2219,26 @@ them.
   did not match commit parent"), REST `500`, and the MCP server's
   `meerkat_resume` an internal error (shipped in 0.9.4:
   `crates/meerkat-session/src/persistent.rs:16504-16510` at v0.9.4). Nothing
-  is written: the tail and the session's inputs stay for reconciliation. REST
-  carries the hold through its attach path as the new
-  `RuntimeDriverError::DurableResumeHeld` (an additive variant of the
-  `#[non_exhaustive]` enum, with `durable_hold_session_error()`) and answers
-  `409` with the hold's code and payload (`ApiError::SessionDurableHold`,
-  under Breaking); `DurableResumeHold::session_error`
-  builds the typed error from a hold. A mob member restore answers
+  is written: the tail and the session's inputs stay for reconciliation.
+  JSON-RPC and the MCP server answer the canonical `SESSION_NOT_RUNNING`
+  form (JSON-RPC `-32003`) with the hold's `durable_resume_hold` payload,
+  whose `session_error_code` names the hold; REST carries the hold through
+  its attach path as the new `RuntimeDriverError::DurableResumeHeld` (an
+  additive variant of the `#[non_exhaustive]` enum, with
+  `durable_hold_session_error()`) and answers `409` `SESSION_NOT_RUNNING`
+  with the same payload. `DurableResumeHold::session_error` builds the typed
+  error from a hold. A mob member restore answers
   `MemberDurableTailUnprovable`, as for a tail its recovery could not prove.
+
+- `meerkat-rest`: an archive refused with a durable resume hold answers `409`
+  `SESSION_NOT_RUNNING` with the hold's `durable_resume_hold` payload (its
+  `session_error_code` names the hold) instead of an internal `500`. In
+  0.9.4 an archive of a WholeBlob session whose document needs the
+  audited-endpoint repair met this: the archive's committed read refused
+  with `WholeBlobAuditedEndpointDivergence`
+  (`crates/meerkat-session/src/persistent.rs:14377` and `128-139` at
+  v0.9.4), and `archive_session_error_to_api_error` answered it `Internal`
+  (`crates/meerkat-rest/src/lib.rs:6560-6578` at v0.9.4).
 
 - `meerkat`, `meerkat-rpc`: a graceful stop that keeps queued work keeps a
   session's first turn as well. When the stop suspended the run of a first

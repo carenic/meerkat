@@ -1261,8 +1261,12 @@ fn durable_hold_session_id(error: &SessionError) -> Option<SessionId> {
 }
 
 fn runtime_executor_attach_error_to_api(error: meerkat_runtime::RuntimeDriverError) -> ApiError {
-    if let Some(held) = error.durable_hold_session_error() {
-        return session_durable_hold_api_error(&held);
+    if let Some(held) = error
+        .durable_hold_session_error()
+        .as_ref()
+        .and_then(session_durable_hold_api_error)
+    {
+        return held;
     }
     if let Some(typed) = error
         .teardown_in_progress_session_error()
@@ -5752,6 +5756,9 @@ fn create_session_error_to_api(err: SessionError) -> ApiError {
     if let Some(busy) = session_busy_api_error(&err) {
         return busy;
     }
+    if let Some(held) = session_durable_hold_api_error(&err) {
+        return held;
+    }
     let message = err.to_string();
     match err.primary_error() {
         SessionError::NotFound { .. } => ApiError::NotFound(message),
@@ -6748,6 +6755,9 @@ fn archive_session_error_to_api_error(id: &str, error: SessionError) -> ApiError
     }
     if let Some(busy) = session_busy_api_error(&error) {
         return busy;
+    }
+    if let Some(held) = session_durable_hold_api_error(&error) {
+        return held;
     }
     match error {
         SessionError::NotFound { .. } => ApiError::NotFound(format!("Session not found: {id}")),
@@ -8932,15 +8942,6 @@ pub enum ApiError {
         message: String,
         details: Value,
     },
-    /// A session whose durable tail is withheld from resume (409): `code` is
-    /// the hold's session error code (`SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY`,
-    /// `SESSION_DURABLE_TAIL_RECOVERY_REFUSED`, ...) and `details` its typed
-    /// `durable_resume_hold` payload. The content is retained.
-    SessionDurableHold {
-        message: String,
-        code: String,
-        details: Value,
-    },
 }
 
 /// `ApiError::SessionBusyWithData` for a typed retryable runtime teardown
@@ -8959,16 +8960,17 @@ fn session_runtime_unavailable_api_error(error: &SessionError) -> Option<ApiErro
     }
 }
 
-/// `ApiError::SessionDurableHold` for a session whose durable tail is
-/// withheld from resume: `409` with the hold's session error code and its
-/// typed `durable_resume_hold` payload. The content is retained; the hold
-/// clears once it is reconciled.
-fn session_durable_hold_api_error(error: &SessionError) -> ApiError {
-    ApiError::SessionDurableHold {
+/// `ApiError::SessionNotRunningWithData` for a session withheld from resume
+/// by a durable hold: the canonical `409` `SESSION_NOT_RUNNING`, with the
+/// hold's typed `durable_resume_hold` payload, whose `session_error_code`
+/// names the hold, as JSON-RPC and MCP answer it. The content is retained;
+/// the hold clears once it is reconciled. `None` for any other error.
+fn session_durable_hold_api_error(error: &SessionError) -> Option<ApiError> {
+    error.durable_resume_hold()?;
+    Some(ApiError::SessionNotRunningWithData {
         message: error.to_string(),
-        code: error.code().to_string(),
-        details: error.structured_data().unwrap_or(Value::Null),
-    }
+        details: meerkat_contracts::error::session_error_details(error).unwrap_or(Value::Null),
+    })
 }
 
 fn session_busy_api_error(error: &SessionError) -> Option<ApiError> {
@@ -9009,7 +9011,6 @@ fn api_error_message(error: &ApiError) -> String {
         | ApiError::InternalWithData { message, .. }
         | ApiError::SessionBusyWithData { message, .. }
         | ApiError::SessionNotRunningWithData { message, .. }
-        | ApiError::SessionDurableHold { message, .. }
         | ApiError::SessionRuntimeUnavailable { message, .. } => message.clone(),
         ApiError::DuplicateInput { existing_id } => {
             format!("duplicate input: {existing_id}")
@@ -9155,11 +9156,6 @@ impl IntoResponse for ApiError {
                 message,
                 Some(details),
             ),
-            ApiError::SessionDurableHold {
-                message,
-                code,
-                details,
-            } => (StatusCode::CONFLICT, code, message, Some(details)),
         };
 
         let body = Json(ErrorResponse {
@@ -9194,14 +9190,12 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use tempfile::TempDir;
 
-    /// A start or attach of a session whose durable tail is withheld from
-    /// resume refuses through the attach path's runtime error with `409`, the
-    /// hold's own session error code and its typed `durable_resume_hold`
-    /// payload (the content is retained), not with a `500`.
-    #[tokio::test]
-    async fn a_withheld_durable_tail_refuses_the_rest_attach_typed() {
-        let id = SessionId::new();
-        for (error, code, hold) in [
+    /// Every durable resume hold of session `id`, with its own session error
+    /// code and its `durable_resume_hold` token.
+    fn durable_resume_hold_errors(
+        id: &SessionId,
+    ) -> [(SessionError, &'static str, &'static str); 4] {
+        [
             (
                 SessionError::DurableTailHeldForRecovery { id: id.clone() },
                 "SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY",
@@ -9217,7 +9211,40 @@ mod tests {
                 "SESSION_DURABLE_EVIDENCE_QUARANTINED",
                 "evidence_quarantined",
             ),
-        ] {
+            (
+                SessionError::WholeBlobAuditedEndpointDivergence { id: id.clone() },
+                "SESSION_WHOLEBLOB_AUDITED_ENDPOINT_DIVERGENCE",
+                "audited_endpoint_divergence",
+            ),
+        ]
+    }
+
+    /// REST's answer for a session withheld from resume by a durable hold:
+    /// the canonical `409` `SESSION_NOT_RUNNING`, whose details carry the
+    /// hold, its own session error code (`code`), the session and the
+    /// retained content.
+    async fn assert_durable_hold_answer(error: ApiError, id: &SessionId, code: &str, hold: &str) {
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT, "{code}");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read the error body");
+        let body: Value = serde_json::from_slice(&bytes).expect("a JSON error body");
+        assert_eq!(body["code"], "SESSION_NOT_RUNNING", "{code}");
+        assert_eq!(body["details"]["session_error_code"], code);
+        assert_eq!(body["details"]["durable_resume_hold"], hold);
+        assert_eq!(body["details"]["content_retained"], true);
+        assert_eq!(body["details"]["session_id"], id.to_string());
+    }
+
+    /// A start or attach of a session withheld from resume by a durable hold
+    /// keeps the hold through the attach path's runtime error and answers
+    /// `409` `SESSION_NOT_RUNNING` with the hold's typed payload (the content
+    /// is retained), not a `500`.
+    #[tokio::test]
+    async fn a_withheld_durable_tail_refuses_the_rest_attach_typed() {
+        let id = SessionId::new();
+        for (error, code, hold) in durable_resume_hold_errors(&id) {
             let driver = runtime_driver_error_from_session_error(error);
             assert!(
                 matches!(
@@ -9231,16 +9258,42 @@ mod tests {
                 runtime_driver_error_to_session_error(driver.clone()).code(),
                 code
             );
-            let response = runtime_executor_attach_error_to_api(driver).into_response();
-            assert_eq!(response.status(), StatusCode::CONFLICT, "{code}");
-            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .expect("read the error body");
-            let body: Value = serde_json::from_slice(&bytes).expect("a JSON error body");
-            assert_eq!(body["code"], code);
-            assert_eq!(body["details"]["durable_resume_hold"], hold);
-            assert_eq!(body["details"]["content_retained"], true);
-            assert_eq!(body["details"]["session_id"], id.to_string());
+            assert_durable_hold_answer(
+                runtime_executor_attach_error_to_api(driver),
+                &id,
+                code,
+                hold,
+            )
+            .await;
+        }
+    }
+
+    /// A create refused with a durable hold answers `409`
+    /// `SESSION_NOT_RUNNING` with the hold's typed payload, not an
+    /// `AGENT_ERROR` `500`.
+    #[tokio::test]
+    async fn a_durable_hold_refuses_the_rest_create_as_not_running() {
+        let id = SessionId::new();
+        for (error, code, hold) in durable_resume_hold_errors(&id) {
+            assert_durable_hold_answer(create_session_error_to_api(error), &id, code, hold).await;
+        }
+    }
+
+    /// An archive refused with a durable hold (the archive's own tail settle
+    /// holding or refusing the tail, or a WholeBlob document that needs the
+    /// audited-endpoint repair) answers `409` `SESSION_NOT_RUNNING` with the
+    /// hold's typed payload, not an internal `500`.
+    #[tokio::test]
+    async fn a_durable_hold_refuses_the_rest_archive_as_not_running() {
+        let id = SessionId::new();
+        for (error, code, hold) in durable_resume_hold_errors(&id) {
+            assert_durable_hold_answer(
+                archive_session_error_to_api_error(&id.to_string(), error),
+                &id,
+                code,
+                hold,
+            )
+            .await;
         }
     }
 
