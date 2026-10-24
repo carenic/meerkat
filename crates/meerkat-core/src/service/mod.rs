@@ -266,6 +266,19 @@ impl DurableResumeHold {
         .into_iter()
         .find(|hold| hold.as_str() == value)
     }
+
+    /// The typed session error that carries this hold for session `id`: the
+    /// inverse of [`SessionError::durable_resume_hold`].
+    pub fn session_error(self, id: SessionId) -> SessionError {
+        match self {
+            Self::TailHeldForRecovery => SessionError::DurableTailHeldForRecovery { id },
+            Self::RecoveryRefused => SessionError::DurableTailRecoveryRefused { id },
+            Self::EvidenceQuarantined => SessionError::DurableEvidenceQuarantined { id },
+            Self::AuditedEndpointDivergence => {
+                SessionError::WholeBlobAuditedEndpointDivergence { id }
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for DurableResumeHold {
@@ -4157,6 +4170,26 @@ mod tests {
             }
             .is_runtime_teardown_in_progress()
         );
+    }
+
+    /// Every hold class builds the typed session error that carries it, for
+    /// the same session.
+    #[test]
+    fn a_durable_resume_hold_builds_the_session_error_that_carries_it() {
+        let id = SessionId::new();
+        for hold in [
+            DurableResumeHold::TailHeldForRecovery,
+            DurableResumeHold::RecoveryRefused,
+            DurableResumeHold::EvidenceQuarantined,
+            DurableResumeHold::AuditedEndpointDivergence,
+        ] {
+            let error = hold.session_error(id.clone());
+            assert_eq!(error.durable_resume_hold(), Some(hold));
+            assert!(
+                error.to_string().contains(&id.to_string()),
+                "{hold}: the error names its session"
+            );
+        }
     }
 
     /// Held-for-recovery and quarantine are distinct, stable, and never

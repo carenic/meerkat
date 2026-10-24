@@ -1536,6 +1536,31 @@ async fn a_restart_before_the_operator_keeps_the_discarded_steer_whole_blob() {
     .await;
 }
 
+/// HeadCanonical twin: the cold attach refuses the restart, typed, as held
+/// for recovery (before any committed read), and the hold stands for the
+/// operator.
+#[tokio::test]
+async fn a_restart_before_the_operator_keeps_the_stranded_prompt_head_canonical() {
+    an_operator_requeues_the_input_stranded_beside_a_pre_release_interrupt(
+        true,
+        Strand::NewRunPrompt,
+        "user second",
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_restart_before_the_operator_keeps_the_discarded_steer_head_canonical() {
+    an_operator_requeues_the_input_stranded_beside_a_pre_release_interrupt(
+        true,
+        Strand::NewRunDiscardedSteer,
+        "user second",
+        true,
+    )
+    .await;
+}
+
 /// A prompt an earlier process left queued, with no tail standing. A
 /// restart whose agent build fails is refused before the session serves,
 /// and its rollback keeps the prompt as the store holds it: not ended, still

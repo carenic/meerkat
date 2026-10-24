@@ -852,6 +852,17 @@ pipeline (SessionDocumentMachine classifies, MeerkatMachine authorizes,
 RuntimeStore realizes) is documented in
 [Machine Authority](/reference/machine-authority#durable-tail-recovery-ownership).
 
+A start or attach of a session whose durable tail is held for recovery or
+refused by recovery refuses the same way, before it reads the session: a
+turn, an input or event admission, a resume and a delivery into it. JSON-RPC
+answers `-32003` and REST `409` `SESSION_NOT_RUNNING`, each with the hold's
+`durable_resume_hold` payload, whose `session_error_code` names the hold;
+the MCP server's `meerkat_resume` answers the same wire error. REST's create
+and archive answer a hold the same way. Nothing is written and the tail
+stays for reconciliation; a continuation or job delivery into the session
+stays pending. A mob member restore answers `MemberDurableTailUnprovable`,
+as for a tail its recovery could not prove.
+
 ### Boundary commits with no durable answer
 
 Since 0.9.4 a persistent session's boundary commit or run terminalization that

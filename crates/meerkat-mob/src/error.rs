@@ -862,8 +862,14 @@ pub enum MobError {
     /// as a revision conflict at that boundary. Nothing was written; the tail
     /// stays for reconciliation. The structured data carries the
     /// `tail_held_for_recovery` resume hold.
+    ///
+    /// It also covers a member tail the recovery withholds from resume (held
+    /// for recovery or refused by recovery): the session's cold-start settle
+    /// refuses with that typed hold, and the member restore answers this
+    /// error with the tail and the member's inputs untouched. Its structured
+    /// data names the `tail_held_for_recovery` hold for a refused tail too.
     #[error(
-        "member {member_id} session {session_id} has a durable tail its recovery could not prove; the tail is kept for reconciliation"
+        "member {member_id} session {session_id} has a durable tail its recovery held or refused; the tail is kept for reconciliation"
     )]
     MemberDurableTailUnprovable {
         member_id: AgentIdentity,

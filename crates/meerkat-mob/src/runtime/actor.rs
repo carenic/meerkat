@@ -32960,6 +32960,34 @@ impl MobActor {
                     .await
                 {
                     Ok(settlement) => settlement,
+                    // The recovery withholds the member's tail from resume
+                    // (held for recovery or refused by recovery): the settle
+                    // refuses typed and keeps the tail and the member's
+                    // inputs as they are. That is the member's
+                    // unprovable-tail outcome, as when the tail still
+                    // conflicts after a settle. Any other hold keeps its own
+                    // typed error below.
+                    Err(error)
+                        if matches!(
+                            error.durable_resume_hold(),
+                            Some(
+                                meerkat_core::service::DurableResumeHold::TailHeldForRecovery
+                                    | meerkat_core::service::DurableResumeHold::RecoveryRefused
+                            )
+                        ) =>
+                    {
+                        tracing::warn!(
+                            %member,
+                            session_id = %session,
+                            %error,
+                            "a member's durable tail is withheld from resume; the mob start \
+                             refuses the member and keeps its tail for reconciliation"
+                        );
+                        return Err(MobError::MemberDurableTailUnprovable {
+                            member_id: member.clone(),
+                            session_id: session.clone(),
+                        });
+                    }
                     Err(error) => {
                         if matches!(
                             error,

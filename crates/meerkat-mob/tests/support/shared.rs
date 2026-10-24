@@ -705,6 +705,7 @@ pub struct FailingOnceSessionService {
     projection_drain_failed_once: AtomicBool,
     recorded_creates: std::sync::Mutex<Vec<RecordedMemberCreate>>,
     keep_durable_tails: AtomicBool,
+    withheld_durable_tails: std::sync::Mutex<Option<meerkat_core::service::DurableResumeHold>>,
     fail_durable_tail_settles: AtomicBool,
     durable_tail_settle_failed: AtomicBool,
 }
@@ -759,6 +760,7 @@ impl FailingOnceSessionService {
             projection_drain_failed_once: AtomicBool::new(false),
             recorded_creates: std::sync::Mutex::new(Vec::new()),
             keep_durable_tails: AtomicBool::new(false),
+            withheld_durable_tails: std::sync::Mutex::new(None),
             fail_durable_tail_settles: AtomicBool::new(false),
             durable_tail_settle_failed: AtomicBool::new(false),
         })
@@ -784,6 +786,28 @@ impl FailingOnceSessionService {
     /// tail intact), without running it.
     pub fn keep_durable_tails_unsettled(&self) {
         self.keep_durable_tails.store(true, Ordering::SeqCst);
+    }
+
+    /// Withhold every durable tail at a cold start: the settle refuses with
+    /// `hold`'s typed session error, as the session's cold attach does when
+    /// the store-owned recovery withholds a tail from resume, without running
+    /// the recovery, so nothing is written.
+    pub fn withhold_durable_tails(&self, hold: meerkat_core::service::DurableResumeHold) {
+        *self
+            .withheld_durable_tails
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hold);
+    }
+
+    fn withheld_durable_tail(
+        &self,
+        session_id: &meerkat_core::SessionId,
+    ) -> Option<meerkat_core::service::SessionError> {
+        let withheld = *self
+            .withheld_durable_tails
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        withheld.map(|hold| hold.session_error(session_id.clone()))
     }
 
     /// Fail every durable tail settle at a cold start as a session store
@@ -1054,6 +1078,9 @@ impl meerkat_mob::MobSessionService for FailingOnceSessionService {
                 "injected session store failure while settling a durable tail".into(),
             ));
         }
+        if let Some(withheld) = self.withheld_durable_tail(session_id) {
+            return Err(withheld);
+        }
         if self.keep_durable_tails.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -1072,6 +1099,9 @@ impl meerkat_mob::MobSessionService for FailingOnceSessionService {
             return Err(meerkat_core::service::SessionError::Store(
                 "injected session store failure while settling a durable tail".into(),
             ));
+        }
+        if let Some(withheld) = self.withheld_durable_tail(session_id) {
+            return Err(withheld);
         }
         if self.keep_durable_tails.load(Ordering::SeqCst) {
             return Ok(meerkat_mob::ColdStartTailSettlement::Settled);

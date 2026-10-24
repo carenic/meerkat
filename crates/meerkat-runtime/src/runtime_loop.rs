@@ -1004,6 +1004,7 @@ impl InteractionTerminalPublicationError {
             | crate::RuntimeDriverError::LiveContextBarrierRevoked { .. }
             | crate::RuntimeDriverError::ServedElsewhere { .. }
             | crate::RuntimeDriverError::HostingUnavailable { .. }
+            | crate::RuntimeDriverError::DurableResumeHeld { .. }
             | crate::RuntimeDriverError::StaleAuthority { .. } => Self::StaleAuthority(detail),
             // A receipt-less terminal is a legitimate read verdict, but
             // terminal publication expects the receipt its run staged.
