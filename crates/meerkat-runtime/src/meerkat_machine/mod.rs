@@ -3954,7 +3954,8 @@ impl PendingRuntimeExecutorAttachment {
                 // repaired as an interrupted run, after the abandonment
                 // committed: its rows stay in the transcript, and the
                 // session's next run commits its first round over the
-                // repaired body.
+                // repaired body (the session layer resynchronizes the seeded
+                // actor from it at its next step).
                 if driver
                     .repair_settled_run_tail(self.witness.session_id(), &run_id)
                     .await
@@ -3995,15 +3996,12 @@ impl PendingRuntimeExecutorAttachment {
                 crate::completion::CompletionWaitError::AttachmentReplaced,
             );
         }
-        // The repair committed a boundary this registration did not, so the
-        // seeded actor is stale, and a tail it left would refuse the
-        // session's next run's first round commit: either way the session
-        // reloads at once, and this attachment does not serve. A crash right
-        // after the settlement leaves the same state for the next
-        // registration's recovery.
+        // A tail the repair left standing would refuse the session's next
+        // run's first round commit, so the session reloads at once, and this
+        // attachment does not serve. A crash right after the settlement
+        // leaves the same state for the next registration's recovery.
         if let Some(run_id) = reload_for_run {
-            let reason =
-                format!("expired run {run_id}'s provisional tail was repaired or still stands");
+            let reason = format!("expired run {run_id}'s provisional tail still stands");
             self.machine
                 .require_session_durability_reload(
                     self.witness.session_id(),

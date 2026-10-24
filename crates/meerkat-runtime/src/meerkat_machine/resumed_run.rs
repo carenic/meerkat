@@ -356,15 +356,18 @@ impl super::driver::DriverEntry {
     /// registration's recovery.
     ///
     /// Returns whether the session must reload before it serves again:
-    /// - the repair committed: it wrote a boundary this live registration did
-    ///   not commit, so the seeded actor's image and base authority are stale,
-    ///   and the next run's first round commit would be refused against them;
-    /// - a tail is left standing (another run's, one the recovery held,
-    ///   refused or would continue, or a failed recovery), which would refuse
-    ///   that commit outright and is the next registration's to judge.
+    /// `true` only when a tail is left standing (another run's, one the
+    /// recovery held, refused or would continue, or a failed recovery), which
+    /// would refuse the next run's first round commit and is the next
+    /// registration's to judge.
     ///
-    /// `false` only when no tail stood (the committed document was already
-    /// aligned). An ephemeral runtime keeps no tail.
+    /// `false` when the repair committed, as after a cancelled run's settle
+    /// ([`Self::settle_cancelled_run_tail`]): the repair wrote a boundary this
+    /// registration did not commit, and the session layer resynchronizes the
+    /// actor seeded from the tail from that committed boundary, its
+    /// checkpointer's receipt and base included, at its next step under the
+    /// turn boundary. Also `false` when no tail stood (the committed document
+    /// was already aligned). An ephemeral runtime keeps no tail.
     pub(crate) async fn repair_settled_run_tail(
         &self,
         session_id: &meerkat_core::types::SessionId,
@@ -390,7 +393,7 @@ impl super::driver::DriverEntry {
                     boundary_sequence,
                     "repaired the settled run's provisional tail as an interrupted run"
                 );
-                return true;
+                return false;
             }
             Ok(None) => "another run's provisional tail stands".to_string(),
             Ok(Some(crate::recovery::DurableTailRecoveryOutcome::Held)) => {
@@ -427,13 +430,14 @@ impl super::driver::DriverEntry {
     /// as an interrupted run here instead: every row kept, open calls
     /// answered as outcome-unknown, the interrupted notice appended.
     ///
-    /// Unlike [`Self::repair_settled_run_tail`] this asks for no reload. The
-    /// session layer kept the live actor, and its next step under the turn
-    /// boundary resynchronizes that actor from the committed boundary, the
-    /// checkpointer's receipt and base included. A tail the recovery holds,
-    /// refuses or would continue, another run's tail, and a failed recovery
-    /// are left as they stand, for the next registration's recovery, and
-    /// logged. A suspended run never comes here: the loop realizes a
+    /// This asks for no reload, as [`Self::repair_settled_run_tail`] asks
+    /// none after a committed repair. The session layer kept the live actor,
+    /// and its next step under the turn boundary resynchronizes that actor
+    /// from the committed boundary, the checkpointer's receipt and base
+    /// included. Unlike that repair, it asks none for a tail it leaves
+    /// either: a tail the recovery holds, refuses or would continue, another
+    /// run's tail, and a failed recovery are left as they stand, for the next
+    /// registration's recovery, and logged. A suspended run never comes here: the loop realizes a
     /// suspension before its cancelled arm. An ephemeral runtime keeps no
     /// tail.
     pub(crate) async fn settle_cancelled_run_tail(

@@ -55258,17 +55258,18 @@ async fn compaction_reconciliation_defers_to_a_standing_provisional_tail() {
     assert_eq!(store.session_snapshot_commits(), 1);
 }
 
-/// A settled run's tail repair makes the session reload whenever it would
-/// otherwise serve over stale state: a tail of another run stands (the run
-/// guard touches nothing), so the session reloads; with no tail at all the
-/// committed document is already aligned, nothing is written, and the session
-/// keeps serving. This row covers those two arms. The committing arm (the
-/// settled run's own tail, its inputs terminal, repaired and answered as a
-/// reload) needs the settled run's durable input rows, which the run-guarded
-/// recovery's own contract row builds; the harness covers it end to end.
-/// Unrun: written while Cargo is not run.
+/// A settled run's tail repair makes the session reload only while a tail
+/// stands: a tail of another run stands (the run guard touches nothing), so
+/// the session reloads; with no tail at all the committed document is already
+/// aligned, nothing is written, and the session keeps serving. This row
+/// covers those two arms. The committing arm (the settled run's own tail, its
+/// inputs terminal, repaired and answered without a reload, the session layer
+/// resynchronizing the seeded actor) needs the settled run's durable input
+/// rows, which the run-guarded recovery's own contract row builds; the long
+/// run harness covers it end to end (a refused resume and a deploy stop past
+/// its bound, each serving the session's next run).
 #[tokio::test]
-async fn a_settled_runs_repair_reloads_unless_no_tail_stood() {
+async fn a_settled_runs_repair_reloads_only_while_a_tail_stands() {
     let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
     let mut session = meerkat_core::Session::new();
     session.push(meerkat_core::types::Message::User(
